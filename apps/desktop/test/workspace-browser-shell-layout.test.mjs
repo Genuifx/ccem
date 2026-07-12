@@ -72,9 +72,12 @@ test('workspace browser entry lives beside the review action in the status strip
     path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceStatusStrip.tsx'),
     'utf8',
   );
+  const launcherSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserLauncherPopover.tsx'),
+    'utf8',
+  );
 
-  assert.match(statusStripSource, /PanelRightOpen/);
-  assert.match(statusStripSource, /PanelRightClose/);
+  assert.match(statusStripSource, /BrowserLauncherPopover/);
   assert.match(statusStripSource, /browserOpen\?: boolean/);
   assert.match(statusStripSource, /onToggleBrowser\?: \(\) => void/);
   assert.match(
@@ -87,16 +90,18 @@ test('workspace browser entry lives beside the review action in the status strip
   assert.match(statusStripSource, /browserOpen \? 'inline-flex' : 'hidden md:inline-flex'/);
   assert.match(statusStripSource, /!browserOpen && activeCronTasks\.length > 0/);
   assert.match(statusStripSource, /data-ccem-workspace-search-trigger="true"/);
-  assert.match(statusStripSource, /data-ccem-workspace-browser-toggle="true"/);
-  assert.match(statusStripSource, /title=\{browserOpen \? t\('workspace.browserClose'\) : t\('workspace.browserOpen'\)\}/);
-  assert.match(statusStripSource, /aria-label=\{browserOpen \? t\('workspace.browserClose'\) : t\('workspace.browserOpen'\)\}/);
-  assert.match(statusStripSource, /onClick=\{onToggleBrowser\}/);
-  assert.match(statusStripSource, /browserOpen[\s\S]*\? 'h-8 w-8 min-h-\[2rem\] min-w-\[2rem\] flex-none justify-center px-0'/);
-  assert.match(statusStripSource, /h-8 w-8 min-h-\[2rem\] min-w-\[2rem\] flex-none/);
+  assert.match(launcherSource, /data-ccem-workspace-browser-toggle="true"/);
+  assert.match(launcherSource, /PanelRightOpen/);
+  assert.match(launcherSource, /PanelRightClose/);
+  assert.match(launcherSource, /title=\{t\('workspace.browserHub'\)\}/);
+  assert.match(launcherSource, /aria-label=\{t\('workspace.browserHub'\)\}/);
+  assert.match(launcherSource, /onTogglePreview/);
+  assert.match(launcherSource, /previewOpen \? \(/);
+  assert.match(launcherSource, /h-8 w-8 min-h-\[2rem\] min-w-\[2rem\] flex-none/);
   assert.match(statusStripSource, /browserOpen \? 'sr-only' : 'sm:text-\[13px\]'/);
 
   const reviewIndex = statusStripSource.indexOf("title={t('workspace.reviewEntry')}");
-  const browserIndex = statusStripSource.indexOf('data-ccem-workspace-browser-toggle="true"');
+  const browserIndex = statusStripSource.indexOf('<BrowserLauncherPopover');
   assert.ok(reviewIndex > 0);
   assert.ok(browserIndex > reviewIndex);
 });

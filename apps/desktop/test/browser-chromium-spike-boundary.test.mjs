@@ -15,7 +15,7 @@ const browserSource = await readFile(
   'utf8',
 );
 const readinessSource = await readFile(
-  new URL('../src-tauri/src/browser/runtime_readiness.rs', import.meta.url),
+  new URL('../src-tauri/src/browser/runtime/state.rs', import.meta.url),
   'utf8',
 );
 const mainSource = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
@@ -46,10 +46,10 @@ test('spike runtime path is explicit and test-only, never a product cache depend
   assert.match(spikeSource, /Never discard the only safe process identity on a signal alone/);
 });
 
-test('Mode 2 readiness is queryable but cannot claim ready before preparation exists', () => {
+test('Mode 2 readiness is queryable and ready is owned by the verified state machine', () => {
   assert.match(readinessSource, /BrowserRuntimeReadinessStatus::Unavailable/);
-  assert.match(readinessSource, /there is no code path that can claim `ready`|only component allowed to return Ready/i);
-  assert.match(mainSource, /browser::browser_runtime_readiness/);
+  assert.match(readinessSource, /BrowserRuntimeReadinessStatus::Ready/);
+  assert.match(mainSource, /browser::runtime_commands::browser_runtime_readiness/);
   assert.match(permissionsSource, /"browser_runtime_readiness"/);
   assert.match(ipcSource, /browser_runtime_readiness: \[void, BrowserRuntimeReadiness\]/);
 });

@@ -36,7 +36,13 @@ test('browser MCP keeps a stable tool surface and enforces hot permission change
     createCcemBrowserMcpServer,
   } = await importBrowserMcpModule();
 
-  const readTools = ['get_url', 'read_console_log', 'screenshot', 'snapshot'];
+  const readTools = [
+    'get_url',
+    'read_console_log',
+    'read_network_log',
+    'screenshot',
+    'snapshot',
+  ];
   const allTools = browserToolNamesForPermissionMode('dev').sort();
 
   for (const mode of ['readonly', 'audit', 'plan', 'safe', 'ci']) {
@@ -94,6 +100,7 @@ test('browser MCP exposes interactive tools for development modes', async () => 
 
   const server = createCcemBrowserMcpServer('dev', async (toolName, args) => ({ toolName, args }));
   assert.ok(registeredToolNames(server).includes('evaluate'));
+  assert.ok(registeredToolNames(server).includes('read_network_log'));
 
   const navigate = server.instance._registeredTools.navigate.handler;
   const result = await navigate({ url: 'https://example.com' });
@@ -107,6 +114,13 @@ test('browser MCP exposes interactive tools for development modes', async () => 
   assert.deepEqual(JSON.parse(clickResult.content[0].text), {
     toolName: 'click',
     args: { snapshotId: 'snapshot-1', ref: 7 },
+  });
+
+  const readNetworkLog = server.instance._registeredTools.read_network_log.handler;
+  const networkResult = await readNetworkLog({});
+  assert.deepEqual(JSON.parse(networkResult.content[0].text), {
+    toolName: 'read_network_log',
+    args: {},
   });
 });
 
@@ -144,6 +158,12 @@ test('browser tool bridge resolves successful responses and rejects failures', a
     request_id: 'missing',
     ok: true,
   }), false);
+});
+
+test('browser bridge caller deadline stays beyond the production backend deadline', async () => {
+  const { BROWSER_TOOL_BRIDGE_TIMEOUT_MS } = await importBrowserMcpModule();
+  assert.equal(BROWSER_TOOL_BRIDGE_TIMEOUT_MS, 45_000);
+  assert.ok(BROWSER_TOOL_BRIDGE_TIMEOUT_MS > 30_000);
 });
 
 test('browser tool bridge rejects all pending requests when the session closes', async () => {

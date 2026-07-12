@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "signing_key_id": "ccem-browser-runtime-2026-01",
+  "sequence": 1,
+  "minimum_protocol_version": 1,
+  "artifact": {
+    "platform": "windows",
+    "architecture": "x86_64",
+    "version": "150.0.7871.115",
+    "minimum_os_version": "10.0",
+    "source_url": "https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.115/win64/chrome-win64.zip",
+    "archive": {
+      "format": "zip",
+      "byte_size": 194764577,
+      "sha256": "90e0d112cb2f2743a7fd723f030c15b6421940be61dcbda7758563f821dd81da",
+      "max_entries": 1000,
+      "max_unpacked_bytes": 600000000,
+      "max_file_bytes": 300000000
+    },
+    "layout": {
+      "root_directory": "chrome-win64",
+      "executable": {
+        "relative_path": "chrome.exe",
+        "byte_size": 3916800,
+        "sha256": "c55dc23c0d6c2b87cf3d056959eb1e351bc98dfb3e5fa5d53aff86a25f1b32c5"
+      },
+      "symlinks": []
+    },
+    "product_identity": {
+      "product_name": "Google Chrome for Testing",
+      "product_version": "150.0.7871.115",
+      "bundle_identifier": null,
+      "publisher": "Google LLC"
+    }
+  }
+}

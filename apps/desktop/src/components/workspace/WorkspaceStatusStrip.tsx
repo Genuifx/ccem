@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Radio, Flame, Clock, Check, Settings2, ClipboardCheck, Search, Command, PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { Radio, Flame, Clock, Check, Settings2, ClipboardCheck, Search, Command } from 'lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
 import { getEnvColorVar, cn } from '@/lib/utils';
@@ -21,6 +21,7 @@ import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import { resolveEnvironmentIconHint } from '@/components/workspace/sessionTreeIcons';
 import { StreakUsagePopoverContent } from './StreakUsagePopover';
+import { BrowserLauncherPopover } from './BrowserLauncherPopover';
 import type { UsageStats } from '@/types/analytics';
 import type { Environment } from '@/store';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
@@ -60,6 +61,7 @@ interface WorkspaceStatusStripProps {
   onNavigate: (tab: string) => void;
   onOpenSearch: () => void;
   browserOpen?: boolean;
+  browserWorkingDir?: string | null;
   onToggleBrowser?: () => void;
 }
 
@@ -125,6 +127,7 @@ export function WorkspaceStatusStrip({
   onNavigate,
   onOpenSearch,
   browserOpen = false,
+  browserWorkingDir = null,
   onToggleBrowser,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
@@ -388,33 +391,11 @@ export function WorkspaceStatusStrip({
       </button>
 
       {onToggleBrowser ? (
-        <button
-          type="button"
-          data-ccem-workspace-browser-toggle="true"
-          aria-pressed={browserOpen}
-          aria-label={browserOpen ? t('workspace.browserClose') : t('workspace.browserOpen')}
-          title={browserOpen ? t('workspace.browserClose') : t('workspace.browserOpen')}
-          onClick={onToggleBrowser}
-          className={cn(
-            'group relative inline-flex h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none items-center justify-center rounded-full p-0 cursor-pointer',
-            'status-chip-glass',
-            'hover:scale-[1.02] active:scale-[0.98]',
-            browserOpen && 'ring-1 ring-inset ring-primary/40'
-          )}
-        >
-          {browserOpen ? (
-            <PanelRightClose
-              className="h-3.5 w-3.5 shrink-0 text-primary transition-transform duration-200 group-hover:scale-110"
-            />
-          ) : (
-            <PanelRightOpen
-              className={cn(
-                'h-3.5 w-3.5 shrink-0 transition-transform duration-200 group-hover:scale-110',
-                'text-muted-foreground'
-              )}
-            />
-          )}
-        </button>
+        <BrowserLauncherPopover
+          previewOpen={browserOpen}
+          workingDir={browserWorkingDir}
+          onTogglePreview={onToggleBrowser}
+        />
       ) : null}
     </div>
   );

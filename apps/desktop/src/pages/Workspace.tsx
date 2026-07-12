@@ -2608,6 +2608,7 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={browserPanelOpen}
+            browserWorkingDir={skillsContext.workingDir}
             onToggleBrowser={() => setActiveBrowserPanelOpen((open) => !open)}
           />
 

@@ -19,6 +19,7 @@
     "audit:prod:high": "node scripts/ci/check-prod-audit.mjs",
     "check:i18n": "node scripts/check-i18n.js",
     "check:file-size": "bash scripts/check-file-size.sh",
+    "check:browser-runtime-manifests": "node scripts/ci/check-browser-runtime-manifests.mjs",
     "check:release-version": "node scripts/ci/check-release-version.mjs",
     "check:all": "pnpm check:i18n && pnpm check:file-size",
     "verify": "pnpm audit:prod:high && pnpm test:run && pnpm build && cd apps/desktop/src-tauri && cargo test",

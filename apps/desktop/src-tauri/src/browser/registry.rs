@@ -25,6 +25,7 @@ pub(super) struct BrowserSessionState {
     pub workspace_dir: Option<String>,
     pub cancel_epoch: u64,
     pub policy_epoch: u64,
+    permission_revision: Option<u64>,
     pub operation_seq: u64,
     pub last_agent_action: Option<String>,
     pub created_at: String,
@@ -54,6 +55,7 @@ impl BrowserSessionState {
             workspace_dir: None,
             cancel_epoch: 0,
             policy_epoch: 0,
+            permission_revision: None,
             operation_seq: 0,
             last_agent_action: None,
             created_at: now.clone(),
@@ -87,6 +89,7 @@ pub(super) struct BrowserOperationToken {
     pub generation: u64,
     pub cancel_epoch: u64,
     pub policy_epoch: u64,
+    pub permission_revision: Option<u64>,
     pub operation_seq: u64,
 }
 
@@ -441,6 +444,24 @@ impl BrowserSessionRegistry {
         session_id: &str,
         tool: &str,
     ) -> Result<(BrowserSessionState, BrowserOperationToken), String> {
+        self.begin_agent_action_inner(session_id, tool, None)
+    }
+
+    pub fn begin_agent_action_with_permission(
+        &self,
+        session_id: &str,
+        tool: &str,
+        permission_revision: u64,
+    ) -> Result<(BrowserSessionState, BrowserOperationToken), String> {
+        self.begin_agent_action_inner(session_id, tool, Some(permission_revision))
+    }
+
+    fn begin_agent_action_inner(
+        &self,
+        session_id: &str,
+        tool: &str,
+        permission_revision: Option<u64>,
+    ) -> Result<(BrowserSessionState, BrowserOperationToken), String> {
         let mut sessions = self.lock_sessions()?;
         let session = sessions
             .get_mut(session_id)
@@ -457,6 +478,17 @@ impl BrowserSessionRegistry {
                 session.lifecycle.as_str()
             ));
         }
+        if let Some(expected) = permission_revision {
+            match session.permission_revision {
+                Some(current) if current != expected => {
+                    return Err(
+                        "Browser permission changed before the Preview action began.".to_string(),
+                    )
+                }
+                None => session.permission_revision = Some(expected),
+                Some(_) => {}
+            }
+        }
         session.operation_seq = session.operation_seq.saturating_add(1);
         session.control = BrowserControlState::Agent;
         session.last_agent_action = Some(tool.to_string());
@@ -466,6 +498,7 @@ impl BrowserSessionRegistry {
             generation: session.generation,
             cancel_epoch: session.cancel_epoch,
             policy_epoch: session.policy_epoch,
+            permission_revision,
             operation_seq: session.operation_seq,
         };
         Ok((session.clone(), token))
@@ -479,6 +512,9 @@ impl BrowserSessionRegistry {
         if session.generation != token.generation
             || session.cancel_epoch != token.cancel_epoch
             || session.policy_epoch != token.policy_epoch
+            || token
+                .permission_revision
+                .is_some_and(|expected| session.permission_revision != Some(expected))
             || session.operation_seq != token.operation_seq
         {
             return Err(
@@ -534,6 +570,21 @@ impl BrowserSessionRegistry {
 
     pub fn bump_policy_epoch(&self, session_id: &str) -> Result<BrowserSessionState, String> {
         self.update(session_id, |session| {
+            session.policy_epoch = session.policy_epoch.saturating_add(1);
+            session.cancel_epoch = session.cancel_epoch.saturating_add(1);
+            if !session.paused {
+                session.control = BrowserControlState::User;
+            }
+        })
+    }
+
+    pub fn bump_permission_epoch(
+        &self,
+        session_id: &str,
+        permission_revision: u64,
+    ) -> Result<BrowserSessionState, String> {
+        self.update(session_id, |session| {
+            session.permission_revision = Some(permission_revision);
             session.policy_epoch = session.policy_epoch.saturating_add(1);
             session.cancel_epoch = session.cancel_epoch.saturating_add(1);
             if !session.paused {

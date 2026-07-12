@@ -1,0 +1,12 @@
+[[permission]]
+identifier = "login-browser-control-commands"
+description = "Allows only the trusted Login Browser control window to inspect and transition its bound browser session."
+commands.allow = [
+  "browser_login_control_snapshot",
+  "browser_login_recent_activity",
+  "browser_login_handoff",
+  "browser_login_pause",
+  "browser_login_takeover",
+  "browser_login_close",
+  "browser_login_force_stop",
+]

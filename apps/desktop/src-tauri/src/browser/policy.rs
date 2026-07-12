@@ -1,4 +1,10 @@
-const READ_ONLY_BROWSER_TOOLS: &[&str] = &["get_url", "snapshot", "screenshot", "read_console_log"];
+const READ_ONLY_BROWSER_TOOLS: &[&str] = &[
+    "get_url",
+    "snapshot",
+    "screenshot",
+    "read_console_log",
+    "read_network_log",
+];
 
 fn browser_mode_is_restricted(mode: &str) -> bool {
     matches!(mode, "readonly" | "audit" | "plan" | "safe" | "ci")
@@ -18,6 +24,7 @@ fn browser_tool_is_known(tool: &str) -> bool {
             | "evaluate"
             | "wait_for"
             | "read_console_log"
+            | "read_network_log"
     )
 }
 
@@ -51,7 +58,13 @@ mod tests {
     #[test]
     fn restricted_modes_allow_diagnostics_and_block_page_mutation() {
         for mode in ["readonly", "audit", "plan", "safe", "ci"] {
-            for tool in ["get_url", "snapshot", "screenshot", "read_console_log"] {
+            for tool in [
+                "get_url",
+                "snapshot",
+                "screenshot",
+                "read_console_log",
+                "read_network_log",
+            ] {
                 authorize_browser_tool(mode, tool)
                     .unwrap_or_else(|error| panic!("{mode}/{tool}: {error}"));
             }
@@ -97,5 +110,6 @@ mod tests {
         assert!(authorize_browser_tool("custom", "click").is_err());
         assert!(authorize_browser_tool("dev", "raw_cdp").is_err());
         assert!(authorize_browser_tool("custom", "snapshot").is_ok());
+        assert!(authorize_browser_tool("custom", "read_network_log").is_ok());
     }
 }

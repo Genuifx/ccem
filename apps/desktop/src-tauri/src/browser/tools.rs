@@ -1,3 +1,4 @@
+use super::login::capability::BrowserPermissionAuthorityTicket;
 use super::registry::BrowserOperationToken;
 use super::{
     build_eval_json_script, decode_eval_json_string, decode_eval_value, emit_browser_opened,
@@ -18,8 +19,36 @@ impl BrowserManager {
         workspace_dir: &str,
         request: &BrowserToolRequest,
     ) -> Result<Value, String> {
+        self.run_tool_with_permission_context(app, session_id, workspace_dir, request, None)
+    }
+
+    pub(crate) fn run_tool_with_permission(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        workspace_dir: &str,
+        request: &BrowserToolRequest,
+        permission: &BrowserPermissionAuthorityTicket,
+    ) -> Result<Value, String> {
+        self.run_tool_with_permission_context(
+            app,
+            session_id,
+            workspace_dir,
+            request,
+            Some(permission),
+        )
+    }
+
+    fn run_tool_with_permission_context(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        workspace_dir: &str,
+        request: &BrowserToolRequest,
+        permission: Option<&BrowserPermissionAuthorityTicket>,
+    ) -> Result<Value, String> {
         let started_at = Instant::now();
-        let outcome = self.run_tool_authorized(app, session_id, workspace_dir, request);
+        let outcome = self.run_tool_authorized(app, session_id, workspace_dir, request, permission);
         if let Err(error) = self.audit_tool_result(
             workspace_dir,
             session_id,
@@ -38,6 +67,7 @@ impl BrowserManager {
         session_id: &str,
         workspace_dir: &str,
         request: &BrowserToolRequest,
+        permission: Option<&BrowserPermissionAuthorityTicket>,
     ) -> Result<Value, String> {
         let session_id = normalize_browser_session_id(Some(session_id));
         let session = self.prepare_agent_tool_session(&session_id, workspace_dir)?;
@@ -51,17 +81,42 @@ impl BrowserManager {
         self.reveal_for_agent_tool(app, &session_id)?;
         self.wait_for_visible_agent_control(app, &session_id)?;
         let _ = self.drain_console_log(app, &session_id, workspace_dir);
-        let (active, token) = self
-            .registry
-            .begin_agent_action(&session_id, &request.tool)?;
+        let (active, token) = match permission {
+            Some(permission) => begin_permission_bound_preview_action(
+                self.registry.as_ref(),
+                &session_id,
+                &request.tool,
+                permission,
+            )?,
+            None => self
+                .registry
+                .begin_agent_action(&session_id, &request.tool)?,
+        };
         emit_browser_state(app, &active, "agent_action_started");
 
-        let outcome = self
-            .run_tool_inner(app, &session_id, workspace_dir, request, &token)
-            .and_then(|value| {
+        let effect = || self.run_tool_inner(app, &session_id, workspace_dir, request, &token);
+        let outcome = if preview_tool_has_immediate_effect(&request.tool) {
+            match permission {
+                Some(permission) => execute_permission_bound_preview_effect(
+                    self.registry.as_ref(),
+                    &token,
+                    permission,
+                    effect,
+                ),
+                None => {
+                    self.registry.validate_operation(&token)?;
+                    effect().and_then(|value| {
+                        self.registry.validate_operation(&token)?;
+                        Ok(value)
+                    })
+                }
+            }
+        } else {
+            effect().and_then(|value| {
                 self.registry.validate_operation(&token)?;
                 Ok(value)
-            });
+            })
+        };
         let finish_error = outcome.as_ref().err().map(String::as_str);
         if let Some(finished) = self.registry.finish_agent_action(&token, finish_error)? {
             emit_browser_state(
@@ -231,6 +286,7 @@ impl BrowserManager {
                 self.wait_for_text(app, Some(session_id), &text, timeout_ms, Some(token))
             }
             "read_console_log" => self.read_console_log(app, session_id, workspace_dir),
+            "read_network_log" => Ok(preview_network_log_unsupported()),
             other => Err(format!("Unsupported browser tool: {other}")),
         }
     }
@@ -379,9 +435,222 @@ impl BrowserManager {
     }
 }
 
+fn begin_permission_bound_preview_action(
+    registry: &super::registry::BrowserSessionRegistry,
+    session_id: &str,
+    tool: &str,
+    permission: &BrowserPermissionAuthorityTicket,
+) -> Result<(super::registry::BrowserSessionState, BrowserOperationToken), String> {
+    let revision = permission.revision();
+    permission
+        .with_current_revision(revision, || {
+            registry.begin_agent_action_with_permission(session_id, tool, revision)
+        })
+        .map_err(|_| "Browser permission changed before the Preview action began.".to_string())?
+}
+
+fn execute_permission_bound_preview_effect<T>(
+    registry: &super::registry::BrowserSessionRegistry,
+    token: &BrowserOperationToken,
+    permission: &BrowserPermissionAuthorityTicket,
+    effect: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let revision = token.permission_revision.ok_or_else(|| {
+        "Browser permission revision is missing from the Preview action.".to_string()
+    })?;
+    permission
+        .with_current_revision(revision, || {
+            registry.validate_operation(token)?;
+            let value = effect()?;
+            registry.validate_operation(token)?;
+            Ok(value)
+        })
+        .map_err(|_| "Browser permission changed before the Preview effect.".to_string())?
+}
+
+fn preview_tool_has_immediate_effect(tool: &str) -> bool {
+    matches!(
+        tool,
+        "navigate" | "click" | "type" | "press_key" | "scroll" | "evaluate"
+    )
+}
+
+fn preview_network_log_unsupported() -> Value {
+    json!({
+        "supported": false,
+        "backend": "preview_browser",
+        "reason": "Preview Browser does not expose network diagnostics.",
+        "recent": [],
+        "untrusted": true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BrowserManager;
+    use super::{
+        begin_permission_bound_preview_action, execute_permission_bound_preview_effect,
+        preview_network_log_unsupported, BrowserManager,
+    };
+    use crate::browser::login::capability::BrowserPermissionAuthority;
+    use crate::browser::registry::BrowserSessionRegistry;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn ready_registry() -> Arc<BrowserSessionRegistry> {
+        let registry = Arc::new(BrowserSessionRegistry::new("session-a"));
+        registry
+            .snapshot_or_create("session-a", |_| "browser-a".to_string())
+            .expect("create preview session");
+        registry.mark_ready("session-a").expect("ready session");
+        registry
+    }
+
+    #[test]
+    fn stale_prevalidated_authority_cannot_begin_after_downgrade() {
+        let registry = ready_registry();
+        let authority = BrowserPermissionAuthority::new("yolo");
+        let stale = authority.current_ticket().expect("current ticket");
+        stale
+            .validate_current()
+            .expect("simulate the former pre-execution validation");
+
+        authority
+            .update_with_invalidation("readonly", |revision| {
+                registry
+                    .bump_permission_epoch("session-a", revision)
+                    .is_ok()
+            })
+            .expect("downgrade authority");
+
+        assert!(begin_permission_bound_preview_action(
+            registry.as_ref(),
+            "session-a",
+            "click",
+            &stale,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn immediate_effect_linearizes_before_downgrade_and_is_stale_afterward() {
+        let registry = ready_registry();
+        let authority = Arc::new(BrowserPermissionAuthority::new("yolo"));
+        let ticket = authority.current_ticket().expect("current ticket");
+        let (_, token) = begin_permission_bound_preview_action(
+            registry.as_ref(),
+            "session-a",
+            "evaluate",
+            &ticket,
+        )
+        .expect("begin bound action");
+        let (effect_entered_tx, effect_entered_rx) = mpsc::channel();
+        let (release_effect_tx, release_effect_rx) = mpsc::channel();
+        let (effect_done_tx, effect_done_rx) = mpsc::channel();
+        let effect_registry = Arc::clone(&registry);
+        let effect_ticket = ticket.clone();
+        let effect_token = token.clone();
+        let effect_thread = std::thread::spawn(move || {
+            let result = execute_permission_bound_preview_effect(
+                effect_registry.as_ref(),
+                &effect_token,
+                &effect_ticket,
+                || {
+                    effect_entered_tx.send(()).unwrap();
+                    release_effect_rx.recv().unwrap();
+                    Ok::<_, String>("effect")
+                },
+            );
+            effect_done_tx.send(result).unwrap();
+        });
+        effect_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("effect acquired revision proof");
+
+        let effect_released = Arc::new(AtomicBool::new(false));
+        let (downgrade_started_tx, downgrade_started_rx) = mpsc::channel();
+        let (downgrade_done_tx, downgrade_done_rx) = mpsc::channel();
+        let downgrade_authority = Arc::clone(&authority);
+        let downgrade_registry = Arc::clone(&registry);
+        let downgrade_effect_released = Arc::clone(&effect_released);
+        let downgrade_thread = std::thread::spawn(move || {
+            downgrade_started_tx.send(()).unwrap();
+            let result = downgrade_authority.update_with_invalidation("readonly", |revision| {
+                assert!(downgrade_effect_released.load(Ordering::Acquire));
+                downgrade_registry
+                    .bump_permission_epoch("session-a", revision)
+                    .is_ok()
+            });
+            downgrade_done_tx.send(result).unwrap();
+        });
+        downgrade_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("downgrade started while the effect held its revision proof");
+        assert!(downgrade_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        effect_released.store(true, Ordering::Release);
+        release_effect_tx.send(()).unwrap();
+        assert_eq!(
+            effect_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("effect completed")
+                .expect("effect result"),
+            "effect"
+        );
+        downgrade_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("downgrade completed")
+            .expect("downgrade result");
+        effect_thread.join().expect("effect thread");
+        downgrade_thread.join().expect("downgrade thread");
+
+        assert!(execute_permission_bound_preview_effect(
+            registry.as_ref(),
+            &token,
+            &ticket,
+            || Ok::<_, String>("stale effect"),
+        )
+        .is_err());
+        assert!(registry.validate_operation(&token).is_err());
+    }
+
+    #[test]
+    fn bound_wait_token_is_cancelled_without_blocking_the_downgrade() {
+        let registry = ready_registry();
+        let authority = BrowserPermissionAuthority::new("yolo");
+        let ticket = authority.current_ticket().expect("current ticket");
+        let (_, token) = begin_permission_bound_preview_action(
+            registry.as_ref(),
+            "session-a",
+            "wait_for",
+            &ticket,
+        )
+        .expect("begin bound wait");
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let wait_registry = Arc::clone(&registry);
+        std::thread::spawn(move || loop {
+            if wait_registry.validate_operation(&token).is_err() {
+                cancelled_tx.send(()).unwrap();
+                break;
+            }
+            std::thread::yield_now();
+        });
+
+        authority
+            .update_with_invalidation("readonly", |revision| {
+                registry
+                    .bump_permission_epoch("session-a", revision)
+                    .is_ok()
+            })
+            .expect("downgrade authority without waiting for the read operation");
+
+        cancelled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bound wait observed cancellation");
+    }
 
     #[test]
     fn first_native_agent_tool_registers_before_binding_workspace() {
@@ -392,6 +661,15 @@ mod tests {
 
         assert_eq!(state.session_id, "native-first-tool");
         assert_eq!(state.workspace_dir.as_deref(), Some("/workspace/preview"));
+    }
+
+    #[test]
+    fn preview_network_diagnostics_fail_explicitly_without_fabricating_data() {
+        let value = preview_network_log_unsupported();
+        assert_eq!(value["supported"], false);
+        assert_eq!(value["backend"], "preview_browser");
+        assert_eq!(value["recent"], serde_json::json!([]));
+        assert!(value.get("path").is_none());
     }
 }
 

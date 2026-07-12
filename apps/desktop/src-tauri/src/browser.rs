@@ -1,20 +1,24 @@
 mod artifacts;
+mod bootstrap;
 #[cfg(all(unix, any(test, feature = "chromium-spike")))]
 mod chromium_spike;
+pub(crate) mod login;
+pub(crate) mod login_commands;
 mod logs;
 mod policy;
 mod registry;
-mod runtime_readiness;
+mod runtime;
+pub(crate) mod runtime_commands;
 mod tools;
 mod url;
 mod webview;
 
 use artifacts::BrowserArtifactStore;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+pub(crate) use bootstrap::{create_browser_runtime_manager, create_login_browser_session_manager};
 use logs::BrowserLogStore;
 pub use logs::BrowserRecentActivity;
 pub(crate) use policy::authorize_browser_tool;
-pub use runtime_readiness::BrowserRuntimeReadiness;
 use registry::{BrowserSessionRegistry, BrowserSessionState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -476,11 +480,18 @@ impl BrowserManager {
         self.info_from_state(state, webview_exists)
     }
 
-    pub fn policy_changed(&self, app: &AppHandle, session_id: &str) -> Result<(), String> {
+    pub fn policy_changed(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        permission_revision: u64,
+    ) -> Result<(), String> {
         let Some(_) = self.registry.snapshot(session_id)? else {
             return Ok(());
         };
-        let state = self.registry.bump_policy_epoch(session_id)?;
+        let state = self
+            .registry
+            .bump_permission_epoch(session_id, permission_revision)?;
         emit_browser_state(app, &state, "permission_mode_changed");
         Ok(())
     }
@@ -747,11 +758,6 @@ pub fn browser_recent_activity(
     session_id: Option<String>,
 ) -> Result<BrowserRecentActivity, String> {
     state.recent_activity(&normalize_browser_session_id(session_id.as_deref()))
-}
-
-#[tauri::command]
-pub fn browser_runtime_readiness() -> BrowserRuntimeReadiness {
-    runtime_readiness::runtime_readiness()
 }
 
 #[tauri::command]

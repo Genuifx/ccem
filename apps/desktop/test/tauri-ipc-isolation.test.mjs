@@ -66,22 +66,58 @@ test('Tauri capabilities grant desktop privileges only to trusted app webviews',
   }
 });
 
-test('trusted app-command ACL stays in lockstep with generate_handler', async () => {
-  const [mainSource, permissionSource] = await Promise.all([
+test('trusted command ACLs stay in lockstep with generate_handler', async () => {
+  const [mainSource, permissionFiles] = await Promise.all([
     fs.readFile(path.join(tauriDir, 'src', 'main.rs'), 'utf8'),
+    fs.readdir(path.join(tauriDir, 'permissions')),
+  ]);
+  const registered = extractRegisteredAppCommands(mainSource);
+  const allowed = (
+    await Promise.all(
+      permissionFiles
+        .filter((name) => name.endsWith('.toml'))
+        .map(async (name) => extractAllowedManifestCommands(
+          await fs.readFile(path.join(tauriDir, 'permissions', name), 'utf8'),
+        )),
+    )
+  ).flat();
+
+  assertUnique(registered, 'generate_handler command list');
+  assertUnique(allowed, 'trusted command ACL union');
+  assert.deepEqual(
+    [...allowed].sort(),
+    [...registered].sort(),
+    'every registered app command must be explicitly covered by one trusted webview ACL',
+  );
+});
+
+test('Login Browser control has an exact least-privilege capability', async () => {
+  const [capabilitySource, permissionSource, defaultPermissionSource] = await Promise.all([
+    fs.readFile(path.join(tauriDir, 'capabilities', 'login-browser-control.json'), 'utf8'),
+    fs.readFile(
+      path.join(tauriDir, 'permissions', 'login-browser-control-commands.toml'),
+      'utf8',
+    ),
     fs.readFile(
       path.join(tauriDir, 'permissions', 'trusted-app-commands.toml'),
       'utf8',
     ),
   ]);
-  const registered = extractRegisteredAppCommands(mainSource);
-  const allowed = extractAllowedManifestCommands(permissionSource);
+  const capability = JSON.parse(capabilitySource);
+  const commands = extractAllowedManifestCommands(permissionSource);
 
-  assertUnique(registered, 'generate_handler command list');
-  assertUnique(allowed, 'trusted app-command ACL');
-  assert.deepEqual(
-    [...allowed].sort(),
-    [...registered].sort(),
-    'every registered app command must be explicitly covered by the trusted webview ACL',
-  );
+  assert.deepEqual(capability.webviews, ['login-browser-control']);
+  assert.ok(capability.permissions.includes('login-browser-control-commands'));
+  assert.deepEqual(commands.sort(), [
+    'browser_login_close',
+    'browser_login_control_snapshot',
+    'browser_login_force_stop',
+    'browser_login_handoff',
+    'browser_login_pause',
+    'browser_login_recent_activity',
+    'browser_login_takeover',
+  ]);
+  for (const command of commands) {
+    assert.doesNotMatch(defaultPermissionSource, new RegExp(`"${command}"`));
+  }
 });

@@ -24,6 +24,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
   const expectedQueryModel = options.expectedQueryModel ?? null;
   const reportModelState = options.reportModelState ?? false;
   const keepAliveAfterResult = options.keepAliveAfterResult ?? false;
+  const rejectPermissionChange = options.rejectPermissionChange ?? false;
 
   await build({
     entryPoints: [path.join(packageDir, 'src', 'index.ts')],
@@ -68,6 +69,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const expectedQueryModel = ${JSON.stringify(expectedQueryModel)};
             const reportModelState = ${JSON.stringify(reportModelState)};
             const keepAliveAfterResult = ${JSON.stringify(keepAliveAfterResult)};
+            const rejectPermissionChange = ${JSON.stringify(rejectPermissionChange)};
             let queryCount = 0;
             let setModelCalled = false;
             export function query({ prompt, options }) {
@@ -102,6 +104,11 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                 },
                 async setModel() {
                   setModelCalled = true;
+                },
+                async setPermissionMode() {
+                  if (rejectPermissionChange) {
+                    throw new Error('mock permission mode rejection');
+                  }
                 },
                 async *[Symbol.asyncIterator]() {
                   const iterator = prompt[Symbol.asyncIterator]();
@@ -670,6 +677,7 @@ test('queues Claude settings without closing an idle retained query', async (t) 
 
   helper.stdin.write(`${JSON.stringify({
     type: 'update_settings',
+    request_id: 'settings-retained-runtime',
     env_name: 'updated',
     env_vars: { ANTHROPIC_MODEL: 'new-model' },
   })}\n`);
@@ -681,6 +689,14 @@ test('queues Claude settings without closing an idle retained query', async (t) 
       && output.detail === 'Settings will apply to the next Claude runtime.',
     stderrRef,
     'queued settings status',
+  );
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'settings_update_result'
+      && output.request_id === 'settings-retained-runtime'
+      && output.outcome === 'deferred',
+    stderrRef,
+    'correlated deferred settings acknowledgement',
   );
 
   await delay(80);
@@ -701,6 +717,74 @@ test('queues Claude settings without closing an idle retained query', async (t) 
   );
 
   assert.doesNotMatch(stderrRef.value, /__MOCK_CLAUDE_CLOSE__/);
+});
+
+test('correlates applied and failed permission settings acknowledgements', async (t) => {
+  for (const scenario of [
+    { outcome: 'applied', rejectPermissionChange: false },
+    { outcome: 'failed', rejectPermissionChange: true },
+  ]) {
+    const helperPath = await buildHelperWithMockClaudeSdk({
+      keepAliveAfterResult: true,
+      rejectPermissionChange: scenario.rejectPermissionChange,
+    });
+    const helper = spawn(process.execPath, [helperPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    t.after(() => helper.kill('SIGTERM'));
+
+    const outputs = [];
+    const stderrRef = { value: '' };
+    let stdoutBuffer = '';
+    helper.stdout.setEncoding('utf8');
+    helper.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk;
+      let newlineIndex = stdoutBuffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        if (line) outputs.push(JSON.parse(line));
+        newlineIndex = stdoutBuffer.indexOf('\n');
+      }
+    });
+    helper.stderr.setEncoding('utf8');
+    helper.stderr.on('data', (chunk) => {
+      stderrRef.value += chunk;
+    });
+
+    helper.stdin.write(`${JSON.stringify({
+      type: 'init',
+      provider: 'claude',
+      env_name: 'default',
+      perm_mode: 'dev',
+      working_dir: os.tmpdir(),
+      initial_prompt: 'first',
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'status'
+        && output.status === 'ready'
+        && output.detail === 'Ready for the next prompt.',
+      stderrRef,
+      `ready before ${scenario.outcome} permission update`,
+    );
+
+    const requestId = `settings-permission-${scenario.outcome}`;
+    helper.stdin.write(`${JSON.stringify({
+      type: 'update_settings',
+      request_id: requestId,
+      perm_mode: 'readonly',
+    })}\n`);
+    const acknowledgement = await waitForOutput(
+      outputs,
+      (output) => output.type === 'settings_update_result'
+        && output.request_id === requestId,
+      stderrRef,
+      `${scenario.outcome} permission settings acknowledgement`,
+    );
+    assert.equal(acknowledgement.outcome, scenario.outcome);
+    helper.kill('SIGTERM');
+  }
 });
 
 test('applies queued Claude settings after the retained query is reclaimed', async (t) => {
@@ -774,6 +858,7 @@ test('applies queued Claude settings after the retained query is reclaimed', asy
 
   helper.stdin.write(`${JSON.stringify({
     type: 'update_settings',
+    request_id: 'settings-after-reclaim',
     env_name: 'updated',
     env_vars: { ANTHROPIC_MODEL: 'new-model' },
   })}\n`);

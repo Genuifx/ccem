@@ -27,7 +27,10 @@ test('agent browser artifacts are app-owned while UI screenshot remains inline',
   assert.match(uiScreenshot, /screenshot_base64/);
 
   assert.match(nativeRuntimeSource, /record\.project_dir\.clone\(\)/);
-  assert.match(nativeRuntimeSource, /browser\.run_tool\(app, runtime_id, &workspace_dir, &request\)/);
+  assert.match(
+    nativeRuntimeSource,
+    /browser\.run_tool_with_permission\(\s*app,\s*runtime_id,\s*&workspace_dir,\s*&request,\s*&authority,?\s*\)/,
+  );
 
   assert.match(artifactSource, /config::get_ccem_dir\(\)\.join\("browser"\)/);
   assert.match(artifactSource, /join\("workspaces"\)[\s\S]*join\("sessions"\)[\s\S]*join\("artifacts"\)/);

@@ -387,6 +387,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allows only the trusted Login Browser control window to inspect and transition its bound browser session.",
+          "type": "string",
+          "const": "login-browser-control-commands",
+          "markdownDescription": "Allows only the trusted Login Browser control window to inspect and transition its bound browser session."
+        },
+        {
           "description": "Allows CCEM application commands only for explicitly trusted application webviews.",
           "type": "string",
           "const": "trusted-app-commands",

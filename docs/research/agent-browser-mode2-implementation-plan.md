@@ -1,8 +1,8 @@
 # CCEM Secure Login Browser implementation plan (Mode 2)
 
-Date: 2026-07-10
+Date: 2026-07-11
 
-Status: implementation-ready plan; Mode 2 code has not started
+Status: implementation in progress on `codex/agent-browser-mode2`
 
 Depends on: Preview Browser final native-flow gate and a verified full Chrome for Testing runtime
 
@@ -94,12 +94,15 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 ### Build
 
 - Add a CCEM-signed runtime manifest containing platform, architecture, exact version, official
-  source URL, archive byte size, SHA-256, unpacked executable identity, and minimum protocol
-  version.
+  source URL, archive byte size, SHA-256, unpacked executable identity, minimum OS version, and
+  minimum protocol version.
 - Download into an app-owned temporary directory with bounded retries, cancellation, progress, and
   resume only when the server validators still match.
-- Verify archive size and SHA-256 before extraction. Reject links, path traversal, unexpected file
-  types, and executable layouts not present in the manifest.
+- Verify archive size and SHA-256 before extraction. Reject path traversal, unexpected file types,
+  undeclared links, and executable layouts not present in the manifest. A platform artifact may
+  declare an exact allowlist of relative symlinks only when both the lexical and final target stay
+  inside the candidate root; absolute, escaping, cyclic, hardlink, and undeclared link entries are
+  rejected.
 - Extract into a new versioned directory; apply private permissions; verify signing/notarization or
   platform-native executable identity where available.
 - Run a private-pipe smoke against the unpacked binary before atomic activation.
@@ -115,6 +118,8 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 - A corrupted archive, wrong hash, wrong executable, failed smoke, or failed signature leaves the
   previous runtime active.
 - No mutable `latest` URL or local Playwright/system-Chrome path can become the trust root.
+- Unsupported OS versions fail with a stable non-retryable error while Preview Browser remains
+  available.
 - `ready` identifies the exact activated version and changes atomically.
 - Standard app startup and Preview Browser remain usable while preparation runs.
 
@@ -169,6 +174,10 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 - Track target creation, navigation, redirect, frame, dialog, download, renderer crash, and process
   termination in the shared registry. Increment generation when a target/session is recreated so
   stale element references fail closed.
+- Before activating an Agent handoff, run a bounded owner-side inventory barrier over the exact
+  primary page target and its recursive frame tree. Reject extra page targets, opaque/cross-origin
+  frames, malformed inventories, or inventory changes during the barrier; a failed preflight rolls
+  policy and capture back to manual user control and grants no semantic capability.
 - Implement Chromium screenshot and true accessibility snapshot, with a documented DOM interaction
   fallback only when the AX result cannot represent a necessary control.
 - Implement trusted input through CDP input dispatch. Do not expose arbitrary page evaluation as an
@@ -183,6 +192,9 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 - The same native Agent script can select either backend for open, navigate, snapshot, screenshot,
   click, type, wait, console, and close without receiving backend handles.
 - Pause or permission change cancels an active operation within one second and blocks the next one.
+- Cancellation first retires the effect epoch, then waits on a bounded owner acknowledgement. If
+  the owner cannot acknowledge within the UI deadline, CCEM signals only the identity-verified
+  owned process domain, marks cleanup required, and still returns without permitting a late effect.
 - Renderer crash, target close, pipe EOF, timeout, and oversized frame produce explicit registry
   states and bounded errors rather than hanging or crashing the desktop app.
 - Old element references fail after navigation or target generation change.
@@ -193,6 +205,12 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 
 - Authorize normalized scheme/host/port rules per workspace and profile. Check initial URLs,
   redirects, popups, iframes used for action, and every mutating semantic capability.
+- Track the source origin of page-derived data. Cross-origin read-to-write is denied by default;
+  a one-shot trusted UI confirmation bound to the exact source, destination, profile, session, and
+  handoff epoch is required before it can proceed.
+- Until that one-shot confirmation UI ships, retain a conservative workspace-plus-actor provenance
+  taint across handoff epochs and browser sessions. A later write at a different origin is an
+  unsupported transfer and fails closed; a fresh handoff must not silently erase the taint.
 - Keep page text unable to grant origins, change permission mode, select local files, or resume a
   paused session.
 - Capture CDP Network metadata into a separate untrusted JSONL log. Request/response bodies remain
@@ -211,6 +229,8 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 - Unauthorized navigation, redirect, popup action, download, and upload are denied before effect.
 - A red-team fixture cannot expand origin authorization, read an unapproved file, resume control,
   or place a secret in network/audit artifacts.
+- Two separately authorized origins do not implicitly authorize moving page-derived data from one
+  origin into the other.
 - Network logs contain no plaintext values for the blocked header, query, and body classes.
 - Audit records can reconstruct who/what/when/decision/result without storing typed secrets.
 
@@ -227,6 +247,10 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 - Keep pause/takeover visible and reachable while the browser window is frontmost. Close and profile
   reset have distinct consequences and labels.
 - Surface recent screenshot/snapshot/console/network/audit artifacts from the trusted CCEM UI.
+- Keep console and network recorders disabled during manual login. A successful handoff begins a
+  new opaque capture segment only after an owner round-trip barrier; pause, takeover, and close stop
+  it. New handoffs cannot read prior live segments, while already-issued immutable snapshot ids
+  remain independently revalidatable.
 
 ### End-to-end acceptance script
 
@@ -247,7 +271,9 @@ CDP sessions, request ids, target ids, cookies, and storage internals remain pri
 
 ## Verification matrix
 
-Run each production slice on mac-arm64 and mac-x64, Windows x64/arm64 where supported, and Linux x64.
+Run each production slice on the repository's actual desktop release matrix: macOS arm64, macOS
+x64, and Windows x64. Treat Windows arm64 and Linux as future platform work until the release
+workflow, signed runtime manifest, installer, and cleanup implementation add them explicitly.
 
 - Unit: manifest verification, extraction traversal, readiness transitions, profile mapping/locks,
   origin normalization, redaction, stale metadata refusal, generation invalidation.

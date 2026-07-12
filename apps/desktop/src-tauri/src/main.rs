@@ -62,7 +62,7 @@ use bot_binding::{
     BindSessionToBotRequest, BotBindingInboundRequest, BotBindingInfo, BotBindingManager,
     BotBindingOutboxFrame,
 };
-use browser::BrowserManager;
+use browser::{create_browser_runtime_manager, BrowserManager};
 use channel::ChannelKind;
 use config::{
     create_env_with_encrypted_key, resolve_claude_env, resolve_codex_runtime,
@@ -1427,7 +1427,11 @@ fn set_native_session_runtime_perm_mode(
     runtime_id: String,
     runtime_perm_mode: Option<String>,
 ) -> Result<(), String> {
-    native_state.update_session_runtime_perm_mode(&app, &runtime_id, runtime_perm_mode.as_deref())
+    native_state.update_session_runtime_perm_mode(
+        &app,
+        &runtime_id,
+        runtime_perm_mode.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -4628,6 +4632,8 @@ fn quit_app(app: tauri::AppHandle) {
 }
 
 fn main() {
+    native_runtime::run_native_helper_launcher_if_requested();
+
     let desktop_instance_lock = match desktop_instance_lock::acquire_desktop_instance_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -4642,6 +4648,12 @@ fn main() {
     let headless_runtime_manager = Arc::new(HeadlessRuntimeManager::default());
     let native_runtime_manager = Arc::new(NativeRuntimeManager::default());
     let browser_manager = Arc::new(BrowserManager::default());
+    let browser_runtime_manager = create_browser_runtime_manager()
+        .expect("failed to initialize managed browser runtime state");
+    let login_browser_session_manager = browser::create_login_browser_session_manager()
+        .expect("failed to initialize Login Browser session state");
+    let login_browser_controller =
+        Arc::new(browser::login_commands::LoginBrowserController::default());
     let external_control_manager =
         Arc::new(ExternalControlManager::new(native_runtime_manager.clone()));
     let event_dispatcher = Arc::new(EventDispatcher::default());
@@ -4671,6 +4683,9 @@ fn main() {
     let weixin_manager_for_setup = weixin_bridge_manager.clone();
     let weixin_manager_for_run = weixin_bridge_manager.clone();
     let bot_binding_manager_for_setup = bot_binding_manager.clone();
+    #[cfg(not(debug_assertions))]
+    let browser_runtime_manager_for_setup = browser_runtime_manager.clone();
+    let browser_runtime_manager_for_run = browser_runtime_manager.clone();
     let notification_prefs_state = notifications::NotificationPrefsState::new();
     let main_window_boot_shown = Arc::new(AtomicBool::new(false));
     let main_window_boot_shown_for_page_load = main_window_boot_shown.clone();
@@ -4698,6 +4713,9 @@ fn main() {
         .manage(headless_runtime_manager.clone())
         .manage(native_runtime_manager.clone())
         .manage(browser_manager.clone())
+        .manage(browser_runtime_manager.clone())
+        .manage(login_browser_session_manager.clone())
+        .manage(login_browser_controller.clone())
         .manage(external_control_manager.clone())
         .manage(event_dispatcher.clone())
         .manage(unified_session_manager.clone())
@@ -4752,7 +4770,28 @@ fn main() {
             browser::browser_health_check,
             browser::browser_set_paused,
             browser::browser_recent_activity,
-            browser::browser_runtime_readiness,
+            browser::runtime_commands::browser_runtime_readiness,
+            browser::runtime_commands::browser_runtime_prepare,
+            browser::runtime_commands::browser_runtime_pause_download,
+            browser::runtime_commands::browser_runtime_resume_download,
+            browser::runtime_commands::browser_runtime_retry,
+            browser::runtime_commands::browser_runtime_reinstall,
+            browser::runtime_commands::browser_runtime_cancel,
+            browser::runtime_commands::browser_runtime_disk_usage,
+            browser::runtime_commands::browser_runtime_delete,
+            browser::login_commands::browser_login_open,
+            browser::login_commands::browser_login_profiles,
+            browser::login_commands::browser_login_open_profile,
+            browser::login_commands::browser_login_profile_recent_activity,
+            browser::login_commands::browser_login_reset_profile,
+            browser::login_commands::browser_login_delete_profile,
+            browser::login_commands::browser_login_control_snapshot,
+            browser::login_commands::browser_login_recent_activity,
+            browser::login_commands::browser_login_handoff,
+            browser::login_commands::browser_login_pause,
+            browser::login_commands::browser_login_takeover,
+            browser::login_commands::browser_login_close,
+            browser::login_commands::browser_login_force_stop,
             browser::browser_snapshot,
             browser::browser_screenshot,
             tray::open_tray_cockpit,
@@ -5060,6 +5099,16 @@ fn main() {
                 proxy_for_boot.maybe_start_on_boot().await;
             });
 
+            // Release builds prewarm the exact signed Login Browser runtime in the background.
+            // Debug builds remain explicit so development never triggers a surprise 180+ MB
+            // download. Preview Browser is independent and remains available during preparation.
+            #[cfg(not(debug_assertions))]
+            if let Err(error) =
+                browser_runtime_manager_for_setup.prepare(Some(app.handle().clone()))
+            {
+                eprintln!("Login Browser runtime prewarm warning: {error}");
+            }
+
             // Start cron scheduler background task
             let cron_scheduler = Arc::new(CronScheduler::default());
             app.manage(cron_scheduler.clone());
@@ -5162,6 +5211,7 @@ fn main() {
             }
 
             if let RunEvent::Exit = event {
+                let _ = browser_runtime_manager_for_run.cancel();
                 telegram_manager_for_run.stop();
                 wecom_manager_for_run.stop();
                 weixin_manager_for_run.stop();
