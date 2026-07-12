@@ -24,18 +24,25 @@ CCEM Desktop so it republishes a fresh endpoint.
 
 ### Development builds and the control descriptor
 
-`pnpm tauri dev` (and other debug builds) does **not** publish the global
+`pnpm tauri:dev` uses the distinct `CCEM Desktop Dev` product name and
+`com.ccem.desktop.dev` bundle identifier. It does **not** publish the global
 `~/.ccem/control.json` descriptor by default, so `ccem desktop health` from
 another terminal will keep using the last release app's descriptor. Run the
 dev build with the opt-in flag when you need the CLI/skill to talk to it:
 
 ```bash
-CCEM_DESKTOP_PUBLISH_CONTROL_DESCRIPTOR=1 pnpm tauri dev
+CCEM_DESKTOP_PUBLISH_CONTROL_DESCRIPTOR=1 pnpm tauri:dev
 ```
 
 Release builds always publish the descriptor. Do not edit or read
 `~/.ccem/control.json` directly — let the CLI wrapper negotiate the
 descriptor for you.
+
+A development self-test must not quit, terminate, or kill
+`/Applications/CCEM Desktop.app` to resolve an ambiguous automation target.
+Target `com.ccem.desktop.dev`, the exact development app path, or the Tauri MCP
+port. If those are unavailable, stop and report the targeting failure without
+disturbing the installed release.
 
 If it is healthy, create sessions through the desktop CLI wrapper:
 

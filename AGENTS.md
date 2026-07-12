@@ -104,14 +104,16 @@ For desktop-, Tauri-, runtime-, history-, settings-, notifications-, or other ap
 
 Minimum expected path:
 
-1. Start the app with `cd apps/desktop && pnpm tauri dev -- --locked`
+1. Start the app with `cd apps/desktop && pnpm tauri:dev`
 2. Connect via `tauri-mcp-server`
 3. Drive the changed flow yourself
 4. Check the actual rendered state, not just backend logs
 
 Manual reasoning alone is not considered enough for app-facing changes when Tauri MCP can exercise the flow.
 
-Use the locked Tauri dev command by default. The trailing `-- --locked` is passed to Cargo as `cargo run --locked`, so desktop self-tests cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
+The `tauri:dev` script applies `src-tauri/tauri.dev.conf.json`, giving the development app its own `CCEM Desktop Dev` product name and `com.ccem.desktop.dev` bundle identifier. It also passes `--locked` to Cargo, so desktop self-tests cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
+
+The installed release is outside the self-test process boundary. Agents must not quit, terminate, or kill `/Applications/CCEM Desktop.app` to disambiguate a development build. If desktop automation reports multiple matching apps, target the development app by its `com.ccem.desktop.dev` identifier, exact development app path, or Tauri MCP port. If none of those targets is available, stop the self-test and report the targeting failure instead of disturbing the release app.
 
 If the locked self-test fails because the lockfile needs to change, do not remove `--locked` to get past the failure. Inspect the dependency or version change first. If the lock update is intentional, regenerate it explicitly with `cd apps/desktop/src-tauri && cargo generate-lockfile --offline`, review the diff, and include `apps/desktop/src-tauri/Cargo.lock` in the related commit. If the change is only verification noise from a local run, restore the lockfile before cleanup and re-check `git status --short -- apps/desktop/src-tauri/Cargo.lock`.
 
@@ -158,7 +160,7 @@ pnpm verify                         # Full CI gate: test + build + cargo test
 
 ```bash
 # Desktop app
-cd apps/desktop && pnpm tauri dev -- --locked # Vite + Rust cargo dev without Cargo.lock drift
+cd apps/desktop && pnpm tauri:dev             # Isolated dev app identity + locked Cargo graph
 cd apps/desktop && pnpm tauri build           # Production build (dmg/app)
 
 # CLI only

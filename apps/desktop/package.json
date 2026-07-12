@@ -12,7 +12,8 @@
     "test:e2e": "node test/opencode.mcp.e2e.mjs",
     "perf:smoke": "node scripts/perf-smoke.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json -- --locked"
   },
   "dependencies": {
     "@ccem/core": "workspace:*",

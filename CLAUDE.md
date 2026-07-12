@@ -15,7 +15,7 @@ pnpm verify                         # Full CI gate: test + build + cargo test
 
 ```bash
 # Desktop app
-cd apps/desktop && pnpm tauri dev -- --locked # Vite + Rust cargo dev without Cargo.lock drift
+cd apps/desktop && pnpm tauri:dev             # Isolated dev app identity + locked Cargo graph
 cd apps/desktop && pnpm tauri build           # Production build (dmg/app)
 
 # CLI only
@@ -26,7 +26,9 @@ pnpm --filter @ccem/cli test -- --run src/__tests__/usage.test.ts  # single test
 
 ## Desktop Self-Test Lockfile Rule
 
-Use `cd apps/desktop && pnpm tauri dev -- --locked` for desktop self-tests. The trailing `-- --locked` reaches Cargo as `cargo run --locked`, so a Tauri dev run cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
+Use `cd apps/desktop && pnpm tauri:dev` for desktop self-tests. This script applies `src-tauri/tauri.dev.conf.json`, so the development app uses the distinct `CCEM Desktop Dev` product name and `com.ccem.desktop.dev` bundle identifier. It also passes `--locked` to Cargo, so a Tauri dev run cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
+
+The installed release is outside the self-test process boundary. Agents must not quit, terminate, or kill `/Applications/CCEM Desktop.app` to make a development app easier to target. If automation sees multiple apps, target `com.ccem.desktop.dev`, the exact development app path, or the Tauri MCP port; otherwise stop and report the targeting failure without disturbing the release app.
 
 If that command fails because the lockfile needs to change, inspect the dependency or version change instead of dropping `--locked`. For an intentional lock update, run `cd apps/desktop/src-tauri && cargo generate-lockfile --offline`, review the diff, and commit `apps/desktop/src-tauri/Cargo.lock` with the related change. For verification-only noise, restore the lockfile before worktree cleanup.
 
