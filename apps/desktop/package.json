@@ -1,6 +1,6 @@
 {
   "name": "@ccem/desktop",
-  "version": "2.52.1",
+  "version": "2.53.0",
   "type": "module",
   "scripts": {
     "predev": "node scripts/prepare-native-runtime-sidecar.mjs",

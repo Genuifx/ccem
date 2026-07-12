@@ -59,16 +59,32 @@ When the user gives a `ccem://` link, use the desktop CLI wrapper to open or ins
 
 ## Cron And Scheduled Work
 
-For scheduled CCEM work, use the `ccem cron` CLI. Do not edit CCEM cron storage files directly.
-
-Useful checks:
+Use the installed `ccem cron` contract and structured output for scheduled work:
 
 ```bash
+ccem cron --help
 ccem cron list --json
-ccem cron runs <taskId> --json
 ```
 
-Create or update tasks with the CLI options exposed by the installed `ccem cron` command. If the user asks for a schedule in natural language, resolve it to an explicit cron expression before creating or updating the task.
+The current agent-facing CLI supports `list`, `create`, and `delete`. It does not expose an `update`, `edit`, or `runs` command.
+
+Read task IDs and complete task configuration from the array returned by `ccem cron list --json`. Resolve an exact task ID before changing an existing task.
+
+For creation, run `ccem cron create --help`, resolve natural-language schedules to explicit five-field cron expressions, and use the supported options or JSON input:
+
+```bash
+ccem cron create --from-json @task.json --json
+```
+
+For deletion, confirm the exact task and use its ID:
+
+```bash
+ccem cron delete "<taskId>" --json
+```
+
+For an update request, first read the task with `ccem cron list --json`. If desktop UI control is available, use CCEM Desktop's Cron page to edit the exact task in place, then read the task list again to verify the stored result. Otherwise explain the CLI limitation and ask whether the user wants to update it in Desktop or replace it. Replacement creates a new task ID and does not preserve the old task's run-history association.
+
+After every create, edit, replacement, or delete, rerun `ccem cron list --json` and report the actual stored task state.
 
 ## Bot Binding
 

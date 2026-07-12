@@ -12,16 +12,16 @@ export const ENV_PRESETS: Record<
 > = {
   'GLM': {
     ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.1',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.1',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
     ANTHROPIC_MODEL: 'opus'
   },
   'KIMI': {
     ANTHROPIC_BASE_URL: 'https://api.moonshot.cn/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'kimi-k2.5',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'kimi-k2.5',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'kimi-k2.5',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'kimi-k2.7-code',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'kimi-k2.7-code',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'kimi-k2.7-code',
     ANTHROPIC_MODEL: 'opus'
   },
   'KimiCodePlan': {
@@ -33,9 +33,9 @@ export const ENV_PRESETS: Record<
   },
   'MiniMax': {
     ANTHROPIC_BASE_URL: 'https://api.minimaxi.com/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M2.7',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M2.7',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7-highspeed',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3[1m]',
     ANTHROPIC_MODEL: 'opus'
   },
   'DeepSeek': {
@@ -46,22 +46,22 @@ export const ENV_PRESETS: Record<
     ANTHROPIC_MODEL: 'opus'
   },
   'Bailian': {
-    ANTHROPIC_BASE_URL: 'https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'qwen3-coder-next',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'qwen3-coder-plus',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3-coder-flash',
+    ANTHROPIC_BASE_URL: 'https://dashscope.aliyuncs.com/apps/anthropic',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'qwen3.7-max',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'qwen3.7-max',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3.6-flash',
     ANTHROPIC_MODEL: 'opus'
   },
   'BailianCodePlan': {
-    ANTHROPIC_BASE_URL: 'https://coding.dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'qwen3-coder-next',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'qwen3-coder-plus',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3-coder-flash',
+    ANTHROPIC_BASE_URL: 'https://coding.dashscope.aliyuncs.com/apps/anthropic',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'qwen3.7-plus',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'qwen3.7-plus',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3.7-plus',
     ANTHROPIC_MODEL: 'opus'
   },
   'OpenRouter': {
     ANTHROPIC_BASE_URL: 'https://openrouter.ai/api/v1',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'anthropic/claude-opus-4.6',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'anthropic/claude-opus-4.7',
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'anthropic/claude-sonnet-4.6',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'anthropic/claude-haiku-4.5',
     ANTHROPIC_MODEL: 'opus'
@@ -84,7 +84,7 @@ export const ENV_PRESETS: Record<
     ANTHROPIC_BASE_URL: 'https://token-plan-cn.xiaomimimo.com/anthropic',
     ANTHROPIC_DEFAULT_OPUS_MODEL: 'mimo-v2.5-pro',
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'mimo-v2.5-pro',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.5',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.5-pro',
     ANTHROPIC_MODEL: 'opus'
   },
 };

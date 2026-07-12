@@ -1,5 +1,11 @@
 # ccem
 
+## 2.53.0
+
+### Minor Changes
+
+- Release v2.53.0: environment copy/enablement feature, provider history hardening, and file-size exemption updates.
+
 ## 2.52.1
 
 ### Patch Changes

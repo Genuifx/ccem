@@ -16,20 +16,26 @@ describe('presets', () => {
     it('should have GLM preset with correct structure', () => {
       expect(ENV_PRESETS.GLM).toBeDefined();
       expect(ENV_PRESETS.GLM.ANTHROPIC_BASE_URL).toContain('bigmodel.cn');
-      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.1');
-      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.1');
-      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4.5-air');
+      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]');
+      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]');
+      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4.7');
       expect(ENV_PRESETS.GLM.ANTHROPIC_MODEL).toBeDefined();
     });
 
     it('should have KIMI preset with correct structure', () => {
       expect(ENV_PRESETS.KIMI).toBeDefined();
       expect(ENV_PRESETS.KIMI.ANTHROPIC_BASE_URL).toContain('moonshot.cn');
+      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-k2.7-code');
+      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-k2.7-code');
+      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('kimi-k2.7-code');
     });
 
     it('should have MiniMax preset with correct structure', () => {
       expect(ENV_PRESETS.MiniMax).toBeDefined();
       expect(ENV_PRESETS.MiniMax.ANTHROPIC_BASE_URL).toContain('minimaxi.com');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('MiniMax-M3[1m]');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('MiniMax-M3[1m]');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('MiniMax-M3[1m]');
     });
 
     it('should have DeepSeek preset with correct structure and 1M context', () => {
@@ -44,6 +50,42 @@ describe('presets', () => {
       expect(ENV_PRESETS.Bailian).toBeDefined();
       expect(ENV_PRESETS.BailianCodePlan).toBeDefined();
       expect(ENV_PRESETS.OpenRouter).toBeDefined();
+    });
+
+    it('should keep highlighted provider presets aligned with official defaults', () => {
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_BASE_URL).toBe('https://api.kimi.com/coding/');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-for-coding');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-for-coding');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('kimi-for-coding');
+
+      expect(ENV_PRESETS.Bailian.ANTHROPIC_BASE_URL).toBe(
+        'https://dashscope.aliyuncs.com/apps/anthropic',
+      );
+      expect(ENV_PRESETS.Bailian.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('qwen3.7-max');
+      expect(ENV_PRESETS.Bailian.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('qwen3.7-max');
+      expect(ENV_PRESETS.Bailian.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('qwen3.6-flash');
+
+      expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_BASE_URL).toBe(
+        'https://coding.dashscope.aliyuncs.com/apps/anthropic',
+      );
+      expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('qwen3.7-plus');
+      expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('qwen3.7-plus');
+      expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('qwen3.7-plus');
+
+      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('anthropic/claude-opus-4.7');
+      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(
+        'anthropic/claude-sonnet-4.6',
+      );
+      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe(
+        'anthropic/claude-haiku-4.5',
+      );
+
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_BASE_URL).toBe(
+        'https://token-plan-cn.xiaomimimo.com/anthropic',
+      );
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('mimo-v2.5-pro');
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('mimo-v2.5-pro');
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('mimo-v2.5-pro');
     });
 
     it('should not include auth tokens in presets', () => {

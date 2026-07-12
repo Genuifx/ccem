@@ -170,17 +170,17 @@ ccem cp <src> <dst>
 
 | Preset | Base URL | Main Model | Fast Model |
 |---|---|---|---|
-| GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.1 | glm-4.5-air |
-| KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k2.5 | kimi-k2.5 |
+| GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.2[1m] | glm-4.7 |
+| KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k2.7-code | kimi-k2.7-code |
 | Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding |
-| MiniMax | `https://api.minimaxi.com/anthropic` | MiniMax-M2.7 | MiniMax-M2.7-highspeed |
+| MiniMax | `https://api.minimaxi.com/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] |
 | DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-v4-pro[1m] | deepseek-v4-flash |
-| Bailian (Aliyun) | `https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy` | qwen3-coder-next | qwen3-coder-flash |
-| Bailian Code Plan | `https://coding.dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy` | qwen3-coder-plus | qwen3-coder-flash |
-| OpenRouter | `https://openrouter.ai/api/v1` | anthropic/claude-opus-4.6 | anthropic/claude-haiku-4.5 |
+| Bailian (Aliyun) | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.6-flash |
+| Bailian Code Plan | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-plus | qwen3.7-plus |
+| OpenRouter | `https://openrouter.ai/api/v1` | anthropic/claude-opus-4.7 | anthropic/claude-haiku-4.5 |
 | Ollama | `http://localhost:11434` | gemma4:31b | gemma4:e4b |
 | MiMo (Xiaomi) | `https://api.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5 |
-| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5 |
+| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro |
 
 > Official environment defaults to `claude-sonnet-4-5-20250929` + `claude-haiku-4-5-20251001`.
 

@@ -4,6 +4,8 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 
 - `apps/cli/src/index.ts`: Main CLI entrypoint still owns command registration and interactive flows.
 - `apps/desktop/src-tauri/src/analytics.rs`: Analytics aggregation and reporting logic has not been split yet.
+- `apps/desktop/src-tauri/src/browser.rs`: Managed Chromium browser lifecycle, session bootstrapping, and diagnostics remain centralized while the agent browser workbench is still iterating.
+- `apps/desktop/src/pages/TrayCockpit.tsx`: Tray cockpit UI orchestration, diagnostics, and preview browser controls remain bundled while the tray surface is being iterated.
 - `apps/desktop/src-tauri/src/config.rs`: Configuration migration, recovery, and runtime resolution still share one module.
 - `apps/desktop/src-tauri/src/cron.rs`: Cron scheduling and execution orchestration is still a large legacy module.
 - `apps/desktop/src-tauri/src/external_control.rs`: Desktop external-control server, descriptor publishing, security boundary checks, and unit coverage remain centralized during the control API hardening.

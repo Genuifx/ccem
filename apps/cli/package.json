@@ -1,6 +1,6 @@
 {
   "name": "ccem",
-  "version": "2.52.1",
+  "version": "2.53.0",
   "type": "module",
   "description": "Claude Code Environment Manager",
   "repository": {
