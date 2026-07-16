@@ -157,15 +157,25 @@ Windows deliverables:
 
 Updater deliverables:
 
-- require repository immutable releases through the read-only GitHub settings endpoint before any
-  production build starts, using a dedicated settings token that is never shared with release
-  mutation; Preview builds skip this production-only gate;
+- require repository immutable releases through the read-only GitHub settings endpoint before a
+  formal release build starts, using a dedicated settings token that is never shared with the
+  signed producer or release mutation. Non-publishing signed readiness intentionally skips this
+  release-policy check because it cannot create or modify a release;
 - verify the final updater archive contains one complete pinned CEF inventory;
 - test old-version to new-version replacement and prove no mixed CEF files remain;
 - keep updater signature verification separate from platform code-signature verification.
 
 Release transaction boundary:
 
+- keep one production-only, read-only reusable signing producer for both readiness and release;
+  readiness exports exact current-attempt evidence only, while the tagged release caller may also
+  export same-run payload artifacts for its later publication transaction;
+- declare the exact signing secret names in the producer, resolve them only through its protected
+  Environment jobs, and never pass or inherit the release settings token, `GITHUB_TOKEN`, or another
+  publication credential into that workflow;
+- gate every secret-consuming producer job with the fixed `mode2-signing` Actions Environment;
+  before activation, restrict that Environment to protected `main` and formal `v*` tags, require a
+  reviewer, move all signing secrets into it, and remove the repository-level copies;
 - GitHub REST unsafe methods do not provide a compare-and-swap precondition for draft asset upload
   or publication. Immutable releases narrow the post-publication window but do not make the draft
   transaction atomic;

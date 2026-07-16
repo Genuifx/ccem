@@ -544,52 +544,60 @@ test('release mutation preflight allows only a missing or still-draft GitHub rel
 });
 
 test('release workflow gates Mode 2 delivery before updater publication', async () => {
-  const workflow = await fs.readFile(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'), 'utf8');
-  const actionRefs = [...workflow.matchAll(/^\s*-?\s*uses:\s+([^\s#]+)/gmu)]
+  const [workflow, producerWorkflow] = await Promise.all([
+    fs.readFile(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'), 'utf8'),
+    fs.readFile(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml'), 'utf8'),
+  ]);
+  const combinedWorkflow = `${workflow}\n${producerWorkflow}`;
+  const actionRefs = [...combinedWorkflow.matchAll(/^\s*-?\s*uses:\s+([^\s#]+)/gmu)]
     .map((match) => match[1]);
-  assert.equal(actionRefs.length, 17);
   for (const actionRef of actionRefs) {
+    if (actionRef.startsWith('./.github/workflows/')) continue;
     assert.match(actionRef, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}$/u);
   }
-  assert.equal(workflow.match(/persist-credentials: false/g)?.length, 4);
+  assert.ok((combinedWorkflow.match(/persist-credentials: false/g)?.length ?? 0) >= 5);
   assert.match(workflow, /permissions: \{\}/);
   assert.equal(workflow.match(/contents: write/g)?.length, 1);
-  assert.equal(workflow.match(/node-version: '22'/g)?.length, 2);
+  assert.equal(producerWorkflow.match(/contents: write/g)?.length ?? 0, 0);
+  assert.ok((combinedWorkflow.match(/node-version: '22'/g)?.length ?? 0) >= 3);
   assert.match(workflow, /concurrency:\n  group: release-desktop\n  cancel-in-progress: false/u);
   assert.match(workflow, /recover_stale_draft:[\s\S]*default: 'false'/u);
-  assert.match(workflow, /pnpm install --frozen-lockfile/);
-  assert.match(workflow, /APPLE_ID: \$\{\{ secrets\.APPLE_ID \}\}/);
-  assert.match(workflow, /APPLE_PASSWORD: \$\{\{ secrets\.APPLE_PASSWORD \}\}/);
-  assert.doesNotMatch(workflow, /--skip-stapling/);
-  assert.match(workflow, /Import-PfxCertificate/);
-  assert.match(workflow, /CCEM_OFFICIAL_WINDOWS_PUBLISHER/);
-  assert.match(workflow, /stage-cef-windows\.mjs/);
-  assert.match(workflow, /produce-cef-windows-sandbox\.mjs/);
-  assert.match(workflow, /cargo rustc `[\s\S]*?--lib `[\s\S]*?--crate-type cdylib/);
-  assert.match(workflow, /ccem-cef-sandbox\/\$env:GITHUB_RUN_ID-\$env:GITHUB_RUN_ATTEMPT/);
-  assert.match(workflow, /--sandbox-root \$sandboxRoot/);
-  assert.match(workflow, /CCEM_DUMPBIN_PATH/);
-  assert.match(workflow, /tauri\.windows-signing\.conf\.json/);
-  assert.match(workflow, /verify-mode2-release-inventory\.mjs/);
-  assert.match(workflow, /x86_64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
-  assert.match(workflow, /unsignedArgs: '--target x86_64-apple-darwin'/);
-  assert.doesNotMatch(workflow, /includeUpdaterJson|releaseDraft:/);
-  assert.doesNotMatch(workflow, /require-draft-github-release\.mjs/);
-  const tauriActionBlocks = workflow.match(/uses: tauri-apps\/tauri-action@[\s\S]*?(?=\n\s{6}- name:)/gu) ?? [];
-  assert.equal(tauriActionBlocks.length, 2);
+  assert.match(producerWorkflow, /pnpm install --frozen-lockfile/);
+  assert.match(producerWorkflow, /APPLE_ID: \$\{\{ secrets\.APPLE_ID \}\}/);
+  assert.match(producerWorkflow, /APPLE_PASSWORD: \$\{\{ secrets\.APPLE_PASSWORD \}\}/);
+  assert.doesNotMatch(combinedWorkflow, /--skip-stapling/);
+  assert.match(producerWorkflow, /Import-PfxCertificate/);
+  assert.match(producerWorkflow, /CCEM_OFFICIAL_WINDOWS_PUBLISHER/);
+  assert.match(producerWorkflow, /stage-cef-windows\.mjs/);
+  assert.match(producerWorkflow, /produce-cef-windows-sandbox\.mjs/);
+  assert.match(producerWorkflow, /cargo rustc `[\s\S]*?--lib `[\s\S]*?--crate-type cdylib/);
+  assert.match(producerWorkflow, /ccem-cef-sandbox\/\$env:GITHUB_RUN_ID-\$env:GITHUB_RUN_ATTEMPT/);
+  assert.match(producerWorkflow, /--sandbox-root \$sandboxRoot/);
+  assert.match(producerWorkflow, /CCEM_DUMPBIN_PATH/);
+  assert.match(producerWorkflow, /tauri\.windows-signing\.conf\.json/);
+  assert.match(producerWorkflow, /verify-mode2-release-inventory\.mjs/);
+  assert.match(producerWorkflow, /x86_64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
+  assert.doesNotMatch(producerWorkflow, /unsignedArgs:|Preview-only/u);
+  assert.doesNotMatch(combinedWorkflow, /includeUpdaterJson|releaseDraft:/);
+  assert.doesNotMatch(combinedWorkflow, /require-draft-github-release\.mjs/);
+  const tauriActionBlocks = producerWorkflow.match(/uses: tauri-apps\/tauri-action@[\s\S]*?(?=\n\s{6}- name:)/gu) ?? [];
+  assert.equal(tauriActionBlocks.length, 1);
   for (const block of tauriActionBlocks) {
     assert.doesNotMatch(block, /GITHUB_TOKEN|tagName|releaseName|releaseBody|releaseDraft|includeUpdaterJson/,
       'tauri-action must build only and have no release mutation access');
   }
-  const releaseModeIndex = workflow.indexOf('  release-mode:');
-  const buildJobIndex = workflow.indexOf('  build-desktop:');
+  const releaseModeIndex = producerWorkflow.indexOf('  release-mode:');
+  const buildJobIndex = producerWorkflow.indexOf('  build-desktop:');
+  const evidenceJobIndex = producerWorkflow.indexOf('  verify-evidence:');
+  const callJobIndex = workflow.indexOf('  signed-producer:');
   const transactionJobIndex = workflow.indexOf('  publish-updater-manifest:');
   const universalJobIndex = workflow.indexOf('  create-universal:');
-  assert.ok(releaseModeIndex > 0 && releaseModeIndex < buildJobIndex && buildJobIndex < transactionJobIndex);
-  const prepareJob = workflow.slice(0, releaseModeIndex);
+  assert.ok(releaseModeIndex > 0 && releaseModeIndex < buildJobIndex && buildJobIndex < evidenceJobIndex);
+  assert.ok(callJobIndex > 0 && callJobIndex < transactionJobIndex && transactionJobIndex < universalJobIndex);
+  const prepareJob = workflow.slice(0, callJobIndex);
   assert.match(prepareJob, /git fetch --force --no-tags origin "refs\/tags\/\$\{current_tag\}:refs\/tags\/\$\{current_tag\}"/u);
   assert.match(prepareJob, /Release tag \$\{current_tag\} must exist before desktop release builds start/u);
-  const releaseModeJob = workflow.slice(releaseModeIndex, buildJobIndex);
+  const releaseModeJob = producerWorkflow.slice(releaseModeIndex, buildJobIndex);
   assert.match(releaseModeJob, /detect-release-mode\.mjs/);
   assert.doesNotMatch(releaseModeJob, /GITHUB_TOKEN|ensure-draft|upload-draft|publish-draft/);
   const releaseModeSource = await fs.readFile(
@@ -598,20 +606,20 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   );
   assert.match(releaseModeSource, /validateMacReleaseSigning\(environment\)/);
   assert.match(releaseModeSource, /validateWindowsReleaseSigning\(environment\)/);
-  assert.doesNotMatch(workflow, /^  prepare-draft-release:/mu);
+  assert.doesNotMatch(combinedWorkflow, /^  prepare-draft-release:/mu);
 
-  const buildJob = workflow.slice(buildJobIndex, transactionJobIndex);
+  const buildJob = producerWorkflow.slice(buildJobIndex, evidenceJobIndex);
   assert.match(buildJob, /permissions:\n\s+actions: read\n\s+contents: read/u);
   assert.doesNotMatch(buildJob, /contents: write/u);
-  assert.ok(buildJob.indexOf('- name: Setup Node.js') < buildJob.indexOf('- name: Reuse immutable current-run production payload'));
-  assert.match(buildJob, /if: \$\{\{ needs\.release-mode\.outputs\.production == 'true' \}\}[\s\S]*detect-actions-release-payload\.mjs/u);
-  assert.match(buildJob, /name: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ matrix\.target \}\}/u);
+  assert.ok(buildJob.indexOf('- name: Setup Node.js') < buildJob.indexOf('- name: Require a fresh current-attempt signed build'));
+  assert.doesNotMatch(buildJob, /detect-actions-release-payload\.mjs|GITHUB_TOKEN/u);
+  assert.match(buildJob, /name: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
   assert.match(buildJob, /retention-days: 30/u);
-  assert.doesNotMatch(buildJob, /mode2-release-payload-[^\n]*run_attempt/u);
+  assert.match(buildJob, /inputs\.export_release_payload == true/u);
 
   const transactionJob = workflow.slice(transactionJobIndex, universalJobIndex);
-  assert.match(transactionJob, /needs: \[prepare-release, release-mode, build-desktop\]/u);
-  assert.match(transactionJob, /needs\.release-mode\.outputs\.production == 'true'/u);
+  assert.match(transactionJob, /needs: \[prepare-release, signed-producer\]/u);
+  assert.match(transactionJob, /needs\.signed-producer\.result == 'success'/u);
   assert.match(transactionJob, /actions: read\n\s+contents: write/u);
   const payloadVerifyIndex = transactionJob.indexOf('- name: Verify exact three immutable payloads and eight assets');
   const draftIndex = transactionJob.indexOf('- name: Create or resume the exact current-run draft release');
@@ -632,28 +640,28 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.doesNotMatch(workflow, /--data '\{"draft":true\}'/);
   assert.doesNotMatch(workflow, /xattr -c|clear quarantine/);
   assert.doesNotMatch(workflow, /\/releases\/tags\//);
-  assert.match(workflow, /APPLE_NOTARY_API_PRIVATE_KEY/);
-  assert.match(workflow, /notary_key=.*RUNNER_TEMP/);
-  assert.doesNotMatch(workflow, /Replace draft DMG|--mode replace-dmg/);
-  assert.match(workflow, /--source-commit "?\$GITHUB_SHA"?/);
+  assert.match(producerWorkflow, /APPLE_NOTARY_API_PRIVATE_KEY/);
+  assert.match(producerWorkflow, /notary_key=.*RUNNER_TEMP/);
+  assert.doesNotMatch(combinedWorkflow, /Replace draft DMG|--mode replace-dmg/);
+  assert.match(producerWorkflow, /--source-commit "?\$GITHUB_SHA"?/);
   assert.match(workflow, /Verify release tag binds the current source commit/);
   assert.match(workflow, /refs\/tags\/\$\{TAG_NAME\}\^\{commit\}/);
-  assert.match(workflow, /--inventory "src-tauri\/target\/release-gates\/mode2-release-inventory-\$\{CCEM_RELEASE_TARGET\}\.json"/u);
-  assert.doesNotMatch(workflow, /target\/\*\*\/release-gates/);
-  assert.doesNotMatch(workflow, /asset_url_regex|asset_url_any/);
-  const cargoRustcIndex = workflow.indexOf('cargo rustc `');
-  const producerIndex = workflow.indexOf('produce-cef-windows-sandbox.mjs');
-  const stageIndex = workflow.indexOf('stage-cef-windows.mjs', producerIndex);
-  const bundleIndex = workflow.indexOf('- name: Build production bundles without release access');
+  assert.match(producerWorkflow, /--inventory "src-tauri\/target\/release-gates\/mode2-release-inventory-\$\{CCEM_RELEASE_TARGET\}\.json"/u);
+  assert.doesNotMatch(combinedWorkflow, /target\/\*\*\/release-gates/);
+  assert.doesNotMatch(combinedWorkflow, /asset_url_regex|asset_url_any/);
+  const cargoRustcIndex = producerWorkflow.indexOf('cargo rustc `');
+  const producerIndex = producerWorkflow.indexOf('produce-cef-windows-sandbox.mjs');
+  const stageIndex = producerWorkflow.indexOf('stage-cef-windows.mjs', producerIndex);
+  const bundleIndex = producerWorkflow.indexOf('- name: Build production bundles without release access');
   assert.ok(cargoRustcIndex > 0 && cargoRustcIndex < producerIndex);
   assert.ok(producerIndex < stageIndex && stageIndex < bundleIndex);
-  const windowsSmokeIndex = workflow.indexOf('- name: Run signed installed Windows Mode 2 production smoke');
-  const windowsInventoryIndex = workflow.indexOf('- name: Verify final Windows Authenticode and Mode 2 installer inventory');
-  const challengePayloadIndex = workflow.indexOf('- name: Prepare updater replacement challenge payload');
-  const previousSourceIndex = workflow.indexOf('- name: Derive fresh instrumented previous release source');
-  const updaterSmokeIndex = workflow.indexOf('- name: Prove real previous-to-current updater replacement');
-  const updaterSealIndex = workflow.indexOf('- name: Seal updater replacement receipt into target inventory');
-  const payloadPrepareIndex = workflow.indexOf('- name: Prepare this verified target\'s immutable current-run payload');
+  const windowsSmokeIndex = producerWorkflow.indexOf('- name: Run signed installed Windows Mode 2 production smoke');
+  const windowsInventoryIndex = producerWorkflow.indexOf('- name: Verify final Windows Authenticode and Mode 2 installer inventory');
+  const challengePayloadIndex = producerWorkflow.indexOf('- name: Prepare updater replacement challenge payload');
+  const previousSourceIndex = producerWorkflow.indexOf('- name: Derive fresh instrumented previous release source');
+  const updaterSmokeIndex = producerWorkflow.indexOf('- name: Prove real previous-to-current updater replacement');
+  const updaterSealIndex = producerWorkflow.indexOf('- name: Seal updater replacement receipt into target inventory');
+  const payloadPrepareIndex = producerWorkflow.indexOf('- name: Prepare this verified target\'s immutable current-run payload');
   assert.ok(bundleIndex < windowsSmokeIndex && windowsSmokeIndex < windowsInventoryIndex);
   assert.ok(windowsInventoryIndex < challengePayloadIndex);
   assert.ok(challengePayloadIndex < previousSourceIndex && previousSourceIndex < updaterSmokeIndex);
@@ -665,7 +673,7 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(buildJob, /mode2-release-inventory-base-\$\{CCEM_RELEASE_TARGET\}\.json/u);
   assert.match(buildJob, /updater-replacement-evidence-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
   assert.match(buildJob, /CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_\*/u);
-  const windowsSmokeBlock = workflow.slice(windowsSmokeIndex, windowsInventoryIndex);
+  const windowsSmokeBlock = producerWorkflow.slice(windowsSmokeIndex, windowsInventoryIndex);
   assert.match(buildJob, /CCEM_WINDOWS_MODE2_ALLOW_PRODUCTION_SMOKE: '1'/u);
   assert.match(buildJob, /run-windows-mode2-production-smoke\.mjs/u);
   assert.match(windowsSmokeBlock, /\$smokeBase = Join-Path \$env:RUNNER_TEMP 'ccem-mode2-production-smoke'/u);
@@ -674,21 +682,8 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(windowsSmokeBlock, /\$attestation = Join-Path \$evidenceRoot 'windows-mode2-production-smoke-attestation\.json'/u);
   assert.doesNotMatch(windowsSmokeBlock, /Join-Path[^\n]+['"][^'"\n]*\//u);
   assert.match(buildJob, /--windows-smoke-attestation \$env:CCEM_WINDOWS_MODE2_SMOKE_ATTESTATION/u);
-  assert.match(buildJob, /mode2-windows-smoke-evidence-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/u);
-  const previewBuildIndex = workflow.indexOf('- name: Build unsigned Preview-only macOS bundles without release access');
-  const previewBuildBlock = workflow.slice(
-    previewBuildIndex,
-    workflow.indexOf('\n      - name:', previewBuildIndex + 1),
-  );
-  assert.match(previewBuildBlock, /release-mode\.outputs\.production != 'true'/);
-  assert.doesNotMatch(previewBuildBlock, /GITHUB_TOKEN|ensure-draft|upload-draft|publish-draft/);
-
-  const actionsLookupSource = await fs.readFile(
-    path.join(desktopDir, 'scripts', 'detect-actions-release-payload.mjs'),
-    'utf8',
-  );
-  assert.match(actionsLookupSource, /\/actions\/runs\/\$\{identity\.runId\}\/artifacts/u);
-  assert.doesNotMatch(actionsLookupSource, /\/releases(?:\/|\?)/u);
+  assert.match(buildJob, /mode2-windows-smoke-evidence-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
+  assert.doesNotMatch(producerWorkflow, /Preview-only|detect-actions-release-payload/u);
 });
 
 test('release gate test path cannot execute signing, Keychain, or notarization tools', async () => {

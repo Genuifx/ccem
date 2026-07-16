@@ -1,95 +1,21 @@
-import { createHash } from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { DraftReleaseClient, exactAssetsNamed } from './github-draft-release-api.mjs';
+import {
+  discoverTargetAssets,
+  isMacReleaseTarget,
+  RELEASE_TARGETS,
+  releaseAssetMetadata,
+  requireRegularReleaseFile,
+} from './release-asset-discovery.mjs';
 
-const MAC_TARGETS = new Set(['aarch64-apple-darwin', 'x86_64-apple-darwin']);
-const WINDOWS_TARGET = 'x86_64-pc-windows-msvc';
-const RELEASE_TARGETS = [...MAC_TARGETS, WINDOWS_TARGET];
+export { discoverTargetAssets };
 
 function fail(message) {
   throw new Error(`[upload-draft-release-assets] ${message}`);
-}
-
-async function requireFile(candidate, label) {
-  let stat;
-  try {
-    stat = await fsp.lstat(candidate);
-  } catch (error) {
-    fail(`${label} is missing: ${error.message}`);
-  }
-  if (!stat.isFile() || stat.isSymbolicLink()) fail(`${label} must be a regular non-symlink file`);
-  return stat;
-}
-
-async function sha256(candidate) {
-  const hash = createHash('sha256');
-  const handle = await fsp.open(candidate, 'r');
-  try {
-    for await (const chunk of handle.createReadStream()) hash.update(chunk);
-  } finally {
-    await handle.close().catch(() => {});
-  }
-  return hash.digest('hex');
-}
-
-async function candidateMetadata(candidate, contentType) {
-  const exact = path.resolve(candidate);
-  const stat = await requireFile(exact, path.basename(exact));
-  const fileName = path.basename(exact);
-  if (
-    ['.', '..'].includes(fileName)
-    || /[\u0000-\u001f\u007f]/u.test(fileName)
-    || fileName !== path.basename(fileName)
-  ) {
-    fail(`invalid release asset basename: ${fileName}`);
-  }
-  return {
-    path: exact,
-    fileName,
-    contentType,
-    sha256: await sha256(exact),
-    size: stat.size,
-  };
-}
-
-async function exactMatches(directory, predicate, label) {
-  const entries = await fsp.readdir(directory, { withFileTypes: true });
-  const matches = entries.filter((entry) => entry.isFile() && predicate(entry.name));
-  if (matches.length !== 1) fail(`expected exactly one ${label}; found ${matches.length}`);
-  return path.join(directory, matches[0].name);
-}
-
-export async function discoverTargetAssets(desktopDir, target) {
-  if (!MAC_TARGETS.has(target) && target !== WINDOWS_TARGET) fail(`unsupported release target: ${target}`);
-  const bundleRoot = path.join(desktopDir, 'src-tauri', 'target', target, 'release', 'bundle');
-  let candidates;
-  if (MAC_TARGETS.has(target)) {
-    const dmgRoot = path.join(bundleRoot, 'dmg');
-    const macRoot = path.join(bundleRoot, 'macos');
-    const dmg = await exactMatches(dmgRoot, (name) => name.endsWith('.dmg'), 'macOS DMG');
-    const updater = await exactMatches(macRoot, (name) => name.endsWith('.app.tar.gz'), 'macOS updater archive');
-    const signature = await exactMatches(macRoot, (name) => name.endsWith('.app.tar.gz.sig'), 'macOS updater signature');
-    candidates = [
-      await candidateMetadata(dmg, 'application/x-apple-diskimage'),
-      await candidateMetadata(updater, 'application/gzip'),
-      await candidateMetadata(signature, 'application/octet-stream'),
-    ];
-  } else {
-    const nsisRoot = path.join(bundleRoot, 'nsis');
-    const updater = await exactMatches(nsisRoot, (name) => /-setup\.exe$/u.test(name), 'Windows NSIS updater');
-    const signature = await exactMatches(nsisRoot, (name) => /-setup\.exe\.sig$/u.test(name), 'Windows updater signature');
-    candidates = [
-      await candidateMetadata(updater, 'application/vnd.microsoft.portable-executable'),
-      await candidateMetadata(signature, 'application/octet-stream'),
-    ];
-  }
-  const names = candidates.map(({ fileName }) => fileName);
-  if (new Set(names).size !== names.length) fail('current target release asset basenames must be unique');
-  return candidates;
 }
 
 async function assetBytesMatch(client, asset, candidate) {
@@ -194,6 +120,42 @@ function releaseRunIdentity(runId) {
   return { runId };
 }
 
+function releaseAttemptIdentity(runAttempt) {
+  if (!/^[1-9][0-9]*$/u.test(runAttempt ?? '')) {
+    fail('GitHub run attempt must be a positive decimal string');
+  }
+  return runAttempt;
+}
+
+function releaseSourceIdentity(sourceCommit) {
+  if (!/^[a-f0-9]{40}$/u.test(sourceCommit ?? '')) {
+    fail('release source commit must be a lowercase 40-character SHA');
+  }
+  return sourceCommit;
+}
+
+function releaseVersionIdentity(appVersion) {
+  if (
+    typeof appVersion !== 'string'
+    || appVersion.trim() !== appVersion
+    || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/u.test(appVersion)
+  ) {
+    fail('release app version is invalid');
+  }
+  return appVersion;
+}
+
+async function requireRegularDirectory(candidate, label) {
+  const exact = path.resolve(candidate);
+  const stat = await fsp.lstat(exact).catch((error) => {
+    fail(`${label} is missing: ${error.message}`);
+  });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    fail(`${label} must be a regular non-symlink directory`);
+  }
+  return exact;
+}
+
 function receiptFingerprint(asset, candidate) {
   return {
     assetId: asset.id,
@@ -237,7 +199,7 @@ export async function uploadLatestJson({
   runId,
 }) {
   const run = releaseRunIdentity(runId);
-  const candidate = await candidateMetadata(latestPath, 'application/json');
+  const candidate = await releaseAssetMetadata(latestPath, 'application/json');
   if (candidate.fileName !== 'latest.json') fail('combined updater manifest must be named latest.json');
   const result = await uploadCandidateIdempotently(client, candidate);
   await confirmAssetSetStillOnDraft(client, [{ candidate, asset: result.asset }]);
@@ -258,7 +220,7 @@ function sameSet(actual, expected) {
 async function readVerifiedContract(candidate) {
   if (typeof candidate !== 'string' || candidate.trim() === '') fail('verified payload contract path is required');
   const exact = path.resolve(candidate);
-  const stat = await requireFile(exact, 'verified payload contract');
+  const stat = await requireRegularReleaseFile(exact, 'verified payload contract');
   if (stat.size <= 0) fail('verified payload contract must not be empty');
   try {
     return JSON.parse(await fsp.readFile(exact, 'utf8'));
@@ -287,15 +249,27 @@ function validateContractAsset(record, label) {
 export async function uploadVerifiedPayloadContract({
   client,
   contractPath,
+  payloadRoot,
   receiptsDir,
   runId,
+  runAttempt,
+  sourceCommit,
+  appVersion,
 }) {
   const run = releaseRunIdentity(runId);
+  const attempt = releaseAttemptIdentity(runAttempt);
+  const source = releaseSourceIdentity(sourceCommit);
+  const version = releaseVersionIdentity(appVersion);
+  const root = await requireRegularDirectory(payloadRoot, 'verified payload root');
   const contract = await readVerifiedContract(contractPath);
   if (
     contract?.schemaVersion !== 1
     || contract.runId !== run.runId
+    || contract.runAttempt !== attempt
     || contract.tag !== client.tag
+    || contract.tag !== `v${version}`
+    || contract.sourceCommit !== source
+    || contract.appVersion !== version
     || !Array.isArray(contract.targets)
     || contract.targets.length !== RELEASE_TARGETS.length
     || !sameSet(contract.targets.map(({ target }) => target), RELEASE_TARGETS)
@@ -307,12 +281,20 @@ export async function uploadVerifiedPayloadContract({
   const allNames = new Set();
   const receipts = [];
   for (const targetContract of contract.targets) {
-    const expectedRoles = MAC_TARGETS.has(targetContract.target)
+    const expectedRoles = isMacReleaseTarget(targetContract.target)
       ? ['dmg', 'updater', 'updaterSignature']
       : ['updater', 'updaterSignature'];
     if (!sameSet(Object.keys(targetContract.assets ?? {}), expectedRoles)) {
       fail(`${targetContract.target} verified payload role set is invalid`);
     }
+    const artifactRoot = await requireRegularDirectory(
+      path.join(root, `mode2-release-payload-${run.runId}-${attempt}-${targetContract.target}`),
+      `${targetContract.target} verified artifact root`,
+    );
+    const assetsRoot = await requireRegularDirectory(
+      path.join(artifactRoot, 'assets'),
+      `${targetContract.target} verified assets root`,
+    );
     const assets = {};
     const confirmed = [];
     for (const role of expectedRoles) {
@@ -320,7 +302,11 @@ export async function uploadVerifiedPayloadContract({
       validateContractAsset(record, `${targetContract.target} ${role}`);
       if (allNames.has(record.fileName)) fail(`duplicate release asset basename: ${record.fileName}`);
       allNames.add(record.fileName);
-      const candidate = await candidateMetadata(record.path, record.contentType);
+      const expectedPath = path.join(assetsRoot, record.fileName);
+      if (path.resolve(record.path) !== expectedPath) {
+        fail(`${targetContract.target} ${role} is outside the current-attempt payload root`);
+      }
+      const candidate = await releaseAssetMetadata(record.path, record.contentType);
       if (
         candidate.fileName !== record.fileName
         || candidate.size !== record.size
@@ -390,8 +376,12 @@ async function main() {
     await uploadVerifiedPayloadContract({
       client,
       contractPath: process.env.CCEM_RELEASE_PAYLOAD_CONTRACT,
+      payloadRoot: process.env.CCEM_RELEASE_PAYLOAD_ROOT,
       receiptsDir: process.env.CCEM_RELEASE_RECEIPTS_DIR,
       runId: process.env.GITHUB_RUN_ID,
+      runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+      sourceCommit: process.env.EXPECTED_RELEASE_SOURCE_COMMIT,
+      appVersion: process.env.CCEM_RELEASE_VERSION,
     });
   } else {
     await uploadLatestJson({

@@ -31,7 +31,7 @@ permissions: {}
 
 jobs:
   prepare-release:
-    name: Prepare Release Notes
+    name: Prepare Exact Tagged Release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,12 +44,14 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Generate release body
         id: release-notes
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             current_tag="${GITHUB_REF_NAME}"
           else
@@ -74,12 +76,10 @@ jobs:
 
           previous_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
           version="${current_tag#v}"
-
           echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
           delimiter="CCEM_RELEASE_BODY_$(date +%s)"
-
           {
             echo "release_body<<${delimiter}"
             echo "## CCEM Desktop v${version}"
@@ -115,684 +115,31 @@ jobs:
       - name: Verify pinned browser runtime manifests
         run: node scripts/ci/check-browser-runtime-manifests.mjs
 
-  release-mode:
-    name: Validate Release Mode
-    needs: prepare-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      production: ${{ steps.release-mode.outputs.production }}
-
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Require complete cross-platform signing before release mutation
-        id: release-mode
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_NOTARY_API_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_API_PRIVATE_KEY }}
-          APPLE_NOTARY_API_KEY_ID: ${{ vars.APPLE_NOTARY_API_KEY_ID }}
-          APPLE_NOTARY_API_ISSUER: ${{ vars.APPLE_NOTARY_API_ISSUER }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-          CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
-        run: node apps/desktop/scripts/detect-release-mode.mjs
-
-      - name: Require immutable GitHub Releases before production builds
-        if: ${{ steps.release-mode.outputs.production == 'true' }}
+      - name: Require immutable GitHub Releases before signed build
         env:
           CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
         run: node apps/desktop/scripts/verify-immutable-releases-enabled.mjs
 
-  build-desktop:
-    name: Build Desktop (${{ matrix.target }})
-    needs: [prepare-release, release-mode]
-    if: ${{ always() && !cancelled() && needs.prepare-release.result == 'success' && needs.release-mode.result == 'success' }}
+  signed-producer:
+    name: Produce Exact Signed Desktop Evidence and Payloads
+    needs: prepare-release
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' }}
     permissions:
       actions: read
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            args: '--target aarch64-apple-darwin --config src-tauri/tauri.cef.conf.json'
-            unsignedArgs: '--target aarch64-apple-darwin'
-            appleSigning: true
-            windowsSigning: false
-          - platform: macos-15-intel
-            target: x86_64-apple-darwin
-            args: '--target x86_64-apple-darwin --config src-tauri/tauri.cef.conf.json'
-            unsignedArgs: '--target x86_64-apple-darwin'
-            appleSigning: true
-            windowsSigning: false
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            args: '--target x86_64-pc-windows-msvc --config src-tauri/target/release-gates/tauri.windows-signing.conf.json --bundles nsis,updater'
-            unsignedArgs: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.windows.conf.json --bundles nsis,updater'
-            appleSigning: false
-            windowsSigning: true
-
-    runs-on: ${{ matrix.platform }}
-
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: '22'
-          cache: 'pnpm'
-
-      - name: Reuse immutable current-run production payload
-        id: release-payload
-        if: ${{ needs.release-mode.outputs.production == 'true' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-        run: node apps/desktop/scripts/detect-actions-release-payload.mjs
-
-      - name: Install Rust stable
-        if: ${{ steps.release-payload.outputs.reuse != 'true' }}
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Rust cache
-        if: ${{ steps.release-payload.outputs.reuse != 'true' }}
-        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: 'apps/desktop/src-tauri -> target'
-          key: ${{ matrix.target }}
-
-      - name: Install dependencies
-        if: ${{ steps.release-payload.outputs.reuse != 'true' }}
-        run: pnpm install --frozen-lockfile
-
-      - name: Build core package
-        if: ${{ steps.release-payload.outputs.reuse != 'true' }}
-        run: pnpm --filter @ccem/core build
-
-      - name: Detect Apple signing config
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.appleSigning }}
-        id: apple-signing
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_NOTARY_API_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_API_PRIVATE_KEY }}
-          APPLE_NOTARY_API_KEY_ID: ${{ vars.APPLE_NOTARY_API_KEY_ID }}
-          APPLE_NOTARY_API_ISSUER: ${{ vars.APPLE_NOTARY_API_ISSUER }}
-        run: |
-          signing_values=("$APPLE_CERTIFICATE" "$APPLE_CERTIFICATE_PASSWORD" "$APPLE_SIGNING_IDENTITY" "$APPLE_TEAM_ID" "$APPLE_ID" "$APPLE_PASSWORD" "$APPLE_NOTARY_API_PRIVATE_KEY" "$APPLE_NOTARY_API_KEY_ID" "$APPLE_NOTARY_API_ISSUER")
-          configured=0
-          for value in "${signing_values[@]}"; do
-            [[ -n "$value" ]] && configured=$((configured + 1))
-          done
-
-          if [[ "$configured" -eq 0 ]]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Apple code signing not configured; building unsigned artifacts with Mode 2 disabled"
-          elif [[ "$configured" -ne "${#signing_values[@]}" ]]; then
-            echo "Mode 2 Apple signing is partially configured; app signing, Apple-ID app notarization, and App Store Connect API-key DMG notarization credentials must be provided together." >&2
-            exit 1
-          elif [[ ! "$CCEM_OFFICIAL_APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
-            echo "Repository variable CCEM_OFFICIAL_APPLE_TEAM_ID must pin the official 10-character Apple Team ID." >&2
-            exit 1
-          elif [[ "$APPLE_TEAM_ID" != "$CCEM_OFFICIAL_APPLE_TEAM_ID" ]]; then
-            echo "APPLE_TEAM_ID does not match the pinned official CCEM Team ID." >&2
-            exit 1
-          elif [[ "$APPLE_SIGNING_IDENTITY" != "Developer ID Application: "*" ($CCEM_OFFICIAL_APPLE_TEAM_ID)" ]]; then
-            echo "APPLE_SIGNING_IDENTITY is not the official Developer ID Application identity." >&2
-            exit 1
-          else
-            node apps/desktop/scripts/validate-release-signing-config.mjs --platform macos --dry-run > /dev/null
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Using pinned Developer ID identity with complete notarization credentials"
-          fi
-
-      - name: Validate and import Windows Authenticode certificate
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.windowsSigning && needs.release-mode.outputs.production == 'true' }}
-        id: windows-signing
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-          CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          node apps/desktop/scripts/validate-release-signing-config.mjs `
-            --platform windows `
-            --output apps/desktop/src-tauri/target/release-gates/tauri.windows-signing.conf.json
-
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'ccem-release-signing.pfx'
-          try {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-            $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
-            $imported = @(Import-PfxCertificate `
-              -FilePath $pfxPath `
-              -CertStoreLocation 'Cert:\CurrentUser\My' `
-              -Password $password `
-              -Exportable:$false)
-            $expectedThumbprint = ($env:WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
-            $certificate = @($imported | Where-Object { $_.Thumbprint -eq $expectedThumbprint })
-            if ($certificate.Count -ne 1) { throw 'PFX did not import exactly the pinned Authenticode certificate' }
-            if ($certificate[0].Subject -ne $env:CCEM_OFFICIAL_WINDOWS_PUBLISHER) {
-              throw 'Imported Authenticode certificate publisher does not match the pinned subject'
-            }
-            if (-not $certificate[0].HasPrivateKey) { throw 'Imported Authenticode certificate has no private key' }
-            $codeSigningEku = @($certificate[0].EnhancedKeyUsageList | Where-Object { $_.ObjectId.Value -eq '1.3.6.1.5.5.7.3.3' })
-            if ($codeSigningEku.Count -ne 1) { throw 'Imported certificate is not valid for code signing' }
-          } finally {
-            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
-          }
-          "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Validate updater signing config
-        if: ${{ steps.release-payload.outputs.reuse != 'true' }}
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY is required because updater artifacts are enabled." >&2
-            echo "Generate it with: cd apps/desktop && pnpm tauri signer generate -w ~/.tauri/ccem-updater.key" >&2
-            exit 1
-          fi
-
-      - name: Import Apple code-signing certificate
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7
-        with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
-          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-
-      - name: Prepare, sign, and attest CEF helpers
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        working-directory: apps/desktop
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
-          CCEM_CEF_ALLOW_CODESIGN: '1'
-          CCEM_CEF_TARGET_TRIPLE: ${{ matrix.target }}
-        run: |
-          node scripts/stage-cef-macos.mjs --prepare-for-signing --target "$CCEM_CEF_TARGET_TRIPLE" --profile release
-          node scripts/sign-and-attest-cef-macos.mjs --target "$CCEM_CEF_TARGET_TRIPLE"
-
-      - name: Require and Authenticode-sign sandbox-capable Windows CEF artifacts
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true' }}
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-          CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
-          CCEM_CEF_ALLOW_SIGNTOOL: '1'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $signtool = (Get-Command signtool.exe -ErrorAction Stop).Source
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
-            throw 'vswhere.exe is required to pin the Visual Studio dumpbin.exe used by the sandbox export gate'
-          }
-          $visualStudio = (& $vswhere `
-            -latest `
-            -products '*' `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath).Trim()
-          if (-not $visualStudio) { throw 'Visual Studio C++ tools are required for the sandbox export gate' }
-          $vcToolsVersionFile = Join-Path $visualStudio 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt'
-          $vcToolsVersion = (Get-Content -LiteralPath $vcToolsVersionFile -Raw).Trim()
-          $dumpbin = (Resolve-Path (Join-Path $visualStudio "VC/Tools/MSVC/$vcToolsVersion/bin/Hostx64/x64/dumpbin.exe")).Path
-          $env:CCEM_SIGNTOOL_PATH = $signtool
-          $env:CCEM_DUMPBIN_PATH = $dumpbin
-          $sandboxRoot = Join-Path $env:RUNNER_TEMP "ccem-cef-sandbox/$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT/x86_64-pc-windows-msvc"
-          "CCEM_SIGNTOOL_PATH=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CCEM_DUMPBIN_PATH=$dumpbin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          cargo rustc `
-            --locked `
-            --manifest-path apps/desktop/src-tauri/Cargo.toml `
-            --lib `
-            --crate-type cdylib `
-            --target x86_64-pc-windows-msvc `
-            --release
-          node apps/desktop/scripts/produce-cef-windows-sandbox.mjs `
-            --target x86_64-pc-windows-msvc `
-            --release-root apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release `
-            --output $sandboxRoot
-          node apps/desktop/scripts/stage-cef-windows.mjs `
-            --target x86_64-pc-windows-msvc `
-            --release-root apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release `
-            --sandbox-root $sandboxRoot `
-            --output apps/desktop/src-tauri/target/cef-bundle/windows
-
-      - name: Build production bundles without release access
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
-          CCEM_CEF_TARGET_TRIPLE: ${{ matrix.target }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          args: ${{ matrix.args }}
-
-      - name: Build unsigned Preview-only macOS bundles without release access
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled != 'true' }}
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          args: ${{ matrix.unsignedArgs }}
-
-      - name: Prove signed macOS Mode 2 Safe Storage isolation and persistence
-        id: macos-safe-storage-smoke
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        shell: bash
-        working-directory: apps/desktop
-        env:
-          CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ALLOW: '1'
-        run: |
-          set -euo pipefail
-          umask 077
-          bundle_root="src-tauri/target/${{ matrix.target }}/release/bundle"
-          shopt -s nullglob
-          app_matches=("${bundle_root}/macos/"*.app)
-          if [[ "${#app_matches[@]}" -ne 1 ]]; then
-            echo "Expected exactly one signed macOS app for Safe Storage smoke; found ${#app_matches[@]}" >&2
-            printf '%s\n' "${app_matches[@]}" >&2
-            exit 1
-          fi
-          nonce="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('hex'))")"
-          smoke_root="${RUNNER_TEMP}/ccem-mode2-safe-storage-smoke/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${nonce:0:16}"
-          attestation="${smoke_root}/evidence/attestation.json"
-          export CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_NONCE="$nonce"
-          export CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ROOT="$smoke_root"
-          export CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ATTESTATION="$attestation"
-          node scripts/run-macos-mode2-safe-storage-smoke.mjs --app "${app_matches[0]}"
-          {
-            printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_NONCE=%s\n' "$nonce"
-            printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ROOT=%s\n' "$smoke_root"
-            printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ATTESTATION=%s\n' "$attestation"
-          } >> "$GITHUB_ENV"
-          printf 'attestation_path=%s\n' "$attestation" >> "$GITHUB_OUTPUT"
-
-      - name: Retain macOS Mode 2 Safe Storage signed-runner evidence
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: mode2-macos-safe-storage-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
-          path: ${{ steps.macos-safe-storage-smoke.outputs.attestation_path }}
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Verify final signed macOS Mode 2 app, DMG, updater, and trust tickets
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        shell: bash
-        working-directory: apps/desktop
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_NOTARY_API_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_API_PRIVATE_KEY }}
-          APPLE_NOTARY_API_KEY_ID: ${{ vars.APPLE_NOTARY_API_KEY_ID }}
-          APPLE_NOTARY_API_ISSUER: ${{ vars.APPLE_NOTARY_API_ISSUER }}
-          CCEM_RELEASE_ALLOW_PLATFORM_VERIFICATION: '1'
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-          CCEM_RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: |
-          set -euo pipefail
-          bundle_root="src-tauri/target/${CCEM_RELEASE_TARGET}/release/bundle"
-          umask 077
-          notary_key="$(mktemp "${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_API_KEY_ID}.p8.XXXXXX")"
-          printf '%s' "$APPLE_NOTARY_API_PRIVATE_KEY" > "$notary_key"
-          export CCEM_NOTARY_API_KEY_PATH="$notary_key"
-          trap 'rm -f "$notary_key"' EXIT
-          one_match() {
-            local label="$1"
-            shift
-            if [[ "$#" -ne 1 ]]; then
-              echo "Expected exactly one ${label}; found $#" >&2
-              printf '%s\n' "$@" >&2
-              exit 1
-            fi
-            printf '%s\n' "$1"
-          }
-          shopt -s nullglob
-          app_matches=("${bundle_root}/macos/"*.app)
-          dmg_matches=("${bundle_root}/dmg/"*.dmg)
-          updater_matches=("${bundle_root}/macos/"*.app.tar.gz)
-          app_path="$(one_match 'macOS app' "${app_matches[@]}")"
-          dmg_path="$(one_match 'DMG' "${dmg_matches[@]}")"
-          updater_path="$(one_match 'macOS updater archive' "${updater_matches[@]}")"
-          node scripts/verify-mode2-release-inventory.mjs \
-            --platform macos \
-            --target "$CCEM_RELEASE_TARGET" \
-            --version "$CCEM_RELEASE_VERSION" \
-            --source-commit "$GITHUB_SHA" \
-            --stage src-tauri/target/cef-bundle/macos \
-            --app "$app_path" \
-            --dmg "$dmg_path" \
-            --updater "$updater_path" \
-            --safe-storage-attestation "$CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ATTESTATION" \
-            --output "src-tauri/target/release-gates/mode2-release-inventory-base-${CCEM_RELEASE_TARGET}.json"
-
-      - name: Record unsigned macOS Preview-only inventory
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled != 'true' }}
-        working-directory: apps/desktop
-        run: |
-          node scripts/verify-mode2-release-inventory.mjs \
-            --platform disabled \
-            --target "${{ matrix.target }}" \
-            --version "${{ needs.prepare-release.outputs.version }}" \
-            --source-commit "$GITHUB_SHA" \
-            --output "src-tauri/target/release-gates/mode2-release-inventory-${{ matrix.target }}.json"
-
-      - name: Run signed installed Windows Mode 2 production smoke
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true' }}
-        shell: pwsh
-        working-directory: apps/desktop
-        env:
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
-          CCEM_WINDOWS_MODE2_ALLOW_PRODUCTION_SMOKE: '1'
-          CCEM_RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $releaseRoot = (Resolve-Path 'src-tauri/target/x86_64-pc-windows-msvc/release').Path
-          $bundleRoot = Join-Path $releaseRoot 'bundle'
-          $nsisRoot = Join-Path $bundleRoot 'nsis'
-          $installer = @(Get-ChildItem -LiteralPath $nsisRoot -File | Where-Object { $_.Name -like '*-setup.exe' })
-          if ($installer.Count -ne 1) { throw "Expected exactly one NSIS installer; found $($installer.Count)" }
-          $stage = (Resolve-Path 'src-tauri/target/cef-bundle/windows').Path
-          $smokeBase = Join-Path $env:RUNNER_TEMP 'ccem-mode2-production-smoke'
-          $smokeRoot = Join-Path $smokeBase "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $evidenceRoot = Join-Path $smokeRoot 'evidence'
-          $attestation = Join-Path $evidenceRoot 'windows-mode2-production-smoke-attestation.json'
-          node scripts/run-windows-mode2-production-smoke.mjs `
-            --installer $installer[0].FullName `
-            --stage $stage `
-            --version $env:CCEM_RELEASE_VERSION `
-            --source-commit $env:GITHUB_SHA `
-            --output $attestation
-          "CCEM_WINDOWS_MODE2_SMOKE_ATTESTATION=$attestation" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Verify final Windows Authenticode and Mode 2 installer inventory
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true' }}
-        shell: pwsh
-        working-directory: apps/desktop
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-          CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
-          CCEM_RELEASE_ALLOW_PLATFORM_VERIFICATION: '1'
-          CCEM_RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $releaseRoot = Resolve-Path 'src-tauri/target/x86_64-pc-windows-msvc/release'
-          $installer = @(Get-ChildItem -LiteralPath (Join-Path $releaseRoot 'bundle/nsis') -File | Where-Object { $_.Name -like '*-setup.exe' })
-          if ($installer.Count -ne 1) { throw "Expected exactly one NSIS installer; found $($installer.Count)" }
-          $signature = @(Get-ChildItem -LiteralPath (Join-Path $releaseRoot 'bundle/nsis') -File | Where-Object { $_.Name -like '*-setup.exe.sig' })
-          if ($signature.Count -ne 1) { throw "Expected exactly one updater signature; found $($signature.Count)" }
-          node scripts/verify-mode2-release-inventory.mjs `
-            --platform windows `
-            --version $env:CCEM_RELEASE_VERSION `
-            --source-commit $env:GITHUB_SHA `
-            --stage 'src-tauri/target/cef-bundle/windows' `
-            --app (Join-Path $releaseRoot 'ccem-desktop.exe') `
-            --installer $installer[0].FullName `
-            --updater-signature $signature[0].FullName `
-            --windows-smoke-attestation $env:CCEM_WINDOWS_MODE2_SMOKE_ATTESTATION `
-            --output 'src-tauri/target/release-gates/mode2-release-inventory-base-x86_64-pc-windows-msvc.json'
-
-      - name: Retain Windows Mode 2 signed-runner evidence
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: mode2-windows-smoke-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ccem-mode2-production-smoke/${{ github.run_id }}-${{ github.run_attempt }}/evidence/windows-mode2-production-smoke-attestation.json
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Prepare updater replacement challenge payload
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        working-directory: apps/desktop
-        env:
-          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-        run: >-
-          node scripts/prepare-release-payload.mjs
-          --target "${CCEM_RELEASE_TARGET}"
-          --inventory "src-tauri/target/release-gates/mode2-release-inventory-base-${CCEM_RELEASE_TARGET}.json"
-          --output "src-tauri/target/release-gates/updater-replacement-challenge-payload-${CCEM_RELEASE_TARGET}"
-          --run-id "${GITHUB_RUN_ID}"
-          --tag "${TAG_NAME}"
-          --source-commit "${GITHUB_SHA}"
-
-      - name: Derive fresh instrumented previous release source
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        shell: bash
-        env:
-          CCEM_UPDATER_REPLACEMENT_SMOKE_ALLOW: '1'
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          previous_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null)"
-          if [[ ! "$previous_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Previous desktop tag is not an exact semantic release: ${previous_tag}" >&2
-            exit 1
-          fi
-          previous_root="$(node -e "process.stdout.write(require('node:path').join(process.env.RUNNER_TEMP, 'ccem-updater-previous-source', process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT, process.env.CCEM_RELEASE_TARGET))")"
-          provenance="$(node -e "process.stdout.write(require('node:path').join(process.env.RUNNER_TEMP, 'ccem-updater-previous-source', process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT, 'provenance-' + process.env.CCEM_RELEASE_TARGET + '.json'))")"
-          node apps/desktop/scripts/prepare-updater-replacement-previous-source.mjs \
-            --repository "$GITHUB_WORKSPACE" \
-            --current-source "$GITHUB_WORKSPACE" \
-            --previous-ref "$previous_tag" \
-            --destination "$previous_root" \
-            --output "$provenance" \
-            --current-source-commit "$GITHUB_SHA"
-          previous_commit="$(node -e "process.stdout.write(JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')).previousCommit)" "$provenance")"
-          {
-            printf 'CCEM_PREVIOUS_SOURCE=%s\n' "$previous_root"
-            printf 'CCEM_PREVIOUS_PROVENANCE=%s\n' "$provenance"
-            printf 'CCEM_PREVIOUS_COMMIT=%s\n' "$previous_commit"
-          } >> "$GITHUB_ENV"
-
-      - name: Build previous release frontend and sidecar in isolated source
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS='=' read -r name _; do
-            [[ "$name" == CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_* ]] && unset "$name"
-          done < <(env)
-          pnpm --dir "$CCEM_PREVIOUS_SOURCE" install --frozen-lockfile
-          pnpm --dir "$CCEM_PREVIOUS_SOURCE" --filter @ccem/core build
-          pnpm --dir "$CCEM_PREVIOUS_SOURCE/apps/desktop" build
-
-      - name: Build signed previous macOS updater fixture
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        shell: bash
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          while IFS='=' read -r name _; do
-            [[ "$name" == CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_* ]] && unset "$name"
-          done < <(env)
-          cd "$CCEM_PREVIOUS_SOURCE/apps/desktop"
-          export GITHUB_SHA="$CCEM_PREVIOUS_COMMIT"
-          overlay='{"bundle":{"createUpdaterArtifacts":false},"plugins":{"updater":{"windows":{"installMode":"quiet"}}}}'
-          pnpm tauri build --target "$CCEM_RELEASE_TARGET" --features updater-replacement-smoke-harness --bundles app --config "$overlay" --ci -- --locked
-          shopt -s nullglob
-          matches=("src-tauri/target/${CCEM_RELEASE_TARGET}/release/bundle/macos/"*.app)
-          if [[ "${#matches[@]}" -ne 1 ]]; then
-            echo "Expected exactly one previous macOS app fixture; found ${#matches[@]}" >&2
-            exit 1
-          fi
-          /usr/bin/codesign --verify --deep --strict --verbose=4 "${matches[0]}"
-          printf 'CCEM_PREVIOUS_ARTIFACT=%s\n' "$(cd "${matches[0]}/.." && pwd -P)/$(basename "${matches[0]}")" >> "$GITHUB_ENV"
-
-      - name: Build and Authenticode-sign previous Windows updater fixture
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true' }}
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Get-ChildItem Env: |
-            Where-Object Name -Like 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_*' |
-            ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
-          Push-Location (Join-Path $env:CCEM_PREVIOUS_SOURCE 'apps/desktop')
-          try {
-            $env:GITHUB_SHA = $env:CCEM_PREVIOUS_COMMIT
-            $overlay = '{"bundle":{"createUpdaterArtifacts":false},"plugins":{"updater":{"windows":{"installMode":"quiet"}}}}'
-            pnpm tauri build --target x86_64-pc-windows-msvc --features updater-replacement-smoke-harness --no-bundle --no-sign --config $overlay --ci -- --locked
-            if ($LASTEXITCODE -ne 0) { throw "Previous Windows cargo build exited $LASTEXITCODE" }
-            $releaseRoot = Join-Path (Get-Location) 'src-tauri/target/x86_64-pc-windows-msvc/release'
-            $executable = Join-Path $releaseRoot 'ccem-desktop.exe'
-            $signtool = if ($env:CCEM_SIGNTOOL_PATH) { $env:CCEM_SIGNTOOL_PATH } else { (Get-Command signtool.exe -ErrorAction Stop).Source }
-            & $signtool sign /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT /fd SHA256 /tr $env:WINDOWS_TIMESTAMP_URL /td SHA256 $executable
-            if ($LASTEXITCODE -ne 0) { throw "Signing previous Windows executable exited $LASTEXITCODE" }
-            pnpm tauri bundle --target x86_64-pc-windows-msvc --features updater-replacement-smoke-harness --bundles nsis --no-sign --config $overlay --ci
-            if ($LASTEXITCODE -ne 0) { throw "Previous Windows NSIS bundle exited $LASTEXITCODE" }
-            $installers = @(Get-ChildItem -LiteralPath (Join-Path $releaseRoot 'bundle/nsis') -File | Where-Object Name -Like '*-setup.exe')
-            if ($installers.Count -ne 1) { throw "Expected exactly one previous NSIS fixture; found $($installers.Count)" }
-            & $signtool sign /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT /fd SHA256 /tr $env:WINDOWS_TIMESTAMP_URL /td SHA256 $installers[0].FullName
-            if ($LASTEXITCODE -ne 0) { throw "Signing previous Windows NSIS fixture exited $LASTEXITCODE" }
-            $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
-            if ($signature.Status -ne 'Valid') { throw 'Previous Windows NSIS fixture signature is invalid' }
-            "CCEM_PREVIOUS_ARTIFACT=$($installers[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          } finally {
-            Pop-Location
-          }
-
-      - name: Prove real previous-to-current updater replacement
-        id: updater-replacement-smoke
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        shell: bash
-        working-directory: apps/desktop
-        env:
-          CCEM_UPDATER_REPLACEMENT_SMOKE_ALLOW: '1'
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
-          CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
-        run: |
-          set -euo pipefail
-          evidence="src-tauri/target/release-gates/updater-replacement-attestation-${CCEM_RELEASE_TARGET}.json"
-          node scripts/run-updater-replacement-smoke.mjs \
-            --payload "src-tauri/target/release-gates/updater-replacement-challenge-payload-${CCEM_RELEASE_TARGET}" \
-            --previous-artifact "$CCEM_PREVIOUS_ARTIFACT" \
-            --previous-provenance "$CCEM_PREVIOUS_PROVENANCE" \
-            --tauri-config src-tauri/tauri.conf.json \
-            --output "$evidence"
-          printf 'attestation_path=%s\n' "$evidence" >> "$GITHUB_OUTPUT"
-
-      - name: Seal updater replacement receipt into target inventory
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        working-directory: apps/desktop
-        env:
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-        run: >-
-          node scripts/seal-updater-replacement-release-inventory.mjs
-          --inventory "src-tauri/target/release-gates/mode2-release-inventory-base-${CCEM_RELEASE_TARGET}.json"
-          --attestation "src-tauri/target/release-gates/updater-replacement-attestation-${CCEM_RELEASE_TARGET}.json"
-          --output "src-tauri/target/release-gates/mode2-release-inventory-${CCEM_RELEASE_TARGET}.json"
-
-      - name: Retain updater replacement signed-runner evidence
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: updater-replacement-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
-          path: ${{ steps.updater-replacement-smoke.outputs.attestation_path }}
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Remove instrumented previous source worktree
-        if: ${{ always() && steps.release-payload.outputs.reuse != 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${CCEM_PREVIOUS_SOURCE:-}" ]]; then
-            git worktree remove --force "$CCEM_PREVIOUS_SOURCE"
-            git worktree prune
-          fi
-
-      - name: Prepare this verified target's immutable current-run payload
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
-        working-directory: apps/desktop
-        env:
-          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
-          CCEM_RELEASE_TARGET: ${{ matrix.target }}
-        run: >-
-          node scripts/prepare-release-payload.mjs
-          --target "${CCEM_RELEASE_TARGET}"
-          --inventory "src-tauri/target/release-gates/mode2-release-inventory-${CCEM_RELEASE_TARGET}.json"
-          --output "src-tauri/target/release-gates/mode2-release-payload-${CCEM_RELEASE_TARGET}"
-          --run-id "${GITHUB_RUN_ID}"
-          --tag "${TAG_NAME}"
-          --source-commit "${GITHUB_SHA}"
-
-      - name: Upload immutable verified production payload
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: mode2-release-payload-${{ github.run_id }}-${{ matrix.target }}
-          path: apps/desktop/src-tauri/target/release-gates/mode2-release-payload-${{ matrix.target }}
-          if-no-files-found: error
-          retention-days: 30
+    uses: ./.github/workflows/mode2-signed-producer.yml
+    with:
+      version: ${{ needs.prepare-release.outputs.version }}
+      source_commit: ${{ github.sha }}
+      caller_workflow_ref: ${{ github.workflow_ref }}
+      export_release_payload: true
+      release_tag: ${{ needs.prepare-release.outputs.current_tag }}
 
   publish-updater-manifest:
     name: Mutate and Publish Exact Release
-    needs: [prepare-release, release-mode, build-desktop]
+    needs: [prepare-release, signed-producer]
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && needs.release-mode.outputs.production == 'true' && needs.build-desktop.result == 'success' }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
     permissions:
       actions: read
       contents: write
@@ -801,6 +148,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Setup Node.js
@@ -808,10 +156,10 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Download immutable current-run release payloads
+      - name: Download immutable current-attempt release payloads
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          pattern: mode2-release-payload-${{ github.run_id }}-*
+          pattern: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-*
           path: release-payloads
           merge-multiple: false
 
@@ -840,6 +188,7 @@ jobs:
           --source-commit "${GITHUB_SHA}"
           --tag "${TAG_NAME}"
           --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
           --inventory-output release-payloads/verified-release-inventory.json
           --contract-output release-payloads/verified-payload-contract.json
 
@@ -863,7 +212,9 @@ jobs:
           EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
           EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
           CCEM_RELEASE_PAYLOAD_CONTRACT: ${{ github.workspace }}/release-payloads/verified-payload-contract.json
+          CCEM_RELEASE_PAYLOAD_ROOT: ${{ github.workspace }}/release-payloads
           CCEM_RELEASE_RECEIPTS_DIR: ${{ github.workspace }}/release-receipts
+          CCEM_RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
         working-directory: apps/desktop
         run: node scripts/upload-draft-release-assets.mjs --mode payload
 
@@ -907,12 +258,11 @@ jobs:
         working-directory: apps/desktop
         run: node scripts/publish-draft-github-release.mjs
 
-  # Universal binary (optional — combines both architectures)
   create-universal:
     name: Create Universal Binary
-    needs: build-desktop
+    needs: signed-producer
     runs-on: macos-latest
-    if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
     permissions: {}
 
     steps:

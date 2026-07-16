@@ -295,27 +295,25 @@ test('attestation writes atomically with private permissions', async (t) => {
   assert.deepEqual((await fs.readdir(root)).filter((name) => name.includes('.tmp-')), []);
 });
 
-test('release workflow imports once, pre-signs CEF, and excludes CEF from unsigned mac builds', async () => {
-  const workflow = await fs.readFile(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'), 'utf8');
+test('signed producer imports once, pre-signs CEF, and has no unsigned fallback', async () => {
+  const workflow = await fs.readFile(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml'), 'utf8');
   const importIndex = workflow.indexOf('uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466');
   const prepareIndex = workflow.indexOf('node scripts/stage-cef-macos.mjs --prepare-for-signing');
   const signIndex = workflow.indexOf('node scripts/sign-and-attest-cef-macos.mjs');
   const signedActionIndex = workflow.indexOf('- name: Build production bundles without release access');
-  const unsignedActionIndex = workflow.indexOf('- name: Build unsigned Preview-only macOS bundles without release access');
+  const signedActionEndIndex = workflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage isolation and persistence');
   assert.ok(importIndex > 0 && importIndex < prepareIndex && prepareIndex < signIndex && signIndex < signedActionIndex);
+  assert.ok(signedActionEndIndex > signedActionIndex);
   const signedAction = workflow.slice(
     signedActionIndex,
-    unsignedActionIndex,
+    signedActionEndIndex,
   );
   assert.doesNotMatch(signedAction, /APPLE_CERTIFICATE(?:_PASSWORD)?:/);
   assert.match(signedAction, /CCEM_CEF_TARGET_TRIPLE: \$\{\{ matrix\.target \}\}/);
   assert.match(workflow, /aarch64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
   assert.match(workflow, /x86_64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
-  assert.match(workflow, /unsignedArgs: '--target aarch64-apple-darwin'/);
-  assert.match(workflow, /unsignedArgs: '--target x86_64-apple-darwin'/);
-  const unsignedAction = workflow.slice(unsignedActionIndex);
-  assert.match(unsignedAction, /args: \$\{\{ matrix\.unsignedArgs \}\}/);
-  assert.doesNotMatch(unsignedAction, /args: \$\{\{ matrix\.args \}\}/);
+  assert.doesNotMatch(workflow, /Build unsigned Preview-only macOS bundles/);
+  assert.doesNotMatch(workflow, /unsignedArgs:/);
 });
 
 test('signer has one fixed signing executable and no Keychain or notarization commands', async () => {

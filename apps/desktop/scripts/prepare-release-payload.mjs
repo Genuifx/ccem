@@ -4,7 +4,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { discoverTargetAssets } from './upload-draft-release-assets.mjs';
+import { discoverTargetAssets } from './release-asset-discovery.mjs';
 
 const TARGET_ROLES = Object.freeze({
   'aarch64-apple-darwin': ['dmg', 'updater', 'updaterSignature'],
@@ -25,6 +25,14 @@ function validateRunId(value) {
   const runId = required(value, 'GitHub run id');
   if (!/^[1-9][0-9]*$/u.test(runId)) fail('GitHub run id must be a positive decimal string');
   return runId;
+}
+
+function validateRunAttempt(value) {
+  const runAttempt = required(value, 'GitHub run attempt');
+  if (!/^[1-9][0-9]*$/u.test(runAttempt)) {
+    fail('GitHub run attempt must be a positive decimal string');
+  }
+  return runAttempt;
 }
 
 function validateSourceCommit(value) {
@@ -83,6 +91,7 @@ export async function prepareReleasePayload({
   outputDir,
   target,
   runId,
+  runAttempt,
   tag,
   sourceCommit,
 }) {
@@ -90,6 +99,7 @@ export async function prepareReleasePayload({
   const expectedRoles = TARGET_ROLES[exactTarget];
   if (!expectedRoles) fail(`unsupported release target: ${exactTarget}`);
   const exactRunId = validateRunId(runId);
+  const exactRunAttempt = validateRunAttempt(runAttempt);
   const exactTag = required(tag, 'release tag');
   const exactSourceCommit = validateSourceCommit(sourceCommit);
   const inventoryRecord = await readJsonFile(inventoryPath, 'release inventory');
@@ -144,6 +154,7 @@ export async function prepareReleasePayload({
     const manifest = {
       schemaVersion: 1,
       runId: exactRunId,
+      runAttempt: exactRunAttempt,
       tag: exactTag,
       target: exactTarget,
       sourceCommit: exactSourceCommit,
@@ -171,6 +182,7 @@ function parseArgs(argv) {
     ['--inventory', 'inventoryPath'],
     ['--output', 'outputDir'],
     ['--run-id', 'runId'],
+    ['--run-attempt', 'runAttempt'],
     ['--tag', 'tag'],
     ['--source-commit', 'sourceCommit'],
   ]);

@@ -437,7 +437,7 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
       'src-tauri/src/browser/login/cef/bootstrap.rs',
     ), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src-tauri/src/lib.rs'), 'utf8'),
-    fs.readFile(path.join(repoDir, '.github/workflows/release-desktop.yml'), 'utf8'),
+    fs.readFile(path.join(repoDir, '.github/workflows/mode2-signed-producer.yml'), 'utf8'),
   ]);
   assert.equal(MACOS_SECURITY_PATH, '/usr/bin/security');
   assert.equal(MACOS_CODESIGN_PATH, '/usr/bin/codesign');

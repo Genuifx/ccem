@@ -37,6 +37,12 @@ function validateRunId(value) {
   return exact;
 }
 
+function validateRunAttempt(value) {
+  const exact = required(value, 'GitHub run attempt');
+  if (!/^[1-9][0-9]*$/u.test(exact)) fail('GitHub run attempt must be a positive decimal string');
+  return exact;
+}
+
 function validateSourceCommit(value) {
   const exact = required(value, 'source commit');
   if (!/^[a-f0-9]{40}$/u.test(exact)) fail('source commit must be a lowercase 40-character SHA');
@@ -109,6 +115,7 @@ export async function verifyReleasePayloads({
   sourceCommit,
   tag,
   runId,
+  runAttempt,
   inventoryOutput,
   contractOutput,
 }) {
@@ -117,15 +124,18 @@ export async function verifyReleasePayloads({
   const exactSourceCommit = validateSourceCommit(sourceCommit);
   const exactTag = required(tag, 'release tag');
   const exactRunId = validateRunId(runId);
+  const exactRunAttempt = validateRunAttempt(runAttempt);
   await requireExactDirectory(root, 'payload root');
 
-  const artifactDirectories = RELEASE_TARGETS.map((target) => `mode2-release-payload-${exactRunId}-${target}`);
+  const artifactDirectories = RELEASE_TARGETS.map(
+    (target) => `mode2-release-payload-${exactRunId}-${exactRunAttempt}-${target}`,
+  );
   await exactEntries(root, artifactDirectories, 'downloaded payload root');
   const inventories = [];
   const contractTargets = [];
 
   for (const target of RELEASE_TARGETS) {
-    const artifactName = `mode2-release-payload-${exactRunId}-${target}`;
+    const artifactName = `mode2-release-payload-${exactRunId}-${exactRunAttempt}-${target}`;
     const artifactRoot = path.join(root, artifactName);
     await requireExactDirectory(artifactRoot, `${target} payload`);
     await exactEntries(artifactRoot, ['assets', 'inventory.json', 'payload-manifest.json'], `${target} payload`);
@@ -137,6 +147,7 @@ export async function verifyReleasePayloads({
     if (
       manifest?.schemaVersion !== 1
       || manifest.runId !== exactRunId
+      || manifest.runAttempt !== exactRunAttempt
       || manifest.tag !== exactTag
       || manifest.target !== target
       || manifest.sourceCommit !== exactSourceCommit
@@ -177,6 +188,7 @@ export async function verifyReleasePayloads({
   const contract = {
     schemaVersion: 1,
     runId: exactRunId,
+    runAttempt: exactRunAttempt,
     tag: exactTag,
     sourceCommit: exactSourceCommit,
     appVersion: exactVersion,
@@ -195,6 +207,7 @@ function parseArgs(argv) {
     ['--source-commit', 'sourceCommit'],
     ['--tag', 'tag'],
     ['--run-id', 'runId'],
+    ['--run-attempt', 'runAttempt'],
     ['--inventory-output', 'inventoryOutput'],
     ['--contract-output', 'contractOutput'],
   ]);

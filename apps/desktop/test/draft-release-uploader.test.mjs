@@ -22,14 +22,17 @@ import {
   uploadCandidateIdempotently,
   uploadDraftTargetAssets,
   uploadLatestJson,
+  uploadVerifiedPayloadContract,
 } from '../scripts/upload-draft-release-assets.mjs';
 import { verifyImmutableReleasesEnabled } from '../scripts/verify-immutable-releases-enabled.mjs';
 
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repoDir = path.resolve(desktopDir, '..', '..');
 const repository = 'fixture-owner/fixture-repo';
-const tag = 'v2.53.0';
+const appVersion = '2.53.0';
+const tag = `v${appVersion}`;
 const runId = '123456789';
+const runAttempt = '7';
 const sourceCommit = 'a'.repeat(40);
 const exactReleasePath = `/repos/${repository}/releases/42`;
 const exactCommitPath = `/repos/${repository}/commits/${encodeURIComponent(tag)}`;
@@ -223,6 +226,41 @@ async function metadata(root, fileName, contents, contentType = 'application/oct
   };
 }
 
+async function verifiedPayloadFixture(root) {
+  const payloadRoot = path.join(root, 'release-payloads');
+  const rolesByTarget = new Map([
+    ['aarch64-apple-darwin', ['dmg', 'updater', 'updaterSignature']],
+    ['x86_64-apple-darwin', ['dmg', 'updater', 'updaterSignature']],
+    ['x86_64-pc-windows-msvc', ['updater', 'updaterSignature']],
+  ]);
+  const targets = [];
+  for (const [target, roles] of rolesByTarget) {
+    const assetsRoot = path.join(
+      payloadRoot,
+      `mode2-release-payload-${runId}-${runAttempt}-${target}`,
+      'assets',
+    );
+    const assets = {};
+    for (const role of roles) {
+      const fileName = `${target}-${role}.bin`;
+      assets[role] = await metadata(assetsRoot, fileName, `${target}:${role}`);
+    }
+    targets.push({ target, assets });
+  }
+  const contract = {
+    schemaVersion: 1,
+    runId,
+    runAttempt,
+    tag,
+    sourceCommit,
+    appVersion,
+    targets,
+  };
+  const contractPath = path.join(payloadRoot, 'verified-payload-contract.json');
+  await fs.writeFile(contractPath, JSON.stringify(contract));
+  return { contract, contractPath, payloadRoot };
+}
+
 function stepBlock(workflow, name) {
   const marker = `      - name: ${name}`;
   const start = workflow.indexOf(marker);
@@ -276,64 +314,48 @@ test('immutable release preflight is read-only and fails closed unless enabled i
 });
 
 test('release DAG keeps builders read-only and defers one privileged transaction until payload verification', async () => {
-  const workflow = await fs.readFile(
-    path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'),
-    'utf8',
+  const [releaseWorkflow, producerWorkflow] = await Promise.all([
+    fs.readFile(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'), 'utf8'),
+    fs.readFile(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml'), 'utf8'),
+  ]);
+  const productionAction = stepBlock(producerWorkflow, 'Build production bundles without release access');
+  assert.match(productionAction, /tauri-apps\/tauri-action@[a-f0-9]{40}/u);
+  assert.doesNotMatch(
+    productionAction,
+    /GITHUB_TOKEN|tagName:|releaseId:|releaseName:|releaseBody:|releaseDraft:|prerelease:|includeUpdaterJson:/u,
   );
-  const actionSteps = [
-    'Build production bundles without release access',
-    'Build unsigned Preview-only macOS bundles without release access',
-  ];
-  for (const name of actionSteps) {
-    const block = stepBlock(workflow, name);
-    assert.match(block, /tauri-apps\/tauri-action@[a-f0-9]{40}/u);
-    assert.doesNotMatch(
-      block,
-      /GITHUB_TOKEN|tagName:|releaseId:|releaseName:|releaseBody:|releaseDraft:|prerelease:|includeUpdaterJson:/u,
-    );
-    assert.deepEqual(
-      [...block.matchAll(/^\s{10}([A-Za-z][A-Za-z0-9]*):/gmu)].map((match) => match[1]),
-      ['projectPath', 'args'],
-    );
-  }
+  assert.deepEqual(
+    [...productionAction.matchAll(/^\s{10}([A-Za-z][A-Za-z0-9]*):/gmu)].map((match) => match[1]),
+    ['projectPath', 'args'],
+  );
+  assert.doesNotMatch(producerWorkflow, /Preview-only|contents: write|detect-actions-release-payload/u);
+  assert.match(producerWorkflow, /Require a fresh current-attempt signed build/u);
+  assert.match(producerWorkflow, /inputs\.export_release_payload == true/u);
+  assert.match(producerWorkflow, /name: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
 
-  const releaseModeIndex = workflow.indexOf('  release-mode:');
-  const buildIndex = workflow.indexOf('  build-desktop:');
-  const transactionIndex = workflow.indexOf('  publish-updater-manifest:');
-  const universalIndex = workflow.indexOf('  create-universal:');
-  assert.ok(releaseModeIndex > 0 && releaseModeIndex < buildIndex && buildIndex < transactionIndex);
-  assert.ok(transactionIndex < universalIndex);
-  assert.equal(workflow.includes('  prepare-draft-release:'), false);
-  assert.match(workflow, /concurrency:\n  group: release-desktop\n  cancel-in-progress: false/u);
-  assert.match(workflow, /recover_stale_draft:[\s\S]*default: 'false'/u);
-  const prepareJob = workflow.slice(0, releaseModeIndex);
-  assert.match(prepareJob, /git fetch --force --no-tags origin "refs\/tags\/\$\{current_tag\}:refs\/tags\/\$\{current_tag\}"/u);
-  assert.match(prepareJob, /Release tag \$\{current_tag\} must exist before desktop release builds start/u);
-
-  const buildJob = workflow.slice(buildIndex, transactionIndex);
-  const releaseModeJob = workflow.slice(releaseModeIndex, buildIndex);
-  const immutableGate = stepBlock(workflow, 'Require immutable GitHub Releases before production builds');
-  assert.ok(releaseModeJob.indexOf('- name: Require complete cross-platform signing before release mutation')
-    < releaseModeJob.indexOf('- name: Require immutable GitHub Releases before production builds'));
-  assert.match(immutableGate, /if: \$\{\{ steps\.release-mode\.outputs\.production == 'true' \}\}/u);
+  assert.match(releaseWorkflow, /concurrency:\n  group: release-desktop\n  cancel-in-progress: false/u);
+  assert.match(releaseWorkflow, /recover_stale_draft:[\s\S]*default: 'false'/u);
+  assert.match(releaseWorkflow, /git fetch --force --no-tags origin "refs\/tags\/\$\{current_tag\}:refs\/tags\/\$\{current_tag\}"/u);
+  assert.match(releaseWorkflow, /Release tag \$\{current_tag\} must exist before desktop release builds start/u);
+  const immutableGate = stepBlock(releaseWorkflow, 'Require immutable GitHub Releases before signed build');
   assert.match(immutableGate, /CCEM_RELEASE_SETTINGS_TOKEN: \$\{\{ secrets\.CCEM_RELEASE_SETTINGS_TOKEN \}\}/u);
   assert.match(immutableGate, /verify-immutable-releases-enabled\.mjs/u);
   assert.doesNotMatch(immutableGate, /GITHUB_TOKEN/u);
-  assert.match(buildJob, /permissions:\n\s+actions: read\n\s+contents: read/u);
-  assert.doesNotMatch(buildJob, /contents: write/u);
-  assert.ok(buildJob.indexOf('- name: Setup Node.js') < buildJob.indexOf('- name: Reuse immutable current-run production payload'));
-  const reuseBlock = stepBlock(workflow, 'Reuse immutable current-run production payload');
-  assert.match(reuseBlock, /needs\.release-mode\.outputs\.production == 'true'/u);
-  assert.match(reuseBlock, /detect-actions-release-payload\.mjs/u);
-  assert.match(workflow, /name: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ matrix\.target \}\}/u);
-  assert.match(workflow, /pattern: mode2-release-payload-\$\{\{ github\.run_id \}\}-\*/u);
-  assert.doesNotMatch(workflow, /mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt/u);
-  assert.match(workflow, /retention-days: 30/u);
+  const producerIndex = releaseWorkflow.indexOf('  signed-producer:');
+  const transactionIndex = releaseWorkflow.indexOf('  publish-updater-manifest:');
+  const universalIndex = releaseWorkflow.indexOf('  create-universal:');
+  assert.ok(producerIndex > 0 && producerIndex < transactionIndex && transactionIndex < universalIndex);
+  const callJob = releaseWorkflow.slice(producerIndex, transactionIndex);
+  assert.match(callJob, /permissions:\n\s+actions: read\n\s+contents: read/u);
+  assert.match(callJob, /uses: \.\/\.github\/workflows\/mode2-signed-producer\.yml/u);
+  assert.match(callJob, /export_release_payload: true/u);
+  assert.doesNotMatch(callJob, /contents: write|secrets:\s*inherit/u);
 
-  const transaction = workflow.slice(transactionIndex, universalIndex);
-  assert.match(transaction, /needs: \[prepare-release, release-mode, build-desktop\]/u);
+  const transaction = releaseWorkflow.slice(transactionIndex, universalIndex);
+  assert.match(transaction, /needs: \[prepare-release, signed-producer\]/u);
   assert.match(transaction, /actions: read\n\s+contents: write/u);
-  assert.equal(workflow.match(/contents: write/gu)?.length, 1);
+  assert.equal(releaseWorkflow.match(/contents: write/gu)?.length, 1);
+  assert.match(transaction, /pattern: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\*/u);
   const verifyIndex = transaction.indexOf('- name: Verify exact three immutable payloads and eight assets');
   const draftIndex = transaction.indexOf('- name: Create or resume the exact current-run draft release');
   const uploadEightIndex = transaction.indexOf('- name: Upload the exact eight verified target assets');
@@ -343,24 +365,20 @@ test('release DAG keeps builders read-only and defers one privileged transaction
   assert.ok(verifyIndex >= 0 && verifyIndex < draftIndex);
   assert.ok(draftIndex < uploadEightIndex && uploadEightIndex < generateLatestIndex);
   assert.ok(generateLatestIndex < uploadLatestIndex && uploadLatestIndex < publishIndex);
-  assert.match(workflow, /ensure-draft-github-release\.mjs/u);
+  assert.match(releaseWorkflow, /ensure-draft-github-release\.mjs/u);
   assert.match(transaction, /ALLOW_STALE_DRAFT_RECOVERY: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.recover_stale_draft \|\| 'false' \}\}/u);
-  assert.equal(workflow.match(/EXPECTED_RELEASE_ID: \$\{\{ steps\.draft-release\.outputs\.release_id \}\}/gu)?.length, 3);
-  assert.equal(workflow.match(/EXPECTED_RELEASE_OWNER_RUN_ID: \$\{\{ steps\.draft-release\.outputs\.release_owner_run_id \}\}/gu)?.length, 3);
-  assert.equal(workflow.match(/EXPECTED_RELEASE_SOURCE_COMMIT: \$\{\{ github\.sha \}\}/gu)?.length, 3);
-  assert.match(workflow, /upload-draft-release-assets\.mjs --mode payload/u);
-  assert.doesNotMatch(workflow, /--mode replace-dmg/u);
-  assert.match(workflow, /upload-draft-release-assets\.mjs --mode latest/u);
-  assert.match(workflow, /publish-draft-github-release\.mjs/u);
-  assert.match(workflow, /CCEM_RELEASE_LATEST_RECEIPT_PATH/u);
-  assert.match(workflow, /CCEM_RELEASE_RECEIPTS_DIR/u);
-  assert.doesNotMatch(workflow, /require-draft-github-release\.mjs/u);
-  const previewAction = stepBlock(workflow, 'Build unsigned Preview-only macOS bundles without release access');
-  assert.match(previewAction, /needs\.release-mode\.outputs\.production != 'true'/u);
-  assert.doesNotMatch(previewAction, /GITHUB_TOKEN|ensure-draft|upload-draft|publish-draft/u);
-  assert.match(transaction, /if: \$\{\{ !cancelled\(\) && needs\.release-mode\.outputs\.production == 'true'/u);
-  assert.doesNotMatch(workflow, /curl[\s\S]{0,180}-H ["']Authorization:/u);
-  assert.doesNotMatch(workflow, /curl[\s\S]{0,180}(?:-X|--request) (?:POST|DELETE|PATCH)/u);
+  assert.equal(releaseWorkflow.match(/EXPECTED_RELEASE_ID: \$\{\{ steps\.draft-release\.outputs\.release_id \}\}/gu)?.length, 3);
+  assert.equal(releaseWorkflow.match(/EXPECTED_RELEASE_OWNER_RUN_ID: \$\{\{ steps\.draft-release\.outputs\.release_owner_run_id \}\}/gu)?.length, 3);
+  assert.equal(releaseWorkflow.match(/EXPECTED_RELEASE_SOURCE_COMMIT: \$\{\{ github\.sha \}\}/gu)?.length, 3);
+  assert.match(releaseWorkflow, /upload-draft-release-assets\.mjs --mode payload/u);
+  assert.doesNotMatch(releaseWorkflow, /--mode replace-dmg/u);
+  assert.match(releaseWorkflow, /upload-draft-release-assets\.mjs --mode latest/u);
+  assert.match(releaseWorkflow, /publish-draft-github-release\.mjs/u);
+  assert.match(releaseWorkflow, /CCEM_RELEASE_LATEST_RECEIPT_PATH/u);
+  assert.match(releaseWorkflow, /CCEM_RELEASE_RECEIPTS_DIR/u);
+  assert.doesNotMatch(releaseWorkflow, /require-draft-github-release\.mjs/u);
+  assert.doesNotMatch(`${releaseWorkflow}\n${producerWorkflow}`, /curl[\s\S]{0,180}-H ["']Authorization:/u);
+  assert.doesNotMatch(`${releaseWorkflow}\n${producerWorkflow}`, /curl[\s\S]{0,180}(?:-X|--request) (?:POST|DELETE|PATCH)/u);
   const uploaderSource = await fs.readFile(
     path.join(desktopDir, 'scripts', 'upload-draft-release-assets.mjs'),
     'utf8',
@@ -445,6 +463,53 @@ test('verified target uploader records final asset ids for the stable run only a
   assert.equal(uploads.length, 3);
   for (const upload of uploads) assertExactReadImmediatelyBefore(api.requests, upload);
   assert.deepEqual(JSON.parse(await fs.readFile(receiptPath, 'utf8')), receipt);
+});
+
+test('verified payload uploader rebinds attempt, source, version, and exact payload roots before mutation', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-verified-payload-upload-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const fixture = await verifiedPayloadFixture(root);
+  const receiptsDir = path.join(root, 'receipts');
+  const options = {
+    contractPath: fixture.contractPath,
+    payloadRoot: fixture.payloadRoot,
+    receiptsDir,
+    runId,
+    runAttempt,
+    sourceCommit,
+    appVersion,
+  };
+
+  const validApi = fakeGitHub();
+  const receipts = await uploadVerifiedPayloadContract({
+    client: clientFor(validApi),
+    ...options,
+  });
+  assert.equal(receipts.length, 3);
+  assert.equal(
+    validApi.requests.filter(({ method, url }) => method === 'POST' && url.startsWith('https://uploads.github.com/')).length,
+    8,
+  );
+
+  const mutations = [
+    [(contract) => { contract.runAttempt = '8'; }, /verified payload contract/iu],
+    [(contract) => { contract.sourceCommit = 'b'.repeat(40); }, /verified payload contract/iu],
+    [(contract) => { contract.appVersion = '2.54.0'; }, /verified payload contract/iu],
+    [(contract) => {
+      contract.targets[0].assets.dmg.path = path.join(root, contract.targets[0].assets.dmg.fileName);
+    }, /payload root/iu],
+  ];
+  for (const [mutate, expectedError] of mutations) {
+    const contract = structuredClone(fixture.contract);
+    mutate(contract);
+    await fs.writeFile(fixture.contractPath, JSON.stringify(contract));
+    const api = fakeGitHub();
+    await assert.rejects(
+      uploadVerifiedPayloadContract({ client: clientFor(api), ...options }),
+      expectedError,
+    );
+    assert.equal(api.requests.some(({ method }) => method === 'POST'), false);
+  }
 });
 
 test('idempotent upload accepts only an exact digest and never deletes collisions', async (t) => {

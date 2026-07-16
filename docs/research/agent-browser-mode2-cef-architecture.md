@@ -239,6 +239,37 @@ Replace or delete:
 - Updater replacement preserves app integrity and does not leave mixed CEF versions.
 - Preview Browser regression remains green.
 
+### Signed readiness and release boundary
+
+The three-platform signing path is implemented once in
+`.github/workflows/mode2-signed-producer.yml`. It is a reusable, production-only evidence producer:
+its jobs receive read-only repository and Actions permissions, always build the current run attempt
+from source, and cannot call a GitHub Release mutation API. Apple, Windows, notarization, and updater
+signing secret names are declared explicitly by the producer; callers pass no repository secret and
+release-only tokens are not inherited.
+Both secret-consuming jobs target the fixed `mode2-signing` Actions Environment. Before enabling
+either caller, configure that Environment with required reviewers and deployment rules limited to
+protected `main` plus formal `v*` release tags, move every Apple, Windows, and updater signing secret
+into it, and delete repository-level duplicates. The reusable secret declarations are optional only
+so the Environment can supply them without a caller value; the producer still fails closed unless
+the full cross-platform signing set is present.
+
+`.github/workflows/mode2-signed-readiness.yml` is the non-publishing entry. A manual run must select
+`main`, repeat the exact 40-character source SHA, and use a package version whose `v<version>` tag is
+still absent from origin. It exports only current-attempt Actions evidence. The aggregate verifier
+requires exactly the macOS arm64, macOS x86_64, and Windows x86_64 inventories and binds their nested
+Safe Storage, Windows runtime, and updater-replacement receipts to the same source, run, attempt,
+repository, caller workflow, job, and target.
+
+`.github/workflows/release-desktop.yml` keeps the existing tag/source gate and is the only caller that
+sets `export_release_payload: true`. Only after the shared producer and aggregate evidence gate pass
+does its separate publication job receive `contents: write`. Re-running only a failed publication job
+cannot reuse payloads from another attempt; the current attempt must contain all three exact payloads.
+
+This structure makes signed readiness possible without creating a tag, draft, release asset, or
+`latest.json`. It does not itself provide current signed-runner evidence: a successful readiness run
+for the exact candidate SHA is still required before Gate 5 can be marked complete.
+
 ## Definition of production ready
 
 Mode 2 is production ready only when every gate above has current evidence. Required behavioral
