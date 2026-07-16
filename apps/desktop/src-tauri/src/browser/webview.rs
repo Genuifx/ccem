@@ -16,8 +16,14 @@ pub(super) fn ensure_browser_webview(
     label: &str,
     generation: u64,
     url: &str,
+    initially_visible: bool,
 ) -> Result<tauri::Webview, String> {
     if let Some(webview) = app.get_webview(label) {
+        if !initially_visible {
+            webview
+                .hide()
+                .map_err(|error| format!("hide existing browser webview before open: {error}"))?;
+        }
         return Ok(webview);
     }
 
@@ -62,13 +68,24 @@ pub(super) fn ensure_browser_webview(
             }
         });
 
-    window
+    let webview = window
         .add_child(
             builder,
             tauri::LogicalPosition::new(0.0, 0.0),
             tauri::LogicalSize::new(1.0, 1.0),
         )
-        .map_err(|error| format!("add browser webview: {error}"))
+        .map_err(|error| format!("add browser webview: {error}"))?;
+
+    if !initially_visible {
+        if let Err(error) = webview.hide() {
+            // A child that cannot acknowledge its initial hidden state must not
+            // survive long enough to paint above an already-open overlay.
+            let _ = webview.close();
+            return Err(format!("hide new browser webview before open: {error}"));
+        }
+    }
+
+    Ok(webview)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -79,6 +96,7 @@ pub(super) fn ensure_browser_webview(
     _label: &str,
     _generation: u64,
     _url: &str,
+    _initially_visible: bool,
 ) -> Result<tauri::Webview, String> {
     Err("Embedded browser is only supported on macOS in this version.".to_string())
 }

@@ -297,7 +297,10 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<u32>, String>
                 .parse::<u32>()
                 .map_err(|_| format!("invalid value '{}'", part))?;
             if v < min || v > max {
-                return Err(format!("value {} out of range (allowed {}-{})", v, min, max));
+                return Err(format!(
+                    "value {} out of range (allowed {}-{})",
+                    v, min, max
+                ));
             }
             result.push(v);
         }
@@ -322,9 +325,11 @@ fn parse_cron_expression(expression: &str) -> Result<CronFieldSets, String> {
     }
     let minutes = parse_cron_field(fields[0], 0, 59).map_err(|e| format!("minute field: {e}"))?;
     let hours = parse_cron_field(fields[1], 0, 23).map_err(|e| format!("hour field: {e}"))?;
-    let days = parse_cron_field(fields[2], 1, 31).map_err(|e| format!("day-of-month field: {e}"))?;
+    let days =
+        parse_cron_field(fields[2], 1, 31).map_err(|e| format!("day-of-month field: {e}"))?;
     let months = parse_cron_field(fields[3], 1, 12).map_err(|e| format!("month field: {e}"))?;
-    let weekdays = parse_cron_field(fields[4], 0, 6).map_err(|e| format!("day-of-week field: {e}"))?;
+    let weekdays =
+        parse_cron_field(fields[4], 0, 6).map_err(|e| format!("day-of-week field: {e}"))?;
     Ok((minutes, hours, days, months, weekdays))
 }
 
@@ -1433,8 +1438,9 @@ mod tests {
         build_cron_claude_command, build_cron_launch_provenance, build_cron_user_path,
         cron_matches, expand_cron_working_dir, next_runs, normalize_execution_profile,
         normalize_wecom_peer_id, parse_cron_field, resolve_cron_env_name,
-        resolve_cron_wecom_notification_target, resolve_execution_profile, resolve_task_tool_policy,
-        validate_cron_expression, CronTask, CronWecomNotification, ResolvedToolPolicy,
+        resolve_cron_wecom_notification_target, resolve_execution_profile,
+        resolve_task_tool_policy, validate_cron_expression, CronTask, CronWecomNotification,
+        ResolvedToolPolicy,
     };
     use crate::wecom::WecomTaskBindingTargetType;
     use std::collections::HashMap;
@@ -1458,13 +1464,19 @@ mod tests {
         assert_eq!(parse_cron_field("1-3", 0, 59).unwrap(), vec![1, 2, 3]);
 
         // step from wildcard
-        assert_eq!(parse_cron_field("*/15", 0, 59).unwrap(), vec![0, 15, 30, 45]);
+        assert_eq!(
+            parse_cron_field("*/15", 0, 59).unwrap(),
+            vec![0, 15, 30, 45]
+        );
 
         // list of values
         assert_eq!(parse_cron_field("1,3,5", 0, 59).unwrap(), vec![1, 3, 5]);
 
         // mixed list (value + range)
-        assert_eq!(parse_cron_field("0,10-12", 0, 59).unwrap(), vec![0, 10, 11, 12]);
+        assert_eq!(
+            parse_cron_field("0,10-12", 0, 59).unwrap(),
+            vec![0, 10, 11, 12]
+        );
 
         // boundary values
         assert_eq!(parse_cron_field("0", 0, 6).unwrap(), vec![0]);
@@ -1550,16 +1562,25 @@ mod tests {
         assert!(err.contains("hour"), "should identify hour field: {err}");
 
         let err = validate_cron_expression("* * * * 7").unwrap_err();
-        assert!(err.contains("day-of-week"), "should identify weekday field: {err}");
+        assert!(
+            err.contains("day-of-week"),
+            "should identify weekday field: {err}"
+        );
 
         let err = validate_cron_expression("* * 32 * *").unwrap_err();
-        assert!(err.contains("day-of-month"), "should identify day field: {err}");
+        assert!(
+            err.contains("day-of-month"),
+            "should identify day field: {err}"
+        );
 
         let err = validate_cron_expression("* * * 13 *").unwrap_err();
         assert!(err.contains("month"), "should identify month field: {err}");
 
         let err = validate_cron_expression("60 * * * *").unwrap_err();
-        assert!(err.contains("minute"), "should identify minute field: {err}");
+        assert!(
+            err.contains("minute"),
+            "should identify minute field: {err}"
+        );
     }
 
     #[test]

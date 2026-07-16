@@ -200,8 +200,7 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         SessionEventPayload::ClaudeJson { .. } | SessionEventPayload::GapNotification { .. } => {
             None
         }
-        SessionEventPayload::StdErrLine { .. }
-        | SessionEventPayload::AssistantChunk { .. } => None,
+        SessionEventPayload::StdErrLine { .. } | SessionEventPayload::AssistantChunk { .. } => None,
     }
 }
 

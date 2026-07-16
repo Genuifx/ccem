@@ -1,6 +1,6 @@
 use super::backend::{
     DiagnosticLogResult, SemanticBrowserCommand, SemanticBrowserResult, SemanticOperation,
-    SemanticWaitCondition, StructuredPageResult,
+    SemanticWaitCondition,
 };
 #[cfg(test)]
 use super::capability::BrowserPermissionAuthority;
@@ -8,7 +8,6 @@ use super::capability::{
     BrowserPermissionAuthorityTicket, PermissionAuthorityBinding, SemanticCapabilityService,
     SemanticExecutionContext,
 };
-use super::cdp::artifacts::CdpArtifactStore;
 use super::console_log::{ConsoleLogArtifact, ConsoleLogStore};
 use super::network_log::{NetworkLogArtifact, NetworkLogStore};
 use super::policy::{BrowserDataProvenance, NormalizedOrigin};
@@ -17,19 +16,27 @@ use super::session::{LoginBrowserSessionManager, TrustedWorkspacePath};
 use super::session_backend::SessionOwnedBackend;
 use crate::browser::BrowserToolRequest;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MAX_RESOLVED_SCREENSHOT_BYTES: u64 = 24 * 1024 * 1024;
-const MAX_RESOLVED_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+mod artifacts;
+
+pub(in crate::browser::login) use artifacts::read_snapshot_artifact_contract;
+#[cfg(test)]
+use artifacts::resolve_snapshot_artifact;
+use artifacts::{insert_artifact_path, resolve_screenshot_artifact, serialize_snapshot_artifact};
 
 pub(crate) struct PreparedAgentToolExecution {
     lease: super::session::AgentExecutionLease,
     command: SemanticBrowserCommand,
     permission: PermissionAuthorityBinding,
+}
+
+impl PreparedAgentToolExecution {
+    pub(in crate::browser::login) fn artifact_root(&self) -> &Path {
+        &self.lease.artifact_root
+    }
 }
 
 impl LoginBrowserSessionManager {
@@ -42,6 +49,11 @@ impl LoginBrowserSessionManager {
         authority: BrowserPermissionAuthorityTicket,
         request: &BrowserToolRequest,
     ) -> Result<Option<PreparedAgentToolExecution>, String> {
+        if !self.is_available() {
+            // This is an optional routing probe. A degraded Mode 2 registry must behave exactly
+            // like "no handoff" so the existing Preview Browser remains the selected backend.
+            return Ok(None);
+        }
         let workspace = TrustedWorkspacePath::from_trusted_app(PathBuf::from(workspace_dir))
             .map_err(|error| error.to_string())?;
         let Some(lease) = self
@@ -380,178 +392,6 @@ fn serialize_diagnostic_log(result: SemanticBrowserResult, path: PathBuf) -> Res
     Ok(value)
 }
 
-fn serialize_snapshot_artifact(
-    page: StructuredPageResult,
-    artifact_root: &Path,
-) -> Result<Value, String> {
-    // The root comes from the trusted session registry. Agent input can neither choose the path
-    // nor supply an artifact identity.
-    let store = CdpArtifactStore::new(artifact_root.to_path_buf())
-        .map_err(|_| "Login Browser snapshot artifact store is unavailable.".to_string())?;
-    let artifact = store
-        .store_snapshot(&page)
-        .map_err(|_| "Login Browser snapshot artifact could not be stored.".to_string())?;
-    let path = resolve_snapshot_artifact(
-        artifact_root,
-        &artifact.artifact_id,
-        &artifact.sha256,
-        artifact.byte_size,
-    )?;
-    let mut value = serde_json::to_value(artifact)
-        .map_err(|_| "Login Browser snapshot result serialization failed.".to_string())?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "Login Browser snapshot result shape is invalid.".to_string())?;
-    object.insert(
-        "result".to_string(),
-        Value::String("structured_page".to_string()),
-    );
-    object.insert(
-        "mime_type".to_string(),
-        Value::String("application/json".to_string()),
-    );
-    object.insert(
-        "path".to_string(),
-        Value::String(path.to_string_lossy().into_owned()),
-    );
-    Ok(value)
-}
-
-fn insert_artifact_path(value: &mut Value, path: PathBuf) -> Result<(), String> {
-    value
-        .as_object_mut()
-        .ok_or_else(|| "Login Browser result shape is invalid.".to_string())?
-        .insert(
-            "path".to_string(),
-            Value::String(path.to_string_lossy().into_owned()),
-        );
-    Ok(())
-}
-
-fn resolve_screenshot_artifact(
-    root: &Path,
-    artifact_id: &str,
-    expected_sha256: &str,
-    expected_size: u64,
-) -> Result<PathBuf, String> {
-    resolve_artifact(
-        root,
-        artifact_id,
-        "png",
-        expected_sha256,
-        expected_size,
-        MAX_RESOLVED_SCREENSHOT_BYTES,
-    )
-}
-
-fn resolve_snapshot_artifact(
-    root: &Path,
-    artifact_id: &str,
-    expected_sha256: &str,
-    expected_size: u64,
-) -> Result<PathBuf, String> {
-    resolve_artifact(
-        root,
-        artifact_id,
-        "json",
-        expected_sha256,
-        expected_size,
-        MAX_RESOLVED_SNAPSHOT_BYTES,
-    )
-}
-
-fn resolve_artifact(
-    root: &Path,
-    artifact_id: &str,
-    extension: &str,
-    expected_sha256: &str,
-    expected_size: u64,
-    maximum_size: u64,
-) -> Result<PathBuf, String> {
-    if artifact_id.is_empty()
-        || artifact_id.len() > 256
-        || !artifact_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        || expected_sha256.len() != 64
-        || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || expected_size == 0
-        || expected_size > maximum_size
-    {
-        return Err("Login Browser artifact identity is invalid.".to_string());
-    }
-    let root_metadata = fs::symlink_metadata(root)
-        .map_err(|_| "Login Browser artifact store is unavailable.".to_string())?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err("Login Browser artifact store identity changed.".to_string());
-    }
-    let path = root.join(format!("{artifact_id}.{extension}"));
-    if path.parent() != Some(root) {
-        return Err("Login Browser artifact path escaped its store.".to_string());
-    }
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|_| "Login Browser screenshot artifact is missing.".to_string())?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() != expected_size
-    {
-        return Err("Login Browser screenshot artifact identity changed.".to_string());
-    }
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|_| "Login Browser artifact store is unavailable.".to_string())?;
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|_| "Login Browser screenshot artifact is unavailable.".to_string())?;
-    if canonical_path.parent() != Some(canonical_root.as_path()) {
-        return Err("Login Browser screenshot artifact escaped its store.".to_string());
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(&canonical_path)
-        .map_err(|_| "Login Browser artifact is unreadable.".to_string())?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| "Login Browser artifact identity is unavailable.".to_string())?;
-    if !opened_metadata.is_file() || opened_metadata.len() != expected_size {
-        return Err("Login Browser artifact identity changed.".to_string());
-    }
-    let mut bytes = Vec::with_capacity(expected_size as usize);
-    file.take(maximum_size.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| "Login Browser artifact is unreadable.".to_string())?;
-    if bytes.len() as u64 != expected_size {
-        return Err("Login Browser artifact identity changed.".to_string());
-    }
-    if hex::encode(Sha256::digest(&bytes)) != expected_sha256 {
-        return Err("Login Browser artifact digest changed.".to_string());
-    }
-    let final_metadata = fs::symlink_metadata(&canonical_path)
-        .map_err(|_| "Login Browser artifact identity changed.".to_string())?;
-    if final_metadata.file_type().is_symlink()
-        || !final_metadata.file_type().is_file()
-        || final_metadata.len() != expected_size
-    {
-        return Err("Login Browser artifact identity changed.".to_string());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if opened_metadata.dev() != final_metadata.dev()
-            || opened_metadata.ino() != final_metadata.ino()
-        {
-            return Err("Login Browser artifact identity changed.".to_string());
-        }
-    }
-    Ok(canonical_path)
-}
-
 fn parse_command(request: &BrowserToolRequest) -> Result<SemanticBrowserCommand, String> {
     let command = match request.tool.as_str() {
         "navigate" => SemanticBrowserCommand::Navigate {
@@ -643,6 +483,7 @@ mod tests {
     use crate::browser::login::network_log::NetworkLogStore;
     use crate::browser::login::profile::TrustedWorkspaceIdentity;
     use crate::browser::login::provenance::ProvenanceLedger;
+    use sha2::{Digest, Sha256};
 
     fn request(tool: &str, args: Value) -> BrowserToolRequest {
         BrowserToolRequest {
@@ -830,6 +671,21 @@ mod tests {
             envelope["page"]["elements"][0]["element_ref"],
             "el-opaque-reference"
         );
+
+        let resolved = read_snapshot_artifact_contract(&root, &value).unwrap();
+        assert_eq!(resolved, envelope);
+
+        let mut wrong_summary = value.clone();
+        wrong_summary["summary"]["element_count"] = serde_json::json!(2);
+        assert!(read_snapshot_artifact_contract(&root, &wrong_summary).is_err());
+
+        let mut wrong_path = value.clone();
+        wrong_path["path"] = serde_json::json!(root.join("substitute.json"));
+        assert!(read_snapshot_artifact_contract(&root, &wrong_path).is_err());
+
+        let mut wrong_digest = value.clone();
+        wrong_digest["sha256"] = serde_json::json!("0".repeat(64));
+        assert!(read_snapshot_artifact_contract(&root, &wrong_digest).is_err());
     }
 
     #[cfg(unix)]

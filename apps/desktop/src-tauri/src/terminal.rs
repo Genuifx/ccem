@@ -2244,8 +2244,7 @@ mod tests {
     fn test_build_opencode_shell_command_omits_secret_block_when_no_path() {
         // When no secret path is provided, the source/rm block must be absent
         // and the launch still works with whatever non-secret env is present.
-        let cmd =
-            build_opencode_shell_command(&HashMap::new(), "/home/user", "sid", None, None);
+        let cmd = build_opencode_shell_command(&HashMap::new(), "/home/user", "sid", None, None);
 
         assert!(!cmd.contains("rm -f"));
         assert!(!cmd.contains("__ccem_src"));
@@ -2282,10 +2281,7 @@ mod tests {
         // Embedded single quote uses the close-quote/escape/reopen idiom.
         assert_eq!(quote_posix_shell_word("/tmp/a' b"), "'/tmp/a'\\'' b'");
         // Multiple embedded single quotes each get their own escape sequence.
-        assert_eq!(
-            quote_posix_shell_word("x'y'z"),
-            "'x'\\''y'\\''z'"
-        );
+        assert_eq!(quote_posix_shell_word("x'y'z"), "'x'\\''y'\\''z'");
     }
 
     /// Regression: working_dir values containing shell metacharacters must be
@@ -2342,7 +2338,8 @@ mod tests {
         let working_dir = "/tmp/$(echo pwned)";
         let claude = build_shell_command(&HashMap::new(), working_dir, "sid", None);
         let codex = build_codex_shell_command(&HashMap::new(), working_dir, "sid", None);
-        let opencode = build_opencode_shell_command(&HashMap::new(), working_dir, "sid", None, None);
+        let opencode =
+            build_opencode_shell_command(&HashMap::new(), working_dir, "sid", None, None);
 
         for (cmd, label) in [
             (claude.as_str(), "claude"),
@@ -2381,7 +2378,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let secret_json = "{\"provider\":{\"anthropic\":{\"options\":{\"apiKey\":\"sk-test-LEAK-CANARY\"}}}}";
+        let secret_json =
+            "{\"provider\":{\"anthropic\":{\"options\":{\"apiKey\":\"sk-test-LEAK-CANARY\"}}}}";
 
         let path = write_opencode_secret_env_file(&session_id, secret_json)
             .expect("secret env file should be written");
@@ -2443,8 +2441,15 @@ mod tests {
 
         // The planted file is untouched.
         let after = std::fs::read_to_string(&target).expect("planted file still readable");
-        assert_eq!(after, "ORIGINAL-SENTINEL\n", "planted file must not be modified");
-        assert_eq!(mode_of(&target), mode_before, "planted file mode must not change");
+        assert_eq!(
+            after, "ORIGINAL-SENTINEL\n",
+            "planted file must not be modified"
+        );
+        assert_eq!(
+            mode_of(&target),
+            mode_before,
+            "planted file mode must not change"
+        );
     }
 
     #[cfg(unix)]
@@ -2473,7 +2478,10 @@ mod tests {
 
         // The victim file behind the symlink is untouched.
         let after = std::fs::read_to_string(&victim).expect("victim still readable");
-        assert_eq!(after, "VICTIM-SENTINEL\n", "victim must not be written via the symlink");
+        assert_eq!(
+            after, "VICTIM-SENTINEL\n",
+            "victim must not be written via the symlink"
+        );
     }
 
     #[cfg(unix)]
@@ -2538,9 +2546,8 @@ mod tests {
         let mut env_vars = HashMap::new();
         env_vars.insert("ANTHROPIC_MODEL".to_string(), "claude-test".to_string());
 
-        let (remaining, secret_path) =
-            split_opencode_secret_env(env_vars.clone(), "sid-no-secret")
-                .expect("split should succeed without secret key");
+        let (remaining, secret_path) = split_opencode_secret_env(env_vars.clone(), "sid-no-secret")
+            .expect("split should succeed without secret key");
         assert!(secret_path.is_none());
         assert_eq!(remaining, env_vars);
     }

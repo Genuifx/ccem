@@ -1,8 +1,87 @@
 use super::super::super::backend::{BackendFailure, BackendFailureCode};
 use super::super::super::control::OperationCancellation;
 use super::super::guard::TrustedNavigationSurface;
-use super::MAX_INTERNAL_ID_CHARS;
+use super::{MAX_AX_NODES, MAX_INTERNAL_ID_CHARS};
+use rand::{rngs::OsRng, RngCore};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrimaryTargetBootstrap {
+    CreateOwnedPage,
+    AttachCurrentPage,
+}
+
+pub(super) fn managed_auto_attach_filter() -> Value {
+    // Chrome exposes internal targets such as `browser_ui` alongside page and worker targets.
+    // Auto-attaching every target would pause an unsupported internal surface and then force a
+    // terminal protocol failure. Keep the supported set closed and exclude everything else; an
+    // unexpected attached type still remains terminal in the event handler.
+    serde_json::json!([
+        {"type": "page", "exclude": false},
+        {"type": "iframe", "exclude": false},
+        {"type": "worker", "exclude": false},
+        {"type": "service_worker", "exclude": false},
+        {"type": "shared_worker", "exclude": false},
+        {"type": "worklet", "exclude": false},
+        {"exclude": true}
+    ])
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NodeBinding {
+    backend_node_id: u64,
+    generation: u64,
+}
+
+#[derive(Debug)]
+pub(super) struct ElementRegistry {
+    generation: u64,
+    nodes: BTreeMap<String, NodeBinding>,
+}
+
+impl ElementRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            generation: 1,
+            nodes: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.nodes.clear();
+    }
+
+    pub(super) fn rebuild(&mut self) {
+        self.invalidate();
+    }
+
+    pub(super) fn insert(&mut self, backend_node_id: u64) -> Result<String, BackendFailure> {
+        if self.nodes.len() == MAX_AX_NODES {
+            return Err(protocol_failure());
+        }
+        let mut random = [0_u8; 12];
+        OsRng.fill_bytes(&mut random);
+        let element_ref = format!("el-{:x}-{}", self.generation, hex::encode(random));
+        self.nodes.insert(
+            element_ref.clone(),
+            NodeBinding {
+                backend_node_id,
+                generation: self.generation,
+            },
+        );
+        Ok(element_ref)
+    }
+
+    pub(super) fn resolve(&self, element_ref: &str) -> Result<u64, BackendFailure> {
+        let binding = self.nodes.get(element_ref).ok_or_else(invalid_reference)?;
+        if binding.generation != self.generation {
+            return Err(invalid_reference());
+        }
+        Ok(binding.backend_node_id)
+    }
+}
 
 pub(super) fn bounded_string_field(value: &Value, name: &str) -> Option<String> {
     value

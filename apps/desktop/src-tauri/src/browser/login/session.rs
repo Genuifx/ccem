@@ -1,24 +1,21 @@
 use super::capability::{CcemPermissionGate, JsonlSemanticAuditSink, TrustedOriginPolicyGate};
+#[cfg(any(target_os = "macos", windows))]
+use super::cef::recovery::{EmbeddedOwnerRecordHandle, EmbeddedOwnerRecordStore};
 use super::control::{HandoffGrant, LoginBrowserControl};
 use super::policy::{BrowserGrantBinding, NormalizedOrigin};
 use super::profile::{
-    BrowserProfileLease, BrowserProfileManager, OwnershipDomainGone, ProfileError, ProfileId,
+    BrowserProfileDescriptor, BrowserProfileLease, BrowserProfileManager, ProfileError, ProfileId,
     TrustedWorkspaceIdentity,
 };
 use super::provenance::ProvenanceLedger;
 use super::session_backend::{
-    LaunchedSessionRuntime, ProductionRuntime, SessionBackendProjection, SessionBackendStartSpec,
-    SessionOwnedBackend,
+    LaunchedSessionRuntime, SessionBackendProjection, SessionBackendStartSpec, SessionOwnedBackend,
 };
 use super::session_policy::SessionNavigationPolicy;
 use super::session_quiescence::{
     acknowledge_paused_owner, enter_user_control, revoke_and_acknowledge_owner,
 };
-use super::supervisor::{
-    LoginRuntimeSpec, LoginSupervisor, SupervisorError, VerifiedRuntimeExecutable,
-};
 use super::workspace::{WorkspaceIdentityError, WorkspaceIdentityStore};
-use crate::browser::runtime::activation::ActivationStore;
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -39,335 +36,98 @@ mod handoff;
 mod permission_update;
 pub(crate) use activity::LoginBrowserRecentActivity;
 
+#[cfg(test)]
 const LOGIN_PROTOCOL_VERSION: &str = "1";
 const SESSION_ID_PREFIX: &str = "login-session-";
 const SESSION_ID_HEX_LENGTH: usize = 32;
 const MAX_TRUSTED_UI_AUTHORIZATION_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_SEMANTIC_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A workspace path resolved by trusted application state, never deserialized from an Agent or
-/// page payload. `WorkspaceIdentityStore` canonicalizes it and maps it to a random stable id.
-#[derive(Clone)]
-pub(crate) struct TrustedWorkspacePath(PathBuf);
-
-impl TrustedWorkspacePath {
-    pub(crate) fn from_trusted_app(path: PathBuf) -> Result<Self, SessionManagerError> {
-        if path.as_os_str().is_empty() || !path.is_absolute() {
-            return Err(SessionManagerError::InvalidTrustedWorkspacePath);
-        }
-        Ok(Self(path))
-    }
-
-    fn as_path(&self) -> &Path {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SessionId(String);
-
-impl SessionId {
-    fn generate() -> Self {
-        let mut bytes = [0_u8; 16];
-        OsRng.fill_bytes(&mut bytes);
-        Self(format!("{SESSION_ID_PREFIX}{}", hex::encode(bytes)))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Non-serializable handle retained by trusted UI/session state. A raw string can identify a
-/// snapshot, but cannot manufacture the authority needed for handoff, pause, takeover, or close.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LoginBrowserSessionHandle {
-    session_id: SessionId,
-}
-
-impl LoginBrowserSessionHandle {
-    pub(crate) fn as_str(&self) -> &str {
-        self.session_id.as_str()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SessionControlOwner {
-    User,
-    Agent,
-    Paused,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LoginBrowserSessionStatus {
-    Running,
-    Closing,
-    CleanupRequired,
-}
-
-/// The complete serializable session projection. It intentionally contains no filesystem path,
-/// PID, process-group/Job identity, CDP descriptor, pipe handle, or profile lock information.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct LoginBrowserSessionSnapshot {
-    pub session_id: String,
-    pub profile_id: String,
-    pub workspace_id: String,
-    pub runtime_version: String,
-    pub control: SessionControlOwner,
-    pub handoff_epoch: u64,
-    pub current_origin: Option<String>,
-    pub status: LoginBrowserSessionStatus,
-}
-
-pub(crate) struct OpenedLoginBrowserSession {
-    pub handle: LoginBrowserSessionHandle,
-    pub snapshot: LoginBrowserSessionSnapshot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrustedUiControlAction {
-    HandoffToAgent,
-    PauseAgent,
-    TakeoverByUser,
-}
-
-/// Single-use, action-bound trusted UI capability. It is neither Clone, Serialize, nor
-/// Deserialize, so ordinary IPC/Agent arguments cannot mint or replay control authority.
-pub(crate) struct TrustedUiControlAuthorization {
-    session_id: SessionId,
-    action: TrustedUiControlAction,
-    expires_at: Instant,
-}
-
-impl TrustedUiControlAuthorization {
-    pub(crate) fn from_trusted_ui(
-        session: &LoginBrowserSessionHandle,
-        action: TrustedUiControlAction,
-        ttl: Duration,
-    ) -> Result<Self, SessionManagerError> {
-        if ttl.is_zero() || ttl > MAX_TRUSTED_UI_AUTHORIZATION_TTL {
-            return Err(SessionManagerError::InvalidTrustedUiAuthorization);
-        }
-        Ok(Self {
-            session_id: session.session_id.clone(),
-            action,
-            expires_at: Instant::now() + ttl,
-        })
-    }
-
-    fn validate(
-        &self,
-        session_id: &SessionId,
-        expected: TrustedUiControlAction,
-    ) -> Result<(), SessionManagerError> {
-        if &self.session_id != session_id || self.action != expected {
-            return Err(SessionManagerError::TrustedUiActionMismatch);
-        }
-        if Instant::now() > self.expires_at {
-            return Err(SessionManagerError::TrustedUiAuthorizationExpired);
-        }
-        Ok(())
-    }
-}
-
-/// Active Agent authority issued by an explicit trusted UI handoff.
-///
-/// This is an in-process capability, not wire data. The control object rejects the binding after
-/// pause, takeover, a newer handoff epoch, or session close.
-pub(crate) struct SessionAgentGrant {
-    binding: BrowserGrantBinding,
-    control: Arc<LoginBrowserControl>,
-}
-
-impl SessionAgentGrant {
-    pub(super) fn binding(&self) -> &BrowserGrantBinding {
-        &self.binding
-    }
-
-    pub(super) fn control(&self) -> Arc<LoginBrowserControl> {
-        Arc::clone(&self.control)
-    }
-}
-
-pub(super) struct AgentExecutionLease {
-    pub(super) binding: BrowserGrantBinding,
-    pub(super) workspace_identity: TrustedWorkspaceIdentity,
-    pub(super) current_url: String,
-    pub(super) control: Arc<LoginBrowserControl>,
-    pub(super) origin: Arc<TrustedOriginPolicyGate>,
-    pub(super) audit: Arc<JsonlSemanticAuditSink>,
-    pub(super) backend: Arc<dyn SessionOwnedBackend>,
-    pub(super) permission: Arc<CcemPermissionGate>,
-    pub(super) operation_ids: Arc<AtomicU64>,
-    pub(super) artifact_root: PathBuf,
-    pub(super) provenance: Arc<ProvenanceLedger>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProfileSelection {
-    Default,
-    ExplicitNew,
-    Existing(ProfileId),
-}
-
-trait SessionSupervisor: Send + Sync {
-    fn reap_stale(&self, profiles: &BrowserProfileManager) -> Result<(), SessionManagerError>;
-
-    fn launch_active(
-        &self,
-        profile_lease: BrowserProfileLease,
-        activation_store: &ActivationStore,
-    ) -> Result<LaunchedSessionRuntime, SessionManagerError>;
-}
-
-struct ProductionSessionSupervisor {
-    inner: LoginSupervisor,
-}
-
-impl SessionSupervisor for ProductionSessionSupervisor {
-    fn reap_stale(&self, profiles: &BrowserProfileManager) -> Result<(), SessionManagerError> {
-        self.inner
-            .reap_stale(profiles)
-            .map(|_| ())
-            .map_err(map_supervisor_error)
-    }
-
-    fn launch_active(
-        &self,
-        profile_lease: BrowserProfileLease,
-        activation_store: &ActivationStore,
-    ) -> Result<LaunchedSessionRuntime, SessionManagerError> {
-        let runtime_lease = match activation_store.lease_active() {
-            Ok(Some(lease)) => lease,
-            Ok(None) => {
-                release_lease_without_runtime(profile_lease)?;
-                return Err(SessionManagerError::NoActiveRuntime);
-            }
-            Err(error) => {
-                release_lease_without_runtime(profile_lease)?;
-                return Err(map_supervisor_error(SupervisorError::RuntimeActivation(
-                    error,
-                )));
-            }
-        };
-        let executable =
-            match VerifiedRuntimeExecutable::from_active_lease(activation_store, &runtime_lease) {
-                Ok(executable) => executable,
-                Err(error) => {
-                    release_lease_without_runtime(profile_lease)?;
-                    return Err(map_supervisor_error(error));
-                }
-            };
-        let runtime_version = executable.runtime_version().to_string();
-        let spec = match LoginRuntimeSpec::new(executable, LOGIN_PROTOCOL_VERSION) {
-            Ok(spec) => spec,
-            Err(error) => {
-                release_lease_without_runtime(profile_lease)?;
-                return Err(map_supervisor_error(error));
-            }
-        };
-        let runtime = self
-            .inner
-            .launch_with_runtime_lease(profile_lease, spec, runtime_lease)
-            .map_err(map_supervisor_error)?;
-        Ok(LaunchedSessionRuntime {
-            runtime: Box::new(ProductionRuntime(runtime)),
-            runtime_version,
-        })
-    }
-}
-
-struct SessionRecord {
-    snapshot: LoginBrowserSessionSnapshot,
-    backend: Arc<dyn SessionOwnedBackend>,
-    control: Arc<LoginBrowserControl>,
-    navigation_policy: Arc<SessionNavigationPolicy>,
-    handoff_candidate: Option<handoff::HandoffCandidateId>,
-    active_binding: Option<BrowserGrantBinding>,
-    origin_gate: Option<Arc<TrustedOriginPolicyGate>>,
-    audit: Arc<JsonlSemanticAuditSink>,
-    permission: Arc<CcemPermissionGate>,
-    operation_ids: Arc<AtomicU64>,
-    artifact_root: PathBuf,
-}
-
-impl Drop for SessionRecord {
-    fn drop(&mut self) {
-        // A grant may be held by an in-flight owner task after the registry entry disappears.
-        // Revoke before dropping the runtime/control Arcs so that capability always fails closed.
-        let _ = self.navigation_policy.pause_agent();
-        let _ = self.control.revoke_handoff();
-        let _ = acknowledge_paused_owner(self.backend.as_ref());
-    }
-}
-
-pub(crate) struct LoginBrowserSessionManager {
-    root: PathBuf,
-    workspace_identities: WorkspaceIdentityStore,
-    profiles: BrowserProfileManager,
-    activation_store: ActivationStore,
-    supervisor: Arc<dyn SessionSupervisor>,
-    provenance: Arc<ProvenanceLedger>,
-    profile_activity: activity::ProfileActivityStore,
-    sessions: Mutex<HashMap<SessionId, SessionRecord>>,
-    open_gate: Mutex<()>,
-}
+include!("session_types.rs");
 
 impl LoginBrowserSessionManager {
-    pub(crate) fn production(
-        root: PathBuf,
-        activation_store: ActivationStore,
-    ) -> Result<Self, SessionManagerError> {
+    pub(crate) fn production(root: PathBuf) -> Result<Self, SessionManagerError> {
         if root.as_os_str().is_empty() || !root.is_absolute() {
             return Err(SessionManagerError::InvalidRoot);
         }
         let workspace_identities =
             WorkspaceIdentityStore::new(root.join("workspaces")).map_err(map_workspace_error)?;
-        let profiles =
-            BrowserProfileManager::new(root.join("profile-state")).map_err(map_profile_error)?;
-        let supervisor = Arc::new(ProductionSessionSupervisor {
-            inner: LoginSupervisor::production(root.join("supervisor"))
-                .map_err(map_supervisor_error)?,
-        });
-        Self::from_parts(
-            root,
-            workspace_identities,
-            profiles,
-            activation_store,
-            supervisor,
-        )
+        let profiles = BrowserProfileManager::new(root.join("profile-state"), root.join("cef"))
+            .map_err(map_profile_error)?;
+        Self::from_initialized_state(root, workspace_identities, profiles)
     }
 
+    #[cfg(test)]
     fn from_parts(
         root: PathBuf,
         workspace_identities: WorkspaceIdentityStore,
         profiles: BrowserProfileManager,
-        activation_store: ActivationStore,
         supervisor: Arc<dyn SessionSupervisor>,
     ) -> Result<Self, SessionManagerError> {
         // Startup is not complete until stale ownership metadata has been reconciled. Otherwise a
         // crashed prior controller could make a profile appear reusable before its domain is gone.
         supervisor.reap_stale(&profiles)?;
+        let mut manager = Self::from_initialized_state(root, workspace_identities, profiles)?;
+        manager
+            .inner
+            .as_mut()
+            .ok_or(SessionManagerError::StateUnavailable)?
+            .supervisor = Some(supervisor);
+        Ok(manager)
+    }
+
+    fn from_initialized_state(
+        root: PathBuf,
+        workspace_identities: WorkspaceIdentityStore,
+        profiles: BrowserProfileManager,
+    ) -> Result<Self, SessionManagerError> {
         let provenance = Arc::new(
             ProvenanceLedger::new(root.join("provenance"))
                 .map_err(|_| SessionManagerError::StateUnavailable)?,
         );
         let profile_activity = activity::ProfileActivityStore::new(root.join("profile-activity"))?;
         Ok(Self {
-            root,
-            workspace_identities,
-            profiles,
-            activation_store,
-            supervisor,
-            provenance,
-            profile_activity,
-            sessions: Mutex::new(HashMap::new()),
-            open_gate: Mutex::new(()),
+            inner: Some(LoginBrowserSessionManagerInner {
+                root,
+                workspace_identities,
+                profiles,
+                #[cfg(test)]
+                supervisor: None,
+                provenance,
+                profile_activity,
+                sessions: Mutex::new(HashMap::new()),
+                open_gate: Mutex::new(()),
+            }),
         })
     }
 
+    /// Infallible placeholder for a damaged or inaccessible persisted Mode 2 state root.
+    /// Session/profile entry points fail with the fixed `StateUnavailable` boundary; integration
+    /// hooks that only discover an optional Mode 2 handoff treat it as absent so Mode 1 survives.
+    pub(crate) fn unavailable() -> Self {
+        Self { inner: None }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    #[cfg(test)]
+    fn profiles_for_test(&self) -> &BrowserProfileManager {
+        &self
+            .inner
+            .as_ref()
+            .expect("test session manager must be available")
+            .profiles
+    }
+
+    fn available(&self) -> Result<&LoginBrowserSessionManagerInner, SessionManagerError> {
+        self.inner
+            .as_ref()
+            .ok_or(SessionManagerError::StateUnavailable)
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_default_profile(
         &self,
         workspace: TrustedWorkspacePath,
@@ -375,6 +135,7 @@ impl LoginBrowserSessionManager {
         self.open(workspace, ProfileSelection::Default)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_new_profile(
         &self,
         workspace: TrustedWorkspacePath,
@@ -382,6 +143,7 @@ impl LoginBrowserSessionManager {
         self.open(workspace, ProfileSelection::ExplicitNew)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_existing_profile(
         &self,
         workspace: TrustedWorkspacePath,
@@ -391,53 +153,150 @@ impl LoginBrowserSessionManager {
         self.open(workspace, ProfileSelection::Existing(profile_id))
     }
 
+    #[cfg(test)]
     fn open(
         &self,
         workspace: TrustedWorkspacePath,
         selection: ProfileSelection,
     ) -> Result<OpenedLoginBrowserSession, SessionManagerError> {
-        let open_guard = self
+        let prepared = self.prepare_profile(workspace, selection)?;
+        let (registration, profile_lease) = prepared.into_launch_parts();
+        let inner = self.available()?;
+        let launched = inner
+            .supervisor
+            .as_ref()
+            .ok_or(SessionManagerError::StateUnavailable)?
+            .launch_active(profile_lease)?;
+        self.register_prepared(registration, launched)
+    }
+
+    #[cfg(test)]
+    pub(in crate::browser::login) fn prepare_profile(
+        &self,
+        workspace: TrustedWorkspacePath,
+        selection: ProfileSelection,
+    ) -> Result<PreparedLoginBrowserProfile, SessionManagerError> {
+        let inner = self.available()?;
+        let open_guard = inner
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
-        let workspace_identity = self
+        let workspace_identity = inner
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(map_workspace_error)?;
-        let descriptor = match selection {
-            ProfileSelection::Default => self
-                .profiles
-                .list_profiles(&workspace_identity)
-                .map_err(map_profile_error)?
-                .into_iter()
-                .next()
-                .map(Ok)
-                .unwrap_or_else(|| self.profiles.create_profile(&workspace_identity))
-                .map_err(map_profile_error)?,
-            ProfileSelection::ExplicitNew => self
-                .profiles
-                .create_profile(&workspace_identity)
-                .map_err(map_profile_error)?,
-            ProfileSelection::Existing(profile_id) => self
-                .profiles
-                .descriptor(&profile_id, &workspace_identity)
-                .map_err(map_profile_error)?,
-        };
-        let profile_lease = self
+        let descriptor = self.select_profile(&workspace_identity, selection)?;
+        let profile_lease = inner
             .profiles
             .acquire_launch_lease(descriptor.profile_id(), &workspace_identity)
             .map_err(map_profile_error)?;
         // The gate protects only default selection + lease acquisition. Process launch may be
         // slow and must not serialize an unrelated workspace or an explicit new-profile launch.
         drop(open_guard);
-        let launched = self
-            .supervisor
-            .launch_active(profile_lease, &self.activation_store)?;
-        self.register_launched(
+        Ok(PreparedLoginBrowserProfile {
             workspace_identity,
-            descriptor.profile_id().clone(),
-            launched,
-        )
+            profile_id: descriptor.profile_id().clone(),
+            profile_lease,
+        })
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    pub(in crate::browser::login) fn prepare_embedded_profile(
+        &self,
+        workspace: TrustedWorkspacePath,
+        selection: ProfileSelection,
+        surface_id: &str,
+        owner_records: &EmbeddedOwnerRecordStore,
+    ) -> Result<PreparedEmbeddedLoginBrowserProfile, SessionManagerError> {
+        let inner = self.available()?;
+        let open_guard = inner
+            .open_gate
+            .lock()
+            .map_err(|_| SessionManagerError::StateUnavailable)?;
+        let workspace_identity = inner
+            .workspace_identities
+            .resolve(workspace.as_path())
+            .map_err(map_workspace_error)?;
+        let descriptor = self.select_profile(&workspace_identity, selection)?;
+        let reservation = inner
+            .profiles
+            .reserve_embedded_launch(descriptor.profile_id(), &workspace_identity)
+            .map_err(map_profile_error)?;
+        let mut owner_record = owner_records
+            .begin_profile_reservation(&reservation, surface_id)
+            .map_err(|_| SessionManagerError::StateUnavailable)?;
+        let (profile_lease, launch_pending_proof) = reservation
+            .commit_launch_pending()
+            .map_err(map_profile_error)?;
+        if owner_record
+            .mark_launch_pending(&launch_pending_proof)
+            .is_err()
+        {
+            if let Ok((_, release_proof)) = profile_lease.cancel_pending_embedded_launch() {
+                let _ = owner_record.finish_after_profile_release(release_proof);
+            }
+            return Err(SessionManagerError::StateUnavailable);
+        }
+        drop(open_guard);
+        Ok(PreparedEmbeddedLoginBrowserProfile {
+            registration: PreparedLoginBrowserRegistration {
+                workspace_identity,
+                profile_id: descriptor.profile_id().clone(),
+            },
+            profile_lease,
+            owner_record,
+        })
+    }
+
+    fn select_profile(
+        &self,
+        workspace_identity: &TrustedWorkspaceIdentity,
+        selection: ProfileSelection,
+    ) -> Result<BrowserProfileDescriptor, SessionManagerError> {
+        let inner = self.available()?;
+        match selection {
+            ProfileSelection::Default => inner
+                .profiles
+                .list_profiles(workspace_identity)
+                .map_err(map_profile_error)?
+                .into_iter()
+                .next()
+                .map(Ok)
+                .unwrap_or_else(|| inner.profiles.create_profile(workspace_identity))
+                .map_err(map_profile_error),
+            ProfileSelection::ExplicitNew => inner
+                .profiles
+                .create_profile(workspace_identity)
+                .map_err(map_profile_error),
+            ProfileSelection::Existing(profile_id) => inner
+                .profiles
+                .descriptor(&profile_id, workspace_identity)
+                .map_err(map_profile_error),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    pub(in crate::browser::login) fn reap_embedded_owner_records(
+        &self,
+        store: &super::cef::recovery::EmbeddedOwnerRecordStore,
+    ) -> Result<(), SessionManagerError> {
+        let inner = self.available()?;
+        store
+            .reap_stale(&inner.profiles)
+            .map(|_| ())
+            .map_err(|_| SessionManagerError::StateUnavailable)
+    }
+
+    pub(in crate::browser::login) fn register_prepared(
+        &self,
+        prepared: PreparedLoginBrowserRegistration,
+        launched: LaunchedSessionRuntime,
+    ) -> Result<OpenedLoginBrowserSession, SessionManagerError> {
+        let PreparedLoginBrowserRegistration {
+            workspace_identity,
+            profile_id,
+        } = prepared;
+        self.register_launched(workspace_identity, profile_id, launched)
     }
 
     fn register_launched(
@@ -446,8 +305,9 @@ impl LoginBrowserSessionManager {
         profile_id: ProfileId,
         launched: LaunchedSessionRuntime,
     ) -> Result<OpenedLoginBrowserSession, SessionManagerError> {
+        let inner = self.available()?;
         let session_id = SessionId::generate();
-        let session_root = self.root.join("sessions").join(session_id.as_str());
+        let session_root = inner.root.join("sessions").join(session_id.as_str());
         let artifact_root = session_root.join("artifacts");
         let audit = Arc::new(JsonlSemanticAuditSink::new(
             session_root.join("audit").join("actions.jsonl"),
@@ -475,11 +335,22 @@ impl LoginBrowserSessionManager {
             current_origin: None,
             status: LoginBrowserSessionStatus::Running,
         };
-        apply_backend_projection(&mut snapshot, backend.projection()?)?;
+        if let Err(projection_error) = backend
+            .projection()
+            .and_then(|projection| apply_backend_projection(&mut snapshot, projection))
+        {
+            // Opening is not allowed to return while an unregistered runtime still owns the
+            // profile. The backend performs its bounded, concrete terminal cleanup here; a cleanup
+            // failure is more authoritative than the earlier projection failure.
+            return match backend.shutdown(true) {
+                Ok(()) => Err(projection_error),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
+        }
         let handle = LoginBrowserSessionHandle {
             session_id: session_id.clone(),
         };
-        let mut sessions = match self.sessions.lock() {
+        let mut sessions = match inner.sessions.lock() {
             Ok(sessions) => sessions,
             Err(_) => {
                 let _ = backend.shutdown(true);
@@ -491,7 +362,7 @@ impl LoginBrowserSessionManager {
             let _ = backend.shutdown(true);
             return Err(SessionManagerError::StateUnavailable);
         }
-        if let Err(error) = self.profile_activity.register(&profile_id, &session_id) {
+        if let Err(error) = inner.profile_activity.register(&profile_id, &session_id) {
             drop(sessions);
             let _ = backend.shutdown(true);
             return Err(error);
@@ -542,7 +413,8 @@ impl LoginBrowserSessionManager {
         &self,
         workspace: &TrustedWorkspacePath,
     ) -> Result<Option<AgentExecutionLease>, SessionManagerError> {
-        let workspace_identity = self
+        let inner = self.available()?;
+        let workspace_identity = inner
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(map_workspace_error)?;
@@ -585,7 +457,7 @@ impl LoginBrowserSessionManager {
             permission: Arc::clone(&record.permission),
             operation_ids: Arc::clone(&record.operation_ids),
             artifact_root: record.artifact_root.clone(),
-            provenance: Arc::clone(&self.provenance),
+            provenance: Arc::clone(&inner.provenance),
         }))
     }
 
@@ -609,6 +481,22 @@ impl LoginBrowserSessionManager {
             authorization,
             TrustedUiControlAction::PauseAgent,
             SessionControlOwner::Paused,
+            false,
+        )
+    }
+
+    /// Trusted host overlays need an idempotent pause barrier: user-owned and
+    /// already-paused sessions are safe, while Agent-owned sessions must revoke
+    /// authority and acknowledge cancellation before the native child is hidden.
+    pub(crate) fn pause_agent_if_active(
+        &self,
+        authorization: TrustedUiControlAuthorization,
+    ) -> Result<LoginBrowserSessionSnapshot, SessionManagerError> {
+        self.transition_away_from_agent(
+            authorization,
+            TrustedUiControlAction::PauseAgent,
+            SessionControlOwner::Paused,
+            true,
         )
     }
 
@@ -620,6 +508,7 @@ impl LoginBrowserSessionManager {
             authorization,
             TrustedUiControlAction::TakeoverByUser,
             SessionControlOwner::User,
+            false,
         )
     }
 
@@ -628,11 +517,18 @@ impl LoginBrowserSessionManager {
         authorization: TrustedUiControlAuthorization,
         expected_action: TrustedUiControlAction,
         target: SessionControlOwner,
+        allow_already_safe: bool,
     ) -> Result<LoginBrowserSessionSnapshot, SessionManagerError> {
         let mut sessions = self.lock_sessions()?;
         let record = self.record_mut(&mut sessions, &authorization.session_id)?;
         authorization.validate(&record_session_id(record)?, expected_action)?;
         ensure_running(record)?;
+        if allow_already_safe
+            && target == SessionControlOwner::Paused
+            && record.snapshot.control != SessionControlOwner::Agent
+        {
+            return Ok(record.snapshot.clone());
+        }
         let valid_source = match target {
             SessionControlOwner::Paused => record.snapshot.control == SessionControlOwner::Agent,
             SessionControlOwner::User => matches!(
@@ -689,6 +585,85 @@ impl LoginBrowserSessionManager {
         self.stop(session, true)
     }
 
+    /// Revokes every current session authority before performing any backend I/O, then makes one
+    /// bounded force-shutdown attempt per backend outside the registry mutex.
+    pub(crate) fn shutdown_all(&self) -> Result<LoginBrowserShutdownReport, SessionManagerError> {
+        if !self.is_available() {
+            return Ok(LoginBrowserShutdownReport {
+                attempted: 0,
+                closed: 0,
+                failures: Vec::new(),
+            });
+        }
+        let mut candidates = {
+            let mut sessions = self.lock_sessions()?;
+            let mut candidates = Vec::with_capacity(sessions.len());
+            for (session_id, record) in sessions.iter_mut() {
+                let next_handoff_epoch = next_epoch(record.snapshot.handoff_epoch);
+                // These are in-process capability mutations. Backend acknowledgement and terminal
+                // cleanup deliberately happen only after the registry guard has been released.
+                let _ = record.navigation_policy.pause_agent();
+                let _ = record.control.revoke_handoff();
+                record.active_binding = None;
+                record.origin_gate = None;
+                record.handoff_candidate = None;
+                if let Ok(epoch) = next_handoff_epoch {
+                    record.snapshot.handoff_epoch = epoch;
+                }
+                record.snapshot.control = SessionControlOwner::Paused;
+                record.snapshot.status = LoginBrowserSessionStatus::Closing;
+                candidates.push((session_id.clone(), Arc::clone(&record.backend)));
+            }
+            candidates
+        };
+        candidates.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+        let attempted = candidates.len();
+        let mut outcomes = Vec::with_capacity(attempted);
+        for (session_id, backend) in candidates {
+            outcomes.push((session_id, backend.shutdown(true)));
+        }
+
+        let mut closed = 0;
+        let mut failures = Vec::new();
+        let mut removed = Vec::new();
+        {
+            let mut sessions = self
+                .available()?
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (session_id, result) in outcomes {
+                match result {
+                    Ok(()) => {
+                        if let Some(record) = sessions.remove(&session_id) {
+                            removed.push(record);
+                        }
+                        closed += 1;
+                    }
+                    Err(error) => {
+                        if let Some(record) = sessions.get_mut(&session_id) {
+                            record.snapshot.status = LoginBrowserSessionStatus::CleanupRequired;
+                        }
+                        failures.push(LoginBrowserShutdownFailure {
+                            session_id: session_id.as_str().to_string(),
+                            error,
+                        });
+                    }
+                }
+            }
+        }
+        // `SessionRecord::drop` acknowledges its backend. Keep that backend I/O outside the
+        // registry mutex even after a successful terminal shutdown.
+        drop(removed);
+
+        Ok(LoginBrowserShutdownReport {
+            attempted,
+            closed,
+            failures,
+        })
+    }
+
     fn stop(
         &self,
         session: &LoginBrowserSessionHandle,
@@ -723,6 +698,7 @@ impl LoginBrowserSessionManager {
         };
         let result = backend.shutdown(force);
         let mut sessions = self
+            .available()?
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -735,7 +711,10 @@ impl LoginBrowserSessionManager {
     }
 
     fn mark_cleanup_required(&self, session_id: &SessionId) {
-        let mut sessions = self
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let mut sessions = inner
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -747,7 +726,8 @@ impl LoginBrowserSessionManager {
     fn lock_sessions(
         &self,
     ) -> Result<MutexGuard<'_, HashMap<SessionId, SessionRecord>>, SessionManagerError> {
-        self.sessions
+        self.available()?
+            .sessions
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)
     }
@@ -818,17 +798,6 @@ fn next_epoch(current: u64) -> Result<u64, SessionManagerError> {
         .ok_or(SessionManagerError::HandoffEpochExhausted)
 }
 
-fn release_lease_without_runtime(
-    profile_lease: BrowserProfileLease,
-) -> Result<(), SessionManagerError> {
-    let proof = OwnershipDomainGone::from_supervisor(profile_lease.ownership_id().to_string())
-        .map_err(map_profile_error)?;
-    profile_lease
-        .release_after_ownership_domain_gone(proof)
-        .map(|_| ())
-        .map_err(map_profile_error)
-}
-
 fn map_workspace_error(_error: WorkspaceIdentityError) -> SessionManagerError {
     SessionManagerError::WorkspaceUnavailable
 }
@@ -838,16 +807,6 @@ fn map_profile_error(error: ProfileError) -> SessionManagerError {
         ProfileError::ProfileInUse => SessionManagerError::ProfileInUse,
         ProfileError::ProfileRequiresCleanup => SessionManagerError::ProfileRequiresCleanup,
         _ => SessionManagerError::ProfileUnavailable,
-    }
-}
-
-fn map_supervisor_error(error: SupervisorError) -> SessionManagerError {
-    match error {
-        SupervisorError::RuntimeUnavailable | SupervisorError::RuntimeActivation(_) => {
-            SessionManagerError::NoActiveRuntime
-        }
-        SupervisorError::TransportFailed => SessionManagerError::TransportUnavailable,
-        _ => SessionManagerError::RuntimeUnavailable,
     }
 }
 
@@ -864,6 +823,7 @@ pub(crate) enum SessionManagerError {
     RuntimeUnavailable,
     TransportUnavailable,
     OriginUnavailable,
+    PopupActive,
     OperationTimedOut,
     OwnerQuiescenceTimedOut,
     AgentSessionConflict,
@@ -896,6 +856,9 @@ impl fmt::Display for SessionManagerError {
             Self::TransportUnavailable => "The private browser transport is unavailable.",
             Self::OriginUnavailable => {
                 "The current page has no HTTP or HTTPS origin available for Agent handoff."
+            }
+            Self::PopupActive => {
+                "Close the Login Browser popup before handing control to the Agent."
             }
             Self::OperationTimedOut => "The Login Browser operation reached its deadline.",
             Self::OwnerQuiescenceTimedOut => {

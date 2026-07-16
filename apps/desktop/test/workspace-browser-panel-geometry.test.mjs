@@ -41,10 +41,10 @@ test('browser panel bounds compensate for app webview zoom', async () => {
     height: 700,
   }, 0.9);
 
-  assert.equal(bounds.x, 1000);
-  assert.equal(bounds.y, 133.33333333333334);
-  assert.equal(bounds.width, 555.5555555555555);
-  assert.equal(bounds.height, 777.7777777777777);
+  assert.equal(bounds.x, 810);
+  assert.equal(bounds.y, 108);
+  assert.equal(bounds.width, 450);
+  assert.equal(bounds.height, 630);
 });
 
 test('browser panel bounds ignore invalid zoom values', async () => {
@@ -74,9 +74,23 @@ test('browser panel bounds clamp stale persisted zoom values', async () => {
     width: 650,
     height: 900,
   }, '1.7'), {
-    x: 1000,
-    y: 100,
-    width: 500,
-    height: 692.3076923076923,
+    x: 1690,
+    y: 169,
+    width: 845,
+    height: 1170,
   });
+});
+
+test('browser panel app zoom maps CSS pixels to host logical coordinates in the same direction', async () => {
+  const { buildNativeBrowserBounds } = await importGeometryModule();
+  const rect = { left: 100, top: 40, width: 600, height: 400 };
+
+  for (const zoom of [0.8, 1, 1.25]) {
+    assert.deepEqual(buildNativeBrowserBounds(rect, zoom), {
+      x: rect.left * zoom,
+      y: rect.top * zoom,
+      width: rect.width * zoom,
+      height: rect.height * zoom,
+    });
+  }
 });

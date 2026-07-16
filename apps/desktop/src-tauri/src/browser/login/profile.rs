@@ -20,316 +20,62 @@ const PROFILE_ID_HEX_LENGTH: usize = 32;
 const METADATA_FILE_PREFIX: &str = "profile-";
 const METADATA_FILE_SUFFIX: &str = ".json";
 const METADATA_REVISION_WIDTH: usize = 20;
+const CEF_CACHE_ROOT_NAME: &str = "cef";
+const CEF_PROFILE_DIRECTORY_PREFIX: &str = "Profile-";
 const MAX_RUNTIME_ID_BYTES: usize = 160;
 const MAX_RUNTIME_VERSION_BYTES: usize = 160;
 const MAX_PROTOCOL_VERSION_BYTES: usize = 80;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct ProfileId(String);
-
-impl ProfileId {
-    fn generate() -> Self {
-        let mut bytes = [0_u8; 16];
-        OsRng.fill_bytes(&mut bytes);
-        Self(format!("{PROFILE_ID_PREFIX}{}", hex::encode(bytes)))
-    }
-
-    pub(crate) fn parse(value: &str) -> Result<Self, ProfileError> {
-        let Some(hex) = value.strip_prefix(PROFILE_ID_PREFIX) else {
-            return Err(ProfileError::InvalidProfileId);
-        };
-        if hex.len() != PROFILE_ID_HEX_LENGTH || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(ProfileError::InvalidProfileId);
-        }
-        Ok(Self(value.to_ascii_lowercase()))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A stable workspace identity resolved by trusted CCEM state.
-///
-/// This type is deliberately not deserializable. Agent arguments and mutable display paths must be
-/// resolved by the trusted application layer before they can authorize access to a login profile.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct TrustedWorkspaceIdentity(String);
-
-impl TrustedWorkspaceIdentity {
-    pub(crate) fn from_trusted_store(value: impl Into<String>) -> Result<Self, ProfileError> {
-        let value = value.into();
-        let trimmed = value.trim();
-        if trimmed.is_empty()
-            || trimmed.len() > 160
-            || trimmed != value
-            || trimmed.contains('/')
-            || trimmed.contains('\\')
-            || !trimmed.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-            })
-        {
-            return Err(ProfileError::InvalidWorkspaceIdentity);
-        }
-        Ok(Self(value))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ProfileRuntimeCompatibility {
-    pub profile_format_version: u32,
-    pub last_runtime_version: Option<String>,
-    pub last_protocol_version: Option<String>,
-}
-
-impl Default for ProfileRuntimeCompatibility {
-    fn default() -> Self {
-        Self {
-            profile_format_version: PROFILE_FORMAT_VERSION,
-            last_runtime_version: None,
-            last_protocol_version: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub(crate) enum ProfileCleanupState {
-    Stopped,
-    LaunchPending {
-        ownership_id: String,
-        since: String,
-    },
-    RuntimeOwned {
-        ownership_id: String,
-        runtime_id: String,
-        since: String,
-    },
-    Resetting {
-        authorization_id: String,
-        since: String,
-    },
-    Deleting {
-        authorization_id: String,
-        since: String,
-    },
-}
-
-impl ProfileCleanupState {
-    fn ownership_id(&self) -> Option<&str> {
-        match self {
-            Self::LaunchPending { ownership_id, .. } | Self::RuntimeOwned { ownership_id, .. } => {
-                Some(ownership_id)
-            }
-            Self::Stopped | Self::Resetting { .. } | Self::Deleting { .. } => None,
-        }
-    }
-
-    fn is_stopped(&self) -> bool {
-        matches!(self, Self::Stopped)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BrowserProfileDescriptor {
-    schema_version: u32,
-    revision: u64,
-    profile_id: ProfileId,
-    workspace_identity: String,
-    created_at: String,
-    last_used_at: Option<String>,
-    runtime_compatibility: ProfileRuntimeCompatibility,
-    cleanup_state: ProfileCleanupState,
-}
-
-impl BrowserProfileDescriptor {
-    pub(crate) fn profile_id(&self) -> &ProfileId {
-        &self.profile_id
-    }
-
-    pub(crate) fn workspace_identity(&self) -> &str {
-        &self.workspace_identity
-    }
-
-    pub(crate) fn last_used_at(&self) -> Option<&str> {
-        self.last_used_at.as_deref()
-    }
-
-    pub(crate) fn runtime_compatibility(&self) -> &ProfileRuntimeCompatibility {
-        &self.runtime_compatibility
-    }
-
-    pub(crate) fn cleanup_state(&self) -> &ProfileCleanupState {
-        &self.cleanup_state
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DestructiveProfileAction {
-    Reset,
-    Delete,
-}
-
-/// A single-use capability minted by the trusted CCEM UI layer.
-///
-/// It is intentionally neither serializable nor clonable, so an Agent request cannot manufacture
-/// or replay this authorization as ordinary JSON input.
-pub(crate) struct DestructiveProfileAuthorization {
-    authorization_id: String,
-    action: DestructiveProfileAction,
-    profile_id: ProfileId,
-    workspace_identity: TrustedWorkspaceIdentity,
-    expires_at: Instant,
-}
-
-impl DestructiveProfileAuthorization {
-    pub(crate) fn from_trusted_ui(
-        action: DestructiveProfileAction,
-        profile_id: ProfileId,
-        workspace_identity: TrustedWorkspaceIdentity,
-        ttl: Duration,
-    ) -> Result<Self, ProfileError> {
-        if ttl.is_zero() || ttl > Duration::from_secs(5 * 60) {
-            return Err(ProfileError::InvalidDestructiveAuthorization);
-        }
-        Ok(Self {
-            authorization_id: random_opaque_id("destructive"),
-            action,
-            profile_id,
-            workspace_identity,
-            expires_at: Instant::now() + ttl,
-        })
-    }
-
-    fn validate(&self, expected: DestructiveProfileAction) -> Result<(), ProfileError> {
-        if self.action != expected {
-            return Err(ProfileError::DestructiveActionMismatch);
-        }
-        if Instant::now() > self.expires_at {
-            return Err(ProfileError::DestructiveAuthorizationExpired);
-        }
-        Ok(())
-    }
-}
-
-/// Evidence produced only after the supervisor has observed the complete process group or Job
-/// Object ownership domain disappear. It is not accepted from IPC or Agent input.
-pub(crate) struct OwnershipDomainGone {
-    ownership_id: String,
-}
-
-impl OwnershipDomainGone {
-    pub(crate) fn from_supervisor(ownership_id: impl Into<String>) -> Result<Self, ProfileError> {
-        let ownership_id = ownership_id.into();
-        validate_bounded_identifier(&ownership_id, MAX_RUNTIME_ID_BYTES, "ownership id")?;
-        Ok(Self { ownership_id })
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum ProfileError {
-    InvalidProfileId,
-    InvalidWorkspaceIdentity,
-    InvalidRuntimeIdentity(String),
-    InvalidDestructiveAuthorization,
-    DestructiveActionMismatch,
-    DestructiveAuthorizationExpired,
-    ProfileNotFound(String),
-    WorkspaceMismatch,
-    ProfileInUse,
-    ProfileRequiresCleanup,
-    ProfileNotStopped,
-    OwnershipMismatch,
-    UnsafePath(String),
-    CorruptMetadata(String),
-    Io(String),
-}
-
-impl fmt::Display for ProfileError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidProfileId => write!(formatter, "Invalid opaque browser profile id."),
-            Self::InvalidWorkspaceIdentity => {
-                write!(formatter, "Invalid trusted workspace identity.")
-            }
-            Self::InvalidRuntimeIdentity(field) => {
-                write!(formatter, "Invalid managed browser {field}.")
-            }
-            Self::InvalidDestructiveAuthorization => {
-                write!(formatter, "Invalid destructive profile authorization.")
-            }
-            Self::DestructiveActionMismatch => {
-                write!(
-                    formatter,
-                    "Destructive profile authorization action does not match."
-                )
-            }
-            Self::DestructiveAuthorizationExpired => {
-                write!(formatter, "Destructive profile authorization expired.")
-            }
-            Self::ProfileNotFound(profile_id) => {
-                write!(formatter, "Browser profile {profile_id} was not found.")
-            }
-            Self::WorkspaceMismatch => {
-                write!(
-                    formatter,
-                    "Browser profile belongs to another workspace identity."
-                )
-            }
-            Self::ProfileInUse => write!(formatter, "Browser profile is already in use."),
-            Self::ProfileRequiresCleanup => write!(
-                formatter,
-                "Browser profile requires verified ownership-domain cleanup before launch."
-            ),
-            Self::ProfileNotStopped => {
-                write!(
-                    formatter,
-                    "Browser profile must be stopped before this operation."
-                )
-            }
-            Self::OwnershipMismatch => write!(
-                formatter,
-                "Ownership-domain proof does not match the browser profile lease."
-            ),
-            Self::UnsafePath(message) => {
-                write!(formatter, "Unsafe browser profile path: {message}")
-            }
-            Self::CorruptMetadata(message) => {
-                write!(formatter, "Corrupt browser profile metadata: {message}")
-            }
-            Self::Io(message) => write!(formatter, "Browser profile storage error: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for ProfileError {}
+include!("profile_types.rs");
 
 #[derive(Clone)]
 pub(crate) struct BrowserProfileManager {
     root: PathBuf,
     profiles_root: PathBuf,
+    cef_cache_root: PathBuf,
     active_leases: Arc<Mutex<HashSet<ProfileId>>>,
 }
 
 impl BrowserProfileManager {
-    pub(crate) fn new(root: PathBuf) -> Result<Self, ProfileError> {
-        ensure_private_directory(&root)?;
+    pub(crate) fn new(root: PathBuf, cef_cache_root: PathBuf) -> Result<Self, ProfileError> {
+        if !root.is_absolute() || !cef_cache_root.is_absolute() {
+            return Err(ProfileError::UnsafePath(
+                "profile roots must be absolute".to_string(),
+            ));
+        }
+        let storage_parent = root.parent().ok_or_else(|| {
+            ProfileError::UnsafePath("profile state root has no app-owned parent".to_string())
+        })?;
+        if root == cef_cache_root
+            || cef_cache_root.parent() != Some(storage_parent)
+            || cef_cache_root.file_name().and_then(|name| name.to_str())
+                != Some(CEF_CACHE_ROOT_NAME)
+        {
+            return Err(ProfileError::UnsafePath(
+                "CEF cache root must be the cef sibling of profile state".to_string(),
+            ));
+        }
+
+        ensure_private_directory(storage_parent)?;
+        ensure_private_child_directory(storage_parent, &root)?;
+        ensure_private_child_directory(storage_parent, &cef_cache_root)?;
         let profiles_root = root.join("profiles");
         ensure_private_child_directory(&root, &profiles_root)?;
         Ok(Self {
             root,
             profiles_root,
+            cef_cache_root,
             active_leases: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cef_cache_root(&self) -> &Path {
+        &self.cef_cache_root
     }
 
     pub(crate) fn create_profile(
@@ -437,6 +183,45 @@ impl BrowserProfileManager {
         result
     }
 
+    /// Reserve a stopped profile for an embedded launch without changing its persisted cleanup
+    /// state. The reservation owns both the in-process slot and the OS file lock. Its ownership id
+    /// is generated before the crash-recovery intent is written and before LaunchPending exists.
+    pub(in crate::browser::login) fn reserve_embedded_launch(
+        &self,
+        profile_id: &ProfileId,
+        workspace_identity: &TrustedWorkspaceIdentity,
+    ) -> Result<EmbeddedProfileLaunchReservation, ProfileError> {
+        self.reserve_in_process(profile_id)?;
+        let result = (|| {
+            let profile_dir = self.checked_profile_dir(profile_id)?;
+            let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
+            lock_file
+                .try_lock_exclusive()
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::WouldBlock => ProfileError::ProfileInUse,
+                    _ => io_error("reserve embedded browser profile", error),
+                })?;
+            let descriptor = load_current_descriptor(&profile_dir, profile_id)?;
+            verify_workspace(&descriptor, workspace_identity)?;
+            if !descriptor.cleanup_state.is_stopped() {
+                let _ = FileExt::unlock(&lock_file);
+                return Err(ProfileError::ProfileRequiresCleanup);
+            }
+            Ok(EmbeddedProfileLaunchReservation {
+                profile_dir,
+                descriptor,
+                ownership_id: random_opaque_id("ownership"),
+                lock_file: Some(lock_file),
+                active_leases: Arc::clone(&self.active_leases),
+                reserved: true,
+            })
+        })();
+        if result.is_err() {
+            self.release_in_process(profile_id);
+        }
+        result
+    }
+
     fn acquire_launch_lease_reserved(
         &self,
         profile_id: &ProfileId,
@@ -491,6 +276,33 @@ impl BrowserProfileManager {
         maintenance.persist_and_release()
     }
 
+    /// Atomically checks the profile lock and reconciles an embedded CEF owner whose exact host
+    /// process is gone. The caller must first validate the persisted owner record, host process
+    /// birth identity, workspace, and (for RuntimeOwned) the CEF surface runtime id.
+    ///
+    /// `AlreadyStopped` covers the final clean-shutdown crash window: OnBeforeClose was observed
+    /// and the profile was persisted/unlocked, but deleting the owner record did not finish.
+    pub(in crate::browser::login) fn recover_embedded_after_host_gone(
+        &self,
+        profile_id: &ProfileId,
+        workspace_identity: &TrustedWorkspaceIdentity,
+        proof: OwnershipDomainGone,
+    ) -> Result<EmbeddedProfileRecoveryOutcome, ProfileError> {
+        let mut maintenance = self.acquire_maintenance_lock(profile_id, workspace_identity)?;
+        match maintenance.descriptor.cleanup_state.ownership_id() {
+            Some(expected) if expected == proof.ownership_id => {
+                maintenance.descriptor.cleanup_state = ProfileCleanupState::Stopped;
+                maintenance.persist_and_release()?;
+                Ok(EmbeddedProfileRecoveryOutcome::Recovered)
+            }
+            None if maintenance.descriptor.cleanup_state.is_stopped() => {
+                maintenance.release_without_state_change()?;
+                Ok(EmbeddedProfileRecoveryOutcome::AlreadyStopped)
+            }
+            _ => Err(ProfileError::OwnershipMismatch),
+        }
+    }
+
     pub(crate) fn reset_profile(
         &self,
         authorization: DestructiveProfileAuthorization,
@@ -500,6 +312,7 @@ impl BrowserProfileManager {
             &authorization.profile_id,
             &authorization.workspace_identity,
         )?;
+        let cef_profile_dir = self.checked_cef_profile_dir(&authorization.profile_id)?;
         let reset_id = match &maintenance.descriptor.cleanup_state {
             ProfileCleanupState::Stopped => {
                 let reset_id = authorization.authorization_id.clone();
@@ -522,28 +335,21 @@ impl BrowserProfileManager {
         let tombstone = maintenance
             .profile_dir
             .join(format!("user-data.reset-{reset_id}"));
+        let cef_tombstone = self.cef_cache_root.join(format!(
+            "{CEF_PROFILE_DIRECTORY_PREFIX}{}.reset-{reset_id}",
+            authorization.profile_id.as_str()
+        ));
         // Reset replaces the complete, stopped profile after trusted confirmation. It never
         // targets Chrome's Singleton* files to bypass an active browser's own lock protocol.
-        ensure_path_is_not_symlink(&user_data)?;
-        if tombstone.exists() {
-            remove_private_directory(&maintenance.profile_dir, &tombstone)?;
-        }
-        if user_data.exists() {
-            fs::rename(&user_data, &tombstone)
-                .map_err(|error| io_error("stage browser profile reset", error))?;
-        }
-        if let Err(error) = ensure_private_child_directory(&maintenance.profile_dir, &user_data) {
-            let _ = fs::rename(&tombstone, &user_data);
-            return Err(error);
-        }
+        reset_private_child_directory(&maintenance.profile_dir, &user_data, &tombstone)?;
+        reset_private_child_directory(&self.cef_cache_root, &cef_profile_dir, &cef_tombstone)?;
 
         maintenance.descriptor.last_used_at = None;
         maintenance.descriptor.runtime_compatibility = ProfileRuntimeCompatibility::default();
         maintenance.descriptor.cleanup_state = ProfileCleanupState::Stopped;
         let descriptor = maintenance.persist_and_release()?;
-        if tombstone.exists() {
-            remove_private_directory(&maintenance.profile_dir, &tombstone)?;
-        }
+        remove_private_directory_if_present(&maintenance.profile_dir, &tombstone)?;
+        remove_private_directory_if_present(&self.cef_cache_root, &cef_tombstone)?;
         Ok(descriptor)
     }
 
@@ -556,6 +362,7 @@ impl BrowserProfileManager {
             &authorization.profile_id,
             &authorization.workspace_identity,
         )?;
+        let cef_profile_dir = self.checked_cef_profile_dir(&authorization.profile_id)?;
         match &maintenance.descriptor.cleanup_state {
             ProfileCleanupState::Stopped => {
                 maintenance.descriptor.cleanup_state = ProfileCleanupState::Deleting {
@@ -570,6 +377,10 @@ impl BrowserProfileManager {
             _ => return Err(ProfileError::ProfileNotStopped),
         }
         let profile_dir = maintenance.profile_dir.clone();
+        // Keep the descriptor and its maintenance lock until the external CEF cache is gone. If
+        // the process stops here, the persisted Deleting state gives a fresh trusted retry enough
+        // information to finish. The descriptor directory is deliberately the final deletion.
+        remove_private_directory_if_present(&self.cef_cache_root, &cef_profile_dir)?;
         maintenance.release_without_state_change()?;
         remove_private_directory(&self.profiles_root, &profile_dir)
     }
@@ -621,6 +432,25 @@ impl BrowserProfileManager {
         self.profiles_root.join(profile_id.as_str())
     }
 
+    fn checked_cef_profile_dir(&self, profile_id: &ProfileId) -> Result<PathBuf, ProfileError> {
+        ProfileId::parse(profile_id.as_str())?;
+        let storage_parent = self.root.parent().ok_or_else(|| {
+            ProfileError::UnsafePath("profile state root has no app-owned parent".to_string())
+        })?;
+        ensure_private_child_directory(storage_parent, &self.cef_cache_root)?;
+        let path = self.cef_cache_root.join(format!(
+            "{CEF_PROFILE_DIRECTORY_PREFIX}{}",
+            profile_id.as_str()
+        ));
+        if path.parent() != Some(self.cef_cache_root.as_path()) {
+            return Err(ProfileError::UnsafePath(
+                "CEF profile cache escaped its direct-child root".to_string(),
+            ));
+        }
+        ensure_path_is_not_symlink(&path)?;
+        Ok(path)
+    }
+
     fn reserve_in_process(&self, profile_id: &ProfileId) -> Result<(), ProfileError> {
         let mut active = self
             .active_leases
@@ -639,12 +469,120 @@ impl BrowserProfileManager {
     }
 }
 
+fn reset_private_child_directory(
+    parent: &Path,
+    target: &Path,
+    tombstone: &Path,
+) -> Result<(), ProfileError> {
+    if target.parent() != Some(parent) || tombstone.parent() != Some(parent) || target == tombstone
+    {
+        return Err(ProfileError::UnsafePath(
+            "profile reset paths must be distinct direct children".to_string(),
+        ));
+    }
+    ensure_path_is_not_symlink(parent)?;
+    ensure_path_is_not_symlink(target)?;
+    ensure_path_is_not_symlink(tombstone)?;
+    remove_private_directory_if_present(parent, tombstone)?;
+
+    let staged = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::rename(target, tombstone)
+                .map_err(|error| io_error("stage browser profile reset", error))?;
+            true
+        }
+        Ok(_) => {
+            return Err(ProfileError::UnsafePath(format!(
+                "{} is not a real directory",
+                target.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_error("inspect browser profile reset target", error)),
+    };
+
+    if let Err(error) = ensure_private_child_directory(parent, target) {
+        let _ = remove_private_directory_if_present(parent, target);
+        if staged {
+            let _ = fs::rename(tombstone, target);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub(crate) struct BrowserProfileLease {
     profile_dir: PathBuf,
     descriptor: BrowserProfileDescriptor,
     ownership_id: String,
     lock_file: Option<File>,
     active_leases: Arc<Mutex<HashSet<ProfileId>>>,
+}
+
+/// A stopped profile held exclusively while its embedded-owner intent is made durable.
+pub(in crate::browser::login) struct EmbeddedProfileLaunchReservation {
+    profile_dir: PathBuf,
+    descriptor: BrowserProfileDescriptor,
+    ownership_id: String,
+    lock_file: Option<File>,
+    active_leases: Arc<Mutex<HashSet<ProfileId>>>,
+    reserved: bool,
+}
+
+impl EmbeddedProfileLaunchReservation {
+    pub(in crate::browser::login) fn descriptor(&self) -> &BrowserProfileDescriptor {
+        &self.descriptor
+    }
+
+    pub(in crate::browser::login) fn ownership_id(&self) -> &str {
+        &self.ownership_id
+    }
+
+    /// Commit LaunchPending only after the embedded owner intent has been fsynced. On any error,
+    /// Drop releases the reservation but deliberately does not guess whether a failed metadata
+    /// publish became durable; the already-written intent remains for startup reconciliation.
+    pub(in crate::browser::login) fn commit_launch_pending(
+        mut self,
+    ) -> Result<(BrowserProfileLease, EmbeddedProfileLaunchPendingProof), ProfileError> {
+        if !self.descriptor.cleanup_state.is_stopped() {
+            return Err(ProfileError::ProfileRequiresCleanup);
+        }
+        self.descriptor.cleanup_state = ProfileCleanupState::LaunchPending {
+            ownership_id: self.ownership_id.clone(),
+            since: Utc::now().to_rfc3339(),
+        };
+        self.descriptor = persist_next_descriptor(&self.profile_dir, self.descriptor.clone())?;
+        let proof = EmbeddedProfileLaunchPendingProof {
+            profile_id: self.descriptor.profile_id.clone(),
+            workspace_identity: self.descriptor.workspace_identity.clone(),
+            ownership_id: self.ownership_id.clone(),
+        };
+        let lock_file = self.lock_file.take().ok_or(ProfileError::ProfileInUse)?;
+        self.reserved = false;
+        Ok((
+            BrowserProfileLease {
+                profile_dir: self.profile_dir.clone(),
+                descriptor: self.descriptor.clone(),
+                ownership_id: self.ownership_id.clone(),
+                lock_file: Some(lock_file),
+                active_leases: Arc::clone(&self.active_leases),
+            },
+            proof,
+        ))
+    }
+}
+
+impl Drop for EmbeddedProfileLaunchReservation {
+    fn drop(&mut self) {
+        if let Some(lock_file) = self.lock_file.take() {
+            let _ = FileExt::unlock(&lock_file);
+        }
+        if self.reserved {
+            if let Ok(mut active) = self.active_leases.lock() {
+                active.remove(&self.descriptor.profile_id);
+            }
+        }
+    }
 }
 
 impl BrowserProfileLease {
@@ -701,13 +639,34 @@ impl BrowserProfileLease {
         Ok(self.descriptor.clone())
     }
 
-    pub(crate) fn release_after_ownership_domain_gone(
+    /// CEF-specific transition that also returns a non-forgeable record-update capability.
+    pub(in crate::browser::login) fn mark_embedded_runtime_owned(
+        &mut self,
+        runtime_id: &str,
+        runtime_version: &str,
+        protocol_version: &str,
+    ) -> Result<(BrowserProfileDescriptor, EmbeddedProfileRuntimeOwnedProof), ProfileError> {
+        let descriptor = self.mark_runtime_owned(runtime_id, runtime_version, protocol_version)?;
+        let proof = EmbeddedProfileRuntimeOwnedProof {
+            profile_id: descriptor.profile_id.clone(),
+            workspace_identity: descriptor.workspace_identity.clone(),
+            ownership_id: self.ownership_id.clone(),
+            runtime_id: runtime_id.to_string(),
+        };
+        Ok((descriptor, proof))
+    }
+
+    /// Cancel a launch that failed before any native/process ownership domain was created.
+    /// Once `mark_runtime_owned` succeeds, callers must instead provide the concrete runtime's
+    /// verified terminal proof.
+    pub(in crate::browser::login) fn cancel_pending_launch(
         mut self,
-        proof: OwnershipDomainGone,
     ) -> Result<BrowserProfileDescriptor, ProfileError> {
-        if proof.ownership_id != self.ownership_id
-            || self.descriptor.cleanup_state.ownership_id() != Some(self.ownership_id.as_str())
-        {
+        if !matches!(
+            &self.descriptor.cleanup_state,
+            ProfileCleanupState::LaunchPending { ownership_id, .. }
+                if ownership_id == &self.ownership_id
+        ) {
             return Err(ProfileError::OwnershipMismatch);
         }
         self.descriptor.cleanup_state = ProfileCleanupState::Stopped;
@@ -716,11 +675,91 @@ impl BrowserProfileLease {
         Ok(self.descriptor.clone())
     }
 
+    /// Cancel a recorded embedded launch before a native surface owner was created, then mint the
+    /// capability required to remove that matching pending owner record.
+    pub(in crate::browser::login) fn cancel_pending_embedded_launch(
+        self,
+    ) -> Result<(BrowserProfileDescriptor, EmbeddedProfileReleasedProof), ProfileError> {
+        let profile_id = self.descriptor.profile_id.clone();
+        let workspace_identity = self.descriptor.workspace_identity.clone();
+        let ownership_id = self.ownership_id.clone();
+        let descriptor = self.cancel_pending_launch()?;
+        Ok((
+            descriptor,
+            EmbeddedProfileReleasedProof {
+                profile_id,
+                workspace_identity,
+                ownership_id,
+            },
+        ))
+    }
+
+    pub(crate) fn release_after_ownership_domain_gone(
+        mut self,
+        proof: OwnershipDomainGone,
+    ) -> Result<BrowserProfileDescriptor, ProfileError> {
+        self.try_release_after_ownership_domain_gone(proof)
+    }
+
+    /// Retryable core of terminal profile release. The lease remains intact if persistence or
+    /// unlock fails, so the verified owner can retry without waiting for process restart recovery.
+    /// `Stopped` is accepted only on this still-held lease to cover a durable metadata write
+    /// followed by a transient unlock failure.
+    fn try_release_after_ownership_domain_gone(
+        &mut self,
+        proof: OwnershipDomainGone,
+    ) -> Result<BrowserProfileDescriptor, ProfileError> {
+        if proof.ownership_id != self.ownership_id {
+            return Err(ProfileError::OwnershipMismatch);
+        }
+        match self.descriptor.cleanup_state.ownership_id() {
+            Some(ownership_id) if ownership_id == self.ownership_id => {
+                let mut stopped = self.descriptor.clone();
+                stopped.cleanup_state = ProfileCleanupState::Stopped;
+                self.descriptor = persist_next_descriptor(&self.profile_dir, stopped)?;
+            }
+            None if self.descriptor.cleanup_state.is_stopped() => {}
+            _ => return Err(ProfileError::OwnershipMismatch),
+        }
+        self.release_lock()?;
+        Ok(self.descriptor.clone())
+    }
+
+    /// Release a closed embedded surface and return the capability that permits deleting its owner
+    /// record. The capability is minted only after Stopped was durable and the profile lock gone.
+    pub(in crate::browser::login) fn release_embedded_after_ownership_domain_gone(
+        mut self,
+        proof: OwnershipDomainGone,
+    ) -> Result<(BrowserProfileDescriptor, EmbeddedProfileReleasedProof), ProfileError> {
+        self.try_release_embedded_after_ownership_domain_gone(proof)
+    }
+
+    /// Borrowing variant used by the embedded surface owner so transient storage failures retain
+    /// the exact OS lock and in-process reservation for an immediate, authoritative retry.
+    pub(in crate::browser::login) fn try_release_embedded_after_ownership_domain_gone(
+        &mut self,
+        proof: OwnershipDomainGone,
+    ) -> Result<(BrowserProfileDescriptor, EmbeddedProfileReleasedProof), ProfileError> {
+        let profile_id = self.descriptor.profile_id.clone();
+        let workspace_identity = self.descriptor.workspace_identity.clone();
+        let ownership_id = self.ownership_id.clone();
+        let descriptor = self.try_release_after_ownership_domain_gone(proof)?;
+        Ok((
+            descriptor,
+            EmbeddedProfileReleasedProof {
+                profile_id,
+                workspace_identity,
+                ownership_id,
+            },
+        ))
+    }
+
     fn release_lock(&mut self) -> Result<(), ProfileError> {
-        if let Some(lock_file) = self.lock_file.take() {
-            FileExt::unlock(&lock_file)
+        if let Some(lock_file) = self.lock_file.as_ref() {
+            FileExt::unlock(lock_file)
                 .map_err(|error| io_error("unlock browser profile", error))?;
         }
+        self.lock_file.take();
         if let Ok(mut active) = self.active_leases.lock() {
             active.remove(&self.descriptor.profile_id);
         }

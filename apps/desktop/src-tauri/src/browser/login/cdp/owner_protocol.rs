@@ -15,12 +15,18 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(super) trait OwnerTerminalTermination: Send + Sync {
-    fn request_force_verified_domain(&self) -> Result<(), BackendFailure>;
+pub(in crate::browser::login) trait OwnerTerminalTermination:
+    Send + Sync
+{
+    /// End the concrete runtime owned by this protocol owner.
+    ///
+    /// Managed Chromium terminates its verified process domain; embedded CEF closes the exact
+    /// native surface and waits for `OnBeforeClose`.
+    fn request_terminal_shutdown(&self) -> Result<(), BackendFailure>;
 }
 
 impl OwnerTerminalTermination for VerifiedRuntimeTerminationHandle {
-    fn request_force_verified_domain(&self) -> Result<(), BackendFailure> {
+    fn request_terminal_shutdown(&self) -> Result<(), BackendFailure> {
         VerifiedRuntimeTerminationHandle::request_force_verified_domain(self)
             .map_err(|_| runtime_failure())
     }
@@ -41,11 +47,12 @@ impl<'a> TerminalJoinGuard<'a> {
         }
     }
 
-    fn request_now(&mut self) {
+    fn request_now(&mut self) -> Result<(), BackendFailure> {
         if !self.requested {
             self.requested = true;
-            let _ = self.termination.request_force_verified_domain();
+            self.termination.request_terminal_shutdown()?;
         }
+        Ok(())
     }
 
     fn disarm(&mut self) {
@@ -56,7 +63,7 @@ impl<'a> TerminalJoinGuard<'a> {
 impl Drop for TerminalJoinGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.request_now();
+            let _ = self.request_now();
         }
     }
 }
@@ -72,6 +79,65 @@ pub(super) fn run_protocol_owner(
     termination: &dyn OwnerTerminalTermination,
     ready: &mut Option<SyncSender<Result<(), BackendFailure>>>,
     projection: &Arc<RwLock<ChromiumOwnerProjection>>,
+) -> Result<(), BackendFailure> {
+    run_protocol_owner_with_shutdown(
+        reader,
+        writer,
+        engine,
+        requests,
+        transitions,
+        shutdown,
+        termination,
+        ready,
+        projection,
+        OwnerProtocolShutdown::BrowserClose,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_embedded_protocol_owner(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    engine: &mut Option<SemanticEngine>,
+    requests: &Receiver<OwnerRequest>,
+    transitions: &OwnerTransitionInbox,
+    shutdown: &Arc<AtomicBool>,
+    termination: &dyn OwnerTerminalTermination,
+    ready: &mut Option<SyncSender<Result<(), BackendFailure>>>,
+    projection: &Arc<RwLock<ChromiumOwnerProjection>>,
+) -> Result<(), BackendFailure> {
+    run_protocol_owner_with_shutdown(
+        reader,
+        writer,
+        engine,
+        requests,
+        transitions,
+        shutdown,
+        termination,
+        ready,
+        projection,
+        OwnerProtocolShutdown::HostSurfaceClose,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerProtocolShutdown {
+    BrowserClose,
+    HostSurfaceClose,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_protocol_owner_with_shutdown(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    engine: &mut Option<SemanticEngine>,
+    requests: &Receiver<OwnerRequest>,
+    transitions: &OwnerTransitionInbox,
+    shutdown: &Arc<AtomicBool>,
+    termination: &dyn OwnerTerminalTermination,
+    ready: &mut Option<SyncSender<Result<(), BackendFailure>>>,
+    projection: &Arc<RwLock<ChromiumOwnerProjection>>,
+    close_mode: OwnerProtocolShutdown,
 ) -> Result<(), BackendFailure> {
     let (frame_tx, inbox, reader_state) = frame_channel();
     thread::scope(|scope| {
@@ -91,8 +157,10 @@ pub(super) fn run_protocol_owner(
             let _ = ready.send(initialized.clone().map(|_| ()));
         }
         if let Err(error) = initialized {
-            let _ = client.send_browser_close();
-            terminal_join.request_now();
+            if close_mode == OwnerProtocolShutdown::BrowserClose {
+                let _ = client.send_browser_close();
+            }
+            let _ = terminal_join.request_now();
             drop(client);
             if reader_thread.join().is_ok() {
                 terminal_join.disarm();
@@ -199,9 +267,14 @@ pub(super) fn run_protocol_owner(
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        let close_write = client.send_browser_close();
-        if terminal_error.is_some() || close_write.is_err() {
-            terminal_join.request_now();
+        let close_write = match close_mode {
+            OwnerProtocolShutdown::BrowserClose => client.send_browser_close(),
+            OwnerProtocolShutdown::HostSurfaceClose => terminal_join.request_now(),
+        };
+        if (terminal_error.is_some() || close_write.is_err())
+            && close_mode == OwnerProtocolShutdown::BrowserClose
+        {
+            let _ = terminal_join.request_now();
         }
         drop(client);
         reader_thread.join().map_err(|_| runtime_failure())?;

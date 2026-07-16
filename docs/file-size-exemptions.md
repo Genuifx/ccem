@@ -11,7 +11,7 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src-tauri/src/external_control.rs`: Desktop external-control server, descriptor publishing, security boundary checks, and unit coverage remain centralized during the control API hardening.
 - `apps/desktop/src-tauri/src/history.rs`: History parsing and projection code is still coupled in one file.
 - `apps/desktop/src-tauri/src/interactive_runtime.rs`: Interactive runtime capture, replay, and prompt monitoring remain centralized while terminal and native-session flows are still converging.
-- `apps/desktop/src-tauri/src/main.rs`: Tauri command wiring and app bootstrap remain centralized in the entrypoint.
+- `apps/desktop/src-tauri/src/lib.rs`: Tauri command wiring and app bootstrap were mechanically moved from the former large binary entrypoint so Windows can expose the official CEF bootstrap client DLL; split this legacy orchestration incrementally after the bootstrap migration lands.
 - `apps/desktop/src-tauri/src/native_runtime.rs`: Native SDK runtime lifecycle, event replay, and helper orchestration are still centralized.
 - `apps/desktop/src-tauri/src/proxy_debug.rs`: Proxy debug parsing and reduction logic still lives in one module.
 - `apps/desktop/src-tauri/src/runtime.rs`: Runtime management remains a large central orchestrator.
@@ -21,6 +21,7 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src-tauri/src/tmux.rs`: tmux launch, status parsing, and recovery helpers are still bundled together.
 - `apps/desktop/src-tauri/src/wecom/mod.rs`: WeCom bot bridge integration is currently a large module and needs phased extraction.
 - `apps/desktop/src-tauri/src/weixin/mod.rs`: Weixin bridge integration remains a large monolith and needs phased extraction.
+- `apps/desktop/src-tauri/resources/native-runtime-helper.mjs`: Generated bundled sidecar resource mirrors the native-runtime-helper build output and is not maintained as hand-written source.
 - `apps/desktop/src/components/analytics/SharePosterDialog.tsx`: Share poster generation UI is still implemented in one large component.
 - `apps/desktop/src/components/use-prompt-area.ts`: Vendored Prompt Area registry hook is kept intact while composer rich-input behavior is validated.
 - `apps/desktop/src/components/workspace/WorkspaceReviewDrawer.tsx`: Workspace review drawer rendering remains concentrated while sub-agent execution details are being iterated.
@@ -34,4 +35,6 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src/pages/Workspace.tsx`: Workspace navigation, history, compose, and live-session coordination remain centralized during the workspace redesign.
 - `apps/desktop/src/hooks/useTauriCommands.ts`: Tauri IPC wrappers are still exposed from one large hook.
 - `apps/desktop/src/lib/tauri-ipc.ts`: Frontend IPC payload types are still centralized while native session events and workspace commands continue to evolve together.
+- `apps/desktop/test/workspace-event-transcript.test.mjs`: Existing transcript regression coverage keeps the full cross-provider event matrix in one test module.
 - `packages/native-runtime-helper/src/index.ts`: Bundled helper protocol, Claude SDK bridge, and Codex SDK bridge are still packaged as one sidecar entrypoint.
+- `packages/native-runtime-helper/test/claude-session-restart.test.mjs`: Existing restart and recovery integration scenarios share a large stateful fixture suite.

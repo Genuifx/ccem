@@ -21,11 +21,7 @@ fn every_persistent_profile_is_discoverable_and_reopenable_by_opaque_id_after_re
         .expect("close isolated");
 
     let restarted_state = Arc::new(Mutex::new(FakeSupervisorState::default()));
-    let restarted = manager(
-        &fixture.session_root,
-        &fixture.runtime_root,
-        Arc::clone(&restarted_state),
-    );
+    let restarted = manager(&fixture.session_root, Arc::clone(&restarted_state));
     let profiles = restarted
         .profile_summaries(Fixture::trusted(&fixture.workspace_a))
         .expect("list persistent profiles after restart");
@@ -100,13 +96,22 @@ fn selected_profile_reset_and_delete_preserve_sibling_profiles_and_confirmation_
         .close(&isolated.handle)
         .expect("close isolated");
 
-    let profile_root = fixture.manager.profiles.root().join("profiles");
+    let profile_root = fixture.manager.profiles_for_test().root().join("profiles");
     let default_dir = profile_root.join(&default.snapshot.profile_id);
     let isolated_dir = profile_root.join(&isolated.snapshot.profile_id);
     let default_marker = default_dir.join("user-data").join("default-cookie");
     let isolated_marker = isolated_dir.join("user-data").join("isolated-cookie");
+    let cef_root = fixture.session_root.join("cef");
+    let default_cef_dir = cef_root.join(format!("Profile-{}", default.snapshot.profile_id));
+    let isolated_cef_dir = cef_root.join(format!("Profile-{}", isolated.snapshot.profile_id));
+    fs::create_dir(&default_cef_dir).expect("default CEF profile cache");
+    fs::create_dir(&isolated_cef_dir).expect("isolated CEF profile cache");
+    let default_cef_marker = default_cef_dir.join("Cookies");
+    let isolated_cef_marker = isolated_cef_dir.join("Cookies");
     fs::write(&default_marker, b"keep").expect("default marker");
     fs::write(&isolated_marker, b"reset").expect("isolated marker");
+    fs::write(&default_cef_marker, b"keep").expect("default CEF marker");
+    fs::write(&isolated_cef_marker, b"reset").expect("isolated CEF marker");
 
     assert_eq!(
         fixture
@@ -121,6 +126,8 @@ fn selected_profile_reset_and_delete_preserve_sibling_profiles_and_confirmation_
     );
     assert!(default_marker.exists());
     assert!(isolated_marker.exists());
+    assert!(default_cef_marker.exists());
+    assert!(isolated_cef_marker.exists());
 
     let reset = fixture
         .manager
@@ -133,6 +140,11 @@ fn selected_profile_reset_and_delete_preserve_sibling_profiles_and_confirmation_
     assert_eq!(reset.profile_id, isolated.snapshot.profile_id);
     assert!(default_marker.exists());
     assert!(!isolated_marker.exists());
+    assert!(default_cef_marker.exists());
+    assert!(!isolated_cef_marker.exists());
+    assert!(isolated_cef_dir.is_dir());
+
+    fs::write(&isolated_cef_marker, b"delete").expect("isolated CEF delete marker");
 
     fixture
         .manager
@@ -144,6 +156,8 @@ fn selected_profile_reset_and_delete_preserve_sibling_profiles_and_confirmation_
         .expect("delete selected isolated profile");
     assert!(default_dir.exists());
     assert!(!isolated_dir.exists());
+    assert!(default_cef_dir.exists());
+    assert!(!isolated_cef_dir.exists());
     let remaining = fixture
         .manager
         .profile_summaries(Fixture::trusted(&fixture.workspace_a))

@@ -89,8 +89,6 @@ impl ChromiumLoginBackend {
     ) -> Result<(), BackendFailure> {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.requests.try_send(OwnerRequest::Shutdown);
-        self.termination
-            .request_force_verified_domain()
-            .map_err(|_| runtime_failure())
+        self.termination.request_terminal_shutdown()
     }
 }

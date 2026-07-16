@@ -4,7 +4,6 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import App from './App';
 import { PetOverlay } from './pages/PetOverlay';
 import { TrayCockpit } from './pages/TrayCockpit';
-import { LoginBrowserControl } from './pages/LoginBrowserControl';
 import { initPerformanceMode } from './lib/performance';
 import { initPerfLog } from './lib/perf-log';
 import { resolveDesktopWindowRoot } from './lib/windowRootRouting';
@@ -29,8 +28,6 @@ function resolveRoot() {
       return PetOverlay;
     case 'tray-cockpit':
       return TrayCockpit;
-    case 'login-browser-control':
-      return LoginBrowserControl;
     case 'main':
     default:
       return App;

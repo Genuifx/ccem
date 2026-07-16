@@ -843,7 +843,11 @@ pub struct DesktopSettings {
     /// Explicitly enabled environment names for runtime selectors.
     /// `None` means legacy mode: all environments are treated as enabled.
     /// Once the user starts managing enablement, this becomes `Some(vec![...])`.
-    #[serde(rename = "enabledEnvironments", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "enabledEnvironments",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub enabled_environments: Option<Vec<String>>,
 }
 

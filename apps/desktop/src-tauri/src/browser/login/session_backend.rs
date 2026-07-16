@@ -93,24 +93,31 @@ impl SessionLaunchRuntime for ProductionRuntime {
             spec.command_timeout,
         )
         .map_err(map_backend_failure)?;
-        let backend = ChromiumLoginBackend::spawn(runtime, config, spec.navigation_guard)
-            .map_err(|error| {
+        let backend = ChromiumLoginBackend::spawn(runtime, config, spec.navigation_guard).map_err(
+            |error| {
                 eprintln!(
                     "Login Browser CDP startup failed ({}): {}",
                     error.code.as_str(),
                     error
                 );
                 map_backend_failure(error)
-            })?;
-        Ok(Arc::new(ProductionSessionBackend { backend }))
+            },
+        )?;
+        Ok(Arc::new(OwnerSessionBackend::new(backend)))
     }
 }
 
-struct ProductionSessionBackend {
+pub(super) struct OwnerSessionBackend {
     backend: ChromiumLoginBackend,
 }
 
-impl SemanticBrowserBackend for ProductionSessionBackend {
+impl OwnerSessionBackend {
+    pub(super) fn new(backend: ChromiumLoginBackend) -> Self {
+        Self { backend }
+    }
+}
+
+impl SemanticBrowserBackend for OwnerSessionBackend {
     fn execute(
         &self,
         command: &super::backend::SemanticBrowserCommand,
@@ -120,7 +127,7 @@ impl SemanticBrowserBackend for ProductionSessionBackend {
     }
 }
 
-impl SessionOwnedBackend for ProductionSessionBackend {
+impl SessionOwnedBackend for OwnerSessionBackend {
     fn projection(&self) -> Result<SessionBackendProjection, SessionManagerError> {
         self.backend
             .projection()
@@ -166,16 +173,15 @@ impl SessionOwnedBackend for ProductionSessionBackend {
     }
 
     fn shutdown(&self, force: bool) -> Result<(), SessionManagerError> {
-        // The owner first requests Browser.close and the supervisor force-terminates its verified
-        // process group/Job Object after the fixed graceful deadline. Both close paths therefore
-        // retain the same identity-checked cleanup guarantee.
-        let stopped = self
+        // The protocol owner delegates terminal cleanup to its concrete runtime. Managed Chromium
+        // closes/forces its verified process domain; embedded CEF closes the exact child surface
+        // and waits for `OnBeforeClose` before releasing the profile lease.
+        let diagnostic_stop = self
             .backend
             .stop_diagnostic_segment()
             .map_err(map_backend_failure);
-        let shutdown = self.backend.shutdown(force).map_err(map_backend_failure);
-        shutdown?;
-        stopped
+        let terminal_shutdown = self.backend.shutdown(force).map_err(map_backend_failure);
+        terminal_cleanup_result(diagnostic_stop, terminal_shutdown)
     }
 
     fn emergency_stop_verified_domain(&self) -> Result<(), SessionManagerError> {
@@ -183,6 +189,22 @@ impl SessionOwnedBackend for ProductionSessionBackend {
             .emergency_stop_verified_domain()
             .map_err(map_backend_failure)
     }
+}
+
+fn terminal_cleanup_result(
+    diagnostic_stop: Result<(), SessionManagerError>,
+    terminal_shutdown: Result<(), SessionManagerError>,
+) -> Result<(), SessionManagerError> {
+    terminal_shutdown?;
+    // Terminal ownership cleanup is authoritative. Once the exact browser
+    // domain is gone and the profile lease is released, an earlier capture
+    // segment error must not strand an already-closed session forever.
+    if let Err(error) = diagnostic_stop {
+        eprintln!(
+            "Login Browser diagnostic segment stop failed before verified terminal cleanup: {error}"
+        );
+    }
+    Ok(())
 }
 
 impl From<ChromiumOwnerProjection> for SessionBackendProjection {
@@ -202,5 +224,26 @@ fn map_backend_failure(error: BackendFailure) -> SessionManagerError {
         super::backend::BackendFailureCode::TimedOut => SessionManagerError::OperationTimedOut,
         super::backend::BackendFailureCode::Cancelled => SessionManagerError::ControlUnavailable,
         _ => SessionManagerError::RuntimeUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod terminal_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn verified_terminal_shutdown_wins_over_an_earlier_diagnostic_stop_failure() {
+        assert_eq!(
+            terminal_cleanup_result(Err(SessionManagerError::RuntimeUnavailable), Ok(())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn terminal_shutdown_failure_remains_authoritative() {
+        assert_eq!(
+            terminal_cleanup_result(Ok(()), Err(SessionManagerError::OwnerQuiescenceTimedOut),),
+            Err(SessionManagerError::OwnerQuiescenceTimedOut)
+        );
     }
 }

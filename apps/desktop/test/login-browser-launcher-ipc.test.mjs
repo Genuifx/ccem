@@ -25,7 +25,7 @@ async function importLauncherIpc() {
   return import(pathToFileURL(outputPath).href);
 }
 
-test('launcher preserves create, inventory, reopen, and per-profile maintenance contracts', async () => {
+test('launcher exposes inventory and per-profile maintenance without legacy launch IPC', async () => {
   const { createLoginBrowserLauncherClient } = await importLauncherIpc();
   const calls = [];
   const projected = { session_id: 'session-a' };
@@ -36,20 +36,14 @@ test('launcher preserves create, inventory, reopen, and per-profile maintenance 
     },
   });
 
-  assert.equal(await client.open('/tmp/project', 'default'), projected);
-  assert.equal(await client.open('/tmp/project', 'new'), projected);
   assert.equal(await client.listProfiles('/tmp/project'), projected);
-  assert.equal(await client.openProfile('/tmp/project', 'profile-b'), projected);
   assert.equal(await client.profileRecentActivity('/tmp/project', 'profile-b'), projected);
   assert.equal(await client.resetProfile('/tmp/project', 'profile-a', false), projected);
   assert.equal(await client.resetProfile('/tmp/project', 'profile-a', true), projected);
   assert.equal(await client.deleteProfile('/tmp/project', 'profile-a', false), projected);
   assert.equal(await client.deleteProfile('/tmp/project', 'profile-a', true), projected);
   assert.deepEqual(calls, [
-    ['browser_login_open', { workingDir: '/tmp/project', profileMode: 'default' }],
-    ['browser_login_open', { workingDir: '/tmp/project', profileMode: 'new' }],
     ['browser_login_profiles', { workingDir: '/tmp/project' }],
-    ['browser_login_open_profile', { workingDir: '/tmp/project', profileId: 'profile-b' }],
     ['browser_login_profile_recent_activity', {
       workingDir: '/tmp/project', profileId: 'profile-b',
     }],

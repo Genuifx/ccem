@@ -1,50 +1,44 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  AlertCircle,
-  CheckCircle2,
-  Download,
   FileCheck2,
   Globe2,
-  HardDrive,
   LoaderCircle,
   PanelRightClose,
   PanelRightOpen,
-  Pause,
   Play,
   Plus,
   RefreshCw,
   ShieldCheck,
   Trash2,
-  X,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import type {
-  BrowserRuntimeDiskUsage,
-  BrowserRuntimeReadiness,
   LoginBrowserProfileSummary,
   LoginBrowserRecentActivity,
 } from '@/lib/tauri-ipc';
-import {
-  type LoginBrowserProfileMode,
-} from '@/lib/loginBrowserLauncherIpc';
 import { loginBrowserLauncherClient } from '@/lib/tauriLoginBrowserLauncherClient';
-import {
-  deriveBrowserRuntimePresentation,
-  summarizeSavedProfileRecentProof,
-} from './browserLauncherModel';
-
-const RUNTIME_EVENT = 'browser_runtime_readiness_changed';
+import type { LoginBrowserPanelRequest } from './browserPanelTarget';
+import { summarizeSavedProfileRecentProof } from './browserLauncherModel';
 
 interface BrowserLauncherPopoverProps {
+  panelOpen: boolean;
   previewOpen: boolean;
   workingDir?: string | null;
   onTogglePreview: () => void;
+  onOpenLoginBrowser: (request: LoginBrowserPanelRequest) => void;
+  onHostOverlayChange?: (open: boolean) => void;
 }
 
 interface ProfileProofState {
@@ -54,20 +48,9 @@ interface ProfileProofState {
   unavailable: boolean;
 }
 
-const EMPTY_RUNTIME: BrowserRuntimeReadiness = {
-  status: 'unavailable',
-  phase: 'idle',
-  progress: null,
-  active: null,
-  candidate: null,
-  error: null,
-  checked_at: '',
-};
-
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+interface PendingProfileAction {
+  kind: 'reset' | 'delete';
+  profile: LoginBrowserProfileSummary;
 }
 
 function formatProfileLastUsed(value: string | null | undefined, neverLabel: string): string {
@@ -81,14 +64,15 @@ function compactProfileId(value: string): string {
 }
 
 export function BrowserLauncherPopover({
+  panelOpen,
   previewOpen,
   workingDir,
   onTogglePreview,
+  onOpenLoginBrowser,
+  onHostOverlayChange,
 }: BrowserLauncherPopoverProps) {
   const { t } = useLocale();
   const [open, setOpen] = useState(false);
-  const [runtime, setRuntime] = useState<BrowserRuntimeReadiness>(EMPTY_RUNTIME);
-  const [diskUsage, setDiskUsage] = useState<BrowserRuntimeDiskUsage | null>(null);
   const [profileState, setProfileState] = useState<{
     workingDir: string;
     profiles: LoginBrowserProfileSummary[];
@@ -97,36 +81,26 @@ export function BrowserLauncherPopover({
   const [profileLoadFailed, setProfileLoadFailed] = useState(false);
   const [profileProofState, setProfileProofState] = useState<ProfileProofState | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [pendingProfileAction, setPendingProfileAction] = useState<PendingProfileAction | null>(null);
+  const onHostOverlayChangeRef = useRef(onHostOverlayChange);
+  onHostOverlayChangeRef.current = onHostOverlayChange;
+  const hostOverlayOpen = open || pendingProfileAction !== null;
   const profiles = profileState && profileState.workingDir === workingDir
     ? profileState.profiles
     : [];
 
-  const refresh = useCallback(async () => {
-    const next = await invoke<BrowserRuntimeReadiness>('browser_runtime_readiness');
-    setRuntime(next);
-    return next;
-  }, []);
-
   useEffect(() => {
-    void refresh().catch(() => {});
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void listen<BrowserRuntimeReadiness>(RUNTIME_EVENT, (event) => {
-      setRuntime(event.payload);
-    }).then((next) => {
-      if (disposed) next();
-      else unlisten = next;
-    }).catch(() => {});
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [refresh]);
+    onHostOverlayChange?.(hostOverlayOpen);
+  }, [hostOverlayOpen, onHostOverlayChange]);
+
+  useEffect(() => () => {
+    onHostOverlayChangeRef.current?.(false);
+  }, []);
 
   useEffect(() => {
     const generation = profileRequestGenerationRef.current + 1;
     profileRequestGenerationRef.current = generation;
-    if (!open || runtime.status !== 'ready' || !workingDir) {
+    if (!open || !workingDir) {
       setProfileState(null);
       setProfileProofState(null);
       setProfileLoadFailed(false);
@@ -152,72 +126,30 @@ export function BrowserLauncherPopover({
     return () => {
       disposed = true;
     };
-  }, [open, runtime.status, workingDir]);
+  }, [open, workingDir]);
 
-  const runRuntimeAction = useCallback(async (command: string) => {
-    setBusyAction(command);
-    try {
-      const next = await invoke<BrowserRuntimeReadiness>(command);
-      setRuntime(next);
-      void invoke<BrowserRuntimeDiskUsage>('browser_runtime_disk_usage')
-        .then(setDiskUsage)
-        .catch(() => {});
-    } catch (error) {
-      toast.error(String(error));
-      void refresh().catch(() => {});
-    } finally {
-      setBusyAction(null);
-    }
-  }, [refresh]);
-
-  const deleteRuntime = useCallback(async () => {
-    if (!window.confirm(t('workspace.loginRuntimeDeleteConfirm'))) return;
-    setBusyAction('browser_runtime_delete');
-    try {
-      await invoke('browser_runtime_delete', { confirmed: true });
-      setDiskUsage(await invoke<BrowserRuntimeDiskUsage>('browser_runtime_disk_usage'));
-      await refresh();
-      toast.success(t('workspace.loginRuntimeDeleted'));
-    } catch (error) {
-      toast.error(String(error));
-      void refresh().catch(() => {});
-    } finally {
-      setBusyAction(null);
-    }
-  }, [refresh, t]);
-
-  const openLoginBrowser = useCallback(async (profileMode: LoginBrowserProfileMode) => {
-    if (!workingDir) {
+  const openLoginBrowser = useCallback((profileMode: 'default' | 'new') => {
+    if (!workingDir?.trim()) {
       toast.error(t('workspace.loginBrowserNeedsWorkspace'));
       return;
     }
-    const busyKey = `browser_login_open_${profileMode}`;
-    setBusyAction(busyKey);
-    try {
-      await loginBrowserLauncherClient.open(workingDir, profileMode);
-      toast.success(t('workspace.loginBrowserOpened'));
-      setOpen(false);
-    } catch (error) {
-      toast.error(String(error));
-    } finally {
-      setBusyAction(null);
-    }
-  }, [t, workingDir]);
+    onOpenLoginBrowser({ workingDir, profileMode });
+    setOpen(false);
+  }, [onOpenLoginBrowser, t, workingDir]);
 
-  const openSavedProfile = useCallback(async (profile: LoginBrowserProfileSummary) => {
-    if (!workingDir) return;
-    const busyKey = `browser_login_open_profile:${profile.profile_id}`;
-    setBusyAction(busyKey);
-    try {
-      await loginBrowserLauncherClient.openProfile(workingDir, profile.profile_id);
-      toast.success(t('workspace.loginBrowserOpened'));
-      setOpen(false);
-    } catch (error) {
-      toast.error(String(error));
-    } finally {
-      setBusyAction(null);
+  const openSavedProfile = useCallback((profile: LoginBrowserProfileSummary) => {
+    const profileId = profile.profile_id.trim();
+    if (!workingDir?.trim() || !profileId) {
+      toast.error(t('workspace.browserSurfaceUnavailable'));
+      return;
     }
-  }, [t, workingDir]);
+    onOpenLoginBrowser({
+      workingDir,
+      profileMode: 'saved',
+      profileId,
+    });
+    setOpen(false);
+  }, [onOpenLoginBrowser, t, workingDir]);
 
   const inspectProfileProof = useCallback(async (profile: LoginBrowserProfileSummary) => {
     if (!workingDir) return;
@@ -266,12 +198,6 @@ export function BrowserLauncherPopover({
 
   const resetProfile = useCallback(async (profile: LoginBrowserProfileSummary) => {
     if (!workingDir) return;
-    if (!window.confirm(
-      t('workspace.loginProfileResetConfirm').replace(
-        '{profile}',
-        compactProfileId(profile.profile_id),
-      ),
-    )) return;
     const generation = profileRequestGenerationRef.current;
     setBusyAction(`browser_login_reset_profile:${profile.profile_id}`);
     try {
@@ -301,12 +227,6 @@ export function BrowserLauncherPopover({
 
   const deleteProfile = useCallback(async (profile: LoginBrowserProfileSummary) => {
     if (!workingDir) return;
-    if (!window.confirm(
-      t('workspace.loginProfileDeleteConfirm').replace(
-        '{profile}',
-        compactProfileId(profile.profile_id),
-      ),
-    )) return;
     const generation = profileRequestGenerationRef.current;
     setBusyAction(`browser_login_delete_profile:${profile.profile_id}`);
     try {
@@ -335,29 +255,23 @@ export function BrowserLauncherPopover({
     }
   }, [t, workingDir]);
 
-  const progressPercent = useMemo(() => {
-    const progress = runtime.progress;
-    if (!progress || progress.total_bytes <= 0) return null;
-    return Math.min(100, Math.round((progress.completed_bytes / progress.total_bytes) * 100));
-  }, [runtime.progress]);
-
-  const phaseLabel = t(`workspace.loginRuntimePhase_${runtime.phase}`);
-  const runtimePresentation = deriveBrowserRuntimePresentation(runtime);
-  const isPreparing = runtimePresentation.showOperation;
+  const confirmProfileAction = useCallback(async () => {
+    const action = pendingProfileAction;
+    if (!action || busyAction !== null) return;
+    if (action.kind === 'reset') {
+      await resetProfile(action.profile);
+    } else {
+      await deleteProfile(action.profile);
+    }
+    setPendingProfileAction(null);
+  }, [busyAction, deleteProfile, pendingProfileAction, resetProfile]);
 
   return (
-    <Popover
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next);
-        if (next) {
-          void refresh().catch(() => {});
-          void invoke<BrowserRuntimeDiskUsage>('browser_runtime_disk_usage')
-            .then(setDiskUsage)
-            .catch(() => {});
-        }
-      }}
-    >
+    <>
+      <Popover
+        open={open}
+        onOpenChange={setOpen}
+      >
       <PopoverTrigger asChild>
         <button
           type="button"
@@ -368,17 +282,14 @@ export function BrowserLauncherPopover({
           className={cn(
             'group relative inline-flex h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none items-center justify-center rounded-full p-0',
             'status-chip-glass cursor-pointer hover:scale-[1.02] active:scale-[0.98]',
-            (previewOpen || runtime.status === 'ready') && 'ring-1 ring-inset ring-primary/40',
+            panelOpen && 'ring-1 ring-inset ring-primary/40',
           )}
         >
-          {previewOpen ? (
+          {panelOpen ? (
             <PanelRightClose className="h-3.5 w-3.5 text-primary transition-transform group-hover:scale-110" />
           ) : (
             <PanelRightOpen className="h-3.5 w-3.5 text-muted-foreground transition-transform group-hover:scale-110" />
           )}
-          {isPreparing ? (
-            <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-primary ring-2 ring-background" />
-          ) : null}
         </button>
       </PopoverTrigger>
 
@@ -422,62 +333,14 @@ export function BrowserLauncherPopover({
                 <ShieldCheck className="h-4 w-4" />
               </span>
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium">{t('workspace.loginBrowser')}</span>
-                  {runtime.status === 'ready' ? (
-                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
-                  ) : runtime.status === 'failed' ? (
-                    <AlertCircle className="h-3.5 w-3.5 text-destructive" />
-                  ) : null}
-                </div>
+                <div className="text-sm font-medium">{t('workspace.loginBrowser')}</div>
                 <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                  {runtime.status === 'ready'
-                    ? t('workspace.loginBrowserReadyHint').replace(
-                        '{version}',
-                        runtime.active?.version ?? '—',
-                      )
-                    : t('workspace.loginBrowserHint')}
+                  {t('workspace.loginBrowserHint')}
                 </p>
               </div>
             </div>
 
-            {runtimePresentation.showOperation ? (
-              <div className="mt-3 rounded-lg bg-background/65 p-2.5">
-                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                  <span className="inline-flex items-center gap-1.5">
-                    {runtime.phase === 'paused' ? <Pause className="h-3 w-3" /> : <LoaderCircle className="h-3 w-3 animate-spin" />}
-                    {phaseLabel}
-                  </span>
-                  {runtime.progress ? (
-                    <span>{formatBytes(runtime.progress.completed_bytes)} / {formatBytes(runtime.progress.total_bytes)}</span>
-                  ) : null}
-                </div>
-                {progressPercent !== null ? (
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
-                    <div className="h-full rounded-full bg-primary transition-[width]" style={{ width: `${progressPercent}%` }} />
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-
-            {runtimePresentation.showFailure && runtime.error ? (
-              <div className="mt-3 rounded-lg border border-destructive/15 bg-destructive/5 px-2.5 py-2 text-xs text-destructive">
-                {t(`workspace.loginRuntimeError_${runtime.error.code}`)}
-              </div>
-            ) : null}
-
-            {diskUsage ? (
-              <div className="mt-3 flex items-center justify-between rounded-lg border border-border/35 bg-background/45 px-2.5 py-2 text-[11px] text-muted-foreground">
-                <span className="inline-flex items-center gap-1.5">
-                  <HardDrive className="h-3.5 w-3.5" />
-                  {t('workspace.loginRuntimeDiskUse')}
-                </span>
-                <span>{formatBytes(diskUsage.total_bytes)}</span>
-              </div>
-            ) : null}
-
-            {runtimePresentation.canOpenProfiles ? (
-              <div className="mt-3 space-y-1.5">
+            <div className="mt-3 space-y-1.5">
                 <div className="flex items-center gap-2">
                   <Button
                     size="sm"
@@ -486,9 +349,7 @@ export function BrowserLauncherPopover({
                     onClick={() => void openLoginBrowser('default')}
                     aria-label={t('workspace.loginBrowserOpenDefault')}
                   >
-                    {busyAction === 'browser_login_open_default'
-                      ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      : <Play className="mr-1.5 h-3.5 w-3.5" />}
+                    <Play className="mr-1.5 h-3.5 w-3.5" />
                     {t('workspace.loginBrowserOpenDefault')}
                   </Button>
                   <Button
@@ -499,9 +360,7 @@ export function BrowserLauncherPopover({
                     onClick={() => void openLoginBrowser('new')}
                     aria-label={t('workspace.loginBrowserNewProfile')}
                   >
-                    {busyAction === 'browser_login_open_new'
-                      ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                      : <Plus className="mr-1.5 h-3.5 w-3.5" />}
+                    <Plus className="mr-1.5 h-3.5 w-3.5" />
                     {t('workspace.loginBrowserNewProfile')}
                   </Button>
                 </div>
@@ -622,16 +481,14 @@ export function BrowserLauncherPopover({
                                 onClick={() => void openSavedProfile(profile)}
                                 aria-label={`${t('workspace.loginProfileOpen')} ${profile.profile_id}`}
                               >
-                                {busyAction === `browser_login_open_profile:${profile.profile_id}`
-                                  ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                                  : <Play className="mr-1.5 h-3.5 w-3.5" />}
+                                <Play className="mr-1.5 h-3.5 w-3.5" />
                                 {t('workspace.loginProfileOpen')}
                               </Button>
                               <Button
                                 size="sm"
                                 variant="ghost"
                                 disabled={busyAction !== null}
-                                onClick={() => void resetProfile(profile)}
+                                onClick={() => setPendingProfileAction({ kind: 'reset', profile })}
                                 aria-label={`${t('workspace.loginProfileReset')} ${profile.profile_id}`}
                               >
                                 {busyAction === `browser_login_reset_profile:${profile.profile_id}`
@@ -644,7 +501,7 @@ export function BrowserLauncherPopover({
                                 variant="ghost"
                                 className="text-destructive hover:text-destructive"
                                 disabled={busyAction !== null}
-                                onClick={() => void deleteProfile(profile)}
+                                onClick={() => setPendingProfileAction({ kind: 'delete', profile })}
                                 aria-label={`${t('workspace.loginProfileDelete')} ${profile.profile_id}`}
                               >
                                 {busyAction === `browser_login_delete_profile:${profile.profile_id}`
@@ -659,65 +516,68 @@ export function BrowserLauncherPopover({
                     </div>
                   </section>
                 ) : null}
-              </div>
-            ) : null}
-
-            <div className="mt-3 flex items-center justify-end gap-2">
-              {runtimePresentation.actionMode === 'resume' ? (
-                <Button size="sm" disabled={busyAction !== null} onClick={() => void runRuntimeAction('browser_runtime_resume_download')}>
-                  <Play className="mr-1.5 h-3.5 w-3.5" />
-                  {t('workspace.loginRuntimeResume')}
-                </Button>
-              ) : runtimePresentation.actionMode === 'active' ? (
-                <>
-                  {runtime.phase === 'downloading' ? (
-                    <Button size="sm" variant="outline" disabled={busyAction !== null} onClick={() => void runRuntimeAction('browser_runtime_pause_download')}>
-                      <Pause className="mr-1.5 h-3.5 w-3.5" />
-                      {t('workspace.loginRuntimePause')}
-                    </Button>
-                  ) : null}
-                  <Button size="sm" variant="ghost" disabled={busyAction !== null} onClick={() => void runRuntimeAction('browser_runtime_cancel')}>
-                    <X className="mr-1.5 h-3.5 w-3.5" />
-                    {t('workspace.loginRuntimeCancel')}
-                  </Button>
-                </>
-              ) : runtimePresentation.actionMode === 'failed' ? (
-                <Button size="sm" disabled={busyAction !== null} onClick={() => void runRuntimeAction(runtime.error?.retryable ? 'browser_runtime_retry' : 'browser_runtime_reinstall')}>
-                  <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                  {runtime.error?.retryable ? t('workspace.loginRuntimeRetry') : t('workspace.loginRuntimeReinstall')}
-                </Button>
-              ) : runtimePresentation.actionMode === 'ready' ? (
-                <>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={busyAction !== null}
-                    onClick={() => void runRuntimeAction('browser_runtime_reinstall')}
-                  >
-                    <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                    {t('workspace.loginRuntimeReinstall')}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="text-destructive hover:text-destructive"
-                    disabled={busyAction !== null}
-                    onClick={() => void deleteRuntime()}
-                  >
-                    <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                    {t('workspace.loginRuntimeDelete')}
-                  </Button>
-                </>
-              ) : (
-                <Button size="sm" disabled={busyAction !== null} onClick={() => void runRuntimeAction('browser_runtime_prepare')}>
-                  {busyAction ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Download className="mr-1.5 h-3.5 w-3.5" />}
-                  {t('workspace.loginRuntimePrepare')}
-                </Button>
-              )}
             </div>
           </div>
         </div>
-      </PopoverContent>
-    </Popover>
+        </PopoverContent>
+      </Popover>
+
+      <Dialog
+        open={pendingProfileAction !== null}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen && busyAction === null) setPendingProfileAction(null);
+        }}
+      >
+        <DialogContent
+          showCloseButton={false}
+          className="max-w-md"
+          onEscapeKeyDown={(event) => {
+            if (busyAction !== null) event.preventDefault();
+          }}
+          onPointerDownOutside={(event) => {
+            if (busyAction !== null) event.preventDefault();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>
+              {pendingProfileAction?.kind === 'delete'
+                ? t('workspace.loginProfileDelete')
+                : t('workspace.loginProfileReset')}
+            </DialogTitle>
+            <DialogDescription>
+              {pendingProfileAction
+                ? t(pendingProfileAction.kind === 'delete'
+                    ? 'workspace.loginProfileDeleteConfirm'
+                    : 'workspace.loginProfileResetConfirm').replace(
+                      '{profile}',
+                      compactProfileId(pendingProfileAction.profile.profile_id),
+                    )
+                : null}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busyAction !== null}
+              onClick={() => setPendingProfileAction(null)}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              type="button"
+              variant={pendingProfileAction?.kind === 'delete' ? 'destructive' : 'default'}
+              disabled={busyAction !== null}
+              onClick={() => void confirmProfileAction()}
+            >
+              {busyAction !== null ? <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+              {pendingProfileAction?.kind === 'delete'
+                ? t('common.delete')
+                : t('common.confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }

@@ -3,12 +3,13 @@ use crate::browser::login::backend::{
     ActionResult, BackendFailure, NavigationResult, SemanticBrowserBackend, SemanticBrowserCommand,
     SemanticBrowserResult,
 };
+#[cfg(target_os = "macos")]
+use crate::browser::login::cef::recovery::{EmbeddedHostProcessIdentity, EmbeddedOwnerRecordStore};
 use crate::browser::login::control::{ControlErrorCode, HandoffControl};
 use crate::browser::login::profile::{OwnershipDomainGone, ProfileCleanupState};
 use crate::browser::login::session_backend::{
     SessionBackendProjection, SessionBackendStartSpec, SessionLaunchRuntime, SessionOwnedBackend,
 };
-use crate::browser::runtime::paths::RuntimePaths;
 use std::fs;
 use std::sync::{mpsc, Barrier, Mutex};
 use std::thread;
@@ -26,8 +27,10 @@ struct FakeSupervisorState {
     launch_count: usize,
     close_count: usize,
     force_count: usize,
+    force_attempt_count: usize,
     emergency_count: usize,
     fail_close: bool,
+    fail_next_force_shutdown: bool,
     fail_diagnostic_begin: bool,
     preflight_count: usize,
     preflight_barriers: Option<(Arc<Barrier>, Arc<Barrier>)>,
@@ -42,8 +45,10 @@ impl Default for FakeSupervisorState {
             launch_count: 0,
             close_count: 0,
             force_count: 0,
+            force_attempt_count: 0,
             emergency_count: 0,
             fail_close: false,
+            fail_next_force_shutdown: false,
             fail_diagnostic_begin: false,
             preflight_count: 0,
             preflight_barriers: None,
@@ -67,7 +72,6 @@ impl SessionSupervisor for FakeSupervisor {
     fn launch_active(
         &self,
         mut profile_lease: BrowserProfileLease,
-        _activation_store: &ActivationStore,
     ) -> Result<LaunchedSessionRuntime, SessionManagerError> {
         let launch_number = {
             let mut state = self.state.lock().unwrap();
@@ -260,6 +264,14 @@ impl SessionOwnedBackend for FakeBackend {
         let runtime = slot
             .as_mut()
             .ok_or(SessionManagerError::RuntimeUnavailable)?;
+        if force {
+            let mut state = runtime.state.lock().unwrap();
+            state.force_attempt_count += 1;
+            if state.fail_next_force_shutdown {
+                state.fail_next_force_shutdown = false;
+                return Err(SessionManagerError::RuntimeUnavailable);
+            }
+        }
         if !force && runtime.state.lock().unwrap().fail_close {
             return Err(SessionManagerError::RuntimeUnavailable);
         }
@@ -296,20 +308,18 @@ struct Fixture {
     workspace_a: PathBuf,
     workspace_b: PathBuf,
     session_root: PathBuf,
-    runtime_root: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().expect("session fixture");
         let session_root = temp.path().join("login-browser");
-        let runtime_root = temp.path().join("runtime");
         let workspace_a = temp.path().join("workspace-a");
         let workspace_b = temp.path().join("workspace-b");
         fs::create_dir_all(&workspace_a).expect("workspace a");
         fs::create_dir_all(&workspace_b).expect("workspace b");
         let state = Arc::new(Mutex::new(FakeSupervisorState::default()));
-        let manager = Arc::new(manager(&session_root, &runtime_root, Arc::clone(&state)));
+        let manager = Arc::new(manager(&session_root, Arc::clone(&state)));
         Self {
             _temp: temp,
             manager,
@@ -317,7 +327,6 @@ impl Fixture {
             workspace_a,
             workspace_b,
             session_root,
-            runtime_root,
         }
     }
 
@@ -328,19 +337,17 @@ impl Fixture {
 
 fn manager(
     session_root: &Path,
-    runtime_root: &Path,
     state: Arc<Mutex<FakeSupervisorState>>,
 ) -> LoginBrowserSessionManager {
     let workspace_identities =
         WorkspaceIdentityStore::new(session_root.join("workspaces")).expect("workspace store");
     let profiles =
-        BrowserProfileManager::new(session_root.join("profile-state")).expect("profiles");
-    let runtime_paths = RuntimePaths::under(runtime_root.to_path_buf()).expect("runtime paths");
+        BrowserProfileManager::new(session_root.join("profile-state"), session_root.join("cef"))
+            .expect("profiles");
     LoginBrowserSessionManager::from_parts(
         session_root.to_path_buf(),
         workspace_identities,
         profiles,
-        ActivationStore::new(runtime_paths),
         Arc::new(FakeSupervisor { state }),
     )
     .expect("session manager")
@@ -391,7 +398,7 @@ fn same_workspace_reuses_stable_identity_and_default_profile_after_restart() {
     fixture.manager.close(&first.handle).expect("first close");
 
     let state = Arc::new(Mutex::new(FakeSupervisorState::default()));
-    let restarted = manager(&fixture.session_root, &fixture.runtime_root, state);
+    let restarted = manager(&fixture.session_root, state);
     let second = restarted
         .open_default_profile(Fixture::trusted(&fixture.workspace_a))
         .expect("open after restart");
@@ -431,6 +438,59 @@ fn concurrent_default_open_allows_one_lease_and_rejects_the_same_profile_twice()
     fixture.manager.close(&opened.handle).expect("close winner");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn embedded_prepare_commits_recovery_intent_before_returning_launch_pending() {
+    let fixture = Fixture::new();
+    let store = EmbeddedOwnerRecordStore::for_test(
+        fixture.session_root.join("embedded-owner-test"),
+        "cef-host-33333333333333333333333333333333".to_string(),
+        EmbeddedHostProcessIdentity {
+            pid: 4242,
+            birth_token: "mac:300:400".to_string(),
+            executable: PathBuf::from("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop"),
+        },
+    )
+    .expect("test embedded owner store");
+    let prepared = fixture
+        .manager
+        .prepare_embedded_profile(
+            Fixture::trusted(&fixture.workspace_a),
+            ProfileSelection::Default,
+            "login-session-contract",
+            &store,
+        )
+        .expect("prepare embedded profile");
+    let profile_id = prepared.profile_id().clone();
+    let (registration, lease, mut owner_record) = prepared.into_launch_parts();
+
+    assert_eq!(registration.profile_id, profile_id);
+    assert!(matches!(
+        lease.descriptor().cleanup_state(),
+        ProfileCleanupState::LaunchPending { ownership_id, .. }
+            if ownership_id == lease.ownership_id()
+    ));
+    let workspace = TrustedWorkspaceIdentity::from_trusted_store(
+        lease.descriptor().workspace_identity().to_string(),
+    )
+    .expect("workspace identity");
+    let (_, release_proof) = lease
+        .cancel_pending_embedded_launch()
+        .expect("cancel before native open");
+    owner_record
+        .finish_after_profile_release(release_proof)
+        .expect("delete matching recovery intent");
+    assert!(matches!(
+        fixture
+            .manager
+            .profiles_for_test()
+            .descriptor(&profile_id, &workspace)
+            .expect("stopped descriptor")
+            .cleanup_state(),
+        ProfileCleanupState::Stopped
+    ));
+}
+
 #[test]
 fn close_and_force_stop_remove_only_after_cleanup_and_release_the_profile() {
     let fixture = Fixture::new();
@@ -449,7 +509,7 @@ fn close_and_force_stop_remove_only_after_cleanup_and_release_the_profile() {
     assert!(matches!(
         fixture
             .manager
-            .profiles
+            .profiles_for_test()
             .descriptor(&profile, &workspace)
             .unwrap()
             .cleanup_state(),
@@ -492,6 +552,88 @@ fn failed_close_keeps_a_truthful_cleanup_required_session() {
         fixture.manager.snapshot(&opened.handle),
         Err(SessionManagerError::SessionNotFound)
     ));
+}
+
+#[test]
+fn shutdown_all_force_closes_every_registered_session() {
+    let fixture = Fixture::new();
+    let first = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("open first session");
+    let second = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_b))
+        .expect("open second session");
+
+    let report = fixture.manager.shutdown_all().expect("shutdown sweep");
+
+    assert_eq!(report.attempted, 2);
+    assert_eq!(report.closed, 2);
+    assert!(report.failures.is_empty());
+    assert!(matches!(
+        fixture.manager.snapshot(&first.handle),
+        Err(SessionManagerError::SessionNotFound)
+    ));
+    assert!(matches!(
+        fixture.manager.snapshot(&second.handle),
+        Err(SessionManagerError::SessionNotFound)
+    ));
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.force_attempt_count, 2);
+    assert_eq!(state.force_count, 2);
+}
+
+#[test]
+fn shutdown_all_continues_after_a_force_shutdown_failure() {
+    let fixture = Fixture::new();
+    let first = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("open first session");
+    let second = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_b))
+        .expect("open second session");
+    fixture.state.lock().unwrap().fail_next_force_shutdown = true;
+
+    let report = fixture.manager.shutdown_all().expect("shutdown sweep");
+
+    assert_eq!(report.attempted, 2);
+    assert_eq!(report.closed, 1);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(
+        report.failures[0].error,
+        SessionManagerError::RuntimeUnavailable
+    );
+    assert_eq!(fixture.state.lock().unwrap().force_attempt_count, 2);
+
+    let failed_handle = [&first.handle, &second.handle]
+        .into_iter()
+        .find(|handle| handle.as_str() == report.failures[0].session_id)
+        .expect("failed session remains addressable");
+    let successful_handle = [&first.handle, &second.handle]
+        .into_iter()
+        .find(|handle| handle.as_str() != report.failures[0].session_id)
+        .expect("successful session handle");
+    let failed_snapshot = fixture
+        .manager
+        .snapshot(failed_handle)
+        .expect("failed session retained");
+    assert_eq!(
+        failed_snapshot.status,
+        LoginBrowserSessionStatus::CleanupRequired
+    );
+    assert_eq!(failed_snapshot.control, SessionControlOwner::Paused);
+    assert!(matches!(
+        fixture.manager.snapshot(successful_handle),
+        Err(SessionManagerError::SessionNotFound)
+    ));
+
+    let retry = fixture.manager.shutdown_all().expect("cleanup retry");
+    assert_eq!(retry.attempted, 1);
+    assert_eq!(retry.closed, 1);
+    assert!(retry.failures.is_empty());
 }
 
 #[test]
@@ -561,385 +703,8 @@ fn trusted_capabilities_are_not_deserializable_and_backend_handles_never_enter_s
     fixture.manager.close(&opened.handle).unwrap();
 }
 
-#[test]
-fn production_missing_active_runtime_releases_the_unlaunched_profile_lease() {
-    let temp = tempfile::tempdir().expect("production manager fixture");
-    let workspace = temp.path().join("workspace");
-    fs::create_dir(&workspace).unwrap();
-    let runtime_paths = RuntimePaths::under(temp.path().join("empty-runtime")).unwrap();
-    let manager = LoginBrowserSessionManager::production(
-        temp.path().join("login-browser"),
-        ActivationStore::new(runtime_paths),
-    )
-    .expect("production session manager");
-
-    for _ in 0..2 {
-        assert!(matches!(
-            manager.open_default_profile(Fixture::trusted(&workspace)),
-            Err(SessionManagerError::NoActiveRuntime)
-        ));
-    }
-}
-
-#[test]
-#[ignore = "requires an exact activated Mode 2 runtime and opens a headed browser"]
-fn exact_activated_runtime_opens_and_closes_full_production_session() {
-    let runtime_root = std::env::var_os("CCEM_MODE2_RUNTIME_TEST_ROOT")
-        .map(std::path::PathBuf::from)
-        .expect("CCEM_MODE2_RUNTIME_TEST_ROOT must point at an activated browser data root");
-    let temp = tempfile::tempdir().expect("production Login Browser fixture");
-    let workspace = temp.path().join("workspace");
-    fs::create_dir(&workspace).unwrap();
-    let runtime_paths = RuntimePaths::under(runtime_root.join("runtime"))
-        .expect("activated runtime paths");
-    let activation_store = ActivationStore::new(runtime_paths);
-    let expected_runtime_version = activation_store
-        .load_pointer()
-        .expect("valid activated runtime pointer")
-        .expect("active runtime pointer")
-        .active
-        .version;
-    let manager = LoginBrowserSessionManager::production(
-        temp.path().join("login-browser"),
-        activation_store,
-    )
-    .expect("production session manager");
-
-    let opened = manager
-        .open_default_profile(Fixture::trusted(&workspace))
-        .expect("full production session opens");
-    assert_eq!(opened.snapshot.runtime_version, expected_runtime_version);
-    assert_eq!(opened.snapshot.status, LoginBrowserSessionStatus::Running);
-    assert_eq!(opened.snapshot.control, SessionControlOwner::User);
-    manager
-        .close(&opened.handle)
-        .expect("full production session closes with ownership proof");
-    assert!(manager.list_snapshots().unwrap().is_empty());
-}
-
-#[test]
-fn default_profile_maintenance_requires_confirmation_and_preserves_state_on_rejection() {
-    let fixture = Fixture::new();
-    assert_eq!(
-        fixture
-            .manager
-            .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-            .expect("empty default profile summary"),
-        None
-    );
-
-    let opened = fixture
-        .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
-        .expect("create default profile");
-    fixture.manager.close(&opened.handle).expect("stop profile");
-    let before = fixture
-        .manager
-        .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-        .expect("default profile summary")
-        .expect("default profile exists");
-    assert_eq!(before.profile_id, opened.snapshot.profile_id);
-    assert!(before.last_used_at.is_some());
-    let projected = serde_json::to_value(&before).expect("serialize maintenance summary");
-    let mut keys = projected
-        .as_object()
-        .expect("maintenance summary object")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort();
-    assert_eq!(keys, vec!["is_default", "last_used_at", "profile_id"]);
-    assert!(!projected
-        .to_string()
-        .contains(fixture._temp.path().to_string_lossy().as_ref()));
-
-    assert_eq!(
-        fixture
-            .manager
-            .reset_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &before.profile_id,
-                false,
-            )
-            .unwrap_err(),
-        SessionManagerError::DestructiveConfirmationRequired
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .delete_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &before.profile_id,
-                false,
-            )
-            .unwrap_err(),
-        SessionManagerError::DestructiveConfirmationRequired
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-            .unwrap(),
-        Some(before)
-    );
-}
-
-#[test]
-fn default_profile_reset_and_delete_are_bound_to_the_canonical_workspace_default() {
-    let fixture = Fixture::new();
-    let opened = fixture
-        .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
-        .expect("create default profile");
-    fixture.manager.close(&opened.handle).expect("stop profile");
-
-    let profile_id = ProfileId::parse(&opened.snapshot.profile_id).expect("profile id");
-    let profile_dir = fixture
-        .manager
-        .profiles
-        .root()
-        .join("profiles")
-        .join(profile_id.as_str());
-    let marker = profile_dir.join("user-data").join("login-cookie-marker");
-    fs::write(&marker, b"private login state").expect("write profile marker");
-
-    let reset = fixture
-        .manager
-        .reset_default_profile(
-            Fixture::trusted(&fixture.workspace_a),
-            &opened.snapshot.profile_id,
-            true,
-        )
-        .expect("reset default profile");
-    assert_eq!(reset.profile_id, opened.snapshot.profile_id);
-    assert_eq!(reset.last_used_at, None);
-    assert!(!marker.exists());
-
-    fixture
-        .manager
-        .delete_default_profile(
-            Fixture::trusted(&fixture.workspace_a),
-            &opened.snapshot.profile_id,
-            true,
-        )
-        .expect("delete default profile");
-    assert_eq!(
-        fixture
-            .manager
-            .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-            .unwrap(),
-        None
-    );
-    assert!(!profile_dir.exists());
-}
-
-#[test]
-fn active_and_cleanup_required_profiles_reject_maintenance_without_profile_effects() {
-    let fixture = Fixture::new();
-    let opened = fixture
-        .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
-        .expect("open active profile");
-    let active_summary = fixture
-        .manager
-        .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-        .unwrap()
-        .expect("active default profile");
-    let profile_id = ProfileId::parse(&opened.snapshot.profile_id).expect("active profile id");
-    let workspace_identity =
-        TrustedWorkspaceIdentity::from_trusted_store(opened.snapshot.workspace_id.clone())
-            .expect("active workspace identity");
-    let active_descriptor = fixture
-        .manager
-        .profiles
-        .descriptor(&profile_id, &workspace_identity)
-        .expect("active profile descriptor");
-
-    assert_eq!(
-        fixture
-            .manager
-            .reset_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &active_summary.profile_id,
-                true,
-            )
-            .unwrap_err(),
-        SessionManagerError::ProfileInUse
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .delete_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &active_summary.profile_id,
-                true,
-            )
-            .unwrap_err(),
-        SessionManagerError::ProfileInUse
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-            .unwrap(),
-        Some(active_summary.clone())
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .profiles
-            .descriptor(&profile_id, &workspace_identity)
-            .unwrap(),
-        active_descriptor
-    );
-
-    fixture.state.lock().unwrap().fail_close = true;
-    assert_eq!(
-        fixture.manager.close(&opened.handle).unwrap_err(),
-        SessionManagerError::RuntimeUnavailable
-    );
-    assert_eq!(
-        fixture.manager.snapshot(&opened.handle).unwrap().status,
-        LoginBrowserSessionStatus::CleanupRequired
-    );
-    let cleanup_descriptor = fixture
-        .manager
-        .profiles
-        .descriptor(&profile_id, &workspace_identity)
-        .expect("cleanup-required profile descriptor");
-    assert_eq!(
-        fixture
-            .manager
-            .reset_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &active_summary.profile_id,
-                true,
-            )
-            .unwrap_err(),
-        SessionManagerError::ProfileInUse
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .delete_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &active_summary.profile_id,
-                true,
-            )
-            .unwrap_err(),
-        SessionManagerError::ProfileInUse
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-            .unwrap(),
-        Some(active_summary)
-    );
-    assert_eq!(
-        fixture
-            .manager
-            .profiles
-            .descriptor(&profile_id, &workspace_identity)
-            .unwrap(),
-        cleanup_descriptor
-    );
-
-    fixture.state.lock().unwrap().fail_close = false;
-    fixture
-        .manager
-        .force_stop(&opened.handle)
-        .expect("clean up fixture session");
-}
-
-#[cfg(unix)]
-#[test]
-fn workspace_aliases_resolve_to_the_same_default_profile_before_authorization_is_minted() {
-    use std::os::unix::fs::symlink;
-
-    let fixture = Fixture::new();
-    let workspace_alias = fixture._temp.path().join("workspace-alias");
-    symlink(&fixture.workspace_a, &workspace_alias).expect("workspace alias");
-    let opened = fixture
-        .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
-        .expect("create canonical default");
-    fixture.manager.close(&opened.handle).expect("stop profile");
-
-    let reset = fixture
-        .manager
-        .reset_default_profile(
-            Fixture::trusted(&workspace_alias),
-            &opened.snapshot.profile_id,
-            true,
-        )
-        .expect("reset through canonical alias");
-    assert_eq!(reset.profile_id, opened.snapshot.profile_id);
-}
-
-#[test]
-fn stale_profile_confirmation_cannot_target_a_newly_promoted_default() {
-    let fixture = Fixture::new();
-    let first = fixture
-        .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
-        .expect("create first default");
-    fixture.manager.close(&first.handle).expect("stop first");
-    let second = fixture
-        .manager
-        .open_new_profile(Fixture::trusted(&fixture.workspace_a))
-        .expect("create next profile");
-    fixture.manager.close(&second.handle).expect("stop second");
-
-    fixture
-        .manager
-        .delete_default_profile(
-            Fixture::trusted(&fixture.workspace_a),
-            &first.snapshot.profile_id,
-            true,
-        )
-        .expect("delete the profile that was actually confirmed");
-    let promoted = fixture
-        .manager
-        .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-        .unwrap()
-        .expect("second profile promoted");
-    assert_eq!(promoted.profile_id, second.snapshot.profile_id);
-    let promoted_id = ProfileId::parse(&promoted.profile_id).unwrap();
-    let workspace = TrustedWorkspaceIdentity::from_trusted_store(second.snapshot.workspace_id)
-        .expect("workspace identity");
-    let before = fixture
-        .manager
-        .profiles
-        .descriptor(&promoted_id, &workspace)
-        .unwrap();
-
-    for result in [
-        fixture.manager.reset_default_profile(
-            Fixture::trusted(&fixture.workspace_a),
-            &first.snapshot.profile_id,
-            true,
-        ),
-        fixture
-            .manager
-            .delete_default_profile(
-                Fixture::trusted(&fixture.workspace_a),
-                &first.snapshot.profile_id,
-                true,
-            )
-            .map(|_| promoted.clone()),
-    ] {
-        assert_eq!(result.unwrap_err(), SessionManagerError::ProfileChanged);
-    }
-    assert_eq!(
-        fixture
-            .manager
-            .profiles
-            .descriptor(&promoted_id, &workspace)
-            .unwrap(),
-        before
-    );
-}
+#[path = "session_profile_maintenance_tests.rs"]
+mod profile_maintenance_tests;
 
 #[path = "session_profile_inventory_tests.rs"]
 mod profile_inventory_tests;

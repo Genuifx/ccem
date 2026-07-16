@@ -201,24 +201,26 @@ impl LoginBrowserSessionManager {
         workspace: TrustedWorkspacePath,
         profile_id: &str,
     ) -> Result<LoginBrowserRecentActivity, SessionManagerError> {
-        let _gate = self
+        let inner = self.available()?;
+        let _gate = inner
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
-        let workspace_identity = self
+        let workspace_identity = inner
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(super::map_workspace_error)?;
         let profile_id = ProfileId::parse(profile_id).map_err(super::map_profile_error)?;
-        self.profiles
+        inner
+            .profiles
             .descriptor(&profile_id, &workspace_identity)
             .map_err(super::map_profile_error)?;
-        let session_ids = self.profile_activity.session_ids(&profile_id)?;
+        let session_ids = inner.profile_activity.session_ids(&profile_id)?;
         let mut artifacts = Vec::new();
         if session_ids.is_empty() {
             return Ok(LoginBrowserRecentActivity { artifacts });
         }
-        let sessions_root = self.root.join("sessions");
+        let sessions_root = inner.root.join("sessions");
         ensure_directory_without_symlink(&sessions_root)?;
         for session_id in session_ids.into_iter().rev() {
             let session_root = sessions_root.join(session_id.as_str());

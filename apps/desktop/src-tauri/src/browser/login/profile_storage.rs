@@ -362,6 +362,25 @@ pub(super) fn remove_private_directory(parent: &Path, target: &Path) -> Result<(
     fs::remove_dir_all(target).map_err(|error| io_error("delete browser profile data", error))
 }
 
+pub(super) fn remove_private_directory_if_present(
+    parent: &Path,
+    target: &Path,
+) -> Result<(), ProfileError> {
+    ensure_path_is_not_symlink(parent)?;
+    ensure_path_is_not_symlink(target)?;
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            remove_private_directory(parent, target)
+        }
+        Ok(_) => Err(ProfileError::UnsafePath(format!(
+            "{} is not a real directory",
+            target.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("inspect browser profile deletion target", error)),
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn secure_directory(path: &Path) -> Result<(), ProfileError> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))

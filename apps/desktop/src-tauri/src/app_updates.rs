@@ -1,21 +1,24 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use semver::Version;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::UpdaterExt;
+
+use crate::app_update_engine::{
+    check_and_store, download_verified_and_install, PendingAppUpdate, UpdateProgress,
+};
 
 const RELEASE_URL_PREFIX: &str =
     "https://github.com/Genuifx/claude-code-env-manager/releases/tag/v";
 
-#[derive(Default)]
-pub struct PendingUpdate(Mutex<Option<Update>>);
+pub type PendingUpdate = PendingAppUpdate;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppUpdateMetadata {
-    version: String,
+    pub(crate) version: String,
     current_version: String,
     channel: String,
     release_tag: String,
@@ -43,26 +46,20 @@ pub async fn check_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingUpdate>,
 ) -> Result<Option<AppUpdateMetadata>, String> {
-    let update = app
-        .updater_builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| error.to_string())?
-        .check()
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let metadata = update.as_ref().map(|update| AppUpdateMetadata {
-        version: update.version.clone(),
-        current_version: update.current_version.clone(),
-        channel: version_channel(&update.version),
-        release_tag: release_tag(&update.version),
-        release_url: release_url(&update.version),
-        date: update.date.map(|date| date.to_string()),
-        body: update.body.clone(),
-    });
-
-    replace_pending_update(&pending_update, update)?;
+    let builder = app.updater_builder().timeout(Duration::from_secs(30));
+    #[cfg(feature = "updater-replacement-smoke-harness")]
+    let builder = crate::updater_replacement_smoke::configure_updater_builder(&app, builder)?;
+    let metadata = check_and_store(builder, &pending_update).await?.map(
+        |(version, current_version, date, body)| AppUpdateMetadata {
+            channel: version_channel(&version),
+            release_tag: release_tag(&version),
+            release_url: release_url(&version),
+            version,
+            current_version,
+            date,
+            body,
+        },
+    );
     Ok(metadata)
 }
 
@@ -71,53 +68,88 @@ pub async fn install_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingUpdate>,
 ) -> Result<(), String> {
-    let update = take_pending_update(&pending_update)?;
+    let update = pending_update.take()?;
     let version = update.version.clone();
-    let progress = Arc::new(Mutex::new((0_u64, None)));
+    let progress = UpdateProgress::default();
 
     emit_app_update_progress(&app, "download-started", &version, 0, None);
 
     let chunk_app = app.clone();
     let chunk_version = version.clone();
-    let chunk_progress = Arc::clone(&progress);
+    let chunk_progress = progress.clone();
     let finish_app = app.clone();
     let finish_version = version.clone();
-    let finish_progress = Arc::clone(&progress);
-    update
-        .download_and_install(
-            move |chunk_length, content_length| {
-                let (downloaded, total) =
-                    update_progress_snapshot(&chunk_progress, chunk_length as u64, content_length);
-                emit_app_update_progress(
-                    &chunk_app,
-                    "download-progress",
-                    &chunk_version,
-                    downloaded,
-                    total,
-                );
-            },
-            move || {
-                let (downloaded, total) = read_progress_snapshot(&finish_progress);
-                emit_app_update_progress(
-                    &finish_app,
-                    "download-finished",
-                    &finish_version,
-                    downloaded,
-                    total,
-                );
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let finish_progress = progress.clone();
+    download_verified_and_install(
+        update,
+        move |chunk_length, content_length| {
+            let (downloaded, total) = chunk_progress.record(chunk_length as u64, content_length);
+            emit_app_update_progress(
+                &chunk_app,
+                "download-progress",
+                &chunk_version,
+                downloaded,
+                total,
+            );
+        },
+        move || {
+            let (downloaded, total) = finish_progress.snapshot();
+            emit_app_update_progress(
+                &finish_app,
+                "download-finished",
+                &finish_version,
+                downloaded,
+                total,
+            );
+        },
+        |bytes| {
+            #[cfg(feature = "updater-replacement-smoke-harness")]
+            crate::updater_replacement_smoke::record_verified_download(bytes)?;
+            #[cfg(not(feature = "updater-replacement-smoke-harness"))]
+            let _ = bytes;
+            Ok(())
+        },
+    )
+    .await?;
 
-    let (downloaded, total) = read_progress_snapshot(&progress);
+    let (downloaded, total) = progress.snapshot();
     emit_app_update_progress(&app, "installed", &version, downloaded, total);
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", windows))]
 #[tauri::command]
-pub fn restart_app(app: AppHandle) {
-    app.restart();
+pub async fn restart_app(
+    app: AppHandle,
+    sessions: State<'_, Arc<crate::browser::login::session::LoginBrowserSessionManager>>,
+    surfaces: State<'_, Arc<crate::browser::login::surface_commands::LoginBrowserSurfaceManager>>,
+    cef_host: State<'_, Arc<crate::browser::login::cef::host::CefHostController>>,
+) -> Result<(), String> {
+    surfaces.begin_shutdown()?;
+    let sessions = Arc::clone(sessions.inner());
+    let cef_host = Arc::clone(cef_host.inner());
+    let app_for_shutdown = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = sessions.shutdown_all().map_err(|error| error.to_string())?;
+        if !report.failures.is_empty() {
+            return Err(format!(
+                "{} Login Browser session(s) did not reach terminal state before restart.",
+                report.failures.len()
+            ));
+        }
+        cef_host.prepare_shutdown(&app_for_shutdown)
+    })
+    .await
+    .map_err(|error| format!("join graceful app restart: {error}"))??;
+    app.request_restart();
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[tauri::command]
+pub fn restart_app(app: AppHandle) -> Result<(), String> {
+    app.request_restart();
+    Ok(())
 }
 
 fn parse_version(raw: &str) -> Result<Version, String> {
@@ -146,27 +178,6 @@ fn version_channel(version: &str) -> String {
         .to_string()
 }
 
-fn replace_pending_update(
-    pending_update: &State<'_, PendingUpdate>,
-    update: Option<Update>,
-) -> Result<(), String> {
-    let mut guard = pending_update
-        .0
-        .lock()
-        .map_err(|_| "Pending update state is unavailable".to_string())?;
-    *guard = update;
-    Ok(())
-}
-
-fn take_pending_update(pending_update: &State<'_, PendingUpdate>) -> Result<Update, String> {
-    pending_update
-        .0
-        .lock()
-        .map_err(|_| "Pending update state is unavailable".to_string())?
-        .take()
-        .ok_or_else(|| "No pending update to install".to_string())
-}
-
 fn emit_app_update_progress(
     app: &AppHandle,
     phase: &str,
@@ -181,30 +192,6 @@ fn emit_app_update_progress(
         total,
     };
     let _ = app.emit("app-update-progress", payload);
-}
-
-fn update_progress_snapshot(
-    progress: &Arc<Mutex<(u64, Option<u64>)>>,
-    chunk_length: u64,
-    content_length: Option<u64>,
-) -> (u64, Option<u64>) {
-    match progress.lock() {
-        Ok(mut guard) => {
-            guard.0 = guard.0.saturating_add(chunk_length);
-            if content_length.is_some() {
-                guard.1 = content_length;
-            }
-            (guard.0, guard.1)
-        }
-        Err(_) => (chunk_length, content_length),
-    }
-}
-
-fn read_progress_snapshot(progress: &Arc<Mutex<(u64, Option<u64>)>>) -> (u64, Option<u64>) {
-    progress
-        .lock()
-        .map(|guard| (guard.0, guard.1))
-        .unwrap_or((0, None))
 }
 
 #[cfg(test)]

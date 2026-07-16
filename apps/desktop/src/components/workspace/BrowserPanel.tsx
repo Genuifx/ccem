@@ -2,7 +2,6 @@ import {
   type CSSProperties,
   type FormEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
   useCallback,
   useEffect,
   useRef,
@@ -11,28 +10,7 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open as openExternalUrl } from '@tauri-apps/plugin-shell';
-import {
-  ArrowLeft,
-  ArrowRight,
-  Copy,
-  ExternalLink,
-  FileImage,
-  FileJson,
-  Files,
-  Globe,
-  LoaderCircle,
-  Pause,
-  Play,
-  RefreshCw,
-  ScrollText,
-  ShieldCheck,
-  X,
-} from 'lucide-react';
 import { toast } from 'sonner';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import type {
@@ -40,17 +18,51 @@ import type {
   BrowserRecentActivity,
   BrowserSessionStateEvent,
 } from '@/lib/tauri-ipc';
+import {
+  applyBrowserSurfaceMutationResponseForLease,
+  BROWSER_SURFACE_HOST_SHORTCUT_EVENT,
+  browserSurfaceEventMatchesLease,
+  browserSurfaceHostShortcutMatchesLease,
+  createBrowserSurfaceClient,
+  createBrowserSurfaceOrdering,
+  highestSequencedSurfaceEventForLease,
+  type BrowserSurfaceHostShortcutAction,
+  type BrowserSurfaceHostShortcutEvent,
+  type BrowserSurfaceOrdering,
+  type BrowserSurfaceProfileSelection,
+  type BrowserSurfaceSnapshot,
+  type BrowserSurfaceStateChangedEvent,
+} from '@/lib/browserSurfaceIpc';
+import { createBrowserPanelNativeSurfaceParticipant } from '@/lib/browserPanelNativeSurfaceParticipant';
+import { useNativeSurfaceOcclusionParticipant } from '@/lib/nativeSurfaceOcclusion';
+import { nativeSurfaceOcclusionStore } from '@/lib/nativeSurfaceOcclusionStore';
 import { CCEM_ZOOM_CHANGE_EVENT, CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
+import { usePreviewSurfaceMutation } from '@/hooks/usePreviewSurfaceMutation';
 import { buildNativeBrowserBounds, normalizeBrowserBoundsZoom } from './browserPanelGeometry';
+import { BrowserPanelNavigation, BrowserPanelTabStrip } from './BrowserPanelChrome';
 
-interface BrowserPanelProps {
+interface BrowserPanelSharedProps {
   sessionId: string;
   defaultUrl?: string | null;
   className?: string;
   style?: CSSProperties;
+  surfaceOccluded?: boolean;
   onResizeStart?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onHostShortcut?: (action: BrowserSurfaceHostShortcutAction) => void;
   onClose: () => void;
 }
+
+type BrowserPanelProps = BrowserPanelSharedProps & (
+  | { backend: 'preview'; workingDir?: never; profileMode?: never; profileId?: never }
+  | ({ backend: 'login'; workingDir: string } & BrowserSurfaceProfileSelection)
+);
+
+type BrowserPanelLifecycle = NonNullable<BrowserInfo['lifecycle']>
+  | NonNullable<BrowserSurfaceSnapshot['lifecycle']>;
+
+const browserSurfaceClient = createBrowserSurfaceClient({
+  invoke: (command, args) => invoke(command, args),
+});
 
 function readCurrentAppZoom(): number {
   try {
@@ -82,58 +94,43 @@ function normalizeBrowserInput(value: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`;
 }
 
-function formatArtifactBytes(byteSize: number): string {
-  if (byteSize < 1024) return `${byteSize} B`;
-  if (byteSize < 1024 * 1024) return `${Math.round(byteSize / 1024)} KB`;
-  return `${(byteSize / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function BrowserToolButton({
-  label,
-  disabled,
-  onClick,
-  children,
-}: {
-  label: string;
-  disabled?: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="inline-flex">
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            className="h-8 w-8 rounded-full"
-            aria-label={label}
-            disabled={disabled}
-            onClick={onClick}
-          >
-            {children}
-          </Button>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">{label}</TooltipContent>
-    </Tooltip>
-  );
-}
-
-export function BrowserPanel({
-  sessionId,
-  defaultUrl = null,
-  className,
-  style,
-  onResizeStart,
-  onClose,
-}: BrowserPanelProps) {
+export function BrowserPanel(props: BrowserPanelProps) {
+  const {
+    backend,
+    sessionId,
+    defaultUrl = null,
+    className,
+    style,
+    surfaceOccluded = false,
+    onResizeStart,
+    onHostShortcut,
+    onClose,
+  } = props;
+  const loginWorkingDir = props.backend === 'login' ? props.workingDir : null;
+  const loginProfileMode = props.backend === 'login' ? props.profileMode : null;
+  const loginProfileId = props.backend === 'login' && props.profileMode === 'saved'
+    ? props.profileId
+    : undefined;
   const { t } = useLocale();
   const frameRef = useRef<HTMLDivElement>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
   const syncFrameRef = useRef<number | null>(null);
   const isUrlEditingRef = useRef(false);
+  const surfaceLeaseRef = useRef<{ leaseId: string; generation: number } | null>(null);
+  const loginSurfaceOrderingRef = useRef<BrowserSurfaceOrdering | null>(null);
+  if (!loginSurfaceOrderingRef.current) loginSurfaceOrderingRef.current = createBrowserSurfaceOrdering();
+  const loginSurfaceOrdering = loginSurfaceOrderingRef.current;
+  const runPreviewSurfaceMutation = usePreviewSurfaceMutation(backend === 'preview' ? sessionId : null);
+  const surfaceClosingRef = useRef(false);
+  const surfaceCloseSucceededRef = useRef(false);
+  const onHostShortcutRef = useRef(onHostShortcut);
+  onHostShortcutRef.current = onHostShortcut;
+  const previewSurfaceReadyRef = useRef(false);
+  const previewDesiredVisibilityRef = useRef(!surfaceOccluded);
+  const surfaceOccludedRef = useRef(surfaceOccluded);
+  const pausedRef = useRef(false);
+  surfaceOccludedRef.current = surfaceOccluded;
+  if (surfaceOccluded) previewDesiredVisibilityRef.current = false;
   const [currentUrl, setCurrentUrl] = useState<string | null>(defaultUrl ?? null);
   const [urlInput, setUrlInput] = useState(defaultUrl ?? '');
   const [isUrlEditing, setIsUrlEditing] = useState(false);
@@ -142,11 +139,20 @@ export function BrowserPanel({
   const [canGoForward, setCanGoForward] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lifecycle, setLifecycle] = useState<BrowserInfo['lifecycle']>('creating');
+  const [lifecycle, setLifecycle] = useState<BrowserPanelLifecycle>('creating');
   const [control, setControl] = useState<BrowserInfo['control']>('user');
   const [paused, setPaused] = useState(false);
+  const [sessionStatus, setSessionStatus] = useState<'running' | 'closing' | 'cleanup_required'>('running');
+  const [popupActive, setPopupActive] = useState(false);
+  const [popupUrl, setPopupUrl] = useState<string | null>(null);
+  const [popupTitle, setPopupTitle] = useState<string | null>(null);
+  const [popupLoading, setPopupLoading] = useState(false);
+  const [popupError, setPopupError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isPauseBusy, setIsPauseBusy] = useState(false);
+  const [isLoginControlBusy, setIsLoginControlBusy] = useState(false);
+  const [isPopupCloseBusy, setIsPopupCloseBusy] = useState(false);
+  const [isClosingSurface, setIsClosingSurface] = useState(false);
   const [recentActivity, setRecentActivity] = useState<BrowserRecentActivity>({ artifacts: [] });
 
   const applyBrowserInfo = useCallback((info: BrowserInfo, fallbackUrl?: string | null) => {
@@ -160,13 +166,117 @@ export function BrowserPanel({
     setCanGoForward(Boolean(info.can_go_forward));
     setLifecycle(info.lifecycle ?? 'ready');
     setControl(info.control ?? 'user');
-    setPaused(Boolean(info.paused));
+    pausedRef.current = Boolean(info.paused);
+    setPaused(pausedRef.current);
     setIsLoading(Boolean(info.loading));
     if (info.error !== undefined) {
       setError(info.error ?? null);
     }
     return nextUrl;
   }, []);
+
+  const applySurfaceSnapshot = useCallback((snapshot?: BrowserSurfaceSnapshot | null) => {
+    if (!snapshot) return;
+    if (snapshot.url !== undefined) {
+      setCurrentUrl(snapshot.url ?? null);
+      if (!isUrlEditingRef.current) {
+        setUrlInput(snapshot.url ?? '');
+      }
+    }
+    if (snapshot.title !== undefined) setTitle(snapshot.title ?? null);
+    if (snapshot.lifecycle !== undefined) setLifecycle(snapshot.lifecycle);
+    if (snapshot.control !== undefined) setControl(snapshot.control);
+    if (snapshot.paused !== undefined) {
+      pausedRef.current = snapshot.paused;
+      setPaused(snapshot.paused);
+    }
+    if (snapshot.loading !== undefined) setIsLoading(snapshot.loading);
+    if (snapshot.error !== undefined) setError(snapshot.error ?? null);
+    if (snapshot.session_status !== undefined) setSessionStatus(snapshot.session_status);
+    if (snapshot.popup_active !== undefined) setPopupActive(snapshot.popup_active);
+    if (snapshot.popup_url !== undefined) setPopupUrl(snapshot.popup_url ?? null);
+    if (snapshot.popup_title !== undefined) setPopupTitle(snapshot.popup_title ?? null);
+    if (snapshot.popup_loading !== undefined) setPopupLoading(snapshot.popup_loading);
+    if (snapshot.popup_error !== undefined) setPopupError(snapshot.popup_error ?? null);
+  }, []);
+
+  const readViewport = useCallback(() => {
+    const frame = frameRef.current;
+    if (!frame) return null;
+    return buildNativeBrowserBounds(frame.getBoundingClientRect(), readCurrentAppZoom());
+  }, []);
+
+  const syncLoginSurface = useCallback((visible = !surfaceOccludedRef.current) => {
+    return loginSurfaceOrdering.enqueue(async (clientRevision) => {
+      if (surfaceClosingRef.current) return;
+      const lease = surfaceLeaseRef.current;
+      const viewport = readViewport();
+      if (!lease || !viewport) return;
+      await browserSurfaceClient.sync({
+        leaseId: lease.leaseId,
+        generation: lease.generation,
+        clientRevision,
+        viewport,
+        visible,
+      });
+    });
+  }, [loginSurfaceOrdering, readViewport]);
+
+  const setNativeSurfaceVisible = useCallback(async (requestedVisible: boolean) => {
+    const visible = requestedVisible
+      && !surfaceOccludedRef.current
+      && !nativeSurfaceOcclusionStore.isOccluded();
+    if (backend === 'login') {
+      await syncLoginSurface(visible);
+      return;
+    }
+    previewDesiredVisibilityRef.current = visible;
+    await runPreviewSurfaceMutation(async () => {
+      if (!previewSurfaceReadyRef.current) return;
+      await invoke('browser_set_visible', { sessionId, visible });
+    });
+  }, [backend, runPreviewSurfaceMutation, sessionId, syncLoginSurface]);
+
+  const pausePreviewForOcclusion = useCallback(async () => {
+    if (backend !== 'preview' || pausedRef.current) return;
+    const info = await invoke<BrowserInfo>('browser_set_paused', {
+      sessionId,
+      paused: true,
+    });
+    applyBrowserInfo(info);
+  }, [applyBrowserInfo, backend, sessionId]);
+
+  const occludeLoginSurface = useCallback(async () => {
+    if (backend !== 'login' || surfaceClosingRef.current) return;
+    const lease = surfaceLeaseRef.current;
+    if (!lease) return;
+    const response = await loginSurfaceOrdering.enqueue((clientRevision) => (
+      browserSurfaceClient.control({
+        leaseId: lease.leaseId,
+        generation: lease.generation,
+        clientRevision,
+        action: 'occlude',
+      })
+    ));
+    applyBrowserSurfaceMutationResponseForLease(
+      loginSurfaceOrdering,
+      surfaceLeaseRef.current,
+      lease,
+      response,
+      applySurfaceSnapshot,
+    );
+  }, [applySurfaceSnapshot, backend, loginSurfaceOrdering]);
+
+  useNativeSurfaceOcclusionParticipant(createBrowserPanelNativeSurfaceParticipant({
+    backend,
+    preparePreviewHide: () => {
+      previewDesiredVisibilityRef.current = false;
+    },
+    pausePreview: pausePreviewForOcclusion,
+    hidePreview: () => setNativeSurfaceVisible(false),
+    occludeLogin: occludeLoginSurface,
+    restore: () => setNativeSurfaceVisible(!surfaceOccludedRef.current),
+  }));
 
   const syncBounds = useCallback(() => {
     if (syncFrameRef.current !== null) {
@@ -175,17 +285,16 @@ export function BrowserPanel({
 
     syncFrameRef.current = requestAnimationFrame(() => {
       syncFrameRef.current = null;
-      const frame = frameRef.current;
-      if (!frame) {
-        return;
-      }
-      const rect = frame.getBoundingClientRect();
-      const bounds = buildNativeBrowserBounds(rect, readCurrentAppZoom());
-      void invoke('browser_set_bounds', { sessionId, ...bounds }).catch((boundsError) => {
+      const bounds = readViewport();
+      if (!bounds) return;
+      const sync = backend === 'login'
+        ? syncLoginSurface()
+        : runPreviewSurfaceMutation(() => invoke('browser_set_bounds', { sessionId, ...bounds }));
+      void sync.catch((boundsError) => {
         console.error('Failed to sync browser bounds:', boundsError);
       });
     });
-  }, [sessionId]);
+  }, [backend, readViewport, runPreviewSurfaceMutation, sessionId, syncLoginSurface]);
 
   const refreshInfo = useCallback(async () => {
     const info = await invoke<BrowserInfo>('browser_info', { sessionId });
@@ -215,13 +324,18 @@ export function BrowserPanel({
   }, []);
 
   const openBrowser = useCallback(async (url?: string | null) => {
+    if (backend !== 'preview') return;
     setIsBusy(true);
     setError(null);
     try {
-      const info = await invoke<BrowserInfo>('browser_open', {
+      const result = await runPreviewSurfaceMutation(() => invoke<BrowserInfo>('browser_open', {
         sessionId,
         url: url || null,
-      });
+        visible: false,
+      }));
+      if (!result.applied) return;
+      const info = result.value;
+      previewSurfaceReadyRef.current = true;
       applyBrowserInfo(info, url ?? null);
       syncBounds();
       window.setTimeout(() => {
@@ -232,21 +346,217 @@ export function BrowserPanel({
     } finally {
       setIsBusy(false);
     }
-  }, [applyBrowserInfo, refreshInfo, sessionId, showBrowserError, syncBounds]);
+  }, [applyBrowserInfo, backend, refreshInfo, runPreviewSurfaceMutation, sessionId, showBrowserError, syncBounds]);
 
   useEffect(() => {
-    void openBrowser(defaultUrl);
+    if (backend !== 'preview') return;
+    previewSurfaceReadyRef.current = false;
+    previewDesiredVisibilityRef.current = !surfaceOccludedRef.current
+      && !nativeSurfaceOcclusionStore.isOccluded();
+    void openBrowser(defaultUrl)
+      .then(() => setNativeSurfaceVisible(previewDesiredVisibilityRef.current))
+      .catch(() => {});
     void refreshRecentActivity().catch(() => {});
 
     return () => {
+      previewSurfaceReadyRef.current = false;
+      previewDesiredVisibilityRef.current = false;
       if (syncFrameRef.current !== null) {
         cancelAnimationFrame(syncFrameRef.current);
       }
-      void invoke('browser_set_visible', { sessionId, visible: false }).catch(() => {});
     };
-  }, [defaultUrl, openBrowser, refreshRecentActivity, sessionId]);
+  }, [backend, defaultUrl, openBrowser, refreshRecentActivity, setNativeSurfaceVisible]);
 
   useEffect(() => {
+    if (backend !== 'login') return;
+
+    let disposed = false;
+    let unlistenState: (() => void) | null = null;
+    let unlistenHostShortcut: (() => void) | null = null;
+    const pendingStates: BrowserSurfaceStateChangedEvent[] = [];
+    setLifecycle('creating');
+    setIsBusy(true);
+    setError(null);
+    surfaceLeaseRef.current = null;
+    loginSurfaceOrdering.resetServerSequence();
+    surfaceClosingRef.current = false;
+    surfaceCloseSucceededRef.current = false;
+    setIsClosingSurface(false);
+    setSessionStatus('running');
+    setPopupActive(false);
+    setPopupUrl(null);
+    setPopupTitle(null);
+    setPopupLoading(false);
+    setPopupError(null);
+
+    if (
+      !loginWorkingDir?.trim()
+      || !loginProfileMode
+      || (loginProfileMode === 'saved' && !loginProfileId?.trim())
+    ) {
+      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      setLifecycle('failed');
+      setIsBusy(false);
+      return;
+    }
+
+    const viewport = readViewport();
+    if (!viewport) {
+      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      setLifecycle('failed');
+      setIsBusy(false);
+      return;
+    }
+
+    const profileSelection: BrowserSurfaceProfileSelection = loginProfileMode === 'saved'
+      ? { profileMode: 'saved', profileId: loginProfileId!.trim() }
+      : { profileMode: loginProfileMode };
+    const acquireRequest = {
+      panelSessionId: sessionId,
+      backend: 'login' as const,
+      workingDir: loginWorkingDir,
+      ...profileSelection,
+      initialUrl: defaultUrl,
+      viewport,
+    };
+
+    const applySurfaceState = (state: BrowserSurfaceStateChangedEvent) => {
+      const lease = surfaceLeaseRef.current;
+      if (!browserSurfaceEventMatchesLease(lease, state)) return false;
+      return loginSurfaceOrdering.applySequencedSnapshot(state.server_sequence, state.snapshot, applySurfaceSnapshot);
+    };
+
+    void (async () => {
+      try {
+        const nextStateUnlisten = await listen<BrowserSurfaceStateChangedEvent>(
+          'browser_surface_state_changed',
+          (event) => {
+            if (disposed) return;
+            if (!surfaceLeaseRef.current) {
+              pendingStates.push(event.payload);
+              if (pendingStates.length > 16) {
+                pendingStates.sort((left, right) => right.server_sequence - left.server_sequence);
+                pendingStates.length = 16;
+              }
+              return;
+            }
+            applySurfaceState(event.payload);
+          },
+        );
+        if (disposed) {
+          nextStateUnlisten();
+          return;
+        }
+        unlistenState = nextStateUnlisten;
+
+        const nextHostShortcutUnlisten = await listen<BrowserSurfaceHostShortcutEvent>(
+          BROWSER_SURFACE_HOST_SHORTCUT_EVENT,
+          (event) => {
+            if (
+              disposed
+              || !browserSurfaceHostShortcutMatchesLease(
+                surfaceLeaseRef.current,
+                event.payload,
+              )
+            ) {
+              return;
+            }
+            onHostShortcutRef.current?.(event.payload.action);
+          },
+        );
+        if (disposed) {
+          nextHostShortcutUnlisten();
+          unlistenState?.();
+          unlistenState = null;
+          return;
+        }
+        unlistenHostShortcut = nextHostShortcutUnlisten;
+
+        const lease = await loginSurfaceOrdering.enqueue((clientRevision) => (
+          browserSurfaceClient.acquire({ ...acquireRequest, clientRevision })
+        ));
+        if (disposed) {
+          await loginSurfaceOrdering.enqueue((clientRevision) => (
+            browserSurfaceClient.release({
+              leaseId: lease.lease_id,
+              generation: lease.generation,
+              clientRevision,
+              disposition: 'close',
+            })
+          ));
+          return;
+        }
+        const leaseIdentity = {
+          leaseId: lease.lease_id,
+          generation: lease.generation,
+        };
+        surfaceLeaseRef.current = leaseIdentity;
+        loginSurfaceOrdering.applySequencedSnapshot(lease.server_sequence, lease.snapshot, applySurfaceSnapshot);
+        const highestPendingState = highestSequencedSurfaceEventForLease(
+          leaseIdentity,
+          pendingStates,
+        );
+        if (highestPendingState) applySurfaceState(highestPendingState);
+        pendingStates.length = 0;
+        void syncLoginSurface().catch((syncError) => {
+          console.error('Failed to sync login browser surface:', syncError);
+        });
+      } catch (acquireError) {
+        if (!disposed) {
+          unlistenState?.();
+          unlistenState = null;
+          unlistenHostShortcut?.();
+          unlistenHostShortcut = null;
+          setLifecycle('failed');
+          showBrowserError(String(acquireError));
+        } else {
+          console.error('Failed to close a disposed login browser surface:', acquireError);
+        }
+      } finally {
+        if (!disposed) setIsBusy(false);
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      unlistenState?.();
+      unlistenHostShortcut?.();
+      if (syncFrameRef.current !== null) {
+        cancelAnimationFrame(syncFrameRef.current);
+      }
+      const lease = surfaceLeaseRef.current;
+      surfaceLeaseRef.current = null;
+      surfaceClosingRef.current = true;
+      if (lease && !surfaceCloseSucceededRef.current) {
+        void loginSurfaceOrdering.enqueue((clientRevision) => (
+          browserSurfaceClient.release({
+            leaseId: lease.leaseId,
+            generation: lease.generation,
+            clientRevision,
+            disposition: 'close',
+          })
+        )).catch((closeError) => {
+          console.error('Failed to close login browser surface during unmount:', closeError);
+        });
+      }
+    };
+  }, [
+    applySurfaceSnapshot,
+    backend,
+    defaultUrl,
+    loginSurfaceOrdering,
+    loginProfileId,
+    loginProfileMode,
+    loginWorkingDir,
+    readViewport,
+    sessionId,
+    showBrowserError,
+    syncLoginSurface,
+    t,
+  ]);
+
+  useEffect(() => {
+    if (backend !== 'preview') return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
 
@@ -300,7 +610,11 @@ export function BrowserPanel({
       unlisten?.();
       window.clearInterval(healthTimer);
     };
-  }, [applyBrowserInfo, refreshRecentActivity, sessionId]);
+  }, [applyBrowserInfo, backend, refreshRecentActivity, sessionId]);
+
+  useEffect(() => {
+    void setNativeSurfaceVisible(!surfaceOccluded).catch(() => {});
+  }, [setNativeSurfaceVisible, surfaceOccluded]);
 
   useEffect(() => {
     isUrlEditingRef.current = isUrlEditing;
@@ -317,6 +631,12 @@ export function BrowserPanel({
       window.clearTimeout(timeoutId);
     };
   }, [isUrlEditing]);
+
+  useEffect(() => {
+    if (popupActive) {
+      setIsUrlEditing(false);
+    }
+  }, [popupActive]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -341,6 +661,7 @@ export function BrowserPanel({
   const runBrowserCommand = useCallback(async (
     command: 'browser_back' | 'browser_forward' | 'browser_reload',
   ) => {
+    if (backend !== 'preview') return;
     setIsBusy(true);
     setError(null);
     try {
@@ -354,9 +675,13 @@ export function BrowserPanel({
     } finally {
       setIsBusy(false);
     }
-  }, [applyBrowserInfo, currentUrl, refreshInfo, sessionId, showBrowserError]);
+  }, [applyBrowserInfo, backend, currentUrl, refreshInfo, sessionId, showBrowserError]);
 
   const navigate = useCallback(async (rawValue: string) => {
+    if (backend === 'login' && popupActive) {
+      showBrowserError(t('workspace.browserPopupCloseBeforeNavigate'));
+      return;
+    }
     const nextUrl = normalizeBrowserInput(rawValue);
     if (!nextUrl) {
       setUrlInput(currentUrl ?? '');
@@ -369,13 +694,30 @@ export function BrowserPanel({
     setUrlInput(nextUrl);
     setCurrentUrl(nextUrl);
     try {
-      const info = await invoke<BrowserInfo>('browser_navigate', { sessionId, url: nextUrl });
-      applyBrowserInfo(info, nextUrl);
+      if (backend === 'login') {
+        const lease = surfaceLeaseRef.current;
+        if (!lease) {
+          throw new Error(t('workspace.browserSurfaceUnavailable'));
+        }
+        await loginSurfaceOrdering.enqueue((clientRevision) => (
+          browserSurfaceClient.navigate({
+            leaseId: lease.leaseId,
+            generation: lease.generation,
+            clientRevision,
+            url: nextUrl,
+          })
+        ));
+      } else {
+        const info = await invoke<BrowserInfo>('browser_navigate', { sessionId, url: nextUrl });
+        applyBrowserInfo(info, nextUrl);
+      }
       setIsUrlEditing(false);
-      syncBounds();
-      window.setTimeout(() => {
-        void refreshInfo().catch(() => {});
-      }, 700);
+      if (backend === 'preview') {
+        syncBounds();
+        window.setTimeout(() => {
+          void refreshInfo().catch(() => {});
+        }, 700);
+      }
     } catch (navigateError) {
       setCurrentUrl(previousUrl);
       setUrlInput(previousUrl ?? '');
@@ -383,12 +725,66 @@ export function BrowserPanel({
     } finally {
       setIsBusy(false);
     }
-  }, [applyBrowserInfo, currentUrl, refreshInfo, sessionId, showBrowserError, syncBounds]);
+  }, [
+    applyBrowserInfo,
+    backend,
+    currentUrl,
+    loginSurfaceOrdering,
+    refreshInfo,
+    sessionId,
+    showBrowserError,
+    syncBounds,
+    t,
+    popupActive,
+  ]);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     void navigate(urlInput);
   }, [navigate, urlInput]);
+
+  const handleClose = useCallback(async () => {
+    if (backend === 'preview') {
+      onClose();
+      return;
+    }
+    if (surfaceClosingRef.current) return;
+
+    const lease = surfaceLeaseRef.current;
+    if (!lease) {
+      if (lifecycle === 'failed' || lifecycle === 'closed') {
+        onClose();
+      } else {
+        showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      }
+      return;
+    }
+
+    surfaceClosingRef.current = true;
+    if (syncFrameRef.current !== null) {
+      cancelAnimationFrame(syncFrameRef.current);
+      syncFrameRef.current = null;
+    }
+    setIsClosingSurface(true);
+    setError(null);
+    try {
+      await loginSurfaceOrdering.enqueue((clientRevision) => (
+        browserSurfaceClient.release({
+          leaseId: lease.leaseId,
+          generation: lease.generation,
+          clientRevision,
+          disposition: 'close',
+        })
+      ));
+      surfaceCloseSucceededRef.current = true;
+      surfaceLeaseRef.current = null;
+      onClose();
+    } catch (closeError) {
+      surfaceClosingRef.current = false;
+      showBrowserError(String(closeError));
+      setIsClosingSurface(false);
+    }
+  }, [backend, lifecycle, loginSurfaceOrdering, onClose, showBrowserError, t]);
 
   const cancelUrlEditing = useCallback(() => {
     setUrlInput(currentUrl ?? '');
@@ -396,20 +792,23 @@ export function BrowserPanel({
   }, [currentUrl]);
 
   const handleStartUrlEditing = useCallback(() => {
+    if (backend === 'login' && popupActive) return;
     setUrlInput(currentUrl ?? '');
     setIsUrlEditing(true);
-  }, [currentUrl]);
+  }, [backend, currentUrl, popupActive]);
 
   const handleOpenExternal = useCallback(() => {
-    if (!currentUrl) {
+    const targetUrl = popupActive ? popupUrl : currentUrl;
+    if (!targetUrl) {
       return;
     }
-    void openExternalUrl(currentUrl).catch((openError) => {
+    void openExternalUrl(targetUrl).catch((openError) => {
       showBrowserError(String(openError));
     });
-  }, [currentUrl, showBrowserError]);
+  }, [currentUrl, popupActive, popupUrl, showBrowserError]);
 
   const handleToggleAgentControl = useCallback(async () => {
+    if (backend !== 'preview') return;
     setIsPauseBusy(true);
     try {
       const info = await invoke<BrowserInfo>('browser_set_paused', {
@@ -422,9 +821,80 @@ export function BrowserPanel({
     } finally {
       setIsPauseBusy(false);
     }
-  }, [applyBrowserInfo, paused, sessionId, showBrowserError]);
+  }, [applyBrowserInfo, backend, paused, sessionId, showBrowserError]);
 
-  const displayUrl = currentUrl || title || t('workspace.browserTitle');
+  const handleLoginControl = useCallback(async (
+    action: 'handoff' | 'pause' | 'takeover',
+  ) => {
+    if (backend !== 'login' || isLoginControlBusy) return;
+    const lease = surfaceLeaseRef.current;
+    if (!lease) {
+      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      return;
+    }
+    setIsLoginControlBusy(true);
+    setError(null);
+    try {
+      const response = await loginSurfaceOrdering.enqueue((clientRevision) => (
+        browserSurfaceClient.control({
+          leaseId: lease.leaseId,
+          generation: lease.generation,
+          clientRevision,
+          action,
+        })
+      ));
+      applyBrowserSurfaceMutationResponseForLease(loginSurfaceOrdering, surfaceLeaseRef.current, lease, response, applySurfaceSnapshot);
+    } catch (controlError) {
+      showBrowserError(String(controlError));
+    } finally {
+      setIsLoginControlBusy(false);
+    }
+  }, [
+    applySurfaceSnapshot,
+    backend,
+    isLoginControlBusy,
+    loginSurfaceOrdering,
+    showBrowserError,
+    t,
+  ]);
+
+  const handleClosePopup = useCallback(async () => {
+    if (backend !== 'login' || isPopupCloseBusy) return;
+    const lease = surfaceLeaseRef.current;
+    if (!lease) {
+      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      return;
+    }
+    setIsPopupCloseBusy(true);
+    setPopupError(null);
+    try {
+      const response = await loginSurfaceOrdering.enqueue((clientRevision) => (
+        browserSurfaceClient.closePopup({
+          leaseId: lease.leaseId,
+          generation: lease.generation,
+          clientRevision,
+        })
+      ));
+      applyBrowserSurfaceMutationResponseForLease(loginSurfaceOrdering, surfaceLeaseRef.current, lease, response, applySurfaceSnapshot);
+    } catch (popupCloseError) {
+      showBrowserError(String(popupCloseError));
+    } finally {
+      setIsPopupCloseBusy(false);
+    }
+  }, [
+    applySurfaceSnapshot,
+    backend,
+    isPopupCloseBusy,
+    loginSurfaceOrdering,
+    showBrowserError,
+    t,
+  ]);
+
+  const panelTitle = backend === 'login'
+    ? t('workspace.loginBrowser')
+    : t('workspace.previewBrowser');
+  const effectiveUrl = popupActive ? popupUrl : currentUrl;
+  const displayUrl = effectiveUrl || (popupActive ? popupTitle : title) || panelTitle;
   const recentActivityCount = recentActivity.artifacts.length
     + (recentActivity.console_log_path ? 1 : 0)
     + (recentActivity.audit_log_path ? 1 : 0);
@@ -432,9 +902,13 @@ export function BrowserPanel({
   return (
     <aside
       data-ccem-browser-panel="true"
+      data-ccem-browser-backend={backend}
       data-ccem-browser-lifecycle={lifecycle}
       data-ccem-browser-control={control}
       data-ccem-browser-paused={paused ? 'true' : 'false'}
+      data-ccem-browser-session-status={sessionStatus}
+      data-ccem-browser-popup={popupActive ? 'active' : 'none'}
+      data-ccem-browser-occluded={surfaceOccluded ? 'true' : 'false'}
       style={style}
       className={cn(
         'workspace-browser-panel relative flex h-full min-w-0 flex-col overflow-hidden',
@@ -448,189 +922,57 @@ export function BrowserPanel({
       />
 
       <div data-ccem-browser-tab-strip="true" className="flex h-10 shrink-0 items-center gap-2 border-b border-border/45 pl-3 pr-2">
-        <div className="flex h-7 min-w-0 max-w-[220px] items-center gap-2 rounded-md bg-muted/45 px-2.5 text-xs font-medium text-foreground">
-          <Globe className="h-4 w-4" />
-          <span className="truncate">{t('workspace.browserTitle')}</span>
-        </div>
-        <div className="min-w-0 flex-1" />
-        {lifecycle === 'crashed' ? (
-          <span className="text-[11px] font-medium text-destructive">
-            {t('workspace.browserCrashed')}
-          </span>
-        ) : control === 'agent' ? (
-          <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-            {t('workspace.browserAgentControlling')}
-          </span>
-        ) : paused ? (
-          <span className="text-[11px] font-medium text-muted-foreground">
-            {t('workspace.browserAgentPaused')}
-          </span>
-        ) : null}
-        <Popover onOpenChange={(open) => {
-          if (open) void refreshRecentActivity().catch(() => {});
-        }}>
-          <PopoverTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="relative h-7 w-7 shrink-0"
-              aria-label={t('workspace.browserRecentArtifacts')}
-              title={t('workspace.browserRecentArtifacts')}
-            >
-              <Files className="h-4 w-4" />
-              {recentActivityCount > 0 ? (
-                <span className="absolute -right-1 -top-1 min-w-3.5 rounded-full bg-primary px-1 text-[9px] font-semibold leading-3.5 text-primary-foreground">
-                  {Math.min(recentActivityCount, 9)}
-                </span>
-              ) : null}
-            </Button>
-          </PopoverTrigger>
-          <PopoverContent align="end" side="bottom" className="w-80 p-2">
-            <div className="px-2 py-1.5 text-xs font-semibold text-foreground">
-              {t('workspace.browserRecentArtifacts')}
-            </div>
-            {recentActivityCount === 0 ? (
-              <div className="px-2 py-6 text-center text-xs text-muted-foreground">
-                {t('workspace.browserNoArtifacts')}
-              </div>
-            ) : (
-              <div className="max-h-72 space-y-1 overflow-y-auto">
-                {recentActivity.artifacts.map((artifact) => {
-                  const ArtifactIcon = artifact.kind === 'screenshot' ? FileImage : FileJson;
-                  return (
-                    <button
-                      key={artifact.path}
-                      type="button"
-                      className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-muted/60"
-                      title={artifact.path}
-                      onClick={() => void copyActivityPath(artifact.path)}
-                    >
-                      <ArtifactIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-xs font-medium text-foreground">
-                          {artifact.file_name}
-                        </span>
-                        <span className="block text-[10px] text-muted-foreground">
-                          {formatArtifactBytes(artifact.byte_size)}
-                        </span>
-                      </span>
-                      <Copy className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                    </button>
-                  );
-                })}
-                {recentActivity.console_log_path ? (
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-muted/60"
-                    title={recentActivity.console_log_path}
-                    onClick={() => void copyActivityPath(recentActivity.console_log_path!)}
-                  >
-                    <ScrollText className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                      {t('workspace.browserConsoleLog')}
-                    </span>
-                    <Copy className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                  </button>
-                ) : null}
-                {recentActivity.audit_log_path ? (
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-muted/60"
-                    title={recentActivity.audit_log_path}
-                    onClick={() => void copyActivityPath(recentActivity.audit_log_path!)}
-                  >
-                    <ShieldCheck className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                      {t('workspace.browserAuditLog')}
-                    </span>
-                    <Copy className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                  </button>
-                ) : null}
-              </div>
-            )}
-          </PopoverContent>
-        </Popover>
-        {isBusy || isLoading ? <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" /> : null}
-        <BrowserToolButton
-          label={paused ? t('workspace.browserResumeAgent') : t('workspace.browserPauseAgent')}
-          onClick={() => void handleToggleAgentControl()}
-          disabled={isPauseBusy || lifecycle === 'crashed'}
-        >
-          {paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
-        </BrowserToolButton>
-        <BrowserToolButton
-          label={t('workspace.browserClose')}
-          onClick={onClose}
-        >
-          <X className="h-4 w-4" />
-        </BrowserToolButton>
+        <BrowserPanelTabStrip
+          backend={backend}
+          panelTitle={panelTitle}
+          sessionStatus={sessionStatus}
+          popupActive={popupActive}
+          lifecycle={lifecycle}
+          control={control}
+          paused={paused}
+          recentActivity={recentActivity}
+          recentActivityCount={recentActivityCount}
+          browserAgentControllingLabel={t('workspace.browserAgentControlling')}
+          browserRecentArtifactsLabel={t('workspace.browserRecentArtifacts')}
+          spinnerActive={isBusy || isLoading || popupLoading || isClosingSurface
+            || isLoginControlBusy || isPopupCloseBusy}
+          isPauseBusy={isPauseBusy}
+          isLoginControlBusy={isLoginControlBusy}
+          isPopupCloseBusy={isPopupCloseBusy}
+          isClosingSurface={isClosingSurface}
+          t={t}
+          onRefreshRecentActivity={() => void refreshRecentActivity().catch(() => {})}
+          onCopyActivityPath={(path) => void copyActivityPath(path)}
+          onToggleAgentControl={() => void handleToggleAgentControl()}
+          onClosePopup={() => void handleClosePopup()}
+          onLoginControl={(action) => void handleLoginControl(action)}
+          onClose={() => void handleClose()}
+        />
       </div>
 
-      <div data-ccem-browser-navigation="true" className="flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
-        <BrowserToolButton
-          label={t('workspace.browserBack')}
-          onClick={() => void runBrowserCommand('browser_back')}
-          disabled={isBusy || !canGoBack}
-        >
-          <ArrowLeft className="h-4 w-4" />
-        </BrowserToolButton>
-        <BrowserToolButton
-          label={t('workspace.browserForward')}
-          onClick={() => void runBrowserCommand('browser_forward')}
-          disabled={isBusy || !canGoForward}
-        >
-          <ArrowRight className="h-4 w-4" />
-        </BrowserToolButton>
-        <BrowserToolButton
-          label={t('workspace.browserReload')}
-          onClick={() => void runBrowserCommand('browser_reload')}
-          disabled={isBusy}
-        >
-          <RefreshCw className={cn('h-4 w-4', isBusy && 'animate-spin')} />
-        </BrowserToolButton>
-        <BrowserToolButton
-          label={t('workspace.browserOpenExternal')}
-          onClick={handleOpenExternal}
-          disabled={!currentUrl}
-        >
-          <ExternalLink className="h-4 w-4" />
-        </BrowserToolButton>
-        <form className="ml-2 min-w-0 flex-1" onSubmit={handleSubmit}>
-          {isUrlEditing ? (
-            <Input
-              ref={urlInputRef}
-              data-ccem-browser-url-input="true"
-              aria-label={t('workspace.browserUrl')}
-              value={urlInput}
-              onChange={(event) => setUrlInput(event.target.value)}
-              onBlur={cancelUrlEditing}
-              onKeyDown={(event) => {
-                if (event.key === 'Escape') {
-                  event.preventDefault();
-                  cancelUrlEditing();
-                }
-              }}
-              className="h-8 min-w-0 rounded-md border-border/60 bg-muted/20 px-2 text-xs shadow-none focus-visible:ring-1 focus-visible:ring-ring"
-            />
-          ) : (
-            <button
-              type="button"
-              data-ccem-browser-url-display="true"
-              aria-label={t('workspace.browserUrl')}
-              title={displayUrl}
-              className="flex h-8 w-full min-w-0 items-center rounded-md px-2 text-left text-xs text-muted-foreground transition hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              onClick={handleStartUrlEditing}
-            >
-              <span className="truncate">{displayUrl}</span>
-            </button>
-          )}
-        </form>
-      </div>
+      <BrowserPanelNavigation
+        backend={backend}
+        isBusy={isBusy}
+        canGoBack={canGoBack}
+        canGoForward={canGoForward}
+        effectiveUrl={effectiveUrl}
+        popupActive={popupActive}
+        isUrlEditing={isUrlEditing}
+        urlInputRef={urlInputRef}
+        urlInput={urlInput}
+        displayUrl={displayUrl}
+        t={t}
+        onBrowserCommand={(command) => void runBrowserCommand(command)}
+        onOpenExternal={handleOpenExternal}
+        onSubmit={handleSubmit}
+        onUrlInputChange={setUrlInput}
+        onCancelUrlEditing={cancelUrlEditing}
+        onStartUrlEditing={handleStartUrlEditing}
+      />
 
-      {error ? (
+      {error || popupError ? (
         <div className="border-b border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          {error}
+          {popupError || error}
         </div>
       ) : null}
 

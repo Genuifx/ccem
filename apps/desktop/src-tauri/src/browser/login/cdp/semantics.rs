@@ -17,10 +17,10 @@ use super::protocol::{CdpEvent, CdpEventKind, CdpMethod};
 use super::transport::{CdpClient, NeverCancelled, ProtocolEventHandler, OWNER_POLL_INTERVAL};
 use helpers::{
     bounded, bounded_content_field, bounded_string_field, box_center, classify_document_surface,
-    ensure_not_cancelled, invalid_reference, navigation_failure, protocol_failure, runtime_failure,
-    string_from_map, target_setup_failure,
+    ensure_not_cancelled, invalid_reference, managed_auto_attach_filter, navigation_failure,
+    protocol_failure, runtime_failure, string_from_map, target_setup_failure, ElementRegistry,
+    PrimaryTargetBootstrap,
 };
-use rand::{rngs::OsRng, RngCore};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -43,77 +43,6 @@ const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const SECONDARY_TARGET_CLOSE_TIMEOUT: Duration = Duration::from_millis(300);
 const FETCH_DISPOSITION_TIMEOUT: Duration = Duration::from_millis(300);
 
-fn managed_auto_attach_filter() -> Value {
-    // Chrome exposes internal targets such as `browser_ui` alongside page and worker targets.
-    // Auto-attaching every target would pause an unsupported internal surface and then force a
-    // terminal protocol failure. Keep the supported set closed and exclude everything else; an
-    // unexpected attached type still remains terminal in the event handler.
-    serde_json::json!([
-        {"type": "page", "exclude": false},
-        {"type": "iframe", "exclude": false},
-        {"type": "worker", "exclude": false},
-        {"type": "service_worker", "exclude": false},
-        {"type": "shared_worker", "exclude": false},
-        {"type": "worklet", "exclude": false},
-        {"exclude": true}
-    ])
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NodeBinding {
-    backend_node_id: u64,
-    generation: u64,
-}
-
-#[derive(Debug)]
-struct ElementRegistry {
-    generation: u64,
-    nodes: BTreeMap<String, NodeBinding>,
-}
-
-impl ElementRegistry {
-    fn new() -> Self {
-        Self {
-            generation: 1,
-            nodes: BTreeMap::new(),
-        }
-    }
-
-    fn invalidate(&mut self) {
-        self.generation = self.generation.saturating_add(1);
-        self.nodes.clear();
-    }
-
-    fn rebuild(&mut self) {
-        self.invalidate();
-    }
-
-    fn insert(&mut self, backend_node_id: u64) -> Result<String, BackendFailure> {
-        if self.nodes.len() == MAX_AX_NODES {
-            return Err(protocol_failure());
-        }
-        let mut random = [0_u8; 12];
-        OsRng.fill_bytes(&mut random);
-        let element_ref = format!("el-{:x}-{}", self.generation, hex::encode(random));
-        self.nodes.insert(
-            element_ref.clone(),
-            NodeBinding {
-                backend_node_id,
-                generation: self.generation,
-            },
-        );
-        Ok(element_ref)
-    }
-
-    fn resolve(&self, element_ref: &str) -> Result<u64, BackendFailure> {
-        let binding = self.nodes.get(element_ref).ok_or_else(invalid_reference)?;
-        if binding.generation != self.generation {
-            return Err(invalid_reference());
-        }
-        Ok(binding.backend_node_id)
-    }
-}
-
 pub(super) struct SemanticEngine {
     pub(super) guard: Arc<dyn TrustedNavigationGuard>,
     artifacts: CdpArtifactStore,
@@ -135,6 +64,7 @@ pub(super) struct SemanticEngine {
     blocked_file_chooser_count: u64,
     blocked_download_count: u64,
     canceled_download_count: u64,
+    primary_target_bootstrap: PrimaryTargetBootstrap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +83,37 @@ impl SemanticEngine {
         artifacts: CdpArtifactStore,
         network: NetworkEventRecorder,
         console: ConsoleEventRecorder,
+    ) -> Self {
+        Self::with_primary_target_bootstrap(
+            guard,
+            artifacts,
+            network,
+            console,
+            PrimaryTargetBootstrap::CreateOwnedPage,
+        )
+    }
+
+    pub(super) fn new_for_existing_target(
+        guard: Arc<dyn TrustedNavigationGuard>,
+        artifacts: CdpArtifactStore,
+        network: NetworkEventRecorder,
+        console: ConsoleEventRecorder,
+    ) -> Self {
+        Self::with_primary_target_bootstrap(
+            guard,
+            artifacts,
+            network,
+            console,
+            PrimaryTargetBootstrap::AttachCurrentPage,
+        )
+    }
+
+    fn with_primary_target_bootstrap(
+        guard: Arc<dyn TrustedNavigationGuard>,
+        artifacts: CdpArtifactStore,
+        network: NetworkEventRecorder,
+        console: ConsoleEventRecorder,
+        primary_target_bootstrap: PrimaryTargetBootstrap,
     ) -> Self {
         Self {
             guard,
@@ -175,6 +136,7 @@ impl SemanticEngine {
             blocked_file_chooser_count: 0,
             blocked_download_count: 0,
             canceled_download_count: 0,
+            primary_target_bootstrap,
         }
     }
 
@@ -228,15 +190,36 @@ impl SemanticEngine {
             &token,
             self,
         )?;
-        let created = client.call(
-            CdpMethod::TargetCreateTarget,
-            serde_json::json!({"url": "about:blank"}),
-            None,
-            deadline,
-            &token,
-            self,
-        )?;
-        let target_id = bounded_string_field(&created, "targetId").ok_or_else(protocol_failure)?;
+        let target_id = match self.primary_target_bootstrap {
+            PrimaryTargetBootstrap::CreateOwnedPage => {
+                let created = client.call(
+                    CdpMethod::TargetCreateTarget,
+                    serde_json::json!({"url": "about:blank"}),
+                    None,
+                    deadline,
+                    &token,
+                    self,
+                )?;
+                bounded_string_field(&created, "targetId").ok_or_else(protocol_failure)?
+            }
+            PrimaryTargetBootstrap::AttachCurrentPage => {
+                let current = client.call(
+                    CdpMethod::TargetGetTargetInfo,
+                    serde_json::json!({}),
+                    None,
+                    deadline,
+                    &token,
+                    self,
+                )?;
+                let target_info = current.get("targetInfo").ok_or_else(protocol_failure)?;
+                let target_type =
+                    bounded_string_field(target_info, "type").ok_or_else(protocol_failure)?;
+                if target_type != "page" {
+                    return Err(protocol_failure());
+                }
+                bounded_string_field(target_info, "targetId").ok_or_else(protocol_failure)?
+            }
+        };
         // Claim the launch-owned target before waiting for the attach response. Target and
         // Inspector crash events can race that response and must already resolve as primary.
         self.primary_target = Some(target_id.clone());
@@ -266,7 +249,9 @@ impl SemanticEngine {
             self,
         )?;
         self.flush_pending_sessions(client, deadline, &token)?;
-        self.close_non_primary_pages(client, deadline, &token)?;
+        if self.primary_target_bootstrap == PrimaryTargetBootstrap::CreateOwnedPage {
+            self.close_non_primary_pages(client, deadline, &token)?;
+        }
         self.refresh_navigation_info(client, deadline, &token)?;
         Ok(())
     }
@@ -962,3 +947,7 @@ mod security_audit_tests;
 #[cfg(test)]
 #[path = "semantics_secondary_target_tests.rs"]
 mod secondary_target_tests;
+
+#[cfg(test)]
+#[path = "semantics_state_tests.rs"]
+mod state_tests;

@@ -57,7 +57,8 @@ impl InstallationSmokeRunner for UnavailableInstallationSmokeRunner {
 impl ManagedInstallationSmokeRunner {
     pub(crate) fn production(root: PathBuf) -> Result<Arc<Self>, RuntimePreparationFailure> {
         let profiles = Arc::new(
-            BrowserProfileManager::new(root.join("profiles")).map_err(|_| smoke_failure(true))?,
+            BrowserProfileManager::new(root.join("profiles"), root.join("cef"))
+                .map_err(|_| smoke_failure(true))?,
         );
         let supervisor = Arc::new(
             LoginSupervisor::production(root.join("supervisor"))
@@ -203,15 +204,6 @@ fn smoke_failure(retryable: bool) -> RuntimePreparationFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::runtime::download::DownloadControl;
-    use crate::browser::runtime::manifest::RuntimeManifest;
-    use crate::browser::runtime::paths::RuntimePaths;
-    use crate::browser::runtime::preparation::{
-        current_embedded_manifest, ProductionRuntimeInstaller, RuntimePreparationObserver,
-    };
-    use crate::browser::runtime::state::{RuntimeCandidateSummary, RuntimePhase};
-    use std::fs;
-    use std::sync::Mutex;
 
     #[test]
     fn smoke_workspace_and_protocol_are_bounded_internal_identifiers() {
@@ -230,80 +222,5 @@ mod tests {
             map_supervisor_error(SupervisorError::TransportFailed).code,
             RuntimeErrorCode::SmokeFailed
         );
-    }
-
-    #[derive(Default)]
-    struct RecordingObserver {
-        phases: Mutex<Vec<RuntimePhase>>,
-    }
-
-    impl RuntimePreparationObserver for RecordingObserver {
-        fn candidate_verified(&self, _candidate: RuntimeCandidateSummary) {
-            self.phases
-                .lock()
-                .expect("phase lock")
-                .push(RuntimePhase::ManifestVerifying);
-        }
-
-        fn phase_changed(&self, phase: RuntimePhase) {
-            self.phases.lock().expect("phase lock").push(phase);
-        }
-
-        fn download_progress(&self, _completed_bytes: u64, _total_bytes: u64) {}
-    }
-
-    /// Full production-path proof. The archive may be pre-seeded through
-    /// `CCEM_MODE2_RUNTIME_ARCHIVE`; the production downloader still rehashes and size-checks it.
-    #[test]
-    #[ignore = "downloads/extracts and visibly launches the exact pinned Chromium runtime"]
-    fn exact_pinned_runtime_runs_headed_smoke_before_atomic_activation() {
-        let root = std::env::var_os("CCEM_MODE2_RUNTIME_TEST_ROOT")
-            .map(PathBuf::from)
-            .expect("set CCEM_MODE2_RUNTIME_TEST_ROOT to an owned evidence directory");
-        let paths = RuntimePaths::under(root.join("runtime")).expect("runtime paths");
-        paths.prepare_private().expect("private runtime root");
-        let embedded = current_embedded_manifest().expect("supported exact manifest");
-        let manifest: RuntimeManifest =
-            serde_json::from_slice(embedded.manifest_bytes).expect("embedded manifest schema");
-        if let Some(source) = std::env::var_os("CCEM_MODE2_RUNTIME_ARCHIVE").map(PathBuf::from) {
-            let destination = paths.downloads.join(format!(
-                "runtime-{}-{}.zip",
-                manifest.artifact.version,
-                &manifest.artifact.archive.sha256[..16]
-            ));
-            if !destination.exists() {
-                fs::copy(&source, &destination).expect("seed exact archive");
-            }
-        }
-        let smoke = production_installation_smoke_runner(root.join("smoke"));
-        let installer = ProductionRuntimeInstaller::new(paths.clone(), smoke);
-        let observer = RecordingObserver::default();
-        let outcome = installer
-            .prepare(&DownloadControl::default(), &observer, true)
-            .expect("production preparation succeeds");
-        assert!(outcome.activated);
-        assert_eq!(outcome.active.version, manifest.artifact.version);
-        let smoke = outcome.smoke.expect("headed smoke evidence");
-        assert_eq!(smoke.browser_version, manifest.artifact.version);
-        assert!(smoke.target_closed);
-        assert_eq!(smoke.transport, "remote_debugging_pipe_nul_json");
-        let phases = observer.phases.lock().unwrap().clone();
-        assert_eq!(
-            phases,
-            vec![
-                RuntimePhase::ManifestVerifying,
-                RuntimePhase::Downloading,
-                RuntimePhase::ArchiveVerifying,
-                RuntimePhase::Extracting,
-                RuntimePhase::IdentityVerifying,
-                RuntimePhase::SmokeTesting,
-                RuntimePhase::Activating,
-            ]
-        );
-        let pointer = crate::browser::runtime::activation::ActivationStore::new(paths)
-            .load_pointer()
-            .expect("load active pointer")
-            .expect("active pointer exists");
-        assert_eq!(pointer.active.version, manifest.artifact.version);
     }
 }

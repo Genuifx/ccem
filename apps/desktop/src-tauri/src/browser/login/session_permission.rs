@@ -15,7 +15,13 @@ impl LoginBrowserSessionManager {
         workspace: TrustedWorkspacePath,
         authority: BrowserPermissionAuthorityTicket,
     ) -> Result<(), SessionManagerError> {
+        if !self.is_available() {
+            // Permission synchronization discovers optional Mode 2 sessions. There cannot be an
+            // active handoff in a placeholder manager, so preserve the caller's Mode 1 path.
+            return Ok(());
+        }
         let workspace_identity = self
+            .available()?
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(map_workspace_error)?;

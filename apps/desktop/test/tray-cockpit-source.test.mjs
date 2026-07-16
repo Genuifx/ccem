@@ -13,7 +13,7 @@ test('tray cockpit owns left-click while preserving the native context menu', as
   const [traySource, mainSource, entrySource, appSource, capabilitySource, cssSource, cockpitSource, packageSource] =
     await Promise.all([
       fs.readFile(path.join(tauriSrcDir, 'tray.rs'), 'utf8'),
-      fs.readFile(path.join(tauriSrcDir, 'main.rs'), 'utf8'),
+      fs.readFile(path.join(tauriSrcDir, 'lib.rs'), 'utf8'),
       fs.readFile(path.join(sourceDir, 'main.tsx'), 'utf8'),
       fs.readFile(path.join(sourceDir, 'App.tsx'), 'utf8'),
       fs.readFile(path.join(desktopDir, 'src-tauri', 'capabilities', 'default.json'), 'utf8'),

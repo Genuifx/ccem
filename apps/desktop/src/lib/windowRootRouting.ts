@@ -1,13 +1,11 @@
 export type DesktopWindowRoot =
   | 'main'
   | 'desktop-pet'
-  | 'tray-cockpit'
-  | 'login-browser-control';
+  | 'tray-cockpit';
 
 const DEDICATED_WINDOW_ROOTS: ReadonlySet<string> = new Set([
   'desktop-pet',
   'tray-cockpit',
-  'login-browser-control',
 ]);
 
 function dedicatedWindowRoot(value: string | null | undefined): DesktopWindowRoot | null {

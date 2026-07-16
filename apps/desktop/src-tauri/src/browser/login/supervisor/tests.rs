@@ -139,7 +139,8 @@ impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().expect("temporary supervisor fixture");
         let profiles =
-            BrowserProfileManager::new(temp.path().join("profiles-root")).expect("profile manager");
+            BrowserProfileManager::new(temp.path().join("profiles-root"), temp.path().join("cef"))
+                .expect("profile manager");
         let workspace = TrustedWorkspaceIdentity::from_trusted_store("workspace-supervisor-001")
             .expect("workspace identity");
         let profile = profiles.create_profile(&workspace).expect("profile");

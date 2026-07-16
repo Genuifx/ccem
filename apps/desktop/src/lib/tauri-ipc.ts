@@ -8,6 +8,16 @@
  */
 
 import type { Environment, Session } from '@/store';
+import type {
+  BrowserSurfaceAcquireRequest,
+  BrowserSurfaceClosePopupRequest,
+  BrowserSurfaceControlRequest,
+  BrowserSurfaceLease,
+  BrowserSurfaceNavigateRequest,
+  BrowserSurfaceReleaseRequest,
+  BrowserSurfaceSyncRequest,
+  BrowserSurfaceSnapshotMutationResponse,
+} from '@/lib/browserSurfaceIpc';
 
 // ============================================
 // Environment Commands
@@ -103,7 +113,10 @@ export interface TauriCommands {
   generate_workspace_session_title: [{ titleInput: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
   browser_set_active_session: [{ sessionId?: string | null; visible?: boolean | null }, void];
-  browser_open: [{ sessionId?: string | null; url?: string | null }, BrowserInfo];
+  browser_open: [
+    { sessionId?: string | null; url?: string | null; visible?: boolean | null },
+    BrowserInfo
+  ];
   browser_set_bounds: [
     { sessionId?: string | null; x: number; y: number; width: number; height: number },
     void
@@ -118,26 +131,18 @@ export interface TauriCommands {
   browser_health_check: [{ sessionId?: string | null } | void, BrowserInfo];
   browser_set_paused: [{ sessionId?: string | null; paused: boolean }, BrowserInfo];
   browser_recent_activity: [{ sessionId?: string | null } | void, BrowserRecentActivity];
-  browser_runtime_readiness: [void, BrowserRuntimeReadiness];
-  browser_runtime_prepare: [void, BrowserRuntimeReadiness];
-  browser_runtime_pause_download: [void, BrowserRuntimeReadiness];
-  browser_runtime_resume_download: [void, BrowserRuntimeReadiness];
-  browser_runtime_retry: [void, BrowserRuntimeReadiness];
-  browser_runtime_reinstall: [void, BrowserRuntimeReadiness];
-  browser_runtime_cancel: [void, BrowserRuntimeReadiness];
-  browser_runtime_disk_usage: [void, BrowserRuntimeDiskUsage];
-  browser_runtime_delete: [{ confirmed: boolean }, BrowserRuntimeDeleteOutcome];
-  browser_login_open: [
-    { workingDir: string; profileMode?: 'default' | 'new' | null },
-    LoginBrowserSessionSnapshot
+  browser_surface_acquire: [BrowserSurfaceAcquireRequest, BrowserSurfaceLease];
+  browser_surface_sync: [BrowserSurfaceSyncRequest, void];
+  browser_surface_release: [BrowserSurfaceReleaseRequest, void];
+  browser_surface_navigate: [BrowserSurfaceNavigateRequest, void];
+  browser_surface_control: [BrowserSurfaceControlRequest, BrowserSurfaceSnapshotMutationResponse];
+  browser_surface_close_popup: [
+    BrowserSurfaceClosePopupRequest,
+    BrowserSurfaceSnapshotMutationResponse
   ];
   browser_login_profiles: [
     { workingDir: string },
     LoginBrowserProfileSummary[]
-  ];
-  browser_login_open_profile: [
-    { workingDir: string; profileId: string },
-    LoginBrowserSessionSnapshot
   ];
   browser_login_profile_recent_activity: [
     { workingDir: string; profileId: string },
@@ -151,13 +156,6 @@ export interface TauriCommands {
     { workingDir: string; profileId: string; confirmed: boolean },
     void
   ];
-  browser_login_control_snapshot: [void, LoginBrowserSessionSnapshot | null];
-  browser_login_recent_activity: [void, LoginBrowserRecentActivity];
-  browser_login_handoff: [void, LoginBrowserSessionSnapshot];
-  browser_login_pause: [void, LoginBrowserSessionSnapshot];
-  browser_login_takeover: [void, LoginBrowserSessionSnapshot];
-  browser_login_close: [void, void];
-  browser_login_force_stop: [void, void];
   browser_snapshot: [{ sessionId?: string | null } | void, BrowserSnapshot];
   browser_screenshot: [{ sessionId?: string | null } | void, string];
   search_workspace_files: [
@@ -646,67 +644,6 @@ export interface BrowserRecentActivity {
   audit_log_path?: string | null;
 }
 
-export type BrowserRuntimeReadinessStatus = 'unavailable' | 'preparing' | 'ready' | 'failed';
-
-export type BrowserRuntimePhase =
-  | 'idle'
-  | 'manifest_verifying'
-  | 'downloading'
-  | 'paused'
-  | 'archive_verifying'
-  | 'extracting'
-  | 'identity_verifying'
-  | 'smoke_testing'
-  | 'activating'
-  | 'cleanup';
-
-export interface BrowserRuntimeProgress {
-  completed_bytes: number;
-  total_bytes: number;
-}
-
-export interface BrowserRuntimeVersionSummary {
-  version: string;
-  sequence: number;
-  manifest_sha256: string;
-}
-
-export interface BrowserRuntimeFailure {
-  code: string;
-  retryable: boolean;
-}
-
-export interface BrowserRuntimeReadiness {
-  status: BrowserRuntimeReadinessStatus;
-  phase: BrowserRuntimePhase;
-  progress?: BrowserRuntimeProgress | null;
-  active?: BrowserRuntimeVersionSummary | null;
-  candidate?: BrowserRuntimeVersionSummary | null;
-  error?: BrowserRuntimeFailure | null;
-  checked_at: string;
-}
-
-export interface BrowserRuntimeDiskUsage {
-  downloads_bytes: number;
-  candidates_bytes: number;
-  versions_bytes: number;
-  state_bytes: number;
-  other_bytes: number;
-  total_bytes: number;
-  retained_versions: number;
-  calculated_at: string;
-}
-
-export interface BrowserRuntimeDeleteOutcome {
-  reclaimed_bytes: number;
-  remaining_bytes: number;
-  deleted_versions: number;
-}
-
-export type LoginBrowserControlOwner = 'user' | 'agent' | 'paused';
-
-export type LoginBrowserSessionStatus = 'running' | 'closing' | 'cleanup_required';
-
 export type LoginBrowserRecentArtifactKind =
   | 'screenshot'
   | 'interaction_snapshot'
@@ -726,21 +663,6 @@ export interface LoginBrowserRecentArtifact {
 
 export interface LoginBrowserRecentActivity {
   artifacts: LoginBrowserRecentArtifact[];
-}
-
-/**
- * Read-only Login Browser projection exposed to the trusted CCEM control window.
- * Process ids, profile paths, CDP handles, and other ownership capabilities stay in Rust.
- */
-export interface LoginBrowserSessionSnapshot {
-  session_id: string;
-  profile_id: string;
-  workspace_id: string;
-  runtime_version: string;
-  control: LoginBrowserControlOwner;
-  handoff_epoch: number;
-  current_origin?: string | null;
-  status: LoginBrowserSessionStatus;
 }
 
 /** Trusted-main-window projection; profile paths and runtime ownership stay in Rust. */

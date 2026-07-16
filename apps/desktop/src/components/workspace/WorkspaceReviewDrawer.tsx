@@ -22,6 +22,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
+import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
 import type {
   NativeSessionSummary,
   WorkspaceFileDiff,
@@ -804,6 +805,7 @@ export function WorkspaceReviewDrawer({
   onLoadSubagents,
   isLive = false,
 }: WorkspaceReviewDrawerProps) {
+  const gatedOpen = useNativeSurfaceOcclusion(isOpen);
   const [page, setPage] = useState<'main' | 'files' | 'agents'>('main');
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [diff, setDiff] = useState<WorkspaceFileDiff | null>(null);
@@ -896,7 +898,7 @@ export function WorkspaceReviewDrawer({
 
   // Closing the drawer resets navigation back to the main page.
   useEffect(() => {
-    if (!isOpen) {
+    if (!gatedOpen) {
       setPage('main');
       setSelectedPath(null);
       setMediaPreview(null);
@@ -906,7 +908,7 @@ export function WorkspaceReviewDrawer({
       setAgentDetail(null);
       setAgentsError(null);
     }
-  }, [isOpen]);
+  }, [gatedOpen]);
 
   // Hold the latest onLoadSubagents in a ref so the parent's inline callback
   // (new identity each render) doesn't recreate loadSubagents and retrigger effects.
@@ -947,10 +949,10 @@ export function WorkspaceReviewDrawer({
 
   // Initial list load when the drawer opens (drives the entry-button count).
   useEffect(() => {
-    if (isOpen && onLoadSubagentsRef.current) {
+    if (gatedOpen && onLoadSubagentsRef.current) {
       void loadSubagents(null);
     }
-  }, [isOpen, loadSubagents]);
+  }, [gatedOpen, loadSubagents]);
 
   // Auto-poll while on the agents page in a live session with a running agent.
   const hasRunningAgent = subagents.some((s) => s.status === 'running');
@@ -959,7 +961,7 @@ export function WorkspaceReviewDrawer({
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
-    if (!isLive || !isOpen || page !== 'agents' || !hasRunningAgent) {
+    if (!isLive || !gatedOpen || page !== 'agents' || !hasRunningAgent) {
       return;
     }
     pollRef.current = setInterval(() => {
@@ -971,7 +973,7 @@ export function WorkspaceReviewDrawer({
         pollRef.current = null;
       }
     };
-  }, [isLive, isOpen, page, hasRunningAgent, selectedAgentId, loadSubagents]);
+  }, [isLive, gatedOpen, page, hasRunningAgent, selectedAgentId, loadSubagents]);
 
   const selectAgent = useCallback(
     (agentId: string) => {
@@ -994,7 +996,7 @@ export function WorkspaceReviewDrawer({
 
   useGSAP(() => {
     const root = drawerMotionRef.current;
-    if (!isOpen || !root) {
+    if (!gatedOpen || !root) {
       return;
     }
 
@@ -1038,7 +1040,7 @@ export function WorkspaceReviewDrawer({
   }, {
     scope: drawerMotionRef,
     dependencies: [
-      isOpen,
+      gatedOpen,
       page,
       model.changedFiles.length,
       model.todos.length,
@@ -1049,7 +1051,7 @@ export function WorkspaceReviewDrawer({
 
   useGSAP(() => {
     const root = drawerMotionRef.current;
-    if (!isOpen || page !== 'files' || !selectedPath || !root) {
+    if (!gatedOpen || page !== 'files' || !selectedPath || !root) {
       return;
     }
 
@@ -1074,7 +1076,7 @@ export function WorkspaceReviewDrawer({
         onComplete: () => clearMotionProps(preview),
       }
     );
-  }, { scope: drawerMotionRef, dependencies: [isOpen, page, selectedPath, diffLoading, mediaLoading] });
+  }, { scope: drawerMotionRef, dependencies: [gatedOpen, page, selectedPath, diffLoading, mediaLoading] });
 
   const openInEditor = async (path: string) => {
     try {
@@ -1095,7 +1097,7 @@ export function WorkspaceReviewDrawer({
     }
   };
 
-  if (!isOpen) {
+  if (!gatedOpen) {
     return null;
   }
 

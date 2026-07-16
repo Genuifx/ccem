@@ -562,9 +562,8 @@ impl ProxyDebugManager {
         // Response body can be much larger (especially SSE), keep a safety cap.
         let request_body = read_body_preview(record.request_body_file.as_deref(), None)?
             .map(|raw| redact_body_text(&raw));
-        let response_body =
-            read_body_preview(record.response_body_file.as_deref(), Some(200_000))?
-                .map(|raw| redact_body_text(&raw));
+        let response_body = read_body_preview(record.response_body_file.as_deref(), Some(200_000))?
+            .map(|raw| redact_body_text(&raw));
         let reduced = recompute_reduced_detail(&record)?;
 
         Ok(ProxyTrafficDetail {
@@ -762,19 +761,18 @@ impl ProxyDebugManager {
             .map(|value| value.contains("text/event-stream"))
             .unwrap_or(false);
 
-        let (response_file_final, spool_state, sample) =
-            if config.record_mode == RecordMode::Full {
-                let final_relative = format!("bodies/{}-res.bin", request_id);
-                let final_path = proxy_debug_dir().join(&final_relative);
-                let spool_state = Arc::new(LogSpoolState::default());
-                (
-                    Some(final_path),
-                    Some(spool_state),
-                    Some(Arc::new(Mutex::new(Vec::new()))),
-                )
-            } else {
-                (None, None, None)
-            };
+        let (response_file_final, spool_state, sample) = if config.record_mode == RecordMode::Full {
+            let final_relative = format!("bodies/{}-res.bin", request_id);
+            let final_path = proxy_debug_dir().join(&final_relative);
+            let spool_state = Arc::new(LogSpoolState::default());
+            (
+                Some(final_path),
+                Some(spool_state),
+                Some(Arc::new(Mutex::new(Vec::new()))),
+            )
+        } else {
+            (None, None, None)
+        };
 
         if let Err(err) = write_response_headers(
             &mut stream,
@@ -1481,7 +1479,8 @@ fn redact_sse_stream(text: &str) -> String {
                 let json_str = json_str.trim();
                 if let Ok(value) = serde_json::from_str::<Value>(json_str) {
                     let redacted = redact_json_value(&value);
-                    let redacted_str = serde_json::to_string(&redacted).unwrap_or_else(|_| json_str.to_string());
+                    let redacted_str =
+                        serde_json::to_string(&redacted).unwrap_or_else(|_| json_str.to_string());
                     return format!("data: {}", redacted_str);
                 }
             }
@@ -1512,9 +1511,7 @@ fn redact_json_value(value: &Value) -> Value {
             }
             Value::Object(out)
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(redact_json_value).collect())
-        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_json_value).collect()),
         _ => value.clone(),
     }
 }
@@ -2943,12 +2940,18 @@ mod tests {
 
     #[test]
     fn redact_json_value_handles_primitives() {
-        assert_eq!(redact_json_value(&serde_json::json!(42)), serde_json::json!(42));
+        assert_eq!(
+            redact_json_value(&serde_json::json!(42)),
+            serde_json::json!(42)
+        );
         assert_eq!(
             redact_json_value(&serde_json::json!("hello")),
             serde_json::json!("hello")
         );
-        assert_eq!(redact_json_value(&serde_json::json!(null)), serde_json::json!(null));
+        assert_eq!(
+            redact_json_value(&serde_json::json!(null)),
+            serde_json::json!(null)
+        );
     }
 
     #[test]

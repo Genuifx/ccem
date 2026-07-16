@@ -13,6 +13,7 @@ import {
 import { useAppStore } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { useLocale } from '@/locales';
+import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
 import { getProjectName, formatRelativeTime, cn } from '@/lib/utils';
 import { shallow } from 'zustand/shallow';
 
@@ -90,6 +91,7 @@ export function ProjectPickerModal({
   onSelectProject,
   onBrowseFolder,
 }: ProjectPickerModalProps) {
+  const gatedOpen = useNativeSurfaceOcclusion(open);
   const { t } = useLocale();
   const [activeTab, setActiveTab] = useState<Tab>('favorites');
   const renderedTab = useDeferredValue(activeTab);
@@ -132,7 +134,7 @@ export function ProjectPickerModal({
 
   const { items, emptyText } = allTabData[renderedTab];
 
-  if (!open) {
+  if (!gatedOpen) {
     return null;
   }
 

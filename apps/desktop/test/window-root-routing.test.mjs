@@ -25,21 +25,18 @@ async function importWindowRootRouting() {
   return import(pathToFileURL(outputPath).href);
 }
 
-test('query routing selects every dedicated desktop window', async () => {
+test('query routing selects supported dedicated desktop windows', async () => {
   const { resolveDesktopWindowRoot } = await importWindowRootRouting();
 
   assert.equal(resolveDesktopWindowRoot('desktop-pet', 'main'), 'desktop-pet');
   assert.equal(resolveDesktopWindowRoot('tray-cockpit', 'main'), 'tray-cockpit');
-  assert.equal(
-    resolveDesktopWindowRoot('login-browser-control', 'main'),
-    'login-browser-control',
-  );
+  assert.equal(resolveDesktopWindowRoot('login-browser-control', 'main'), 'main');
 });
 
 test('native window label is the fallback when the query is absent', async () => {
   const { resolveDesktopWindowRoot } = await importWindowRootRouting();
 
-  assert.equal(resolveDesktopWindowRoot(null, 'login-browser-control'), 'login-browser-control');
+  assert.equal(resolveDesktopWindowRoot(null, 'login-browser-control'), 'main');
   assert.equal(resolveDesktopWindowRoot(null, 'tray-cockpit'), 'tray-cockpit');
   assert.equal(resolveDesktopWindowRoot(null, 'main'), 'main');
 });

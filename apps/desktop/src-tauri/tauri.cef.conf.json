@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBundleCommand": "node scripts/prepare-cef-before-bundle.mjs"
+  },
+  "bundle": {
+    "macOS": {
+      "frameworks": [
+        "target/cef-bundle/macos/Chromium Embedded Framework.framework"
+      ],
+      "files": {
+        "Resources/third-party/cef": "target/cef-bundle/macos/third-party/cef",
+        "Frameworks/ccem-desktop Helper (GPU).app": "target/cef-bundle/macos/ccem-desktop Helper (GPU).app",
+        "Frameworks/ccem-desktop Helper (Renderer).app": "target/cef-bundle/macos/ccem-desktop Helper (Renderer).app",
+        "Frameworks/ccem-desktop Helper (Plugin).app": "target/cef-bundle/macos/ccem-desktop Helper (Plugin).app",
+        "Frameworks/ccem-desktop Helper (Alerts).app": "target/cef-bundle/macos/ccem-desktop Helper (Alerts).app",
+        "Frameworks/ccem-desktop Helper.app": "target/cef-bundle/macos/ccem-desktop Helper.app"
+      }
+    }
+  }
+}

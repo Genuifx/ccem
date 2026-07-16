@@ -48,8 +48,7 @@ fn load_or_create_install_key_at(key_path: &Path) -> Result<[u8; 32], String> {
         let content = std::fs::read_to_string(key_path)
             .map_err(|e| format!("Failed to read install key: {}", e))?;
         let trimmed = content.trim();
-        let bytes = hex::decode(trimmed)
-            .map_err(|_| "Install key is not valid hex".to_string())?;
+        let bytes = hex::decode(trimmed).map_err(|_| "Install key is not valid hex".to_string())?;
         if bytes.len() != 32 {
             return Err(format!(
                 "Install key has wrong length: expected 32 bytes, got {}",
@@ -441,7 +440,11 @@ mod tests {
         let persisted = std::fs::read_to_string(&key_path).expect("read persisted key");
         let decoded = hex::decode(persisted.trim()).expect("persisted key is hex");
         assert_eq!(decoded.len(), 32, "persisted key has 32 bytes");
-        assert_eq!(decoded, created.to_vec(), "persisted bytes match returned key");
+        assert_eq!(
+            decoded,
+            created.to_vec(),
+            "persisted bytes match returned key"
+        );
 
         // Second call must load the same key (not generate a new one)
         let reloaded = load_or_create_install_key_at(&key_path).expect("second call reads key");
@@ -476,11 +479,9 @@ mod tests {
     fn install_key_rejects_non_hex_content() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let key_path = dir.path().join(".install-key");
-        std::fs::write(&key_path, "this-is-not-hex!!")
-            .expect("seed malformed key file");
+        std::fs::write(&key_path, "this-is-not-hex!!").expect("seed malformed key file");
 
-        let error = load_or_create_install_key_at(&key_path)
-            .expect_err("non-hex key should fail");
+        let error = load_or_create_install_key_at(&key_path).expect_err("non-hex key should fail");
         assert!(
             !error.contains("this-is-not-hex"),
             "error must not echo file contents: {}",
@@ -498,11 +499,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let key_path = dir.path().join(".install-key");
         // 16 bytes instead of 32 — valid hex, wrong length.
-        std::fs::write(&key_path, hex::encode([0u8; 16]))
-            .expect("seed short key");
+        std::fs::write(&key_path, hex::encode([0u8; 16])).expect("seed short key");
 
-        let error = load_or_create_install_key_at(&key_path)
-            .expect_err("short key should fail");
+        let error = load_or_create_install_key_at(&key_path).expect_err("short key should fail");
         assert!(
             error.contains("wrong length") && error.contains("32"),
             "error should mention expected length: {}",
@@ -533,7 +532,10 @@ mod tests {
             error
         );
         // Crucially: no key file was created, no key returned.
-        assert!(!key_path.exists(), "key file must not be created on failure");
+        assert!(
+            !key_path.exists(),
+            "key file must not be created on failure"
+        );
     }
 
     #[test]

@@ -11,6 +11,12 @@ pub struct DesktopInstanceLock {
 }
 
 fn lock_path() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(root) = std::env::var_os("CCEM_BROWSER_DATA_ROOT").map(PathBuf::from) {
+        if root.is_absolute() {
+            return root.join("desktop-app-dev.lock");
+        }
+    }
     let lock_name = if cfg!(debug_assertions) {
         "desktop-app-dev.lock"
     } else {

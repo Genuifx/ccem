@@ -25,6 +25,8 @@ import { BrowserLauncherPopover } from './BrowserLauncherPopover';
 import type { UsageStats } from '@/types/analytics';
 import type { Environment } from '@/store';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
+import type { BrowserSurfaceBackend } from '@/lib/browserSurfaceIpc';
+import type { LoginBrowserPanelRequest } from './browserPanelTarget';
 
 function EnvironmentLobeIcon({
   environment,
@@ -61,8 +63,11 @@ interface WorkspaceStatusStripProps {
   onNavigate: (tab: string) => void;
   onOpenSearch: () => void;
   browserOpen?: boolean;
+  browserBackend?: BrowserSurfaceBackend | null;
   browserWorkingDir?: string | null;
-  onToggleBrowser?: () => void;
+  onTogglePreviewBrowser?: () => void;
+  onOpenLoginBrowser?: (request: LoginBrowserPanelRequest) => void;
+  onBrowserHostOverlayChange?: (open: boolean) => void;
 }
 
 function StatusChip({
@@ -127,8 +132,11 @@ export function WorkspaceStatusStrip({
   onNavigate,
   onOpenSearch,
   browserOpen = false,
+  browserBackend = null,
   browserWorkingDir = null,
-  onToggleBrowser,
+  onTogglePreviewBrowser,
+  onOpenLoginBrowser,
+  onBrowserHostOverlayChange,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
   const { sessions, currentEnv, environments, enabledEnvironments, continuousUsageDays, cronTasks, usageStats } = useAppStore(
@@ -390,11 +398,14 @@ export function WorkspaceStatusStrip({
         ) : null}
       </button>
 
-      {onToggleBrowser ? (
+      {onTogglePreviewBrowser && onOpenLoginBrowser ? (
         <BrowserLauncherPopover
-          previewOpen={browserOpen}
+          panelOpen={browserOpen}
+          previewOpen={browserBackend === 'preview'}
           workingDir={browserWorkingDir}
-          onTogglePreview={onToggleBrowser}
+          onTogglePreview={onTogglePreviewBrowser}
+          onOpenLoginBrowser={onOpenLoginBrowser}
+          onHostOverlayChange={onBrowserHostOverlayChange}
         />
       ) : null}
     </div>

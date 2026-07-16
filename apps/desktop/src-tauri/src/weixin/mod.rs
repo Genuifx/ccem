@@ -1821,10 +1821,9 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decrypt_weixin_settings, encrypt_weixin_settings, is_peer_allowed,
-        normalize_api_base_url, parse_headless_result_payload, parse_permission_reply,
-        split_text_chunks, PermissionOwner, PermissionResolution, WeixinBridgeManager,
-        WeixinSettings,
+        decrypt_weixin_settings, encrypt_weixin_settings, is_peer_allowed, normalize_api_base_url,
+        parse_headless_result_payload, parse_permission_reply, split_text_chunks, PermissionOwner,
+        PermissionResolution, WeixinBridgeManager, WeixinSettings,
     };
     use std::thread;
     use std::time::Duration;
@@ -1953,7 +1952,11 @@ mod tests {
             Some("wx-bot-secret-12345"),
             "persisted token must be ciphertext, not plaintext"
         );
-        assert!(persisted.bot_token.as_deref().unwrap().starts_with("enc:v2:"));
+        assert!(persisted
+            .bot_token
+            .as_deref()
+            .unwrap()
+            .starts_with("enc:v2:"));
 
         let restored = decrypt_weixin_settings(persisted).expect("decrypt should succeed");
         assert_eq!(restored.bot_token.as_deref(), original.bot_token.as_deref());
@@ -1968,7 +1971,8 @@ mod tests {
             ..WeixinSettings::default()
         };
 
-        let restored = decrypt_weixin_settings(legacy.clone()).expect("plaintext should pass through");
+        let restored =
+            decrypt_weixin_settings(legacy.clone()).expect("plaintext should pass through");
         assert_eq!(restored.bot_token, legacy.bot_token);
     }
 
@@ -2005,7 +2009,10 @@ mod tests {
             "Serialized settings must not contain the plaintext token: {}",
             json
         );
-        assert!(json.contains("enc:v2:"), "Serialized settings should carry v2 ciphertext");
+        assert!(
+            json.contains("enc:v2:"),
+            "Serialized settings should carry v2 ciphertext"
+        );
     }
 
     #[test]

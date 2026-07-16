@@ -1,6 +1,6 @@
 mod artifacts;
 mod bootstrap;
-#[cfg(all(unix, any(test, feature = "chromium-spike")))]
+#[cfg(all(unix, feature = "chromium-spike"))]
 mod chromium_spike;
 pub(crate) mod login;
 pub(crate) mod login_commands;
@@ -8,14 +8,20 @@ mod logs;
 mod policy;
 mod registry;
 mod runtime;
+#[cfg(test)]
 pub(crate) mod runtime_commands;
+mod surface_coordinator;
 mod tools;
 mod url;
 mod webview;
 
 use artifacts::BrowserArtifactStore;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-pub(crate) use bootstrap::{create_browser_runtime_manager, create_login_browser_session_manager};
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) use bootstrap::create_cef_host_controller;
+pub(crate) use bootstrap::{
+    create_login_browser_session_manager, create_login_browser_surface_manager,
+};
 use logs::BrowserLogStore;
 pub use logs::BrowserRecentActivity;
 pub(crate) use policy::authorize_browser_tool;
@@ -152,6 +158,39 @@ impl Default for BrowserManager {
 }
 
 impl BrowserManager {
+    fn with_preview_surface_slot<T>(
+        &self,
+        app: &AppHandle,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let surface =
+                app.try_state::<Arc<login::surface_commands::LoginBrowserSurfaceManager>>();
+            let sessions = app.try_state::<Arc<login::session::LoginBrowserSessionManager>>();
+            let cef_host = app.try_state::<Arc<login::cef::host::CefHostController>>();
+            if let (Some(surface), Some(sessions), Some(cef_host)) = (surface, sessions, cef_host) {
+                return surface.with_preview_surface_slot(
+                    app,
+                    sessions.inner().as_ref(),
+                    cef_host.inner().as_ref(),
+                    operation,
+                );
+            }
+        }
+
+        operation()
+    }
+
+    pub(crate) fn hide_all(&self, app: &AppHandle) -> Result<(), String> {
+        let sessions = self.registry.snapshots()?;
+        for session in sessions {
+            let state = self.registry.set_visible(&session.session_id, false)?;
+            emit_browser_state(app, &state, "native_surface_superseded");
+        }
+        self.sync_webview_visibility(app)
+    }
+
     pub fn set_active_session(
         &self,
         app: &AppHandle,
@@ -160,11 +199,18 @@ impl BrowserManager {
     ) -> Result<(), String> {
         let session_id = normalize_browser_session_id(session_id);
         self.session_snapshot(&session_id)?;
-        self.registry.set_active_session(&session_id)?;
-        let state = self.registry.set_visible(&session_id, visible)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_state(app, &state, "active_session");
-        Ok(())
+        let apply = || {
+            self.registry.set_active_session(&session_id)?;
+            let state = self.registry.set_visible(&session_id, visible)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_state(app, &state, "active_session");
+            Ok(())
+        };
+        if visible {
+            self.with_preview_surface_slot(app, apply)
+        } else {
+            apply()
+        }
     }
 
     pub fn open(
@@ -173,14 +219,24 @@ impl BrowserManager {
         session_id: Option<&str>,
         url: Option<&str>,
     ) -> Result<BrowserInfo, String> {
+        self.open_with_visibility(app, session_id, url, true)
+    }
+
+    pub fn open_with_visibility(
+        &self,
+        app: &AppHandle,
+        session_id: Option<&str>,
+        url: Option<&str>,
+        visible: bool,
+    ) -> Result<BrowserInfo, String> {
         let session_id = normalize_browser_session_id(session_id);
         let requested = url.map(str::trim).filter(|value| !value.is_empty());
         let parsed_requested = requested.map(parse_browser_url).transpose()?;
-        let target = parsed_requested
+        let target_url = parsed_requested
             .as_ref()
             .map(|value| value.as_str())
-            .unwrap_or(DEFAULT_BROWSER_URL);
-        let target_url = target.to_string();
+            .unwrap_or(DEFAULT_BROWSER_URL)
+            .to_string();
         let mut session = self.session_snapshot(&session_id)?;
         let mut existed = app.get_webview(&session.label).is_some();
         if session.lifecycle == BrowserLifecycleState::Crashed {
@@ -194,43 +250,77 @@ impl BrowserManager {
             existed = false;
         }
         if !existed || parsed_requested.is_some() {
-            let (state, _) = self.registry.mark_navigation(&session_id, target_url)?;
+            let (state, _) = self
+                .registry
+                .mark_navigation(&session_id, target_url.clone())?;
             emit_browser_state(app, &state, "navigation_requested");
         }
-        let webview = ensure_browser_webview(
-            app,
-            Arc::clone(&self.registry),
-            &session.session_id,
-            &session.label,
-            session.generation,
-            target,
-        )
-        .map_err(|error| self.record_browser_error(app, &session_id, error))?;
-        if existed {
-            if let Some(parsed) = parsed_requested {
-                webview.navigate(parsed).map_err(|error| {
+        if !visible {
+            let state = self.registry.set_visible(&session_id, false)?;
+            self.sync_webview_visibility(app)?;
+            if let Some(webview) = app.get_webview(&session.label) {
+                webview.hide().map_err(|error| {
                     self.record_browser_error(
                         app,
                         &session_id,
-                        format!("navigate browser webview: {error}"),
+                        format!("hide browser webview before hidden open: {error}"),
                     )
                 })?;
+                if let Some(parsed) = parsed_requested.as_ref() {
+                    webview.navigate(parsed.clone()).map_err(|error| {
+                        self.record_browser_error(
+                            app,
+                            &session_id,
+                            format!("navigate hidden browser webview: {error}"),
+                        )
+                    })?;
+                }
+                apply_browser_bounds(&webview, session.bounds)?;
             }
+            // Hidden open is an absolute no-create path. If the child is absent
+            // or disappears at any point, only a later explicit reveal may
+            // attach its replacement.
+            emit_browser_state(app, &state, "opened_hidden");
+            return self.info(app, Some(&session_id));
         }
-        apply_browser_bounds(&webview, session.bounds)?;
-        let state = self.registry.set_visible(&session_id, true)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_opened(
-            app,
-            &session_id,
-            &session.label,
-            if session.control == BrowserControlState::Agent {
-                "agent_reveal"
-            } else {
-                "ui_open"
-            },
-        );
-        emit_browser_state(app, &state, "opened");
+        self.with_preview_surface_slot(app, || {
+            let webview = ensure_browser_webview(
+                app,
+                Arc::clone(&self.registry),
+                &session.session_id,
+                &session.label,
+                session.generation,
+                &target_url,
+                true,
+            )
+            .map_err(|error| self.record_browser_error(app, &session_id, error))?;
+            if existed {
+                if let Some(parsed) = parsed_requested {
+                    webview.navigate(parsed).map_err(|error| {
+                        self.record_browser_error(
+                            app,
+                            &session_id,
+                            format!("navigate browser webview: {error}"),
+                        )
+                    })?;
+                }
+            }
+            apply_browser_bounds(&webview, session.bounds)?;
+            let state = self.registry.set_visible(&session_id, true)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_opened(
+                app,
+                &session_id,
+                &session.label,
+                if session.control == BrowserControlState::Agent {
+                    "agent_reveal"
+                } else {
+                    "ui_open"
+                },
+            );
+            emit_browser_state(app, &state, "opened");
+            Ok(())
+        })?;
         self.info(app, Some(&session_id))
     }
 
@@ -257,11 +347,35 @@ impl BrowserManager {
         visible: bool,
     ) -> Result<(), String> {
         let session_id = normalize_browser_session_id(session_id);
-        self.session_snapshot(&session_id)?;
-        let state = self.registry.set_visible(&session_id, visible)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_state(app, &state, if visible { "shown" } else { "hidden" });
-        Ok(())
+        let session = self.session_snapshot(&session_id)?;
+        let apply = || {
+            if visible && app.get_webview(&session.label).is_none() {
+                let target = session
+                    .current_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_BROWSER_URL);
+                let webview = ensure_browser_webview(
+                    app,
+                    Arc::clone(&self.registry),
+                    &session.session_id,
+                    &session.label,
+                    session.generation,
+                    target,
+                    true,
+                )
+                .map_err(|error| self.record_browser_error(app, &session_id, error))?;
+                apply_browser_bounds(&webview, session.bounds)?;
+            }
+            let state = self.registry.set_visible(&session_id, visible)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_state(app, &state, if visible { "shown" } else { "hidden" });
+            Ok(())
+        };
+        if visible {
+            self.with_preview_surface_slot(app, apply)
+        } else {
+            apply()
+        }
     }
 
     pub fn close(&self, app: &AppHandle, session_id: Option<&str>) -> Result<(), String> {
@@ -297,39 +411,43 @@ impl BrowserManager {
         let session = self.session_snapshot(&session_id)?;
         let (state, _) = self.registry.mark_navigation(&session_id, next_url)?;
         emit_browser_state(app, &state, "navigation_requested");
-        let webview = match app.get_webview(&session.label) {
-            Some(webview) => Ok(webview),
-            None => ensure_browser_webview(
-                app,
-                Arc::clone(&self.registry),
-                &session.session_id,
-                &session.label,
-                session.generation,
-                parsed.as_str(),
-            ),
-        }
-        .map_err(|error| self.record_browser_error(app, &session_id, error))?;
-        webview.navigate(parsed).map_err(|error| {
-            self.record_browser_error(
+        self.with_preview_surface_slot(app, || {
+            let webview = match app.get_webview(&session.label) {
+                Some(webview) => Ok(webview),
+                None => ensure_browser_webview(
+                    app,
+                    Arc::clone(&self.registry),
+                    &session.session_id,
+                    &session.label,
+                    session.generation,
+                    parsed.as_str(),
+                    true,
+                ),
+            }
+            .map_err(|error| self.record_browser_error(app, &session_id, error))?;
+            webview.navigate(parsed).map_err(|error| {
+                self.record_browser_error(
+                    app,
+                    &session_id,
+                    format!("navigate browser webview: {error}"),
+                )
+            })?;
+            apply_browser_bounds(&webview, session.bounds)?;
+            let state = self.registry.set_visible(&session_id, true)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_opened(
                 app,
                 &session_id,
-                format!("navigate browser webview: {error}"),
-            )
+                &session.label,
+                if session.control == BrowserControlState::Agent {
+                    "agent_reveal"
+                } else {
+                    "navigation"
+                },
+            );
+            emit_browser_state(app, &state, "shown");
+            Ok(())
         })?;
-        apply_browser_bounds(&webview, session.bounds)?;
-        let state = self.registry.set_visible(&session_id, true)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_opened(
-            app,
-            &session_id,
-            &session.label,
-            if session.control == BrowserControlState::Agent {
-                "agent_reveal"
-            } else {
-                "navigation"
-            },
-        );
-        emit_browser_state(app, &state, "shown");
         self.info(app, Some(&session_id))
     }
 
@@ -604,23 +722,35 @@ impl BrowserManager {
 }
 
 #[tauri::command]
-pub fn browser_set_active_session(
+pub async fn browser_set_active_session(
     app: AppHandle,
     state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
     session_id: Option<String>,
     visible: Option<bool>,
 ) -> Result<(), String> {
-    state.set_active_session(&app, session_id.as_deref(), visible.unwrap_or(false))
+    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
+        state.set_active_session(&app, session_id.as_deref(), visible.unwrap_or(false))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_open(
+pub async fn browser_open(
     app: AppHandle,
     state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
     session_id: Option<String>,
     url: Option<String>,
+    visible: Option<bool>,
 ) -> Result<BrowserInfo, String> {
-    state.open(&app, session_id.as_deref(), url.as_deref())
+    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
+        state.open_with_visibility(
+            &app,
+            session_id.as_deref(),
+            url.as_deref(),
+            visible.unwrap_or(true),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -646,13 +776,16 @@ pub fn browser_set_bounds(
 }
 
 #[tauri::command]
-pub fn browser_set_visible(
+pub async fn browser_set_visible(
     app: AppHandle,
     state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
     session_id: Option<String>,
     visible: bool,
 ) -> Result<(), String> {
-    state.set_visible(&app, session_id.as_deref(), visible)
+    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
+        state.set_visible(&app, session_id.as_deref(), visible)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -665,13 +798,16 @@ pub fn browser_close(
 }
 
 #[tauri::command]
-pub fn browser_navigate(
+pub async fn browser_navigate(
     app: AppHandle,
     state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
     session_id: Option<String>,
     url: String,
 ) -> Result<BrowserInfo, String> {
-    state.navigate(&app, session_id.as_deref(), &url)
+    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
+        state.navigate(&app, session_id.as_deref(), &url)
+    })
+    .await
 }
 
 #[tauri::command]

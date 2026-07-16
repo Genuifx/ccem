@@ -6,8 +6,8 @@ use super::preparation::{
     RuntimePreparationObserver, RuntimePreparationOutcome, RuntimePreparationStop,
 };
 use super::state::{
-    BrowserRuntimeReadiness, RuntimeCandidateSummary, RuntimeFailure, RuntimePhase,
-    RuntimeProgress, RuntimeStateMachine, RuntimeVersionSummary,
+    BrowserRuntimeReadiness, RuntimeCandidateSummary, RuntimeErrorCode, RuntimeFailure,
+    RuntimePhase, RuntimeProgress, RuntimeStateMachine, RuntimeVersionSummary,
 };
 use serde::Serialize;
 use std::fmt;
@@ -124,7 +124,7 @@ impl Default for RuntimeOperation {
 }
 
 pub(crate) struct BrowserRuntimeManager {
-    installer: Arc<dyn RuntimeInstaller>,
+    installer: Option<Arc<dyn RuntimeInstaller>>,
     state: Arc<Mutex<RuntimeStateMachine>>,
     operation: Mutex<RuntimeOperation>,
 }
@@ -157,10 +157,34 @@ impl BrowserRuntimeManager {
                 .map_err(|_| RuntimeManagerError::new(RuntimeManagerErrorCode::StateUnavailable))?;
         }
         Ok(Arc::new(Self {
-            installer,
+            installer: Some(installer),
             state: Arc::new(Mutex::new(state)),
             operation: Mutex::new(RuntimeOperation::default()),
         }))
+    }
+
+    /// Infallible placeholder used when the app-owned runtime root cannot be initialized.
+    ///
+    /// Read-only readiness remains available to the shell as a bounded `StateCorrupt` failure,
+    /// while every runtime mutation fails before starting a worker or touching installation state.
+    pub(crate) fn unavailable() -> Arc<Self> {
+        let mut state = RuntimeStateMachine::new(None);
+        let transition = state.fail_without_candidate(RuntimeFailure {
+            code: RuntimeErrorCode::StateCorrupt,
+            retryable: false,
+        });
+        debug_assert!(transition.is_ok());
+        Arc::new(Self {
+            installer: None,
+            state: Arc::new(Mutex::new(state)),
+            operation: Mutex::new(RuntimeOperation::default()),
+        })
+    }
+
+    fn installer(&self) -> Result<&Arc<dyn RuntimeInstaller>, RuntimeManagerError> {
+        self.installer
+            .as_ref()
+            .ok_or_else(|| RuntimeManagerError::new(RuntimeManagerErrorCode::StateUnavailable))
     }
 
     pub(crate) fn readiness(&self) -> Result<BrowserRuntimeReadiness, RuntimeManagerError> {
@@ -171,13 +195,16 @@ impl BrowserRuntimeManager {
     }
 
     pub(crate) fn disk_usage(&self) -> Result<RuntimeDiskUsage, RuntimeManagerError> {
-        self.installer.disk_usage().map_err(map_maintenance_error)
+        self.installer()?
+            .disk_usage()
+            .map_err(map_maintenance_error)
     }
 
     pub(crate) fn delete_runtime(
         &self,
         app: Option<AppHandle>,
     ) -> Result<RuntimeDeleteOutcome, RuntimeManagerError> {
+        let installer = self.installer()?;
         let operation = self
             .operation
             .lock()
@@ -188,7 +215,7 @@ impl BrowserRuntimeManager {
             ));
         }
 
-        let result = self.installer.delete_runtime();
+        let result = installer.delete_runtime();
         match result {
             Ok(outcome) => {
                 if let Ok(mut state) = self.state.lock() {
@@ -200,7 +227,7 @@ impl BrowserRuntimeManager {
                 Ok(outcome)
             }
             Err(error) => {
-                if !matches!(self.installer.recover_active(), Ok(Some(_))) {
+                if !matches!(installer.recover_active(), Ok(Some(_))) {
                     if let Ok(mut state) = self.state.lock() {
                         state.clear_failed_candidate();
                         state.clear_active();
@@ -231,6 +258,7 @@ impl BrowserRuntimeManager {
         self: &Arc<Self>,
         app: Option<AppHandle>,
     ) -> Result<BrowserRuntimeReadiness, RuntimeManagerError> {
+        self.installer()?;
         let readiness = self.readiness()?;
         if readiness.phase != RuntimePhase::Idle || readiness.error.is_none() {
             return Err(RuntimeManagerError::new(
@@ -241,6 +269,7 @@ impl BrowserRuntimeManager {
     }
 
     pub(crate) fn pause_download(&self) -> Result<BrowserRuntimeReadiness, RuntimeManagerError> {
+        self.installer()?;
         let operation = self
             .operation
             .lock()
@@ -259,6 +288,7 @@ impl BrowserRuntimeManager {
         self: &Arc<Self>,
         app: Option<AppHandle>,
     ) -> Result<BrowserRuntimeReadiness, RuntimeManagerError> {
+        self.installer()?;
         let readiness = self.readiness()?;
         if readiness.phase != RuntimePhase::Paused {
             return Err(RuntimeManagerError::new(
@@ -269,6 +299,7 @@ impl BrowserRuntimeManager {
     }
 
     pub(crate) fn cancel(&self) -> Result<BrowserRuntimeReadiness, RuntimeManagerError> {
+        self.installer()?;
         let operation = self
             .operation
             .lock()
@@ -287,6 +318,7 @@ impl BrowserRuntimeManager {
         app: Option<AppHandle>,
         force_reinstall: bool,
     ) -> Result<BrowserRuntimeReadiness, RuntimeManagerError> {
+        let installer = Arc::clone(self.installer()?);
         let control = {
             let mut operation = self
                 .operation
@@ -322,9 +354,7 @@ impl BrowserRuntimeManager {
         let spawn = thread::Builder::new()
             .name("ccem-browser-runtime-prepare".to_string())
             .spawn(move || {
-                let result = manager
-                    .installer
-                    .prepare(&control, &observer, force_reinstall);
+                let result = installer.prepare(&control, &observer, force_reinstall);
                 manager.finish_worker(result, &worker_app);
             });
         if spawn.is_err() {
@@ -666,5 +696,28 @@ mod tests {
             RuntimeManagerErrorCode::OperationInProgress
         );
         wait_until_idle(&manager);
+    }
+
+    #[test]
+    fn unavailable_manager_keeps_bounded_failure_queryable_and_rejects_mutation() {
+        let manager = BrowserRuntimeManager::unavailable();
+
+        let readiness = manager.readiness().unwrap();
+        assert_eq!(readiness.status, BrowserRuntimeReadinessStatus::Failed);
+        assert_eq!(
+            readiness.error,
+            Some(RuntimeFailure {
+                code: RuntimeErrorCode::StateCorrupt,
+                retryable: false,
+            })
+        );
+        assert_eq!(
+            manager.prepare(None).unwrap_err().code,
+            RuntimeManagerErrorCode::StateUnavailable
+        );
+        assert_eq!(
+            manager.disk_usage().unwrap_err().code,
+            RuntimeManagerErrorCode::StateUnavailable
+        );
     }
 }

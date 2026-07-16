@@ -1,6 +1,68 @@
 use super::*;
 
 #[test]
+fn trusted_occlusion_pause_is_idempotent_and_cancels_only_agent_control() {
+    let fixture = Fixture::new();
+    let opened = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("open");
+
+    let user = fixture
+        .manager
+        .pause_agent_if_active(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::PauseAgent,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .expect("user-owned session is already safe");
+    assert_eq!(user.control, SessionControlOwner::User);
+    assert_eq!(user.handoff_epoch, 0);
+
+    fixture
+        .manager
+        .handoff_to_agent(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::HandoffToAgent,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .expect("handoff");
+    let paused = fixture
+        .manager
+        .pause_agent_if_active(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::PauseAgent,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .expect("occlusion pause");
+    assert_eq!(paused.control, SessionControlOwner::Paused);
+    assert_eq!(paused.handoff_epoch, 2);
+
+    let still_paused = fixture
+        .manager
+        .pause_agent_if_active(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::PauseAgent,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+        .expect("already-paused session stays safe");
+    assert_eq!(still_paused.control, SessionControlOwner::Paused);
+    assert_eq!(still_paused.handoff_epoch, paused.handoff_epoch);
+}
+
+#[test]
 fn trusted_handoff_pause_and_takeover_advance_epoch_and_invalidate_old_grants() {
     let fixture = Fixture::new();
     let opened = fixture

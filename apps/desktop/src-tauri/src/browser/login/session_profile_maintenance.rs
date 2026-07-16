@@ -33,15 +33,17 @@ impl LoginBrowserSessionManager {
         &self,
         workspace: TrustedWorkspacePath,
     ) -> Result<Vec<LoginBrowserProfileSummary>, SessionManagerError> {
-        let _gate = self
+        let inner = self.available()?;
+        let _gate = inner
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
-        let workspace_identity = self
+        let workspace_identity = inner
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(super::map_workspace_error)?;
-        self.profiles
+        inner
+            .profiles
             .list_profiles(&workspace_identity)
             .map_err(super::map_profile_error)
             .map(|profiles| {
@@ -64,7 +66,8 @@ impl LoginBrowserSessionManager {
         if !confirmed {
             return Err(SessionManagerError::DestructiveConfirmationRequired);
         }
-        let _gate = self
+        let inner = self.available()?;
+        let _gate = inner
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
@@ -77,7 +80,8 @@ impl LoginBrowserSessionManager {
             DESTRUCTIVE_PROFILE_AUTHORIZATION_TTL,
         )
         .map_err(super::map_profile_error)?;
-        self.profiles
+        inner
+            .profiles
             .reset_profile(authorization)
             .map(|descriptor| LoginBrowserProfileSummary::from_descriptor(&descriptor, is_default))
             .map_err(super::map_profile_error)
@@ -92,7 +96,8 @@ impl LoginBrowserSessionManager {
         if !confirmed {
             return Err(SessionManagerError::DestructiveConfirmationRequired);
         }
-        let _gate = self
+        let inner = self.available()?;
+        let _gate = inner
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
@@ -104,7 +109,8 @@ impl LoginBrowserSessionManager {
             DESTRUCTIVE_PROFILE_AUTHORIZATION_TTL,
         )
         .map_err(super::map_profile_error)?;
-        self.profiles
+        inner
+            .profiles
             .delete_profile(authorization)
             .map_err(super::map_profile_error)
     }
@@ -114,12 +120,13 @@ impl LoginBrowserSessionManager {
         workspace: TrustedWorkspacePath,
         profile_id: &str,
     ) -> Result<(TrustedWorkspaceIdentity, BrowserProfileDescriptor), SessionManagerError> {
-        let workspace_identity = self
+        let inner = self.available()?;
+        let workspace_identity = inner
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(super::map_workspace_error)?;
         let profile_id = ProfileId::parse(profile_id).map_err(super::map_profile_error)?;
-        let descriptor = self
+        let descriptor = inner
             .profiles
             .descriptor(&profile_id, &workspace_identity)
             .map_err(super::map_profile_error)?;
@@ -131,7 +138,8 @@ impl LoginBrowserSessionManager {
         workspace_identity: &TrustedWorkspaceIdentity,
         profile_id: &ProfileId,
     ) -> Result<bool, SessionManagerError> {
-        self.profiles
+        self.available()?
+            .profiles
             .list_profiles(workspace_identity)
             .map_err(super::map_profile_error)
             .map(|profiles| {
