@@ -1168,6 +1168,11 @@
   background: hsl(var(--primary) / 0.25);
 }
 
+[data-workspace-selection-highlight-active='true']::selection,
+[data-workspace-selection-highlight-active='true'] *::selection {
+  background: transparent;
+}
+
 .ccem-prompt-area .prompt-area-placeholder {
   color: hsl(var(--muted-foreground) / 0.75);
   font-size: 14px;

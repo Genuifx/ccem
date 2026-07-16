@@ -57,6 +57,6 @@ test('Preview Browser exposes recent artifacts and log paths through trusted app
   assert.match(panelSource, /console_log_path/);
   assert.match(panelSource, /audit_log_path/);
   assert.match(ipcSource, /browser_recent_activity/);
-  assert.match(mainSource, /browser::browser_recent_activity/);
+  assert.match(mainSource, /browser::commands::browser_recent_activity/);
   assert.match(permissionSource, /"browser_recent_activity"/);
 });

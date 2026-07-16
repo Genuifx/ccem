@@ -32,7 +32,7 @@ test('composer submit reads live DOM text and attachment ref to avoid paste/subm
   assert.match(submitBlock, /let text = ensureComposerImagePlaceholders\(promptValue, currentAttachments\);/);
   assert.match(
     submitBlock,
-    /const displayText = ensureComposerImagePlaceholders\(buildComposerDisplayText\(promptValue\), currentAttachments\);/,
+    /let displayText = ensureComposerImagePlaceholders\(buildComposerDisplayText\(promptValue\), currentAttachments\);/,
   );
   assert.match(submitBlock, /attachments: currentAttachments,/);
   assert.match(submitBlock, /revokeComposerImageUrls\(currentAttachments\);/);

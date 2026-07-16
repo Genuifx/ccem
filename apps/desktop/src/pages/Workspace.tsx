@@ -4,6 +4,7 @@ import {
   lazy,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -68,8 +69,10 @@ import type {
 } from '@/features/conversations/types';
 import { toSessionKey } from '@/features/conversations/types';
 import { useWorkspaceSessionDecorations } from '@/components/workspace/useWorkspaceSessionDecorations';
+import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
 import type {
   NativeSessionSummary,
+  SessionEventRecord,
   SessionPromptImage,
   WorkspaceCommand,
   WorkspaceGitSnapshot,
@@ -108,7 +111,7 @@ import {
   calculateWorkspaceSidebarWidth,
   clampWorkspaceSidebarWidth,
 } from '@/components/workspace/workspaceSidebarLayout';
-import { LazyWorkspaceReviewDrawer } from '@/components/workspace/LazyWorkspaceReviewDrawer';
+import { LazyWorkspaceReviewPopover } from '@/components/workspace/LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
   buildWorkspaceReviewSummary,
@@ -373,6 +376,7 @@ export function Workspace({
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [messages, setMessages] = useState<ConversationMessageData[]>([]);
   const [segments, setSegments] = useState<HistorySegment[]>([]);
+  const [historyEvents, setHistoryEvents] = useState<SessionEventRecord[]>([]);
   const [activeSegment, setActiveSegment] = useState<number | null>(null);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [codexInstalled, setCodexInstalled] = useState(false);
@@ -435,6 +439,16 @@ export function Workspace({
   const prevIsActiveRef = useRef(isActive);
   const selectedKeyRef = useRef<string | null>(null);
   const persistedGeneratedTitleKeysRef = useRef(new Set<string>());
+  const reviewOwnerKey = `${workspaceMode}:${selectedKey ?? ''}:${activeLiveRuntimeId ?? ''}:${composeDir ?? ''}`;
+  const reviewOwnerKeyRef = useRef(reviewOwnerKey);
+
+  useLayoutEffect(() => {
+    const ownerChanged = reviewOwnerKeyRef.current !== reviewOwnerKey;
+    reviewOwnerKeyRef.current = reviewOwnerKey;
+    if ((!isActive || ownerChanged) && workspaceReviewOpen) {
+      setWorkspaceReviewOpen(false);
+    }
+  }, [isActive, reviewOwnerKey, setWorkspaceReviewOpen, workspaceReviewOpen]);
 
   const handleComposePromptChange = useCallback((value: string) => {
     composePromptRef.current = value;
@@ -818,6 +832,7 @@ export function Workspace({
       setSelectedKey(null);
       setMessages([]);
       setSegments([]);
+      setHistoryEvents([]);
       setActiveSegment(null);
       setIsLoadingMessages(false);
       if (Object.keys(liveSessionsSnapshot).length === 0) {
@@ -854,6 +869,16 @@ export function Workspace({
     ? liveSessionsByRuntimeId[activeLiveRuntimeId] ?? null
     : null;
 
+  const statusStripEnvContext = useMemo(() => {
+    if (workspaceMode === 'history') {
+      return historyEnv || undefined;
+    }
+    if (workspaceMode === 'live') {
+      return activeLiveEntry?.session.env_name || undefined;
+    }
+    return undefined;
+  }, [workspaceMode, historyEnv, activeLiveEntry]);
+
   useEffect(() => {
     if (workspaceMode !== 'live') {
       return;
@@ -883,7 +908,11 @@ export function Workspace({
 
   const loadNativeHistoryConversation = useCallback(async (
     nativeSession: NativeSessionSummary,
-  ): Promise<{ messages: ConversationMessageData[]; segments: HistorySegment[] } | null> => {
+  ): Promise<{
+    messages: ConversationMessageData[];
+    segments: HistorySegment[];
+    events: SessionEventRecord[];
+  } | null> => {
     const replayBatch = await getNativeSessionEvents(nativeSession.runtime_id, null, null);
     if (replayBatch.events.length === 0) {
       return null;
@@ -895,13 +924,10 @@ export function Workspace({
       replayBatch.events,
       nativeSession.status === 'error' ? nativeSession.last_error : null,
     );
-    if (!hasNativeHistoryTranscriptMessages(nativeMessages)) {
-      return null;
-    }
-
     return {
       messages: nativeMessages,
       segments: [],
+      events: replayBatch.events,
     };
   }, [getNativeSessionEvents]);
 
@@ -915,11 +941,18 @@ export function Workspace({
       } = {}
     ) => {
       const { resetBeforeLoad = true, showLoading = true } = options;
+      const hasNativeHistorySessionOption = Object.prototype.hasOwnProperty.call(
+        options,
+        'nativeHistorySession',
+      );
       const requestSeq = ++conversationRequestSeqRef.current;
 
       if (resetBeforeLoad) {
         setMessages([]);
         setSegments([]);
+        if (hasNativeHistorySessionOption) {
+          setHistoryEvents([]);
+        }
         setActiveSegment(null);
       }
 
@@ -937,12 +970,16 @@ export function Workspace({
         if (requestSeq !== conversationRequestSeqRef.current) {
           return;
         }
-        if (nativeHistory) {
+        if (nativeHistory && hasNativeHistoryTranscriptMessages(nativeHistory.messages)) {
           setMessages(nativeHistory.messages);
           setSegments(nativeHistory.segments);
+          setHistoryEvents(nativeHistory.events);
           return;
         }
 
+        if (hasNativeHistorySessionOption) {
+          setHistoryEvents(nativeHistory?.events ?? []);
+        }
         const { messages: msgs, segments: segs } = await fetchConversationDetail(session);
 
         if (requestSeq !== conversationRequestSeqRef.current) {
@@ -1142,6 +1179,10 @@ export function Workspace({
     if (!selectedKey) return null;
     return sessions.find((session) => toSessionKey(session) === selectedKey) ?? null;
   }, [selectedKey, sessions]);
+  const historyAnnotationSessionKey = selectedSession
+    ? `history:${selectedSession.source}:${selectedSession.id}`
+    : null;
+  const historyAnnotations = useWorkspaceAnnotations(historyAnnotationSessionKey);
 
   const activeBrowserSessionId = useMemo(() => {
     if (workspaceMode === 'live' && activeLiveEntry) {
@@ -1453,6 +1494,10 @@ export function Workspace({
   const effectiveComposeDir = composeDir || selectedWorkingDir || defaultWorkingDir || null;
   const effectiveComposeDirLabel = effectiveComposeDir ? getProjectName(effectiveComposeDir) : null;
   const shouldRenderWorkspaceReview = workspaceMode !== 'live' || !activeLiveEntry;
+  const workspaceReviewEvents = useMemo(
+    () => workspaceMode === 'history' && selectedSession ? historyEvents : [],
+    [historyEvents, selectedSession, workspaceMode],
+  );
   const workspaceReviewWorkingDir = workspaceMode === 'history' && selectedSession
     ? selectedSession.project || null
     : effectiveComposeDir;
@@ -1511,10 +1556,10 @@ export function Workspace({
   ]);
   const workspaceReviewSummary = useMemo(
     () => buildWorkspaceReviewSummary({
-      events: [],
+      events: workspaceReviewEvents,
       gitSnapshot: workspaceGitSnapshot,
     }),
-    [workspaceGitSnapshot],
+    [workspaceGitSnapshot, workspaceReviewEvents],
   );
   const workspaceReviewModel = useMemo(
     () => {
@@ -1524,7 +1569,7 @@ export function Workspace({
 
       return buildWorkspaceReviewModel({
         session: workspaceReviewSession,
-        events: [],
+        events: workspaceReviewEvents,
         messages: workspaceMode === 'history' ? messages : [],
         gitSnapshot: workspaceGitSnapshot,
       });
@@ -1534,6 +1579,7 @@ export function Workspace({
       shouldRenderWorkspaceReview,
       workspaceGitSnapshot,
       workspaceMode,
+      workspaceReviewEvents,
       workspaceReviewOpen,
       workspaceReviewSession,
     ],
@@ -2526,6 +2572,11 @@ export function Workspace({
               activeSegment={activeSegment}
               onActiveSegmentChange={setActiveSegment}
               isLoadingMessages={isLoadingMessages}
+              canAddAnnotation={selectedHistorySupportsInline && historyAnnotations.canAddAnnotation}
+              annotations={historyAnnotations.annotations}
+              onAddAnnotation={selectedHistorySupportsInline ? historyAnnotations.addAnnotation : undefined}
+              onUpdateAnnotation={selectedHistorySupportsInline ? historyAnnotations.updateAnnotation : undefined}
+              onRemoveAnnotation={selectedHistorySupportsInline ? historyAnnotations.removeAnnotation : undefined}
             />
           </WorkspaceHistoryErrorBoundary>
         </Suspense>
@@ -2557,6 +2608,11 @@ export function Workspace({
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
+          annotations={historyAnnotations.annotations}
+          onUpdateAnnotation={historyAnnotations.updateAnnotation}
+          onRemoveAnnotation={historyAnnotations.removeAnnotation}
+          onClearAnnotations={historyAnnotations.clearAnnotations}
+          onAnnotationsSent={historyAnnotations.clearAnnotations}
           controls={(
             <ComposerControls
               provider={historyProvider}
@@ -2696,6 +2752,7 @@ export function Workspace({
             onTogglePreviewBrowser={toggleActivePreviewBrowser}
             onOpenLoginBrowser={openActiveLoginBrowser}
             onBrowserHostOverlayChange={setBrowserHostOverlayOpen}
+            envContext={statusStripEnvContext}
           />
 
           <div
@@ -2724,7 +2781,8 @@ export function Workspace({
             <div className="workspace-reading-surface relative flex min-w-0 flex-1 flex-col overflow-hidden">
               {shouldRenderWorkspaceReview && workspaceReviewOpen && workspaceReviewModel ? (
                 <Suspense fallback={null}>
-                  <LazyWorkspaceReviewDrawer
+                  <LazyWorkspaceReviewPopover
+                    key={`${workspaceReviewSession.runtime_id}:${workspaceReviewSession.project_dir}`}
                     session={workspaceReviewSession}
                     model={workspaceReviewModel}
                     gitSnapshot={workspaceGitSnapshot}

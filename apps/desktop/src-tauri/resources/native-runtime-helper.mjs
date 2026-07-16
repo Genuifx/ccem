@@ -22151,8 +22151,7 @@ async function applyClaudePermissionModeToQuery(query, permMode) {
 
 // src/claudePermissionRequests.ts
 function resolveClaudePermissionRequestId(options, now = Date.now) {
-  const sdkRequestId = options.requestId?.trim();
-  return sdkRequestId || `${options.toolUseID}:${now()}`;
+  return typeof options.requestId === "string" && options.requestId.length > 0 ? options.requestId : `${options.toolUseID}:${now()}`;
 }
 
 // src/claudeQuerySnapshotSlot.ts
@@ -36604,6 +36603,312 @@ function buildClaudeFileCheckpointEvent(message, providerSessionId) {
   };
 }
 
+// src/todoSnapshots.ts
+function readObject2(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+function readString(record2, keys) {
+  if (!record2) {
+    return void 0;
+  }
+  for (const key of keys) {
+    const value = record2[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return void 0;
+}
+function readText(record2) {
+  return readString(record2, ["subject", "content", "text", "description"]);
+}
+function readActiveText(record2) {
+  return readString(record2, ["activeForm", "active_text"]);
+}
+function readId(record2) {
+  return readString(record2, ["id", "taskId", "task_id"]);
+}
+function normalizeStatus(value, fallback = "pending") {
+  if (value === "pending" || value === "in_progress" || value === "completed" || value === "failed") {
+    return value;
+  }
+  return fallback;
+}
+function parseResultObject(value) {
+  const direct = readObject2(value);
+  if (direct) {
+    if (direct.type === "tool_result" && direct.content !== void 0) {
+      return parseResultObject(direct.content);
+    }
+    return direct;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      return readObject2(JSON.parse(trimmed));
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const record2 = readObject2(entry);
+      const parsed = record2?.type === "text" ? parseResultObject(record2.text) : parseResultObject(entry);
+      if (parsed) {
+        return parsed;
+      }
+    }
+  }
+  return null;
+}
+function cloneItem(item) {
+  return { ...item };
+}
+function isTodoSnapshotItemV1(value) {
+  const record2 = readObject2(value);
+  return Boolean(
+    record2 && typeof record2.id === "string" && record2.id.trim() && typeof record2.text === "string" && record2.text.trim() && ["pending", "in_progress", "completed", "failed"].includes(String(record2.status)) && (record2.active_text === void 0 || typeof record2.active_text === "string")
+  );
+}
+function isTodoSnapshotV1(value) {
+  const record2 = readObject2(value);
+  if (!record2 || record2.version !== 1 || record2.provider !== "claude" && record2.provider !== "codex" || typeof record2.revision !== "number" || !Number.isSafeInteger(record2.revision) || record2.revision < 0 || !Array.isArray(record2.items) || !record2.items.every(isTodoSnapshotItemV1)) {
+    return false;
+  }
+  return record2.provider === "claude" ? ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(String(record2.source)) : record2.source === "todo_list";
+}
+function itemFromRecord(value, fallbackId) {
+  const record2 = readObject2(value);
+  const text = readText(record2);
+  if (!record2 || !text) {
+    return null;
+  }
+  const activeText = readActiveText(record2);
+  return {
+    id: readId(record2) ?? fallbackId,
+    text,
+    status: typeof record2.completed === "boolean" ? record2.completed ? "completed" : "pending" : normalizeStatus(record2.status),
+    ...activeText ? { active_text: activeText } : {}
+  };
+}
+function snapshotFromCodexTodoList(item, revision = 1) {
+  const record2 = readObject2(item);
+  if (record2?.type !== "todo_list" || !Array.isArray(record2.items)) {
+    return void 0;
+  }
+  const listId = readId(record2) ?? "todo-list";
+  const items = record2.items.map((value, index) => itemFromRecord(value, `${listId}:${index}`)).filter((value) => Boolean(value));
+  return {
+    version: 1,
+    provider: "codex",
+    source: "todo_list",
+    revision,
+    items
+  };
+}
+var TodoSnapshotTracker = class {
+  revision = 0;
+  claudeItems = /* @__PURE__ */ new Map();
+  claudeBaselineKnown = true;
+  reset(seed, claudeBaselineKnown = true) {
+    this.revision = 0;
+    this.claudeItems = /* @__PURE__ */ new Map();
+    this.claudeBaselineKnown = seed ? false : claudeBaselineKnown;
+    if (!isTodoSnapshotV1(seed)) {
+      return;
+    }
+    this.revision = seed.revision;
+    if (seed.provider !== "claude") {
+      return;
+    }
+    this.claudeBaselineKnown = true;
+    this.claudeItems = new Map(
+      seed.items.map((item) => [item.id, cloneItem(item)])
+    );
+  }
+  fromClaudeToolStarted(_rawName, _input) {
+    return void 0;
+  }
+  fromClaudeToolCompleted(rawName, input, result) {
+    const inputRecord = readObject2(input);
+    const resultRecord = parseResultObject(result);
+    if (resultRecord?.success === false) {
+      return void 0;
+    }
+    if (rawName === "TodoWrite") {
+      if (!Array.isArray(inputRecord?.todos)) {
+        return void 0;
+      }
+      this.claudeItems = new Map(
+        inputRecord.todos.map((value, index) => itemFromRecord(value, `todo-${index}`)).filter((value) => Boolean(value)).map((item) => [item.id, item])
+      );
+      this.claudeBaselineKnown = true;
+      return this.emitClaudeSnapshot("TodoWrite");
+    }
+    if (rawName === "TaskCreate") {
+      if (!this.claudeBaselineKnown) {
+        return void 0;
+      }
+      const task = readObject2(resultRecord?.task);
+      const id2 = readId(task) ?? readId(inputRecord);
+      const text = readText(inputRecord) ?? readText(task);
+      if (!id2 || !text) {
+        return void 0;
+      }
+      const activeText = readActiveText(inputRecord) ?? readActiveText(task);
+      this.claudeItems.set(id2, {
+        id: id2,
+        text,
+        status: normalizeStatus(inputRecord?.status),
+        ...activeText ? { active_text: activeText } : {}
+      });
+      return this.emitClaudeSnapshot("TaskCreate");
+    }
+    if (rawName === "TaskUpdate") {
+      if (!this.claudeBaselineKnown || !inputRecord) {
+        return void 0;
+      }
+      const id2 = readId(inputRecord) ?? readId(resultRecord);
+      if (!id2) {
+        return void 0;
+      }
+      if (inputRecord.status === "deleted") {
+        this.claudeItems.delete(id2);
+        return this.emitClaudeSnapshot("TaskUpdate");
+      }
+      const current = this.claudeItems.get(id2);
+      const text = readText(inputRecord) ?? current?.text ?? `Task ${id2}`;
+      const activeText = readActiveText(inputRecord) ?? current?.active_text;
+      this.claudeItems.set(id2, {
+        id: id2,
+        text,
+        status: normalizeStatus(inputRecord.status, current?.status),
+        ...activeText ? { active_text: activeText } : {}
+      });
+      return this.emitClaudeSnapshot("TaskUpdate");
+    }
+    if (rawName === "TaskList") {
+      if (!Array.isArray(resultRecord?.tasks)) {
+        return void 0;
+      }
+      this.claudeItems = new Map(
+        resultRecord.tasks.map((value, index) => itemFromRecord(value, `task-${index}`)).filter((value) => Boolean(value)).map((item) => [item.id, item])
+      );
+      this.claudeBaselineKnown = true;
+      return this.emitClaudeSnapshot("TaskList");
+    }
+    return void 0;
+  }
+  fromCodexTodoList(item) {
+    const snapshot = snapshotFromCodexTodoList(item, this.revision + 1);
+    if (!snapshot) {
+      return void 0;
+    }
+    this.revision = snapshot.revision;
+    return snapshot;
+  }
+  emitClaudeSnapshot(source) {
+    this.revision += 1;
+    return {
+      version: 1,
+      provider: "claude",
+      source,
+      revision: this.revision,
+      items: Array.from(this.claudeItems.values(), cloneItem)
+    };
+  }
+};
+
+// src/permissionPreview.ts
+var DEFAULT_IGNORABLE_RANGES = [
+  [173, 173],
+  [847, 847],
+  [1564, 1564],
+  [4447, 4448],
+  [6068, 6069],
+  [6155, 6159],
+  [8203, 8207],
+  [8234, 8238],
+  [8288, 8303],
+  [12644, 12644],
+  [65024, 65039],
+  [65279, 65279],
+  [65440, 65440],
+  [65520, 65528],
+  [113824, 113827],
+  [119155, 119162],
+  [917504, 921599]
+];
+function belongsToRange(codePoint, ranges) {
+  return ranges.some(([start, end]) => codePoint >= start && codePoint <= end);
+}
+function isLookalikeQuote(codePoint) {
+  return codePoint >= 697 && codePoint <= 701 || codePoint === 715 || codePoint >= 8216 && codePoint <= 8223 || codePoint >= 8242 && codePoint <= 8247 || codePoint === 65282 || codePoint === 65287 || codePoint === 65344;
+}
+function shouldExposeCodePoint(codePoint) {
+  return belongsToRange(codePoint, DEFAULT_IGNORABLE_RANGES) || codePoint >= 0 && codePoint <= 31 || codePoint >= 127 && codePoint <= 159 || codePoint >= 8232 && codePoint <= 8233 || codePoint >= 65529 && codePoint <= 65531 || codePoint >= 10075 && codePoint <= 10078 || codePoint >= 12317 && codePoint <= 12319 || isLookalikeQuote(codePoint);
+}
+function visibleCodePoint(codePoint) {
+  return `\\u{${codePoint.toString(16).toUpperCase().padStart(4, "0")}}`;
+}
+function formatPermissionPreview(value, maxLength = 160) {
+  if (maxLength <= 0) {
+    return "";
+  }
+  const tokens = [];
+  let displayLength = 0;
+  let pendingSpace = false;
+  const appendToken = (token) => {
+    if (displayLength + token.length <= maxLength) {
+      tokens.push(token);
+      displayLength += token.length;
+      return null;
+    }
+    if (maxLength === 1) {
+      return "\u2026";
+    }
+    const availableLength = maxLength - 1;
+    while (tokens.length > 0 && displayLength > availableLength) {
+      displayLength -= tokens.pop().length;
+    }
+    while (tokens.at(-1) === " ") {
+      displayLength -= tokens.pop().length;
+    }
+    return `${tokens.join("")}\u2026`;
+  };
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (shouldExposeCodePoint(codePoint)) {
+      if (pendingSpace && tokens.length > 0) {
+        const truncated3 = appendToken(" ");
+        if (truncated3) return truncated3;
+      }
+      pendingSpace = false;
+      const truncated2 = appendToken(visibleCodePoint(codePoint));
+      if (truncated2) return truncated2;
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      pendingSpace = tokens.length > 0;
+      continue;
+    }
+    if (pendingSpace) {
+      const truncated2 = appendToken(" ");
+      if (truncated2) return truncated2;
+      pendingSpace = false;
+    }
+    const truncated = appendToken(character);
+    if (truncated) return truncated;
+  }
+  return tokens.join("");
+}
+
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
 var DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8e3;
@@ -36635,6 +36940,8 @@ var pendingPermissions = /* @__PURE__ */ new Map();
 var pendingClaudeInteractivePrompts = /* @__PURE__ */ new Map();
 var startedToolNames = /* @__PURE__ */ new Map();
 var completedToolUseIds = /* @__PURE__ */ new Set();
+var pendingClaudeToolInputs = /* @__PURE__ */ new Map();
+var todoSnapshotTracker = new TodoSnapshotTracker();
 var browserToolBridge = createBrowserToolBridge((request) => emit(request));
 var browserEvaluateApprovedForSession = false;
 var AsyncMessageQueue = class {
@@ -37042,17 +37349,17 @@ function summarizeQuestionInput(input) {
   if (!firstQuestion || typeof firstQuestion !== "object") {
     return null;
   }
-  const questionText = typeof firstQuestion.question === "string" ? firstQuestion.question.trim() : "";
-  if (!questionText) {
+  const questionText = typeof firstQuestion.question === "string" ? firstQuestion.question : "";
+  if (!formatPermissionPreview(questionText)) {
     return null;
   }
-  return truncateSummary2(`\u9700\u8981\u7528\u6237\u56DE\u7B54 ${questions.length} \u4E2A\u95EE\u9898\uFF1A${questionText}`);
+  return formatPermissionPreview(`\u9700\u8981\u7528\u6237\u56DE\u7B54 ${questions.length} \u4E2A\u95EE\u9898\uFF1A${questionText}`);
 }
 function extractStringField(input, keys) {
   for (const key of keys) {
     const value = input[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
+    if (typeof value === "string" && formatPermissionPreview(value)) {
+      return value;
     }
   }
   return null;
@@ -37065,13 +37372,13 @@ function summarizeClaudeToolInput(toolName, input, options) {
   if (toolName.includes("PlanMode") && toolName.includes("Exit")) {
     const planSummary = extractStringField(input, ["plan"]);
     if (planSummary) {
-      return truncateSummary2(planSummary);
+      return formatPermissionPreview(planSummary);
     }
   }
   if (toolName === "Bash") {
     const command = extractStringField(input, ["command"]);
     if (command) {
-      return truncateSummary2(command);
+      return formatPermissionPreview(command);
     }
   }
   const pathLikeValue = extractStringField(input, [
@@ -37082,18 +37389,18 @@ function summarizeClaudeToolInput(toolName, input, options) {
     "query"
   ]);
   if (pathLikeValue) {
-    return truncateSummary2(pathLikeValue);
+    return formatPermissionPreview(pathLikeValue);
   }
   const displayReason = [
     options?.title,
     options?.description,
     options?.blockedPath,
     options?.decisionReason
-  ].find((value) => typeof value === "string" && value.trim().length > 0);
+  ].find((value) => typeof value === "string" && formatPermissionPreview(value).length > 0);
   if (displayReason) {
-    return truncateSummary2(displayReason);
+    return formatPermissionPreview(displayReason);
   }
-  return truncateSummary2(compactJson(input));
+  return formatPermissionPreview(compactJson(input));
 }
 function parseClaudeInteractiveToolPrompt(name, input) {
   if (name.includes("AskUser") || name.includes("Question")) {
@@ -37144,7 +37451,13 @@ function parseClaudeInteractiveToolPrompt(name, input) {
   return void 0;
 }
 function emitClaudeToolUseStarted(payload) {
-  if (!payload.toolUseId || startedToolNames.has(payload.toolUseId)) {
+  if (!payload.toolUseId) {
+    return;
+  }
+  if (payload.input) {
+    pendingClaudeToolInputs.set(payload.toolUseId, payload.input);
+  }
+  if (startedToolNames.has(payload.toolUseId)) {
     return;
   }
   startedToolNames.set(payload.toolUseId, payload.rawName);
@@ -37158,19 +37471,21 @@ function emitClaudeToolUseStarted(payload) {
     ...payload.prompt ? { prompt: payload.prompt } : {}
   });
 }
-function emitClaudeToolUseCompleted(toolUseId, resultSummary, success2) {
+function emitClaudeToolUseCompleted(toolUseId, resultSummary, success2, todoSnapshot) {
   if (!toolUseId || completedToolUseIds.has(toolUseId)) {
     return;
   }
   completedToolUseIds.add(toolUseId);
   const rawName = startedToolNames.get(toolUseId) ?? "tool";
   startedToolNames.delete(toolUseId);
+  pendingClaudeToolInputs.delete(toolUseId);
   emitEvent({
     type: "tool_use_completed",
     tool_use_id: toolUseId,
     raw_name: rawName,
     result_summary: resultSummary,
-    success: success2
+    success: success2,
+    ...todoSnapshot ? { todo_snapshot: todoSnapshot } : {}
   });
 }
 function summarizeClaudeToolResult(block) {
@@ -37283,13 +37598,14 @@ async function waitForPermission(toolName, input, options) {
     toolUseId,
     rawName: toolName,
     inputSummary,
-    needsResponse: false
+    needsResponse: false,
+    input
   });
   emitEvent({
     type: "permission_required",
     request_id: requestId,
     tool_use_id: toolUseId,
-    tool_name: options.displayName || toolName,
+    tool_name: formatPermissionPreview(options.displayName || toolName, 80),
     input_summary: inputSummary
   });
   const approved = await new Promise((resolve) => {
@@ -37689,6 +38005,7 @@ async function consumeClaudeMessages() {
               rawName: block.name,
               inputSummary: summarizeClaudeToolInput(block.name, input),
               needsResponse,
+              input,
               prompt
             });
           }
@@ -37705,10 +38022,19 @@ async function consumeClaudeMessages() {
           if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
             return;
           }
+          const success2 = block.is_error !== true;
+          const rawName = startedToolNames.get(block.tool_use_id) ?? "tool";
+          const input = pendingClaudeToolInputs.get(block.tool_use_id);
+          const todoSnapshot = success2 && input ? todoSnapshotTracker.fromClaudeToolCompleted(
+            rawName,
+            input,
+            message.tool_use_result ?? block.content
+          ) : void 0;
           emitClaudeToolUseCompleted(
             block.tool_use_id,
             summarizeClaudeToolResult(block),
-            block.is_error !== true
+            success2,
+            todoSnapshot
           );
         });
         continue;
@@ -38188,23 +38514,40 @@ async function runCodexTurn(text, images) {
         continue;
       }
       if (event.type === "item.started") {
+        const todoSnapshot = item.type === "todo_list" ? todoSnapshotTracker.fromCodexTodoList(item) : void 0;
         emitEvent({
           type: "tool_use_started",
           tool_use_id: String(item.id || `${item.type}-${Date.now()}`),
           category: codexCategoryForItem(item),
           raw_name: String(item.type || "item"),
           input_summary: summarizeCodexItem(item),
-          needs_response: false
+          needs_response: false,
+          ...todoSnapshot ? { todo_snapshot: todoSnapshot } : {}
+        });
+        continue;
+      }
+      if (event.type === "item.updated" && item.type === "todo_list") {
+        const todoSnapshot = todoSnapshotTracker.fromCodexTodoList(item);
+        emitEvent({
+          type: "tool_use_started",
+          tool_use_id: String(item.id || `${item.type}-${Date.now()}`),
+          category: codexCategoryForItem(item),
+          raw_name: String(item.type || "item"),
+          input_summary: summarizeCodexItem(item),
+          needs_response: false,
+          ...todoSnapshot ? { todo_snapshot: todoSnapshot } : {}
         });
         continue;
       }
       if (event.type === "item.completed") {
+        const todoSnapshot = item.type === "todo_list" ? todoSnapshotTracker.fromCodexTodoList(item) : void 0;
         emitEvent({
           type: "tool_use_completed",
           tool_use_id: String(item.id || `${item.type}-${Date.now()}`),
           raw_name: String(item.type || "item"),
           result_summary: summarizeCodexItem(item),
-          success: item.status !== "failed"
+          success: item.status !== "failed",
+          ...todoSnapshot ? { todo_snapshot: todoSnapshot } : {}
         });
         continue;
       }
@@ -38263,6 +38606,11 @@ async function handleCommand(command) {
   }
   if (command.type === "init") {
     initCommand = command;
+    const resumedClaudeWithoutTodoSeed = command.provider === "claude" && Boolean(command.provider_session_id?.trim()) && !command.todo_snapshot_seed;
+    todoSnapshotTracker.reset(
+      command.todo_snapshot_seed,
+      !resumedClaudeWithoutTodoSeed
+    );
     currentProviderSessionId = command.provider_session_id ?? null;
     browserEvaluateApprovedForSession = false;
     if (currentProviderSessionId) {

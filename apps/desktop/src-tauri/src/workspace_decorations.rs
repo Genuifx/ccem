@@ -537,6 +537,7 @@ mod tests {
                     allowed_prompts: vec![],
                     plan_summary: None,
                 }),
+                todo_snapshot: None,
             },
         };
         let mut events_by_runtime = HashMap::new();

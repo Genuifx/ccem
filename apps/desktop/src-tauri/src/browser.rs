@@ -2,6 +2,7 @@ mod artifacts;
 mod bootstrap;
 #[cfg(all(unix, feature = "chromium-spike"))]
 mod chromium_spike;
+pub(crate) mod commands;
 pub(crate) mod login;
 pub(crate) mod login_commands;
 mod logs;
@@ -11,6 +12,8 @@ mod runtime;
 #[cfg(test)]
 pub(crate) mod runtime_commands;
 mod surface_coordinator;
+#[cfg(test)]
+mod tests;
 mod tools;
 mod url;
 mod webview;
@@ -721,205 +724,6 @@ impl BrowserManager {
     }
 }
 
-#[tauri::command]
-pub async fn browser_set_active_session(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    visible: Option<bool>,
-) -> Result<(), String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.set_active_session(&app, session_id.as_deref(), visible.unwrap_or(false))
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn browser_open(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    url: Option<String>,
-    visible: Option<bool>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.open_with_visibility(
-            &app,
-            session_id.as_deref(),
-            url.as_deref(),
-            visible.unwrap_or(true),
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_set_bounds(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    state.set_bounds(
-        &app,
-        session_id.as_deref(),
-        BrowserBounds {
-            x,
-            y,
-            width,
-            height,
-        },
-    )
-}
-
-#[tauri::command]
-pub async fn browser_set_visible(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    visible: bool,
-) -> Result<(), String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.set_visible(&app, session_id.as_deref(), visible)
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_close(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<(), String> {
-    state.close(&app, session_id.as_deref())
-}
-
-#[tauri::command]
-pub async fn browser_navigate(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    url: String,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.navigate(&app, session_id.as_deref(), &url)
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_reload(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    state.reload(&app, session_id.as_deref())
-}
-
-async fn run_blocking_browser_command<T, F>(
-    app: AppHandle,
-    state: std::sync::Arc<BrowserManager>,
-    command: F,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce(std::sync::Arc<BrowserManager>, AppHandle) -> Result<T, String> + Send + 'static,
-{
-    tauri::async_runtime::spawn_blocking(move || command(state, app))
-        .await
-        .map_err(|error| format!("join browser command: {error}"))?
-}
-
-#[tauri::command]
-pub async fn browser_back(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.back(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn browser_forward(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.forward(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_info(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    state.info(&app, session_id.as_deref())
-}
-
-#[tauri::command]
-pub async fn browser_health_check(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.health_check(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_set_paused(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    paused: bool,
-) -> Result<BrowserInfo, String> {
-    state.set_paused(&app, session_id.as_deref(), paused)
-}
-
-#[tauri::command]
-pub fn browser_recent_activity(
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserRecentActivity, String> {
-    state.recent_activity(&normalize_browser_session_id(session_id.as_deref()))
-}
-
-#[tauri::command]
-pub async fn browser_snapshot(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<Value, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.snapshot(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn browser_screenshot(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<String, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.screenshot_base64(&app, session_id.as_deref())
-    })
-    .await
-}
-
 fn sanitize_bounds(bounds: BrowserBounds) -> BrowserBounds {
     BrowserBounds {
         x: bounds.x.max(0.0),
@@ -953,52 +757,6 @@ fn browser_label_for_session_id(session_id: &str, generation: u64) -> String {
         "{BROWSER_LABEL}-{:016x}-g{generation}",
         stable_hash64(0, session_id)
     )
-}
-
-fn required_string_arg(args: &Value, key: &str) -> Result<String, String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("Missing browser tool string arg: {key}"))
-}
-
-fn required_u32_arg(args: &Value, key: &str) -> Result<u32, String> {
-    let value = args
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("Missing browser tool numeric arg: {key}"))?;
-    u32::try_from(value).map_err(|_| format!("Browser tool arg out of range: {key}"))
-}
-
-fn decode_eval_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
-}
-
-fn decode_eval_json_string(raw: &str) -> Result<String, String> {
-    match serde_json::from_str::<Value>(raw)
-        .map_err(|error| format!("decode browser eval: {error}"))?
-    {
-        Value::String(value) => Ok(value),
-        other => Ok(other.to_string()),
-    }
-}
-
-fn build_eval_json_script(expression: &str) -> Result<String, String> {
-    Ok(format!(
-        r#"
-(() => {{
-  try {{
-    const value = (
-{expression}
-    );
-    return JSON.stringify(value === undefined ? null : value);
-  }} catch (error) {{
-    return JSON.stringify({{ ok: false, error: String(error && error.message || error) }});
-  }}
-}})()
-"#
-    ))
 }
 
 fn emit_browser_opened(app: &AppHandle, session_id: &str, label: &str, cause: &str) {
@@ -1035,69 +793,4 @@ fn emit_browser_state(app: &AppHandle, state: &BrowserSessionState, cause: &str)
             "cause": cause,
         }),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        browser_label_for_session_id, build_eval_json_script, normalize_browser_session_id,
-        sanitize_bounds, BrowserBounds, BROWSER_LABEL, DEFAULT_BROWSER_SESSION_ID,
-    };
-
-    #[test]
-    fn sanitize_bounds_keeps_browser_renderable() {
-        let bounds = sanitize_bounds(BrowserBounds {
-            x: -10.0,
-            y: -4.0,
-            width: 0.0,
-            height: -1.0,
-        });
-        assert_eq!(bounds.x, 0.0);
-        assert_eq!(bounds.y, 0.0);
-        assert_eq!(bounds.width, 1.0);
-        assert_eq!(bounds.height, 1.0);
-    }
-
-    #[test]
-    fn build_eval_json_script_runs_without_page_eval() {
-        let script = build_eval_json_script(
-            r#"
-            (() => {
-              window.scrollBy(0, 100);
-              return { ok: true };
-            })()
-            "#,
-        )
-        .expect("script");
-        assert!(!script.contains("eval("));
-        assert!(script.contains("window.scrollBy"));
-        assert!(script.contains("JSON.stringify"));
-    }
-
-    #[test]
-    fn browser_session_ids_default_to_workspace() {
-        assert_eq!(
-            normalize_browser_session_id(None),
-            DEFAULT_BROWSER_SESSION_ID.to_string()
-        );
-        assert_eq!(
-            normalize_browser_session_id(Some("  ")),
-            DEFAULT_BROWSER_SESSION_ID.to_string()
-        );
-        assert_eq!(normalize_browser_session_id(Some("native-a")), "native-a");
-    }
-
-    #[test]
-    fn browser_labels_are_scoped_per_session() {
-        assert_eq!(
-            browser_label_for_session_id(DEFAULT_BROWSER_SESSION_ID, 7),
-            format!("{BROWSER_LABEL}-g7")
-        );
-        let first = browser_label_for_session_id("native-a", 1);
-        let second = browser_label_for_session_id("native-b", 1);
-        assert!(first.starts_with(&format!("{BROWSER_LABEL}-")));
-        assert!(second.starts_with(&format!("{BROWSER_LABEL}-")));
-        assert_ne!(first, second);
-        assert_ne!(first, browser_label_for_session_id("native-a", 2));
-    }
 }

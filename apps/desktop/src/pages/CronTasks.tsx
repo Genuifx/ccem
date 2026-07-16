@@ -5,13 +5,17 @@ import { useLocale } from '@/locales';
 import { useAppStore, type CronTask, type CronTaskRun, type CronTemplate, type CronWecomNotification } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { CronEditor } from '@/components/cron';
+import {
+  buildCronRunSessionLink,
+  getCronRunSessionAvailability,
+} from '@/components/cron/cronSessionLink';
 import { PageActionsSlot } from '@/components/layout';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import {
   Clock, Plus, Play, Trash2, CheckCircle2, XCircle,
   Timer, AlertTriangle, FolderOpen, ChevronDown, GitPullRequest,
   FlaskConical, FileText, Shield, Newspaper, Sparkles, X,
-  Zap, Terminal, Copy, Check, Bell,
+  Zap, Terminal, Copy, Check, Bell, ExternalLink, History,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
@@ -127,7 +131,16 @@ function StatusDot({ task, runs }: { task: CronTask; runs?: CronTaskRun[] }) {
 
 // --- Timeline Bar ---
 
-function TimelineBar({ tasks, runs }: { tasks: CronTask[]; runs: Record<string, CronTaskRun[]> }) {
+function TimelineBar({
+  tasks,
+  runs,
+  onSelectRun,
+}: {
+  tasks: CronTask[];
+  runs: Record<string, CronTaskRun[]>;
+  onSelectRun: (taskId: string, runId: string) => void;
+}) {
+  const { t } = useLocale();
   const now = new Date();
   const currentMinutes = now.getHours() * 60 + now.getMinutes();
   const progressPercent = (currentMinutes / (24 * 60)) * 100;
@@ -136,7 +149,7 @@ function TimelineBar({ tasks, runs }: { tasks: CronTask[]; runs: Record<string, 
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
 
-  const dots: { percent: number; status: string }[] = [];
+  const dots: { percent: number; status: string; taskId: string; runId: string; taskName: string }[] = [];
   for (const task of tasks) {
     const taskRuns = runs[task.id] ?? [];
     for (const run of taskRuns) {
@@ -145,7 +158,13 @@ function TimelineBar({ tasks, runs }: { tasks: CronTask[]; runs: Record<string, 
         const runMinutes = startTime.getHours() * 60 + startTime.getMinutes();
         // Keep dots inside the rounded bar ends
         const pct = Math.min(98, Math.max(2, (runMinutes / (24 * 60)) * 100));
-        dots.push({ percent: pct, status: run.status });
+        dots.push({
+          percent: pct,
+          status: run.status,
+          taskId: task.id,
+          runId: run.id,
+          taskName: task.name,
+        });
       }
     }
   }
@@ -190,12 +209,20 @@ function TimelineBar({ tasks, runs }: { tasks: CronTask[]; runs: Record<string, 
         ))
       )}
       {/* Run dots */}
-      {dots.map((dot, i) => (
-        <div
-          key={i}
+      {dots.map((dot) => (
+        <button
+          key={dot.runId}
+          type="button"
           data-cron-motion-dot
-          className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full ring-2 ring-[hsl(var(--surface-raised))]"
+          title={t('cron.timelineDotLabel')
+            .replace('{name}', dot.taskName)
+            .replace('{status}', dot.status)}
+          onClick={() => onSelectRun(dot.taskId, dot.runId)}
+          className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full ring-2 ring-[hsl(var(--surface-raised))] hover:scale-125 transition-transform"
           style={{ left: `${dot.percent}%`, backgroundColor: statusColor(dot.status) }}
+          aria-label={t('cron.timelineDotLabel')
+            .replace('{name}', dot.taskName)
+            .replace('{status}', dot.status)}
         />
       ))}
     </div>
@@ -275,6 +302,7 @@ function TimelineTaskCard({
   onToggleEnabled,
   onRetry,
   onViewRun,
+  onOpenSession,
 }: {
   task: CronTask;
   runs: CronTaskRun[];
@@ -286,9 +314,13 @@ function TimelineTaskCard({
   onToggleEnabled: () => void;
   onRetry: () => void;
   onViewRun: (runId: string) => void;
+  onOpenSession: (run: CronTaskRun) => void;
 }) {
   const { t } = useLocale();
   const lastRun = runs[runs.length - 1];
+  const [showAllRuns, setShowAllRuns] = useState(false);
+  const orderedRuns = useMemo(() => [...runs].reverse(), [runs]);
+  const visibleRuns = showAllRuns ? orderedRuns : orderedRuns.slice(0, 8);
 
   return (
     <div
@@ -414,23 +446,66 @@ function TimelineTaskCard({
             {/* Run history */}
             {runs.length > 0 && (
               <div>
-                <p className="text-[10px] font-medium text-muted-foreground/70 uppercase tracking-wider mb-2">{t('cron.runHistory')}</p>
-                <div className="space-y-1">
-                  {[...runs].reverse().slice(0, 5).map((run) => (
-                    <div key={run.id} className="group/run flex items-center gap-3 px-3 py-1 rounded-lg glass-subtle">
-                      <StatusBadge status={run.status} />
-                      <span className="text-[11px] text-muted-foreground flex-1">{formatTime(run.startedAt)}</span>
-                      <span className="text-[11px] text-muted-foreground tabular-nums">{formatDuration(run.durationMs)}</span>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onViewRun(run.id); }}
-                        className="opacity-0 group-hover/run:opacity-100 transition-opacity p-1 rounded-md hover:bg-foreground/[0.06]"
-                        aria-label={t('cron.viewOutput')}
-                      >
-                        <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
-                      </button>
-                    </div>
-                  ))}
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-[10px] font-medium text-muted-foreground/70 uppercase tracking-wider">{t('cron.runHistory')}</p>
+                  <span className="text-[10px] text-muted-foreground tabular-nums">
+                    {t('cron.runCount').replace('{n}', String(runs.length))}
+                  </span>
                 </div>
+                <div className="space-y-1">
+                  {visibleRuns.map((run) => {
+                    const session = getCronRunSessionAvailability({
+                      id: run.id,
+                      runtimeId: run.runtimeId,
+                      providerSessionId: run.providerSessionId,
+                      workingDir: run.workingDir ?? task.workingDir,
+                      status: run.status,
+                    });
+                    return (
+                      <div key={run.id} className="group/run flex items-center gap-2 px-2.5 py-1 rounded-lg glass-subtle">
+                        <StatusBadge status={run.status} />
+                        <span className="text-[11px] text-muted-foreground flex-1 min-w-0 truncate">{formatTime(run.startedAt)}</span>
+                        <span className="text-[11px] text-muted-foreground tabular-nums shrink-0">{formatDuration(run.durationMs)}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (session.canOpen) onOpenSession(run);
+                          }}
+                          disabled={!session.canOpen}
+                          className={cn(
+                            'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] transition-colors',
+                            session.canOpen
+                              ? 'text-primary hover:bg-primary/10'
+                              : 'text-muted-foreground/50 cursor-not-allowed',
+                          )}
+                          aria-label={session.canOpen ? t('cron.openSession') : t('cron.openSessionUnavailable')}
+                          title={session.canOpen ? t('cron.openSession') : t('cron.sessionUnavailable')}
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          {session.canOpen ? t('cron.openSession') : t('cron.openSessionUnavailable')}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); onViewRun(run.id); }}
+                          className="p-1 rounded-md hover:bg-foreground/[0.06]"
+                          aria-label={t('cron.viewOutput')}
+                        >
+                          <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                {orderedRuns.length > 8 && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); setShowAllRuns((v) => !v); }}
+                    className="mt-1.5 text-[11px] text-primary hover:text-primary/80"
+                  >
+                    {showAllRuns
+                      ? t('cron.showLessRuns')
+                      : t('cron.viewAllRuns')}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -818,7 +893,13 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
 
 // --- Main Export Component ---
 
-export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
+export function CronTasks({
+  onAiCreate,
+  onOpenSessionLink,
+}: {
+  onAiCreate?: () => void;
+  onOpenSessionLink?: (link: string) => void;
+}) {
   const { t } = useLocale();
   const { cronTasks, cronRuns, environments, isLoadingCron } = useAppStore(
     (state) => ({
@@ -844,7 +925,9 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
   const [platformCapabilities, setPlatformCapabilities] = useState<PlatformCapabilities | null>(null);
   const [nextRunTimes, setNextRunTimes] = useState<Record<string, string>>({});
   const [drawerRun, setDrawerRun] = useState<CronTaskRun | null>(null);
+  const [drawerTask, setDrawerTask] = useState<CronTask | null>(null);
   const [drawerLoading, setDrawerLoading] = useState(false);
+  const [recentRange, setRecentRange] = useState<'today' | '7d' | 'all'>('today');
   const cronMotionRef = useRef<HTMLDivElement>(null);
   const hasHydratedCronMotionRef = useRef(false);
   const seenCronMotionTargetsRef = useRef<Set<string>>(new Set());
@@ -854,6 +937,7 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
   const openRunDrawer = useCallback(async (taskId: string, runId: string) => {
     setDrawerLoading(true);
     setDrawerRun(null);
+    setDrawerTask(cronTasks.find((task) => task.id === taskId) ?? null);
     try {
       const detail = await getCronRunDetail(taskId, runId);
       setDrawerRun(detail);
@@ -863,7 +947,26 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
     } finally {
       setDrawerLoading(false);
     }
-  }, [getCronRunDetail]);
+  }, [cronTasks, getCronRunDetail]);
+
+  const openRunSession = useCallback((task: CronTask | null | undefined, run: CronTaskRun) => {
+    const link = buildCronRunSessionLink({
+      id: run.id,
+      runtimeId: run.runtimeId,
+      providerSessionId: run.providerSessionId,
+      workingDir: run.workingDir ?? task?.workingDir ?? null,
+      status: run.status,
+    }, { focus: 'live' });
+    if (!link) {
+      toast.error(t('cron.sessionUnavailable'));
+      return;
+    }
+    if (onOpenSessionLink) {
+      onOpenSessionLink(link);
+      return;
+    }
+    toast.error(t('cron.sessionUnavailable'));
+  }, [onOpenSessionLink, t]);
 
   // Load tasks and templates on mount
   useEffect(() => {
@@ -892,7 +995,13 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
     const setup = async () => {
       try {
         for (const evt of ['cron-task-started', 'cron-task-completed', 'cron-task-failed']) {
-          const fn = await listen(evt, () => { if (mounted) loadCronTasks(); });
+          const fn = await listen(evt, () => {
+            if (!mounted) return;
+            void loadCronTasks();
+            for (const task of useAppStore.getState().cronTasks) {
+              void loadCronTaskRuns(task.id);
+            }
+          });
           // If unmounted while listen() was resolving, immediately clean up
           if (!mounted) { fn(); return; }
           unsubs.push(fn);
@@ -906,7 +1015,7 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
       mounted = false;
       unsubs.forEach((fn) => fn());
     };
-  }, [loadCronTasks]);
+  }, [loadCronTaskRuns, loadCronTasks]);
 
   // Fetch next run times for each task
   useEffect(() => {
@@ -938,26 +1047,32 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
 
   const disabledTasks = useMemo(() => cronTasks.filter((task) => !task.enabled), [cronTasks]);
 
-  // Completed runs from today
-  const todayCompletedRuns = useMemo(() => {
+  // Recent completed runs (filterable)
+  const recentCompletedRuns = useMemo(() => {
+    const now = Date.now();
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
     const results: { task: CronTask; run: CronTaskRun }[] = [];
     for (const task of cronTasks) {
       const runs = cronRuns[task.id] || [];
       for (const run of runs) {
-        if (run.status !== 'running' && run.finishedAt) {
-          const completedDate = new Date(run.finishedAt);
-          if (completedDate >= today) {
-            results.push({ task, run });
-          }
-        }
+        if (run.status === 'running') continue;
+        const stamp = run.finishedAt || run.startedAt;
+        if (!stamp) continue;
+        const ts = new Date(stamp).getTime();
+        if (Number.isNaN(ts)) continue;
+        if (recentRange === 'today' && ts < today.getTime()) continue;
+        if (recentRange === '7d' && ts < sevenDaysAgo) continue;
+        results.push({ task, run });
       }
     }
-    return results.sort((a, b) =>
-      new Date(b.run.finishedAt!).getTime() - new Date(a.run.finishedAt!).getTime()
-    );
-  }, [cronTasks, cronRuns]);
+    return results.sort((a, b) => {
+      const aTs = new Date(a.run.finishedAt || a.run.startedAt).getTime();
+      const bTs = new Date(b.run.finishedAt || b.run.startedAt).getTime();
+      return bTs - aTs;
+    });
+  }, [cronTasks, cronRuns, recentRange]);
 
   // Only structural list identity should re-trigger entrance motion.
   // nextRunTimes / run status updates are local data refreshes and must not
@@ -967,12 +1082,12 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
       .slice(0, 12)
       .map((task) => `${task.id}:${task.enabled ? 'on' : 'off'}`)
       .join('|');
-    const completedIds = todayCompletedRuns
+    const completedIds = recentCompletedRuns
       .slice(0, 6)
       .map(({ run }) => run.id)
       .join('|');
     return `${isLoadingCron ? 'loading' : 'ready'}:${taskIds}:${completedIds}`;
-  }, [disabledTasks, isLoadingCron, todayCompletedRuns, upcomingTasks]);
+  }, [disabledTasks, isLoadingCron, recentCompletedRuns, upcomingTasks]);
 
   useGSAP(() => {
     const root = cronMotionRef.current;
@@ -1149,6 +1264,8 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
     }
   };
 
+  const hasTaskColumn = upcomingTasks.length > 0 || disabledTasks.length > 0;
+
   return (
     <div ref={cronMotionRef} className="space-y-4">
       {/* Tmux warning */}
@@ -1219,92 +1336,168 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
       ) : cronTasks.length === 0 ? (
         <CronEmptyState onAdd={handleAdd} onAi={handleAiCreate} />
       ) : (
-        <div className="space-y-5">
-          {/* Timeline bar */}
-          <TimelineBar tasks={cronTasks} runs={cronRuns} />
+        <div className="space-y-4">
+          {/* Timeline bar — always full width */}
+          <TimelineBar tasks={cronTasks} runs={cronRuns} onSelectRun={openRunDrawer} />
 
-          {/* Upcoming section */}
-          {upcomingTasks.length > 0 && (
-            <div data-cron-motion-section className="space-y-2.5">
-              <div className="flex items-center gap-2">
-                <Zap className="w-3.5 h-3.5 text-primary" />
-                <h3 className="text-xs font-semibold text-foreground uppercase tracking-wide">{t('cron.upcoming')}</h3>
-                <span className="text-[10px] font-medium text-primary bg-primary/10 px-1.5 py-0.5 rounded-full tabular-nums">{upcomingTasks.length}</span>
-              </div>
-              <div className="space-y-1.5">
-                {upcomingTasks.map((task) => (
-                  <TimelineTaskCard
-                    key={task.id}
-                    task={task}
-                    runs={cronRuns[task.id] || []}
-                    nextRun={nextRunTimes[task.id]}
-                    expanded={expandedTaskId === task.id}
-                    onToggleExpand={() => setExpandedTaskId(expandedTaskId === task.id ? null : task.id)}
-                    onEdit={() => handleEdit(task)}
-                    onDelete={() => setPendingDelete(task)}
-                    onToggleEnabled={() => toggleCronTask(task.id)}
-                    onRetry={() => handleRetry(task.id)}
-                    onViewRun={(runId) => openRunDrawer(task.id, runId)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Disabled tasks */}
-          {disabledTasks.length > 0 && (
-            <div data-cron-motion-section className="space-y-2.5">
-              <div className="flex items-center gap-2">
-                <Timer className="w-3.5 h-3.5 text-muted-foreground" />
-                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{t('cron.disabled')}</h3>
-                <span className="text-[10px] font-medium text-muted-foreground bg-muted-foreground/10 px-1.5 py-0.5 rounded-full tabular-nums">{disabledTasks.length}</span>
-              </div>
-              <div className="space-y-1.5">
-                {disabledTasks.map((task) => (
-                  <TimelineTaskCard
-                    key={task.id}
-                    task={task}
-                    runs={cronRuns[task.id] || []}
-                    expanded={expandedTaskId === task.id}
-                    onToggleExpand={() => setExpandedTaskId(expandedTaskId === task.id ? null : task.id)}
-                    onEdit={() => handleEdit(task)}
-                    onDelete={() => setPendingDelete(task)}
-                    onToggleEnabled={() => toggleCronTask(task.id)}
-                    onRetry={() => handleRetry(task.id)}
-                    onViewRun={(runId) => openRunDrawer(task.id, runId)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Completed today section */}
-          {todayCompletedRuns.length > 0 && (
-            <div data-cron-motion-section className="space-y-2.5">
-              <div className="flex items-center gap-2">
-                <CheckCircle2 className="w-3.5 h-3.5 text-success" />
-                <h3 className="text-xs font-semibold text-foreground uppercase tracking-wide">{t('cron.completedToday')}</h3>
-                <span className="text-[10px] font-medium text-[hsl(var(--success))] bg-[hsl(var(--success)/0.1)] px-1.5 py-0.5 rounded-full tabular-nums">{todayCompletedRuns.length}</span>
-              </div>
-              <div className="space-y-1.5">
-                {todayCompletedRuns.slice(0, 10).map(({ task, run }) => (
-                  <div key={run.id} data-cron-motion-run data-cron-run-id={run.id} className="group/run glass-subtle glass-noise rounded-lg px-4 py-2 flex items-center gap-3">
-                    <StatusBadge status={run.status} />
-                    <span className="text-xs font-medium text-foreground flex-1 truncate">{task.name}</span>
-                    <span className="text-2xs text-muted-foreground tabular-nums">{formatTimeShort(run.finishedAt)}</span>
-                    <span className="text-2xs text-muted-foreground tabular-nums">{formatDuration(run.durationMs)}</span>
-                    <button
-                      onClick={() => openRunDrawer(task.id, run.id)}
-                      className="opacity-0 group-hover/run:opacity-100 transition-opacity p-1 rounded-md hover:bg-foreground/[0.06]"
-                      aria-label={t('cron.viewOutput')}
-                    >
-                      <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
-                    </button>
+          {/* Responsive: stack below lg, tasks + recent side-by-side at lg+ */}
+          <div
+            className={cn(
+              'grid gap-4 items-start',
+              hasTaskColumn
+                ? 'grid-cols-1 lg:grid-cols-[minmax(0,1.45fr)_minmax(280px,0.95fr)] xl:grid-cols-[minmax(0,1.55fr)_minmax(300px,0.9fr)] 2xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.85fr)]'
+                : 'grid-cols-1',
+            )}
+          >
+            {hasTaskColumn && (
+              <div className="min-w-0 space-y-4">
+                {upcomingTasks.length > 0 && (
+                  <div data-cron-motion-section className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Zap className="w-3.5 h-3.5 text-primary" />
+                      <h3 className="text-xs font-semibold text-foreground uppercase tracking-wide">{t('cron.upcoming')}</h3>
+                      <span className="text-[10px] font-medium text-primary bg-primary/10 px-1.5 py-0.5 rounded-full tabular-nums">{upcomingTasks.length}</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {upcomingTasks.map((task) => (
+                        <TimelineTaskCard
+                          key={task.id}
+                          task={task}
+                          runs={cronRuns[task.id] || []}
+                          nextRun={nextRunTimes[task.id]}
+                          expanded={expandedTaskId === task.id}
+                          onToggleExpand={() => setExpandedTaskId(expandedTaskId === task.id ? null : task.id)}
+                          onEdit={() => handleEdit(task)}
+                          onDelete={() => setPendingDelete(task)}
+                          onToggleEnabled={() => toggleCronTask(task.id)}
+                          onRetry={() => handleRetry(task.id)}
+                          onViewRun={(runId) => openRunDrawer(task.id, runId)}
+                          onOpenSession={(run) => openRunSession(task, run)}
+                        />
+                      ))}
+                    </div>
                   </div>
-                ))}
+                )}
+
+                {disabledTasks.length > 0 && (
+                  <div data-cron-motion-section className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Timer className="w-3.5 h-3.5 text-muted-foreground" />
+                      <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{t('cron.disabled')}</h3>
+                      <span className="text-[10px] font-medium text-muted-foreground bg-muted-foreground/10 px-1.5 py-0.5 rounded-full tabular-nums">{disabledTasks.length}</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {disabledTasks.map((task) => (
+                        <TimelineTaskCard
+                          key={task.id}
+                          task={task}
+                          runs={cronRuns[task.id] || []}
+                          expanded={expandedTaskId === task.id}
+                          onToggleExpand={() => setExpandedTaskId(expandedTaskId === task.id ? null : task.id)}
+                          onEdit={() => handleEdit(task)}
+                          onDelete={() => setPendingDelete(task)}
+                          onToggleEnabled={() => toggleCronTask(task.id)}
+                          onRetry={() => handleRetry(task.id)}
+                          onViewRun={(runId) => openRunDrawer(task.id, runId)}
+                          onOpenSession={(run) => openRunSession(task, run)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
+            )}
+
+            <div
+              data-cron-motion-section
+              className={cn(
+                'min-w-0 space-y-2',
+                hasTaskColumn && 'lg:sticky lg:top-0 lg:max-h-[calc(100vh-7.5rem)] lg:overflow-y-auto lg:pr-0.5',
+              )}
+            >
+              <div className="flex items-center gap-2 flex-wrap">
+                <History className="w-3.5 h-3.5 text-muted-foreground" />
+                <h3 className="text-xs font-semibold text-foreground uppercase tracking-wide">{t('cron.recentRuns')}</h3>
+                <span className="text-[10px] font-medium text-muted-foreground bg-muted-foreground/10 px-1.5 py-0.5 rounded-full tabular-nums">{recentCompletedRuns.length}</span>
+                <div className="ml-auto flex items-center gap-1">
+                  {([
+                    ['today', 'cron.runsToday'],
+                    ['7d', 'cron.runs7d'],
+                    ['all', 'cron.runsAll'],
+                  ] as const).map(([key, labelKey]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setRecentRange(key)}
+                      className={cn(
+                        'px-2 py-0.5 rounded-full text-[10px] font-medium transition-colors',
+                        recentRange === key
+                          ? 'bg-primary/15 text-primary'
+                          : 'text-muted-foreground hover:bg-foreground/[0.05]',
+                      )}
+                    >
+                      {t(labelKey)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {recentCompletedRuns.length === 0 ? (
+                <div className="glass-subtle glass-noise rounded-lg px-3 py-2.5 text-xs text-muted-foreground">
+                  {t('cron.noRuns')}
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  {recentCompletedRuns.map(({ task, run }) => {
+                    const session = getCronRunSessionAvailability({
+                      id: run.id,
+                      runtimeId: run.runtimeId,
+                      providerSessionId: run.providerSessionId,
+                      workingDir: run.workingDir ?? task.workingDir,
+                      status: run.status,
+                    });
+                    return (
+                      <div
+                        key={run.id}
+                        data-cron-motion-run
+                        data-cron-run-id={run.id}
+                        className="group/run glass-subtle glass-noise rounded-lg px-2.5 py-1.5 flex items-center gap-1.5"
+                      >
+                        <StatusBadge status={run.status} />
+                        <span className="text-xs font-medium text-foreground flex-1 min-w-0 truncate">{task.name}</span>
+                        <span className="text-2xs text-muted-foreground tabular-nums shrink-0 hidden sm:inline">{formatTime(run.finishedAt || run.startedAt)}</span>
+                        <span className="text-2xs text-muted-foreground tabular-nums shrink-0">{formatDuration(run.durationMs)}</span>
+                        <button
+                          type="button"
+                          onClick={() => openRunSession(task, run)}
+                          disabled={!session.canOpen}
+                          className={cn(
+                            'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] shrink-0 transition-colors',
+                            session.canOpen
+                              ? 'text-primary hover:bg-primary/10'
+                              : 'text-muted-foreground/50 cursor-not-allowed',
+                          )}
+                          aria-label={session.canOpen ? t('cron.openSession') : t('cron.openSessionUnavailable')}
+                          title={session.canOpen ? t('cron.openSession') : t('cron.sessionUnavailable')}
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          <span className="hidden xl:inline">
+                            {session.canOpen ? t('cron.openSession') : t('cron.openSessionUnavailable')}
+                          </span>
+                        </button>
+                        <button
+                          onClick={() => openRunDrawer(task.id, run.id)}
+                          className="p-1 rounded-md hover:bg-foreground/[0.06] shrink-0"
+                          aria-label={t('cron.viewOutput')}
+                        >
+                          <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          )}
+          </div>
         </div>
       )}
 
@@ -1347,8 +1540,10 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
       {(drawerRun || drawerLoading) && (
         <RunDetailDrawer
           run={drawerRun}
+          task={drawerTask}
           loading={drawerLoading}
-          onClose={() => { setDrawerRun(null); setDrawerLoading(false); }}
+          onClose={() => { setDrawerRun(null); setDrawerTask(null); setDrawerLoading(false); }}
+          onOpenSession={(run) => openRunSession(drawerTask, run)}
           t={t}
         />
       )}
@@ -1358,10 +1553,12 @@ export function CronTasks({ onAiCreate }: { onAiCreate?: () => void }) {
 
 // --- Run Detail Drawer ---
 
-function RunDetailDrawer({ run, loading, onClose, t }: {
+function RunDetailDrawer({ run, task, loading, onClose, onOpenSession, t }: {
   run: CronTaskRun | null;
+  task: CronTask | null;
   loading: boolean;
   onClose: () => void;
+  onOpenSession: (run: CronTaskRun) => void;
   t: (key: string) => string;
 }) {
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -1372,6 +1569,16 @@ function RunDetailDrawer({ run, loading, onClose, t }: {
       setTimeout(() => setCopiedField(null), 2000);
     });
   }, []);
+
+  const session = run
+    ? getCronRunSessionAvailability({
+      id: run.id,
+      runtimeId: run.runtimeId,
+      providerSessionId: run.providerSessionId,
+      workingDir: run.workingDir ?? task?.workingDir,
+      status: run.status,
+    })
+    : null;
 
   return createPortal(
     <>
@@ -1411,20 +1618,46 @@ function RunDetailDrawer({ run, loading, onClose, t }: {
             <>
               {/* Meta info */}
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                {task?.name && <span className="font-medium text-foreground/80">{task.name}</span>}
                 <span>{formatTime(run.startedAt)}</span>
                 <span>{formatDuration(run.durationMs)}</span>
-                {run.exitCode !== null && (
+                {run.exitCode !== null && run.exitCode !== undefined && (
                   <span>{t('cron.exitCode')}: {run.exitCode}</span>
                 )}
+              </div>
+
+              {/* Session CTA */}
+              <div className="rounded-xl border border-[hsl(var(--glass-border-light)/0.18)] bg-foreground/[0.03] px-3 py-3 space-y-2">
+                <p className="text-[11px] text-muted-foreground">
+                  {session?.reason === 'live'
+                    ? t('cron.sessionAvailableLive')
+                    : session?.reason === 'history'
+                      ? t('cron.sessionAvailableHistory')
+                      : t('cron.sessionUnavailable')}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onOpenSession(run)}
+                  disabled={!session?.canOpen}
+                  className={cn(
+                    'inline-flex items-center gap-1.5 px-3 py-[7px] rounded-full text-[12px] font-medium transition-all active:scale-[0.97]',
+                    session?.canOpen
+                      ? 'bg-primary text-white hover:bg-primary/90'
+                      : 'bg-foreground/[0.06] text-muted-foreground cursor-not-allowed',
+                  )}
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  {session?.canOpen ? t('cron.openSession') : t('cron.openSessionUnavailable')}
+                </button>
               </div>
 
               {/* Stdout */}
               <OutputBlock
                 label={t('cron.stdout')}
-                content={run.stdout}
+                content={run.stdout || ''}
                 emptyText={t('cron.noOutput')}
                 copied={copiedField === 'stdout'}
-                onCopy={() => handleCopy(run.stdout, 'stdout')}
+                onCopy={() => handleCopy(run.stdout || '', 'stdout')}
                 t={t}
               />
 
@@ -1435,7 +1668,7 @@ function RunDetailDrawer({ run, loading, onClose, t }: {
                   content={run.stderr}
                   emptyText={t('cron.noOutput')}
                   copied={copiedField === 'stderr'}
-                  onCopy={() => handleCopy(run.stderr, 'stderr')}
+                  onCopy={() => handleCopy(run.stderr || '', 'stderr')}
                   t={t}
                   isError
                 />

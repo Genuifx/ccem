@@ -1,15 +1,60 @@
 use super::login::capability::BrowserPermissionAuthorityTicket;
 use super::registry::BrowserOperationToken;
 use super::{
-    build_eval_json_script, decode_eval_json_string, decode_eval_value, emit_browser_opened,
-    emit_browser_state, normalize_browser_session_id, required_string_arg, required_u32_arg,
-    BrowserManager, BrowserToolRequest,
+    emit_browser_opened, emit_browser_state, normalize_browser_session_id, BrowserManager,
+    BrowserToolRequest,
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
+
+fn required_string_arg(args: &Value, key: &str) -> Result<String, String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("Missing browser tool string arg: {key}"))
+}
+
+fn required_u32_arg(args: &Value, key: &str) -> Result<u32, String> {
+    let value = args
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("Missing browser tool numeric arg: {key}"))?;
+    u32::try_from(value).map_err(|_| format!("Browser tool arg out of range: {key}"))
+}
+
+fn decode_eval_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+fn decode_eval_json_string(raw: &str) -> Result<String, String> {
+    match serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("decode browser eval: {error}"))?
+    {
+        Value::String(value) => Ok(value),
+        other => Ok(other.to_string()),
+    }
+}
+
+pub(super) fn build_eval_json_script(expression: &str) -> Result<String, String> {
+    Ok(format!(
+        r#"
+(() => {{
+  try {{
+    const value = (
+{expression}
+    );
+    return JSON.stringify(value === undefined ? null : value);
+  }} catch (error) {{
+    return JSON.stringify({{ ok: false, error: String(error && error.message || error) }});
+  }}
+}})()
+"#
+    ))
+}
 
 impl BrowserManager {
     pub fn run_tool(

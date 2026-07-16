@@ -300,19 +300,20 @@ test('without an overlay delayed native creation keeps its normal visible intent
   unregister();
 });
 
-test('BrowserPanel and every modal primitive use the acknowledgement gate', async () => {
+test('BrowserPanel and every overlapping React surface use the acknowledgement gate', async () => {
   const [
     workspace,
     browserPanel,
     browserPanelParticipant,
     browserBackend,
+    browserCommands,
     previewWebview,
     tauriIpc,
     hook,
     dialog,
     allProjects,
     projectPicker,
-    reviewDrawer,
+    reviewPopover,
     app,
   ] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
@@ -325,6 +326,7 @@ test('BrowserPanel and every modal primitive use the acknowledgement gate', asyn
       'utf8',
     ),
     fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser.rs'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser', 'commands.rs'), 'utf8'),
     fs.readFile(
       path.join(desktopDir, 'src-tauri', 'src', 'browser', 'webview.rs'),
       'utf8',
@@ -341,7 +343,7 @@ test('BrowserPanel and every modal primitive use the acknowledgement gate', asyn
       'utf8',
     ),
     fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewDrawer.tsx'),
+      path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewPopover.tsx'),
       'utf8',
     ),
     fs.readFile(path.join(desktopDir, 'src', 'App.tsx'), 'utf8'),
@@ -381,18 +383,18 @@ test('BrowserPanel and every modal primitive use the acknowledgement gate', asyn
     /browser_open: \[[\s\S]*?sessionId\?: string \| null; url\?: string \| null; visible\?: boolean \| null[\s\S]*?BrowserInfo[\s\S]*?\];/,
   );
   assert.match(browserBackend, /pub fn open_with_visibility\(/);
-  assert.match(browserBackend, /visible\.unwrap_or\(true\)/);
+  assert.match(browserCommands, /visible\.unwrap_or\(true\)/);
   for (const command of [
     'browser_set_active_session',
     'browser_open',
     'browser_set_visible',
     'browser_navigate',
   ]) {
-    const commandStart = browserBackend.indexOf(`pub async fn ${command}(`);
-    const commandEnd = browserBackend.indexOf('\n}\n', commandStart);
+    const commandStart = browserCommands.indexOf(`pub async fn ${command}(`);
+    const commandEnd = browserCommands.indexOf('\n}\n', commandStart);
     assert.ok(commandStart > 0 && commandEnd > commandStart, `${command} must be async`);
     assert.match(
-      browserBackend.slice(commandStart, commandEnd),
+      browserCommands.slice(commandStart, commandEnd),
       /run_blocking_browser_command\(/,
       `${command} must leave the Tauri UI thread before waiting for the native surface lane`,
     );
@@ -456,8 +458,8 @@ test('BrowserPanel and every modal primitive use the acknowledgement gate', asyn
   assert.match(allProjects, /if \(!gatedOpen\) return null/);
   assert.match(projectPicker, /const gatedOpen = useNativeSurfaceOcclusion\(open\)/);
   assert.match(projectPicker, /if \(!gatedOpen\)/);
-  assert.match(reviewDrawer, /const gatedOpen = useNativeSurfaceOcclusion\(isOpen\)/);
-  assert.match(reviewDrawer, /if \(!gatedOpen\)/);
+  assert.match(reviewPopover, /const gatedOpen = useNativeSurfaceOcclusion\(isOpen\)/);
+  assert.match(reviewPopover, /open=\{gatedOpen\}/);
   assert.match(app, /const gatedOpen = useNativeSurfaceOcclusion\(true\)/);
   assert.match(app, /if \(!gatedOpen\) return null/);
 });

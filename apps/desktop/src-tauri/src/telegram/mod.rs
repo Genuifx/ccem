@@ -9,6 +9,7 @@ use crate::event_bus::{
     ToolQuestionPrompt,
 };
 use crate::interactive_runtime::{InteractiveRuntimeManager, InteractiveSessionOptions};
+use crate::permission_preview::format_permission_preview;
 use crate::runtime::{
     clear_runtime_recovery_candidates_by_claude_session_id, HeadlessRuntimeManager,
     HeadlessSessionOptions, HeadlessSessionSource,
@@ -2745,7 +2746,7 @@ fn handle_message(
                     token,
                     chat_id,
                     thread_id,
-                    &format!("Approved permission request {request_id}."),
+                    &format_permission_command_result(request_id, true, None),
                 )?;
             }
             Err(error) => {
@@ -2753,7 +2754,7 @@ fn handle_message(
                     token,
                     chat_id,
                     thread_id,
-                    &format!("Failed to approve {request_id}: {error}"),
+                    &format_permission_command_result(request_id, true, Some(&error)),
                 )?;
             }
         }
@@ -2776,7 +2777,7 @@ fn handle_message(
                     token,
                     chat_id,
                     thread_id,
-                    &format!("Denied permission request {request_id}."),
+                    &format_permission_command_result(request_id, false, None),
                 )?;
             }
             Err(error) => {
@@ -2784,7 +2785,7 @@ fn handle_message(
                     token,
                     chat_id,
                     thread_id,
-                    &format!("Failed to deny {request_id}: {error}"),
+                    &format_permission_command_result(request_id, false, Some(&error)),
                 )?;
             }
         }
@@ -4740,10 +4741,8 @@ fn monitor_session_completion(
                         responder,
                         ..
                     } if announced_responses.insert(request_id.clone()) => {
-                        let text = format!(
-                            "Permission request {request_id} was {} by {responder}.",
-                            if approved { "approved" } else { "denied" }
-                        );
+                        let text =
+                            format_permission_response_text(&request_id, approved, &responder);
                         if let Some(sent_message) = permission_messages.remove(&request_id) {
                             if edit_message_text(
                                 &token,
@@ -4897,6 +4896,7 @@ fn monitor_interactive_session(
                         input_summary,
                         needs_response,
                         prompt,
+                        ..
                     } => {
                         if !manager.mark_interactive_tool_seen(chat_id, thread_id, &tool_use_id) {
                             continue;
@@ -5710,9 +5710,45 @@ fn send_permission_request_message(
         token,
         chat_id,
         thread_id,
-        &format!("Permission required for {tool_name}.\nRequest: {request_id}"),
+        &format_permission_request_text(tool_name, request_id),
         Some(markup),
     )
+}
+
+fn format_permission_request_text(tool_name: &str, request_id: &str) -> String {
+    format!(
+        "Permission required for {}.\nRequest: {}",
+        format_permission_preview(tool_name, 120),
+        format_permission_preview(request_id, 240)
+    )
+}
+
+fn format_permission_response_text(request_id: &str, approved: bool, responder: &str) -> String {
+    format!(
+        "Permission request {} was {} by {}.",
+        format_permission_preview(request_id, 240),
+        if approved { "approved" } else { "denied" },
+        format_permission_preview(responder, 120)
+    )
+}
+
+fn format_permission_command_result(
+    request_id: &str,
+    approved: bool,
+    error: Option<&str>,
+) -> String {
+    let request_id = format_permission_preview(request_id, 240);
+    match error {
+        Some(error) => format!(
+            "Failed to {} {request_id}: {}",
+            if approved { "approve" } else { "deny" },
+            format_permission_preview(error, 400)
+        ),
+        None => format!(
+            "{} permission request {request_id}.",
+            if approved { "Approved" } else { "Denied" }
+        ),
+    }
 }
 
 fn send_interactive_permission_request_message(
@@ -5921,16 +5957,18 @@ mod tests {
         build_multi_select_text_entry_steps, build_plan_exit_question, canonical_thread_id,
         command_scopes_to_clear, decrypt_telegram_settings, ensure_chat_about_this_option,
         ensure_text_entry_option, expand_home_dir, format_active_choice_text,
-        format_new_topic_welcome_message, format_tool_completed_message,
-        format_topic_binding_success_message, is_chat_about_this_option, is_chat_allowed,
-        is_sender_allowed, is_vscode_text_entry_option, normalize_command_text, parse_bind_command,
-        parse_interactive_tool_cancel_callback_data, parse_interactive_tool_select_callback_data,
-        parse_interactive_tool_submit_callback_data, parse_new_topic_command,
-        parse_permission_callback_data, redact_telegram_token, remove_topic_binding,
-        selection_submit_options, summarize_interactive_prompt_resolution, upsert_topic_binding,
-        ActiveInteractiveChoicePrompt, InteractiveChoiceSubmitMode, PendingInteractiveAction,
-        TelegramBotCommandScope, TelegramBridgeManager, TelegramSettings, TelegramTopicBinding,
-        TELEGRAM_FULL_GROUP_COMMANDS, TELEGRAM_MINIMAL_GROUP_COMMANDS, TELEGRAM_PRIVATE_COMMANDS,
+        format_new_topic_welcome_message, format_permission_command_result,
+        format_permission_request_text, format_permission_response_text,
+        format_tool_completed_message, format_topic_binding_success_message,
+        is_chat_about_this_option, is_chat_allowed, is_sender_allowed, is_vscode_text_entry_option,
+        normalize_command_text, parse_bind_command, parse_interactive_tool_cancel_callback_data,
+        parse_interactive_tool_select_callback_data, parse_interactive_tool_submit_callback_data,
+        parse_new_topic_command, parse_permission_callback_data, redact_telegram_token,
+        remove_topic_binding, selection_submit_options, summarize_interactive_prompt_resolution,
+        upsert_topic_binding, ActiveInteractiveChoicePrompt, InteractiveChoiceSubmitMode,
+        PendingInteractiveAction, TelegramBotCommandScope, TelegramBridgeManager, TelegramSettings,
+        TelegramTopicBinding, TELEGRAM_FULL_GROUP_COMMANDS, TELEGRAM_MINIMAL_GROUP_COMMANDS,
+        TELEGRAM_PRIVATE_COMMANDS,
     };
     use crate::event_bus::{ToolQuestionOption, ToolQuestionPrompt};
     use chrono::Utc;
@@ -5992,6 +6030,29 @@ mod tests {
             Some((false, "req-456"))
         );
         assert_eq!(parse_permission_callback_data("noop:req-123"), None);
+    }
+
+    #[test]
+    fn permission_messages_expose_only_sanitized_display_copies() {
+        let request_id = "req\n\u{17b4}\u{202e}id";
+        let tool_name = "Bash\u{1d173}\u{201c}";
+
+        assert_eq!(
+            format_permission_request_text(tool_name, request_id),
+            "Permission required for Bash\\u{1D173}\\u{201C}.\nRequest: req\\u{000A}\\u{17B4}\\u{202E}id"
+        );
+        assert_eq!(
+            format_permission_response_text(request_id, true, "telegram"),
+            "Permission request req\\u{000A}\\u{17B4}\\u{202E}id was approved by telegram."
+        );
+        assert_eq!(
+            format_permission_command_result(request_id, true, None),
+            "Approved permission request req\\u{000A}\\u{17B4}\\u{202E}id."
+        );
+        assert_eq!(
+            format_permission_command_result(request_id, false, Some("bad\nrequest")),
+            "Failed to deny req\\u{000A}\\u{17B4}\\u{202E}id: bad\\u{000A}request"
+        );
     }
 
     #[test]

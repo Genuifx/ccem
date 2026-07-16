@@ -96,6 +96,11 @@ import {
   type ComposerTokenKind,
 } from './composerModel';
 import { composerSegmentsReferenceImageAttachment } from './composerImageReferences';
+import { WorkspaceComposerAnnotations } from './WorkspaceAnnotations';
+import {
+  buildComposerPromptWithAnnotations,
+  type WorkspaceAnnotation,
+} from './workspaceAnnotationModel';
 
 export interface ComposerQueuedMessage {
   id: string;
@@ -148,6 +153,11 @@ interface WorkspaceSessionComposerProps {
   onFlushQueuedMessages?: () => void | Promise<void>;
   onRemoveQueuedMessage?: (id: string) => void;
   queueCanFlush?: boolean;
+  annotations?: WorkspaceAnnotation[];
+  onUpdateAnnotation?: (id: string, note: string) => void;
+  onRemoveAnnotation?: (id: string) => void;
+  onClearAnnotations?: () => void;
+  onAnnotationsSent?: () => void;
 }
 
 function attachmentIcon(attachment: ComposerAttachment) {
@@ -765,6 +775,11 @@ export function WorkspaceSessionComposer({
   onFlushQueuedMessages,
   onRemoveQueuedMessage,
   queueCanFlush = true,
+  annotations = [],
+  onUpdateAnnotation,
+  onRemoveAnnotation,
+  onClearAnnotations,
+  onAnnotationsSent,
 }: WorkspaceSessionComposerProps) {
   const { t } = useLocale();
   const composerShellRef = useRef<HTMLDivElement | null>(null);
@@ -803,7 +818,10 @@ export function WorkspaceSessionComposer({
       width: `min(${previewImageSize.width}px, min(92vw, 960px), calc(min(78vh, 720px) * ${previewImageSize.width} / ${previewImageSize.height}))`,
     };
   }, [previewImageSize]);
-  const canSubmitWithAttachments = canSubmit || composerPlainText.trim().length > 0 || attachments.length > 0;
+  const canSubmitWithAttachments = canSubmit
+    || composerPlainText.trim().length > 0
+    || attachments.length > 0
+    || annotations.length > 0;
   const resolvedActionLabel = isSubmitting ? loadingLabel : (primaryActionLabel ?? submitLabel);
   const resolvedPrimaryDisabled = primaryActionDisabled ?? (!canSubmitWithAttachments || disabled);
   const resolvedPrimaryIcon = isSubmitting
@@ -1197,7 +1215,7 @@ export function WorkspaceSessionComposer({
     const promptValue = promptAreaRef.current?.getPlainText() ?? segmentsToPlainText(composerSegments);
     const currentAttachments = attachmentsRef.current;
     let text = ensureComposerImagePlaceholders(promptValue, currentAttachments);
-    const displayText = ensureComposerImagePlaceholders(buildComposerDisplayText(promptValue), currentAttachments);
+    let displayText = ensureComposerImagePlaceholders(buildComposerDisplayText(promptValue), currentAttachments);
     let latestInstalledSkills = installedSkills;
     if (onRefreshSkills) {
       try {
@@ -1235,6 +1253,13 @@ export function WorkspaceSessionComposer({
         return false;
       }
     }
+    if (annotations.length > 0) {
+      text = buildComposerPromptWithAnnotations(text, annotations);
+      if (!displayText.trim()) {
+        displayText = t('workspace.composerAnnotationsOnly')
+          .replace('{count}', String(annotations.length));
+      }
+    }
 
     const payload: ComposerSubmitPayload = {
       text,
@@ -1256,11 +1281,14 @@ export function WorkspaceSessionComposer({
       setDraggedFileCount(0);
       setInlineSkillPopover(null);
       setTriggerPanelState(null);
+      onAnnotationsSent?.();
     }
     return result;
   }, [
     composerSegments,
     installedSkills,
+    annotations,
+    onAnnotationsSent,
     onRefreshSkills,
     onSubmit,
     provider,
@@ -1492,6 +1520,16 @@ export function WorkspaceSessionComposer({
                 <ListChecks className="h-3 w-3" />
                 {t('workspace.composerPlanModeShort')}
               </span>
+            </div>
+          ) : null}
+          {annotations.length > 0 && onUpdateAnnotation && onRemoveAnnotation && onClearAnnotations ? (
+            <div className={cn(aboveTextarea ? 'mb-2' : 'mb-3')}>
+              <WorkspaceComposerAnnotations
+                annotations={annotations}
+                onUpdate={onUpdateAnnotation}
+                onRemove={onRemoveAnnotation}
+                onClear={onClearAnnotations}
+              />
             </div>
           ) : null}
           {aboveTextarea ? (

@@ -11,29 +11,50 @@ async function readSource(...parts) {
   return fs.readFile(path.join(desktopDir, ...parts), 'utf8');
 }
 
-test('workspace review drawer stays lazy and only mounts while open', async () => {
+test('workspace review popover stays lazy and only mounts while open', async () => {
   const workspace = await readSource('src', 'pages', 'Workspace.tsx');
   const nativeView = await readSource('src', 'components', 'workspace', 'WorkspaceNativeSessionView.tsx');
 
   assert.doesNotMatch(
     workspace,
-    /from ['"]@\/components\/workspace\/WorkspaceReviewDrawer['"]/,
-    'Workspace page must not statically import the heavy review drawer',
+    /from ['"]@\/components\/workspace\/WorkspaceReviewPopover['"]/,
+    'Workspace page must not statically import the heavy review popover',
   );
   assert.doesNotMatch(
     nativeView,
-    /from ['"]\.\/WorkspaceReviewDrawer['"]/,
-    'Native session view must not statically import the heavy review drawer',
+    /from ['"]\.\/WorkspaceReviewPopover['"]/,
+    'Native session view must not statically import the heavy review popover',
   );
   assert.match(
     workspace,
     /shouldRenderWorkspaceReview && workspaceReviewOpen && workspaceReviewModel/,
-    'Workspace page should only mount the lazy drawer when the review panel is open',
+    'Workspace page should only mount the lazy popover when the review panel is open',
   );
   assert.match(
     nativeView,
-    /isReviewDrawerOpen && reviewModel/,
-    'Native session view should only mount the lazy drawer when the review panel is open',
+    /isReviewPopoverOpen && reviewModel/,
+    'Native session view should only mount the lazy popover when the review panel is open',
+  );
+
+  assert.match(
+    workspace,
+    /from ['"]@\/components\/workspace\/LazyWorkspaceReviewPopover['"]/,
+    'Workspace page should load the review UI through its lazy boundary',
+  );
+  assert.match(
+    nativeView,
+    /from ['"]\.\/LazyWorkspaceReviewPopover['"]/,
+    'Native session view should load the review UI through its lazy boundary',
+  );
+  assert.match(
+    workspace,
+    /key=\{`\$\{workspaceReviewSession\.runtime_id\}:\$\{workspaceReviewSession\.project_dir\}`\}/,
+    'history and compose review state should reset when the reviewed session identity changes',
+  );
+  assert.match(
+    nativeView,
+    /key=\{`\$\{session\.runtime_id\}:\$\{session\.project_dir\}`\}/,
+    'live review state should reset when the reviewed session identity changes',
   );
 });
 

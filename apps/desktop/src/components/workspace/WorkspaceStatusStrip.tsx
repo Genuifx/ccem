@@ -27,6 +27,10 @@ import type { Environment } from '@/store';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
 import type { BrowserSurfaceBackend } from '@/lib/browserSurfaceIpc';
 import type { LoginBrowserPanelRequest } from './browserPanelTarget';
+import {
+  WORKSPACE_REVIEW_POPOVER_ID,
+  workspaceReviewTriggerRef,
+} from './workspaceReviewAnchor';
 
 function EnvironmentLobeIcon({
   environment,
@@ -68,6 +72,8 @@ interface WorkspaceStatusStripProps {
   onTogglePreviewBrowser?: () => void;
   onOpenLoginBrowser?: (request: LoginBrowserPanelRequest) => void;
   onBrowserHostOverlayChange?: (open: boolean) => void;
+  /** Optional env context (e.g. the active history/live session env) to keep visible alongside the global current env. */
+  envContext?: string;
 }
 
 function StatusChip({
@@ -137,6 +143,7 @@ export function WorkspaceStatusStrip({
   onTogglePreviewBrowser,
   onOpenLoginBrowser,
   onBrowserHostOverlayChange,
+  envContext,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
   const { sessions, currentEnv, environments, enabledEnvironments, continuousUsageDays, cronTasks, usageStats } = useAppStore(
@@ -151,8 +158,11 @@ export function WorkspaceStatusStrip({
     }),
     shallow
   );
+  const statusStripCurrentEnvs = envContext
+    ? [currentEnv, envContext].filter((name): name is string => Boolean(name))
+    : currentEnv;
   const runtimeEnvironments = filterRuntimeEnvironments(environments, enabledEnvironments, {
-    currentEnv,
+    currentEnv: statusStripCurrentEnvs.length > 0 ? statusStripCurrentEnvs : null,
   });
   const [streakPopoverOpen, setStreakPopoverOpen] = useState(false);
   const [isRefreshingStreak, setIsRefreshingStreak] = useState(false);
@@ -355,8 +365,12 @@ export function WorkspaceStatusStrip({
 
       {/* Review audit entry — always visible, far-right, context-aware */}
       <button
+        ref={workspaceReviewTriggerRef}
         type="button"
-        aria-pressed={reviewPanelOpen}
+        data-ccem-workspace-review-trigger
+        aria-haspopup="dialog"
+        aria-expanded={reviewPanelOpen}
+        aria-controls={reviewPanelOpen ? WORKSPACE_REVIEW_POPOVER_ID : undefined}
         title={t('workspace.reviewEntry')}
         onClick={() => setReviewPanelOpen(!reviewPanelOpen)}
         className={cn(

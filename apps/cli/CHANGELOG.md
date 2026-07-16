@@ -1,5 +1,29 @@
 # ccem
 
+## 2.57.0
+
+### Minor Changes
+
+- Minor release: cron run session history, responsive cron page, workspace selection polish.
+
+## 2.56.0
+
+### Minor Changes
+
+- Stabilize workspace annotation markers and desktop fixes.
+
+## 2.55.0
+
+### Minor Changes
+
+- Release v2.55.0: workspace todo persistence, native runtime helper refresh, and interactive workspace review improvements
+
+## 2.54.0
+
+### Minor Changes
+
+- Minor release: desktop workspace sidebar resize, preview browser diagnostics and session management, red-box and coding plan provider preset refresh, bundled cron skill alignment.
+
 ## 2.53.0
 
 ### Minor Changes

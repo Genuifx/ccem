@@ -251,7 +251,7 @@ test('selected skill prompt augmentation stays out of user-visible display text'
 
   assert.match(
     composerSource,
-    /const displayText = ensureComposerImagePlaceholders\(buildComposerDisplayText\(promptValue\), currentAttachments\);/,
+    /let displayText = ensureComposerImagePlaceholders\(buildComposerDisplayText\(promptValue\), currentAttachments\);/,
   );
   assert.match(composerSource, /buildComposerPromptWithSelectedSkills\(displayText, selectedSkills\)/);
   assert.doesNotMatch(composerSource, /buildComposerPromptWithSelectedSkills\(promptValue, selectedSkills\)/);

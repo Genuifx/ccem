@@ -28,6 +28,7 @@ mod native_runtime;
 mod notifications;
 mod opencode;
 mod permission;
+mod permission_preview;
 mod pet_notifications;
 mod pet_window;
 mod prompt_image_store;
@@ -5157,19 +5158,19 @@ pub fn run_desktop_app() -> i32 {
             pet_notifications::open_pet_notification,
             pet_window::resize_pet_window,
             pet_window::set_pet_window_content_visible,
-            browser::browser_set_active_session,
-            browser::browser_open,
-            browser::browser_set_bounds,
-            browser::browser_set_visible,
-            browser::browser_close,
-            browser::browser_navigate,
-            browser::browser_reload,
-            browser::browser_back,
-            browser::browser_forward,
-            browser::browser_info,
-            browser::browser_health_check,
-            browser::browser_set_paused,
-            browser::browser_recent_activity,
+            browser::commands::browser_set_active_session,
+            browser::commands::browser_open,
+            browser::commands::browser_set_bounds,
+            browser::commands::browser_set_visible,
+            browser::commands::browser_close,
+            browser::commands::browser_navigate,
+            browser::commands::browser_reload,
+            browser::commands::browser_back,
+            browser::commands::browser_forward,
+            browser::commands::browser_info,
+            browser::commands::browser_health_check,
+            browser::commands::browser_set_paused,
+            browser::commands::browser_recent_activity,
             browser::login::surface_commands::ipc::browser_surface_acquire,
             browser::login::surface_commands::ipc::browser_surface_sync,
             browser::login::surface_commands::ipc::browser_surface_release,
@@ -5180,8 +5181,8 @@ pub fn run_desktop_app() -> i32 {
             browser::login_commands::browser_login_profile_recent_activity,
             browser::login_commands::browser_login_reset_profile,
             browser::login_commands::browser_login_delete_profile,
-            browser::browser_snapshot,
-            browser::browser_screenshot,
+            browser::commands::browser_snapshot,
+            browser::commands::browser_screenshot,
             tray::open_tray_cockpit,
             app_updates::get_app_version,
             app_updates::check_app_update,

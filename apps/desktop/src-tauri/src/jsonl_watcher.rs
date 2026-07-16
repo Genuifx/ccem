@@ -268,6 +268,7 @@ fn parse_assistant_line(
                             input_summary: summarize_tool_input(raw_name, &input),
                             needs_response,
                             prompt,
+                            todo_snapshot: None,
                         });
                     }
                     _ => {}
@@ -354,6 +355,7 @@ fn parse_user_line(
                 raw_name,
                 result_summary: summarize_tool_result(block),
                 success,
+                todo_snapshot: None,
             });
         }
     }
@@ -708,6 +710,7 @@ mod tests {
                 input_summary,
                 needs_response,
                 prompt: None,
+                ..
             } if tool_use_id == "toolu-1"
                 && raw_name == "Bash"
                 && raw_name_again == "Bash"
@@ -828,6 +831,7 @@ mod tests {
                 result_summary,
                 result_content: None,
                 success,
+                ..
             } if tool_use_id == "toolu-plan"
                 && raw_name == "EnterPlanMode"
                 && result_summary == "Entered plan mode."
@@ -862,6 +866,7 @@ mod tests {
                 result_summary,
                 result_content: Some(result_content),
                 success,
+                ..
             } if tool_use_id == "toolu-agent"
                 && raw_name == "Agent"
                 && result_summary == full_output

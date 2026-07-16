@@ -8,7 +8,7 @@ type Messages = Record<string, Record<string, string>>;
 const messages: Record<LocaleKey, Messages> = { zh, en };
 
 interface LocaleContextType {
-  t: (key: string) => string;
+  t: (key: string, params?: Record<string, string | number>) => string;
   lang: LocaleKey;
   setLang: (lang: LocaleKey) => void;
 }
@@ -25,10 +25,12 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     localStorage.setItem('ccem-locale', newLang);
   }, []);
 
-  const t = useCallback((key: string): string => {
+  const t = useCallback((key: string, params?: Record<string, string | number>): string => {
     const [namespace, ...rest] = key.split('.');
     const msgKey = rest.join('.');
-    return messages[lang]?.[namespace]?.[msgKey] || key;
+    const message = messages[lang]?.[namespace]?.[msgKey] || key;
+    if (!params) return message;
+    return message.replace(/\{(\w+)\}/g, (_, paramKey) => String(params[paramKey] ?? `{${paramKey}}`));
   }, [lang]);
 
   const value = useMemo(() => ({ t, lang, setLang }), [t, lang, setLang]);

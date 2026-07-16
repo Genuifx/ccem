@@ -1,6 +1,7 @@
 use super::{truncate_utf8, WecomBridgeManager, WecomConnection};
 use crate::channel::{ChannelKind, OutputChannel};
 use crate::event_bus::{SessionEventPayload, SessionEventRecord};
+use crate::permission_preview::format_permission_preview;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
@@ -107,9 +108,9 @@ impl WecomChannel {
                     tool_name,
                     ..
                 } => {
-                    state.content.push_str(&format!(
-                        "\n\nPermission required: `{tool_name}` ({request_id}). Admin can reply `/approve {request_id}` or `/deny {request_id}`."
-                    ));
+                    state
+                        .content
+                        .push_str(&format_permission_required_text(tool_name, request_id));
                     force_flush = true;
                 }
                 SessionEventPayload::SessionCompleted { reason } => {
@@ -207,4 +208,25 @@ fn parse_result_text(raw_json: &str) -> Option<String> {
         .ok()
         .and_then(|payload| payload.result.or(payload.error))
         .filter(|text| !text.trim().is_empty())
+}
+
+fn format_permission_required_text(tool_name: &str, request_id: &str) -> String {
+    let tool_name = format_permission_preview(tool_name, 120);
+    let request_id = format_permission_preview(request_id, 240);
+    format!(
+        "\n\nPermission required: `{tool_name}` ({request_id}). Open CCEM Desktop to approve or deny this request."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_permission_required_text;
+
+    #[test]
+    fn permission_message_exposes_only_sanitized_display_copies() {
+        assert_eq!(
+            format_permission_required_text("Bash\u{180f}", "req\n\u{2065}\u{202e}id"),
+            "\n\nPermission required: `Bash\\u{180F}` (req\\u{000A}\\u{2065}\\u{202E}id). Open CCEM Desktop to approve or deny this request."
+        );
+    }
 }

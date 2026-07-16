@@ -9,10 +9,23 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
+async function readSource(...parts) {
+  return fs.readFile(path.join(desktopDir, ...parts), 'utf8');
+}
+
 async function importWorkspaceReview() {
   const sourcePath = path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceReview.ts');
+  const todosSourcePath = path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceTodos.ts');
   const source = await fs.readFile(sourcePath, 'utf8');
+  const todosSource = await fs.readFile(todosSourcePath, 'utf8');
   const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ES2022,
+      target: ts.ScriptTarget.ES2022,
+      isolatedModules: true,
+    },
+  });
+  const todosOutput = ts.transpileModule(todosSource, {
     compilerOptions: {
       module: ts.ModuleKind.ES2022,
       target: ts.ScriptTarget.ES2022,
@@ -21,7 +34,13 @@ async function importWorkspaceReview() {
   });
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-workspace-review-test-'));
   const outputPath = path.join(tempDir, 'workspaceReview.mjs');
-  await fs.writeFile(outputPath, output.outputText, 'utf8');
+  const todosOutputPath = path.join(tempDir, 'workspaceTodos.mjs');
+  await fs.writeFile(
+    outputPath,
+    output.outputText.replace("from './workspaceTodos'", "from './workspaceTodos.mjs'"),
+    'utf8',
+  );
+  await fs.writeFile(todosOutputPath, todosOutput.outputText, 'utf8');
   return import(pathToFileURL(outputPath).href);
 }
 
@@ -237,6 +256,35 @@ test('maps Codex todo_list summaries to unified todos', async () => {
   );
 });
 
+test('exposes structured Todo provenance for truthful review warnings', async () => {
+  const { buildWorkspaceReviewModel } = await importWorkspaceReview();
+  const model = buildWorkspaceReviewModel({
+    session: session(),
+    events: [
+      event(1, {
+        type: 'tool_use_started',
+        tool_use_id: 'todo-structured',
+        raw_name: 'TodoWrite',
+        input_summary: '{"todos":[...]}',
+        needs_response: false,
+        category: { category: 'task_mgmt', raw_name: 'TodoWrite' },
+        todo_snapshot: {
+          version: 1,
+          provider: 'claude',
+          source: 'TodoWrite',
+          revision: 7,
+          items: [{ id: 'one', text: 'Structured task', status: 'in_progress' }],
+        },
+      }),
+    ],
+    messages: [],
+    gitSnapshot: null,
+  });
+
+  assert.equal(model.todoSource, 'structured');
+  assert.equal(model.todoRevision, 7);
+});
+
 test('maps Claude TaskCreate TaskUpdate and TaskList to unified todos', async () => {
   const { buildWorkspaceReviewModel } = await importWorkspaceReview();
   const model = buildWorkspaceReviewModel({
@@ -421,5 +469,68 @@ test('recognizes expected artifact file types from changed files', async () => {
   assert.deepEqual(
     model.artifacts.map((artifact) => [artifact.path, artifact.kind, artifact.openable]),
     expectedArtifacts.map(([path, kind]) => [path, kind, true]),
+  );
+});
+
+test('native history carries replay events into review and provider-only history clears them', async () => {
+  const source = await readSource('src', 'pages', 'Workspace.tsx');
+
+  assert.match(
+    source,
+    /const \[historyEvents, setHistoryEvents\] = useState<SessionEventRecord\[\]>\(\[\]\)/,
+  );
+  assert.match(
+    source,
+    /return \{[\s\S]*messages: nativeMessages,[\s\S]*segments: \[\],[\s\S]*events: replayBatch\.events,[\s\S]*\}/,
+  );
+  assert.match(
+    source,
+    /if \(nativeHistory && hasNativeHistoryTranscriptMessages\(nativeHistory\.messages\)\) \{[\s\S]*setHistoryEvents\(nativeHistory\.events\)/,
+  );
+  assert.match(
+    source,
+    /if \(hasNativeHistorySessionOption\) \{[\s\S]*setHistoryEvents\(nativeHistory\?\.events \?\? \[\]\);[\s\S]*\}/,
+  );
+  assert.equal(
+    source.match(/events: workspaceReviewEvents/g)?.length,
+    2,
+    'history replay events should feed both the lightweight summary and lazy full review model',
+  );
+  assert.match(
+    source,
+    /const workspaceReviewEvents = useMemo\([\s\S]*workspaceMode === 'history' && selectedSession[\s\S]*\? historyEvents[\s\S]*: \[\],[\s\S]*\[historyEvents, selectedSession, workspaceMode\]/,
+  );
+});
+
+test('routine history refresh with native option omitted preserves replay events', async () => {
+  const source = await readSource('src', 'pages', 'Workspace.tsx');
+
+  assert.match(
+    source,
+    /const hasNativeHistorySessionOption = Object\.prototype\.hasOwnProperty\.call\([\s\S]*options,[\s\S]*'nativeHistorySession',[\s\S]*\)/,
+  );
+  assert.match(
+    source,
+    /loadConversation\(selectedSession, \{[\s\S]*resetBeforeLoad: false,[\s\S]*showLoading: false,[\s\S]*\}\)/,
+    'routine background refresh should continue omitting nativeHistorySession',
+  );
+  assert.match(
+    source,
+    /if \(hasNativeHistorySessionOption\) \{[\s\S]*setHistoryEvents\(nativeHistory\?\.events \?\? \[\]\);[\s\S]*\}/,
+    'history events should only be replaced when the native option was explicitly supplied',
+  );
+});
+
+test('selection loss clears history events and prevents stale review publication', async () => {
+  const source = await readSource('src', 'pages', 'Workspace.tsx');
+  const selectionLossStart = source.indexOf('if (!stillExists) {');
+  const selectionLossEnd = source.indexOf('return retainedSessions;', selectionLossStart);
+  const selectionLossBlock = source.slice(selectionLossStart, selectionLossEnd);
+
+  assert.notEqual(selectionLossStart, -1, 'selection-loss cleanup branch should exist');
+  assert.match(selectionLossBlock, /setHistoryEvents\(\[\]\)/);
+  assert.match(
+    source,
+    /const workspaceReviewEvents = useMemo\([\s\S]*workspaceMode === 'history' && selectedSession[\s\S]*\? historyEvents[\s\S]*: \[\],[\s\S]*\[historyEvents, selectedSession, workspaceMode\]/,
   );
 });

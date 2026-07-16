@@ -1371,7 +1371,7 @@ function WorkspaceImageLightbox({
   initialIndex: number;
   onClose: () => void;
   onIndexChange: (index: number) => void;
-  t: (key: string, params?: Record<string, unknown>) => string;
+  t: (key: string, params?: Record<string, string | number>) => string;
 }) {
   const [index, setIndex] = useState(initialIndex);
   const hasMultiple = blocks.length > 1;
@@ -1447,7 +1447,7 @@ function WorkspaceLightboxImage({
 }: {
   block: ConversationContentBlock;
   index: number;
-  t: (key: string, params?: Record<string, unknown>) => string;
+  t: (key: string, params?: Record<string, string | number>) => string;
 }) {
   const { src, loading, failed } = useImageBlockSrc(block);
   const altKey = t('workspace.imageThumbnailAlt', { index: index + 1 });
@@ -1490,7 +1490,7 @@ function WorkspaceImageThumbnail({
   index: number;
   active: boolean;
   onSelect: () => void;
-  t: (key: string, params?: Record<string, unknown>) => string;
+  t: (key: string, params?: Record<string, string | number>) => string;
 }) {
   const { src, loading, failed } = useImageBlockSrc(block);
   const altLabel = t('workspace.imageThumbnailAlt', { index: index + 1 });
@@ -1537,7 +1537,7 @@ function WorkspaceImageStrip({
 }: {
   blocks: ConversationContentBlock[];
   isUser: boolean;
-  t: (key: string, params?: Record<string, unknown>) => string;
+  t: (key: string, params?: Record<string, string | number>) => string;
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [lightboxOpen, setLightboxOpen] = useState(false);

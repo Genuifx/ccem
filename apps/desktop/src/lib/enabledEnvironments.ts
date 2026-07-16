@@ -18,15 +18,22 @@ export function isEnvironmentEnabled(
 export function filterRuntimeEnvironments<T extends Pick<Environment, 'name'>>(
   environments: T[],
   enabledEnvironments: string[] | null | undefined,
-  options?: { currentEnv?: string | null },
+  options?: { currentEnv?: string | string[] | null },
 ): T[] {
   if (enabledEnvironments == null) return environments;
 
   const enabledSet = new Set(enabledEnvironments);
   const currentEnv = options?.currentEnv ?? null;
+  const alwaysVisible = new Set(
+    Array.isArray(currentEnv)
+      ? currentEnv.filter((name): name is string => typeof name === 'string' && name.length > 0)
+      : typeof currentEnv === 'string' && currentEnv.length > 0
+        ? [currentEnv]
+        : [],
+  );
 
   return environments.filter(
-    (env) => enabledSet.has(env.name) || env.name === currentEnv,
+    (env) => enabledSet.has(env.name) || alwaysVisible.has(env.name),
   );
 }
 

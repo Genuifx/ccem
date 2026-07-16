@@ -1255,6 +1255,23 @@ export interface NativePromptImageInput {
   placeholder?: string;
 }
 
+export type TodoSnapshotStatusV1 = 'pending' | 'in_progress' | 'completed' | 'failed';
+
+export interface TodoSnapshotItemV1 {
+  id: string;
+  text: string;
+  status: TodoSnapshotStatusV1;
+  active_text?: string;
+}
+
+export interface TodoSnapshotV1 {
+  version: 1;
+  provider: 'claude' | 'codex';
+  source: 'TodoWrite' | 'TaskCreate' | 'TaskUpdate' | 'TaskList' | 'todo_list';
+  revision: number;
+  items: TodoSnapshotItemV1[];
+}
+
 export type SessionEventPayload =
   | { type: 'user_prompt'; text: string; image_count: number; images?: SessionPromptImage[] | null; canonical_hash?: string | null }
   | { type: 'system_message'; message: string }
@@ -1270,6 +1287,7 @@ export type SessionEventPayload =
       input_summary: string;
       needs_response: boolean;
       prompt?: InteractiveToolPrompt | null;
+      todo_snapshot?: TodoSnapshotV1 | null;
     }
   | {
       type: 'tool_use_completed';
@@ -1278,6 +1296,7 @@ export type SessionEventPayload =
       result_summary: string;
       result_content?: string | null;
       success: boolean;
+      todo_snapshot?: TodoSnapshotV1 | null;
     }
   | {
       type: 'permission_required';
@@ -1523,6 +1542,8 @@ export interface CronTaskRun {
   durationMs?: number | null;
   runtimeId?: string | null;
   runtimeKind?: string | null;
+  providerSessionId?: string | null;
+  workingDir?: string | null;
 }
 
 export interface CronRunDetail {

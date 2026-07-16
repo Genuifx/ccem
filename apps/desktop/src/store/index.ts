@@ -145,6 +145,8 @@ export interface CronTaskRun {
   status: string; // "running" | "success" | "failed" | "timeout"
   runtimeId?: string | null;
   runtimeKind?: string | null;
+  providerSessionId?: string | null;
+  workingDir?: string | null;
 }
 
 export interface CronTemplate {

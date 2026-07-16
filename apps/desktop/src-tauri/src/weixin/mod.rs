@@ -1025,7 +1025,7 @@ fn handle_message(
                     &settings.api_base_url,
                     token,
                     &peer_id,
-                    "Multiple permission requests are waiting. Reply with /approve <request_id>.",
+                    "Multiple permission requests are waiting. Use CCEM Desktop to choose one.",
                 )?;
             }
         }
@@ -1085,7 +1085,7 @@ fn handle_message(
                     &settings.api_base_url,
                     token,
                     &peer_id,
-                    "Multiple permission requests are waiting. Reply with /deny <request_id>.",
+                    "Multiple permission requests are waiting. Use CCEM Desktop to choose one.",
                 )?;
             }
         }
@@ -1137,11 +1137,7 @@ fn handle_message(
                     &settings.api_base_url,
                     token,
                     &peer_id,
-                    if approved {
-                        "Multiple permission requests are waiting. Reply with /approve <request_id>."
-                    } else {
-                        "Multiple permission requests are waiting. Reply with /deny <request_id>."
-                    },
+                    "Multiple permission requests are waiting. Use CCEM Desktop to choose one.",
                 )?;
                 return Ok(());
             }

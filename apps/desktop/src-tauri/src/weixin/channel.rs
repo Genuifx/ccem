@@ -1,6 +1,7 @@
 use super::*;
 use crate::channel::{ChannelKind, OutputChannel};
 use crate::event_bus::{SessionEventPayload, SessionEventRecord};
+use crate::permission_preview::format_permission_preview;
 
 struct WeixinChannelState {
     last_flush_at: Instant,
@@ -168,10 +169,7 @@ impl WeixinChannel {
                         &self.api_base_url,
                         &self.token,
                         &self.peer_id,
-                        &format!(
-                            "Permission required for {}.\nrequest_id: {}\nReply with 通过 / 拒绝, or use /approve {} / /deny {}.",
-                            tool_name, request_id, request_id, request_id
-                        ),
+                        &format_permission_required_text(tool_name, request_id),
                     )?;
                     return Ok(());
                 }
@@ -188,12 +186,7 @@ impl WeixinChannel {
                         &self.api_base_url,
                         &self.token,
                         &self.peer_id,
-                        &format!(
-                            "Permission request {} was {} by {}.",
-                            request_id,
-                            if *approved { "approved" } else { "denied" },
-                            responder
-                        ),
+                        &format_permission_response_text(request_id, *approved, responder),
                     )?;
                     return Ok(());
                 }
@@ -301,6 +294,23 @@ impl OutputChannel for WeixinChannel {
     }
 }
 
+fn format_permission_required_text(tool_name: &str, request_id: &str) -> String {
+    let tool_name = format_permission_preview(tool_name, 120);
+    let request_id = format_permission_preview(request_id, 240);
+    format!(
+        "Permission required for {tool_name}.\nrequest_id: {request_id}\nReply with 通过 / 拒绝. If multiple requests are pending, use CCEM Desktop."
+    )
+}
+
+fn format_permission_response_text(request_id: &str, approved: bool, responder: &str) -> String {
+    format!(
+        "Permission request {} was {} by {}.",
+        format_permission_preview(request_id, 240),
+        if approved { "approved" } else { "denied" },
+        format_permission_preview(responder, 120)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +376,20 @@ mod tests {
         assert!(state.live_ready);
         assert_eq!(state.last_event_seq, 1);
         assert_eq!(state.pending_stdout, vec!["only-once"]);
+    }
+
+    #[test]
+    fn permission_messages_expose_only_sanitized_display_copies() {
+        let request_id = "req\n\u{e0080}\u{202e}id";
+        let tool_name = "Bash\u{17b5}";
+
+        assert_eq!(
+            format_permission_required_text(tool_name, request_id),
+            "Permission required for Bash\\u{17B5}.\nrequest_id: req\\u{000A}\\u{E0080}\\u{202E}id\nReply with 通过 / 拒绝. If multiple requests are pending, use CCEM Desktop."
+        );
+        assert_eq!(
+            format_permission_response_text(request_id, false, "weixin"),
+            "Permission request req\\u{000A}\\u{E0080}\\u{202E}id was denied by weixin."
+        );
     }
 }

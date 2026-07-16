@@ -3,7 +3,9 @@ use crate::browser::login::capability::{
 };
 use crate::browser::{authorize_browser_tool, BrowserManager, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
-use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionPromptImage, SessionStore};
+use crate::event_bus::{
+    ReplayBatch, SessionEventPayload, SessionPromptImage, SessionStore, TodoSnapshotV1,
+};
 use crate::native_event_log::NativeEventLog;
 use crate::native_helper_resource::native_helper_script_path;
 use crate::prompt_image_store::PromptImageStore;
@@ -596,6 +598,8 @@ enum HelperInputCommand<'a> {
         codex_api_key: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         effort: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        todo_snapshot_seed: Option<&'a TodoSnapshotV1>,
     },
     Prompt {
         text: &'a str,
@@ -2889,6 +2893,7 @@ impl NativeRuntimeManager {
                 "Native runtime {runtime_id} is quarantined after an incomplete permission update."
             ));
         }
+        let todo_snapshot_seed = self.event_log.latest_todo_snapshot(runtime_id)?;
         let helper_path = native_helper_script_path(&app)?;
         let launcher = std::env::current_exe()
             .map_err(|error| format!("Failed to resolve native helper launcher: {error}"))?;
@@ -2987,6 +2992,7 @@ impl NativeRuntimeManager {
                 codex_base_url: handle.codex_base_url.as_deref(),
                 codex_api_key: handle.codex_api_key.as_deref(),
                 effort: options.effort.as_deref(),
+                todo_snapshot_seed: todo_snapshot_seed.as_ref(),
             },
         ) {
             return self.fail_unverified_helper_launch(
@@ -4672,7 +4678,7 @@ mod tests {
         NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
         NativeTransport, PromptImage,
     };
-    use crate::event_bus::{SessionEventPayload, SessionStore};
+    use crate::event_bus::{SessionEventPayload, SessionStore, TodoSnapshotItemV1, TodoSnapshotV1};
     use crate::native_event_log::NativeEventLog;
     use crate::prompt_image_store::PromptImageStore;
     use chrono::Utc;
@@ -5794,6 +5800,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            todo_snapshot_seed: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -5804,6 +5811,47 @@ mod tests {
             "iVBORw0KGgo="
         );
         assert_eq!(serialized["initial_images"][0]["placeholder"], "[Image #1]");
+    }
+
+    #[test]
+    fn helper_init_serializes_todo_snapshot_seed_for_reconnect() {
+        let env_vars = HashMap::new();
+        let seed = TodoSnapshotV1 {
+            version: 1,
+            provider: "claude".to_string(),
+            source: "TaskList".to_string(),
+            revision: 7,
+            items: vec![TodoSnapshotItemV1 {
+                id: "task-1".to_string(),
+                text: "Preserve this task".to_string(),
+                status: "pending".to_string(),
+                active_text: None,
+            }],
+        };
+        let command = HelperInputCommand::Init {
+            provider: "claude",
+            env_name: "default",
+            perm_mode: "dev",
+            allow_dangerously_skip_permissions: false,
+            working_dir: "/tmp/project",
+            env_vars: &env_vars,
+            initial_prompt: None,
+            initial_images: None,
+            provider_session_id: Some("provider-session"),
+            claude_path: None,
+            codex_path: None,
+            codex_base_url: None,
+            codex_api_key: None,
+            effort: None,
+            todo_snapshot_seed: Some(&seed),
+        };
+
+        let serialized = serde_json::to_value(command).expect("serialize init command");
+        assert_eq!(serialized["todo_snapshot_seed"]["revision"], 7);
+        assert_eq!(
+            serialized["todo_snapshot_seed"]["items"][0]["text"],
+            "Preserve this task"
+        );
     }
 
     #[test]
@@ -5824,6 +5872,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            todo_snapshot_seed: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");

@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
 import { getPerformanceMode } from '@/lib/performance';
+import { WorkspaceTranscriptSelection } from './WorkspaceAnnotations';
 import { mergeToolResults } from '@/features/conversations/messageState';
 import type {
   ConversationMessageData,
@@ -15,6 +16,10 @@ import {
   getInitialTranscriptRenderCount,
   getLatestTranscriptWindow,
 } from './workspaceTranscriptWindow';
+import type {
+  WorkspaceAnnotation,
+  WorkspaceAnnotationAnchor,
+} from './workspaceAnnotationModel';
 
 interface WorkspaceConversationDetailProps {
   selectedSession: HistorySessionItem;
@@ -23,6 +28,11 @@ interface WorkspaceConversationDetailProps {
   activeSegment: number | null;
   onActiveSegmentChange: (segment: number | null) => void;
   isLoadingMessages: boolean;
+  canAddAnnotation?: boolean;
+  annotations?: WorkspaceAnnotation[];
+  onAddAnnotation?: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
+  onUpdateAnnotation?: (id: string, note: string) => void;
+  onRemoveAnnotation?: (id: string) => void;
 }
 
 function isNearBottom(container: HTMLDivElement): boolean {
@@ -38,6 +48,11 @@ export function WorkspaceConversationDetail({
   messages,
   activeSegment,
   isLoadingMessages,
+  canAddAnnotation = false,
+  annotations = [],
+  onAddAnnotation,
+  onUpdateAnnotation,
+  onRemoveAnnotation,
 }: WorkspaceConversationDetailProps) {
   const { t } = useLocale();
   const [, startTransition] = useTransition();
@@ -250,6 +265,17 @@ export function WorkspaceConversationDetail({
 
   return (
     <>
+      {onAddAnnotation && onUpdateAnnotation && onRemoveAnnotation ? (
+        <WorkspaceTranscriptSelection
+          rootRef={messagesContainerRef}
+          scopeKey={`history:${selectedSession.source}:${selectedSession.id}:${activeSegment ?? 'all'}`}
+          canAdd={canAddAnnotation}
+          annotations={annotations}
+          onAdd={onAddAnnotation}
+          onUpdate={onUpdateAnnotation}
+          onRemove={onRemoveAnnotation}
+        />
+      ) : null}
       <ScrollArea viewportRef={messagesContainerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
         <div className="mx-auto max-w-[860px] px-8 py-8">
           {isLoadingMessages ? (
