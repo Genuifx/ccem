@@ -34,11 +34,13 @@ test('active temporary section renders as a flat sidebar section, not a floating
   );
   assert.match(projectTreeSections, /workspace\.activeTemporaryProjects/);
 
-  // Pinned to the bottom (shrink-0) and separated from the tree by a hairline
+  // Rendered inside ScrollArea as part of the content flow (mt-2 indicates
+  // in-flow spacing, not a shrink-0 bottom-docked layer that leaves whitespace
+  // when the project list is short) and separated from the tree by a hairline
   // top border — not wrapped in a bg-background floating card.
   assert.match(
     projectTreeSections,
-    /shrink-0 border-t border-border\/60[\s\S]*?workspace\.activeTemporaryProjects/,
+    /mt-2 border-t border-border\/60[\s\S]*?workspace\.activeTemporaryProjects/,
   );
 
   // Bans: no ghost-card dock, no nested-card padding wrapper, no decorative
