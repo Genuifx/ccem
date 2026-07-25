@@ -33,7 +33,7 @@ export function resolveIcon(model: string | undefined): IconEntry | null {
   if (m.includes('openrouter')) return { icon: OpenRouterIcon, color: '#6467F2' };
   if (m.includes('deepseek')) return { icon: DeepSeek, color: '#4D6BFE' };
   if (m.includes('minimax') || m.includes('abab')) return { icon: Minimax, color: '#F23F5D' };
-  if (m.includes('moonshot') || m.includes('kimi')) return { icon: Moonshot, color: '#16191E', needsContrastBg: true };
+  if (m.includes('moonshot') || m.includes('kimi') || m.includes('k3')) return { icon: Moonshot, color: '#16191E', needsContrastBg: true };
   if (m.includes('mimo') || m.includes('xiaomimimo')) return { icon: XiaomiMiMo, variant: 'avatar' };
   if (m.includes('qwen') || m.includes('qwq') || m.includes('dashscope') || m.includes('tongyi')) return { icon: Qwen, color: '#615CED' };
   if (m.includes('glm') || m.includes('zhipu') || m.includes('chatglm')) return { icon: Zhipu, color: '#3859FF' };

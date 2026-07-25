@@ -99,6 +99,26 @@ test('resolveIcon maps grok and xai model ids', async () => {
   assert.equal(resolveIcon('unknown-model-xyz'), null);
 });
 
+test('resolveIcon maps kimi and k3 model ids', async () => {
+  const { resolveIcon } = await importResolveIcon();
+
+  const kimi = resolveIcon('kimi-latest');
+  assert.ok(kimi);
+  assert.equal(kimi.needsContrastBg, true);
+
+  const k3 = resolveIcon('k3');
+  assert.ok(k3);
+  assert.equal(k3.needsContrastBg, true);
+
+  const k3_256k = resolveIcon('k3-256k');
+  assert.ok(k3_256k);
+  assert.equal(k3_256k.needsContrastBg, true);
+
+  const moonshot = resolveIcon('moonshot-v1-8k');
+  assert.ok(moonshot);
+  assert.equal(moonshot.needsContrastBg, true);
+});
+
 test('resolveEnvironmentIconHint prefers concrete grok model over tier alias', async () => {
   const { resolveEnvironmentIconHint } = await importResolveEnvironmentIconHint();
 
