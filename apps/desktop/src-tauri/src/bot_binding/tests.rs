@@ -310,3 +310,72 @@ fn task_card_exposes_short_route_id_without_internal_markers() {
     assert!(!card.contains("task_id:"));
     assert!(!card.contains("correlation_marker:"));
 }
+
+#[test]
+fn permission_preview_exposes_controls_and_lookalike_quotes() {
+    let hostile = "printf \u{201c}safe\u{201d}\u{202e} ; rm\u{200b} -rf /tmp/demo\u{feff}";
+
+    assert_eq!(
+        crate::permission_preview::format_permission_preview(hostile, 1_000),
+        "printf \\u{201C}safe\\u{201D}\\u{202E} ; rm\\u{200B} -rf /tmp/demo\\u{FEFF}"
+    );
+    assert_eq!(
+        crate::permission_preview::format_permission_preview(
+            "echo \"中文内容\" && cat /tmp/CCEM",
+            1_000
+        ),
+        "echo \"中文内容\" && cat /tmp/CCEM"
+    );
+    assert_eq!(
+        crate::permission_preview::format_permission_preview(
+            &crate::permission_preview::format_permission_preview("x\u{202e}y", 1_000),
+            1_000
+        ),
+        crate::permission_preview::format_permission_preview("x\u{202e}y", 1_000)
+    );
+    assert_eq!(
+        crate::permission_preview::format_permission_preview(
+            "\u{206a}\u{fe0f}\u{e0100}\u{115f}\u{1160}\u{3164}\u{ffa0}\u{275b}\u{301d}",
+            1_000
+        ),
+        "\\u{206A}\\u{FE0F}\\u{E0100}\\u{115F}\\u{1160}\\u{3164}\\u{FFA0}\\u{275B}\\u{301D}"
+    );
+}
+
+#[test]
+fn permission_prompt_sanitizes_only_its_display_copy() {
+    let payload = SessionEventPayload::PermissionRequired {
+        request_id: "req-original-1".to_string(),
+        tool_use_id: Some("tool-original-1".to_string()),
+        tool_name: "Bash\u{202e}".to_string(),
+        input_summary: Some("printf \u{201c}safe\u{201d}\u{200b}".to_string()),
+    };
+    let original = payload.clone();
+
+    let summary = formatting::summarize_payload(&payload).expect("permission summary");
+
+    assert_eq!(summary.kind, BotBindingOutboxFrameKind::PermissionPrompt);
+    assert_eq!(summary.title, "Permission required · Bash\\u{202E}");
+    assert_eq!(
+        summary.text,
+        "request_id: req-original-1\nprintf \\u{201C}safe\\u{201D}\\u{200B}"
+    );
+    assert_eq!(payload, original);
+}
+
+#[test]
+fn permission_prompt_does_not_split_a_visible_escape_at_its_limit() {
+    let payload = SessionEventPayload::PermissionRequired {
+        request_id: "req-boundary".to_string(),
+        tool_use_id: Some("tool-boundary".to_string()),
+        tool_name: "Bash".to_string(),
+        input_summary: Some(format!("{}\u{202e}tail", "a".repeat(1177))),
+    };
+
+    let summary = formatting::summarize_payload(&payload).expect("permission summary");
+
+    assert!(summary.text.ends_with('…'));
+    assert!(!summary.text.ends_with("\\u{202E..."));
+    assert!(!summary.text.ends_with("\\u{202E}..."));
+    assert!(summary.text.chars().count() <= 1200);
+}

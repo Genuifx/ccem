@@ -1,4 +1,4 @@
-import { Check, ChevronDown, Download, FolderOpen, Loader2, Package, Plug, Trash2 } from 'lucide-react';
+import { Check, ChevronDown, Download, FolderOpen, Loader2, Package, Plug, Trash2 } from '@/lib/lucide-react';
 import { useLocale } from '@/locales';
 
 export interface DiscoverSkillInfo {

@@ -1,4 +1,4 @@
-import { FolderOpen, Globe, Shield, Copy, Rocket, TerminalSquare } from 'lucide-react';
+import { FolderOpen, Globe, Shield, Copy, Rocket, TerminalSquare } from '@/lib/lucide-react';
 import {
   Select,
   SelectContent,

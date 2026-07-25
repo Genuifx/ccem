@@ -2,6 +2,7 @@ use super::{bot_binding_route_id, BotBindingInfo, BotBindingOutboxFrameKind};
 use crate::event_bus::{
     InteractiveToolPrompt, SessionEventPayload, SessionEventRecord, ToolCategory,
 };
+use crate::permission_preview::format_permission_preview;
 
 pub(super) struct EventSummary {
     pub(super) kind: BotBindingOutboxFrameKind,
@@ -92,15 +93,19 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
             ..
         } => Some(EventSummary {
             kind: BotBindingOutboxFrameKind::PermissionPrompt,
-            title: format!("Permission required · {tool_name}"),
-            text: truncate_text(
-                &format!(
-                    "request_id: {}\n{}",
-                    request_id,
-                    input_summary.as_deref().unwrap_or("")
-                ),
-                1200,
+            title: format!(
+                "Permission required · {}",
+                format_permission_preview(tool_name, 120)
             ),
+            text: {
+                let request_id = format_permission_preview(request_id, 240);
+                let prefix = format!("request_id: {request_id}\n");
+                let remaining = 1200usize.saturating_sub(prefix.chars().count());
+                format!(
+                    "{prefix}{}",
+                    format_permission_preview(input_summary.as_deref().unwrap_or(""), remaining)
+                )
+            },
         }),
         SessionEventPayload::PermissionResponded {
             request_id,
@@ -110,7 +115,11 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         } => Some(EventSummary {
             kind: BotBindingOutboxFrameKind::EventUpdate,
             title: "Permission responded".to_string(),
-            text: format!("request_id: {request_id}\napproved: {approved}\nresponder: {responder}"),
+            text: format!(
+                "request_id: {}\napproved: {approved}\nresponder: {}",
+                format_permission_preview(request_id, 240),
+                format_permission_preview(responder, 120)
+            ),
         }),
         SessionEventPayload::CheckpointCreated {
             checkpoint_id,

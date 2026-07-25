@@ -1,4 +1,4 @@
-import { CheckCircle2, MessageSquareWarning, XCircle } from 'lucide-react';
+import { CheckCircle2, MessageSquareWarning, XCircle } from '@/lib/lucide-react';
 import { useLocale } from '@/locales';
 import type { TelegramBridgeStatus } from '@/lib/tauri-ipc';
 

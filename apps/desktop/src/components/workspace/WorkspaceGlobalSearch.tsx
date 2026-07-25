@@ -10,7 +10,7 @@ import {
   MessageSquare,
   Search,
   X,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { cn, getProjectName } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { useLocale } from '@/locales';

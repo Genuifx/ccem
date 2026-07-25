@@ -21,7 +21,7 @@ import {
   Shield,
   TrendingUp,
   Users,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { shallow } from 'zustand/shallow';
 
 type FilterCategory = 'all' | 'official' | 'popular' | 'community' | 'installed';

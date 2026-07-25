@@ -4,7 +4,6 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 
 - `apps/cli/src/index.ts`: Main CLI entrypoint still owns command registration and interactive flows.
 - `apps/desktop/src-tauri/src/analytics.rs`: Analytics aggregation and reporting logic has not been split yet.
-- `apps/desktop/src-tauri/src/browser.rs`: Managed Chromium browser lifecycle, session bootstrapping, and diagnostics remain centralized while the agent browser workbench is still iterating.
 - `apps/desktop/src/pages/TrayCockpit.tsx`: Tray cockpit UI orchestration, diagnostics, and preview browser controls remain bundled while the tray surface is being iterated.
 - `apps/desktop/src-tauri/src/config.rs`: Configuration migration, recovery, and runtime resolution still share one module.
 - `apps/desktop/src-tauri/src/cron.rs`: Cron scheduling and execution orchestration is still a large legacy module.
@@ -23,7 +22,6 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src-tauri/src/weixin/mod.rs`: Weixin bridge integration remains a large monolith and needs phased extraction.
 - `apps/desktop/src/components/analytics/SharePosterDialog.tsx`: Share poster generation UI is still implemented in one large component.
 - `apps/desktop/src/components/use-prompt-area.ts`: Vendored Prompt Area registry hook is kept intact while composer rich-input behavior is validated.
-- `apps/desktop/src/components/workspace/WorkspaceReviewDrawer.tsx`: Workspace review drawer rendering remains concentrated while sub-agent execution details are being iterated.
 - `apps/desktop/src/components/workspace/WorkspaceMessageBubble.tsx`: Workspace transcript rendering is still bundled with attachment, diff, and tool-call presentation during the workspace redesign.
 - `apps/desktop/src/components/workspace/workspaceEventTranscript.ts`: Workspace event transcript projection remains concentrated while native/runtime event shapes are still being unified.
 - `apps/desktop/src/components/workspace/ProjectTree.tsx`: Workspace project tree rendering and navigation state remain concentrated during the workspace redesign.

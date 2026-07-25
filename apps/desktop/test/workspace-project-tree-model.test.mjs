@@ -192,16 +192,237 @@ test('stabilized project sessions append backfilled sessions behind retained row
   assert.deepEqual(stable[0].sessions.map((session) => session.id), ['first', 'active', 'backfill']);
 });
 
-test('detects active sidebar sessions from runtime decorations', async () => {
-  const { isSessionActiveInSidebar } = await importWorkspaceProjectTreeModel();
-  const session = historySession({ id: 'active-session', source: 'claude' });
+test('runtime to provider identity migration keeps its prior slot among 155 sessions', async () => {
+  const { stabilizeProjectNodeSessions } = await importWorkspaceProjectTreeModel();
+  const project = '/repo/app';
+  const ordinary = Array.from({ length: 154 }, (_, index) => historySession({
+    id: `ordinary-${index}`,
+    source: 'claude',
+    project,
+    projectName: 'app',
+    timestamp: 10_000 - index,
+  }));
+  const runtimeSession = historySession({
+    id: 'native-1784217587618',
+    source: 'claude',
+    project,
+    projectName: 'app',
+    timestamp: 9_999.5,
+  });
+  const previousSessions = [ordinary[0], runtimeSession, ...ordinary.slice(1)];
+  const providerSession = historySession({
+    id: '784591d3-62d2-4702-908e-677a934c7f61',
+    source: 'claude',
+    project,
+    projectName: 'app',
+    timestamp: 1,
+  });
+  const nextSessions = [...ordinary, providerSession];
+  const canonicalKeyBySessionKey = {
+    'claude:native-1784217587618': 'claude:784591d3-62d2-4702-908e-677a934c7f61',
+    'claude:784591d3-62d2-4702-908e-677a934c7f61': 'claude:784591d3-62d2-4702-908e-677a934c7f61',
+  };
 
-  assert.equal(isSessionActiveInSidebar(session, {
-    'claude:active-session': { visualState: 'attention' },
-  }), true);
-  assert.equal(isSessionActiveInSidebar(session, {
-    'claude:active-session': { visualState: 'identity' },
-  }), false);
+  const stable = stabilizeProjectNodeSessions(
+    [{ project, projectName: 'app', latestTimestamp: 10_000, sessions: previousSessions }],
+    [{ project, projectName: 'app', latestTimestamp: 10_000, sessions: nextSessions }],
+    { canonicalKeyBySessionKey },
+  );
+
+  assert.equal(stable[0].sessions.length, 155);
+  assert.equal(stable[0].sessions[1].id, providerSession.id);
+  assert.equal(stable[0].sessions.some((session) => session.id === runtimeSession.id), false);
+  assert.deepEqual(
+    stable[0].sessions.filter((session) => session.id.startsWith('ordinary-')).map((session) => session.id),
+    ordinary.map((session) => session.id),
+  );
+});
+
+test('project session window keeps all active rows visible without expanding to hidden indexes', async () => {
+  const { selectVisibleProjectSessions } = await importWorkspaceProjectTreeModel();
+  const sessions = Array.from({ length: 155 }, (_, index) => historySession({
+    id: `session-${index}`,
+    source: 'claude',
+    timestamp: 1_000 - index,
+  }));
+  const activeSessionKeys = new Set([
+    'claude:session-0',
+    'claude:session-5',
+    'claude:session-154',
+  ]);
+
+  const visible = selectVisibleProjectSessions(sessions, 6, activeSessionKeys);
+
+  assert.equal(visible.length, 7);
+  assert.deepEqual(visible.map((session) => session.id), [
+    'session-0',
+    'session-1',
+    'session-2',
+    'session-3',
+    'session-4',
+    'session-5',
+    'session-154',
+  ]);
+  assert.equal(new Set(visible.map((session) => session.id)).size, visible.length);
+});
+
+test('project session window shows every active row when active count exceeds page budget', async () => {
+  const { selectVisibleProjectSessions } = await importWorkspaceProjectTreeModel();
+  const sessions = Array.from({ length: 12 }, (_, index) => historySession({
+    id: `session-${index}`,
+    timestamp: 1_000 - index,
+  }));
+  const activeSessionKeys = new Set(
+    sessions.slice(5).map((session) => `${session.source}:${session.id}`)
+  );
+
+  const visible = selectVisibleProjectSessions(sessions, 6, activeSessionKeys);
+
+  assert.equal(visible.length, 12);
+  assert.deepEqual(visible.map((session) => session.id), sessions.map((session) => session.id));
+});
+
+test('project session window resolves a stale runtime selection to its provider row', async () => {
+  const { selectVisibleProjectSessions } = await importWorkspaceProjectTreeModel();
+  const sessions = Array.from({ length: 12 }, (_, index) => historySession({
+    id: index === 11 ? 'provider-1' : `session-${index}`,
+    source: 'claude',
+    timestamp: 1_000 - index,
+  }));
+  const canonicalKeyBySessionKey = {
+    'claude:native-1': 'claude:provider-1',
+    'claude:provider-1': 'claude:provider-1',
+  };
+
+  const visible = selectVisibleProjectSessions(
+    sessions,
+    6,
+    new Set(['claude:native-1']),
+    canonicalKeyBySessionKey,
+  );
+
+  assert.equal(visible.some((session) => session.id === 'provider-1'), true);
+  assert.equal(visible[0].id, 'session-0');
+  assert.equal(visible.length, 7);
+});
+
+test('project session window preserves active visibility across load-more and collapse budgets', async () => {
+  const { selectVisibleProjectSessions } = await importWorkspaceProjectTreeModel();
+  const sessions = Array.from({ length: 20 }, (_, index) => historySession({
+    id: `session-${index}`,
+    source: 'claude',
+    timestamp: 1_000 - index,
+  }));
+  const activeSessionKeys = new Set(['claude:session-19']);
+
+  const collapsed = selectVisibleProjectSessions(sessions, 6, activeSessionKeys);
+  const expanded = selectVisibleProjectSessions(sessions, 12, activeSessionKeys);
+  const collapsedAgain = selectVisibleProjectSessions(sessions, 6, activeSessionKeys);
+
+  assert.equal(collapsed.some((session) => session.id === 'session-19'), true);
+  assert.equal(expanded.some((session) => session.id === 'session-19'), true);
+  assert.equal(collapsedAgain.some((session) => session.id === 'session-19'), true);
+  assert.equal(collapsed.length, 7);
+  assert.equal(expanded.length, 13);
+  assert.deepEqual(collapsedAgain.map((session) => session.id), collapsed.map((session) => session.id));
+});
+
+test('project session window caps priority overflow to one extra page', async () => {
+  const { selectVisibleProjectSessions } = await importWorkspaceProjectTreeModel();
+  const sessions = Array.from({ length: 30 }, (_, index) => historySession({
+    id: `session-${index}`,
+    source: 'claude',
+    timestamp: 1_000 - index,
+  }));
+  const activeSessionKeys = new Set([
+    'claude:session-0',
+    'claude:session-5',
+    'claude:session-10',
+    'claude:session-15',
+    'claude:session-20',
+    'claude:session-25',
+    'claude:session-26',
+    'claude:session-27',
+    'claude:session-28',
+    'claude:session-29',
+  ]);
+
+  const visible = selectVisibleProjectSessions(sessions, 6, activeSessionKeys);
+
+  // 6 base + 6 overflow = 12 max. Ordinary sessions 6/7 are squeezed out by
+  // priority overflow; the last priorities at indices 28/29 are dropped.
+  assert.equal(visible.length, 12);
+  assert.deepEqual(visible.map((session) => session.id), [
+    'session-0',
+    'session-1',
+    'session-2',
+    'session-3',
+    'session-4',
+    'session-5',
+    'session-10',
+    'session-15',
+    'session-20',
+    'session-25',
+    'session-26',
+    'session-27',
+  ]);
+});
+
+test('project priorities combine true live activity with urgent runtime decorations only', async () => {
+  const { buildProjectPrioritySessionKeys } = await importWorkspaceProjectTreeModel();
+  const canonicalKeyBySessionKey = {
+    'claude:native-ready': 'claude:provider-ready',
+    'claude:provider-ready': 'claude:provider-ready',
+  };
+
+  const priorities = buildProjectPrioritySessionKeys(
+    new Set(['claude:native-ready']),
+    {
+      'claude:provider-ready': { visualState: 'identity' },
+      'codex:external-processing': { visualState: 'processing' },
+      'claude:external-attention': { visualState: 'attention' },
+      'claude:inactive-history': { visualState: 'identity' },
+    },
+    canonicalKeyBySessionKey,
+  );
+
+  assert.deepEqual([...priorities], [
+    'claude:provider-ready',
+    'codex:external-processing',
+    'claude:external-attention',
+  ]);
+});
+
+test('project priorities honor decoration isActive truth before visual status', async () => {
+  const { buildProjectPrioritySessionKeys } = await importWorkspaceProjectTreeModel();
+
+  const priorities = buildProjectPrioritySessionKeys(
+    new Set(),
+    {
+      'claude:ready-active': { visualState: 'identity', isActive: true },
+      'claude:stale-processing': { visualState: 'processing', isActive: false },
+      'claude:stale-attention': { visualState: 'attention', isActive: false },
+      'codex:legacy-processing': { visualState: 'processing' },
+    },
+  );
+
+  assert.deepEqual([...priorities], [
+    'claude:ready-active',
+    'codex:legacy-processing',
+  ]);
+});
+
+test('fresh local activity is not hidden by an independently sampled inactive decoration', async () => {
+  const { buildProjectPrioritySessionKeys } = await importWorkspaceProjectTreeModel();
+
+  const priorities = buildProjectPrioritySessionKeys(
+    new Set(['claude:stale']),
+    {
+      'claude:stale': { visualState: 'processing', isActive: false },
+    },
+  );
+
+  assert.deepEqual([...priorities], ['claude:stale']);
 });
 
 test('keeps active temporary projects in the fixed strip until dismissed', async () => {

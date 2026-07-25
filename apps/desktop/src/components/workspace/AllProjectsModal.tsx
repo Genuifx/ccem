@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Check, Copy, Link2, Play, Star, X, RefreshCw, Plus, Code2 } from 'lucide-react';
+import { Check, Copy, Link2, Play, Star, X, RefreshCw, Plus, Code2 } from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { BindToTelegramDialog } from '@/components/telegram/BindToTelegramDialog';

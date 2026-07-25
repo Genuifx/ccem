@@ -397,6 +397,7 @@ mod tests {
                         options: Vec::new(),
                     }],
                 }),
+                todo_snapshot: None,
             },
         )
         .expect("expected action notification");

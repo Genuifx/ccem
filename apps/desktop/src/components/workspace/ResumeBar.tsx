@@ -1,4 +1,4 @@
-import { Check, Play } from 'lucide-react';
+import { Check, Play } from '@/lib/lucide-react';
 import { useLocale } from '@/locales';
 import { cn } from '@/lib/utils';
 import type { HistorySessionItem } from '@/features/conversations/types';

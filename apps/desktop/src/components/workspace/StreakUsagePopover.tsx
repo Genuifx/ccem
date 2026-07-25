@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Flame, ArrowRight } from 'lucide-react';
+import { Flame, ArrowRight } from '@/lib/lucide-react';
 import type { ChartDataPoint, UsageStats } from '@/types/analytics';
 import { sumTokens } from '@/components/analytics/poster-types';
 import { useLocale } from '@/locales';

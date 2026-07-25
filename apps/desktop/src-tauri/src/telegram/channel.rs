@@ -196,10 +196,7 @@ impl TelegramChannel {
                     responder,
                     ..
                 } if state.announced_responses.insert(request_id.clone()) => {
-                    let text = format!(
-                        "Permission request {request_id} was {} by {responder}.",
-                        if *approved { "approved" } else { "denied" }
-                    );
+                    let text = format_permission_response_text(request_id, *approved, responder);
                     if let Some(sent_message) = state.permission_messages.remove(request_id) {
                         if edit_message_text(
                             &self.token,
@@ -279,6 +276,7 @@ impl TelegramChannel {
                 input_summary,
                 needs_response,
                 prompt,
+                ..
             } => {
                 if !self.manager.mark_interactive_tool_seen(
                     self.chat_id,

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Bot, FolderOpen, Loader2, PlusSquare } from 'lucide-react';
+import { Bot, FolderOpen, Loader2, PlusSquare } from '@/lib/lucide-react';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { toast } from 'sonner';

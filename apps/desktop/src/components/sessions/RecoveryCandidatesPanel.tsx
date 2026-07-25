@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, useTransition, type ReactNode } from 'react';
-import { History, RefreshCw, RotateCcw, X } from 'lucide-react';
+import { History, RefreshCw, RotateCcw, X } from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { LaunchButton } from '@/components/ui/LaunchButton';

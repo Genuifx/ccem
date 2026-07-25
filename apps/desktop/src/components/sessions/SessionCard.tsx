@@ -15,7 +15,7 @@ import {
   SquareTerminal,
   Target,
   X,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import {
   DropdownMenu,

@@ -1,4 +1,4 @@
-import { FolderOpen, Globe, LayoutGrid, List, Plus, Shield } from 'lucide-react';
+import { FolderOpen, Globe, LayoutGrid, List, Plus, Shield } from '@/lib/lucide-react';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import {

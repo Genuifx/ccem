@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { FolderOpen, Link2, Pencil, PlusSquare, RotateCcw, Trash2 } from 'lucide-react';
+import { FolderOpen, Link2, Pencil, PlusSquare, RotateCcw, Trash2 } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useLocale } from '@/locales';

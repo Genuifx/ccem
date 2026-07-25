@@ -67,3 +67,25 @@ test('removes inherited API key when a managed auth token is present', async () 
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'managed-auth-token');
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
 });
+
+test('does not restore omitted official model pins from the desktop process environment', async () => {
+  const { buildClaudeQueryEnv } = await importClaudeEnvModule();
+
+  const env = buildClaudeQueryEnv({
+    baseEnv: {
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'inherited-opus-pin',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'inherited-sonnet-pin',
+      ANTHROPIC_MODEL: 'inherited-model',
+      PATH: '/usr/bin',
+    },
+    envVars: {
+      ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+      ANTHROPIC_MODEL: 'opus',
+    },
+  });
+
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_MODEL, 'opus');
+  assert.equal(env.PATH, '/usr/bin');
+});

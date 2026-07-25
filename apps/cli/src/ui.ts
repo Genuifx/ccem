@@ -4,8 +4,8 @@
  */
 import chalk from 'chalk';
 import Table from 'cli-table3';
-import type { PermissionModeName, UsageStats, TokenUsageWithCost } from '@ccem/core';
-import { PERMISSION_PRESETS } from '@ccem/core';
+import type { EnvConfig, PermissionModeName, UsageStats, TokenUsageWithCost } from '@ccem/core';
+import { PERMISSION_PRESETS, resolveEnvConfigForRuntime } from '@ccem/core';
 import { formatTokens, formatCost, getTotalTokens } from './usage.js';
 import { LOGO_FULL, LOGO_COMPACT, LOGO_MINIMAL, type LogoVariant } from './logo-generated.js';
 
@@ -80,6 +80,7 @@ export const renderLogoWithEnvPanel = (
   },
   defaultMode?: PermissionModeName | null
 ): string => {
+  const displayEnv = resolveEnvConfigForRuntime(envName, env as EnvConfig);
   const termWidth = getTerminalWidth();
   const isNarrow = termWidth < 60;
   const isVeryNarrow = termWidth < 45;
@@ -94,11 +95,13 @@ export const renderLogoWithEnvPanel = (
   const envLabel = theme.muted('Env:   ') + theme.primary(envName);
 
   // 构建环境变量显示
-  const baseUrl = env.ANTHROPIC_BASE_URL || '-';
-  const runtimeModel = env.ANTHROPIC_MODEL || '-';
-  const opusModel = env.ANTHROPIC_DEFAULT_OPUS_MODEL || '-';
-  const haikuModel = env.ANTHROPIC_DEFAULT_HAIKU_MODEL || '-';
-  const authToken = env.ANTHROPIC_AUTH_TOKEN ? env.ANTHROPIC_AUTH_TOKEN.slice(0, 2) + '••••' + env.ANTHROPIC_AUTH_TOKEN.slice(-4) : '-';
+  const baseUrl = displayEnv.ANTHROPIC_BASE_URL || '-';
+  const runtimeModel = displayEnv.ANTHROPIC_MODEL || '-';
+  const opusModel =
+    displayEnv.ANTHROPIC_DEFAULT_OPUS_MODEL ||
+    (envName === 'official' ? 'Claude default' : '-');
+  const haikuModel = displayEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL || '-';
+  const authToken = displayEnv.ANTHROPIC_AUTH_TOKEN ? displayEnv.ANTHROPIC_AUTH_TOKEN.slice(0, 2) + '••••' + displayEnv.ANTHROPIC_AUTH_TOKEN.slice(-4) : '-';
 
   // 截断过长的值
   const truncate = (s: string, max: number) => s.length > max ? s.slice(0, max - 3) + '...' : s;
@@ -265,18 +268,20 @@ export const renderEnvPanel = (
   },
   defaultMode?: PermissionModeName | null
 ): string => {
+  const displayEnv = resolveEnvConfigForRuntime(envName, env as EnvConfig);
   const lines: string[] = [];
 
   lines.push(theme.muted('Environment: ') + theme.primary(envName));
   lines.push('');
 
+  const tierDefault = envName === 'official' ? 'Claude default' : '-';
   const vars = [
-    { key: 'Base URL', value: env.ANTHROPIC_BASE_URL || '-' },
-    { key: 'Runtime', value: env.ANTHROPIC_MODEL || '-' },
-    { key: 'Opus', value: env.ANTHROPIC_DEFAULT_OPUS_MODEL || '-' },
-    { key: 'Sonnet', value: env.ANTHROPIC_DEFAULT_SONNET_MODEL || '-' },
-    { key: 'Haiku', value: env.ANTHROPIC_DEFAULT_HAIKU_MODEL || '-' },
-    { key: 'Token', value: env.ANTHROPIC_AUTH_TOKEN ? env.ANTHROPIC_AUTH_TOKEN.slice(0, 2) + '••••' + env.ANTHROPIC_AUTH_TOKEN.slice(-4) : '-' },
+    { key: 'Base URL', value: displayEnv.ANTHROPIC_BASE_URL || '-' },
+    { key: 'Runtime', value: displayEnv.ANTHROPIC_MODEL || '-' },
+    { key: 'Opus', value: displayEnv.ANTHROPIC_DEFAULT_OPUS_MODEL || tierDefault },
+    { key: 'Sonnet', value: displayEnv.ANTHROPIC_DEFAULT_SONNET_MODEL || tierDefault },
+    { key: 'Haiku', value: displayEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL || '-' },
+    { key: 'Token', value: displayEnv.ANTHROPIC_AUTH_TOKEN ? displayEnv.ANTHROPIC_AUTH_TOKEN.slice(0, 2) + '••••' + displayEnv.ANTHROPIC_AUTH_TOKEN.slice(-4) : '-' },
   ];
 
   vars.forEach(({ key, value }) => {

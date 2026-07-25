@@ -5,7 +5,7 @@
  */
 import { useCallback, useEffect, useMemo, useState, useTransition } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { Bot, CheckCircle2, LoaderCircle, RefreshCw, Send, Sparkles, Square, TerminalSquare, Trash2, XCircle } from 'lucide-react';
+import { Bot, CheckCircle2, LoaderCircle, RefreshCw, Send, Sparkles, Square, TerminalSquare, Trash2, XCircle } from '@/lib/lucide-react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/EmptyState';

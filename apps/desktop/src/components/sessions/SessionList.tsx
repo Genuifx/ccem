@@ -1,4 +1,4 @@
-import { Clock, FolderOpen, Minus, X } from 'lucide-react';
+import { Clock, FolderOpen, Minus, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn, getProjectName } from '@/lib/utils';
 import type { TmuxAttachTerminalInfo, TmuxAttachTerminalType } from '@/lib/tauri-ipc';

@@ -46,3 +46,13 @@ test('falls back to the legacy toolUseID timestamp request id', async () => {
     'toolu-1:42',
   );
 });
+
+test('preserves the exact Claude Agent SDK permission requestId', async () => {
+  const { resolveClaudePermissionRequestId } = await importClaudePermissionRequestsModule();
+  const requestId = `\uFEFF req\u202Eid \uFEFF`;
+
+  assert.equal(
+    resolveClaudePermissionRequestId({ toolUseID: 'toolu-1', requestId }),
+    requestId,
+  );
+});

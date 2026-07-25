@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, HeartPulse, LifeBuoy, TerminalSquare, Workflow } from 'lucide-react';
+import { Bot, HeartPulse, LifeBuoy, TerminalSquare, Workflow } from '@/lib/lucide-react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { useTauriCommands } from '@/hooks/useTauriCommands';

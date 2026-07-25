@@ -8,7 +8,7 @@ import { useLocale } from '@/locales';
 import { useAppStore } from '@/store';
 import { emit } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { Sparkles, Loader2, Bot, Wrench, FolderOpen, FileText, Pencil, Check, X, AlertTriangle, Settings } from 'lucide-react';
+import { Sparkles, Loader2, Bot, Wrench, FolderOpen, FileText, Pencil, Check, X, AlertTriangle, Settings } from '@/lib/lucide-react';
 
 interface StreamMessage {
   type: 'thinking' | 'tool' | 'result' | 'error';

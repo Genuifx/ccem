@@ -1,4 +1,4 @@
-import { MessageCircle } from 'lucide-react';
+import { MessageCircle } from '@/lib/lucide-react';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { useLocale } from '@/locales';
 

@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { Play, Plus, Star, ArrowRight, Code2, Sparkles, Clock } from 'lucide-react';
+import { Play, Plus, Star, ArrowRight, Code2, Sparkles, Clock } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';

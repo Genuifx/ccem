@@ -33,6 +33,7 @@ function nativeSession(overrides = {}) {
     project_dir: '/Users/wzt/G/Github/claude-code-env-manager',
     env_name: 'DeepSeek',
     status: 'processing',
+    is_active: true,
     created_at: '2026-05-02T12:52:35.000Z',
     updated_at: '2026-05-02T12:52:40.000Z',
     ...overrides,
@@ -251,4 +252,106 @@ test('keeps interrupted native sessions in the workspace sidebar for recovery', 
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, 'native-interrupted');
   assert.equal(sessions[0].display, '可以恢复输入的任务');
+});
+
+test('canonicalizes runtime and provider ids to one current project-tree identity', async () => {
+  const { buildLiveSessionTreeState } = await importWorkspaceSidebarSessions();
+
+  const state = buildLiveSessionTreeState([
+    {
+      session: nativeSession({
+        runtime_id: 'native-1784217587618',
+        provider_session_id: '784591d3-62d2-4702-908e-677a934c7f61',
+        status: 'ready',
+        is_active: true,
+      }),
+      initialPrompt: '/lightweight-dev-mode 修复 workspace 的这个问题',
+    },
+  ]);
+
+  const providerKey = 'claude:784591d3-62d2-4702-908e-677a934c7f61';
+  assert.equal(state.canonicalKeyBySessionKey['claude:native-1784217587618'], providerKey);
+  assert.equal(state.canonicalKeyBySessionKey[providerKey], providerKey);
+  assert.deepEqual([...state.activeSessionKeys], [providerKey]);
+});
+
+test('only marks actually active live sessions as project-tree priorities', async () => {
+  const { buildLiveSessionTreeState } = await importWorkspaceSidebarSessions();
+
+  const state = buildLiveSessionTreeState([
+    {
+      session: nativeSession({
+        runtime_id: 'native-ready-active',
+        provider_session_id: 'provider-ready-active',
+        status: 'ready',
+        is_active: true,
+      }),
+    },
+    {
+      session: nativeSession({
+        runtime_id: 'native-processing-inactive',
+        provider_session_id: 'provider-processing-inactive',
+        status: 'processing',
+        is_active: false,
+      }),
+    },
+    {
+      session: nativeSession({
+        runtime_id: 'native-interrupted',
+        provider_session_id: 'provider-interrupted',
+        status: 'interrupted',
+        is_active: false,
+      }),
+    },
+    {
+      session: nativeSession({
+        runtime_id: 'native-stopped',
+        provider_session_id: 'provider-stopped',
+        status: 'stopped',
+        is_active: true,
+      }),
+    },
+  ]);
+
+  assert.deepEqual([...state.activeSessionKeys], ['claude:provider-ready-active']);
+  assert.equal(
+    state.canonicalKeyBySessionKey['claude:native-interrupted'],
+    'claude:provider-interrupted'
+  );
+});
+
+test('discovers every authoritative active native session while restoring only persisted inactive sessions', async () => {
+  const { selectWorkspaceLiveSessionsForRestore } = await importWorkspaceSidebarSessions();
+  const sessions = [
+    nativeSession({ runtime_id: 'active-unpersisted', status: 'ready', is_active: true }),
+    nativeSession({ runtime_id: 'active-persisted', status: 'processing', is_active: true }),
+    nativeSession({ runtime_id: 'recoverable-persisted', status: 'interrupted', is_active: false }),
+    nativeSession({ runtime_id: 'recoverable-unpersisted', status: 'closed_idle', is_active: false }),
+    nativeSession({ runtime_id: 'stale-processing', status: 'processing', is_active: false }),
+    nativeSession({ runtime_id: 'terminal-persisted', status: 'stopped', is_active: false }),
+  ];
+
+  const restored = selectWorkspaceLiveSessionsForRestore(
+    sessions,
+    ['active-persisted', 'recoverable-persisted', 'terminal-persisted'],
+  );
+
+  assert.deepEqual(restored.map((session) => session.runtime_id), [
+    'active-unpersisted',
+    'active-persisted',
+    'recoverable-persisted',
+  ]);
+});
+
+test('detects local-active and decoration-inactive truth conflicts for reconciliation', async () => {
+  const { hasWorkspaceLiveActivityConflict } = await importWorkspaceSidebarSessions();
+  const activeSessionKeys = new Set(['claude:provider-active']);
+
+  assert.equal(hasWorkspaceLiveActivityConflict(activeSessionKeys, {
+    'claude:provider-active': { isActive: false },
+  }), true);
+  assert.equal(hasWorkspaceLiveActivityConflict(activeSessionKeys, {
+    'claude:provider-active': { isActive: true },
+  }), false);
+  assert.equal(hasWorkspaceLiveActivityConflict(activeSessionKeys, {}), false);
 });

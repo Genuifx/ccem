@@ -29,6 +29,7 @@ mod native_runtime;
 mod notifications;
 mod opencode;
 mod permission;
+mod permission_preview;
 mod pet_notifications;
 mod pet_window;
 mod prompt_image_store;
@@ -964,7 +965,9 @@ async fn get_workspace_session_decorations(
 
         let mut events_by_runtime = unified_sessions
             .iter()
-            .filter(|runtime| should_replay_decoration_events(&runtime.status))
+            .filter(|runtime| {
+                runtime.is_active && should_replay_decoration_events(&runtime.status)
+            })
             .filter_map(|runtime| {
                 unified_state
                     .get_session_events(&app, &runtime.id, None)
@@ -975,7 +978,9 @@ async fn get_workspace_session_decorations(
         events_by_runtime.extend(
             native_sessions
                 .iter()
-                .filter(|runtime| should_replay_decoration_events(&runtime.status))
+                .filter(|runtime| {
+                    runtime.is_active && should_replay_decoration_events(&runtime.status)
+                })
                 .filter_map(|runtime| {
                     native_state
                         .replay_events(&runtime.runtime_id, None)

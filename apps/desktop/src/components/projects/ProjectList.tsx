@@ -1,4 +1,4 @@
-import { Star, Clock, Monitor, Brain, RefreshCw, FolderOpen, Play, X, Plus } from 'lucide-react';
+import { Star, Clock, Monitor, Brain, RefreshCw, FolderOpen, Play, X, Plus } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';

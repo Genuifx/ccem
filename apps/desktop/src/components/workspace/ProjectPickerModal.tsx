@@ -9,7 +9,7 @@ import {
   Play,
   X,
   FolderSearch,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { useLocale } from '@/locales';

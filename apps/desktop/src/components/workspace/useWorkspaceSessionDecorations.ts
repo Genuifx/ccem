@@ -11,6 +11,7 @@ export interface WorkspaceSessionDecoration {
   runtimeId?: string;
   client?: 'claude' | 'codex' | 'opencode';
   status?: string;
+  isActive?: boolean;
   envName?: string;
   visualState: WorkspaceSessionVisualState;
   attentionKind?: WorkspaceAttentionKind;
@@ -68,6 +69,7 @@ function normalizeDecoration(value: WorkspaceSessionDecoration): WorkspaceSessio
   return {
     ...value,
     client: normalizeClient(value.client),
+    isActive: typeof value.isActive === 'boolean' ? value.isActive : undefined,
     visualState: normalizeVisualState(value.visualState),
     attentionKind: normalizeAttentionKind(value.attentionKind),
   };
@@ -90,6 +92,7 @@ function decorationsEqual(
       && left.runtimeId === right.runtimeId
       && left.client === right.client
       && left.status === right.status
+      && left.isActive === right.isActive
       && left.envName === right.envName
       && left.visualState === right.visualState
       && left.attentionKind === right.attentionKind;

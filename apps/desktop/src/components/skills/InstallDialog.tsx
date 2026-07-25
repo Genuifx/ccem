@@ -11,7 +11,7 @@ import {
 } from '@/components/ui/dialog';
 import { useLocale } from '@/locales';
 import { toast } from 'sonner';
-import { Download, Loader2 } from 'lucide-react';
+import { Download, Loader2 } from '@/lib/lucide-react';
 import { ccemMotion, clearMotionProps, getMotionTargets, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 
 interface InstallDialogProps {

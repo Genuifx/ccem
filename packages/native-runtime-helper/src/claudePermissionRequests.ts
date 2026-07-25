@@ -7,6 +7,7 @@ export function resolveClaudePermissionRequestId(
   options: ClaudeToolPermissionOptions,
   now: () => number = Date.now,
 ) {
-  const sdkRequestId = options.requestId?.trim();
-  return sdkRequestId || `${options.toolUseID}:${now()}`;
+  return typeof options.requestId === 'string' && options.requestId.length > 0
+    ? options.requestId
+    : `${options.toolUseID}:${now()}`;
 }

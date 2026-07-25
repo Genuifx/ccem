@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Bot, Play, Square, MessageSquareWarning, ChevronDown, ChevronUp, FolderOpen, Circle } from 'lucide-react';
+import { Bot, Play, Square, MessageSquareWarning, ChevronDown, ChevronUp, FolderOpen, Circle } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store';
 import { toast } from 'sonner';

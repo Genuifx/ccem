@@ -10,6 +10,34 @@ import {
 import { getSettingsPath, ensureClaudeDir } from './utils.js';
 import { launchClaude } from './launcher.js';
 
+const PERMISSION_RULE_LINE_WIDTH = 100;
+
+const wrapPermissionRule = (rule: string): string[] => {
+  return rule.split('\n').flatMap((line) => {
+    const characters = Array.from(line);
+    if (characters.length === 0) return [''];
+
+    const chunks: string[] = [];
+    for (let index = 0; index < characters.length; index += PERMISSION_RULE_LINE_WIDTH) {
+      chunks.push(characters.slice(index, index + PERMISSION_RULE_LINE_WIDTH).join(''));
+    }
+    return chunks;
+  });
+};
+
+const formatPermissionRulesForDisplay = (rules: string[]): string => {
+  if (rules.length === 0) return '  (无)';
+
+  const numberWidth = String(rules.length).length;
+  return rules.flatMap((rule, index) => {
+    const prefix = `${String(index + 1).padStart(numberWidth)}. `;
+    const continuationPrefix = ' '.repeat(prefix.length);
+    return wrapPermissionRule(rule).map((line, lineIndex) =>
+      `${lineIndex === 0 ? prefix : continuationPrefix}${line}`
+    );
+  }).join('\n');
+};
+
 /**
  * 读取 settings 文件
  */
@@ -148,20 +176,13 @@ export const showCurrentMode = (): void => {
 
   console.log(chalk.gray(`配置文件: ${settingsPath}`));
 
-  // 显示权限表格
-  const table = new Table({
-    head: ['类型', '规则'],
-    style: { head: ['cyan'] },
-    colWidths: [10, 70]
-  });
-
   const allowRules = config.permissions.allow || [];
   const denyRules = config.permissions.deny || [];
 
-  table.push(['Allow', allowRules.length > 0 ? allowRules.join('\n') : '(无)']);
-  table.push(['Deny', denyRules.length > 0 ? denyRules.join('\n') : '(无)']);
-
-  console.log(table.toString());
+  console.log(chalk.cyan(`\nAllow (${allowRules.length})`));
+  console.log(formatPermissionRulesForDisplay(allowRules));
+  console.log(chalk.cyan(`\nDeny (${denyRules.length})`));
+  console.log(formatPermissionRulesForDisplay(denyRules));
 };
 
 /**

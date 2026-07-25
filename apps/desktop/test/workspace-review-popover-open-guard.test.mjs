@@ -7,27 +7,34 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
-async function readDrawer() {
-  return fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewDrawer.tsx'),
-    'utf8',
-  );
+async function readReviewDetails() {
+  try {
+    return await fs.readFile(
+      path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewDetails.tsx'),
+      'utf8',
+    );
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return '';
+    }
+    throw error;
+  }
 }
 
-test('WorkspaceReviewDrawer routes open-file through the workspace-guarded IPC command', async () => {
-  const component = await readDrawer();
+test('WorkspaceReviewDetails routes open-file through the workspace-guarded IPC command', async () => {
+  const component = await readReviewDetails();
 
   // MUST NOT import the unguarded shell plugin open() — that bypasses the Rust
   // workspace guard and lets session review open arbitrary paths.
   assert.doesNotMatch(
     component,
     /from ['"]@tauri-apps\/plugin-shell['"]/,
-    'drawer must not import @tauri-apps/plugin-shell; route through open_file_in_workspace instead',
+    'details must not import @tauri-apps/plugin-shell; route through open_file_in_workspace instead',
   );
   assert.doesNotMatch(
     component,
     /\bopen\(\s*resolveWorkspacePath/,
-    'drawer must not call shell open() with a client-resolved path',
+    'details must not call shell open() with a client-resolved path',
   );
 
   // MUST invoke the guarded Rust command. The command canonicalizes the
@@ -47,15 +54,15 @@ test('WorkspaceReviewDrawer routes open-file through the workspace-guarded IPC c
   );
 });
 
-test('WorkspaceReviewDrawer surfaces a workspace-boundary rejection toast', async () => {
-  const component = await readDrawer();
+test('WorkspaceReviewDetails surfaces a workspace-boundary rejection toast', async () => {
+  const component = await readReviewDetails();
 
   // When the Rust guard rejects (message contains "escapes working dir"), the
   // UI must not silently swallow the error. Assert a dedicated user-facing
   // message is shown, not the raw IPC string.
   assert.match(
     component,
-    /message\.includes\(['"]escapes working dir['"]\)[\s\S]*?toast\.error\(['"]路径超出工作区范围，已拒绝打开['"]\)/,
+    /message\.includes\(['"]escapes working dir['"]\)[\s\S]*?toast\.error\(t\(['"]workspace\.reviewPathOutsideWorkspace['"]\)\)/,
     'workspace-guard rejection must surface a workspace-boundary toast',
   );
 });

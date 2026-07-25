@@ -1,5 +1,5 @@
 import { memo } from 'react';
-import { BadgeAlert, LoaderCircle } from 'lucide-react';
+import { BadgeAlert, LoaderCircle } from '@/lib/lucide-react';
 import { Claude, Codex, DeepSeek, Gemini, Grok, Minimax, Moonshot, Ollama, OpenAI, OpenCode, OpenRouter, Qwen, XiaomiMiMo, Zhipu } from '@lobehub/icons';
 import { cn } from '@/lib/utils';
 import type { HistorySessionItem } from '@/features/conversations/types';

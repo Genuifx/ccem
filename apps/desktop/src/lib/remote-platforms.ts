@@ -1,4 +1,4 @@
-import { Building2, MessageCircle, Send, type LucideIcon } from 'lucide-react';
+import { Building2, MessageCircle, Send, type LucideIcon } from '@/lib/lucide-react';
 import type { ChannelKind, ManagedSessionSource } from '@/lib/tauri-ipc';
 
 export type RemotePlatformId = 'telegram' | 'weixin' | 'wecom';

@@ -10,7 +10,7 @@ import {
   RefreshCw,
   Settings2,
   Workflow,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { LocaleProvider, useLocale } from '@/locales';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import type { CronTask, DesktopSettings, PlatformCapabilities, TelegramBridgeStatus } from '@/lib/tauri-ipc';

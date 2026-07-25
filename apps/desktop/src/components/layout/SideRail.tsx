@@ -2,7 +2,7 @@ import { useCallback, useRef } from 'react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { ccemMotion, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
-import { Home, Terminal, Globe, BarChart3, Box, Settings, MessageSquare, MessageCircleMore, Clock, Bug } from 'lucide-react';
+import { Home, Terminal, Globe, BarChart3, Box, Settings, MessageSquare, MessageCircleMore, Clock, Bug } from '@/lib/lucide-react';
 // import { PetEntry } from '@/components/pet/PetEntry';
 
 interface SideRailProps {

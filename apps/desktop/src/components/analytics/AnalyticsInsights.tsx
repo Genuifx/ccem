@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Suspense, lazy, memo, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from 'react';
-import { BarChart3, DollarSign, Flame, RefreshCw } from 'lucide-react';
+import { BarChart3, DollarSign, Flame, RefreshCw } from '@/lib/lucide-react';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { cn } from '@/lib/utils';
 import { buildWeekBucketKey } from '@/lib/analyticsTimeBuckets';

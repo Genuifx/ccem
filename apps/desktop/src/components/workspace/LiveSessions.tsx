@@ -1,4 +1,4 @@
-import { Eye, X, LayoutGrid, Radio } from 'lucide-react';
+import { Eye, X, LayoutGrid, Radio } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';

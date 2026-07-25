@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
-import { File, FileText, FileSpreadsheet, FileCode, Image as ImageIcon } from 'lucide-react'
+import { File, FileText, FileSpreadsheet, FileCode, Image as ImageIcon } from '@/lib/lucide-react'
 import { RemoveButton } from './remove-button'
 import type { PromptAreaFile } from './types'
 

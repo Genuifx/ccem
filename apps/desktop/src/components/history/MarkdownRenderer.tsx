@@ -1,7 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Check, Copy, Maximize2, X } from 'lucide-react';
+import { Check, Copy, Maximize2, X } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { getPerformanceMode } from '@/lib/performance';

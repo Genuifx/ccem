@@ -137,7 +137,7 @@ Developers need to quickly assess state:
 ## Implementation Notes
 
 - **i18n**: All strings via `t('namespace.key')` - Chinese default, English supported
-- **Icons**: Lucide React only, no emoji
+- **Icons**: Hugeicons only (via `lucide-react` compatibility adapter), no emoji
 - **State management**: Zustand store, no optimistic updates
 - **Loading states**: Skeleton components, no spinners
 - **Design tokens**: Use CSS custom properties, consumed via Tailwind config

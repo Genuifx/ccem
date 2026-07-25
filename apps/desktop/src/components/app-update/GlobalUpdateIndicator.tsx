@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import { AlertCircle, Download, Loader2, RefreshCw, RotateCw } from 'lucide-react';
+import { AlertCircle, Download, Loader2, RefreshCw, RotateCw } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';

@@ -14,7 +14,7 @@ import {
   Square,
   SquarePen,
   Terminal,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { Suspense, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -109,12 +109,18 @@ import {
 } from './workspaceEventTranscript';
 import { ContextWindowIndicator } from './ContextWindowIndicator';
 import { computeSessionUsage } from './workspaceUsage';
-import { LazyWorkspaceReviewDrawer } from './LazyWorkspaceReviewDrawer';
+import { LazyWorkspaceReviewPopover } from './LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
   buildWorkspaceReviewSummary,
 } from './workspaceReview';
+import {
+  mergeWorkspaceReplayEvents,
+  selectCachedWorkspaceEvents,
+} from './workspaceTodos';
 import { WorkspaceWecomBindDialog } from './WorkspaceWecomBindDialog';
+import { WorkspaceTranscriptSelection } from './WorkspaceAnnotations';
+import { useWorkspaceAnnotations } from './useWorkspaceAnnotations';
 
 function ProcessingActionIcon({ stopping = false }: { stopping?: boolean }) {
   return (
@@ -458,7 +464,7 @@ function writeCachedNativeEvents(runtimeId: string, events: SessionEventRecord[]
     const key = nativeEventCacheKey(runtimeId);
     for (const limit of [NATIVE_EVENT_CACHE_LIMIT, 3000, 1000]) {
       try {
-        sessionStorage.setItem(key, JSON.stringify(events.slice(-limit)));
+        sessionStorage.setItem(key, JSON.stringify(selectCachedWorkspaceEvents(events, limit)));
         return;
       } catch {
         // Try a smaller retained window before giving up.
@@ -1323,8 +1329,11 @@ export function WorkspaceNativeSessionView({
   );
   const composerTextRef = useRef('');
   const composerHasDraftRef = useRef(false);
+  const pendingEnvironmentUpdateRef = useRef<Promise<boolean> | null>(null);
+  const environmentUpdateRequestSeqRef = useRef(0);
   const [composerDraftRevision, setComposerDraftRevision] = useState(0);
   const [composerHasDraft, setComposerHasDraft] = useState(false);
+  const sessionAnnotations = useWorkspaceAnnotations(`live:${session.runtime_id}`);
   const [composerPlanModeEnabled, setComposerPlanModeEnabled] = useState(
     () => isNativeSessionPlanRuntime(session),
   );
@@ -1354,7 +1363,7 @@ export function WorkspaceNativeSessionView({
   const reviewPanelOpen = useAppStore((state) => state.reviewPanelOpen);
   const setReviewPanelOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
-  const isReviewDrawerOpen = isVisible && reviewPanelOpen;
+  const isReviewPopoverOpen = isVisible && reviewPanelOpen;
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [isRefreshingGitSnapshot, setIsRefreshingGitSnapshot] = useState(false);
   const [respondingRequestId, setRespondingRequestId] = useState<string | null>(null);
@@ -1398,6 +1407,7 @@ export function WorkspaceNativeSessionView({
   const pendingRewindStartSeqRef = useRef(0);
   const prevEventCountRef = useRef(0);
   const tickInFlightRef = useRef(false);
+  const initialReplayRuntimeRef = useRef<string | null>(null);
   const initialReplayBackfillRuntimeRef = useRef<string | null>(null);
   const gitSnapshotRequestSeqRef = useRef(0);
 
@@ -1550,6 +1560,12 @@ export function WorkspaceNativeSessionView({
   }, [clearComposerDraft, clearFileRewindTimeout, initialImages, initialPrompt, session.runtime_id]);
 
   useEffect(() => {
+    environmentUpdateRequestSeqRef.current += 1;
+    pendingEnvironmentUpdateRef.current = null;
+    initialReplayRuntimeRef.current = null;
+  }, [session.runtime_id]);
+
+  useEffect(() => {
     gitSnapshotRequestSeqRef.current += 1;
     setGitSnapshot(null);
     setIsRefreshingGitSnapshot(false);
@@ -1604,7 +1620,7 @@ export function WorkspaceNativeSessionView({
   );
   const reviewModel = useMemo(
     () => {
-      if (!isReviewDrawerOpen) {
+      if (!isReviewPopoverOpen) {
         return null;
       }
 
@@ -1615,7 +1631,7 @@ export function WorkspaceNativeSessionView({
         gitSnapshot,
       });
     },
-    [events, gitSnapshot, isReviewDrawerOpen, messages, session],
+    [events, gitSnapshot, isReviewPopoverOpen, messages, session],
   );
 
   // Publish review summary to the status-strip entry pill while this live session owns the view.
@@ -1710,7 +1726,7 @@ export function WorkspaceNativeSessionView({
       return;
     }
 
-    const delay = isReviewDrawerOpen ? 250 : 1200;
+    const delay = isReviewPopoverOpen ? 250 : 1200;
     const timeoutId = window.setTimeout(() => {
       void refreshGitSnapshot();
     }, delay);
@@ -1720,7 +1736,7 @@ export function WorkspaceNativeSessionView({
     };
   }, [
     events.length,
-    isReviewDrawerOpen,
+    isReviewPopoverOpen,
     isVisible,
     refreshGitSnapshot,
     session.status,
@@ -1753,12 +1769,13 @@ export function WorkspaceNativeSessionView({
         return;
       }
 
+      const fullBatchLatestSeq = latestEventSeq(fullBatch.events);
+      if (fullBatchLatestSeq != null) {
+        lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? fullBatchLatestSeq, fullBatchLatestSeq);
+      }
+
       startTransition(() => {
-        setEvents((previous) => {
-          const merged = appendSessionEvents(fullBatch.events, previous);
-          lastSeenSeqRef.current = latestEventSeq(merged);
-          return merged;
-        });
+        setEvents((previous) => appendSessionEvents(fullBatch.events, previous));
       });
 
       if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
@@ -1770,19 +1787,28 @@ export function WorkspaceNativeSessionView({
   }, [getNativeSessionEvents, refreshSummary, session.runtime_id]);
 
   const pollEvents = useCallback(async () => {
-    const sinceSeq = lastSeenSeqRef.current;
+    const isInitialReplay = initialReplayRuntimeRef.current !== session.runtime_id;
+    const sinceSeq = isInitialReplay ? null : lastSeenSeqRef.current;
     const batch = await getNativeSessionEvents(
       session.runtime_id,
       sinceSeq,
-      sinceSeq == null ? INITIAL_EVENT_REPLAY_LIMIT : null,
+      isInitialReplay ? INITIAL_EVENT_REPLAY_LIMIT : null,
     );
+    initialReplayRuntimeRef.current = session.runtime_id;
     if (!batch.events.length) {
       return false;
     }
 
-    lastSeenSeqRef.current = batch.events[batch.events.length - 1]?.seq ?? lastSeenSeqRef.current;
+    const batchLatestSeq = latestEventSeq(batch.events);
+    if (batchLatestSeq != null) {
+      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? batchLatestSeq, batchLatestSeq);
+    }
     const updateEvents = () => {
-      setEvents((previous) => appendSessionEvents(previous, batch.events, batch.gap_detected));
+      setEvents((previous) => (
+        isInitialReplay
+          ? mergeWorkspaceReplayEvents(previous, batch.events)
+          : appendSessionEvents(previous, batch.events, batch.gap_detected)
+      ));
     };
 
     if (hasImmediateAttentionEvent(batch.events)) {
@@ -1791,7 +1817,7 @@ export function WorkspaceNativeSessionView({
       startTransition(updateEvents);
     }
 
-    if (sinceSeq == null && !replayBatchCoversAvailableSequenceRange(batch)) {
+    if (isInitialReplay && !replayBatchCoversAvailableSequenceRange(batch)) {
       void backfillInitialReplay();
     }
 
@@ -2011,7 +2037,7 @@ export function WorkspaceNativeSessionView({
   const hasAttentionPanel = hasBlockingAttention;
   const canSend = !isSending
     && !isTerminalStatus(session.status)
-    && composerHasDraft;
+    && (composerHasDraft || sessionAnnotations.annotations.length > 0);
   const canShowFileRestorePoints = session.provider === 'claude'
     && fileCheckpoints.length > 0;
   const canUseFileRestorePoints = canShowFileRestorePoints
@@ -2353,16 +2379,53 @@ export function WorkspaceNativeSessionView({
     t,
   ]);
 
+  const waitForPendingEnvironmentUpdate = useCallback(async () => {
+    while (pendingEnvironmentUpdateRef.current) {
+      const pendingUpdate = pendingEnvironmentUpdateRef.current;
+      const succeeded = await pendingUpdate;
+      if (!succeeded) {
+        return false;
+      }
+      if (pendingEnvironmentUpdateRef.current === pendingUpdate) {
+        return true;
+      }
+    }
+    return true;
+  }, []);
+
   const handleEnvChange = useCallback((envName: string) => {
     const previousEnv = sessionEnv;
+    const runtimeId = session.runtime_id;
+    const requestSeq = environmentUpdateRequestSeqRef.current + 1;
+    const previousUpdate = pendingEnvironmentUpdateRef.current;
+    environmentUpdateRequestSeqRef.current = requestSeq;
     setSessionEnv(envName);
-    void updateNativeSessionSettings(session.runtime_id, envName, undefined)
-      .then(() => refreshSummary({ force: true }))
-      .catch((error) => {
+
+    let updatePromise: Promise<boolean>;
+    updatePromise = (async () => {
+      if (previousUpdate) {
+        await previousUpdate;
+      }
+      try {
+        await updateNativeSessionSettings(runtimeId, envName, undefined);
+        if (environmentUpdateRequestSeqRef.current === requestSeq) {
+          await refreshSummary({ force: true });
+        }
+        return true;
+      } catch (error) {
         console.error('Failed to update native session environment:', error);
-        setSessionEnv(previousEnv);
-        toast.error(t('workspace.nativeSettingsFailed'));
-      });
+        if (environmentUpdateRequestSeqRef.current === requestSeq) {
+          setSessionEnv(previousEnv);
+          toast.error(t('workspace.nativeSettingsFailed'));
+        }
+        return false;
+      }
+    })().finally(() => {
+      if (pendingEnvironmentUpdateRef.current === updatePromise) {
+        pendingEnvironmentUpdateRef.current = null;
+      }
+    });
+    pendingEnvironmentUpdateRef.current = updatePromise;
   }, [refreshSummary, session.runtime_id, sessionEnv, t, updateNativeSessionSettings]);
 
   const handlePermModeChange = useCallback((mode: PermissionModeName) => {
@@ -2415,6 +2478,9 @@ export function WorkspaceNativeSessionView({
     const displayText = payload?.displayText ?? text;
     const attachments = payload?.attachments ?? [];
     if (!text && attachments.length === 0) {
+      return false;
+    }
+    if (!await waitForPendingEnvironmentUpdate()) {
       return false;
     }
     const isCronCommand = isWorkspaceCronCommand(text);
@@ -2517,6 +2583,7 @@ export function WorkspaceNativeSessionView({
     session.project_dir,
     sessionRuntimePermMode,
     t,
+    waitForPendingEnvironmentUpdate,
   ]);
 
   const flushQueuedMessages = useCallback(async () => {
@@ -2527,6 +2594,10 @@ export function WorkspaceNativeSessionView({
       || hasBlockingAttention
       || isTerminalStatus(session.status)
     ) {
+      return;
+    }
+
+    if (!await waitForPendingEnvironmentUpdate()) {
       return;
     }
 
@@ -2547,6 +2618,7 @@ export function WorkspaceNativeSessionView({
     sendPromptBatch,
     session.status,
     t,
+    waitForPendingEnvironmentUpdate,
   ]);
 
   useEffect(() => {
@@ -2728,20 +2800,22 @@ export function WorkspaceNativeSessionView({
   ]);
 
   const hasComposerDraft = composerHasDraft;
+  const hasComposerInput = hasComposerDraft || sessionAnnotations.annotations.length > 0;
   const shouldGuideModel = !isTerminalStatus(session.status)
-    && hasComposerDraft
+    && hasComposerInput
     && (isProcessingTurn || hasHardBlockingAttention);
 
   return (
     <>
     <div className="relative flex h-full min-h-0 flex-col">
-      {isReviewDrawerOpen && reviewModel ? (
+      {isReviewPopoverOpen && reviewModel ? (
         <Suspense fallback={null}>
-          <LazyWorkspaceReviewDrawer
+          <LazyWorkspaceReviewPopover
+            key={`${session.runtime_id}:${session.project_dir}`}
             session={session}
             model={reviewModel}
             gitSnapshot={gitSnapshot}
-            isOpen={isReviewDrawerOpen}
+            isOpen={isReviewPopoverOpen}
             isRefreshingGit={isRefreshingGitSnapshot}
             onOpenChange={setReviewPanelOpen}
             onRefreshGit={() => void refreshGitSnapshot()}
@@ -2757,6 +2831,18 @@ export function WorkspaceNativeSessionView({
           />
         </Suspense>
       ) : null}
+
+      <WorkspaceTranscriptSelection
+        rootRef={containerRef}
+        scopeKey={`live:${session.runtime_id}`}
+        isActive={isVisible}
+        canCreate={!isTerminalStatus(session.status)}
+        canAdd={sessionAnnotations.canAddAnnotation}
+        annotations={sessionAnnotations.annotations}
+        onAdd={sessionAnnotations.addAnnotation}
+        onUpdate={sessionAnnotations.updateAnnotation}
+        onRemove={sessionAnnotations.removeAnnotation}
+      />
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
         <div className="mx-auto max-w-[960px] px-8 py-8">
@@ -2797,7 +2883,7 @@ export function WorkspaceNativeSessionView({
         primaryActionLabel={
           isTerminalStatus(session.status)
             ? t('workspace.newSession')
-            : !hasComposerDraft && isProcessingTurn
+            : !hasComposerInput && isProcessingTurn
               ? t('workspace.nativeStop')
               : shouldGuideModel
                 ? t('workspace.composerGuideModel')
@@ -2806,7 +2892,7 @@ export function WorkspaceNativeSessionView({
         primaryActionIcon={
           isTerminalStatus(session.status)
             ? <SquarePen className="h-4 w-4" />
-            : !hasComposerDraft && isProcessingTurn
+            : !hasComposerInput && isProcessingTurn
               ? <ProcessingActionIcon stopping={isStopping} />
               : shouldGuideModel
                 ? <MessageSquareQuote className="h-4 w-4" />
@@ -2815,14 +2901,14 @@ export function WorkspaceNativeSessionView({
         primaryActionDisabled={
           isTerminalStatus(session.status)
             ? false
-            : !hasComposerDraft && isProcessingTurn
+            : !hasComposerInput && isProcessingTurn
               ? isStopping
               : undefined
         }
         onPrimaryAction={
           isTerminalStatus(session.status)
             ? onStartNew
-            : !hasComposerDraft && isProcessingTurn
+            : !hasComposerInput && isProcessingTurn
               ? () => void handleStop()
               : undefined
         }
@@ -2856,6 +2942,11 @@ export function WorkspaceNativeSessionView({
           setQueuedMessages((previous) => previous.filter((message) => message.id !== id));
         }}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
+        annotations={sessionAnnotations.annotations}
+        onUpdateAnnotation={sessionAnnotations.updateAnnotation}
+        onRemoveAnnotation={sessionAnnotations.removeAnnotation}
+        onClearAnnotations={sessionAnnotations.clearAnnotations}
+        onAnnotationsSent={sessionAnnotations.clearAnnotations}
         aboveComposer={hasAttentionPanel ? (
           <WorkspaceAttentionPanel
             provider={session.provider}

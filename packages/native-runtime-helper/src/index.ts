@@ -31,6 +31,8 @@ import {
   readLatestCodexContextUsageFromSessionFile,
 } from './codexContextUsage';
 import { buildClaudeFileCheckpointEvent } from './claudeFileCheckpoints';
+import { TodoSnapshotTracker, type TodoSnapshotV1 } from './todoSnapshots';
+import { formatPermissionPreview } from './permissionPreview';
 
 type NativeProvider = 'claude' | 'codex';
 
@@ -52,6 +54,7 @@ type InitCommand = {
   effort?: string | null;
   allowed_tools?: string[] | null;
   disallowed_tools?: string[] | null;
+  todo_snapshot_seed?: TodoSnapshotV1 | null;
 };
 
 type PromptCommand = {
@@ -171,6 +174,7 @@ type ClaudeInteractivePromptResolver = {
 
 const DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8_000;
+const CLAUDE_INCOMPLETE_RESPONSE_REASON = 'Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.';
 
 let initCommand: InitCommand | null = null;
 let stopped = false;
@@ -191,6 +195,7 @@ let claudeInterruptCompletionEmitted = false;
 let claudeSawPartialText = false;
 let claudeSawPartialThinking = false;
 let claudeTurnCompletionEmitted = false;
+let claudeTurnAwaitingResult = false;
 let pendingClaudePromptReplay: { text: string; images?: PromptImage[] | null } | null = null;
 const claudeSeenMessageIds = new Set<string>();
 let claudeContextUsageFailureKey: string | null = null;
@@ -203,6 +208,8 @@ const pendingPermissions = new Map<string, PermissionResolver>();
 const pendingClaudeInteractivePrompts = new Map<string, ClaudeInteractivePromptResolver>();
 const startedToolNames = new Map<string, string>();
 const completedToolUseIds = new Set<string>();
+const pendingClaudeToolInputs = new Map<string, Record<string, unknown>>();
+const todoSnapshotTracker = new TodoSnapshotTracker();
 const browserToolBridge = createBrowserToolBridge((request) => emit(request));
 let browserEvaluateApprovedForSession = false;
 
@@ -373,6 +380,10 @@ function closeClaudeQueryForRecovery(snapshot = captureCurrentClaudeQuerySnapsho
     return;
   }
 
+  if (isCurrentClaudeQuerySnapshot(snapshot)) {
+    claudeTurnAwaitingResult = false;
+  }
+
   const queueToClose = snapshot.inputQueue;
   const queryToClose = snapshot.query;
 
@@ -393,7 +404,7 @@ function shouldInterruptCurrentClaudeTurn(
   return snapshot !== null
     && isCurrentClaudeQuerySnapshot(snapshot)
     && !claudeTurnCompletionEmitted
-    && claudeLastSessionState !== 'idle';
+    && claudeTurnAwaitingResult;
 }
 
 function scheduleClaudeIdleClose() {
@@ -654,12 +665,17 @@ function emitClaudeTurnCompleted(detail: string) {
     stage: 'turn_completed',
     detail,
   });
+  if (applyPendingClaudeSettingsAfterTurn()) {
+    emitStatus('ready', 'Settings applied.');
+    return true;
+  }
   emitStatus('ready', 'Ready for the next prompt.');
   scheduleClaudeIdleClose();
   return true;
 }
 
 function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop workspace.') {
+  claudeTurnAwaitingResult = false;
   claudeLastSessionState = 'idle';
   resetClaudeTurnTracking();
   claudeTurnCompletionEmitted = true;
@@ -671,8 +687,28 @@ function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop 
       detail,
     });
   }
+  if (applyPendingClaudeSettingsAfterTurn()) {
+    emitStatus('ready', 'Settings applied.');
+    return;
+  }
   emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
   scheduleClaudeIdleClose();
+}
+
+function emitClaudeIncompleteResponse() {
+  if (!claudeTurnAwaitingResult) {
+    return false;
+  }
+
+  claudeTurnAwaitingResult = false;
+  claudeLastSessionState = 'idle';
+  claudeTurnCompletionEmitted = true;
+  emitEvent({
+    type: 'session_completed',
+    reason: CLAUDE_INCOMPLETE_RESPONSE_REASON,
+  });
+  emitStatus('ready', 'Claude response incomplete. Ready to retry.');
+  return true;
 }
 
 function categorizeClaudeTool(name: string) {
@@ -722,13 +758,13 @@ function summarizeQuestionInput(input: Record<string, unknown>) {
   }
 
   const questionText = typeof firstQuestion.question === 'string'
-    ? firstQuestion.question.trim()
+    ? firstQuestion.question
     : '';
-  if (!questionText) {
+  if (!formatPermissionPreview(questionText)) {
     return null;
   }
 
-  return truncateSummary(`需要用户回答 ${questions.length} 个问题：${questionText}`);
+  return formatPermissionPreview(`需要用户回答 ${questions.length} 个问题：${questionText}`);
 }
 
 function extractStringField(
@@ -737,8 +773,8 @@ function extractStringField(
 ): string | null {
   for (const key of keys) {
     const value = input[key];
-    if (typeof value === 'string' && value.trim()) {
-      return value.trim();
+    if (typeof value === 'string' && formatPermissionPreview(value)) {
+      return value;
     }
   }
   return null;
@@ -762,14 +798,14 @@ function summarizeClaudeToolInput(
   if (toolName.includes('PlanMode') && toolName.includes('Exit')) {
     const planSummary = extractStringField(input, ['plan']);
     if (planSummary) {
-      return truncateSummary(planSummary);
+      return formatPermissionPreview(planSummary);
     }
   }
 
   if (toolName === 'Bash') {
     const command = extractStringField(input, ['command']);
     if (command) {
-      return truncateSummary(command);
+      return formatPermissionPreview(command);
     }
   }
 
@@ -781,7 +817,7 @@ function summarizeClaudeToolInput(
     'query',
   ]);
   if (pathLikeValue) {
-    return truncateSummary(pathLikeValue);
+    return formatPermissionPreview(pathLikeValue);
   }
 
   const displayReason = [
@@ -789,12 +825,14 @@ function summarizeClaudeToolInput(
     options?.description,
     options?.blockedPath,
     options?.decisionReason,
-  ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  ].find((value): value is string => (
+    typeof value === 'string' && formatPermissionPreview(value).length > 0
+  ));
   if (displayReason) {
-    return truncateSummary(displayReason);
+    return formatPermissionPreview(displayReason);
   }
 
-  return truncateSummary(compactJson(input));
+  return formatPermissionPreview(compactJson(input));
 }
 
 function parseClaudeInteractiveToolPrompt(name: string, input: Record<string, unknown>) {
@@ -888,9 +926,18 @@ function emitClaudeToolUseStarted(payload: {
   rawName: string;
   inputSummary: string;
   needsResponse: boolean;
+  input?: Record<string, unknown>;
   prompt?: Record<string, unknown>;
 }) {
-  if (!payload.toolUseId || startedToolNames.has(payload.toolUseId)) {
+  if (!payload.toolUseId) {
+    return;
+  }
+
+  if (payload.input) {
+    pendingClaudeToolInputs.set(payload.toolUseId, payload.input);
+  }
+
+  if (startedToolNames.has(payload.toolUseId)) {
     return;
   }
 
@@ -906,7 +953,12 @@ function emitClaudeToolUseStarted(payload: {
   });
 }
 
-function emitClaudeToolUseCompleted(toolUseId: string, resultSummary: string, success: boolean) {
+function emitClaudeToolUseCompleted(
+  toolUseId: string,
+  resultSummary: string,
+  success: boolean,
+  todoSnapshot?: TodoSnapshotV1,
+) {
   if (!toolUseId || completedToolUseIds.has(toolUseId)) {
     return;
   }
@@ -914,12 +966,14 @@ function emitClaudeToolUseCompleted(toolUseId: string, resultSummary: string, su
   completedToolUseIds.add(toolUseId);
   const rawName = startedToolNames.get(toolUseId) ?? 'tool';
   startedToolNames.delete(toolUseId);
+  pendingClaudeToolInputs.delete(toolUseId);
   emitEvent({
     type: 'tool_use_completed',
     tool_use_id: toolUseId,
     raw_name: rawName,
     result_summary: resultSummary,
     success,
+    ...(todoSnapshot ? { todo_snapshot: todoSnapshot } : {}),
   });
 }
 
@@ -1105,12 +1159,13 @@ async function waitForPermission(
     rawName: toolName,
     inputSummary,
     needsResponse: false,
+    input,
   });
   emitEvent({
     type: 'permission_required',
     request_id: requestId,
     tool_use_id: toolUseId,
-    tool_name: options.displayName || toolName,
+    tool_name: formatPermissionPreview(options.displayName || toolName, 80),
     input_summary: inputSummary,
   });
 
@@ -1402,6 +1457,26 @@ function canApplySettingsImmediately() {
   return !hasRetainedClaudeRuntime();
 }
 
+function applyPendingClaudeSettingsAfterTurn() {
+  if (initCommand?.provider !== 'claude' || !pendingSettings) {
+    return false;
+  }
+
+  applyPendingSettingsToInitCommand();
+  closeClaudeQueryForRecovery();
+  return true;
+}
+
+function applyClaudeSettingsByRestartingIdleRuntime(command: UpdateSettingsCommand) {
+  if (shouldInterruptCurrentClaudeTurn()) {
+    return false;
+  }
+
+  applySettingsCommand(command);
+  closeClaudeQueryForRecovery();
+  return true;
+}
+
 function buildClaudeQueryOptions() {
   if (!initCommand || initCommand.provider !== 'claude') {
     throw new Error('Native runtime helper not initialized for Claude');
@@ -1521,6 +1596,7 @@ async function consumeClaudeMessages() {
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
+  let incompleteResponse = false;
 
   try {
     for await (const message of claudeQuery) {
@@ -1530,6 +1606,9 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'stream_event') {
+        if (isCurrentClaudeQuerySnapshot(querySnapshot)) {
+          pendingClaudePromptReplay = null;
+        }
         const event = (message as { event?: Record<string, unknown> }).event;
         if (event) {
           handleClaudePartialEvent(event);
@@ -1538,6 +1617,9 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'assistant') {
+        if (isCurrentClaudeQuerySnapshot(querySnapshot)) {
+          pendingClaudePromptReplay = null;
+        }
         // Emit token_usage per unique message (parallel tool calls share the same id)
         const msgId = (message as { message?: { id?: string; usage?: Record<string, unknown> } }).message?.id;
         const msgUsage = (message as { message?: { id?: string; usage?: Record<string, unknown> } }).message?.usage;
@@ -1596,6 +1678,7 @@ async function consumeClaudeMessages() {
               rawName: block.name,
               inputSummary: summarizeClaudeToolInput(block.name, input),
               needsResponse,
+              input,
               prompt,
             });
           }
@@ -1614,10 +1697,21 @@ async function consumeClaudeMessages() {
           if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') {
             return;
           }
+          const success = block.is_error !== true;
+          const rawName = startedToolNames.get(block.tool_use_id) ?? 'tool';
+          const input = pendingClaudeToolInputs.get(block.tool_use_id);
+          const todoSnapshot = success && input
+            ? todoSnapshotTracker.fromClaudeToolCompleted(
+              rawName,
+              input,
+              message.tool_use_result ?? block.content,
+            )
+            : undefined;
           emitClaudeToolUseCompleted(
             block.tool_use_id,
             summarizeClaudeToolResult(block),
-            block.is_error !== true,
+            success,
+            todoSnapshot,
           );
         });
         continue;
@@ -1676,8 +1770,6 @@ async function consumeClaudeMessages() {
           if (message.state === 'idle') {
             if (claudeInterruptRequested) {
               emitClaudeTurnInterrupted();
-            } else {
-              emitClaudeTurnCompleted('Claude turn completed.');
             }
           }
         }
@@ -1688,6 +1780,10 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'result') {
+        if (isCurrentClaudeQuerySnapshot(querySnapshot)) {
+          claudeTurnAwaitingResult = false;
+          pendingClaudePromptReplay = null;
+        }
         if (claudeInterruptRequested) {
           emitClaudeTurnInterrupted();
           claudeInterruptRequested = false;
@@ -1735,6 +1831,11 @@ async function consumeClaudeMessages() {
         });
       }
     }
+    incompleteResponse = claudeTurnAwaitingResult
+      && pendingClaudePromptReplay === null
+      && !stopped
+      && !claudeInterruptRequested
+      && isCurrentClaudeQuerySnapshot(querySnapshot);
   } finally {
     if (claudeInputQueue === inputQueue) {
       claudeInputQueue = null;
@@ -1747,6 +1848,10 @@ async function consumeClaudeMessages() {
       applyPendingSettingsToInitCommand();
       emitStatus('ready', 'Settings applied.');
     }
+  }
+
+  if (incompleteResponse) {
+    emitClaudeIncompleteResponse();
   }
 }
 
@@ -1773,6 +1878,10 @@ async function ensureClaudeSession() {
       }
       if (stopped || isAbort) {
         return;
+      }
+
+      if (!currentClaudeQuery) {
+        claudeTurnAwaitingResult = false;
       }
 
       const message = error instanceof Error ? error.message : String(error);
@@ -1861,6 +1970,7 @@ function enqueueClaudePrompt(text: string, images?: PromptImage[] | null) {
     },
     parent_tool_use_id: null,
   });
+  claudeTurnAwaitingResult = true;
   emitStatus('processing', 'Claude is processing a turn.');
 }
 
@@ -2159,6 +2269,9 @@ async function runCodexTurn(text: string, images?: PromptImage[] | null) {
     }
 
     if (event.type === 'item.started') {
+      const todoSnapshot = item.type === 'todo_list'
+        ? todoSnapshotTracker.fromCodexTodoList(item)
+        : undefined;
       emitEvent({
         type: 'tool_use_started',
         tool_use_id: String(item.id || `${item.type}-${Date.now()}`),
@@ -2166,17 +2279,36 @@ async function runCodexTurn(text: string, images?: PromptImage[] | null) {
         raw_name: String(item.type || 'item'),
         input_summary: summarizeCodexItem(item),
         needs_response: false,
+        ...(todoSnapshot ? { todo_snapshot: todoSnapshot } : {}),
+      });
+      continue;
+    }
+
+    if (event.type === 'item.updated' && item.type === 'todo_list') {
+      const todoSnapshot = todoSnapshotTracker.fromCodexTodoList(item);
+      emitEvent({
+        type: 'tool_use_started',
+        tool_use_id: String(item.id || `${item.type}-${Date.now()}`),
+        category: codexCategoryForItem(item),
+        raw_name: String(item.type || 'item'),
+        input_summary: summarizeCodexItem(item),
+        needs_response: false,
+        ...(todoSnapshot ? { todo_snapshot: todoSnapshot } : {}),
       });
       continue;
     }
 
     if (event.type === 'item.completed') {
+      const todoSnapshot = item.type === 'todo_list'
+        ? todoSnapshotTracker.fromCodexTodoList(item)
+        : undefined;
       emitEvent({
         type: 'tool_use_completed',
         tool_use_id: String(item.id || `${item.type}-${Date.now()}`),
         raw_name: String(item.type || 'item'),
         result_summary: summarizeCodexItem(item),
         success: item.status !== 'failed',
+        ...(todoSnapshot ? { todo_snapshot: todoSnapshot } : {}),
       });
       continue;
     }
@@ -2240,6 +2372,13 @@ async function handleCommand(command: InputCommand) {
 
   if (command.type === 'init') {
     initCommand = command;
+    const resumedClaudeWithoutTodoSeed = command.provider === 'claude'
+      && Boolean(command.provider_session_id?.trim())
+      && !command.todo_snapshot_seed;
+    todoSnapshotTracker.reset(
+      command.todo_snapshot_seed,
+      !resumedClaudeWithoutTodoSeed,
+    );
     currentProviderSessionId = command.provider_session_id ?? null;
     browserEvaluateApprovedForSession = false;
     if (currentProviderSessionId) {
@@ -2361,6 +2500,8 @@ async function handleCommand(command: InputCommand) {
     if (initCommand.provider === 'claude') {
       if (canApplySettingsImmediately()) {
         applySettingsCommand(command);
+        emitStatus('ready', 'Settings applied.');
+      } else if (applyClaudeSettingsByRestartingIdleRuntime(command)) {
         emitStatus('ready', 'Settings applied.');
       } else {
         queuePendingSettings(command);

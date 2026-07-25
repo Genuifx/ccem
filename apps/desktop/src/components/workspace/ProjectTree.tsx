@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Check, Copy, Link, Pin, RefreshCw, X, Plus, ShieldAlert } from 'lucide-react';
+import { Check, Copy, Link, Pin, RefreshCw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion } from '@/lib/gsapMotion';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -32,9 +32,10 @@ import {
 } from './ProjectTreeSections';
 import {
   buildProjectNodes,
+  buildProjectPrioritySessionKeys,
   classifyProject,
-  isSessionActiveInSidebar,
   reconcileProjectOrder,
+  selectVisibleProjectSessions,
   sortProjectNodesByOrder,
   splitProjectNodesForSidebar,
   stabilizeProjectNodeSessions,
@@ -48,6 +49,8 @@ interface ProjectTreeProps {
   precomputedProjectNodes?: ProjectNode[];
   environmentByName?: Record<string, Environment>;
   decorationsBySessionKey?: Record<string, WorkspaceSessionDecoration>;
+  canonicalKeyBySessionKey?: Readonly<Record<string, string | undefined>>;
+  activeSessionKeys?: ReadonlySet<string>;
   isLoading: boolean;
   isRefreshing?: boolean;
   selectedKey: string | null;
@@ -93,6 +96,8 @@ const PINNED_SESSION_KEYS_STORAGE_KEY = 'ccem-workspace-pinned-sessions';
 const PROJECT_ORDER_STORAGE_KEY = 'ccem-workspace-project-order';
 const PROJECT_CLASSIFICATION_STORAGE_KEY = 'ccem-workspace-project-classification';
 const DISMISSED_ACTIVE_TEMP_PROJECTS_STORAGE_KEY = 'ccem-workspace-dismissed-active-temp-projects';
+const EMPTY_CANONICAL_KEY_MAP: Readonly<Record<string, string | undefined>> = {};
+const EMPTY_SESSION_KEY_SET: ReadonlySet<string> = new Set();
 
 function readPinnedSessionKeys(): string[] {
   try {
@@ -482,6 +487,8 @@ export const ProjectTree = memo(function ProjectTree({
   precomputedProjectNodes,
   environmentByName = {},
   decorationsBySessionKey = {},
+  canonicalKeyBySessionKey = EMPTY_CANONICAL_KEY_MAP,
+  activeSessionKeys = EMPTY_SESSION_KEY_SET,
   isLoading,
   isRefreshing = false,
   selectedKey,
@@ -509,10 +516,52 @@ export const ProjectTree = memo(function ProjectTree({
 
   const processingKeysRef = useRef<Set<string>>(new Set());
   const treeMotionRef = useRef<HTMLDivElement>(null);
+  const sessionElementRef = useRef<Map<string, HTMLElement>>(new Map());
   const previousTreeRectsRef = useRef<Map<string, DOMRect>>(new Map());
   const hasHydratedTreeMotionRef = useRef(false);
   const stableProjectNodesRef = useRef<ProjectNode[]>([]);
+  const lastRevealedSelectedKeyRef = useRef<string | null>(null);
   const [freshDotKeys, setFreshDotKeys] = useState<Set<string>>(new Set());
+
+  const canonicalizeSessionKey = useMemo(() => {
+    if (Object.keys(canonicalKeyBySessionKey).length === 0) {
+      return (key: string) => key;
+    }
+    return (key: string) => canonicalKeyBySessionKey[key] ?? key;
+  }, [canonicalKeyBySessionKey]);
+  const canonicalSelectedKey = selectedKey ? canonicalizeSessionKey(selectedKey) : null;
+
+  useEffect(() => {
+    setPinnedSessionKeys((previous) => {
+      const seen = new Set<string>();
+      const next: string[] = [];
+      let changed = false;
+      for (const key of previous) {
+        const canonicalKey = canonicalizeSessionKey(key);
+        changed ||= canonicalKey !== key || seen.has(canonicalKey);
+        if (seen.has(canonicalKey)) {
+          continue;
+        }
+        seen.add(canonicalKey);
+        next.push(canonicalKey);
+      }
+      return changed ? next : previous;
+    });
+    setEditingKey((previous) => previous ? canonicalizeSessionKey(previous) : previous);
+    setFreshDotKeys((previous) => {
+      const next = new Set(Array.from(previous, canonicalizeSessionKey));
+      return next.size === previous.size
+        && [...next].every((key) => previous.has(key))
+        ? previous
+        : next;
+    });
+
+    const migratedProcessingKeys = new Set<string>();
+    for (const key of processingKeysRef.current) {
+      migratedProcessingKeys.add(canonicalizeSessionKey(key));
+    }
+    processingKeysRef.current = migratedProcessingKeys;
+  }, [canonicalizeSessionKey]);
 
   useEffect(() => {
     localStorage.setItem(PINNED_SESSION_KEYS_STORAGE_KEY, JSON.stringify(pinnedSessionKeys));
@@ -541,8 +590,9 @@ export const ProjectTree = memo(function ProjectTree({
     setFreshDotKeys((prev) => {
       let next: Set<string> | null = null;
       for (const session of sessions) {
-        const key = toKey(session);
-        const decoration = decorationsBySessionKey[key];
+        const rawKey = toKey(session);
+        const key = canonicalizeSessionKey(rawKey);
+        const decoration = decorationsBySessionKey[rawKey];
         if (decoration?.visualState === 'processing') {
           processingKeysRef.current.add(key);
         } else if (processingKeysRef.current.has(key)) {
@@ -555,19 +605,20 @@ export const ProjectTree = memo(function ProjectTree({
       }
       return next ?? prev;
     });
-  }, [sessions, decorationsBySessionKey]);
+  }, [canonicalizeSessionKey, sessions, decorationsBySessionKey]);
 
   // Dismiss fresh dot when user selects (reads) the session
   useEffect(() => {
     if (selectedKey) {
       setFreshDotKeys((prev) => {
-        if (!prev.has(selectedKey)) return prev;
+        const canonicalKey = canonicalizeSessionKey(selectedKey);
+        if (!prev.has(canonicalKey)) return prev;
         const next = new Set(prev);
-        next.delete(selectedKey);
+        next.delete(canonicalKey);
         return next;
       });
     }
-  }, [selectedKey]);
+  }, [canonicalizeSessionKey, selectedKey]);
 
   const saveEdit = useCallback(async (session: HistorySessionItem, newTitle: string) => {
     try {
@@ -584,39 +635,39 @@ export const ProjectTree = memo(function ProjectTree({
   const [projectVisibleCount, setProjectVisibleCount] = useState<Record<string, number>>({});
 
   const pinnedSessionKeySet = useMemo(
-    () => new Set(pinnedSessionKeys),
-    [pinnedSessionKeys]
+    () => new Set(pinnedSessionKeys.map(canonicalizeSessionKey)),
+    [canonicalizeSessionKey, pinnedSessionKeys]
   );
 
   const sessionByKey = useMemo(() => {
     const map = new Map<string, HistorySessionItem>();
     for (const session of sessions) {
-      map.set(toKey(session), session);
+      map.set(canonicalizeSessionKey(toKey(session)), session);
     }
     return map;
-  }, [sessions]);
+  }, [canonicalizeSessionKey, sessions]);
 
   const pinnedSessions = useMemo(
     () => pinnedSessionKeys
-      .map((key) => sessionByKey.get(key))
+      .map((key) => sessionByKey.get(canonicalizeSessionKey(key)))
       .filter((session): session is HistorySessionItem => !!session),
-    [pinnedSessionKeys, sessionByKey]
+    [canonicalizeSessionKey, pinnedSessionKeys, sessionByKey]
   );
 
   const unpinnedSessions = useMemo(
-    () => sessions.filter((session) => !pinnedSessionKeySet.has(toKey(session))),
-    [pinnedSessionKeySet, sessions]
+    () => sessions.filter((session) => !pinnedSessionKeySet.has(canonicalizeSessionKey(toKey(session)))),
+    [canonicalizeSessionKey, pinnedSessionKeySet, sessions]
   );
 
   const togglePinnedSession = useCallback((session: HistorySessionItem) => {
-    const key = toKey(session);
+    const key = canonicalizeSessionKey(toKey(session));
     setPinnedSessionKeys((previous) => {
       if (previous.includes(key)) {
         return previous.filter((pinnedKey) => pinnedKey !== key);
       }
       return [key, ...previous.filter((pinnedKey) => pinnedKey !== key)];
     });
-  }, []);
+  }, [canonicalizeSessionKey]);
 
   const copyText = useCallback(async (text: string) => {
     try {
@@ -641,19 +692,19 @@ export const ProjectTree = memo(function ProjectTree({
 
   const handlePinnedDragStart = useCallback(
     (event: DragEvent<HTMLDivElement>, session: HistorySessionItem) => {
-      const key = toKey(session);
+      const key = canonicalizeSessionKey(toKey(session));
       dragSourceKeyRef.current = key;
       setDraggingKey(key);
       event.dataTransfer.effectAllowed = 'move';
       event.dataTransfer.setData('text/plain', key);
     },
-    []
+    [canonicalizeSessionKey]
   );
 
   const handlePinnedDragOver = useCallback(
     (event: DragEvent<HTMLDivElement>, session: HistorySessionItem) => {
       if (!dragSourceKeyRef.current) return;
-      const key = toKey(session);
+      const key = canonicalizeSessionKey(toKey(session));
       if (key === dragSourceKeyRef.current) {
         if (dropTargetKey) setDropTargetKey(null);
         return;
@@ -665,14 +716,14 @@ export const ProjectTree = memo(function ProjectTree({
       setDropTargetKey(key);
       setDropPosition(isTopHalf ? 'before' : 'after');
     },
-    [dropTargetKey]
+    [canonicalizeSessionKey, dropTargetKey]
   );
 
   const handlePinnedDrop = useCallback(
     (event: DragEvent<HTMLDivElement>, session: HistorySessionItem) => {
       event.preventDefault();
       const sourceKey = dragSourceKeyRef.current;
-      const targetKey = toKey(session);
+      const targetKey = canonicalizeSessionKey(toKey(session));
       if (!sourceKey || sourceKey === targetKey) {
         clearDragState();
         return;
@@ -688,7 +739,7 @@ export const ProjectTree = memo(function ProjectTree({
       });
       clearDragState();
     },
-    [clearDragState, dropPosition]
+    [canonicalizeSessionKey, clearDragState, dropPosition]
   );
 
   const activitySortedProjectNodes = useMemo(() => {
@@ -698,8 +749,8 @@ export const ProjectTree = memo(function ProjectTree({
 
       for (const node of precomputedProjectNodes) {
         const unpinnedNodeSessions = node.sessions.filter((session) => {
-          const key = toKey(session);
-          if (pinnedSessionKeySet.has(key)) {
+          const key = canonicalizeSessionKey(toKey(session));
+          if (pinnedSessionKeySet.has(key) || seenSessionKeys.has(key)) {
             return false;
           }
           seenSessionKeys.add(key);
@@ -721,7 +772,7 @@ export const ProjectTree = memo(function ProjectTree({
       }
 
       for (const session of unpinnedSessions) {
-        const key = toKey(session);
+        const key = canonicalizeSessionKey(toKey(session));
         if (seenSessionKeys.has(key)) {
           continue;
         }
@@ -751,7 +802,7 @@ export const ProjectTree = memo(function ProjectTree({
     }
 
     return buildProjectNodes(unpinnedSessions);
-  }, [pinnedSessionKeySet, precomputedProjectNodes, unpinnedSessions]);
+  }, [canonicalizeSessionKey, pinnedSessionKeySet, precomputedProjectNodes, unpinnedSessions]);
 
   const activityProjectOrder = useMemo(
     () => activitySortedProjectNodes.map((node) => node.project),
@@ -761,11 +812,12 @@ export const ProjectTree = memo(function ProjectTree({
   const stableActivityProjectNodes = useMemo(() => {
     const stableNodes = stabilizeProjectNodeSessions(
       stableProjectNodesRef.current,
-      activitySortedProjectNodes
+      activitySortedProjectNodes,
+      { canonicalKeyBySessionKey },
     );
     stableProjectNodesRef.current = stableNodes;
     return stableNodes;
-  }, [activitySortedProjectNodes]);
+  }, [activitySortedProjectNodes, canonicalKeyBySessionKey]);
 
   const activityProjectOrderKey = activityProjectOrder.join('\u0000');
 
@@ -806,15 +858,26 @@ export const ProjectTree = memo(function ProjectTree({
     [dismissedActiveTemporaryProjects]
   );
 
+  const activityPrioritySessionKeys = useMemo(
+    () => buildProjectPrioritySessionKeys(
+      activeSessionKeys,
+      decorationsBySessionKey,
+      canonicalKeyBySessionKey,
+    ),
+    [activeSessionKeys, canonicalKeyBySessionKey, decorationsBySessionKey]
+  );
+
   const activeTemporaryProjectSet = useMemo(() => {
     const active = new Set<string>();
     for (const node of temporaryCandidateProjectNodes) {
-      if (node.sessions.some((session) => isSessionActiveInSidebar(session, decorationsBySessionKey))) {
+      if (node.sessions.some((session) => (
+        activityPrioritySessionKeys.has(canonicalizeSessionKey(toKey(session)))
+      ))) {
         active.add(node.project);
       }
     }
     return active;
-  }, [decorationsBySessionKey, temporaryCandidateProjectNodes]);
+  }, [activityPrioritySessionKeys, canonicalizeSessionKey, temporaryCandidateProjectNodes]);
 
   useEffect(() => {
     setDismissedActiveTemporaryProjects((previous) => {
@@ -884,19 +947,89 @@ export const ProjectTree = memo(function ProjectTree({
     ));
   }, []);
 
-  // Auto-expand top 3 main projects on first load. Active temporary projects stay visible in their fixed strip.
+  const activeProjectSet = useMemo(() => {
+    const projects = new Set<string>();
+    for (const node of projectNodes) {
+      if (node.sessions.some((session) => (
+        activityPrioritySessionKeys.has(canonicalizeSessionKey(toKey(session)))
+      ))) {
+        projects.add(node.project);
+      }
+    }
+    return projects;
+  }, [activityPrioritySessionKeys, canonicalizeSessionKey, projectNodes]);
+
+  const selectedProject = useMemo(() => {
+    if (!canonicalSelectedKey) {
+      return null;
+    }
+    return projectNodes.find((node) => node.sessions.some((session) => (
+      canonicalizeSessionKey(toKey(session)) === canonicalSelectedKey
+    )))?.project ?? null;
+  }, [canonicalSelectedKey, canonicalizeSessionKey, projectNodes]);
+
+  const prioritySessionKeys = useMemo(() => {
+    const keys = new Set(activityPrioritySessionKeys);
+    if (canonicalSelectedKey) {
+      keys.add(canonicalSelectedKey);
+    }
+    return keys;
+  }, [activityPrioritySessionKeys, canonicalSelectedKey]);
+
+  const defaultExpandedProjects = useMemo(() => new Set([
+    ...mainProjectNodes.slice(0, 3).map((node) => node.project),
+    ...activeTemporaryProjectNodes.map((node) => node.project),
+  ]), [activeTemporaryProjectNodes, mainProjectNodes]);
+
+  // Selecting a hidden row reveals its project once. A later explicit collapse
+  // remains respected until the user selects another row.
+  useEffect(() => {
+    if (!selectedProject) {
+      return;
+    }
+    setExpandedProjects((previous) => {
+      const expanded = new Set(previous ?? defaultExpandedProjects);
+      if (expanded.has(selectedProject)) {
+        return previous;
+      }
+      expanded.add(selectedProject);
+      return expanded;
+    });
+  }, [canonicalSelectedKey, selectedProject]);
+
+  // Active projects stay open while their activity signal is present, but only
+  // until the user explicitly interacts with the tree. After the first toggle,
+  // user intent wins and active projects can be collapsed like any other.
+  const [hasUserToggled, setHasUserToggled] = useState(false);
   const effectiveExpanded = useMemo(() => {
-    if (expandedProjects !== null) return expandedProjects;
-    return new Set([
-      ...mainProjectNodes.slice(0, 3).map((node) => node.project),
-      ...activeTemporaryProjectNodes.map((node) => node.project),
-    ]);
-  }, [activeTemporaryProjectNodes, expandedProjects, mainProjectNodes]);
+    if (hasUserToggled && expandedProjects !== null) {
+      return expandedProjects;
+    }
+    const expanded = new Set(expandedProjects ?? defaultExpandedProjects);
+    for (const project of activeProjectSet) {
+      expanded.add(project);
+    }
+    return expanded;
+  }, [
+    activeProjectSet,
+    defaultExpandedProjects,
+    expandedProjects,
+    hasUserToggled,
+  ]);
 
   // Per-project visible count helper
   const getVisibleCount = useCallback(
     (project: string) => projectVisibleCount[project] ?? PROJECT_TREE_PAGE_SIZE,
     [projectVisibleCount]
+  );
+  const getVisibleSessions = useCallback(
+    (node: ProjectNode) => selectVisibleProjectSessions(
+      node.sessions,
+      getVisibleCount(node.project),
+      prioritySessionKeys,
+      canonicalKeyBySessionKey,
+    ),
+    [canonicalKeyBySessionKey, getVisibleCount, prioritySessionKeys]
   );
   const loadMore = useCallback(
     (project: string) =>
@@ -919,6 +1052,7 @@ export const ProjectTree = memo(function ProjectTree({
 
   const toggleProject = useCallback(
     (project: string) => {
+      setHasUserToggled(true);
       setExpandedProjects((prev) => {
         const next = new Set(prev ?? effectiveExpanded);
         if (next.has(project)) {
@@ -938,28 +1072,27 @@ export const ProjectTree = memo(function ProjectTree({
       if (!isExpanded) {
         return `${section}:${node.project}:collapsed`;
       }
-      const visibleCount = projectVisibleCount[node.project] ?? PROJECT_TREE_PAGE_SIZE;
-      const visibleSessionKeys = node.sessions
-        .slice(0, visibleCount)
-        .map(toKey)
+      const visibleSessionKeys = getVisibleSessions(node)
+        .map((session) => canonicalizeSessionKey(toKey(session)))
         .join(',');
       return `${section}:${node.project}:expanded:${visibleSessionKeys}`;
     };
 
     return [
       `loading:${isLoading}`,
-      `pinned:${pinnedSessions.map(toKey).join(',')}`,
+      `pinned:${pinnedSessions.map((session) => canonicalizeSessionKey(toKey(session))).join(',')}`,
       ...mainProjectNodes.map((node) => serializeProjectNode('main', node)),
       ...temporaryProjectNodes.map((node) => serializeProjectNode('temporary', node)),
       ...activeTemporaryProjectNodes.map((node) => serializeProjectNode('activeTemporary', node)),
     ].join('\n');
   }, [
     activeTemporaryProjectNodes,
+    canonicalizeSessionKey,
     effectiveExpanded,
+    getVisibleSessions,
     isLoading,
     mainProjectNodes,
     pinnedSessions,
-    projectVisibleCount,
     temporaryProjectNodes,
   ]);
 
@@ -1031,6 +1164,35 @@ export const ProjectTree = memo(function ProjectTree({
     hasHydratedTreeMotionRef.current = true;
   }, [treeMotionKey]);
 
+  useLayoutEffect(() => {
+    if (!canonicalSelectedKey) {
+      lastRevealedSelectedKeyRef.current = null;
+      return;
+    }
+    if (lastRevealedSelectedKeyRef.current === canonicalSelectedKey) {
+      return;
+    }
+
+    const target = sessionElementRef.current.get(canonicalSelectedKey);
+    if (!target) {
+      return;
+    }
+
+    const root = treeMotionRef.current;
+    if (root) {
+      const rootRect = root.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const isVisible = targetRect.top >= rootRect.top
+        && targetRect.bottom <= rootRect.bottom;
+      if (!isVisible) {
+        target.scrollIntoView({ block: 'nearest' });
+      }
+    } else {
+      target.scrollIntoView({ block: 'nearest' });
+    }
+    lastRevealedSelectedKeyRef.current = canonicalSelectedKey;
+  }, [canonicalSelectedKey, treeMotionKey]);
+
   const totalProjects = projectNodes.length;
   const totalSessions = sessions.length;
 
@@ -1074,12 +1236,13 @@ export const ProjectTree = memo(function ProjectTree({
     session: HistorySessionItem,
     options: { pinnedSection?: boolean; activeTemporarySection?: boolean } = {},
   ) => {
-    const key = toKey(session);
-    const isSelected = key === selectedKey;
+    const rawKey = toKey(session);
+    const key = canonicalizeSessionKey(rawKey);
+    const isSelected = key === canonicalSelectedKey;
     const isEditing = editingKey === key;
     const isPinned = pinnedSessionKeySet.has(key);
     const pinLabel = isPinned ? t('workspace.unpinSession') : t('workspace.pinSession');
-    const decoration = decorationsBySessionKey[key];
+    const decoration = decorationsBySessionKey[rawKey];
     const approvalRequired = decoration?.attentionKind === 'permission_required';
     // activeTemporarySection is intentionally a no-op visually: session rows
     // share one vocabulary across sections. The option remains in the type so
@@ -1093,7 +1256,15 @@ export const ProjectTree = memo(function ProjectTree({
       return (
         <div
           key={key}
+          ref={(element) => {
+            if (element) {
+              sessionElementRef.current.set(key, element);
+            } else {
+              sessionElementRef.current.delete(key);
+            }
+          }}
           data-project-motion-key={`session:${key}`}
+          data-workspace-session-key={key}
           className={cn(
             'w-full flex items-center gap-2 py-1.5 rounded-md bg-surface-raised',
             rowChrome,
@@ -1133,7 +1304,15 @@ export const ProjectTree = memo(function ProjectTree({
     const row = (
       <div
         key={key}
+        ref={(element) => {
+          if (element) {
+            sessionElementRef.current.set(key, element);
+          } else {
+            sessionElementRef.current.delete(key);
+          }
+        }}
         data-project-motion-key={`session:${key}`}
+        data-workspace-session-key={key}
         role="button"
         tabIndex={0}
         draggable={options.pinnedSection === true}
@@ -1287,6 +1466,8 @@ export const ProjectTree = memo(function ProjectTree({
       </ContextMenu>
     );
   }, [
+    canonicalSelectedKey,
+    canonicalizeSessionKey,
     clearDragState,
     copyText,
     decorationsBySessionKey,
@@ -1305,7 +1486,6 @@ export const ProjectTree = memo(function ProjectTree({
     pinnedSessionKeySet,
     resolveEnvironment,
     saveEdit,
-    selectedKey,
     t,
     togglePinnedSession,
   ]);
@@ -1371,6 +1551,7 @@ export const ProjectTree = memo(function ProjectTree({
         classificationsByProject={classificationsByProject}
         effectiveExpanded={effectiveExpanded}
         getVisibleCount={getVisibleCount}
+        getVisibleSessions={getVisibleSessions}
         isLoading={isLoading}
         mainProjectNodes={mainProjectNodes}
         onCreateForProject={onCreateForProject}

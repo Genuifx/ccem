@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Plus, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Search, LayoutGrid, List } from 'lucide-react';
+import { Plus, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Search, LayoutGrid, List } from '@/lib/lucide-react';
 import { ErrorBanner } from '@/components/ui/EmptyState';
 import { EnvList } from '@/components/environments';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
@@ -129,7 +129,7 @@ export function Environments({ onAddEnv, onEditEnv, onCopyEnv, onDeleteEnv }: En
                 title={env.name}
               >
                 <ModelIcon
-                  model={env.defaultOpusModel || 'claude-opus-4-1-20250805'}
+                  model={env.defaultOpusModel || 'opus'}
                   size={11}
                 />
                 <span className="truncate max-w-[8.5rem]">{env.name}</span>

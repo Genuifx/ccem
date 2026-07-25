@@ -1,7 +1,7 @@
 // apps/desktop/src/pages/Analytics.tsx
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Flame, RefreshCw, Share2, TrendingDown, TrendingUp } from 'lucide-react';
+import { Flame, RefreshCw, Share2, TrendingDown, TrendingUp } from '@/lib/lucide-react';
 import { ErrorBanner } from '@/components/ui/EmptyState';
 import { cn } from '@/lib/utils';
 import { HeatmapCalendar } from '@/components/analytics/HeatmapCalendar';

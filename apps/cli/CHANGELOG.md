@@ -1,5 +1,53 @@
 # ccem
 
+## 2.62.0
+
+### Minor Changes
+
+- Minor release: expose composer environment overflow on desktop and align CLI/Desktop release surfaces for the next minor cycle.
+
+## 2.61.0
+
+### Minor Changes
+
+- Hugeicons migration, CLI permission rule rendering fix, incomplete Claude response guard, and fast-uri security fix.
+
+## 2.60.0
+
+### Minor Changes
+
+- Respect user collapse intent for active workspace projects and guard incomplete Claude responses.
+
+## 2.59.0
+
+### Minor Changes
+
+- Release v2.59.0: bundle desktop session-environment fix as a minor bump.
+
+## 2.58.0
+
+### Minor Changes
+
+- Minor release covering workspace session visibility, composer auto-grow, provider preset refresh, and i18n type alignment fixes since v2.57.0.
+
+## 2.57.0
+
+### Minor Changes
+
+- Minor release: cron run session history, responsive cron page, workspace selection polish.
+
+## 2.56.0
+
+### Minor Changes
+
+- Stabilize workspace annotation markers and desktop fixes.
+
+## 2.55.0
+
+### Minor Changes
+
+- Release v2.55.0: workspace todo persistence, native runtime helper refresh, and interactive workspace review improvements
+
 ## 2.54.0
 
 ### Minor Changes

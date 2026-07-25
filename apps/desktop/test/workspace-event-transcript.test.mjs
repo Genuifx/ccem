@@ -556,6 +556,35 @@ test('turn_interrupted flushes the active assistant turn before later prompts', 
   );
 });
 
+test('keeps partial Claude text visible beside one incomplete-response error before the recovered turn', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const incompleteReason = 'Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.';
+
+  const messages = buildMessagesFromEvents(
+    [],
+    [],
+    [
+      event(1, { type: 'user_prompt', text: 'first prompt', image_count: 0 }),
+      event(2, { type: 'assistant_chunk', text: 'partial reply' }),
+      event(3, { type: 'session_completed', reason: incompleteReason }),
+      event(4, { type: 'user_prompt', text: 'second prompt', image_count: 0 }),
+      event(5, { type: 'assistant_chunk', text: 'recovered reply' }),
+      event(6, { type: 'lifecycle', stage: 'turn_completed', detail: 'done' }),
+    ],
+  );
+
+  assert.deepEqual(
+    messages.map((message) => [message.msgType, message.content]),
+    [
+      ['user', 'first prompt'],
+      ['assistant', 'partial reply'],
+      ['assistant', incompleteReason],
+      ['user', 'second prompt'],
+      ['assistant', 'recovered reply'],
+    ],
+  );
+});
+
 test('renders persisted native user prompts as turn boundaries without lifecycle markers', async () => {
   const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
 

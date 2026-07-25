@@ -101,6 +101,10 @@ pub struct CronTaskRun {
     pub runtime_id: Option<String>,
     #[serde(rename = "runtimeKind", default)]
     pub runtime_kind: Option<String>,
+    #[serde(rename = "providerSessionId", default)]
+    pub provider_session_id: Option<String>,
+    #[serde(rename = "workingDir", default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -216,6 +220,75 @@ fn update_run(
         updater(r);
     }
     write_runs(task_id, &runs)
+}
+
+
+fn normalize_optional_session_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn enrich_run_with_provenance(run: &mut CronTaskRun) {
+    if run.provider_session_id.as_deref().map(str::trim).filter(|v| !v.is_empty()).is_some()
+        && run.working_dir.as_deref().map(str::trim).filter(|v| !v.is_empty()).is_some()
+    {
+        return;
+    }
+
+    let Ok(Some(record)) =
+        crate::session_provenance::find_record_by_ccem_session_id("claude", &run.id)
+    else {
+        return;
+    };
+
+    if run
+        .provider_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        run.provider_session_id = normalize_optional_session_id(Some(&record.source_session_id));
+    }
+
+    if run
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        run.working_dir = normalize_optional_session_id(Some(&record.working_dir));
+    }
+}
+
+fn persist_run_session_binding(
+    task_id: &str,
+    run_id: &str,
+    provider_session_id: &str,
+    working_dir: Option<&str>,
+) {
+    let provider_session_id = provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        return;
+    }
+
+    let _ = update_run(task_id, run_id, |run| {
+        run.provider_session_id = Some(provider_session_id.to_string());
+        if run
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            if let Some(dir) = normalize_optional_session_id(working_dir) {
+                run.working_dir = Some(dir);
+            }
+        }
+    });
 }
 
 // ============================================================================
@@ -471,12 +544,41 @@ fn register_cron_launch_provenance(
         return;
     }
 
+    let task_id = task.id.clone();
+    let run_id_owned = run_id.to_string();
+    let working_dir_owned = working_dir.to_string();
     spawn_claude_source_binding(
         run_id.to_string(),
         working_dir.to_string(),
         started_at,
         None,
     );
+
+    // Best-effort: after provenance bind completes, mirror provider session id onto the run record
+    // so the cron UI can deep-link into Workspace without an extra lookup race.
+    let poll_run_id = run_id_owned.clone();
+    let poll_task_id = task_id.clone();
+    let poll_working_dir = working_dir_owned.clone();
+    thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(25) {
+            if let Ok(Some(record)) =
+                crate::session_provenance::find_record_by_ccem_session_id("claude", &poll_run_id)
+            {
+                let provider = record.source_session_id.trim();
+                if !provider.is_empty() {
+                    persist_run_session_binding(
+                        &poll_task_id,
+                        &poll_run_id,
+                        provider,
+                        Some(&poll_working_dir),
+                    );
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
 }
 
 fn format_cron_notification(task: &CronTask, run: &CronTaskRun) -> String {
@@ -890,6 +992,8 @@ fn execute_task(
         status: "running".to_string(),
         runtime_id: None,
         runtime_kind: Some("headless".to_string()),
+        provider_session_id: None,
+        working_dir: None,
     };
 
     let _ = append_run(&task.id, run.clone());
@@ -904,6 +1008,9 @@ fn execute_task(
     let home = dirs::home_dir();
     let expanded_path = build_cron_user_path(home.as_deref(), std::env::var_os("PATH"));
     let working_dir = expand_cron_working_dir(&task.working_dir, home.as_deref());
+    let _ = update_run(&task.id, &run_id, |r| {
+        r.working_dir = Some(working_dir.clone());
+    });
     register_cron_launch_provenance(&task, &run_id, &working_dir, started_at_instant);
 
     let mut cmd =
@@ -989,19 +1096,42 @@ fn execute_task(
         }
     });
 
-    let finished_run = CronTaskRun {
-        id: run_id,
-        task_id: task.id.clone(),
-        started_at,
-        finished_at: Some(finished_at),
-        exit_code,
-        stdout,
-        stderr,
-        duration_ms: Some(duration_ms),
-        status: status_str,
-        runtime_id: None,
-        runtime_kind: Some("headless".to_string()),
-    };
+    // Re-read so provider_session_id writebacks from provenance binding are preserved.
+    let mut finished_run = read_runs(&task.id)
+        .ok()
+        .and_then(|runs| runs.into_iter().find(|r| r.id == run_id))
+        .unwrap_or(CronTaskRun {
+            id: run_id.clone(),
+            task_id: task.id.clone(),
+            started_at: started_at.clone(),
+            finished_at: None,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: None,
+            status: "running".to_string(),
+            runtime_id: None,
+            runtime_kind: Some("headless".to_string()),
+            provider_session_id: None,
+            working_dir: Some(working_dir.clone()),
+        });
+    finished_run.started_at = started_at;
+    finished_run.finished_at = Some(finished_at);
+    finished_run.exit_code = exit_code;
+    finished_run.stdout = stdout;
+    finished_run.stderr = stderr;
+    finished_run.duration_ms = Some(duration_ms);
+    finished_run.status = status_str;
+    if finished_run.runtime_kind.is_none() {
+        finished_run.runtime_kind = Some("headless".to_string());
+    }
+    if finished_run.working_dir.is_none() {
+        finished_run.working_dir = Some(working_dir.clone());
+    }
+    enrich_run_with_provenance(&mut finished_run);
+    let _ = update_run(&task.id, &run_id, |r| {
+        *r = finished_run.clone();
+    });
 
     let event_name = if finished_run.status == "success" {
         "cron-task-completed"
@@ -1311,7 +1441,20 @@ pub fn toggle_cron_task(id: String) -> Result<CronTask, String> {
 
 #[tauri::command]
 pub fn get_cron_task_runs(task_id: String) -> Result<Vec<CronTaskRun>, String> {
-    read_runs(&task_id)
+    let mut runs = read_runs(&task_id)?;
+    let mut dirty = false;
+    for run in &mut runs {
+        let before_provider = run.provider_session_id.clone();
+        let before_dir = run.working_dir.clone();
+        enrich_run_with_provenance(run);
+        if run.provider_session_id != before_provider || run.working_dir != before_dir {
+            dirty = true;
+        }
+    }
+    if dirty {
+        let _ = write_runs(&task_id, &runs);
+    }
+    Ok(runs)
 }
 
 #[tauri::command]
@@ -1326,10 +1469,17 @@ pub fn retry_cron_task(
 
 #[tauri::command]
 pub fn get_cron_run_detail(task_id: String, run_id: String) -> Result<CronTaskRun, String> {
-    let runs = read_runs(&task_id)?;
-    runs.into_iter()
-        .find(|r| r.id == run_id)
-        .ok_or_else(|| format!("Run not found: {}", run_id))
+    let mut runs = read_runs(&task_id)?;
+    let Some(index) = runs.iter().position(|r| r.id == run_id) else {
+        return Err(format!("Run not found: {}", run_id));
+    };
+    let before_provider = runs[index].provider_session_id.clone();
+    let before_dir = runs[index].working_dir.clone();
+    enrich_run_with_provenance(&mut runs[index]);
+    if runs[index].provider_session_id != before_provider || runs[index].working_dir != before_dir {
+        let _ = write_runs(&task_id, &runs);
+    }
+    Ok(runs[index].clone())
 }
 
 #[tauri::command]
@@ -1431,10 +1581,11 @@ pub fn generate_cron_task_stream(app: AppHandle, query: String) {
 mod tests {
     use super::{
         build_cron_claude_command, build_cron_launch_provenance, build_cron_user_path,
-        cron_matches, expand_cron_working_dir, next_runs, normalize_execution_profile,
-        normalize_wecom_peer_id, parse_cron_field, resolve_cron_env_name,
-        resolve_cron_wecom_notification_target, resolve_execution_profile, resolve_task_tool_policy,
-        validate_cron_expression, CronTask, CronWecomNotification, ResolvedToolPolicy,
+        cron_matches, enrich_run_with_provenance, expand_cron_working_dir, next_runs,
+        normalize_execution_profile, normalize_optional_session_id, normalize_wecom_peer_id,
+        parse_cron_field, resolve_cron_env_name, resolve_cron_wecom_notification_target,
+        resolve_execution_profile, resolve_task_tool_policy, validate_cron_expression, CronTask,
+        CronTaskRun, CronWecomNotification, ResolvedToolPolicy,
     };
     use crate::wecom::WecomTaskBindingTargetType;
     use std::collections::HashMap;
@@ -1670,6 +1821,34 @@ mod tests {
             "~other/repo"
         );
         assert_eq!(expand_cron_working_dir("~/repo", None), "~/repo");
+    }
+
+    #[test]
+    fn enrich_run_with_provenance_is_noop_without_record() {
+        let mut run = CronTaskRun {
+            id: "run-missing".to_string(),
+            task_id: "task-1".to_string(),
+            started_at: "2026-03-08T00:00:00Z".to_string(),
+            finished_at: None,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: None,
+            status: "success".to_string(),
+            runtime_id: None,
+            runtime_kind: Some("headless".to_string()),
+            provider_session_id: None,
+            working_dir: None,
+        };
+        enrich_run_with_provenance(&mut run);
+        assert!(run.provider_session_id.is_none());
+    }
+
+    #[test]
+    fn normalize_optional_session_id_trims_and_drops_empty() {
+        assert_eq!(normalize_optional_session_id(Some("  abc  ")).as_deref(), Some("abc"));
+        assert_eq!(normalize_optional_session_id(Some("   ")), None);
+        assert_eq!(normalize_optional_session_id(None), None);
     }
 
     #[test]

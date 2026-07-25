@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useState, useTransition } from 'react';
-import { MessageSquare } from 'lucide-react';
+import { MessageSquare } from '@/lib/lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { HistoryList } from '@/components/history/HistoryList';

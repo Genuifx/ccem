@@ -52,7 +52,7 @@ CSS custom properties defined in `apps/desktop/src/index.css`.
 ## UI Rules
 
 - Use color tokens (`text-primary`, `bg-surface-raised`) — never hardcoded Tailwind colors
-- Lucide icons only, no emoji
+- Hugeicons only (via `lucide-react` compatibility adapter in `apps/desktop/src/lib/lucide-react.tsx`), no emoji
 - All strings via `t()`, never hardcoded text
 - All glass surfaces include `glass-noise` for grain
 - New cards use `glass-card glass-noise`

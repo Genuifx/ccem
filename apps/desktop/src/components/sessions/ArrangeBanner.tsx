@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { LayoutGrid, X, ChevronDown, Loader2, Check, Minimize2 } from 'lucide-react';
+import { LayoutGrid, X, ChevronDown, Loader2, Check, Minimize2 } from '@/lib/lucide-react';
 // Note: useState imported for future use, dismissed state removed per design
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/locales';

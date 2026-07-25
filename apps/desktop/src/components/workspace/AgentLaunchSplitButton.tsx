@@ -1,5 +1,5 @@
 import { Claude, Codex, OpenCode } from '@lobehub/icons';
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup, ButtonGroupSeparator } from '@/components/ui/button-group';

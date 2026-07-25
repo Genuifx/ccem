@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { Monitor, SquareTerminal } from 'lucide-react';
+import { Monitor, SquareTerminal } from '@/lib/lucide-react';
 import type { Session } from '@/store';
 import type { ChannelKind, TmuxAttachTerminalInfo, TmuxAttachTerminalType } from '@/lib/tauri-ipc';
 import { useTauriCommands } from '@/hooks/useTauriCommands';

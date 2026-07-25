@@ -1,5 +1,5 @@
 import { useDeferredValue, useState, useMemo, useRef, useEffect, type KeyboardEvent } from 'react';
-import { Search, MessageSquare } from 'lucide-react';
+import { Search, MessageSquare } from '@/lib/lucide-react';
 import { Claude, Codex, OpenCode } from '@lobehub/icons';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';

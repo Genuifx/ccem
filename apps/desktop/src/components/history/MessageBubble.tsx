@@ -1,5 +1,5 @@
 import { memo, startTransition, useMemo, useState } from 'react';
-import { ChevronRight, Brain, CheckCircle2, XCircle, Circle, Scissors, ChevronsUpDown, ClipboardList, ChevronDown, Terminal, Sparkles, Users, AlertCircle, Copy, Check } from 'lucide-react';
+import { ChevronRight, Brain, CheckCircle2, XCircle, Circle, Scissors, ChevronsUpDown, ClipboardList, ChevronDown, Terminal, Sparkles, Users, AlertCircle, Copy, Check } from '@/lib/lucide-react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';

@@ -23,7 +23,7 @@ All user-facing strings must use `t('namespace.key')`. Never hardcode Chinese or
 ## Design system
 
 - Use color tokens (`text-primary`, `bg-surface-raised`) — never hardcoded Tailwind colors like `text-emerald-600`
-- Lucide React icons only, no emoji in UI
+- Hugeicons only (import surface stays `lucide-react` via adapter), no emoji in UI
 - Glass surfaces include `glass-noise` for grain texture
 - New cards use `glass-card glass-noise`
 - Glass borders use `--glass-border-light` (white) — never gray Tailwind border classes

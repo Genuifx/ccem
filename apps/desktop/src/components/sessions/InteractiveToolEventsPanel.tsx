@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, useTransition } from 'react';
-import { Bot, CheckCircle2, ClipboardList, FilePenLine, Search, ShieldCheck, TerminalSquare, Wrench } from 'lucide-react';
+import { Bot, CheckCircle2, ClipboardList, FilePenLine, Search, ShieldCheck, TerminalSquare, Wrench } from '@/lib/lucide-react';
 import { Card } from '@/components/ui/card';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { useLocale } from '@/locales';

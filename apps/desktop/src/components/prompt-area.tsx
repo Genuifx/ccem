@@ -210,7 +210,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
     return {
       height: isFocused && editorHeight ? `${editorHeight}px` : `${minHeight}px`,
       minHeight: `${minHeight}px`,
-      maxHeight: '70dvh',
+      maxHeight: maxHeight ? `${maxHeight}px` : '70dvh',
       overflowY: isFocused ? 'auto' : ('hidden' as const),
       transition: 'height 150ms ease-out',
     }

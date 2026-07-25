@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { domToPng } from 'modern-screenshot';
 import { QRCodeSVG } from 'qrcode.react';
 import { invoke } from '@tauri-apps/api/core';
-import { Copy, Download, Loader2, Moon, Sun, Terminal, BookOpen } from 'lucide-react';
+import { Copy, Download, Loader2, Moon, Sun, Terminal, BookOpen } from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import {
   Dialog,

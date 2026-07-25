@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { AlertTriangle } from '@/lib/lucide-react';
 import { useLocale } from '@/locales';
 import { TelegramPanel } from '@/components/chat-app/telegram/TelegramPanel';
 import { WecomPanel } from '@/components/chat-app/wecom/WecomPanel';

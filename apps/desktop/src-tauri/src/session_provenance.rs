@@ -171,6 +171,67 @@ pub fn bind_source_session_id(
     Ok(())
 }
 
+pub fn find_record_by_ccem_session_id(
+    client: &str,
+    ccem_session_id: &str,
+) -> Result<Option<SessionProvenanceRecord>, String> {
+    let client = client.trim().to_lowercase();
+    let ccem_session_id = ccem_session_id.trim();
+    if client.is_empty() || ccem_session_id.is_empty() {
+        return Ok(None);
+    }
+
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                ccem_session_id,
+                client,
+                source_session_id,
+                env_name,
+                config_source,
+                working_dir,
+                perm_mode,
+                launch_mode,
+                started_via,
+                created_at,
+                updated_at
+             FROM session_provenance
+             WHERE client = ?1
+               AND ccem_session_id = ?2
+             LIMIT 1",
+        )
+        .map_err(|error| format!("Failed to prepare provenance lookup by ccem session: {}", error))?;
+
+    let mut rows = stmt
+        .query(params![client, ccem_session_id])
+        .map_err(|error| format!("Failed to query provenance by ccem session: {}", error))?;
+
+    let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Failed to read provenance by ccem session: {}", error))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(SessionProvenanceRecord {
+        ccem_session_id: row.get(0).map_err(|error| format!("Failed to read provenance ccem_session_id: {}", error))?,
+        client: row.get(1).map_err(|error| format!("Failed to read provenance client: {}", error))?,
+        source_session_id: row
+            .get::<_, Option<String>>(2)
+            .map_err(|error| format!("Failed to read provenance source_session_id: {}", error))?
+            .unwrap_or_default(),
+        env_name: row.get(3).map_err(|error| format!("Failed to read provenance env_name: {}", error))?,
+        config_source: row.get(4).map_err(|error| format!("Failed to read provenance config_source: {}", error))?,
+        working_dir: row.get(5).map_err(|error| format!("Failed to read provenance working_dir: {}", error))?,
+        perm_mode: row.get(6).map_err(|error| format!("Failed to read provenance perm_mode: {}", error))?,
+        launch_mode: row.get(7).map_err(|error| format!("Failed to read provenance launch_mode: {}", error))?,
+        started_via: row.get(8).map_err(|error| format!("Failed to read provenance started_via: {}", error))?,
+        created_at: row.get(9).map_err(|error| format!("Failed to read provenance created_at: {}", error))?,
+        updated_at: row.get(10).map_err(|error| format!("Failed to read provenance updated_at: {}", error))?,
+    }))
+}
+
 pub fn list_records_by_client(
     client: &str,
 ) -> Result<HashMap<String, SessionProvenanceRecord>, String> {
@@ -540,7 +601,7 @@ fn normalize_project_dir(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_source_session_id, list_records_by_client, register_launch,
+        bind_source_session_id, find_record_by_ccem_session_id, list_records_by_client, register_launch,
         spawn_codex_source_binding, state_db_path, SessionProvenanceUpsert,
     };
     use chrono::Utc;
@@ -583,6 +644,14 @@ mod tests {
         })
         .expect("register launch");
         bind_source_session_id("claude", "ccem-1", "native-1").expect("bind source session id");
+        let by_ccem = find_record_by_ccem_session_id("claude", "ccem-1")
+            .expect("lookup by ccem")
+            .expect("record present");
+        assert_eq!(by_ccem.source_session_id, "native-1");
+        assert!(find_record_by_ccem_session_id("claude", "missing")
+            .expect("lookup missing")
+            .is_none());
+
 
         let records = list_records_by_client("claude").expect("list records");
         let record = records.get("native-1").expect("native lookup");

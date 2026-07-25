@@ -24,6 +24,7 @@ import {
   ENV_PRESETS,
   normalizeEnvConfig,
   recoverEnvConfigFromLegacy,
+  resolveEnvConfigForRuntime,
   PERMISSION_PRESETS,
   getCcemConfigDir,
   ensureCcemDir,
@@ -92,8 +93,6 @@ type StoredEnvConfig = EnvConfig & {
 
 const DEFAULT_OFFICIAL_ENV: EnvConfig = {
   ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-1-20250805',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-opus-4-1-20250805',
   ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-3-5-haiku-20241022',
   ANTHROPIC_MODEL: 'opus',
 };
@@ -118,20 +117,24 @@ const clearManagedClaudeEnv = (env: NodeJS.ProcessEnv): void => {
   }
 };
 
-const buildResolvedEnvVars = (env: EnvConfig): Record<string, string> => {
+const buildResolvedEnvVars = (
+  envName: string | undefined,
+  env: EnvConfig
+): Record<string, string> => {
+  const runtimeEnv = resolveEnvConfigForRuntime(envName, env);
   const resolved: Record<string, string> = {};
-  if (env.ANTHROPIC_BASE_URL) resolved.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL;
-  if (env.ANTHROPIC_AUTH_TOKEN) resolved.ANTHROPIC_AUTH_TOKEN = decrypt(env.ANTHROPIC_AUTH_TOKEN);
-  if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) resolved.ANTHROPIC_DEFAULT_OPUS_MODEL = env.ANTHROPIC_DEFAULT_OPUS_MODEL;
-  if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) resolved.ANTHROPIC_DEFAULT_SONNET_MODEL = env.ANTHROPIC_DEFAULT_SONNET_MODEL;
-  if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) resolved.ANTHROPIC_DEFAULT_HAIKU_MODEL = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
-  if (env.ANTHROPIC_MODEL) resolved.ANTHROPIC_MODEL = env.ANTHROPIC_MODEL;
-  if (env.CLAUDE_CODE_SUBAGENT_MODEL) resolved.CLAUDE_CODE_SUBAGENT_MODEL = env.CLAUDE_CODE_SUBAGENT_MODEL;
+  if (runtimeEnv.ANTHROPIC_BASE_URL) resolved.ANTHROPIC_BASE_URL = runtimeEnv.ANTHROPIC_BASE_URL;
+  if (runtimeEnv.ANTHROPIC_AUTH_TOKEN) resolved.ANTHROPIC_AUTH_TOKEN = decrypt(runtimeEnv.ANTHROPIC_AUTH_TOKEN);
+  if (runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL) resolved.ANTHROPIC_DEFAULT_OPUS_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  if (runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL) resolved.ANTHROPIC_DEFAULT_SONNET_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+  if (runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL) resolved.ANTHROPIC_DEFAULT_HAIKU_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  if (runtimeEnv.ANTHROPIC_MODEL) resolved.ANTHROPIC_MODEL = runtimeEnv.ANTHROPIC_MODEL;
+  if (runtimeEnv.CLAUDE_CODE_SUBAGENT_MODEL) resolved.CLAUDE_CODE_SUBAGENT_MODEL = runtimeEnv.CLAUDE_CODE_SUBAGENT_MODEL;
   return resolved;
 };
 
-const buildShellEnvCommands = (env: EnvConfig): string[] => {
-  const resolved = buildResolvedEnvVars(env);
+const buildShellEnvCommands = (envName: string | undefined, env: EnvConfig): string[] => {
+  const resolved = buildResolvedEnvVars(envName, env);
 
   return MANAGED_CLAUDE_ENV_KEYS.map((key) =>
     resolved[key]
@@ -473,7 +476,7 @@ const switchEnvironment = async (name: string) => {
   showCurrentEnv(null, false);
 
   const env = registries[name];
-  const exportCmds = buildShellEnvCommands(env);
+  const exportCmds = buildShellEnvCommands(name, env);
 
   if (process.stdout.isTTY) {
     console.log(chalk.yellow('\nTo apply to current shell immediately, run:'));
@@ -672,11 +675,13 @@ program
 
     Object.keys(registries).forEach(name => {
       const reg = registries[name];
+      const displayReg = resolveEnvConfigForRuntime(name, reg);
       const prefix = name === current ? chalk.green('* ') : '  ';
       table.push([
         prefix + name,
-        reg.ANTHROPIC_BASE_URL || '-',
-        reg.ANTHROPIC_DEFAULT_OPUS_MODEL || '-'
+        displayReg.ANTHROPIC_BASE_URL || '-',
+        displayReg.ANTHROPIC_DEFAULT_OPUS_MODEL ||
+          (name === 'official' ? 'Claude default' : '-')
       ]);
     });
 
@@ -965,15 +970,12 @@ program
 
     if (!env) return;
 
-    const outputEnv = { ...env };
-    if (outputEnv.ANTHROPIC_AUTH_TOKEN) {
-        outputEnv.ANTHROPIC_AUTH_TOKEN = decrypt(outputEnv.ANTHROPIC_AUTH_TOKEN);
-    }
+    const outputEnv = buildResolvedEnvVars(current, env);
 
     if (options.json) {
         console.log(JSON.stringify(outputEnv, null, 2));
     } else {
-        buildShellEnvCommands(env).forEach(cmd => console.log(cmd));
+        buildShellEnvCommands(current, env).forEach(cmd => console.log(cmd));
     }
   });
 
@@ -992,7 +994,7 @@ program
 
     const env = { ...process.env };
     clearManagedClaudeEnv(env);
-    Object.assign(env, buildResolvedEnvVars(envConfig));
+    Object.assign(env, buildResolvedEnvVars(current, envConfig));
 
     const [cmd, ...args] = command;
     const child = spawn(cmd, args, {

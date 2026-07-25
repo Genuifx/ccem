@@ -25,9 +25,9 @@ describe('presets', () => {
     it('should have KIMI preset with correct structure', () => {
       expect(ENV_PRESETS.KIMI).toBeDefined();
       expect(ENV_PRESETS.KIMI.ANTHROPIC_BASE_URL).toContain('moonshot.cn');
-      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-k2.7-code');
-      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-k2.7-code');
-      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('kimi-k2.7-code');
+      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-k3[1m]');
+      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-k3[1m]');
+      expect(ENV_PRESETS.KIMI.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('kimi-k3[1m]');
     });
 
     it('should have MiniMax preset with correct structure', () => {

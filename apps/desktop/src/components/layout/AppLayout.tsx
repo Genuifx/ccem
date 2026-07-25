@@ -1,5 +1,5 @@
 import { ReactNode } from 'react';
-import { Home } from 'lucide-react';
+import { Home } from '@/lib/lucide-react';
 import { SideRail } from './SideRail';
 import { MacFullscreenWindowControls } from './MacFullscreenWindowControls';
 import { GlobalUpdateIndicator } from '@/components/app-update/GlobalUpdateIndicator';

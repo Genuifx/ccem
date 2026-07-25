@@ -1,5 +1,5 @@
 import * as Popover from '@radix-ui/react-popover';
-import { ChevronDown, SquareArrowOutUpRight } from 'lucide-react';
+import { ChevronDown, SquareArrowOutUpRight } from '@/lib/lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';

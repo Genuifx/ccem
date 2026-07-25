@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Copy, Edit2, Globe, Search, Trash2 } from 'lucide-react';
+import { Copy, Edit2, Globe, Search, Trash2 } from '@/lib/lucide-react';
 import { useAppStore, type Environment } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { cn } from '@/lib/utils';
@@ -196,7 +196,7 @@ function EnvGridCard({
   onToggleEnabled,
 }: EnvCardProps) {
   const { t } = useLocale();
-  const iconHint = resolveEnvironmentIconHint(env) || env.defaultOpusModel || 'claude-opus-4-1-20250805';
+  const iconHint = resolveEnvironmentIconHint(env) || env.defaultOpusModel || 'opus';
   const runtimeModel = env.runtimeModel || 'opus';
 
   return (
@@ -306,7 +306,7 @@ function EnvListCard({
 }: EnvCardProps) {
   const { t } = useLocale();
   const runtimeModel = env.runtimeModel || 'opus';
-  const iconHint = resolveEnvironmentIconHint(env) || env.defaultOpusModel || 'claude-opus-4-1-20250805';
+  const iconHint = resolveEnvironmentIconHint(env) || env.defaultOpusModel || 'opus';
 
   return (
     <div

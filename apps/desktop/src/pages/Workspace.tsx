@@ -4,6 +4,7 @@ import {
   lazy,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,7 +16,7 @@ import {
   FolderOpen,
   LoaderCircle,
   Terminal,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import { shallow } from 'zustand/shallow';
 import { WorkspaceStatusStrip } from '@/components/workspace/WorkspaceStatusStrip';
@@ -66,22 +67,28 @@ import type {
 } from '@/features/conversations/types';
 import { toSessionKey } from '@/features/conversations/types';
 import { useWorkspaceSessionDecorations } from '@/components/workspace/useWorkspaceSessionDecorations';
+import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
 import type {
   NativeSessionSummary,
+  SessionEventRecord,
   SessionPromptImage,
   WorkspaceCommand,
   WorkspaceGitSnapshot,
 } from '@/lib/tauri-ipc';
 import {
+  buildLiveSessionTreeState,
   buildWorkspaceSidebarSessions,
+  canRestoreWorkspaceLiveSession,
   findLiveEntryForSidebarSession,
+  hasWorkspaceLiveActivityConflict,
   retainStableHistorySessions,
   resolveWorkspaceReviewProviderSessionId,
+  selectWorkspaceLiveSessionsForRestore,
   toLiveHistorySessionItem,
 } from '@/components/workspace/workspaceSidebarSessions';
 import { launchWorkspaceTerminalSession } from '@/components/workspace/workspaceTerminalLaunch';
 import {
-  replaceWorkspaceLiveSessionsSnapshot,
+  reconcileWorkspaceLiveSessionsSnapshot,
   updateWorkspaceLiveSessionsSnapshot,
   upsertWorkspaceLiveSessionEntry,
   type WorkspaceLiveSessionEntry,
@@ -101,7 +108,7 @@ import {
   calculateWorkspaceSidebarWidth,
   clampWorkspaceSidebarWidth,
 } from '@/components/workspace/workspaceSidebarLayout';
-import { LazyWorkspaceReviewDrawer } from '@/components/workspace/LazyWorkspaceReviewDrawer';
+import { LazyWorkspaceReviewPopover } from '@/components/workspace/LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
   buildWorkspaceReviewSummary,
@@ -143,6 +150,9 @@ const ACTIVE_LIVE_RUNTIME_STORAGE_KEY = 'ccem-workspace-live-runtime';
 const LIVE_RUNTIME_SET_STORAGE_KEY = 'ccem-workspace-live-runtimes';
 const WORKSPACE_BROWSER_COMPOSE_SESSION_ID = 'workspace';
 const WORKSPACE_HISTORY_SESSION_LIMIT = 240;
+const NATIVE_ACTIVITY_CONFLICT_RETRY_MS = 3000;
+const NATIVE_ACTIVITY_CONFLICT_MAX_RETRIES = 10;
+const NATIVE_ACTIVITY_CONFLICT_MAX_RETRY_MS = 60_000;
 
 function readStoredBrowserPanelWidthPercent(): number {
   try {
@@ -201,18 +211,6 @@ function writePersistedLiveRuntimeIds(runtimeIds: string[]) {
 
 function DetailFallback() {
   return <div className="flex-1 overflow-hidden" />;
-}
-
-function canRestoreWorkspaceLiveSession(session: NativeSessionSummary): boolean {
-  if (session.status === 'interrupted' || session.status === 'closed_idle') {
-    return true;
-  }
-
-  if (!session.is_active) {
-    return false;
-  }
-
-  return !['stopped', 'error', 'handoff'].includes(session.status);
 }
 
 function contentBlockHasRenderableContent(
@@ -366,6 +364,7 @@ export function Workspace({
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [messages, setMessages] = useState<ConversationMessageData[]>([]);
   const [segments, setSegments] = useState<HistorySegment[]>([]);
+  const [historyEvents, setHistoryEvents] = useState<SessionEventRecord[]>([]);
   const [activeSegment, setActiveSegment] = useState<number | null>(null);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [codexInstalled, setCodexInstalled] = useState(false);
@@ -396,6 +395,7 @@ export function Workspace({
   const [workspaceCommands, setWorkspaceCommands] = useState<WorkspaceCommand[]>([]);
   const [liveSessionsByRuntimeId, setLiveSessionsByRuntimeId] = useState<WorkspaceLiveSessionsByRuntimeId>({});
   const liveSessionsByRuntimeIdRef = useRef<WorkspaceLiveSessionsByRuntimeId>(liveSessionsByRuntimeId);
+  const nativeSessionRestoreRequestSeqRef = useRef(0);
   const [activeLiveRuntimeId, setActiveLiveRuntimeId] = useState<string | null>(null);
   const [hasAttemptedNativeSessionRestore, setHasAttemptedNativeSessionRestore] = useState(false);
   const [workspaceGitSnapshot, setWorkspaceGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
@@ -424,6 +424,16 @@ export function Workspace({
   const prevIsActiveRef = useRef(isActive);
   const selectedKeyRef = useRef<string | null>(null);
   const persistedGeneratedTitleKeysRef = useRef(new Set<string>());
+  const reviewOwnerKey = `${workspaceMode}:${selectedKey ?? ''}:${activeLiveRuntimeId ?? ''}:${composeDir ?? ''}`;
+  const reviewOwnerKeyRef = useRef(reviewOwnerKey);
+
+  useLayoutEffect(() => {
+    const ownerChanged = reviewOwnerKeyRef.current !== reviewOwnerKey;
+    reviewOwnerKeyRef.current = reviewOwnerKey;
+    if ((!isActive || ownerChanged) && workspaceReviewOpen) {
+      setWorkspaceReviewOpen(false);
+    }
+  }, [isActive, reviewOwnerKey, setWorkspaceReviewOpen, workspaceReviewOpen]);
 
   const handleComposePromptChange = useCallback((value: string) => {
     composePromptRef.current = value;
@@ -624,14 +634,6 @@ export function Workspace({
     }
   }, [composeDir, composeSeed, defaultWorkingDir, resetComposePrompt, selectedWorkingDir]);
 
-  const replaceLiveSessionsByRuntimeId = useCallback((next: WorkspaceLiveSessionsByRuntimeId) => {
-    return replaceWorkspaceLiveSessionsSnapshot(
-      liveSessionsByRuntimeIdRef,
-      setLiveSessionsByRuntimeId,
-      next,
-    );
-  }, []);
-
   const updateLiveSessionsByRuntimeId = useCallback((
     updater: (previous: WorkspaceLiveSessionsByRuntimeId) => WorkspaceLiveSessionsByRuntimeId,
   ) => {
@@ -669,53 +671,43 @@ export function Workspace({
     });
   }, [updateLiveSessionsByRuntimeId]);
 
-  const restoreNativeSessions = useCallback(async () => {
+  const restoreNativeSessions = useCallback(async ({
+    restorePersistedSelection = true,
+  }: {
+    restorePersistedSelection?: boolean;
+  } = {}) => {
+    const requestSeq = ++nativeSessionRestoreRequestSeqRef.current;
     const persistedRuntimeId = localStorage.getItem(ACTIVE_LIVE_RUNTIME_STORAGE_KEY);
     const persistedRuntimeIds = readPersistedLiveRuntimeIds();
-
-    if (persistedRuntimeIds.length === 0) {
-      setHasAttemptedNativeSessionRestore(true);
-      return;
-    }
+    const requestBaseline = liveSessionsByRuntimeIdRef.current;
 
     try {
       const nativeSessions = await listNativeSessions();
-      const restorableSessionsByRuntimeId = new Map(
-        nativeSessions
-          .filter(canRestoreWorkspaceLiveSession)
-          .map((session) => [session.runtime_id, session]),
+      if (requestSeq !== nativeSessionRestoreRequestSeqRef.current) {
+        return;
+      }
+      const restoredSessions = selectWorkspaceLiveSessionsForRestore(
+        nativeSessions,
+        persistedRuntimeIds,
       );
-      const restoredSessions = persistedRuntimeIds
-        .map((runtimeId) => restorableSessionsByRuntimeId.get(runtimeId))
-        .filter((session): session is NativeSessionSummary => Boolean(session));
+      const reconciledSessions = updateLiveSessionsByRuntimeId((previous) =>
+        reconcileWorkspaceLiveSessionsSnapshot(previous, restoredSessions, requestBaseline)
+      );
 
-      if (restoredSessions.length === 0) {
+      if (Object.keys(reconciledSessions).length === 0) {
         localStorage.removeItem(ACTIVE_LIVE_RUNTIME_STORAGE_KEY);
         localStorage.removeItem(LIVE_RUNTIME_SET_STORAGE_KEY);
-        replaceLiveSessionsByRuntimeId({});
-        setActiveLiveRuntimeId(null);
+        if (restorePersistedSelection) {
+          setActiveLiveRuntimeId(null);
+        }
         return;
       }
 
-      replaceLiveSessionsByRuntimeId(
-        Object.fromEntries(
-          restoredSessions.map((session) => [
-            session.runtime_id,
-            {
-              session,
-              initialPrompt: null,
-              initialImages: null,
-              seedMessages: [],
-            } satisfies WorkspaceLiveSessionEntry,
-          ]),
-        ),
-      );
-
-      if (!persistedRuntimeId) {
+      if (!restorePersistedSelection || !persistedRuntimeId) {
         return;
       }
 
-      const target = restoredSessions.find((session) => session.runtime_id === persistedRuntimeId);
+      const target = reconciledSessions[persistedRuntimeId]?.session;
       if (!target) {
         localStorage.removeItem(ACTIVE_LIVE_RUNTIME_STORAGE_KEY);
         setActiveLiveRuntimeId(null);
@@ -727,11 +719,15 @@ export function Workspace({
       setSelectedWorkingDir(target.project_dir);
       setWorkspaceMode('live');
     } catch (error) {
-      console.error('Failed to restore native workspace sessions:', error);
+      if (requestSeq === nativeSessionRestoreRequestSeqRef.current) {
+        console.error('Failed to restore native workspace sessions:', error);
+      }
     } finally {
-      setHasAttemptedNativeSessionRestore(true);
+      if (requestSeq === nativeSessionRestoreRequestSeqRef.current) {
+        setHasAttemptedNativeSessionRestore(true);
+      }
     }
-  }, [listNativeSessions, replaceLiveSessionsByRuntimeId, setSelectedWorkingDir]);
+  }, [listNativeSessions, setSelectedWorkingDir, updateLiveSessionsByRuntimeId]);
 
   useEffect(() => {
     if (installedSkills.length === 0 || workspaceInstalledSkills.length > 0) {
@@ -803,6 +799,7 @@ export function Workspace({
       setSelectedKey(null);
       setMessages([]);
       setSegments([]);
+      setHistoryEvents([]);
       setActiveSegment(null);
       setIsLoadingMessages(false);
       if (Object.keys(liveSessionsSnapshot).length === 0) {
@@ -839,6 +836,16 @@ export function Workspace({
     ? liveSessionsByRuntimeId[activeLiveRuntimeId] ?? null
     : null;
 
+  const statusStripEnvContext = useMemo(() => {
+    if (workspaceMode === 'history') {
+      return historyEnv || undefined;
+    }
+    if (workspaceMode === 'live') {
+      return activeLiveEntry?.session.env_name || undefined;
+    }
+    return undefined;
+  }, [workspaceMode, historyEnv, activeLiveEntry]);
+
   useEffect(() => {
     if (workspaceMode !== 'live') {
       return;
@@ -868,7 +875,11 @@ export function Workspace({
 
   const loadNativeHistoryConversation = useCallback(async (
     nativeSession: NativeSessionSummary,
-  ): Promise<{ messages: ConversationMessageData[]; segments: HistorySegment[] } | null> => {
+  ): Promise<{
+    messages: ConversationMessageData[];
+    segments: HistorySegment[];
+    events: SessionEventRecord[];
+  } | null> => {
     const replayBatch = await getNativeSessionEvents(nativeSession.runtime_id, null, null);
     if (replayBatch.events.length === 0) {
       return null;
@@ -880,13 +891,10 @@ export function Workspace({
       replayBatch.events,
       nativeSession.status === 'error' ? nativeSession.last_error : null,
     );
-    if (!hasNativeHistoryTranscriptMessages(nativeMessages)) {
-      return null;
-    }
-
     return {
       messages: nativeMessages,
       segments: [],
+      events: replayBatch.events,
     };
   }, [getNativeSessionEvents]);
 
@@ -900,11 +908,18 @@ export function Workspace({
       } = {}
     ) => {
       const { resetBeforeLoad = true, showLoading = true } = options;
+      const hasNativeHistorySessionOption = Object.prototype.hasOwnProperty.call(
+        options,
+        'nativeHistorySession',
+      );
       const requestSeq = ++conversationRequestSeqRef.current;
 
       if (resetBeforeLoad) {
         setMessages([]);
         setSegments([]);
+        if (hasNativeHistorySessionOption) {
+          setHistoryEvents([]);
+        }
         setActiveSegment(null);
       }
 
@@ -922,12 +937,16 @@ export function Workspace({
         if (requestSeq !== conversationRequestSeqRef.current) {
           return;
         }
-        if (nativeHistory) {
+        if (nativeHistory && hasNativeHistoryTranscriptMessages(nativeHistory.messages)) {
           setMessages(nativeHistory.messages);
           setSegments(nativeHistory.segments);
+          setHistoryEvents(nativeHistory.events);
           return;
         }
 
+        if (hasNativeHistorySessionOption) {
+          setHistoryEvents(nativeHistory?.events ?? []);
+        }
         const { messages: msgs, segments: segs } = await fetchConversationDetail(session);
 
         if (requestSeq !== conversationRequestSeqRef.current) {
@@ -1127,6 +1146,10 @@ export function Workspace({
     if (!selectedKey) return null;
     return sessions.find((session) => toSessionKey(session) === selectedKey) ?? null;
   }, [selectedKey, sessions]);
+  const historyAnnotationSessionKey = selectedSession
+    ? `history:${selectedSession.source}:${selectedSession.id}`
+    : null;
+  const historyAnnotations = useWorkspaceAnnotations(historyAnnotationSessionKey);
 
   const activeBrowserSessionId = useMemo(() => {
     if (workspaceMode === 'live' && activeLiveEntry) {
@@ -1201,10 +1224,80 @@ export function Workspace({
     [liveSessionEntries, sessions],
   );
 
+  const liveSessionTreeState = useMemo(
+    () => buildLiveSessionTreeState(liveSessionEntries),
+    [liveSessionEntries],
+  );
+
+  useEffect(() => {
+    const currentKey = selectedKeyRef.current;
+    if (!currentKey) {
+      return;
+    }
+    const canonicalKey = liveSessionTreeState.canonicalKeyBySessionKey[currentKey] ?? currentKey;
+    if (canonicalKey === currentKey) {
+      return;
+    }
+    selectedKeyRef.current = canonicalKey;
+    setSelectedKey(canonicalKey);
+  }, [liveSessionTreeState.canonicalKeyBySessionKey]);
+
   const { decorationsBySessionKey } = useWorkspaceSessionDecorations({
     sessions: sidebarSessions,
     isActive,
   });
+
+  const hasNativeActivityTruthConflict = useMemo(
+    () => hasWorkspaceLiveActivityConflict(
+      liveSessionTreeState.activeSessionKeys,
+      decorationsBySessionKey,
+    ),
+    [decorationsBySessionKey, liveSessionTreeState.activeSessionKeys],
+  );
+
+  useEffect(() => {
+    if (!isActive || !hasAttemptedNativeSessionRestore || !hasNativeActivityTruthConflict) {
+      return;
+    }
+
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    let retryCount = 0;
+    const reconcileNativeActivity = async () => {
+      await restoreNativeSessions({ restorePersistedSelection: false });
+      if (cancelled) {
+        return;
+      }
+      if (retryCount >= NATIVE_ACTIVITY_CONFLICT_MAX_RETRIES) {
+        console.warn(
+          `Native activity conflict persisted after ${NATIVE_ACTIVITY_CONFLICT_MAX_RETRIES} retries; stopping background reconciliation.`,
+        );
+        return;
+      }
+      const delay = Math.min(
+        NATIVE_ACTIVITY_CONFLICT_RETRY_MS * 2 ** retryCount,
+        NATIVE_ACTIVITY_CONFLICT_MAX_RETRY_MS,
+      );
+      retryCount++;
+      retryTimer = window.setTimeout(
+        () => void reconcileNativeActivity(),
+        delay,
+      );
+    };
+
+    void reconcileNativeActivity();
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
+    };
+  }, [
+    hasAttemptedNativeSessionRestore,
+    hasNativeActivityTruthConflict,
+    isActive,
+    restoreNativeSessions,
+  ]);
 
   const findLiveEntryForSession = useCallback((session: HistorySessionItem) => {
     const sessionKey = toSessionKey(session);
@@ -1405,6 +1498,10 @@ export function Workspace({
   const effectiveComposeDir = composeDir || selectedWorkingDir || defaultWorkingDir || null;
   const effectiveComposeDirLabel = effectiveComposeDir ? getProjectName(effectiveComposeDir) : null;
   const shouldRenderWorkspaceReview = workspaceMode !== 'live' || !activeLiveEntry;
+  const workspaceReviewEvents = useMemo(
+    () => workspaceMode === 'history' && selectedSession ? historyEvents : [],
+    [historyEvents, selectedSession, workspaceMode],
+  );
   const workspaceReviewWorkingDir = workspaceMode === 'history' && selectedSession
     ? selectedSession.project || null
     : effectiveComposeDir;
@@ -1463,10 +1560,10 @@ export function Workspace({
   ]);
   const workspaceReviewSummary = useMemo(
     () => buildWorkspaceReviewSummary({
-      events: [],
+      events: workspaceReviewEvents,
       gitSnapshot: workspaceGitSnapshot,
     }),
-    [workspaceGitSnapshot],
+    [workspaceGitSnapshot, workspaceReviewEvents],
   );
   const workspaceReviewModel = useMemo(
     () => {
@@ -1476,7 +1573,7 @@ export function Workspace({
 
       return buildWorkspaceReviewModel({
         session: workspaceReviewSession,
-        events: [],
+        events: workspaceReviewEvents,
         messages: workspaceMode === 'history' ? messages : [],
         gitSnapshot: workspaceGitSnapshot,
       });
@@ -1486,6 +1583,7 @@ export function Workspace({
       shouldRenderWorkspaceReview,
       workspaceGitSnapshot,
       workspaceMode,
+      workspaceReviewEvents,
       workspaceReviewOpen,
       workspaceReviewSession,
     ],
@@ -2443,6 +2541,11 @@ export function Workspace({
               activeSegment={activeSegment}
               onActiveSegmentChange={setActiveSegment}
               isLoadingMessages={isLoadingMessages}
+              canAddAnnotation={selectedHistorySupportsInline && historyAnnotations.canAddAnnotation}
+              annotations={historyAnnotations.annotations}
+              onAddAnnotation={selectedHistorySupportsInline ? historyAnnotations.addAnnotation : undefined}
+              onUpdateAnnotation={selectedHistorySupportsInline ? historyAnnotations.updateAnnotation : undefined}
+              onRemoveAnnotation={selectedHistorySupportsInline ? historyAnnotations.removeAnnotation : undefined}
             />
           </WorkspaceHistoryErrorBoundary>
         </Suspense>
@@ -2474,6 +2577,11 @@ export function Workspace({
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
+          annotations={historyAnnotations.annotations}
+          onUpdateAnnotation={historyAnnotations.updateAnnotation}
+          onRemoveAnnotation={historyAnnotations.removeAnnotation}
+          onClearAnnotations={historyAnnotations.clearAnnotations}
+          onAnnotationsSent={historyAnnotations.clearAnnotations}
           controls={(
             <ComposerControls
               provider={historyProvider}
@@ -2525,12 +2633,15 @@ export function Workspace({
   };
 
   const handleProjectTreeRefresh = useCallback(() => {
-    void refreshWorkspaceData({
-      force: true,
-      silent: false,
-      includeSelectedConversation: true,
-    });
-  }, [refreshWorkspaceData]);
+    void Promise.all([
+      refreshWorkspaceData({
+        force: true,
+        silent: false,
+        includeSelectedConversation: true,
+      }),
+      restoreNativeSessions({ restorePersistedSelection: false }),
+    ]);
+  }, [refreshWorkspaceData, restoreNativeSessions]);
 
   const handleProjectTreeSaveTitle = useCallback(async (
     session: HistorySessionItem,
@@ -2609,6 +2720,7 @@ export function Workspace({
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={browserPanelOpen}
             onToggleBrowser={() => setActiveBrowserPanelOpen((open) => !open)}
+            envContext={statusStripEnvContext}
           />
 
           <div
@@ -2620,6 +2732,8 @@ export function Workspace({
               precomputedProjectNodes={precomputedProjectNodes}
               environmentByName={environmentByName}
               decorationsBySessionKey={decorationsBySessionKey}
+              canonicalKeyBySessionKey={liveSessionTreeState.canonicalKeyBySessionKey}
+              activeSessionKeys={liveSessionTreeState.activeSessionKeys}
               isLoading={isLoadingSessions}
               isRefreshing={isRefreshing}
               selectedKey={selectedKey}
@@ -2637,7 +2751,8 @@ export function Workspace({
             <div className="workspace-reading-surface relative flex min-w-0 flex-1 flex-col overflow-hidden">
               {shouldRenderWorkspaceReview && workspaceReviewOpen && workspaceReviewModel ? (
                 <Suspense fallback={null}>
-                  <LazyWorkspaceReviewDrawer
+                  <LazyWorkspaceReviewPopover
+                    key={`${workspaceReviewSession.runtime_id}:${workspaceReviewSession.project_dir}`}
                     session={workspaceReviewSession}
                     model={workspaceReviewModel}
                     gitSnapshot={workspaceGitSnapshot}

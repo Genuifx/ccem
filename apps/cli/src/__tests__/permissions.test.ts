@@ -6,6 +6,7 @@ import {
   readSettings,
   writeSettings,
   mergePermissions,
+  showCurrentMode,
 } from '../permissions.js';
 import type { PermissionConfig } from '@ccem/core';
 
@@ -158,6 +159,32 @@ describe('permissions', () => {
       const result = mergePermissions(existing, preset);
 
       expect((result as any).someOtherField).toBe('value');
+    });
+  });
+
+  describe('showCurrentMode', () => {
+    it('renders very long permission rules completely without stalling', () => {
+      const claudeDir = path.join(tempDir, '.claude');
+      fs.mkdirSync(claudeDir);
+      const longRule = `Bash(${`x`.repeat(8_500)}:tail-sentinel)`;
+      const allowRules = [
+        longRule,
+        ...Array.from({ length: 72 }, (_, index) => `Bash(test-command-${index}:${'y'.repeat(40)})`),
+      ];
+      fs.writeFileSync(
+        path.join(claudeDir, 'settings.local.json'),
+        JSON.stringify({ permissions: { allow: allowRules, deny: [] } }),
+      );
+      const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      const startedAt = performance.now();
+      showCurrentMode();
+      const elapsedMs = performance.now() - startedAt;
+
+      const output = consoleLog.mock.calls.flat().join('\n');
+      expect(output).toContain('tail-sentinel');
+      expect(output).toContain('73. Bash(test-command-71');
+      expect(elapsedMs).toBeLessThan(500);
     });
   });
 });

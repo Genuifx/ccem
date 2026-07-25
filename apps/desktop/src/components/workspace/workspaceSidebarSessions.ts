@@ -10,6 +10,7 @@ export interface WorkspaceSidebarLiveSessionEntry {
     | 'project_dir'
     | 'env_name'
     | 'status'
+    | 'is_active'
     | 'created_at'
     | 'updated_at'
   >;
@@ -43,6 +44,10 @@ function liveSessionSidebarId(entry: WorkspaceSidebarLiveSessionEntry): string {
 
 export function liveSessionSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): string {
   return `${toHistorySource(entry.session.provider)}:${liveSessionSidebarId(entry)}`;
+}
+
+function liveSessionRuntimeSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): string {
+  return `${toHistorySource(entry.session.provider)}:${entry.session.runtime_id}`;
 }
 
 function historySessionKey(session: Pick<HistorySessionItem, 'id' | 'source'>): string {
@@ -98,8 +103,91 @@ export function retainStableHistorySessions(
   return hasChanged ? retainedSessions : previousSessions;
 }
 
+function isTerminalNativeStatus(status: string): boolean {
+  return TERMINAL_NATIVE_STATUSES.has(status);
+}
+
 function isTerminalNativeSession(entry: WorkspaceSidebarLiveSessionEntry): boolean {
-  return TERMINAL_NATIVE_STATUSES.has(entry.session.status);
+  return isTerminalNativeStatus(entry.session.status);
+}
+
+export function isActiveWorkspaceNativeSession(
+  session: Pick<NativeSessionSummary, 'status' | 'is_active'>,
+): boolean {
+  return session.is_active && !isTerminalNativeStatus(session.status);
+}
+
+export function canRestoreWorkspaceLiveSession(
+  session: Pick<NativeSessionSummary, 'status' | 'is_active'>,
+): boolean {
+  if (session.status === 'interrupted' || session.status === 'closed_idle') {
+    return true;
+  }
+  return isActiveWorkspaceNativeSession(session);
+}
+
+/**
+ * Always discover authoritative active runtimes. Persistence is only needed to
+ * keep explicitly recoverable inactive sessions (for example interrupted
+ * conversations) across a desktop restart.
+ */
+export function selectWorkspaceLiveSessionsForRestore(
+  nativeSessions: NativeSessionSummary[],
+  persistedRuntimeIds: string[],
+): NativeSessionSummary[] {
+  const persistedRuntimeIdSet = new Set(persistedRuntimeIds);
+  return nativeSessions.filter((session) => (
+    isActiveWorkspaceNativeSession(session)
+    || (
+      persistedRuntimeIdSet.has(session.runtime_id)
+      && canRestoreWorkspaceLiveSession(session)
+    )
+  ));
+}
+
+export interface LiveSessionTreeState {
+  canonicalKeyBySessionKey: Record<string, string>;
+  activeSessionKeys: Set<string>;
+}
+
+export function hasWorkspaceLiveActivityConflict(
+  activeSessionKeys: ReadonlySet<string>,
+  decorationsBySessionKey: Readonly<Record<string, { isActive?: boolean } | undefined>>,
+): boolean {
+  for (const sessionKey of activeSessionKeys) {
+    if (decorationsBySessionKey[sessionKey]?.isActive === false) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Keep runtime wrappers and their eventual provider history rows as one UI
+ * identity. Provider ids remain the canonical business id when available;
+ * runtime ids are only aliases used while the provider is still starting.
+ */
+export function buildLiveSessionTreeState(
+  liveEntries: WorkspaceSidebarLiveSessionEntry[],
+): LiveSessionTreeState {
+  const canonicalKeyBySessionKey: Record<string, string> = {};
+  const activeSessionKeys = new Set<string>();
+
+  for (const entry of liveEntries) {
+    const runtimeKey = liveSessionRuntimeSidebarKey(entry);
+    const canonicalKey = liveSessionSidebarKey(entry);
+    canonicalKeyBySessionKey[runtimeKey] = canonicalKey;
+    canonicalKeyBySessionKey[canonicalKey] = canonicalKey;
+
+    if (isActiveWorkspaceNativeSession(entry.session)) {
+      activeSessionKeys.add(canonicalKey);
+    }
+  }
+
+  return {
+    canonicalKeyBySessionKey,
+    activeSessionKeys,
+  };
 }
 
 export function toLiveHistorySessionItem(

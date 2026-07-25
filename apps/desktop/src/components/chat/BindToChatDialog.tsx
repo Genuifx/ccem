@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react';
-import { FolderOpen, Loader2, PlusSquare, Send } from 'lucide-react';
+import { FolderOpen, Loader2, PlusSquare, Send } from '@/lib/lucide-react';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { toast } from 'sonner';

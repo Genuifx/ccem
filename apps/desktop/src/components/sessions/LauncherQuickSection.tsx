@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { FolderOpen, Star, Clock, Check, Loader2, Columns2, LayoutGrid } from 'lucide-react';
+import { FolderOpen, Star, Clock, Check, Loader2, Columns2, LayoutGrid } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { LaunchButton } from '@/components/ui/LaunchButton';
 import { useLocale } from '@/locales';

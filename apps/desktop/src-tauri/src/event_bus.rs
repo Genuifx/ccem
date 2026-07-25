@@ -98,6 +98,24 @@ pub struct SessionPromptImage {
     pub placeholder: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoSnapshotItemV1 {
+    pub id: String,
+    pub text: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoSnapshotV1 {
+    pub version: u8,
+    pub provider: String,
+    pub source: String,
+    pub revision: u64,
+    pub items: Vec<TodoSnapshotItemV1>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEventPayload {
@@ -135,6 +153,8 @@ pub enum SessionEventPayload {
         needs_response: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<InteractiveToolPrompt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        todo_snapshot: Option<TodoSnapshotV1>,
     },
     ToolUseCompleted {
         tool_use_id: String,
@@ -143,6 +163,8 @@ pub enum SessionEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_content: Option<String>,
         success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        todo_snapshot: Option<TodoSnapshotV1>,
     },
     PermissionRequired {
         request_id: String,
@@ -340,7 +362,8 @@ impl SessionStore {
 mod tests {
     use super::{
         ContextUsageCategory, InteractiveToolPrompt, SessionEventPayload, SessionStore,
-        ToolCategory, ToolQuestionOption, ToolQuestionPrompt, UserInputKind,
+        TodoSnapshotItemV1, TodoSnapshotV1, ToolCategory, ToolQuestionOption, ToolQuestionPrompt,
+        UserInputKind,
     };
 
     #[test]
@@ -418,11 +441,85 @@ mod tests {
                     ],
                 }],
             }),
+            todo_snapshot: None,
         };
 
         let encoded = serde_json::to_string(&payload).expect("serialize");
         let decoded: SessionEventPayload = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn legacy_tool_events_without_todo_snapshot_still_deserialize() {
+        let started: SessionEventPayload = serde_json::from_str(
+            r#"{"type":"tool_use_started","tool_use_id":"toolu-legacy-start","category":{"category":"task_mgmt","raw_name":"TodoWrite"},"raw_name":"TodoWrite","input_summary":"1 todo","needs_response":false}"#,
+        )
+        .expect("deserialize legacy tool start");
+        let completed: SessionEventPayload = serde_json::from_str(
+            r#"{"type":"tool_use_completed","tool_use_id":"toolu-legacy-complete","raw_name":"TaskUpdate","result_summary":"updated","success":true}"#,
+        )
+        .expect("deserialize legacy tool completion");
+
+        assert!(matches!(
+            started,
+            SessionEventPayload::ToolUseStarted {
+                todo_snapshot: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            completed,
+            SessionEventPayload::ToolUseCompleted {
+                todo_snapshot: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn todo_snapshot_round_trips_long_text_on_tool_events() {
+        let long_text = "preserve this todo detail ".repeat(32);
+        let snapshot = TodoSnapshotV1 {
+            version: 1,
+            provider: "claude".to_string(),
+            source: "TodoWrite".to_string(),
+            revision: 7,
+            items: vec![TodoSnapshotItemV1 {
+                id: "todo-long".to_string(),
+                text: long_text.clone(),
+                status: "in_progress".to_string(),
+                active_text: Some("Preserving the full task detail".to_string()),
+            }],
+        };
+        let payloads = [
+            SessionEventPayload::ToolUseStarted {
+                tool_use_id: "toolu-todo-start".to_string(),
+                category: ToolCategory::TaskMgmt {
+                    raw_name: "TodoWrite".to_string(),
+                },
+                raw_name: "TodoWrite".to_string(),
+                input_summary: "1 todo".to_string(),
+                needs_response: false,
+                prompt: None,
+                todo_snapshot: Some(snapshot.clone()),
+            },
+            SessionEventPayload::ToolUseCompleted {
+                tool_use_id: "toolu-todo-complete".to_string(),
+                raw_name: "TodoWrite".to_string(),
+                result_summary: "updated".to_string(),
+                result_content: None,
+                success: true,
+                todo_snapshot: Some(snapshot.clone()),
+            },
+        ];
+
+        for payload in payloads {
+            let encoded = serde_json::to_value(&payload).expect("serialize todo snapshot event");
+            assert_eq!(encoded["todo_snapshot"]["items"][0]["text"], long_text);
+            let decoded: SessionEventPayload =
+                serde_json::from_value(encoded).expect("deserialize todo snapshot event");
+            assert_eq!(decoded, payload);
+        }
     }
 
     #[test]

@@ -1,5 +1,10 @@
 import type { ConversationContentBlock, ConversationMessageData } from '@/features/conversations/types';
 import type { NativeSessionSummary, SessionEventRecord, WorkspaceGitSnapshot } from '@/lib/tauri-ipc';
+import {
+  buildWorkspaceTodos,
+  type WorkspaceTodoItem,
+  type WorkspaceTodos,
+} from './workspaceTodos';
 
 export type ReviewSource = 'sdk' | 'git' | 'matched';
 
@@ -16,14 +21,7 @@ export interface ReviewToolEvidence {
   completedAt?: string;
 }
 
-export interface ReviewTodoItem {
-  id: string;
-  text: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'failed';
-  sourceLabel: string;
-  sourceSeq: number;
-  toolUseId?: string;
-}
+export type ReviewTodoItem = WorkspaceTodoItem;
 
 export interface ReviewChangedFile {
   path: string;
@@ -54,19 +52,14 @@ export interface WorkspaceReviewModel {
   failedTools: ReviewToolEvidence[];
   todoCompleted: number;
   todoTotal: number;
+  todoSource: WorkspaceTodos['source'];
+  todoRevision: number | null;
 }
 
 export interface WorkspaceReviewSummary {
   failedTools: number;
   changedFiles: number;
   artifacts: number;
-}
-
-interface ClaudeRawToolUse {
-  seq: number;
-  id: string;
-  name: string;
-  input: Record<string, unknown>;
 }
 
 const ARTIFACT_EXTENSIONS = new Map<string, ReviewArtifact['kind']>([
@@ -162,178 +155,6 @@ function getString(input: Record<string, unknown>, keys: string[]): string | nul
     }
   }
   return null;
-}
-
-function normalizeTodoStatus(value: unknown): ReviewTodoItem['status'] {
-  const status = typeof value === 'string' ? value.toLowerCase() : '';
-  if (status.includes('done') || status.includes('complete')) {
-    return 'completed';
-  }
-  if (status.includes('progress') || status.includes('active') || status.includes('doing')) {
-    return 'in_progress';
-  }
-  if (status.includes('fail') || status.includes('error') || status.includes('blocked')) {
-    return 'failed';
-  }
-  return 'pending';
-}
-
-function todoTextFromUnknown(value: unknown): string | null {
-  if (typeof value === 'string') {
-    return compactText(value);
-  }
-  if (!value || typeof value !== 'object') {
-    return null;
-  }
-  const record = value as Record<string, unknown>;
-  return getString(record, ['content', 'text', 'title', 'task', 'description', 'name']);
-}
-
-function todoStableIdFromUnknown(value: unknown): string | null {
-  if (!value || typeof value !== 'object') {
-    return null;
-  }
-  const record = value as Record<string, unknown>;
-  return getString(record, ['id', 'task_id', 'taskId', 'todo_id', 'todoId', 'uuid']);
-}
-
-function todoStatusFromUnknown(value: unknown): ReviewTodoItem['status'] {
-  if (!value || typeof value !== 'object') {
-    return 'pending';
-  }
-  const record = value as Record<string, unknown>;
-  if (typeof record.completed === 'boolean') {
-    return record.completed ? 'completed' : 'pending';
-  }
-  return normalizeTodoStatus(record.status ?? record.state ?? record.phase);
-}
-
-function readTodoArray(input: Record<string, unknown>): unknown[] {
-  for (const key of ['todos', 'tasks', 'items', 'todo_list']) {
-    const value = input[key];
-    if (Array.isArray(value)) {
-      return value;
-    }
-  }
-  return [];
-}
-
-function extractClaudeRawToolUses(events: SessionEventRecord[]): Map<string, ClaudeRawToolUse> {
-  const tools = new Map<string, ClaudeRawToolUse>();
-  for (const event of events) {
-    if (event.payload.type !== 'claude_json') {
-      continue;
-    }
-    const parsed = safeJson(event.payload.raw_json);
-    if (!parsed || typeof parsed !== 'object') {
-      continue;
-    }
-    const message = (parsed as { message?: { content?: unknown } }).message;
-    const blocks = Array.isArray(message?.content) ? message.content : [];
-    for (const block of blocks) {
-      if (!block || typeof block !== 'object') {
-        continue;
-      }
-      const record = block as Record<string, unknown>;
-      if (record.type !== 'tool_use' || typeof record.id !== 'string' || typeof record.name !== 'string') {
-        continue;
-      }
-      const input = record.input && typeof record.input === 'object'
-        ? record.input as Record<string, unknown>
-        : {};
-      tools.set(record.id, {
-        seq: event.seq,
-        id: record.id,
-        name: record.name,
-        input,
-      });
-    }
-  }
-  return tools;
-}
-
-function pushTodo(
-  map: Map<string, ReviewTodoItem>,
-  value: unknown,
-  source: { idSeed: string; seq: number; label: string; toolUseId?: string },
-) {
-  const text = todoTextFromUnknown(value);
-  const stableId = todoStableIdFromUnknown(value);
-  if (!text && !stableId) {
-    return;
-  }
-  const id = stableId ? `id:${stableId}` : `text:${text}`;
-  const current = map.get(id);
-  map.set(id, {
-    id,
-    text: text ?? current?.text ?? `Task ${stableId}`,
-    status: todoStatusFromUnknown(value),
-    sourceLabel: source.label,
-    sourceSeq: source.seq,
-    toolUseId: source.toolUseId,
-  });
-}
-
-function buildTodos(events: SessionEventRecord[], rawClaudeTools: Map<string, ClaudeRawToolUse>) {
-  const todos = new Map<string, ReviewTodoItem>();
-  for (const event of events) {
-    if (event.payload.type !== 'tool_use_started' && event.payload.type !== 'tool_use_completed') {
-      continue;
-    }
-    const rawName = event.payload.raw_name;
-    const isTaskTool = rawName.includes('Task') || rawName.includes('Todo') || rawName === 'todo_list';
-    if (!isTaskTool) {
-      continue;
-    }
-
-    const rawTool = 'tool_use_id' in event.payload
-      ? rawClaudeTools.get(event.payload.tool_use_id)
-      : undefined;
-    const input = rawTool?.input;
-    const parsedSummary = 'result_summary' in event.payload
-      ? safeJson(event.payload.result_summary)
-      : 'input_summary' in event.payload
-        ? safeJson(event.payload.input_summary)
-        : null;
-    const parsedInput = parsedSummary && typeof parsedSummary === 'object'
-      ? parsedSummary as Record<string, unknown>
-      : null;
-    const todoValues = input ? readTodoArray(input) : parsedInput ? readTodoArray(parsedInput) : [];
-
-    if (todoValues.length > 0) {
-      for (const todo of todoValues) {
-        pushTodo(todos, todo, {
-          idSeed: `${event.seq}`,
-          seq: event.seq,
-          label: rawName,
-          toolUseId: 'tool_use_id' in event.payload ? event.payload.tool_use_id : undefined,
-        });
-      }
-      continue;
-    }
-
-    if (input && (rawName === 'TaskCreate' || rawName === 'TaskUpdate')) {
-      const text = getString(input, ['content', 'text', 'title', 'task', 'description']);
-      pushTodo(todos, text ? { ...input, text } : input, {
-        idSeed: `${event.seq}`,
-        seq: event.seq,
-        label: rawName,
-        toolUseId: event.payload.tool_use_id,
-      });
-      continue;
-    }
-
-    const fallback = 'input_summary' in event.payload ? event.payload.input_summary : '';
-    if (fallback && !fallback.startsWith('{')) {
-      pushTodo(todos, { text: fallback, status: rawName === 'TaskUpdate' ? 'in_progress' : 'pending' }, {
-        idSeed: `${event.seq}`,
-        seq: event.seq,
-        label: rawName,
-        toolUseId: 'tool_use_id' in event.payload ? event.payload.tool_use_id : undefined,
-      });
-    }
-  }
-  return Array.from(todos.values());
 }
 
 function toolPathFromSummary(summary: string): string | null {
@@ -594,12 +415,11 @@ export function buildWorkspaceReviewModel({
   messages: ConversationMessageData[];
   gitSnapshot?: WorkspaceGitSnapshot | null;
 }): WorkspaceReviewModel {
-  const rawClaudeTools = extractClaudeRawToolUses(events);
-  const todos = buildTodos(events, rawClaudeTools);
+  const todoState = buildWorkspaceTodos(events);
+  const todos = todoState.items;
   const changedFiles = buildChangedFiles(events, gitSnapshot);
   const tools = buildToolEvidence(events);
   const failedTools = tools.filter((tool) => tool.success === false);
-  const todoCompleted = todos.filter((todo) => todo.status === 'completed').length;
 
   return {
     finalReply: latestAssistantReply(messages),
@@ -608,7 +428,9 @@ export function buildWorkspaceReviewModel({
     changedFiles,
     tools,
     failedTools,
-    todoCompleted,
-    todoTotal: todos.length,
+    todoCompleted: todoState.completed,
+    todoTotal: todoState.total,
+    todoSource: todoState.source,
+    todoRevision: todoState.revision,
   };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Circle, MessageSquareWarning, Play, QrCode, Square } from 'lucide-react';
+import { Circle, MessageSquareWarning, Play, QrCode, Square } from '@/lib/lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';

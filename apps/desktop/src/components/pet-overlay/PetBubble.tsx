@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleAlert, Loader2, X } from 'lucide-react';
+import { CheckCircle2, CircleAlert, Loader2, X } from '@/lib/lucide-react';
 import type { PetNotificationItem } from '@/types/pet';
 
 interface PetBubbleProps {

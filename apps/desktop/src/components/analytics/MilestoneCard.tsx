@@ -1,4 +1,4 @@
-import { Check, BarChart3, DollarSign, Flame, Gem } from 'lucide-react';
+import { Check, BarChart3, DollarSign, Flame, Gem } from '@/lib/lucide-react';
 import type { Milestone } from '@/types/analytics';
 import { useLocale } from '@/locales';
 

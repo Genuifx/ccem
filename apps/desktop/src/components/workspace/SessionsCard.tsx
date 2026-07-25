@@ -1,5 +1,5 @@
 import { useEffect, useCallback } from 'react';
-import { Terminal, Moon } from 'lucide-react';
+import { Terminal, Moon } from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import type { Session } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';

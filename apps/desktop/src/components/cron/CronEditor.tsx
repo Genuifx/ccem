@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { useLocale } from '@/locales';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { cn } from '@/lib/utils';
-import { Code } from 'lucide-react';
+import { Code } from '@/lib/lucide-react';
 
 type Frequency = 'minute' | 'hourly' | 'daily' | 'weekly' | 'monthly';
 

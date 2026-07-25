@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
-import { Minimize2, Plus, Terminal, X } from 'lucide-react';
+import { Minimize2, Plus, Terminal, X } from '@/lib/lucide-react';
 import { ProjectPickerModal } from '@/components/workspace/ProjectPickerModal';
 import {
   SessionCard,

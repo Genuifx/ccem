@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Radio, Flame, Clock, Check, Settings2, ClipboardCheck, Search, Command, PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { Radio, Flame, Clock, Check, Settings2, ClipboardCheck, Search, Command, PanelRightClose, PanelRightOpen } from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
 import { getEnvColorVar, cn } from '@/lib/utils';
@@ -24,6 +24,10 @@ import { StreakUsagePopoverContent } from './StreakUsagePopover';
 import type { UsageStats } from '@/types/analytics';
 import type { Environment } from '@/store';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
+import {
+  WORKSPACE_REVIEW_POPOVER_ID,
+  workspaceReviewTriggerRef,
+} from './workspaceReviewAnchor';
 
 function EnvironmentLobeIcon({
   environment,
@@ -61,6 +65,8 @@ interface WorkspaceStatusStripProps {
   onOpenSearch: () => void;
   browserOpen?: boolean;
   onToggleBrowser?: () => void;
+  /** Optional env context (e.g. the active history/live session env) to keep visible alongside the global current env. */
+  envContext?: string;
 }
 
 function StatusChip({
@@ -126,6 +132,7 @@ export function WorkspaceStatusStrip({
   onOpenSearch,
   browserOpen = false,
   onToggleBrowser,
+  envContext,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
   const { sessions, currentEnv, environments, enabledEnvironments, continuousUsageDays, cronTasks, usageStats } = useAppStore(
@@ -140,8 +147,11 @@ export function WorkspaceStatusStrip({
     }),
     shallow
   );
+  const statusStripCurrentEnvs = envContext
+    ? [currentEnv, envContext].filter((name): name is string => Boolean(name))
+    : currentEnv;
   const runtimeEnvironments = filterRuntimeEnvironments(environments, enabledEnvironments, {
-    currentEnv,
+    currentEnv: statusStripCurrentEnvs.length > 0 ? statusStripCurrentEnvs : null,
   });
   const [streakPopoverOpen, setStreakPopoverOpen] = useState(false);
   const [isRefreshingStreak, setIsRefreshingStreak] = useState(false);
@@ -344,8 +354,12 @@ export function WorkspaceStatusStrip({
 
       {/* Review audit entry — always visible, far-right, context-aware */}
       <button
+        ref={workspaceReviewTriggerRef}
         type="button"
-        aria-pressed={reviewPanelOpen}
+        data-ccem-workspace-review-trigger
+        aria-haspopup="dialog"
+        aria-expanded={reviewPanelOpen}
+        aria-controls={reviewPanelOpen ? WORKSPACE_REVIEW_POPOVER_ID : undefined}
         title={t('workspace.reviewEntry')}
         onClick={() => setReviewPanelOpen(!reviewPanelOpen)}
         className={cn(

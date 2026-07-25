@@ -78,6 +78,63 @@ export function upsertWorkspaceLiveSessionEntry(
   };
 }
 
+export function reconcileWorkspaceLiveSessionsSnapshot(
+  previous: WorkspaceLiveSessionsByRuntimeId,
+  sessions: NativeSessionSummary[],
+  requestBaseline: WorkspaceLiveSessionsByRuntimeId = previous,
+): WorkspaceLiveSessionsByRuntimeId {
+  const next: WorkspaceLiveSessionsByRuntimeId = {};
+  const snapshotRuntimeIds = new Set(sessions.map((session) => session.runtime_id));
+
+  for (const session of sessions) {
+    const existing = previous[session.runtime_id];
+    const baselineEntry = requestBaseline[session.runtime_id];
+    const changedDuringRequest = Boolean(existing && existing !== baselineEntry);
+    const currentUpdatedAt = existing ? Date.parse(existing.session.updated_at) : Number.NaN;
+    const incomingUpdatedAt = Date.parse(session.updated_at);
+    const incomingIsOlder = changedDuringRequest
+      && existing
+      && (
+        (Number.isFinite(currentUpdatedAt) && Number.isFinite(incomingUpdatedAt)
+          && incomingUpdatedAt < currentUpdatedAt)
+        || (
+          incomingUpdatedAt === currentUpdatedAt
+          && (session.last_event_seq ?? -1) < (existing.session.last_event_seq ?? -1)
+        )
+      );
+    const nextSession = incomingIsOlder && existing ? existing.session : session;
+
+    if (existing && areNativeSessionSummariesEqual(existing.session, nextSession)) {
+      next[session.runtime_id] = existing;
+      continue;
+    }
+
+    next[session.runtime_id] = existing
+      ? { ...existing, session: nextSession }
+      : {
+          session: nextSession,
+          initialPrompt: null,
+          initialImages: null,
+          generatedTitle: null,
+          seedMessages: [],
+        };
+  }
+
+  for (const [runtimeId, entry] of Object.entries(previous)) {
+    if (snapshotRuntimeIds.has(runtimeId)) {
+      continue;
+    }
+    if (requestBaseline[runtimeId] !== entry) {
+      next[runtimeId] = entry;
+    }
+  }
+
+  const previousRuntimeIds = Object.keys(previous);
+  const unchanged = previousRuntimeIds.length === Object.keys(next).length
+    && previousRuntimeIds.every((runtimeId) => next[runtimeId] === previous[runtimeId]);
+  return unchanged ? previous : next;
+}
+
 export function replaceWorkspaceLiveSessionsSnapshot(
   liveSessionsRef: MutableSnapshotRef<WorkspaceLiveSessionsByRuntimeId>,
   setLiveSessions: (next: WorkspaceLiveSessionsByRuntimeId) => void,

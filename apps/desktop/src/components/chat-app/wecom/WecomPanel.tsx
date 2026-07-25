@@ -12,7 +12,7 @@ import {
   Square,
   Trash2,
   Users,
-} from 'lucide-react';
+} from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';

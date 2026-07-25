@@ -35,6 +35,10 @@ const TEMPORARY_PROJECT_NAME_PATTERNS = [
   /(?:^|-)checkpoint(?:-|$)/i,
 ];
 
+// Align overflow budget with the UI page size so auto-expansion for active
+// sessions feels like one extra "Load more" click rather than an unbounded list.
+const PRIORITY_OVERFLOW_BUDGET = 6;
+
 export function normalizeProjectPath(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/+$/, '').trim();
 }
@@ -136,15 +140,31 @@ function projectSessionKey(session: Pick<HistorySessionItem, 'id' | 'source'>): 
   return `${session.source}:${session.id}`;
 }
 
+export type ProjectSessionCanonicalKeyMap = Readonly<Record<string, string | undefined>>;
+
+function canonicalProjectSessionKey(
+  session: Pick<HistorySessionItem, 'id' | 'source'>,
+  canonicalKeyBySessionKey: ProjectSessionCanonicalKeyMap,
+): string {
+  const key = projectSessionKey(session);
+  return canonicalKeyBySessionKey[key] ?? key;
+}
+
+export interface StabilizeProjectNodeSessionOptions {
+  canonicalKeyBySessionKey?: ProjectSessionCanonicalKeyMap;
+}
+
 export function stabilizeProjectNodeSessions(
   previousNodes: ProjectNode[],
   nextNodes: ProjectNode[],
+  options: StabilizeProjectNodeSessionOptions = {},
 ): ProjectNode[] {
   if (previousNodes.length === 0 || nextNodes.length === 0) {
     return nextNodes;
   }
 
   const previousByProject = new Map(previousNodes.map((node) => [node.project, node]));
+  const canonicalKeyBySessionKey = options.canonicalKeyBySessionKey ?? {};
 
   return nextNodes.map((node) => {
     const previousNode = previousByProject.get(node.project);
@@ -152,16 +172,22 @@ export function stabilizeProjectNodeSessions(
       return node;
     }
 
-    const nextSessionByKey = new Map(
-      node.sessions.map((session) => [projectSessionKey(session), session])
-    );
+    const nextSessionByKey = new Map<string, HistorySessionItem>();
+    for (const session of node.sessions) {
+      const canonicalKey = canonicalProjectSessionKey(session, canonicalKeyBySessionKey);
+      const existing = nextSessionByKey.get(canonicalKey);
+      const currentKey = projectSessionKey(session);
+      if (!existing || currentKey === canonicalKey) {
+        nextSessionByKey.set(canonicalKey, session);
+      }
+    }
     const retainedSessions: HistorySessionItem[] = [];
     const retainedKeys = new Set<string>();
 
     for (const previousSession of previousNode.sessions) {
-      const key = projectSessionKey(previousSession);
+      const key = canonicalProjectSessionKey(previousSession, canonicalKeyBySessionKey);
       const nextSession = nextSessionByKey.get(key);
-      if (!nextSession) {
+      if (!nextSession || retainedKeys.has(key)) {
         continue;
       }
       retainedSessions.push(nextSession);
@@ -172,7 +198,16 @@ export function stabilizeProjectNodeSessions(
       return node;
     }
 
-    const newSessions = node.sessions.filter((session) => !retainedKeys.has(projectSessionKey(session)));
+    const newSessions: HistorySessionItem[] = [];
+    const seenNewKeys = new Set<string>();
+    for (const session of node.sessions) {
+      const key = canonicalProjectSessionKey(session, canonicalKeyBySessionKey);
+      if (retainedKeys.has(key) || seenNewKeys.has(key)) {
+        continue;
+      }
+      seenNewKeys.add(key);
+      newSessions.push(nextSessionByKey.get(key) ?? session);
+    }
     if (newSessions.length === 0) {
       const alreadyStable = retainedSessions.every((session, index) => session === node.sessions[index]);
       return alreadyStable ? node : { ...node, sessions: retainedSessions };
@@ -197,6 +232,86 @@ export function stabilizeProjectNodeSessions(
       sessions: [...freshSessions, ...retainedSessions, ...backfilledSessions],
     };
   });
+}
+
+/**
+ * Build the rendered page while preserving the canonical stable order.
+ * Priority (active/selected) rows are guaranteed visible, but they stay in
+ * their original position instead of jumping to the top. The first
+ * `visibleCount` rows are shown as the base window; any priority row beyond
+ * that window is appended without displacing earlier rows, up to one extra
+ * page budget so the list cannot auto-expand without bound.
+ */
+export function selectVisibleProjectSessions(
+  sessions: HistorySessionItem[],
+  visibleCount: number,
+  prioritySessionKeys: ReadonlySet<string>,
+  canonicalKeyBySessionKey: ProjectSessionCanonicalKeyMap = {},
+): HistorySessionItem[] {
+  const canonicalPriorityKeys = new Set<string>();
+  for (const key of prioritySessionKeys) {
+    canonicalPriorityKeys.add(canonicalKeyBySessionKey[key] ?? key);
+  }
+
+  const pageBudget = Number.isFinite(visibleCount)
+    ? Math.max(0, Math.floor(visibleCount))
+    : 0;
+  const maxVisible = pageBudget + PRIORITY_OVERFLOW_BUDGET;
+
+  const visible: HistorySessionItem[] = [];
+  const seenKeys = new Set<string>();
+  let count = 0;
+
+  for (const session of sessions) {
+    const key = canonicalProjectSessionKey(session, canonicalKeyBySessionKey);
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    seenKeys.add(key);
+
+    const isPriority = canonicalPriorityKeys.has(key);
+    if (count < pageBudget || (isPriority && count < maxVisible)) {
+      visible.push(session);
+      count++;
+    }
+  }
+
+  return visible;
+}
+
+/**
+ * Local native entries and runtime decorations are sampled independently, so
+ * visibility is the union of affirmative activity signals. An explicit
+ * decoration `false` suppresses that decoration's visual fallback, but cannot
+ * hide a live entry that may have reconnected after the decoration poll.
+ */
+export function buildProjectPrioritySessionKeys(
+  activeSessionKeys: ReadonlySet<string>,
+  decorationsBySessionKey: Readonly<Record<string, {
+    visualState?: string;
+    isActive?: boolean;
+  } | undefined>>,
+  canonicalKeyBySessionKey: ProjectSessionCanonicalKeyMap = {},
+): Set<string> {
+  const priorities = new Set<string>();
+  for (const key of activeSessionKeys) {
+    priorities.add(canonicalKeyBySessionKey[key] ?? key);
+  }
+  for (const [key, decoration] of Object.entries(decorationsBySessionKey)) {
+    const canonicalKey = canonicalKeyBySessionKey[key] ?? key;
+    if (decoration?.isActive === true) {
+      priorities.add(canonicalKey);
+      continue;
+    }
+    if (decoration?.isActive === false) {
+      continue;
+    }
+    if (decoration?.visualState !== 'processing' && decoration?.visualState !== 'attention') {
+      continue;
+    }
+    priorities.add(canonicalKey);
+  }
+  return priorities;
 }
 
 export function reconcileProjectOrder(
@@ -230,14 +345,6 @@ export function sortProjectNodesByOrder(nodes: ProjectNode[], projectOrder: stri
     }
     return right.latestTimestamp - left.latestTimestamp;
   });
-}
-
-export function isSessionActiveInSidebar(
-  session: HistorySessionItem,
-  decorationsBySessionKey: Record<string, { visualState?: string } | undefined>,
-): boolean {
-  const decoration = decorationsBySessionKey[`${session.source}:${session.id}`];
-  return decoration?.visualState === 'processing' || decoration?.visualState === 'attention';
 }
 
 export function splitProjectNodesForSidebar(

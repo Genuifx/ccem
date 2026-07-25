@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition } from 'react';
-import { Check, Download, Play } from 'lucide-react';
+import { Check, Download, Play } from '@/lib/lucide-react';
 import { MessageBubble } from './MessageBubble';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';

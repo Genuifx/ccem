@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Bot, LoaderCircle, Send } from 'lucide-react';
+import { Bot, LoaderCircle, Send } from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import {

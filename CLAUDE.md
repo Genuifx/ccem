@@ -57,7 +57,7 @@ docs/architecture/ Detailed reference docs (see below)
 - Config stored at `~/.ccem/config.json`, shared between CLI and desktop
 - API keys encrypted with AES-256-CBC before storage
 - i18n: default language is Chinese (`zh`), all strings via `t('namespace.key')`
-- Icons: Lucide React only, no emoji
+- Icons: Hugeicons only (via `lucide-react` compatibility adapter), no emoji
 - No ESLint/Prettier — no formatting enforcement via config files
 - File size gate: 1000-line max per new file (exemptions in `docs/file-size-exemptions.md`)
 

@@ -31,6 +31,7 @@ pub struct WorkspaceSessionDecoration {
     pub client: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    pub is_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_name: Option<String>,
     pub visual_state: String,
@@ -44,6 +45,7 @@ pub enum WorkspaceRuntimeDescriptor {
         id: String,
         client: String,
         status: String,
+        is_active: bool,
         env_name: String,
         project_dir: String,
         created_at: u64,
@@ -53,6 +55,7 @@ pub enum WorkspaceRuntimeDescriptor {
         id: String,
         client: String,
         status: String,
+        is_active: bool,
         env_name: String,
         project_dir: String,
         created_at: u64,
@@ -62,6 +65,7 @@ pub enum WorkspaceRuntimeDescriptor {
         id: String,
         client: String,
         status: String,
+        is_active: bool,
         env_name: String,
         project_dir: String,
         created_at: u64,
@@ -81,22 +85,28 @@ pub fn build_workspace_session_decorations(
         let Some(runtime) = matched_runtime_by_session_key.get(&session_key) else {
             continue;
         };
-        let attention_kind = resolve_attention_kind(
-            events_by_runtime
-                .get(runtime.id())
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        );
+        let is_active = runtime.is_active();
+        let attention_kind = is_active
+            .then(|| {
+                resolve_attention_kind(
+                    events_by_runtime
+                        .get(runtime.id())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                )
+            })
+            .flatten();
 
         decorations.push(WorkspaceSessionDecoration {
             session_key,
             runtime_id: Some(runtime.id().to_string()),
             client: Some(runtime.client().to_string()),
             status: Some(runtime.status().to_string()),
+            is_active,
             env_name: Some(runtime.env_name().to_string()),
             visual_state: if attention_kind.is_some() {
                 "attention".to_string()
-            } else if is_runtime_processing(runtime) {
+            } else if is_active && is_runtime_processing(runtime) {
                 "processing".to_string()
             } else {
                 "identity".to_string()
@@ -120,6 +130,7 @@ pub fn unified_runtime_descriptor(runtime: &UnifiedSessionInfo) -> WorkspaceRunt
         id: runtime.id.clone(),
         client: normalize_runtime_client(runtime.client.as_deref()),
         status: runtime.status.clone(),
+        is_active: runtime.is_active,
         env_name: runtime.env_name.clone(),
         project_dir: runtime.project_dir.clone(),
         created_at: timestamp_millis(runtime.created_at),
@@ -132,6 +143,7 @@ pub fn native_runtime_descriptor(runtime: &NativeSessionSummary) -> WorkspaceRun
         id: runtime.runtime_id.clone(),
         client: runtime.provider.as_str().to_string(),
         status: runtime.status.clone(),
+        is_active: runtime.is_active,
         env_name: runtime.env_name.clone(),
         project_dir: runtime.project_dir.clone(),
         created_at: timestamp_millis(runtime.created_at),
@@ -144,6 +156,7 @@ pub fn legacy_interactive_runtime_descriptor(session: &Session) -> WorkspaceRunt
         id: session.id.clone(),
         client: normalize_runtime_client(Some(session.client.as_str())),
         status: session.status.clone(),
+        is_active: session.status == "running",
         env_name: session.env_name.clone(),
         project_dir: session.working_dir.clone(),
         created_at: parse_timestamp_millis(&session.start_time).unwrap_or(0),
@@ -172,6 +185,14 @@ impl WorkspaceRuntimeDescriptor {
             Self::Unified { status, .. }
             | Self::Native { status, .. }
             | Self::LegacyInteractive { status, .. } => status,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Unified { is_active, .. }
+            | Self::Native { is_active, .. }
+            | Self::LegacyInteractive { is_active, .. } => *is_active,
         }
     }
 
@@ -221,11 +242,12 @@ fn build_runtime_match_map(
     let mut used_runtime_ids = HashSet::new();
     let mut history_by_timestamp = sessions.to_vec();
     history_by_timestamp.sort_by_key(|session| Reverse(session.timestamp));
-    let mut runtimes_by_recency = runtimes.to_vec();
-    runtimes_by_recency.sort_by_key(|runtime| Reverse(runtime.created_at()));
+    let mut runtimes_by_priority = runtimes.to_vec();
+    runtimes_by_priority
+        .sort_by_key(|runtime| Reverse((runtime.is_active(), runtime.created_at())));
 
     for session in &history_by_timestamp {
-        let direct_match = runtimes_by_recency.iter().find(|runtime| {
+        let direct_match = runtimes_by_priority.iter().find(|runtime| {
             !used_runtime_ids.contains(runtime.id())
                 && runtime.client() == session.source
                 && runtime.provider_identity() == Some(session.id.as_str())
@@ -237,7 +259,7 @@ fn build_runtime_match_map(
         }
     }
 
-    for runtime in &runtimes_by_recency {
+    for runtime in &runtimes_by_priority {
         if used_runtime_ids.contains(runtime.id()) || runtime.provider_identity().is_some() {
             continue;
         }
@@ -445,6 +467,7 @@ mod tests {
             id: "runtime-1".to_string(),
             client: "codex".to_string(),
             status: "processing".to_string(),
+            is_active: true,
             env_name: "dev".to_string(),
             project_dir: "/repo/a".to_string(),
             created_at: 1001,
@@ -457,6 +480,100 @@ mod tests {
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].session_key, "codex:target");
         assert_eq!(decorations[0].visual_state, "processing");
+    }
+
+    #[test]
+    fn inactive_native_runtime_cannot_claim_processing_priority() {
+        let sessions = vec![session("target", "claude", 1000, "/repo/a")];
+        let runtimes = vec![WorkspaceRuntimeDescriptor::Native {
+            id: "native-stale".to_string(),
+            client: "claude".to_string(),
+            status: "processing".to_string(),
+            is_active: false,
+            env_name: "dev".to_string(),
+            project_dir: "/repo/a".to_string(),
+            created_at: 1000,
+            provider_session_id: Some("target".to_string()),
+        }];
+
+        let decorations =
+            build_workspace_session_decorations(&sessions, &runtimes, &HashMap::new());
+
+        assert_eq!(decorations.len(), 1);
+        assert!(!decorations[0].is_active);
+        assert_eq!(decorations[0].visual_state, "identity");
+        assert_eq!(decorations[0].attention_kind, None);
+    }
+
+    #[test]
+    fn active_runtime_wins_over_newer_inactive_runtime_for_same_provider_session() {
+        let sessions = vec![session("target", "claude", 1000, "/repo/a")];
+        let runtimes = vec![
+            WorkspaceRuntimeDescriptor::Native {
+                id: "native-active".to_string(),
+                client: "claude".to_string(),
+                status: "ready".to_string(),
+                is_active: true,
+                env_name: "dev".to_string(),
+                project_dir: "/repo/a".to_string(),
+                created_at: 1000,
+                provider_session_id: Some("target".to_string()),
+            },
+            WorkspaceRuntimeDescriptor::Native {
+                id: "native-newer-inactive".to_string(),
+                client: "claude".to_string(),
+                status: "processing".to_string(),
+                is_active: false,
+                env_name: "dev".to_string(),
+                project_dir: "/repo/a".to_string(),
+                created_at: 2000,
+                provider_session_id: Some("target".to_string()),
+            },
+        ];
+
+        let decorations =
+            build_workspace_session_decorations(&sessions, &runtimes, &HashMap::new());
+
+        assert_eq!(decorations.len(), 1);
+        assert_eq!(decorations[0].runtime_id.as_deref(), Some("native-active"));
+        assert!(decorations[0].is_active);
+    }
+
+    #[test]
+    fn active_runtime_wins_over_newer_inactive_runtime_for_fallback_match() {
+        let sessions = vec![session("target", "claude", 1000, "/repo/a")];
+        let runtimes = vec![
+            WorkspaceRuntimeDescriptor::Unified {
+                id: "active-fallback".to_string(),
+                client: "claude".to_string(),
+                status: "ready".to_string(),
+                is_active: true,
+                env_name: "dev".to_string(),
+                project_dir: "/repo/a".to_string(),
+                created_at: 1000,
+                history_session_id: None,
+            },
+            WorkspaceRuntimeDescriptor::Unified {
+                id: "newer-inactive-fallback".to_string(),
+                client: "claude".to_string(),
+                status: "processing".to_string(),
+                is_active: false,
+                env_name: "dev".to_string(),
+                project_dir: "/repo/a".to_string(),
+                created_at: 2000,
+                history_session_id: None,
+            },
+        ];
+
+        let decorations =
+            build_workspace_session_decorations(&sessions, &runtimes, &HashMap::new());
+
+        assert_eq!(decorations.len(), 1);
+        assert_eq!(
+            decorations[0].runtime_id.as_deref(),
+            Some("active-fallback")
+        );
+        assert!(decorations[0].is_active);
     }
 
     #[test]
@@ -494,6 +611,7 @@ mod tests {
             id: "runtime-1".to_string(),
             client: "claude".to_string(),
             status: "ready".to_string(),
+            is_active: true,
             env_name: "dev".to_string(),
             project_dir: "/repo/a".to_string(),
             created_at: 10_500,
@@ -506,6 +624,7 @@ mod tests {
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].session_key, "claude:candidate");
         assert_eq!(decorations[0].visual_state, "identity");
+        assert!(decorations[0].is_active);
     }
 
     #[test]
@@ -515,6 +634,7 @@ mod tests {
             id: "runtime-1".to_string(),
             client: "claude".to_string(),
             status: "processing".to_string(),
+            is_active: true,
             env_name: "dev".to_string(),
             project_dir: "/repo/a".to_string(),
             created_at: 1000,
@@ -537,6 +657,7 @@ mod tests {
                     allowed_prompts: vec![],
                     plan_summary: None,
                 }),
+                todo_snapshot: None,
             },
         };
         let mut events_by_runtime = HashMap::new();
@@ -560,6 +681,7 @@ mod tests {
             id: "native-1".to_string(),
             client: "claude".to_string(),
             status: "processing".to_string(),
+            is_active: true,
             env_name: "dev".to_string(),
             project_dir: "/repo/a".to_string(),
             created_at: 1000,
