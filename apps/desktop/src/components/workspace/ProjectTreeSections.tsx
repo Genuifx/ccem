@@ -329,25 +329,20 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
             )}
           </>
         )}
-      </ScrollArea>
-
-      {activeTemporaryProjectNodes.length > 0 && (
-        <div className="shrink-0 border-t border-border/60 px-0.5 pb-1 pt-1.5">
-          <div className="mb-0.5 flex h-5 items-center justify-between px-3">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-              {t('workspace.activeTemporaryProjects')}
-            </span>
-            <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
-              {activeTemporaryProjectNodes.length}
-            </span>
-          </div>
-          {/* Cap the dock height so a flood of active projects scrolls inside its
-              own region instead of eating the project tree. */}
-          <div className="max-h-[40%] overflow-y-auto pr-0.5">
+        {activeTemporaryProjectNodes.length > 0 && (
+          <div className="mt-2 border-t border-border/60 px-0.5 pb-1 pt-1.5">
+            <div className="mb-0.5 flex h-5 items-center justify-between px-3">
+              <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                {t('workspace.activeTemporaryProjects')}
+              </span>
+              <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
+                {activeTemporaryProjectNodes.length}
+              </span>
+            </div>
             {activeTemporaryProjectNodes.map((node) => renderProjectNode(node, 'activeTemporary'))}
           </div>
-        </div>
-      )}
+        )}
+      </ScrollArea>
     </>
   );
 });
