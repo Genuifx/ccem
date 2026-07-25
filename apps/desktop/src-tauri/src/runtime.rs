@@ -4,6 +4,7 @@
 //! and remote adapters. It is not the primary local interactive runtime.
 
 use crate::channel::DesktopChannel;
+use crate::config;
 use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionStore};
 use crate::event_dispatcher::EventDispatcher;
 use crate::notifications::{self, NotificationContext};
@@ -1199,6 +1200,7 @@ fn build_claude_command(
         .stderr(Stdio::piped())
         .current_dir(&options.working_dir);
 
+    config::clear_managed_claude_env(&mut command);
     for (key, value) in &options.env_vars {
         command.env(key, value);
     }
@@ -2400,6 +2402,47 @@ mod tests {
         assert!(args.contains(&"Grep".to_string()));
         assert!(args.contains(&"--disallowedTools".to_string()));
         assert!(args.contains(&"WebSearch".to_string()));
+    }
+
+    #[test]
+    fn build_claude_command_clears_omitted_managed_model_pins() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("ANTHROPIC_MODEL".to_string(), "opus".to_string());
+        let options = ManagedSessionOptions {
+            env_name: "official".to_string(),
+            perm_mode: "default".to_string(),
+            working_dir: "/tmp".to_string(),
+            resume_session_id: None,
+            initial_prompt: None,
+            max_budget_usd: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            env_vars,
+            source: ManagedSessionSource::Desktop,
+        };
+
+        let command = build_claude_command(&options, "runtime-env-test")
+            .expect("build Claude command")
+            .command;
+        let command_env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|item| item.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(command_env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some(&None));
+        assert_eq!(
+            command_env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&None)
+        );
+        assert_eq!(
+            command_env.get("ANTHROPIC_MODEL"),
+            Some(&Some("opus".to_string()))
+        );
     }
 
     #[test]

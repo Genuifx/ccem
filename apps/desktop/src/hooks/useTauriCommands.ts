@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { resolveEnvConfigForRuntime } from '@ccem/core/browser';
 import { useAppStore, type Environment, type Session, type ArrangeLayout, type InstalledSkill, type CronTask, type CronTaskRun, type CronTemplate, type CronWecomNotification, type LaunchClient } from '@/store';
 import { useCallback } from 'react';
 import { toast } from 'sonner';
@@ -262,16 +263,19 @@ export function useTauriCommands() {
     }
     try {
       const envs = await invoke<Record<string, TauriEnvConfig>>('get_environments');
-      const envList: Environment[] = Object.entries(envs).map(([name, config]) => ({
-        name,
-        baseUrl: config.ANTHROPIC_BASE_URL || '',
-        authToken: config.ANTHROPIC_AUTH_TOKEN,
-        defaultOpusModel: config.ANTHROPIC_DEFAULT_OPUS_MODEL || '',
-        defaultSonnetModel: config.ANTHROPIC_DEFAULT_SONNET_MODEL,
-        defaultHaikuModel: config.ANTHROPIC_DEFAULT_HAIKU_MODEL,
-        runtimeModel: config.ANTHROPIC_MODEL || 'opus',
-        subagentModel: config.CLAUDE_CODE_SUBAGENT_MODEL,
-      }));
+      const envList: Environment[] = Object.entries(envs).map(([name, config]) => {
+        const displayConfig = resolveEnvConfigForRuntime(name, config);
+        return {
+          name,
+          baseUrl: displayConfig.ANTHROPIC_BASE_URL || '',
+          authToken: displayConfig.ANTHROPIC_AUTH_TOKEN,
+          defaultOpusModel: displayConfig.ANTHROPIC_DEFAULT_OPUS_MODEL || '',
+          defaultSonnetModel: displayConfig.ANTHROPIC_DEFAULT_SONNET_MODEL,
+          defaultHaikuModel: displayConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+          runtimeModel: displayConfig.ANTHROPIC_MODEL || 'opus',
+          subagentModel: displayConfig.CLAUDE_CODE_SUBAGENT_MODEL,
+        };
+      });
       envList.sort((a, b) => a.name.localeCompare(b.name));
       setEnvironments(envList);
       setError(null);

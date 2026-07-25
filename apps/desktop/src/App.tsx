@@ -422,8 +422,7 @@ function App() {
       envList.unshift({
         name: 'official',
         baseUrl: 'https://api.anthropic.com',
-        defaultOpusModel: 'claude-opus-4-1-20250805',
-        defaultSonnetModel: 'claude-opus-4-1-20250805',
+        defaultOpusModel: '',
         defaultHaikuModel: 'claude-3-5-haiku-20241022',
         runtimeModel: 'opus',
       });

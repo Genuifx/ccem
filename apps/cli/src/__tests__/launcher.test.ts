@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildPermArgs } from '../launcher.js';
+import { buildEnvVars, buildPermArgs } from '../launcher.js';
 
 describe('launcher', () => {
   describe('buildPermArgs', () => {
@@ -17,6 +17,24 @@ describe('launcher', () => {
       expect(args).toContain('Bash(npm:*)');
       expect(args).not.toContain('Read(*)');
       expect(args).toContain('Bash(sudo:*)');
+    });
+  });
+
+  describe('buildEnvVars', () => {
+    it('omits untouched legacy official tier pins while keeping the opus alias', () => {
+      expect(
+        buildEnvVars('official', {
+          ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-1-20250805',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-opus-4-1-20250805',
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-3-5-haiku-20241022',
+          ANTHROPIC_MODEL: 'opus',
+        })
+      ).toEqual({
+        ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-3-5-haiku-20241022',
+        ANTHROPIC_MODEL: 'opus',
+      });
     });
   });
 });

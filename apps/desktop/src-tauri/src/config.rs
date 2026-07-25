@@ -85,6 +85,11 @@ pub struct ResolvedCodexRuntime {
 }
 
 pub const OPENCODE_NATIVE_ENV_NAME: &str = "OpenCode Native";
+const OFFICIAL_ENV_NAME: &str = "official";
+const OFFICIAL_BASE_URL: &str = "https://api.anthropic.com";
+const LEGACY_OFFICIAL_MODEL_PIN: &str = "claude-opus-4-1-20250805";
+const LEGACY_OFFICIAL_HAIKU_PIN: &str = "claude-3-5-haiku-20241022";
+const OFFICIAL_RUNTIME_ALIAS: &str = "opus";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CcemConfig {
@@ -110,12 +115,29 @@ fn default_official_env() -> EnvConfig {
     EnvConfig {
         base_url: Some("https://api.anthropic.com".to_string()),
         auth_token: None,
-        default_opus_model: Some("claude-opus-4-1-20250805".to_string()),
-        default_sonnet_model: Some("claude-opus-4-1-20250805".to_string()),
+        default_opus_model: None,
+        default_sonnet_model: None,
         default_haiku_model: Some("claude-3-5-haiku-20241022".to_string()),
         model: Some("opus".to_string()),
         subagent_model: None,
     }
+}
+
+fn resolve_env_config_for_runtime(env_name: &str, mut env: EnvConfig) -> EnvConfig {
+    let has_untouched_legacy_official_pins = env_name == OFFICIAL_ENV_NAME
+        && env.base_url.as_deref() == Some(OFFICIAL_BASE_URL)
+        && env.default_opus_model.as_deref() == Some(LEGACY_OFFICIAL_MODEL_PIN)
+        && env.default_sonnet_model.as_deref() == Some(LEGACY_OFFICIAL_MODEL_PIN)
+        && env.default_haiku_model.as_deref() == Some(LEGACY_OFFICIAL_HAIKU_PIN)
+        && env.model.as_deref() == Some(OFFICIAL_RUNTIME_ALIAS)
+        && env.subagent_model.is_none();
+
+    if has_untouched_legacy_official_pins {
+        env.default_opus_model = None;
+        env.default_sonnet_model = None;
+    }
+
+    env
 }
 
 fn normalize_env_config(raw: RawEnvConfig) -> EnvConfig {
@@ -269,7 +291,7 @@ fn read_normalized_config_file(config_path: &PathBuf) -> Result<CcemConfig, Stri
     Ok(normalize_config(raw))
 }
 
-const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
+pub(crate) const MANAGED_CLAUDE_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -607,7 +629,7 @@ pub fn resolve_claude_env(env_name: &str) -> Result<ResolvedClaudeEnv, String> {
         .registries
         .get(env_name)
         .ok_or_else(|| format!("Environment '{}' does not exist", env_name))?;
-    let env = get_env_with_decrypted_key(env_config)?;
+    let env = resolve_env_config_for_runtime(env_name, get_env_with_decrypted_key(env_config)?);
     let (env_vars, upstream_base_url) = env_config_to_process_env(&env);
 
     Ok(ResolvedClaudeEnv {
@@ -843,7 +865,11 @@ pub struct DesktopSettings {
     /// Explicitly enabled environment names for runtime selectors.
     /// `None` means legacy mode: all environments are treated as enabled.
     /// Once the user starts managing enablement, this becomes `Some(vec![...])`.
-    #[serde(rename = "enabledEnvironments", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "enabledEnvironments",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub enabled_environments: Option<Vec<String>>,
 }
 
@@ -948,7 +974,8 @@ pub fn inject_ai_env(cmd: &mut std::process::Command) {
                     return;
                 }
             };
-            for (key, value) in build_claude_env_vars(&decrypted) {
+            let runtime_env = resolve_env_config_for_runtime(name, decrypted);
+            for (key, value) in build_claude_env_vars(&runtime_env) {
                 cmd.env(key, value);
             }
         }
@@ -968,6 +995,10 @@ pub fn create_env_with_encrypted_key(
     runtime_model: Option<String>,
     subagent_model: Option<String>,
 ) -> Result<EnvConfig, String> {
+    let default_opus_model = default_opus_model
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+    let default_sonnet_model = default_sonnet_model
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
     let default_sonnet_model = default_sonnet_model.or_else(|| default_opus_model.clone());
 
     Ok(EnvConfig {
@@ -987,8 +1018,9 @@ pub fn create_env_with_encrypted_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_opencode_config_content, env_config_to_process_env, get_env_with_decrypted_key,
-        inject_ai_env, recover_config_from_legacy, resolve_opencode_primary_model,
+        build_claude_env_vars, build_opencode_config_content, create_env_with_encrypted_key,
+        default_official_env, env_config_to_process_env, get_env_with_decrypted_key, inject_ai_env,
+        recover_config_from_legacy, resolve_env_config_for_runtime, resolve_opencode_primary_model,
         resolve_opencode_runtime, write_config, CcemConfig, EnvConfig, OPENCODE_NATIVE_ENV_NAME,
     };
     use std::collections::HashMap;
@@ -1029,6 +1061,18 @@ mod tests {
             } else {
                 env::remove_var("HOME");
             }
+        }
+    }
+
+    fn legacy_official_env() -> EnvConfig {
+        EnvConfig {
+            base_url: Some("https://api.anthropic.com".to_string()),
+            auth_token: None,
+            default_opus_model: Some("claude-opus-4-1-20250805".to_string()),
+            default_sonnet_model: Some("claude-opus-4-1-20250805".to_string()),
+            default_haiku_model: Some("claude-3-5-haiku-20241022".to_string()),
+            model: Some("opus".to_string()),
+            subagent_model: None,
         }
     }
 
@@ -1076,6 +1120,104 @@ mod tests {
                 .get("CLAUDE_CODE_SUBAGENT_MODEL")
                 .map(String::as_str),
             Some("claude-subagent-test")
+        );
+    }
+
+    #[test]
+    fn fresh_official_defaults_do_not_pin_opus_or_sonnet() {
+        let env_vars = build_claude_env_vars(&default_official_env());
+
+        assert_eq!(
+            env_vars.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("opus")
+        );
+        assert_eq!(env_vars.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), None);
+        assert_eq!(env_vars.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), None);
+    }
+
+    #[test]
+    fn blank_model_fields_remain_unpinned_when_saving_the_official_environment() {
+        let env = create_env_with_encrypted_key(
+            Some("https://api.anthropic.com".to_string()),
+            None,
+            Some("  ".to_string()),
+            Some(String::new()),
+            Some("claude-3-5-haiku-20241022".to_string()),
+            Some("opus".to_string()),
+            None,
+        )
+        .expect("create official environment");
+
+        assert_eq!(env.default_opus_model, None);
+        assert_eq!(env.default_sonnet_model, None);
+    }
+
+    #[test]
+    fn untouched_legacy_official_defaults_follow_current_claude_aliases_at_runtime() {
+        let stored = legacy_official_env();
+        let original = serde_json::to_value(&stored).expect("serialize stored environment");
+
+        let resolved = resolve_env_config_for_runtime("official", stored.clone());
+        let env_vars = build_claude_env_vars(&resolved);
+
+        assert_eq!(
+            env_vars.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("opus")
+        );
+        assert_eq!(env_vars.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), None);
+        assert_eq!(env_vars.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), None);
+        assert_eq!(
+            serde_json::to_value(&stored).expect("serialize stored environment"),
+            original,
+            "runtime resolution must not rewrite the stored environment"
+        );
+    }
+
+    #[test]
+    fn customized_official_and_third_party_model_pins_are_preserved() {
+        let mut customized = legacy_official_env();
+        customized.default_sonnet_model = Some("claude-sonnet-custom".to_string());
+        assert_eq!(
+            resolve_env_config_for_runtime("official", customized.clone()).default_opus_model,
+            customized.default_opus_model
+        );
+        assert_eq!(
+            resolve_env_config_for_runtime("official", customized.clone()).default_sonnet_model,
+            customized.default_sonnet_model
+        );
+
+        let mut custom_endpoint = legacy_official_env();
+        custom_endpoint.base_url = Some("https://partner.example.com/anthropic".to_string());
+        let resolved_custom_endpoint =
+            resolve_env_config_for_runtime("official", custom_endpoint.clone());
+        assert_eq!(
+            resolved_custom_endpoint.default_opus_model,
+            custom_endpoint.default_opus_model
+        );
+        assert_eq!(
+            resolved_custom_endpoint.default_sonnet_model,
+            custom_endpoint.default_sonnet_model
+        );
+
+        let mut custom_haiku = legacy_official_env();
+        custom_haiku.default_haiku_model = Some("claude-haiku-custom".to_string());
+        let resolved_custom_haiku =
+            resolve_env_config_for_runtime("official", custom_haiku.clone());
+        assert_eq!(
+            resolved_custom_haiku.default_opus_model,
+            custom_haiku.default_opus_model
+        );
+        assert_eq!(
+            resolved_custom_haiku.default_sonnet_model,
+            custom_haiku.default_sonnet_model
+        );
+
+        let third_party = legacy_official_env();
+        let resolved = resolve_env_config_for_runtime("partner", third_party.clone());
+        assert_eq!(resolved.default_opus_model, third_party.default_opus_model);
+        assert_eq!(
+            resolved.default_sonnet_model,
+            third_party.default_sonnet_model
         );
     }
 

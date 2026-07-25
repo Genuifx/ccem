@@ -22029,13 +22029,28 @@ import process4 from "node:process";
 import process2 from "node:process";
 var CLAUDE_DESKTOP_CLIENT_APP = "ccem-desktop";
 var CLAUDE_NON_INTERACTIVE_SANDBOX = "1";
+var MANAGED_CLAUDE_ENV_KEYS = [
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_SMALL_FAST_MODEL"
+];
 function buildClaudeQueryEnv({
   envVars,
   effort,
   baseEnv = process2.env
 } = {}) {
+  const cleanBaseEnv = { ...baseEnv };
+  for (const key of MANAGED_CLAUDE_ENV_KEYS) {
+    delete cleanBaseEnv[key];
+  }
   const env = {
-    ...baseEnv,
+    ...cleanBaseEnv,
     ...envVars,
     CLAUDE_AGENT_SDK_CLIENT_APP: CLAUDE_DESKTOP_CLIENT_APP,
     CLAUDE_CODE_SANDBOXED: CLAUDE_NON_INTERACTIVE_SANDBOX

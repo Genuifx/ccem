@@ -129,7 +129,7 @@ export function Environments({ onAddEnv, onEditEnv, onCopyEnv, onDeleteEnv }: En
                 title={env.name}
               >
                 <ModelIcon
-                  model={env.defaultOpusModel || 'claude-opus-4-1-20250805'}
+                  model={env.defaultOpusModel || 'opus'}
                   size={11}
                 />
                 <span className="truncate max-w-[8.5rem]">{env.name}</span>

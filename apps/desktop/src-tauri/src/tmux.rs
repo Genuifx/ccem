@@ -1,3 +1,4 @@
+use crate::config::MANAGED_CLAUDE_ENV_KEYS;
 use crate::diagnostic_log;
 use crate::terminal::{
     resolve_claude_path, resolve_codex_path, resolve_opencode_path, resolve_tmux_path,
@@ -1018,10 +1019,12 @@ fn build_tmux_launch_spec(
     command_parts.extend(client_args.iter().map(|arg| shell_quote(arg)));
 
     let environment_loader = build_tmux_environment_loader(&environment_keys, target, tmux_binary);
+    let managed_env_keys = MANAGED_CLAUDE_ENV_KEYS.join(" ");
 
     TmuxLaunchSpec {
         command: format!(
-            "{} unset CLAUDECODE; exec {}",
+            "unset {}; unset CLAUDECODE; {} exec {}",
+            managed_env_keys,
             environment_loader,
             command_parts.join(" ")
         ),
@@ -1597,6 +1600,36 @@ mod tests {
             .environment
             .iter()
             .any(|entry| entry == "ANTHROPIC_AUTH_TOKEN=sk-ant-secret-value"));
+    }
+
+    #[test]
+    fn launch_spec_clears_omitted_managed_model_pins_before_loading_selected_env() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("ANTHROPIC_MODEL".to_string(), "opus".to_string());
+
+        let spec = build_tmux_launch_spec(
+            "claude",
+            &[],
+            &env_vars,
+            "ccem-session123:main",
+            "/opt/homebrew/bin/tmux",
+        );
+
+        assert!(spec.command.starts_with("unset ANTHROPIC_BASE_URL "));
+        assert!(spec.command.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        assert!(spec.command.contains("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        assert!(!spec
+            .environment
+            .iter()
+            .any(|entry| entry.starts_with("ANTHROPIC_DEFAULT_OPUS_MODEL=")));
+        assert!(!spec
+            .environment
+            .iter()
+            .any(|entry| entry.starts_with("ANTHROPIC_DEFAULT_SONNET_MODEL=")));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|entry| entry == "ANTHROPIC_MODEL=opus"));
     }
 
     #[test]

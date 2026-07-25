@@ -634,6 +634,7 @@
     "baseUrlPlaceholder": "https://api.anthropic.com",
     "authTokenPlaceholder": "粘贴厂商提供的 Token 或 Key",
     "defaultOpusModelPlaceholder": "例如: glm-5.1, deepseek-v4-pro[1m], kimi-k2.5",
+    "officialModelPlaceholder": "留空则跟随 Claude 当前默认模型",
     "defaultSonnetModelPlaceholder": "留空时默认与 Opus 模型保持一致",
     "defaultHaikuModelPlaceholder": "例如: glm-4.5-air, gemma4:e4b",
     "runtimeModelPlaceholder": "opus",

@@ -8,6 +8,7 @@ import {
   PERMISSION_PRESETS,
   ensureCcemDir,
   normalizePermissionAllowRules,
+  resolveEnvConfigForRuntime,
 } from '@ccem/core';
 import { renderStarting } from './ui.js';
 import { startCliClaudeProvenanceTracking, type CliProvenanceTrackingHandle } from './sessionProvenance.js';
@@ -39,15 +40,19 @@ const MANAGED_CLAUDE_ENV_KEYS = [
 /**
  * Build environment variables from an EnvConfig, decrypting the auth token.
  */
-function buildEnvVars(envConfig: EnvConfig): Record<string, string> {
+export function buildEnvVars(
+  envName: string | undefined,
+  envConfig: EnvConfig
+): Record<string, string> {
+  const runtimeEnv = resolveEnvConfigForRuntime(envName, envConfig);
   const vars: Record<string, string> = {};
-  if (envConfig.ANTHROPIC_BASE_URL) vars.ANTHROPIC_BASE_URL = envConfig.ANTHROPIC_BASE_URL;
-  if (envConfig.ANTHROPIC_AUTH_TOKEN) vars.ANTHROPIC_AUTH_TOKEN = decrypt(envConfig.ANTHROPIC_AUTH_TOKEN);
-  if (envConfig.ANTHROPIC_DEFAULT_OPUS_MODEL) vars.ANTHROPIC_DEFAULT_OPUS_MODEL = envConfig.ANTHROPIC_DEFAULT_OPUS_MODEL;
-  if (envConfig.ANTHROPIC_DEFAULT_SONNET_MODEL) vars.ANTHROPIC_DEFAULT_SONNET_MODEL = envConfig.ANTHROPIC_DEFAULT_SONNET_MODEL;
-  if (envConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL) vars.ANTHROPIC_DEFAULT_HAIKU_MODEL = envConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL;
-  if (envConfig.ANTHROPIC_MODEL) vars.ANTHROPIC_MODEL = envConfig.ANTHROPIC_MODEL;
-  if (envConfig.CLAUDE_CODE_SUBAGENT_MODEL) vars.CLAUDE_CODE_SUBAGENT_MODEL = envConfig.CLAUDE_CODE_SUBAGENT_MODEL;
+  if (runtimeEnv.ANTHROPIC_BASE_URL) vars.ANTHROPIC_BASE_URL = runtimeEnv.ANTHROPIC_BASE_URL;
+  if (runtimeEnv.ANTHROPIC_AUTH_TOKEN) vars.ANTHROPIC_AUTH_TOKEN = decrypt(runtimeEnv.ANTHROPIC_AUTH_TOKEN);
+  if (runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL) vars.ANTHROPIC_DEFAULT_OPUS_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  if (runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL) vars.ANTHROPIC_DEFAULT_SONNET_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
+  if (runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL) vars.ANTHROPIC_DEFAULT_HAIKU_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  if (runtimeEnv.ANTHROPIC_MODEL) vars.ANTHROPIC_MODEL = runtimeEnv.ANTHROPIC_MODEL;
+  if (runtimeEnv.CLAUDE_CODE_SUBAGENT_MODEL) vars.CLAUDE_CODE_SUBAGENT_MODEL = runtimeEnv.CLAUDE_CODE_SUBAGENT_MODEL;
   return vars;
 }
 
@@ -101,7 +106,7 @@ export async function launchClaude(options: LaunchOptions): Promise<void> {
     delete env[key];
   }
   if (envConfig) {
-    Object.assign(env, buildEnvVars(envConfig));
+    Object.assign(env, buildEnvVars(envName, envConfig));
   }
   // Prevent nested session detection
   delete env.CLAUDECODE;

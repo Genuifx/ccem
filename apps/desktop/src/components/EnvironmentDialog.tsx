@@ -251,6 +251,9 @@ export function EnvironmentDialog({
     }
   };
 
+  const followsClaudeOfficialDefaults =
+    baseUrl.trim() === "https://api.anthropic.com";
+
   const handleSave = () => {
     const trimmedName = name.trim();
     const trimmedBaseUrl = baseUrl.trim();
@@ -258,7 +261,11 @@ export function EnvironmentDialog({
     const trimmedSonnetModel = defaultSonnetModel.trim() || trimmedOpusModel;
     const trimmedRuntimeModel = runtimeModel.trim() || "opus";
 
-    if (!trimmedName || !trimmedBaseUrl || !trimmedOpusModel) {
+    if (
+      !trimmedName ||
+      !trimmedBaseUrl ||
+      (!trimmedOpusModel && !followsClaudeOfficialDefaults)
+    ) {
       return;
     }
 
@@ -266,7 +273,7 @@ export function EnvironmentDialog({
       name: trimmedName,
       baseUrl: trimmedBaseUrl,
       defaultOpusModel: trimmedOpusModel,
-      defaultSonnetModel: trimmedSonnetModel,
+      ...(trimmedSonnetModel && { defaultSonnetModel: trimmedSonnetModel }),
       runtimeModel: trimmedRuntimeModel,
       ...(authToken.trim() && { authToken: authToken.trim() }),
       ...(defaultHaikuModel.trim() && {
@@ -282,7 +289,7 @@ export function EnvironmentDialog({
   const isValid =
     Boolean(name.trim()) &&
     Boolean(baseUrl.trim()) &&
-    Boolean(defaultOpusModel.trim());
+    (Boolean(defaultOpusModel.trim()) || followsClaudeOfficialDefaults);
 
   const presetMetadata = selectedPreset
     ? ENV_PRESET_METADATA[selectedPreset]
@@ -357,14 +364,20 @@ export function EnvironmentDialog({
           <Bot className="h-3.5 w-3.5 text-muted-foreground" />
           {t("environmentDialog.defaultOpusModel")}{" "}
           <span className="text-xs text-muted-foreground">
-            *{t("environmentDialog.required")}
+            {followsClaudeOfficialDefaults
+              ? t("environmentDialog.optional")
+              : `*${t("environmentDialog.required")}`}
           </span>
         </Label>
         <Input
           id="defaultOpusModel"
           value={defaultOpusModel}
           onChange={(e) => setDefaultOpusModel(e.target.value)}
-          placeholder={t("environmentDialog.defaultOpusModelPlaceholder")}
+          placeholder={
+            followsClaudeOfficialDefaults
+              ? t("environmentDialog.officialModelPlaceholder")
+              : t("environmentDialog.defaultOpusModelPlaceholder")
+          }
         />
       </div>
 

@@ -3,6 +3,7 @@ import {
   hasLegacyEnvFields,
   normalizeEnvConfig,
   recoverEnvConfigFromLegacy,
+  resolveEnvConfigForRuntime,
 } from '../env-config.js';
 
 describe('env config migration', () => {
@@ -77,5 +78,62 @@ describe('env config migration', () => {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air',
       ANTHROPIC_MODEL: 'opus',
     });
+  });
+});
+
+describe('runtime environment resolution', () => {
+  const legacyOfficialDefaults = {
+    ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-1-20250805',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-opus-4-1-20250805',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-3-5-haiku-20241022',
+    ANTHROPIC_MODEL: 'opus',
+  };
+
+  it('lets an untouched official environment follow current Claude tier aliases', () => {
+    const resolved = resolveEnvConfigForRuntime('official', legacyOfficialDefaults);
+
+    expect(resolved).toEqual({
+      ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-3-5-haiku-20241022',
+      ANTHROPIC_MODEL: 'opus',
+    });
+    expect(legacyOfficialDefaults).toHaveProperty(
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'claude-opus-4-1-20250805'
+    );
+  });
+
+  it('preserves customized official model pins', () => {
+    const customized = {
+      ...legacyOfficialDefaults,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-custom',
+    };
+
+    expect(resolveEnvConfigForRuntime('official', customized)).toEqual(customized);
+  });
+
+  it('preserves legacy-looking pins when official uses a custom endpoint', () => {
+    const customized = {
+      ...legacyOfficialDefaults,
+      ANTHROPIC_BASE_URL: 'https://partner.example.com/anthropic',
+    };
+
+    expect(resolveEnvConfigForRuntime('official', customized)).toEqual(customized);
+  });
+
+  it('preserves legacy-looking pins when another official default was customized', () => {
+    const customized = {
+      ...legacyOfficialDefaults,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-custom',
+    };
+
+    expect(resolveEnvConfigForRuntime('official', customized)).toEqual(customized);
+  });
+
+  it('preserves the same model pins for third-party environments', () => {
+    expect(resolveEnvConfigForRuntime('partner', legacyOfficialDefaults)).toEqual(
+      legacyOfficialDefaults
+    );
   });
 });
