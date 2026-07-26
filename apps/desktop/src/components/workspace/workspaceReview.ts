@@ -415,7 +415,7 @@ export function buildWorkspaceReviewModel({
   messages: ConversationMessageData[];
   gitSnapshot?: WorkspaceGitSnapshot | null;
 }): WorkspaceReviewModel {
-  const todoState = buildWorkspaceTodos(events);
+  const todoState = buildWorkspaceTodos(events, messages);
   const todos = todoState.items;
   const changedFiles = buildChangedFiles(events, gitSnapshot);
   const tools = buildToolEvidence(events);

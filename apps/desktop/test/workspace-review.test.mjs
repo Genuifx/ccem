@@ -361,6 +361,45 @@ test('maps Claude TaskCreate TaskUpdate and TaskList to unified todos', async ()
   );
 });
 
+test('uses successful history TodoWrite calls when history has no native events', async () => {
+  const { buildWorkspaceReviewModel } = await importWorkspaceReview();
+  const model = buildWorkspaceReviewModel({
+    session: session(),
+    events: [],
+    messages: [
+      {
+        msgType: 'assistant',
+        uuid: 'history-todo',
+        content: [{
+          type: 'tool_use',
+          id: 'history-todo',
+          name: 'TodoWrite',
+          input: {
+            todos: [
+              { content: 'Read the history', status: 'completed' },
+              { content: 'Render recovered todos', status: 'in_progress' },
+            ],
+          },
+          _result: { success: true },
+        }],
+        segmentIndex: 0,
+        isCompactBoundary: false,
+      },
+    ],
+    gitSnapshot: null,
+  });
+
+  assert.equal(model.todoSource, 'history');
+  assert.equal(model.todoCompleted, 1);
+  assert.deepEqual(
+    model.todos.map((todo) => [todo.text, todo.status]),
+    [
+      ['Read the history', 'completed'],
+      ['Render recovered todos', 'in_progress'],
+    ],
+  );
+});
+
 test('uses structured Codex file_change summaries as SDK file evidence', async () => {
   const { buildWorkspaceReviewModel } = await importWorkspaceReview();
   const model = buildWorkspaceReviewModel({
