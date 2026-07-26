@@ -627,20 +627,6 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
     }
   };
 
-  const handleRemoveHeadless = async (id: string) => {
-    try {
-      const item = findDisplayItem(id);
-      // Stop if still running
-      if (item?.unifiedSession && ['ready', 'processing', 'waiting_permission', 'initializing'].includes(item.unifiedSession.status)) {
-        await stopUnifiedSession(id);
-      }
-      await removeHeadlessSession(id);
-      toast.success(t('sessions.sessionStopped'));
-    } catch (err) {
-      toast.error(t('sessions.stopFailed').replace('{error}', String(err)));
-    }
-  };
-
   const handleDisconnectChannel = async (sessionId: string, channelKind: string) => {
     try {
       // Find the real ChannelKind from the unified session's channel data
@@ -846,7 +832,6 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
                     onMinimize={handleMinimize}
                     onClose={handleRequestClose}
                     onStop={handleStopUnified}
-                    onRemove={handleRemoveHeadless}
                     onDisconnectChannel={handleDisconnectChannel}
                     confirmingClose={confirmingId === item.session.id}
                     onCancelClose={handleCancelClose}

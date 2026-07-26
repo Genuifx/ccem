@@ -164,6 +164,7 @@ commands.allow = [
   "set_default_working_dir",
   "get_settings",
   "save_settings",
+  "save_language",
   "send_test_notification",
   "get_telegram_settings",
   "get_wecom_settings",

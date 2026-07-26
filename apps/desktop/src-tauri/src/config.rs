@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf; // 文件锁支持
 use std::process::Command;
+use std::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EnvConfig {
@@ -809,6 +810,8 @@ pub fn get_default_working_dir() -> Option<String> {
 pub struct DesktopSettings {
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(rename = "autoStart", default)]
     pub auto_start: bool,
     #[serde(rename = "startMinimized", default)]
@@ -908,6 +911,7 @@ impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            language: None,
             auto_start: false,
             start_minimized: false,
             close_to_tray: default_close_to_tray(),
@@ -943,11 +947,32 @@ pub fn read_settings() -> Result<DesktopSettings, String> {
     serde_json::from_str(&content).map_err(|e| format!("Failed to parse settings: {}", e))
 }
 
-pub fn write_settings(settings: &DesktopSettings) -> Result<(), String> {
+static DESKTOP_SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_settings_unlocked(settings: &DesktopSettings) -> Result<(), String> {
     ensure_ccem_dir().map_err(|e| format!("Failed to create config dir: {}", e))?;
     let content = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     fs::write(get_settings_path(), content).map_err(|e| format!("Failed to write settings: {}", e))
+}
+
+pub fn write_settings(settings: &DesktopSettings) -> Result<(), String> {
+    let _guard = DESKTOP_SETTINGS_WRITE_LOCK
+        .lock()
+        .map_err(|_| "Desktop settings write lock is poisoned".to_string())?;
+    write_settings_unlocked(settings)
+}
+
+pub fn update_settings(
+    update: impl FnOnce(&mut DesktopSettings),
+) -> Result<DesktopSettings, String> {
+    let _guard = DESKTOP_SETTINGS_WRITE_LOCK
+        .lock()
+        .map_err(|_| "Desktop settings write lock is poisoned".to_string())?;
+    let mut settings = read_settings()?;
+    update(&mut settings);
+    write_settings_unlocked(&settings)?;
+    Ok(settings)
 }
 
 /// Inject the appropriate AI environment variables into a Command.
@@ -1410,6 +1435,42 @@ mod desktop_pet_settings_tests {
     fn desktop_pet_setting_defaults_to_disabled() {
         let settings = DesktopSettings::default();
         assert!(!settings.desktop_pet_enabled);
+    }
+
+    #[test]
+    fn missing_language_is_preserved_for_legacy_migration() {
+        let settings = DesktopSettings::default();
+        assert_eq!(settings.language, None);
+
+        let serialized = serde_json::to_value(&settings).expect("settings serialize");
+        assert!(serialized.get("language").is_none());
+
+        let legacy: DesktopSettings = serde_json::from_str(
+            r#"{
+                "theme": "system",
+                "autoStart": false,
+                "startMinimized": false,
+                "closeToTray": true
+            }"#,
+        )
+        .expect("settings deserialize");
+        assert_eq!(legacy.language, None);
+    }
+
+    #[test]
+    fn language_uses_the_existing_json_field_when_present() {
+        let settings: DesktopSettings = serde_json::from_str(
+            r#"{
+                "theme": "system",
+                "language": "en",
+                "autoStart": false,
+                "startMinimized": false,
+                "closeToTray": true
+            }"#,
+        )
+        .expect("settings deserialize");
+
+        assert_eq!(settings.language.as_deref(), Some("en"));
     }
 
     #[test]

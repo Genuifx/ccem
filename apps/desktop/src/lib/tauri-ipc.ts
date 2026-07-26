@@ -57,6 +57,7 @@ export interface TauriCommands {
   remove_favorite: [{ path: string }, void];
   add_recent: [{ path: string }, void];
   save_settings: [{ settings: DesktopSettings }, void];
+  save_language: [{ language: 'zh' | 'en' }, void];
   get_pet_notification_read_state: [void, PetNotificationReadState];
   mark_pet_notification_read: [{ notificationId: string }, PetNotificationReadState];
   open_pet_notification: [{ request: PetOpenSessionRequest }, void];
@@ -667,6 +668,7 @@ export interface JetBrainsProject {
 
 export interface DesktopSettings {
   theme: string;
+  language?: 'zh' | 'en';
   autoStart: boolean;
   startMinimized: boolean;
   closeToTray: boolean;

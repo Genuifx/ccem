@@ -3074,6 +3074,33 @@ fn get_settings(app: tauri::AppHandle) -> Result<DesktopSettings, String> {
     Ok(settings)
 }
 
+fn merge_settings_page_update(
+    mut current: DesktopSettings,
+    update: DesktopSettings,
+) -> DesktopSettings {
+    current.theme = update.theme;
+    // Language has a dedicated, serialized command. Generic settings saves must
+    // never carry an unconfirmed locale change into the backend.
+    current.auto_start = update.auto_start;
+    current.start_minimized = update.start_minimized;
+    current.close_to_tray = update.close_to_tray;
+    current.desktop_pet_enabled = update.desktop_pet_enabled;
+    current.default_mode = update.default_mode;
+    current.performance_mode = update.performance_mode;
+    current.desktop_notifications_enabled = update.desktop_notifications_enabled;
+    current.notify_on_task_completed = update.notify_on_task_completed;
+    current.notify_on_task_failed = update.notify_on_task_failed;
+    current.notify_on_action_required = update.notify_on_action_required;
+    current.ai_enhanced = update.ai_enhanced;
+    current.ai_env_name = update.ai_env_name;
+    // Only overwrite enablement when the payload explicitly includes it.
+    // Settings page saves omit this field; environment page writes include it.
+    if update.enabled_environments.is_some() {
+        current.enabled_environments = update.enabled_environments;
+    }
+    current
+}
+
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
@@ -3106,26 +3133,9 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
     // Save desktop-specific settings to settings.json.
     // Merge fields that are not part of the Settings page payload to avoid resetting
     // proxy-debug config when users change unrelated options.
-    let mut merged_settings = config::read_settings().unwrap_or_default();
-    merged_settings.theme = settings.theme;
-    merged_settings.auto_start = settings.auto_start;
-    merged_settings.start_minimized = settings.start_minimized;
-    merged_settings.close_to_tray = settings.close_to_tray;
-    merged_settings.desktop_pet_enabled = settings.desktop_pet_enabled;
-    merged_settings.default_mode = settings.default_mode;
-    merged_settings.performance_mode = settings.performance_mode;
-    merged_settings.desktop_notifications_enabled = settings.desktop_notifications_enabled;
-    merged_settings.notify_on_task_completed = settings.notify_on_task_completed;
-    merged_settings.notify_on_task_failed = settings.notify_on_task_failed;
-    merged_settings.notify_on_action_required = settings.notify_on_action_required;
-    merged_settings.ai_enhanced = settings.ai_enhanced;
-    merged_settings.ai_env_name = settings.ai_env_name;
-    // Only overwrite enablement when the payload explicitly includes it.
-    // Settings page saves omit this field; environment page writes include it.
-    if settings.enabled_environments.is_some() {
-        merged_settings.enabled_environments = settings.enabled_environments;
-    }
-    config::write_settings(&merged_settings)?;
+    let merged_settings = config::update_settings(move |current| {
+        *current = merge_settings_page_update(current.clone(), settings);
+    })?;
     if let Err(e) =
         pet_window::sync_pet_window_visibility(&app, merged_settings.desktop_pet_enabled)
     {
@@ -3133,7 +3143,7 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
     }
     if let Some(notification_prefs_state) = app.try_state::<notifications::NotificationPrefsState>()
     {
-        notification_prefs_state.replace_from_settings(&merged_settings);
+        notification_prefs_state.replace_preferences_from_settings(&merged_settings);
     }
 
     #[cfg(target_os = "macos")]
@@ -3149,6 +3159,47 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
         Ok(())
     } else {
         Err(format!("Partial save failures: {}", errors.join("; ")))
+    }
+}
+
+#[tauri::command]
+fn save_language(app: tauri::AppHandle, language: String) -> Result<(), String> {
+    let language = match language.as_str() {
+        "zh" => "zh",
+        "en" => "en",
+        _ => return Err("language must be either zh or en".to_string()),
+    };
+    let settings = config::update_settings(|settings| {
+        settings.language = Some(language.to_string());
+    })?;
+
+    if let Some(notification_prefs_state) = app.try_state::<notifications::NotificationPrefsState>()
+    {
+        notification_prefs_state.replace_language_from_settings(&settings);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod desktop_settings_command_tests {
+    use super::{merge_settings_page_update, DesktopSettings};
+
+    #[test]
+    fn generic_settings_save_preserves_backend_owned_language() {
+        let current = DesktopSettings {
+            language: Some("en".to_string()),
+            ..DesktopSettings::default()
+        };
+        let update = DesktopSettings {
+            language: Some("zh".to_string()),
+            theme: "dark".to_string(),
+            ..DesktopSettings::default()
+        };
+
+        let merged = merge_settings_page_update(current, update);
+
+        assert_eq!(merged.language.as_deref(), Some("en"));
+        assert_eq!(merged.theme, "dark");
     }
 }
 
@@ -4908,6 +4959,7 @@ fn main() {
             set_default_working_dir,
             get_settings,
             save_settings,
+            save_language,
             send_test_notification,
             get_telegram_settings,
             get_wecom_settings,

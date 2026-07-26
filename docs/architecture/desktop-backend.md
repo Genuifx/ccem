@@ -26,7 +26,7 @@ Source: `apps/desktop/src-tauri/src/`
 | `event_dispatcher.rs` | — | `EventDispatcher` — fan-out events to Tauri frontend |
 | `channel.rs` | — | `ChannelKind` — DesktopUI / Telegram / Weixin channel routing |
 | `permission.rs` | — | Permission config read/write (shared format with CLI) |
-| `crypto.rs` | — | AES-256-CBC matching CLI encryption |
+| `crypto.rs` | — | AES-256-GCM `enc:v2` shared with the CLI; legacy AES-256-CBC is decrypt-only |
 | `remote.rs` | — | Remote environment loading |
 | `telegram/mod.rs` | — | Telegram Bot API bridge, forum topic binding |
 | `telegram/channel.rs` | — | Telegram channel message routing |

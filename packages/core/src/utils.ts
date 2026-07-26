@@ -2,13 +2,17 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import {
+  decryptParsedV2Ciphertext,
+  encryptV2WithKey,
+  parseV2Ciphertext,
+} from './crypto-v2-internal.js';
 
 // Legacy key (for migration decryption only — hardcoded, same as pre-v2)
 const LEGACY_ALGORITHM = 'aes-256-cbc';
 const LEGACY_KEY = crypto.scryptSync('claude-code-env-manager-secret', 'salt', 32);
 
 // v2 encryption: AES-256-GCM with per-install random key
-const V2_ALGORITHM = 'aes-256-gcm';
 let _installKey: Buffer | null = null;
 
 /**
@@ -38,13 +42,7 @@ function getOrCreateInstallKey(): Buffer {
  */
 export const encrypt = (text: string): string => {
   if (!text) return text;
-  const key = getOrCreateInstallKey();
-  const nonce = crypto.randomBytes(12); // 96-bit nonce for GCM
-  const cipher = crypto.createCipheriv(V2_ALGORITHM, key, nonce);
-  let encrypted = cipher.update(text, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  const tag = cipher.getAuthTag();
-  return `enc:v2:${nonce.toString('hex')}:${encrypted}:${tag.toString('hex')}`;
+  return encryptV2WithKey(text, getOrCreateInstallKey(), crypto.randomBytes(12));
 };
 
 /**
@@ -56,37 +54,10 @@ export const decrypt = (text: string): string => {
 
   // v2 format: enc:v2:nonce_hex:ciphertext_hex:tag_hex
   if (text.startsWith('enc:v2:')) {
-    const parts = text.split(':');
-    if (parts.length !== 5) {
-      throw new Error('Invalid enc:v2: ciphertext format');
-    }
-
-    const nonceHex = parts[2];
-    const ciphertextHex = parts[3];
-    const tagHex = parts[4];
-
-    // Validate hex encoding and expected lengths before crypto operations.
-    // Buffer.from(str, 'hex') silently truncates on invalid chars, so we must
-    // check explicitly — matching Rust crypto.rs fail-closed behavior.
-    if (!/^[0-9a-f]{24}$/i.test(nonceHex)) {
-      throw new Error('Invalid enc:v2: nonce');
-    }
-    if (!/^[0-9a-f]{32}$/i.test(tagHex)) {
-      throw new Error('Invalid enc:v2: auth tag');
-    }
-    if (ciphertextHex.length === 0 || !/^[0-9a-f]+$/i.test(ciphertextHex) || ciphertextHex.length % 2 !== 0) {
-      throw new Error('Invalid enc:v2: ciphertext');
-    }
+    const parsed = parseV2Ciphertext(text);
 
     try {
-      const key = getOrCreateInstallKey();
-      const nonce = Buffer.from(nonceHex, 'hex');
-      const tag = Buffer.from(tagHex, 'hex');
-      const decipher = crypto.createDecipheriv(V2_ALGORITHM, key, nonce);
-      decipher.setAuthTag(tag);
-      let decrypted = decipher.update(ciphertextHex, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
+      return decryptParsedV2Ciphertext(parsed, getOrCreateInstallKey());
     } catch {
       // AEAD auth tag failure = tampered data or wrong key.
       // Must NOT return the ciphertext as plaintext — that would silently

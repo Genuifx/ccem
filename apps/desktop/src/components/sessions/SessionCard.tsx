@@ -1,5 +1,13 @@
 // apps/desktop/src/components/sessions/SessionCard.tsx
-import { Suspense, lazy, useEffect, useRef, useState, type ElementType } from 'react';
+import {
+  Suspense,
+  lazy,
+  useEffect,
+  useRef,
+  useState,
+  type ElementType,
+  type Ref,
+} from 'react';
 import {
   Check,
   Clock,
@@ -58,7 +66,6 @@ interface SessionCardProps {
   onMinimize: (id: string) => void;
   onClose: (id: string) => void;
   onStop?: (id: string) => void;
-  onRemove?: (id: string) => void;
   onDisconnectChannel?: (sessionId: string, channelKind: string) => void;
   confirmingClose?: boolean;
   onCancelClose?: () => void;
@@ -73,6 +80,7 @@ function SessionActionIconButton({
   disabled,
   variant = 'ghost',
   className,
+  buttonRef,
 }: {
   icon: ElementType;
   onClick?: () => void;
@@ -80,12 +88,15 @@ function SessionActionIconButton({
   disabled?: boolean;
   variant?: 'ghost' | 'destructive';
   className?: string;
+  buttonRef?: Ref<HTMLButtonElement>;
 }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
+          ref={buttonRef}
           type="button"
+          aria-label={tooltip}
           onClick={onClick}
           disabled={disabled}
           className={cn(
@@ -176,7 +187,6 @@ export function SessionCard({
   onMinimize,
   onClose,
   onStop,
-  onRemove,
   onDisconnectChannel,
   confirmingClose,
   onCancelClose,
@@ -188,6 +198,8 @@ export function SessionCard({
   const [bindDialogOpen, setBindDialogOpen] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
+  const closeActionRef = useRef<HTMLButtonElement>(null);
+  const restoreCloseFocusRef = useRef(false);
   const hasHydratedStatusMotionRef = useRef(false);
 
   useEffect(() => {
@@ -197,6 +209,13 @@ export function SessionCard({
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!confirmingClose && restoreCloseFocusRef.current) {
+      restoreCloseFocusRef.current = false;
+      closeActionRef.current?.focus();
+    }
+  }, [confirmingClose]);
 
   // --- Status indicator: minimal dot ---
   const getStatusIndicator = (status: string) => {
@@ -297,6 +316,11 @@ export function SessionCard({
     : session.status === 'running';
   const cardIsSelectable = isEmbedded && !isHeadless && Boolean(onSelectEmbedded);
 
+  const cancelClose = () => {
+    restoreCloseFocusRef.current = true;
+    onCancelClose?.();
+  };
+
   // --- Handle copy bind command ---
   const handleCopyBind = async () => {
     try {
@@ -366,14 +390,27 @@ export function SessionCard({
     // Confirm close state
     if (confirmingClose) {
       return (
-        <div data-session-confirm-actions className="flex items-center justify-between w-full">
+        <div
+          data-session-confirm-actions
+          role="group"
+          aria-label={t('sessions.confirmTerminate')}
+          className="flex items-center justify-between w-full"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              event.stopPropagation();
+              cancelClose();
+            }
+          }}
+        >
           <span className="text-[13px] text-destructive font-medium tracking-[-0.02em]">
             {t('sessions.confirmTerminate')}
           </span>
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={onCancelClose}
+              autoFocus
+              onClick={cancelClose}
               className="px-3 py-1.5 text-[13px] text-muted-foreground hover:text-foreground rounded-full transition-colors"
             >
               {t('common.cancel')}
@@ -418,14 +455,13 @@ export function SessionCard({
                 onOpenBindDialog={() => setBindDialogOpen(true)}
               />
             )}
-            {onRemove && (
-              <SessionActionIconButton
-                icon={X}
-                onClick={() => onRemove(sessionId)}
-                tooltip={t('sessions.headlessRemove')}
-                variant="destructive"
-              />
-            )}
+            <SessionActionIconButton
+              icon={X}
+              buttonRef={closeActionRef}
+              onClick={() => onClose(sessionId)}
+              tooltip={t('sessions.headlessRemove')}
+              variant="destructive"
+            />
           </div>
         </div>
       );
@@ -456,7 +492,13 @@ export function SessionCard({
                 onOpenBindDialog={() => setBindDialogOpen(true)}
               />
             )}
-            <SessionActionIconButton icon={X} onClick={() => onClose(sessionId)} tooltip={t('workspace.close')} variant="destructive" />
+            <SessionActionIconButton
+              icon={X}
+              buttonRef={closeActionRef}
+              onClick={() => onClose(sessionId)}
+              tooltip={t('workspace.close')}
+              variant="destructive"
+            />
           </div>
         </div>
       );
@@ -521,7 +563,13 @@ export function SessionCard({
               disabled={!terminalActions.isRunning}
             />
           )}
-          <SessionActionIconButton icon={X} onClick={() => onClose(sessionId)} tooltip={t('workspace.close')} variant="destructive" />
+          <SessionActionIconButton
+            icon={X}
+            buttonRef={closeActionRef}
+            onClick={() => onClose(sessionId)}
+            tooltip={t('workspace.close')}
+            variant="destructive"
+          />
         </div>
       </div>
     );
