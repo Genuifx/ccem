@@ -529,6 +529,7 @@
     "multiLaunchTerminalRetrySuccess": "已在 Terminal 打开 {count} 个已有会话",
     "multiLaunchTerminalRetryPartial": "已在 Terminal 打开 {opened}/{total} 个已有会话",
     "multiLaunchTerminalRetryFailed": "Terminal 仍无法打开这些已有会话",
+    "multiLaunchArrangeFailed": "已启动 {count} 个会话，但窗口排列失败",
     "noRecentProjects": "暂无最近项目",
     "dirNotFound": "目录不存在",
     "multiLaunch": "多分屏",

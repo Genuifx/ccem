@@ -98,6 +98,30 @@ export async function openTerminalForCreatedInteractiveSession({
   return session;
 }
 
+interface OpenExistingInteractiveSessionTerminalOptions {
+  openTerminal: () => Promise<void>;
+  syncSessions: () => Promise<unknown>;
+  onTerminalOpenError?: (error: unknown) => void;
+  onSessionSyncError?: (error: unknown) => void;
+}
+
+export async function openExistingInteractiveSessionTerminal({
+  openTerminal,
+  syncSessions,
+  onTerminalOpenError,
+  onSessionSyncError,
+}: OpenExistingInteractiveSessionTerminalOptions): Promise<void> {
+  try {
+    await openTerminal();
+  } catch (error) {
+    onTerminalOpenError?.(error);
+    await syncSessionsBestEffort({ syncSessions, onSessionSyncError });
+    throw error;
+  }
+
+  await syncSessionsBestEffort({ syncSessions, onSessionSyncError });
+}
+
 interface LaunchInteractiveSessionOptions
   extends Omit<OpenCreatedInteractiveSessionOptions, 'session'> {
   createStartDetails: Record<string, unknown>;
@@ -170,8 +194,7 @@ export interface MultiInteractiveSessionLaunchResult {
 interface LaunchMultipleInteractiveSessionsOptions<TLayout> {
   workingDirs: string[];
   layout: TLayout;
-  launchSession: (workingDir: string) => Promise<unknown>;
-  listArrangeableSessionIds: () => string[];
+  launchSession: (workingDir: string) => Promise<Session>;
   arrangeSessions: (sessionIds: string[], layout: TLayout) => Promise<unknown>;
   waitForTerminals?: () => Promise<void>;
 }
@@ -180,18 +203,17 @@ export async function launchMultipleInteractiveSessions<TLayout>({
   workingDirs,
   layout,
   launchSession,
-  listArrangeableSessionIds,
   arrangeSessions,
   waitForTerminals = () => new Promise((resolve) => setTimeout(resolve, 800)),
 }: LaunchMultipleInteractiveSessionsOptions<TLayout>): Promise<MultiInteractiveSessionLaunchResult> {
-  let openedCount = 0;
+  const openedSessionIds: string[] = [];
   const terminalOpenFailures: InteractiveSessionTerminalOpenError[] = [];
   const launchFailures: MultiInteractiveSessionLaunchFailure[] = [];
 
   for (const workingDir of workingDirs) {
     try {
-      await launchSession(workingDir);
-      openedCount += 1;
+      const session = await launchSession(workingDir);
+      openedSessionIds.push(session.id);
     } catch (error) {
       if (isInteractiveSessionTerminalOpenError(error)) {
         terminalOpenFailures.push(error);
@@ -203,23 +225,20 @@ export async function launchMultipleInteractiveSessions<TLayout>({
 
   let arranged = false;
   let arrangementError: unknown;
-  if (openedCount >= 2) {
+  if (openedSessionIds.length >= 2) {
     await waitForTerminals();
-    const sessionIds = listArrangeableSessionIds();
-    if (sessionIds.length >= 2) {
-      try {
-        await arrangeSessions(sessionIds, layout);
-        arranged = true;
-      } catch (error) {
-        arrangementError = error;
-      }
+    try {
+      await arrangeSessions(openedSessionIds, layout);
+      arranged = true;
+    } catch (error) {
+      arrangementError = error;
     }
   }
 
   return {
     requestedCount: workingDirs.length,
-    createdCount: openedCount + terminalOpenFailures.length,
-    openedCount,
+    createdCount: openedSessionIds.length + terminalOpenFailures.length,
+    openedCount: openedSessionIds.length,
     arranged,
     arrangementError,
     terminalOpenFailures,

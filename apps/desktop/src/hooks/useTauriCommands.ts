@@ -8,6 +8,7 @@ import type { SessionStickerId, SessionTaskStage, SessionSubagentsPayload } from
 import {
   formatInteractiveSessionLaunchError,
   launchInteractiveSession,
+  openExistingInteractiveSessionTerminal,
 } from '@/lib/interactiveSessionLaunch';
 import type {
   ChannelKind,
@@ -758,17 +759,17 @@ export function useTauriCommands() {
     options: { notifyOnError?: boolean } = {},
   ) => {
     try {
-      await invoke('open_interactive_session_in_terminal', {
-        sessionId,
-        terminalType: terminalType ?? null,
+      await openExistingInteractiveSessionTerminal({
+        openTerminal: () => invoke('open_interactive_session_in_terminal', {
+          sessionId,
+          terminalType: terminalType ?? null,
+        }),
+        syncSessions: syncInteractiveSessions,
+        onSessionSyncError: (syncError) => {
+          console.error('Failed to sync sessions after terminal open attempt:', syncError);
+        },
       });
-      await syncInteractiveSessions();
     } catch (err) {
-      try {
-        await syncInteractiveSessions();
-      } catch (syncErr) {
-        console.error('Failed to sync sessions after terminal open failure:', syncErr);
-      }
       if (options.notifyOnError !== false) {
         toast.error(`Failed to open session in terminal: ${err}`);
       }

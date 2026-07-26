@@ -136,7 +136,10 @@ test('terminal-open failure is an explicit partial success and retries the creat
 });
 
 test('a session-list sync failure does not relabel an opened terminal as failed', async () => {
-  const { openTerminalForCreatedInteractiveSession } =
+  const {
+    openExistingInteractiveSessionTerminal,
+    openTerminalForCreatedInteractiveSession,
+  } =
     await importInteractiveSessionLaunch();
   const session = embeddedSession('session-opened-before-sync-error');
   const traces = [];
@@ -160,6 +163,43 @@ test('a session-list sync failure does not relabel an opened terminal as failed'
   assert.equal(result, session);
   assert.deepEqual(traces, ['open_terminal.start', 'open_terminal.ok']);
   assert.equal(syncErrors.length, 1);
+
+  let existingOpenCount = 0;
+  const existingSyncErrors = [];
+  await openExistingInteractiveSessionTerminal({
+    openTerminal: async () => {
+      existingOpenCount += 1;
+    },
+    syncSessions: async () => {
+      throw new Error('existing list refresh failed');
+    },
+    onSessionSyncError: (error) => {
+      existingSyncErrors.push(error);
+    },
+  });
+
+  assert.equal(existingOpenCount, 1);
+  assert.equal(existingSyncErrors.length, 1);
+
+  const terminalError = new Error('existing Terminal unavailable');
+  let failureSyncCount = 0;
+  let observedTerminalError;
+  await assert.rejects(
+    openExistingInteractiveSessionTerminal({
+      openTerminal: async () => {
+        throw terminalError;
+      },
+      syncSessions: async () => {
+        failureSyncCount += 1;
+      },
+      onTerminalOpenError: (error) => {
+        observedTerminalError = error;
+      },
+    }),
+    terminalError,
+  );
+  assert.equal(observedTerminalError, terminalError);
+  assert.equal(failureSyncCount, 1);
 });
 
 test('create failure is the only path that records create invoke error', async () => {
@@ -232,8 +272,10 @@ test('multi-launch separates opened, partial, and create-failed sessions', async
       if (workingDir === '/create-failed') {
         throw new Error('create failed');
       }
+      return embeddedSession(
+        workingDir === '/ok-1' ? 'opened-1' : 'opened-2',
+      );
     },
-    listArrangeableSessionIds: () => ['opened-1', 'opened-2'],
     arrangeSessions: async (sessionIds, layout) => {
       arranged.push({ sessionIds, layout });
     },
@@ -275,4 +317,18 @@ test('multi-launch separates opened, partial, and create-failed sessions', async
     openedCount: 1,
     failedSessionIds: ['another-created-session'],
   });
+
+  const arrangeError = new Error('window manager unavailable');
+  const arrangeFailure = await launchMultipleInteractiveSessions({
+    workingDirs: ['/arrange-1', '/arrange-2'],
+    layout: 'vertical2',
+    launchSession: async (workingDir) => embeddedSession(workingDir),
+    arrangeSessions: async () => {
+      throw arrangeError;
+    },
+    waitForTerminals: async () => {},
+  });
+  assert.equal(arrangeFailure.openedCount, 2);
+  assert.equal(arrangeFailure.arranged, false);
+  assert.equal(arrangeFailure.arrangementError, arrangeError);
 });

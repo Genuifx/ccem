@@ -175,10 +175,14 @@ export function RecoveryCandidatesPanel() {
             action: {
               label: t('common.retry'),
               onClick: () => {
-                void openInteractiveSessionInTerminal(error.sessionId)
+                void openInteractiveSessionInTerminal(
+                  error.sessionId,
+                  undefined,
+                  { notifyOnError: false },
+                )
                   .then(() => toast.success(t('workspace.nativeHandoffDone')))
                   .catch(() => {
-                    // The command hook owns the single retry-failure notification.
+                    toast.error(t('workspace.nativeHandoffFailed'));
                   });
               },
             },

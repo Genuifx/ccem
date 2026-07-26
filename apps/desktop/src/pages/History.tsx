@@ -147,14 +147,18 @@ export function History() {
             action: {
               label: t('common.retry'),
               onClick: () => {
-                void openInteractiveSessionInTerminal(err.sessionId)
+                void openInteractiveSessionInTerminal(
+                  err.sessionId,
+                  undefined,
+                  { notifyOnError: false },
+                )
                   .then(() => {
                     setLaunched(true);
                     setTimeout(() => setLaunched(false), 1200);
                     toast.success(t('workspace.nativeHandoffDone'));
                   })
                   .catch(() => {
-                    // The command hook owns the single retry-failure notification.
+                    toast.error(t('workspace.nativeHandoffFailed'));
                   });
               },
             },

@@ -6,7 +6,6 @@ import {
   launchMultipleInteractiveSessions,
   retryInteractiveSessionTerminals,
 } from '@/lib/interactiveSessionLaunch';
-import { useAppStore } from '@/store';
 
 interface UseMultiSessionTerminalLaunchOptions {
   isLaunching: boolean;
@@ -43,15 +42,6 @@ export function useMultiSessionTerminalLaunch({
         workingDirs,
         layout,
         launchSession,
-        listArrangeableSessionIds: () => useAppStore
-          .getState()
-          .sessions
-          .filter(
-            (session) =>
-              session.status === 'running'
-              && session.terminalType !== 'embedded',
-          )
-          .map(({ id }) => id),
         arrangeSessions,
       });
 
@@ -106,6 +96,13 @@ export function useMultiSessionTerminalLaunch({
               },
             },
           },
+        );
+      } else if (result.arrangementError) {
+        toast.error(
+          t('sessions.multiLaunchArrangeFailed').replace(
+            '{count}',
+            String(result.openedCount),
+          ),
         );
       } else if (
         result.openedCount === result.requestedCount

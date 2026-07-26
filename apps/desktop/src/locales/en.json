@@ -529,6 +529,7 @@
     "multiLaunchTerminalRetrySuccess": "Opened {count} existing sessions in Terminal",
     "multiLaunchTerminalRetryPartial": "Opened {opened}/{total} existing sessions in Terminal",
     "multiLaunchTerminalRetryFailed": "Terminal still could not open the existing sessions",
+    "multiLaunchArrangeFailed": "Launched {count} sessions, but could not arrange their windows",
     "noRecentProjects": "No recent projects",
     "dirNotFound": "Directory not found",
     "multiLaunch": "Multi-Launch",
