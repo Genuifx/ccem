@@ -66,7 +66,7 @@ pub(crate) fn should_append_mock_keychain_switch(
     policy: CefCredentialStorePolicy,
     process_type: Option<&str>,
 ) -> bool {
-    policy == CefCredentialStorePolicy::MockKeychain && process_type.map_or(true, str::is_empty)
+    policy == CefCredentialStorePolicy::MockKeychain && process_type.is_none_or(str::is_empty)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

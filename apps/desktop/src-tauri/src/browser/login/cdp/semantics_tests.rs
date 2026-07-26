@@ -270,12 +270,17 @@ fn cancelled_click_releases_a_dispatched_mouse_press_before_returning_original_e
     };
 
     assert_eq!(error.code, BackendFailureCode::Cancelled);
-    let input_types = parse_commands(&output.bytes)
+    let inputs = parse_commands(&output.bytes)
         .into_iter()
         .filter(|command| command["method"] == "Input.dispatchMouseEvent")
-        .map(|command| command["params"]["type"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(input_types, ["mousePressed", "mouseReleased"]);
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["params"]["type"], "mousePressed");
+    assert_eq!(inputs[1]["params"]["type"], "mouseReleased");
+    assert_eq!(inputs[1]["params"]["x"], inputs[0]["params"]["x"]);
+    assert_eq!(inputs[1]["params"]["y"], inputs[0]["params"]["y"]);
+    assert_eq!(inputs[1]["params"]["buttons"], 0);
+    assert_eq!(inputs[1]["params"]["clickCount"], 0);
 }
 
 #[test]
@@ -448,7 +453,7 @@ fn timed_out_replace_type_uses_an_independent_deadline_to_release_keyboard_input
 }
 
 #[test]
-fn rejected_key_up_is_retried_without_masking_the_original_protocol_error() {
+fn rejected_committed_key_up_is_not_duplicated_and_preserves_protocol_error() {
     let temp = tempfile::tempdir().unwrap();
     let mut engine = test_engine(&temp);
     engine.primary_session = Some("primary".to_string());
@@ -477,7 +482,7 @@ fn rejected_key_up_is_retried_without_masking_the_original_protocol_error() {
         .filter(|command| command["method"] == "Input.dispatchKeyEvent")
         .map(|command| command["params"]["type"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(key_types, ["keyDown", "keyUp", "keyUp"]);
+    assert_eq!(key_types, ["keyDown", "keyUp"]);
 }
 
 #[test]

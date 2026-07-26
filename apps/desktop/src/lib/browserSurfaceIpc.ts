@@ -2,6 +2,17 @@ import type { NativeBrowserBounds } from '@/components/workspace/browserPanelGeo
 
 export type BrowserSurfaceBackend = 'preview' | 'login';
 
+export type BrowserSurfaceRecoveryState =
+  | 'retained_live_host'
+  | 'retained_inspection_unknown'
+  | 'retained_profile_lock'
+  | 'retained_unknown_or_external_owner'
+  | 'retained_profile_unavailable'
+  | 'recovered_launch_pending'
+  | 'recovered_runtime_owned'
+  | 'removed_finished_record'
+  | 'renderer_process_terminated';
+
 export type BrowserSurfaceProfileSelection =
   | { profileMode: 'default'; profileId?: never }
   | { profileMode: 'new'; profileId?: never }
@@ -28,6 +39,7 @@ export interface BrowserSurfaceSnapshot {
   paused?: boolean;
   profile_id?: string | null;
   session_status?: 'running' | 'closing' | 'cleanup_required';
+  recovery_states?: BrowserSurfaceRecoveryState[];
   popup_active?: boolean;
   popup_url?: string | null;
   popup_title?: string | null;
@@ -73,7 +85,10 @@ export type BrowserSurfaceHostShortcutAction =
   | 'open_search'
   | 'open_project'
   | 'submit'
-  | 'escape';
+  | 'escape'
+  | 'zoom_in'
+  | 'zoom_out'
+  | 'zoom_reset';
 
 export interface BrowserSurfaceHostShortcutEvent {
   surface_id: string;

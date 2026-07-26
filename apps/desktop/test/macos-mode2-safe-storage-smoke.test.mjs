@@ -12,6 +12,8 @@ import {
   MACOS_SAFE_STORAGE_SMOKE_ATTESTATION_ENV,
   MACOS_SAFE_STORAGE_SMOKE_NONCE_ENV,
   MACOS_SAFE_STORAGE_SMOKE_ROOT_ENV,
+  MACOS_SAFE_STORAGE_SMOKE_TARGET_ENV,
+  MODE2_PRODUCER_WORKFLOW_REF_ENV,
   createMacosSafeStorageReleaseSummary,
   createMacosSafeStorageSmokePlan,
   validateMacosSafeStorageReleaseSummary,
@@ -28,6 +30,13 @@ import { inspectMacosSafeStorageReleaseAttestation } from '../scripts/verify-mac
 
 const NONCE = 'b'.repeat(64);
 const SOURCE_COMMIT = 'a'.repeat(40);
+const REPOSITORY = 'Genuifx/claude-code-env-manager';
+const WORKFLOW_REF =
+  `${REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
+const PRODUCER_WORKFLOW_REF =
+  `${REPOSITORY}/.github/workflows/mode2-signed-producer.yml@refs/heads/main`;
+const TARGET = 'aarch64-apple-darwin';
+const JOB = 'build-desktop';
 const RUNNER_TEMP = '/private/tmp/ccem-safe-storage-test';
 const RUN_ROOT = `${RUNNER_TEMP}/ccem-mode2-safe-storage-smoke/12345-2-${NONCE.slice(0, 16)}`;
 const environment = {
@@ -39,10 +48,15 @@ const environment = {
   GITHUB_SHA: SOURCE_COMMIT,
   GITHUB_RUN_ID: '12345',
   GITHUB_RUN_ATTEMPT: '2',
+  GITHUB_REPOSITORY: REPOSITORY,
+  GITHUB_WORKFLOW_REF: WORKFLOW_REF,
+  GITHUB_JOB: JOB,
+  [MODE2_PRODUCER_WORKFLOW_REF_ENV]: PRODUCER_WORKFLOW_REF,
   [MACOS_SAFE_STORAGE_SMOKE_ALLOW_ENV]: '1',
   [MACOS_SAFE_STORAGE_SMOKE_NONCE_ENV]: NONCE,
   [MACOS_SAFE_STORAGE_SMOKE_ROOT_ENV]: RUN_ROOT,
   [MACOS_SAFE_STORAGE_SMOKE_ATTESTATION_ENV]: `${RUN_ROOT}/evidence/attestation.json`,
+  [MACOS_SAFE_STORAGE_SMOKE_TARGET_ENV]: TARGET,
 };
 const sourceApp = `${RUNNER_TEMP}/build/CCEM Desktop.app`;
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -54,8 +68,10 @@ function planFixture() {
 
 function receiptFixture(plan, scenario, phase) {
   const scenarioPlan = plan.scenarios.find((entry) => entry.name === scenario);
+  const primaryProfileId = `primary-${scenario}-${phase}`;
+  const secondaryProfileId = `secondary-${scenario}-${phase}`;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     smoke: 'macos-mode2-safe-storage-release',
     status: 'passed',
     exitCode: 0,
@@ -64,6 +80,11 @@ function receiptFixture(plan, scenario, phase) {
     sourceCommit: SOURCE_COMMIT,
     runId: '12345',
     runAttempt: '2',
+    target: TARGET,
+    repository: REPOSITORY,
+    workflowRef: WORKFLOW_REF,
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
     scenario,
     phase,
     appVersion: '2.53.0',
@@ -82,6 +103,61 @@ function receiptFixture(plan, scenario, phase) {
     persistentProfileStorage: true,
     normalStartupBypassed: true,
     sandboxEnabled: true,
+    productionPath: {
+      schemaVersion: 2,
+      verified: true,
+      manager: 'LoginBrowserSurfaceManager/SessionManager',
+      sessionRoot: `${scenarioPlan.root}/data/login`,
+      workspaceRoot: `${scenarioPlan.root}/workspace-${phase}`,
+      secondaryWorkspaceRoot: `${scenarioPlan.root}/workspace-${phase}-secondary`,
+      primaryProfileId,
+      reopenedPrimaryProfileId: primaryProfileId,
+      finalPrimaryProfileId: primaryProfileId,
+      secondaryProfileId,
+      finalSecondaryProfileId: secondaryProfileId,
+      semantic: {
+        navigatedViaCapability: true,
+        axSnapshotViaCapability: true,
+        clickViaElementRef: true,
+        typeViaElementRef: true,
+        screenshot: {
+          canonicalPath:
+            `${scenarioPlan.root}/data/login/sessions/session-${phase}/artifacts/shot-${phase}.png`,
+          byteSize: 4096,
+          sha256: 'e'.repeat(64),
+          pngMagicVerified: true,
+          pngStructureVerified: true,
+          pngDecodedVerified: true,
+          byteSizeVerified: true,
+          sha256Verified: true,
+          appOwnedCanonicalPathVerified: true,
+        },
+        storageCommitViaElementRef: true,
+        activeEffectEntered: true,
+        activeEffectCancelled: true,
+        occlusionAckUnderOneSecond: true,
+        occlusionAckMillis: 73,
+        postPauseNoLateWrite: true,
+      },
+      profileIsolation: {
+        distinctWorkspaceProfiles: true,
+        primaryCookiePersisted: true,
+        primaryLocalStoragePersisted: true,
+        secondaryProfileInitiallyEmpty: true,
+        secondaryCookieIsolated: true,
+        secondaryLocalStorageIsolated: true,
+        primaryUnchangedAfterSecondary: true,
+        secondaryUnchangedAfterPrimary: true,
+      },
+      cleanup: {
+        activeSurfaceCount: 0,
+        activeSessionCount: 0,
+        ownerRecordCount: 0,
+        persistedProfileCount: 2,
+        workspaceCount: 2,
+        profileLocksAvailable: true,
+      },
+    },
     stages: MACOS_SAFE_STORAGE_REQUIRED_RUNTIME_STAGES.map((name, index) => ({
       name,
       monotonicMs: index + 1,
@@ -91,12 +167,13 @@ function receiptFixture(plan, scenario, phase) {
 
 function attestationFixture(plan) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     platform: 'macos',
+    target: TARGET,
     status: 'passed',
     sourceCommit: SOURCE_COMMIT,
     nonce: NONCE,
-    run: { id: '12345', attempt: '2' },
+    run: { ...plan.run },
     app: {
       bundlePath: plan.paths.installedApp,
       executablePath: plan.paths.executable,
@@ -137,11 +214,45 @@ test('plan binds copied app, two scenarios, receipts, and attestation to one run
   assert.equal(plan.paths.smokeRoot, RUN_ROOT);
   assert.equal(plan.paths.installedApp, `${RUN_ROOT}/app/CCEM.app`);
   assert.equal(plan.paths.executable, `${RUN_ROOT}/app/CCEM.app/Contents/MacOS/ccem-desktop`);
+  assert.equal(plan.target, TARGET);
+  assert.deepEqual(plan.run, {
+    id: '12345',
+    attempt: '2',
+    repository: REPOSITORY,
+    workflowRef: WORKFLOW_REF,
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
+  });
   assert.deepEqual(plan.scenarios.map((entry) => entry.name), ['clean', 'generic-conflict']);
   for (const scenario of plan.scenarios) {
     assert.equal(scenario.keychain, `${scenario.root}/keychain/smoke.keychain-db`);
     assert.equal(scenario.receipts.prime, `${scenario.root}/evidence/prime-runtime.json`);
     assert.equal(scenario.receipts.verify, `${scenario.root}/evidence/verify-runtime.json`);
+  }
+});
+
+test('plan rejects every malformed or foreign GitHub provenance field', () => {
+  for (const [field, value, message] of [
+    ['GITHUB_REPOSITORY', 'foreign-repository', /owner\/name/u],
+    [
+      'GITHUB_WORKFLOW_REF',
+      'Other/repository/.github/workflows/release.yml@refs/heads/main',
+      /repository-bound workflow ref/u,
+    ],
+    ['GITHUB_JOB', 'signed-readiness', /signed producer build job/u],
+    [
+      MODE2_PRODUCER_WORKFLOW_REF_ENV,
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`,
+      /mode2-signed-producer\.yml/u,
+    ],
+  ]) {
+    assert.throws(
+      () => createMacosSafeStorageSmokePlan({
+        environment: { ...environment, [field]: value },
+        sourceApp,
+      }),
+      message,
+    );
   }
 });
 
@@ -310,11 +421,33 @@ test('runtime and final contracts require two successful signed launches per sce
   assert.equal(validateMacosSafeStorageSmokeAttestation(attestation, plan).status, 'passed');
 
   for (const mutate of [
+    (value) => { value.run.repository = 'Other/repository'; },
+    (value) => {
+      value.run.workflowRef =
+        `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/tags/v2.53.0`;
+    },
+    (value) => { value.run.job = 'signed-readiness'; },
+    (value) => {
+      value.run.producerWorkflowRef =
+        `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`;
+    },
     (value) => { value.scenarios[0].launchCount = 1; },
     (value) => { value.scenarios[1].genericItemUnchanged = false; },
     (value) => { value.scenarios[1].genericItemPresentAfter = false; },
     (value) => { value.scenarios[0].receipts.prime.safeStorageBrandingVerified = false; },
     (value) => { value.scenarios[0].receipts.verify.persistentCookieVerified = false; },
+    (value) => { value.scenarios[0].receipts.prime.target = 'x86_64-apple-darwin'; },
+    (value) => {
+      value.scenarios[0].receipts.prime.producerWorkflowRef =
+        `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`;
+    },
+    (value) => {
+      value.scenarios[0].receipts.prime.productionPath.semantic.screenshot.sha256Verified = false;
+    },
+    (value) => {
+      value.scenarios[1].receipts.verify.productionPath.profileIsolation
+        .secondaryUnchangedAfterPrimary = false;
+    },
     (value) => { value.cleanup.originalKeychainStateRestored = false; },
   ]) {
     const invalid = structuredClone(attestation);
@@ -327,11 +460,15 @@ test('release summary binds target, app bytes, version, and full attestation dig
   const plan = planFixture();
   const attestation = attestationFixture(plan);
   const expected = {
-    target: 'aarch64-apple-darwin',
+    target: TARGET,
     sourceCommit: SOURCE_COMMIT,
     appVersion: '2.53.0',
     executableSha256: 'c'.repeat(64),
     frameworkSha256: 'd'.repeat(64),
+    repository: REPOSITORY,
+    workflowRef: WORKFLOW_REF,
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
   };
   const summary = createMacosSafeStorageReleaseSummary(attestation, plan, {
     target: expected.target,
@@ -343,6 +480,24 @@ test('release summary binds target, app bytes, version, and full attestation dig
   assert.deepEqual(validateMacosSafeStorageReleaseSummary(summary, expected), summary);
   assert.equal(summary.launchCount, 4);
   assert.equal(summary.genericConflictIsolationVerified, true);
+
+  for (const [field, value] of [
+    ['repository', 'Other/repository'],
+    [
+      'workflowRef',
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/tags/v2.53.0`,
+    ],
+    ['job', 'signed-readiness'],
+    [
+      'producerWorkflowRef',
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`,
+    ],
+  ]) {
+    assert.throws(
+      () => validateMacosSafeStorageReleaseSummary({ ...summary, [field]: value }, expected),
+      /release summary/u,
+    );
+  }
 
   assert.throws(() => createMacosSafeStorageReleaseSummary(attestation, plan, {
     target: expected.target,
@@ -418,7 +573,9 @@ test('release inventory consumes only the exact private current-run attestation 
 });
 
 test('source contract keeps debug mock Keychain separate and release smoke CI-only', async () => {
-  const [runner, gate, runtime, debugSmoke, bootstrap, desktopLib, workflow] = await Promise.all([
+  const [
+    runner, gate, runtime, productionRuntime, debugSmoke, bootstrap, desktopLib, workflow,
+  ] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'scripts/run-macos-mode2-safe-storage-smoke.mjs'), 'utf8'),
     fs.readFile(path.join(
       desktopDir,
@@ -427,6 +584,10 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
     fs.readFile(path.join(
       desktopDir,
       'src-tauri/src/browser/login/cef/macos_safe_storage_smoke/runtime.rs',
+    ), 'utf8'),
+    fs.readFile(path.join(
+      desktopDir,
+      'src-tauri/src/browser/login/cef/macos_safe_storage_smoke/production_runtime.rs',
     ), 'utf8'),
     fs.readFile(path.join(
       desktopDir,
@@ -463,6 +624,11 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
   assert.match(runtime, /persistent_cookie_verified/);
   assert.match(runtime, /macos-system-keychain-v2/);
   assert.match(runtime, /WATCHDOG_TIMEOUT/);
+  assert.match(runtime, /production_runtime::run/u);
+  assert.match(productionRuntime, /production_smoke_run_semantic_chain/u);
+  assert.match(productionRuntime, /ProductionSmokeScreenshotProof/u);
+  assert.match(productionRuntime, /production_smoke_write_isolated_profile/u);
+  assert.match(productionRuntime, /try_lock_exclusive/u);
   assert.match(debugSmoke, /CefCredentialStorePolicy::MockKeychain/);
   assert.match(bootstrap, /use-mock-keychain/);
   const updaterGateIndex = desktopLib.indexOf('if updater_replacement_smoke::is_requested()');
@@ -482,7 +648,7 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
   assert.match(desktopLib, /cfg\(all\(target_os = "macos", not\(debug_assertions\)\)\)/u);
   assert.doesNotMatch(runner, /login\.keychain/u);
   const smokeIndex = workflow.indexOf(
-    '- name: Prove signed macOS Mode 2 Safe Storage isolation and persistence',
+    '- name: Prove signed macOS Mode 2 Safe Storage and production behavior',
   );
   const evidenceIndex = workflow.indexOf(
     '- name: Retain macOS Mode 2 Safe Storage signed-runner evidence',

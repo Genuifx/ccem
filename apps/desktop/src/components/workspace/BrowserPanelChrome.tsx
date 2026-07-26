@@ -24,12 +24,27 @@ import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { BrowserInfo, BrowserRecentActivity } from '@/lib/tauri-ipc';
-import type { BrowserSurfaceSnapshot } from '@/lib/browserSurfaceIpc';
+import type {
+  BrowserSurfaceRecoveryState,
+  BrowserSurfaceSnapshot,
+} from '@/lib/browserSurfaceIpc';
 
 type BrowserPanelLifecycle = NonNullable<BrowserInfo['lifecycle']>
   | NonNullable<BrowserSurfaceSnapshot['lifecycle']>;
 
 type LoginControlAction = 'handoff' | 'pause' | 'takeover';
+
+const recoveryStateTranslationKeys: Record<BrowserSurfaceRecoveryState, string> = {
+  retained_live_host: 'workspace.browserRecoveryRetainedLiveHost',
+  retained_inspection_unknown: 'workspace.browserRecoveryInspectionUnknown',
+  retained_profile_lock: 'workspace.browserRecoveryProfileLock',
+  retained_unknown_or_external_owner: 'workspace.browserRecoveryUnknownOwner',
+  retained_profile_unavailable: 'workspace.browserRecoveryProfileUnavailable',
+  recovered_launch_pending: 'workspace.browserRecoveryLaunchRecovered',
+  recovered_runtime_owned: 'workspace.browserRecoveryRuntimeRecovered',
+  removed_finished_record: 'workspace.browserRecoveryRecordCleared',
+  renderer_process_terminated: 'workspace.browserRecoveryRendererStopped',
+};
 
 function formatArtifactBytes(byteSize: number): string {
   if (byteSize < 1024) return `${byteSize} B`;
@@ -179,6 +194,7 @@ interface BrowserPanelTabStripProps {
   backend: 'preview' | 'login';
   panelTitle: string;
   sessionStatus: 'running' | 'closing' | 'cleanup_required';
+  recoveryStates: BrowserSurfaceRecoveryState[];
   popupActive: boolean;
   lifecycle: BrowserPanelLifecycle;
   control: BrowserInfo['control'];
@@ -205,6 +221,7 @@ export function BrowserPanelTabStrip({
   backend,
   panelTitle,
   sessionStatus,
+  recoveryStates,
   popupActive,
   lifecycle,
   control,
@@ -226,6 +243,12 @@ export function BrowserPanelTabStrip({
   onLoginControl,
   onClose,
 }: BrowserPanelTabStripProps) {
+  const recoveryNeedsAttention = recoveryStates.some((state) => (
+    state.startsWith('retained_') || state === 'renderer_process_terminated'
+  ));
+  const recoveryLabel = recoveryStates
+    .map((state) => t(recoveryStateTranslationKeys[state]))
+    .join(', ');
   return (
     <>
       <div className="flex h-7 min-w-0 max-w-[220px] items-center gap-2 rounded-md bg-muted/45 px-2.5 text-xs font-medium text-foreground">
@@ -233,6 +256,19 @@ export function BrowserPanelTabStrip({
         <span className="truncate">{panelTitle}</span>
       </div>
       <div className="min-w-0 flex-1" />
+      {backend === 'login' && recoveryStates.length > 0 ? (
+        <span
+          data-ccem-browser-recovery-status={recoveryNeedsAttention ? 'attention' : 'recovered'}
+          className={recoveryNeedsAttention
+            ? 'max-w-56 truncate text-[11px] font-medium text-destructive'
+            : 'max-w-56 truncate text-[11px] font-medium text-primary'}
+          title={recoveryLabel}
+        >
+          {t(recoveryNeedsAttention
+            ? 'workspace.browserRecoveryAttention'
+            : 'workspace.browserRecoveryRecovered').replace('{state}', recoveryLabel)}
+        </span>
+      ) : null}
       {sessionStatus === 'cleanup_required' ? (
         <span className="text-[11px] font-medium text-destructive">
           {t('loginBrowserControl.owner_danger')}

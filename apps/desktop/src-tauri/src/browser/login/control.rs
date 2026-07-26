@@ -1,5 +1,6 @@
 use super::execution_fence::{
-    EffectWritePermit, ExecutionFence, FenceUnavailable, OwnerExecutionPermit,
+    EffectWritePermit, ExecutionFence, FenceQuiescenceFailure, FenceUnavailable,
+    OwnerExecutionPermit,
 };
 use super::policy::BrowserGrantBinding;
 use std::fmt;
@@ -35,6 +36,7 @@ pub(super) enum ControlErrorCode {
     AgentControlPaused,
     AuditDegraded,
     OwnerQuiescenceTimedOut,
+    EffectSafetyUnconfirmed,
     StateUnavailable,
 }
 
@@ -47,6 +49,7 @@ impl ControlErrorCode {
             Self::AgentControlPaused => "agent_control_paused",
             Self::AuditDegraded => "audit_degraded",
             Self::OwnerQuiescenceTimedOut => "owner_quiescence_timed_out",
+            Self::EffectSafetyUnconfirmed => "effect_safety_unconfirmed",
             Self::StateUnavailable => "state_unavailable",
         }
     }
@@ -95,6 +98,10 @@ impl CancellationState {
         }
     }
 
+    fn is_safe(&self) -> bool {
+        self.fence.is_safe()
+    }
+
     fn cancel(&self) -> RetiredOperationEpoch {
         let retired = self.fence.retire_current();
         self.wake.notify_all();
@@ -110,17 +117,39 @@ impl CancellationState {
     ) -> Result<(), ControlError> {
         self.fence
             .wait_for_retired_timeout(retired.generation, maximum_wait)
-            .map_err(|_| {
-                ControlError::new(
+            .map_err(|error| match error {
+                FenceQuiescenceFailure::TimedOut => ControlError::new(
                     ControlErrorCode::OwnerQuiescenceTimedOut,
                     "Login Browser protocol owner did not acknowledge cancellation before the fixed deadline.",
-                )
+                ),
+                FenceQuiescenceFailure::EffectSafetyUnconfirmed => ControlError::new(
+                    ControlErrorCode::EffectSafetyUnconfirmed,
+                    "Login Browser input safety release was not confirmed before control transfer.",
+                ),
             })
     }
 
     fn cancel_and_wait(&self, maximum_wait: Duration) -> Result<(), ControlError> {
         let retired = self.cancel();
         self.wait_for_quiescence(&retired, maximum_wait)
+    }
+}
+
+/// Identity-preserving fault capability for a committed input effect.
+///
+/// The generation and state are captured from the same per-session operation token that admitted
+/// the input-down write. A failed safety release can therefore poison only that exact execution
+/// fence, while also waking cooperative waits on that session.
+#[derive(Debug)]
+pub(super) struct EffectSafetyFence {
+    state: Arc<CancellationState>,
+    generation: u64,
+}
+
+impl EffectSafetyFence {
+    pub(super) fn mark_unconfirmed(&self) {
+        self.state.fence.mark_effect_unsafe(self.generation);
+        self.state.wake.notify_all();
     }
 }
 
@@ -152,6 +181,13 @@ impl OperationCancellation {
 
     pub(super) fn enter_effect_write(&self) -> Result<EffectWritePermit, FenceUnavailable> {
         self.state.fence.enter_effect(self.generation)
+    }
+
+    pub(super) fn effect_safety_fence(&self) -> EffectSafetyFence {
+        EffectSafetyFence {
+            state: Arc::clone(&self.state),
+            generation: self.generation,
+        }
     }
 
     pub(super) fn wait_cancelled(&self, maximum_wait: Duration) -> bool {
@@ -327,6 +363,12 @@ impl HandoffControl for LoginBrowserControl {
                 "Login Browser write capability is blocked while audit is degraded.",
             ));
         }
+        if !self.cancellation.is_safe() {
+            return Err(ControlError::new(
+                ControlErrorCode::EffectSafetyUnconfirmed,
+                "Login Browser input safety release remains unconfirmed.",
+            ));
+        }
         Ok(self.cancellation.capture())
     }
 
@@ -499,6 +541,39 @@ mod tests {
         );
         assert!(token.enter_effect_write().is_err());
         drop(owner);
+    }
+
+    #[test]
+    fn unconfirmed_effect_cancels_the_token_and_denies_new_operations() {
+        let control = LoginBrowserControl::new();
+        let current = binding("session-a", 1);
+        control
+            .activate_handoff(HandoffGrant::new_trusted(current.clone()))
+            .expect("activate");
+        let token = control
+            .begin_operation(&current, true)
+            .expect("begin operation");
+
+        token.effect_safety_fence().mark_unconfirmed();
+
+        assert!(token.is_cancelled());
+        assert!(token.enter_owner_execution().is_err());
+        assert!(token.enter_effect_write().is_err());
+        assert_eq!(
+            control
+                .begin_operation(&current, true)
+                .expect_err("unsafe fence blocks new operation")
+                .code,
+            ControlErrorCode::EffectSafetyUnconfirmed
+        );
+        let retired = control.revoke_handoff().expect("revoke");
+        assert_eq!(
+            control
+                .wait_for_quiescence(&retired, Duration::from_millis(25))
+                .expect_err("unsafe effect cannot acknowledge")
+                .code,
+            ControlErrorCode::EffectSafetyUnconfirmed
+        );
     }
 
     #[test]

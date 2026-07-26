@@ -13,7 +13,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{
         DestroyWindow, GetClientRect, GetParent, GetWindowRect, GetWindowThreadProcessId, IsWindow,
         IsWindowVisible, PostMessageW, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
-        SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_CLOSE,
+        SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_CLOSE,
     },
 };
 
@@ -145,7 +145,7 @@ pub(super) fn set_window_visible(
 ) -> Result<WindowsNativeWindowObservation, String> {
     inspect_child_window(hwnd, parent)?;
     unsafe {
-        ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+        ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
     }
     let observation = inspect_child_window(hwnd, parent)?;
     validate_windows_native_window_observation(

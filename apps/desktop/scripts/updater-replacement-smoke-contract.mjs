@@ -46,7 +46,7 @@ export {
   hashUpdaterReplacementSmokeJson,
 } from './updater-replacement-smoke-contract-core.mjs';
 
-export const UPDATER_REPLACEMENT_SMOKE_SCHEMA_VERSION = 3;
+export const UPDATER_REPLACEMENT_SMOKE_SCHEMA_VERSION = 4;
 export { UPDATER_REPLACEMENT_FLOW };
 export const UPDATER_REPLACEMENT_CLOCK = 'system-boot-monotonic-ms';
 export const UPDATER_REPLACEMENT_STAGES = Object.freeze([
@@ -76,7 +76,8 @@ const PROCESS_CENSUS_METHOD = 'os-process-census-by-pid-start-token-image-and-ch
 
 function validateRunIdentity(value, label) {
   exactKeys(value, [
-    'id', 'attempt', 'repository', 'workflowRef', 'job', 'challengeNonce',
+    'id', 'attempt', 'repository', 'workflowRef', 'producerWorkflowRef', 'job',
+    'challengeNonce',
   ], label);
   const repository = exactNonEmptyText(value.repository, `${label} repository`, 200);
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository)) {
@@ -89,6 +90,19 @@ function validateRunIdentity(value, label) {
   ) {
     fail(`${label} workflow ref must be a repository-bound workflow ref`);
   }
+  const producerWorkflowRef = exactNonEmptyText(
+    value.producerWorkflowRef,
+    `${label} producer workflow ref`,
+    512,
+  );
+  if (
+    !producerWorkflowRef.startsWith(
+      `${repository}/.github/workflows/mode2-signed-producer.yml@refs/`,
+    )
+    || !/\.yml@refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+$/u.test(producerWorkflowRef)
+  ) {
+    fail(`${label} producer workflow ref must identify the repository-bound signed producer`);
+  }
   const job = exactNonEmptyText(value.job, `${label} job`, 100);
   if (!/^[A-Za-z0-9_-]+$/u.test(job)) fail(`${label} job is invalid`);
   return {
@@ -96,6 +110,7 @@ function validateRunIdentity(value, label) {
     attempt: exactRunNumber(value.attempt, `${label} attempt`),
     repository,
     workflowRef,
+    producerWorkflowRef,
     job,
     challengeNonce: exactSha256(value.challengeNonce, `${label} challenge nonce`),
   };
@@ -708,6 +723,7 @@ export function validateUpdaterReplacementSmokeAttestation(attestation, expected
     runAttempt: normalizedExpected.run.attempt,
     repository: normalizedExpected.run.repository,
     workflowRef: normalizedExpected.run.workflowRef,
+    producerWorkflowRef: normalizedExpected.run.producerWorkflowRef,
     job: normalizedExpected.run.job,
     challengeNonce: normalizedExpected.run.challengeNonce,
     sourceCommit: normalizedExpected.sourceCommit,

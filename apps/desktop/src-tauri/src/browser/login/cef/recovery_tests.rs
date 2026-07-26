@@ -338,6 +338,8 @@ fn startup_removes_reserved_intent_when_crash_precedes_launch_pending() {
         removed[0].disposition,
         EmbeddedOwnerRecoveryDisposition::RemovedFinishedRecord
     );
+    assert_eq!(removed[0].profile_id, descriptor.profile_id().as_str());
+    assert_eq!(removed[0].workspace_identity, workspace().as_str());
     assert!(stopped(&manager, descriptor.profile_id()));
     assert!(store
         .load(&record_id)

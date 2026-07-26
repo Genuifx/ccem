@@ -255,6 +255,17 @@ wrap_request_handler! {
         ) -> i32 {
             1
         }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: i32,
+            error_string: Option<&CefString>,
+        ) {
+            let _ = (browser, status, error_code, error_string);
+            self.shared.record_popup_renderer_termination(self.popup_id);
+        }
     }
 }
 
@@ -336,10 +347,13 @@ wrap_load_handler! {
                 "CEF popup load failed ({code}) at {}",
                 diagnostic_url(&failed_url),
             );
-            self.shared.update_popup_from_load(self.popup_id, |popup| {
+            let failed = self.shared.update_popup_from_load(self.popup_id, |popup| {
                 popup.lifecycle = CefSurfaceLifecycle::Failed;
                 popup.error = Some(message);
             });
+            if failed {
+                self.shared.clear_focus_restore_intent();
+            }
         }
     }
 }

@@ -207,27 +207,56 @@ impl LoginBrowserSessionManager {
         selection: ProfileSelection,
         surface_id: &str,
         owner_records: &EmbeddedOwnerRecordStore,
-    ) -> Result<PreparedEmbeddedLoginBrowserProfile, SessionManagerError> {
-        let inner = self.available()?;
-        let open_guard = inner
-            .open_gate
-            .lock()
-            .map_err(|_| SessionManagerError::StateUnavailable)?;
+    ) -> Result<PreparedEmbeddedLoginBrowserProfile, EmbeddedProfilePreparationError> {
+        let inner = self
+            .available()
+            .map_err(EmbeddedProfilePreparationError::before_profile)?;
+        let open_guard = inner.open_gate.lock().map_err(|_| {
+            EmbeddedProfilePreparationError::before_profile(SessionManagerError::StateUnavailable)
+        })?;
         let workspace_identity = inner
             .workspace_identities
             .resolve(workspace.as_path())
-            .map_err(map_workspace_error)?;
-        let descriptor = self.select_profile(&workspace_identity, selection)?;
+            .map_err(map_workspace_error)
+            .map_err(EmbeddedProfilePreparationError::before_profile)?;
+        let requested_identity = match &selection {
+            ProfileSelection::Existing(profile_id) => Some(EmbeddedProfileIdentity::new(
+                profile_id,
+                &workspace_identity,
+            )),
+            ProfileSelection::Default | ProfileSelection::ExplicitNew => None,
+        };
+        let descriptor = self
+            .select_profile(&workspace_identity, selection)
+            .map_err(|error| {
+                requested_identity.clone().map_or_else(
+                    || EmbeddedProfilePreparationError::before_profile(error),
+                    |identity| EmbeddedProfilePreparationError::for_profile(error, identity),
+                )
+            })?;
+        let recovery_identity =
+            EmbeddedProfileIdentity::new(descriptor.profile_id(), &workspace_identity);
         let reservation = inner
             .profiles
             .reserve_embedded_launch(descriptor.profile_id(), &workspace_identity)
-            .map_err(map_profile_error)?;
+            .map_err(map_profile_error)
+            .map_err(|error| {
+                EmbeddedProfilePreparationError::for_profile(error, recovery_identity.clone())
+            })?;
         let mut owner_record = owner_records
             .begin_profile_reservation(&reservation, surface_id)
-            .map_err(|_| SessionManagerError::StateUnavailable)?;
+            .map_err(|_| {
+                EmbeddedProfilePreparationError::for_profile(
+                    SessionManagerError::StateUnavailable,
+                    recovery_identity.clone(),
+                )
+            })?;
         let (profile_lease, launch_pending_proof) = reservation
             .commit_launch_pending()
-            .map_err(map_profile_error)?;
+            .map_err(map_profile_error)
+            .map_err(|error| {
+                EmbeddedProfilePreparationError::for_profile(error, recovery_identity.clone())
+            })?;
         if owner_record
             .mark_launch_pending(&launch_pending_proof)
             .is_err()
@@ -235,7 +264,10 @@ impl LoginBrowserSessionManager {
             if let Ok((_, release_proof)) = profile_lease.cancel_pending_embedded_launch() {
                 let _ = owner_record.finish_after_profile_release(release_proof);
             }
-            return Err(SessionManagerError::StateUnavailable);
+            return Err(EmbeddedProfilePreparationError::for_profile(
+                SessionManagerError::StateUnavailable,
+                recovery_identity,
+            ));
         }
         drop(open_guard);
         Ok(PreparedEmbeddedLoginBrowserProfile {
@@ -279,11 +311,10 @@ impl LoginBrowserSessionManager {
     pub(in crate::browser::login) fn reap_embedded_owner_records(
         &self,
         store: &super::cef::recovery::EmbeddedOwnerRecordStore,
-    ) -> Result<(), SessionManagerError> {
+    ) -> Result<Vec<super::cef::recovery::EmbeddedOwnerRecoveryRecord>, SessionManagerError> {
         let inner = self.available()?;
         store
             .reap_stale(&inner.profiles)
-            .map(|_| ())
             .map_err(|_| SessionManagerError::StateUnavailable)
     }
 

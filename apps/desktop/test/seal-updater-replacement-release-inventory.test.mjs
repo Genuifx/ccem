@@ -33,6 +33,14 @@ test('sealer revalidates and binds updater evidence to the exact target inventor
         updater: { sha256: expected.updater.artifact.sha256 },
         updaterSignature: { sha256: expected.updater.signature.sha256 },
       },
+      macosSafeStorageRuntimeAttestation: {
+        runId: expected.run.id,
+        runAttempt: expected.run.attempt,
+        repository: expected.run.repository,
+        workflowRef: expected.run.workflowRef,
+        producerWorkflowRef: expected.run.producerWorkflowRef,
+        job: expected.run.job,
+      },
     };
     const inventoryPath = path.join(root, 'inventory.json');
     const evidencePath = path.join(root, 'evidence.json');
@@ -45,6 +53,23 @@ test('sealer revalidates and binds updater evidence to the exact target inventor
       outputPath,
     });
     assert.deepEqual(sealed.updaterReplacementAttestation, summary);
+
+    const staleAttemptPath = path.join(root, 'stale-attempt.json');
+    await writeJson(staleAttemptPath, {
+      ...inventory,
+      macosSafeStorageRuntimeAttestation: {
+        ...inventory.macosSafeStorageRuntimeAttestation,
+        runAttempt: '3',
+      },
+    });
+    await assert.rejects(
+      sealUpdaterReplacementReleaseInventory({
+        inventoryPath: staleAttemptPath,
+        attestationPath: evidencePath,
+        outputPath: path.join(root, 'should-not-seal-stale-attempt.json'),
+      }),
+      /does not bind the exact release target/u,
+    );
 
     const mismatchedPath = path.join(root, 'mismatched.json');
     await writeJson(mismatchedPath, { ...inventory, platform: 'x86_64-apple-darwin' });
@@ -78,6 +103,14 @@ test('sealer binds the Windows updater summary to the exact full installed-tree 
     artifacts: {
       updater: { sha256: expected.updater.artifact.sha256 },
       updaterSignature: { sha256: expected.updater.signature.sha256 },
+    },
+    windowsRuntimeAttestation: {
+      runId: expected.run.id,
+      runAttempt: expected.run.attempt,
+      repository: expected.run.repository,
+      workflowRef: expected.run.workflowRef,
+      producerWorkflowRef: expected.run.producerWorkflowRef,
+      job: expected.run.job,
     },
   };
   const inventoryPath = path.join(root, 'inventory.json');

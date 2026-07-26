@@ -212,10 +212,15 @@ fn windows_native_window_evidence_binds_real_parent_rect_visibility_and_dpi() {
 #[test]
 fn windows_mode2_uses_real_cef_modules_and_production_ipc_not_unsupported_stubs() {
     let modules = include_str!("cef/mod.rs");
+    let shared_surface = include_str!("cef/surface.rs");
     let surface = include_str!("cef/surface/windows.rs");
     let popup = include_str!("cef/surface/windows/popup.rs");
     let windows_util = include_str!("cef/surface/windows/util.rs");
     let windows_mutation = include_str!("cef/surface/windows/mutation.rs");
+    let macos_mutation = include_str!("cef/surface/macos/mutation.rs");
+    let focus_restore = include_str!("cef/surface/focus_restore.rs");
+    let renderer_recovery = include_str!("cef/surface/renderer_recovery.rs");
+    let recovery_state = include_str!("cef/surface/recovery_state.rs");
     let host_shortcut = include_str!("cef/surface/host_shortcut.rs");
     let macos_surface = include_str!("cef/surface/macos.rs");
     let macos_popup = include_str!("cef/surface/macos/popup.rs");
@@ -240,7 +245,42 @@ fn windows_mode2_uses_real_cef_modules_and_production_ipc_not_unsupported_stubs(
         .expect("shared visibility must be committed");
     assert!(native_visibility < shared_visibility);
     assert!(windows_mutation.contains("rollback CEF child visibility failed"));
-    assert!(!surface.contains("GetFocus()"));
+    assert!(windows_util
+        .contains("ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });"));
+    assert!(!windows_util.contains("if visible { SW_SHOW } else { SW_HIDE }"));
+    assert!(windows_mutation.contains("GetFocus()"));
+    assert!(windows_mutation.contains("IsChild(root, focused)"));
+    assert!(windows_mutation.contains("SetFocus(Some(root))"));
+    assert!(macos_mutation.contains("window.firstResponder()"));
+    assert!(macos_mutation.contains("first_view.isDescendantOf(child)"));
+    assert!(macos_mutation.contains("window.makeFirstResponder(Some(child))"));
+    assert!(focus_restore.contains("peek_for_current_popup"));
+    assert!(focus_restore.contains("commit_if_unchanged"));
+    assert!(focus_restore.contains("current_popup == Some(popup_id)"));
+    assert!(windows_mutation.contains("shared.try_restore_focus_intent(current_popup"));
+    assert!(macos_mutation.contains("shared.try_restore_focus_intent(current_popup"));
+    let windows_show = windows_mutation
+        .split_once("pub(crate) fn set_visible(")
+        .expect("Windows visibility mutation")
+        .1
+        .split_once("pub(crate) fn occlude(")
+        .expect("Windows explicit occlusion")
+        .0;
+    let macos_show = macos_mutation
+        .split_once("pub(crate) fn set_visible(")
+        .expect("macOS visibility mutation")
+        .1
+        .split_once("type PopupFocusChild")
+        .expect("macOS focus helpers")
+        .0;
+    assert!(!windows_show.contains("SetFocus("));
+    assert!(!macos_show.contains("makeFirstResponder("));
+    assert!(shared_surface.contains("self.clear_focus_restore_intent();"));
+    assert!(recovery_state.contains("self.clear_focus_restore_intent();"));
+    assert!(surface.contains("shared.clear_focus_restore_intent();"));
+    assert!(macos_surface.contains("shared.clear_focus_restore_intent();"));
+    assert!(popup.contains("self.shared.clear_focus_restore_intent();"));
+    assert!(macos_popup.contains("self.shared.clear_focus_restore_intent();"));
     assert!(popup.contains("reserve_user_popup"));
     assert!(popup.contains("PopupRequestHandler"));
     assert!(popup.contains("!surface.close_requested"));
@@ -248,6 +288,12 @@ fn windows_mode2_uses_real_cef_modules_and_production_ipc_not_unsupported_stubs(
     assert!(surface.contains("fn keyboard_handler(&self) -> Option<KeyboardHandler>"));
     assert!(popup.contains("fn keyboard_handler(&self) -> Option<KeyboardHandler>"));
     assert!(macos_surface.contains("fn keyboard_handler(&self) -> Option<KeyboardHandler>"));
+    assert!(surface.contains("fn request_handler(&self) -> Option<RequestHandler>"));
+    assert!(macos_surface.contains("fn request_handler(&self) -> Option<RequestHandler>"));
+    assert!(renderer_recovery.contains("fn on_render_process_terminated("));
+    assert!(renderer_recovery.contains("self.shared.record_renderer_termination();"));
+    assert!(popup.contains("self.shared.record_popup_renderer_termination(self.popup_id);"));
+    assert!(macos_popup.contains("self.shared.record_popup_renderer_termination(self.popup_id);"));
     assert!(macos_popup.contains("fn keyboard_handler(&self) -> Option<KeyboardHandler>"));
     assert!(host_shortcut.contains("fn on_pre_key_event("));
     assert!(host_shortcut.contains("browser_surface_host_shortcut"));

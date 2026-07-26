@@ -246,6 +246,74 @@ fn pause_cancels_an_active_owner_operation_without_waiting_for_backend_io() {
 }
 
 #[test]
+fn unconfirmed_input_release_forces_the_bound_backend_before_pause_or_user_ack() {
+    for target in [SessionControlOwner::Paused, SessionControlOwner::User] {
+        let fixture = Fixture::new();
+        let opened = fixture
+            .manager
+            .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+            .expect("open");
+        let grant = fixture
+            .manager
+            .handoff_to_agent(
+                TrustedUiControlAuthorization::from_trusted_ui(
+                    &opened.handle,
+                    TrustedUiControlAction::HandoffToAgent,
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            )
+            .expect("handoff");
+        let cancellation = grant
+            .control()
+            .begin_operation(grant.binding(), true)
+            .expect("operation");
+        cancellation.effect_safety_fence().mark_unconfirmed();
+
+        let authorization = TrustedUiControlAuthorization::from_trusted_ui(
+            &opened.handle,
+            match target {
+                SessionControlOwner::Paused => TrustedUiControlAction::PauseAgent,
+                SessionControlOwner::User => TrustedUiControlAction::TakeoverByUser,
+                SessionControlOwner::Agent => unreachable!(),
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let transition = match target {
+            SessionControlOwner::Paused => fixture.manager.pause_agent(authorization),
+            SessionControlOwner::User => fixture.manager.takeover_by_user(authorization),
+            SessionControlOwner::Agent => unreachable!(),
+        };
+
+        assert_eq!(
+            transition.unwrap_err(),
+            SessionManagerError::ControlUnavailable
+        );
+        let failed = fixture.manager.snapshot(&opened.handle).unwrap();
+        assert_eq!(failed.control, SessionControlOwner::Paused);
+        assert_eq!(failed.status, LoginBrowserSessionStatus::CleanupRequired);
+        assert_eq!(fixture.state.lock().unwrap().emergency_count, 1);
+
+        let retry = fixture.manager.pause_agent_if_active(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::PauseAgent,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        assert_eq!(retry.unwrap_err(), SessionManagerError::SessionNotRunning);
+        assert_eq!(
+            fixture.state.lock().unwrap().emergency_count,
+            1,
+            "cleanup-required state must not request a second emergency stop"
+        );
+        fixture.manager.force_stop(&opened.handle).unwrap();
+    }
+}
+
+#[test]
 fn diagnostic_start_failure_rolls_back_before_discovery_and_consumes_the_authority_epoch() {
     let fixture = Fixture::new();
     let opened = fixture

@@ -208,10 +208,91 @@ pub(in crate::browser::login) struct PreparedEmbeddedLoginBrowserProfile {
     owner_record: EmbeddedOwnerRecordHandle,
 }
 
+/// Opaque persisted identities used only to associate startup recovery with the profile selected
+/// by trusted application state. Neither the workspace path nor native/process ownership details
+/// cross this boundary.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::browser::login) struct EmbeddedProfileIdentity {
+    profile_id: String,
+    workspace_id: String,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl EmbeddedProfileIdentity {
+    pub(in crate::browser::login) fn new(
+        profile_id: &ProfileId,
+        workspace_identity: &TrustedWorkspaceIdentity,
+    ) -> Self {
+        Self {
+            profile_id: profile_id.as_str().to_string(),
+            workspace_id: workspace_identity.as_str().to_string(),
+        }
+    }
+
+    pub(in crate::browser::login) fn from_recovery_record(
+        profile_id: String,
+        workspace_id: String,
+    ) -> Self {
+        Self {
+            profile_id,
+            workspace_id,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug)]
+pub(in crate::browser::login) struct EmbeddedProfilePreparationError {
+    source: SessionManagerError,
+    identity: Option<EmbeddedProfileIdentity>,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl EmbeddedProfilePreparationError {
+    pub(in crate::browser::login) fn before_profile(source: SessionManagerError) -> Self {
+        Self {
+            source,
+            identity: None,
+        }
+    }
+
+    pub(in crate::browser::login) fn for_profile(
+        source: SessionManagerError,
+        identity: EmbeddedProfileIdentity,
+    ) -> Self {
+        Self {
+            source,
+            identity: Some(identity),
+        }
+    }
+
+    pub(in crate::browser::login) fn identity(&self) -> Option<&EmbeddedProfileIdentity> {
+        self.identity.as_ref()
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl fmt::Display for EmbeddedProfilePreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl std::error::Error for EmbeddedProfilePreparationError {}
+
 #[cfg(any(target_os = "macos", windows))]
 impl PreparedEmbeddedLoginBrowserProfile {
     pub(in crate::browser::login) fn profile_id(&self) -> &ProfileId {
         &self.registration.profile_id
+    }
+
+    pub(in crate::browser::login) fn recovery_identity(&self) -> EmbeddedProfileIdentity {
+        EmbeddedProfileIdentity::new(
+            &self.registration.profile_id,
+            &self.registration.workspace_identity,
+        )
     }
 
     pub(in crate::browser::login) fn into_launch_parts(

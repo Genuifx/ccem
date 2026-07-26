@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { validateWindowsMode2ProductionSmokeAttestation } from '../scripts/windows-mode2-production-smoke-contract.mjs';
+import {
+  validateWindowsMode2ProductionSmokeAttestation,
+  validateWindowsMode2SmokeSummary,
+} from '../scripts/windows-mode2-production-smoke-contract.mjs';
 import { windowsSmokeFixture } from './fixtures/windows-mode2-production-smoke.mjs';
 
 function validateFixture(fixture) {
@@ -21,6 +24,68 @@ test('internal CEF feature proof cannot be substituted by a forged WMI command l
       /internal CEF NetworkServiceSandbox request/,
     );
   }
+});
+
+test('attestation and summary reject every foreign signed-producer provenance field', () => {
+  const mutations = [
+    ['repository', 'Other/repository'],
+    [
+      'workflowRef',
+      'Genuifx/claude-code-env-manager/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
+    ],
+    [
+      'producerWorkflowRef',
+      'Genuifx/claude-code-env-manager/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
+    ],
+    ['job', 'signed-readiness'],
+  ];
+  for (const [field, value] of mutations) {
+    const attestationFixture = windowsSmokeFixture();
+    attestationFixture.attestation.run[field] = value;
+    assert.throws(
+      () => validateFixture(attestationFixture),
+      /GitHub run identity|attestation run fields differ/u,
+    );
+
+    const summaryFixture = windowsSmokeFixture();
+    const summary = {
+      ...validateFixture(summaryFixture),
+      attestationSha256: 'f'.repeat(64),
+      [field]: value,
+    };
+    assert.throws(
+      () => validateWindowsMode2SmokeSummary(summary, summaryFixture.expected),
+      /smoke summary/u,
+    );
+  }
+});
+
+test('sealed summary fails closed on every folded semantic production gate', () => {
+  for (const field of [
+    'semanticBehaviorVerified',
+    'effectFenceVerified',
+    'profileIsolationVerified',
+    'screenshotArtifactVerified',
+  ]) {
+    const fixture = windowsSmokeFixture();
+    const summary = {
+      ...validateFixture(fixture),
+      attestationSha256: 'f'.repeat(64),
+      [field]: false,
+    };
+    assert.throws(
+      () => validateWindowsMode2SmokeSummary(summary, fixture.expected),
+      /smoke summary is incomplete or mismatched/u,
+    );
+  }
+
+  const missing = windowsSmokeFixture();
+  const summary = { ...validateFixture(missing), attestationSha256: 'f'.repeat(64) };
+  delete summary.semanticBehaviorVerified;
+  assert.throws(
+    () => validateWindowsMode2SmokeSummary(summary, missing.expected),
+    /smoke summary fields differ/u,
+  );
 });
 
 test('NetworkService proof requires exact subtype, LPAC token class, and LPAC authority SID', () => {

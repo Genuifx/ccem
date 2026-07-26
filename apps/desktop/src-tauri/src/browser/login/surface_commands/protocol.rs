@@ -9,7 +9,10 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
 #[cfg(any(target_os = "macos", windows))]
-use super::super::cef::surface::{CefSurfaceLifecycle, CefSurfaceSnapshot};
+use super::super::cef::{
+    recovery::EmbeddedOwnerRecoveryDisposition,
+    surface::{CefSurfaceLifecycle, CefSurfaceRecoveryState, CefSurfaceSnapshot},
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BrowserSurfaceLeaseResponse {
@@ -45,11 +48,50 @@ pub(crate) struct BrowserSurfaceSnapshotResponse {
     paused: bool,
     profile_id: Option<String>,
     session_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_states: Option<Vec<String>>,
     popup_active: bool,
     popup_url: Option<String>,
     popup_title: Option<String>,
     popup_loading: bool,
     popup_error: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrowserSurfaceRecoveryState {
+    RendererProcessTerminated,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl BrowserSurfaceRecoveryState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RendererProcessTerminated => "renderer_process_terminated",
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl BrowserSurfaceSnapshotResponse {
+    pub(super) fn set_recovery_states(&mut self, states: &[EmbeddedOwnerRecoveryDisposition]) {
+        if !states.is_empty() {
+            let recovery_states = self.recovery_states.get_or_insert_with(Vec::new);
+            recovery_states.extend(states.iter().map(|state| state.as_str().to_string()));
+            recovery_states.sort();
+            recovery_states.dedup();
+        }
+    }
+
+    pub(super) fn push_recovery_state(&mut self, state: BrowserSurfaceRecoveryState) {
+        self.recovery_states
+            .get_or_insert_with(Vec::new)
+            .push(state.as_str().to_string());
+        if let Some(states) = self.recovery_states.as_mut() {
+            states.sort();
+            states.dedup();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,7 +121,7 @@ pub(super) fn snapshot_response(
     session: &LoginBrowserSessionSnapshot,
 ) -> BrowserSurfaceSnapshotResponse {
     let popup = native.popup.as_ref();
-    BrowserSurfaceSnapshotResponse {
+    let mut response = BrowserSurfaceSnapshotResponse {
         url: (!native.current_url.is_empty()).then(|| native.current_url.clone()),
         title: native.title.clone(),
         visible: native.visible,
@@ -108,6 +150,7 @@ pub(super) fn snapshot_response(
             LoginBrowserSessionStatus::Closing => "closing",
             LoginBrowserSessionStatus::CleanupRequired => "cleanup_required",
         },
+        recovery_states: None,
         popup_active: popup.is_some(),
         popup_url: popup
             .filter(|popup| !popup.current_url.is_empty())
@@ -120,7 +163,11 @@ pub(super) fn snapshot_response(
             )
         }),
         popup_error: popup.and_then(|popup| popup.error.clone()),
+    };
+    if native.recovery_state == Some(CefSurfaceRecoveryState::RendererProcessTerminated) {
+        response.push_recovery_state(BrowserSurfaceRecoveryState::RendererProcessTerminated);
     }
+    response
 }
 
 pub(super) fn emit_surface_state(
@@ -163,6 +210,8 @@ fn next_server_sequence(current: &mut u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", windows))]
+    use super::BrowserSurfaceRecoveryState;
     use super::{next_server_sequence, snapshot_mutation_response, BrowserSurfaceSnapshotResponse};
     use crate::browser::surface_coordinator::{
         BrowserSurfaceBackend, BrowserSurfaceLease, BrowserSurfaceLifecycle,
@@ -175,6 +224,15 @@ mod tests {
         assert_eq!(next_server_sequence(&mut current), 1);
         assert_eq!(next_server_sequence(&mut current), 2);
         assert_eq!(current, 2);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn renderer_termination_uses_a_stable_non_sensitive_recovery_state() {
+        assert_eq!(
+            BrowserSurfaceRecoveryState::RendererProcessTerminated.as_str(),
+            "renderer_process_terminated"
+        );
     }
 
     #[test]
@@ -204,6 +262,7 @@ mod tests {
                 paused: false,
                 profile_id: Some("profile-a".to_string()),
                 session_status: "running",
+                recovery_states: Some(vec!["recovered_runtime_owned".to_string()]),
                 popup_active: false,
                 popup_url: None,
                 popup_title: None,
@@ -215,5 +274,9 @@ mod tests {
         assert_eq!(json["lease_id"], "lease-a");
         assert_eq!(json["generation"], 8);
         assert_eq!(json["server_sequence"], 17);
+        assert_eq!(
+            json["snapshot"]["recovery_states"][0],
+            "recovered_runtime_owned"
+        );
     }
 }

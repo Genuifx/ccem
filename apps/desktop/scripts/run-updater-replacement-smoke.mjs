@@ -520,6 +520,7 @@ async function runSmoke(options) {
       attempt: runAttempt,
       repository: process.env.GITHUB_REPOSITORY,
       workflowRef: process.env.GITHUB_WORKFLOW_REF,
+      producerWorkflowRef: process.env.CCEM_MODE2_PRODUCER_WORKFLOW_REF,
       job: process.env.GITHUB_JOB,
       challengeNonce,
     },

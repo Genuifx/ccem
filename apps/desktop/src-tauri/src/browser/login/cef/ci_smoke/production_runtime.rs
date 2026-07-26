@@ -1,13 +1,16 @@
 use super::{
     check_cancelled, publish_observation_ready, wait_for_observation_ack, ProductionCleanupProof,
-    ProductionPathCheckpoint, ProductionPathReceipt, ProductionSemanticProof, RuntimeReceipt,
-    StageRecorder, WindowsMode2SmokeConfig, WindowsMode2SmokeRuntime, ACK_TIMEOUT, CDP_TIMEOUT,
-    CLOSE_TIMEOUT, READY_TIMEOUT, SCHEMA_VERSION, SMOKE_URL,
+    ProductionPathCheckpoint, ProductionPathReceipt, ProductionProfileIsolationProof,
+    ProductionSemanticProof, RuntimeReceipt, StageRecorder, WindowsMode2SmokeConfig,
+    WindowsMode2SmokeRuntime, ACK_TIMEOUT, CDP_TIMEOUT, CLOSE_TIMEOUT, READY_TIMEOUT,
+    SCHEMA_VERSION, SMOKE_URL,
 };
 use crate::browser::login::{
     cef::surface::{CefSurfaceConnection, CefSurfaceLifecycle, CefSurfaceRequest, LogicalViewport},
     session::TrustedWorkspacePath,
-    surface_commands::{BrowserSurfaceControlActionArg, ProductionSmokeLease},
+    surface_commands::{
+        BrowserSurfaceControlActionArg, ProductionSmokeLease, ProductionSmokeSemanticRun,
+    },
 };
 use fs2::FileExt;
 use std::{
@@ -16,11 +19,11 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::AppHandle;
 
@@ -45,7 +48,7 @@ pub(super) fn execute_smoke(
 
     let mut stages = StageRecorder::new();
     run_direct_host_probe(&app, &runtime, &config, &cancelled, &mut stages)?;
-    let server = LocalSmokeServer::start()?;
+    let server = LocalSmokeServer::start(&config.nonce)?;
     let mut cleanup =
         ProductionSurfaceCleanup::new(app.clone(), runtime.clone(), Arc::clone(&preview));
 
@@ -57,7 +60,7 @@ pub(super) fn execute_smoke(
         &preview,
         workspace.clone(),
         None,
-        server.url().to_string(),
+        server.bootstrap_url().to_string(),
         1,
     )?;
     cleanup.lease = Some(lease.clone());
@@ -115,16 +118,22 @@ pub(super) fn execute_smoke(
     stages.record("production_handoff")?;
     check_cancelled(&cancelled)?;
 
-    let semantic_marker = format!("CCEM_MODE2_WRITE_{}", &config.nonce[..16]);
-    let pending_write = runtime.sessions.production_smoke_semantic_read_write(
+    let semantic_marker = format!("CCEM_MODE2_PRIMARY_{}", &config.nonce[..16]);
+    let ProductionSmokeSemanticRun {
+        proof: mut semantic,
+        active_effect,
+    } = runtime.sessions.production_smoke_run_semantic_chain(
         &workspace,
-        server.url(),
+        server.semantic_url(),
         &semantic_marker,
     )?;
-    let retained_value = pending_write.retained_value().to_string();
-    stages.record("production_semantic_read_write")?;
+    stages.record("production_semantic_chain_started")?;
+    server.wait_for_effect_entry(Duration::from_secs(5))?;
+    semantic.active_effect_entered = true;
+    stages.record("production_active_effect_entered")?;
     check_cancelled(&cancelled)?;
 
+    let occlusion_started = Instant::now();
     runtime.surfaces.production_smoke_control(
         &app,
         &runtime.sessions,
@@ -133,14 +142,22 @@ pub(super) fn execute_smoke(
         6,
         BrowserSurfaceControlActionArg::Occlude,
     )?;
+    let occlusion_ack_millis =
+        u64::try_from(occlusion_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if occlusion_ack_millis >= 1_000 {
+        return Err(
+            "Windows Mode 2 trusted occlusion acknowledgement exceeded one second".to_string(),
+        );
+    }
+    semantic.occlusion_ack_millis = occlusion_ack_millis;
+    semantic.occlusion_ack_under_one_second = true;
     cleanup.lease = Some(lease.clone());
     stages.record("production_occluded")?;
     check_cancelled(&cancelled)?;
 
-    let mut semantic = runtime
-        .sessions
-        .production_smoke_require_post_pause_write_denial(pending_write)?;
-    stages.record("production_stale_write_denied")?;
+    active_effect.require_cancelled(Duration::from_secs(2))?;
+    semantic.active_effect_cancelled = true;
+    stages.record("production_active_effect_cancelled")?;
     check_cancelled(&cancelled)?;
 
     runtime.surfaces.production_smoke_sync(
@@ -167,13 +184,14 @@ pub(super) fn execute_smoke(
     stages.record("production_rehandoff")?;
     check_cancelled(&cancelled)?;
 
-    runtime.sessions.production_smoke_verify_post_pause_value(
+    runtime.sessions.production_smoke_verify_profile_storage(
         &workspace,
-        server.url(),
-        &retained_value,
-        &mut semantic,
+        server.semantic_url(),
+        &semantic_marker,
+        true,
     )?;
-    stages.record("production_post_pause_verified")?;
+    semantic.post_pause_no_late_write = true;
+    stages.record("production_post_pause_no_late_write")?;
     check_cancelled(&cancelled)?;
 
     runtime.surfaces.production_smoke_control(
@@ -216,9 +234,9 @@ pub(super) fn execute_smoke(
         &runtime.sessions,
         &runtime.cef_host,
         &preview,
-        workspace,
+        workspace.clone(),
         Some(lease.profile_id.clone()),
-        server.url().to_string(),
+        server.semantic_url().to_string(),
         12,
     )?;
     if reopened.profile_id != lease.profile_id {
@@ -238,17 +256,195 @@ pub(super) fn execute_smoke(
     stages.record("production_reopened_shown")?;
     check_cancelled(&cancelled)?;
 
-    runtime.surfaces.production_smoke_release(
+    runtime.surfaces.production_smoke_control(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
         &mut reopened,
         14,
+        BrowserSurfaceControlActionArg::Handoff,
+    )?;
+    cleanup.lease = Some(reopened.clone());
+    stages.record("production_reopened_handoff")?;
+    runtime.sessions.production_smoke_verify_profile_storage(
+        &workspace,
+        server.semantic_url(),
+        &semantic_marker,
+        false,
+    )?;
+    stages.record("production_profile_persistence_verified")?;
+
+    runtime.surfaces.production_smoke_release(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut reopened,
+        15,
     )?;
     cleanup.lease = None;
     stages.record("production_reclosed")?;
 
-    let cleanup_proof = verify_production_cleanup(&runtime, &config, &lease.profile_id)?;
+    let secondary_workspace = config
+        .secondary_workspace_root
+        .to_string_lossy()
+        .into_owned();
+    let mut secondary = runtime.surfaces.production_smoke_acquire(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &preview,
+        secondary_workspace.clone(),
+        None,
+        server.semantic_url().to_string(),
+        16,
+    )?;
+    if secondary.profile_id == lease.profile_id {
+        return Err("Windows Mode 2 isolated workspaces selected the same profile".to_string());
+    }
+    cleanup.lease = Some(secondary.clone());
+    stages.record("production_secondary_acquired")?;
+    runtime.surfaces.production_smoke_sync(
+        &app,
+        &runtime.cef_host,
+        &preview,
+        &mut secondary,
+        17,
+        true,
+    )?;
+    cleanup.lease = Some(secondary.clone());
+    stages.record("production_secondary_shown")?;
+    runtime.surfaces.production_smoke_control(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut secondary,
+        18,
+        BrowserSurfaceControlActionArg::Handoff,
+    )?;
+    cleanup.lease = Some(secondary.clone());
+    stages.record("production_secondary_handoff")?;
+    let secondary_marker = format!("CCEM_MODE2_SECONDARY_{}", &config.nonce[..16]);
+    runtime.sessions.production_smoke_write_isolated_profile(
+        &secondary_workspace,
+        server.semantic_url(),
+        &secondary_marker,
+    )?;
+    stages.record("production_secondary_isolation_verified")?;
+    runtime.surfaces.production_smoke_release(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut secondary,
+        19,
+    )?;
+    cleanup.lease = None;
+    stages.record("production_secondary_released")?;
+
+    let mut reopened_secondary = runtime.surfaces.production_smoke_acquire(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &preview,
+        secondary_workspace.clone(),
+        Some(secondary.profile_id.clone()),
+        server.semantic_url().to_string(),
+        20,
+    )?;
+    if reopened_secondary.profile_id != secondary.profile_id {
+        return Err("Windows Mode 2 smoke reopened a different secondary profile".to_string());
+    }
+    cleanup.lease = Some(reopened_secondary.clone());
+    stages.record("production_secondary_reopened_ready")?;
+    runtime.surfaces.production_smoke_sync(
+        &app,
+        &runtime.cef_host,
+        &preview,
+        &mut reopened_secondary,
+        21,
+        true,
+    )?;
+    cleanup.lease = Some(reopened_secondary.clone());
+    stages.record("production_secondary_reopened_shown")?;
+    runtime.surfaces.production_smoke_control(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut reopened_secondary,
+        22,
+        BrowserSurfaceControlActionArg::Handoff,
+    )?;
+    cleanup.lease = Some(reopened_secondary.clone());
+    stages.record("production_secondary_reopened_handoff")?;
+    runtime.sessions.production_smoke_verify_profile_storage(
+        &secondary_workspace,
+        server.semantic_url(),
+        &secondary_marker,
+        false,
+    )?;
+    stages.record("production_secondary_persistence_verified")?;
+    runtime.surfaces.production_smoke_release(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut reopened_secondary,
+        23,
+    )?;
+    cleanup.lease = None;
+    stages.record("production_secondary_reclosed")?;
+
+    let mut final_primary = runtime.surfaces.production_smoke_acquire(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &preview,
+        workspace.clone(),
+        Some(lease.profile_id.clone()),
+        server.semantic_url().to_string(),
+        24,
+    )?;
+    if final_primary.profile_id != lease.profile_id {
+        return Err("Windows Mode 2 final primary reopen selected a different profile".to_string());
+    }
+    cleanup.lease = Some(final_primary.clone());
+    runtime.surfaces.production_smoke_sync(
+        &app,
+        &runtime.cef_host,
+        &preview,
+        &mut final_primary,
+        25,
+        true,
+    )?;
+    cleanup.lease = Some(final_primary.clone());
+    stages.record("production_primary_final_reopened")?;
+    runtime.surfaces.production_smoke_control(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut final_primary,
+        26,
+        BrowserSurfaceControlActionArg::Handoff,
+    )?;
+    cleanup.lease = Some(final_primary.clone());
+    stages.record("production_primary_final_handoff")?;
+    runtime.sessions.production_smoke_verify_profile_storage(
+        &workspace,
+        server.semantic_url(),
+        &semantic_marker,
+        false,
+    )?;
+    stages.record("production_primary_unchanged_verified")?;
+    runtime.surfaces.production_smoke_release(
+        &app,
+        &runtime.sessions,
+        &runtime.cef_host,
+        &mut final_primary,
+        27,
+    )?;
+    cleanup.lease = None;
+    stages.record("production_primary_final_released")?;
+
+    let cleanup_proof =
+        verify_production_cleanup(&runtime, &config, &lease.profile_id, &secondary.profile_id)?;
     stages.record("production_cleanup_verified")?;
     drop(cleanup);
     drop(server);
@@ -268,13 +464,34 @@ pub(super) fn execute_smoke(
         production_path: ProductionPathReceipt {
             checkpoint,
             semantic: ProductionSemanticProof {
-                read_via_capability: semantic.read_via_capability,
-                write_via_capability: semantic.write_via_capability,
-                write_observed: semantic.write_observed,
-                post_pause_write_denied: semantic.post_pause_write_denied,
-                post_pause_value_unchanged: semantic.post_pause_value_unchanged,
+                navigated_via_capability: semantic.navigated_via_capability,
+                ax_snapshot_via_capability: semantic.ax_snapshot_via_capability,
+                click_via_element_ref: semantic.click_via_element_ref,
+                type_via_element_ref: semantic.type_via_element_ref,
+                screenshot: semantic.screenshot,
+                storage_commit_via_element_ref: semantic.storage_commit_via_element_ref,
+                active_effect_entered: semantic.active_effect_entered,
+                active_effect_cancelled: semantic.active_effect_cancelled,
+                occlusion_ack_under_one_second: semantic.occlusion_ack_under_one_second,
+                occlusion_ack_millis: semantic.occlusion_ack_millis,
+                post_pause_no_late_write: semantic.post_pause_no_late_write,
             },
             reopened_profile_id: reopened.profile_id,
+            secondary_reopened_profile_id: reopened_secondary.profile_id,
+            final_reopened_profile_id: final_primary.profile_id,
+            profile_isolation: ProductionProfileIsolationProof {
+                secondary_workspace_root: secondary_workspace,
+                secondary_profile_id: secondary.profile_id,
+                distinct_workspace_profiles: true,
+                primary_cookie_persisted: true,
+                primary_local_storage_persisted: true,
+                secondary_profile_initially_empty: true,
+                secondary_cookie_isolated: true,
+                secondary_local_storage_isolated: true,
+                secondary_cookie_persisted: true,
+                secondary_local_storage_persisted: true,
+                primary_unchanged_after_secondary: true,
+            },
             cleanup: cleanup_proof,
         },
         stages: stages.stages,
@@ -324,7 +541,8 @@ fn run_direct_host_probe(
 fn verify_production_cleanup(
     runtime: &WindowsMode2SmokeRuntime,
     config: &WindowsMode2SmokeConfig,
-    profile_id: &str,
+    primary_profile_id: &str,
+    secondary_profile_id: &str,
 ) -> Result<ProductionCleanupProof, String> {
     runtime.surfaces.production_smoke_assert_inactive()?;
     let active_session_count = runtime
@@ -339,29 +557,35 @@ fn verify_production_cleanup(
     if owner_record_count != 0 {
         return Err("Windows Mode 2 smoke retained an embedded owner record".to_string());
     }
-    let workspace = TrustedWorkspacePath::from_trusted_app(config.workspace_root.clone())
-        .map_err(|error| error.to_string())?;
-    let profiles = runtime
-        .sessions
-        .profile_summaries(workspace)
-        .map_err(|error| error.to_string())?;
-    if profiles.len() != 1 || profiles[0].profile_id != profile_id {
-        return Err(
-            "Windows Mode 2 smoke production profile inventory is inconsistent".to_string(),
-        );
+    for (workspace_root, profile_id) in [
+        (&config.workspace_root, primary_profile_id),
+        (&config.secondary_workspace_root, secondary_profile_id),
+    ] {
+        let workspace = TrustedWorkspacePath::from_trusted_app(workspace_root.clone())
+            .map_err(|error| error.to_string())?;
+        let profiles = runtime
+            .sessions
+            .profile_summaries(workspace)
+            .map_err(|error| error.to_string())?;
+        if profiles.len() != 1 || profiles[0].profile_id != profile_id {
+            return Err(
+                "Windows Mode 2 smoke workspace profile inventory is inconsistent".to_string(),
+            );
+        }
+        let lock_path = config
+            .profile_state_root
+            .join("profiles")
+            .join(profile_id)
+            .join("profile.lock");
+        require_profile_lock_available(&lock_path)?;
     }
-    let lock_path = config
-        .profile_state_root
-        .join("profiles")
-        .join(profile_id)
-        .join("profile.lock");
-    require_profile_lock_available(&lock_path)?;
     Ok(ProductionCleanupProof {
         active_surface_count: 0,
         active_session_count: 0,
         owner_record_count: 0,
-        persisted_profile_count: 1,
-        profile_lock_available: true,
+        persisted_profile_count: 2,
+        workspace_count: 2,
+        profile_locks_available: true,
     })
 }
 
@@ -418,6 +642,7 @@ impl WindowsMode2SmokeConfig {
         for (path, label) in [
             (&self.data_root, "data"),
             (&self.workspace_root, "workspace"),
+            (&self.secondary_workspace_root, "secondary workspace"),
             (&self.owner_record_root, "owner record"),
             (&self.profile_state_root, "profile state"),
             (&self.cef_cache_root, "CEF cache"),
@@ -511,13 +736,15 @@ impl Drop for ProductionSurfaceCleanup {
 
 struct LocalSmokeServer {
     address: SocketAddr,
-    url: String,
+    bootstrap_url: String,
+    semantic_url: String,
+    effect_entries: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl LocalSmokeServer {
-    fn start() -> Result<Self, String> {
+    fn start(nonce: &str) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind Windows Mode 2 local smoke origin: {error}"))?;
         listener
@@ -527,21 +754,60 @@ impl LocalSmokeServer {
             .local_addr()
             .map_err(|error| format!("resolve Windows Mode 2 local smoke origin: {error}"))?;
         let stopped = Arc::new(AtomicBool::new(false));
+        let effect_entries = Arc::new(AtomicUsize::new(0));
         let worker_stopped = Arc::clone(&stopped);
+        let worker_entries = Arc::clone(&effect_entries);
+        let effect_path = format!("/effect-entered/{}", &nonce[..16]);
+        let worker_effect_path = effect_path.clone();
+        let body = local_smoke_body(&effect_path);
         let worker = thread::Builder::new()
             .name("ccem-mode2-smoke-origin".to_string())
-            .spawn(move || serve_local_origin(listener, worker_stopped))
+            .spawn(move || {
+                serve_local_origin(
+                    listener,
+                    worker_stopped,
+                    worker_entries,
+                    worker_effect_path,
+                    body,
+                )
+            })
             .map_err(|error| format!("start Windows Mode 2 local smoke origin: {error}"))?;
         Ok(Self {
             address,
-            url: format!("http://{address}/mode2-production-smoke"),
+            bootstrap_url: format!("http://{address}/bootstrap"),
+            semantic_url: format!(
+                "http://{address}/mode2-production-smoke?run={}",
+                &nonce[..16]
+            ),
+            effect_entries,
             stopped,
             worker: Some(worker),
         })
     }
 
-    fn url(&self) -> &str {
-        &self.url
+    fn bootstrap_url(&self) -> &str {
+        &self.bootstrap_url
+    }
+
+    fn semantic_url(&self) -> &str {
+        &self.semantic_url
+    }
+
+    fn wait_for_effect_entry(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.effect_entries.load(Ordering::Acquire) {
+                0 => thread::sleep(Duration::from_millis(1)),
+                1 => return Ok(()),
+                _ => {
+                    return Err(
+                        "Windows Mode 2 active effect entered the smoke barrier more than once"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        Err("Windows Mode 2 active effect never reached the page barrier".to_string())
     }
 }
 
@@ -555,10 +821,16 @@ impl Drop for LocalSmokeServer {
     }
 }
 
-fn serve_local_origin(listener: TcpListener, stopped: Arc<AtomicBool>) {
+fn serve_local_origin(
+    listener: TcpListener,
+    stopped: Arc<AtomicBool>,
+    effect_entries: Arc<AtomicUsize>,
+    effect_path: String,
+    body: String,
+) {
     while !stopped.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => respond_local_origin(stream),
+            Ok((stream, _)) => respond_local_origin(stream, &effect_entries, &effect_path, &body),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -567,17 +839,61 @@ fn serve_local_origin(listener: TcpListener, stopped: Arc<AtomicBool>) {
     }
 }
 
-fn respond_local_origin(mut stream: TcpStream) {
+fn respond_local_origin(
+    mut stream: TcpStream,
+    effect_entries: &AtomicUsize,
+    effect_path: &str,
+    body: &str,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut request = [0_u8; 4096];
-    let _ = stream.read(&mut request);
-    const BODY: &str = "<!doctype html><meta charset=utf-8><title>CCEM_WINDOWS_MODE2_PRODUCTION_READY</title><main id=ccem-mode2-production>MODE 2 PRODUCTION MANAGER<label for=ccem-mode2-semantic-input>CCEM Mode 2 semantic input</label><input id=ccem-mode2-semantic-input aria-label=\"CCEM Mode 2 semantic input\" value=\"\"></main>";
+    let count = stream.read(&mut request).unwrap_or(0);
+    let request = String::from_utf8_lossy(&request[..count]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_ascii_whitespace().nth(1));
+    if path == Some(effect_path) {
+        effect_entries.fetch_add(1, Ordering::AcqRel);
+        // Keep mousePressed in flight just long enough for the trusted host to
+        // issue occlusion. The fixed delay is below the 200 ms owner-ack fence;
+        // cancellation wakes transport polling and emits only the safety release.
+        thread::sleep(Duration::from_millis(100));
+        let _ = stream.write_all(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        );
+        let _ = stream.flush();
+        return;
+    }
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{BODY}",
-        BODY.len()
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
+        body.len()
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+fn local_smoke_body(effect_path: &str) -> String {
+    format!(
+        r#"<!doctype html><meta charset=utf-8><title>CCEM_WINDOWS_MODE2_PRODUCTION_READY</title>
+<main id=ccem-mode2-production>
+<label>CCEM Mode 2 semantic input<input id=input aria-label="CCEM Mode 2 semantic input"></label>
+<button id=commit>Commit CCEM Mode 2 profile storage</button>
+<button id=race>Start CCEM Mode 2 cancellable effect</button>
+<input id=cookie readonly aria-label="CCEM Mode 2 cookie marker">
+<input id=local readonly aria-label="CCEM Mode 2 local storage marker">
+<input id=entered readonly aria-label="CCEM Mode 2 effect entered">
+<input id=late readonly aria-label="CCEM Mode 2 late write">
+</main><script>
+const storageKey='ccem_mode2_profile_marker';
+const readCookie=()=>{{const row=document.cookie.split('; ').find(v=>v.startsWith(storageKey+'='));return row?decodeURIComponent(row.slice(storageKey.length+1)):'';}};
+const sync=()=>{{cookie.value=readCookie();local.value=localStorage.getItem(storageKey)||'';input.value=local.value||cookie.value;}};
+commit.addEventListener('click',()=>{{document.cookie=storageKey+'='+encodeURIComponent(input.value)+'; Path=/; SameSite=Strict';localStorage.setItem(storageKey,input.value);sync();}});
+race.addEventListener('mousedown',()=>{{entered.value='EFFECT_ENTERED';const request=new XMLHttpRequest();request.open('GET','{effect_path}',false);request.send();}});
+race.addEventListener('click',()=>{{late.value='LATE_WRITE_MUST_NOT_APPEAR';}});
+sync();
+</script>"#
+    )
 }
 
 fn require_cdp_document(

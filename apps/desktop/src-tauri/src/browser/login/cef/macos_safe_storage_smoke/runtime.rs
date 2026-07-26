@@ -52,6 +52,7 @@ struct RuntimeFacts {
     safe_storage_branding_verified: bool,
     system_keychain_marker_verified: bool,
     persistent_cookie_verified: bool,
+    production_path: Option<super::production_runtime::MacosProductionPathProof>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +67,11 @@ struct RuntimeReceipt<'a> {
     source_commit: &'a str,
     run_id: &'a str,
     run_attempt: &'a str,
+    target: &'a str,
+    repository: &'a str,
+    workflow_ref: &'a str,
+    producer_workflow_ref: &'a str,
+    job: &'a str,
     scenario: &'a str,
     phase: &'a str,
     app_version: &'static str,
@@ -84,6 +90,7 @@ struct RuntimeReceipt<'a> {
     persistent_profile_storage: bool,
     normal_startup_bypassed: bool,
     sandbox_enabled: bool,
+    production_path: Option<&'a super::production_runtime::MacosProductionPathProof>,
     stages: &'a [SmokeStage],
 }
 
@@ -487,9 +494,15 @@ fn execute_smoke(
     require_closed(reopened.wait_until_closed(CLOSE_TIMEOUT)?)?;
     cleanup.surface_open = false;
     recorder.record("reclosed")?;
-    if let Ok(mut facts) = facts.lock() {
-        facts.persistent_cookie_verified = true;
-    }
+    drop(reopened);
+    check_cancelled(&cancelled)?;
+    let production_path = super::production_runtime::run(&app, Arc::clone(&controller), &config)?;
+    let mut facts = facts
+        .lock()
+        .map_err(|_| "macOS Mode 2 runtime facts are unavailable".to_string())?;
+    facts.persistent_cookie_verified = true;
+    facts.production_path = Some(production_path);
+    drop(facts);
     drop(server);
     Ok(())
 }
@@ -758,6 +771,11 @@ fn write_terminal_receipt(
         source_commit: &config.source_commit,
         run_id: &config.run_id,
         run_attempt: &config.run_attempt,
+        target: &config.target,
+        repository: &config.repository,
+        workflow_ref: &config.workflow_ref,
+        producer_workflow_ref: &config.producer_workflow_ref,
+        job: &config.job,
         scenario: &config.scenario,
         phase: &config.phase,
         app_version: env!("CARGO_PKG_VERSION"),
@@ -776,6 +794,7 @@ fn write_terminal_receipt(
         persistent_profile_storage: true,
         normal_startup_bypassed: true,
         sandbox_enabled: facts.sandbox_enabled,
+        production_path: facts.production_path.as_ref(),
         stages,
     };
     write_json_atomic_create(&config.receipt_path, &receipt)

@@ -110,9 +110,7 @@ pub(super) fn abort_pending_popup(
 ) {
     let removed = SURFACES.with(|surfaces| {
         let mut surfaces = surfaces.borrow_mut();
-        let Some(surface) = surfaces.get_mut(surface_id) else {
-            return None;
-        };
+        let surface = surfaces.get_mut(surface_id)?;
         let pending = surface
             .popup
             .as_ref()
@@ -221,7 +219,7 @@ wrap_request_handler! {
             _user_gesture: i32,
             _is_redirect: i32,
         ) -> i32 {
-            if !frame.is_some_and(|frame| frame.is_main() == 1) {
+            if frame.is_none_or(|frame| frame.is_main() != 1) {
                 return 0;
             }
             let url = request
@@ -244,6 +242,17 @@ wrap_request_handler! {
         ) -> i32 {
             // A second tab/window would escape the one-popup ownership model.
             1
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: i32,
+            error_string: Option<&CefString>,
+        ) {
+            let _ = (browser, status, error_code, error_string);
+            self.shared.record_popup_renderer_termination(self.popup_id);
         }
     }
 }
@@ -313,7 +322,7 @@ wrap_load_handler! {
             error_text: Option<&CefString>,
             failed_url: Option<&CefString>,
         ) {
-            if !frame.is_some_and(|frame| frame.is_main() == 1) {
+            if frame.is_none_or(|frame| frame.is_main() != 1) {
                 return;
             }
             let code = sys::cef_errorcode_t::from(error_code) as i32;
@@ -326,10 +335,13 @@ wrap_load_handler! {
                 "CEF popup load failed ({code}) at {}",
                 diagnostic_url(&failed_url),
             );
-            self.shared.update_popup_from_load(self.popup_id, |popup| {
+            let failed = self.shared.update_popup_from_load(self.popup_id, |popup| {
                 popup.lifecycle = CefSurfaceLifecycle::Failed;
                 popup.error = Some(message);
             });
+            if failed {
+                self.shared.clear_focus_restore_intent();
+            }
         }
     }
 }

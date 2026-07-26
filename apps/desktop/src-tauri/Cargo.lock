@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "ccem-desktop"
-version = "2.57.0"
+version = "2.58.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -596,6 +596,7 @@ dependencies = [
  "cbc",
  "cef",
  "chrono",
+ "crc32fast",
  "dirs 5.0.1",
  "fs2",
  "hex",
@@ -609,6 +610,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-web-kit 0.2.2",
  "plist",
+ "png 0.18.0",
  "quick-xml 0.31.0",
  "rand 0.8.5",
  "reqwest",

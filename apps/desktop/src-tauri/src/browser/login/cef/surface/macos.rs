@@ -2,7 +2,7 @@ use super::{
     diagnostic_url, profile_cache_path, run_cancellable_on_main,
     should_retire_surface_without_browser, validate_surface_id, CefSurfaceConnection,
     CefSurfaceLifecycle, CefSurfaceOpenSpec, HostShortcutKeyboardHandler, NativeChildBounds,
-    SharedSurfaceState,
+    SharedSurfaceState, SurfaceRequestHandler,
 };
 use crate::browser::login::cef::{
     devtools_bridge::{CefDevToolsBridge, CefDevToolsObserver},
@@ -11,7 +11,6 @@ use crate::browser::login::cef::{
 use cef::*;
 use cef_objc2::MainThreadMarker;
 use cef_objc2_app_kit::NSView;
-use cef_objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -23,7 +22,10 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+mod mutation;
 mod popup;
+
+pub(crate) use mutation::{occlude, set_bounds, set_visible};
 
 const DEVTOOLS_DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 const SURFACE_CLOSE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -99,6 +101,7 @@ fn finalize_surface_if_terminal(surface_id: &str, shared: &Arc<SharedSurfaceStat
     surface.browser.take();
     surface.context.take();
     drop(surface);
+    shared.clear_focus_restore_intent();
     shared.update(|state| {
         state.lifecycle = CefSurfaceLifecycle::Closed;
         state.devtools_attached = false;
@@ -166,16 +169,7 @@ wrap_load_handler! {
                 return;
             }
             let url = CefString::from(&frame.url()).to_string();
-            self.shared.update(|state| {
-                if !matches!(
-                    state.lifecycle,
-                    CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
-                ) {
-                    state.lifecycle = CefSurfaceLifecycle::Loading;
-                    state.current_url = url;
-                    state.error = None;
-                }
-            });
+            self.shared.begin_main_frame_load(url);
         }
 
         fn on_load_end(
@@ -195,16 +189,7 @@ wrap_load_handler! {
             if url == "about:blank" && self.initial_url != "about:blank" {
                 return;
             }
-            self.shared.update(|state| {
-                state.current_url = url;
-                if !matches!(
-                    state.lifecycle,
-                    CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
-                ) {
-                    state.lifecycle = CefSurfaceLifecycle::Ready;
-                    state.error = None;
-                }
-            });
+            self.shared.finish_main_frame_load(url);
         }
 
         fn on_load_error(
@@ -215,7 +200,7 @@ wrap_load_handler! {
             error_text: Option<&CefString>,
             failed_url: Option<&CefString>,
         ) {
-            if !frame.is_some_and(|frame| frame.is_main() == 1) {
+            if frame.is_none_or(|frame| frame.is_main() != 1) {
                 return;
             }
             let code = sys::cef_errorcode_t::from(error_code) as i32;
@@ -463,6 +448,10 @@ wrap_client! {
             Some(HostShortcutKeyboardHandler::new(self.app.clone(), self.surface_id.clone()))
         }
 
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(SurfaceRequestHandler::new(Arc::clone(&self.shared)))
+        }
+
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(SurfaceLoadHandler::new(
                 Arc::clone(&self.shared),
@@ -695,76 +684,6 @@ pub(crate) fn create_surface(
     })
 }
 
-pub(crate) fn set_bounds(surface_id: &str, bounds: NativeChildBounds) -> Result<(), String> {
-    require_main_thread()?;
-    let browsers = SURFACES.with(|surfaces| {
-        let mut surfaces = surfaces.borrow_mut();
-        let surface = surfaces
-            .get_mut(surface_id)
-            .ok_or_else(|| format!("CEF surface {surface_id} does not exist"))?;
-        surface.bounds = bounds;
-        Ok::<_, String>((
-            surface.browser.clone(),
-            surface
-                .popup
-                .as_ref()
-                .and_then(|popup| popup.browser.clone()),
-        ))
-    })?;
-    for browser in [browsers.0, browsers.1].into_iter().flatten() {
-        let host = browser
-            .host()
-            .ok_or_else(|| "CEF BrowserHost is unavailable".to_string())?;
-        let child = host.window_handle().cast::<NSView>();
-        let child = unsafe { child.as_ref() }
-            .ok_or_else(|| "CEF child NSView is unavailable".to_string())?;
-        child.setFrame(NSRect::new(
-            NSPoint::new(bounds.x.into(), bounds.y.into()),
-            NSSize::new(bounds.width.into(), bounds.height.into()),
-        ));
-        host.notify_move_or_resize_started();
-    }
-    Ok(())
-}
-
-pub(crate) fn set_visible(surface_id: &str, visible: bool) -> Result<(), String> {
-    require_main_thread()?;
-    let (primary, popup_browser) = SURFACES.with(|surfaces| {
-        let mut surfaces = surfaces.borrow_mut();
-        let surface = surfaces
-            .get_mut(surface_id)
-            .ok_or_else(|| format!("CEF surface {surface_id} does not exist"))?;
-        surface.visible = visible;
-        surface.shared.update(|state| state.visible = visible);
-        Ok::<_, String>((
-            surface.browser.clone(),
-            surface
-                .popup
-                .as_ref()
-                .and_then(|popup| popup.browser.clone()),
-        ))
-    })?;
-    if let Some(browser) = primary {
-        let host = browser
-            .host()
-            .ok_or_else(|| "CEF BrowserHost is unavailable".to_string())?;
-        let child = host.window_handle().cast::<NSView>();
-        let child = unsafe { child.as_ref() }
-            .ok_or_else(|| "CEF child NSView is unavailable".to_string())?;
-        child.setHidden(!visible || popup_browser.is_some());
-    }
-    if let Some(browser) = popup_browser {
-        let host = browser
-            .host()
-            .ok_or_else(|| "CEF popup BrowserHost is unavailable".to_string())?;
-        let child = host.window_handle().cast::<NSView>();
-        let child = unsafe { child.as_ref() }
-            .ok_or_else(|| "CEF popup child NSView is unavailable".to_string())?;
-        child.setHidden(!visible);
-    }
-    Ok(())
-}
-
 pub(crate) fn navigate(surface_id: &str, url: &str) -> Result<(), String> {
     require_main_thread()?;
     if url.trim().is_empty() {
@@ -781,15 +700,7 @@ pub(crate) fn navigate(surface_id: &str, url: &str) -> Result<(), String> {
         let frame = browser
             .main_frame()
             .ok_or_else(|| "CEF child browser has no main frame".to_string())?;
-        surface.shared.update(|state| {
-            if !matches!(
-                state.lifecycle,
-                CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
-            ) {
-                state.lifecycle = CefSurfaceLifecycle::Loading;
-                state.error = None;
-            }
-        });
+        surface.shared.begin_navigation()?;
         let url = CefString::from(url);
         frame.load_url(Some(&url));
         Ok(())
@@ -833,6 +744,7 @@ pub(crate) fn close(surface_id: &str) -> Result<(), String> {
             remove_without_browser,
         ))
     })?;
+    shared.clear_focus_restore_intent();
     shared.deny_popups();
 
     if remove_without_browser {

@@ -156,6 +156,7 @@ export async function verifyReleasePayloads({
       || inventory.sourceCommit !== exactSourceCommit
       || inventory.appVersion !== exactVersion
       || inventory.updaterReplacementAttestation?.runId !== exactRunId
+      || inventory.updaterReplacementAttestation?.runAttempt !== exactRunAttempt
       || !sameSet(Object.keys(manifest.assets ?? {}), expectedRoles)
       || !sameSet(Object.keys(inventory.artifacts ?? {}), expectedRoles)
     ) {

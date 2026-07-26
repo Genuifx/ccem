@@ -301,7 +301,7 @@ test('signed producer imports once, pre-signs CEF, and has no unsigned fallback'
   const prepareIndex = workflow.indexOf('node scripts/stage-cef-macos.mjs --prepare-for-signing');
   const signIndex = workflow.indexOf('node scripts/sign-and-attest-cef-macos.mjs');
   const signedActionIndex = workflow.indexOf('- name: Build production bundles without release access');
-  const signedActionEndIndex = workflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage isolation and persistence');
+  const signedActionEndIndex = workflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage and production behavior');
   assert.ok(importIndex > 0 && importIndex < prepareIndex && prepareIndex < signIndex && signIndex < signedActionIndex);
   assert.ok(signedActionEndIndex > signedActionIndex);
   const signedAction = workflow.slice(

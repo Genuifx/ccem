@@ -39,7 +39,6 @@ const MAX_PAGE_TEXT_CHARS: usize = 2_000_000;
 const MAX_PENDING_SESSIONS: usize = 32;
 const MAX_SESSIONS: usize = 64;
 const IDLE_EVENT_BURST: usize = 64;
-const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const SECONDARY_TARGET_CLOSE_TIMEOUT: Duration = Duration::from_millis(300);
 const FETCH_DISPOSITION_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -354,78 +353,33 @@ impl SemanticEngine {
             cancellation,
             self,
         )?;
-        let mut press_may_be_down = false;
-        let dispatch_result = (|| {
+        ensure_not_cancelled(cancellation)?;
+        self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
+        let (_, sequence) = client.begin_input_sequence(
+            CdpMethod::InputDispatchMouseEvent,
+            serde_json::json!({
+                "type": "mousePressed",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1
+            }),
+            &session,
+            deadline,
+            cancellation,
+            self,
+        )?;
+        if let Err(error) = (|| {
             ensure_not_cancelled(cancellation)?;
-            self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
-            press_may_be_down = true;
-            client.call(
-                CdpMethod::InputDispatchMouseEvent,
-                serde_json::json!({
-                    "type": "mousePressed",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "clickCount": 1
-                }),
-                Some(&session),
-                deadline,
-                cancellation,
-                self,
-            )?;
-            ensure_not_cancelled(cancellation)?;
-            self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
-            client.call(
-                CdpMethod::InputDispatchMouseEvent,
-                serde_json::json!({
-                    "type": "mouseReleased",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "clickCount": 1
-                }),
-                Some(&session),
-                deadline,
-                cancellation,
-                self,
-            )?;
-            press_may_be_down = false;
-            Ok::<(), BackendFailure>(())
-        })();
-        if let Err(error) = dispatch_result {
-            if press_may_be_down {
-                self.release_mouse_best_effort(client, &session, x, y);
-            }
-            return Err(error);
+            self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)
+        })() {
+            return Err(client.abort_input_sequence_preserving_error(sequence, self, error));
         }
+        client.finish_input_sequence(sequence, deadline, cancellation, self)?;
         ensure_not_cancelled(cancellation)?;
         Ok(SemanticBrowserResult::Action(ActionResult {
             completed: true,
         }))
-    }
-
-    fn release_mouse_best_effort(
-        &mut self,
-        client: &mut CdpClient<'_>,
-        session: &str,
-        x: f64,
-        y: f64,
-    ) {
-        let _ = client.call(
-            CdpMethod::InputDispatchMouseEvent,
-            serde_json::json!({
-                "type": "mouseReleased",
-                "x": x,
-                "y": y,
-                "button": "left",
-                "buttons": 0,
-                "clickCount": 0
-            }),
-            Some(session),
-            Instant::now() + INPUT_CLEANUP_TIMEOUT,
-            &NeverCancelled,
-            self,
-        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -453,21 +407,14 @@ impl SemanticEngine {
         )?;
         if replace {
             let modifier = if cfg!(target_os = "macos") { 4 } else { 2 };
-            for (key_down, key_up) in [
-                (
-                    serde_json::json!({"type":"keyDown","key":"a","code":"KeyA","modifiers":modifier}),
-                    serde_json::json!({"type":"keyUp","key":"a","code":"KeyA","modifiers":modifier}),
-                ),
-                (
-                    serde_json::json!({"type":"keyDown","key":"Backspace","code":"Backspace"}),
-                    serde_json::json!({"type":"keyUp","key":"Backspace","code":"Backspace"}),
-                ),
+            for key_down in [
+                serde_json::json!({"type":"keyDown","key":"a","code":"KeyA","modifiers":modifier}),
+                serde_json::json!({"type":"keyDown","key":"Backspace","code":"Backspace"}),
             ] {
                 self.dispatch_key_pair(
                     client,
                     &session,
                     key_down,
-                    key_up,
                     cancellation,
                     deadline,
                     expected_generation,
@@ -496,59 +443,29 @@ impl SemanticEngine {
         client: &mut CdpClient<'_>,
         session: &str,
         key_down: Value,
-        key_up: Value,
         cancellation: &OperationCancellation,
         deadline: Instant,
         expected_generation: u64,
     ) -> Result<(), BackendFailure> {
         ensure_not_cancelled(cancellation)?;
         self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
-        let mut key_may_be_down = true;
-        let dispatch_result = (|| {
-            client.call(
-                CdpMethod::InputDispatchKeyEvent,
-                key_down,
-                Some(session),
-                deadline,
-                cancellation,
-                self,
-            )?;
-            ensure_not_cancelled(cancellation)?;
-            self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
-            client.call(
-                CdpMethod::InputDispatchKeyEvent,
-                key_up.clone(),
-                Some(session),
-                deadline,
-                cancellation,
-                self,
-            )?;
-            key_may_be_down = false;
-            Ok::<(), BackendFailure>(())
-        })();
-        if let Err(error) = dispatch_result {
-            if key_may_be_down {
-                self.release_key_best_effort(client, session, key_up);
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn release_key_best_effort(
-        &mut self,
-        client: &mut CdpClient<'_>,
-        session: &str,
-        key_up: Value,
-    ) {
-        let _ = client.call(
+        let (_, sequence) = client.begin_input_sequence(
             CdpMethod::InputDispatchKeyEvent,
-            key_up,
-            Some(session),
-            Instant::now() + INPUT_CLEANUP_TIMEOUT,
-            &NeverCancelled,
+            key_down,
+            session,
+            deadline,
+            cancellation,
             self,
-        );
+        )?;
+        let validation = (|| {
+            ensure_not_cancelled(cancellation)?;
+            self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)
+        })();
+        if let Err(error) = validation {
+            return Err(client.abort_input_sequence_preserving_error(sequence, self, error));
+        }
+        client.finish_input_sequence(sequence, deadline, cancellation, self)?;
+        Ok(())
     }
 
     fn read_page(
@@ -939,6 +856,10 @@ fn security_audit_failure() -> BackendFailure {
 #[cfg(test)]
 #[path = "semantics_tests.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "input_sequence_race_tests.rs"]
+mod input_sequence_race_tests;
 
 #[cfg(test)]
 #[path = "semantics_security_audit_tests.rs"]

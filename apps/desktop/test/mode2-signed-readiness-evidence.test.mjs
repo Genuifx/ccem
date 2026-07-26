@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  MODE2_SIGNED_PRODUCER_JOB,
   MODE2_SIGNED_READINESS_TARGETS,
   run,
   verifyMode2SignedReadinessEvidence,
@@ -40,6 +41,9 @@ const RUN_ATTEMPT = '3';
 const REPOSITORY = 'Genuifx/claude-code-env-manager';
 const WORKFLOW_REF =
   `${REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
+const PRODUCER_WORKFLOW_REF =
+  `${REPOSITORY}/.github/workflows/mode2-signed-producer.yml@refs/heads/main`;
+const JOB = 'build-desktop';
 const SAFE_STORAGE_BRANDING = Object.freeze({
   schemaVersion: 1,
   method: 'unique-null-padded-literal-replacement-v1',
@@ -62,13 +66,17 @@ function artifact(fileName, seed) {
 
 function macosRuntimeAttestation(target, executableSha256, seed) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     platform: target,
     status: 'passed',
     sourceCommit: SOURCE_COMMIT,
     appVersion: VERSION,
     runId: RUN_ID,
     runAttempt: RUN_ATTEMPT,
+    repository: REPOSITORY,
+    workflowRef: WORKFLOW_REF,
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
     attestationSha256: seed.repeat(64),
     executableSha256,
     frameworkSha256: SAFE_STORAGE_BRANDING.signedExecutableSha256,
@@ -79,6 +87,11 @@ function macosRuntimeAttestation(target, executableSha256, seed) {
     cleanKeychainVerified: true,
     genericConflictIsolationVerified: true,
     cookiePersistenceVerified: true,
+    productionBehaviorVerified: true,
+    semanticLaunchCount: 4,
+    effectFenceVerified: true,
+    profileIsolationVerified: true,
+    screenshotArtifactsVerified: true,
     keychainStateRestored: true,
     cleanupVerified: true,
   };
@@ -101,7 +114,8 @@ function updaterReplacementAttestation(
     runAttempt: RUN_ATTEMPT,
     repository: REPOSITORY,
     workflowRef: WORKFLOW_REF,
-    job: 'build-desktop',
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
     challengeNonce: '0'.repeat(64),
     sourceCommit: SOURCE_COMMIT,
     previousTag: 'v2.57.0',
@@ -185,6 +199,10 @@ function createInventories() {
     appVersion: VERSION,
     runId: RUN_ID,
     runAttempt: RUN_ATTEMPT,
+    repository: REPOSITORY,
+    workflowRef: WORKFLOW_REF,
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
     installedExecutableSha256: 'b'.repeat(64),
     installerSha256: '7'.repeat(64),
     runtimeInventorySha256: windowsRuntimeFingerprint.sha256,
@@ -201,6 +219,10 @@ function createInventories() {
     verifiedPathCount: windowsRuntimeFingerprint.verifiedPathCount,
     verifiedPathsSha256: hashWindowsMode2SmokeJson(windowsRuntimeFingerprint.relativePaths),
     productionPathVerified: true,
+    semanticBehaviorVerified: true,
+    effectFenceVerified: true,
+    profileIsolationVerified: true,
+    screenshotArtifactVerified: true,
     nativeWindowVerified: true,
     processTokenSandboxVerified: true,
     networkServiceSandboxed: true,
@@ -332,6 +354,7 @@ async function createFixture(t) {
       runAttempt: RUN_ATTEMPT,
       repository: REPOSITORY,
       workflowRef: WORKFLOW_REF,
+      producerWorkflowRef: PRODUCER_WORKFLOW_REF,
       output,
     },
   };
@@ -346,6 +369,7 @@ function cliArguments(options) {
     '--run-attempt', options.runAttempt,
     '--repository', options.repository,
     '--workflow-ref', options.workflowRef,
+    '--producer-workflow-ref', options.producerWorkflowRef,
     '--output', options.output,
   ];
 }
@@ -367,9 +391,12 @@ test('CLI verifies and atomically writes one three-target signed-readiness aggre
   assert.equal(summary.runAttempt, RUN_ATTEMPT);
   assert.equal(summary.repository, REPOSITORY);
   assert.equal(summary.workflowRef, WORKFLOW_REF);
+  assert.equal(summary.producerWorkflowRef, PRODUCER_WORKFLOW_REF);
+  assert.equal(summary.job, JOB);
+  assert.equal(MODE2_SIGNED_PRODUCER_JOB, JOB);
   assert.deepEqual(summary.targets.map(({ target }) => target), MODE2_SIGNED_READINESS_TARGETS);
   assert.deepEqual(summary.inventory.targets.map(({ platform }) => platform), MODE2_SIGNED_READINESS_TARGETS);
-  assert.equal(summary.targets[0].runtimeAttestation.kind, 'macos-safe-storage-runtime');
+  assert.equal(summary.targets[0].runtimeAttestation.kind, 'macos-mode2-production-runtime');
   assert.equal(summary.targets[2].runtimeAttestation.kind, 'windows-mode2-runtime');
   assert.match(summary.targets[0].inventorySha256, /^[a-f0-9]{64}$/u);
   assert.equal((await fs.stat(fixture.output)).mode & 0o777, 0o600);
@@ -489,6 +516,10 @@ test('every updater replacement attestation field is bound on every target', asy
     ['target', 'unexpected-target'],
     ['repository', 'Other/example'],
     ['workflowRef', `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`],
+    [
+      'producerWorkflowRef',
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`,
+    ],
     ['job', 'signed-readiness'],
   ];
   for (const target of MODE2_SIGNED_READINESS_TARGETS) {
@@ -512,6 +543,13 @@ test('macOS Safe Storage runtime identity fields are individually bound', async 
     ['runId', '1234'],
     ['runAttempt', '9'],
     ['sourceCommit', 'b'.repeat(40)],
+    ['repository', 'Other/example'],
+    ['workflowRef', `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`],
+    [
+      'producerWorkflowRef',
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`,
+    ],
+    ['job', 'signed-readiness'],
     ['platform', 'x86_64-pc-windows-msvc'],
   ];
   for (const target of MODE2_SIGNED_READINESS_TARGETS.slice(0, 2)) {
@@ -520,6 +558,10 @@ test('macOS Safe Storage runtime identity fields are individually bound', async 
         const fixture = await createFixture(subtest);
         await mutateInventory(fixture, target, (inventory) => {
           inventory.macosSafeStorageRuntimeAttestation[field] = value;
+          if (field === 'repository') {
+            inventory.macosSafeStorageRuntimeAttestation.workflowRef =
+              `${value}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
+          }
         });
         await assert.rejects(
           () => verifyMode2SignedReadinessEvidence(fixture.options),
@@ -530,11 +572,39 @@ test('macOS Safe Storage runtime identity fields are individually bound', async 
   }
 });
 
+test('macOS production behavior gates are individually fail-closed', async (t) => {
+  for (const [field, value] of [
+    ['productionBehaviorVerified', false],
+    ['semanticLaunchCount', 3],
+    ['effectFenceVerified', false],
+    ['profileIsolationVerified', false],
+    ['screenshotArtifactsVerified', false],
+  ]) {
+    await t.test(field, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      await mutateInventory(fixture, 'aarch64-apple-darwin', (inventory) => {
+        inventory.macosSafeStorageRuntimeAttestation[field] = value;
+      });
+      await assert.rejects(
+        () => verifyMode2SignedReadinessEvidence(fixture.options),
+        /release summary|productionBehavior|production behavior|semantic|effect|profile|screenshot/u,
+      );
+    });
+  }
+});
+
 test('Windows Mode 2 runtime identity fields are individually bound', async (t) => {
   const mutations = [
     ['runId', '1234'],
     ['runAttempt', '9'],
     ['sourceCommit', 'b'.repeat(40)],
+    ['repository', 'Other/example'],
+    ['workflowRef', `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`],
+    [
+      'producerWorkflowRef',
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`,
+    ],
+    ['job', 'signed-readiness'],
     ['platform', 'aarch64-apple-darwin'],
   ];
   for (const [field, value] of mutations) {
@@ -542,10 +612,34 @@ test('Windows Mode 2 runtime identity fields are individually bound', async (t) 
       const fixture = await createFixture(subtest);
       await mutateInventory(fixture, 'x86_64-pc-windows-msvc', (inventory) => {
         inventory.windowsRuntimeAttestation[field] = value;
+        if (field === 'repository') {
+          inventory.windowsRuntimeAttestation.workflowRef =
+            `${value}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
+        }
       });
       await assert.rejects(
         () => verifyMode2SignedReadinessEvidence(fixture.options),
-        /Windows Mode 2 smoke summary|Windows Mode 2 runtime/u,
+        /(?:Windows Mode 2|smoke) summary|Windows Mode 2 runtime/u,
+      );
+    });
+  }
+});
+
+test('Windows production behavior gates are individually fail-closed', async (t) => {
+  for (const field of [
+    'semanticBehaviorVerified',
+    'effectFenceVerified',
+    'profileIsolationVerified',
+    'screenshotArtifactVerified',
+  ]) {
+    await t.test(field, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      await mutateInventory(fixture, 'x86_64-pc-windows-msvc', (inventory) => {
+        inventory.windowsRuntimeAttestation[field] = false;
+      });
+      await assert.rejects(
+        () => verifyMode2SignedReadinessEvidence(fixture.options),
+        new RegExp(field, 'u'),
       );
     });
   }

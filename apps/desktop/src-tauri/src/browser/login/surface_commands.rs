@@ -1,13 +1,12 @@
 use super::session::{
     LoginBrowserSessionHandle, LoginBrowserSessionManager, LoginBrowserSessionSnapshot,
-    ProfileSelection, SessionManagerError, TrustedUiControlAction, TrustedUiControlAuthorization,
-    TrustedWorkspacePath,
+    SessionControlOwner, SessionManagerError, TrustedUiControlAction,
+    TrustedUiControlAuthorization, TrustedWorkspacePath,
 };
 use crate::browser::surface_coordinator::{
     BrowserSurfaceApplyOutcome, BrowserSurfaceBackend, BrowserSurfaceCoordinator,
 };
 use crate::browser::BrowserManager;
-use serde::Deserialize;
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", windows))]
 use std::sync::Barrier;
@@ -23,7 +22,6 @@ use super::cef::{
     session_runtime::prepare_launched_runtime_with_owner_record,
     surface::{
         CefSurfaceRequest, CefSurfaceSnapshot, CefSurfaceStateChange, CefSurfaceStateHandle,
-        LogicalViewport,
     },
 };
 
@@ -33,14 +31,30 @@ const SURFACE_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 #[cfg(any(target_os = "macos", windows))]
 const SURFACE_CONTROL_AUTHORIZATION_TTL: Duration = Duration::from_secs(30);
 
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), test))]
 mod production_smoke;
 mod protocol;
+#[cfg(any(target_os = "macos", windows))]
+mod recovery_projection;
+mod request;
+#[cfg(any(not(debug_assertions), test))]
+pub(in crate::browser::login) use production_smoke::ProductionSmokeScreenshotProof;
 #[cfg(not(debug_assertions))]
-pub(in crate::browser::login) use production_smoke::ProductionSmokeLease;
+pub(in crate::browser::login) use production_smoke::{
+    ProductionSmokeLease, ProductionSmokeSemanticRun,
+};
 use protocol::{
     snapshot_mutation_response, snapshot_response, BrowserSurfaceLeaseResponse,
     BrowserSurfaceSnapshotMutationResponse, BrowserSurfaceSnapshotResponse,
+};
+#[cfg(any(target_os = "macos", windows))]
+use recovery_projection::{
+    pause_for_renderer_recovery, recovery_aware_error, EmbeddedRecoveryRegistry,
+};
+pub(in crate::browser::login) use request::BrowserSurfaceControlActionArg;
+use request::{
+    parse_profile_selection, validate_panel_session_id, BrowserSurfaceBackendArg,
+    BrowserSurfaceProfileModeArg, BrowserSurfaceReleaseArg, BrowserSurfaceViewportArg,
 };
 
 #[derive(Default)]
@@ -58,6 +72,8 @@ struct LoginBrowserSurfaceState {
     active: Option<ActiveLoginSurface>,
     shutting_down: bool,
     unavailable_reason: Option<String>,
+    #[cfg(any(target_os = "macos", windows))]
+    recovery: EmbeddedRecoveryRegistry,
 }
 
 #[derive(Clone)]
@@ -68,44 +84,6 @@ struct ActiveLoginSurface {
     surface_id: String,
     profile_id: String,
     session: LoginBrowserSessionHandle,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BrowserSurfaceBackendArg {
-    Preview,
-    Login,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BrowserSurfaceProfileModeArg {
-    Default,
-    New,
-    Saved,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BrowserSurfaceReleaseArg {
-    Close,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BrowserSurfaceControlActionArg {
-    Handoff,
-    Pause,
-    Takeover,
-    Occlude,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct BrowserSurfaceViewportArg {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
 }
 
 pub(crate) mod ipc;
@@ -131,13 +109,16 @@ impl LoginBrowserSurfaceManager {
     ) -> Result<Self, String> {
         let owner_records = EmbeddedOwnerRecordStore::production(owner_record_root)
             .map_err(|error| error.to_string())?;
-        sessions
+        let recovery_records = sessions
             .reap_embedded_owner_records(&owner_records)
             .map_err(|error| error.to_string())?;
         Ok(Self {
             operation_gate: Mutex::new(()),
             event_sequence: Mutex::new(0),
-            state: Mutex::new(LoginBrowserSurfaceState::default()),
+            state: Mutex::new(LoginBrowserSurfaceState {
+                recovery: EmbeddedRecoveryRegistry::from_records(recovery_records),
+                ..LoginBrowserSurfaceState::default()
+            }),
             owner_records: Some(owner_records),
         })
     }
@@ -226,9 +207,25 @@ impl LoginBrowserSurfaceManager {
             .owner_records
             .as_ref()
             .ok_or_else(|| "Embedded browser recovery state is unavailable.".to_string())?;
-        let prepared = sessions
-            .prepare_embedded_profile(workspace, selection, &surface_id, owner_records)
-            .map_err(|error| self.fail_current(&lease, error.to_string()))?;
+        let prepared = match sessions.prepare_embedded_profile(
+            workspace,
+            selection,
+            &surface_id,
+            owner_records,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let recovery_states = if let Some(identity) = error.identity() {
+                    self.state()?.recovery.states_for(identity)
+                } else {
+                    Vec::new()
+                };
+                let failure = recovery_aware_error(&error.to_string(), &recovery_states);
+                return Err(self.fail_current(&lease, failure));
+            }
+        };
+        let recovery_identity = prepared.recovery_identity();
+        let recovery_states = self.state()?.recovery.states_for(&recovery_identity);
         let selected_profile_id = prepared.profile_id().as_str().to_string();
         let (registration, profile_lease, mut owner_record) = prepared.into_launch_parts();
         let connection = match cef_host.open_surface(
@@ -310,7 +307,27 @@ impl LoginBrowserSurfaceManager {
             }
         };
         let native = native_state.snapshot();
-        let snapshot = snapshot_response(&native, &opened.snapshot);
+        let initial_session = match pause_for_renderer_recovery(
+            sessions,
+            &opened.handle,
+            &native,
+            SURFACE_CONTROL_AUTHORIZATION_TTL,
+        ) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => opened.snapshot.clone(),
+            Err(error) => {
+                let cleanup = sessions.force_stop(&opened.handle);
+                if cleanup.is_ok() {
+                    self.state()?.active = None;
+                }
+                return Err(self.fail_current(
+                    &lease,
+                    format!("Login Browser renderer recovery fence failed: {error}"),
+                ));
+            }
+        };
+        let mut snapshot = snapshot_response(&native, &initial_session);
+        snapshot.set_recovery_states(&recovery_states);
         let watcher_start = match self.start_state_watcher(
             app.clone(),
             Arc::clone(sessions),
@@ -319,7 +336,7 @@ impl LoginBrowserSurfaceManager {
             lease.generation,
             opened.handle.clone(),
             native,
-            opened.snapshot.clone(),
+            initial_session,
         ) {
             Ok(watcher_start) => watcher_start,
             Err(error) => {
@@ -332,6 +349,14 @@ impl LoginBrowserSurfaceManager {
         };
         let server_sequence =
             self.emit_surface_state(app, &current, "ready", Some(snapshot.clone()));
+        match self.state() {
+            Ok(mut state) => state
+                .recovery
+                .acknowledge_successful_acquire(&recovery_identity),
+            Err(error) => eprintln!(
+                "Login Browser could not acknowledge its startup recovery projection: {error}"
+            ),
+        }
         // The thread is already owned before Ready is published, but cannot
         // overtake the initial event.
         watcher_start.wait();
@@ -504,8 +529,32 @@ impl LoginBrowserSurfaceManager {
                     return;
                 };
                 native = native_state.snapshot();
-                if let Ok(current_session) = sessions.snapshot(&session) {
-                    session_snapshot = current_session;
+                match pause_for_renderer_recovery(
+                    &sessions,
+                    &session,
+                    &native,
+                    SURFACE_CONTROL_AUTHORIZATION_TTL,
+                ) {
+                    Ok(Some(current_session)) => session_snapshot = current_session,
+                    Ok(None) => {
+                        if let Ok(current_session) = sessions.snapshot(&session) {
+                            session_snapshot = current_session;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "CEF renderer recovery control fence failed lease={} generation={}: {error}",
+                            lease_id, generation,
+                        );
+                        match sessions.snapshot(&session) {
+                            Ok(current_session)
+                                if current_session.control != SessionControlOwner::Agent =>
+                            {
+                                session_snapshot = current_session;
+                            }
+                            _ => continue,
+                        }
+                    }
                 }
                 let response = snapshot_response(&native, &session_snapshot);
                 if response == last_emitted {
@@ -767,7 +816,7 @@ impl LoginBrowserSurfaceManager {
                 // This remains inside the surface operation lane. Once it returns,
                 // an overlay owns proof that Agent effects were cancelled before
                 // the native child acknowledged hide.
-                cef_host.set_surface_visible(app, active.surface_id.clone(), false)?;
+                cef_host.occlude_surface(app, active.surface_id.clone())?;
                 session
             }
         };
@@ -908,56 +957,6 @@ impl LoginBrowserSurfaceManager {
             .lock()
             .map_err(|_| "Browser surface state is unavailable.".to_string())
     }
-}
-
-impl BrowserSurfaceViewportArg {
-    #[cfg(any(target_os = "macos", windows))]
-    fn validate(self) -> Result<LogicalViewport, String> {
-        if ![self.x, self.y, self.width, self.height]
-            .into_iter()
-            .all(f64::is_finite)
-            || self.x < 0.0
-            || self.y < 0.0
-            || self.width <= 0.0
-            || self.height <= 0.0
-        {
-            return Err("Browser surface viewport is invalid.".to_string());
-        }
-        Ok(LogicalViewport {
-            x: self.x,
-            y: self.y,
-            width: self.width,
-            height: self.height,
-        })
-    }
-}
-
-fn parse_profile_selection(
-    mode: Option<BrowserSurfaceProfileModeArg>,
-    profile_id: Option<String>,
-) -> Result<ProfileSelection, String> {
-    match (mode, profile_id.filter(|value| !value.trim().is_empty())) {
-        (Some(BrowserSurfaceProfileModeArg::Default), None) => Ok(ProfileSelection::Default),
-        (Some(BrowserSurfaceProfileModeArg::New), None) => Ok(ProfileSelection::ExplicitNew),
-        (Some(BrowserSurfaceProfileModeArg::Saved), Some(profile_id)) => {
-            super::profile::ProfileId::parse(profile_id.trim())
-                .map(ProfileSelection::Existing)
-                .map_err(|error| error.to_string())
-        }
-        _ => Err("Login Browser profile selection is invalid.".to_string()),
-    }
-}
-
-fn validate_panel_session_id(value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 160
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
-        return Err("Browser panel session id is invalid.".to_string());
-    }
-    Ok(())
 }
 
 fn current_watcher_lease(

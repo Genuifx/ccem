@@ -3,6 +3,13 @@ use std::io::Write;
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NONCE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TARGET: &str = "aarch64-apple-darwin";
+const REPOSITORY: &str = "Genuifx/claude-code-env-manager";
+const WORKFLOW_REF: &str =
+    "Genuifx/claude-code-env-manager/.github/workflows/mode2-signed-readiness.yml@refs/heads/main";
+const PRODUCER_WORKFLOW_REF: &str =
+    "Genuifx/claude-code-env-manager/.github/workflows/mode2-signed-producer.yml@refs/heads/main";
+const JOB: &str = "build-desktop";
 
 fn build() -> BuildIdentity<'static> {
     BuildIdentity {
@@ -11,6 +18,11 @@ fn build() -> BuildIdentity<'static> {
         source_commit: Some(SHA),
         run_id: Some("12345"),
         run_attempt: Some("2"),
+        target: Some(TARGET),
+        repository: Some(REPOSITORY),
+        workflow_ref: Some(WORKFLOW_REF),
+        producer_workflow_ref: Some(PRODUCER_WORKFLOW_REF),
+        job: Some(JOB),
     }
 }
 
@@ -42,6 +54,8 @@ fn valid_environment() -> BTreeMap<&'static str, String> {
             ENV_ISOLATION,
             format!("{scenario_root}/keychain/isolation.json"),
         ),
+        (ENV_TARGET, TARGET.to_string()),
+        (ENV_PRODUCER_WORKFLOW_REF, PRODUCER_WORKFLOW_REF.to_string()),
         ("GITHUB_ACTIONS", "true".to_string()),
         ("CI", "true".to_string()),
         ("RUNNER_OS", "macOS".to_string()),
@@ -49,6 +63,9 @@ fn valid_environment() -> BTreeMap<&'static str, String> {
         ("GITHUB_SHA", SHA.to_string()),
         ("GITHUB_RUN_ID", "12345".to_string()),
         ("GITHUB_RUN_ATTEMPT", "2".to_string()),
+        ("GITHUB_REPOSITORY", REPOSITORY.to_string()),
+        ("GITHUB_WORKFLOW_REF", WORKFLOW_REF.to_string()),
+        ("GITHUB_JOB", JOB.to_string()),
     ])
 }
 
@@ -96,7 +113,16 @@ fn gate_requires_exact_github_build_identity() {
             MacosSafeStorageSmokeGate::Rejected(_)
         ));
     }
-    for name in ["GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"] {
+    for name in [
+        "GITHUB_SHA",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_ATTEMPT",
+        ENV_TARGET,
+        "GITHUB_REPOSITORY",
+        "GITHUB_WORKFLOW_REF",
+        ENV_PRODUCER_WORKFLOW_REF,
+        "GITHUB_JOB",
+    ] {
         let mut environment = valid_environment();
         environment.insert(name, "9".repeat(environment[name].len()));
         assert!(matches!(
@@ -117,6 +143,11 @@ fn gate_accepts_only_exact_current_run_scenario_paths() {
     assert_eq!(config.source_commit, SHA);
     assert_eq!(config.run_id, "12345");
     assert_eq!(config.run_attempt, "2");
+    assert_eq!(config.target, TARGET);
+    assert_eq!(config.repository, REPOSITORY);
+    assert_eq!(config.workflow_ref, WORKFLOW_REF);
+    assert_eq!(config.producer_workflow_ref, PRODUCER_WORKFLOW_REF);
+    assert_eq!(config.job, JOB);
     assert_eq!(
         config.cef_cache_root,
         PathBuf::from(format!(
@@ -163,7 +194,7 @@ fn one_shot_ticket_is_bound_and_consumed_by_no_replace_hard_link() {
         .expect("create ticket");
     writeln!(
         ticket,
-        "{{\"schemaVersion\":1,\"nonce\":\"{NONCE}\",\"scenario\":\"clean\",\"phase\":\"prime\"}}"
+        "{{\"schemaVersion\":2,\"nonce\":\"{NONCE}\",\"scenario\":\"clean\",\"phase\":\"prime\"}}"
     )
     .expect("write ticket");
     let config = MacosSafeStorageSmokeConfig {
@@ -171,6 +202,11 @@ fn one_shot_ticket_is_bound_and_consumed_by_no_replace_hard_link() {
         source_commit: SHA.to_string(),
         run_id: "12345".to_string(),
         run_attempt: "2".to_string(),
+        target: TARGET.to_string(),
+        repository: REPOSITORY.to_string(),
+        workflow_ref: WORKFLOW_REF.to_string(),
+        producer_workflow_ref: PRODUCER_WORKFLOW_REF.to_string(),
+        job: JOB.to_string(),
         scenario: "clean".to_string(),
         phase: "prime".to_string(),
         smoke_root: temporary.path().to_path_buf(),
@@ -197,7 +233,7 @@ fn one_shot_ticket_rejects_wrong_nonce_scenario_or_phase() {
     ] {
         let ticket_path = temporary.path().join(format!("{field}.ticket"));
         let mut body = serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "nonce": NONCE,
             "scenario": "clean",
             "phase": "prime",
@@ -209,6 +245,11 @@ fn one_shot_ticket_rejects_wrong_nonce_scenario_or_phase() {
             source_commit: SHA.to_string(),
             run_id: "12345".to_string(),
             run_attempt: "2".to_string(),
+            target: TARGET.to_string(),
+            repository: REPOSITORY.to_string(),
+            workflow_ref: WORKFLOW_REF.to_string(),
+            producer_workflow_ref: PRODUCER_WORKFLOW_REF.to_string(),
+            job: JOB.to_string(),
             scenario: "clean".to_string(),
             phase: "prime".to_string(),
             smoke_root: temporary.path().to_path_buf(),

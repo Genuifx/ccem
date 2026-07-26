@@ -6,6 +6,9 @@
 //! unlock a matching profile after that exact host identity is gone and the profile lock can be
 //! acquired. Unknown records and external runtime ids always fail closed.
 
+pub(in crate::browser::login) use super::recovery_projection::{
+    EmbeddedOwnerRecoveryDisposition, EmbeddedOwnerRecoveryRecord,
+};
 use super::surface::validate_surface_id;
 use crate::browser::login::profile::{
     BrowserProfileManager, EmbeddedProfileLaunchPendingProof, EmbeddedProfileLaunchReservation,
@@ -95,25 +98,6 @@ pub(in crate::browser::login) enum EmbeddedOwnerRecoveryDecision {
     RecoverLaunchPending,
     RecoverRuntimeOwned,
     RemoveFinishedRecord,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::browser::login) enum EmbeddedOwnerRecoveryDisposition {
-    RetainedLiveHost,
-    RetainedInspectionUnknown,
-    RetainedProfileLock,
-    RetainedUnknownOrExternalOwner,
-    RetainedProfileUnavailable,
-    RecoveredLaunchPending,
-    RecoveredRuntimeOwned,
-    RemovedFinishedRecord,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::browser::login) struct EmbeddedOwnerRecoveryRecord {
-    pub(in crate::browser::login) record_id: String,
-    pub(in crate::browser::login) surface_id: String,
-    pub(in crate::browser::login) disposition: EmbeddedOwnerRecoveryDisposition,
 }
 
 #[derive(Debug)]
@@ -651,6 +635,8 @@ fn outcome(
     EmbeddedOwnerRecoveryRecord {
         record_id: record.record_id.clone(),
         surface_id: record.surface_id.clone(),
+        profile_id: record.profile_id.clone(),
+        workspace_identity: record.workspace_identity.clone(),
         disposition,
     }
 }

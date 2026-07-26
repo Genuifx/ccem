@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Default)]
 struct ActivePermits {
     owners: BTreeMap<u64, usize>,
+    unsafe_effects: BTreeSet<u64>,
 }
 
 impl ActivePermits {
@@ -25,6 +26,13 @@ impl ActivePermits {
 
     fn has_retired(&self, retired_generation: u64) -> bool {
         self.owners.range(..=retired_generation).next().is_some()
+    }
+
+    fn has_unsafe_effect(&self, retired_generation: u64) -> bool {
+        self.unsafe_effects
+            .range(..=retired_generation)
+            .next()
+            .is_some()
     }
 }
 
@@ -53,7 +61,18 @@ impl ExecutionFence {
     }
 
     pub(super) fn is_current(&self, generation: u64) -> bool {
-        self.capture_generation() == generation
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.generation.load(Ordering::Acquire) == generation && active.unsafe_effects.is_empty()
+    }
+
+    pub(super) fn is_safe(&self) -> bool {
+        self.active
+            .lock()
+            .map(|active| active.unsafe_effects.is_empty())
+            .unwrap_or(false)
     }
 
     /// Close the current epoch before waking its cooperative waits.
@@ -87,7 +106,7 @@ impl ExecutionFence {
         &self,
         retired_generation: u64,
         maximum_wait: Duration,
-    ) -> Result<(), FenceQuiescenceTimedOut> {
+    ) -> Result<(), FenceQuiescenceFailure> {
         let deadline = Instant::now()
             .checked_add(maximum_wait)
             .unwrap_or_else(Instant::now);
@@ -96,12 +115,15 @@ impl ExecutionFence {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
+            if active.has_unsafe_effect(retired_generation) {
+                return Err(FenceQuiescenceFailure::EffectSafetyUnconfirmed);
+            }
             if !active.has_retired(retired_generation) {
                 return Ok(());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(FenceQuiescenceTimedOut);
+                return Err(FenceQuiescenceFailure::TimedOut);
             }
             let (next, timed) = self
                 .quiesced
@@ -109,7 +131,7 @@ impl ExecutionFence {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             active = next;
             if timed.timed_out() && active.has_retired(retired_generation) {
-                return Err(FenceQuiescenceTimedOut);
+                return Err(FenceQuiescenceFailure::TimedOut);
             }
         }
     }
@@ -119,7 +141,9 @@ impl ExecutionFence {
         generation: u64,
     ) -> Result<OwnerExecutionPermit, FenceUnavailable> {
         let mut active = self.active.lock().map_err(|_| FenceUnavailable)?;
-        if self.generation.load(Ordering::Acquire) != generation {
+        if self.generation.load(Ordering::Acquire) != generation
+            || !active.unsafe_effects.is_empty()
+        {
             return Err(FenceUnavailable);
         }
         active.increment_owner(generation);
@@ -133,8 +157,10 @@ impl ExecutionFence {
         self: &Arc<Self>,
         generation: u64,
     ) -> Result<EffectWritePermit, FenceUnavailable> {
-        let _active = self.active.lock().map_err(|_| FenceUnavailable)?;
-        if self.generation.load(Ordering::Acquire) != generation {
+        let active = self.active.lock().map_err(|_| FenceUnavailable)?;
+        if self.generation.load(Ordering::Acquire) != generation
+            || !active.unsafe_effects.is_empty()
+        {
             return Err(FenceUnavailable);
         }
         // The owner permit is the quiescence acknowledgement. This permit only makes effect
@@ -151,13 +177,25 @@ impl ExecutionFence {
         active.decrement_owner(generation);
         self.quiesced.notify_all();
     }
+
+    pub(super) fn mark_effect_unsafe(&self, generation: u64) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.unsafe_effects.insert(generation);
+        self.quiesced.notify_all();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FenceUnavailable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FenceQuiescenceTimedOut;
+pub(super) enum FenceQuiescenceFailure {
+    TimedOut,
+    EffectSafetyUnconfirmed,
+}
 
 #[derive(Debug)]
 struct Permit {
@@ -254,7 +292,7 @@ mod tests {
 
         assert_eq!(
             fence.wait_for_retired_timeout(retired, Duration::from_millis(25)),
-            Err(FenceQuiescenceTimedOut)
+            Err(FenceQuiescenceFailure::TimedOut)
         );
         assert!(
             started.elapsed() < Duration::from_millis(250),
@@ -267,5 +305,22 @@ mod tests {
             fence.wait_for_retired_timeout(retired, Duration::from_millis(25)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn retired_epoch_with_unconfirmed_effect_never_acknowledges_quiescence() {
+        let fence = Arc::new(ExecutionFence::new());
+        let generation = fence.capture_generation();
+        let retired = fence.retire_current();
+
+        fence.mark_effect_unsafe(generation);
+
+        assert_eq!(
+            fence.wait_for_retired_timeout(retired, Duration::from_millis(25)),
+            Err(FenceQuiescenceFailure::EffectSafetyUnconfirmed)
+        );
+        assert!(fence.enter_effect(generation).is_err());
+        assert!(!fence.is_current(fence.capture_generation()));
+        assert!(!fence.is_safe());
     }
 }

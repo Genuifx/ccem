@@ -34,7 +34,7 @@ pub(crate) const EXIT_SMOKE_FAILED: i32 = 83;
 #[cfg(all(windows, not(debug_assertions)))]
 const EXIT_SMOKE_TIMEOUT: i32 = 84;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 9;
 const NETWORK_SERVICE_SANDBOX_FEATURE: &str = "NetworkServiceSandbox";
 const NETWORK_SERVICE_LPAC_FEATURE: &str = "WinSboxNetworkServiceSandboxIsLPAC";
 const SMOKE_DIRECTORY: &str = "ccem-mode2-production-smoke";
@@ -108,6 +108,7 @@ pub(crate) struct WindowsMode2SmokeConfig {
     smoke_root: PathBuf,
     data_root: PathBuf,
     workspace_root: PathBuf,
+    secondary_workspace_root: PathBuf,
     session_root: PathBuf,
     owner_record_root: PathBuf,
     profile_state_root: PathBuf,
@@ -121,7 +122,7 @@ pub(crate) struct WindowsMode2SmokeConfig {
 
 pub(crate) enum WindowsMode2SmokeGate {
     Disabled,
-    Enabled(WindowsMode2SmokeConfig),
+    Enabled(Box<WindowsMode2SmokeConfig>),
     Rejected(String),
 }
 
@@ -197,6 +198,7 @@ fn evaluate_gate(
             windows_join(&windows_join(&base, INSTALL_DIRECTORY), EXECUTABLE_FILE);
         let data_root = windows_join(&base, "data");
         let workspace_root = windows_join(&base, "workspace");
+        let secondary_workspace_root = windows_join(&base, "workspace-secondary");
         let session_root = windows_join(&data_root, "login");
         let owner_record_root = windows_join(&session_root, "embedded-owners");
         let profile_state_root = windows_join(&session_root, "profile-state");
@@ -220,6 +222,7 @@ fn evaluate_gate(
             smoke_root: PathBuf::from(base),
             data_root: PathBuf::from(data_root),
             workspace_root: PathBuf::from(workspace_root),
+            secondary_workspace_root: PathBuf::from(secondary_workspace_root),
             session_root: PathBuf::from(session_root),
             owner_record_root: PathBuf::from(owner_record_root),
             profile_state_root: PathBuf::from(profile_state_root),
@@ -232,7 +235,7 @@ fn evaluate_gate(
         })
     })();
     match result {
-        Ok(config) => WindowsMode2SmokeGate::Enabled(config),
+        Ok(config) => WindowsMode2SmokeGate::Enabled(Box::new(config)),
         Err(error) => WindowsMode2SmokeGate::Rejected(error),
     }
 }
@@ -411,6 +414,7 @@ fn validate_process_filesystem(config: &WindowsMode2SmokeConfig) -> Result<(), S
     for (path, label) in [
         (&config.data_root, "data root"),
         (&config.workspace_root, "workspace root"),
+        (&config.secondary_workspace_root, "secondary workspace root"),
     ] {
         if fs::symlink_metadata(path).is_ok() {
             return Err(format!(
@@ -456,6 +460,12 @@ impl WindowsMode2SmokeConfig {
                 self.workspace_root.display()
             )
         })?;
+        fs::create_dir(&self.secondary_workspace_root).map_err(|error| {
+            format!(
+                "create Windows Mode 2 secondary workspace root {}: {error}",
+                self.secondary_workspace_root.display()
+            )
+        })?;
         let sessions = Arc::new(
             LoginBrowserSessionManager::production(self.session_root.clone())
                 .map_err(|error| error.to_string())?,
@@ -494,6 +504,7 @@ struct ProductionPathCheckpoint {
     native_window: super::surface::WindowsNativeWindowObservation,
 }
 
+#[cfg(any(not(debug_assertions), test))]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProductionCleanupProof {
@@ -501,19 +512,45 @@ struct ProductionCleanupProof {
     active_session_count: u32,
     owner_record_count: u32,
     persisted_profile_count: u32,
-    profile_lock_available: bool,
+    workspace_count: u32,
+    profile_locks_available: bool,
 }
 
+#[cfg(any(not(debug_assertions), test))]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProductionSemanticProof {
-    read_via_capability: bool,
-    write_via_capability: bool,
-    write_observed: bool,
-    post_pause_write_denied: bool,
-    post_pause_value_unchanged: bool,
+    navigated_via_capability: bool,
+    ax_snapshot_via_capability: bool,
+    click_via_element_ref: bool,
+    type_via_element_ref: bool,
+    screenshot: super::super::surface_commands::ProductionSmokeScreenshotProof,
+    storage_commit_via_element_ref: bool,
+    active_effect_entered: bool,
+    active_effect_cancelled: bool,
+    occlusion_ack_under_one_second: bool,
+    occlusion_ack_millis: u64,
+    post_pause_no_late_write: bool,
 }
 
+#[cfg(any(not(debug_assertions), test))]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionProfileIsolationProof {
+    secondary_workspace_root: String,
+    secondary_profile_id: String,
+    distinct_workspace_profiles: bool,
+    primary_cookie_persisted: bool,
+    primary_local_storage_persisted: bool,
+    secondary_profile_initially_empty: bool,
+    secondary_cookie_isolated: bool,
+    secondary_local_storage_isolated: bool,
+    secondary_cookie_persisted: bool,
+    secondary_local_storage_persisted: bool,
+    primary_unchanged_after_secondary: bool,
+}
+
+#[cfg(any(not(debug_assertions), test))]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProductionPathReceipt {
@@ -521,6 +558,9 @@ struct ProductionPathReceipt {
     checkpoint: ProductionPathCheckpoint,
     semantic: ProductionSemanticProof,
     reopened_profile_id: String,
+    secondary_reopened_profile_id: String,
+    final_reopened_profile_id: String,
+    profile_isolation: ProductionProfileIsolationProof,
     cleanup: ProductionCleanupProof,
 }
 
@@ -555,6 +595,7 @@ struct ObservationAck {
     observed: bool,
 }
 
+#[cfg(any(not(debug_assertions), test))]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeReceipt {
@@ -587,7 +628,7 @@ impl StageRecorder {
     }
 
     fn record(&mut self, expected: &'static str) -> Result<(), String> {
-        const ORDER: [&str; 21] = [
+        const ORDER: [&str; 38] = [
             "direct_ready",
             "direct_cdp",
             "direct_closed",
@@ -596,18 +637,35 @@ impl StageRecorder {
             "production_hidden",
             "production_reshown",
             "production_handoff",
-            "production_semantic_read_write",
+            "production_semantic_chain_started",
+            "production_active_effect_entered",
             "production_occluded",
-            "production_stale_write_denied",
+            "production_active_effect_cancelled",
             "production_restored",
             "production_rehandoff",
-            "production_post_pause_verified",
+            "production_post_pause_no_late_write",
             "production_paused",
             "production_takeover",
             "production_released",
             "production_reopened_ready",
             "production_reopened_shown",
+            "production_reopened_handoff",
+            "production_profile_persistence_verified",
             "production_reclosed",
+            "production_secondary_acquired",
+            "production_secondary_shown",
+            "production_secondary_handoff",
+            "production_secondary_isolation_verified",
+            "production_secondary_released",
+            "production_secondary_reopened_ready",
+            "production_secondary_reopened_shown",
+            "production_secondary_reopened_handoff",
+            "production_secondary_persistence_verified",
+            "production_secondary_reclosed",
+            "production_primary_final_reopened",
+            "production_primary_final_handoff",
+            "production_primary_unchanged_verified",
+            "production_primary_final_released",
             "production_cleanup_verified",
         ];
         let next = ORDER

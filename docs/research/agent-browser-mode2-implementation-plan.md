@@ -124,12 +124,19 @@ Deliverables:
 - make profile lock release retryable and never report cleanup success before persistence and unlock
   both succeed;
 - recover explicitly from renderer crash, browser close, app force-exit, and restart;
-- keep redacted audit, console, network, snapshot, and screenshot artifacts.
+- keep redacted audit, console, and network artifacts; keep snapshots and screenshots in the
+  private CCEM-owned artifact store because those page-content artifacts are not content-redacted.
 
 Evidence:
 
 - semantic, cancellation, provenance, profile, cleanup, and recovery tests;
-- real persistent-login restart and two-profile isolation smoke.
+- signed production-runtime smoke on every release target that runs the bounded semantic chain,
+  overlaps a real write with Occlude, verifies the canonical app-owned PNG through strict chunk,
+  all-chunk CRC, bounded decode, size, and digest checks, reopens the primary and secondary profiles,
+  and binds every result to the exact producer workflow and release identity;
+- installed-app persistent-login restart, two-profile isolation, focus/IME, OAuth popup, trusted
+  overlay, renderer-crash, and force-exit recovery observation. Automation is supporting evidence
+  for these interaction-sensitive cases, not a substitute for the real installed flow.
 
 ## Phase 4: packaging, signing, and updater integrity
 
@@ -181,6 +188,9 @@ Release transaction boundary:
   transaction atomic;
 - one trusted release workflow must remain the unique writer for the tag and draft. Repository tag
   rules must prevent any other actor from moving or recreating the release tag;
+- every readiness/release entry must independently require the read-only GitHub branch metadata for
+  `main` to report `protected: true`; current-ref protection and source ancestry remain separate
+  checks, so protecting only a `v*` tag cannot authorize publication;
 - every mutation is fenced by the exact release id plus unique owner/source markers. Each uploaded
   or reused asset is read back while the release is still a draft, and publication succeeds only
   after both the PATCH response and a subsequent exact release GET preserve all nine asset ids,
@@ -208,7 +218,8 @@ Production readiness requires current evidence for this exact installed-app flow
 7. Open a second workspace/profile and prove cookie and local-storage isolation.
 8. Exercise renderer crash, browser close, app force-exit, and recovery.
 9. Close Mode 2 and CCEM, then prove no owned CEF helper remains.
-10. Inspect redacted audit, network, console, snapshot, and screenshot artifacts.
+10. Inspect redacted audit, network, and console artifacts, then verify that raw page-content
+    snapshots and screenshots remain confined to the private CCEM-owned artifact store.
 11. Install an update and prove the pinned CEF inventory is complete and unmixed.
 12. Prove development/test runs caused no macOS Safe Storage prompt; separately prove the stable
     signed release does not enter a repeated prompt loop.

@@ -1,6 +1,101 @@
 use super::*;
 use crate::browser::surface_coordinator::BrowserSurfaceReleaseDisposition;
 
+#[cfg(any(target_os = "macos", windows))]
+use crate::browser::login::{
+    cef::recovery::{EmbeddedOwnerRecoveryDisposition, EmbeddedOwnerRecoveryRecord},
+    session::EmbeddedProfileIdentity,
+};
+
+#[cfg(any(target_os = "macos", windows))]
+fn recovery_record(
+    profile_id: &str,
+    workspace_id: &str,
+    disposition: EmbeddedOwnerRecoveryDisposition,
+) -> EmbeddedOwnerRecoveryRecord {
+    EmbeddedOwnerRecoveryRecord {
+        record_id: "embedded-owner-internal".to_string(),
+        surface_id: "login-internal".to_string(),
+        profile_id: profile_id.to_string(),
+        workspace_identity: workspace_id.to_string(),
+        disposition,
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn recovery_projection_is_profile_scoped_and_retained_states_survive_acknowledgement() {
+    let profile_a = EmbeddedProfileIdentity::from_recovery_record(
+        "profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "workspace-a".to_string(),
+    );
+    let profile_b = EmbeddedProfileIdentity::from_recovery_record(
+        "profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        "workspace-b".to_string(),
+    );
+    let mut registry = EmbeddedRecoveryRegistry::from_records(vec![
+        recovery_record(
+            "profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "workspace-a",
+            EmbeddedOwnerRecoveryDisposition::RetainedProfileLock,
+        ),
+        recovery_record(
+            "profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "workspace-a",
+            EmbeddedOwnerRecoveryDisposition::RecoveredRuntimeOwned,
+        ),
+        recovery_record(
+            "profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "workspace-b",
+            EmbeddedOwnerRecoveryDisposition::RemovedFinishedRecord,
+        ),
+    ]);
+
+    assert_eq!(
+        registry
+            .states_for(&profile_a)
+            .into_iter()
+            .map(EmbeddedOwnerRecoveryDisposition::as_str)
+            .collect::<Vec<_>>(),
+        vec!["recovered_runtime_owned", "retained_profile_lock"]
+    );
+    assert_eq!(
+        registry
+            .states_for(&profile_b)
+            .into_iter()
+            .map(EmbeddedOwnerRecoveryDisposition::as_str)
+            .collect::<Vec<_>>(),
+        vec!["removed_finished_record"]
+    );
+
+    registry.acknowledge_successful_acquire(&profile_a);
+    registry.acknowledge_successful_acquire(&profile_b);
+    assert_eq!(
+        registry.states_for(&profile_a),
+        vec![EmbeddedOwnerRecoveryDisposition::RetainedProfileLock]
+    );
+    assert!(registry.states_for(&profile_b).is_empty());
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn recovery_error_exposes_only_stable_states() {
+    let message = recovery_aware_error(
+        "The Login Browser profile is already in use.",
+        &[
+            EmbeddedOwnerRecoveryDisposition::RetainedLiveHost,
+            EmbeddedOwnerRecoveryDisposition::RetainedProfileLock,
+        ],
+    );
+    assert_eq!(
+        message,
+        "Login Browser startup recovery states: retained_live_host,retained_profile_lock. The Login Browser profile is already in use."
+    );
+    for forbidden in ["embedded-owner-", "login-internal", "/Users/", "pid="] {
+        assert!(!message.contains(forbidden));
+    }
+}
+
 #[test]
 fn embedded_profile_handshake_precedes_native_surface_open() {
     let source = include_str!("../surface_commands.rs");
@@ -44,7 +139,34 @@ fn acquire_keeps_cef_hidden_until_the_current_frontend_lease_syncs_visibility() 
         .expect("sync source end");
     let sync = &source[sync_start..sync_end];
     assert!(sync.contains("set_surface_visible"));
+    assert!(!sync.contains("occlude_surface"));
     assert!(!sync.contains("focus_surface"));
+}
+
+#[test]
+fn trusted_overlay_occlusion_pauses_effects_before_capturing_native_focus_and_hiding() {
+    let source = include_str!("../surface_commands.rs");
+    let control_start = source
+        .find("fn transition_control(")
+        .expect("control source");
+    let control_end = source[control_start..]
+        .find("fn close_popup(")
+        .map(|offset| control_start + offset)
+        .expect("control source end");
+    let control = &source[control_start..control_end];
+    let occlude = control
+        .split_once("BrowserSurfaceControlActionArg::Occlude =>")
+        .expect("occlude branch")
+        .1;
+    let pause = occlude
+        .find("pause_agent_if_active")
+        .expect("effect cleanup acknowledgement");
+    let native_occlude = occlude
+        .find("occlude_surface")
+        .expect("native focus capture and hide");
+
+    assert!(pause < native_occlude);
+    assert!(!occlude[..native_occlude].contains("set_surface_visible"));
 }
 
 #[test]
@@ -122,11 +244,22 @@ fn watcher_reloads_authoritative_state_inside_the_command_operation_lane() {
         .find("native = native_state.snapshot()")
         .map(|offset| operation + offset)
         .expect("fresh native snapshot");
-    let publish = watcher[fresh_native..]
-        .find("self.emit_surface_state(")
+    let recovery_fence = watcher[fresh_native..]
+        .find("pause_for_renderer_recovery(")
         .map(|offset| fresh_native + offset)
+        .expect("renderer recovery control fence");
+    let fresh_response = watcher[recovery_fence..]
+        .find("let response = snapshot_response(")
+        .map(|offset| recovery_fence + offset)
+        .expect("post-fence snapshot");
+    let publish = watcher[fresh_response..]
+        .find("self.emit_surface_state(")
+        .map(|offset| fresh_response + offset)
         .expect("sequenced publish");
 
     assert!(operation < fresh_native);
-    assert!(fresh_native < publish);
+    assert!(fresh_native < recovery_fence);
+    assert!(recovery_fence < fresh_response);
+    assert!(fresh_response < publish);
+    assert!(!watcher[operation..publish].contains("force_stop"));
 }

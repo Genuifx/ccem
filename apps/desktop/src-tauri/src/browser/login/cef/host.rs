@@ -205,6 +205,15 @@ impl CefHostController {
         })
     }
 
+    pub(crate) fn occlude_surface(
+        &self,
+        app: &AppHandle,
+        surface_id: String,
+    ) -> Result<(), String> {
+        let _operation = self.lock_ready_operation()?;
+        run_on_main(app, move || super::surface::macos::occlude(&surface_id))
+    }
+
     pub(crate) fn navigate_surface(
         &self,
         app: &AppHandle,

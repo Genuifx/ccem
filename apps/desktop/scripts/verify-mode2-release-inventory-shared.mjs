@@ -205,18 +205,6 @@ export function validateInventorySetWithPolicy(
     ) {
       fail(`${inventory.platform} updater signature basename does not bind its updater artifact`);
     }
-    validateUpdaterReplacementReleaseSummary(
-      inventory.updaterReplacementAttestation,
-      {
-        target: inventory.platform,
-        sourceCommit: expectedSourceCommit,
-        appVersion: expectedVersion,
-        currentExecutableSha256: inventory.mainExecutable?.sha256,
-        updaterArtifactSha256: inventory.artifacts.updater.sha256,
-        updaterSignatureSha256: inventory.artifacts.updaterSignature.sha256,
-        installedTree: inventory.installedTree,
-      },
-    );
     if (inventory.platform.endsWith('apple-darwin')) {
       validateArtifactRecord(inventory.artifacts?.dmg, `${inventory.platform} DMG`);
       validateArtifactRecord(inventory.mainExecutable, `${inventory.platform} main executable`);
@@ -289,6 +277,27 @@ export function validateInventorySetWithPolicy(
         fail(`${inventory.platform} runtime smoke does not bind the published installer and runtime`);
       }
     }
+    const runtimeAttestation = inventory.platform.endsWith('apple-darwin')
+      ? inventory.macosSafeStorageRuntimeAttestation
+      : inventory.windowsRuntimeAttestation;
+    validateUpdaterReplacementReleaseSummary(
+      inventory.updaterReplacementAttestation,
+      {
+        target: inventory.platform,
+        sourceCommit: expectedSourceCommit,
+        appVersion: expectedVersion,
+        currentExecutableSha256: inventory.mainExecutable?.sha256,
+        updaterArtifactSha256: inventory.artifacts.updater.sha256,
+        updaterSignatureSha256: inventory.artifacts.updaterSignature.sha256,
+        installedTree: inventory.installedTree,
+        runId: runtimeAttestation?.runId,
+        runAttempt: runtimeAttestation?.runAttempt,
+        repository: runtimeAttestation?.repository,
+        workflowRef: runtimeAttestation?.workflowRef,
+        producerWorkflowRef: runtimeAttestation?.producerWorkflowRef,
+        job: runtimeAttestation?.job,
+      },
+    );
     for (const record of Object.values(inventory.artifacts)) {
       if (artifactNames.has(record.fileName)) {
         fail(`duplicate release artifact basename: ${record.fileName}`);

@@ -1,44 +1,33 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { hashWindowsMode2SmokeJson } from './windows-mode2-json-contract.mjs';
+import { createWindowsInstalledTreeInventory, validateWindowsInstalledTreeInventory }
+  from './windows-mode2-installed-tree-contract.mjs';
 import {
-  createWindowsInstalledTreeInventory,
-  validateWindowsInstalledTreeInventory,
-} from './windows-mode2-installed-tree-contract.mjs';
+  WINDOWS_MODE2_REQUIRED_STAGES,
+  WINDOWS_MODE2_SMOKE_SCHEMA_VERSION,
+  validateWindowsMode2ProductionPath,
+} from './windows-mode2-semantic-smoke-contract.mjs';
+import {
+  createWindowsMode2GithubRunIdentity,
+  exactJob,
+  exactProducerWorkflowRef,
+  exactRepository,
+  exactRunNumber,
+  exactWorkflowRef,
+} from './windows-mode2-github-provenance-contract.mjs';
 
-export {
-  createWindowsInstalledTreeInventory,
-  validateWindowsInstalledTreeInventory,
-};
+export { createWindowsMode2GithubRunIdentity, createWindowsInstalledTreeInventory,
+  hashWindowsMode2SmokeJson,
+  validateWindowsInstalledTreeInventory, WINDOWS_MODE2_REQUIRED_STAGES,
+  WINDOWS_MODE2_SMOKE_SCHEMA_VERSION };
 
-export const WINDOWS_MODE2_SMOKE_SCHEMA_VERSION = 6;
 export const WINDOWS_MODE2_SMOKE_PLATFORM = 'x86_64-pc-windows-msvc';
+export const WINDOWS_MODE2_SMOKE_PROVENANCE_JOB = 'build-desktop';
 export const WINDOWS_MODE2_CHROMIUM_VERSION = '150.0.7871.101';
 export const WINDOWS_MODE2_SANDBOX_PROFILE = 'chromium-150-win-token-v1';
 export const WINDOWS_LPAC_SID = 'S-1-15-2-2';
 const WINDOWS_SYSTEM_SID = 'S-1-5-18';
-export const WINDOWS_MODE2_REQUIRED_STAGES = Object.freeze([
-  'direct_ready',
-  'direct_cdp',
-  'direct_closed',
-  'production_acquired_hidden_ready',
-  'production_shown',
-  'production_hidden',
-  'production_reshown',
-  'production_handoff',
-  'production_semantic_read_write',
-  'production_occluded',
-  'production_stale_write_denied',
-  'production_restored',
-  'production_rehandoff',
-  'production_post_pause_verified',
-  'production_paused',
-  'production_takeover',
-  'production_released',
-  'production_reopened_ready',
-  'production_reopened_shown',
-  'production_reclosed',
-  'production_cleanup_verified',
-]);
 export const WINDOWS_MODE2_REQUIRED_PROCESS_TYPES = Object.freeze([
   'renderer',
   'gpu-process',
@@ -64,33 +53,6 @@ function exactGitSha(value, label) {
 function positiveInteger(value, label) {
   if (!Number.isSafeInteger(value) || value <= 0) fail(`${label} must be a positive integer`);
   return value;
-}
-
-function exactRunNumber(value, label) {
-  if (!/^\d+$/u.test(value ?? '')) fail(`${label} must be a GitHub run number`);
-  return value;
-}
-
-function canonicalJson(value) {
-  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
-    return JSON.stringify(value);
-  }
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) fail('smoke evidence contains a non-finite number');
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
-      .join(',')}}`;
-  }
-  fail('smoke evidence contains a non-JSON value');
-}
-
-export function hashWindowsMode2SmokeJson(value) {
-  return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
 export function expectedWindowsMode2SmokeRoot(environment) {
@@ -395,7 +357,8 @@ function validateRuntimeReceipt(receipt, expected) {
     || receipt.networkServiceLpacFeature !== 'WinSboxNetworkServiceSandboxIsLPAC'
     || receipt.networkServiceLpacRequested !== true
   ) fail('runtime receipt did not bind the internal CEF NetworkServiceSandbox request');
-  validateProductionPath(receipt.productionPath, expected.smokeRoot);
+  validateWindowsMode2ProductionPath(receipt.productionPath, expected.smokeRoot,
+    validateWindowsNativeWindowObservation);
   if (receipt.productionPath.nativeWindow.ownerPid !== receipt.mainPid) {
     fail('runtime receipt native HWND is not owned by the browser process');
   }
@@ -414,57 +377,6 @@ function validateRuntimeReceipt(receipt, expected) {
     previous = stage.monotonicMs;
   });
   return receipt;
-}
-
-function validateProductionPath(productionPath, smokeRoot) {
-  exactKeys(productionPath, [
-    'verified', 'manager', 'dataRoot', 'workspaceRoot', 'ownerRecordRoot',
-    'profileStateRoot', 'cefCacheRoot', 'profileId', 'nativeWindow',
-    'semantic', 'reopenedProfileId', 'cleanup',
-  ], 'production path receipt');
-  if (productionPath.verified !== true || productionPath.manager !== 'LoginBrowserSurfaceManager') {
-    fail('runtime receipt did not exercise the production LoginBrowserSurfaceManager path');
-  }
-  const expectedRoots = {
-    dataRoot: path.win32.join(smokeRoot, 'data'),
-    workspaceRoot: path.win32.join(smokeRoot, 'workspace'),
-    ownerRecordRoot: path.win32.join(smokeRoot, 'data', 'login', 'embedded-owners'),
-    profileStateRoot: path.win32.join(smokeRoot, 'data', 'login', 'profile-state'),
-    cefCacheRoot: path.win32.join(smokeRoot, 'data', 'login', 'cef'),
-  };
-  for (const [field, wanted] of Object.entries(expectedRoots)) {
-    exactWindowsPath(productionPath[field], `production path ${field}`);
-    if (!sameWindowsPath(productionPath[field], wanted)) {
-      fail(`production path ${field} escaped the isolated current-run root`);
-    }
-  }
-  if (
-    !/^profile-[a-f0-9]{32}$/u.test(productionPath.profileId ?? '')
-    || productionPath.reopenedProfileId !== productionPath.profileId
-  ) {
-    fail('production path did not reopen the exact persisted profile');
-  }
-  validateWindowsNativeWindowObservation(productionPath.nativeWindow);
-  exactKeys(productionPath.semantic, [
-    'readViaCapability', 'writeViaCapability', 'writeObserved',
-    'postPauseWriteDenied', 'postPauseValueUnchanged',
-  ], 'production semantic proof');
-  if (Object.values(productionPath.semantic).some((value) => value !== true)) {
-    fail('production path did not prove capability read/write and post-pause revocation');
-  }
-  exactKeys(productionPath.cleanup, [
-    'activeSurfaceCount', 'activeSessionCount', 'ownerRecordCount',
-    'persistedProfileCount', 'profileLockAvailable',
-  ], 'production cleanup proof');
-  if (
-    productionPath.cleanup.activeSurfaceCount !== 0
-    || productionPath.cleanup.activeSessionCount !== 0
-    || productionPath.cleanup.ownerRecordCount !== 0
-    || productionPath.cleanup.persistedProfileCount !== 1
-    || productionPath.cleanup.profileLockAvailable !== true
-  ) {
-    fail('production path did not prove profile, owner, and session cleanup');
-  }
 }
 
 function validateWindowsProcessClosure(processClosure, processes, receipt, expected) {
@@ -786,7 +698,9 @@ function validateEvidenceAcl(evidenceAcl, expected) {
 
 export function validateWindowsMode2ProductionSmokeAttestation(attestation, expected) {
   exactKeys(expected, [
-    'sourceCommit', 'appVersion', 'runId', 'runAttempt', 'installedRoot',
+    'sourceCommit', 'appVersion', 'runId', 'runAttempt', 'repository', 'workflowRef',
+    'producerWorkflowRef', 'job',
+    'installedRoot',
     'installedExecutablePath', 'installedExecutableSha256', 'installerSha256',
     'runtimeInventorySha256', 'verifiedPathCount', 'runtimeRelativePaths',
     'installedTreeInventorySha256', 'installedTreePathSetSha256',
@@ -795,6 +709,14 @@ export function validateWindowsMode2ProductionSmokeAttestation(attestation, expe
   exactGitSha(expected.sourceCommit, 'expected source commit');
   exactRunNumber(expected.runId, 'expected run id');
   exactRunNumber(expected.runAttempt, 'expected run attempt');
+  const expectedRepository = exactRepository(expected.repository, 'expected repository');
+  exactWorkflowRef(expected.workflowRef, expectedRepository, 'expected workflow ref');
+  exactProducerWorkflowRef(
+    expected.producerWorkflowRef,
+    expectedRepository,
+    'expected producer workflow ref',
+  );
+  exactJob(expected.job, 'expected job');
   exactWindowsPath(expected.installedRoot, 'expected installed root');
   exactWindowsPath(expected.smokeRoot, 'expected smoke root');
   exactWindowsPath(expected.installedExecutablePath, 'expected installed executable');
@@ -823,8 +745,17 @@ export function validateWindowsMode2ProductionSmokeAttestation(attestation, expe
     fail('attestation source commit mismatch');
   }
   if (attestation.appVersion !== expected.appVersion) fail('attestation app version mismatch');
-  exactKeys(attestation.run, ['id', 'attempt', 'smokeRoot'], 'attestation run');
-  if (attestation.run.id !== expected.runId || attestation.run.attempt !== expected.runAttempt) {
+  exactKeys(attestation.run, [
+    'id', 'attempt', 'repository', 'workflowRef', 'producerWorkflowRef', 'job', 'smokeRoot',
+  ], 'attestation run');
+  if (
+    attestation.run.id !== expected.runId
+    || attestation.run.attempt !== expected.runAttempt
+    || attestation.run.repository !== expectedRepository
+    || attestation.run.workflowRef !== expected.workflowRef
+    || attestation.run.producerWorkflowRef !== expected.producerWorkflowRef
+    || attestation.run.job !== expected.job
+  ) {
     fail('attestation GitHub run identity mismatch');
   }
   exactWindowsPath(attestation.run.smokeRoot, 'attestation smoke root');
@@ -921,6 +852,10 @@ export function validateWindowsMode2ProductionSmokeAttestation(attestation, expe
     appVersion: expected.appVersion,
     runId: expected.runId,
     runAttempt: expected.runAttempt,
+    repository: expectedRepository,
+    workflowRef: expected.workflowRef,
+    producerWorkflowRef: expected.producerWorkflowRef,
+    job: expected.job,
     installedExecutableSha256: expected.installedExecutableSha256,
     installerSha256: expected.installerSha256,
     runtimeInventorySha256: expected.runtimeInventorySha256,
@@ -936,6 +871,10 @@ export function validateWindowsMode2ProductionSmokeAttestation(attestation, expe
     verifiedPathCount: expected.verifiedPathCount,
     verifiedPathsSha256: hashWindowsMode2SmokeJson(expectedRuntimeRelativePaths),
     productionPathVerified: true,
+    semanticBehaviorVerified: true,
+    effectFenceVerified: true,
+    profileIsolationVerified: true,
+    screenshotArtifactVerified: true,
     nativeWindowVerified: true,
     processTokenSandboxVerified: true,
     networkServiceSandboxed: true,
@@ -949,15 +888,58 @@ export function validateWindowsMode2ProductionSmokeAttestation(attestation, expe
 export function validateWindowsMode2SmokeSummary(summary, expected) {
   exactKeys(summary, [
     'schemaVersion', 'platform', 'sourceCommit', 'appVersion', 'runId', 'runAttempt',
+    'repository', 'workflowRef', 'producerWorkflowRef', 'job',
     'installedExecutableSha256', 'installerSha256', 'runtimeInventorySha256',
     'installedTreeInventorySha256', 'installedTreePathSetSha256',
     'installedTreePathCount', 'runtimeReceiptSha256', 'attestationSha256',
     'chromiumVersion', 'sandboxProfile',
     'processTypes', 'stages', 'lpacSid',
     'verifiedPathCount', 'verifiedPathsSha256', 'productionPathVerified',
+    'semanticBehaviorVerified', 'effectFenceVerified', 'profileIsolationVerified',
+    'screenshotArtifactVerified',
     'nativeWindowVerified', 'processTokenSandboxVerified', 'networkServiceSandboxed',
     'upgradeAclNarrowed', 'observedDpi', 'profileCleanupVerified', 'cleanExit',
   ], 'Windows Mode 2 smoke summary');
+  const summaryRepository = exactRepository(summary.repository, 'smoke summary repository');
+  const summaryWorkflowRef = exactWorkflowRef(
+    summary.workflowRef,
+    summaryRepository,
+    'smoke summary workflow ref',
+  );
+  const summaryProducerWorkflowRef = exactProducerWorkflowRef(
+    summary.producerWorkflowRef,
+    summaryRepository,
+    'smoke summary producer workflow ref',
+  );
+  const summaryJob = exactJob(summary.job, 'smoke summary job');
+  const expectedIdentity = [
+    expected.repository,
+    expected.workflowRef,
+    expected.producerWorkflowRef,
+    expected.job,
+  ];
+  if (expectedIdentity.some((value) => value !== undefined)) {
+    if (expectedIdentity.some((value) => value === undefined)) {
+      fail('Windows Mode 2 smoke summary provenance expectation is incomplete');
+    }
+    const expectedRepository = exactRepository(expected.repository, 'expected repository');
+    if (
+      summaryRepository !== expectedRepository
+      || summaryWorkflowRef !== exactWorkflowRef(
+        expected.workflowRef,
+        expectedRepository,
+        'expected workflow ref',
+      )
+      || summaryProducerWorkflowRef !== exactProducerWorkflowRef(
+        expected.producerWorkflowRef,
+        expectedRepository,
+        'expected producer workflow ref',
+      )
+      || summaryJob !== exactJob(expected.job, 'expected job')
+    ) {
+      fail('Windows Mode 2 smoke summary provenance does not bind the signed producer job');
+    }
+  }
   if (
     summary.schemaVersion !== WINDOWS_MODE2_SMOKE_SCHEMA_VERSION
     || summary.platform !== WINDOWS_MODE2_SMOKE_PLATFORM
@@ -968,6 +950,10 @@ export function validateWindowsMode2SmokeSummary(summary, expected) {
     || summary.installedTreePathCount !== expected.installedTreePathCount
     || summary.cleanExit !== true
     || summary.productionPathVerified !== true
+    || summary.semanticBehaviorVerified !== true
+    || summary.effectFenceVerified !== true
+    || summary.profileIsolationVerified !== true
+    || summary.screenshotArtifactVerified !== true
     || summary.nativeWindowVerified !== true
     || summary.processTokenSandboxVerified !== true
     || summary.networkServiceSandboxed !== true

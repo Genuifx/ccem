@@ -491,6 +491,48 @@ fn embedded_prepare_commits_recovery_intent_before_returning_launch_pending() {
     ));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn embedded_prepare_failure_keeps_the_requested_profile_recovery_identity() {
+    let fixture = Fixture::new();
+    let profile_id = ProfileId::parse("profile-ffffffffffffffffffffffffffffffff")
+        .expect("valid missing profile id");
+    let workspace_identity = fixture
+        .manager
+        .available()
+        .expect("session manager")
+        .workspace_identities
+        .resolve(&fixture.workspace_a)
+        .expect("workspace identity");
+    let store = EmbeddedOwnerRecordStore::for_test(
+        fixture.session_root.join("embedded-owner-error-test"),
+        "cef-host-44444444444444444444444444444444".to_string(),
+        EmbeddedHostProcessIdentity {
+            pid: 4343,
+            birth_token: "mac:500:600".to_string(),
+            executable: PathBuf::from("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop"),
+        },
+    )
+    .expect("test embedded owner store");
+
+    let error = match fixture.manager.prepare_embedded_profile(
+        Fixture::trusted(&fixture.workspace_a),
+        ProfileSelection::Existing(profile_id.clone()),
+        "login-missing-profile",
+        &store,
+    ) {
+        Ok(_) => panic!("missing selected profile must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.identity(),
+        Some(&EmbeddedProfileIdentity::new(
+            &profile_id,
+            &workspace_identity
+        ))
+    );
+}
+
 #[test]
 fn close_and_force_stop_remove_only_after_cleanup_and_release_the_profile() {
     let fixture = Fixture::new();

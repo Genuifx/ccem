@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 mod artifacts;
 
+#[cfg(any(not(debug_assertions), test))]
 pub(in crate::browser::login) use artifacts::read_snapshot_artifact_contract;
 #[cfg(test)]
 use artifacts::resolve_snapshot_artifact;
@@ -225,7 +226,7 @@ fn serialize_agent_result(
                 &screenshot.sha256,
                 screenshot.byte_size,
             )?;
-            let mut value = serde_json::to_value(&SemanticBrowserResult::Screenshot(screenshot))
+            let mut value = serde_json::to_value(SemanticBrowserResult::Screenshot(screenshot))
                 .map_err(|_| "Login Browser result serialization failed.".to_string())?;
             insert_artifact_path(&mut value, path)?;
             Ok(value)

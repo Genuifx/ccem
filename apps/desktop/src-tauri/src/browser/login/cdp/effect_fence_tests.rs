@@ -117,6 +117,77 @@ fn transport_pre_write_barrier_observes_revoke_and_emits_no_frame() {
 }
 
 #[test]
+fn input_down_revoked_at_pre_write_barrier_emits_no_input_or_release_frame() {
+    let (control, cancellation) = operation();
+    let owner = cancellation.enter_owner_execution().expect("owner entered");
+    let observer = cancellation.clone();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let _owner = owner;
+        let (_frames, inbox, _state) = frame_channel();
+        let mut output = Vec::new();
+        let mut client = CdpClient::new(&mut output, inbox);
+        let probe = PreWriteBarrier {
+            cancellation,
+            entered: Mutex::new(Some(entered_tx)),
+            release: release_rx,
+        };
+        let result = client.begin_input_sequence(
+            CdpMethod::InputDispatchMouseEvent,
+            serde_json::json!({
+                "type": "mousePressed",
+                "x": 10.0,
+                "y": 20.0,
+                "button": "left",
+                "clickCount": 1
+            }),
+            "session",
+            Instant::now() + Duration::from_secs(1),
+            &probe,
+            &mut NoopHandler,
+        );
+        drop(client);
+        done_tx.send((result, output)).expect("worker result");
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("at input pre-write boundary");
+    let (revoked_tx, revoked_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        control.cancel_active();
+        revoked_tx.send(()).expect("revoked");
+    });
+    let revoke_deadline = Instant::now() + Duration::from_secs(1);
+    while !observer.is_cancelled() && Instant::now() < revoke_deadline {
+        std::thread::yield_now();
+    }
+    assert!(observer.is_cancelled(), "epoch must retire before release");
+    assert!(revoked_rx.try_recv().is_err(), "owner is not quiescent yet");
+
+    release_tx
+        .send(())
+        .expect("release input pre-write barrier");
+    let (result, output) = done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker stopped");
+    revoked_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("revoke acknowledged owner quiescence");
+    assert_eq!(
+        result.expect_err("stale input denied").code,
+        BackendFailureCode::Cancelled
+    );
+    assert!(
+        output.is_empty(),
+        "uncommitted input must not synthesize a release frame"
+    );
+}
+
+#[test]
 fn queued_stale_command_emits_no_frame() {
     let (control, cancellation) = operation();
     control.cancel_active();

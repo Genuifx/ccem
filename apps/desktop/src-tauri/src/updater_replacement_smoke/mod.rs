@@ -203,7 +203,7 @@ fn run(
 }
 
 pub fn is_requested() -> bool {
-    std::env::args_os().any(|value| value == std::ffi::OsString::from(ARGUMENT))
+    std::env::args_os().any(|value| value == ARGUMENT)
 }
 
 pub fn run_requested(context: tauri::Context<tauri::Wry>) -> i32 {

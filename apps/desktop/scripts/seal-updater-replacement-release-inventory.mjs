@@ -19,7 +19,8 @@ function fail(message) {
 
 const SUMMARY_FIELDS = Object.freeze([
   'schemaVersion', 'proofClass', 'platform', 'target', 'runId', 'runAttempt',
-  'repository', 'workflowRef', 'job', 'challengeNonce', 'sourceCommit', 'previousTag',
+  'repository', 'workflowRef', 'producerWorkflowRef', 'job', 'challengeNonce',
+  'sourceCommit', 'previousTag',
   'previousSourceCommit', 'previousVersion', 'previousExecutableSha256',
   'instrumentationPatchSha256', 'previousEmbeddedUpdaterPublicKeySha256',
   'currentVersion', 'currentExecutableSha256', 'updaterPublicKeySha256',
@@ -66,11 +67,18 @@ export function validateUpdaterReplacementReleaseSummary(summary, expected) {
     || summary.platform !== platform
     || summary.target !== expected.target
     || summary.sourceCommit !== expected.sourceCommit
+    || summary.repository !== expected.repository
+    || summary.workflowRef !== expected.workflowRef
+    || summary.producerWorkflowRef !== expected.producerWorkflowRef
+    || summary.job !== expected.job
+    || summary.runId !== expected.runId
+    || summary.runAttempt !== expected.runAttempt
     || summary.currentVersion !== expected.appVersion
     || summary.currentExecutableSha256 !== expected.currentExecutableSha256
     || summary.updaterArtifactSha256 !== expected.updaterArtifactSha256
     || summary.updaterSignatureSha256 !== expected.updaterSignatureSha256
-    || (expected.runId !== undefined && summary.runId !== expected.runId)
+    || !/^[1-9][0-9]*$/u.test(expected.runId ?? '')
+    || !/^[1-9][0-9]*$/u.test(expected.runAttempt ?? '')
     || !/^[1-9][0-9]*$/u.test(summary.runId ?? '')
     || !/^[1-9][0-9]*$/u.test(summary.runAttempt ?? '')
     || !/^[a-f0-9]{40}$/u.test(summary.previousSourceCommit ?? '')
@@ -94,9 +102,6 @@ export function validateUpdaterReplacementReleaseSummary(summary, expected) {
       || summary.installedTreeInventorySha256 !== installedTree.inventorySha256
     ))
     || !pathApi.isAbsolute(summary.installRoot ?? '')
-    || !summary.repository
-    || !summary.workflowRef
-    || !summary.job
   ) {
     fail('updater replacement release summary does not bind the exact release target');
   }
@@ -164,6 +169,18 @@ export async function sealUpdaterReplacementReleaseInventory({
     updaterArtifactSha256: inventory.artifacts?.updater?.sha256,
     updaterSignatureSha256: inventory.artifacts?.updaterSignature?.sha256,
     installedTree: inventory.installedTree,
+    runId: inventory.macosSafeStorageRuntimeAttestation?.runId
+      ?? inventory.windowsRuntimeAttestation?.runId,
+    runAttempt: inventory.macosSafeStorageRuntimeAttestation?.runAttempt
+      ?? inventory.windowsRuntimeAttestation?.runAttempt,
+    repository: inventory.macosSafeStorageRuntimeAttestation?.repository
+      ?? inventory.windowsRuntimeAttestation?.repository,
+    workflowRef: inventory.macosSafeStorageRuntimeAttestation?.workflowRef
+      ?? inventory.windowsRuntimeAttestation?.workflowRef,
+    producerWorkflowRef: inventory.macosSafeStorageRuntimeAttestation?.producerWorkflowRef
+      ?? inventory.windowsRuntimeAttestation?.producerWorkflowRef,
+    job: inventory.macosSafeStorageRuntimeAttestation?.job
+      ?? inventory.windowsRuntimeAttestation?.job,
   });
   const sealed = {
     ...inventory,

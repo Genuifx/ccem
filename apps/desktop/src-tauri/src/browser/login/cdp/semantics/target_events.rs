@@ -151,9 +151,8 @@ impl SemanticEngine {
         let sessions = self
             .session_targets
             .iter()
-            .filter_map(|(session, mapped_target)| {
-                (mapped_target == target).then(|| session.clone())
-            })
+            .filter(|(_, mapped_target)| *mapped_target == target)
+            .map(|(session, _)| session.clone())
             .collect::<Vec<_>>();
         for session in sessions {
             self.cleanup_session(&session);

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   WINDOWS_MODE2_SMOKE_PLATFORM,
   WINDOWS_MODE2_SMOKE_SCHEMA_VERSION,
+  createWindowsMode2GithubRunIdentity,
   createWindowsRuntimeInventoryFingerprint,
   expectedWindowsMode2EvidenceRoot,
   expectedWindowsMode2InstallRoot,
@@ -92,11 +93,6 @@ function exactSha256(value, label) {
   return value;
 }
 
-function exactRunNumber(value, label) {
-  if (!/^\d+$/u.test(value ?? '')) fail(`${label} must be a GitHub run number`);
-  return value;
-}
-
 function exactNonce(value) {
   if (!/^[a-f0-9]{64}$/u.test(value ?? '')) fail('smoke nonce must be 32 random bytes');
   return value;
@@ -167,8 +163,7 @@ export function createWindowsMode2SmokePlan({
   nonce = randomBytes(32).toString('hex'),
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
-  const runId = exactRunNumber(environment.GITHUB_RUN_ID, 'GITHUB_RUN_ID');
-  const runAttempt = exactRunNumber(environment.GITHUB_RUN_ATTEMPT, 'GITHUB_RUN_ATTEMPT');
+  const run = createWindowsMode2GithubRunIdentity(environment);
   const smokeRoot = expectedWindowsMode2SmokeRoot(environment);
   const installRoot = expectedWindowsMode2InstallRoot(environment);
   const evidenceRoot = expectedWindowsMode2EvidenceRoot(environment);
@@ -193,7 +188,7 @@ export function createWindowsMode2SmokePlan({
     platform: WINDOWS_MODE2_SMOKE_PLATFORM,
     sourceCommit: exactSourceCommit,
     appVersion: exactVersion,
-    run: { id: runId, attempt: runAttempt },
+    run,
     paths: {
       smokeRoot,
       installRoot,
@@ -471,6 +466,10 @@ export function assembleWindowsMode2ProductionSmokeAttestation({
     appVersion: plan.appVersion,
     runId: plan.run.id,
     runAttempt: plan.run.attempt,
+    repository: plan.run.repository,
+    workflowRef: plan.run.workflowRef,
+    producerWorkflowRef: plan.run.producerWorkflowRef,
+    job: plan.run.job,
     installedRoot: plan.paths.installRoot,
     installedExecutablePath: plan.paths.installedExecutablePath,
     installedExecutableSha256: preflight.installedExecutableSha256,
@@ -488,7 +487,7 @@ export function assembleWindowsMode2ProductionSmokeAttestation({
     platform: WINDOWS_MODE2_SMOKE_PLATFORM,
     sourceCommit: plan.sourceCommit,
     appVersion: plan.appVersion,
-    run: { id: plan.run.id, attempt: plan.run.attempt, smokeRoot: plan.paths.smokeRoot },
+    run: { ...plan.run, smokeRoot: plan.paths.smokeRoot },
     installed: {
       root: plan.paths.installRoot,
       executablePath: plan.paths.installedExecutablePath,

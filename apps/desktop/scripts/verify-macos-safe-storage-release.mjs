@@ -80,5 +80,9 @@ export async function inspectMacosSafeStorageReleaseAttestation({
     appVersion,
     executableSha256,
     frameworkSha256,
+    repository: plan.run.repository,
+    workflowRef: plan.run.workflowRef,
+    producerWorkflowRef: plan.run.producerWorkflowRef,
+    job: plan.run.job,
   });
 }

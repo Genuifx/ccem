@@ -1,4 +1,5 @@
 use super::*;
+use crate::browser::login::surface_commands::ProductionSmokeScreenshotProof;
 
 fn build() -> BuildIdentity<'static> {
     BuildIdentity {
@@ -43,7 +44,7 @@ fn environment() -> BTreeMap<&'static str, String> {
 
 fn enabled_config() -> WindowsMode2SmokeConfig {
     match evaluate_gate(build(), &environment()) {
-        WindowsMode2SmokeGate::Enabled(config) => config,
+        WindowsMode2SmokeGate::Enabled(config) => *config,
         WindowsMode2SmokeGate::Disabled => panic!("smoke unexpectedly disabled"),
         WindowsMode2SmokeGate::Rejected(error) => panic!("smoke rejected: {error}"),
     }
@@ -75,6 +76,10 @@ fn complete_ci_release_identity_enables_exact_evidence_paths() {
     assert_eq!(
         config.workspace_root.to_string_lossy(),
         r"D:\a\_temp\ccem-mode2-production-smoke\12345-2\workspace"
+    );
+    assert_eq!(
+        config.secondary_workspace_root.to_string_lossy(),
+        r"D:\a\_temp\ccem-mode2-production-smoke\12345-2\workspace-secondary"
     );
     assert_eq!(
         config.owner_record_root.to_string_lossy(),
@@ -143,18 +148,35 @@ fn stages_are_strictly_ordered_and_monotonic() {
         "production_hidden",
         "production_reshown",
         "production_handoff",
-        "production_semantic_read_write",
+        "production_semantic_chain_started",
+        "production_active_effect_entered",
         "production_occluded",
-        "production_stale_write_denied",
+        "production_active_effect_cancelled",
         "production_restored",
         "production_rehandoff",
-        "production_post_pause_verified",
+        "production_post_pause_no_late_write",
         "production_paused",
         "production_takeover",
         "production_released",
         "production_reopened_ready",
         "production_reopened_shown",
+        "production_reopened_handoff",
+        "production_profile_persistence_verified",
         "production_reclosed",
+        "production_secondary_acquired",
+        "production_secondary_shown",
+        "production_secondary_handoff",
+        "production_secondary_isolation_verified",
+        "production_secondary_released",
+        "production_secondary_reopened_ready",
+        "production_secondary_reopened_shown",
+        "production_secondary_reopened_handoff",
+        "production_secondary_persistence_verified",
+        "production_secondary_reclosed",
+        "production_primary_final_reopened",
+        "production_primary_final_handoff",
+        "production_primary_unchanged_verified",
+        "production_primary_final_released",
         "production_cleanup_verified",
     ] {
         recorder.record(stage).unwrap();
@@ -228,19 +250,53 @@ fn atomic_publication_is_machine_readable_and_create_only() {
                     },
             },
             semantic: ProductionSemanticProof {
-                read_via_capability: true,
-                write_via_capability: true,
-                write_observed: true,
-                post_pause_write_denied: true,
-                post_pause_value_unchanged: true,
+                navigated_via_capability: true,
+                ax_snapshot_via_capability: true,
+                click_via_element_ref: true,
+                type_via_element_ref: true,
+                screenshot: ProductionSmokeScreenshotProof {
+                    canonical_path:
+                        r"D:\smoke\data\login\sessions\session-fixture\artifacts\shot-fixture.png"
+                            .to_string(),
+                    byte_size: 128,
+                    sha256: "c".repeat(64),
+                    png_magic_verified: true,
+                    png_structure_verified: true,
+                    png_decoded_verified: true,
+                    byte_size_verified: true,
+                    sha256_verified: true,
+                    app_owned_canonical_path_verified: true,
+                },
+                storage_commit_via_element_ref: true,
+                active_effect_entered: true,
+                active_effect_cancelled: true,
+                occlusion_ack_under_one_second: true,
+                occlusion_ack_millis: 42,
+                post_pause_no_late_write: true,
             },
             reopened_profile_id: "profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            secondary_reopened_profile_id: "profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            final_reopened_profile_id: "profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            profile_isolation: ProductionProfileIsolationProof {
+                secondary_workspace_root: r"D:\smoke\workspace-secondary".to_string(),
+                secondary_profile_id: "profile-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                distinct_workspace_profiles: true,
+                primary_cookie_persisted: true,
+                primary_local_storage_persisted: true,
+                secondary_profile_initially_empty: true,
+                secondary_cookie_isolated: true,
+                secondary_local_storage_isolated: true,
+                secondary_cookie_persisted: true,
+                secondary_local_storage_persisted: true,
+                primary_unchanged_after_secondary: true,
+            },
             cleanup: ProductionCleanupProof {
                 active_surface_count: 0,
                 active_session_count: 0,
                 owner_record_count: 0,
-                persisted_profile_count: 1,
-                profile_lock_available: true,
+                persisted_profile_count: 2,
+                workspace_count: 2,
+                profile_locks_available: true,
             },
         },
         stages: vec![SmokeStage {

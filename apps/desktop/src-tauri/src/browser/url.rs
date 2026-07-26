@@ -40,7 +40,7 @@ fn has_explicit_browser_url_scheme(raw: &str) -> bool {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
-    !(!port_candidate.is_empty() && port_candidate.chars().all(|ch| ch.is_ascii_digit()))
+    port_candidate.is_empty() || !port_candidate.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn browser_host_defaults_to_http(raw: &str) -> bool {

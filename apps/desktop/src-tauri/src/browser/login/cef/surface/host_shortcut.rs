@@ -6,8 +6,15 @@ pub(crate) const HOST_SHORTCUT_EVENT: &str = "browser_surface_host_shortcut";
 
 const KEY_ENTER: i32 = 0x0D;
 const KEY_ESCAPE: i32 = 0x1B;
+const KEY_0: i32 = 0x30;
 const KEY_K: i32 = 0x4B;
 const KEY_O: i32 = 0x4F;
+const KEY_NUMPAD_0: i32 = 0x60;
+const KEY_NUMPAD_ADD: i32 = 0x6B;
+const KEY_NUMPAD_SUBTRACT: i32 = 0x6D;
+// The main keyboard's `=` and `+` share VK_OEM_PLUS; Shift distinguishes the glyph.
+const KEY_OEM_PLUS: i32 = 0xBB;
+const KEY_OEM_MINUS: i32 = 0xBD;
 
 // cef_event_flags_t values are stable CEF ABI values. Keep the classifier
 // independent from the platform bindings so its ownership contract can be
@@ -42,6 +49,9 @@ pub(crate) enum HostShortcutAction {
     OpenProject,
     Submit,
     Escape,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -73,23 +83,38 @@ pub(crate) fn classify_host_shortcut(
     }
 
     let semantic_modifiers = event.modifiers & SEMANTIC_MODIFIERS;
-    if event.windows_key_code == KEY_ESCAPE && semantic_modifiers == 0 {
-        // Workspace owns bare Escape even when an editor has focus so it can
-        // stop a running session, matching the Wry-side Escape contract.
-        return Some(HostShortcutAction::Escape);
-    }
-
-    // useKeyboardShortcuts deliberately leaves modified keys inside inputs,
-    // textareas and contenteditable elements to that editor. CEF exposes the
-    // same distinction, so page editing and IME input keep their shortcuts.
-    if event.focus_on_editable_field {
-        return None;
-    }
-
     let expected_primary = match primary_modifier {
         HostPrimaryModifier::Command => MODIFIER_COMMAND,
         HostPrimaryModifier::Control => MODIFIER_CONTROL,
     };
+    let primary_only = semantic_modifiers == expected_primary;
+    let primary_with_shift = semantic_modifiers == (expected_primary | MODIFIER_SHIFT);
+    let zoom_action = match event.windows_key_code {
+        KEY_OEM_PLUS | KEY_NUMPAD_ADD if primary_only || primary_with_shift => {
+            Some(HostShortcutAction::ZoomIn)
+        }
+        KEY_OEM_MINUS | KEY_NUMPAD_SUBTRACT if primary_only => Some(HostShortcutAction::ZoomOut),
+        KEY_0 | KEY_NUMPAD_0 if primary_only => Some(HostShortcutAction::ZoomReset),
+        _ => None,
+    };
+    if zoom_action.is_some() {
+        // App zoom is a capture-phase desktop shortcut in Wry. Keep the same
+        // ownership while CEF has native focus, including editable fields.
+        return zoom_action;
+    }
+
+    // useKeyboardShortcuts deliberately leaves modified keys inside inputs,
+    // textareas and contenteditable elements to that editor. CEF exposes the
+    // same distinction. Keep bare Escape there too so an active IME composition
+    // can cancel itself instead of being consumed by the Workspace host.
+    if event.focus_on_editable_field {
+        return None;
+    }
+
+    if event.windows_key_code == KEY_ESCAPE && semantic_modifiers == 0 {
+        return Some(HostShortcutAction::Escape);
+    }
+
     if semantic_modifiers != expected_primary {
         return None;
     }
@@ -242,26 +267,100 @@ mod tests {
     }
 
     #[test]
-    fn bare_escape_remains_host_owned_from_editable_fields() {
+    fn editable_fields_keep_bare_escape_for_page_and_ime_composition() {
         assert_eq!(
             classify_host_shortcut(key(KEY_ESCAPE, 0, true), HostPrimaryModifier::Control,),
-            Some(HostShortcutAction::Escape),
+            None,
         );
     }
 
     #[test]
+    fn routes_main_and_numpad_zoom_shortcuts_even_from_editable_fields() {
+        for (primary, modifier) in [
+            (HostPrimaryModifier::Command, MODIFIER_COMMAND),
+            (HostPrimaryModifier::Control, MODIFIER_CONTROL),
+        ] {
+            for focus_on_editable_field in [false, true] {
+                for key_code in [KEY_OEM_PLUS, KEY_NUMPAD_ADD] {
+                    assert_eq!(
+                        classify_host_shortcut(
+                            key(key_code, modifier, focus_on_editable_field),
+                            primary,
+                        ),
+                        Some(HostShortcutAction::ZoomIn),
+                    );
+                }
+                assert_eq!(
+                    classify_host_shortcut(
+                        key(
+                            KEY_OEM_PLUS,
+                            modifier | MODIFIER_SHIFT,
+                            focus_on_editable_field,
+                        ),
+                        primary,
+                    ),
+                    Some(HostShortcutAction::ZoomIn),
+                );
+                for key_code in [KEY_OEM_MINUS, KEY_NUMPAD_SUBTRACT] {
+                    assert_eq!(
+                        classify_host_shortcut(
+                            key(key_code, modifier, focus_on_editable_field),
+                            primary,
+                        ),
+                        Some(HostShortcutAction::ZoomOut),
+                    );
+                }
+                for key_code in [KEY_0, KEY_NUMPAD_0] {
+                    assert_eq!(
+                        classify_host_shortcut(
+                            key(key_code, modifier, focus_on_editable_field),
+                            primary,
+                        ),
+                        Some(HostShortcutAction::ZoomReset),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_zoom_shortcuts_with_foreign_semantic_modifiers() {
+        for modifiers in [
+            MODIFIER_COMMAND | MODIFIER_ALT,
+            MODIFIER_COMMAND | MODIFIER_CONTROL,
+            MODIFIER_COMMAND | MODIFIER_ALT_GR,
+            MODIFIER_CONTROL | MODIFIER_SHIFT | MODIFIER_ALT,
+        ] {
+            assert_eq!(
+                classify_host_shortcut(
+                    key(KEY_OEM_PLUS, modifiers, true),
+                    HostPrimaryModifier::Command,
+                ),
+                None,
+            );
+        }
+    }
+
+    #[test]
     fn frontend_event_uses_stable_snake_case_action_names() {
-        assert_eq!(
-            serde_json::to_value(HostShortcutEventPayload {
-                surface_id: "login-4-lease-a".to_string(),
-                action: HostShortcutAction::OpenSearch,
-            })
-            .expect("serialize host shortcut event"),
-            serde_json::json!({
-                "surface_id": "login-4-lease-a",
-                "action": "open_search",
-            }),
-        );
+        for (action, expected) in [
+            (HostShortcutAction::OpenSearch, "open_search"),
+            (HostShortcutAction::ZoomIn, "zoom_in"),
+            (HostShortcutAction::ZoomOut, "zoom_out"),
+            (HostShortcutAction::ZoomReset, "zoom_reset"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(HostShortcutEventPayload {
+                    surface_id: "login-4-lease-a".to_string(),
+                    action,
+                })
+                .expect("serialize host shortcut event"),
+                serde_json::json!({
+                    "surface_id": "login-4-lease-a",
+                    "action": expected,
+                }),
+            );
+        }
     }
 
     #[cfg(any(target_os = "macos", windows))]

@@ -48,6 +48,7 @@ import {
   useTaskErrorEvent,
 } from '@/hooks/useTauriEvents';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { dispatchAppZoomCommand } from '@/hooks/useZoom';
 import { useLocale } from '@/locales';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
 import { useNativeSurfaceOccluded } from '@/lib/nativeSurfaceOcclusion';
@@ -2438,6 +2439,11 @@ export function Workspace({
         break;
       case 'escape':
         handleWorkspaceEscapeShortcut();
+        break;
+      case 'zoom_in':
+      case 'zoom_out':
+      case 'zoom_reset':
+        dispatchAppZoomCommand(action);
         break;
     }
   }, [

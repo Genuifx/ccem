@@ -1,5 +1,5 @@
 use super::super::backend::{BackendFailure, BackendFailureCode};
-use super::super::control::OperationCancellation;
+use super::super::control::{EffectSafetyFence, OperationCancellation};
 use super::super::execution_fence::EffectWritePermit;
 use super::protocol::{classify_frame, CdpEvent, CdpMethod, IncomingFrame};
 use serde_json::{Map, Value};
@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "transport/input_sequence.rs"]
+mod input_sequence;
 
 pub(super) const MAX_CDP_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_QUEUED_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -247,6 +250,10 @@ pub(super) trait CancellationProbe {
     fn enter_effect_write(&self) -> Result<Option<EffectWritePermit>, ()> {
         Ok(None)
     }
+
+    fn effect_safety_fence(&self) -> Option<EffectSafetyFence> {
+        None
+    }
 }
 
 impl CancellationProbe for OperationCancellation {
@@ -258,6 +265,10 @@ impl CancellationProbe for OperationCancellation {
         OperationCancellation::enter_effect_write(self)
             .map(Some)
             .map_err(|_| ())
+    }
+
+    fn effect_safety_fence(&self) -> Option<EffectSafetyFence> {
+        Some(OperationCancellation::effect_safety_fence(self))
     }
 }
 
@@ -304,7 +315,8 @@ impl<'a> CdpClient<'a> {
         cancellation: &dyn CancellationProbe,
         handler: &mut H,
     ) -> Result<Value, BackendFailure> {
-        self.call_with_rejection(
+        let mut committed = false;
+        self.call_with_rejection_tracking_commit(
             method,
             params,
             session_id,
@@ -312,6 +324,7 @@ impl<'a> CdpClient<'a> {
             cancellation,
             handler,
             BackendFailureCode::ProtocolViolation,
+            &mut committed,
         )
     }
 
@@ -324,7 +337,8 @@ impl<'a> CdpClient<'a> {
         cancellation: &dyn CancellationProbe,
         handler: &mut H,
     ) -> Result<Value, BackendFailure> {
-        self.call_with_rejection(
+        let mut committed = false;
+        self.call_with_rejection_tracking_commit(
             method,
             params,
             session_id,
@@ -332,11 +346,12 @@ impl<'a> CdpClient<'a> {
             cancellation,
             handler,
             BackendFailureCode::InvalidSemanticReference,
+            &mut committed,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn call_with_rejection<H: ProtocolEventHandler>(
+    fn call_with_rejection_tracking_commit<H: ProtocolEventHandler>(
         &mut self,
         method: CdpMethod,
         params: Value,
@@ -345,13 +360,17 @@ impl<'a> CdpClient<'a> {
         cancellation: &dyn CancellationProbe,
         handler: &mut H,
         rejection_code: BackendFailureCode,
+        committed: &mut bool,
     ) -> Result<Value, BackendFailure> {
+        *committed = false;
         check_time_and_cancel(deadline, cancellation)?;
         let id = self.allocate_id()?;
         self.write_command(id, method, params, session_id, Some(cancellation))?;
+        *committed = true;
         loop {
             if let Err(error) = check_time_and_cancel(deadline, cancellation) {
-                self.abandon_response(id)?;
+                // Cleanup bookkeeping must not replace the authoritative cancellation/deadline.
+                let _ = self.abandon_response(id);
                 return Err(error);
             }
             if let Some(response) = self.take_pending(id) {
@@ -380,7 +399,7 @@ impl<'a> CdpClient<'a> {
                             error.code,
                             BackendFailureCode::Cancelled | BackendFailureCode::TimedOut
                         ) {
-                            self.abandon_response(id)?;
+                            let _ = self.abandon_response(id);
                         }
                         return Err(error);
                     }
@@ -574,6 +593,10 @@ fn transport_failure(code: TransportFaultCode) -> BackendFailure {
 #[cfg(test)]
 #[path = "transport_reader_tests.rs"]
 mod reader_tests;
+
+#[cfg(test)]
+#[path = "transport_capacity_tests.rs"]
+mod capacity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -937,39 +960,5 @@ mod tests {
             .unwrap();
         assert_eq!(first["order"], 1);
         assert_eq!(second["order"], 2);
-    }
-
-    #[test]
-    fn abandoned_response_tracking_overflow_fails_closed() {
-        let (_sender, inbox, _state) = frame_channel();
-        let mut output = Vec::new();
-        let mut client = CdpClient::new(&mut output, inbox);
-
-        for _ in 0..MAX_IGNORED_RESPONSES {
-            let error = client
-                .call(
-                    CdpMethod::PageEnable,
-                    serde_json::json!({}),
-                    Some("session"),
-                    Instant::now() + Duration::from_secs(1),
-                    &CancelAfterDispatch::new(),
-                    &mut NoopHandler,
-                )
-                .unwrap_err();
-            assert_eq!(error.code, BackendFailureCode::Cancelled);
-        }
-
-        let error = client
-            .call(
-                CdpMethod::PageEnable,
-                serde_json::json!({}),
-                Some("session"),
-                Instant::now() + Duration::from_secs(1),
-                &CancelAfterDispatch::new(),
-                &mut NoopHandler,
-            )
-            .unwrap_err();
-        assert_eq!(error.code, BackendFailureCode::ProtocolViolation);
-        assert_eq!(client.ignored.len(), MAX_IGNORED_RESPONSES);
     }
 }

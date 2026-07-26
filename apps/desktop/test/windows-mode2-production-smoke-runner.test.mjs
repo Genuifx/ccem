@@ -1,9 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 
 import {
   WINDOWS_MODE2_SMOKE_ALLOW_ENV,
@@ -33,6 +30,7 @@ import {
   validateWindowsProcessSandboxEvidence,
 } from '../scripts/windows-mode2-production-smoke-contract.mjs';
 import { WINDOWS_CEF_SOURCE_PIN } from '../scripts/stage-cef-windows.mjs';
+import { windowsSemanticProductionPathProof } from './fixtures/windows-mode2-production-smoke.mjs';
 
 const SOURCE_COMMIT = 'a'.repeat(40);
 const NONCE = 'b'.repeat(64);
@@ -41,7 +39,12 @@ const EXECUTABLE_SHA = 'd'.repeat(64);
 const THUMBPRINT = 'A'.repeat(40);
 const TIMESTAMP_THUMBPRINT = 'E'.repeat(40);
 const PUBLISHER = 'CN=CCEM Release, O=CCEM';
-const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const REPOSITORY = 'Genuifx/claude-code-env-manager';
+const WORKFLOW_REF =
+  `${REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
+const PRODUCER_WORKFLOW_REF =
+  `${REPOSITORY}/.github/workflows/mode2-signed-producer.yml@refs/heads/main`;
+const JOB = 'build-desktop';
 const environment = {
   GITHUB_ACTIONS: 'true',
   RUNNER_OS: 'Windows',
@@ -49,6 +52,10 @@ const environment = {
   GITHUB_SHA: SOURCE_COMMIT,
   GITHUB_RUN_ID: '12345',
   GITHUB_RUN_ATTEMPT: '2',
+  GITHUB_REPOSITORY: REPOSITORY,
+  GITHUB_WORKFLOW_REF: WORKFLOW_REF,
+  CCEM_MODE2_PRODUCER_WORKFLOW_REF: PRODUCER_WORKFLOW_REF,
+  GITHUB_JOB: JOB,
   WINDOWS_CERTIFICATE_THUMBPRINT: THUMBPRINT,
   CCEM_OFFICIAL_WINDOWS_PUBLISHER: PUBLISHER,
   [WINDOWS_MODE2_SMOKE_ALLOW_ENV]: '1',
@@ -266,21 +273,10 @@ function fixtureReceipt(plan, checkpoint) {
     networkServiceLpacRequested: true,
     productionPath: {
       ...checkpoint.productionPath,
-      semantic: {
-        readViaCapability: true,
-        writeViaCapability: true,
-        writeObserved: true,
-        postPauseWriteDenied: true,
-        postPauseValueUnchanged: true,
-      },
-      reopenedProfileId: checkpoint.productionPath.profileId,
-      cleanup: {
-        activeSurfaceCount: 0,
-        activeSessionCount: 0,
-        ownerRecordCount: 0,
-        persistedProfileCount: 1,
-        profileLockAvailable: true,
-      },
+      ...windowsSemanticProductionPathProof(
+        plan.paths.smokeRoot,
+        checkpoint.productionPath.profileId,
+      ),
     },
     stages: WINDOWS_MODE2_REQUIRED_STAGES.map((name, index) => ({
       name,
@@ -378,6 +374,14 @@ test('plan pins the exact current-run app/evidence roots and safe NSIS invocatio
   assert.equal(plan.paths.smokeRoot, 'D:\\a\\_temp\\ccem-mode2-production-smoke\\12345-2');
   assert.equal(plan.paths.installRoot, `${plan.paths.smokeRoot}\\app`);
   assert.equal(plan.paths.evidenceRoot, `${plan.paths.smokeRoot}\\evidence`);
+  assert.deepEqual(plan.run, {
+    id: '12345',
+    attempt: '2',
+    repository: REPOSITORY,
+    workflowRef: WORKFLOW_REF,
+    producerWorkflowRef: PRODUCER_WORKFLOW_REF,
+    job: JOB,
+  });
   assert.deepEqual(plan.install, {
     program: 'D:\\a\\ccem\\ccem_2.53.0_x64-setup.exe',
     args: ['/S', `/D=${plan.paths.installRoot}`],
@@ -388,62 +392,34 @@ test('plan pins the exact current-run app/evidence roots and safe NSIS invocatio
   assert.equal(plan.launch.environment.CCEM_WINDOWS_MODE2_SMOKE_RECEIPT_PATH, plan.paths.receiptPath);
 });
 
-test('installed smoke source enters the production manager path with isolated state and exact lifecycle', async () => {
-  const [runtime, surfaceBridge, desktop, windowsBootstrap] = await Promise.all([
-    fs.readFile(path.join(
-      desktopDir,
-      'src-tauri/src/browser/login/cef/ci_smoke/production_runtime.rs',
-    ), 'utf8'),
-    fs.readFile(path.join(
-      desktopDir,
-      'src-tauri/src/browser/login/surface_commands/production_smoke.rs',
-    ), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src-tauri/src/lib.rs'), 'utf8'),
-    fs.readFile(path.join(
-      desktopDir,
-      'src-tauri/src/browser/login/cef/bootstrap/windows.rs',
-    ), 'utf8'),
-  ]);
-  const ordered = [
-    'production_acquired_hidden_ready',
-    'production_shown',
-    'production_hidden',
-    'production_reshown',
-    'BrowserSurfaceControlActionArg::Handoff',
-    'BrowserSurfaceControlActionArg::Pause',
-    'BrowserSurfaceControlActionArg::Takeover',
-    'production_released',
-    'production_reopened_ready',
-    'production_reopened_shown',
-    'production_reclosed',
-    'production_cleanup_verified',
-  ];
-  let cursor = -1;
-  for (const marker of ordered) {
-    const next = runtime.indexOf(marker, cursor + 1);
-    assert.notEqual(next, -1, `missing production lifecycle marker ${marker}`);
-    cursor = next;
+test('plan rejects every malformed or foreign GitHub provenance field', () => {
+  for (const [field, value, message] of [
+    ['GITHUB_REPOSITORY', 'foreign-repository', /owner\/name/u],
+    [
+      'GITHUB_WORKFLOW_REF',
+      'Other/repository/.github/workflows/release.yml@refs/heads/main',
+      /repository-bound workflow ref/u,
+    ],
+    [
+      'CCEM_MODE2_PRODUCER_WORKFLOW_REF',
+      `${REPOSITORY}/.github/workflows/release-desktop.yml@refs/heads/main`,
+      /mode2-signed-producer\.yml/u,
+    ],
+    ['CCEM_MODE2_PRODUCER_WORKFLOW_REF', undefined, /repository-bound workflow ref/u],
+    ['GITHUB_JOB', 'signed-readiness', /signed producer build job/u],
+  ]) {
+    assert.throws(
+      () => createWindowsMode2SmokePlan({
+        environment: { ...environment, [field]: value },
+        installerPath: 'D:\\a\\ccem\\ccem_2.53.0_x64-setup.exe',
+        stageDir: 'D:\\a\\ccem\\cef-stage',
+        appVersion: '2.53.0',
+        sourceCommit: SOURCE_COMMIT,
+        nonce: NONCE,
+      }),
+      message,
+    );
   }
-  assert.match(surfaceBridge, /snapshot\.lifecycle != "ready"[\s\S]*snapshot\.visible/);
-  assert.match(surfaceBridge, /snapshot\.visible != visible/);
-  assert.match(surfaceBridge, /native\.current_url != expected_initial_url/);
-  for (const owner of ['Agent', 'Paused', 'User']) {
-    assert.match(surfaceBridge, new RegExp(`SessionControlOwner::${owner}`));
-  }
-  assert.match(surfaceBridge, /session\.control != expected_control/);
-  assert.match(runtime, /profile_state_root[\s\S]*profile\.lock/);
-  assert.match(runtime, /owner_record_count != 0/);
-  assert.match(runtime, /list_snapshots\(\)/);
-  assert.match(desktop, /config\.create_isolated_runtime\(\)/);
-  assert.match(desktop, /runtime\.sessions\.clone\(\)/);
-  assert.match(desktop, /runtime\.surfaces\.clone\(\)/);
-  assert.match(desktop, /runtime\.cef_host\.clone\(\)/);
-  assert.match(windowsBootstrap, /NETWORK_SERVICE_SANDBOX_FEATURE: &str = "NetworkServiceSandbox"/);
-  assert.match(windowsBootstrap, /NETWORK_SERVICE_LPAC_FEATURE: &str =[\s\S]*"WinSboxNetworkServiceSandboxIsLPAC"/);
-  assert.match(windowsBootstrap, /switch_value\(Some\(&name\)\)/);
-  assert.match(windowsBootstrap, /features\.push\(NETWORK_SERVICE_SANDBOX_FEATURE\.to_string\(\)\)/);
-  assert.match(windowsBootstrap, /features\.push\(NETWORK_SERVICE_LPAC_FEATURE\.to_string\(\)\)/);
-  assert.match(windowsBootstrap, /append_switch_with_value\(Some\(&name\), Some\(&features\)\)/);
 });
 
 test('real execution requires both Windows GitHub runner identity and explicit authorization', () => {
@@ -648,6 +624,14 @@ test('injected runner observes live children before ACK and writes validated att
   assert.equal(result.attestation.runtime.receiptSha256, hashWindowsMode2SmokeJson(receipt));
   assert.deepEqual(result.attestation.runtime.window, fixtureWindow());
   assert.equal(result.summary.nativeWindowVerified, true);
+  assert.equal(result.summary.semanticBehaviorVerified, true);
+  assert.equal(result.summary.effectFenceVerified, true);
+  assert.equal(result.summary.profileIsolationVerified, true);
+  assert.equal(result.summary.screenshotArtifactVerified, true);
+  assert.equal(result.summary.repository, REPOSITORY);
+  assert.equal(result.summary.workflowRef, WORKFLOW_REF);
+  assert.equal(result.summary.producerWorkflowRef, PRODUCER_WORKFLOW_REF);
+  assert.equal(result.summary.job, JOB);
   assert.equal(result.summary.processTokenSandboxVerified, true);
   assert.equal(result.summary.upgradeAclNarrowed, true);
   assert.equal(result.summary.attestationSha256, createHash('sha256')
@@ -855,10 +839,10 @@ test('checkpoint and receipt reject a fake production path or incomplete cleanup
     waitForExit: async () => ({ code: 0, signal: null }),
     inspectCleanup: async () => fixtureCleanedProcesses(),
     terminate: async () => fixtureCleanedProcesses(),
-  }), /profile, owner, and session cleanup/);
+  }), /two-profile owner, session, and lock cleanup/);
 
   const semanticReceipt = fixtureReceipt(plan, checkpoint);
-  semanticReceipt.productionPath.semantic.postPauseWriteDenied = false;
+  semanticReceipt.productionPath.semantic.postPauseNoLateWrite = false;
   await assert.rejects(() => executeWindowsMode2ProductionSmoke({
     plan, manifestIdentity, environment,
   }, {
@@ -869,7 +853,7 @@ test('checkpoint and receipt reject a fake production path or incomplete cleanup
     observeProcesses: async () => fixtureObservation(plan), writeJson: async () => {},
     waitForExit: async () => ({ code: 0, signal: null }),
     inspectCleanup: async () => ({ remainingOwnedPids: [], remainingClosurePids: [] }), terminate: async () => {},
-  }), /capability read\/write and post-pause revocation/);
+  }), /postPauseNoLateWrite is not true/);
 });
 
 test('runner refuses an unbound upgrade ACL seed before installation', async () => {

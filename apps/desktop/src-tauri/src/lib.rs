@@ -4652,7 +4652,7 @@ pub fn run_desktop_app() -> i32 {
             config,
         ) => {
             #[cfg(all(target_os = "macos", not(debug_assertions)))]
-            return browser::login::cef::macos_safe_storage_smoke::run(config);
+            return browser::login::cef::macos_safe_storage_smoke::run(*config);
             #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
             {
                 let _ = config;
@@ -4864,7 +4864,7 @@ pub fn run_desktop_app() -> i32 {
             }
 
             #[cfg(all(target_os = "windows", not(debug_assertions)))]
-            if let Some(config) = windows_mode2_ci_smoke_for_page_load.as_ref().cloned() {
+            if let Some(config) = windows_mode2_ci_smoke_for_page_load.as_deref().cloned() {
                 let smoke_app = webview.app_handle().clone();
                 let main_window = webview.window();
                 let prepare_window = main_window

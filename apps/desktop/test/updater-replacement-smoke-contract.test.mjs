@@ -93,14 +93,15 @@ test('Windows fixture and evidence DACLs are protected before installer or app l
   assert.ok(evidenceProtected < previousInstaller && previousInstaller < previousApp);
 });
 
-test('schema v3 accepts exact macOS and Windows replacement evidence', () => {
+test('schema v4 accepts exact macOS and Windows replacement evidence', () => {
   for (const platform of ['macos', 'windows']) {
     const { expected, attestation } = attestationFixture(platform);
     const summary = validateUpdaterReplacementSmokeAttestation(attestation, expected);
-    assert.equal(summary.schemaVersion, 3);
+    assert.equal(summary.schemaVersion, 4);
     assert.equal(summary.proofClass, 'instrumented-previous-source');
     assert.equal(summary.repository, expected.run.repository);
     assert.equal(summary.workflowRef, expected.run.workflowRef);
+    assert.equal(summary.producerWorkflowRef, expected.run.producerWorkflowRef);
     assert.equal(summary.job, expected.run.job);
     assert.equal(summary.challengeNonce, CHALLENGE_NONCE);
     assert.equal(summary.previousExecutableSha256, PREVIOUS_EXECUTABLE_SHA256);
@@ -134,6 +135,7 @@ test('proof class and GitHub run identity are mandatory and exact', () => {
   for (const [field, value, pattern] of [
     ['repository', 'not-a-repository', /owner\/name/],
     ['workflowRef', 'other/repo/.github/workflows/x.yml@refs/heads/main', /repository-bound/],
+    ['producerWorkflowRef', 'ccem-org/claude-code-env-manager/.github/workflows/other.yml@refs/heads/main', /signed producer/],
     ['job', 'invalid job', /job is invalid/],
     ['challengeNonce', 'c'.repeat(63), /exact SHA-256/],
     ['id', '0', /positive GitHub run number/],

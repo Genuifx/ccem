@@ -408,9 +408,9 @@ fn write_snapshot_atomic(
         fs::rename(&temp_path, &final_path)
             .map_err(|_| ConsoleLogError::new(ConsoleLogErrorCode::Io))?;
         sync_directory(root)?;
-        Ok(final_path
+        final_path
             .canonicalize()
-            .map_err(|_| ConsoleLogError::new(ConsoleLogErrorCode::Io))?)
+            .map_err(|_| ConsoleLogError::new(ConsoleLogErrorCode::Io))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);

@@ -1,7 +1,7 @@
 use super::{
     diagnostic_url, run_cancellable_on_main, should_retire_surface_without_browser,
     validate_surface_id, CefSurfaceConnection, CefSurfaceLifecycle, CefSurfaceOpenSpec,
-    HostShortcutKeyboardHandler, NativeChildBounds, SharedSurfaceState,
+    HostShortcutKeyboardHandler, NativeChildBounds, SharedSurfaceState, SurfaceRequestHandler,
 };
 use crate::browser::login::cef::{
     devtools_bridge::{CefDevToolsBridge, CefDevToolsObserver},
@@ -26,7 +26,7 @@ mod mutation;
 mod popup;
 mod util;
 
-pub(crate) use mutation::{native_window_observation, set_bounds, set_visible};
+pub(crate) use mutation::{native_window_observation, occlude, set_bounds, set_visible};
 
 pub(super) use util::{
     cef_hwnd, destroy_cef_child, inspect_child_window, position_window, prepare_profile_path,
@@ -125,6 +125,7 @@ fn finalize_surface_if_terminal(surface_id: &str, shared: &Arc<SharedSurfaceStat
     surface.browser.take();
     surface.context.take();
     drop(surface);
+    shared.clear_focus_restore_intent();
     shared.update(|state| {
         state.lifecycle = CefSurfaceLifecycle::Closed;
         state.devtools_attached = false;
@@ -192,16 +193,7 @@ wrap_load_handler! {
                 return;
             }
             let url = CefString::from(&frame.url()).to_string();
-            self.shared.update(|state| {
-                if !matches!(
-                    state.lifecycle,
-                    CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
-                ) {
-                    state.lifecycle = CefSurfaceLifecycle::Loading;
-                    state.current_url = url;
-                    state.error = None;
-                }
-            });
+            self.shared.begin_main_frame_load(url);
         }
 
         fn on_load_end(
@@ -218,16 +210,7 @@ wrap_load_handler! {
             if url == "about:blank" && self.initial_url != "about:blank" {
                 return;
             }
-            self.shared.update(|state| {
-                state.current_url = url;
-                if !matches!(
-                    state.lifecycle,
-                    CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
-                ) {
-                    state.lifecycle = CefSurfaceLifecycle::Ready;
-                    state.error = None;
-                }
-            });
+            self.shared.finish_main_frame_load(url);
         }
 
         fn on_load_error(
@@ -470,6 +453,10 @@ wrap_client! {
 
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
             Some(HostShortcutKeyboardHandler::new(self.app.clone(), self.surface_id.clone()))
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(SurfaceRequestHandler::new(Arc::clone(&self.shared)))
         }
 
         fn load_handler(&self) -> Option<LoadHandler> {
@@ -729,15 +716,7 @@ pub(crate) fn navigate(surface_id: &str, url: &str) -> Result<(), String> {
         let frame = browser
             .main_frame()
             .ok_or_else(|| "CEF child browser has no main frame".to_string())?;
-        surface.shared.update(|state| {
-            if !matches!(
-                state.lifecycle,
-                CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
-            ) {
-                state.lifecycle = CefSurfaceLifecycle::Loading;
-                state.error = None;
-            }
-        });
+        surface.shared.begin_navigation()?;
         frame.load_url(Some(&CefString::from(url)));
         Ok(())
     })
@@ -783,6 +762,7 @@ pub(crate) fn close(surface_id: &str) -> Result<(), String> {
                 remove_without_browser,
             ))
         })?;
+    shared.clear_focus_restore_intent();
     shared.deny_popups();
 
     if remove_without_browser {

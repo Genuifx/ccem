@@ -76,6 +76,9 @@ jobs:
           EXPECTED_VERSION: ${{ inputs.version }}
           EXPORT_RELEASE_PAYLOAD: ${{ inputs.export_release_payload }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          GH_TOKEN: ${{ github.token }}
           PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
           PRODUCER_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
@@ -104,14 +107,68 @@ jobs:
             exit 1
           }
           if [[ "$EXPORT_RELEASE_PAYLOAD" == "true" ]]; then
+            expected_caller_ref="${GITHUB_REPOSITORY}/.github/workflows/release-desktop.yml@${GITHUB_REF}"
+            [[ "$GITHUB_WORKFLOW_REF" == "$expected_caller_ref" ]] || {
+              echo "Release payload export is restricted to release-desktop.yml" >&2
+              exit 1
+            }
             [[ "$RELEASE_TAG" == "v${EXPECTED_VERSION}" ]] || {
               echo "Release payload export requires release_tag=v<version>" >&2
               exit 1
             }
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+              echo "Release payload export requires a formal semantic-version tag" >&2
+              exit 1
+            }
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+                echo "Manual release producer calls may run only from protected main" >&2
+                exit 1
+              }
+            else
+              [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/tags/${RELEASE_TAG}" ]] || {
+                echo "Release producer calls require the exact formal tag push" >&2
+                exit 1
+              }
+            fi
           elif [[ -n "$RELEASE_TAG" ]]; then
             echo "Readiness calls must not pass a release tag" >&2
             exit 1
+          else
+            expected_caller_ref="${GITHUB_REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@${GITHUB_REF}"
+            [[ "$GITHUB_WORKFLOW_REF" == "$expected_caller_ref" ]] || {
+              echo "Non-publishing evidence is restricted to mode2-signed-readiness.yml" >&2
+              exit 1
+            }
+            [[ "$EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Signed readiness producer calls may run only from protected main" >&2
+              exit 1
+            }
           fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Signed producer requires a protected caller ref" >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not verify main branch protection through the GitHub API" >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Signed producer requires the main branch to be protected" >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Signed producer source ${source_commit} is not reachable from origin/main" >&2
+            exit 1
+          }
 
       - name: Validate version consistency
         env:
@@ -389,6 +446,7 @@ jobs:
           APPLE_TEAM_ID: ${{ matrix.appleSigning && secrets.APPLE_TEAM_ID || '' }}
           CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
           CCEM_CEF_TARGET_TRIPLE: ${{ matrix.target }}
+          CCEM_MODE2_PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
           APPLE_ID: ${{ matrix.appleSigning && secrets.APPLE_ID || '' }}
           APPLE_PASSWORD: ${{ matrix.appleSigning && secrets.APPLE_PASSWORD || '' }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -397,13 +455,15 @@ jobs:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
 
-      - name: Prove signed macOS Mode 2 Safe Storage isolation and persistence
+      - name: Prove signed macOS Mode 2 Safe Storage and production behavior
         id: macos-safe-storage-smoke
         if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
         shell: bash
         working-directory: apps/desktop
         env:
           CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ALLOW: '1'
+          CCEM_MODE2_PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
+          CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           umask 077
@@ -426,6 +486,7 @@ jobs:
             printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_NONCE=%s\n' "$nonce"
             printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ROOT=%s\n' "$smoke_root"
             printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ATTESTATION=%s\n' "$attestation"
+            printf 'CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_TARGET=%s\n' "$CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_TARGET"
           } >> "$GITHUB_ENV"
           printf 'attestation_path=%s\n' "$attestation" >> "$GITHUB_OUTPUT"
 
@@ -456,6 +517,7 @@ jobs:
           CCEM_RELEASE_ALLOW_PLATFORM_VERIFICATION: '1'
           CCEM_RELEASE_TARGET: ${{ matrix.target }}
           CCEM_RELEASE_VERSION: ${{ inputs.version }}
+          CCEM_MODE2_PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
           set -euo pipefail
           bundle_root="src-tauri/target/${CCEM_RELEASE_TARGET}/release/bundle"
@@ -502,6 +564,7 @@ jobs:
           CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
           CCEM_WINDOWS_MODE2_ALLOW_PRODUCTION_SMOKE: '1'
           CCEM_RELEASE_VERSION: ${{ inputs.version }}
+          CCEM_MODE2_PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           $releaseRoot = (Resolve-Path 'src-tauri/target/x86_64-pc-windows-msvc/release').Path
@@ -534,6 +597,7 @@ jobs:
           CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
           CCEM_RELEASE_ALLOW_PLATFORM_VERIFICATION: '1'
           CCEM_RELEASE_VERSION: ${{ inputs.version }}
+          CCEM_MODE2_PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           $releaseRoot = Resolve-Path 'src-tauri/target/x86_64-pc-windows-msvc/release'
@@ -687,6 +751,7 @@ jobs:
           CCEM_OFFICIAL_APPLE_TEAM_ID: ${{ vars.CCEM_OFFICIAL_APPLE_TEAM_ID }}
           WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
           CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
+          CCEM_MODE2_PRODUCER_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
           set -euo pipefail
           evidence="src-tauri/target/release-gates/updater-replacement-attestation-${CCEM_RELEASE_TARGET}.json"
@@ -802,6 +867,7 @@ jobs:
           --run-attempt "${GITHUB_RUN_ATTEMPT}"
           --repository "${GITHUB_REPOSITORY}"
           --workflow-ref "${GITHUB_WORKFLOW_REF}"
+          --producer-workflow-ref "${{ job.workflow_ref }}"
           --output signed-evidence-summary.json
 
       - name: Reconfirm non-publishing candidate tag remains absent

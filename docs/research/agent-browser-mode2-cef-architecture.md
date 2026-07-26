@@ -218,6 +218,12 @@ Replace or delete:
 - `navigate -> AX snapshot -> click -> type -> screenshot` runs through the existing semantic
   capability path using the CEF DevTools observer bridge.
 - Pause/takeover cancels active effects within one second and no later write reaches CEF.
+- Each signed production-runtime smoke repeats that semantic chain against the embedded production
+  surface and binds the resulting canonical app-owned PNG path, size, and SHA-256 digest into the
+  platform evidence. The verifier also requires a strict PNG chunk envelope, validates every chunk
+  CRC, decodes the bounded pixel payload, and rejects duplicate/missing terminal chunks or trailing
+  bytes. Its cancellation fixture must overlap a real in-flight write with Occlude and prove the
+  execution fence prevented every late write.
 - Redirect, popup, iframe, download, and file chooser policy remains fail-closed.
 
 ### Gate 4: profile and recovery
@@ -225,7 +231,14 @@ Replace or delete:
 - Manual login survives CCEM restart in the same opaque profile.
 - Two workspaces and two profiles do not share cookies or local storage.
 - Reset/delete works only after the browser is closed and trusted confirmation is current.
-- Renderer crash, browser close, forced app exit, and restart have explicit recovery states.
+- The signed production-runtime smoke closes and reopens both primary and secondary profiles,
+  proving cookie and local-storage persistence within each profile and isolation across them.
+- Renderer termination is sticky until an explicit close/reopen, is projected to the workspace only
+  after active Agent control is paused, and has a visible retry path. Browser close, forced app exit,
+  and restart have equally explicit recovery states.
+- Focus restoration is a one-shot native intent for the requested main surface or popup. Ordinary
+  geometry/show mutations cannot steal focus, and trusted host overlays keep CEF occluded until the
+  overlay is dismissed.
 
 ### Gate 5: delivery
 
@@ -259,12 +272,17 @@ the full cross-platform signing set is present.
 still absent from origin. It exports only current-attempt Actions evidence. The aggregate verifier
 requires exactly the macOS arm64, macOS x86_64, and Windows x86_64 inventories and binds their nested
 Safe Storage, Windows runtime, and updater-replacement receipts to the same source, run, attempt,
-repository, caller workflow, job, and target.
+repository, caller workflow, producer workflow, job, and target. It also requires the platform
+production-behavior, effect-fence, profile-isolation, and screenshot-artifact hard gates; a signed
+artifact that only boots or reports process inventory cannot satisfy readiness.
 
 `.github/workflows/release-desktop.yml` keeps the existing tag/source gate and is the only caller that
 sets `export_release_payload: true`. Only after the shared producer and aggregate evidence gate pass
 does its separate publication job receive `contents: write`. Re-running only a failed publication job
 cannot reuse payloads from another attempt; the current attempt must contain all three exact payloads.
+The prepare, producer, and publication gates independently query the read-only branch metadata for
+`main` and require `protected: true`, in addition to checking the selected branch/tag protection and
+source ancestry. A protected release tag therefore cannot compensate for an unprotected `main`.
 
 This structure makes signed readiness possible without creating a tag, draft, release asset, or
 `latest.json`. It does not itself provide current signed-runner evidence: a successful readiness run
@@ -282,10 +300,18 @@ proof is a real installed-app flow:
 5. Restart CCEM, reopen the same profile, and prove login persistence.
 6. Open another workspace/profile and prove storage isolation.
 7. Close the browser and CCEM, then prove no owned helper remains.
-8. Inspect redacted audit, network, console, screenshot, and snapshot artifacts.
+8. Inspect redacted audit, network, and console artifacts, plus the private snapshot and screenshot
+   artifacts. Snapshots and screenshots intentionally retain page content and must stay inside the
+   CCEM-owned artifact store; they are not advertised as content-redacted.
 
 Build success, source assertions, unit tests, or a static screenshot are supporting evidence only.
 They cannot independently satisfy this definition.
+
+The signed production-runtime smokes automate the semantic chain, effect-fence race, screenshot
+integrity, profile persistence/isolation, process teardown, and release-identity bindings. They do
+not replace installed-app observation of the native child staying inside BrowserPanel, OAuth/new
+window behavior, Chinese IME and keyboard focus, host-overlay composition, or crash/force-exit
+recovery. Those interactions remain required before calling the exact candidate production ready.
 
 ## Stop and redesign conditions
 

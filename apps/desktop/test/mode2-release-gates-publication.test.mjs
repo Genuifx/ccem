@@ -49,6 +49,12 @@ const repoDir = path.resolve(desktopDir, '..', '..');
 const windowsStageScript = path.join(desktopDir, 'scripts', 'stage-cef-windows.mjs');
 const inventoryScript = path.join(desktopDir, 'scripts', 'verify-mode2-release-inventory.mjs');
 const sourceCommit = 'a'.repeat(40);
+const repository = 'Genuifx/claude-code-env-manager';
+const workflowRef =
+  `${repository}/.github/workflows/release-desktop.yml@refs/tags/v2.53.0`;
+const producerWorkflowRef =
+  `${repository}/.github/workflows/mode2-signed-producer.yml@refs/tags/v2.53.0`;
+const job = 'build-desktop';
 const safeStorageBranding = Object.freeze({
   schemaVersion: 1,
   method: 'unique-null-padded-literal-replacement-v1',
@@ -63,13 +69,17 @@ const safeStorageBranding = Object.freeze({
 
 function macosSafeStorageRuntimeAttestation(platform, executableSha256, attestationSeed) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     platform,
     status: 'passed',
     sourceCommit,
     appVersion: '2.53.0',
     runId: '1234',
     runAttempt: '2',
+    repository,
+    workflowRef,
+    producerWorkflowRef,
+    job,
     attestationSha256: attestationSeed.repeat(64),
     executableSha256,
     frameworkSha256: safeStorageBranding.signedExecutableSha256,
@@ -80,6 +90,11 @@ function macosSafeStorageRuntimeAttestation(platform, executableSha256, attestat
     cleanKeychainVerified: true,
     genericConflictIsolationVerified: true,
     cookiePersistenceVerified: true,
+    productionBehaviorVerified: true,
+    semanticLaunchCount: 4,
+    effectFenceVerified: true,
+    profileIsolationVerified: true,
+    screenshotArtifactsVerified: true,
     keychainStateRestored: true,
     cleanupVerified: true,
   };
@@ -100,9 +115,10 @@ function updaterReplacementAttestation(
     target: platform,
     runId: '1234',
     runAttempt: '2',
-    repository: 'Genuifx/claude-code-env-manager',
-    workflowRef: 'Genuifx/claude-code-env-manager/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
-    job: 'build-desktop',
+    repository,
+    workflowRef,
+    producerWorkflowRef,
+    job,
     challengeNonce: '0'.repeat(64),
     sourceCommit,
     previousTag: 'v2.52.1',
@@ -330,6 +346,10 @@ test('release inventory set rejects mixed versions, missing targets, and Windows
     appVersion: '2.53.0',
     runId: '1234',
     runAttempt: '2',
+    repository,
+    workflowRef,
+    producerWorkflowRef,
+    job,
     installedExecutableSha256: 'b'.repeat(64),
     installerSha256: '7'.repeat(64),
     runtimeInventorySha256: windowsRuntimeFingerprint.sha256,
@@ -346,6 +366,10 @@ test('release inventory set rejects mixed versions, missing targets, and Windows
     verifiedPathCount: windowsRuntimeFingerprint.verifiedPathCount,
     verifiedPathsSha256: hashWindowsMode2SmokeJson(windowsRuntimeFingerprint.relativePaths),
     productionPathVerified: true,
+    semanticBehaviorVerified: true,
+    effectFenceVerified: true,
+    profileIsolationVerified: true,
+    screenshotArtifactVerified: true,
     nativeWindowVerified: true,
     processTokenSandboxVerified: true,
     networkServiceSandboxed: true,
@@ -644,7 +668,7 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(producerWorkflow, /notary_key=.*RUNNER_TEMP/);
   assert.doesNotMatch(combinedWorkflow, /Replace draft DMG|--mode replace-dmg/);
   assert.match(producerWorkflow, /--source-commit "?\$GITHUB_SHA"?/);
-  assert.match(workflow, /Verify release tag binds the current source commit/);
+  assert.match(workflow, /Revalidate protected release source and exact tag/);
   assert.match(workflow, /refs\/tags\/\$\{TAG_NAME\}\^\{commit\}/);
   assert.match(producerWorkflow, /--inventory "src-tauri\/target\/release-gates\/mode2-release-inventory-\$\{CCEM_RELEASE_TARGET\}\.json"/u);
   assert.doesNotMatch(combinedWorkflow, /target\/\*\*\/release-gates/);

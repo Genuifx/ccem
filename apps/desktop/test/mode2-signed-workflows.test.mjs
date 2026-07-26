@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,7 +39,64 @@ function stepBlock(source, stepName) {
   return source.slice(start, end >= 0 ? end : source.length);
 }
 
-const mutationSurface = /(?:contents:\s*write|write-all|GITHUB_TOKEN|github\.token|api\.github\.com|uploads\.github\.com|ensure-draft-github-release|upload-draft-release-assets|publish-draft-github-release|github-draft-release-api|create-latest-from-release-payload|verify-immutable-releases-enabled|detect-actions-release-payload|gh\s+(?:api|release))/u;
+function stepRunScript(source, stepName) {
+  const block = stepBlock(source, stepName);
+  const marker = '\n        run: |\n';
+  const start = block.indexOf(marker);
+  assert.ok(start >= 0, `step ${stepName} must use a block run script`);
+  const lines = block.slice(start + marker.length).split('\n');
+  const script = [];
+  for (const line of lines) {
+    if (line.startsWith('          ')) {
+      script.push(line.slice(10));
+    } else if (line.length === 0) {
+      script.push('');
+    } else {
+      break;
+    }
+  }
+  return script.join('\n');
+}
+
+function assertReadOnlyMainProtectionApi(block) {
+  assert.match(block, /GH_TOKEN: \$\{\{ github\.token \}\}/u);
+  assert.match(
+    block,
+    /if ! main_protection_verified="\$\([\s\S]*?gh api --method GET[\s\S]*?"\/repos\/\$\{GITHUB_REPOSITORY\}\/branches\/main"[\s\S]*?--jq '\.protected == true'[\s\S]*?\)"; then/u,
+  );
+  assert.match(block, /\[\[ "\$main_protection_verified" == "true" \]\]/u);
+  assert.doesNotMatch(block, /branches\/main\/protection/u);
+  assert.doesNotMatch(block, /gh api --method (?:POST|PUT|PATCH|DELETE)/u);
+}
+
+async function fakeProtectionCommands(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-main-protection-contract-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, 'bin');
+  await fs.mkdir(bin);
+  await fs.writeFile(
+    path.join(bin, 'gh'),
+    '#!/bin/sh\nprintf "false\\n"\n',
+    { mode: 0o700 },
+  );
+  await fs.writeFile(
+    path.join(bin, 'git'),
+    [
+      '#!/bin/sh',
+      'if [ "$1" = "rev-parse" ]; then',
+      '  printf "%s\\n" "$TEST_SOURCE_COMMIT"',
+      '  exit 0',
+      'fi',
+      'printf "unexpected git command after failed main-protection gate: %s\\n" "$*" >&2',
+      'exit 97',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  return bin;
+}
+
+const mutationSurface = /(?:contents:\s*write|write-all|GITHUB_TOKEN|api\.github\.com|uploads\.github\.com|ensure-draft-github-release|upload-draft-release-assets|publish-draft-github-release|github-draft-release-api|create-latest-from-release-payload|verify-immutable-releases-enabled|detect-actions-release-payload|gh\s+release)/u;
 
 test('signed producer is a fresh read-only three-target evidence pipeline', async () => {
   const source = await workflow('mode2-signed-producer.yml');
@@ -48,6 +107,9 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
   assert.equal(source.match(/^\s+environment: mode2-signing$/gmu)?.length, 2);
   assert.equal(source.match(/^\s+required: false$/gmu)?.length, 13);
   assert.doesNotMatch(source, mutationSurface);
+  assert.equal(source.match(/GH_TOKEN: \$\{\{ github\.token \}\}/gu)?.length, 1);
+  assert.equal(source.match(/gh api --method GET/gu)?.length, 1);
+  assert.doesNotMatch(source, /gh api --method (?:POST|PUT|PATCH|DELETE)/u);
   assert.doesNotMatch(source, /secrets:\s*inherit/u);
   assert.doesNotMatch(source, /Preview-only|unsignedArgs/u);
   assert.match(source, /export_release_payload:[\s\S]*default: false/u);
@@ -67,6 +129,28 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
   assert.match(source, /PRODUCER_WORKFLOW_REF: \$\{\{ job\.workflow_ref \}\}/u);
   assert.match(source, /PRODUCER_WORKFLOW_SHA: \$\{\{ job\.workflow_sha \}\}/u);
   assert.match(source, /mode2-signed-producer\.yml@\$\{GITHUB_REF\}/u);
+  assert.match(
+    source,
+    /expected_caller_ref="\$\{GITHUB_REPOSITORY\}\/\.github\/workflows\/release-desktop\.yml@\$\{GITHUB_REF\}"/u,
+  );
+  assert.match(
+    source,
+    /expected_caller_ref="\$\{GITHUB_REPOSITORY\}\/\.github\/workflows\/mode2-signed-readiness\.yml@\$\{GITHUB_REF\}"/u,
+  );
+  assert.match(source, /REF_PROTECTED: \$\{\{ github\.ref_protected \}\}/u);
+  assert.match(source, /\[\[ "\$REF_PROTECTED" == "true" \]\]/u);
+  assertReadOnlyMainProtectionApi(stepBlock(source, 'Bind producer to the exact caller source'));
+  assert.match(source, /refs\/heads\/main:refs\/remotes\/origin\/main/u);
+  assert.match(
+    source,
+    /git merge-base --is-ancestor "\$source_commit" refs\/remotes\/origin\/main/u,
+  );
+  assert.match(source, /\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+/u);
+  assert.equal(
+    source.match(/CCEM_MODE2_PRODUCER_WORKFLOW_REF: \$\{\{ job\.workflow_ref \}\}/gu)?.length,
+    6,
+  );
+  assert.match(source, /--producer-workflow-ref "\$\{\{ job\.workflow_ref \}\}"/u);
   assert.match(source, /name: Build Desktop \(\$\{\{ matrix\.target \}\}\)/u);
   for (const target of [
     'aarch64-apple-darwin',
@@ -76,7 +160,7 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
     assert.equal(source.match(new RegExp(`target: ${target}`, 'gu'))?.length, 1);
   }
   assert.match(source, /Run signed installed Windows Mode 2 production smoke/u);
-  assert.match(source, /Prove signed macOS Mode 2 Safe Storage isolation and persistence/u);
+  assert.match(source, /Prove signed macOS Mode 2 Safe Storage and production behavior/u);
   assert.match(source, /Prove real previous-to-current updater replacement/u);
   assert.match(source, /Verify signed evidence set/u);
   const finalTagGate = stepBlock(source, 'Reconfirm non-publishing candidate tag remains absent');
@@ -134,6 +218,33 @@ test('release caller keeps the only write token behind the shared producer', asy
   const source = await workflow('release-desktop.yml');
   assert.match(source, /^name: Release Desktop$/mu);
   assert.match(source, /^  push:\n\s+tags:\n\s+- 'v\*'/mu);
+  assert.equal(source.match(/REF_PROTECTED: \$\{\{ github\.ref_protected \}\}/gu)?.length, 2);
+  assert.equal(source.match(/\[\[ "\$REF_PROTECTED" == "true" \]\]/gu)?.length, 2);
+  assertReadOnlyMainProtectionApi(
+    stepBlock(source, 'Require protected release ref and main ancestry'),
+  );
+  assertReadOnlyMainProtectionApi(
+    stepBlock(source, 'Revalidate protected release source and exact tag'),
+  );
+  assert.equal(
+    source.match(/"\/repos\/\$\{GITHUB_REPOSITORY\}\/branches\/main"/gu)?.length,
+    2,
+  );
+  assert.equal(
+    source.match(/refs\/heads\/main:refs\/remotes\/origin\/main/gu)?.length,
+    2,
+  );
+  assert.equal(
+    source.match(/git merge-base --is-ancestor "\$source_commit" refs\/remotes\/origin\/main/gu)
+      ?.length,
+    2,
+  );
+  assert.match(source, /Manual desktop release may run only from protected main\./u);
+  assert.match(source, /Automatic desktop release requires a formal v\* tag push\./u);
+  assert.equal(
+    source.match(/Desktop release requires a formal semantic-version tag\./gu)?.length,
+    2,
+  );
   assert.match(source, /uses: \.\/\.github\/workflows\/mode2-signed-producer\.yml/u);
   assert.match(source, /export_release_payload: true/u);
   assert.doesNotMatch(source, /^\s+secrets:/mu);
@@ -152,4 +263,83 @@ test('release caller keeps the only write token behind the shared producer', asy
   assert.match(publisher, /upload-draft-release-assets\.mjs --mode payload/u);
   assert.match(publisher, /publish-draft-github-release\.mjs/u);
   assertExternalActionsPinned(source);
+});
+
+test('protected tag cannot enter prepare, producer, or publish when main is unprotected', async (t) => {
+  const [releaseSource, producerSource] = await Promise.all([
+    workflow('release-desktop.yml'),
+    workflow('mode2-signed-producer.yml'),
+  ]);
+  const bin = await fakeProtectionCommands(t);
+  const sourceCommit = 'a'.repeat(40);
+  const repository = 'Genuifx/claude-code-env-manager';
+  const tag = 'v2.58.0';
+  const tagRef = `refs/tags/${tag}`;
+  const callerWorkflowRef =
+    `${repository}/.github/workflows/release-desktop.yml@${tagRef}`;
+  const commonEnvironment = {
+    ...process.env,
+    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+    TEST_SOURCE_COMMIT: sourceCommit,
+    GITHUB_REPOSITORY: repository,
+    GITHUB_REF: tagRef,
+    GITHUB_SHA: sourceCommit,
+    EVENT_NAME: 'push',
+    REF_PROTECTED: 'true',
+    SOURCE_COMMIT: sourceCommit,
+    TAG_NAME: tag,
+    GH_TOKEN: 'read-only-test-token',
+  };
+  const cases = [
+    {
+      name: 'release prepare',
+      script: stepRunScript(
+        releaseSource,
+        'Require protected release ref and main ancestry',
+      ),
+      environment: commonEnvironment,
+    },
+    {
+      name: 'reusable producer',
+      script: stepRunScript(
+        producerSource,
+        'Bind producer to the exact caller source',
+      ),
+      environment: {
+        ...commonEnvironment,
+        EXPECTED_SOURCE_COMMIT: sourceCommit,
+        EXPECTED_CALLER_WORKFLOW_REF: callerWorkflowRef,
+        EXPECTED_VERSION: tag.slice(1),
+        EXPORT_RELEASE_PAYLOAD: 'true',
+        RELEASE_TAG: tag,
+        GITHUB_WORKFLOW_REF: callerWorkflowRef,
+        PRODUCER_WORKFLOW_REF:
+          `${repository}/.github/workflows/mode2-signed-producer.yml@${tagRef}`,
+        PRODUCER_WORKFLOW_SHA: sourceCommit,
+      },
+    },
+    {
+      name: 'release publish',
+      script: stepRunScript(
+        releaseSource,
+        'Revalidate protected release source and exact tag',
+      ),
+      environment: commonEnvironment,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const result = spawnSync('bash', ['-c', fixture.script], {
+      cwd: repoDir,
+      env: fixture.environment,
+      encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0, `${fixture.name} unexpectedly accepted unprotected main`);
+    assert.match(
+      result.stderr,
+      /requires the main branch to (?:be|remain) protected/u,
+      `${fixture.name} did not fail at the main protection gate: ${result.stderr}`,
+    );
+    assert.doesNotMatch(result.stderr, /unexpected git command/u);
+  }
 });

@@ -108,19 +108,10 @@ impl fmt::Display for RuntimeManagerError {
 
 impl std::error::Error for RuntimeManagerError {}
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct RuntimeOperation {
     running: bool,
     control: DownloadControl,
-}
-
-impl Default for RuntimeOperation {
-    fn default() -> Self {
-        Self {
-            running: false,
-            control: DownloadControl::default(),
-        }
-    }
 }
 
 pub(crate) struct BrowserRuntimeManager {

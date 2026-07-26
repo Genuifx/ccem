@@ -18,6 +18,8 @@ import {
   MACOS_SAFE_STORAGE_SMOKE_ATTESTATION_ENV,
   MACOS_SAFE_STORAGE_SMOKE_NONCE_ENV,
   MACOS_SAFE_STORAGE_SMOKE_ROOT_ENV,
+  MACOS_SAFE_STORAGE_SMOKE_TARGET_ENV,
+  MODE2_PRODUCER_WORKFLOW_REF_ENV,
   createMacosSafeStorageSmokePlan,
   validateMacosSafeStorageRuntimeReceipt,
   validateMacosSafeStorageSmokeAttestation,
@@ -316,9 +318,14 @@ function runtimeEnvironment(plan, scenario, phase) {
     GITHUB_SHA: plan.sourceCommit,
     GITHUB_RUN_ID: plan.run.id,
     GITHUB_RUN_ATTEMPT: plan.run.attempt,
+    GITHUB_REPOSITORY: plan.run.repository,
+    GITHUB_WORKFLOW_REF: plan.run.workflowRef,
+    GITHUB_JOB: plan.run.job,
+    [MODE2_PRODUCER_WORKFLOW_REF_ENV]: plan.run.producerWorkflowRef,
     [MACOS_SAFE_STORAGE_SMOKE_ALLOW_ENV]: '1',
     [MACOS_SAFE_STORAGE_SMOKE_NONCE_ENV]: plan.nonce,
     [MACOS_SAFE_STORAGE_SMOKE_ROOT_ENV]: plan.paths.smokeRoot,
+    [MACOS_SAFE_STORAGE_SMOKE_TARGET_ENV]: plan.target,
     CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_SCENARIO: scenario.name,
     CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_PHASE: phase,
     CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_SCENARIO_ROOT: scenario.root,
@@ -368,7 +375,7 @@ async function runScenario(plan, scenario, timeoutMs, dependencies) {
     keychainCreated = true;
     await createExclusiveTemporaryKeychain(command, scenario.keychain, password);
     await writePrivateJson(path.join(scenario.root, 'keychain', 'isolation.json'), {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nonce: plan.nonce,
       scenario: scenario.name,
       keychainPath: scenario.keychain,
@@ -392,7 +399,7 @@ async function runScenario(plan, scenario, timeoutMs, dependencies) {
     for (const phase of MACOS_SAFE_STORAGE_PHASES) {
       const ticket = path.join(scenario.root, 'tickets', `${phase}.ticket`);
       await writePrivateJson(ticket, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         nonce: plan.nonce,
         scenario: scenario.name,
         phase,
@@ -494,8 +501,9 @@ export async function executeMacosSafeStorageSmoke(plan, options = {}) {
     const frameworkSha256 = await sha256File(plan.paths.framework);
     await fsp.rm(path.dirname(plan.paths.installedApp), { recursive: true, force: true });
     const attestation = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       platform: 'macos',
+      target: plan.target,
       status: 'passed',
       sourceCommit: plan.sourceCommit,
       nonce: plan.nonce,

@@ -6,6 +6,64 @@ import {
 } from '../../scripts/windows-mode2-production-smoke-contract.mjs';
 
 const sourceCommit = 'a'.repeat(40);
+const repository = 'Genuifx/claude-code-env-manager';
+const workflowRef =
+  `${repository}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
+const producerWorkflowRef =
+  `${repository}/.github/workflows/mode2-signed-producer.yml@refs/heads/main`;
+const job = 'build-desktop';
+
+export function windowsSemanticProductionPathProof(smokeRoot, profileId) {
+  return {
+    semantic: {
+      navigatedViaCapability: true,
+      axSnapshotViaCapability: true,
+      clickViaElementRef: true,
+      typeViaElementRef: true,
+      screenshot: {
+        canonicalPath: `${smokeRoot}\\data\\login\\sessions\\login-session-${'7'.repeat(32)}\\artifacts\\shot-${'8'.repeat(32)}.png`,
+        byteSize: 4096,
+        sha256: '9'.repeat(64),
+        pngMagicVerified: true,
+        pngStructureVerified: true,
+        pngDecodedVerified: true,
+        byteSizeVerified: true,
+        sha256Verified: true,
+        appOwnedCanonicalPathVerified: true,
+      },
+      storageCommitViaElementRef: true,
+      activeEffectEntered: true,
+      activeEffectCancelled: true,
+      occlusionAckUnderOneSecond: true,
+      occlusionAckMillis: 87,
+      postPauseNoLateWrite: true,
+    },
+    reopenedProfileId: profileId,
+    secondaryReopenedProfileId: `profile-${'6'.repeat(32)}`,
+    finalReopenedProfileId: profileId,
+    profileIsolation: {
+      secondaryWorkspaceRoot: `${smokeRoot}\\workspace-secondary`,
+      secondaryProfileId: `profile-${'6'.repeat(32)}`,
+      distinctWorkspaceProfiles: true,
+      primaryCookiePersisted: true,
+      primaryLocalStoragePersisted: true,
+      secondaryProfileInitiallyEmpty: true,
+      secondaryCookieIsolated: true,
+      secondaryLocalStorageIsolated: true,
+      secondaryCookiePersisted: true,
+      secondaryLocalStoragePersisted: true,
+      primaryUnchangedAfterSecondary: true,
+    },
+    cleanup: {
+      activeSurfaceCount: 0,
+      activeSessionCount: 0,
+      ownerRecordCount: 0,
+      persistedProfileCount: 2,
+      workspaceCount: 2,
+      profileLocksAvailable: true,
+    },
+  };
+}
 
 export function windowsSmokeFixture(overrides = {}) {
   const installedRoot = 'C:\\Users\\runneradmin\\AppData\\Local\\CCEM Desktop';
@@ -46,6 +104,7 @@ export function windowsSmokeFixture(overrides = {}) {
     visible: true,
     dpi: 96,
   };
+  const primaryProfileId = `profile-${'5'.repeat(32)}`;
   const receipt = {
     schemaVersion: WINDOWS_MODE2_SMOKE_SCHEMA_VERSION,
     nonce: '2'.repeat(64),
@@ -66,23 +125,9 @@ export function windowsSmokeFixture(overrides = {}) {
       ownerRecordRoot: `${smokeRoot}\\data\\login\\embedded-owners`,
       profileStateRoot: `${smokeRoot}\\data\\login\\profile-state`,
       cefCacheRoot: `${smokeRoot}\\data\\login\\cef`,
-      profileId: `profile-${'5'.repeat(32)}`,
+      profileId: primaryProfileId,
       nativeWindow,
-      semantic: {
-        readViaCapability: true,
-        writeViaCapability: true,
-        writeObserved: true,
-        postPauseWriteDenied: true,
-        postPauseValueUnchanged: true,
-      },
-      reopenedProfileId: `profile-${'5'.repeat(32)}`,
-      cleanup: {
-        activeSurfaceCount: 0,
-        activeSessionCount: 0,
-        ownerRecordCount: 0,
-        persistedProfileCount: 1,
-        profileLockAvailable: true,
-      },
+      ...windowsSemanticProductionPathProof(smokeRoot, primaryProfileId),
     },
     stages: WINDOWS_MODE2_REQUIRED_STAGES.map((name, index) => ({
       name,
@@ -219,7 +264,15 @@ export function windowsSmokeFixture(overrides = {}) {
     platform: 'x86_64-pc-windows-msvc',
     sourceCommit,
     appVersion: '2.53.0',
-    run: { id: '1234', attempt: '2', smokeRoot },
+    run: {
+      id: '1234',
+      attempt: '2',
+      repository,
+      workflowRef,
+      producerWorkflowRef,
+      job,
+      smokeRoot,
+    },
     installed: {
       root: installedRoot,
       executablePath,
@@ -308,6 +361,10 @@ export function windowsSmokeFixture(overrides = {}) {
     appVersion: '2.53.0',
     runId: '1234',
     runAttempt: '2',
+    repository,
+    workflowRef,
+    producerWorkflowRef,
+    job,
     installedRoot,
     installedExecutablePath: executablePath,
     installedExecutableSha256: executableSha256,

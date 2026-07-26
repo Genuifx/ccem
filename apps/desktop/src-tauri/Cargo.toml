@@ -1,6 +1,6 @@
 [package]
 name = "ccem-desktop"
-version = "2.57.0"
+version = "2.58.0"
 description = "CCEM Desktop Application"
 authors = ["Genuifx"]
 edition = "2021"
@@ -36,11 +36,13 @@ toml = "0.9"
 scrypt = "0.11"
 aes = "0.8"
 cbc = "0.1"
+crc32fast = "1.5"
 aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
+png = "=0.18.0"
 minisign-verify = "0.2.5"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2"] }

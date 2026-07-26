@@ -8,8 +8,12 @@ pub(crate) mod macos;
 pub(crate) mod windows;
 
 mod dispatch;
+mod focus_restore;
 mod geometry;
 mod host_shortcut;
+mod recovery_state;
+#[cfg(any(target_os = "macos", windows))]
+mod renderer_recovery;
 use dispatch::run_cancellable_on_main;
 pub(crate) use geometry::{
     macos_child_bounds, profile_cache_path, LogicalViewport, NativeChildBounds,
@@ -19,6 +23,8 @@ pub(crate) use geometry::{
 pub(crate) use geometry::{validate_windows_native_window_observation, windows_child_bounds};
 #[cfg(any(target_os = "macos", windows))]
 use host_shortcut::HostShortcutKeyboardHandler;
+#[cfg(any(target_os = "macos", windows))]
+use renderer_recovery::SurfaceRequestHandler;
 
 fn should_retire_surface_without_browser(browser_ready: bool, popup_active: bool) -> bool {
     !browser_ready && !popup_active
@@ -53,6 +59,11 @@ pub(crate) enum CefSurfaceLifecycle {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CefSurfaceRecoveryState {
+    RendererProcessTerminated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CefPopupSnapshot {
     pub(crate) popup_id: i32,
@@ -81,6 +92,7 @@ pub(crate) struct CefSurfaceSnapshot {
     pub(crate) title: Option<String>,
     pub(crate) visible: bool,
     pub(crate) error: Option<String>,
+    pub(crate) recovery_state: Option<CefSurfaceRecoveryState>,
     pub(crate) popup: Option<CefPopupSnapshot>,
     pub(crate) user_popups_allowed: bool,
 }
@@ -206,6 +218,7 @@ impl CefSurfaceStateHandle {
 
 pub(super) struct SharedSurfaceState {
     state: Mutex<CefSurfaceSnapshot>,
+    focus_restore: Mutex<focus_restore::FocusRestoreIntent>,
     changed: Condvar,
 }
 
@@ -224,11 +237,13 @@ impl SharedSurfaceState {
                 title: None,
                 visible: spec.visible,
                 error: None,
+                recovery_state: None,
                 popup: None,
                 // Admission opens only after the owning Session is registered in User control.
                 // Creating/loading surfaces, Agent control, Paused, and Closing all fail closed.
                 user_popups_allowed: false,
             }),
+            focus_restore: Mutex::new(focus_restore::FocusRestoreIntent::default()),
             changed: Condvar::new(),
         })
     }
@@ -277,7 +292,9 @@ impl SharedSurfaceState {
         self.update(|state| {
             if matches!(
                 state.lifecycle,
-                CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
+                CefSurfaceLifecycle::Closing
+                    | CefSurfaceLifecycle::Closed
+                    | CefSurfaceLifecycle::Failed
             ) {
                 return;
             }
@@ -293,6 +310,7 @@ impl SharedSurfaceState {
 
     pub(super) fn fail_creation(&self, error: impl Into<String>) {
         let error = error.into();
+        self.clear_focus_restore_intent();
         self.update(|state| {
             if !matches!(
                 state.lifecycle,
@@ -339,6 +357,8 @@ impl SharedSurfaceState {
             .checked_add(1)
             .expect("CEF surface state revision exhausted");
         self.changed.notify_all();
+        drop(state);
+        self.clear_focus_restore_intent();
         Ok(())
     }
 
@@ -366,7 +386,9 @@ impl SharedSurfaceState {
         self.update_popup(popup_id, |popup| {
             if matches!(
                 popup.lifecycle,
-                CefSurfaceLifecycle::Closing | CefSurfaceLifecycle::Closed
+                CefSurfaceLifecycle::Closing
+                    | CefSurfaceLifecycle::Closed
+                    | CefSurfaceLifecycle::Failed
             ) {
                 return;
             }
@@ -385,7 +407,7 @@ impl SharedSurfaceState {
     }
 
     pub(super) fn finish_popup(&self, popup_id: i32) -> bool {
-        self.update(|state| {
+        let finished = self.update(|state| {
             if state
                 .popup
                 .as_ref()
@@ -393,7 +415,11 @@ impl SharedSurfaceState {
             {
                 state.popup = None;
             }
-        })
+        });
+        if finished {
+            self.clear_focus_restore_intent();
+        }
+        finished
     }
 
     fn lock_popups_for_agent(&self) -> Result<(), CefPopupAgentLockError> {
@@ -701,6 +727,71 @@ mod state_tests {
         });
         assert_eq!(state.snapshot().lifecycle, CefSurfaceLifecycle::Loading);
         assert!(state.snapshot().error.is_none());
+    }
+
+    #[test]
+    fn renderer_termination_is_sticky_until_explicit_surface_reopen() {
+        let state = state();
+        state.update(|snapshot| {
+            snapshot.lifecycle = CefSurfaceLifecycle::Ready;
+            snapshot.devtools_attached = true;
+            snapshot.user_popups_allowed = true;
+        });
+
+        state.record_renderer_termination();
+        let failed = state.snapshot();
+        assert_eq!(failed.lifecycle, CefSurfaceLifecycle::Failed);
+        assert!(!failed.devtools_attached);
+        assert!(!failed.user_popups_allowed);
+        assert_eq!(
+            failed.recovery_state,
+            Some(CefSurfaceRecoveryState::RendererProcessTerminated)
+        );
+        assert!(failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Close and reopen")));
+
+        state.begin_main_frame_load("https://late.example/start".to_string());
+        state.finish_main_frame_load("https://late.example/end".to_string());
+        state.record_recoverable_load_error(
+            "https://late.example/error".to_string(),
+            "late load error",
+        );
+        assert!(state.begin_navigation().is_err());
+        assert_eq!(state.snapshot(), failed);
+    }
+
+    #[test]
+    fn popup_renderer_termination_stays_failed_until_user_closes_popup() {
+        let state = state();
+        state.update(|snapshot| {
+            snapshot.lifecycle = CefSurfaceLifecycle::Ready;
+            snapshot.user_popups_allowed = true;
+        });
+        state
+            .reserve_user_popup(42, "https://id.example/login".to_string())
+            .expect("user-owned popup");
+
+        state.record_popup_renderer_termination(42);
+        let failed = state
+            .snapshot()
+            .popup
+            .expect("failed popup remains visible");
+        assert_eq!(failed.lifecycle, CefSurfaceLifecycle::Failed);
+        assert!(failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Close this popup")));
+
+        state.update_popup_from_load(42, |popup| {
+            popup.lifecycle = CefSurfaceLifecycle::Ready;
+            popup.error = None;
+        });
+        assert_eq!(
+            state.snapshot().popup.expect("popup remains").lifecycle,
+            CefSurfaceLifecycle::Failed
+        );
     }
 
     #[test]

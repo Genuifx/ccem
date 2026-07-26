@@ -19,6 +19,8 @@ pub(crate) mod pump;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) mod recovery;
 #[cfg(any(target_os = "macos", windows))]
+mod recovery_projection;
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) mod session_runtime;
 pub(crate) mod surface;
 #[cfg(target_os = "macos")]

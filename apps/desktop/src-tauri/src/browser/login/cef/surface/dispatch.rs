@@ -28,7 +28,7 @@ where
     }
 
     run_cancellable_dispatch(timeout, label, operation, |task| {
-        app.run_on_main_thread(move || task())
+        app.run_on_main_thread(task)
             .map_err(|error| error.to_string())
     })
 }

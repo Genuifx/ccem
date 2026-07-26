@@ -9,7 +9,7 @@ pub(crate) const EXIT_GATE_REJECTED: i32 = 88;
 pub(crate) const EXIT_SMOKE_FAILED: i32 = 89;
 pub(crate) const EXIT_SMOKE_TIMEOUT: i32 = 90;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const SMOKE_NAME: &str = "macos-mode2-safe-storage-release";
 const SMOKE_DIRECTORY: &str = "ccem-mode2-safe-storage-smoke";
 const ENV_ALLOW: &str = "CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ALLOW";
@@ -23,8 +23,10 @@ const ENV_TICKET: &str = "CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_TICKET_PATH";
 const ENV_EXPECTED_EXE: &str = "CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_EXPECTED_EXE";
 const ENV_KEYCHAIN: &str = "CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_KEYCHAIN_PATH";
 const ENV_ISOLATION: &str = "CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_ISOLATION_RECEIPT";
+const ENV_TARGET: &str = "CCEM_MACOS_MODE2_SAFE_STORAGE_SMOKE_TARGET";
+const ENV_PRODUCER_WORKFLOW_REF: &str = "CCEM_MODE2_PRODUCER_WORKFLOW_REF";
 
-const EXPLICIT_ENVIRONMENT: [&str; 11] = [
+const EXPLICIT_ENVIRONMENT: [&str; 13] = [
     ENV_ALLOW,
     ENV_NONCE,
     ENV_ROOT,
@@ -36,9 +38,11 @@ const EXPLICIT_ENVIRONMENT: [&str; 11] = [
     ENV_EXPECTED_EXE,
     ENV_KEYCHAIN,
     ENV_ISOLATION,
+    ENV_TARGET,
+    ENV_PRODUCER_WORKFLOW_REF,
 ];
 
-const PROCESS_ENVIRONMENT: [&str; 18] = [
+const PROCESS_ENVIRONMENT: [&str; 23] = [
     ENV_ALLOW,
     ENV_NONCE,
     ENV_ROOT,
@@ -50,6 +54,8 @@ const PROCESS_ENVIRONMENT: [&str; 18] = [
     ENV_EXPECTED_EXE,
     ENV_KEYCHAIN,
     ENV_ISOLATION,
+    ENV_TARGET,
+    ENV_PRODUCER_WORKFLOW_REF,
     "GITHUB_ACTIONS",
     "CI",
     "RUNNER_OS",
@@ -57,6 +63,9 @@ const PROCESS_ENVIRONMENT: [&str; 18] = [
     "GITHUB_SHA",
     "GITHUB_RUN_ID",
     "GITHUB_RUN_ATTEMPT",
+    "GITHUB_REPOSITORY",
+    "GITHUB_WORKFLOW_REF",
+    "GITHUB_JOB",
 ];
 
 #[derive(Clone, Debug)]
@@ -65,6 +74,11 @@ pub(crate) struct MacosSafeStorageSmokeConfig {
     pub(crate) source_commit: String,
     pub(crate) run_id: String,
     pub(crate) run_attempt: String,
+    pub(crate) target: String,
+    pub(crate) repository: String,
+    pub(crate) workflow_ref: String,
+    pub(crate) producer_workflow_ref: String,
+    pub(crate) job: String,
     pub(crate) scenario: String,
     pub(crate) phase: String,
     pub(crate) smoke_root: PathBuf,
@@ -78,7 +92,7 @@ pub(crate) struct MacosSafeStorageSmokeConfig {
 
 pub(crate) enum MacosSafeStorageSmokeGate {
     Disabled,
-    Enabled(MacosSafeStorageSmokeConfig),
+    Enabled(Box<MacosSafeStorageSmokeConfig>),
     Rejected(String),
 }
 
@@ -89,6 +103,11 @@ struct BuildIdentity<'a> {
     source_commit: Option<&'a str>,
     run_id: Option<&'a str>,
     run_attempt: Option<&'a str>,
+    target: Option<&'a str>,
+    repository: Option<&'a str>,
+    workflow_ref: Option<&'a str>,
+    producer_workflow_ref: Option<&'a str>,
+    job: Option<&'a str>,
 }
 
 impl BuildIdentity<'static> {
@@ -99,6 +118,11 @@ impl BuildIdentity<'static> {
             source_commit: option_env!("GITHUB_SHA"),
             run_id: option_env!("GITHUB_RUN_ID"),
             run_attempt: option_env!("GITHUB_RUN_ATTEMPT"),
+            target: option_env!("CCEM_CEF_TARGET_TRIPLE"),
+            repository: option_env!("GITHUB_REPOSITORY"),
+            workflow_ref: option_env!("GITHUB_WORKFLOW_REF"),
+            producer_workflow_ref: option_env!("CCEM_MODE2_PRODUCER_WORKFLOW_REF"),
+            job: option_env!("GITHUB_JOB"),
         }
     }
 }
@@ -141,9 +165,28 @@ fn evaluate_gate(
         let source_commit = require_lower_hex(environment, "GITHUB_SHA", 40)?;
         let run_id = require_run_number(environment, "GITHUB_RUN_ID")?;
         let run_attempt = require_run_number(environment, "GITHUB_RUN_ATTEMPT")?;
+        let target = require_choice(
+            environment,
+            ENV_TARGET,
+            &["aarch64-apple-darwin", "x86_64-apple-darwin"],
+        )?;
+        let repository = require_repository(environment, "GITHUB_REPOSITORY")?;
+        let workflow_ref = require_workflow_ref(environment, "GITHUB_WORKFLOW_REF", &repository)?;
+        let producer_workflow_ref =
+            require_producer_workflow_ref(environment, ENV_PRODUCER_WORKFLOW_REF, &repository)?;
+        let job = require_choice(environment, "GITHUB_JOB", &["build-desktop"])?;
         require_built_identity("GITHUB_SHA", build.source_commit, &source_commit)?;
         require_built_identity("GITHUB_RUN_ID", build.run_id, &run_id)?;
         require_built_identity("GITHUB_RUN_ATTEMPT", build.run_attempt, &run_attempt)?;
+        require_built_identity("CCEM_CEF_TARGET_TRIPLE", build.target, &target)?;
+        require_built_identity("GITHUB_REPOSITORY", build.repository, &repository)?;
+        require_built_identity("GITHUB_WORKFLOW_REF", build.workflow_ref, &workflow_ref)?;
+        require_built_identity(
+            ENV_PRODUCER_WORKFLOW_REF,
+            build.producer_workflow_ref,
+            &producer_workflow_ref,
+        )?;
+        require_built_identity("GITHUB_JOB", build.job, &job)?;
 
         let runner_temp = require_normalized_absolute_path(environment, "RUNNER_TEMP")?;
         let current_run_root = runner_temp
@@ -172,6 +215,11 @@ fn evaluate_gate(
             source_commit,
             run_id,
             run_attempt,
+            target,
+            repository,
+            workflow_ref,
+            producer_workflow_ref,
+            job,
             scenario,
             phase,
             cef_cache_root: smoke_root.join("data/login/cef"),
@@ -184,7 +232,7 @@ fn evaluate_gate(
         })
     })();
     match result {
-        Ok(config) => MacosSafeStorageSmokeGate::Enabled(config),
+        Ok(config) => MacosSafeStorageSmokeGate::Enabled(Box::new(config)),
         Err(error) => MacosSafeStorageSmokeGate::Rejected(error),
     }
 }
@@ -238,6 +286,77 @@ fn require_run_number(environment: &BTreeMap<&str, String>, name: &str) -> Resul
     } else {
         Err(format!(
             "macOS Safe Storage smoke requires {name} as a positive canonical run number"
+        ))
+    }
+}
+
+fn require_repository(environment: &BTreeMap<&str, String>, name: &str) -> Result<String, String> {
+    let value = environment
+        .get(name)
+        .ok_or_else(|| format!("macOS Safe Storage smoke requires {name}"))?;
+    let mut parts = value.split('/');
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    };
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repository), None) if valid_part(owner) && valid_part(repository) => {
+            Ok(value.clone())
+        }
+        _ => Err(format!(
+            "macOS Safe Storage smoke requires {name} as an exact owner/name"
+        )),
+    }
+}
+
+fn require_workflow_ref(
+    environment: &BTreeMap<&str, String>,
+    name: &str,
+    repository: &str,
+) -> Result<String, String> {
+    let value = environment
+        .get(name)
+        .ok_or_else(|| format!("macOS Safe Storage smoke requires {name}"))?;
+    let prefix = format!("{repository}/.github/workflows/");
+    let suffix = value
+        .strip_prefix(&prefix)
+        .and_then(|value| value.split_once("@refs/"));
+    let valid = suffix.is_some_and(|(workflow, git_ref)| {
+        (workflow.ends_with(".yml") || workflow.ends_with(".yaml"))
+            && !workflow.contains("..")
+            && !workflow
+                .chars()
+                .any(|character| matches!(character, '\\' | '\0'))
+            && (git_ref.starts_with("heads/") || git_ref.starts_with("tags/"))
+            && git_ref.len() > "heads/".len()
+            && !git_ref.contains("..")
+            && !git_ref
+                .chars()
+                .any(|character| matches!(character, '\\' | '\0'))
+    });
+    if valid {
+        Ok(value.clone())
+    } else {
+        Err(format!(
+            "macOS Safe Storage smoke requires {name} as an exact repository-bound workflow ref"
+        ))
+    }
+}
+
+fn require_producer_workflow_ref(
+    environment: &BTreeMap<&str, String>,
+    name: &str,
+    repository: &str,
+) -> Result<String, String> {
+    let value = require_workflow_ref(environment, name, repository)?;
+    let prefix = format!("{repository}/.github/workflows/mode2-signed-producer.yml@refs/");
+    if value.starts_with(&prefix) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "macOS Safe Storage smoke requires {name} to identify mode2-signed-producer.yml"
         ))
     }
 }
@@ -468,6 +587,8 @@ pub(crate) fn rejection_json(error: &str) -> String {
     })
 }
 
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod production_runtime;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 mod runtime;
 

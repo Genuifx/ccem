@@ -30,13 +30,15 @@ import {
   type BrowserSurfaceHostShortcutEvent,
   type BrowserSurfaceOrdering,
   type BrowserSurfaceProfileSelection,
+  type BrowserSurfaceRecoveryState,
   type BrowserSurfaceSnapshot,
   type BrowserSurfaceStateChangedEvent,
 } from '@/lib/browserSurfaceIpc';
 import { createBrowserPanelNativeSurfaceParticipant } from '@/lib/browserPanelNativeSurfaceParticipant';
 import { useNativeSurfaceOcclusionParticipant } from '@/lib/nativeSurfaceOcclusion';
 import { nativeSurfaceOcclusionStore } from '@/lib/nativeSurfaceOcclusionStore';
-import { CCEM_ZOOM_CHANGE_EVENT, CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
+import { useNativeBrowserSurfaceGeometrySync } from '@/hooks/useNativeBrowserSurfaceGeometrySync';
+import { CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
 import { usePreviewSurfaceMutation } from '@/hooks/usePreviewSurfaceMutation';
 import { buildNativeBrowserBounds, normalizeBrowserBoundsZoom } from './browserPanelGeometry';
 import { BrowserPanelNavigation, BrowserPanelTabStrip } from './BrowserPanelChrome';
@@ -143,6 +145,7 @@ export function BrowserPanel(props: BrowserPanelProps) {
   const [control, setControl] = useState<BrowserInfo['control']>('user');
   const [paused, setPaused] = useState(false);
   const [sessionStatus, setSessionStatus] = useState<'running' | 'closing' | 'cleanup_required'>('running');
+  const [recoveryStates, setRecoveryStates] = useState<BrowserSurfaceRecoveryState[]>([]);
   const [popupActive, setPopupActive] = useState(false);
   const [popupUrl, setPopupUrl] = useState<string | null>(null);
   const [popupTitle, setPopupTitle] = useState<string | null>(null);
@@ -191,14 +194,19 @@ export function BrowserPanel(props: BrowserPanelProps) {
       setPaused(snapshot.paused);
     }
     if (snapshot.loading !== undefined) setIsLoading(snapshot.loading);
-    if (snapshot.error !== undefined) setError(snapshot.error ?? null);
+    if (snapshot.recovery_states?.includes('renderer_process_terminated')) {
+      setError(t('workspace.browserRecoveryRendererStopped'));
+    } else if (snapshot.error !== undefined) {
+      setError(snapshot.error ?? null);
+    }
     if (snapshot.session_status !== undefined) setSessionStatus(snapshot.session_status);
+    if (snapshot.recovery_states !== undefined) setRecoveryStates([...snapshot.recovery_states]);
     if (snapshot.popup_active !== undefined) setPopupActive(snapshot.popup_active);
     if (snapshot.popup_url !== undefined) setPopupUrl(snapshot.popup_url ?? null);
     if (snapshot.popup_title !== undefined) setPopupTitle(snapshot.popup_title ?? null);
     if (snapshot.popup_loading !== undefined) setPopupLoading(snapshot.popup_loading);
     if (snapshot.popup_error !== undefined) setPopupError(snapshot.popup_error ?? null);
-  }, []);
+  }, [t]);
 
   const readViewport = useCallback(() => {
     const frame = frameRef.current;
@@ -206,12 +214,15 @@ export function BrowserPanel(props: BrowserPanelProps) {
     return buildNativeBrowserBounds(frame.getBoundingClientRect(), readCurrentAppZoom());
   }, []);
 
-  const syncLoginSurface = useCallback((visible = !surfaceOccludedRef.current) => {
+  const syncLoginSurface = useCallback((requestedVisible = true) => {
     return loginSurfaceOrdering.enqueue(async (clientRevision) => {
       if (surfaceClosingRef.current) return;
       const lease = surfaceLeaseRef.current;
       const viewport = readViewport();
       if (!lease || !viewport) return;
+      const visible = requestedVisible
+        && !surfaceOccludedRef.current
+        && !nativeSurfaceOcclusionStore.isOccluded();
       await browserSurfaceClient.sync({
         leaseId: lease.leaseId,
         generation: lease.generation,
@@ -383,6 +394,7 @@ export function BrowserPanel(props: BrowserPanelProps) {
     surfaceCloseSucceededRef.current = false;
     setIsClosingSurface(false);
     setSessionStatus('running');
+    setRecoveryStates([]);
     setPopupActive(false);
     setPopupUrl(null);
     setPopupTitle(null);
@@ -638,25 +650,7 @@ export function BrowserPanel(props: BrowserPanelProps) {
     }
   }, [popupActive]);
 
-  useEffect(() => {
-    const frame = frameRef.current;
-    if (!frame) {
-      return;
-    }
-
-    const observer = new ResizeObserver(syncBounds);
-    observer.observe(frame);
-    window.addEventListener('resize', syncBounds);
-    window.addEventListener(CCEM_ZOOM_CHANGE_EVENT, syncBounds);
-    const timeoutId = window.setTimeout(syncBounds, 80);
-
-    return () => {
-      window.clearTimeout(timeoutId);
-      window.removeEventListener('resize', syncBounds);
-      window.removeEventListener(CCEM_ZOOM_CHANGE_EVENT, syncBounds);
-      observer.disconnect();
-    };
-  }, [syncBounds]);
+  useNativeBrowserSurfaceGeometrySync(frameRef, syncBounds);
 
   const runBrowserCommand = useCallback(async (
     command: 'browser_back' | 'browser_forward' | 'browser_reload',
@@ -907,6 +901,7 @@ export function BrowserPanel(props: BrowserPanelProps) {
       data-ccem-browser-control={control}
       data-ccem-browser-paused={paused ? 'true' : 'false'}
       data-ccem-browser-session-status={sessionStatus}
+      data-ccem-browser-recovery={recoveryStates.join(',') || 'none'}
       data-ccem-browser-popup={popupActive ? 'active' : 'none'}
       data-ccem-browser-occluded={surfaceOccluded ? 'true' : 'false'}
       style={style}
@@ -926,6 +921,7 @@ export function BrowserPanel(props: BrowserPanelProps) {
           backend={backend}
           panelTitle={panelTitle}
           sessionStatus={sessionStatus}
+          recoveryStates={recoveryStates}
           popupActive={popupActive}
           lifecycle={lifecycle}
           control={control}

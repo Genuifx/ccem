@@ -10,7 +10,8 @@ import {
 } from './verify-mode2-release-inventory.mjs';
 import { readJsonWithSha256 } from './verify-mode2-release-inventory-shared.mjs';
 
-export const MODE2_SIGNED_READINESS_EVIDENCE_SCHEMA_VERSION = 1;
+export const MODE2_SIGNED_READINESS_EVIDENCE_SCHEMA_VERSION = 2;
+export const MODE2_SIGNED_PRODUCER_JOB = 'build-desktop';
 export const MODE2_SIGNED_READINESS_TARGETS = Object.freeze([
   'aarch64-apple-darwin',
   'x86_64-apple-darwin',
@@ -25,6 +26,7 @@ const CLI_OPTIONS = new Map([
   ['--run-attempt', 'runAttempt'],
   ['--repository', 'repository'],
   ['--workflow-ref', 'workflowRef'],
+  ['--producer-workflow-ref', 'producerWorkflowRef'],
   ['--output', 'output'],
 ]);
 
@@ -88,6 +90,16 @@ function exactWorkflowRef(value, repository) {
   return exact;
 }
 
+function exactProducerWorkflowRef(value, repository, callerWorkflowRef) {
+  const exact = exactWorkflowRef(value, repository);
+  const prefix = `${repository}/.github/workflows/mode2-signed-producer.yml@`;
+  const callerRef = callerWorkflowRef.slice(callerWorkflowRef.lastIndexOf('@') + 1);
+  if (!exact.startsWith(prefix) || !exact.endsWith(`@${callerRef}`)) {
+    fail('producer workflow ref must identify the same-ref Mode 2 signed producer');
+  }
+  return exact;
+}
+
 function sameNames(actual, expected) {
   return JSON.stringify([...actual].sort()) === JSON.stringify([...expected].sort());
 }
@@ -137,7 +149,12 @@ function validateUpdaterRunBinding(inventory, expected) {
   assertBound(attestation?.target, expected.target, `${expected.target} updater target`);
   assertBound(attestation?.repository, expected.repository, `${expected.target} updater repository`);
   assertBound(attestation?.workflowRef, expected.workflowRef, `${expected.target} updater workflowRef`);
-  assertBound(attestation?.job, 'build-desktop', `${expected.target} updater job`);
+  assertBound(
+    attestation?.producerWorkflowRef,
+    expected.producerWorkflowRef,
+    `${expected.target} updater producerWorkflowRef`,
+  );
+  assertBound(attestation?.job, expected.job, `${expected.target} updater job`);
 }
 
 function validateRuntimeRunBinding(inventory, expected) {
@@ -152,9 +169,49 @@ function validateRuntimeRunBinding(inventory, expected) {
     expected.sourceCommit,
     `${expected.target} ${label} sourceCommit`,
   );
+  assertBound(
+    attestation?.repository,
+    expected.repository,
+    `${expected.target} ${label} repository`,
+  );
+  assertBound(
+    attestation?.workflowRef,
+    expected.workflowRef,
+    `${expected.target} ${label} workflowRef`,
+  );
+  assertBound(
+    attestation?.producerWorkflowRef,
+    expected.producerWorkflowRef,
+    `${expected.target} ${label} producerWorkflowRef`,
+  );
+  assertBound(attestation?.job, expected.job, `${expected.target} ${label} job`);
   assertBound(attestation?.platform, expected.target, `${expected.target} ${label} platform`);
+  if (macos) {
+    for (const field of [
+      'productionBehaviorVerified',
+      'effectFenceVerified',
+      'profileIsolationVerified',
+      'screenshotArtifactsVerified',
+    ]) {
+      assertBound(attestation?.[field], true, `${expected.target} ${label} ${field}`);
+    }
+    assertBound(
+      attestation?.semanticLaunchCount,
+      4,
+      `${expected.target} ${label} semanticLaunchCount`,
+    );
+  } else {
+    for (const field of [
+      'semanticBehaviorVerified',
+      'effectFenceVerified',
+      'profileIsolationVerified',
+      'screenshotArtifactVerified',
+    ]) {
+      assertBound(attestation?.[field], true, `${expected.target} ${label} ${field}`);
+    }
+  }
   return {
-    kind: macos ? 'macos-safe-storage-runtime' : 'windows-mode2-runtime',
+    kind: macos ? 'macos-mode2-production-runtime' : 'windows-mode2-runtime',
     attestationSha256: attestation.attestationSha256,
   };
 }
@@ -191,6 +248,7 @@ export async function verifyMode2SignedReadinessEvidence({
   runAttempt,
   repository,
   workflowRef,
+  producerWorkflowRef,
   output,
 }) {
   const root = path.resolve(exactText(evidenceRoot, 'evidence root', 4096));
@@ -200,6 +258,11 @@ export async function verifyMode2SignedReadinessEvidence({
   const exactRunAttempt = exactRunNumber(runAttempt, 'run attempt');
   const exactRepositoryValue = exactRepository(repository);
   const exactWorkflowRefValue = exactWorkflowRef(workflowRef, exactRepositoryValue);
+  const exactProducerWorkflowRefValue = exactProducerWorkflowRef(
+    producerWorkflowRef,
+    exactRepositoryValue,
+    exactWorkflowRefValue,
+  );
   const outputPath = path.resolve(exactText(output, 'output path', 4096));
   if (pathIsInside(root, outputPath)) {
     fail('output must be outside the immutable downloaded evidence root');
@@ -233,13 +296,7 @@ export async function verifyMode2SignedReadinessEvidence({
   }
 
   validateInventoryFileBindings(inventoryFiles, inventories);
-  const aggregateInventory = validateInventorySet(
-    inventories,
-    exactVersionValue,
-    exactSourceCommitValue,
-  );
-
-  const targets = records.map((record) => {
+  const boundRecords = records.map((record) => {
     const expected = {
       target: record.target,
       runId: exactRunId,
@@ -247,9 +304,20 @@ export async function verifyMode2SignedReadinessEvidence({
       sourceCommit: exactSourceCommitValue,
       repository: exactRepositoryValue,
       workflowRef: exactWorkflowRefValue,
+      producerWorkflowRef: exactProducerWorkflowRefValue,
+      job: MODE2_SIGNED_PRODUCER_JOB,
     };
     validateUpdaterRunBinding(record.inventory, expected);
     const runtimeAttestation = validateRuntimeRunBinding(record.inventory, expected);
+    return { ...record, runtimeAttestation };
+  });
+  const aggregateInventory = validateInventorySet(
+    inventories,
+    exactVersionValue,
+    exactSourceCommitValue,
+  );
+
+  const targets = boundRecords.map((record) => {
     return {
       target: record.target,
       artifactName: record.artifactName,
@@ -257,7 +325,7 @@ export async function verifyMode2SignedReadinessEvidence({
       inventorySha256: record.inventorySha256,
       updaterReplacementAttestationSha256:
         record.inventory.updaterReplacementAttestation.attestationSha256,
-      runtimeAttestation,
+      runtimeAttestation: record.runtimeAttestation,
     };
   });
 
@@ -271,6 +339,8 @@ export async function verifyMode2SignedReadinessEvidence({
     runAttempt: exactRunAttempt,
     repository: exactRepositoryValue,
     workflowRef: exactWorkflowRefValue,
+    producerWorkflowRef: exactProducerWorkflowRefValue,
+    job: MODE2_SIGNED_PRODUCER_JOB,
     inventory: aggregateInventory,
     targets,
   };

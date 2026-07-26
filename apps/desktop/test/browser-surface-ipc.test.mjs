@@ -33,6 +33,45 @@ async function importBrowserSurfaceIpc() {
   return import(pathToFileURL(outputPath).href);
 }
 
+test('overlay occlusion round-trips native focus intent without ordinary-show focus stealing', async () => {
+  const [commands, windowsMutation, macosMutation, focusRestore, browserPanel] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser', 'login', 'surface_commands.rs'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser', 'login', 'cef', 'surface', 'windows', 'mutation.rs'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser', 'login', 'cef', 'surface', 'macos', 'mutation.rs'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser', 'login', 'cef', 'surface', 'focus_restore.rs'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'), 'utf8'),
+  ]);
+
+  const control = commands.slice(
+    commands.indexOf('fn transition_control('),
+    commands.indexOf('fn close_popup('),
+  );
+  const occlude = control.slice(control.indexOf('BrowserSurfaceControlActionArg::Occlude =>'));
+  assert.ok(occlude.indexOf('pause_agent_if_active') < occlude.indexOf('occlude_surface'));
+  assert.match(windowsMutation, /GetFocus\(\)/);
+  assert.match(windowsMutation, /IsChild\(root, focused\)/);
+  assert.match(macosMutation, /firstResponder\(\)/);
+  assert.match(macosMutation, /isDescendantOf\(child\)/);
+  assert.match(focusRestore, /current_popup == Some\(popup_id\)/);
+  assert.match(focusRestore, /struct FocusRestoreAttempt[\s\S]*revision: u64/);
+  assert.match(focusRestore, /peek_for_current_popup\(current_popup\)/);
+  assert.match(
+    focusRestore,
+    /if !restore\(attempt\.target\)\?[\s\S]*commit_if_unchanged\(attempt\)/,
+  );
+  assert.match(
+    focusRestore,
+    /self\.target == Some\(restored\.target\) && self\.revision == restored\.revision/,
+  );
+  assert.doesNotMatch(focusRestore, /self\.target\.take\(\)/);
+  assert.match(
+    browserPanel,
+    /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
+  );
+  assert.match(browserPanel, /recovery_states\?\.includes\('renderer_process_terminated'\)/);
+  assert.match(browserPanel, /setError\(t\('workspace\.browserRecoveryRendererStopped'\)\)/);
+});
+
 test('surface client preserves lease generation and monotonic revision payloads', async () => {
   const {
     browserSurfaceEventMatchesLease,
@@ -272,14 +311,82 @@ test('a delayed mutation response cannot cross a lease replacement after sequenc
   assert.deepEqual(applied, [{ title: 'current lease B' }]);
 });
 
-test('panel source isolates login leases from the legacy preview command path', async () => {
-  const [panelSource, panelChromeSource, workspaceSource, launcherSource] = await Promise.all([
+test('recovery projection exposes only stable states and renders them in the related panel', async () => {
+  const [ipcSource, panelSource, chromeSource, enRaw, zhRaw] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src', 'lib', 'browserSurfaceIpc.ts'), 'utf8'),
     fs.readFile(
       path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
       'utf8',
     ),
     fs.readFile(
       path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanelChrome.tsx'),
+      'utf8',
+    ),
+    fs.readFile(path.join(desktopDir, 'src', 'locales', 'en.json'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'locales', 'zh.json'), 'utf8'),
+  ]);
+  const states = [
+    'retained_live_host',
+    'retained_inspection_unknown',
+    'retained_profile_lock',
+    'retained_unknown_or_external_owner',
+    'retained_profile_unavailable',
+    'recovered_launch_pending',
+    'recovered_runtime_owned',
+    'removed_finished_record',
+    'renderer_process_terminated',
+  ];
+  for (const state of states) assert.match(ipcSource, new RegExp(`'${state}'`));
+  assert.match(panelSource, /snapshot\.recovery_states/);
+  assert.match(panelSource, /data-ccem-browser-recovery=/);
+  assert.match(panelSource, /recoveryStates=\{recoveryStates\}/);
+  assert.match(chromeSource, /data-ccem-browser-recovery-status=/);
+  assert.match(chromeSource, /recoveryStates[\s\S]*\.map\(\(state\) => t\(recoveryStateTranslationKeys\[state\]\)\)[\s\S]*\.join\(', '\)/);
+  assert.doesNotMatch(chromeSource, /\{recoveryStates\.join\(/);
+
+  const en = JSON.parse(enRaw);
+  const zh = JSON.parse(zhRaw);
+  const translationKeys = [
+    'browserRecoveryRecovered',
+    'browserRecoveryAttention',
+    'browserRecoveryRetainedLiveHost',
+    'browserRecoveryInspectionUnknown',
+    'browserRecoveryProfileLock',
+    'browserRecoveryUnknownOwner',
+    'browserRecoveryProfileUnavailable',
+    'browserRecoveryLaunchRecovered',
+    'browserRecoveryRuntimeRecovered',
+    'browserRecoveryRecordCleared',
+    'browserRecoveryRendererStopped',
+  ];
+  for (const key of translationKeys) {
+    assert.equal(typeof en.workspace[key], 'string');
+    assert.equal(typeof zh.workspace[key], 'string');
+  }
+  assert.match(en.workspace.browserRecoveryRecovered, /\{state\}/);
+  assert.match(zh.workspace.browserRecoveryRecovered, /\{state\}/);
+  assert.match(en.workspace.browserRecoveryAttention, /\{state\}/);
+  assert.match(zh.workspace.browserRecoveryAttention, /\{state\}/);
+});
+
+test('panel source isolates login leases from the legacy preview command path', async () => {
+  const [
+    panelSource,
+    panelChromeSource,
+    geometrySyncSource,
+    workspaceSource,
+    launcherSource,
+  ] = await Promise.all([
+    fs.readFile(
+      path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
+      'utf8',
+    ),
+    fs.readFile(
+      path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanelChrome.tsx'),
+      'utf8',
+    ),
+    fs.readFile(
+      path.join(desktopDir, 'src', 'hooks', 'useNativeBrowserSurfaceGeometrySync.ts'),
       'utf8',
     ),
     fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
@@ -308,10 +415,24 @@ test('panel source isolates login leases from the legacy preview command path', 
     /await loginSurfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.release\(\{[\s\S]*disposition: 'close'/,
   );
   assert.match(panelSource, /backend === 'login'[\s\S]*browserSurfaceClient\.navigate/);
-  assert.match(panelSource, /visible = !surfaceOccludedRef\.current/);
+  assert.match(
+    panelSource,
+    /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
+  );
   assert.doesNotMatch(panelSource, /focused:/);
   assert.doesNotMatch(panelSource, /document\.hasFocus\(\)/);
   assert.doesNotMatch(panelSource, /window\.addEventListener\(['"]focus['"]/);
+  assert.match(panelSource, /useNativeBrowserSurfaceGeometrySync\(frameRef, syncBounds\)/);
+  assert.match(geometrySyncSource, /getCurrentWindow\(\)/);
+  assert.match(
+    geometrySyncSource,
+    /currentWindow\.onMoved\(syncBounds\)[\s\S]*currentWindow\.onResized\(syncBounds\)[\s\S]*currentWindow\.onScaleChanged\(syncBounds\)[\s\S]*currentWindow\.onFocusChanged\(syncBounds\)/,
+  );
+  assert.match(
+    geometrySyncSource,
+    /nativeWindowUnlisteners\.forEach\(\(unlisten\) => unlisten\(\)\)/,
+  );
+  assert.match(geometrySyncSource, /observer\.disconnect\(\)/);
   assert.match(panelSource, /data-ccem-browser-occluded=\{surfaceOccluded \? 'true' : 'false'\}/);
   assert.match(panelSource, /<BrowserPanelNavigation/);
   assert.match(panelChromeSource, /disabled=\{backend === 'login' \|\| isBusy \|\| !canGoBack\}/);

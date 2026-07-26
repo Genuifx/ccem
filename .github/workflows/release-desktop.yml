@@ -47,6 +47,52 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - name: Require protected release ref and main ancestry
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Manual desktop release may run only from protected main." >&2
+              exit 1
+            }
+          else
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] || {
+              echo "Automatic desktop release requires a formal v* tag push." >&2
+              exit 1
+            }
+          fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Desktop release requires the selected main ref or v* tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not verify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Desktop release requires the main branch to be protected." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Desktop release source ${source_commit} is not reachable from origin/main." >&2
+            exit 1
+          }
+
       - name: Generate release body
         id: release-notes
         shell: bash
@@ -62,6 +108,10 @@ jobs:
             fi
             current_tag="v${version}"
           fi
+          [[ "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Desktop release requires a formal semantic-version tag." >&2
+            exit 1
+          }
 
           git fetch --force --no-tags origin "refs/tags/${current_tag}:refs/tags/${current_tag}" || {
             echo "Release tag ${current_tag} must exist before desktop release builds start" >&2
@@ -163,15 +213,58 @@ jobs:
           path: release-payloads
           merge-multiple: false
 
-      - name: Verify release tag binds the current source commit
+      - name: Revalidate protected release source and exact tag
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
           TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Manual desktop release may run only from protected main." >&2
+              exit 1
+            }
+          else
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] || {
+              echo "Automatic desktop release requires a formal v* tag push." >&2
+              exit 1
+            }
+          fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Desktop release requires the selected main ref or v* tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not reverify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Desktop release requires the main branch to remain protected." >&2
+            exit 1
+          }
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Desktop release requires a formal semantic-version tag." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
           git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
           tag_commit="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
-          source_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Desktop release source ${source_commit} is no longer reachable from origin/main." >&2
+            exit 1
+          }
           [[ "$tag_commit" == "$source_commit" ]] || {
             echo "Release tag ${TAG_NAME} resolves to ${tag_commit}, not current source ${source_commit}" >&2
             exit 1

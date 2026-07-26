@@ -121,6 +121,7 @@ function commonExpected(platform, paths) {
       attempt: '2',
       repository: 'ccem-org/claude-code-env-manager',
       workflowRef: 'ccem-org/claude-code-env-manager/.github/workflows/release-desktop.yml@refs/heads/main',
+      producerWorkflowRef: 'ccem-org/claude-code-env-manager/.github/workflows/mode2-signed-producer.yml@refs/heads/main',
       job: `updater_replacement_${platform}`,
       challengeNonce: CHALLENGE_NONCE,
     },
