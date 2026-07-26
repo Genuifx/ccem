@@ -925,21 +925,23 @@ impl NativeRuntimeManager {
         let prompt_annotations = validate_prompt_annotations(prompt_annotations)?;
 
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
-        self.append_interactive_prompt_response_event(
+        self.deliver_and_append_interactive_prompt_response(
             runtime_id,
             display_text,
             answers,
             prompt_annotations.as_ref(),
-        )?;
-        self.write_to_child_with_reconnect(
-            app,
-            runtime_id,
-            handle,
-            &HelperInputCommand::InteractivePromptResponse {
-                tool_use_id,
-                prompt_type,
-                answers,
-                annotations,
+            || {
+                self.write_to_child_with_reconnect(
+                    app,
+                    runtime_id,
+                    handle,
+                    &HelperInputCommand::InteractivePromptResponse {
+                        tool_use_id,
+                        prompt_type,
+                        answers,
+                        annotations,
+                    },
+                )
             },
         )
     }
@@ -2123,6 +2125,23 @@ impl NativeRuntimeManager {
             return Ok(());
         };
         self.append_user_prompt_event(runtime_id, &text, None, annotations)
+    }
+
+    fn deliver_and_append_interactive_prompt_response(
+        &self,
+        runtime_id: &str,
+        display_text: Option<&str>,
+        answers: &HashMap<String, String>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
+        deliver: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        deliver()?;
+        self.append_interactive_prompt_response_event(
+            runtime_id,
+            display_text,
+            answers,
+            annotations,
+        )
     }
 
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {
@@ -3382,6 +3401,37 @@ mod tests {
         assert_eq!(images, &None);
         assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn failed_interactive_prompt_delivery_does_not_persist_a_user_prompt() {
+        let runtime_id = format!(
+            "native-interactive-response-failed-write-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let answers = HashMap::from([("Pick one".to_string(), "Use SQLite".to_string())]);
+        let prompt_annotations = vec![SessionPromptAnnotation {
+            quote: "current query".to_string(),
+            note: "only persist after delivery".to_string(),
+        }];
+
+        let error = manager
+            .deliver_and_append_interactive_prompt_response(
+                &runtime_id,
+                Some("Use SQLite"),
+                &answers,
+                Some(&prompt_annotations),
+                || Err("Failed to write to native sidecar stdin: Broken pipe".to_string()),
+            )
+            .expect_err("failed helper delivery must be returned");
+
+        assert!(error.contains("Broken pipe"));
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay events")
+            .events
+            .is_empty());
     }
 
     #[test]
