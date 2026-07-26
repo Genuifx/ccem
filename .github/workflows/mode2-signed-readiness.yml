@@ -1,0 +1,100 @@
+name: Mode 2 Signed Readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: 'Full 40-character main commit SHA to verify without publishing'
+        required: true
+        type: string
+
+concurrency:
+  group: mode2-signed-readiness
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  prepare-readiness:
+    name: Bind Non-Publishing Readiness Source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require protected main and exact operator-confirmed SHA
+        id: source
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "Mode 2 signed readiness may run only from protected main." >&2
+            exit 1
+          }
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Mode 2 signed readiness requires branch protection or a ruleset on main." >&2
+            exit 1
+          }
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$EXPECTED_SHA" == "$SOURCE_COMMIT" ]] || {
+            echo "expected_sha must exactly match the selected 40-character main commit." >&2
+            exit 1
+          }
+          checkout_commit="$(git rev-parse HEAD^{commit})"
+          [[ "$checkout_commit" == "$SOURCE_COMMIT" ]] || {
+            echo "Readiness checkout does not match GITHUB_SHA." >&2
+            exit 1
+          }
+
+          version="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' apps/desktop/package.json | head -n1)"
+          [[ -n "$version" ]] || {
+            echo "Failed to determine desktop version." >&2
+            exit 1
+          }
+          candidate_tag="v${version}"
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${candidate_tag}" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [[ "$tag_status" -eq 0 ]]; then
+            echo "Signed readiness requires an unpublished version; ${candidate_tag} already exists." >&2
+            exit 1
+          elif [[ "$tag_status" -ne 2 ]]; then
+            echo "Could not prove that ${candidate_tag} is absent from origin." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate readiness version consistency
+        env:
+          EXPECTED_VERSION: ${{ steps.source.outputs.version }}
+        run: node scripts/ci/check-release-version.mjs "$EXPECTED_VERSION"
+
+      - name: Verify pinned browser runtime manifests
+        run: node scripts/ci/check-browser-runtime-manifests.mjs
+
+  signed-producer:
+    name: Produce Signed Evidence Without Publishing
+    needs: prepare-readiness
+    if: ${{ !cancelled() && needs.prepare-readiness.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/mode2-signed-producer.yml
+    with:
+      version: ${{ needs.prepare-readiness.outputs.version }}
+      source_commit: ${{ github.sha }}
+      caller_workflow_ref: ${{ github.workflow_ref }}
+      export_release_payload: false
+      release_tag: ''

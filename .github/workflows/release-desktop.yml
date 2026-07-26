@@ -14,32 +14,90 @@ on:
         options:
           - 'true'
           - 'false'
+      recover_stale_draft:
+        description: 'Resume an unpublished CCEM-owned draft for the same tag and source commit'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 concurrency:
-  group: release-desktop-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-desktop
+  cancel-in-progress: false
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare-release:
-    name: Prepare Release Notes
+    name: Prepare Exact Tagged Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       release_body: ${{ steps.release-notes.outputs.release_body }}
       current_tag: ${{ steps.release-notes.outputs.current_tag }}
       version: ${{ steps.release-notes.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require protected release ref and main ancestry
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Manual desktop release may run only from protected main." >&2
+              exit 1
+            }
+          else
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] || {
+              echo "Automatic desktop release requires a formal v* tag push." >&2
+              exit 1
+            }
+          fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Desktop release requires the selected main ref or v* tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not verify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Desktop release requires the main branch to be protected." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Desktop release source ${source_commit} is not reachable from origin/main." >&2
+            exit 1
+          }
 
       - name: Generate release body
         id: release-notes
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             current_tag="${GITHUB_REF_NAME}"
           else
@@ -50,15 +108,28 @@ jobs:
             fi
             current_tag="v${version}"
           fi
+          [[ "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Desktop release requires a formal semantic-version tag." >&2
+            exit 1
+          }
 
-          previous_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          git fetch --force --no-tags origin "refs/tags/${current_tag}:refs/tags/${current_tag}" || {
+            echo "Release tag ${current_tag} must exist before desktop release builds start" >&2
+            exit 1
+          }
+          tag_commit="$(git rev-parse "refs/tags/${current_tag}^{commit}")"
+          source_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          [[ "$tag_commit" == "$source_commit" ]] || {
+            echo "Release tag ${current_tag} does not resolve to current source ${source_commit}" >&2
+            exit 1
+          }
+
+          previous_tag="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
           version="${current_tag#v}"
-
           echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
           delimiter="CCEM_RELEASE_BODY_$(date +%s)"
-
           {
             echo "release_body<<${delimiter}"
             echo "## CCEM Desktop v${version}"
@@ -73,12 +144,8 @@ jobs:
             echo "npm install -g ccem@${version}"
             echo '```'
             echo
-            echo "### macOS Gatekeeper"
-            echo "If you use an unsigned macOS build, clear quarantine after installing:"
-            echo
-            echo '```bash'
-            echo 'xattr -c /Applications/CCEM\ Desktop.app'
-            echo '```'
+            echo "### macOS trust"
+            echo "Production artifacts are Developer ID-signed, notarized, and stapled before publication."
             echo
             echo "### Commits"
             if [[ -n "$previous_tag" ]]; then
@@ -95,245 +162,202 @@ jobs:
           EXPECTED_VERSION: ${{ steps.release-notes.outputs.version }}
         run: node scripts/ci/check-release-version.mjs "$EXPECTED_VERSION"
 
-  build-desktop:
-    name: Build Desktop (${{ matrix.target }})
+      - name: Verify pinned browser runtime manifests
+        run: node scripts/ci/check-browser-runtime-manifests.mjs
+
+      - name: Require immutable GitHub Releases before signed build
+        env:
+          CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
+        run: node apps/desktop/scripts/verify-immutable-releases-enabled.mjs
+
+  signed-producer:
+    name: Produce Exact Signed Desktop Evidence and Payloads
     needs: prepare-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            args: '--target aarch64-apple-darwin'
-            appleSigning: true
-          - platform: macos-15-intel
-            target: x86_64-apple-darwin
-            args: '--target x86_64-apple-darwin'
-            appleSigning: true
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            args: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.windows.conf.json --bundles nsis,updater'
-            appleSigning: false
-
-    runs-on: ${{ matrix.platform }}
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          cache: 'pnpm'
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: 'apps/desktop/src-tauri -> target'
-          key: ${{ matrix.target }}
-
-      - name: Install dependencies
-        run: pnpm install
-
-      - name: Build core package
-        run: pnpm --filter @ccem/core build
-
-      - name: Detect Apple signing config
-        if: ${{ matrix.appleSigning }}
-        id: apple-signing
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          if [[ -n "$APPLE_CERTIFICATE" && -n "$APPLE_CERTIFICATE_PASSWORD" && -n "$APPLE_SIGNING_IDENTITY" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Using Apple code signing"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Apple code signing not configured; building unsigned artifacts"
-          fi
-
-      - name: Validate updater signing config
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY is required because updater artifacts are enabled." >&2
-            echo "Generate it with: cd apps/desktop && pnpm tauri signer generate -w ~/.tauri/ccem-updater.key" >&2
-            exit 1
-          fi
-
-      - name: Build and release (signed)
-        if: ${{ matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          tagName: v__VERSION__
-          releaseName: 'CCEM v__VERSION__'
-          releaseBody: ${{ needs.prepare-release.outputs.release_body }}
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
-
-      - name: Build and release (unsigned)
-        if: ${{ !matrix.appleSigning || steps.apple-signing.outputs.enabled != 'true' }}
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          tagName: v__VERSION__
-          releaseName: 'CCEM v__VERSION__'
-          releaseBody: ${{ needs.prepare-release.outputs.release_body }}
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/mode2-signed-producer.yml
+    with:
+      version: ${{ needs.prepare-release.outputs.version }}
+      source_commit: ${{ github.sha }}
+      caller_workflow_ref: ${{ github.workflow_ref }}
+      export_release_payload: true
+      release_tag: ${{ needs.prepare-release.outputs.current_tag }}
 
   publish-updater-manifest:
-    name: Publish Updater Manifest
-    needs: [prepare-release, build-desktop]
+    name: Mutate and Publish Exact Release
+    needs: [prepare-release, signed-producer]
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
+    permissions:
+      actions: read
+      contents: write
 
     steps:
-      - name: Publish combined latest.json
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - name: Download immutable current-attempt release payloads
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: release-payloads
+          merge-multiple: false
+
+      - name: Revalidate protected release source and exact tag
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
           TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
-          VERSION: ${{ needs.prepare-release.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          api="https://api.github.com/repos/${REPO}"
-          auth_headers=(
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
-            -H "Accept: application/vnd.github+json"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-
-          release_json="$(mktemp)"
-          curl -fsSL "${auth_headers[@]}" "${api}/releases/tags/${TAG_NAME}" > "$release_json"
-
-          release_id="$(jq -r '.id' "$release_json")"
-          upload_url="$(jq -r '.upload_url' "$release_json" | sed 's/{.*//')"
-
-          asset_url() {
-            jq -r --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n1
-          }
-
-          asset_url_any() {
-            local candidate
-            for candidate in "$@"; do
-              local url
-              url="$(asset_url "$candidate")"
-              if [[ -n "$url" && "$url" != "null" ]]; then
-                echo "$url"
-                return 0
-              fi
-            done
-          }
-
-          asset_url_regex() {
-            jq -r --arg pattern "$1" \
-              '.assets[] | select(.name | test($pattern)) | .browser_download_url' \
-              "$release_json" | head -n1
-          }
-
-          aarch64_bundle_url="$(asset_url_any 'CCEM.Desktop_aarch64.app.tar.gz' 'CCEM Desktop_aarch64.app.tar.gz')"
-          aarch64_sig_url="$(asset_url_any 'CCEM.Desktop_aarch64.app.tar.gz.sig' 'CCEM Desktop_aarch64.app.tar.gz.sig')"
-          x64_bundle_url="$(asset_url_any 'CCEM.Desktop_x64.app.tar.gz' 'CCEM Desktop_x64.app.tar.gz')"
-          x64_sig_url="$(asset_url_any 'CCEM.Desktop_x64.app.tar.gz.sig' 'CCEM Desktop_x64.app.tar.gz.sig')"
-          windows_bundle_url="$(asset_url_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)$')"
-          windows_sig_url="$(asset_url_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)\.sig$')"
-
-          for value in "$aarch64_bundle_url" "$aarch64_sig_url" "$x64_bundle_url" "$x64_sig_url" "$windows_bundle_url" "$windows_sig_url"; do
-            if [[ -z "$value" || "$value" == "null" ]]; then
-              echo "Missing updater bundle or signature asset for ${TAG_NAME}" >&2
-              jq -r '.assets[].name' "$release_json" >&2
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Manual desktop release may run only from protected main." >&2
               exit 1
-            fi
-          done
-
-          aarch64_sig="$(curl -fsSL "$aarch64_sig_url" | tr -d '\r\n')"
-          x64_sig="$(curl -fsSL "$x64_sig_url" | tr -d '\r\n')"
-          windows_sig="$(curl -fsSL "$windows_sig_url" | tr -d '\r\n')"
-          pub_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          notes="See https://github.com/${REPO}/releases/tag/${TAG_NAME}"
-
-          jq -n \
-            --arg version "$VERSION" \
-            --arg notes "$notes" \
-            --arg pub_date "$pub_date" \
-            --arg aarch64_url "$aarch64_bundle_url" \
-            --arg aarch64_sig "$aarch64_sig" \
-            --arg x64_url "$x64_bundle_url" \
-            --arg x64_sig "$x64_sig" \
-            --arg windows_url "$windows_bundle_url" \
-            --arg windows_sig "$windows_sig" \
-            '{
-              version: $version,
-              notes: $notes,
-              pub_date: $pub_date,
-              platforms: {
-                "darwin-aarch64": {
-                  signature: $aarch64_sig,
-                  url: $aarch64_url
-                },
-                "darwin-x86_64": {
-                  signature: $x64_sig,
-                  url: $x64_url
-                },
-                "windows-x86_64": {
-                  signature: $windows_sig,
-                  url: $windows_url
-                }
-              }
-            }' > latest.json
-
-          existing_latest_id="$(jq -r '.assets[] | select(.name == "latest.json") | .id' "$release_json" | head -n1)"
-          if [[ -n "$existing_latest_id" && "$existing_latest_id" != "null" ]]; then
-            curl -fsSL -X DELETE "${auth_headers[@]}" "${api}/releases/assets/${existing_latest_id}"
+            }
+          else
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] || {
+              echo "Automatic desktop release requires a formal v* tag push." >&2
+              exit 1
+            }
           fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Desktop release requires the selected main ref or v* tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not reverify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Desktop release requires the main branch to remain protected." >&2
+            exit 1
+          }
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Desktop release requires a formal semantic-version tag." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          tag_commit="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Desktop release source ${source_commit} is no longer reachable from origin/main." >&2
+            exit 1
+          }
+          [[ "$tag_commit" == "$source_commit" ]] || {
+            echo "Release tag ${TAG_NAME} resolves to ${tag_commit}, not current source ${source_commit}" >&2
+            exit 1
+          }
 
-          curl -fsSL -X POST \
-            "${auth_headers[@]}" \
-            -H "Content-Type: application/json" \
-            --data-binary @latest.json \
-            "${upload_url}?name=latest.json"
+      - name: Verify exact three immutable payloads and eight assets
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+        run: >-
+          node apps/desktop/scripts/verify-release-payloads.mjs
+          --payload-root release-payloads
+          --version "${VERSION}"
+          --source-commit "${GITHUB_SHA}"
+          --tag "${TAG_NAME}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --inventory-output release-payloads/verified-release-inventory.json
+          --contract-output release-payloads/verified-payload-contract.json
 
-  # Universal binary (optional — combines both architectures)
+      - name: Create or resume the exact current-run draft release
+        id: draft-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          RELEASE_NAME: CCEM v${{ needs.prepare-release.outputs.version }}
+          RELEASE_BODY: ${{ needs.prepare-release.outputs.release_body }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          ALLOW_STALE_DRAFT_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.recover_stale_draft || 'false' }}
+        run: node apps/desktop/scripts/ensure-draft-github-release.mjs
+
+      - name: Upload the exact eight verified target assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+          EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
+          EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          CCEM_RELEASE_PAYLOAD_CONTRACT: ${{ github.workspace }}/release-payloads/verified-payload-contract.json
+          CCEM_RELEASE_PAYLOAD_ROOT: ${{ github.workspace }}/release-payloads
+          CCEM_RELEASE_RECEIPTS_DIR: ${{ github.workspace }}/release-receipts
+          CCEM_RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        working-directory: apps/desktop
+        run: node scripts/upload-draft-release-assets.mjs --mode payload
+
+      - name: Generate latest.json from verified current-run payload
+        shell: bash
+        env:
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          CCEM_RELEASE_PAYLOAD_CONTRACT: ${{ github.workspace }}/release-payloads/verified-payload-contract.json
+          CCEM_RELEASE_LATEST_PATH: ${{ github.workspace }}/latest.json
+        run: |
+          set -euo pipefail
+          export PUB_DATE
+          PUB_DATE="$(git show -s --format=%cI "${TAG_NAME}^{commit}")"
+          node apps/desktop/scripts/create-latest-from-release-payload.mjs
+
+      - name: Upload exact latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+          EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
+          EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          CCEM_RELEASE_ASSET_PATH: ${{ github.workspace }}/latest.json
+          CCEM_RELEASE_RECEIPT_PATH: ${{ github.workspace }}/latest-upload-receipt.json
+        working-directory: apps/desktop
+        run: node scripts/upload-draft-release-assets.mjs --mode latest
+
+      - name: Verify exact nine assets and publish the locked draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+          EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
+          EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          CCEM_RELEASE_INVENTORY_PATH: ${{ github.workspace }}/release-payloads/verified-release-inventory.json
+          CCEM_RELEASE_RECEIPTS_DIR: ${{ github.workspace }}/release-receipts
+          CCEM_RELEASE_LATEST_RECEIPT_PATH: ${{ github.workspace }}/latest-upload-receipt.json
+          CCEM_RELEASE_LATEST_PATH: ${{ github.workspace }}/latest.json
+          DESIRED_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
+        working-directory: apps/desktop
+        run: node scripts/publish-draft-github-release.mjs
+
   create-universal:
     name: Create Universal Binary
-    needs: build-desktop
+    needs: signed-producer
     runs-on: macos-latest
-    if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
+    permissions: {}
 
     steps:
       - name: Note

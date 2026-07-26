@@ -48,7 +48,7 @@ test('Preview Browser exposes recent artifacts and log paths through trusted app
   const [panelSource, ipcSource, mainSource, permissionSource] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'main.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'lib.rs'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src-tauri', 'permissions', 'trusted-app-commands.toml'), 'utf8'),
   ]);
 
@@ -57,6 +57,6 @@ test('Preview Browser exposes recent artifacts and log paths through trusted app
   assert.match(panelSource, /console_log_path/);
   assert.match(panelSource, /audit_log_path/);
   assert.match(ipcSource, /browser_recent_activity/);
-  assert.match(mainSource, /browser::browser_recent_activity/);
+  assert.match(mainSource, /browser::commands::browser_recent_activity/);
   assert.match(permissionSource, /"browser_recent_activity"/);
 });

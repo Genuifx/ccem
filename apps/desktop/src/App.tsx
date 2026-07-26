@@ -21,6 +21,7 @@ import { StartupSplash } from '@/components/layout/StartupSplash';
 import type { PetOpenSessionRequest } from '@/types/pet';
 import { AppUpdateProvider } from '@/components/app-update/AppUpdateProvider';
 import { runExclusiveLaunch } from '@/components/sessions/sessionLaunchAction';
+import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
 
 interface CcemControlRequest {
   kind?: string;
@@ -863,8 +864,11 @@ function DeleteEnvConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const gatedOpen = useNativeSurfaceOcclusion(true);
   const { t } = useLocale();
   const message = t('environments.confirmDelete').replace('{name}', envName);
+
+  if (!gatedOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onCancel}>

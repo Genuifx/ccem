@@ -40,7 +40,7 @@ test('macOS traffic light position includes the overlay titlebar visual offset',
 
 test('macOS chrome avoids runtime traffic light repositioning', async () => {
   const [mainSource, traySource, petNotificationSource, fullscreenControls] = await Promise.all([
-    fs.readFile(path.join(tauriSrcDir, 'main.rs'), 'utf8'),
+    fs.readFile(path.join(tauriSrcDir, 'lib.rs'), 'utf8'),
     fs.readFile(path.join(tauriSrcDir, 'tray.rs'), 'utf8'),
     fs.readFile(path.join(tauriSrcDir, 'pet_notifications.rs'), 'utf8'),
     fs.readFile(
@@ -67,7 +67,7 @@ test('macOS chrome avoids runtime traffic light repositioning', async () => {
 
 test('visible-window restore paths keep showing and focusing the window', async () => {
   const [mainSource, traySource, petNotificationSource] = await Promise.all([
-    fs.readFile(path.join(tauriSrcDir, 'main.rs'), 'utf8'),
+    fs.readFile(path.join(tauriSrcDir, 'lib.rs'), 'utf8'),
     fs.readFile(path.join(tauriSrcDir, 'tray.rs'), 'utf8'),
     fs.readFile(path.join(tauriSrcDir, 'pet_notifications.rs'), 'utf8'),
   ]);

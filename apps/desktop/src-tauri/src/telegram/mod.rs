@@ -5569,10 +5569,9 @@ fn set_my_commands(
         .post(url)
         .json(&SetMyCommandsBody { commands, scope })
         .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram setMyCommands failed: {}",
-            error
-        )))?;
+        .map_err(|error| {
+            redact_telegram_token(&format!("Telegram setMyCommands failed: {}", error))
+        })?;
     let payload: TelegramApiResponse<bool> =
         parse_telegram_response(response, "Telegram setMyCommands response")?;
     if payload.ok {
@@ -5601,10 +5600,9 @@ fn delete_my_commands(token: &str, scope: Option<&TelegramBotCommandScope>) -> R
         .post(url)
         .json(&DeleteMyCommandsBody { scope })
         .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram deleteMyCommands failed: {}",
-            error
-        )))?;
+        .map_err(|error| {
+            redact_telegram_token(&format!("Telegram deleteMyCommands failed: {}", error))
+        })?;
     let payload: TelegramApiResponse<bool> =
         parse_telegram_response(response, "Telegram deleteMyCommands response")?;
     if payload.ok {
@@ -5628,14 +5626,9 @@ fn get_updates(token: &str, offset: Option<i64>) -> Result<Vec<TelegramUpdate>, 
         query.push(("offset", offset.to_string()));
     }
 
-    let response = client
-        .get(url)
-        .query(&query)
-        .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram getUpdates failed: {}",
-            error
-        )))?;
+    let response = client.get(url).query(&query).send().map_err(|error| {
+        redact_telegram_token(&format!("Telegram getUpdates failed: {}", error))
+    })?;
     let payload: TelegramApiResponse<Vec<TelegramUpdate>> =
         parse_telegram_response(response, "Telegram updates")?;
     if payload.ok {
@@ -5667,10 +5660,9 @@ fn create_forum_topic(token: &str, chat_id: i64, name: &str) -> Result<i64, Stri
             icon_color: TELEGRAM_DEFAULT_TOPIC_ICON_COLOR,
         })
         .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram createForumTopic failed: {}",
-            error
-        )))?;
+        .map_err(|error| {
+            redact_telegram_token(&format!("Telegram createForumTopic failed: {}", error))
+        })?;
     let payload: TelegramApiResponse<TelegramCreatedForumTopic> =
         parse_telegram_response(response, "Telegram createForumTopic response")?;
     if payload.ok {
@@ -5815,10 +5807,9 @@ fn send_message_with_markup(
             reply_markup,
         })
         .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram sendMessage failed: {}",
-            error
-        )))?;
+        .map_err(|error| {
+            redact_telegram_token(&format!("Telegram sendMessage failed: {}", error))
+        })?;
     let payload: TelegramApiResponse<TelegramSentMessage> =
         parse_telegram_response(response, "Telegram sendMessage response")?;
     if payload.ok {
@@ -5859,10 +5850,9 @@ fn edit_message_text(
             reply_markup,
         })
         .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram editMessageText failed: {}",
-            error
-        )))?;
+        .map_err(|error| {
+            redact_telegram_token(&format!("Telegram editMessageText failed: {}", error))
+        })?;
     let payload: TelegramApiResponse<serde_json::Value> =
         parse_telegram_response(response, "Telegram editMessageText response")?;
     if payload.ok {
@@ -5900,10 +5890,9 @@ fn answer_callback_query(
             show_alert,
         })
         .send()
-        .map_err(|error| redact_telegram_token(&format!(
-            "Telegram answerCallbackQuery failed: {}",
-            error
-        )))?;
+        .map_err(|error| {
+            redact_telegram_token(&format!("Telegram answerCallbackQuery failed: {}", error))
+        })?;
     let payload: TelegramApiResponse<serde_json::Value> =
         parse_telegram_response(response, "Telegram answerCallbackQuery response")?;
     if payload.ok {
@@ -5925,9 +5914,9 @@ fn telegram_http_client(timeout: Option<Duration>) -> Result<reqwest::blocking::
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
     }
-    builder
-        .build()
-        .map_err(|error| redact_telegram_token(&format!("Failed to build Telegram client: {}", error)))
+    builder.build().map_err(|error| {
+        redact_telegram_token(&format!("Failed to build Telegram client: {}", error))
+    })
 }
 
 fn telegram_no_proxy_requested() -> bool {
@@ -5970,16 +5959,16 @@ mod tests {
         ensure_text_entry_option, expand_home_dir, format_active_choice_text,
         format_new_topic_welcome_message, format_permission_command_result,
         format_permission_request_text, format_permission_response_text,
-        format_tool_completed_message,
-        format_topic_binding_success_message, is_chat_about_this_option, is_chat_allowed,
-        is_sender_allowed, is_vscode_text_entry_option, normalize_command_text, parse_bind_command,
-        parse_interactive_tool_cancel_callback_data, parse_interactive_tool_select_callback_data,
-        parse_interactive_tool_submit_callback_data, parse_new_topic_command,
-        parse_permission_callback_data, redact_telegram_token, remove_topic_binding,
-        selection_submit_options, summarize_interactive_prompt_resolution, upsert_topic_binding,
-        ActiveInteractiveChoicePrompt, InteractiveChoiceSubmitMode, PendingInteractiveAction,
-        TelegramBotCommandScope, TelegramBridgeManager, TelegramSettings, TelegramTopicBinding,
-        TELEGRAM_FULL_GROUP_COMMANDS, TELEGRAM_MINIMAL_GROUP_COMMANDS, TELEGRAM_PRIVATE_COMMANDS,
+        format_tool_completed_message, format_topic_binding_success_message,
+        is_chat_about_this_option, is_chat_allowed, is_sender_allowed, is_vscode_text_entry_option,
+        normalize_command_text, parse_bind_command, parse_interactive_tool_cancel_callback_data,
+        parse_interactive_tool_select_callback_data, parse_interactive_tool_submit_callback_data,
+        parse_new_topic_command, parse_permission_callback_data, redact_telegram_token,
+        remove_topic_binding, selection_submit_options, summarize_interactive_prompt_resolution,
+        upsert_topic_binding, ActiveInteractiveChoicePrompt, InteractiveChoiceSubmitMode,
+        PendingInteractiveAction, TelegramBotCommandScope, TelegramBridgeManager, TelegramSettings,
+        TelegramTopicBinding, TELEGRAM_FULL_GROUP_COMMANDS, TELEGRAM_MINIMAL_GROUP_COMMANDS,
+        TELEGRAM_PRIVATE_COMMANDS,
     };
     use crate::event_bus::{ToolQuestionOption, ToolQuestionPrompt};
     use chrono::Utc;
@@ -6800,7 +6789,10 @@ mod tests {
         manager.set_last_error(leaked);
 
         let status = manager.status();
-        assert!(!status.running, "set_last_error must mark bridge as not running");
+        assert!(
+            !status.running,
+            "set_last_error must mark bridge as not running"
+        );
         let stored = status
             .last_error
             .as_deref()

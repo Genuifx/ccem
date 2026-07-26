@@ -8,9 +8,9 @@ const rustDir = path.join(desktopDir, 'src-tauri', 'src');
 const repoDir = path.resolve(desktopDir, '..', '..');
 
 test('agent browser artifacts are app-owned while UI screenshot remains inline', async () => {
-  const [artifactSource, browserSource, toolSource, nativeRuntimeSource] = await Promise.all([
+  const [artifactSource, commandSource, toolSource, nativeRuntimeSource] = await Promise.all([
     fs.readFile(path.join(rustDir, 'browser', 'artifacts.rs'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'browser.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'browser', 'commands.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'tools.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'native_runtime.rs'), 'utf8'),
   ]);
@@ -21,13 +21,16 @@ test('agent browser artifacts are app-owned while UI screenshot remains inline',
   assert.match(agentScreenshot, /capture_screenshot_artifact/);
   assert.doesNotMatch(agentScreenshot, /screenshot_base64|"data"/);
 
-  const uiScreenshot = browserSource.match(
+  const uiScreenshot = commandSource.match(
     /pub async fn browser_screenshot\([\s\S]*?\n\}/,
   )?.[0] ?? '';
   assert.match(uiScreenshot, /screenshot_base64/);
 
   assert.match(nativeRuntimeSource, /record\.project_dir\.clone\(\)/);
-  assert.match(nativeRuntimeSource, /browser\.run_tool\(app, runtime_id, &workspace_dir, &request\)/);
+  assert.match(
+    nativeRuntimeSource,
+    /browser\.run_tool_with_permission\(\s*app,\s*runtime_id,\s*&workspace_dir,\s*&request,\s*&authority,?\s*\)/,
+  );
 
   assert.match(artifactSource, /config::get_ccem_dir\(\)\.join\("browser"\)/);
   assert.match(artifactSource, /join\("workspaces"\)[\s\S]*join\("sessions"\)[\s\S]*join\("artifacts"\)/);

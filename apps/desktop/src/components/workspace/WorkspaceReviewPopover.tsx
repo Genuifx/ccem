@@ -23,6 +23,7 @@ import type {
   WorkspaceGitSnapshot,
   WorkspaceMediaPreview,
 } from '@/lib/tauri-ipc';
+import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
 import { cn, getEnvColorVar } from '@/lib/utils';
 import type { SessionSubagentsPayload } from '@/features/conversations/types';
 import type { ReviewTodoItem, WorkspaceReviewModel } from './workspaceReview';
@@ -200,6 +201,7 @@ export function WorkspaceReviewPopover({
   isLive,
 }: WorkspaceReviewPopoverProps) {
   const { t } = useLocale();
+  const gatedOpen = useNativeSurfaceOcclusion(isOpen);
   const [page, setPage] = useState<ReviewPage>('main');
   const envColor = getEnvColorVar(session.env_name);
 
@@ -258,7 +260,7 @@ export function WorkspaceReviewPopover({
       : t('workspace.reviewProgress');
 
   return (
-    <Popover modal={false} open={isOpen} onOpenChange={handleOpenChange}>
+    <Popover modal={false} open={gatedOpen} onOpenChange={handleOpenChange}>
       <PopoverAnchor virtualRef={workspaceReviewTriggerRef} />
       <PopoverContent
         id={WORKSPACE_REVIEW_POPOVER_ID}

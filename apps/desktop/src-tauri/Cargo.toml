@@ -1,9 +1,21 @@
 [package]
 name = "ccem-desktop"
-version = "2.62.0"
+version = "2.63.0"
 description = "CCEM Desktop Application"
 authors = ["Genuifx"]
 edition = "2021"
+default-run = "ccem-desktop"
+
+[lib]
+name = "ccem_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ccem-cef-helper"
+path = "src/bin/ccem_cef_helper.rs"
+
+[package.metadata.cef.bundle]
+helper_name = "ccem-cef-helper"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -24,12 +36,17 @@ toml = "0.9"
 scrypt = "0.11"
 aes = "0.8"
 cbc = "0.1"
+crc32fast = "1.5"
 aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
+png = "=0.18.0"
+minisign-verify = "0.2.5"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2"] }
+plist = "1.8"
 tungstenite = { version = "0.28", features = ["native-tls"] }
 urlencoding = "2"
 quick-xml = "0.31"
@@ -43,16 +60,26 @@ tauri-plugin-updater = "2"
 semver = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cef = { version = "=150.0.0", default-features = false, features = ["sandbox", "build-util"] }
+cef-objc2 = { package = "objc2", version = "0.6" }
+cef-objc2-app-kit = { package = "objc2-app-kit", version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
+cef-objc2-foundation = { package = "objc2-foundation", version = "0.3", default-features = false, features = ["NSGeometry", "NSObject", "NSValue", "NSProcessInfo", "NSRunLoop", "NSThread", "NSTimer"] }
 objc2 = { version = "0.5.2", default-features = false }
 block2 = { version = "0.5.1" }
 objc2-foundation = { version = "0.2.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSJSONSerialization", "NSObject", "NSString"] }
 objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSBitmapImageRep", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSWindow"] }
 objc2-web-kit = { version = "0.2.2", default-features = false, features = ["block2", "WKNavigation", "WKSnapshotConfiguration", "WKWebView"] }
 
+[target.'cfg(windows)'.dependencies]
+cef = { version = "=150.0.0", default-features = false, features = ["sandbox", "build-util"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 chromium-spike = []
+updater-replacement-smoke-harness = []
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

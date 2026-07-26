@@ -140,10 +140,7 @@ impl NativeEventLog {
         })
     }
 
-    pub fn latest_todo_snapshot(
-        &self,
-        runtime_id: &str,
-    ) -> Result<Option<TodoSnapshotV1>, String> {
+    pub fn latest_todo_snapshot(&self, runtime_id: &str) -> Result<Option<TodoSnapshotV1>, String> {
         self.flush_pending()?;
         self.with_conn(|conn| {
             let mut stmt = conn
@@ -155,7 +152,10 @@ impl NativeEventLog {
                      ORDER BY seq DESC",
                 )
                 .map_err(|error| {
-                    format!("Failed to prepare latest native todo snapshot query: {}", error)
+                    format!(
+                        "Failed to prepare latest native todo snapshot query: {}",
+                        error
+                    )
                 })?;
             let rows = stmt
                 .query_map([runtime_id], |row| row.get::<_, String>(0))
@@ -167,9 +167,13 @@ impl NativeEventLog {
                 let payload_json = row.map_err(|error| {
                     format!("Failed to read latest native todo snapshot row: {}", error)
                 })?;
-                let payload: SessionEventPayload = serde_json::from_str(&payload_json).map_err(
-                    |error| format!("Failed to deserialize native todo snapshot event: {}", error),
-                )?;
+                let payload: SessionEventPayload =
+                    serde_json::from_str(&payload_json).map_err(|error| {
+                        format!(
+                            "Failed to deserialize native todo snapshot event: {}",
+                            error
+                        )
+                    })?;
                 if let Some(snapshot) = todo_snapshot_from_payload(&payload) {
                     return Ok(Some(snapshot.clone()));
                 }

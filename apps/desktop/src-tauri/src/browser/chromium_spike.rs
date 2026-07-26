@@ -143,9 +143,7 @@ impl CdpPipeClient {
 
     fn read_message(&mut self, deadline: Instant) -> Result<Value, String> {
         loop {
-            if let Some(delimiter) = self.read_buffer.iter().position(|byte| *byte == 0) {
-                let mut frame = self.read_buffer.drain(..=delimiter).collect::<Vec<_>>();
-                frame.pop();
+            if let Some(frame) = take_next_cdp_frame(&mut self.read_buffer, MAX_CDP_FRAME_BYTES)? {
                 return serde_json::from_slice(&frame)
                     .map_err(|error| format!("decode Chromium CDP pipe frame: {error}"));
             }
@@ -155,13 +153,6 @@ impl CdpPipeClient {
                     self.read_buffer.len()
                 ));
             }
-            if self.read_buffer.len() > MAX_CDP_FRAME_BYTES {
-                return Err(format!(
-                    "Chromium CDP frame exceeded {} bytes.",
-                    MAX_CDP_FRAME_BYTES
-                ));
-            }
-
             let mut chunk = [0_u8; 64 * 1024];
             match self.reader.read(&mut chunk) {
                 Ok(0) => {
@@ -185,6 +176,21 @@ impl CdpPipeClient {
             }
         }
     }
+}
+
+fn take_next_cdp_frame(buffer: &mut Vec<u8>, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+    if let Some(delimiter) = buffer.iter().position(|byte| *byte == 0) {
+        if delimiter > max_bytes {
+            return Err(format!("Chromium CDP frame exceeded {max_bytes} bytes."));
+        }
+        let mut frame = buffer.drain(..=delimiter).collect::<Vec<_>>();
+        frame.pop();
+        return Ok(Some(frame));
+    }
+    if buffer.len() > max_bytes {
+        return Err(format!("Chromium CDP frame exceeded {max_bytes} bytes."));
+    }
+    Ok(None)
 }
 
 pub(super) struct ManagedChromiumSpike {
@@ -534,9 +540,17 @@ pub(super) fn reap_stale_runtime(metadata_path: &Path) -> Result<StaleReapOutcom
     if process_exists(metadata.owner_pid as i32) {
         return Ok(StaleReapOutcome::OwnerStillRunning);
     }
-    if !process_exists(metadata.browser_pid as i32) {
+    if !process_exists(metadata.browser_pid as i32)
+        && !process_group_exists(metadata.process_group_id)
+    {
         remove_file_if_present(metadata_path)?;
         return Ok(StaleReapOutcome::AlreadyExited);
+    }
+    if !process_exists(metadata.browser_pid as i32) {
+        // The browser leader can exit before its renderer descendants. Without a live leader we
+        // cannot re-run the full executable/profile identity check safely, so retain the metadata
+        // for the production ownership-domain reaper instead of losing the only cleanup evidence.
+        return Ok(StaleReapOutcome::RefusedProcessMismatch);
     }
     if !process_matches_metadata(&metadata)? {
         return Ok(StaleReapOutcome::RefusedProcessMismatch);

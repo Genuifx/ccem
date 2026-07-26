@@ -554,7 +554,9 @@ fn run_browser_smoke_probe(
         "url": info.url,
         "visible": info.visible,
     }));
-    browser.set_active_session(app, Some(BROWSER_SMOKE_SESSION_ID), true)?;
+    // External smoke is never allowed to supersede a Workspace presentation that already owns
+    // the native browser slot. Epoch one works only before the Workspace has selected an owner.
+    browser.set_active_session(app, Some(BROWSER_SMOKE_SESSION_ID), true, Some(1))?;
     steps.push(json!({ "step": "activate", "sessionId": BROWSER_SMOKE_SESSION_ID }));
 
     browser.set_bounds(app, Some(BROWSER_SMOKE_SESSION_ID), bounds)?;

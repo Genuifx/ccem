@@ -348,9 +348,7 @@ impl BotBindingManager {
         };
         let mut items = bindings
             .values()
-            .filter(|binding| {
-                binding_target_matches(binding, platform, bot_id.as_deref(), peer_id)
-            })
+            .filter(|binding| binding_target_matches(binding, platform, bot_id.as_deref(), peer_id))
             .cloned()
             .collect::<Vec<_>>();
         items.sort_by_key(|binding| binding.connected_at);

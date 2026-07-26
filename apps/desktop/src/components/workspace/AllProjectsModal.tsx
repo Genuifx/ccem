@@ -7,6 +7,7 @@ import { useAppStore } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { useLocale } from '@/locales';
 import { copyBindCommand } from '@/lib/telegram-utils';
+import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
 import { getProjectName, truncatePath, formatRelativeTime } from '@/lib/utils';
 import { cn } from '@/lib/utils';
 import { shallow } from 'zustand/shallow';
@@ -20,6 +21,7 @@ interface AllProjectsModalProps {
 type Tab = 'favorites' | 'recent' | 'vscode' | 'jetbrains';
 
 export function AllProjectsModal({ open, onOpenChange, onLaunch }: AllProjectsModalProps) {
+  const gatedOpen = useNativeSurfaceOcclusion(open);
   const { t } = useLocale();
   const [activeTab, setActiveTab] = useState<Tab>('favorites');
   const {
@@ -49,7 +51,7 @@ export function AllProjectsModal({ open, onOpenChange, onLaunch }: AllProjectsMo
   } = useTauriCommands();
   const [syncing, setSyncing] = useState<'vscode' | 'jetbrains' | null>(null);
 
-  if (!open) return null;
+  if (!gatedOpen) return null;
 
   const isFavorite = (path: string) => favorites.some(f => f.path === path);
 

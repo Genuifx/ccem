@@ -173,7 +173,7 @@ impl BrowserLogStore {
                 },
             ));
         }
-        recent.sort_by(|left, right| right.0.cmp(&left.0));
+        recent.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         let logs = artifacts.location(workspace_dir, session_id, BrowserStorageArea::Logs)?;
         let audit = artifacts.location(workspace_dir, session_id, BrowserStorageArea::Audit)?;
         Ok(BrowserRecentActivity {

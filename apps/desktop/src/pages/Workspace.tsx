@@ -48,8 +48,11 @@ import {
   useTaskErrorEvent,
 } from '@/hooks/useTauriEvents';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { dispatchAppZoomCommand } from '@/hooks/useZoom';
 import { useLocale } from '@/locales';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
+import { useNativeSurfaceOccluded } from '@/lib/nativeSurfaceOcclusion';
+import { PREVIEW_ACTIVE_SESSION_SCOPE, previewSurfaceOrdering } from '@/lib/previewSurfaceOrdering';
 import { cn, getProjectName } from '@/lib/utils';
 import {
   fetchConversationDetail,
@@ -102,6 +105,23 @@ import {
   calculateBrowserPanelWidthPercent,
   clampBrowserPanelWidthPercent,
 } from '@/components/workspace/browserPanelLayout';
+import type {
+  BrowserPanelTarget,
+  LoginBrowserPanelRequest,
+} from '@/components/workspace/browserPanelTarget';
+import {
+  createBrowserPanelSurfaceSessionId,
+  createBrowserPanelSessionKeyRegistry,
+  findBrowserPanelOwnerSessionIdBySurfaceSessionId,
+  isBrowserPanelTargetVisible,
+  rebindBrowserPanelTarget,
+  resolveActiveBrowserAgentSessionId,
+  setBrowserPanelTargetVisible,
+  setPreviewBrowserPanelAgentSessionId,
+  WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
+} from '@/components/workspace/browserPanelTarget';
+import { createBrowserPresentationRevisionAllocator } from '@/components/workspace/browserPresentationRevision';
+import type { BrowserSurfaceHostShortcutAction } from '@/lib/browserSurfaceIpc';
 import {
   WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX,
   WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY,
@@ -148,7 +168,6 @@ type WorkspaceViewMode = 'compose' | 'live' | 'history';
 
 const ACTIVE_LIVE_RUNTIME_STORAGE_KEY = 'ccem-workspace-live-runtime';
 const LIVE_RUNTIME_SET_STORAGE_KEY = 'ccem-workspace-live-runtimes';
-const WORKSPACE_BROWSER_COMPOSE_SESSION_ID = 'workspace';
 const WORKSPACE_HISTORY_SESSION_LIMIT = 240;
 const NATIVE_ACTIVITY_CONFLICT_RETRY_MS = 3000;
 const NATIVE_ACTIVITY_CONFLICT_MAX_RETRIES = 10;
@@ -406,7 +425,16 @@ export function Workspace({
   const [isLaunchingComposeTerminal, setIsLaunchingComposeTerminal] = useState(false);
   const [isResumingHistorySession, setIsResumingHistorySession] = useState(false);
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
-  const [browserOpenBySessionId, setBrowserOpenBySessionId] = useState<Record<string, boolean>>({});
+  const [browserTargetBySessionId, setBrowserTargetBySessionId] = useState<
+    Record<string, BrowserPanelTarget | undefined>
+  >({});
+  const [browserHostOverlayOpen, setBrowserHostOverlayOpen] = useState(false);
+  const browserPanelInstanceSeqRef = useRef(0);
+  const browserNavigationRequestSeqRef = useRef(0);
+  const browserPanelSessionKeyRegistryRef = useRef(createBrowserPanelSessionKeyRegistry());
+  const browserPresentationRevisionAllocatorRef = useRef(
+    createBrowserPresentationRevisionAllocator(),
+  );
   const [browserPanelWidthPercent, setBrowserPanelWidthPercent] = useState(
     readStoredBrowserPanelWidthPercent,
   );
@@ -575,20 +603,63 @@ export function Workspace({
     let disposed = false;
     let unlisten: (() => void) | null = null;
 
-    void listen<{ sessionId?: string; session_id?: string; cause?: string }>('browser_panel_requested', (event) => {
+    void listen<{
+      sessionId?: string;
+      session_id?: string;
+      agentSessionId?: string;
+      agent_session_id?: string;
+      cause?: string;
+    }>('browser_panel_requested', (event) => {
       if (event.payload?.cause && event.payload.cause !== 'agent_reveal') {
         return;
       }
-      const requestedSessionId = event.payload?.sessionId
-        ?? event.payload?.session_id
+      const requestedSurfaceSessionId = event.payload?.sessionId
+        ?? event.payload?.session_id;
+      const requestedSessionId = requestedSurfaceSessionId
         ?? WORKSPACE_BROWSER_COMPOSE_SESSION_ID;
-      setBrowserOpenBySessionId((previous) => {
-        if (previous[requestedSessionId]) {
-          return previous;
+      const requestedLiveEntry = liveSessionsByRuntimeIdRef.current[requestedSessionId];
+      const requestedAgentSessionId = event.payload?.agentSessionId
+        ?? event.payload?.agent_session_id
+        ?? (requestedLiveEntry ? requestedSessionId : undefined);
+      const browserSessionId = requestedLiveEntry
+        ? browserPanelSessionKeyRegistryRef.current.resolveLive({
+          provider: requestedLiveEntry.session.provider,
+          providerSessionId: requestedLiveEntry.session.provider_session_id,
+          runtimeId: requestedLiveEntry.session.runtime_id,
+        })
+        : requestedSessionId;
+      setBrowserTargetBySessionId((previous) => {
+        const existingOwnerSessionId = requestedSurfaceSessionId
+          ? findBrowserPanelOwnerSessionIdBySurfaceSessionId(previous, requestedSurfaceSessionId)
+          : undefined;
+        const ownerSessionId = existingOwnerSessionId ?? browserSessionId;
+        const existing = previous[ownerSessionId];
+        if (existing) {
+          const visibleExisting = setBrowserPanelTargetVisible(existing, true);
+          const nextExisting = requestedAgentSessionId
+            ? setPreviewBrowserPanelAgentSessionId(
+              visibleExisting,
+              requestedAgentSessionId,
+            )
+            : visibleExisting;
+          if (nextExisting === existing) return previous;
+          return {
+            ...previous,
+            [ownerSessionId]: nextExisting,
+          };
         }
+        const instanceId = browserPanelInstanceSeqRef.current += 1;
         return {
           ...previous,
-          [requestedSessionId]: true,
+          [ownerSessionId]: {
+            backend: 'preview',
+            instanceId,
+            surfaceSessionId: requestedSurfaceSessionId
+              ?? createBrowserPanelSurfaceSessionId(ownerSessionId, instanceId),
+            ...(requestedAgentSessionId
+              ? { agentSessionId: requestedAgentSessionId }
+              : {}),
+          },
         };
       });
     }).then((nextUnlisten) => {
@@ -1153,38 +1224,178 @@ export function Workspace({
 
   const activeBrowserSessionId = useMemo(() => {
     if (workspaceMode === 'live' && activeLiveEntry) {
-      return activeLiveEntry.session.runtime_id;
+      return browserPanelSessionKeyRegistryRef.current.resolveLive({
+        provider: activeLiveEntry.session.provider,
+        providerSessionId: activeLiveEntry.session.provider_session_id,
+        runtimeId: activeLiveEntry.session.runtime_id,
+      });
     }
     if (workspaceMode === 'history' && selectedSession) {
-      return `history:${selectedSession.source}:${selectedSession.id}`;
+      const matchingLiveEntry = Object.values(liveSessionsByRuntimeId).find((entry) => (
+        entry.session.provider === selectedSession.source
+        && entry.session.provider_session_id === selectedSession.id
+      ));
+      return browserPanelSessionKeyRegistryRef.current.resolveHistory({
+        provider: selectedSession.source,
+        providerSessionId: selectedSession.id,
+        matchingLiveSession: matchingLiveEntry
+          ? {
+            provider: matchingLiveEntry.session.provider,
+            providerSessionId: matchingLiveEntry.session.provider_session_id,
+            runtimeId: matchingLiveEntry.session.runtime_id,
+          }
+          : null,
+      });
     }
     return WORKSPACE_BROWSER_COMPOSE_SESSION_ID;
-  }, [activeLiveEntry, selectedSession, workspaceMode]);
+  }, [activeLiveEntry, liveSessionsByRuntimeId, selectedSession, workspaceMode]);
+  const activeBrowserAgentSessionId = useMemo(() => {
+    if (workspaceMode === 'live') {
+      return resolveActiveBrowserAgentSessionId(activeLiveEntry?.session);
+    }
+    if (workspaceMode === 'history' && selectedSession) {
+      const matchingLiveEntry = Object.values(liveSessionsByRuntimeId).find((entry) => (
+        entry.session.provider === selectedSession.source
+        && entry.session.provider_session_id === selectedSession.id
+      ));
+      return resolveActiveBrowserAgentSessionId(matchingLiveEntry?.session);
+    }
+    return null;
+  }, [activeLiveEntry, liveSessionsByRuntimeId, selectedSession, workspaceMode]);
 
-  const browserPanelOpen = browserOpenBySessionId[activeBrowserSessionId] ?? false;
+  const activeBrowserTarget = browserTargetBySessionId[activeBrowserSessionId] ?? null;
+  const activeVisibleBrowserTarget = isBrowserPanelTargetVisible(activeBrowserTarget)
+    ? activeBrowserTarget
+    : null;
+  const browserPanelOpen = activeVisibleBrowserTarget !== null;
+  const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
+  const browserSurfaceOccluded = !isActive
+    || browserHostOverlayOpen
+    || isGlobalSearchOpen
+    || nativeSurfaceModalOccluded;
+  const activeBrowserSurfaceSessionId = activeVisibleBrowserTarget?.surfaceSessionId ?? null;
+  const presentationSurfaceSessionId = activeBrowserTarget?.surfaceSessionId
+    ?? activeBrowserSessionId;
+  const browserPresentationRevision = browserPresentationRevisionAllocatorRef.current.observe({
+    ownerSessionId: activeBrowserSessionId,
+    surfaceSessionId: presentationSurfaceSessionId,
+    backend: activeVisibleBrowserTarget?.backend ?? null,
+    occluded: activeVisibleBrowserTarget ? browserSurfaceOccluded : false,
+  });
 
-  const setActiveBrowserPanelOpen = useCallback((next: boolean | ((previous: boolean) => boolean)) => {
-    setBrowserOpenBySessionId((previous) => {
-      const previousOpen = previous[activeBrowserSessionId] ?? false;
-      const nextOpen = typeof next === 'function' ? next(previousOpen) : next;
-      if (previousOpen === nextOpen) {
+  const closeBrowserPanel = useCallback((sessionId: string) => {
+    setBrowserTargetBySessionId((previous) => {
+      if (!previous[sessionId]) return previous;
+      const next = { ...previous };
+      delete next[sessionId];
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    setBrowserTargetBySessionId((previous) => {
+      const existing = previous[activeBrowserSessionId];
+      if (!existing || existing.backend !== 'preview') return previous;
+      const next = setPreviewBrowserPanelAgentSessionId(
+        existing,
+        activeBrowserAgentSessionId,
+      );
+      return next === existing
+        ? previous
+        : { ...previous, [activeBrowserSessionId]: next };
+    });
+  }, [activeBrowserAgentSessionId, activeBrowserSessionId]);
+
+  const toggleActivePreviewBrowser = useCallback(() => {
+    setBrowserTargetBySessionId((previous) => {
+      const existing = previous[activeBrowserSessionId];
+      if (existing?.backend === 'preview') {
+        const withAgentSession = setPreviewBrowserPanelAgentSessionId(
+          existing,
+          activeBrowserAgentSessionId,
+        );
+        return {
+          ...previous,
+          [activeBrowserSessionId]: setBrowserPanelTargetVisible(
+            withAgentSession,
+            !isBrowserPanelTargetVisible(existing),
+          ),
+        };
+      }
+      if (existing) {
         return previous;
       }
+      const instanceId = browserPanelInstanceSeqRef.current += 1;
       return {
         ...previous,
-        [activeBrowserSessionId]: nextOpen,
+        [activeBrowserSessionId]: {
+          backend: 'preview',
+          instanceId,
+          surfaceSessionId: createBrowserPanelSurfaceSessionId(activeBrowserSessionId, instanceId),
+          visible: true,
+          ...(activeBrowserAgentSessionId
+            ? { agentSessionId: activeBrowserAgentSessionId }
+            : {}),
+        },
+      };
+    });
+  }, [activeBrowserAgentSessionId, activeBrowserSessionId]);
+
+  const openActiveLoginBrowser = useCallback((request: LoginBrowserPanelRequest) => {
+    setBrowserTargetBySessionId((previous) => {
+      const existing = previous[activeBrowserSessionId];
+      if (existing) {
+        if (existing.backend !== 'login') {
+          return previous;
+        }
+        const visibleExisting = setBrowserPanelTargetVisible(existing, true);
+        if (!request.initialUrl) {
+          return visibleExisting === existing
+            ? previous
+            : { ...previous, [activeBrowserSessionId]: visibleExisting };
+        }
+        return {
+          ...previous,
+          [activeBrowserSessionId]: {
+            ...visibleExisting,
+            navigationRequestId: browserNavigationRequestSeqRef.current += 1,
+            navigationUrl: request.initialUrl,
+          },
+        };
+      }
+      const instanceId = browserPanelInstanceSeqRef.current += 1;
+      return {
+        ...previous,
+        [activeBrowserSessionId]: {
+          backend: 'login',
+          instanceId,
+          surfaceSessionId: createBrowserPanelSurfaceSessionId(activeBrowserSessionId, instanceId),
+          visible: true,
+          ...request,
+        },
       };
     });
   }, [activeBrowserSessionId]);
 
   useEffect(() => {
-    void invoke('browser_set_active_session', {
-      sessionId: activeBrowserSessionId,
-      visible: browserPanelOpen,
-    }).catch((error) => {
+    if (!activeBrowserSurfaceSessionId) {
+      return;
+    }
+    const owner = previewSurfaceOrdering.claim(PREVIEW_ACTIVE_SESSION_SCOPE);
+    void previewSurfaceOrdering.enqueue(owner, () => invoke('browser_set_active_session', {
+      sessionId: activeBrowserSurfaceSessionId,
+      visible: activeVisibleBrowserTarget?.backend === 'preview' && !browserSurfaceOccluded,
+      presentationRevision: browserPresentationRevision,
+    })).catch((error) => {
       console.error('Failed to sync active browser session:', error);
     });
-  }, [activeBrowserSessionId, browserPanelOpen]);
+    return () => previewSurfaceOrdering.release(owner);
+  }, [
+    activeBrowserSurfaceSessionId,
+    activeVisibleBrowserTarget?.backend,
+    browserPresentationRevision,
+    browserSurfaceOccluded,
+  ]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
@@ -2206,6 +2417,27 @@ export function Workspace({
         seedBoundaryMessageCount: 0,
       });
 
+      const liveBrowserSessionId = browserPanelSessionKeyRegistryRef.current.resolveLive({
+        provider: summary.provider,
+        providerSessionId: summary.provider_session_id,
+        runtimeId: summary.runtime_id,
+      });
+      setBrowserTargetBySessionId((previous) => {
+        const rebound = rebindBrowserPanelTarget(
+          previous,
+          WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
+          liveBrowserSessionId,
+        );
+        const reboundTarget = rebound[liveBrowserSessionId];
+        if (!reboundTarget || reboundTarget.backend !== 'preview') return rebound;
+        const withAgentSession = setPreviewBrowserPanelAgentSessionId(
+          reboundTarget,
+          summary.runtime_id,
+        );
+        return withAgentSession === reboundTarget
+          ? rebound
+          : { ...rebound, [liveBrowserSessionId]: withAgentSession };
+      });
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
@@ -2238,6 +2470,7 @@ export function Workspace({
   }, [
     buildComposerPromptPreview,
     buildComposerPromptText,
+    browserPanelSessionKeyRegistryRef,
     extractComposerImagePayloads,
     composeEffort,
     composeProvider,
@@ -2388,30 +2621,76 @@ export function Workspace({
     setSelectedKey(nextKey);
   }, [activeLiveEntry, workspaceMode]);
 
+  const activeLiveStatus = activeLiveEntry?.session.status;
+  const activeLiveStoppingId = activeLiveEntry?.session.runtime_id;
+
+  const handleOpenSearchShortcut = useCallback(() => {
+    setIsGlobalSearchOpen(true);
+  }, []);
+
+  const handleOpenProjectShortcut = useCallback(() => {
+    void handlePickComposeDir();
+  }, [handlePickComposeDir]);
+
+  const handleWorkspaceSubmitShortcut = useCallback(() => {
+    if (workspaceMode === 'history') {
+      void handleContinueHistorySession();
+      return;
+    }
+    void handleCreateNativeConversation();
+  }, [handleContinueHistorySession, handleCreateNativeConversation, workspaceMode]);
+
+  const handleWorkspaceEscapeShortcut = useCallback(() => {
+    if (
+      (activeLiveStatus === 'initializing' || activeLiveStatus === 'processing')
+      && activeLiveStoppingId
+    ) {
+      void stopNativeSession(activeLiveStoppingId, 'workspace_escape');
+    }
+  }, [activeLiveStatus, activeLiveStoppingId, stopNativeSession]);
+
   const shortcuts = useMemo(
     () => ({
-      'meta+k': () => setIsGlobalSearchOpen(true),
-      'meta+o': () => void handlePickComposeDir(),
-      'meta+enter': () => {
-        if (workspaceMode === 'history') {
-          void handleContinueHistorySession();
-          return;
-        }
-        void handleCreateNativeConversation();
-      },
+      'meta+k': handleOpenSearchShortcut,
+      'meta+o': handleOpenProjectShortcut,
+      'meta+enter': handleWorkspaceSubmitShortcut,
     }),
-    [
-      handleContinueHistorySession,
-      handleCreateNativeConversation,
-      handlePickComposeDir,
-      workspaceMode,
-    ]
+    [handleOpenProjectShortcut, handleOpenSearchShortcut, handleWorkspaceSubmitShortcut],
   );
   useKeyboardShortcuts(isActive ? shortcuts : {});
 
+  const handleBrowserSurfaceHostShortcut = useCallback((
+    action: BrowserSurfaceHostShortcutAction,
+  ) => {
+    if (!isActive) return;
+    switch (action) {
+      case 'open_search':
+        handleOpenSearchShortcut();
+        break;
+      case 'open_project':
+        handleOpenProjectShortcut();
+        break;
+      case 'submit':
+        handleWorkspaceSubmitShortcut();
+        break;
+      case 'escape':
+        handleWorkspaceEscapeShortcut();
+        break;
+      case 'zoom_in':
+      case 'zoom_out':
+      case 'zoom_reset':
+        dispatchAppZoomCommand(action);
+        break;
+    }
+  }, [
+    handleOpenProjectShortcut,
+    handleOpenSearchShortcut,
+    handleWorkspaceEscapeShortcut,
+    handleWorkspaceSubmitShortcut,
+    isActive,
+  ]);
+
   // Escape key: abort running session, prevent fullscreen exit
-  const activeLiveStatus = activeLiveEntry?.session.status;
-  const activeLiveStoppingId = activeLiveEntry?.session.runtime_id;
 
   useEffect(() => {
     if (!isActive) return;
@@ -2420,18 +2699,12 @@ export function Workspace({
       if (e.key !== 'Escape') return;
 
       e.preventDefault();
-
-      if (
-        activeLiveStatus === 'initializing' ||
-        activeLiveStatus === 'processing'
-      ) {
-        void stopNativeSession(activeLiveStoppingId!, 'workspace_escape');
-      }
+      handleWorkspaceEscapeShortcut();
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [isActive, activeLiveStatus, activeLiveStoppingId, stopNativeSession]);
+  }, [handleWorkspaceEscapeShortcut, isActive]);
 
   const renderComposeView = () => (
     <div className="flex h-full min-h-0 flex-col items-center px-4 sm:px-6 lg:px-8">
@@ -2719,7 +2992,11 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={browserPanelOpen}
-            onToggleBrowser={() => setActiveBrowserPanelOpen((open) => !open)}
+            browserBackend={activeVisibleBrowserTarget?.backend ?? null}
+            browserWorkingDir={skillsContext.workingDir}
+            onTogglePreviewBrowser={toggleActivePreviewBrowser}
+            onOpenLoginBrowser={openActiveLoginBrowser}
+            onBrowserHostOverlayChange={setBrowserHostOverlayOpen}
             envContext={statusStripEnvContext}
           />
 
@@ -2828,20 +3105,60 @@ export function Workspace({
           </div>
         </div>
 
-        {browserPanelOpen ? (
-          <BrowserPanel
-            key={activeBrowserSessionId}
-            sessionId={activeBrowserSessionId}
-            className="shrink-0"
-            style={{
-              flex: `0 0 ${browserPanelWidthPercent}%`,
-              maxWidth: `${BROWSER_PANEL_MAX_WIDTH_PERCENT}%`,
-              minWidth: BROWSER_PANEL_MIN_WIDTH_PX,
-            }}
-            onResizeStart={handleBrowserPanelResizeStart}
-            onClose={() => setActiveBrowserPanelOpen(false)}
-          />
-        ) : null}
+        {Object.entries(browserTargetBySessionId).map(([sessionId, target]) => {
+          if (!target) return null;
+          const isPanelActive = sessionId === activeBrowserSessionId
+            && isBrowserPanelTargetVisible(target);
+          const panelKey = String(target.instanceId);
+          const panelProps = {
+            sessionId: target.surfaceSessionId,
+            defaultUrl: target.initialUrl,
+            presentationRevision: browserPresentationRevision,
+            isActiveSurface: isPanelActive,
+            surfaceOccluded: browserSurfaceOccluded || !isPanelActive,
+            className: 'h-full w-full',
+            onResizeStart: handleBrowserPanelResizeStart,
+            onHostShortcut: handleBrowserSurfaceHostShortcut,
+            onClose: () => closeBrowserPanel(sessionId),
+          };
+
+          return (
+            <div
+              key={panelKey}
+              data-ccem-browser-panel-owner={sessionId}
+              data-ccem-browser-panel-instance={target.instanceId}
+              className={cn(
+                'h-full shrink-0',
+                isPanelActive ? 'flex' : 'hidden',
+              )}
+              style={isPanelActive ? {
+                flex: `0 0 ${browserPanelWidthPercent}%`,
+                maxWidth: `${BROWSER_PANEL_MAX_WIDTH_PERCENT}%`,
+                minWidth: BROWSER_PANEL_MIN_WIDTH_PX,
+              } : undefined}
+            >
+              {target.backend === 'login' ? (
+                <BrowserPanel
+                  key={panelKey}
+                  {...target}
+                  {...panelProps}
+                  agentSessionId={
+                    sessionId === activeBrowserSessionId
+                      ? activeBrowserAgentSessionId ?? undefined
+                      : undefined
+                  }
+                />
+              ) : (
+                <BrowserPanel
+                  key={panelKey}
+                  {...panelProps}
+                  backend="preview"
+                  agentSessionId={target.agentSessionId}
+                />
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <WorkspaceGlobalSearch

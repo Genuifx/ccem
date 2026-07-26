@@ -8,6 +8,16 @@
  */
 
 import type { Environment, Session } from '@/store';
+import type {
+  BrowserSurfaceAcquireRequest,
+  BrowserSurfaceClosePopupRequest,
+  BrowserSurfaceControlRequest,
+  BrowserSurfaceLease,
+  BrowserSurfaceNavigateRequest,
+  BrowserSurfaceReleaseRequest,
+  BrowserSurfaceSyncRequest,
+  BrowserSurfaceSnapshotMutationResponse,
+} from '@/lib/browserSurfaceIpc';
 
 // ============================================
 // Environment Commands
@@ -102,13 +112,37 @@ export interface TauriCommands {
   clear_proxy_traffic: [void, void];
   generate_workspace_session_title: [{ titleInput: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
-  browser_set_active_session: [{ sessionId?: string | null; visible?: boolean | null }, void];
-  browser_open: [{ sessionId?: string | null; url?: string | null }, BrowserInfo];
+  browser_set_active_session: [{
+    sessionId?: string | null;
+    visible?: boolean | null;
+    presentationRevision: number;
+  }, void];
+  browser_open: [
+    {
+      sessionId?: string | null;
+      aliasSessionId?: string | null;
+      url?: string | null;
+      visible?: boolean | null;
+    },
+    BrowserOpenResponse
+  ];
+  browser_bind_preview_alias: [
+    { aliasSessionId: string; sessionId: string },
+    BrowserSessionAliasLease
+  ];
+  browser_unbind_preview_alias: [
+    { aliasSessionId: string; bindingId: number },
+    void
+  ];
   browser_set_bounds: [
     { sessionId?: string | null; x: number; y: number; width: number; height: number },
     void
   ];
-  browser_set_visible: [{ sessionId?: string | null; visible: boolean }, void];
+  browser_set_visible: [{
+    sessionId?: string | null;
+    visible: boolean;
+    presentationRevision: number;
+  }, void];
   browser_close: [{ sessionId?: string | null } | void, void];
   browser_navigate: [{ sessionId?: string | null; url: string }, BrowserInfo];
   browser_reload: [{ sessionId?: string | null } | void, BrowserInfo];
@@ -118,7 +152,31 @@ export interface TauriCommands {
   browser_health_check: [{ sessionId?: string | null } | void, BrowserInfo];
   browser_set_paused: [{ sessionId?: string | null; paused: boolean }, BrowserInfo];
   browser_recent_activity: [{ sessionId?: string | null } | void, BrowserRecentActivity];
-  browser_runtime_readiness: [void, BrowserRuntimeReadiness];
+  browser_surface_acquire: [BrowserSurfaceAcquireRequest, BrowserSurfaceLease];
+  browser_surface_sync: [BrowserSurfaceSyncRequest, void];
+  browser_surface_release: [BrowserSurfaceReleaseRequest, void];
+  browser_surface_navigate: [BrowserSurfaceNavigateRequest, void];
+  browser_surface_control: [BrowserSurfaceControlRequest, BrowserSurfaceSnapshotMutationResponse];
+  browser_surface_close_popup: [
+    BrowserSurfaceClosePopupRequest,
+    BrowserSurfaceSnapshotMutationResponse
+  ];
+  browser_login_profiles: [
+    { workingDir: string },
+    LoginBrowserProfileSummary[]
+  ];
+  browser_login_profile_recent_activity: [
+    { workingDir: string; profileId: string },
+    LoginBrowserRecentActivity
+  ];
+  browser_login_reset_profile: [
+    { workingDir: string; profileId: string; confirmed: boolean },
+    LoginBrowserProfileSummary
+  ];
+  browser_login_delete_profile: [
+    { workingDir: string; profileId: string; confirmed: boolean },
+    void
+  ];
   browser_snapshot: [{ sessionId?: string | null } | void, BrowserSnapshot];
   browser_screenshot: [{ sessionId?: string | null } | void, string];
   search_workspace_files: [
@@ -533,6 +591,17 @@ export interface BrowserInfo {
   updated_at?: string;
 }
 
+export interface BrowserSessionAliasLease {
+  alias_session_id: string;
+  session_id: string;
+  generation: number;
+  binding_id: number;
+}
+
+export interface BrowserOpenResponse extends BrowserInfo {
+  alias_lease?: BrowserSessionAliasLease | null;
+}
+
 export interface BrowserSessionStateEvent {
   sessionId: string;
   label: string;
@@ -607,13 +676,32 @@ export interface BrowserRecentActivity {
   audit_log_path?: string | null;
 }
 
-export type BrowserRuntimeReadinessStatus = 'unavailable' | 'preparing' | 'ready' | 'failed';
+export type LoginBrowserRecentArtifactKind =
+  | 'screenshot'
+  | 'interaction_snapshot'
+  | 'console_log'
+  | 'network_log'
+  | 'audit_log';
 
-export interface BrowserRuntimeReadiness {
-  status: BrowserRuntimeReadinessStatus;
-  version?: string | null;
-  error?: string | null;
-  checked_at: string;
+/** Bounded artifact metadata; trusted control windows never receive paths or raw page data. */
+export interface LoginBrowserRecentArtifact {
+  kind: LoginBrowserRecentArtifactKind;
+  artifact_id: string;
+  byte_size: number;
+  modified_at: string;
+  immutable: boolean;
+  untrusted: boolean;
+}
+
+export interface LoginBrowserRecentActivity {
+  artifacts: LoginBrowserRecentArtifact[];
+}
+
+/** Trusted-main-window projection; profile paths and runtime ownership stay in Rust. */
+export interface LoginBrowserProfileSummary {
+  profile_id: string;
+  last_used_at?: string | null;
+  is_default: boolean;
 }
 
 export interface AppConfig {

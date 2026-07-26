@@ -14,6 +14,8 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 export const CCEM_ZOOM_STORAGE_KEY = 'ccem-zoom-level';
 export const CCEM_ZOOM_CHANGE_EVENT = 'ccem-zoom-change';
+export const CCEM_ZOOM_COMMAND_EVENT = 'ccem-zoom-command';
+export type AppZoomCommand = 'zoom_in' | 'zoom_out' | 'zoom_reset';
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 1.3;
 const STEP = 0.1;
@@ -78,6 +80,16 @@ function emitZoomChange(value: number): void {
   window.dispatchEvent(new CustomEvent(CCEM_ZOOM_CHANGE_EVENT, { detail: { zoom: value } }));
 }
 
+function isAppZoomCommand(value: unknown): value is AppZoomCommand {
+  return value === 'zoom_in' || value === 'zoom_out' || value === 'zoom_reset';
+}
+
+export function dispatchAppZoomCommand(command: AppZoomCommand): void {
+  window.dispatchEvent(new CustomEvent(CCEM_ZOOM_COMMAND_EVENT, {
+    detail: { command },
+  }));
+}
+
 export function useZoom(): void {
   useEffect(() => {
     // Restore the persisted zoom on mount.
@@ -98,6 +110,20 @@ export function useZoom(): void {
       emitZoomChange(clamped);
     };
 
+    const applyZoomCommand = (command: AppZoomCommand) => {
+      switch (command) {
+        case 'zoom_in':
+          setZoom(current + STEP);
+          break;
+        case 'zoom_out':
+          setZoom(current - STEP);
+          break;
+        case 'zoom_reset':
+          setZoom(DEFAULT_ZOOM);
+          break;
+      }
+    };
+
     const handler = (e: KeyboardEvent) => {
       if (!isZoomModifier(e, isMac)) return;
 
@@ -105,24 +131,33 @@ export function useZoom(): void {
       // Cmd+= and Cmd++ (Shift+=) both mean "zoom in" on macOS.
       if (key === '=' || key === '+') {
         e.preventDefault();
-        setZoom(current + STEP);
+        applyZoomCommand('zoom_in');
         return;
       }
       if (key === '-') {
         e.preventDefault();
-        setZoom(current - STEP);
+        applyZoomCommand('zoom_out');
         return;
       }
       if (key === '0') {
         e.preventDefault();
-        setZoom(DEFAULT_ZOOM);
+        applyZoomCommand('zoom_reset');
         return;
       }
     };
 
+    const handleZoomCommandEvent = (event: Event) => {
+      if (!(event instanceof CustomEvent)) return;
+      const command = (event.detail as { command?: unknown } | null)?.command;
+      if (!isAppZoomCommand(command)) return;
+      applyZoomCommand(command);
+    };
+
     window.addEventListener('keydown', handler, { capture: true });
+    window.addEventListener(CCEM_ZOOM_COMMAND_EVENT, handleZoomCommandEvent);
     return () => {
       window.removeEventListener('keydown', handler, { capture: true });
+      window.removeEventListener(CCEM_ZOOM_COMMAND_EVENT, handleZoomCommandEvent);
     };
   }, []);
 }

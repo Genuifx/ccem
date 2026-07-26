@@ -49,6 +49,7 @@ import {
   Edit02Icon,
   File01Icon,
   File02Icon,
+  FileCheckIcon,
   FileCodeIcon,
   FileEditIcon,
   FileImageIcon,
@@ -95,6 +96,7 @@ import {
   PackageDeliveredIcon,
   PackageIcon,
   PaintBoardIcon,
+  PanelBottomCloseIcon,
   PauseIcon,
   PencilEdit01Icon,
   PencilEdit02Icon,
@@ -140,6 +142,7 @@ import {
   Timer01Icon,
   TradeDownIcon,
   TradeUpIcon,
+  UserCircleIcon,
   UserGroupIcon,
   ViewIcon,
   WorkflowSquare01Icon,
@@ -234,6 +237,7 @@ export const Edit2 = createIcon(Edit02Icon, 'Edit2');
 export const ExternalLink = createIcon(LinkSquare02Icon, 'ExternalLink');
 export const Eye = createIcon(ViewIcon, 'Eye');
 export const File = createIcon(File01Icon, 'File');
+export const FileCheck2 = createIcon(FileCheckIcon, 'FileCheck2');
 export const FileCode = createIcon(FileCodeIcon, 'FileCode');
 export const FileDiff = createIcon(GitCompareIcon, 'FileDiff');
 export const FileImage = createIcon(FileImageIcon, 'FileImage');
@@ -252,6 +256,7 @@ export const Gauge = createIcon(DashboardSpeed01Icon, 'Gauge');
 export const Gem = createIcon(DiamondIcon, 'Gem');
 export const GitPullRequest = createIcon(GitPullRequestIcon, 'GitPullRequest');
 export const Globe = createIcon(Globe02Icon, 'Globe');
+export const Globe2 = createIcon(Globe02Icon, 'Globe2');
 export const HeartPulse = createIcon(HeartCheckIcon, 'HeartPulse');
 export const History = createIcon(Clock04Icon, 'History');
 export const Home = createIcon(Home01Icon, 'Home');
@@ -290,6 +295,7 @@ export const Palette = createIcon(PaintBoardIcon, 'Palette');
 export const PanelLeft = createIcon(SidebarLeft01Icon, 'PanelLeft');
 export const PanelRightClose = createIcon(SidebarRight01Icon, 'PanelRightClose');
 export const PanelRightOpen = createIcon(SidebarRight01Icon, 'PanelRightOpen');
+export const PanelTopClose = createIcon(PanelBottomCloseIcon, 'PanelTopClose');
 export const Paperclip = createIcon(AttachmentIcon, 'Paperclip');
 export const Pause = createIcon(PauseIcon, 'Pause');
 export const PenLine = createIcon(PencilEdit02Icon, 'PenLine');
@@ -333,6 +339,7 @@ export const Timer = createIcon(Timer01Icon, 'Timer');
 export const Trash2 = createIcon(Delete02Icon, 'Trash2');
 export const TrendingDown = createIcon(TradeDownIcon, 'TrendingDown');
 export const TrendingUp = createIcon(TradeUpIcon, 'TrendingUp');
+export const UserRound = createIcon(UserCircleIcon, 'UserRound');
 export const Users = createIcon(UserGroupIcon, 'Users');
 export const Workflow = createIcon(WorkflowSquare01Icon, 'Workflow');
 export const Wrench = createIcon(Wrench01Icon, 'Wrench');

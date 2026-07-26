@@ -29,10 +29,13 @@ export function buildNativeBrowserBounds(
   zoom: unknown = 1,
 ): NativeBrowserBounds {
   const scale = normalizeBrowserBoundsZoom(zoom);
+  // DOMRect values are CSS pixels inside the zoomed Wry document. Native child views are placed
+  // in host-window logical units, so page zoom must be applied before the backend converts those
+  // logical units to platform pixels. Dividing reverses the transform and lets CEF escape its slot.
   return {
-    x: rect.left / scale,
-    y: rect.top / scale,
-    width: rect.width / scale,
-    height: rect.height / scale,
+    x: rect.left * scale,
+    y: rect.top * scale,
+    width: rect.width * scale,
+    height: rect.height * scale,
   };
 }
