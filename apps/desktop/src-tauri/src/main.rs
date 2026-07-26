@@ -3180,9 +3180,26 @@ fn save_language(app: tauri::AppHandle, language: String) -> Result<(), String> 
     Ok(())
 }
 
+fn apply_enabled_environments_update(
+    settings: &mut DesktopSettings,
+    names: Option<Vec<String>>,
+) {
+    settings.enabled_environments = names;
+}
+
+#[tauri::command]
+fn save_enabled_environments(names: Option<Vec<String>>) -> Result<(), String> {
+    config::update_settings(|settings| {
+        apply_enabled_environments_update(settings, names);
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod desktop_settings_command_tests {
-    use super::{merge_settings_page_update, DesktopSettings};
+    use super::{
+        apply_enabled_environments_update, merge_settings_page_update, DesktopSettings,
+    };
 
     #[test]
     fn generic_settings_save_preserves_backend_owned_language() {
@@ -3200,6 +3217,30 @@ mod desktop_settings_command_tests {
 
         assert_eq!(merged.language.as_deref(), Some("en"));
         assert_eq!(merged.theme, "dark");
+    }
+
+    #[test]
+    fn enabled_environment_update_preserves_unrelated_settings() {
+        let mut settings = DesktopSettings {
+            theme: "dark".to_string(),
+            language: Some("en".to_string()),
+            close_to_tray: false,
+            enabled_environments: Some(vec!["old".to_string()]),
+            ..DesktopSettings::default()
+        };
+
+        apply_enabled_environments_update(
+            &mut settings,
+            Some(vec!["official".to_string(), "staging".to_string()]),
+        );
+
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.language.as_deref(), Some("en"));
+        assert!(!settings.close_to_tray);
+        assert_eq!(
+            settings.enabled_environments,
+            Some(vec!["official".to_string(), "staging".to_string()])
+        );
     }
 }
 
@@ -4960,6 +5001,7 @@ fn main() {
             get_settings,
             save_settings,
             save_language,
+            save_enabled_environments,
             send_test_notification,
             get_telegram_settings,
             get_wecom_settings,

@@ -58,6 +58,7 @@ export interface TauriCommands {
   add_recent: [{ path: string }, void];
   save_settings: [{ settings: DesktopSettings }, void];
   save_language: [{ language: 'zh' | 'en' }, void];
+  save_enabled_environments: [{ names: string[] | null }, void];
   get_pet_notification_read_state: [void, PetNotificationReadState];
   mark_pet_notification_read: [{ notificationId: string }, PetNotificationReadState];
   open_pet_notification: [{ request: PetOpenSessionRequest }, void];

@@ -611,10 +611,13 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
           await closeSession(id);
           break;
       }
+      if (action === 'stopThenRemoveHeadless' || action === 'removeHeadless') {
+        toast.success(t('sessions.sessionStopped'));
+      }
+      setConfirmingId(null);
     } catch (err) {
       console.error('Failed to close session:', err);
-    } finally {
-      setConfirmingId(null);
+      toast.error(t('sessions.stopFailed').replace('{error}', String(err)));
     }
   };
 

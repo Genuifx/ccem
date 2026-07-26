@@ -335,12 +335,7 @@ export function useTauriCommands() {
       const currentEnabled = useAppStore.getState().enabledEnvironments;
       if (currentEnabled != null && !currentEnabled.includes(env.name)) {
         const next = [...currentEnabled, env.name];
-        await invoke('save_settings', {
-          settings: {
-            ...(await invoke<DesktopSettings>('get_settings')),
-            enabledEnvironments: next,
-          },
-        });
+        await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
       setError(null);
@@ -378,12 +373,7 @@ export function useTauriCommands() {
         const next = currentEnabled.map((envName) =>
           envName === previousName ? env.name : envName,
         );
-        await invoke('save_settings', {
-          settings: {
-            ...(await invoke<DesktopSettings>('get_settings')),
-            enabledEnvironments: next,
-          },
-        });
+        await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
       setError(null);
@@ -403,12 +393,7 @@ export function useTauriCommands() {
       const currentEnabled = useAppStore.getState().enabledEnvironments;
       if (currentEnabled != null && currentEnabled.includes(name)) {
         const next = currentEnabled.filter((envName) => envName !== name);
-        await invoke('save_settings', {
-          settings: {
-            ...(await invoke<DesktopSettings>('get_settings')),
-            enabledEnvironments: next,
-          },
-        });
+        await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
       setError(null);
@@ -432,14 +417,7 @@ export function useTauriCommands() {
   }, [setEnabledEnvironments]);
 
   const saveEnabledEnvironments = useCallback(async (names: string[] | null) => {
-    // Read-modify-write full settings so unrelated fields are not reset.
-    const current = await invoke<DesktopSettings>('get_settings');
-    await invoke('save_settings', {
-      settings: {
-        ...current,
-        enabledEnvironments: names,
-      },
-    });
+    await invoke('save_enabled_environments', { names });
     setEnabledEnvironments(names);
   }, [setEnabledEnvironments]);
 

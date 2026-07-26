@@ -165,6 +165,7 @@ commands.allow = [
   "get_settings",
   "save_settings",
   "save_language",
+  "save_enabled_environments",
   "send_test_notification",
   "get_telegram_settings",
   "get_wecom_settings",
