@@ -308,6 +308,11 @@ test('live and history workspace paths wire transcript selections into successfu
     /promptType: 'plan_exit',[\s\S]*displayText: payload\.text,[\s\S]*approval: payload\.requestText \?\? payload\.text[\s\S]*promptAnnotations: payload\.annotations,/,
     'plan review must keep internal XML out of the bubble while persisting annotations',
   );
+  assert.match(
+    liveSource,
+    /if \(!isCronCommand && hasQuickReplyPrompt[\s\S]*isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*if \(isProcessingTurn \|\| hasHardBlockingAttention\) \{\s*if \(collectQueuedPromptAnnotations/,
+    'interactive replies must bypass aggregate limits for a queue they will not join',
+  );
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
   assert.match(liveSource, /isActive=\{isVisible\}/);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.annotations\}/);

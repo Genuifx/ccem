@@ -2534,12 +2534,6 @@ export function WorkspaceNativeSessionView({
       attachments: isCronCommand ? [] : attachments,
       annotations: isCronCommand ? [] : annotations,
     });
-    if (collectQueuedPromptAnnotations([...queuedMessages, nextPrompt]) == null) {
-      toast.error(t('workspace.messageAnnotationsBatchLimit'));
-      return false;
-    }
-    clearComposerDraft();
-    setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
 
     if (!isCronCommand && hasQuickReplyPrompt && !isProcessingTurn && !hasHardBlockingAttention) {
       const planExitReplies = planExitApprovalPrompt?.prompt.prompt_type === 'plan_exit'
@@ -2580,12 +2574,24 @@ export function WorkspaceNativeSessionView({
     }
 
     if (isProcessingTurn || hasHardBlockingAttention) {
+      if (collectQueuedPromptAnnotations([...queuedMessages, nextPrompt]) == null) {
+        toast.error(t('workspace.messageAnnotationsBatchLimit'));
+        return false;
+      }
+      clearComposerDraft();
+      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       setQueuedMessages((previous) => [...previous, nextPrompt]);
       return true;
     }
 
     if (queuedMessages.length > 0 && !hasBlockingAttention) {
       const pendingBatch = [...queuedMessages, nextPrompt];
+      if (collectQueuedPromptAnnotations(pendingBatch) == null) {
+        toast.error(t('workspace.messageAnnotationsBatchLimit'));
+        return false;
+      }
+      clearComposerDraft();
+      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       setQueuedMessages([]);
       try {
         await sendPromptBatch(pendingBatch);
@@ -2603,6 +2609,8 @@ export function WorkspaceNativeSessionView({
 
     try {
       await sendPromptBatch([nextPrompt]);
+      clearComposerDraft();
+      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       return true;
     } catch (error) {
       toast.error(t(
