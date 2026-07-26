@@ -1346,6 +1346,7 @@ fn respond_native_session_prompt(
     display_text: Option<String>,
     answers: HashMap<String, String>,
     annotations: Option<HashMap<String, InteractivePromptAnnotation>>,
+    prompt_annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
     native_state.respond_to_prompt(
         &app,
@@ -1355,6 +1356,7 @@ fn respond_native_session_prompt(
         display_text.as_deref(),
         &answers,
         annotations.as_ref(),
+        prompt_annotations.as_ref(),
     )
 }
 

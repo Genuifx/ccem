@@ -337,6 +337,7 @@ export interface TauriCommands {
       displayText?: string | null;
       answers: Record<string, string>;
       annotations?: Record<string, InteractivePromptAnnotation> | null;
+      promptAnnotations?: SessionPromptAnnotation[] | null;
     },
     void
   ];

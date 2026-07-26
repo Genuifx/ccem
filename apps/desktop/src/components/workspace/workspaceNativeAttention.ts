@@ -45,6 +45,38 @@ export function getPlanExitPrimaryReply(
   return replies[0] ?? fallback;
 }
 
+export function isPlanExitApprovalText(text: string, quickReplies: string[]) {
+  const normalizedText = text.trim().toLocaleLowerCase();
+  if (!normalizedText) {
+    return false;
+  }
+
+  if (quickReplies.some((reply) => reply.trim().toLocaleLowerCase() === normalizedText)) {
+    return true;
+  }
+
+  return new Set([
+    'ok',
+    'okay',
+    'yes',
+    'y',
+    'approve',
+    'approved',
+    'continue',
+    'execute',
+    'go',
+    'proceed',
+    '同意',
+    '通过',
+    '批准',
+    '确认',
+    '继续',
+    '继续执行',
+    '执行',
+    '开始执行',
+  ]).has(normalizedText);
+}
+
 function isSyntheticPlanExitSummary(summary: string) {
   return /^Claude is ready to run\b/.test(summary.trim());
 }

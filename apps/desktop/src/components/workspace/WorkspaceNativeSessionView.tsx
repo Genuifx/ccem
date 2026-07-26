@@ -85,6 +85,7 @@ import type { EffortLevel } from './ComposerControls';
 import {
   extractAttentionState,
   getPlanExitPrimaryReply,
+  isPlanExitApprovalText,
   type NativeSessionAttentionState,
 } from './workspaceNativeAttention';
 import { normalizeEffortForProvider } from './workspaceSessionPreferences';
@@ -192,7 +193,9 @@ type InteractivePromptReplyPayload =
       kind: 'plan_exit';
       toolUseId: string;
       text: string;
+      requestText?: string;
       approved: boolean;
+      annotations?: SessionPromptAnnotation[];
     };
 
 type QueuedGuidanceMessage = {
@@ -561,38 +564,6 @@ function promptQuickReplies(prompt: InteractiveToolPrompt): string[] {
 function isSyntheticPlanExitPrompt(prompt: InteractiveToolPrompt) {
   return prompt.prompt_type === 'plan_exit'
     && /^Claude is ready to run\b/.test((prompt.plan_summary ?? '').trim());
-}
-
-function isPlanExitApprovalText(text: string, quickReplies: string[]) {
-  const normalizedText = text.trim().toLocaleLowerCase();
-  if (!normalizedText) {
-    return false;
-  }
-
-  if (quickReplies.some((reply) => reply.trim().toLocaleLowerCase() === normalizedText)) {
-    return true;
-  }
-
-  return new Set([
-    'ok',
-    'okay',
-    'yes',
-    'y',
-    'approve',
-    'approved',
-    'continue',
-    'execute',
-    'go',
-    'proceed',
-    '同意',
-    '通过',
-    '批准',
-    '确认',
-    '继续',
-    '继续执行',
-    '执行',
-    '开始执行',
-  ]).has(normalizedText);
 }
 
 function questionDisplayLabel(question: {
@@ -2284,7 +2255,9 @@ export function WorkspaceNativeSessionView({
           ? payload.text
           : buildComposerPromptPreview(payload.displayText ?? payload.text, payload.attachments ?? []),
       images: payload.kind === 'text' ? requestImages : undefined,
-      annotations: payload.kind === 'text' ? payload.annotations : undefined,
+      annotations: payload.kind === 'text' || payload.kind === 'plan_exit'
+        ? payload.annotations
+        : undefined,
       timestamp: Date.now(),
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
     };
@@ -2353,12 +2326,13 @@ export function WorkspaceNativeSessionView({
           answers: payload.approved
             ? {
                 decision: 'approve',
-                approval: payload.text,
+                approval: payload.requestText ?? payload.text,
               }
             : {
                 decision: 'revise',
-                feedback: payload.text,
+                feedback: payload.requestText ?? payload.text,
               },
+          promptAnnotations: payload.annotations,
         });
       } else {
         await sendNativeSessionInput(
@@ -2574,21 +2548,25 @@ export function WorkspaceNativeSessionView({
       if (
         planExitApprovalPrompt
         && attachments.length === 0
-        && isPlanExitApprovalText(text, planExitReplies)
+        && isPlanExitApprovalText(displayText, planExitReplies)
       ) {
         return sendInteractivePromptReply({
           kind: 'plan_exit',
           toolUseId: planExitApprovalPrompt.toolUseId,
-          text,
+          text: displayText,
+          requestText: text,
           approved: true,
+          annotations,
         });
       }
       if (planExitApprovalPrompt && attachments.length === 0) {
         return sendInteractivePromptReply({
           kind: 'plan_exit',
           toolUseId: planExitApprovalPrompt.toolUseId,
-          text,
+          text: displayText,
+          requestText: text,
           approved: false,
+          annotations,
         });
       }
 

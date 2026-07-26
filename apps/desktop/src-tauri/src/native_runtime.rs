@@ -917,13 +917,20 @@ impl NativeRuntimeManager {
         display_text: Option<&str>,
         answers: &HashMap<String, String>,
         annotations: Option<&HashMap<String, InteractivePromptAnnotation>>,
+        prompt_annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         if answers.is_empty() {
             return Err("Interactive prompt response requires at least one answer.".to_string());
         }
+        let prompt_annotations = validate_prompt_annotations(prompt_annotations)?;
 
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
-        self.append_interactive_prompt_response_event(runtime_id, display_text, answers)?;
+        self.append_interactive_prompt_response_event(
+            runtime_id,
+            display_text,
+            answers,
+            prompt_annotations.as_ref(),
+        )?;
         self.write_to_child_with_reconnect(
             app,
             runtime_id,
@@ -2110,11 +2117,12 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         display_text: Option<&str>,
         answers: &HashMap<String, String>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         let Some(text) = summarize_interactive_prompt_response(display_text, answers) else {
             return Ok(());
         };
-        self.append_user_prompt_event(runtime_id, &text, None, None)
+        self.append_user_prompt_event(runtime_id, &text, None, annotations)
     }
 
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {
@@ -3340,12 +3348,17 @@ mod tests {
         );
         let manager = manager_with_handle(&runtime_id);
         let answers = HashMap::from([("Pick one".to_string(), "Use the SQLite path".to_string())]);
+        let prompt_annotations = vec![SessionPromptAnnotation {
+            quote: "current query".to_string(),
+            note: "keep the response visible".to_string(),
+        }];
 
         manager
             .append_interactive_prompt_response_event(
                 &runtime_id,
                 Some("Use the SQLite path"),
                 &answers,
+                Some(&prompt_annotations),
             )
             .expect("append interactive response event");
 
@@ -3367,7 +3380,7 @@ mod tests {
         assert_eq!(text, "Use the SQLite path");
         assert_eq!(*image_count, 0);
         assert_eq!(images, &None);
-        assert_eq!(annotations, &None);
+        assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
     }
 

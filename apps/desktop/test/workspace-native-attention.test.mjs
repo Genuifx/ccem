@@ -79,7 +79,10 @@ test('plan review card prefers the detailed ExitPlanMode plan over a synthetic b
 });
 
 test('plan exit prompts always expose a primary approval reply', async () => {
-  const { getPlanExitPrimaryReply } = await importWorkspaceNativeAttention();
+  const {
+    getPlanExitPrimaryReply,
+    isPlanExitApprovalText,
+  } = await importWorkspaceNativeAttention();
 
   assert.equal(
     getPlanExitPrimaryReply({
@@ -103,6 +106,17 @@ test('plan exit prompts always expose a primary approval reply', async () => {
       questions: [],
     }),
     null,
+  );
+  assert.equal(isPlanExitApprovalText('approve', []), true);
+  assert.equal(isPlanExitApprovalText('通过', []), true);
+  assert.equal(isPlanExitApprovalText('ship it', ['Ship it']), true);
+  assert.equal(
+    isPlanExitApprovalText(
+      '<workspace_annotations>approve</workspace_annotations>',
+      [],
+    ),
+    false,
+    'model-only annotation XML must never determine the visible approval intent',
   );
 });
 

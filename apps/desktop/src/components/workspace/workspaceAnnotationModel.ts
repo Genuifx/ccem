@@ -136,12 +136,14 @@ export function parseWorkspacePromptAnnotations(
     const candidate = item as Partial<WorkspacePromptAnnotation>;
     const quote = typeof candidate.quote === 'string' ? candidate.quote.trim() : '';
     const note = typeof candidate.note === 'string' ? candidate.note.trim() : '';
-    const nextChars = quote.length + note.length;
+    const quoteChars = [...quote].length;
+    const noteChars = [...note].length;
+    const nextChars = quoteChars + noteChars;
     if (
       !quote
-      || quote.length > MAX_WORKSPACE_SELECTION_CHARS
+      || quoteChars > MAX_WORKSPACE_SELECTION_CHARS
       || !note
-      || note.length > MAX_WORKSPACE_ANNOTATION_NOTE_CHARS
+      || noteChars > MAX_WORKSPACE_ANNOTATION_NOTE_CHARS
       || totalChars + nextChars > MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS
     ) {
       return null;

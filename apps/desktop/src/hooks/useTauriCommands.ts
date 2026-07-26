@@ -950,6 +950,7 @@ export function useTauriCommands() {
       displayText?: string | null;
       answers: Record<string, string>;
       annotations?: Record<string, InteractivePromptAnnotation>;
+      promptAnnotations?: SessionPromptAnnotation[];
     },
   ): Promise<void> => {
     await invoke('respond_native_session_prompt', {
@@ -959,6 +960,9 @@ export function useTauriCommands() {
       displayText: payload.displayText ?? null,
       answers: payload.answers,
       annotations: payload.annotations ?? null,
+      promptAnnotations: payload.promptAnnotations?.length
+        ? payload.promptAnnotations
+        : null,
     });
   }, []);
 

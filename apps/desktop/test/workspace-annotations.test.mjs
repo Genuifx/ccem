@@ -268,6 +268,21 @@ test('sent annotation snapshots reject overflow instead of silently truncating m
     ]),
     null,
   );
+  assert.equal(
+    parseWorkspacePromptAnnotations([{
+      quote: '😀'.repeat(12_000),
+      note: 'Unicode scalar boundary',
+    }])?.length,
+    1,
+    'frontend limits should count Unicode scalars like the Rust backend',
+  );
+  assert.equal(
+    parseWorkspacePromptAnnotations([{
+      quote: '😀'.repeat(12_001),
+      note: 'one scalar past the boundary',
+    }]),
+    null,
+  );
 });
 
 test('live and history workspace paths wire transcript selections into successful composer sends', async () => {
@@ -283,6 +298,16 @@ test('live and history workspace paths wire transcript selections into successfu
   assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
   assert.match(composerSource, /if \(result !== false\)[\s\S]*onAnnotationsSent\?\.\(\)/);
   assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.annotations\.length > 0/);
+  assert.match(
+    liveSource,
+    /isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*requestText: text,[\s\S]*annotations,/,
+    'plan review must classify visible text while preserving model context and annotation metadata',
+  );
+  assert.match(
+    liveSource,
+    /promptType: 'plan_exit',[\s\S]*displayText: payload\.text,[\s\S]*approval: payload\.requestText \?\? payload\.text[\s\S]*promptAnnotations: payload\.annotations,/,
+    'plan review must keep internal XML out of the bubble while persisting annotations',
+  );
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
   assert.match(liveSource, /isActive=\{isVisible\}/);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.annotations\}/);
