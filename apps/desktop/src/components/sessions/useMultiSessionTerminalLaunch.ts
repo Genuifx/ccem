@@ -60,7 +60,11 @@ export function useMultiSessionTerminalLaunch({
           ({ sessionId }) => sessionId,
         );
         toast.error(
-          t('sessions.multiLaunchTerminalPartial')
+          t(
+            result.arrangementError
+              ? 'sessions.multiLaunchTerminalAndArrangePartial'
+              : 'sessions.multiLaunchTerminalPartial',
+          )
             .replace('{created}', String(result.createdCount))
             .replace('{opened}', String(result.openedCount))
             .replace('{total}', String(result.requestedCount)),

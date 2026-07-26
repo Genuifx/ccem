@@ -526,6 +526,7 @@
     "multiLaunchSuccess": "成功启动 {count} 个会话并排列",
     "multiLaunchPartial": "成功启动 {success}/{total} 个会话",
     "multiLaunchTerminalPartial": "已创建 {created}/{total} 个会话，但仅有 {opened} 个成功打开 Terminal。可重试已有会话。",
+    "multiLaunchTerminalAndArrangePartial": "已创建 {created}/{total} 个会话，其中 {opened} 个成功打开 Terminal，但这些窗口排列失败。可重试尚未打开的会话。",
     "multiLaunchTerminalRetrySuccess": "已在 Terminal 打开 {count} 个已有会话",
     "multiLaunchTerminalRetryPartial": "已在 Terminal 打开 {opened}/{total} 个已有会话",
     "multiLaunchTerminalRetryFailed": "Terminal 仍无法打开这些已有会话",

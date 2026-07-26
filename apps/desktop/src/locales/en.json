@@ -526,6 +526,7 @@
     "multiLaunchSuccess": "Launched {count} sessions and arranged",
     "multiLaunchPartial": "Launched {success}/{total} sessions",
     "multiLaunchTerminalPartial": "Created {created}/{total} sessions, but Terminal opened for {opened}. Retry the existing sessions.",
+    "multiLaunchTerminalAndArrangePartial": "Created {created}/{total} sessions; Terminal opened for {opened}, but those windows could not be arranged. Retry the unopened sessions.",
     "multiLaunchTerminalRetrySuccess": "Opened {count} existing sessions in Terminal",
     "multiLaunchTerminalRetryPartial": "Opened {opened}/{total} existing sessions in Terminal",
     "multiLaunchTerminalRetryFailed": "Terminal still could not open the existing sessions",

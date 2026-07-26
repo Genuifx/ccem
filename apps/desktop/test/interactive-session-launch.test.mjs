@@ -331,4 +331,25 @@ test('multi-launch separates opened, partial, and create-failed sessions', async
   assert.equal(arrangeFailure.openedCount, 2);
   assert.equal(arrangeFailure.arranged, false);
   assert.equal(arrangeFailure.arrangementError, arrangeError);
+
+  const combinedFailure = await launchMultipleInteractiveSessions({
+    workingDirs: ['/combined-1', '/combined-2', '/combined-partial'],
+    layout: 'grid',
+    launchSession: async (workingDir) => {
+      if (workingDir === '/combined-partial') {
+        throw new InteractiveSessionTerminalOpenError(
+          embeddedSession('combined-partial'),
+          new Error('Terminal unavailable'),
+        );
+      }
+      return embeddedSession(workingDir);
+    },
+    arrangeSessions: async () => {
+      throw arrangeError;
+    },
+    waitForTerminals: async () => {},
+  });
+  assert.equal(combinedFailure.openedCount, 2);
+  assert.equal(combinedFailure.terminalOpenFailures.length, 1);
+  assert.equal(combinedFailure.arrangementError, arrangeError);
 });
