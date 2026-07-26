@@ -48,6 +48,7 @@ import type {
 } from '@/lib/tauri-ipc';
 import { cn } from '@/lib/utils';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
+import { MarkdownRenderer } from '@/components/history/MarkdownRenderer';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
@@ -502,10 +503,7 @@ function promptPanelBody(prompt: InteractiveToolPrompt): string[] {
     }
     case 'plan_exit':
       return prompt.plan_summary?.trim()
-        ? prompt.plan_summary
-          .split(/\n+/)
-          .map((line) => line.trim())
-          .filter(Boolean)
+        ? [prompt.plan_summary.trim()]
         : [];
     case 'plan_entry':
       return [];
@@ -1206,11 +1204,17 @@ function WorkspaceAttentionPanel({
               </span>
             </div>
             {bodyLines.length > 0 ? (
-              <div className="mt-1.5 space-y-1 text-[12px] leading-relaxed text-foreground/90">
-                {bodyLines.map((line, index) => (
-                  <p key={`${entry.toolUseId}-line-${index}`}>{line}</p>
-                ))}
-              </div>
+              isPlanExitPrompt ? (
+                <div className="mt-1.5 text-foreground/90">
+                  <MarkdownRenderer content={bodyLines[0]!} className="text-[12px] leading-relaxed" />
+                </div>
+              ) : (
+                <div className="mt-1.5 space-y-1 text-[12px] leading-relaxed text-foreground/90">
+                  {bodyLines.map((line, index) => (
+                    <p key={`${entry.toolUseId}-line-${index}`}>{line}</p>
+                  ))}
+                </div>
+              )
             ) : (
               <p className="mt-1.5 text-[11px] text-muted-foreground/75">
                 {t('workspace.nativeReplyHint')}
