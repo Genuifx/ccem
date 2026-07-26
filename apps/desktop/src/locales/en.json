@@ -649,6 +649,8 @@
     "runtimeModel": "Runtime Model",
     "subagentModel": "Subagent Model",
     "advancedSettings": "Advanced Settings",
+    "limitWriteTools": "Limit write tools",
+    "limitWriteToolsDescription": "Remind the model to write in chunks when a Workspace session starts",
     "namePlaceholder": "my-environment",
     "baseUrlPlaceholder": "https://api.anthropic.com",
     "authTokenPlaceholder": "Paste provider token or key",

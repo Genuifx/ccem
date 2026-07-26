@@ -458,6 +458,7 @@ function AppContent() {
         defaultSonnetModel: config.ANTHROPIC_DEFAULT_SONNET_MODEL,
         defaultHaikuModel: config.ANTHROPIC_DEFAULT_HAIKU_MODEL,
         runtimeModel: config.ANTHROPIC_MODEL || 'opus',
+        limitWriteTools: Boolean(config.CCEM_LIMIT_WRITE_TOOLS),
       }));
       envList.unshift({
         name: 'official',
@@ -465,6 +466,7 @@ function AppContent() {
         defaultOpusModel: '',
         defaultHaikuModel: 'claude-3-5-haiku-20241022',
         runtimeModel: 'opus',
+        limitWriteTools: false,
       });
       setEnvironments(envList);
     });

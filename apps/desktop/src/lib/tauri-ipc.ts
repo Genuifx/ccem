@@ -28,6 +28,7 @@ export interface TauriCommands {
       defaultHaikuModel?: string;
       runtimeModel?: string;
       subagentModel?: string;
+      limitWriteTools: boolean;
     },
     void
   ];
@@ -42,6 +43,7 @@ export interface TauriCommands {
       defaultHaikuModel?: string;
       runtimeModel?: string;
       subagentModel?: string;
+      limitWriteTools: boolean;
     },
     void
   ];

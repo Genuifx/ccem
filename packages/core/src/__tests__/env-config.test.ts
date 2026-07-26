@@ -54,6 +54,17 @@ describe('env config migration', () => {
     });
   });
 
+  it('preserves the workspace write-tool limit flag', () => {
+    expect(
+      normalizeEnvConfig({
+        ANTHROPIC_BASE_URL: 'https://example.com/anthropic',
+        CCEM_LIMIT_WRITE_TOOLS: true,
+      })
+    ).toMatchObject({
+      CCEM_LIMIT_WRITE_TOOLS: true,
+    });
+  });
+
   it('recovers missing auth token and tier models from legacy config', () => {
     const recovered = recoverEnvConfigFromLegacy(
       {

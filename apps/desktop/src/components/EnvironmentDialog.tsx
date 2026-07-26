@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { LaunchButton } from "@/components/ui/LaunchButton";
+import { Switch } from "@/components/ui/switch";
 import { useLocale } from "@/locales";
 import { ENV_PRESETS, ENV_PRESET_METADATA } from "@ccem/core/browser";
 import {
@@ -129,6 +130,7 @@ export function EnvironmentDialog({
   const [defaultHaikuModel, setDefaultHaikuModel] = React.useState("");
   const [runtimeModel, setRuntimeModel] = React.useState("opus");
   const [subagentModel, setSubagentModel] = React.useState("");
+  const [limitWriteTools, setLimitWriteTools] = React.useState(false);
   const [serverUrl, setServerUrl] = React.useState("");
   const [serverKey, setServerKey] = React.useState("");
   const [serverSecret, setServerSecret] = React.useState("");
@@ -159,6 +161,7 @@ export function EnvironmentDialog({
       setDefaultHaikuModel(environment.defaultHaikuModel || "");
       setRuntimeModel(environment.runtimeModel || "opus");
       setSubagentModel(environment.subagentModel || "");
+      setLimitWriteTools(Boolean(environment.limitWriteTools));
       setSelectedPreset(null);
       setActiveTab("manual");
       setShowAdvanced(
@@ -167,7 +170,8 @@ export function EnvironmentDialog({
             (environment.runtimeModel &&
               environment.runtimeModel !== "opus") ||
             (environment.defaultSonnetModel &&
-              environment.defaultSonnetModel !== environment.defaultOpusModel)
+              environment.defaultSonnetModel !== environment.defaultOpusModel) ||
+            environment.limitWriteTools
         )
       );
       return;
@@ -181,6 +185,7 @@ export function EnvironmentDialog({
     setDefaultHaikuModel("");
     setRuntimeModel("opus");
     setSubagentModel("");
+    setLimitWriteTools(false);
     setActiveTab("manual");
     setServerUrl("");
     setServerKey("");
@@ -280,6 +285,7 @@ export function EnvironmentDialog({
         defaultHaikuModel: defaultHaikuModel.trim(),
       }),
       ...(subagentModel.trim() && { subagentModel: subagentModel.trim() }),
+      limitWriteTools,
     };
 
     onSave(env);
@@ -468,6 +474,26 @@ export function EnvironmentDialog({
                 placeholder={t("environmentDialog.subagentModelPlaceholder")}
               />
             </div>
+
+            <div className="flex items-start justify-between gap-4 rounded-lg border border-border/60 bg-background/45 px-3 py-2.5">
+              <div className="min-w-0 space-y-0.5">
+                <Label htmlFor="limitWriteTools" className="text-sm">
+                  {t("environmentDialog.limitWriteTools")}
+                </Label>
+                <p
+                  id="limitWriteToolsDescription"
+                  className="text-xs leading-relaxed text-muted-foreground"
+                >
+                  {t("environmentDialog.limitWriteToolsDescription")}
+                </p>
+              </div>
+              <Switch
+                id="limitWriteTools"
+                checked={limitWriteTools}
+                onCheckedChange={setLimitWriteTools}
+                aria-describedby="limitWriteToolsDescription"
+              />
+            </div>
           </div>
         )}
       </div>
@@ -496,7 +522,7 @@ export function EnvironmentDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="-mx-1.5 flex-1 overflow-y-auto px-1.5 min-h-0">
         {mode === "add" && !isCopyMode ? (
           <Tabs value={activeTab} onValueChange={setActiveTab}>
             <TabsList className="grid w-full grid-cols-3">

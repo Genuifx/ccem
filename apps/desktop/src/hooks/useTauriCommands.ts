@@ -75,6 +75,7 @@ interface TauriEnvConfig {
   ANTHROPIC_DEFAULT_HAIKU_MODEL?: string;
   ANTHROPIC_MODEL?: string;
   CLAUDE_CODE_SUBAGENT_MODEL?: string;
+  CCEM_LIMIT_WRITE_TOOLS?: boolean;
 }
 
 interface TauriSession {
@@ -280,6 +281,7 @@ export function useTauriCommands() {
           defaultHaikuModel: displayConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL,
           runtimeModel: displayConfig.ANTHROPIC_MODEL || 'opus',
           subagentModel: displayConfig.CLAUDE_CODE_SUBAGENT_MODEL,
+          limitWriteTools: Boolean(displayConfig.CCEM_LIMIT_WRITE_TOOLS),
         };
       });
       envList.sort((a, b) => a.name.localeCompare(b.name));
@@ -329,6 +331,7 @@ export function useTauriCommands() {
         defaultHaikuModel: env.defaultHaikuModel,
         runtimeModel: env.runtimeModel,
         subagentModel: env.subagentModel,
+        limitWriteTools: env.limitWriteTools,
       });
       await loadEnvironments();
       // In managed enable mode, newly created/copied envs start enabled.
@@ -360,6 +363,7 @@ export function useTauriCommands() {
         defaultHaikuModel: env.defaultHaikuModel,
         runtimeModel: env.runtimeModel,
         subagentModel: env.subagentModel,
+        limitWriteTools: env.limitWriteTools,
       });
       await loadEnvironments();
       await loadCurrentEnv();

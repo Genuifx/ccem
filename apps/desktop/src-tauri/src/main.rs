@@ -311,6 +311,7 @@ fn add_environment(
     default_haiku_model: Option<String>,
     runtime_model: Option<String>,
     subagent_model: Option<String>,
+    limit_write_tools: Option<bool>,
 ) -> Result<(), String> {
     let mut cfg = config::read_config()?;
 
@@ -318,7 +319,7 @@ fn add_environment(
         return Err(format!("Environment '{}' already exists", name));
     }
 
-    let env_config = create_env_with_encrypted_key(
+    let mut env_config = create_env_with_encrypted_key(
         Some(base_url),
         auth_token,
         Some(default_opus_model),
@@ -327,6 +328,7 @@ fn add_environment(
         runtime_model,
         subagent_model,
     )?;
+    env_config.limit_write_tools = limit_write_tools.unwrap_or(false);
 
     cfg.registries.insert(name, env_config);
     config::write_config(&cfg)
@@ -343,6 +345,7 @@ fn update_environment(
     default_haiku_model: Option<String>,
     runtime_model: Option<String>,
     subagent_model: Option<String>,
+    limit_write_tools: Option<bool>,
 ) -> Result<(), String> {
     let mut cfg = config::read_config()?;
 
@@ -355,7 +358,12 @@ fn update_environment(
         return Err(format!("Environment '{}' already exists", name));
     }
 
-    let env_config = create_env_with_encrypted_key(
+    let previous_limit_write_tools = cfg
+        .registries
+        .get(&old_name)
+        .map(|env| env.limit_write_tools)
+        .unwrap_or(false);
+    let mut env_config = create_env_with_encrypted_key(
         Some(base_url),
         auth_token,
         Some(default_opus_model),
@@ -364,6 +372,7 @@ fn update_environment(
         runtime_model,
         subagent_model,
     )?;
+    env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
 
     // Remove old key if renamed
     if old_name != name {
@@ -1197,6 +1206,16 @@ fn debug_compare_sessions(
     unified_state.debug_compare_sessions()
 }
 
+const WRITE_TOOL_LIMIT_SYSTEM_TIP: &str = "请注意分片写入，不要一次性写入太多内容到文件中，Write/Edit 失败 → 不要重试相同内容 → 改用更小的分块";
+
+fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: bool) -> String {
+    if !limit_write_tools {
+        return initial_prompt.to_string();
+    }
+
+    format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{initial_prompt}")
+}
+
 #[tauri::command]
 async fn create_native_session(
     app: tauri::AppHandle,
@@ -1231,7 +1250,10 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode.clone(),
                 working_dir: effective_working_dir,
-                initial_prompt: Some(initial_prompt),
+                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                    &initial_prompt,
+                    resolved.limit_write_tools,
+                )),
                 display_prompt: initial_display_prompt.clone(),
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
@@ -1259,7 +1281,10 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode,
                 working_dir: effective_working_dir,
-                initial_prompt: Some(initial_prompt),
+                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                    &initial_prompt,
+                    resolved.limit_write_tools,
+                )),
                 display_prompt: initial_display_prompt.clone(),
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
@@ -2857,6 +2882,8 @@ struct RemoteEnvConfig {
     small_fast_model: Option<String>,
     #[serde(rename = "CLAUDE_CODE_SUBAGENT_MODEL")]
     subagent_model: Option<String>,
+    #[serde(rename = "CCEM_LIMIT_WRITE_TOOLS", default)]
+    limit_write_tools: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3014,7 +3041,7 @@ fn load_from_remote(url: String, key: String, secret: String) -> Result<LoadResu
             "opus".to_string()
         });
 
-        let env_config = create_env_with_encrypted_key(
+        let mut env_config = create_env_with_encrypted_key(
             env.base_url,
             env.auth_token.or(env.api_key),
             default_opus_model,
@@ -3023,6 +3050,7 @@ fn load_from_remote(url: String, key: String, secret: String) -> Result<LoadResu
             runtime_model,
             env.subagent_model,
         )?;
+        env_config.limit_write_tools = env.limit_write_tools;
 
         cfg.registries.insert(final_name.clone(), env_config);
         loaded.push(LoadedEnv {
@@ -5288,7 +5316,8 @@ mod tests {
     use super::{
         build_remote_load_args, build_remote_load_stdin_payload, media_kind_for_extension,
         merge_git_numstat, normalize_git_changed_path, parse_git_status_line,
-        WorkspaceGitChangedFile,
+        prepend_write_tool_limit_system_tip, RemoteEnvConfig, WorkspaceGitChangedFile,
+        WRITE_TOOL_LIMIT_SYSTEM_TIP,
     };
     use std::collections::HashMap;
 
@@ -5302,6 +5331,27 @@ mod tests {
     fn test_launch_claude_code_validates_env() {
         // 这个测试需要完整的 Tauri 上下文，暂时跳过
         // 实际测试应该在集成测试中进行
+    }
+
+    #[test]
+    fn write_tool_limit_tip_is_prefixed_only_when_enabled() {
+        let prompt = "Update the configuration";
+
+        assert_eq!(
+            prepend_write_tool_limit_system_tip(prompt, true),
+            format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{prompt}"),
+        );
+        assert_eq!(prepend_write_tool_limit_system_tip(prompt, false), prompt);
+    }
+
+    #[test]
+    fn remote_write_tool_limit_defaults_to_disabled_and_reads_enabled_value() {
+        let legacy: RemoteEnvConfig = serde_json::from_str("{}").expect("parse legacy remote env");
+        assert!(!legacy.limit_write_tools);
+
+        let enabled: RemoteEnvConfig = serde_json::from_str(r#"{"CCEM_LIMIT_WRITE_TOOLS":true}"#)
+            .expect("parse enabled remote env");
+        assert!(enabled.limit_write_tools);
     }
 
     // -----------------------------------------------------------------

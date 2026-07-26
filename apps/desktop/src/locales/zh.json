@@ -649,6 +649,8 @@
     "runtimeModel": "运行时模型",
     "subagentModel": "子代理模型",
     "advancedSettings": "高级配置",
+    "limitWriteTools": "限制写入工具",
+    "limitWriteToolsDescription": "Workspace 会话启动时提醒模型分片写入",
     "namePlaceholder": "my-environment",
     "baseUrlPlaceholder": "https://api.anthropic.com",
     "authTokenPlaceholder": "粘贴厂商提供的 Token 或 Key",

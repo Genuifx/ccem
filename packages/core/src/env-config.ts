@@ -66,6 +66,9 @@ export function normalizeEnvConfig(
     ...(envConfig.CLAUDE_CODE_SUBAGENT_MODEL && {
       CLAUDE_CODE_SUBAGENT_MODEL: envConfig.CLAUDE_CODE_SUBAGENT_MODEL,
     }),
+    ...(typeof envConfig.CCEM_LIMIT_WRITE_TOOLS === 'boolean' && {
+      CCEM_LIMIT_WRITE_TOOLS: envConfig.CCEM_LIMIT_WRITE_TOOLS,
+    }),
   };
 }
 
