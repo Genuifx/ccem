@@ -14,13 +14,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
@@ -541,22 +541,19 @@ struct TerminalLaunchInvocation {
 }
 
 #[cfg(test)]
-fn terminal_launches() -> &'static Mutex<Vec<TerminalLaunchInvocation>> {
-    static LAUNCHES: OnceLock<Mutex<Vec<TerminalLaunchInvocation>>> = OnceLock::new();
-    LAUNCHES.get_or_init(|| Mutex::new(Vec::new()))
+thread_local! {
+    static TERMINAL_LAUNCHES: RefCell<Vec<TerminalLaunchInvocation>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 fn clear_terminal_launches() {
-    terminal_launches()
-        .lock()
-        .expect("terminal launches")
-        .clear();
+    TERMINAL_LAUNCHES.with(|launches| launches.borrow_mut().clear());
 }
 
 #[cfg(test)]
 fn take_terminal_launches() -> Vec<TerminalLaunchInvocation> {
-    std::mem::take(&mut *terminal_launches().lock().expect("terminal launches"))
+    TERMINAL_LAUNCHES.with(|launches| std::mem::take(&mut *launches.borrow_mut()))
 }
 
 #[cfg(not(test))]
@@ -594,10 +591,8 @@ fn launch_terminal_for_native_handoff(
     resume_session_id: Option<&str>,
     client: &str,
 ) -> Result<(), String> {
-    terminal_launches()
-        .lock()
-        .expect("terminal launches")
-        .push(TerminalLaunchInvocation {
+    TERMINAL_LAUNCHES.with(|launches| {
+        launches.borrow_mut().push(TerminalLaunchInvocation {
             terminal,
             working_dir: working_dir.to_string(),
             runtime_id: runtime_id.to_string(),
@@ -606,6 +601,7 @@ fn launch_terminal_for_native_handoff(
             resume_session_id: resume_session_id.map(str::to_string),
             client: client.to_string(),
         });
+    });
     Ok(())
 }
 
@@ -2731,9 +2727,10 @@ mod tests {
         is_retryable_native_child_write_error, merge_helper_env_path,
         merge_path_values_with_separator, native_runtime_state_temp_file_path,
         native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
-        reactivate_record_for_reconnect, read_native_runtime_state_from, take_terminal_launches,
-        HelperInputCommand, NativeProvider, NativeRuntimeManager, NativeSessionHandle,
-        NativeSessionOptions, NativeSessionRecord, NativeTransport, PromptImage,
+        launch_terminal_for_native_handoff, reactivate_record_for_reconnect,
+        read_native_runtime_state_from, take_terminal_launches, HelperInputCommand, NativeProvider,
+        NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
+        NativeTransport, PromptImage,
     };
     use crate::event_bus::{
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
@@ -3602,6 +3599,40 @@ mod tests {
         assert!(!is_retryable_native_child_write_error(
             "Failed to encode helper command: invalid payload"
         ));
+    }
+
+    #[test]
+    fn terminal_launch_capture_is_isolated_between_parallel_test_threads() {
+        clear_terminal_launches();
+        let launch_barrier = Arc::new(Barrier::new(3));
+
+        let launch_and_take = |runtime_id: &'static str| {
+            let launch_barrier = Arc::clone(&launch_barrier);
+            std::thread::spawn(move || {
+                launch_terminal_for_native_handoff(
+                    crate::terminal::TerminalType::TerminalApp,
+                    HashMap::new(),
+                    "/tmp/project",
+                    runtime_id,
+                    "official",
+                    Some("dev"),
+                    None,
+                    "claude",
+                )
+                .expect("capture terminal launch");
+                launch_barrier.wait();
+
+                let launches = take_terminal_launches();
+                assert_eq!(launches.len(), 1);
+                assert_eq!(launches[0].runtime_id, runtime_id);
+            })
+        };
+
+        let first = launch_and_take("parallel-terminal-capture-a");
+        let second = launch_and_take("parallel-terminal-capture-b");
+        launch_barrier.wait();
+        first.join().expect("first capture thread");
+        second.join().expect("second capture thread");
     }
 
     #[cfg(target_os = "macos")]
