@@ -71,6 +71,7 @@ use config::{
     JetBrainsProject, RecentProject, VSCodeProject,
 };
 use cron::{start_cron_scheduler, CronScheduler};
+use event_bus::SessionPromptAnnotation;
 use event_dispatcher::EventDispatcher;
 use external_control::ExternalControlManager;
 use history::{
@@ -1208,6 +1209,7 @@ async fn create_native_session(
     initial_prompt: String,
     initial_display_prompt: Option<String>,
     initial_images: Option<Vec<PromptImage>>,
+    initial_annotations: Option<Vec<SessionPromptAnnotation>>,
     provider_session_id: Option<String>,
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
@@ -1232,6 +1234,7 @@ async fn create_native_session(
                 initial_prompt: Some(initial_prompt),
                 display_prompt: initial_display_prompt.clone(),
                 initial_images: initial_images.clone(),
+                initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
                 seed_boundary_message_count,
                 helper_env_vars: resolved.env_vars.clone(),
@@ -1259,6 +1262,7 @@ async fn create_native_session(
                 initial_prompt: Some(initial_prompt),
                 display_prompt: initial_display_prompt.clone(),
                 initial_images: initial_images.clone(),
+                initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
                 seed_boundary_message_count,
                 helper_env_vars: proxy_env_vars.clone(),
@@ -1309,6 +1313,7 @@ fn send_native_session_input(
     text: String,
     display_text: Option<String>,
     images: Option<Vec<PromptImage>>,
+    annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
     native_state.send_user_message(
         &app,
@@ -1316,6 +1321,7 @@ fn send_native_session_input(
         &text,
         display_text.as_deref(),
         images.as_ref(),
+        annotations.as_ref(),
     )
 }
 

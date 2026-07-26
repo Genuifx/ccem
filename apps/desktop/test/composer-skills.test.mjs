@@ -260,7 +260,10 @@ test('selected skill prompt augmentation stays out of user-visible display text'
   assert.match(workspaceSource, /const previewPrompt = buildComposerPromptPreview\(displayPrompt, attachments\);/);
   assert.match(nativeViewSource, /const displayText = payload\?\.displayText \?\? text;/);
   assert.match(nativeViewSource, /buildComposerPromptPreview\(payload\.displayText \?\? payload\.text, payload\.attachments \?\? \[\]\)/);
-  assert.match(nativeViewSource, /sendNativeSessionInput\(session\.runtime_id, requestText, requestImages, promptEntry\.text\)/);
+  assert.match(
+    nativeViewSource,
+    /sendNativeSessionInput\(\s*session\.runtime_id,\s*requestText,\s*requestImages,\s*promptEntry\.text,\s*payload\.annotations,\s*\)/,
+  );
 });
 
 test('image attachments are referenced only while their chip or placeholder remains', async () => {

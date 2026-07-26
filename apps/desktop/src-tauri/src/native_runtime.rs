@@ -1,7 +1,8 @@
 use crate::browser::{authorize_browser_tool, BrowserManager, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
-    ReplayBatch, SessionEventPayload, SessionPromptImage, SessionStore, TodoSnapshotV1,
+    ReplayBatch, SessionEventPayload, SessionPromptAnnotation, SessionPromptImage, SessionStore,
+    TodoSnapshotV1,
 };
 use crate::native_event_log::NativeEventLog;
 use crate::native_helper_resource::native_helper_script_path;
@@ -29,6 +30,10 @@ use tauri_plugin_shell::{
 };
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const MAX_PROMPT_ANNOTATIONS: usize = 20;
+const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
+const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
+const MAX_PROMPT_ANNOTATION_TOTAL_CHARS: usize = 60_000;
 static NATIVE_RUNTIME_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +149,7 @@ pub struct NativeSessionOptions {
     pub initial_prompt: Option<String>,
     pub display_prompt: Option<String>,
     pub initial_images: Option<Vec<PromptImage>>,
+    pub initial_annotations: Option<Vec<SessionPromptAnnotation>>,
     pub provider_session_id: Option<String>,
     pub seed_boundary_message_count: Option<u64>,
     pub helper_env_vars: HashMap<String, String>,
@@ -203,8 +209,12 @@ fn prompt_images_for_event(
 fn canonical_user_prompt_hash(
     text: &str,
     images: Option<&Vec<SessionPromptImage>>,
+    annotations: Option<&Vec<SessionPromptAnnotation>>,
 ) -> Option<String> {
-    if text.trim().is_empty() && images.map(|items| items.is_empty()).unwrap_or(true) {
+    if text.trim().is_empty()
+        && images.map(|items| items.is_empty()).unwrap_or(true)
+        && annotations.map(|items| items.is_empty()).unwrap_or(true)
+    {
         return None;
     }
 
@@ -221,8 +231,69 @@ fn canonical_user_prompt_hash(
             hasher.update(b"\0");
         }
     }
+    if let Some(annotations) = annotations {
+        for annotation in annotations {
+            hasher.update(b"annotation\0");
+            hasher.update(annotation.quote.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(annotation.note.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
 
     Some(hex::encode(hasher.finalize()))
+}
+
+fn validate_prompt_annotations(
+    annotations: Option<&Vec<SessionPromptAnnotation>>,
+) -> Result<Option<Vec<SessionPromptAnnotation>>, String> {
+    let Some(annotations) = annotations else {
+        return Ok(None);
+    };
+    if annotations.is_empty() {
+        return Ok(None);
+    }
+    if annotations.len() > MAX_PROMPT_ANNOTATIONS {
+        return Err(format!(
+            "A prompt can include at most {MAX_PROMPT_ANNOTATIONS} annotations."
+        ));
+    }
+
+    let mut total_chars = 0usize;
+    let mut validated = Vec::with_capacity(annotations.len());
+    for annotation in annotations {
+        let quote = annotation.quote.trim();
+        let note = annotation.note.trim();
+        let quote_chars = quote.chars().count();
+        let note_chars = note.chars().count();
+        if quote.is_empty() || note.is_empty() {
+            return Err("Prompt annotations require both selected text and a note.".to_string());
+        }
+        if quote_chars > MAX_PROMPT_ANNOTATION_QUOTE_CHARS {
+            return Err(format!(
+                "Prompt annotation selected text exceeds {MAX_PROMPT_ANNOTATION_QUOTE_CHARS} characters."
+            ));
+        }
+        if note_chars > MAX_PROMPT_ANNOTATION_NOTE_CHARS {
+            return Err(format!(
+                "Prompt annotation note exceeds {MAX_PROMPT_ANNOTATION_NOTE_CHARS} characters."
+            ));
+        }
+        total_chars = total_chars
+            .checked_add(quote_chars + note_chars)
+            .ok_or_else(|| "Prompt annotation size overflowed.".to_string())?;
+        if total_chars > MAX_PROMPT_ANNOTATION_TOTAL_CHARS {
+            return Err(format!(
+                "Prompt annotations exceed {MAX_PROMPT_ANNOTATION_TOTAL_CHARS} total characters."
+            ));
+        }
+        validated.push(SessionPromptAnnotation {
+            quote: quote.to_string(),
+            note: note.to_string(),
+        });
+    }
+
+    Ok(Some(validated))
 }
 
 #[derive(Debug, Serialize)]
@@ -579,6 +650,8 @@ impl NativeRuntimeManager {
         options: NativeSessionOptions,
     ) -> Result<NativeSessionSummary, String> {
         let mut options = options;
+        options.initial_annotations =
+            validate_prompt_annotations(options.initial_annotations.as_ref())?;
         merge_helper_env_path(&mut options.helper_env_vars, &terminal::get_user_path());
         let runtime_id = generate_runtime_id();
         inject_ccem_runtime_env(&mut options.helper_env_vars, &runtime_id);
@@ -635,6 +708,7 @@ impl NativeRuntimeManager {
                 .or(options.initial_prompt.as_deref())
                 .unwrap_or_default(),
             options.initial_images.as_ref(),
+            options.initial_annotations.as_ref(),
         )?;
         self.spawn_helper(app, &runtime_id, &options, handle)?;
         self.summary_for(&runtime_id)
@@ -751,9 +825,11 @@ impl NativeRuntimeManager {
         text: &str,
         display_text: Option<&str>,
         images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         let text = text.trim();
         let has_images = images.as_ref().is_some_and(|imgs| !imgs.is_empty());
+        let annotations = validate_prompt_annotations(annotations)?;
         if text.is_empty() && !has_images {
             return Ok(());
         }
@@ -805,7 +881,12 @@ impl NativeRuntimeManager {
                 image_count
             ),
         )?;
-        self.append_user_prompt_event(runtime_id, display_text.unwrap_or(text), images)
+        self.append_user_prompt_event(
+            runtime_id,
+            display_text.unwrap_or(text),
+            images,
+            annotations.as_ref(),
+        )
     }
 
     pub fn respond_to_permission(
@@ -2000,14 +2081,17 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         text: &str,
         images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         let text = text.trim();
         let image_count = images.map(|items| items.len()).unwrap_or(0);
-        if text.is_empty() && image_count == 0 {
+        let annotations = validate_prompt_annotations(annotations)?;
+        if text.is_empty() && image_count == 0 && annotations.is_none() {
             return Ok(());
         }
         let event_images = prompt_images_for_event(images, &self.prompt_image_store)?;
-        let canonical_hash = canonical_user_prompt_hash(text, event_images.as_ref());
+        let canonical_hash =
+            canonical_user_prompt_hash(text, event_images.as_ref(), annotations.as_ref());
 
         self.append_event(
             runtime_id,
@@ -2015,6 +2099,7 @@ impl NativeRuntimeManager {
                 text: text.to_string(),
                 image_count: image_count as u64,
                 images: event_images,
+                annotations,
                 canonical_hash,
             },
         )
@@ -2029,7 +2114,7 @@ impl NativeRuntimeManager {
         let Some(text) = summarize_interactive_prompt_response(display_text, answers) else {
             return Ok(());
         };
-        self.append_user_prompt_event(runtime_id, &text, None)
+        self.append_user_prompt_event(runtime_id, &text, None, None)
     }
 
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {
@@ -2594,6 +2679,7 @@ fn build_runtime_bootstrap_options(
         initial_prompt: None,
         display_prompt: None,
         initial_images: None,
+        initial_annotations: None,
         provider_session_id: record.provider_session_id.clone(),
         seed_boundary_message_count: record.seed_boundary_message_count,
         helper_env_vars,
@@ -2623,7 +2709,8 @@ mod tests {
         NativeSessionOptions, NativeSessionRecord, NativeTransport, PromptImage,
     };
     use crate::event_bus::{
-        SessionEventPayload, SessionStore, TodoSnapshotItemV1, TodoSnapshotV1,
+        SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
+        TodoSnapshotV1,
     };
     use crate::native_event_log::NativeEventLog;
     use crate::prompt_image_store::PromptImageStore;
@@ -2785,6 +2872,7 @@ mod tests {
             initial_prompt: None,
             display_prompt: None,
             initial_images: None,
+            initial_annotations: None,
             provider_session_id: None,
             seed_boundary_message_count: None,
             helper_env_vars: HashMap::new(),
@@ -3137,9 +3225,18 @@ mod tests {
             base64_data: "iVBORw0KGgo=".to_string(),
             placeholder: Some("[Image #1]".to_string()),
         }];
+        let prompt_annotations = vec![SessionPromptAnnotation {
+            quote: "selected code".to_string(),
+            note: "keep the user input visible".to_string(),
+        }];
 
         manager
-            .append_user_prompt_event(&runtime_id, "continue", Some(&images))
+            .append_user_prompt_event(
+                &runtime_id,
+                "continue",
+                Some(&images),
+                Some(&prompt_annotations),
+            )
             .expect("append user prompt event");
 
         let batch = manager
@@ -3151,6 +3248,7 @@ mod tests {
             text,
             image_count,
             images,
+            annotations,
             canonical_hash,
         } = &batch.events[0].payload
         else {
@@ -3158,6 +3256,7 @@ mod tests {
         };
         assert_eq!(text, "continue");
         assert_eq!(*image_count, 1);
+        assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
         let image = images
             .as_ref()
@@ -3192,6 +3291,32 @@ mod tests {
             persisted_json["canonical_hash"].as_str().map(str::len),
             Some(64)
         );
+    }
+
+    #[test]
+    fn native_user_prompt_rejects_annotation_overflow_without_persisting_an_event() {
+        let runtime_id = format!(
+            "native-user-prompt-annotation-limit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let annotations = (0..21)
+            .map(|index| SessionPromptAnnotation {
+                quote: format!("quote {index}"),
+                note: format!("note {index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let error = manager
+            .append_user_prompt_event(&runtime_id, "continue", None, Some(&annotations))
+            .expect_err("annotation overflow must fail");
+
+        assert!(error.contains("at most 20 annotations"));
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay events")
+            .events
+            .is_empty());
     }
 
     #[test]
@@ -3233,6 +3358,7 @@ mod tests {
             text,
             image_count,
             images,
+            annotations,
             canonical_hash,
         } = &batch.events[0].payload
         else {
@@ -3241,6 +3367,7 @@ mod tests {
         assert_eq!(text, "Use the SQLite path");
         assert_eq!(*image_count, 0);
         assert_eq!(images, &None);
+        assert_eq!(annotations, &None);
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
     }
 

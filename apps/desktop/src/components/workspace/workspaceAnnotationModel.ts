@@ -20,6 +20,11 @@ export interface WorkspaceAnnotation {
   anchor?: WorkspaceAnnotationAnchor;
 }
 
+export interface WorkspacePromptAnnotation {
+  quote: string;
+  note: string;
+}
+
 export function normalizeWorkspaceSelection(value: string): string | null {
   const normalized = value
     .replace(/\r\n?/g, '\n')
@@ -114,6 +119,46 @@ export function normalizeStoredWorkspaceAnnotations(value: unknown): WorkspaceAn
     });
 }
 
+export function parseWorkspacePromptAnnotations(
+  value: unknown,
+): WorkspacePromptAnnotation[] | null {
+  if (!Array.isArray(value) || value.length > MAX_WORKSPACE_ANNOTATIONS) {
+    return null;
+  }
+
+  let totalChars = 0;
+  const annotations: WorkspacePromptAnnotation[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      return null;
+    }
+
+    const candidate = item as Partial<WorkspacePromptAnnotation>;
+    const quote = typeof candidate.quote === 'string' ? candidate.quote.trim() : '';
+    const note = typeof candidate.note === 'string' ? candidate.note.trim() : '';
+    const nextChars = quote.length + note.length;
+    if (
+      !quote
+      || quote.length > MAX_WORKSPACE_SELECTION_CHARS
+      || !note
+      || note.length > MAX_WORKSPACE_ANNOTATION_NOTE_CHARS
+      || totalChars + nextChars > MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS
+    ) {
+      return null;
+    }
+    totalChars += nextChars;
+    annotations.push({ quote, note });
+  }
+
+  return annotations;
+}
+
+export function mergeWorkspacePromptAnnotationBatches(
+  batches: ReadonlyArray<ReadonlyArray<WorkspacePromptAnnotation>>,
+): WorkspacePromptAnnotation[] | null {
+  return parseWorkspacePromptAnnotations(batches.flat());
+}
+
 function escapeXml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -125,14 +170,14 @@ function escapeXml(value: string): string {
 
 export function buildComposerPromptWithAnnotations(
   prompt: string,
-  annotations: WorkspaceAnnotation[],
+  annotations: ReadonlyArray<WorkspacePromptAnnotation>,
 ): string {
-  const validAnnotations = normalizeStoredWorkspaceAnnotations(annotations);
-  if (validAnnotations.length === 0) {
+  const promptAnnotations = parseWorkspacePromptAnnotations(annotations);
+  if (!promptAnnotations?.length) {
     return prompt;
   }
 
-  const annotationBlocks = validAnnotations.flatMap((annotation, index) => [
+  const annotationBlocks = promptAnnotations.flatMap((annotation, index) => [
     `  <annotation index="${index + 1}">`,
     `    <selected_text>${escapeXml(annotation.quote)}</selected_text>`,
     `    <note>${escapeXml(annotation.note)}</note>`,

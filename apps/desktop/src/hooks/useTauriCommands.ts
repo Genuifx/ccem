@@ -22,6 +22,7 @@ import type {
   ManagedSessionSummary,
   NativeHandoffResult,
   NativePromptImageInput,
+  SessionPromptAnnotation,
   NativeSessionSummary,
   NativeTerminalType,
   PlatformCapabilities,
@@ -886,6 +887,7 @@ export function useTauriCommands() {
     initialPrompt: string;
     initialDisplayPrompt?: string | null;
     initialImages?: NativePromptImageInput[];
+    initialAnnotations?: SessionPromptAnnotation[];
     providerSessionId?: string | null;
     effort?: string | null;
     seedBoundaryMessageCount?: number | null;
@@ -900,6 +902,7 @@ export function useTauriCommands() {
       initialPrompt: options.initialPrompt,
       initialDisplayPrompt: options.initialDisplayPrompt ?? null,
       initialImages: options.initialImages?.length ? options.initialImages : null,
+      initialAnnotations: options.initialAnnotations?.length ? options.initialAnnotations : null,
       providerSessionId: options.providerSessionId ?? null,
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
@@ -915,12 +918,14 @@ export function useTauriCommands() {
     text: string,
     images?: NativePromptImageInput[],
     displayText?: string | null,
+    annotations?: SessionPromptAnnotation[],
   ): Promise<void> => {
     await invoke('send_native_session_input', {
       runtimeId,
       text,
       displayText: displayText ?? null,
       images: images?.length ? images : null,
+      annotations: annotations?.length ? annotations : null,
     });
   }, []);
 

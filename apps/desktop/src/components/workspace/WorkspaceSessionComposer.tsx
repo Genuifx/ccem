@@ -99,6 +99,7 @@ import { composerSegmentsReferenceImageAttachment } from './composerImageReferen
 import { WorkspaceComposerAnnotations } from './WorkspaceAnnotations';
 import {
   buildComposerPromptWithAnnotations,
+  parseWorkspacePromptAnnotations,
   type WorkspaceAnnotation,
 } from './workspaceAnnotationModel';
 
@@ -1253,11 +1254,16 @@ export function WorkspaceSessionComposer({
         return false;
       }
     }
-    if (annotations.length > 0) {
-      text = buildComposerPromptWithAnnotations(text, annotations);
+    const promptAnnotations = parseWorkspacePromptAnnotations(annotations);
+    if (promptAnnotations == null) {
+      toast.error(t('workspace.messageAnnotationsInvalid'));
+      return false;
+    }
+    if (promptAnnotations.length > 0) {
+      text = buildComposerPromptWithAnnotations(text, promptAnnotations);
       if (!displayText.trim()) {
         displayText = t('workspace.composerAnnotationsOnly')
-          .replace('{count}', String(annotations.length));
+          .replace('{count}', String(promptAnnotations.length));
       }
     }
 
@@ -1265,6 +1271,7 @@ export function WorkspaceSessionComposer({
       text,
       displayText,
       attachments: currentAttachments,
+      annotations: promptAnnotations.length > 0 ? promptAnnotations : undefined,
     };
 
     if (!payload.text && payload.attachments.length === 0) {

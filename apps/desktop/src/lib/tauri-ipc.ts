@@ -303,6 +303,7 @@ export interface TauriCommands {
       initialPrompt: string;
       initialDisplayPrompt?: string | null;
       initialImages?: NativePromptImageInput[] | null;
+      initialAnnotations?: SessionPromptAnnotation[] | null;
       providerSessionId?: string | null;
       effort?: string | null;
       seedBoundaryMessageCount?: number | null;
@@ -316,6 +317,7 @@ export interface TauriCommands {
       text: string;
       displayText?: string | null;
       images?: NativePromptImageInput[] | null;
+      annotations?: SessionPromptAnnotation[] | null;
     },
     void
   ];
@@ -1199,6 +1201,11 @@ export interface NativePromptImageInput {
   placeholder?: string;
 }
 
+export interface SessionPromptAnnotation {
+  quote: string;
+  note: string;
+}
+
 export type TodoSnapshotStatusV1 = 'pending' | 'in_progress' | 'completed' | 'failed';
 
 export interface TodoSnapshotItemV1 {
@@ -1217,7 +1224,14 @@ export interface TodoSnapshotV1 {
 }
 
 export type SessionEventPayload =
-  | { type: 'user_prompt'; text: string; image_count: number; images?: SessionPromptImage[] | null; canonical_hash?: string | null }
+  | {
+      type: 'user_prompt';
+      text: string;
+      image_count: number;
+      images?: SessionPromptImage[] | null;
+      annotations?: SessionPromptAnnotation[] | null;
+      canonical_hash?: string | null;
+    }
   | { type: 'system_message'; message: string }
   | { type: 'lifecycle'; stage: string; detail: string }
   | { type: 'claude_json'; message_type?: string | null; raw_json: string }

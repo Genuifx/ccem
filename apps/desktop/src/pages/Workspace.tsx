@@ -71,6 +71,7 @@ import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnno
 import type {
   NativeSessionSummary,
   SessionEventRecord,
+  SessionPromptAnnotation,
   SessionPromptImage,
   WorkspaceCommand,
   WorkspaceGitSnapshot,
@@ -654,6 +655,7 @@ export function Workspace({
     options: {
       initialPrompt?: string | null;
       initialImages?: SessionPromptImage[] | null;
+      initialAnnotations?: SessionPromptAnnotation[] | null;
       generatedTitle?: string | null;
       seedMessages?: ConversationMessageData[];
     } = {},
@@ -1449,6 +1451,7 @@ export function Workspace({
       session: matchingSession,
       initialPrompt: null,
       initialImages: null,
+      initialAnnotations: null,
       seedMessages: hydratedMessages ?? [],
     };
   }, [
@@ -1809,6 +1812,7 @@ export function Workspace({
     upsertLiveSessionEntry(session, {
       initialPrompt: existingEntry?.initialPrompt ?? null,
       initialImages: existingEntry?.initialImages ?? null,
+      initialAnnotations: existingEntry?.initialAnnotations ?? null,
       seedMessages: existingEntry?.seedMessages ?? [],
     });
 
@@ -2234,6 +2238,7 @@ export function Workspace({
         initialPrompt: dispatch.prompt,
         initialDisplayPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : undefined,
+        initialAnnotations: payload?.annotations,
         effort: normalizeEffortForProvider(composeEffort, composeProvider),
         seedBoundaryMessageCount: 0,
       });
@@ -2241,6 +2246,7 @@ export function Workspace({
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
+        initialAnnotations: payload?.annotations ?? null,
         seedMessages: [],
       });
       const liveItem = toLiveHistorySessionItem({
@@ -2349,6 +2355,7 @@ export function Workspace({
         initialPrompt: dispatch.prompt,
         initialDisplayPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : undefined,
+        initialAnnotations: payload?.annotations,
         providerSessionId: selectedSession.id,
         effort: normalizeEffortForProvider(historyEffort, provider),
         seedBoundaryMessageCount: messages.length,
@@ -2358,6 +2365,7 @@ export function Workspace({
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
+        initialAnnotations: payload?.annotations ?? null,
         seedMessages: messages,
       });
       setActiveLiveRuntimeId(summary.runtime_id);
@@ -2837,6 +2845,7 @@ export function Workspace({
                           session={entry.session}
                           initialPrompt={entry.initialPrompt}
                           initialImages={entry.initialImages}
+                          initialAnnotations={entry.initialAnnotations}
                           seedMessages={entry.seedMessages}
                           installedSkills={workspaceInstalledSkills}
                           onRefreshSkills={refreshWorkspaceInstalledSkills}

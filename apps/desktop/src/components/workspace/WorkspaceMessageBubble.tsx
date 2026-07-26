@@ -43,6 +43,7 @@ import {
 } from './workspaceEventTranscript';
 import { stripRenderedImageMarkers } from './transcriptIdentity';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
+import { WorkspaceMessageAnnotationsPopover } from './WorkspaceMessageAnnotationsPopover';
 
 interface WorkspaceMessageBubbleProps {
   message: ConversationMessageData;
@@ -1862,6 +1863,11 @@ function WorkspaceMessageBubbleComponent({ message, prevRole }: WorkspaceMessage
             onBlurCapture={handleActionRegionBlur}
           >
             <div className="rounded-[24px] border border-border/30 bg-[hsl(var(--chat-assistant-bg)/0.7)] px-5 py-4 text-foreground">
+              {message.annotations?.length ? (
+                <div className="mb-3 border-b border-border/25 pb-2">
+                  <WorkspaceMessageAnnotationsPopover annotations={message.annotations} />
+                </div>
+              ) : null}
               {renderedContent}
               {hasImages ? <WorkspaceImageStrip blocks={imageBlocks} isUser t={t} /> : null}
             </div>

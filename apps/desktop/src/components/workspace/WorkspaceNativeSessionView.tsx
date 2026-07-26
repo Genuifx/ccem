@@ -41,6 +41,7 @@ import type {
   NativePromptImageInput,
   NativeSessionSummary,
   SessionEventRecord,
+  SessionPromptAnnotation,
   SessionPromptImage,
   WorkspaceCommand,
   WorkspaceGitSnapshot,
@@ -100,6 +101,7 @@ import {
   appendSessionEvents,
   buildBaseMessages,
   buildMessagesFromEvents,
+  createInitialLocalUserPrompts,
   filterConfirmedLocalUserPrompts,
   replayBatchCoversAvailableSequenceRange,
   sessionEventsNeedSummaryRefresh,
@@ -122,6 +124,10 @@ import {
 import { WorkspaceWecomBindDialog } from './WorkspaceWecomBindDialog';
 import { WorkspaceTranscriptSelection } from './WorkspaceAnnotations';
 import { useWorkspaceAnnotations } from './useWorkspaceAnnotations';
+import {
+  mergeWorkspacePromptAnnotationBatches,
+  parseWorkspacePromptAnnotations,
+} from './workspaceAnnotationModel';
 
 function ProcessingActionIcon({ stopping = false }: { stopping?: boolean }) {
   return (
@@ -173,6 +179,7 @@ type InteractivePromptReplyPayload =
       text: string;
       displayText?: string;
       attachments?: ComposerAttachment[];
+      annotations?: SessionPromptAnnotation[];
     }
   | {
       kind: 'ask_user_question';
@@ -194,6 +201,7 @@ type QueuedGuidanceMessage = {
   displayText?: string;
   planMode: boolean;
   attachments: ComposerAttachment[];
+  annotations: SessionPromptAnnotation[];
 };
 
 type QueuedGuidanceState = {
@@ -209,6 +217,7 @@ interface WorkspaceNativeSessionViewProps {
   session: NativeSessionSummary;
   initialPrompt?: string | null;
   initialImages?: SessionPromptImage[] | null;
+  initialAnnotations?: SessionPromptAnnotation[] | null;
   seedMessages?: ConversationMessageData[];
   installedSkills?: InstalledSkill[];
   onRefreshSkills?: () => Promise<InstalledSkill[]>;
@@ -231,6 +240,16 @@ const INITIAL_EVENT_REPLAY_LIMIT = 1200;
 const NATIVE_EVENT_CACHE_KEY_PREFIX = 'ccem-workspace-native-events:';
 const NATIVE_EVENT_CACHE_LIMIT = 8000;
 const GUIDANCE_QUEUE_STORAGE_PREFIX = 'ccem:workspace-native-guidance-queue:v1:';
+
+class PromptAnnotationLimitError extends Error {}
+
+function collectQueuedPromptAnnotations(
+  messages: QueuedGuidanceMessage[],
+): SessionPromptAnnotation[] | null {
+  return mergeWorkspacePromptAnnotationBatches(
+    messages.map((message) => message.annotations),
+  );
+}
 
 function guidanceQueueStorageKey(runtimeId: string): string {
   return `${GUIDANCE_QUEUE_STORAGE_PREFIX}${runtimeId}`;
@@ -310,6 +329,12 @@ function normalizeStoredGuidanceQueue(value: unknown): QueuedGuidanceMessage[] {
     ) {
       return [];
     }
+    const annotations = candidate.annotations == null
+      ? []
+      : parseWorkspacePromptAnnotations(candidate.annotations);
+    if (annotations == null) {
+      return [];
+    }
 
     return [{
       id: candidate.id,
@@ -319,6 +344,7 @@ function normalizeStoredGuidanceQueue(value: unknown): QueuedGuidanceMessage[] {
       attachments: candidate.attachments
         .filter(isStoredComposerAttachment)
         .map(makePersistableAttachment),
+      annotations,
     }];
   });
 }
@@ -1288,6 +1314,7 @@ export function WorkspaceNativeSessionView({
   session,
   initialPrompt,
   initialImages,
+  initialAnnotations,
   seedMessages = [],
   installedSkills = [],
   onRefreshSkills,
@@ -1344,17 +1371,9 @@ export function WorkspaceNativeSessionView({
   const [events, setEvents] = useState<SessionEventRecord[]>(() =>
     readCachedNativeEvents(session.runtime_id),
   );
-  const [localUserPrompts, setLocalUserPrompts] = useState<LocalUserPrompt[]>(() => {
-    if (!initialPrompt) {
-      return [];
-    }
-
-    return [{
-      id: 'initial-user',
-      text: initialPrompt,
-      images: initialImages ?? undefined,
-    }];
-  });
+  const [localUserPrompts, setLocalUserPrompts] = useState<LocalUserPrompt[]>(() =>
+    createInitialLocalUserPrompts(initialPrompt, initialImages, initialAnnotations)
+  );
   const [isSending, setIsSending] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isHandingOff, setIsHandingOff] = useState(false);
@@ -1535,9 +1554,11 @@ export function WorkspaceNativeSessionView({
 
   useEffect(() => {
     const cachedEvents = readCachedNativeEvents(session.runtime_id);
-    const initialPrompts = initialPrompt
-      ? [{ id: 'initial-user', text: initialPrompt, images: initialImages ?? undefined }]
-      : [];
+    const initialPrompts = createInitialLocalUserPrompts(
+      initialPrompt,
+      initialImages,
+      initialAnnotations,
+    );
 
     lastSeenSeqRef.current = latestEventSeq(cachedEvents);
     latestEventsRef.current = cachedEvents;
@@ -1561,7 +1582,14 @@ export function WorkspaceNativeSessionView({
     gitSnapshotRequestSeqRef.current += 1;
     setGitSnapshot(null);
     setIsRefreshingGitSnapshot(false);
-  }, [clearComposerDraft, clearFileRewindTimeout, initialImages, initialPrompt, session.runtime_id]);
+  }, [
+    clearComposerDraft,
+    clearFileRewindTimeout,
+    initialAnnotations,
+    initialImages,
+    initialPrompt,
+    session.runtime_id,
+  ]);
 
   useEffect(() => {
     environmentUpdateRequestSeqRef.current += 1;
@@ -2134,6 +2162,10 @@ export function WorkspaceNativeSessionView({
   const sendPromptBatch = useCallback(async (prompts: QueuedGuidanceMessage[]) => {
     const allAttachments = prompts.flatMap((p) => p.attachments);
     const images = extractComposerImagePayloads(allAttachments);
+    const annotations = collectQueuedPromptAnnotations(prompts);
+    if (annotations == null) {
+      throw new PromptAnnotationLimitError();
+    }
     const payload = buildQueuedBatchText(prompts.map((prompt) => ({
       text: prompt.text,
       planMode: prompt.planMode,
@@ -2160,6 +2192,7 @@ export function WorkspaceNativeSessionView({
         : `queue-batch-${Date.now()}`,
       text: previewText,
       images: images.length > 0 ? images : undefined,
+      annotations: annotations.length > 0 ? annotations : undefined,
       timestamp: Date.now(),
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
     };
@@ -2173,6 +2206,7 @@ export function WorkspaceNativeSessionView({
         payload ?? '',
         images.length > 0 ? images : undefined,
         promptEntry.text,
+        annotations.length > 0 ? annotations : undefined,
       );
       await pollEvents();
       await refreshSummary({ force: true });
@@ -2250,6 +2284,7 @@ export function WorkspaceNativeSessionView({
           ? payload.text
           : buildComposerPromptPreview(payload.displayText ?? payload.text, payload.attachments ?? []),
       images: payload.kind === 'text' ? requestImages : undefined,
+      annotations: payload.kind === 'text' ? payload.annotations : undefined,
       timestamp: Date.now(),
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
     };
@@ -2326,7 +2361,13 @@ export function WorkspaceNativeSessionView({
               },
         });
       } else {
-        await sendNativeSessionInput(session.runtime_id, requestText, requestImages, promptEntry.text);
+        await sendNativeSessionInput(
+          session.runtime_id,
+          requestText,
+          requestImages,
+          promptEntry.text,
+          payload.annotations,
+        );
       }
       await pollEvents();
       await refreshSummary({ force: true });
@@ -2481,6 +2522,13 @@ export function WorkspaceNativeSessionView({
     const text = payload?.text ?? composerTextRef.current.trim();
     const displayText = payload?.displayText ?? text;
     const attachments = payload?.attachments ?? [];
+    const annotations = payload?.annotations == null
+      ? []
+      : parseWorkspacePromptAnnotations(payload.annotations);
+    if (annotations == null) {
+      toast.error(t('workspace.messageAnnotationsInvalid'));
+      return false;
+    }
     if (!text && attachments.length === 0) {
       return false;
     }
@@ -2510,7 +2558,12 @@ export function WorkspaceNativeSessionView({
       displayText: promptDisplayText,
       planMode: isCronCommand ? false : composerPlanModeEnabled,
       attachments: isCronCommand ? [] : attachments,
+      annotations: isCronCommand ? [] : annotations,
     });
+    if (collectQueuedPromptAnnotations([...queuedMessages, nextPrompt]) == null) {
+      toast.error(t('workspace.messageAnnotationsBatchLimit'));
+      return false;
+    }
     clearComposerDraft();
     setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
 
@@ -2544,6 +2597,7 @@ export function WorkspaceNativeSessionView({
         text,
         displayText,
         attachments,
+        annotations,
       });
     }
 
@@ -2560,7 +2614,11 @@ export function WorkspaceNativeSessionView({
         return true;
       } catch (error) {
         setQueuedMessages(pendingBatch);
-        toast.error(t('workspace.nativeSendFailed'));
+        toast.error(t(
+          error instanceof PromptAnnotationLimitError
+            ? 'workspace.messageAnnotationsBatchLimit'
+            : 'workspace.nativeSendFailed',
+        ));
         return false;
       }
     }
@@ -2569,7 +2627,11 @@ export function WorkspaceNativeSessionView({
       await sendPromptBatch([nextPrompt]);
       return true;
     } catch (error) {
-      toast.error(t('workspace.nativeSendFailed'));
+      toast.error(t(
+        error instanceof PromptAnnotationLimitError
+          ? 'workspace.messageAnnotationsBatchLimit'
+          : 'workspace.nativeSendFailed',
+      ));
       return false;
     }
   }, [
@@ -2604,6 +2666,10 @@ export function WorkspaceNativeSessionView({
     if (!await waitForPendingEnvironmentUpdate()) {
       return;
     }
+    if (collectQueuedPromptAnnotations(queuedMessages) == null) {
+      toast.error(t('workspace.messageAnnotationsBatchLimit'));
+      return;
+    }
 
     const pendingBatch = queuedMessages;
     setQueuedMessages([]);
@@ -2612,7 +2678,11 @@ export function WorkspaceNativeSessionView({
       await sendPromptBatch(pendingBatch);
     } catch (error) {
       setQueuedMessages((previous) => [...pendingBatch, ...previous]);
-      toast.error(t('workspace.nativeSendFailed'));
+      toast.error(t(
+        error instanceof PromptAnnotationLimitError
+          ? 'workspace.messageAnnotationsBatchLimit'
+          : 'workspace.nativeSendFailed',
+      ));
     }
   }, [
     hasBlockingAttention,

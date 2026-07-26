@@ -363,6 +363,7 @@ impl ExternalControlManager {
                     &params.text,
                     params.display_text.as_deref(),
                     None,
+                    None,
                 )?;
                 Ok(json!({ "ok": true }))
             }
@@ -436,6 +437,7 @@ impl ExternalControlManager {
                     initial_prompt: Some(params.prompt),
                     display_prompt: None,
                     initial_images: None,
+                    initial_annotations: None,
                     provider_session_id: params.provider_session_id,
                     seed_boundary_message_count: None,
                     helper_env_vars: resolved.env_vars.clone(),
@@ -463,6 +465,7 @@ impl ExternalControlManager {
                     initial_prompt: Some(params.prompt),
                     display_prompt: None,
                     initial_images: None,
+                    initial_annotations: None,
                     provider_session_id: params.provider_session_id,
                     seed_boundary_message_count: None,
                     helper_env_vars: proxy_env_vars.clone(),

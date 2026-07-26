@@ -225,6 +225,51 @@ test('stored annotations preserve valid transcript anchors and discard malformed
   assert.equal('anchor' in normalized[1], false);
 });
 
+test('sent annotation snapshots reject overflow instead of silently truncating model context', async () => {
+  const {
+    buildComposerPromptWithAnnotations,
+    mergeWorkspacePromptAnnotationBatches,
+    parseWorkspacePromptAnnotations,
+  } = await importWorkspaceAnnotations();
+  const valid = Array.from({ length: 20 }, (_, index) => ({
+    quote: ` selected text ${index} `,
+    note: ` keep change ${index} `,
+  }));
+
+  const parsed = parseWorkspacePromptAnnotations(valid);
+  assert.equal(parsed.length, 20);
+  assert.deepEqual(parsed[0], {
+    quote: 'selected text 0',
+    note: 'keep change 0',
+  });
+  const modelPrompt = buildComposerPromptWithAnnotations('Continue', parsed);
+  assert.equal(modelPrompt.match(/<annotation index="/g)?.length, 20);
+  assert.match(modelPrompt, /<selected_text>selected text 0<\/selected_text>/);
+  assert.match(modelPrompt, /<note>keep change 19<\/note>/);
+  assert.equal(
+    parseWorkspacePromptAnnotations([
+      ...valid,
+      { quote: 'would be lost', note: 'must block the send instead' },
+    ]),
+    null,
+  );
+  assert.equal(
+    parseWorkspacePromptAnnotations([{ quote: '', note: 'invalid' }]),
+    null,
+  );
+  assert.equal(
+    mergeWorkspacePromptAnnotationBatches([valid.slice(0, 10), valid.slice(10)]).length,
+    20,
+  );
+  assert.equal(
+    mergeWorkspacePromptAnnotationBatches([
+      valid,
+      [{ quote: 'queued overflow', note: 'block before sending' }],
+    ]),
+    null,
+  );
+});
+
 test('live and history workspace paths wire transcript selections into successful composer sends', async () => {
   const [composerSource, liveSource, historySource, detailSource, annotationSource, styleSource] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceSessionComposer.tsx'), 'utf8'),
@@ -235,7 +280,7 @@ test('live and history workspace paths wire transcript selections into successfu
     fs.readFile(path.join(desktopDir, 'src', 'index.css'), 'utf8'),
   ]);
 
-  assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, annotations\)/);
+  assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
   assert.match(composerSource, /if \(result !== false\)[\s\S]*onAnnotationsSent\?\.\(\)/);
   assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.annotations\.length > 0/);
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
