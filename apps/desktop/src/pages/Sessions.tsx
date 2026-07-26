@@ -13,6 +13,11 @@ import {
   isLaunchAlreadyInProgressError,
   launchSingleSession,
 } from '@/components/sessions/sessionLaunchAction';
+import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
+import { useMultiSessionTerminalLaunch } from '@/components/sessions/useMultiSessionTerminalLaunch';
 import { useAppStore, type ArrangeLayout, type LaunchClient, type Session, type UnifiedSession } from '@/store';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
@@ -405,55 +410,14 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
     }
   }, [externalRunningCount, isArranging, getSmartLayout, externalRunningSessions, arrangeSessions, t]);
 
-  // Multi-session launch: serially launch N sessions, then auto-arrange
-  const handleMultiLaunch = useCallback(async (dirs: string[], layout: ArrangeLayout) => {
-    if (dirs.length === 0 || isMultiLaunching) return;
-
-    setIsMultiLaunching(true);
-    let successCount = 0;
-
-    for (const dir of dirs) {
-      try {
-        await launchClaudeCode(dir);
-        successCount++;
-      } catch (err) {
-        console.error(`Failed to launch session for ${dir}:`, err);
-      }
-    }
-
-    // Wait for terminal windows to be ready before arranging
-    if (successCount >= 2) {
-      await new Promise(resolve => setTimeout(resolve, 800));
-
-      try {
-        const allRunning = useAppStore
-          .getState()
-          .sessions
-          .filter((session) => session.status === 'running' && session.terminalType !== 'embedded');
-        if (allRunning.length >= 2) {
-          await arrangeSessions(allRunning.map(s => s.id), layout);
-        }
-        toast.success(
-          t('sessions.multiLaunchSuccess').replace('{count}', String(successCount))
-        );
-      } catch (err) {
-        // Sessions launched but arrange failed — still a partial success
-        toast.success(
-          t('sessions.multiLaunchPartial')
-            .replace('{success}', String(successCount))
-            .replace('{total}', String(dirs.length))
-        );
-      }
-    } else if (successCount > 0) {
-      toast.success(
-        t('sessions.multiLaunchPartial')
-          .replace('{success}', String(successCount))
-          .replace('{total}', String(dirs.length))
-      );
-    }
-
-    setIsMultiLaunching(false);
-  }, [isMultiLaunching, launchClaudeCode, arrangeSessions, t]);
+  const handleMultiLaunch = useMultiSessionTerminalLaunch({
+    isLaunching: isMultiLaunching,
+    setIsLaunching: setIsMultiLaunching,
+    launchSession: launchClaudeCode,
+    openSessionInTerminal: openInteractiveSessionInTerminal,
+    arrangeSessions,
+    t,
+  });
 
   const markLaunchSuccess = useCallback(() => {
     setLaunched(true);
@@ -462,6 +426,28 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
   }, []);
 
   const showLaunchError = useCallback((err: unknown) => {
+    if (isInteractiveSessionTerminalOpenError(err)) {
+      toast.error(
+        t('workspace.terminalSessionCreatedOpenFailed').replace(
+          '{error}',
+          formatInteractiveSessionLaunchError(err.terminalError),
+        ),
+        {
+          action: {
+            label: t('common.retry'),
+            onClick: () => {
+              void openInteractiveSessionInTerminal(err.sessionId)
+                .then(() => toast.success(t('workspace.nativeHandoffDone')))
+                .catch(() => {
+                  // The command hook owns the single retry-failure notification.
+                });
+            },
+          },
+        },
+      );
+      return;
+    }
+
     if (isLaunchAlreadyInProgressError(err)) {
       toast.error(t('sessions.launchAlreadyInProgress'));
       return;
@@ -470,7 +456,7 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
     toast.error(
       t('sessions.launchFailed').replace('{error}', formatSessionLaunchError(err))
     );
-  }, [t]);
+  }, [openInteractiveSessionInTerminal, t]);
 
   // Browse directory and launch single session
   const handleBrowseAndLaunch = useCallback(async () => {

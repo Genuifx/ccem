@@ -88,6 +88,10 @@ import {
 } from '@/components/workspace/workspaceSidebarSessions';
 import { launchWorkspaceTerminalSession } from '@/components/workspace/workspaceTerminalLaunch';
 import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
+import {
   reconcileWorkspaceLiveSessionsSnapshot,
   updateWorkspaceLiveSessionsSnapshot,
   upsertWorkspaceLiveSessionEntry,
@@ -347,6 +351,7 @@ export function Workspace({
     listNativeSessions,
     launchOpenCodeWeb,
     launchClaudeCode,
+    openInteractiveSessionInTerminal,
     searchWorkspaceFiles,
     stopNativeSession,
     generateWorkspaceSessionTitle,
@@ -2041,6 +2046,32 @@ export function Workspace({
     }
   }, [openDirectoryPicker, setSelectedWorkingDir]);
 
+  const showWorkspaceTerminalLaunchError = useCallback((error: unknown) => {
+    if (!isInteractiveSessionTerminalOpenError(error)) {
+      toast.error(t('workspace.nativeHandoffFailed'));
+      return;
+    }
+
+    toast.error(
+      t('workspace.terminalSessionCreatedOpenFailed').replace(
+        '{error}',
+        formatInteractiveSessionLaunchError(error.terminalError),
+      ),
+      {
+        action: {
+          label: t('common.retry'),
+          onClick: () => {
+            void openInteractiveSessionInTerminal(error.sessionId)
+              .then(() => toast.success(t('workspace.nativeHandoffDone')))
+              .catch(() => {
+                // The command hook owns the single retry-failure notification.
+              });
+          },
+        },
+      },
+    );
+  }, [openInteractiveSessionInTerminal, t]);
+
   const handleLaunchComposeTerminal = useCallback(async () => {
     if (isLaunchingComposeTerminal) {
       return;
@@ -2068,7 +2099,7 @@ export function Workspace({
       toast.success(t('workspace.nativeHandoffDone'));
     } catch (error) {
       console.error('Failed to launch workspace terminal session:', error);
-      toast.error(t('workspace.nativeHandoffFailed'));
+      showWorkspaceTerminalLaunchError(error);
     } finally {
       setIsLaunchingComposeTerminal(false);
     }
@@ -2081,6 +2112,7 @@ export function Workspace({
     openDirectoryPicker,
     scheduleWorkspaceRefresh,
     setSelectedWorkingDir,
+    showWorkspaceTerminalLaunchError,
     t,
   ]);
 
@@ -2615,7 +2647,7 @@ export function Workspace({
                             historyEnv,
                           )
                             .then(() => toast.success(t('workspace.nativeHandoffDone')))
-                            .catch(() => toast.error(t('workspace.nativeHandoffFailed')));
+                            .catch(showWorkspaceTerminalLaunchError);
                         }}
                       >
                         <Terminal className="h-4 w-4" />

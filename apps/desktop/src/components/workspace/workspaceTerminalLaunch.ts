@@ -14,7 +14,7 @@ export interface LaunchWorkspaceTerminalSessionOptions {
     client?: LaunchClient,
     envName?: string,
     initialPrompt?: string,
-  ) => Promise<void>;
+  ) => Promise<unknown>;
   onWorkingDirResolved?: (workingDir: string) => void;
   scheduleRefresh?: (delayMs?: number) => void;
 }

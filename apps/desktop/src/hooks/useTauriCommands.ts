@@ -5,6 +5,10 @@ import { useCallback } from 'react';
 import { toast } from 'sonner';
 import { shallow } from 'zustand/shallow';
 import type { SessionStickerId, SessionTaskStage, SessionSubagentsPayload } from '@/features/conversations/types';
+import {
+  formatInteractiveSessionLaunchError,
+  launchInteractiveSession,
+} from '@/lib/interactiveSessionLaunch';
 import type {
   ChannelKind,
   BindSessionToBotRequest,
@@ -476,94 +480,82 @@ export function useTauriCommands() {
     try {
       const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
       const workDir = options.workingDir ?? selectedWorkingDir ?? null;
-      await recordSessionLaunchTrace('create_interactive_session.invoke_start', {
-        trace_id: launchTraceId,
-        client: options.client ?? 'claude',
-        env_name: options.envName ?? currentEnv,
-        perm_mode: options.permMode ?? permissionMode,
-        working_dir: workDir,
-        resume: Boolean(options.resumeSessionId),
-        initial_prompt: Boolean(options.initialPrompt),
-      });
-      const tauriSession = await invoke<TauriSession>('create_interactive_session', {
-        envName: options.envName ?? currentEnv,
-        permMode: options.permMode ?? permissionMode,
-        workingDir: workDir,
-        resumeSessionId: options.resumeSessionId ?? null,
-        client: options.client ?? 'claude',
-        initialPrompt: options.initialPrompt ?? null,
-        launchTraceId,
-      });
-      await recordSessionLaunchTrace('create_interactive_session.invoke_ok', {
-        trace_id: launchTraceId,
-        session_id: tauriSession.id,
-        client: tauriSession.client,
-        terminal_type: tauriSession.terminal_type,
-        tmux_target: tauriSession.tmux_target,
-      });
-      const session = toFrontendSession(tauriSession);
 
-      addSession(session);
-      await recordSessionLaunchTrace('store.add_session.ok', {
-        trace_id: launchTraceId,
-        session_id: session.id,
-        terminal_type: session.terminalType,
-        tmux_target: session.tmuxTarget,
-      });
-
-      // Add to recent projects if a working directory was used
-      if (workDir) {
-        await invoke('add_recent', { path: workDir });
-        await loadAppConfig(); // Refresh store so UI shows the new recent entry
-      }
-
-      setError(null);
-
-      if (session.terminalType === 'embedded') {
-        try {
-          await recordSessionLaunchTrace('open_terminal.start', {
+      return await launchInteractiveSession({
+        traceId: launchTraceId,
+        createStartDetails: {
+          trace_id: launchTraceId,
+          client: options.client ?? 'claude',
+          env_name: options.envName ?? currentEnv,
+          perm_mode: options.permMode ?? permissionMode,
+          working_dir: workDir,
+          resume: Boolean(options.resumeSessionId),
+          initial_prompt: Boolean(options.initialPrompt),
+        },
+        createSession: async () => {
+          const tauriSession = await invoke<TauriSession>('create_interactive_session', {
+            envName: options.envName ?? currentEnv,
+            permMode: options.permMode ?? permissionMode,
+            workingDir: workDir,
+            resumeSessionId: options.resumeSessionId ?? null,
+            client: options.client ?? 'claude',
+            initialPrompt: options.initialPrompt ?? null,
+            launchTraceId,
+          });
+          return toFrontendSession(tauriSession);
+        },
+        describeCreatedSession: (session) => ({
+          session_id: session.id,
+          client: session.client,
+          terminal_type: session.terminalType,
+          tmux_target: session.tmuxTarget,
+        }),
+        onCreateError: (error) => {
+          const clientLabel = options.client === 'codex'
+            ? 'Codex'
+            : options.client === 'opencode'
+              ? 'OpenCode'
+              : 'Claude Code';
+          setError(
+            `Failed to launch ${clientLabel}: `
+            + formatInteractiveSessionLaunchError(error),
+          );
+        },
+        onSessionCreated: async (session) => {
+          addSession(session);
+          await recordSessionLaunchTrace('store.add_session.ok', {
             trace_id: launchTraceId,
             session_id: session.id,
+            terminal_type: session.terminalType,
+            tmux_target: session.tmuxTarget,
           });
+
+          if (workDir) {
+            try {
+              await invoke('add_recent', { path: workDir });
+              await loadAppConfig();
+            } catch (error) {
+              console.error('Failed to refresh recent projects after session creation:', error);
+            }
+          }
+
+          setError(null);
+        },
+        openTerminal: async (sessionId) => {
           await invoke('open_interactive_session_in_terminal', {
-            sessionId: session.id,
+            sessionId,
             terminalType: null,
           });
-          await recordSessionLaunchTrace('open_terminal.ok', {
-            trace_id: launchTraceId,
-            session_id: session.id,
-          });
-          await syncInteractiveSessions();
-        } catch (openErr) {
-          await recordSessionLaunchTrace('open_terminal.error', {
-            trace_id: launchTraceId,
-            session_id: session.id,
-            error: String(openErr),
-          });
-          console.error('Interactive session created but failed to open terminal:', openErr);
-          try {
-            await syncInteractiveSessions();
-          } catch (syncErr) {
-            console.error('Failed to sync sessions after terminal open failure:', syncErr);
-          }
-          toast.error(`Session created, but failed to open terminal: ${openErr}`);
-        }
-      }
-
-      return session;
-    } catch (err) {
-      await recordSessionLaunchTrace('create_interactive_session.invoke_error', {
-        trace_id: launchTraceId,
-        client: options.client ?? 'claude',
-        error: String(err),
+        },
+        syncSessions: syncInteractiveSessions,
+        recordTrace: recordSessionLaunchTrace,
+        onTerminalOpenError: (error) => {
+          console.error('Interactive session created but failed to open terminal:', error);
+        },
+        onSessionSyncError: (error) => {
+          console.error('Failed to sync sessions after terminal open attempt:', error);
+        },
       });
-      const clientLabel = options.client === 'codex'
-        ? 'Codex'
-        : options.client === 'opencode'
-          ? 'OpenCode'
-          : 'Claude Code';
-      setError(`Failed to launch ${clientLabel}: ${err}`);
-      throw err;
     } finally {
       setLoading(false);
     }
@@ -582,8 +574,8 @@ export function useTauriCommands() {
     client: LaunchClient = 'claude',
     envName?: string,
     initialPrompt?: string,
-  ) => {
-    await createInteractiveSession({
+  ): Promise<Session> => {
+    return createInteractiveSession({
       envName: envName ?? undefined,
       workingDir: workingDir ?? null,
       resumeSessionId: resumeSessionId ?? null,
@@ -762,6 +754,7 @@ export function useTauriCommands() {
   const openInteractiveSessionInTerminal = useCallback(async (
     sessionId: string,
     terminalType?: TmuxAttachTerminalType,
+    options: { notifyOnError?: boolean } = {},
   ) => {
     try {
       await invoke('open_interactive_session_in_terminal', {
@@ -775,7 +768,9 @@ export function useTauriCommands() {
       } catch (syncErr) {
         console.error('Failed to sync sessions after terminal open failure:', syncErr);
       }
-      toast.error(`Failed to open session in terminal: ${err}`);
+      if (options.notifyOnError !== false) {
+        toast.error(`Failed to open session in terminal: ${err}`);
+      }
       throw err;
     }
   }, [syncInteractiveSessions]);

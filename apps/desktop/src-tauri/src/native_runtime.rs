@@ -1793,13 +1793,17 @@ impl NativeRuntimeManager {
                     .unwrap_or_default()
             );
             self.update_record(runtime_id, |record| {
-                record.status = if is_recoverable_native_process_exit(record) {
+                let recoverable = is_recoverable_native_process_exit(record);
+                record.status = if recoverable {
                     "interrupted"
                 } else {
                     "error"
                 }
                 .to_string();
                 record.is_active = false;
+                record.pending_handoff_terminal = None;
+                record.can_handoff_to_terminal =
+                    recoverable && terminal::external_terminal_launch_supported();
                 record.updated_at = Utc::now();
                 if record.last_error.is_none() {
                     record.last_error = Some(exit_reason.clone());
@@ -3511,6 +3515,89 @@ mod tests {
         assert_eq!(
             summary.provider_session_id.as_deref(),
             Some("provider-session-2")
+        );
+    }
+
+    #[test]
+    fn pending_handoff_exit_reconnect_session_meta_does_not_launch_old_terminal() {
+        let runtime_id = "native-pending-handoff-exit-reconnect";
+        let manager = manager_with_handle(runtime_id);
+        clear_terminal_launches();
+        manager
+            .update_record(runtime_id, |record| {
+                record.status = "handoff_pending".to_string();
+                record.is_active = true;
+                record.can_handoff_to_terminal = true;
+                record.pending_handoff_terminal =
+                    Some(crate::terminal::TerminalType::TerminalApp);
+            })
+            .expect("set pending handoff");
+        let exited_handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("pending handoff handle")
+            .clone();
+
+        manager
+            .mark_process_exit(runtime_id, Some(1), &exited_handle)
+            .expect("mark pending helper exit");
+
+        let exited = manager.summary_for(runtime_id).expect("exited summary");
+        assert_eq!(exited.status, "error");
+        assert!(!exited.is_active);
+        assert!(!exited.can_handoff_to_terminal);
+        let mut reconnected_record = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("persisted exited record")
+            .clone();
+        assert_eq!(reconnected_record.pending_handoff_terminal, None);
+        assert!(reactivate_record_for_reconnect(&mut reconnected_record));
+        manager
+            .update_record(runtime_id, |record| {
+                *record = reconnected_record.clone();
+            })
+            .expect("persist reconnected record");
+        manager
+            .insert_handle(
+                runtime_id.to_string(),
+                native_session_handle_with_generation(reconnected_record, 2),
+            )
+            .expect("insert reconnected handle");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"provider-session-after-reconnect"}"#,
+            )
+            .expect("process session meta after reconnect");
+
+        assert!(
+            take_terminal_launches().is_empty(),
+            "stale pending handoff must not open a terminal after reconnect"
+        );
+        let summary = manager
+            .summary_for(runtime_id)
+            .expect("reconnected summary");
+        assert_eq!(summary.status, "initializing");
+        assert!(summary.is_active);
+        assert_eq!(
+            summary.provider_session_id.as_deref(),
+            Some("provider-session-after-reconnect")
+        );
+        assert_eq!(
+            manager
+                .records
+                .lock()
+                .expect("records")
+                .get(runtime_id)
+                .expect("reconnected record")
+                .pending_handoff_terminal,
+            None
         );
     }
 
