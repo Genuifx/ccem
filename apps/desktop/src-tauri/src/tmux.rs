@@ -586,6 +586,14 @@ impl TmuxManager {
             return Ok(());
         }
 
+        // Claude can replace its initial tmux window during startup. The
+        // dedicated session is the stable liveness boundary in that race.
+        if let Some((session_name, _)) = target.split_once(':') {
+            if self.target_exists(session_name)? {
+                return Ok(());
+            }
+        }
+
         Err(format!(
             "tmux target {} exited immediately after launch",
             target
@@ -1091,7 +1099,7 @@ fn tmux_integration_test_lock() -> std::sync::MutexGuard<'static, ()> {
     TMUX_INTEGRATION_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("tmux integration test lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn get_user_path() -> &'static str {
@@ -1371,7 +1379,7 @@ mod tests {
                 &session_name,
                 "-n",
                 "main",
-                "sleep 30",
+                "/bin/sleep 30",
             ])
             .status()
             .expect("test tmux session should be created");
@@ -1523,7 +1531,7 @@ mod tests {
                 &session_name,
                 "-n",
                 "main",
-                "sleep 30",
+                "/bin/sleep 30",
             ])
             .output()
             .expect("test tmux session should be created");
@@ -1556,6 +1564,114 @@ mod tests {
             .expect("renamed dedicated session should still resolve");
         assert_eq!(info.target, stable_target);
         assert_eq!(info.window_name, "claude");
+    }
+
+    #[test]
+    fn launch_healthcheck_accepts_live_dedicated_session_after_window_replacement() {
+        let _tmux_guard = tmux_integration_test_lock();
+
+        if TmuxManager::check_tmux_installed().is_err() {
+            return;
+        }
+
+        let runtime_id = format!("session-replace-test-{}", std::process::id());
+        let session_prefix = format!("ccem-replace-test-{}", std::process::id());
+        let session_name = session_name_for_runtime(&runtime_id, &session_prefix);
+
+        let _ = tmux_command().and_then(|mut command| {
+            command
+                .args(["kill-session", "-t", &session_name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|_| ())
+                .map_err(|error| {
+                    format!(
+                        "Failed to clean stale test tmux session {}: {}",
+                        session_name, error
+                    )
+                })
+        });
+
+        let output = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_index}",
+                "-s",
+                &session_name,
+                "-n",
+                "initial",
+                "/bin/sleep 30",
+            ])
+            .output()
+            .expect("test tmux session should be created");
+        assert!(output.status.success());
+
+        struct TmuxSessionGuard {
+            session_name: String,
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = tmux_command().and_then(|mut command| {
+                    command
+                        .args(["kill-session", "-t", &self.session_name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|_| ())
+                        .map_err(|error| {
+                            format!(
+                                "Failed to clean test tmux session {}: {}",
+                                self.session_name, error
+                            )
+                        })
+                });
+            }
+        }
+
+        let _guard = TmuxSessionGuard {
+            session_name: session_name.clone(),
+        };
+        let initial_index = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!initial_index.is_empty());
+        let initial_target = format!("{session_name}:{initial_index}");
+
+        let replacement = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_index}",
+                "-t",
+                &session_name,
+                "-n",
+                "claude",
+                "/bin/sleep 30",
+            ])
+            .output()
+            .expect("replacement tmux window should be created");
+        assert!(replacement.status.success());
+
+        let kill_status = tmux_command()
+            .expect("tmux command should be available")
+            .args(["kill-window", "-t", &initial_target])
+            .status()
+            .expect("initial tmux window should be removed");
+        assert!(kill_status.success());
+
+        let manager = TmuxManager { session_prefix };
+        manager
+            .verify_target_survived_launch(&initial_target)
+            .expect("live dedicated session should survive window replacement");
     }
 
     #[test]

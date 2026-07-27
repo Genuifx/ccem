@@ -1387,7 +1387,7 @@ fn load_claude_history_from_paths_limited_with_provenance_records(
             &mut session_map,
             SOURCE_CLAUDE,
             records,
-            Some(&projects_dir),
+            Some(projects_dir),
         );
     }
     Ok(session_map.into_values().collect())
@@ -2383,7 +2383,7 @@ fn normalize_claude_user_content(content: &serde_json::Value) -> Option<serde_js
                     .cloned(),
             );
 
-            (!normalized.is_empty()).then(|| serde_json::Value::Array(normalized))
+            (!normalized.is_empty()).then_some(serde_json::Value::Array(normalized))
         }
         _ => Some(content.clone()),
     }

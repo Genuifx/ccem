@@ -983,7 +983,6 @@ fn build_client_args(
     }
 
     if let Some(prompt) = initial_prompt {
-        args.push("--prompt".to_string());
         args.push(prompt.to_string());
     }
 
@@ -1040,7 +1039,8 @@ fn diff_capture_snapshot(previous: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        diff_capture_snapshot, normalize_project_dir, project_dirs_match, InteractiveTranscript,
+        build_client_args, diff_capture_snapshot, normalize_project_dir, project_dirs_match,
+        InteractiveTranscript,
     };
     use std::path::PathBuf;
 
@@ -1062,6 +1062,18 @@ mod tests {
         let previous = "line-1\nline-2\n";
         let current = "line-1\nline-2\nline-3\n";
         assert_eq!(diff_capture_snapshot(previous, current), "line-3\n");
+    }
+
+    #[test]
+    fn claude_initial_prompt_is_positional() {
+        assert_eq!(
+            build_client_args("claude", "yolo", None, Some("CCEM_TERMINAL_SMOKE_OK")),
+            vec![
+                "--permission-mode",
+                "bypassPermissions",
+                "CCEM_TERMINAL_SMOKE_OK",
+            ]
+        );
     }
 
     #[cfg(target_os = "macos")]
