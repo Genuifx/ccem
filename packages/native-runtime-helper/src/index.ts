@@ -1964,6 +1964,7 @@ function enqueueClaudePrompt(text: string, images?: PromptImage[] | null) {
   resetClaudeTurnTracking();
   claudeInputQueue.push({
     type: 'user',
+    origin: { kind: 'human' },
     message: {
       role: 'user',
       content,

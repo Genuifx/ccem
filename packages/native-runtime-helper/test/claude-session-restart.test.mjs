@@ -26,6 +26,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
   const reportModelState = options.reportModelState ?? false;
   const keepAliveAfterResult = options.keepAliveAfterResult ?? false;
   const endFirstTurnWithoutResult = options.endFirstTurnWithoutResult ?? false;
+  const assertHumanPromptOrigin = options.assertHumanPromptOrigin ?? false;
 
   await build({
     entryPoints: [path.join(packageDir, 'src', 'index.ts')],
@@ -72,6 +73,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const reportModelState = ${JSON.stringify(reportModelState)};
             const keepAliveAfterResult = ${JSON.stringify(keepAliveAfterResult)};
             const endFirstTurnWithoutResult = ${JSON.stringify(endFirstTurnWithoutResult)};
+            const assertHumanPromptOrigin = ${JSON.stringify(assertHumanPromptOrigin)};
             let queryCount = 0;
             let setModelCalled = false;
             export function query({ prompt, options }) {
@@ -114,6 +116,9 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                   while (!closed) {
                     const next = await iterator.next();
                     if (closed || next.done) return;
+                    if (assertHumanPromptOrigin && next.value?.origin?.kind !== 'human') {
+                      throw new Error('expected SDK prompt origin.kind to be human');
+                    }
                     localTurn += 1;
                     const responseNumber = (interruptible && !interruptHangs) || keepAliveAfterResult ? localTurn : turn;
                     const text = reportModelState
@@ -229,8 +234,10 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-test('restarts Claude query after a completed turn so later prompts are consumed', async (t) => {
-  const helperPath = await buildHelperWithMockClaudeSdk();
+test('restarts Claude query and marks each desktop prompt as human-originated', async (t) => {
+  const helperPath = await buildHelperWithMockClaudeSdk({
+    assertHumanPromptOrigin: true,
+  });
   const helper = spawn(process.execPath, [helperPath], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
