@@ -32,6 +32,7 @@ type EventHandlerDeps = {
   readSegmentsFromDOM: () => Segment[]
   onChange: (segments: Segment[]) => void
   renderSegmentsToDOM: (segments: Segment[]) => void
+  reconcileCompositionEnd: () => void
   runTriggerDetection: () => void
   dismissTrigger: () => void
   triggers: TriggerConfig[]
@@ -104,6 +105,7 @@ export function usePromptAreaEvents(deps: EventHandlerDeps): PromptAreaEventHand
     readSegmentsFromDOM,
     onChange,
     renderSegmentsToDOM,
+    reconcileCompositionEnd,
     runTriggerDetection,
     dismissTrigger,
     triggers,
@@ -360,9 +362,10 @@ export function usePromptAreaEvents(deps: EventHandlerDeps): PromptAreaEventHand
   const handleCompositionEnd = useCallback(() => {
     isComposing.current = false
     compositionEndTime.current = Date.now() // Record when composition ended
+    reconcileCompositionEnd()
     // Run trigger detection after composition ends
     runTriggerDetection()
-  }, [runTriggerDetection])
+  }, [reconcileCompositionEnd, runTriggerDetection])
 
   // -----------------------------------------------------------------------
   // Blur: dismiss trigger dropdown with delay (so popover clicks work)

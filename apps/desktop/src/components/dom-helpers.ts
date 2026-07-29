@@ -204,6 +204,28 @@ export function unwrapBlockElement(parent: HTMLElement, block: HTMLElement): voi
 }
 
 /**
+ * Moves user text accidentally inserted into an internal prompt-area sentinel
+ * back into a normal editable text node. Empty sentinels stay in place because
+ * they preserve the visible line after a trailing newline.
+ */
+export function normalizePromptAreaSentinels(editor: HTMLElement): boolean {
+  let changed = false
+
+  for (let i = editor.childNodes.length - 1; i >= 0; i--) {
+    const child = editor.childNodes[i]
+    if (!isPromptAreaSentinel(child)) continue
+
+    const userText = getPromptAreaSentinelUserText(child)
+    if (userText) {
+      editor.replaceChild(document.createTextNode(userText), child)
+      changed = true
+    }
+  }
+
+  return changed
+}
+
+/**
  * Normalizes the editor DOM after browser mutations.
  *
  * Browsers insert various wrapper elements on Enter/paste:
@@ -217,7 +239,7 @@ export function unwrapBlockElement(parent: HTMLElement, block: HTMLElement): voi
  * - Chip <span> elements (with data-chip-trigger)
  */
 export function normalizeEditorDOM(editor: HTMLElement): boolean {
-  let changed = false
+  let changed = normalizePromptAreaSentinels(editor)
   const blockTags = new Set(['DIV', 'P', 'SECTION', 'ARTICLE', 'BLOCKQUOTE'])
 
   // Iterate backwards since we're modifying the DOM
@@ -227,14 +249,7 @@ export function normalizeEditorDOM(editor: HTMLElement): boolean {
     // Skip non-element nodes, chip elements, sentinels, and BR elements
     if (!(child instanceof HTMLElement)) continue
     if (child.dataset.chipTrigger !== undefined) continue
-    if (isPromptAreaSentinel(child)) {
-      const userText = getPromptAreaSentinelUserText(child)
-      if (userText) {
-        editor.replaceChild(document.createTextNode(userText), child)
-        changed = true
-      }
-      continue
-    }
+    if (isPromptAreaSentinel(child)) continue
     if (child instanceof HTMLBRElement) continue
 
     const tag = child.tagName
