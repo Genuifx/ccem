@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf; // 文件锁支持
 use std::process::Command;
+use std::sync::Mutex;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EnvConfig {
@@ -38,6 +43,12 @@ pub struct EnvConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub subagent_model: Option<String>,
+    #[serde(
+        rename = "CCEM_LIMIT_WRITE_TOOLS",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub limit_write_tools: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -60,6 +71,8 @@ struct RawEnvConfig {
     small_fast_model: Option<String>,
     #[serde(rename = "CLAUDE_CODE_SUBAGENT_MODEL", default)]
     subagent_model: Option<String>,
+    #[serde(rename = "CCEM_LIMIT_WRITE_TOOLS", default)]
+    limit_write_tools: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +80,7 @@ pub struct ResolvedClaudeEnv {
     pub env_name: String,
     pub env_vars: HashMap<String, String>,
     pub upstream_base_url: Option<String>,
+    pub limit_write_tools: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +96,7 @@ pub struct ResolvedCodexRuntime {
     pub env_vars: HashMap<String, String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub limit_write_tools: bool,
 }
 
 pub const OPENCODE_NATIVE_ENV_NAME: &str = "OpenCode Native";
@@ -120,6 +135,7 @@ fn default_official_env() -> EnvConfig {
         default_haiku_model: Some("claude-3-5-haiku-20241022".to_string()),
         model: Some("opus".to_string()),
         subagent_model: None,
+        limit_write_tools: false,
     }
 }
 
@@ -176,6 +192,7 @@ fn normalize_env_config(raw: RawEnvConfig) -> EnvConfig {
             "opus".to_string()
         }),
         subagent_model: raw.subagent_model,
+        limit_write_tools: raw.limit_write_tools,
     }
 }
 
@@ -585,6 +602,7 @@ pub fn get_env_with_decrypted_key(env: &EnvConfig) -> Result<EnvConfig, String> 
         default_haiku_model: env.default_haiku_model.clone(),
         model: env.model.clone(),
         subagent_model: env.subagent_model.clone(),
+        limit_write_tools: env.limit_write_tools,
     })
 }
 
@@ -636,6 +654,7 @@ pub fn resolve_claude_env(env_name: &str) -> Result<ResolvedClaudeEnv, String> {
         env_name: env_name.to_string(),
         env_vars,
         upstream_base_url,
+        limit_write_tools: env_config.limit_write_tools,
     })
 }
 
@@ -679,11 +698,13 @@ pub fn resolve_codex_runtime(env_name: &str) -> Result<ResolvedCodexRuntime, Str
             env_vars: HashMap::new(),
             base_url: None,
             api_key: None,
+            limit_write_tools: false,
         });
     }
 
     let cfg = read_config()?;
-    cfg.registries
+    let env_config = cfg
+        .registries
         .get(env_name)
         .ok_or_else(|| format!("Environment '{}' does not exist", env_name))?;
 
@@ -692,6 +713,7 @@ pub fn resolve_codex_runtime(env_name: &str) -> Result<ResolvedCodexRuntime, Str
         env_vars: HashMap::new(),
         base_url: None,
         api_key: None,
+        limit_write_tools: env_config.limit_write_tools,
     })
 }
 
@@ -809,6 +831,8 @@ pub fn get_default_working_dir() -> Option<String> {
 pub struct DesktopSettings {
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(rename = "autoStart", default)]
     pub auto_start: bool,
     #[serde(rename = "startMinimized", default)]
@@ -908,6 +932,7 @@ impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            language: None,
             auto_start: false,
             start_minimized: false,
             close_to_tray: default_close_to_tray(),
@@ -943,11 +968,32 @@ pub fn read_settings() -> Result<DesktopSettings, String> {
     serde_json::from_str(&content).map_err(|e| format!("Failed to parse settings: {}", e))
 }
 
-pub fn write_settings(settings: &DesktopSettings) -> Result<(), String> {
+static DESKTOP_SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn write_settings_unlocked(settings: &DesktopSettings) -> Result<(), String> {
     ensure_ccem_dir().map_err(|e| format!("Failed to create config dir: {}", e))?;
     let content = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     fs::write(get_settings_path(), content).map_err(|e| format!("Failed to write settings: {}", e))
+}
+
+pub fn write_settings(settings: &DesktopSettings) -> Result<(), String> {
+    let _guard = DESKTOP_SETTINGS_WRITE_LOCK
+        .lock()
+        .map_err(|_| "Desktop settings write lock is poisoned".to_string())?;
+    write_settings_unlocked(settings)
+}
+
+pub fn update_settings(
+    update: impl FnOnce(&mut DesktopSettings),
+) -> Result<DesktopSettings, String> {
+    let _guard = DESKTOP_SETTINGS_WRITE_LOCK
+        .lock()
+        .map_err(|_| "Desktop settings write lock is poisoned".to_string())?;
+    let mut settings = read_settings()?;
+    update(&mut settings);
+    write_settings_unlocked(&settings)?;
+    Ok(settings)
 }
 
 /// Inject the appropriate AI environment variables into a Command.
@@ -1012,6 +1058,7 @@ pub fn create_env_with_encrypted_key(
         default_haiku_model,
         model: runtime_model.or_else(|| Some("opus".to_string())),
         subagent_model,
+        limit_write_tools: false,
     })
 }
 
@@ -1020,8 +1067,9 @@ mod tests {
     use super::{
         build_claude_env_vars, build_opencode_config_content, create_env_with_encrypted_key,
         default_official_env, env_config_to_process_env, get_env_with_decrypted_key, inject_ai_env,
-        recover_config_from_legacy, resolve_env_config_for_runtime, resolve_opencode_primary_model,
-        resolve_opencode_runtime, write_config, CcemConfig, EnvConfig, OPENCODE_NATIVE_ENV_NAME,
+        normalize_env_config, recover_config_from_legacy, resolve_env_config_for_runtime,
+        resolve_opencode_primary_model, resolve_opencode_runtime, write_config, CcemConfig,
+        EnvConfig, RawEnvConfig, OPENCODE_NATIVE_ENV_NAME,
     };
     use std::collections::HashMap;
     use std::env;
@@ -1073,6 +1121,7 @@ mod tests {
             default_haiku_model: Some("claude-3-5-haiku-20241022".to_string()),
             model: Some("opus".to_string()),
             subagent_model: None,
+            limit_write_tools: false,
         }
     }
 
@@ -1086,6 +1135,7 @@ mod tests {
             default_haiku_model: Some("claude-haiku-test".to_string()),
             model: Some("claude-sonnet-test".to_string()),
             subagent_model: Some("claude-subagent-test".to_string()),
+            limit_write_tools: false,
         };
 
         let (env_vars, upstream_base_url) = env_config_to_process_env(&env);
@@ -1121,6 +1171,19 @@ mod tests {
                 .map(String::as_str),
             Some("claude-subagent-test")
         );
+    }
+
+    #[test]
+    fn write_tool_limit_is_backward_compatible_and_persists_when_enabled() {
+        let raw: RawEnvConfig =
+            serde_json::from_str(r#"{"ANTHROPIC_BASE_URL":"https://example.com/anthropic"}"#)
+                .expect("parse legacy environment");
+        assert!(!normalize_env_config(raw).limit_write_tools);
+
+        let mut env = default_official_env();
+        env.limit_write_tools = true;
+        let serialized = serde_json::to_value(&env).expect("serialize environment");
+        assert_eq!(serialized["CCEM_LIMIT_WRITE_TOOLS"], true);
     }
 
     #[test]
@@ -1232,6 +1295,7 @@ mod tests {
             default_haiku_model: None,
             model: Some("opus".to_string()),
             subagent_model: None,
+            limit_write_tools: false,
         };
 
         let error = get_env_with_decrypted_key(&env).expect_err("tampered v2 token should fail");
@@ -1257,6 +1321,7 @@ mod tests {
                 default_haiku_model: None,
                 model: Some("opus".to_string()),
                 subagent_model: None,
+                limit_write_tools: false,
             },
         );
         write_config(&CcemConfig {
@@ -1294,6 +1359,7 @@ mod tests {
                 default_haiku_model: None,
                 model: Some("opus".to_string()),
                 subagent_model: None,
+                limit_write_tools: false,
             },
         );
         let mut current = CcemConfig {
@@ -1313,6 +1379,7 @@ mod tests {
                 default_haiku_model: Some("glm-4.5-air".to_string()),
                 model: Some("opus".to_string()),
                 subagent_model: None,
+                limit_write_tools: false,
             },
         );
         let legacy = CcemConfig {
@@ -1344,6 +1411,7 @@ mod tests {
             default_haiku_model: Some("claude-haiku-test".to_string()),
             model: Some("sonnet".to_string()),
             subagent_model: None,
+            limit_write_tools: false,
         };
 
         let content = build_opencode_config_content(&env).expect("overlay content");
@@ -1393,6 +1461,7 @@ mod tests {
             default_haiku_model: Some("claude-haiku-test".to_string()),
             model: Some("haiku".to_string()),
             subagent_model: None,
+            limit_write_tools: false,
         };
 
         assert_eq!(
@@ -1410,6 +1479,42 @@ mod desktop_pet_settings_tests {
     fn desktop_pet_setting_defaults_to_disabled() {
         let settings = DesktopSettings::default();
         assert!(!settings.desktop_pet_enabled);
+    }
+
+    #[test]
+    fn missing_language_is_preserved_for_legacy_migration() {
+        let settings = DesktopSettings::default();
+        assert_eq!(settings.language, None);
+
+        let serialized = serde_json::to_value(&settings).expect("settings serialize");
+        assert!(serialized.get("language").is_none());
+
+        let legacy: DesktopSettings = serde_json::from_str(
+            r#"{
+                "theme": "system",
+                "autoStart": false,
+                "startMinimized": false,
+                "closeToTray": true
+            }"#,
+        )
+        .expect("settings deserialize");
+        assert_eq!(legacy.language, None);
+    }
+
+    #[test]
+    fn language_uses_the_existing_json_field_when_present() {
+        let settings: DesktopSettings = serde_json::from_str(
+            r#"{
+                "theme": "system",
+                "language": "en",
+                "autoStart": false,
+                "startMinimized": false,
+                "closeToTray": true
+            }"#,
+        )
+        .expect("settings deserialize");
+
+        assert_eq!(settings.language.as_deref(), Some("en"));
     }
 
     #[test]

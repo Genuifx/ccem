@@ -74,6 +74,7 @@ use config::{
     JetBrainsProject, RecentProject, VSCodeProject,
 };
 use cron::{start_cron_scheduler, CronScheduler};
+use event_bus::SessionPromptAnnotation;
 use event_dispatcher::EventDispatcher;
 use external_control::ExternalControlManager;
 use history::{
@@ -313,6 +314,7 @@ fn add_environment(
     default_haiku_model: Option<String>,
     runtime_model: Option<String>,
     subagent_model: Option<String>,
+    limit_write_tools: Option<bool>,
 ) -> Result<(), String> {
     let mut cfg = config::read_config()?;
 
@@ -320,7 +322,7 @@ fn add_environment(
         return Err(format!("Environment '{}' already exists", name));
     }
 
-    let env_config = create_env_with_encrypted_key(
+    let mut env_config = create_env_with_encrypted_key(
         Some(base_url),
         auth_token,
         Some(default_opus_model),
@@ -329,6 +331,7 @@ fn add_environment(
         runtime_model,
         subagent_model,
     )?;
+    env_config.limit_write_tools = limit_write_tools.unwrap_or(false);
 
     cfg.registries.insert(name, env_config);
     config::write_config(&cfg)
@@ -345,6 +348,7 @@ fn update_environment(
     default_haiku_model: Option<String>,
     runtime_model: Option<String>,
     subagent_model: Option<String>,
+    limit_write_tools: Option<bool>,
 ) -> Result<(), String> {
     let mut cfg = config::read_config()?;
 
@@ -357,7 +361,12 @@ fn update_environment(
         return Err(format!("Environment '{}' already exists", name));
     }
 
-    let env_config = create_env_with_encrypted_key(
+    let previous_limit_write_tools = cfg
+        .registries
+        .get(&old_name)
+        .map(|env| env.limit_write_tools)
+        .unwrap_or(false);
+    let mut env_config = create_env_with_encrypted_key(
         Some(base_url),
         auth_token,
         Some(default_opus_model),
@@ -366,6 +375,7 @@ fn update_environment(
         runtime_model,
         subagent_model,
     )?;
+    env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
 
     // Remove old key if renamed
     if old_name != name {
@@ -1197,6 +1207,16 @@ fn debug_compare_sessions(
     unified_state.debug_compare_sessions()
 }
 
+const WRITE_TOOL_LIMIT_SYSTEM_TIP: &str = "请注意分片写入，不要一次性写入太多内容到文件中，Write/Edit 失败 → 不要重试相同内容 → 改用更小的分块";
+
+fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: bool) -> String {
+    if !limit_write_tools {
+        return initial_prompt.to_string();
+    }
+
+    format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{initial_prompt}")
+}
+
 #[tauri::command]
 async fn create_native_session(
     app: tauri::AppHandle,
@@ -1209,6 +1229,7 @@ async fn create_native_session(
     initial_prompt: String,
     initial_display_prompt: Option<String>,
     initial_images: Option<Vec<PromptImage>>,
+    initial_annotations: Option<Vec<SessionPromptAnnotation>>,
     provider_session_id: Option<String>,
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
@@ -1230,9 +1251,13 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode.clone(),
                 working_dir: effective_working_dir,
-                initial_prompt: Some(initial_prompt),
+                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                    &initial_prompt,
+                    resolved.limit_write_tools,
+                )),
                 display_prompt: initial_display_prompt.clone(),
                 initial_images: initial_images.clone(),
+                initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
                 seed_boundary_message_count,
                 helper_env_vars: resolved.env_vars.clone(),
@@ -1257,9 +1282,13 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode,
                 working_dir: effective_working_dir,
-                initial_prompt: Some(initial_prompt),
+                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                    &initial_prompt,
+                    resolved.limit_write_tools,
+                )),
                 display_prompt: initial_display_prompt.clone(),
                 initial_images: initial_images.clone(),
+                initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
                 seed_boundary_message_count,
                 helper_env_vars: proxy_env_vars.clone(),
@@ -1310,6 +1339,7 @@ fn send_native_session_input(
     text: String,
     display_text: Option<String>,
     images: Option<Vec<PromptImage>>,
+    annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
     native_state.send_user_message(
         &app,
@@ -1317,6 +1347,7 @@ fn send_native_session_input(
         &text,
         display_text.as_deref(),
         images.as_ref(),
+        annotations.as_ref(),
     )
 }
 
@@ -1341,6 +1372,7 @@ fn respond_native_session_prompt(
     display_text: Option<String>,
     answers: HashMap<String, String>,
     annotations: Option<HashMap<String, InteractivePromptAnnotation>>,
+    prompt_annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
     native_state.respond_to_prompt(
         &app,
@@ -1350,6 +1382,7 @@ fn respond_native_session_prompt(
         display_text.as_deref(),
         &answers,
         annotations.as_ref(),
+        prompt_annotations.as_ref(),
     )
 }
 
@@ -2844,6 +2877,8 @@ struct RemoteEnvConfig {
     small_fast_model: Option<String>,
     #[serde(rename = "CLAUDE_CODE_SUBAGENT_MODEL")]
     subagent_model: Option<String>,
+    #[serde(rename = "CCEM_LIMIT_WRITE_TOOLS", default)]
+    limit_write_tools: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3001,7 +3036,7 @@ fn load_from_remote(url: String, key: String, secret: String) -> Result<LoadResu
             "opus".to_string()
         });
 
-        let env_config = create_env_with_encrypted_key(
+        let mut env_config = create_env_with_encrypted_key(
             env.base_url,
             env.auth_token.or(env.api_key),
             default_opus_model,
@@ -3010,6 +3045,7 @@ fn load_from_remote(url: String, key: String, secret: String) -> Result<LoadResu
             runtime_model,
             env.subagent_model,
         )?;
+        env_config.limit_write_tools = env.limit_write_tools;
 
         cfg.registries.insert(final_name.clone(), env_config);
         loaded.push(LoadedEnv {
@@ -3061,6 +3097,33 @@ fn get_settings(app: tauri::AppHandle) -> Result<DesktopSettings, String> {
     Ok(settings)
 }
 
+fn merge_settings_page_update(
+    mut current: DesktopSettings,
+    update: DesktopSettings,
+) -> DesktopSettings {
+    current.theme = update.theme;
+    // Language has a dedicated, serialized command. Generic settings saves must
+    // never carry an unconfirmed locale change into the backend.
+    current.auto_start = update.auto_start;
+    current.start_minimized = update.start_minimized;
+    current.close_to_tray = update.close_to_tray;
+    current.desktop_pet_enabled = update.desktop_pet_enabled;
+    current.default_mode = update.default_mode;
+    current.performance_mode = update.performance_mode;
+    current.desktop_notifications_enabled = update.desktop_notifications_enabled;
+    current.notify_on_task_completed = update.notify_on_task_completed;
+    current.notify_on_task_failed = update.notify_on_task_failed;
+    current.notify_on_action_required = update.notify_on_action_required;
+    current.ai_enhanced = update.ai_enhanced;
+    current.ai_env_name = update.ai_env_name;
+    // Only overwrite enablement when the payload explicitly includes it.
+    // Settings page saves omit this field; environment page writes include it.
+    if update.enabled_environments.is_some() {
+        current.enabled_environments = update.enabled_environments;
+    }
+    current
+}
+
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
@@ -3093,26 +3156,9 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
     // Save desktop-specific settings to settings.json.
     // Merge fields that are not part of the Settings page payload to avoid resetting
     // proxy-debug config when users change unrelated options.
-    let mut merged_settings = config::read_settings().unwrap_or_default();
-    merged_settings.theme = settings.theme;
-    merged_settings.auto_start = settings.auto_start;
-    merged_settings.start_minimized = settings.start_minimized;
-    merged_settings.close_to_tray = settings.close_to_tray;
-    merged_settings.desktop_pet_enabled = settings.desktop_pet_enabled;
-    merged_settings.default_mode = settings.default_mode;
-    merged_settings.performance_mode = settings.performance_mode;
-    merged_settings.desktop_notifications_enabled = settings.desktop_notifications_enabled;
-    merged_settings.notify_on_task_completed = settings.notify_on_task_completed;
-    merged_settings.notify_on_task_failed = settings.notify_on_task_failed;
-    merged_settings.notify_on_action_required = settings.notify_on_action_required;
-    merged_settings.ai_enhanced = settings.ai_enhanced;
-    merged_settings.ai_env_name = settings.ai_env_name;
-    // Only overwrite enablement when the payload explicitly includes it.
-    // Settings page saves omit this field; environment page writes include it.
-    if settings.enabled_environments.is_some() {
-        merged_settings.enabled_environments = settings.enabled_environments;
-    }
-    config::write_settings(&merged_settings)?;
+    let merged_settings = config::update_settings(move |current| {
+        *current = merge_settings_page_update(current.clone(), settings);
+    })?;
     if let Err(e) =
         pet_window::sync_pet_window_visibility(&app, merged_settings.desktop_pet_enabled)
     {
@@ -3120,7 +3166,7 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
     }
     if let Some(notification_prefs_state) = app.try_state::<notifications::NotificationPrefsState>()
     {
-        notification_prefs_state.replace_from_settings(&merged_settings);
+        notification_prefs_state.replace_preferences_from_settings(&merged_settings);
     }
 
     #[cfg(target_os = "macos")]
@@ -3136,6 +3182,83 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
         Ok(())
     } else {
         Err(format!("Partial save failures: {}", errors.join("; ")))
+    }
+}
+
+#[tauri::command]
+fn save_language(app: tauri::AppHandle, language: String) -> Result<(), String> {
+    let language = match language.as_str() {
+        "zh" => "zh",
+        "en" => "en",
+        _ => return Err("language must be either zh or en".to_string()),
+    };
+    let settings = config::update_settings(|settings| {
+        settings.language = Some(language.to_string());
+    })?;
+
+    if let Some(notification_prefs_state) = app.try_state::<notifications::NotificationPrefsState>()
+    {
+        notification_prefs_state.replace_language_from_settings(&settings);
+    }
+    Ok(())
+}
+
+fn apply_enabled_environments_update(settings: &mut DesktopSettings, names: Option<Vec<String>>) {
+    settings.enabled_environments = names;
+}
+
+#[tauri::command]
+fn save_enabled_environments(names: Option<Vec<String>>) -> Result<(), String> {
+    config::update_settings(|settings| {
+        apply_enabled_environments_update(settings, names);
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod desktop_settings_command_tests {
+    use super::{apply_enabled_environments_update, merge_settings_page_update, DesktopSettings};
+
+    #[test]
+    fn generic_settings_save_preserves_backend_owned_language() {
+        let current = DesktopSettings {
+            language: Some("en".to_string()),
+            ..DesktopSettings::default()
+        };
+        let update = DesktopSettings {
+            language: Some("zh".to_string()),
+            theme: "dark".to_string(),
+            ..DesktopSettings::default()
+        };
+
+        let merged = merge_settings_page_update(current, update);
+
+        assert_eq!(merged.language.as_deref(), Some("en"));
+        assert_eq!(merged.theme, "dark");
+    }
+
+    #[test]
+    fn enabled_environment_update_preserves_unrelated_settings() {
+        let mut settings = DesktopSettings {
+            theme: "dark".to_string(),
+            language: Some("en".to_string()),
+            close_to_tray: false,
+            enabled_environments: Some(vec!["old".to_string()]),
+            ..DesktopSettings::default()
+        };
+
+        apply_enabled_environments_update(
+            &mut settings,
+            Some(vec!["official".to_string(), "staging".to_string()]),
+        );
+
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.language.as_deref(), Some("en"));
+        assert!(!settings.close_to_tray);
+        assert_eq!(
+            settings.enabled_environments,
+            Some(vec!["official".to_string(), "staging".to_string()])
+        );
     }
 }
 
@@ -5321,6 +5444,8 @@ pub fn run_desktop_app() -> i32 {
             set_default_working_dir,
             get_settings,
             save_settings,
+            save_language,
+            save_enabled_environments,
             send_test_notification,
             get_telegram_settings,
             get_wecom_settings,
@@ -5695,7 +5820,8 @@ mod tests {
     use super::{
         build_remote_load_args, build_remote_load_stdin_payload, media_kind_for_extension,
         merge_git_numstat, normalize_git_changed_path, parse_git_status_line,
-        WorkspaceGitChangedFile,
+        prepend_write_tool_limit_system_tip, RemoteEnvConfig, WorkspaceGitChangedFile,
+        WRITE_TOOL_LIMIT_SYSTEM_TIP,
     };
     use std::collections::HashMap;
 
@@ -5709,6 +5835,25 @@ mod tests {
     fn test_launch_claude_code_validates_env() {
         // 这个测试需要完整的 Tauri 上下文，暂时跳过
         // 实际测试应该在集成测试中进行
+    }
+
+    #[test]
+    fn write_tool_limit_tip_is_prefixed_only_when_enabled() {
+        let prompt = "Update the configuration";
+        assert_eq!(
+            prepend_write_tool_limit_system_tip(prompt, true),
+            format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{prompt}"),
+        );
+        assert_eq!(prepend_write_tool_limit_system_tip(prompt, false), prompt);
+    }
+
+    #[test]
+    fn remote_write_tool_limit_defaults_to_disabled_and_reads_enabled_value() {
+        let legacy: RemoteEnvConfig = serde_json::from_str("{}").expect("parse legacy remote env");
+        assert!(!legacy.limit_write_tools);
+        let enabled: RemoteEnvConfig = serde_json::from_str(r#"{"CCEM_LIMIT_WRITE_TOOLS":true}"#)
+            .expect("parse enabled remote env");
+        assert!(enabled.limit_write_tools);
     }
 
     // -----------------------------------------------------------------

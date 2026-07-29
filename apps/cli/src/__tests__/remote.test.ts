@@ -282,18 +282,32 @@ describe('remote', () => {
       // Server encrypts with its own SECRET (not with the access key)
       const encrypted = encryptWithSecret(payload, SERVER_SECRET);
 
-      // Client must decrypt with SERVER_SECRET, not ACCESS_KEY
-      expect(() => decryptWithSecret(encrypted, ACCESS_KEY)).toThrow();
-      const decrypted = decryptWithSecret(encrypted, SERVER_SECRET);
+      // Legacy v1 CBC is unauthenticated: a wrong key can occasionally
+      // produce garbage instead of throwing on PKCS#7 padding. It must
+      // never recover the server payload.
+      let decryptedWithAccessKey: string | undefined;
+      try {
+        decryptedWithAccessKey = realDecryptWithSecret(encrypted, ACCESS_KEY);
+      } catch {
+        // Wrong-key padding failures are also expected for v1.
+      }
+      expect(decryptedWithAccessKey).not.toBe(payload);
+      const decrypted = realDecryptWithSecret(encrypted, SERVER_SECRET);
       expect(JSON.parse(decrypted)).toEqual(JSON.parse(payload));
     });
 
-    it('should fail when using access key to decrypt server-encrypted payload', () => {
+    it('should not recover a server-encrypted payload with an access key', () => {
       const SERVER_SECRET = 'server-encryption-secret';
-      const encrypted = encryptWithSecret('{"environments":{}}', SERVER_SECRET);
+      const payload = '{"environments":{}}';
+      const encrypted = encryptWithSecret(payload, SERVER_SECRET);
 
-      // Access key is different from encryption secret — decryption must fail
-      expect(() => decryptWithSecret(encrypted, 'different-access-key')).toThrow();
+      let decryptedWithAccessKey: string | undefined;
+      try {
+        decryptedWithAccessKey = realDecryptWithSecret(encrypted, 'different-access-key');
+      } catch {
+        // Wrong-key padding failures are also expected for v1.
+      }
+      expect(decryptedWithAccessKey).not.toBe(payload);
     });
   });
 

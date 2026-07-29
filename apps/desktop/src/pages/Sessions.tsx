@@ -10,9 +10,15 @@ import {
 import { resolveSessionCloseAction } from '@/components/sessions/sessionCloseActions';
 import {
   formatSessionLaunchError,
+  getSessionCommandExitDetails,
   isLaunchAlreadyInProgressError,
   launchSingleSession,
 } from '@/components/sessions/sessionLaunchAction';
+import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
+import { useMultiSessionTerminalLaunch } from '@/components/sessions/useMultiSessionTerminalLaunch';
 import { useAppStore, type ArrangeLayout, type LaunchClient, type Session, type UnifiedSession } from '@/store';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
@@ -405,55 +411,14 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
     }
   }, [externalRunningCount, isArranging, getSmartLayout, externalRunningSessions, arrangeSessions, t]);
 
-  // Multi-session launch: serially launch N sessions, then auto-arrange
-  const handleMultiLaunch = useCallback(async (dirs: string[], layout: ArrangeLayout) => {
-    if (dirs.length === 0 || isMultiLaunching) return;
-
-    setIsMultiLaunching(true);
-    let successCount = 0;
-
-    for (const dir of dirs) {
-      try {
-        await launchClaudeCode(dir);
-        successCount++;
-      } catch (err) {
-        console.error(`Failed to launch session for ${dir}:`, err);
-      }
-    }
-
-    // Wait for terminal windows to be ready before arranging
-    if (successCount >= 2) {
-      await new Promise(resolve => setTimeout(resolve, 800));
-
-      try {
-        const allRunning = useAppStore
-          .getState()
-          .sessions
-          .filter((session) => session.status === 'running' && session.terminalType !== 'embedded');
-        if (allRunning.length >= 2) {
-          await arrangeSessions(allRunning.map(s => s.id), layout);
-        }
-        toast.success(
-          t('sessions.multiLaunchSuccess').replace('{count}', String(successCount))
-        );
-      } catch (err) {
-        // Sessions launched but arrange failed — still a partial success
-        toast.success(
-          t('sessions.multiLaunchPartial')
-            .replace('{success}', String(successCount))
-            .replace('{total}', String(dirs.length))
-        );
-      }
-    } else if (successCount > 0) {
-      toast.success(
-        t('sessions.multiLaunchPartial')
-          .replace('{success}', String(successCount))
-          .replace('{total}', String(dirs.length))
-      );
-    }
-
-    setIsMultiLaunching(false);
-  }, [isMultiLaunching, launchClaudeCode, arrangeSessions, t]);
+  const handleMultiLaunch = useMultiSessionTerminalLaunch({
+    isLaunching: isMultiLaunching,
+    setIsLaunching: setIsMultiLaunching,
+    launchSession: launchClaudeCode,
+    openSessionInTerminal: openInteractiveSessionInTerminal,
+    arrangeSessions,
+    t,
+  });
 
   const markLaunchSuccess = useCallback(() => {
     setLaunched(true);
@@ -462,15 +427,49 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
   }, []);
 
   const showLaunchError = useCallback((err: unknown) => {
+    if (isInteractiveSessionTerminalOpenError(err)) {
+      toast.error(
+        t('workspace.terminalSessionCreatedOpenFailed').replace(
+          '{error}',
+          formatInteractiveSessionLaunchError(err.terminalError),
+        ),
+        {
+          action: {
+            label: t('common.retry'),
+            onClick: () => {
+              void openInteractiveSessionInTerminal(
+                err.sessionId,
+                undefined,
+                { notifyOnError: false },
+              )
+                .then(() => toast.success(t('workspace.nativeHandoffDone')))
+                .catch(() => {
+                  toast.error(t('workspace.nativeHandoffFailed'));
+                });
+            },
+          },
+        },
+      );
+      return;
+    }
+
     if (isLaunchAlreadyInProgressError(err)) {
       toast.error(t('sessions.launchAlreadyInProgress'));
+      return;
+    }
+
+    const commandExitDetails = getSessionCommandExitDetails(err);
+    if (commandExitDetails !== null) {
+      toast.error(
+        t('sessions.sessionCommandExited').replace('{error}', commandExitDetails)
+      );
       return;
     }
 
     toast.error(
       t('sessions.launchFailed').replace('{error}', formatSessionLaunchError(err))
     );
-  }, [t]);
+  }, [openInteractiveSessionInTerminal, t]);
 
   // Browse directory and launch single session
   const handleBrowseAndLaunch = useCallback(async () => {
@@ -621,30 +620,19 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
           await closeSession(id);
           break;
       }
+      if (action === 'stopThenRemoveHeadless' || action === 'removeHeadless') {
+        toast.success(t('sessions.sessionStopped'));
+      }
+      setConfirmingId(null);
     } catch (err) {
       console.error('Failed to close session:', err);
-    } finally {
-      setConfirmingId(null);
+      toast.error(t('sessions.stopFailed').replace('{error}', String(err)));
     }
   };
 
   const handleStopUnified = async (id: string) => {
     try {
       await stopUnifiedSession(id);
-      toast.success(t('sessions.sessionStopped'));
-    } catch (err) {
-      toast.error(t('sessions.stopFailed').replace('{error}', String(err)));
-    }
-  };
-
-  const handleRemoveHeadless = async (id: string) => {
-    try {
-      const item = findDisplayItem(id);
-      // Stop if still running
-      if (item?.unifiedSession && ['ready', 'processing', 'waiting_permission', 'initializing'].includes(item.unifiedSession.status)) {
-        await stopUnifiedSession(id);
-      }
-      await removeHeadlessSession(id);
       toast.success(t('sessions.sessionStopped'));
     } catch (err) {
       toast.error(t('sessions.stopFailed').replace('{error}', String(err)));
@@ -856,7 +844,6 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
                     onMinimize={handleMinimize}
                     onClose={handleRequestClose}
                     onStop={handleStopUnified}
-                    onRemove={handleRemoveHeadless}
                     onDisconnectChannel={handleDisconnectChannel}
                     confirmingClose={confirmingId === item.session.id}
                     onCancelClose={handleCancelClose}

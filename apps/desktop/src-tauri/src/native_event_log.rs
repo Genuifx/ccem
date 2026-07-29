@@ -720,6 +720,7 @@ mod tests {
                 text: "start here".to_string(),
                 image_count: 0,
                 images: None,
+                annotations: None,
                 canonical_hash: None,
             },
         })
@@ -781,6 +782,7 @@ mod tests {
                 text: "start here".to_string(),
                 image_count: 0,
                 images: None,
+                annotations: None,
                 canonical_hash: None,
             },
         })

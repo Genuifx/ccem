@@ -1,5 +1,11 @@
 # ccem
 
+## 2.63.0
+
+### Minor Changes
+
+- Restore new and prompted Terminal launches, native session handoff, and release CI portability.
+
 ## 2.62.0
 
 ### Minor Changes

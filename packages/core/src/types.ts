@@ -7,6 +7,7 @@ export interface EnvConfig {
   ANTHROPIC_DEFAULT_HAIKU_MODEL?: string;
   ANTHROPIC_MODEL?: string;
   CLAUDE_CODE_SUBAGENT_MODEL?: string;
+  CCEM_LIMIT_WRITE_TOOLS?: boolean;
 }
 
 export interface EnvPresetMetadata {

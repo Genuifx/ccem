@@ -37,6 +37,73 @@ function eventAt(seq, payload, occurredAt) {
   };
 }
 
+test('optimistic annotation prompts converge to the persisted replay snapshot', async () => {
+  const {
+    buildMessagesFromEvents,
+    filterConfirmedLocalUserPrompts,
+  } = await importWorkspaceEventTranscript();
+  const optimisticAnnotations = [{
+    quote: 'const value = before',
+    note: 'keep the sent annotation visible',
+  }];
+  const optimisticPrompts = [{
+    id: 'optimistic-user-1',
+    text: 'Please update this',
+    annotations: optimisticAnnotations,
+  }];
+
+  const optimisticMessages = buildMessagesFromEvents([], optimisticPrompts, []);
+  assert.deepEqual(optimisticMessages[0].annotations, optimisticAnnotations);
+
+  const persistedAnnotations = [{
+    quote: 'const value = before',
+    note: 'keep the sent annotation visible',
+  }];
+  const persistedEvents = [event(1, {
+    type: 'user_prompt',
+    text: 'Please update this',
+    image_count: 0,
+    annotations: persistedAnnotations,
+  })];
+  const remainingOptimistic = filterConfirmedLocalUserPrompts(
+    optimisticPrompts,
+    persistedEvents,
+  );
+  const replayedMessages = buildMessagesFromEvents([], remainingOptimistic, persistedEvents);
+
+  assert.equal(remainingOptimistic.length, 0);
+  assert.equal(replayedMessages.length, 1);
+  assert.equal(replayedMessages[0].uuid, 'user-prompt-1');
+  assert.deepEqual(replayedMessages[0].annotations, persistedAnnotations);
+});
+
+test('initial prompt reconstruction restores annotations after a session reset', async () => {
+  const { createInitialLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const annotations = [{
+    quote: 'selected history text',
+    note: 'restore this snapshot after switching sessions',
+  }];
+
+  const initial = createInitialLocalUserPrompts(
+    'Continue the history session',
+    null,
+    annotations,
+  );
+  const reset = createInitialLocalUserPrompts(
+    'Continue the history session',
+    null,
+    annotations,
+  );
+
+  assert.deepEqual(initial, [{
+    id: 'initial-user',
+    text: 'Continue the history session',
+    images: undefined,
+    annotations,
+  }]);
+  assert.deepEqual(reset, initial);
+});
+
 test('live transcript preserves thinking, tool, and text event order in assistant content', async () => {
   const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
 

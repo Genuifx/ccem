@@ -5,9 +5,10 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
 
-const ROOT = path.resolve(new URL('..', import.meta.url).pathname);
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVER_DIR = path.join(ROOT, 'server');
 
 const writeJson = (filePath, value) => {

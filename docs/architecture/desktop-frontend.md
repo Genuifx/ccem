@@ -16,9 +16,7 @@ Dashboard, Sessions, Environments, Analytics, Skills, History, CronTasks, ChatAp
 
 ## State Management
 
-Single Zustand store (`src/store/index.ts`, ~374 lines) with ~17 domain slices and ~40 actions. Equality-guarded setters for environments and sessions prevent spurious re-renders.
-
-Known debt: a shadow `stores/envStore.ts` exists but is not wired into the active app.
+Single Zustand store (`src/store/index.ts`) owns the active desktop state. Equality-guarded setters for environments and sessions prevent spurious re-renders.
 
 Per-domain loading flags: `isLoadingEnvs`, `isLoadingSessions`, `isLoadingStats`, `isLoadingSkills`, `isLoadingSettings`
 
@@ -78,7 +76,7 @@ components/
 
 ## i18n
 
-`src/locales/index.tsx` — `LocaleProvider` + `useLocale()` hook. JSON files: `zh.json`, `en.json`. Default: Chinese. Persisted in `localStorage['ccem-locale']`. All strings via `t('namespace.key')`.
+`src/locales/index.tsx` — `LocaleProvider` + `useLocale()` hook. JSON files: `zh.json`, `en.json`. Default: Chinese. The provider hydrates from the backend-owned `DesktopSettings.language` and serializes user changes through the dedicated `save_language` command; generic `save_settings` never owns language. When an upgraded settings file has no language field, the provider migrates the legacy `ccem-locale` value once and removes that compatibility key only after the backend save succeeds. All strings go through `t('namespace.key')`.
 
 ## Lib Utilities
 

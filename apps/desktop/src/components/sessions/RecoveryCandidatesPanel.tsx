@@ -9,6 +9,10 @@ import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import type { RuntimeRecoveryCandidate } from '@/lib/tauri-ipc';
+import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
 
 function formatTimestamp(value: string) {
   try {
@@ -91,6 +95,7 @@ export function RecoveryCandidatesPanel() {
     dismissRuntimeRecoveryCandidate,
     createInteractiveSession,
     createHeadlessSession,
+    openInteractiveSessionInTerminal,
   } = useTauriCommands();
 
   const refreshCandidates = useCallback(async () => {
@@ -152,11 +157,50 @@ export function RecoveryCandidatesPanel() {
       await refreshCandidates();
       toast.success(t('sessions.recoveryResumed'));
     } catch (error) {
+      if (isInteractiveSessionTerminalOpenError(error)) {
+        try {
+          await refreshCandidates();
+        } catch (refreshError) {
+          console.error(
+            'Failed to refresh recovery candidates after terminal open failure:',
+            refreshError,
+          );
+        }
+        toast.error(
+          t('workspace.terminalSessionCreatedOpenFailed').replace(
+            '{error}',
+            formatInteractiveSessionLaunchError(error.terminalError),
+          ),
+          {
+            action: {
+              label: t('common.retry'),
+              onClick: () => {
+                void openInteractiveSessionInTerminal(
+                  error.sessionId,
+                  undefined,
+                  { notifyOnError: false },
+                )
+                  .then(() => toast.success(t('workspace.nativeHandoffDone')))
+                  .catch(() => {
+                    toast.error(t('workspace.nativeHandoffFailed'));
+                  });
+              },
+            },
+          },
+        );
+        return;
+      }
       toast.error(t('sessions.recoveryResumeFailed').replace('{error}', String(error)));
     } finally {
       setBusyRuntimeId(null);
     }
-  }, [createHeadlessSession, createInteractiveSession, refreshCandidates, t]);
+  }, [
+    createHeadlessSession,
+    createInteractiveSession,
+    openInteractiveSessionInTerminal,
+    refreshCandidates,
+    t,
+  ]);
 
   if (candidates.length === 0) {
     return null;

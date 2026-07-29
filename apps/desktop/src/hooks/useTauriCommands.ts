@@ -5,6 +5,11 @@ import { useCallback } from 'react';
 import { toast } from 'sonner';
 import { shallow } from 'zustand/shallow';
 import type { SessionStickerId, SessionTaskStage, SessionSubagentsPayload } from '@/features/conversations/types';
+import {
+  formatInteractiveSessionLaunchError,
+  launchInteractiveSession,
+  openExistingInteractiveSessionTerminal,
+} from '@/lib/interactiveSessionLaunch';
 import type {
   ChannelKind,
   BindSessionToBotRequest,
@@ -18,6 +23,7 @@ import type {
   ManagedSessionSummary,
   NativeHandoffResult,
   NativePromptImageInput,
+  SessionPromptAnnotation,
   NativeSessionSummary,
   NativeTerminalType,
   PlatformCapabilities,
@@ -69,6 +75,7 @@ interface TauriEnvConfig {
   ANTHROPIC_DEFAULT_HAIKU_MODEL?: string;
   ANTHROPIC_MODEL?: string;
   CLAUDE_CODE_SUBAGENT_MODEL?: string;
+  CCEM_LIMIT_WRITE_TOOLS?: boolean;
 }
 
 interface TauriSession {
@@ -274,6 +281,7 @@ export function useTauriCommands() {
           defaultHaikuModel: displayConfig.ANTHROPIC_DEFAULT_HAIKU_MODEL,
           runtimeModel: displayConfig.ANTHROPIC_MODEL || 'opus',
           subagentModel: displayConfig.CLAUDE_CODE_SUBAGENT_MODEL,
+          limitWriteTools: Boolean(displayConfig.CCEM_LIMIT_WRITE_TOOLS),
         };
       });
       envList.sort((a, b) => a.name.localeCompare(b.name));
@@ -323,18 +331,14 @@ export function useTauriCommands() {
         defaultHaikuModel: env.defaultHaikuModel,
         runtimeModel: env.runtimeModel,
         subagentModel: env.subagentModel,
+        limitWriteTools: env.limitWriteTools,
       });
       await loadEnvironments();
       // In managed enable mode, newly created/copied envs start enabled.
       const currentEnabled = useAppStore.getState().enabledEnvironments;
       if (currentEnabled != null && !currentEnabled.includes(env.name)) {
         const next = [...currentEnabled, env.name];
-        await invoke('save_settings', {
-          settings: {
-            ...(await invoke<DesktopSettings>('get_settings')),
-            enabledEnvironments: next,
-          },
-        });
+        await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
       setError(null);
@@ -359,6 +363,7 @@ export function useTauriCommands() {
         defaultHaikuModel: env.defaultHaikuModel,
         runtimeModel: env.runtimeModel,
         subagentModel: env.subagentModel,
+        limitWriteTools: env.limitWriteTools,
       });
       await loadEnvironments();
       await loadCurrentEnv();
@@ -372,12 +377,7 @@ export function useTauriCommands() {
         const next = currentEnabled.map((envName) =>
           envName === previousName ? env.name : envName,
         );
-        await invoke('save_settings', {
-          settings: {
-            ...(await invoke<DesktopSettings>('get_settings')),
-            enabledEnvironments: next,
-          },
-        });
+        await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
       setError(null);
@@ -397,12 +397,7 @@ export function useTauriCommands() {
       const currentEnabled = useAppStore.getState().enabledEnvironments;
       if (currentEnabled != null && currentEnabled.includes(name)) {
         const next = currentEnabled.filter((envName) => envName !== name);
-        await invoke('save_settings', {
-          settings: {
-            ...(await invoke<DesktopSettings>('get_settings')),
-            enabledEnvironments: next,
-          },
-        });
+        await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
       setError(null);
@@ -426,14 +421,7 @@ export function useTauriCommands() {
   }, [setEnabledEnvironments]);
 
   const saveEnabledEnvironments = useCallback(async (names: string[] | null) => {
-    // Read-modify-write full settings so unrelated fields are not reset.
-    const current = await invoke<DesktopSettings>('get_settings');
-    await invoke('save_settings', {
-      settings: {
-        ...current,
-        enabledEnvironments: names,
-      },
-    });
+    await invoke('save_enabled_environments', { names });
     setEnabledEnvironments(names);
   }, [setEnabledEnvironments]);
 
@@ -476,94 +464,82 @@ export function useTauriCommands() {
     try {
       const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
       const workDir = options.workingDir ?? selectedWorkingDir ?? null;
-      await recordSessionLaunchTrace('create_interactive_session.invoke_start', {
-        trace_id: launchTraceId,
-        client: options.client ?? 'claude',
-        env_name: options.envName ?? currentEnv,
-        perm_mode: options.permMode ?? permissionMode,
-        working_dir: workDir,
-        resume: Boolean(options.resumeSessionId),
-        initial_prompt: Boolean(options.initialPrompt),
-      });
-      const tauriSession = await invoke<TauriSession>('create_interactive_session', {
-        envName: options.envName ?? currentEnv,
-        permMode: options.permMode ?? permissionMode,
-        workingDir: workDir,
-        resumeSessionId: options.resumeSessionId ?? null,
-        client: options.client ?? 'claude',
-        initialPrompt: options.initialPrompt ?? null,
-        launchTraceId,
-      });
-      await recordSessionLaunchTrace('create_interactive_session.invoke_ok', {
-        trace_id: launchTraceId,
-        session_id: tauriSession.id,
-        client: tauriSession.client,
-        terminal_type: tauriSession.terminal_type,
-        tmux_target: tauriSession.tmux_target,
-      });
-      const session = toFrontendSession(tauriSession);
 
-      addSession(session);
-      await recordSessionLaunchTrace('store.add_session.ok', {
-        trace_id: launchTraceId,
-        session_id: session.id,
-        terminal_type: session.terminalType,
-        tmux_target: session.tmuxTarget,
-      });
-
-      // Add to recent projects if a working directory was used
-      if (workDir) {
-        await invoke('add_recent', { path: workDir });
-        await loadAppConfig(); // Refresh store so UI shows the new recent entry
-      }
-
-      setError(null);
-
-      if (session.terminalType === 'embedded') {
-        try {
-          await recordSessionLaunchTrace('open_terminal.start', {
+      return await launchInteractiveSession({
+        traceId: launchTraceId,
+        createStartDetails: {
+          trace_id: launchTraceId,
+          client: options.client ?? 'claude',
+          env_name: options.envName ?? currentEnv,
+          perm_mode: options.permMode ?? permissionMode,
+          working_dir: workDir,
+          resume: Boolean(options.resumeSessionId),
+          initial_prompt: Boolean(options.initialPrompt),
+        },
+        createSession: async () => {
+          const tauriSession = await invoke<TauriSession>('create_interactive_session', {
+            envName: options.envName ?? currentEnv,
+            permMode: options.permMode ?? permissionMode,
+            workingDir: workDir,
+            resumeSessionId: options.resumeSessionId ?? null,
+            client: options.client ?? 'claude',
+            initialPrompt: options.initialPrompt ?? null,
+            launchTraceId,
+          });
+          return toFrontendSession(tauriSession);
+        },
+        describeCreatedSession: (session) => ({
+          session_id: session.id,
+          client: session.client,
+          terminal_type: session.terminalType,
+          tmux_target: session.tmuxTarget,
+        }),
+        onCreateError: (error) => {
+          const clientLabel = options.client === 'codex'
+            ? 'Codex'
+            : options.client === 'opencode'
+              ? 'OpenCode'
+              : 'Claude Code';
+          setError(
+            `Failed to launch ${clientLabel}: `
+            + formatInteractiveSessionLaunchError(error),
+          );
+        },
+        onSessionCreated: async (session) => {
+          addSession(session);
+          await recordSessionLaunchTrace('store.add_session.ok', {
             trace_id: launchTraceId,
             session_id: session.id,
+            terminal_type: session.terminalType,
+            tmux_target: session.tmuxTarget,
           });
+
+          if (workDir) {
+            try {
+              await invoke('add_recent', { path: workDir });
+              await loadAppConfig();
+            } catch (error) {
+              console.error('Failed to refresh recent projects after session creation:', error);
+            }
+          }
+
+          setError(null);
+        },
+        openTerminal: async (sessionId) => {
           await invoke('open_interactive_session_in_terminal', {
-            sessionId: session.id,
+            sessionId,
             terminalType: null,
           });
-          await recordSessionLaunchTrace('open_terminal.ok', {
-            trace_id: launchTraceId,
-            session_id: session.id,
-          });
-          await syncInteractiveSessions();
-        } catch (openErr) {
-          await recordSessionLaunchTrace('open_terminal.error', {
-            trace_id: launchTraceId,
-            session_id: session.id,
-            error: String(openErr),
-          });
-          console.error('Interactive session created but failed to open terminal:', openErr);
-          try {
-            await syncInteractiveSessions();
-          } catch (syncErr) {
-            console.error('Failed to sync sessions after terminal open failure:', syncErr);
-          }
-          toast.error(`Session created, but failed to open terminal: ${openErr}`);
-        }
-      }
-
-      return session;
-    } catch (err) {
-      await recordSessionLaunchTrace('create_interactive_session.invoke_error', {
-        trace_id: launchTraceId,
-        client: options.client ?? 'claude',
-        error: String(err),
+        },
+        syncSessions: syncInteractiveSessions,
+        recordTrace: recordSessionLaunchTrace,
+        onTerminalOpenError: (error) => {
+          console.error('Interactive session created but failed to open terminal:', error);
+        },
+        onSessionSyncError: (error) => {
+          console.error('Failed to sync sessions after terminal open attempt:', error);
+        },
       });
-      const clientLabel = options.client === 'codex'
-        ? 'Codex'
-        : options.client === 'opencode'
-          ? 'OpenCode'
-          : 'Claude Code';
-      setError(`Failed to launch ${clientLabel}: ${err}`);
-      throw err;
     } finally {
       setLoading(false);
     }
@@ -582,8 +558,8 @@ export function useTauriCommands() {
     client: LaunchClient = 'claude',
     envName?: string,
     initialPrompt?: string,
-  ) => {
-    await createInteractiveSession({
+  ): Promise<Session> => {
+    return createInteractiveSession({
       envName: envName ?? undefined,
       workingDir: workingDir ?? null,
       resumeSessionId: resumeSessionId ?? null,
@@ -762,20 +738,23 @@ export function useTauriCommands() {
   const openInteractiveSessionInTerminal = useCallback(async (
     sessionId: string,
     terminalType?: TmuxAttachTerminalType,
+    options: { notifyOnError?: boolean } = {},
   ) => {
     try {
-      await invoke('open_interactive_session_in_terminal', {
-        sessionId,
-        terminalType: terminalType ?? null,
+      await openExistingInteractiveSessionTerminal({
+        openTerminal: () => invoke('open_interactive_session_in_terminal', {
+          sessionId,
+          terminalType: terminalType ?? null,
+        }),
+        syncSessions: syncInteractiveSessions,
+        onSessionSyncError: (syncError) => {
+          console.error('Failed to sync sessions after terminal open attempt:', syncError);
+        },
       });
-      await syncInteractiveSessions();
     } catch (err) {
-      try {
-        await syncInteractiveSessions();
-      } catch (syncErr) {
-        console.error('Failed to sync sessions after terminal open failure:', syncErr);
+      if (options.notifyOnError !== false) {
+        toast.error(`Failed to open session in terminal: ${err}`);
       }
-      toast.error(`Failed to open session in terminal: ${err}`);
       throw err;
     }
   }, [syncInteractiveSessions]);
@@ -891,6 +870,7 @@ export function useTauriCommands() {
     initialPrompt: string;
     initialDisplayPrompt?: string | null;
     initialImages?: NativePromptImageInput[];
+    initialAnnotations?: SessionPromptAnnotation[];
     providerSessionId?: string | null;
     effort?: string | null;
     seedBoundaryMessageCount?: number | null;
@@ -905,6 +885,7 @@ export function useTauriCommands() {
       initialPrompt: options.initialPrompt,
       initialDisplayPrompt: options.initialDisplayPrompt ?? null,
       initialImages: options.initialImages?.length ? options.initialImages : null,
+      initialAnnotations: options.initialAnnotations?.length ? options.initialAnnotations : null,
       providerSessionId: options.providerSessionId ?? null,
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
@@ -920,12 +901,14 @@ export function useTauriCommands() {
     text: string,
     images?: NativePromptImageInput[],
     displayText?: string | null,
+    annotations?: SessionPromptAnnotation[],
   ): Promise<void> => {
     await invoke('send_native_session_input', {
       runtimeId,
       text,
       displayText: displayText ?? null,
       images: images?.length ? images : null,
+      annotations: annotations?.length ? annotations : null,
     });
   }, []);
 
@@ -949,6 +932,7 @@ export function useTauriCommands() {
       displayText?: string | null;
       answers: Record<string, string>;
       annotations?: Record<string, InteractivePromptAnnotation>;
+      promptAnnotations?: SessionPromptAnnotation[];
     },
   ): Promise<void> => {
     await invoke('respond_native_session_prompt', {
@@ -958,6 +942,9 @@ export function useTauriCommands() {
       displayText: payload.displayText ?? null,
       answers: payload.answers,
       annotations: payload.annotations ?? null,
+      promptAnnotations: payload.promptAnnotations?.length
+        ? payload.promptAnnotations
+        : null,
     });
   }, []);
 

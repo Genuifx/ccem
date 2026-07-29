@@ -225,6 +225,66 @@ test('stored annotations preserve valid transcript anchors and discard malformed
   assert.equal('anchor' in normalized[1], false);
 });
 
+test('sent annotation snapshots reject overflow instead of silently truncating model context', async () => {
+  const {
+    buildComposerPromptWithAnnotations,
+    mergeWorkspacePromptAnnotationBatches,
+    parseWorkspacePromptAnnotations,
+  } = await importWorkspaceAnnotations();
+  const valid = Array.from({ length: 20 }, (_, index) => ({
+    quote: ` selected text ${index} `,
+    note: ` keep change ${index} `,
+  }));
+
+  const parsed = parseWorkspacePromptAnnotations(valid);
+  assert.equal(parsed.length, 20);
+  assert.deepEqual(parsed[0], {
+    quote: 'selected text 0',
+    note: 'keep change 0',
+  });
+  const modelPrompt = buildComposerPromptWithAnnotations('Continue', parsed);
+  assert.equal(modelPrompt.match(/<annotation index="/g)?.length, 20);
+  assert.match(modelPrompt, /<selected_text>selected text 0<\/selected_text>/);
+  assert.match(modelPrompt, /<note>keep change 19<\/note>/);
+  assert.equal(
+    parseWorkspacePromptAnnotations([
+      ...valid,
+      { quote: 'would be lost', note: 'must block the send instead' },
+    ]),
+    null,
+  );
+  assert.equal(
+    parseWorkspacePromptAnnotations([{ quote: '', note: 'invalid' }]),
+    null,
+  );
+  assert.equal(
+    mergeWorkspacePromptAnnotationBatches([valid.slice(0, 10), valid.slice(10)]).length,
+    20,
+  );
+  assert.equal(
+    mergeWorkspacePromptAnnotationBatches([
+      valid,
+      [{ quote: 'queued overflow', note: 'block before sending' }],
+    ]),
+    null,
+  );
+  assert.equal(
+    parseWorkspacePromptAnnotations([{
+      quote: '😀'.repeat(12_000),
+      note: 'Unicode scalar boundary',
+    }])?.length,
+    1,
+    'frontend limits should count Unicode scalars like the Rust backend',
+  );
+  assert.equal(
+    parseWorkspacePromptAnnotations([{
+      quote: '😀'.repeat(12_001),
+      note: 'one scalar past the boundary',
+    }]),
+    null,
+  );
+});
+
 test('live and history workspace paths wire transcript selections into successful composer sends', async () => {
   const [composerSource, liveSource, historySource, detailSource, annotationSource, styleSource] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceSessionComposer.tsx'), 'utf8'),
@@ -235,9 +295,24 @@ test('live and history workspace paths wire transcript selections into successfu
     fs.readFile(path.join(desktopDir, 'src', 'index.css'), 'utf8'),
   ]);
 
-  assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, annotations\)/);
+  assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
   assert.match(composerSource, /if \(result !== false\)[\s\S]*onAnnotationsSent\?\.\(\)/);
   assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.annotations\.length > 0/);
+  assert.match(
+    liveSource,
+    /isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*requestText: text,[\s\S]*annotations,/,
+    'plan review must classify visible text while preserving model context and annotation metadata',
+  );
+  assert.match(
+    liveSource,
+    /promptType: 'plan_exit',[\s\S]*displayText: payload\.text,[\s\S]*approval: payload\.requestText \?\? payload\.text[\s\S]*promptAnnotations: payload\.annotations,/,
+    'plan review must keep internal XML out of the bubble while persisting annotations',
+  );
+  assert.match(
+    liveSource,
+    /if \(!isCronCommand && hasQuickReplyPrompt[\s\S]*isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*if \(isProcessingTurn \|\| hasHardBlockingAttention\) \{\s*if \(collectQueuedPromptAnnotations/,
+    'interactive replies must bypass aggregate limits for a queue they will not join',
+  );
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
   assert.match(liveSource, /isActive=\{isVisible\}/);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.annotations\}/);

@@ -4,7 +4,8 @@ use crate::browser::login::capability::{
 use crate::browser::{authorize_browser_tool, BrowserManager, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
-    ReplayBatch, SessionEventPayload, SessionPromptImage, SessionStore, TodoSnapshotV1,
+    ReplayBatch, SessionEventPayload, SessionPromptAnnotation, SessionPromptImage, SessionStore,
+    TodoSnapshotV1,
 };
 use crate::native_event_log::NativeEventLog;
 use crate::native_helper_resource::native_helper_script_path;
@@ -17,13 +18,13 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -38,6 +39,10 @@ const NATIVE_SETTINGS_UPDATE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_HELPER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_HELPER_WRITE_QUEUE_CAPACITY: usize = 16;
 const NATIVE_HELPER_LAUNCHER_ARG: &str = "--ccem-native-helper-launcher";
+const MAX_PROMPT_ANNOTATIONS: usize = 20;
+const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
+const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
+const MAX_PROMPT_ANNOTATION_TOTAL_CHARS: usize = 60_000;
 static NATIVE_RUNTIME_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const BROWSER_ACTOR_ID_PREFIX: &str = "browser-actor-";
 const BROWSER_ACTOR_ID_RANDOM_BYTES: usize = 16;
@@ -491,6 +496,7 @@ pub struct NativeSessionOptions {
     pub initial_prompt: Option<String>,
     pub display_prompt: Option<String>,
     pub initial_images: Option<Vec<PromptImage>>,
+    pub initial_annotations: Option<Vec<SessionPromptAnnotation>>,
     pub provider_session_id: Option<String>,
     pub seed_boundary_message_count: Option<u64>,
     pub helper_env_vars: HashMap<String, String>,
@@ -550,8 +556,12 @@ fn prompt_images_for_event(
 fn canonical_user_prompt_hash(
     text: &str,
     images: Option<&Vec<SessionPromptImage>>,
+    annotations: Option<&Vec<SessionPromptAnnotation>>,
 ) -> Option<String> {
-    if text.trim().is_empty() && images.map(|items| items.is_empty()).unwrap_or(true) {
+    if text.trim().is_empty()
+        && images.map(|items| items.is_empty()).unwrap_or(true)
+        && annotations.map(|items| items.is_empty()).unwrap_or(true)
+    {
         return None;
     }
 
@@ -568,8 +578,69 @@ fn canonical_user_prompt_hash(
             hasher.update(b"\0");
         }
     }
+    if let Some(annotations) = annotations {
+        for annotation in annotations {
+            hasher.update(b"annotation\0");
+            hasher.update(annotation.quote.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(annotation.note.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
 
     Some(hex::encode(hasher.finalize()))
+}
+
+fn validate_prompt_annotations(
+    annotations: Option<&Vec<SessionPromptAnnotation>>,
+) -> Result<Option<Vec<SessionPromptAnnotation>>, String> {
+    let Some(annotations) = annotations else {
+        return Ok(None);
+    };
+    if annotations.is_empty() {
+        return Ok(None);
+    }
+    if annotations.len() > MAX_PROMPT_ANNOTATIONS {
+        return Err(format!(
+            "A prompt can include at most {MAX_PROMPT_ANNOTATIONS} annotations."
+        ));
+    }
+
+    let mut total_chars = 0usize;
+    let mut validated = Vec::with_capacity(annotations.len());
+    for annotation in annotations {
+        let quote = annotation.quote.trim();
+        let note = annotation.note.trim();
+        let quote_chars = quote.chars().count();
+        let note_chars = note.chars().count();
+        if quote.is_empty() || note.is_empty() {
+            return Err("Prompt annotations require both selected text and a note.".to_string());
+        }
+        if quote_chars > MAX_PROMPT_ANNOTATION_QUOTE_CHARS {
+            return Err(format!(
+                "Prompt annotation selected text exceeds {MAX_PROMPT_ANNOTATION_QUOTE_CHARS} characters."
+            ));
+        }
+        if note_chars > MAX_PROMPT_ANNOTATION_NOTE_CHARS {
+            return Err(format!(
+                "Prompt annotation note exceeds {MAX_PROMPT_ANNOTATION_NOTE_CHARS} characters."
+            ));
+        }
+        total_chars = total_chars
+            .checked_add(quote_chars + note_chars)
+            .ok_or_else(|| "Prompt annotation size overflowed.".to_string())?;
+        if total_chars > MAX_PROMPT_ANNOTATION_TOTAL_CHARS {
+            return Err(format!(
+                "Prompt annotations exceed {MAX_PROMPT_ANNOTATION_TOTAL_CHARS} total characters."
+            ));
+        }
+        validated.push(SessionPromptAnnotation {
+            quote: quote.to_string(),
+            note: note.to_string(),
+        });
+    }
+
+    Ok(Some(validated))
 }
 
 #[derive(Debug, Serialize)]
@@ -1490,22 +1561,19 @@ struct TerminalLaunchInvocation {
 }
 
 #[cfg(test)]
-fn terminal_launches() -> &'static Mutex<Vec<TerminalLaunchInvocation>> {
-    static LAUNCHES: OnceLock<Mutex<Vec<TerminalLaunchInvocation>>> = OnceLock::new();
-    LAUNCHES.get_or_init(|| Mutex::new(Vec::new()))
+thread_local! {
+    static TERMINAL_LAUNCHES: RefCell<Vec<TerminalLaunchInvocation>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 fn clear_terminal_launches() {
-    terminal_launches()
-        .lock()
-        .expect("terminal launches")
-        .clear();
+    TERMINAL_LAUNCHES.with(|launches| launches.borrow_mut().clear());
 }
 
 #[cfg(test)]
 fn take_terminal_launches() -> Vec<TerminalLaunchInvocation> {
-    std::mem::take(&mut *terminal_launches().lock().expect("terminal launches"))
+    TERMINAL_LAUNCHES.with(|launches| std::mem::take(&mut *launches.borrow_mut()))
 }
 
 #[cfg(not(test))]
@@ -1543,10 +1611,8 @@ fn launch_terminal_for_native_handoff(
     resume_session_id: Option<&str>,
     client: &str,
 ) -> Result<(), String> {
-    terminal_launches()
-        .lock()
-        .expect("terminal launches")
-        .push(TerminalLaunchInvocation {
+    TERMINAL_LAUNCHES.with(|launches| {
+        launches.borrow_mut().push(TerminalLaunchInvocation {
             terminal,
             working_dir: working_dir.to_string(),
             runtime_id: runtime_id.to_string(),
@@ -1555,6 +1621,7 @@ fn launch_terminal_for_native_handoff(
             resume_session_id: resume_session_id.map(str::to_string),
             client: client.to_string(),
         });
+    });
     Ok(())
 }
 
@@ -1611,6 +1678,8 @@ impl NativeRuntimeManager {
         options: NativeSessionOptions,
     ) -> Result<NativeSessionSummary, String> {
         let mut options = options;
+        options.initial_annotations =
+            validate_prompt_annotations(options.initial_annotations.as_ref())?;
         merge_helper_env_path(&mut options.helper_env_vars, &terminal::get_user_path());
         let runtime_id = generate_runtime_id();
         inject_ccem_runtime_env(&mut options.helper_env_vars, &runtime_id);
@@ -1678,6 +1747,7 @@ impl NativeRuntimeManager {
                 .or(options.initial_prompt.as_deref())
                 .unwrap_or_default(),
             options.initial_images.as_ref(),
+            options.initial_annotations.as_ref(),
         )?;
         self.spawn_helper(app, &runtime_id, &options, handle)?;
         self.summary_for(&runtime_id)
@@ -1794,9 +1864,11 @@ impl NativeRuntimeManager {
         text: &str,
         display_text: Option<&str>,
         images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         let text = text.trim();
         let has_images = images.as_ref().is_some_and(|imgs| !imgs.is_empty());
+        let annotations = validate_prompt_annotations(annotations)?;
         if text.is_empty() && !has_images {
             return Ok(());
         }
@@ -1848,7 +1920,12 @@ impl NativeRuntimeManager {
                 image_count
             ),
         )?;
-        self.append_user_prompt_event(runtime_id, display_text.unwrap_or(text), images)
+        self.append_user_prompt_event(
+            runtime_id,
+            display_text.unwrap_or(text),
+            images,
+            annotations.as_ref(),
+        )
     }
 
     pub fn respond_to_permission(
@@ -1879,22 +1956,31 @@ impl NativeRuntimeManager {
         display_text: Option<&str>,
         answers: &HashMap<String, String>,
         annotations: Option<&HashMap<String, InteractivePromptAnnotation>>,
+        prompt_annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         if answers.is_empty() {
             return Err("Interactive prompt response requires at least one answer.".to_string());
         }
+        let prompt_annotations = validate_prompt_annotations(prompt_annotations)?;
 
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
-        self.append_interactive_prompt_response_event(runtime_id, display_text, answers)?;
-        self.write_to_child_with_reconnect(
-            app,
+        self.deliver_and_append_interactive_prompt_response(
             runtime_id,
-            handle,
-            &HelperInputCommand::InteractivePromptResponse {
-                tool_use_id,
-                prompt_type,
-                answers,
-                annotations,
+            display_text,
+            answers,
+            prompt_annotations.as_ref(),
+            || {
+                self.write_to_child_with_reconnect(
+                    app,
+                    runtime_id,
+                    handle,
+                    &HelperInputCommand::InteractivePromptResponse {
+                        tool_use_id,
+                        prompt_type,
+                        answers,
+                        annotations,
+                    },
+                )
             },
         )
     }
@@ -3625,13 +3711,12 @@ impl NativeRuntimeManager {
                     .unwrap_or_default()
             );
             self.update_record(runtime_id, |record| {
-                record.status = if is_recoverable_native_process_exit(record) {
-                    "interrupted"
-                } else {
-                    "error"
-                }
-                .to_string();
+                let recoverable = is_recoverable_native_process_exit(record);
+                record.status = if recoverable { "interrupted" } else { "error" }.to_string();
                 record.is_active = false;
+                record.pending_handoff_terminal = None;
+                record.can_handoff_to_terminal =
+                    recoverable && terminal::external_terminal_launch_supported();
                 record.updated_at = Utc::now();
                 if record.last_error.is_none() {
                     record.last_error = Some(exit_reason.clone());
@@ -3934,14 +4019,17 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         text: &str,
         images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         let text = text.trim();
         let image_count = images.map(|items| items.len()).unwrap_or(0);
-        if text.is_empty() && image_count == 0 {
+        let annotations = validate_prompt_annotations(annotations)?;
+        if text.is_empty() && image_count == 0 && annotations.is_none() {
             return Ok(());
         }
         let event_images = prompt_images_for_event(images, &self.prompt_image_store)?;
-        let canonical_hash = canonical_user_prompt_hash(text, event_images.as_ref());
+        let canonical_hash =
+            canonical_user_prompt_hash(text, event_images.as_ref(), annotations.as_ref());
 
         self.append_event(
             runtime_id,
@@ -3949,6 +4037,7 @@ impl NativeRuntimeManager {
                 text: text.to_string(),
                 image_count: image_count as u64,
                 images: event_images,
+                annotations,
                 canonical_hash,
             },
         )
@@ -3959,11 +4048,29 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         display_text: Option<&str>,
         answers: &HashMap<String, String>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
         let Some(text) = summarize_interactive_prompt_response(display_text, answers) else {
             return Ok(());
         };
-        self.append_user_prompt_event(runtime_id, &text, None)
+        self.append_user_prompt_event(runtime_id, &text, None, annotations)
+    }
+
+    fn deliver_and_append_interactive_prompt_response(
+        &self,
+        runtime_id: &str,
+        display_text: Option<&str>,
+        answers: &HashMap<String, String>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
+        deliver: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        deliver()?;
+        self.append_interactive_prompt_response_event(
+            runtime_id,
+            display_text,
+            answers,
+            annotations,
+        )
     }
 
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {
@@ -4842,6 +4949,7 @@ fn build_runtime_bootstrap_options(
         initial_prompt: None,
         display_prompt: None,
         initial_images: None,
+        initial_annotations: None,
         provider_session_id: record.provider_session_id.clone(),
         seed_boundary_message_count: record.seed_boundary_message_count,
         helper_env_vars,
@@ -4864,14 +4972,17 @@ mod tests {
     use super::{
         authorize_browser_tool_for_record, clear_terminal_launches, drain_helper_output_lines,
         is_retryable_native_child_write_error, is_unknown_native_child_delivery_error,
-        merge_helper_env_path, merge_path_values_with_separator,
-        native_runtime_state_temp_file_path, native_session_allows_dangerously_skip_permissions,
-        native_status_allows_file_rewind, reactivate_record_for_reconnect,
-        read_native_runtime_state_from, take_terminal_launches, HelperInputCommand, NativeProvider,
-        NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
-        NativeTransport, PromptImage,
+        launch_terminal_for_native_handoff, merge_helper_env_path,
+        merge_path_values_with_separator, native_runtime_state_temp_file_path,
+        native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
+        reactivate_record_for_reconnect, read_native_runtime_state_from, take_terminal_launches,
+        HelperInputCommand, NativeProvider, NativeRuntimeManager, NativeSessionHandle,
+        NativeSessionOptions, NativeSessionRecord, NativeTransport, PromptImage,
     };
-    use crate::event_bus::{SessionEventPayload, SessionStore, TodoSnapshotItemV1, TodoSnapshotV1};
+    use crate::event_bus::{
+        SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
+        TodoSnapshotV1,
+    };
     use crate::native_event_log::NativeEventLog;
     use crate::prompt_image_store::PromptImageStore;
     use chrono::Utc;
@@ -5663,6 +5774,7 @@ mod tests {
             initial_prompt: None,
             display_prompt: None,
             initial_images: None,
+            initial_annotations: None,
             provider_session_id: None,
             seed_boundary_message_count: None,
             helper_env_vars: HashMap::new(),
@@ -6457,9 +6569,18 @@ mod tests {
             base64_data: "iVBORw0KGgo=".to_string(),
             placeholder: Some("[Image #1]".to_string()),
         }];
+        let prompt_annotations = vec![SessionPromptAnnotation {
+            quote: "selected code".to_string(),
+            note: "keep the user input visible".to_string(),
+        }];
 
         manager
-            .append_user_prompt_event(&runtime_id, "continue", Some(&images))
+            .append_user_prompt_event(
+                &runtime_id,
+                "continue",
+                Some(&images),
+                Some(&prompt_annotations),
+            )
             .expect("append user prompt event");
 
         let batch = manager
@@ -6471,6 +6592,7 @@ mod tests {
             text,
             image_count,
             images,
+            annotations,
             canonical_hash,
         } = &batch.events[0].payload
         else {
@@ -6478,6 +6600,7 @@ mod tests {
         };
         assert_eq!(text, "continue");
         assert_eq!(*image_count, 1);
+        assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
         let image = images
             .as_ref()
@@ -6515,6 +6638,32 @@ mod tests {
     }
 
     #[test]
+    fn native_user_prompt_rejects_annotation_overflow_without_persisting_an_event() {
+        let runtime_id = format!(
+            "native-user-prompt-annotation-limit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let annotations = (0..21)
+            .map(|index| SessionPromptAnnotation {
+                quote: format!("quote {index}"),
+                note: format!("note {index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let error = manager
+            .append_user_prompt_event(&runtime_id, "continue", None, Some(&annotations))
+            .expect_err("annotation overflow must fail");
+
+        assert!(error.contains("at most 20 annotations"));
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay events")
+            .events
+            .is_empty());
+    }
+
+    #[test]
     fn native_session_summary_preserves_seed_boundary_message_count() {
         let runtime_id = "native-seed-boundary-summary";
         let mut record = native_record(runtime_id, "processing", true);
@@ -6535,12 +6684,17 @@ mod tests {
         );
         let manager = manager_with_handle(&runtime_id);
         let answers = HashMap::from([("Pick one".to_string(), "Use the SQLite path".to_string())]);
+        let prompt_annotations = vec![SessionPromptAnnotation {
+            quote: "current query".to_string(),
+            note: "keep the response visible".to_string(),
+        }];
 
         manager
             .append_interactive_prompt_response_event(
                 &runtime_id,
                 Some("Use the SQLite path"),
                 &answers,
+                Some(&prompt_annotations),
             )
             .expect("append interactive response event");
 
@@ -6553,6 +6707,7 @@ mod tests {
             text,
             image_count,
             images,
+            annotations,
             canonical_hash,
         } = &batch.events[0].payload
         else {
@@ -6561,7 +6716,39 @@ mod tests {
         assert_eq!(text, "Use the SQLite path");
         assert_eq!(*image_count, 0);
         assert_eq!(images, &None);
+        assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn failed_interactive_prompt_delivery_does_not_persist_a_user_prompt() {
+        let runtime_id = format!(
+            "native-interactive-response-failed-write-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let answers = HashMap::from([("Pick one".to_string(), "Use SQLite".to_string())]);
+        let prompt_annotations = vec![SessionPromptAnnotation {
+            quote: "current query".to_string(),
+            note: "only persist after delivery".to_string(),
+        }];
+
+        let error = manager
+            .deliver_and_append_interactive_prompt_response(
+                &runtime_id,
+                Some("Use SQLite"),
+                &answers,
+                Some(&prompt_annotations),
+                || Err("Failed to write to native sidecar stdin: Broken pipe".to_string()),
+            )
+            .expect_err("failed helper delivery must be returned");
+
+        assert!(error.contains("Broken pipe"));
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay events")
+            .events
+            .is_empty());
     }
 
     #[test]
@@ -6765,6 +6952,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_launch_capture_is_isolated_between_parallel_test_threads() {
+        clear_terminal_launches();
+        let launch_barrier = Arc::new(Barrier::new(3));
+
+        let launch_and_take = |runtime_id: &'static str| {
+            let launch_barrier = Arc::clone(&launch_barrier);
+            std::thread::spawn(move || {
+                launch_terminal_for_native_handoff(
+                    crate::terminal::TerminalType::TerminalApp,
+                    HashMap::new(),
+                    "/tmp/project",
+                    runtime_id,
+                    "official",
+                    Some("dev"),
+                    None,
+                    "claude",
+                )
+                .expect("capture terminal launch");
+                launch_barrier.wait();
+
+                let launches = take_terminal_launches();
+                assert_eq!(launches.len(), 1);
+                assert_eq!(launches[0].runtime_id, runtime_id);
+            })
+        };
+
+        let first = launch_and_take("parallel-terminal-capture-a");
+        let second = launch_and_take("parallel-terminal-capture-b");
+        launch_barrier.wait();
+        first.join().expect("first capture thread");
+        second.join().expect("second capture thread");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn handoff_without_provider_session_waits_for_session_meta() {
@@ -6866,6 +7087,88 @@ mod tests {
         assert_eq!(
             summary.provider_session_id.as_deref(),
             Some("provider-session-2")
+        );
+    }
+
+    #[test]
+    fn pending_handoff_exit_reconnect_session_meta_does_not_launch_old_terminal() {
+        let runtime_id = "native-pending-handoff-exit-reconnect";
+        let manager = manager_with_handle(runtime_id);
+        clear_terminal_launches();
+        manager
+            .update_record(runtime_id, |record| {
+                record.status = "handoff_pending".to_string();
+                record.is_active = true;
+                record.can_handoff_to_terminal = true;
+                record.pending_handoff_terminal = Some(crate::terminal::TerminalType::TerminalApp);
+            })
+            .expect("set pending handoff");
+        let exited_handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("pending handoff handle")
+            .clone();
+
+        manager
+            .mark_process_exit(runtime_id, Some(1), &exited_handle)
+            .expect("mark pending helper exit");
+
+        let exited = manager.summary_for(runtime_id).expect("exited summary");
+        assert_eq!(exited.status, "error");
+        assert!(!exited.is_active);
+        assert!(!exited.can_handoff_to_terminal);
+        let mut reconnected_record = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("persisted exited record")
+            .clone();
+        assert_eq!(reconnected_record.pending_handoff_terminal, None);
+        assert!(reactivate_record_for_reconnect(&mut reconnected_record));
+        manager
+            .update_record(runtime_id, |record| {
+                *record = reconnected_record.clone();
+            })
+            .expect("persist reconnected record");
+        manager
+            .insert_handle(
+                runtime_id.to_string(),
+                native_session_handle_with_generation(reconnected_record, 2),
+            )
+            .expect("insert reconnected handle");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"provider-session-after-reconnect"}"#,
+            )
+            .expect("process session meta after reconnect");
+
+        assert!(
+            take_terminal_launches().is_empty(),
+            "stale pending handoff must not open a terminal after reconnect"
+        );
+        let summary = manager
+            .summary_for(runtime_id)
+            .expect("reconnected summary");
+        assert_eq!(summary.status, "initializing");
+        assert!(summary.is_active);
+        assert_eq!(
+            summary.provider_session_id.as_deref(),
+            Some("provider-session-after-reconnect")
+        );
+        assert_eq!(
+            manager
+                .records
+                .lock()
+                .expect("records")
+                .get(runtime_id)
+                .expect("reconnected record")
+                .pending_handoff_terminal,
+            None
         );
     }
 

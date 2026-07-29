@@ -9,6 +9,10 @@ import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
+import {
   fetchConversationDetail,
   fetchHistorySessions,
   getCachedHistorySessions,
@@ -52,7 +56,11 @@ function HistoryDetailFallback() {
 
 export function History() {
   const { t } = useLocale();
-  const { launchClaudeCode, setSessionTitle } = useTauriCommands();
+  const {
+    launchClaudeCode,
+    openInteractiveSessionInTerminal,
+    setSessionTitle,
+  } = useTauriCommands();
   const [sessions, setSessions] = useState<HistorySessionItem[]>(() => getCachedHistorySessions('all') ?? []);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [messages, setMessages] = useState<ConversationMessageData[]>([]);
@@ -129,10 +137,39 @@ export function History() {
       setTimeout(() => setLaunched(false), 1200);
     } catch (err) {
       console.error('Failed to resume session:', err);
+      if (isInteractiveSessionTerminalOpenError(err)) {
+        toast.error(
+          t('workspace.terminalSessionCreatedOpenFailed').replace(
+            '{error}',
+            formatInteractiveSessionLaunchError(err.terminalError),
+          ),
+          {
+            action: {
+              label: t('common.retry'),
+              onClick: () => {
+                void openInteractiveSessionInTerminal(
+                  err.sessionId,
+                  undefined,
+                  { notifyOnError: false },
+                )
+                  .then(() => {
+                    setLaunched(true);
+                    setTimeout(() => setLaunched(false), 1200);
+                    toast.success(t('workspace.nativeHandoffDone'));
+                  })
+                  .catch(() => {
+                    toast.error(t('workspace.nativeHandoffFailed'));
+                  });
+              },
+            },
+          },
+        );
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       toast.error(`${t('history.resumeFailed')}: ${message}`);
     }
-  }, [selectedSession, launchClaudeCode, t]);
+  }, [launchClaudeCode, openInteractiveSessionInTerminal, selectedSession, t]);
 
   const handleExport = useCallback(async () => {
     if (!selectedSession) return;

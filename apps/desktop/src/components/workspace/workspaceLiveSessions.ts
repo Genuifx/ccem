@@ -1,12 +1,17 @@
 import type {
   ConversationMessageData,
 } from '@/features/conversations/types';
-import type { NativeSessionSummary, SessionPromptImage } from '@/lib/tauri-ipc';
+import type {
+  NativeSessionSummary,
+  SessionPromptAnnotation,
+  SessionPromptImage,
+} from '@/lib/tauri-ipc';
 
 export interface WorkspaceLiveSessionEntry {
   session: NativeSessionSummary;
   initialPrompt: string | null;
   initialImages: SessionPromptImage[] | null;
+  initialAnnotations: SessionPromptAnnotation[] | null;
   generatedTitle?: string | null;
   seedMessages: ConversationMessageData[];
 }
@@ -45,6 +50,7 @@ export function upsertWorkspaceLiveSessionEntry(
   options: {
     initialPrompt?: string | null;
     initialImages?: SessionPromptImage[] | null;
+    initialAnnotations?: SessionPromptAnnotation[] | null;
     generatedTitle?: string | null;
     seedMessages?: ConversationMessageData[];
   } = {},
@@ -52,6 +58,7 @@ export function upsertWorkspaceLiveSessionEntry(
   const existing = previous[session.runtime_id];
   const nextInitialPrompt = options.initialPrompt ?? existing?.initialPrompt ?? null;
   const nextInitialImages = options.initialImages ?? existing?.initialImages ?? null;
+  const nextInitialAnnotations = options.initialAnnotations ?? existing?.initialAnnotations ?? null;
   const nextGeneratedTitle = options.generatedTitle ?? existing?.generatedTitle ?? null;
   const nextSeedMessages = options.seedMessages ?? existing?.seedMessages ?? [];
 
@@ -59,6 +66,7 @@ export function upsertWorkspaceLiveSessionEntry(
     existing
     && existing.initialPrompt === nextInitialPrompt
     && existing.initialImages === nextInitialImages
+    && existing.initialAnnotations === nextInitialAnnotations
     && existing.generatedTitle === nextGeneratedTitle
     && existing.seedMessages === nextSeedMessages
     && areNativeSessionSummariesEqual(existing.session, session)
@@ -72,6 +80,7 @@ export function upsertWorkspaceLiveSessionEntry(
       session,
       initialPrompt: nextInitialPrompt,
       initialImages: nextInitialImages,
+      initialAnnotations: nextInitialAnnotations,
       generatedTitle: nextGeneratedTitle,
       seedMessages: nextSeedMessages,
     },
@@ -115,6 +124,7 @@ export function reconcileWorkspaceLiveSessionsSnapshot(
           session: nextSession,
           initialPrompt: null,
           initialImages: null,
+          initialAnnotations: null,
           generatedTitle: null,
           seedMessages: [],
         };

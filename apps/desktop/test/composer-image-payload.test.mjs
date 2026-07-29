@@ -27,6 +27,7 @@ test('new and resumed workspace sessions pass all composer images as initialImag
     assert.match(block, /const attachments = payload\?\.attachments \?\? \[\];/);
     assert.match(block, /const images = extractComposerImagePayloads\(attachments\);/);
     assert.match(block, /initialImages: images\.length > 0 \? images : undefined,/);
+    assert.match(block, /initialAnnotations: payload\?\.annotations,/);
   }
 });
 
@@ -41,5 +42,8 @@ test('live session sends queued and direct composer images to native runtime', a
 
   assert.match(replyBlock, /const images = extractComposerImagePayloads\(payload\.attachments \?\? \[\]\);/);
   assert.match(replyBlock, /requestImages = images\.length > 0 \? images : undefined;/);
-  assert.match(replyBlock, /await sendNativeSessionInput\(session\.runtime_id, requestText, requestImages, promptEntry\.text\);/);
+  assert.match(
+    replyBlock,
+    /await sendNativeSessionInput\([\s\S]*?session\.runtime_id,[\s\S]*?requestText,[\s\S]*?requestImages,[\s\S]*?promptEntry\.text,[\s\S]*?payload\.annotations,/,
+  );
 });

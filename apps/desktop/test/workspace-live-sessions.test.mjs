@@ -99,15 +99,21 @@ test('keeps cold-start live selection visible before React commits state', async
 
 test('upserts generated titles without losing the original prompt anchor', async () => {
   const { upsertWorkspaceLiveSessionEntry } = await importWorkspaceLiveSessions();
+  const initialAnnotations = [{
+    quote: 'selected code',
+    note: 'keep this visible',
+  }];
 
   const first = upsertWorkspaceLiveSessionEntry({}, nativeSession(), {
     initialPrompt: '帮我给工作间会话生成标题',
+    initialAnnotations,
   });
   const second = upsertWorkspaceLiveSessionEntry(first, nativeSession(), {
     generatedTitle: '工作间会话标题生成',
   });
 
   assert.equal(second['native-1'].initialPrompt, '帮我给工作间会话生成标题');
+  assert.equal(second['native-1'].initialAnnotations, initialAnnotations);
   assert.equal(second['native-1'].generatedTitle, '工作间会话标题生成');
 });
 
@@ -117,8 +123,10 @@ test('reconciles restored runtime truth without erasing live conversation metada
     upsertWorkspaceLiveSessionEntry,
   } = await importWorkspaceLiveSessions();
   const seedMessages = [{ id: 'seed-1', role: 'user', content: 'hello' }];
+  const initialAnnotations = [{ quote: 'selected text', note: 'restore this' }];
   const previous = upsertWorkspaceLiveSessionEntry({}, nativeSession(), {
     initialPrompt: '原始提示',
+    initialAnnotations,
     generatedTitle: '已生成标题',
     seedMessages,
   });
@@ -138,10 +146,12 @@ test('reconciles restored runtime truth without erasing live conversation metada
 
   assert.deepEqual(Object.keys(reconciled), ['native-1', 'native-2']);
   assert.equal(reconciled['native-1'].initialPrompt, '原始提示');
+  assert.equal(reconciled['native-1'].initialAnnotations, initialAnnotations);
   assert.equal(reconciled['native-1'].generatedTitle, '已生成标题');
   assert.equal(reconciled['native-1'].seedMessages, seedMessages);
   assert.equal(reconciled['native-1'].session.provider_session_id, 'provider-1');
   assert.equal(reconciled['native-2'].initialPrompt, null);
+  assert.equal(reconciled['native-2'].initialAnnotations, null);
   assert.deepEqual(reconciled['native-2'].seedMessages, []);
 });
 

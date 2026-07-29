@@ -12,6 +12,8 @@ export interface LaunchSingleSessionResult {
   workingDir?: string | null;
 }
 
+const SESSION_COMMAND_EXITED_PREFIX = 'session_command_exited:';
+
 export class LaunchAlreadyInProgressError extends Error {
   constructor(readonly key: string) {
     super('Session launch is already in progress for this target.');
@@ -49,6 +51,18 @@ export function formatSessionLaunchError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+export function getSessionCommandExitDetails(error: unknown): string | null {
+  const message = formatSessionLaunchError(error);
+  if (!message.startsWith(SESSION_COMMAND_EXITED_PREFIX)) {
+    return null;
+  }
+
+  const details = message
+    .slice(SESSION_COMMAND_EXITED_PREFIX.length)
+    .trim();
+  return details || message;
 }
 
 export async function launchSingleSession(

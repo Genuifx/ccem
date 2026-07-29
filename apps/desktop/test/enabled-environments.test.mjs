@@ -1,5 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function isEnvironmentEnabled(name, enabledEnvironments) {
   if (enabledEnvironments == null) return true;
@@ -82,5 +87,22 @@ test('suggests unique copied environment names', () => {
   assert.equal(
     suggestCopiedEnvironmentName('glm', ['official', 'glm', 'glm-copy', 'glm-copy-2']),
     'glm-copy-3',
+  );
+});
+
+test('environment enablement persists through its field-scoped command', async () => {
+  const source = await fs.readFile(
+    path.resolve(__dirname, '../src/hooks/useTauriCommands.ts'),
+    'utf8',
+  );
+
+  assert.equal(
+    source.match(/invoke\('save_enabled_environments', \{ names(?:: next)? \}\)/g)?.length,
+    4,
+    'add, rename, delete, and explicit toggle paths must avoid stale full-settings writes',
+  );
+  assert.doesNotMatch(
+    source,
+    /invoke\('save_settings',[\s\S]{0,180}enabledEnvironments/,
   );
 });

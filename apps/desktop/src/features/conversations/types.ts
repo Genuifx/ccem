@@ -90,6 +90,7 @@ export interface ConversationMessageData {
   segmentIndex: number;
   isCompactBoundary: boolean;
   planContent?: string;
+  annotations?: Array<{ quote: string; note: string }>;
 }
 
 export type ConversationMessageList = ConversationMessageData[] & {

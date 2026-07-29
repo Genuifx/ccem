@@ -28,6 +28,7 @@ import {
 } from '@/lib/doctor-perf-smoke';
 import { shallow } from 'zustand/shallow';
 import type { CcemAgentSkillStatus, PlatformCapabilities } from '@/lib/tauri-ipc';
+import { canPersistSettings } from './settingsPersistence';
 
 const MODE_DISPLAY_NAMES: Record<PermissionModeName, string> = {
   yolo: 'YOLO',
@@ -77,6 +78,19 @@ function formatMessage(template: string, values: Record<string, string>) {
   );
 }
 
+function cacheConfirmedSettings(settings: Record<string, unknown>) {
+  try {
+    const cached = localStorage.getItem('ccem-settings');
+    const parsed = cached ? JSON.parse(cached) : {};
+    localStorage.setItem('ccem-settings', JSON.stringify({
+      ...parsed,
+      ...settings,
+    }));
+  } catch {
+    // The backend is authoritative; a presentation-cache failure is non-fatal.
+  }
+}
+
 export function Settings() {
   const { defaultMode, setDefaultMode, setPermissionMode, isLoadingSettings, defaultWorkingDir, environments } = useAppStore(
     (state) => ({
@@ -89,7 +103,13 @@ export function Settings() {
     }),
     shallow
   );
-  const { t, lang, setLang } = useLocale();
+  const {
+    t,
+    lang,
+    setLang,
+    captureLanguageHydration,
+    hydratePersistedLanguage,
+  } = useLocale();
   const {
     openDirectoryPicker,
     saveDefaultWorkingDir,
@@ -232,10 +252,13 @@ export function Settings() {
 
   // Load settings on mount
   useEffect(() => {
+    const languageHydrationRevision = captureLanguageHydration();
+
     const loadSettings = async () => {
       try {
         const settings = await invoke<{
           theme: string;
+          language?: 'zh' | 'en';
           autoStart: boolean;
           startMinimized: boolean;
           closeToTray: boolean;
@@ -249,6 +272,7 @@ export function Settings() {
           aiEnhanced: boolean;
           aiEnvName: string | null;
         }>('get_settings');
+        hydratePersistedLanguage(settings.language, languageHydrationRevision);
         const nextPerformanceMode = normalizePerformanceMode(settings.performanceMode);
         setTheme(settings.theme as 'light' | 'dark' | 'system');
         setPerformanceMode(nextPerformanceMode);
@@ -263,10 +287,11 @@ export function Settings() {
         setAiEnhanced(settings.aiEnhanced ?? false);
         setAiEnvName(settings.aiEnvName ?? null);
         applyPerformancePreference(nextPerformanceMode);
-        localStorage.setItem('ccem-settings', JSON.stringify({
-          ...settings,
+        const { language: _language, ...cacheableSettings } = settings;
+        cacheConfirmedSettings({
+          ...cacheableSettings,
           performanceMode: nextPerformanceMode,
-        }));
+        });
         if (settings.defaultMode) {
           setDefaultMode(settings.defaultMode as PermissionModeName);
           setPermissionMode(settings.defaultMode as PermissionModeName);
@@ -298,7 +323,7 @@ export function Settings() {
       loaded.current = true;
     };
     loadSettings();
-  }, []);
+  }, [captureLanguageHydration, hydratePersistedLanguage]);
 
   // Apply theme to DOM
   useEffect(() => {
@@ -356,7 +381,7 @@ export function Settings() {
 
   // Auto-save whenever settings change (skip initial load)
   useEffect(() => {
-    if (!loaded.current) return;
+    if (!canPersistSettings(loaded.current)) return;
     const settings = {
       theme,
       autoStart,
@@ -372,10 +397,10 @@ export function Settings() {
       aiEnhanced,
       aiEnvName,
     };
-    localStorage.setItem('ccem-settings', JSON.stringify(settings));
     (async () => {
       try {
         await invoke('save_settings', { settings });
+        cacheConfirmedSettings(settings);
       } catch (e) {
         toast.error(t('settings.saveFailed'));
       }
@@ -453,7 +478,9 @@ export function Settings() {
         </label>
         <div className="inline-flex items-center gap-0.5 p-0.5 rounded-lg border border-border-subtle bg-muted/30">
           <button
-            onClick={() => setLang('zh')}
+            onClick={() => {
+              void setLang('zh').catch(() => toast.error(t('settings.saveFailed')));
+            }}
             className={`px-3 py-1.5 rounded-md text-sm transition-all duration-150 active:scale-[0.97] ${
               lang === 'zh'
                 ? 'bg-background text-foreground shadow-sm'
@@ -463,7 +490,9 @@ export function Settings() {
             中文
           </button>
           <button
-            onClick={() => setLang('en')}
+            onClick={() => {
+              void setLang('en').catch(() => toast.error(t('settings.saveFailed')));
+            }}
             className={`px-3 py-1.5 rounded-md text-sm transition-all duration-150 active:scale-[0.97] ${
               lang === 'en'
                 ? 'bg-background text-foreground shadow-sm'

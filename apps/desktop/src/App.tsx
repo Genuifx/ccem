@@ -22,6 +22,10 @@ import type { PetOpenSessionRequest } from '@/types/pet';
 import { AppUpdateProvider } from '@/components/app-update/AppUpdateProvider';
 import { runExclusiveLaunch } from '@/components/sessions/sessionLaunchAction';
 import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
+import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
 
 interface CcemControlRequest {
   kind?: string;
@@ -86,7 +90,8 @@ function calculateContinuousUsageDays(dailyHistory: UsageStats['dailyHistory']):
   }
 }
 
-function App() {
+function AppContent() {
+  const { t } = useLocale();
   const FOCUS_SYNC_INTERVAL_MS = 5000;
   const FOCUS_SYNC_DELAY_MS = 180;
   const perfAutopilotEnabled = import.meta.env.DEV && import.meta.env.VITE_PERF_AUTOPILOT === '1';
@@ -129,12 +134,42 @@ function App() {
     loadSessions,
     loadAppConfig,
     launchClaudeCode,
+    openInteractiveSessionInTerminal,
     addEnvironment,
     updateEnvironment,
     deleteEnvironment,
     loadEnabledEnvironments,
     loadFromRemote,
   } = useTauriCommands();
+
+  const surfaceBackgroundTerminalPartial = useCallback((error: unknown) => {
+    if (!isInteractiveSessionTerminalOpenError(error)) {
+      return;
+    }
+
+    toast.error(
+      t('workspace.terminalSessionCreatedOpenFailed').replace(
+        '{error}',
+        formatInteractiveSessionLaunchError(error.terminalError),
+      ),
+      {
+        action: {
+          label: t('common.retry'),
+          onClick: () => {
+            void openInteractiveSessionInTerminal(
+              error.sessionId,
+              undefined,
+              { notifyOnError: false },
+            )
+              .then(() => toast.success(t('workspace.nativeHandoffDone')))
+              .catch(() => {
+                toast.error(t('workspace.nativeHandoffFailed'));
+              });
+          },
+        },
+      },
+    );
+  }, [openInteractiveSessionInTerminal, t]);
 
   const preloadAnalyticsPage = useCallback(() => {
     void import('@/pages/Analytics').then((module) => {
@@ -289,8 +324,8 @@ function App() {
     const setupListeners = async () => {
       try {
         const listener1 = await listen('tray-launch-claude', () => {
-          void handleLaunch().catch(() => {
-            // handleLaunch already logs and surfaces the launch error.
+          void handleLaunch().catch((error) => {
+            surfaceBackgroundTerminalPartial(error);
           });
         });
         if (cancelled) {
@@ -370,7 +405,12 @@ function App() {
       cancelled = true;
       unlisteners.forEach(fn => fn());
     };
-  }, [navigateToTab, setCurrentEnv, setPermissionMode]);
+  }, [
+    navigateToTab,
+    setCurrentEnv,
+    setPermissionMode,
+    surfaceBackgroundTerminalPartial,
+  ]);
 
   const refreshCriticalData = useCallback(async () => {
     const settingsPromise = invoke<{
@@ -419,6 +459,7 @@ function App() {
         defaultSonnetModel: config.ANTHROPIC_DEFAULT_SONNET_MODEL,
         defaultHaikuModel: config.ANTHROPIC_DEFAULT_HAIKU_MODEL,
         runtimeModel: config.ANTHROPIC_MODEL || 'opus',
+        limitWriteTools: Boolean(config.CCEM_LIMIT_WRITE_TOOLS),
       }));
       envList.unshift({
         name: 'official',
@@ -426,6 +467,7 @@ function App() {
         defaultOpusModel: '',
         defaultHaikuModel: 'claude-3-5-haiku-20241022',
         runtimeModel: 'opus',
+        limitWriteTools: false,
       });
       setEnvironments(envList);
     });
@@ -648,11 +690,11 @@ function App() {
     'meta+7': () => navigateToTab('chat-app'),
     'meta+8': () => navigateToTab('analytics'),
     'meta+9': () => navigateToTab('proxy-debug'),
-    'meta+enter': () => handleLaunch(),
-    'meta+n': () => handleLaunch(),
+    'meta+enter': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
+    'meta+n': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
     'meta+,': () => navigateToTab('settings'),
     'meta+q': () => invoke('quit_app'),
-  }), [handleLaunch, navigateToTab]);
+  }), [handleLaunch, navigateToTab, surfaceBackgroundTerminalPartial]);
 
   useKeyboardShortcuts(globalShortcuts);
 
@@ -762,8 +804,7 @@ function App() {
   const isFullBleedTab = activeTab === 'history' || activeTab === 'workspace' || activeTab === 'settings';
 
   return (
-    <LocaleProvider>
-      <AppUpdateProvider>
+    <AppUpdateProvider>
         <TooltipProvider>
           {startupReady ? (
             <AppLayout
@@ -837,7 +878,14 @@ function App() {
           {/* Toast notifications */}
           <Toaster position="top-center" richColors />
         </TooltipProvider>
-      </AppUpdateProvider>
+    </AppUpdateProvider>
+  );
+}
+
+function App() {
+  return (
+    <LocaleProvider>
+      <AppContent />
     </LocaleProvider>
   );
 }

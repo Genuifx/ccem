@@ -74,6 +74,7 @@ mod tests {
                 default_haiku_model: None,
                 model: None,
                 subagent_model: None,
+                limit_write_tools: false,
             },
         );
         config

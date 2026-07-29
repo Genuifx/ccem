@@ -17,6 +17,12 @@ static LOCAL_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 // `OnceLock::get_or_try_init` while still preventing repeated IO on success.
 static INSTALL_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
+struct V2CiphertextParts {
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    tag: [u8; 16],
+}
+
 /// Derive the same 32-byte key as Node.js crypto.scryptSync (legacy, migration only)
 fn derive_key() -> [u8; 32] {
     *LOCAL_KEY.get_or_init(|| {
@@ -101,26 +107,17 @@ fn get_or_create_install_key() -> Result<[u8; 32], String> {
     Ok(key)
 }
 
-/// Encrypt plaintext using AES-256-GCM with install-bound key.
-/// Format: enc:v2:<nonce_hex>:<ciphertext_hex>:<tag_hex>
-///
-/// Returns Err if the install key cannot be loaded/persisted or AES-GCM
-/// encryption itself fails. Empty plaintext short-circuits to an empty
-/// string (no key material needed).
-pub fn encrypt(plaintext: &str) -> Result<String, String> {
-    if plaintext.is_empty() {
-        return Ok(String::new());
-    }
-
-    let key = get_or_create_install_key()?;
-    let cipher = Aes256Gcm::new(&key.into());
-    let nonce: [u8; 12] = rand::thread_rng().gen();
-
+fn encrypt_v2_with_key(
+    plaintext: &str,
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+) -> Result<String, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("fixed AES-256-GCM key length");
     let ciphertext = cipher
-        .encrypt(aes_gcm::Nonce::from_slice(&nonce), plaintext.as_bytes())
+        .encrypt(aes_gcm::Nonce::from_slice(nonce), plaintext.as_bytes())
         .map_err(|e| format!("Encryption failed: {}", e))?;
 
-    // aes-gcm appends the 16-byte tag to the ciphertext
+    // aes-gcm appends the 16-byte tag to the ciphertext.
     let ct_len = ciphertext.len().saturating_sub(16);
     let ct = &ciphertext[..ct_len];
     let tag = &ciphertext[ct_len..];
@@ -133,6 +130,68 @@ pub fn encrypt(plaintext: &str) -> Result<String, String> {
     ))
 }
 
+fn parse_v2_ciphertext(ciphertext: &str) -> Result<V2CiphertextParts, String> {
+    let parts: Vec<&str> = ciphertext.split(':').collect();
+    if parts.len() != 5 {
+        return Err("Invalid v2 encrypted format".to_string());
+    }
+
+    let nonce_bytes = hex::decode(parts[2]).map_err(|e| format!("Invalid nonce: {}", e))?;
+    let ct_bytes = hex::decode(parts[3]).map_err(|e| format!("Invalid ciphertext: {}", e))?;
+    let tag_bytes = hex::decode(parts[4]).map_err(|e| format!("Invalid tag: {}", e))?;
+
+    if nonce_bytes.len() != 12 || ct_bytes.is_empty() || tag_bytes.len() != 16 {
+        return Err("Invalid v2 encrypted format".to_string());
+    }
+
+    let nonce = nonce_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid v2 encrypted format".to_string())?;
+    let tag = tag_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Invalid v2 encrypted format".to_string())?;
+
+    Ok(V2CiphertextParts {
+        nonce,
+        ciphertext: ct_bytes,
+        tag,
+    })
+}
+
+fn decrypt_v2_parts(parts: V2CiphertextParts, key: &[u8; 32]) -> Result<String, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("fixed AES-256-GCM key length");
+    let mut combined = parts.ciphertext;
+    combined.extend_from_slice(&parts.tag);
+
+    let plaintext = cipher
+        .decrypt(aes_gcm::Nonce::from_slice(&parts.nonce), combined.as_ref())
+        .map_err(|_| "Decryption failed (wrong key or tampered data)".to_string())?;
+
+    String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8: {}", e))
+}
+
+fn decrypt_v2_with_key(ciphertext: &str, key: &[u8; 32]) -> Result<String, String> {
+    decrypt_v2_parts(parse_v2_ciphertext(ciphertext)?, key)
+}
+
+/// Encrypt plaintext using AES-256-GCM with install-bound key.
+/// Format: enc:v2:<nonce_hex>:<ciphertext_hex>:<tag_hex>
+///
+/// Returns Err if the install key cannot be loaded/persisted or AES-GCM
+/// encryption itself fails. Empty plaintext short-circuits to an empty
+/// string (no key material needed).
+pub fn encrypt(plaintext: &str) -> Result<String, String> {
+    if plaintext.is_empty() {
+        return Ok(String::new());
+    }
+
+    let key = get_or_create_install_key()?;
+    let nonce: [u8; 12] = rand::thread_rng().gen();
+    encrypt_v2_with_key(plaintext, &key, &nonce)
+}
+
 /// Decrypt ciphertext. Auto-detects v2 (AES-256-GCM) vs legacy (AES-256-CBC).
 pub fn decrypt(ciphertext: &str) -> Result<String, String> {
     // If not encrypted, return as-is
@@ -142,31 +201,9 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
 
     // v2 format: enc:v2:nonce_hex:ciphertext_hex:tag_hex
     if ciphertext.starts_with("enc:v2:") {
-        let parts: Vec<&str> = ciphertext.split(':').collect();
-        if parts.len() != 5 {
-            return Err("Invalid v2 encrypted format".to_string());
-        }
-
-        let nonce_bytes = hex::decode(parts[2]).map_err(|e| format!("Invalid nonce: {}", e))?;
-        let ct_bytes = hex::decode(parts[3]).map_err(|e| format!("Invalid ciphertext: {}", e))?;
-        let tag_bytes = hex::decode(parts[4]).map_err(|e| format!("Invalid tag: {}", e))?;
-
-        if nonce_bytes.len() != 12 || tag_bytes.len() != 16 {
-            return Err("Invalid v2 encrypted format".to_string());
-        }
-
+        let parts = parse_v2_ciphertext(ciphertext)?;
         let key = get_or_create_install_key()?;
-        let cipher = Aes256Gcm::new(&key.into());
-
-        // aes-gcm expects ciphertext + tag concatenated
-        let mut combined = ct_bytes.clone();
-        combined.extend_from_slice(&tag_bytes);
-
-        let plaintext = cipher
-            .decrypt(aes_gcm::Nonce::from_slice(&nonce_bytes), combined.as_ref())
-            .map_err(|_| "Decryption failed (wrong key or tampered data)".to_string())?;
-
-        String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8: {}", e))
+        decrypt_v2_parts(parts, &key)
     } else {
         // Legacy format: enc:iv_hex:ciphertext_hex (AES-256-CBC with hardcoded key)
         decrypt_legacy(ciphertext)
@@ -277,6 +314,61 @@ mod tests {
     fn test_encrypt_empty() {
         let result = encrypt("").expect("empty plaintext should short-circuit without key IO");
         assert_eq!(result, "");
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GoldenVectors {
+        key_hex: String,
+        plaintext: String,
+        typescript: GoldenVector,
+        rust: GoldenVector,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GoldenVector {
+        nonce_hex: String,
+        ciphertext: String,
+    }
+
+    #[test]
+    fn cross_language_enc_v2_golden_vectors() {
+        let vectors: GoldenVectors = serde_json::from_str(include_str!(
+            "../../../../packages/core/test-fixtures/enc-v2-golden-vectors.json"
+        ))
+        .expect("golden vector fixture should parse");
+        let key: [u8; 32] = hex::decode(&vectors.key_hex)
+            .expect("fixture key should be hex")
+            .try_into()
+            .expect("fixture key should be 32 bytes");
+
+        assert_eq!(
+            decrypt_v2_with_key(&vectors.typescript.ciphertext, &key).unwrap(),
+            vectors.plaintext
+        );
+        assert_eq!(
+            decrypt_v2_with_key(&vectors.rust.ciphertext, &key).unwrap(),
+            vectors.plaintext
+        );
+
+        let typescript_nonce: [u8; 12] = hex::decode(&vectors.typescript.nonce_hex)
+            .expect("TypeScript nonce should be hex")
+            .try_into()
+            .expect("TypeScript nonce should be 12 bytes");
+        assert_eq!(
+            encrypt_v2_with_key(&vectors.plaintext, &key, &typescript_nonce).unwrap(),
+            vectors.typescript.ciphertext
+        );
+
+        let rust_nonce: [u8; 12] = hex::decode(&vectors.rust.nonce_hex)
+            .expect("Rust nonce should be hex")
+            .try_into()
+            .expect("Rust nonce should be 12 bytes");
+        assert_eq!(
+            encrypt_v2_with_key(&vectors.plaintext, &key, &rust_nonce).unwrap(),
+            vectors.rust.ciphertext
+        );
     }
 
     #[test]

@@ -434,6 +434,7 @@ impl BotBindingManager {
             &routed_text,
             Some(&routed_text),
             None,
+            None,
         )
     }
 

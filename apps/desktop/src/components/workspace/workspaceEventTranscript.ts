@@ -2,7 +2,12 @@ import type {
   ConversationContentBlock,
   ConversationMessageData,
 } from '@/features/conversations/types';
-import type { ReplayBatch, SessionEventRecord, SessionPromptImage } from '@/lib/tauri-ipc';
+import type {
+  ReplayBatch,
+  SessionEventRecord,
+  SessionPromptAnnotation,
+  SessionPromptImage,
+} from '@/lib/tauri-ipc';
 import {
   normalizePromptConfirmationText,
   normalizePromptIdentityText,
@@ -20,6 +25,7 @@ export interface LocalUserPrompt {
   id: string;
   text: string;
   images?: SessionPromptImage[];
+  annotations?: SessionPromptAnnotation[];
   timestamp?: number;
   afterEventSeq?: number;
 }
@@ -74,6 +80,7 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
       timestamp: prompt.timestamp,
       segmentIndex: 0,
       isCompactBoundary: false,
+      ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
     };
   }
 
@@ -84,7 +91,25 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
     timestamp: prompt.timestamp,
     segmentIndex: 0,
     isCompactBoundary: false,
+    ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
   };
+}
+
+export function createInitialLocalUserPrompts(
+  initialPrompt?: string | null,
+  initialImages?: SessionPromptImage[] | null,
+  initialAnnotations?: SessionPromptAnnotation[] | null,
+): LocalUserPrompt[] {
+  if (!initialPrompt) {
+    return [];
+  }
+
+  return [{
+    id: 'initial-user',
+    text: initialPrompt,
+    images: initialImages ?? undefined,
+    annotations: initialAnnotations ?? undefined,
+  }];
 }
 
 function createPromptImageBlocks(images?: SessionPromptImage[] | null): ConversationContentBlock[] {
@@ -775,6 +800,7 @@ function shallowEqualMessages(
     && previous.outputTokens === next.outputTokens
     && previous.cacheCreationTokens === next.cacheCreationTokens
     && previous.cacheReadTokens === next.cacheReadTokens
+    && previous.annotations === next.annotations
     && shallowEqualContent(previous.content, next.content);
 }
 
@@ -1126,6 +1152,7 @@ export function buildMessagesFromEvents(
           id: `user-prompt-${event.seq}`,
           text,
           images,
+          annotations: event.payload.annotations ?? undefined,
           timestamp: occurredAt,
         }));
         if (text) {

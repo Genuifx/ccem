@@ -499,9 +499,9 @@ impl ProxyDebugManager {
     }
 
     pub async fn set_enabled(self: &Arc<Self>, enabled: bool) -> Result<ProxyDebugState, String> {
-        let mut settings = config::read_settings().unwrap_or_default();
-        settings.proxy_debug_enabled = enabled;
-        config::write_settings(&settings)?;
+        let settings = config::update_settings(|settings| {
+            settings.proxy_debug_enabled = enabled;
+        })?;
         *self.runtime_config.lock().unwrap() = RuntimeConfig::from_settings(&settings);
 
         if enabled {
@@ -533,10 +533,10 @@ impl ProxyDebugManager {
             None => self.runtime_config.lock().unwrap().record_mode,
         };
 
-        let mut settings = config::read_settings().unwrap_or_default();
-        settings.proxy_debug_codex_upstream_base_url = codex_upstream_base_url;
-        settings.proxy_debug_record_mode = selected_mode.as_str().to_string();
-        config::write_settings(&settings)?;
+        let settings = config::update_settings(|settings| {
+            settings.proxy_debug_codex_upstream_base_url = codex_upstream_base_url;
+            settings.proxy_debug_record_mode = selected_mode.as_str().to_string();
+        })?;
         *self.runtime_config.lock().unwrap() = RuntimeConfig::from_settings(&settings);
 
         if self.is_enabled() {

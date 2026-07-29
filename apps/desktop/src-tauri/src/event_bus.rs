@@ -116,6 +116,12 @@ pub struct TodoSnapshotV1 {
     pub items: Vec<TodoSnapshotItemV1>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPromptAnnotation {
+    pub quote: String,
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEventPayload {
@@ -124,6 +130,8 @@ pub enum SessionEventPayload {
         image_count: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<SessionPromptImage>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Vec<SessionPromptAnnotation>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         canonical_hash: Option<String>,
     },

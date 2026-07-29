@@ -1,3 +1,5 @@
+import type { SessionPromptAnnotation } from '@/lib/tauri-ipc';
+
 export type ComposerAttachmentSource = 'drop' | 'paste' | 'recent' | 'search';
 
 export interface ComposerFileAttachment {
@@ -41,6 +43,7 @@ export interface ComposerSubmitPayload {
   text: string;
   displayText?: string;
   attachments: ComposerAttachment[];
+  annotations?: SessionPromptAnnotation[];
 }
 
 export interface ComposerRecentFile {

@@ -74,6 +74,7 @@ import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnno
 import type {
   NativeSessionSummary,
   SessionEventRecord,
+  SessionPromptAnnotation,
   SessionPromptImage,
   WorkspaceCommand,
   WorkspaceGitSnapshot,
@@ -90,6 +91,10 @@ import {
   toLiveHistorySessionItem,
 } from '@/components/workspace/workspaceSidebarSessions';
 import { launchWorkspaceTerminalSession } from '@/components/workspace/workspaceTerminalLaunch';
+import {
+  formatInteractiveSessionLaunchError,
+  isInteractiveSessionTerminalOpenError,
+} from '@/lib/interactiveSessionLaunch';
 import {
   reconcileWorkspaceLiveSessionsSnapshot,
   updateWorkspaceLiveSessionsSnapshot,
@@ -366,6 +371,7 @@ export function Workspace({
     listNativeSessions,
     launchOpenCodeWeb,
     launchClaudeCode,
+    openInteractiveSessionInTerminal,
     searchWorkspaceFiles,
     stopNativeSession,
     generateWorkspaceSessionTitle,
@@ -720,6 +726,7 @@ export function Workspace({
     options: {
       initialPrompt?: string | null;
       initialImages?: SessionPromptImage[] | null;
+      initialAnnotations?: SessionPromptAnnotation[] | null;
       generatedTitle?: string | null;
       seedMessages?: ConversationMessageData[];
     } = {},
@@ -1655,6 +1662,7 @@ export function Workspace({
       session: matchingSession,
       initialPrompt: null,
       initialImages: null,
+      initialAnnotations: null,
       seedMessages: hydratedMessages ?? [],
     };
   }, [
@@ -2015,6 +2023,7 @@ export function Workspace({
     upsertLiveSessionEntry(session, {
       initialPrompt: existingEntry?.initialPrompt ?? null,
       initialImages: existingEntry?.initialImages ?? null,
+      initialAnnotations: existingEntry?.initialAnnotations ?? null,
       seedMessages: existingEntry?.seedMessages ?? [],
     });
 
@@ -2252,6 +2261,36 @@ export function Workspace({
     }
   }, [openDirectoryPicker, setSelectedWorkingDir]);
 
+  const showWorkspaceTerminalLaunchError = useCallback((error: unknown) => {
+    if (!isInteractiveSessionTerminalOpenError(error)) {
+      toast.error(t('workspace.nativeHandoffFailed'));
+      return;
+    }
+
+    toast.error(
+      t('workspace.terminalSessionCreatedOpenFailed').replace(
+        '{error}',
+        formatInteractiveSessionLaunchError(error.terminalError),
+      ),
+      {
+        action: {
+          label: t('common.retry'),
+          onClick: () => {
+            void openInteractiveSessionInTerminal(
+              error.sessionId,
+              undefined,
+              { notifyOnError: false },
+            )
+              .then(() => toast.success(t('workspace.nativeHandoffDone')))
+              .catch(() => {
+                toast.error(t('workspace.nativeHandoffFailed'));
+              });
+          },
+        },
+      },
+    );
+  }, [openInteractiveSessionInTerminal, t]);
+
   const handleLaunchComposeTerminal = useCallback(async () => {
     if (isLaunchingComposeTerminal) {
       return;
@@ -2279,7 +2318,7 @@ export function Workspace({
       toast.success(t('workspace.nativeHandoffDone'));
     } catch (error) {
       console.error('Failed to launch workspace terminal session:', error);
-      toast.error(t('workspace.nativeHandoffFailed'));
+      showWorkspaceTerminalLaunchError(error);
     } finally {
       setIsLaunchingComposeTerminal(false);
     }
@@ -2292,6 +2331,7 @@ export function Workspace({
     openDirectoryPicker,
     scheduleWorkspaceRefresh,
     setSelectedWorkingDir,
+    showWorkspaceTerminalLaunchError,
     t,
   ]);
 
@@ -2413,6 +2453,7 @@ export function Workspace({
         initialPrompt: dispatch.prompt,
         initialDisplayPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : undefined,
+        initialAnnotations: payload?.annotations,
         effort: normalizeEffortForProvider(composeEffort, composeProvider),
         seedBoundaryMessageCount: 0,
       });
@@ -2441,6 +2482,7 @@ export function Workspace({
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
+        initialAnnotations: payload?.annotations ?? null,
         seedMessages: [],
       });
       const liveItem = toLiveHistorySessionItem({
@@ -2550,6 +2592,7 @@ export function Workspace({
         initialPrompt: dispatch.prompt,
         initialDisplayPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : undefined,
+        initialAnnotations: payload?.annotations,
         providerSessionId: selectedSession.id,
         effort: normalizeEffortForProvider(historyEffort, provider),
         seedBoundaryMessageCount: messages.length,
@@ -2559,6 +2602,7 @@ export function Workspace({
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
+        initialAnnotations: payload?.annotations ?? null,
         seedMessages: messages,
       });
       setActiveLiveRuntimeId(summary.runtime_id);
@@ -2888,7 +2932,7 @@ export function Workspace({
                             historyEnv,
                           )
                             .then(() => toast.success(t('workspace.nativeHandoffDone')))
-                            .catch(() => toast.error(t('workspace.nativeHandoffFailed')));
+                            .catch(showWorkspaceTerminalLaunchError);
                         }}
                       >
                         <Terminal className="h-4 w-4" />
@@ -3082,6 +3126,7 @@ export function Workspace({
                           session={entry.session}
                           initialPrompt={entry.initialPrompt}
                           initialImages={entry.initialImages}
+                          initialAnnotations={entry.initialAnnotations}
                           seedMessages={entry.seedMessages}
                           installedSkills={workspaceInstalledSkills}
                           onRefreshSkills={refreshWorkspaceInstalledSkills}

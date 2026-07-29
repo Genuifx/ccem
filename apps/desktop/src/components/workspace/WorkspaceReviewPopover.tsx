@@ -253,6 +253,21 @@ export function WorkspaceReviewPopover({
   const sessionIsActive = ['initializing', 'processing', 'running'].includes(session.status);
   const sessionHasFailed = ['error', 'failed', 'interrupted'].includes(session.status);
   const hasTodoProgress = model.todoSource !== 'unavailable' && model.todoTotal > 0;
+  const todoWarning = model.todoSource === 'history'
+    ? t('workspace.reviewTodoHistoryWarning')
+    : model.todoSource === 'legacy'
+      ? t('workspace.reviewTodoLegacyWarning')
+      : null;
+  const todoEmptyTitle = model.todoSource === 'history'
+    ? t('workspace.reviewTodoHistoryEmptyTitle')
+    : model.todoSource === 'legacy'
+      ? t('workspace.reviewTodoLegacyEmptyTitle')
+      : t('workspace.reviewTodoStructuredEmptyTitle');
+  const todoEmptyBody = model.todoSource === 'history'
+    ? t('workspace.reviewTodoHistoryEmpty')
+    : model.todoSource === 'legacy'
+      ? t('workspace.reviewTodoLegacyEmpty')
+      : t('workspace.reviewTodoStructuredEmpty');
   const progressTemplate = sessionIsActive
     ? t('workspace.reviewProgressActive')
     : sessionHasFailed
@@ -372,7 +387,7 @@ export function WorkspaceReviewPopover({
                         {model.todoSource === 'unavailable'
                           ? t('workspace.reviewTodoUnavailableTitle')
                           : model.todoTotal === 0
-                            ? t('workspace.reviewTodoStructuredEmptyTitle')
+                            ? todoEmptyTitle
                             : interpolate(progressTemplate, {
                               completed: model.todoCompleted,
                               total: model.todoTotal,
@@ -400,16 +415,20 @@ export function WorkspaceReviewPopover({
                     <p className="text-[10px] text-muted-foreground">
                       {model.todoSource === 'unavailable'
                         ? t('workspace.reviewTodoUnavailableBody')
-                        : model.todoSource === 'structured' && model.todoTotal === 0
-                          ? t('workspace.reviewTodoStructuredEmpty')
-                          : t('workspace.reviewTodoHint')}
+                        : model.todoTotal === 0
+                          ? todoEmptyBody
+                          : model.todoSource === 'history'
+                            ? t('workspace.reviewTodoHistoryHint')
+                            : model.todoSource === 'legacy'
+                              ? t('workspace.reviewTodoLegacyHint')
+                              : t('workspace.reviewTodoHint')}
                     </p>
                   </section>
 
-                  {model.todoSource === 'legacy' ? (
+                  {todoWarning ? (
                     <div className="flex items-start gap-2 rounded-lg border border-warning/35 bg-warning/5 px-2.5 py-2 text-[10px] leading-snug text-warning">
                       <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                      <span>{t('workspace.reviewTodoLegacyWarning')}</span>
+                      <span>{todoWarning}</span>
                     </div>
                   ) : null}
 

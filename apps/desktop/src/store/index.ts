@@ -23,6 +23,7 @@ export interface Environment {
   defaultHaikuModel?: string;
   runtimeModel?: string;
   subagentModel?: string;
+  limitWriteTools: boolean;
 }
 
 export type ArrangeLayout = 'horizontal2' | 'vertical2' | 'grid4' | 'left_main3';
@@ -318,7 +319,8 @@ function areEnvironmentsEqual(left: Environment[], right: Environment[]) {
       && candidate.defaultSonnetModel === env.defaultSonnetModel
       && candidate.defaultHaikuModel === env.defaultHaikuModel
       && candidate.runtimeModel === env.runtimeModel
-      && candidate.subagentModel === env.subagentModel;
+      && candidate.subagentModel === env.subagentModel
+      && candidate.limitWriteTools === env.limitWriteTools;
   });
 }
 

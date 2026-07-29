@@ -112,3 +112,55 @@ test('cancels terminal launch when no working dir is selected', async () => {
   });
   assert.equal(launched, false);
 });
+
+test('terminal partial success still retains the resolved directory and refreshes sessions', async () => {
+  const { launchWorkspaceTerminalSession } = await importWorkspaceTerminalLaunch();
+  const resolvedDirs = [];
+  const refreshDelays = [];
+  const partialError = Object.assign(new Error('Terminal unavailable'), {
+    code: 'interactive_session_terminal_open_failed',
+    sessionId: 'session-created-1',
+  });
+
+  await assert.rejects(
+    launchWorkspaceTerminalSession({
+      prompt: 'continue',
+      provider: 'claude',
+      workingDir: null,
+      pickWorkingDir: async () => '/tmp/picked-project',
+      launchTerminal: async () => {
+        throw partialError;
+      },
+      onWorkingDirResolved: (dir) => resolvedDirs.push(dir),
+      scheduleRefresh: (delayMs) => refreshDelays.push(delayMs),
+    }),
+    (error) => error === partialError,
+  );
+
+  assert.deepEqual(resolvedDirs, ['/tmp/picked-project']);
+  assert.deepEqual(refreshDelays, [350]);
+});
+
+test('create failure does not retain a directory for a session that was never created', async () => {
+  const { launchWorkspaceTerminalSession } = await importWorkspaceTerminalLaunch();
+  const resolvedDirs = [];
+  const refreshDelays = [];
+
+  await assert.rejects(
+    launchWorkspaceTerminalSession({
+      prompt: 'continue',
+      provider: 'claude',
+      workingDir: null,
+      pickWorkingDir: async () => '/tmp/picked-project',
+      launchTerminal: async () => {
+        throw new Error('create failed');
+      },
+      onWorkingDirResolved: (dir) => resolvedDirs.push(dir),
+      scheduleRefresh: (delayMs) => refreshDelays.push(delayMs),
+    }),
+    /create failed/,
+  );
+
+  assert.deepEqual(resolvedDirs, []);
+  assert.deepEqual(refreshDelays, []);
+});

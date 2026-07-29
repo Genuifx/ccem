@@ -84,3 +84,25 @@ test('legacy-only session (no unified) resolves to closeLegacyInteractive', asyn
   });
   assert.equal(result, 'closeLegacyInteractive');
 });
+
+test('close failures stay actionable and visible to the user', async () => {
+  const source = await fs.readFile(
+    path.join(desktopDir, 'src', 'pages', 'Sessions.tsx'),
+    'utf8',
+  );
+  const handler = source.match(
+    /const handleConfirmClose = async \(id: string\) => \{([\s\S]*?)\n  \};/,
+  )?.[1];
+
+  assert.ok(handler, 'expected the session close confirmation handler');
+  assert.match(handler, /setConfirmingId\(null\);\s*\} catch \(err\) \{/);
+  assert.match(
+    handler,
+    /toast\.error\(t\('sessions\.stopFailed'\)\.replace\('\{error\}', String\(err\)\)\)/,
+  );
+  assert.doesNotMatch(
+    handler,
+    /\} finally \{\s*setConfirmingId\(null\)/,
+    'a failed close must leave the confirmation controls available for retry',
+  );
+});
