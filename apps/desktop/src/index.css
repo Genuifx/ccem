@@ -1180,10 +1180,6 @@
 }
 
 .ccem-prompt-area .prompt-area-trailing-newline-sentinel {
-  display: inline-block;
-  width: 0;
-  min-width: 0;
-  overflow: hidden;
   line-height: inherit;
   vertical-align: baseline;
 }

@@ -37,6 +37,7 @@ import {
   getDirectChildContaining,
   indexOfChildNode,
   normalizeEditorDOM,
+  normalizePromptAreaSentinels,
   decorateURLsInEditor,
   decorateMarkdownInEditor,
   isPromptAreaSentinel,
@@ -92,6 +93,7 @@ type UsePromptAreaReturn = {
     onCompositionStart: () => void
     onCompositionEnd: () => void
     onBlur: () => void
+    isComposing: React.RefObject<boolean>
   }
 }
 
@@ -397,6 +399,29 @@ export function usePromptArea({
     resetSearch()
   }, [resetSearch])
 
+  const reconcileCompositionEnd = useCallback(() => {
+    const editor = editorRef.current
+    if (!editor) return
+
+    // WebKit can normalize the caret into the trailing-newline sentinel while
+    // composing. Preserve its plain-text position before replacing the
+    // sentinel so committed IME text and the caret return to editable text.
+    const savedCursorOffset = getCursorOffset(editor)
+    const editorDomChanged = normalizePromptAreaSentinels(editor)
+    if (!editorDomChanged) return
+
+    const segments = readSegmentsFromDOM()
+    const modelChanged = !segmentsEqual(segments, lastRenderedValue.current)
+
+    lastRenderedValue.current = segments
+    if (modelChanged) {
+      onChange(segments)
+    }
+    if (savedCursorOffset !== null) {
+      setCursorAtOffset(editor, savedCursorOffset)
+    }
+  }, [onChange, readSegmentsFromDOM])
+
   // -----------------------------------------------------------------------
   // Wire up edge-case event handlers
   // -----------------------------------------------------------------------
@@ -406,6 +431,7 @@ export function usePromptArea({
     readSegmentsFromDOM,
     onChange,
     renderSegmentsToDOM,
+    reconcileCompositionEnd,
     runTriggerDetection,
     dismissTrigger,
     triggers,
@@ -1163,6 +1189,7 @@ export function usePromptArea({
       onCompositionStart: events.handleCompositionStart,
       onCompositionEnd: events.handleCompositionEnd,
       onBlur: events.handleBlur,
+      isComposing: events.isComposing,
     }),
     [
       events.handlePaste,
@@ -1173,6 +1200,7 @@ export function usePromptArea({
       events.handleCompositionStart,
       events.handleCompositionEnd,
       events.handleBlur,
+      events.isComposing,
     ],
   )
 
