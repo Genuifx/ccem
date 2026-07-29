@@ -10,6 +10,7 @@ import {
 import { resolveSessionCloseAction } from '@/components/sessions/sessionCloseActions';
 import {
   formatSessionLaunchError,
+  getSessionCommandExitDetails,
   isLaunchAlreadyInProgressError,
   launchSingleSession,
 } from '@/components/sessions/sessionLaunchAction';
@@ -454,6 +455,14 @@ export function Sessions({ onLaunch, onLaunchWithDir }: SessionsProps) {
 
     if (isLaunchAlreadyInProgressError(err)) {
       toast.error(t('sessions.launchAlreadyInProgress'));
+      return;
+    }
+
+    const commandExitDetails = getSessionCommandExitDetails(err);
+    if (commandExitDetails !== null) {
+      toast.error(
+        t('sessions.sessionCommandExited').replace('{error}', commandExitDetails)
+      );
       return;
     }
 

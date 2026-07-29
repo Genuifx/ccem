@@ -4,9 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(not(windows))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+#[cfg(not(windows))]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Supported terminal types on macOS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +263,10 @@ static CCEM_INSTALLED: OnceLock<bool> = OnceLock::new();
 static CLAUDE_INSTALLED: OnceLock<bool> = OnceLock::new();
 static OPENCODE_INSTALLED: OnceLock<bool> = OnceLock::new();
 static LOGIN_SHELL_PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+#[cfg(not(windows))]
+const LOGIN_SHELL_PATH_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(windows))]
+static LOGIN_SHELL_PATH_PROBE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Compare a parsed semver tuple against a minimum requirement.
 fn version_gte(
@@ -383,6 +395,65 @@ fn binary_lookup_names(binary: &str) -> Vec<String> {
     }
 }
 
+#[cfg(not(windows))]
+fn read_login_shell_path(shell: &str, timeout: Duration) -> Option<String> {
+    let probe_dir = std::env::temp_dir().join(format!(
+        "ccem-login-shell-path-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+        LOGIN_SHELL_PATH_PROBE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&probe_dir).ok()?;
+    #[cfg(unix)]
+    if fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o700)).is_err() {
+        let _ = fs::remove_dir(&probe_dir);
+        return None;
+    }
+    let probe_path = probe_dir.join("path");
+    let probe_command = format!(
+        "printf %s \"$PATH\" > {}",
+        quote_posix_shell_word(probe_path.to_string_lossy().as_ref())
+    );
+    let result = (|| {
+        let mut child = Command::new(shell)
+            .args(["-li", "-c", &probe_command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return None;
+                    }
+                    return fs::read_to_string(&probe_path)
+                        .ok()
+                        .map(|path| path.trim().to_string())
+                        .filter(|path| !path.is_empty());
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+    })();
+    let _ = fs::remove_file(probe_path);
+    let _ = fs::remove_dir(probe_dir);
+    result
+}
+
 fn login_shell_paths() -> &'static [PathBuf] {
     LOGIN_SHELL_PATHS.get_or_init(|| {
         #[cfg(windows)]
@@ -393,17 +464,11 @@ fn login_shell_paths() -> &'static [PathBuf] {
         #[cfg(not(windows))]
         {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-            let output = Command::new(&shell)
-                .args(["-li", "-c", "printf %s \"$PATH\""])
-                .output();
-
-            match output {
-                Ok(out) if out.status.success() => std::env::split_paths(std::ffi::OsStr::new(
-                    String::from_utf8_lossy(&out.stdout).trim(),
-                ))
-                .collect(),
-                _ => Vec::new(),
-            }
+            read_login_shell_path(&shell, LOGIN_SHELL_PATH_TIMEOUT)
+                .map(|path| {
+                    std::env::split_paths(std::ffi::OsStr::new(&path)).collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
         }
     })
 }
@@ -2171,6 +2236,59 @@ mod tests {
         .expect("expected path should be utf-8");
 
         assert_eq!(user_path, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_path_probe_ignores_shell_startup_stdout() {
+        let root = temp_test_root("login-path-output");
+        fs::create_dir_all(&root).expect("create fake shell directory");
+        let shell = root.join("fake-shell");
+        fs::write(
+            &shell,
+            "#!/bin/sh\nprintf 'startup banner:/not/a/path\\n'\nPATH='/expected/bin:/usr/bin'\nexport PATH\nprobe=''\nfor arg in \"$@\"; do probe=\"$arg\"; done\nexec /bin/sh -c \"$probe\"\n",
+        )
+        .expect("write fake login shell");
+        let mut permissions = fs::metadata(&shell)
+            .expect("read fake shell metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&shell, permissions).expect("mark fake shell executable");
+
+        let path = read_login_shell_path(
+            shell.to_string_lossy().as_ref(),
+            LOGIN_SHELL_PATH_TIMEOUT,
+        );
+
+        assert_eq!(path.as_deref(), Some("/expected/bin:/usr/bin"));
+        fs::remove_dir_all(root).expect("remove fake shell directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_path_probe_times_out_and_reaps_shell() {
+        let root = temp_test_root("login-path-timeout");
+        fs::create_dir_all(&root).expect("create fake shell directory");
+        let shell = root.join("slow-shell");
+        fs::write(&shell, "#!/bin/sh\nexec /bin/sleep 5\n").expect("write slow login shell");
+        let mut permissions = fs::metadata(&shell)
+            .expect("read slow shell metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&shell, permissions).expect("mark slow shell executable");
+
+        let started = Instant::now();
+        let path = read_login_shell_path(
+            shell.to_string_lossy().as_ref(),
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(path, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "login shell timeout should remain bounded"
+        );
+        fs::remove_dir_all(root).expect("remove slow shell directory");
     }
 
     #[test]

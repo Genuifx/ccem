@@ -148,3 +148,22 @@ test('clears in-flight launch key after failure', async () => {
 
   assert.deepEqual(calls, ['failed', 'retried']);
 });
+
+test('extracts actionable details only from session command exit errors', async () => {
+  const { getSessionCommandExitDetails } = await importSessionLaunchAction();
+  const details = 'session command exited during launch (exit code 127); pane output: missing';
+
+  assert.equal(
+    getSessionCommandExitDetails(`session_command_exited: ${details}`),
+    details,
+  );
+  assert.equal(
+    getSessionCommandExitDetails(new Error(`session_command_exited: ${details}`)),
+    details,
+  );
+  assert.equal(getSessionCommandExitDetails(new Error('generic launch failure')), null);
+  assert.equal(
+    getSessionCommandExitDetails(new Error(`generic failure: session_command_exited: ${details}`)),
+    null,
+  );
+});

@@ -1,10 +1,15 @@
 use crate::config::MANAGED_CLAUDE_ENV_KEYS;
 use crate::diagnostic_log;
 use crate::terminal::{
-    resolve_claude_path, resolve_codex_path, resolve_opencode_path, resolve_tmux_path,
+    get_user_path, resolve_claude_path, resolve_codex_path, resolve_opencode_path,
+    resolve_tmux_path,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::process::Stdio;
@@ -12,9 +17,8 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-static USER_PATH: OnceLock<String> = OnceLock::new();
 static TMUX_BINARY: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 static TMUX_INTEGRATION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -22,6 +26,8 @@ static TMUX_INTEGRATION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const DEFAULT_TMUX_SESSION: &str = "ccem";
 const DEFAULT_TMUX_WINDOW: &str = "main";
 const LAUNCH_TARGET_HEALTHCHECK_DELAY: Duration = Duration::from_millis(350);
+const LAUNCH_ERROR_PANE_TAIL_CHARS: usize = 1_600;
+const LAUNCH_DIAGNOSTIC_PANE_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxWindowInfo {
@@ -37,6 +43,23 @@ pub struct TmuxWindowInfo {
 struct TmuxLaunchSpec {
     command: String,
     environment: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxLaunchPaneState {
+    target: String,
+    window_index: u32,
+    window_name: String,
+    pane_dead: bool,
+    pane_dead_status: Option<i32>,
+    pane_dead_signal: Option<String>,
+    pane_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedPaneOutput {
+    output: String,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +157,15 @@ impl TmuxManager {
             create_args.push(entry.clone());
         }
         create_args.push(launch_spec.command.clone());
+        create_args.extend([
+            ";".to_string(),
+            "set-option".to_string(),
+            "-w".to_string(),
+            "-t".to_string(),
+            session_name.clone(),
+            "remain-on-exit".to_string(),
+            "on".to_string(),
+        ]);
 
         let window_index = match self.run_create_command(&session_name, &create_args) {
             Ok(index) => index,
@@ -149,20 +181,24 @@ impl TmuxManager {
                 self.inspect_target(&session_name)?.window_index
             }
             Err(error) => {
+                let cleanup_error = self.cleanup_partial_create(&session_name);
                 diagnostic_log::append_session_launch_event(
                     "tmux.create_session.create_error",
                     serde_json::json!({
                         "runtime_id": runtime_id,
                         "session_name": &session_name,
                         "error": &error,
+                        "cleanup_error": cleanup_error.as_deref(),
                     }),
                 );
-                return Err(error);
+                return Err(cleanup_error
+                    .map(|cleanup| format!("{}; cleanup failed: {}", error, cleanup))
+                    .unwrap_or(error));
             }
         };
         let target = format!("{}:{}", session_name, window_index);
 
-        let window = match self.inspect_target(&target) {
+        let mut window = match self.inspect_target(&target) {
             Ok(window) => window,
             Err(_) => TmuxWindowInfo {
                 session_name,
@@ -182,18 +218,21 @@ impl TmuxManager {
             );
         }
 
-        match self.verify_target_survived_launch(&window.target) {
-            Ok(()) => diagnostic_log::append_session_launch_event(
-                "tmux.create_session.healthcheck.ok",
-                serde_json::json!({
-                    "runtime_id": runtime_id,
-                    "session_name": &window.session_name,
-                    "target": &window.target,
-                    "pane_pid": window.pane_pid,
-                    "window_name": &window.window_name,
-                    "window_index": window.window_index,
-                }),
-            ),
+        match self.verify_target_survived_launch(runtime_id, &window.target, env_vars) {
+            Ok(live_window) => {
+                window = live_window;
+                diagnostic_log::append_session_launch_event(
+                    "tmux.create_session.healthcheck.ok",
+                    serde_json::json!({
+                        "runtime_id": runtime_id,
+                        "session_name": &window.session_name,
+                        "target": &window.target,
+                        "pane_pid": window.pane_pid,
+                        "window_name": &window.window_name,
+                        "window_index": window.window_index,
+                    }),
+                );
+            }
             Err(error) => {
                 diagnostic_log::append_session_launch_event(
                     "tmux.create_session.healthcheck.error",
@@ -456,6 +495,51 @@ impl TmuxManager {
         }
     }
 
+    fn capture_pane_all_target(&self, target: &str) -> Result<CapturedPaneOutput, String> {
+        let capture_path = std::env::temp_dir().join(format!(
+            "ccem-launch-pane-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut capture_file = options.open(&capture_path).map_err(|error| {
+            format!(
+                "Failed to create bounded pane capture for {}: {}",
+                target, error
+            )
+        })?;
+
+        let result = (|| {
+            let output = tmux_command()?
+                .args(["capture-pane", "-t", target, "-p", "-S", "-"])
+                .stdout(Stdio::from(capture_file.try_clone().map_err(|error| {
+                    format!("Failed to prepare pane capture for {}: {}", target, error)
+                })?))
+                .output()
+                .map_err(|error| format!("Failed to capture tmux pane {}: {}", target, error))?;
+
+            if !output.status.success() {
+                return Err(format!(
+                    "tmux capture-pane failed for {}: {}",
+                    target,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+
+            read_bounded_pane_capture(&mut capture_file, LAUNCH_DIAGNOSTIC_PANE_MAX_BYTES)
+                .map_err(|error| format!("Failed to read pane capture {}: {}", target, error))
+        })();
+        drop(capture_file);
+        let _ = std::fs::remove_file(capture_path);
+        result
+    }
+
     pub fn send_terminal_input(&self, runtime_id: &str, data: &str) -> Result<(), String> {
         let target = self.get_attach_target(runtime_id)?;
         self.send_terminal_input_to_target(&target, data)
@@ -580,23 +664,291 @@ impl TmuxManager {
             .is_some_and(|info| target_matches_info(target, &info)))
     }
 
-    fn verify_target_survived_launch(&self, target: &str) -> Result<(), String> {
-        thread::sleep(LAUNCH_TARGET_HEALTHCHECK_DELAY);
-        if self.target_exists(target)? {
-            return Ok(());
+    fn launch_pane_states(&self, session_name: &str) -> Result<Vec<TmuxLaunchPaneState>, String> {
+        let output = tmux_command()?
+            .args([
+                "list-panes",
+                "-s",
+                "-t",
+                session_name,
+                "-F",
+                "#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_active}",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| {
+                format!(
+                    "Failed to inspect launch panes for session {}: {}",
+                    session_name, error
+                )
+            })?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "tmux launch pane lookup failed for {}: {}",
+                session_name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
 
-        // Claude can replace its initial tmux window during startup. The
-        // dedicated session is the stable liveness boundary in that race.
-        if let Some((session_name, _)) = target.split_once(':') {
-            if self.target_exists(session_name)? {
-                return Ok(());
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| parse_launch_pane_line(session_name, line))
+            .collect())
+    }
+
+    fn clear_launch_retention(&self, target: &str) -> Result<(), String> {
+        let status = tmux_command()?
+            .args(["set-option", "-wu", "-t", target, "remain-on-exit"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| {
+                format!(
+                    "Failed to restore remain-on-exit for tmux target {}: {}",
+                    target, error
+                )
+            })?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "tmux failed to restore remain-on-exit for target {}",
+                target
+            ))
+        }
+    }
+
+    fn cleanup_partial_create(&self, session_name: &str) -> Option<String> {
+        match self.target_exists(session_name) {
+            Ok(true) => self.kill_session_target(session_name).err(),
+            Ok(false) => None,
+            Err(error) => Some(error),
+        }
+    }
+
+    fn kill_pane_target(&self, target: &str) -> Result<(), String> {
+        let status = tmux_command()?
+            .args(["kill-pane", "-t", target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Failed to kill tmux pane {}: {}", target, error))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("tmux kill-pane failed for {}", target))
+        }
+    }
+
+    fn restore_launch_lifecycle(
+        &self,
+        session_name: &str,
+        launch_target: &str,
+        pane_states: &[TmuxLaunchPaneState],
+    ) -> Result<Vec<TmuxLaunchPaneState>, String> {
+        if let Some(retention_window) = pane_states
+            .iter()
+            .find(|pane| launch_pane_matches_target(pane, launch_target))
+        {
+            let retention_target =
+                format!("{}:{}", session_name, retention_window.window_index);
+            if self.target_exists(&retention_target)? {
+                if let Err(error) = self.clear_launch_retention(&retention_target) {
+                    if self.target_exists(&retention_target)? {
+                        return Err(error);
+                    }
+                }
             }
         }
 
+        let retained_launch_panes = pane_states
+            .iter()
+            .filter(|pane| pane.pane_dead && launch_pane_matches_target(pane, launch_target))
+            .map(|pane| pane.target.clone())
+            .collect::<Vec<_>>();
+        let mut removal_errors = Vec::new();
+        for pane_target in &retained_launch_panes {
+            if let Err(error) = self.kill_pane_target(pane_target) {
+                removal_errors.push(error);
+            }
+        }
+
+        let refreshed = self.launch_pane_states(session_name)?;
+        let stale_launch_panes = refreshed
+            .iter()
+            .filter(|pane| pane.pane_dead && launch_pane_matches_target(pane, launch_target))
+            .map(|pane| pane.target.as_str())
+            .collect::<Vec<_>>();
+        if !stale_launch_panes.is_empty() {
+            let removal_detail = if removal_errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", removal_errors.join("; "))
+            };
+            return Err(format!(
+                "tmux retained dead launch panes after lifecycle restore: {}{}",
+                stale_launch_panes.join(", "),
+                removal_detail
+            ));
+        }
+
+        Ok(refreshed)
+    }
+
+    fn verify_target_survived_launch(
+        &self,
+        runtime_id: &str,
+        target: &str,
+        env_vars: &HashMap<String, String>,
+    ) -> Result<TmuxWindowInfo, String> {
+        thread::sleep(LAUNCH_TARGET_HEALTHCHECK_DELAY);
+        let session_name = target.split_once(':').map(|(session, _)| session).unwrap_or(target);
+        let pane_states = match self.launch_pane_states(session_name) {
+            Ok(states) if !states.is_empty() => states,
+            Ok(_) => {
+                let cleanup_error = self.kill_session_target(session_name).err();
+                diagnostic_log::append_session_launch_event(
+                    "tmux.create_session.pane_dead",
+                    serde_json::json!({
+                        "runtime_id": runtime_id,
+                        "session_name": session_name,
+                        "target": target,
+                        "exit_code": null,
+                        "signal": null,
+                        "pane_output": "",
+                        "pane_output_truncated": false,
+                        "capture_error": "tmux returned no panes for the launch session",
+                        "cleanup_error": cleanup_error,
+                    }),
+                );
+                return Err(format!(
+                    "session_command_exited: tmux target {} exited before output could be captured",
+                    target
+                ));
+            }
+            Err(error) => {
+                let cleanup_error = self.kill_session_target(session_name).err();
+                diagnostic_log::append_session_launch_event(
+                    "tmux.create_session.pane_dead",
+                    serde_json::json!({
+                        "runtime_id": runtime_id,
+                        "session_name": session_name,
+                        "target": target,
+                        "exit_code": null,
+                        "signal": null,
+                        "pane_output": "",
+                        "pane_output_truncated": false,
+                        "capture_error": &error,
+                        "cleanup_error": cleanup_error,
+                    }),
+                );
+                return Err(format!(
+                    "session_command_exited: tmux target {} exited before output could be captured ({})",
+                    target, error
+                ));
+            }
+        };
+
+        if pane_states.iter().any(|pane| !pane.pane_dead) {
+            let restored_states =
+                match self.restore_launch_lifecycle(session_name, target, &pane_states) {
+                    Ok(states) => states,
+                    Err(error) => {
+                        let cleanup_error = self.kill_session_target(session_name).err();
+                        diagnostic_log::append_session_launch_event(
+                            "tmux.create_session.retention_restore_error",
+                            serde_json::json!({
+                                "runtime_id": runtime_id,
+                                "session_name": session_name,
+                                "target": target,
+                                "error": &error,
+                                "cleanup_error": cleanup_error.as_deref(),
+                            }),
+                        );
+                        return Err(error);
+                    }
+                };
+            let live_pane = restored_states
+                .iter()
+                .find(|pane| !pane.pane_dead && pane.pane_active)
+                .or_else(|| restored_states.iter().find(|pane| !pane.pane_dead))
+                .ok_or_else(|| {
+                    format!(
+                        "tmux session {} lost its live pane while restoring launch lifecycle",
+                        session_name
+                    )
+                })?;
+
+            return self.inspect_target(&format!(
+                "{}:{}",
+                session_name, live_pane.window_index
+            ));
+        }
+
+        let failed_pane = pane_states
+            .iter()
+            .find(|pane| launch_pane_matches_target(pane, target))
+            .or_else(|| pane_states.iter().find(|pane| pane.pane_active))
+            .unwrap_or(&pane_states[0]);
+        let (pane_output, pane_output_truncated, capture_error) =
+            match self.capture_pane_all_target(&failed_pane.target) {
+                Ok(capture) => (
+                    redact_sensitive_launch_output(&capture.output, env_vars),
+                    capture.truncated,
+                    None,
+                ),
+                Err(error) => (String::new(), false, Some(error)),
+            };
+        let cleanup_error = self.kill_session_target(session_name).err();
+        diagnostic_log::append_session_launch_event(
+            "tmux.create_session.pane_dead",
+            serde_json::json!({
+                "runtime_id": runtime_id,
+                "session_name": session_name,
+                "target": &failed_pane.target,
+                "window_index": failed_pane.window_index,
+                "window_name": &failed_pane.window_name,
+                "exit_code": failed_pane.pane_dead_status,
+                "signal": failed_pane.pane_dead_signal,
+                "pane_output": &pane_output,
+                "pane_output_truncated": pane_output_truncated,
+                "capture_error": capture_error.as_deref(),
+                "cleanup_error": cleanup_error.as_deref(),
+            }),
+        );
+
+        let exit_description = failed_pane
+            .pane_dead_status
+            .map(|status| format!("exit code {}", status))
+            .or_else(|| {
+                failed_pane
+                    .pane_dead_signal
+                    .as_deref()
+                    .map(|signal| format!("signal {}", signal))
+            })
+            .unwrap_or_else(|| "unknown exit status".to_string());
+        let output_tail = launch_error_pane_tail(&pane_output);
+        let output_detail = if output_tail.is_empty() {
+            capture_error
+                .as_deref()
+                .map(|error| format!("; pane output unavailable: {}", error))
+                .unwrap_or_else(|| "; no pane output was captured".to_string())
+        } else {
+            format!("; pane output:\n{}", output_tail)
+        };
+        let cleanup_detail = cleanup_error
+            .as_deref()
+            .map(|error| format!("; cleanup failed: {}", error))
+            .unwrap_or_default();
+
         Err(format!(
-            "tmux target {} exited immediately after launch",
-            target
+            "session_command_exited: session command exited during launch ({}){}{}",
+            exit_description, output_detail, cleanup_detail
         ))
     }
 
@@ -974,6 +1326,175 @@ fn parse_target_line(line: &str) -> Option<TmuxWindowInfo> {
     })
 }
 
+fn parse_launch_pane_line(session_name: &str, line: &str) -> Option<TmuxLaunchPaneState> {
+    let mut parts = line.trim().split('\t');
+    let window_index = parts.next()?.parse::<u32>().ok()?;
+    let window_name = parts.next()?.to_string();
+    let pane_index = parts.next()?.parse::<u32>().ok()?;
+    let pane_dead = parts.next()? == "1";
+    let pane_dead_status = parts.next().and_then(|value| value.parse::<i32>().ok());
+    let pane_dead_signal = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let pane_active = parts.next()? == "1";
+
+    Some(TmuxLaunchPaneState {
+        target: format!("{}:{}.{}", session_name, window_index, pane_index),
+        window_index,
+        window_name,
+        pane_dead,
+        pane_dead_status,
+        pane_dead_signal,
+        pane_active,
+    })
+}
+
+fn launch_pane_matches_target(pane: &TmuxLaunchPaneState, target: &str) -> bool {
+    pane.target
+        .split_once(':')
+        .map(|(session, _)| {
+            target == session
+                || target == format!("{}:{}", session, pane.window_index)
+                || target == format!("{}:{}", session, pane.window_name)
+                || target == pane.target
+        })
+        .unwrap_or(false)
+}
+
+fn launch_error_pane_tail(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= LAUNCH_ERROR_PANE_TAIL_CHARS {
+        return trimmed.to_string();
+    }
+
+    let tail = trimmed
+        .chars()
+        .rev()
+        .take(LAUNCH_ERROR_PANE_TAIL_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("…{}", tail)
+}
+
+fn read_bounded_pane_capture(
+    capture_file: &mut File,
+    max_bytes: u64,
+) -> Result<CapturedPaneOutput, String> {
+    let captured_bytes = capture_file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .len();
+    let truncated = captured_bytes > max_bytes;
+    if truncated {
+        capture_file
+            .seek(SeekFrom::End(-(max_bytes as i64)))
+            .map_err(|error| error.to_string())?;
+    } else {
+        capture_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+    }
+    let mut bytes = Vec::with_capacity(captured_bytes.min(max_bytes) as usize);
+    capture_file
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+
+    Ok(CapturedPaneOutput {
+        output: String::from_utf8_lossy(&bytes).to_string(),
+        truncated,
+    })
+}
+
+fn redact_sensitive_launch_output(
+    output: &str,
+    env_vars: &HashMap<String, String>,
+) -> String {
+    let mut sensitive_values = Vec::new();
+    for (key, value) in env_vars {
+        if value.is_empty() {
+            continue;
+        }
+        if is_sensitive_launch_env_key(key) || is_sensitive_config_content_key(key) {
+            sensitive_values.push(value.clone());
+        }
+        if is_sensitive_config_content_key(key) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(value) {
+                collect_sensitive_json_strings(&config, &mut sensitive_values);
+            }
+        }
+    }
+    sensitive_values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    sensitive_values.dedup();
+
+    sensitive_values
+        .into_iter()
+        .fold(output.to_string(), |redacted, value| {
+            redacted.replace(&value, "[REDACTED]")
+        })
+}
+
+fn is_sensitive_launch_env_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect::<String>();
+    normalized.contains("APIKEY")
+        || normalized.contains("TOKEN")
+        || normalized.contains("SECRET")
+        || normalized.contains("PASSWORD")
+}
+
+fn is_sensitive_config_content_key(key: &str) -> bool {
+    key.to_ascii_uppercase().ends_with("CONFIG_CONTENT")
+}
+
+fn collect_sensitive_json_strings(
+    value: &serde_json::Value,
+    sensitive_values: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, nested) in entries {
+                if is_sensitive_launch_env_key(key) {
+                    collect_json_strings(nested, sensitive_values);
+                } else {
+                    collect_sensitive_json_strings(nested, sensitive_values);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_sensitive_json_strings(item, sensitive_values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_json_strings(value: &serde_json::Value, sensitive_values: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) if !value.is_empty() => {
+            sensitive_values.push(value.clone());
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, sensitive_values);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for nested in entries.values() {
+                collect_json_strings(nested, sensitive_values);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn target_matches_info(requested_target: &str, info: &TmuxWindowInfo) -> bool {
     requested_target == info.target
         || requested_target == info.session_name
@@ -1102,42 +1623,6 @@ fn tmux_integration_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn get_user_path() -> &'static str {
-    USER_PATH.get_or_init(|| {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let login_path = match Command::new(&shell)
-            .args(["-li", "-c", "echo $PATH"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
-            }
-            _ => current_path.clone(),
-        };
-
-        merge_path_entries(&current_path, &login_path)
-    })
-}
-
-fn merge_path_entries(primary: &str, secondary: &str) -> String {
-    let mut merged = Vec::new();
-    let mut seen = HashSet::new();
-
-    for candidate in primary.split(':').chain(secondary.split(':')) {
-        if candidate.is_empty() {
-            continue;
-        }
-
-        let entry = candidate.to_string();
-        if seen.insert(entry.clone()) {
-            merged.push(entry);
-        }
-    }
-
-    merged.join(":")
-}
-
 fn sanitize_target_for_filename(target: &str) -> String {
     target
         .chars()
@@ -1176,11 +1661,12 @@ mod tests {
         attach_target_candidates_for_runtime, build_status_left_format, build_status_right_format,
         build_tmux_environment_loader, build_tmux_launch_command, build_tmux_launch_spec,
         compact_model_label, detect_state_from_capture, is_managed_session_name,
-        is_missing_tmux_session_error, is_tmux_session_create_race_error, merge_path_entries,
-        orphaned_managed_tmux_targets, parse_target_line, parse_window_line, resolve_tmux_binary,
-        session_name_for_runtime, shell_quote, target_candidates_for_runtime, target_matches_info,
-        tmux_command, tmux_integration_test_lock, window_name_for_runtime, ClaudeTerminalState,
-        ManagedTmuxTargetAction, TmuxManager, TmuxWindowInfo,
+        is_missing_tmux_session_error, is_tmux_session_create_race_error,
+        orphaned_managed_tmux_targets, parse_launch_pane_line, parse_target_line,
+        parse_window_line, read_bounded_pane_capture, redact_sensitive_launch_output,
+        resolve_tmux_binary, session_name_for_runtime, shell_quote, target_candidates_for_runtime,
+        target_matches_info, tmux_command, tmux_integration_test_lock, window_name_for_runtime,
+        ClaudeTerminalState, ManagedTmuxTargetAction, TmuxManager, TmuxWindowInfo,
     };
     use std::collections::HashMap;
     use std::process::Stdio;
@@ -1404,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_healthcheck_rejects_immediately_exited_tmux_target() {
+    fn launch_healthcheck_captures_exited_pane_and_cleans_session() {
         let _tmux_guard = tmux_integration_test_lock();
 
         if TmuxManager::check_tmux_installed().is_err() {
@@ -1414,7 +1900,6 @@ mod tests {
         let runtime_id = format!("session-exit-test-{}", std::process::id());
         let session_prefix = format!("ccem-exit-test-{}", std::process::id());
         let session_name = session_name_for_runtime(&runtime_id, &session_prefix);
-        let target = format!("{session_name}:main");
 
         let _ = tmux_command().and_then(|mut command| {
             command
@@ -1432,26 +1917,208 @@ mod tests {
                 })
         });
 
-        let status = tmux_command()
+        struct TmuxSessionGuard {
+            session_name: String,
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = tmux_command().and_then(|mut command| {
+                    command
+                        .args(["kill-session", "-t", &self.session_name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|_| ())
+                        .map_err(|error| {
+                            format!(
+                                "Failed to clean test tmux session {}: {}",
+                                self.session_name, error
+                            )
+                        })
+                });
+            }
+        }
+
+        let output = tmux_command()
             .expect("tmux command should be available")
             .args([
                 "new-session",
                 "-d",
+                "-P",
+                "-F",
+                "#{window_index}",
                 "-s",
                 &session_name,
                 "-n",
                 "main",
-                "false",
+                "exec /ccem-missing-session-client",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                &session_name,
+                "remain-on-exit",
+                "on",
             ])
-            .status()
+            .output()
             .expect("test tmux session should be created");
-        assert!(status.success());
+        assert!(output.status.success());
+        let _guard = TmuxSessionGuard {
+            session_name: session_name.clone(),
+        };
+        let window_index = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!window_index.is_empty());
+        let target = format!("{session_name}:{window_index}");
 
         let manager = TmuxManager { session_prefix };
         let error = manager
-            .verify_target_survived_launch(&target)
+            .verify_target_survived_launch(&runtime_id, &target, &HashMap::new())
             .expect_err("exited tmux target should fail launch healthcheck");
-        assert!(error.contains("exited immediately after launch"));
+        assert!(error.starts_with("session_command_exited:"));
+        assert!(error.contains("exit code 127"), "unexpected error: {error}");
+        assert!(
+            error.contains("ccem-missing-session-client"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !manager
+                .has_session(&session_name)
+                .expect("tmux session lookup should succeed"),
+            "failed launch session should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn launch_healthcheck_reports_signal_and_cleans_session() {
+        let _tmux_guard = tmux_integration_test_lock();
+
+        if TmuxManager::check_tmux_installed().is_err() {
+            return;
+        }
+
+        let runtime_id = format!("session-signal-test-{}", std::process::id());
+        let session_prefix = format!("ccem-signal-test-{}", std::process::id());
+        let session_name = session_name_for_runtime(&runtime_id, &session_prefix);
+
+        struct TmuxSessionGuard {
+            session_name: String,
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = tmux_command().and_then(|mut command| {
+                    command
+                        .args(["kill-session", "-t", &self.session_name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|_| ())
+                        .map_err(|error| {
+                            format!(
+                                "Failed to clean test tmux session {}: {}",
+                                self.session_name, error
+                            )
+                        })
+                });
+            }
+        }
+
+        let output = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_index}",
+                "-s",
+                &session_name,
+                "-n",
+                "main",
+                "exec /bin/sh -c 'kill -TERM $$'",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                &session_name,
+                "remain-on-exit",
+                "on",
+            ])
+            .output()
+            .expect("signal test tmux session should be created");
+        assert!(output.status.success());
+        let _guard = TmuxSessionGuard {
+            session_name: session_name.clone(),
+        };
+        let window_index = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let target = format!("{session_name}:{window_index}");
+
+        let manager = TmuxManager { session_prefix };
+        let error = manager
+            .verify_target_survived_launch(&runtime_id, &target, &HashMap::new())
+            .expect_err("signaled tmux target should fail launch healthcheck");
+        assert!(error.starts_with("session_command_exited:"));
+        assert!(error.contains("signal term"), "unexpected error: {error}");
+        assert!(
+            !manager
+                .has_session(&session_name)
+                .expect("tmux session lookup should succeed"),
+            "signaled launch session should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn partial_create_failure_cleanup_removes_created_session() {
+        let _tmux_guard = tmux_integration_test_lock();
+
+        if TmuxManager::check_tmux_installed().is_err() {
+            return;
+        }
+
+        let runtime_id = format!("session-partial-create-test-{}", std::process::id());
+        let session_prefix = format!("ccem-partial-create-test-{}", std::process::id());
+        let session_name = session_name_for_runtime(&runtime_id, &session_prefix);
+        let manager = TmuxManager { session_prefix };
+        let args = [
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_index}",
+            "-s",
+            &session_name,
+            "/bin/sleep 30",
+            ";",
+            "set-option",
+            "-w",
+            "-t",
+            &session_name,
+            "ccem-invalid-option",
+            "on",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        manager
+            .run_create_command(&session_name, &args)
+            .expect_err("invalid chained option should fail after creating the session");
+        assert!(
+            manager
+                .target_exists(&session_name)
+                .expect("partial session lookup should succeed"),
+            "tmux should expose the partially created session"
+        );
+        assert_eq!(manager.cleanup_partial_create(&session_name), None);
+        assert!(
+            !manager
+                .target_exists(&session_name)
+                .expect("cleaned session lookup should succeed"),
+            "partial launch session should be removed"
+        );
     }
 
     #[test]
@@ -1465,6 +2132,18 @@ mod tests {
         assert!(target_matches_info("ccem-session222", &target));
         assert!(target_matches_info("ccem-session222:claude", &target));
         assert!(target_matches_info("ccem-session222:3", &target));
+    }
+
+    #[test]
+    fn launch_pane_parser_preserves_text_signal_names() {
+        let pane = parse_launch_pane_line(
+            "ccem-session222",
+            "3\tmain\t0\t1\t\tterm\t1",
+        )
+        .expect("launch pane metadata should parse");
+
+        assert_eq!(pane.pane_dead_signal.as_deref(), Some("term"));
+        assert_eq!(pane.pane_dead_status, None);
     }
 
     #[test]
@@ -1557,7 +2236,7 @@ mod tests {
         let manager = TmuxManager { session_prefix };
         let stable_target = format!("{session_name}:{window_index}");
         manager
-            .verify_target_survived_launch(&stable_target)
+            .verify_target_survived_launch(&runtime_id, &stable_target, &HashMap::new())
             .expect("stable index target should survive window rename");
         let info = manager
             .get_window_info(&runtime_id)
@@ -1607,6 +2286,13 @@ mod tests {
                 "-n",
                 "initial",
                 "/bin/sleep 30",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                &session_name,
+                "remain-on-exit",
+                "on",
             ])
             .output()
             .expect("test tmux session should be created");
@@ -1660,18 +2346,173 @@ mod tests {
             .output()
             .expect("replacement tmux window should be created");
         assert!(replacement.status.success());
+        let replacement_index = String::from_utf8_lossy(&replacement.stdout)
+            .trim()
+            .to_string();
+        assert!(!replacement_index.is_empty());
+        let replacement_target = format!("{session_name}:{replacement_index}");
 
-        let kill_status = tmux_command()
+        let exit_status = tmux_command()
             .expect("tmux command should be available")
-            .args(["kill-window", "-t", &initial_target])
+            .args(["respawn-pane", "-k", "-t", &initial_target, "/bin/true"])
             .status()
-            .expect("initial tmux window should be removed");
-        assert!(kill_status.success());
+            .expect("initial tmux pane should exit");
+        assert!(exit_status.success());
 
         let manager = TmuxManager { session_prefix };
-        manager
-            .verify_target_survived_launch(&initial_target)
+        let live_window = manager
+            .verify_target_survived_launch(&runtime_id, &initial_target, &HashMap::new())
             .expect("live dedicated session should survive window replacement");
+        assert_eq!(live_window.target, replacement_target);
+        assert!(
+            !manager
+                .target_exists(&initial_target)
+                .expect("initial target lookup should succeed"),
+            "retained dead launch window should be removed"
+        );
+        assert_eq!(
+            manager
+                .get_window_info(&runtime_id)
+                .expect("replacement session should remain addressable")
+                .target,
+            replacement_target
+        );
+    }
+
+    #[test]
+    fn launch_healthcheck_preserves_replacement_window_lifecycle_setting() {
+        let _tmux_guard = tmux_integration_test_lock();
+
+        if TmuxManager::check_tmux_installed().is_err() {
+            return;
+        }
+
+        let runtime_id = format!("session-replace-setting-test-{}", std::process::id());
+        let session_prefix = format!("ccem-replace-setting-test-{}", std::process::id());
+        let session_name = session_name_for_runtime(&runtime_id, &session_prefix);
+
+        struct TmuxSessionGuard {
+            session_name: String,
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = tmux_command().and_then(|mut command| {
+                    command
+                        .args(["kill-session", "-t", &self.session_name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|_| ())
+                        .map_err(|error| {
+                            format!(
+                                "Failed to clean test tmux session {}: {}",
+                                self.session_name, error
+                            )
+                        })
+                });
+            }
+        }
+
+        let initial = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_index}",
+                "-s",
+                &session_name,
+                "-n",
+                "initial",
+                "/bin/sleep 30",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                &session_name,
+                "remain-on-exit",
+                "on",
+            ])
+            .output()
+            .expect("initial tmux session should be created");
+        assert!(initial.status.success());
+        let _guard = TmuxSessionGuard {
+            session_name: session_name.clone(),
+        };
+        let initial_target = format!(
+            "{}:{}",
+            session_name,
+            String::from_utf8_lossy(&initial.stdout).trim()
+        );
+
+        let replacement = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_index}",
+                "-t",
+                &session_name,
+                "-n",
+                "claude",
+                "/bin/sleep 30",
+            ])
+            .output()
+            .expect("replacement tmux window should be created");
+        assert!(replacement.status.success());
+        let replacement_target = format!(
+            "{}:{}",
+            session_name,
+            String::from_utf8_lossy(&replacement.stdout).trim()
+        );
+        assert!(
+            tmux_command()
+                .expect("tmux command should be available")
+                .args([
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &replacement_target,
+                    "remain-on-exit",
+                    "on",
+                ])
+                .status()
+                .expect("replacement lifecycle setting should apply")
+                .success()
+        );
+        assert!(
+            tmux_command()
+                .expect("tmux command should be available")
+                .args(["kill-window", "-t", &initial_target])
+                .status()
+                .expect("initial launch window should be removed")
+                .success()
+        );
+
+        let manager = TmuxManager { session_prefix };
+        let live_window = manager
+            .verify_target_survived_launch(&runtime_id, &initial_target, &HashMap::new())
+            .expect("replacement window should survive launch healthcheck");
+        assert_eq!(live_window.target, replacement_target);
+
+        let lifecycle = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "show-options",
+                "-wv",
+                "-t",
+                &replacement_target,
+                "remain-on-exit",
+            ])
+            .output()
+            .expect("replacement lifecycle setting should be readable");
+        assert!(lifecycle.status.success());
+        assert_eq!(String::from_utf8_lossy(&lifecycle.stdout).trim(), "on");
     }
 
     #[test]
@@ -1716,6 +2557,60 @@ mod tests {
             .environment
             .iter()
             .any(|entry| entry == "ANTHROPIC_AUTH_TOKEN=sk-ant-secret-value"));
+    }
+
+    #[test]
+    fn launch_diagnostics_redact_sensitive_environment_values() {
+        let env_vars = HashMap::from([
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "sk-ant-secret-value".to_string(),
+            ),
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://diagnostic.example".to_string(),
+            ),
+            (
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                r#"{"provider":{"anthropic":{"options":{"apiKey":"opencode-secret-canary"}}}}"#
+                    .to_string(),
+            ),
+        ]);
+
+        let output = redact_sensitive_launch_output(
+            "auth failed for sk-ant-secret-value and opencode-secret-canary at https://diagnostic.example",
+            &env_vars,
+        );
+
+        assert_eq!(
+            output,
+            "auth failed for [REDACTED] and [REDACTED] at https://diagnostic.example"
+        );
+        assert!(!output.contains("opencode-secret-canary"));
+    }
+
+    #[test]
+    fn launch_diagnostics_keep_only_the_bounded_output_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "ccem-bounded-pane-test-{}.log",
+            std::process::id()
+        ));
+        let mut payload = vec![b'x'; 70_000];
+        payload.extend_from_slice(b"diagnostic-tail");
+        std::fs::write(&path, payload).expect("write oversized pane fixture");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open oversized pane fixture");
+
+        let capture =
+            read_bounded_pane_capture(&mut file, 64 * 1024).expect("read bounded pane tail");
+
+        assert!(capture.truncated);
+        assert_eq!(capture.output.len(), 64 * 1024);
+        assert!(capture.output.ends_with("diagnostic-tail"));
+        drop(file);
+        std::fs::remove_file(path).expect("remove oversized pane fixture");
     }
 
     #[test]
@@ -1914,17 +2809,6 @@ mod tests {
         let target = parse_target_line("ccem-session222\tmain\t0\t202\t2").unwrap();
         assert_eq!(target.session_attached_clients, 2);
         assert_eq!(target.target, "ccem-session222:0");
-    }
-
-    #[test]
-    fn merge_path_entries_keeps_runtime_overrides_first() {
-        assert_eq!(
-            merge_path_entries(
-                "/tmp/fixture/bin:/usr/bin:/bin",
-                "/opt/homebrew/bin:/usr/bin:/bin"
-            ),
-            "/tmp/fixture/bin:/usr/bin:/bin:/opt/homebrew/bin"
-        );
     }
 
     #[test]

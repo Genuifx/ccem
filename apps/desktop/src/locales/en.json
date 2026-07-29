@@ -522,6 +522,7 @@
     "launchCount": "Launch {count} sessions",
     "launching": "Launching...",
     "launchFailed": "Failed to launch session: {error}",
+    "sessionCommandExited": "The session command exited immediately. Check the selected environment; diagnostic output was saved to the log. Details: {error}",
     "launchAlreadyInProgress": "A new session is already launching. Wait a moment; if it stays stuck, restart CCEM Desktop and try again.",
     "multiLaunchSuccess": "Launched {count} sessions and arranged",
     "multiLaunchPartial": "Launched {success}/{total} sessions",
