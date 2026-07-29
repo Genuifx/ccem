@@ -8,6 +8,7 @@
  */
 
 import type { Environment, Session } from '@/store';
+import type { UsageStats as AnalyticsUsageStats } from '@/types/analytics';
 
 // ============================================
 // Environment Commands
@@ -65,6 +66,8 @@ export interface TauriCommands {
   mark_pet_notification_read: [{ notificationId: string }, PetNotificationReadState];
   open_pet_notification: [{ request: PetOpenSessionRequest }, void];
   open_tray_cockpit: [{ x?: number | null; y?: number | null }, void];
+  get_tray_runtime_snapshot: [void, TrayRuntimeSnapshot];
+  get_tray_usage_stats: [void, AnalyticsUsageStats | null];
   get_telegram_settings: [void, TelegramSettings];
   save_telegram_settings: [{ settings: TelegramSettings }, void];
   get_telegram_bridge_status: [void, TelegramBridgeStatus];
@@ -414,7 +417,13 @@ export interface TauriCommands {
   check_arrange_support: [void, boolean];
 
   // 使用统计
-  get_usage_stats: [void, UsageStats];
+  get_usage_stats: [
+    void | {
+      source?: 'claude' | 'codex' | 'opencode' | null;
+      force?: boolean;
+    },
+    AnalyticsUsageStats
+  ];
   get_usage_history: [{ days: number }, UsageHistoryEntry[]];
   get_continuous_usage_days: [void, number];
   check_ccem_installed: [void, boolean];
@@ -1368,14 +1377,7 @@ export interface ReducedStreamLog {
   totalStreamMs?: number;
 }
 
-export interface UsageStats {
-  totalTokens: number;
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-}
+export type UsageStats = AnalyticsUsageStats;
 
 export interface UsageHistoryEntry {
   date: string;
@@ -1492,6 +1494,22 @@ export interface CronWecomNotification {
   botId?: string | null;
   peerId?: string | null;
   enabled?: boolean | null;
+}
+
+export interface TrayRuntimeSnapshot {
+  currentEnv: string;
+  permissionMode: string;
+  theme: string;
+  sessions: Array<{
+    id: string;
+    client: string;
+    env_name: string;
+    perm_mode: string;
+    working_dir: string;
+    status: string;
+    start_time: string;
+  }>;
+  cronTasks: CronTask[];
 }
 
 export interface CronTaskRun {

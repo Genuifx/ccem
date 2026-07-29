@@ -2837,6 +2837,27 @@
   opacity: 0.55 !important;
 }
 
+:root[data-performance-mode='reduced'] .tray-cockpit-window,
+:root[data-performance-mode='reduced'] .tray-cockpit-panel,
+:root[data-performance-mode='reduced'] .tray-cockpit-body > *,
+:root[data-performance-mode='reduced'] .tray-cockpit-panel > footer,
+:root[data-performance-mode='reduced'] .tray-chart-cursor,
+:root[data-performance-mode='reduced'] .tray-chart-tooltip,
+:root[data-performance-mode='reduced'] .tray-model-bar {
+  will-change: auto !important;
+}
+
+:root[data-performance-mode='reduced'] .tray-logo-ring,
+:root[data-performance-mode='reduced'] .tray-chart-area,
+:root[data-performance-mode='reduced'] .tray-chart-line,
+:root[data-performance-mode='reduced'] .tray-chart-dot,
+:root[data-performance-mode='reduced'] .tray-dock-button,
+:root[data-performance-mode='reduced'] .tray-icon-button {
+  animation: none !important;
+  transition-duration: 1ms !important;
+  transform: none !important;
+}
+
 :root[data-performance-mode='reduced'] .glass-sidebar-inset,
 :root[data-performance-mode='reduced'] .glass-sidebar-panel,
 :root[data-performance-mode='reduced'] .frosted-panel,

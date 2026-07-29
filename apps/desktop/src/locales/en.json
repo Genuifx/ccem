@@ -20,8 +20,6 @@
   },
   "trayCockpit": {
     "title": "CCEM",
-    "live": "Live cockpit",
-    "preview": "Preview data",
     "refresh": "Refresh",
     "env": "Env",
     "perm": "Perm",

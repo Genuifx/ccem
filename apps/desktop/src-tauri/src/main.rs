@@ -4889,6 +4889,7 @@ fn main() {
             browser::browser_snapshot,
             browser::browser_screenshot,
             tray::open_tray_cockpit,
+            tray::get_tray_runtime_snapshot,
             app_updates::get_app_version,
             app_updates::check_app_update,
             app_updates::install_app_update,
@@ -4979,6 +4980,7 @@ fn main() {
             sync_vscode_projects,
             sync_jetbrains_projects,
             get_usage_stats,
+            analytics::get_tray_usage_stats,
             get_usage_history,
             get_usage_model_breakdown,
             get_continuous_usage_days,
@@ -5185,6 +5187,9 @@ fn main() {
             }
 
             let _ = create_tray(app.handle())?;
+            if let Err(error) = tray::prepare_tray_cockpit(app.handle()) {
+                eprintln!("Tray cockpit prewarm warning: {}", error);
+            }
 
             // Start session monitor background task
             start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());

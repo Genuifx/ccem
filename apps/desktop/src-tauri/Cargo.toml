@@ -49,6 +49,9 @@ objc2-foundation = { version = "0.2.2", default-features = false, features = ["N
 objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSBitmapImageRep", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSWindow"] }
 objc2-web-kit = { version = "0.2.2", default-features = false, features = ["block2", "WKNavigation", "WKSnapshotConfiguration", "WKWebView"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

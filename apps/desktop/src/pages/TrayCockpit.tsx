@@ -13,7 +13,8 @@ import {
 } from '@/lib/lucide-react';
 import { LocaleProvider, useLocale } from '@/locales';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import type { CronTask, DesktopSettings, PlatformCapabilities, TelegramBridgeStatus } from '@/lib/tauri-ipc';
+import type { CronTask, TrayRuntimeSnapshot } from '@/lib/tauri-ipc';
+import { createTrayRefreshGate } from '@/lib/tray-refresh';
 import type { TokenUsageWithCost, UsageStats } from '@/types/analytics';
 import { cn, formatTokens } from '@/lib/utils';
 
@@ -42,14 +43,10 @@ interface TauriSession {
 interface TraySnapshot {
   currentEnv: string;
   permissionMode: string;
+  theme: string;
   usage: UsageStats;
   sessions: TraySession[];
   cronTasks: CronTask[];
-  platform: PlatformCapabilities | null;
-  telegram: TelegramBridgeStatus | null;
-  version: string | null;
-  source: 'live' | 'fallback';
-  loadedAt: number;
 }
 
 interface ChartPoint {
@@ -92,37 +89,13 @@ const EMPTY_USAGE: TokenUsageWithCost = {
   cost: 0,
 };
 
-const REFRESH_INTERVAL_MS = 7000;
+const AUTO_REFRESH_MIN_INTERVAL_MS = 1_000;
 
 const FALLBACK_USAGE: UsageStats = {
-  today: {
-    inputTokens: 92_400,
-    outputTokens: 41_200,
-    cacheReadTokens: 21_300,
-    cacheCreationTokens: 1_900,
-    cost: 3.12,
-  },
-  week: {
-    inputTokens: 620_000,
-    outputTokens: 288_000,
-    cacheReadTokens: 130_000,
-    cacheCreationTokens: 10_000,
-    cost: 21.4,
-  },
-  month: {
-    inputTokens: 2_100_000,
-    outputTokens: 930_000,
-    cacheReadTokens: 480_000,
-    cacheCreationTokens: 38_000,
-    cost: 72.8,
-  },
-  total: {
-    inputTokens: 8_200_000,
-    outputTokens: 3_400_000,
-    cacheReadTokens: 1_900_000,
-    cacheCreationTokens: 124_000,
-    cost: 286.5,
-  },
+  today: { ...EMPTY_USAGE },
+  week: { ...EMPTY_USAGE },
+  month: { ...EMPTY_USAGE },
+  total: { ...EMPTY_USAGE },
   dailyHistory: {},
   hourlyHistory: {},
   byModel: {},
@@ -130,73 +103,13 @@ const FALLBACK_USAGE: UsageStats = {
   lastUpdated: new Date().toISOString(),
 };
 
-const FALLBACK_SESSIONS: TraySession[] = [
-  {
-    id: 'preview-ccem',
-    client: 'codex',
-    envName: 'official',
-    permMode: 'dev',
-    workingDir: '/Users/wzt/G/Github/claude-code-env-manager',
-    status: 'running',
-    startedAt: new Date().toISOString(),
-  },
-  {
-    id: 'preview-baymax',
-    client: 'claude',
-    envName: 'official',
-    permMode: 'safe',
-    workingDir: '/Users/wzt/Documents/baymax',
-    status: 'idle',
-    startedAt: new Date(Date.now() - 24 * 60 * 1000).toISOString(),
-  },
-];
-
-const FALLBACK_CRON_TASKS: CronTask[] = [
-  {
-    id: 'preview-radar',
-    name: 'upstream radar',
-    cronExpression: '0 */2 * * *',
-    prompt: '',
-    workingDir: '/Users/wzt/G/Github/claude-code-env-manager',
-    envName: 'official',
-    executionProfile: 'standard',
-    enabled: true,
-    timeoutSecs: 600,
-    templateId: null,
-    triggerType: 'schedule',
-    parentTaskId: null,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-  {
-    id: 'preview-release',
-    name: 'release check',
-    cronExpression: '0 */6 * * *',
-    prompt: '',
-    workingDir: '/Users/wzt/G/Github/claude-code-env-manager',
-    envName: 'official',
-    executionProfile: 'conservative',
-    enabled: true,
-    timeoutSecs: 600,
-    templateId: null,
-    triggerType: 'schedule',
-    parentTaskId: null,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  },
-];
-
 const INITIAL_SNAPSHOT: TraySnapshot = {
   currentEnv: 'official',
   permissionMode: 'dev',
+  theme: 'system',
   usage: FALLBACK_USAGE,
   sessions: [],
   cronTasks: [],
-  platform: null,
-  telegram: null,
-  version: null,
-  source: 'fallback',
-  loadedAt: Date.now(),
 };
 
 function toTraySession(session: TauriSession): TraySession {
@@ -459,39 +372,6 @@ function statusDotClass(tone: StatusTone): string {
   }
 }
 
-async function readSnapshot(): Promise<TraySnapshot> {
-  const [envResult, settingsResult, usageResult, sessionResult, cronResult, platformResult, telegramResult, versionResult] =
-    await Promise.allSettled([
-      invoke<string | null>('get_current_env'),
-      invoke<DesktopSettings>('get_settings'),
-      invoke<UsageStats>('get_usage_stats'),
-      invoke<TauriSession[]>('list_interactive_sessions'),
-      invoke<CronTask[]>('list_cron_tasks'),
-      invoke<PlatformCapabilities>('get_platform_capabilities'),
-      invoke<TelegramBridgeStatus>('get_telegram_bridge_status'),
-      invoke<string>('get_app_version'),
-    ]);
-
-  const settings = settingsResult.status === 'fulfilled' ? settingsResult.value : null;
-  const liveSessions = sessionResult.status === 'fulfilled'
-    ? sessionResult.value.map(toTraySession)
-    : FALLBACK_SESSIONS;
-  const liveCronTasks = cronResult.status === 'fulfilled' ? cronResult.value : FALLBACK_CRON_TASKS;
-
-  return {
-    currentEnv: envResult.status === 'fulfilled' && envResult.value ? envResult.value : 'official',
-    permissionMode: settings?.defaultMode || 'dev',
-    usage: usageResult.status === 'fulfilled' ? usageResult.value : FALLBACK_USAGE,
-    sessions: liveSessions,
-    cronTasks: liveCronTasks,
-    platform: platformResult.status === 'fulfilled' ? platformResult.value : null,
-    telegram: telegramResult.status === 'fulfilled' ? telegramResult.value : null,
-    version: versionResult.status === 'fulfilled' ? versionResult.value : null,
-    source: usageResult.status === 'fulfilled' || sessionResult.status === 'fulfilled' ? 'live' : 'fallback',
-    loadedAt: Date.now(),
-  };
-}
-
 function applyTheme(theme: string | null | undefined) {
   const root = document.documentElement;
   const previewTheme = new URLSearchParams(window.location.search).get('theme');
@@ -528,30 +408,75 @@ function TrayCockpitContent() {
   const [refreshing, setRefreshing] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [chartRange, setChartRange] = useState<TrayChartRange>('hour');
+  const runtimeRefreshGateRef = useRef(createTrayRefreshGate({
+    minIntervalMs: 0,
+  }));
+  const usageRefreshGateRef = useRef(createTrayRefreshGate({
+    minIntervalMs: AUTO_REFRESH_MIN_INTERVAL_MS,
+  }));
 
-  const refresh = useCallback(async () => {
-    setRefreshing(true);
+  const refresh = useCallback(async ({
+    refreshUsage = false,
+    includeUsage = true,
+  }: {
+    refreshUsage?: boolean;
+    includeUsage?: boolean;
+  } = {}) => {
+    if (refreshUsage) {
+      setRefreshing(true);
+    }
+
+    const runtimeRequest = runtimeRefreshGateRef.current.run(async () => {
+      const runtime = await invoke<TrayRuntimeSnapshot>('get_tray_runtime_snapshot');
+      setSnapshot((current) => ({
+        ...current,
+        currentEnv: runtime.currentEnv || 'official',
+        permissionMode: runtime.permissionMode || 'dev',
+        theme: runtime.theme || 'system',
+        sessions: runtime.sessions.map(toTraySession),
+        cronTasks: runtime.cronTasks,
+      }));
+      applyTheme(runtime.theme);
+    });
+    const usageRequest = includeUsage
+      ? usageRefreshGateRef.current.run(async () => {
+        const usage = refreshUsage
+          ? await invoke<UsageStats>('get_usage_stats', { force: true })
+          : await invoke<UsageStats | null>('get_tray_usage_stats');
+        if (!usage) {
+          throw new Error('Usage summary is not ready');
+        }
+        setSnapshot((current) => ({
+          ...current,
+          usage,
+        }));
+      }, { force: refreshUsage })
+      : Promise.resolve(false);
+
     try {
-      const next = await readSnapshot();
-      setSnapshot(next);
-      const settings = await invoke<DesktopSettings>('get_settings').catch(() => null);
-      applyTheme(settings?.theme);
+      await Promise.allSettled([runtimeRequest, usageRequest]);
     } finally {
-      setRefreshing(false);
+      if (refreshUsage) {
+        setRefreshing(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    void refresh();
-    const intervalId = window.setInterval(() => {
-      void refresh();
-    }, REFRESH_INTERVAL_MS);
-
     let disposed = false;
     const unlisteners: Array<() => void> = [];
     const setupListeners = async () => {
+      const currentWindow = WebviewWindow.getCurrent();
+      const showUnlisten = await listen('tray-cockpit-refresh', () => {
+        void refresh();
+      });
+      if (disposed) {
+        showUnlisten();
+        return;
+      }
+      unlisteners.push(showUnlisten);
+
       for (const eventName of [
-        'tray-cockpit-refresh',
         'session-updated',
         'native-session-updated',
         'task-completed',
@@ -560,7 +485,11 @@ function TrayCockpitContent() {
         'perm-changed',
       ]) {
         const unlisten = await listen(eventName, () => {
-          void refresh();
+          void currentWindow.isVisible().then((visible) => {
+            if (visible) {
+              void refresh({ includeUsage: false });
+            }
+          }).catch(() => {});
         });
         if (disposed) {
           unlisten();
@@ -568,12 +497,17 @@ function TrayCockpitContent() {
           unlisteners.push(unlisten);
         }
       }
+
+      // The prewarmed hidden webview loads only compact snapshots so the first
+      // visible frame already has the correct theme and last-known data.
+      if (!disposed) {
+        void refresh();
+      }
     };
     void setupListeners();
 
     return () => {
       disposed = true;
-      window.clearInterval(intervalId);
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, [refresh]);
@@ -593,6 +527,15 @@ function TrayCockpitContent() {
 
   useGSAP(() => {
     const mm = gsap.matchMedia();
+    const reducedPerformance = document.documentElement.dataset.performanceMode === 'reduced';
+
+    if (reducedPerformance) {
+      gsap.set(
+        '.tray-cockpit-panel, .tray-cockpit-panel > header, .tray-cockpit-body > *, .tray-cockpit-panel > footer, .tray-model-bar',
+        { autoAlpha: 1, y: 0, scale: 1, scaleX: 1 },
+      );
+      return () => mm.revert();
+    }
 
     mm.add('(prefers-reduced-motion: reduce)', () => {
       gsap.set(
@@ -649,7 +592,6 @@ function TrayCockpitContent() {
     }
   };
 
-  const liveLabel = snapshot.source === 'live' ? t('trayCockpit.live') : t('trayCockpit.preview');
   const updatedLabel = t('trayCockpit.updated').replace('{time}', formatRelativeTime(snapshot.usage.lastUpdated));
   const monthCostLabel = t('trayCockpit.monthCost').replace('{cost}', formatCost(snapshot.usage.month.cost));
 
@@ -660,29 +602,15 @@ function TrayCockpitContent() {
           <div className="flex min-w-0 flex-1 items-center gap-2.5">
             <TrayLogo />
             <div className="min-w-0 leading-none">
-              <div className="flex items-center gap-1.5">
-                <h1 className="truncate text-[14px] font-semibold tracking-[-0.005em] text-[var(--tray-text-1)]">
-                  {t('trayCockpit.title')}
-                </h1>
-                <span
-                  className={cn(
-                    'inline-block h-[5px] w-[5px] shrink-0 rounded-full',
-                    snapshot.source === 'live' ? 'bg-[var(--tray-accent)]' : 'bg-[var(--tray-text-3)]',
-                  )}
-                  aria-hidden="true"
-                />
-              </div>
-              <div className="mt-1 flex min-w-0 items-center gap-1 text-[10.5px] text-[var(--tray-text-3)]">
-                <span className="truncate">{liveLabel}</span>
-                <span aria-hidden="true">·</span>
-                <span className="tabular-nums">{updatedLabel}</span>
-              </div>
+              <h1 className="truncate text-[14px] font-semibold tracking-[-0.005em] text-[var(--tray-text-1)]">
+                {t('trayCockpit.title')}
+              </h1>
             </div>
           </div>
           <button
             type="button"
             aria-label={t('trayCockpit.refresh')}
-            onClick={() => void refresh()}
+            onClick={() => void refresh({ refreshUsage: true })}
             className="tray-icon-button grid h-7 w-7 shrink-0 place-items-center rounded-[8px] text-[var(--tray-text-3)] hover:bg-[var(--tray-surface-2)] hover:text-[var(--tray-text-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
           >
             <RefreshCw className={cn('h-[14px] w-[14px]', refreshing && 'animate-spin')} />
@@ -884,7 +812,8 @@ function ActivityChart({
   };
 
   useGSAP(() => {
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      || document.documentElement.dataset.performanceMode === 'reduced';
     const quickDuration = reducedMotion ? 0 : 0.16;
 
     if (cursorLineRef.current) {

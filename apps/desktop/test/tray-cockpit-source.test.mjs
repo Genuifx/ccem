@@ -10,7 +10,19 @@ const sourceDir = path.join(desktopDir, 'src');
 const tauriSrcDir = path.join(desktopDir, 'src-tauri', 'src');
 
 test('tray cockpit owns left-click while preserving the native context menu', async () => {
-  const [traySource, mainSource, entrySource, appSource, capabilitySource, cssSource, cockpitSource, packageSource] =
+  const [
+    traySource,
+    mainSource,
+    entrySource,
+    appSource,
+    capabilitySource,
+    cssSource,
+    cockpitSource,
+    analyticsSource,
+    zhLocaleSource,
+    enLocaleSource,
+    packageSource,
+  ] =
     await Promise.all([
       fs.readFile(path.join(tauriSrcDir, 'tray.rs'), 'utf8'),
       fs.readFile(path.join(tauriSrcDir, 'main.rs'), 'utf8'),
@@ -19,6 +31,9 @@ test('tray cockpit owns left-click while preserving the native context menu', as
       fs.readFile(path.join(desktopDir, 'src-tauri', 'capabilities', 'default.json'), 'utf8'),
       fs.readFile(path.join(sourceDir, 'index.css'), 'utf8'),
       fs.readFile(path.join(sourceDir, 'pages', 'TrayCockpit.tsx'), 'utf8'),
+      fs.readFile(path.join(tauriSrcDir, 'analytics.rs'), 'utf8'),
+      fs.readFile(path.join(sourceDir, 'locales', 'zh.json'), 'utf8'),
+      fs.readFile(path.join(sourceDir, 'locales', 'en.json'), 'utf8'),
       fs.readFile(path.join(desktopDir, 'package.json'), 'utf8'),
     ]);
 
@@ -44,9 +59,22 @@ test('tray cockpit owns left-click while preserving the native context menu', as
   assert.match(traySource, /panel_x - TRAY_COCKPIT_SHADOW_MARGIN_X/);
   assert.match(traySource, /panel_y - TRAY_COCKPIT_SHADOW_MARGIN_TOP/);
   assert.match(traySource, /#\[tauri::command\][\s\S]*pub fn open_tray_cockpit/);
+  assert.match(traySource, /pub fn prepare_tray_cockpit/);
+  assert.match(traySource, /pub async fn get_tray_runtime_snapshot/);
+  assert.match(traySource, /fn schedule_tray_cockpit_build/);
+  assert.match(traySource, /tauri::async_runtime::spawn_blocking/);
 
   assert.match(mainSource, /use tray::\{create_tray, TRAY_COCKPIT_LABEL\}/);
   assert.match(mainSource, /tray::open_tray_cockpit/);
+  assert.match(mainSource, /tray::get_tray_runtime_snapshot/);
+  assert.match(mainSource, /analytics::get_tray_usage_stats/);
+  assert.match(mainSource, /tray::prepare_tray_cockpit\(app\.handle\(\)\)/);
+  const trayUsageCommand = analyticsSource.match(
+    /pub async fn get_tray_usage_stats\(\)[\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(trayUsageCommand, 'lightweight tray usage command should exist');
+  assert.match(trayUsageCommand, /read_tray_usage_stats/);
+  assert.doesNotMatch(trayUsageCommand, /refresh_usage_cache/);
   assert.match(mainSource, /window\.label\(\) == TRAY_COCKPIT_LABEL[\s\S]*api\.prevent_close\(\)[\s\S]*hide_tray_cockpit/);
   assert.match(entrySource, /label === 'tray-cockpit'[\s\S]*return TrayCockpit/);
   assert.match(entrySource, /requestedWindow === 'tray-cockpit'[\s\S]*return TrayCockpit/);
@@ -63,6 +91,7 @@ test('tray cockpit owns left-click while preserving the native context menu', as
 
   assert.match(cssSource, /html\[data-window='tray-cockpit'\]/);
   assert.match(cssSource, /prefers-reduced-motion/);
+  assert.match(cssSource, /data-performance-mode='reduced'\] \.tray-cockpit-window/);
   assert.match(cssSource, /tray-logo-image/);
   assert.match(cssSource, /tray-chart-hitbox/);
   assert.match(cssSource, /tray-chart-tooltip/);
@@ -126,8 +155,21 @@ test('tray cockpit owns left-click while preserving the native context menu', as
   assert.doesNotMatch(cockpitSource, /function ProviderSplit/);
   assert.doesNotMatch(cockpitSource, /providerBreakdown/);
   assert.doesNotMatch(cockpitSource, /tray-provider-bar/);
-  assert.match(cockpitSource, /invoke<UsageStats>\('get_usage_stats'\)/);
-  assert.match(cockpitSource, /invoke<CronTask\[]>\('list_cron_tasks'\)/);
+  assert.match(cockpitSource, /createTrayRefreshGate/);
+  assert.match(cockpitSource, /invoke<UsageStats \| null>\('get_tray_usage_stats'\)/);
+  assert.match(cockpitSource, /invoke<TrayRuntimeSnapshot>\('get_tray_runtime_snapshot'\)/);
+  assert.match(cockpitSource, /invoke<UsageStats>\('get_usage_stats', \{ force: true \}\)/);
+  assert.doesNotMatch(cockpitSource, /window\.setInterval/);
+  assert.doesNotMatch(cockpitSource, /REFRESH_INTERVAL_MS/);
+  assert.doesNotMatch(cockpitSource, /invoke<CronTask\[]>\('list_cron_tasks'\)/);
+  assert.doesNotMatch(cockpitSource, /get_platform_capabilities/);
+  assert.doesNotMatch(cockpitSource, /get_telegram_bridge_status/);
+  assert.doesNotMatch(cockpitSource, /get_app_version/);
+  assert.doesNotMatch(cockpitSource, /trayCockpit\.(live|preview)/);
+  assert.doesNotMatch(cockpitSource, /snapshot\.source/);
+  assert.doesNotMatch(zhLocaleSource, /实时驾驶舱|预览数据/);
+  assert.doesNotMatch(enLocaleSource, /Live cockpit|Preview data/);
+  assert.match(cockpitSource, /dataset\.performanceMode === 'reduced'/);
   assert.match(cockpitSource, /WebviewWindow\.getByLabel\('main'\)/);
   assert.match(cockpitSource, /emit\('tray-open-tab'/);
 });

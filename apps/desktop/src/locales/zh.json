@@ -20,8 +20,6 @@
   },
   "trayCockpit": {
     "title": "CCEM",
-    "live": "实时驾驶舱",
-    "preview": "预览数据",
     "refresh": "刷新",
     "env": "环境",
     "perm": "权限",

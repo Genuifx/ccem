@@ -5,18 +5,25 @@
 use crate::config;
 use crate::opencode;
 use chrono::{Datelike, Local, NaiveDate};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
 const USAGE_CACHE_VERSION: u32 = 2;
+const USAGE_SUMMARY_VERSION: u32 = 1;
+const USAGE_STATS_MEMO_TTL: Duration = Duration::from_secs(60);
 const OPENCODE_NATIVE_ENV_NAME: &str = opencode::OPENCODE_NATIVE_ENV_NAME;
+static USAGE_REFRESH_LOCK: Mutex<()> = Mutex::new(());
+static USAGE_STATS_MEMO: OnceLock<Mutex<UsageStatsMemo>> = OnceLock::new();
 
 // ============================================================================
 // Output types — sent to frontend (must use camelCase)
@@ -42,7 +49,7 @@ impl TokenUsageWithCost {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageStats {
     pub today: TokenUsageWithCost,
@@ -54,6 +61,23 @@ pub struct UsageStats {
     pub by_model: HashMap<String, TokenUsageWithCost>,
     pub by_environment: HashMap<String, TokenUsageWithCost>,
     pub last_updated: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageSummaryFile {
+    version: u32,
+    stats: UsageStats,
+}
+
+struct CachedUsageStats {
+    collected_at: Instant,
+    stats: UsageStats,
+}
+
+#[derive(Default)]
+struct UsageStatsMemo {
+    by_source: HashMap<&'static str, CachedUsageStats>,
 }
 
 pub type ModelBreakdownHistory = HashMap<String, HashMap<String, TokenUsageWithCost>>;
@@ -762,8 +786,16 @@ fn parse_codex_jsonl_reader<R: BufRead>(
 // Cache read / write
 // ============================================================================
 
+fn usage_cache_path() -> PathBuf {
+    config::get_ccem_dir().join("usage-cache.json")
+}
+
+fn usage_summary_path() -> PathBuf {
+    config::get_ccem_dir().join("usage-summary.json")
+}
+
 fn read_usage_cache() -> CacheFile {
-    let cache_path = config::get_ccem_dir().join("usage-cache.json");
+    let cache_path = usage_cache_path();
     if !cache_path.exists() {
         return CacheFile::default();
     }
@@ -777,14 +809,156 @@ fn read_usage_cache() -> CacheFile {
     }
 }
 
+fn replace_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        fs::rename(temp_path, target_path)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let temp_wide = temp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let target_wide = target_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let moved = unsafe {
+            MoveFileExW(
+                temp_wide.as_ptr(),
+                target_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create usage cache directory: {error}"))?;
+    }
+
+    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let result = (|| {
+        let file = File::create(&temp_path)
+            .map_err(|error| format!("Failed to create usage cache temp file: {error}"))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value)
+            .map_err(|error| format!("Failed to serialize usage cache: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("Failed to flush usage cache: {error}"))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("Failed to sync usage cache: {error}"))?;
+        replace_file(&temp_path, path)
+            .map_err(|error| format!("Failed to replace usage cache: {error}"))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+    result
+}
+
 fn write_usage_cache(cache: &CacheFile) {
     if config::ensure_ccem_dir().is_err() {
         return;
     }
-    let cache_path = config::get_ccem_dir().join("usage-cache.json");
-    if let Ok(content) = serde_json::to_string_pretty(cache) {
-        let _ = fs::write(cache_path, content);
+    if let Err(error) = write_json_atomic(&usage_cache_path(), cache) {
+        eprintln!("Usage cache write warning: {error}");
     }
+}
+
+fn read_usage_summary_from(path: &Path) -> Option<UsageStats> {
+    let content = fs::read_to_string(path).ok()?;
+    let summary = serde_json::from_str::<UsageSummaryFile>(&content).ok()?;
+    (summary.version == USAGE_SUMMARY_VERSION).then_some(summary.stats)
+}
+
+fn write_usage_summary_to(path: &Path, stats: &UsageStats) -> Result<(), String> {
+    write_json_atomic(
+        path,
+        &UsageSummaryFile {
+            version: USAGE_SUMMARY_VERSION,
+            stats: stats.clone(),
+        },
+    )
+}
+
+fn write_usage_summary(stats: &UsageStats) {
+    if let Err(error) = write_usage_summary_to(&usage_summary_path(), stats) {
+        eprintln!("Usage summary write warning: {error}");
+    }
+}
+
+fn usage_stats_memo() -> &'static Mutex<UsageStatsMemo> {
+    USAGE_STATS_MEMO.get_or_init(|| Mutex::new(UsageStatsMemo::default()))
+}
+
+fn lock_usage_stats_memo() -> MutexGuard<'static, UsageStatsMemo> {
+    usage_stats_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_usage_refresh() -> MutexGuard<'static, ()> {
+    USAGE_REFRESH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn should_reuse_usage_stats(
+    force_requested: bool,
+    collected_at: Instant,
+    request_started: Instant,
+) -> bool {
+    if force_requested {
+        return collected_at >= request_started;
+    }
+
+    collected_at.elapsed() < USAGE_STATS_MEMO_TTL
+}
+
+fn read_tray_usage_stats() -> Option<UsageStats> {
+    if let Some(stats) = usage_stats_memo()
+        .try_lock()
+        .ok()
+        .and_then(|memo| memo.by_source.get("all").map(|cached| cached.stats.clone()))
+    {
+        return Some(stats);
+    }
+
+    read_usage_summary_from(&usage_summary_path())
+}
+
+fn cache_files_have_same_meta(
+    existing: &HashMap<String, CacheFileEntry>,
+    next: &HashMap<String, CacheFileEntry>,
+) -> bool {
+    existing.len() == next.len()
+        && next.iter().all(|(path, entry)| {
+            existing.get(path).is_some_and(|cached| {
+                (cached.meta.mtime - entry.meta.mtime).abs() < 1.0
+                    && cached.meta.size == entry.meta.size
+            })
+        })
 }
 
 // ============================================================================
@@ -793,6 +967,31 @@ fn write_usage_cache(cache: &CacheFile) {
 
 /// Refresh usage cache by scanning known usage files incrementally.
 fn refresh_usage_cache() -> CacheFile {
+    let _process_guard = lock_usage_refresh();
+    let _ = config::ensure_ccem_dir();
+    let lock_path = config::get_ccem_dir().join("usage-cache.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok();
+
+    if let Some(file) = lock_file.as_ref() {
+        if file.lock_exclusive().is_err() {
+            return read_usage_cache();
+        }
+    }
+
+    let refreshed = refresh_usage_cache_locked();
+    if let Some(file) = lock_file.as_ref() {
+        let _ = FileExt::unlock(file);
+    }
+    refreshed
+}
+
+fn refresh_usage_cache_locked() -> CacheFile {
     let prices = load_model_prices();
     let jsonl_files = discover_jsonl_files();
     let existing_cache = read_usage_cache();
@@ -833,7 +1032,9 @@ fn refresh_usage_cache() -> CacheFile {
         new_cache.files.insert(path_key, entry);
     }
 
-    write_usage_cache(&new_cache);
+    if !cache_files_have_same_meta(&existing_cache.files, &new_cache.files) {
+        write_usage_cache(&new_cache);
+    }
     new_cache
 }
 
@@ -1512,13 +1713,42 @@ where
 // Tauri commands
 // ============================================================================
 
+#[tauri::command]
+pub async fn get_tray_usage_stats() -> Result<Option<UsageStats>, String> {
+    run_blocking(|| Ok(read_tray_usage_stats())).await
+}
+
 /// Get usage statistics (optionally filtered by source).
 #[tauri::command]
-pub async fn get_usage_stats(source: Option<String>) -> Result<UsageStats, String> {
+pub async fn get_usage_stats(
+    source: Option<String>,
+    force: Option<bool>,
+) -> Result<UsageStats, String> {
+    let request_started = Instant::now();
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
+        let source_key = source_filter.unwrap_or("all");
+        let force_requested = force.unwrap_or(false);
+        let mut memo = lock_usage_stats_memo();
+        if let Some(cached) = memo.by_source.get(source_key) {
+            if should_reuse_usage_stats(force_requested, cached.collected_at, request_started) {
+                return Ok(cached.stats.clone());
+            }
+        }
+
         let cache = refresh_usage_cache();
-        Ok(aggregate_cache(&cache, source_filter))
+        let stats = aggregate_cache(&cache, source_filter);
+        if source_filter.is_none() {
+            write_usage_summary(&stats);
+        }
+        memo.by_source.insert(
+            source_key,
+            CachedUsageStats {
+                collected_at: Instant::now(),
+                stats: stats.clone(),
+            },
+        );
+        Ok(stats)
     })
     .await
 }
@@ -1579,15 +1809,17 @@ pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, St
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_model_breakdown, default_prices, extract_model_breakdown_bucket,
-        format_week_bucket, normalize_usage_source, parse_codex_jsonl_reader,
-        parse_opencode_export_stats, parse_opencode_session_items, CacheEntry, CacheFile,
-        CacheFileEntry, CacheMeta, CacheStats, CacheUsage, ModelBreakdownGranularity, ModelPrice,
-        OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
+        aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
+        extract_model_breakdown_bucket, format_week_bucket, normalize_usage_source,
+        parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
+        read_usage_summary_from, should_reuse_usage_stats, write_usage_summary_to, CacheEntry,
+        CacheFile, CacheFileEntry, CacheMeta, CacheStats, CacheUsage, ModelBreakdownGranularity,
+        ModelPrice, UsageStats, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
     };
     use chrono::{Local, TimeZone};
     use std::collections::HashMap;
     use std::io::BufReader;
+    use std::time::Instant;
 
     #[test]
     fn test_codex_token_count_differential() {
@@ -1702,6 +1934,66 @@ mod tests {
             Some("opencode")
         );
         assert!(normalize_usage_source(Some("other")).is_err());
+    }
+
+    #[test]
+    fn test_usage_summary_round_trip_uses_atomic_replacement() {
+        let temp = tempfile::tempdir().expect("create usage summary tempdir");
+        let summary_path = temp.path().join("usage-summary.json");
+        let stats = UsageStats {
+            last_updated: "2026-07-29T12:00:00+08:00".to_string(),
+            ..Default::default()
+        };
+
+        assert!(read_usage_summary_from(&summary_path).is_none());
+        write_usage_summary_to(&summary_path, &stats).expect("write usage summary");
+        let parsed = read_usage_summary_from(&summary_path).expect("read usage summary");
+
+        assert_eq!(parsed.last_updated, stats.last_updated);
+        assert!(summary_path.metadata().expect("summary metadata").len() < 2048);
+        assert!(!summary_path
+            .with_extension(format!("json.{}.tmp", std::process::id()))
+            .exists());
+    }
+
+    #[test]
+    fn test_forced_usage_refresh_reuses_a_newer_result() {
+        let request_started = Instant::now();
+        let collected_before = request_started
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("instant subtraction");
+        let collected_after = Instant::now();
+
+        assert!(should_reuse_usage_stats(
+            false,
+            collected_before,
+            request_started
+        ));
+        assert!(!should_reuse_usage_stats(
+            true,
+            collected_before,
+            request_started
+        ));
+        assert!(should_reuse_usage_stats(
+            true,
+            collected_after,
+            request_started
+        ));
+    }
+
+    #[test]
+    fn test_cache_metadata_comparison_detects_source_changes() {
+        let entry = |mtime, size| CacheFileEntry {
+            meta: CacheMeta { mtime, size },
+            stats: CacheStats::default(),
+        };
+        let existing = HashMap::from([("session.jsonl".to_string(), entry(100.0, 512))]);
+        let unchanged = HashMap::from([("session.jsonl".to_string(), entry(100.0, 512))]);
+        let resized = HashMap::from([("session.jsonl".to_string(), entry(100.0, 1024))]);
+
+        assert!(cache_files_have_same_meta(&existing, &unchanged));
+        assert!(!cache_files_have_same_meta(&existing, &resized));
+        assert!(!cache_files_have_same_meta(&existing, &HashMap::new()));
     }
 
     #[test]
