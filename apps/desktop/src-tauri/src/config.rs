@@ -1010,6 +1010,14 @@ pub fn inject_ai_env(cmd: &mut std::process::Command) {
     } else {
         cfg.current.as_deref()
     };
+    inject_ai_env_from_config(cmd, &cfg, env_name);
+}
+
+fn inject_ai_env_from_config(
+    cmd: &mut std::process::Command,
+    cfg: &CcemConfig,
+    env_name: Option<&str>,
+) {
     if let Some(name) = env_name {
         if let Some(env) = cfg.registries.get(name) {
             clear_managed_claude_env(cmd);
@@ -1066,51 +1074,14 @@ pub fn create_env_with_encrypted_key(
 mod tests {
     use super::{
         build_claude_env_vars, build_opencode_config_content, create_env_with_encrypted_key,
-        default_official_env, env_config_to_process_env, get_env_with_decrypted_key, inject_ai_env,
-        normalize_env_config, recover_config_from_legacy, resolve_env_config_for_runtime,
-        resolve_opencode_primary_model, resolve_opencode_runtime, write_config, CcemConfig,
-        EnvConfig, RawEnvConfig, OPENCODE_NATIVE_ENV_NAME,
+        default_official_env, env_config_to_process_env, get_env_with_decrypted_key,
+        inject_ai_env_from_config, normalize_env_config, recover_config_from_legacy,
+        resolve_env_config_for_runtime, resolve_opencode_primary_model, resolve_opencode_runtime,
+        CcemConfig, EnvConfig, RawEnvConfig, OPENCODE_NATIVE_ENV_NAME,
     };
     use std::collections::HashMap;
-    use std::env;
     use std::ffi::OsStr;
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn test_home_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct TestHome {
-        _lock: MutexGuard<'static, ()>,
-        previous_home: Option<String>,
-        _temp: tempfile::TempDir,
-    }
-
-    impl TestHome {
-        fn new() -> Self {
-            let lock = test_home_lock().lock().expect("lock test home");
-            let temp = tempfile::tempdir().expect("create temp home");
-            let previous_home = env::var("HOME").ok();
-            env::set_var("HOME", temp.path());
-            Self {
-                _lock: lock,
-                previous_home,
-                _temp: temp,
-            }
-        }
-    }
-
-    impl Drop for TestHome {
-        fn drop(&mut self) {
-            if let Some(previous_home) = &self.previous_home {
-                env::set_var("HOME", previous_home);
-            } else {
-                env::remove_var("HOME");
-            }
-        }
-    }
 
     fn legacy_official_env() -> EnvConfig {
         EnvConfig {
@@ -1308,7 +1279,6 @@ mod tests {
 
     #[test]
     fn inject_ai_env_clears_managed_env_when_decryption_fails() {
-        let _home = TestHome::new();
         let tampered = "enc:v2:000000000000000000000000:00:00000000000000000000000000000000";
         let mut registries = HashMap::new();
         registries.insert(
@@ -1324,16 +1294,15 @@ mod tests {
                 limit_write_tools: false,
             },
         );
-        write_config(&CcemConfig {
+        let config = CcemConfig {
             registries,
             current: Some("bad".to_string()),
             default_mode: Some("dev".to_string()),
-        })
-        .expect("write temp config");
+        };
         let mut command = Command::new("env");
         command.env("ANTHROPIC_AUTH_TOKEN", "parent-token");
 
-        inject_ai_env(&mut command);
+        inject_ai_env_from_config(&mut command, &config, Some("bad"));
 
         let managed_value = command
             .get_envs()

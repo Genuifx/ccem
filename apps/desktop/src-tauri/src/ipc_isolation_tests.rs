@@ -23,6 +23,14 @@ fn request(command: &str, url: &str, body: serde_json::Value) -> InvokeRequest {
     }
 }
 
+fn local_app_origin() -> &'static str {
+    if cfg!(any(windows, target_os = "android")) {
+        "http://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    }
+}
+
 #[test]
 fn trusted_app_webviews_can_invoke_app_and_core_commands() {
     let app = tauri::test::mock_builder()
@@ -41,7 +49,7 @@ fn trusted_app_webviews_can_invoke_app_and_core_commands() {
 
         let greeting = tauri::test::get_ipc_response(
             &webview,
-            request("greet", "tauri://localhost", json!({ "name": "IPC test" })),
+            request("greet", local_app_origin(), json!({ "name": "IPC test" })),
         )
         .unwrap_or_else(|error| panic!("trusted {label} app command denied: {error}"))
         .deserialize::<String>()
@@ -50,7 +58,7 @@ fn trusted_app_webviews_can_invoke_app_and_core_commands() {
 
         tauri::test::get_ipc_response(
             &webview,
-            request("plugin:app|version", "tauri://localhost", json!({})),
+            request("plugin:app|version", local_app_origin(), json!({})),
         )
         .unwrap_or_else(|error| panic!("trusted {label} core command denied: {error}"));
     }
@@ -82,7 +90,7 @@ fn remote_browser_child_webview_cannot_invoke_app_or_plugin_commands() {
             .expect("build untrusted browser child webview"),
     );
 
-    for origin in ["https://example.test", "tauri://localhost"] {
+    for origin in ["https://example.test", local_app_origin()] {
         for command in ["greet", "plugin:app|version"] {
             let response = tauri::test::get_ipc_response(
                 &browser,

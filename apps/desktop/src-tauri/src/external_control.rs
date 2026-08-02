@@ -1953,9 +1953,11 @@ mod tests {
 
     #[test]
     fn test_resolve_working_dir_absolute_accepted() {
-        let result = resolve_working_dir(Some("/tmp/some/path".to_string()));
+        let absolute = std::env::current_dir().expect("resolve current working directory");
+        let absolute = absolute.to_string_lossy().into_owned();
+        let result = resolve_working_dir(Some(absolute.clone()));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "/tmp/some/path");
+        assert_eq!(result.unwrap(), absolute);
     }
 
     #[test]

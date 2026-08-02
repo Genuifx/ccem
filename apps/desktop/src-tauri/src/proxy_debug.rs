@@ -1797,7 +1797,18 @@ fn append_chat_completion_content(value: &Value, output: &mut Vec<String>) {
 }
 
 fn proxy_debug_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_PROXY_DEBUG_DIR.with(|path| path.borrow().clone()) {
+        return path;
+    }
+
     config::get_ccem_dir().join("proxy-debug")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PROXY_DEBUG_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn bodies_dir() -> PathBuf {
@@ -2421,36 +2432,31 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::io::{self, ErrorKind, Read};
-    use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
 
-    struct HomeEnvGuard {
-        previous: Option<std::ffi::OsString>,
+    struct ProxyDebugDirGuard {
+        previous: Option<std::path::PathBuf>,
     }
 
-    impl HomeEnvGuard {
-        fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
+    impl ProxyDebugDirGuard {
+        fn set(path: std::path::PathBuf) -> Self {
+            let previous = super::TEST_PROXY_DEBUG_DIR.with(|current| current.replace(Some(path)));
             Self { previous }
         }
     }
 
-    impl Drop for HomeEnvGuard {
+    impl Drop for ProxyDebugDirGuard {
         fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var("HOME", previous);
-            } else {
-                std::env::remove_var("HOME");
-            }
+            super::TEST_PROXY_DEBUG_DIR.with(|current| {
+                let _ = current.replace(self.previous.take());
+            });
         }
     }
 
-    fn with_temp_proxy_home<T>(f: impl FnOnce() -> T) -> T {
-        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _lock = HOME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let temp = tempfile::tempdir().expect("create temp home");
-        let _home = HomeEnvGuard::set(temp.path());
+    fn with_temp_proxy_dir<T>(f: impl FnOnce() -> T) -> T {
+        let temp = tempfile::tempdir().expect("create temp proxy directory");
+        let expected = temp.path().join("proxy-debug");
+        let _dir = ProxyDebugDirGuard::set(expected.clone());
+        assert_eq!(proxy_debug_dir(), expected);
         f()
     }
 
@@ -2554,7 +2560,7 @@ mod tests {
 
     #[test]
     fn traffic_index_pages_many_records_with_timestamp_cursor() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             for index in 0..250 {
                 append_record(&sample_traffic_record(index, 1_000 + index as i64))
                     .expect("append record");
@@ -2576,7 +2582,7 @@ mod tests {
 
     #[test]
     fn traffic_detail_uses_index_offset_for_id_lookup() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             for index in 0..25 {
                 append_record(&sample_traffic_record(index, 2_000 + index as i64))
                     .expect("append record");
@@ -2592,7 +2598,7 @@ mod tests {
 
     #[test]
     fn traffic_index_bad_lines_fall_back_to_jsonl_when_unusable() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             append_record(&sample_traffic_record(1, 3_001)).expect("append first");
             append_record(&sample_traffic_record(2, 3_002)).expect("append second");
             fs::write(traffic_idx_path(), "not,a,valid,offset\nalso bad\n").expect("corrupt index");
@@ -2613,7 +2619,7 @@ mod tests {
 
     #[test]
     fn traffic_index_missing_file_falls_back_to_jsonl() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             append_record(&sample_traffic_record(1, 3_101)).expect("append first");
             append_record(&sample_traffic_record(2, 3_102)).expect("append second");
             fs::remove_file(traffic_idx_path()).expect("remove index");
@@ -2634,7 +2640,7 @@ mod tests {
 
     #[test]
     fn traffic_index_offset_mismatch_returns_clear_error() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             append_record(&sample_traffic_record(1, 3_201)).expect("append first");
             append_record(&sample_traffic_record(2, 3_202)).expect("append second");
             fs::write(traffic_idx_path(), "3202,req-0002,0\n").expect("write stale index");
@@ -2650,7 +2656,7 @@ mod tests {
 
     #[test]
     fn traffic_retention_rewrites_index_offsets_consistently() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             for index in 0..40 {
                 let mut record = sample_traffic_record(index, 4_000 + index as i64);
                 let body_file = format!("bodies/req-{index:04}-res.bin");
