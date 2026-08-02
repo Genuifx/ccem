@@ -1,5 +1,11 @@
 # ccem
 
+## 2.64.0
+
+### Minor Changes
+
+- Stabilize Desktop session launches and Chinese IME input, upgrade the Claude runtime, refresh OpenRouter Claude 5 presets, optimize tray analytics startup, and harden cross-platform release validation.
+
 ## 2.63.0
 
 ### Minor Changes
