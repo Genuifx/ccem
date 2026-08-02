@@ -540,13 +540,9 @@ mod tests {
         assert_eq!(reloaded, created, "reloaded key must match created key");
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_key_unix_permissions_are_restricted() {
-        // Only meaningful on Unix; on other platforms the chmod step is absent.
-        if !cfg!(unix) {
-            return;
-        }
-
         let dir = tempfile::tempdir().expect("create tempdir");
         let key_path = dir.path().join(".install-key");
         load_or_create_install_key_at(&key_path).expect("create key");
