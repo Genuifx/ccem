@@ -33,6 +33,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - name: Install tmux integration-test dependency
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - name: Audit production dependencies
         run: pnpm audit:prod:high
 
@@ -50,6 +54,8 @@ jobs:
         run: node scripts/ci/run-rust-clippy.mjs apps/desktop/src-tauri
 
       - name: Run Rust tests
+        env:
+          CCEM_REQUIRE_TMUX_TESTS: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: node scripts/ci/run-rust-tests.mjs apps/desktop/src-tauri
 
   windows-installer-smoke:

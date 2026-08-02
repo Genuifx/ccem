@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
+const cliDir = path.resolve(desktopDir, '..', 'cli');
 const tauriDir = path.join(desktopDir, 'src-tauri');
 
 // ---------------------------------------------------------------------------
@@ -99,11 +100,12 @@ test('CLI desktop-control boundary tests pass', { timeout: 60000 }, async () => 
     return;
   }
 
+  const vitestEntry = path.join(cliDir, 'node_modules', 'vitest', 'vitest.mjs');
   const result = spawnSync(
-    'pnpm',
-    ['--filter', '@ccem/cli', 'exec', 'vitest', 'run', 'src/__tests__/desktop-control.test.ts'],
+    process.execPath,
+    [vitestEntry, 'run', 'src/__tests__/desktop-control.test.ts'],
     {
-      cwd: path.resolve(desktopDir, '..', '..'),
+      cwd: cliDir,
       encoding: 'utf8',
       timeout: 50000,
     },
@@ -112,6 +114,6 @@ test('CLI desktop-control boundary tests pass', { timeout: 60000 }, async () => 
   assert.equal(
     result.status,
     0,
-    `CLI desktop-control tests failed (status=${result.status}):\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    `CLI desktop-control tests failed (status=${result.status}):\nerror:\n${result.error?.stack ?? result.error ?? ''}\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}`,
   );
 });

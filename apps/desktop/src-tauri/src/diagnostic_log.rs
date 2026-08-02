@@ -9,11 +9,32 @@ use std::sync::{Mutex, OnceLock};
 
 const MAX_SESSION_LAUNCH_LOG_BYTES: u64 = 5 * 1024 * 1024;
 static SESSION_LAUNCH_LOG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+static SESSION_LAUNCH_TEST_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn log_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| home.join(".ccem/desktop-session-launch.log"))
-        .unwrap_or_else(|| PathBuf::from(".ccem/desktop-session-launch.log"))
+    #[cfg(test)]
+    {
+        return SESSION_LAUNCH_TEST_LOG_PATH
+            .get_or_init(|| {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                std::env::temp_dir().join(format!(
+                    "ccem-test-session-launch-{}-{nonce:x}.log",
+                    std::process::id()
+                ))
+            })
+            .clone();
+    }
+
+    #[cfg(not(test))]
+    {
+        dirs::home_dir()
+            .map(|home| home.join(".ccem/desktop-session-launch.log"))
+            .unwrap_or_else(|| PathBuf::from(".ccem/desktop-session-launch.log"))
+    }
 }
 
 pub fn append_session_launch_event(event: &str, details: Value) {
@@ -116,7 +137,20 @@ pub fn launch_log_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_line_at, rotated_log_path};
+    use super::{append_line_at, log_path, rotated_log_path};
+
+    #[test]
+    fn session_launch_test_log_isolated_from_user_state() {
+        let path = log_path();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test diagnostic log should have a UTF-8 file name");
+
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(file_name.starts_with("ccem-test-session-launch-"));
+        assert_ne!(file_name, "desktop-session-launch.log");
+    }
 
     #[test]
     fn session_launch_log_rotates_before_exceeding_limit() {

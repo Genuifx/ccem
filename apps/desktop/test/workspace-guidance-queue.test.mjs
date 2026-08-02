@@ -8,7 +8,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
 async function readSource(...segments) {
-  return fs.readFile(path.join(desktopDir, 'src', ...segments), 'utf8');
+  const source = await fs.readFile(path.join(desktopDir, 'src', ...segments), 'utf8');
+  return source.replace(/\r\n?/g, '\n');
 }
 
 function sliceBetween(source, startNeedle, endNeedle) {

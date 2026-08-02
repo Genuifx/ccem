@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 
 const desktopDir = path.resolve(import.meta.dirname, '..');
@@ -17,7 +18,7 @@ async function importWorkspaceAnnotations() {
     format: 'esm',
     platform: 'node',
   });
-  return import(`${outfile}?v=${Date.now()}`);
+  return import(`${pathToFileURL(outfile).href}?v=${Date.now()}`);
 }
 
 async function importWorkspaceAnnotationRects() {
@@ -30,7 +31,7 @@ async function importWorkspaceAnnotationRects() {
     format: 'esm',
     platform: 'node',
   });
-  return import(`${outfile}?v=${Date.now()}`);
+  return import(`${pathToFileURL(outfile).href}?v=${Date.now()}`);
 }
 
 test('annotation highlights use selected text boxes instead of broad layout boxes', async () => {
