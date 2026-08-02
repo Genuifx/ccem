@@ -15,7 +15,7 @@ static SESSION_LAUNCH_TEST_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 fn log_path() -> PathBuf {
     #[cfg(test)]
     {
-        return SESSION_LAUNCH_TEST_LOG_PATH
+        SESSION_LAUNCH_TEST_LOG_PATH
             .get_or_init(|| {
                 let nonce = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -26,7 +26,7 @@ fn log_path() -> PathBuf {
                     std::process::id()
                 ))
             })
-            .clone();
+            .clone()
     }
 
     #[cfg(not(test))]

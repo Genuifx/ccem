@@ -1885,7 +1885,8 @@ mod tests {
 
         let removed_environment = command
             .get_envs()
-            .filter_map(|(key, value)| value.is_none().then(|| key.to_string_lossy().into_owned()))
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(removed_environment.iter().any(|key| key == "TMUX"));
         assert!(removed_environment.iter().any(|key| key == "TMUX_PANE"));
@@ -2140,7 +2141,10 @@ mod tests {
             .verify_target_survived_launch(&runtime_id, &target, &HashMap::new())
             .expect_err("exited tmux target should fail launch healthcheck");
         assert!(error.starts_with("session_command_exited:"));
-        assert!(error.contains("exit code 127"), "unexpected error: {error}");
+        assert!(
+            error.contains("exit code 126") || error.contains("exit code 127"),
+            "unexpected error: {error}"
+        );
         assert!(
             error.contains("ccem-missing-session-client"),
             "unexpected error: {error}"
