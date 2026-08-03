@@ -33,6 +33,7 @@ import {
 import { buildClaudeFileCheckpointEvent } from './claudeFileCheckpoints';
 import { TodoSnapshotTracker, type TodoSnapshotV1 } from './todoSnapshots';
 import { formatPermissionPreview } from './permissionPreview';
+import { withSuppressedClaudeBypassShadowWarning } from './claudeSdkWarnings';
 
 type NativeProvider = 'claude' | 'codex';
 
@@ -1589,10 +1590,11 @@ async function consumeClaudeMessages() {
   claudeContextUsageFailureKey = null;
 
   const inputQueue = new AsyncMessageQueue<SDKUserMessage>();
-  const claudeQuery = query({
+  const options = buildClaudeQueryOptions();
+  const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => query({
     prompt: inputQueue,
-    options: buildClaudeQueryOptions(),
-  });
+    options,
+  }));
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
@@ -1998,10 +2000,11 @@ async function rewindClaudeFiles(checkpointId: string) {
     throw new Error('Cannot rewind before Claude provides a session id.');
   }
 
-  const rewindQuery = query({
+  const options = buildClaudeQueryOptions();
+  const rewindQuery = withSuppressedClaudeBypassShadowWarning(options, () => query({
     prompt: '',
-    options: buildClaudeQueryOptions(),
-  });
+    options,
+  }));
 
   try {
     for await (const message of rewindQuery) {

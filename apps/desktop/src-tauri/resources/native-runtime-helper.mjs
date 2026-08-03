@@ -27388,7 +27388,7 @@ var Codex = class {
 
 // src/index.ts
 import { createInterface } from "node:readline";
-import process4 from "node:process";
+import process5 from "node:process";
 
 // src/claudeEnv.ts
 import process2 from "node:process";
@@ -42265,6 +42265,37 @@ function formatPermissionPreview(value, maxLength = 160) {
   return tokens.join("");
 }
 
+// src/claudeSdkWarnings.ts
+import process4 from "node:process";
+var SHADOWED_CAN_USE_TOOL_WARNING_CODE = "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED";
+var BYPASS_PERMISSIONS_WARNING_MESSAGE = "canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call (except explicit deny rules) before the callback is consulted. To gate every tool call, use a PreToolUse hook instead.";
+function isBypassPermissionsShadowWarning(args) {
+  const [warning, typeOrOptions, positionalCode] = args;
+  const message = typeof warning === "string" ? warning : warning instanceof Error ? warning.message : "";
+  const warningCode = typeOrOptions && typeof typeOrOptions === "object" && "code" in typeOrOptions && typeof typeOrOptions.code === "string" ? typeOrOptions.code : typeof positionalCode === "string" ? positionalCode : warning instanceof Error && "code" in warning && typeof warning.code === "string" ? warning.code : void 0;
+  return warningCode === SHADOWED_CAN_USE_TOOL_WARNING_CODE && message === BYPASS_PERMISSIONS_WARNING_MESSAGE;
+}
+function withSuppressedClaudeBypassShadowWarning(options, createQuery) {
+  if (options.permissionMode !== "bypassPermissions" || typeof options.canUseTool !== "function") {
+    return createQuery();
+  }
+  const originalEmitWarning = process4.emitWarning;
+  const filteredEmitWarning = ((...args) => {
+    if (isBypassPermissionsShadowWarning(args)) {
+      return;
+    }
+    Reflect.apply(originalEmitWarning, process4, args);
+  });
+  process4.emitWarning = filteredEmitWarning;
+  try {
+    return createQuery();
+  } finally {
+    if (process4.emitWarning === filteredEmitWarning) {
+      process4.emitWarning = originalEmitWarning;
+    }
+  }
+}
+
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
 var DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8e3;
@@ -42343,7 +42374,7 @@ var AsyncMessageQueue = class {
   }
 };
 function emit(output) {
-  process4.stdout.write(`${JSON.stringify(output)}
+  process5.stdout.write(`${JSON.stringify(output)}
 `);
 }
 function emitStatus(status, detail) {
@@ -42360,7 +42391,7 @@ function emitSessionMeta(providerSessionId) {
   emit({ type: "session_meta", provider_session_id: providerSessionId });
 }
 function resolveClaudeIdleTtlMs() {
-  const raw = process4.env.CCEM_NATIVE_CLAUDE_IDLE_TTL_MS;
+  const raw = process5.env.CCEM_NATIVE_CLAUDE_IDLE_TTL_MS;
   if (raw == null || raw.trim() === "") {
     return DEFAULT_CLAUDE_IDLE_TTL_MS;
   }
@@ -42368,7 +42399,7 @@ function resolveClaudeIdleTtlMs() {
   return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_IDLE_TTL_MS;
 }
 function resolveClaudeInterruptTimeoutMs() {
-  const raw = process4.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS;
+  const raw = process5.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS;
   if (raw == null || raw.trim() === "") {
     return DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
   }
@@ -43327,10 +43358,11 @@ async function consumeClaudeMessages() {
   }
   claudeContextUsageFailureKey = null;
   const inputQueue = new AsyncMessageQueue();
-  const claudeQuery = Okt({
+  const options = buildClaudeQueryOptions();
+  const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => Okt({
     prompt: inputQueue,
-    options: buildClaudeQueryOptions()
-  });
+    options
+  }));
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
@@ -43679,10 +43711,11 @@ async function rewindClaudeFiles(checkpointId) {
   if (!currentProviderSessionId) {
     throw new Error("Cannot rewind before Claude provides a session id.");
   }
-  const rewindQuery = Okt({
+  const options = buildClaudeQueryOptions();
+  const rewindQuery = withSuppressedClaudeBypassShadowWarning(options, () => Okt({
     prompt: "",
-    options: buildClaudeQueryOptions()
-  });
+    options
+  }));
   try {
     for await (const message of rewindQuery) {
       const sessionId = message?.session_id;
@@ -43775,7 +43808,7 @@ async function ensureCodexThread() {
       baseUrl: initCommand.codex_base_url ?? void 0,
       apiKey: initCommand.codex_api_key ?? void 0,
       env: {
-        ...process4.env,
+        ...process5.env,
         ...initCommand.env_vars
       }
     });
@@ -44245,7 +44278,7 @@ async function handleCommand(command) {
   }
 }
 var rl2 = createInterface({
-  input: process4.stdin,
+  input: process5.stdin,
   crlfDelay: Infinity
 });
 rl2.on("line", (line) => {
