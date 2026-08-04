@@ -1,5 +1,11 @@
 # ccem
 
+## 2.65.0
+
+### Minor Changes
+
+- Suppress false yolo permission warnings on desktop, restore tmux 3.6+ session target parsing, and resolve production audit advisories in fast-uri and ip-address.
+
 ## 2.64.0
 
 ### Minor Changes
