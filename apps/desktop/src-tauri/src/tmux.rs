@@ -354,7 +354,7 @@ impl TmuxManager {
                     "-t",
                     session_name,
                     "-F",
-                    "#{window_index}\t#{window_name}\t#{pane_pid}\t#{session_attached}",
+                    "#{window_index}|#{window_name}|#{pane_pid}|#{session_attached}",
                 ])
                 .output()
                 .map_err(|error| {
@@ -622,7 +622,7 @@ impl TmuxManager {
                 "-p",
                 "-t",
                 target,
-                "#{session_name}\t#{window_name}\t#{window_index}\t#{pane_pid}\t#{session_attached}",
+                "#{session_name}|#{window_name}|#{window_index}|#{pane_pid}|#{session_attached}",
             ])
             .stdin(Stdio::null())
             .output()
@@ -655,7 +655,7 @@ impl TmuxManager {
                 "-p",
                 "-t",
                 target,
-                "#{session_name}\t#{window_name}\t#{window_index}\t#{pane_pid}\t#{session_attached}",
+                "#{session_name}|#{window_name}|#{window_index}|#{pane_pid}|#{session_attached}",
             ])
             .stdin(Stdio::null())
             .output()
@@ -676,7 +676,7 @@ impl TmuxManager {
                 "-t",
                 session_name,
                 "-F",
-                "#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_active}",
+                "#{window_index}|#{window_name}|#{pane_index}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_active}",
             ])
             .stdin(Stdio::null())
             .output()
@@ -1292,7 +1292,7 @@ fn contains_approval_pattern(lines: &str) -> bool {
 }
 
 fn parse_window_line(session_name: &str, line: &str) -> Option<TmuxWindowInfo> {
-    let mut parts = line.split('\t');
+    let mut parts = line.split('|');
     let window_index = parts.next()?.parse::<u32>().ok()?;
     let window_name = parts.next()?.to_string();
     let pane_pid = parts.next().and_then(|value| value.parse::<u32>().ok());
@@ -1311,7 +1311,7 @@ fn parse_window_line(session_name: &str, line: &str) -> Option<TmuxWindowInfo> {
 }
 
 fn parse_target_line(line: &str) -> Option<TmuxWindowInfo> {
-    let mut parts = line.trim().split('\t');
+    let mut parts = line.trim().split('|');
     let session_name = parts.next()?.to_string();
     let window_name = parts.next()?.to_string();
     let window_index = parts.next()?.parse::<u32>().ok()?;
@@ -1331,7 +1331,7 @@ fn parse_target_line(line: &str) -> Option<TmuxWindowInfo> {
 }
 
 fn parse_launch_pane_line(session_name: &str, line: &str) -> Option<TmuxLaunchPaneState> {
-    let mut parts = line.trim().split('\t');
+    let mut parts = line.trim().split('|');
     let window_index = parts.next()?.parse::<u32>().ok()?;
     let window_name = parts.next()?.to_string();
     let pane_index = parts.next()?.parse::<u32>().ok()?;
@@ -2290,11 +2290,11 @@ mod tests {
 
     #[test]
     fn target_parsing_uses_window_index_not_renamable_window_name() {
-        let window = parse_window_line("ccem-session222", "3\tclaude\t202\t1").unwrap();
+        let window = parse_window_line("ccem-session222", "3|claude|202|1").unwrap();
         assert_eq!(window.target, "ccem-session222:claude");
         assert_eq!(window.window_name, "claude");
 
-        let target = parse_target_line("ccem-session222\tclaude\t3\t202\t2").unwrap();
+        let target = parse_target_line("ccem-session222|claude|3|202|2").unwrap();
         assert_eq!(target.target, "ccem-session222:3");
         assert!(target_matches_info("ccem-session222", &target));
         assert!(target_matches_info("ccem-session222:claude", &target));
@@ -2305,7 +2305,7 @@ mod tests {
     fn launch_pane_parser_preserves_text_signal_names() {
         let pane = parse_launch_pane_line(
             "ccem-session222",
-            "3\tmain\t0\t1\t\tterm\t1",
+            "3|main|0|1||term|1",
         )
         .expect("launch pane metadata should parse");
 
@@ -2970,10 +2970,10 @@ mod tests {
 
     #[test]
     fn tmux_metadata_parses_attached_client_count() {
-        let window = parse_window_line("ccem-session222", "0\tmain\t202\t1").unwrap();
+        let window = parse_window_line("ccem-session222", "0|main|202|1").unwrap();
         assert_eq!(window.session_attached_clients, 1);
 
-        let target = parse_target_line("ccem-session222\tmain\t0\t202\t2").unwrap();
+        let target = parse_target_line("ccem-session222|main|0|202|2").unwrap();
         assert_eq!(target.session_attached_clients, 2);
         assert_eq!(target.target, "ccem-session222:0");
     }
