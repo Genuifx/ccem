@@ -330,5 +330,18 @@ test('live and history workspace paths wire transcript selections into successfu
   assert.match(annotationSource, /document\.addEventListener\('mousedown', handleMouseDown, true\)/);
   assert.match(annotationSource, /event\.shiftKey[\s\S]*'Home'[\s\S]*'PageDown'[\s\S]*\.includes\(event\.key\)/);
   assert.match(annotationSource, /event\.metaKey \|\| event\.ctrlKey/);
-  assert.match(styleSource, /data-workspace-selection-highlight-active/);
+  const suppressionRuleStart = styleSource.indexOf('[data-workspace-selection-highlight-active');
+  assert.ok(suppressionRuleStart >= 0, 'native selection suppression rule must exist');
+  const suppressionRuleEnd = styleSource.indexOf('}', suppressionRuleStart);
+  const suppressionRule = styleSource.slice(suppressionRuleStart, suppressionRuleEnd + 1);
+  assert.match(
+    suppressionRule,
+    /background-color:\s*transparent/,
+    'selection suppression must paint the native ::selection background transparent via the background-color longhand',
+  );
+  assert.doesNotMatch(
+    suppressionRule,
+    /background:\s*transparent/,
+    'the background shorthand is invalid in ::selection and would let the native blue selection layer show through',
+  );
 });

@@ -1170,7 +1170,7 @@
 
 [data-workspace-selection-highlight-active='true']::selection,
 [data-workspace-selection-highlight-active='true'] *::selection {
-  background: transparent;
+  background-color: transparent;
 }
 
 .ccem-prompt-area .prompt-area-placeholder {
