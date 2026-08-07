@@ -1,5 +1,11 @@
 # ccem
 
+## 2.66.0
+
+### Minor Changes
+
+- Remove duplicate workspace selection highlight in the desktop app.
+
 ## 2.65.0
 
 ### Minor Changes
