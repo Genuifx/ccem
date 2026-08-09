@@ -126,12 +126,32 @@ CCEM Router
 - 新 session 创建时拷贝快照进 session record;改全局默认**不影响**运行中 session
 - session 设置面板改 bindings → 只改路由表,即时生效,不碰 SDK query
 
-### 4.5 UI
+### 4.5 UI 与交互(plan mode 式动态开关,用户已确认)
 
-- session 设置新增「模型路由」区:每个内置 subagent 类型一行 env 下拉 + `subagent:*` 兜底行 + background 行
-- 全局设置页新增「Router」区:开关、端口、全局默认 bindings
-- workspace 状态条加 router 存活徽标(含实际端口)
-- i18n:全部走 `t()`,zh 默认;图标 Hugeicons;组件 shadcn/ui
+路由状态是会话中随时想切的东西,交互类比 plan mode:主界面只放最快的开关,完整控制渐进展开。三层结构:
+
+**L1 状态条路由 chip(每 session,即时开关)**
+- `WorkspaceStatusStrip` 现有 env chip 旁新增 router chip(Hugeicons Route 图标 + 当前 profile 名或「直连」,单行紧凑——紧凑度按用户偏好再收一档)
+- 点击弹 Popover(shadcn):profile 单选列表(每项附一行绑定摘要)+「动态改派」开关(对应 `router.dynamic_routing`)+「自定义绑定…」入口(跳 L2)
+- 切换 = 一次 `update_session_bindings` IPC 改路由表,**即时生效不重启 query**;toast 轻提示生效内容
+- 红利:router 模式下现有 env chip 切换也变即时生效(§3.3),两个 chip 手感统一
+
+**L2 Session 设置「模型路由」区(完整控制)**
+- per-type 绑定行(内置花名册下拉 + `subagent:*` + `background`),env 下拉
+- 动态路由开关;「存为我的默认」写全局默认 bindings
+
+**L3 全局设置 Router 区**
+- 总开关、端口(改动提示需重启)、全局默认 bindings、自定义 profile 管理
+
+**Profile(方案)模型**
+- 内置:`直连`(本 session 不走 router)/ `省钱杂活`(`subagent:*` + `background` → 便宜环境)/ `特长分工`(推荐矩阵,如 Explore→GLM、Plan→DeepSeek)
+- 用户自定义存 `config.json router.profiles[]`:`{ id, name, bindings }`(name 走 i18n 或用户输入)
+- profile 是 bindings 的**命名快照**:切换时展开写入 session 路由表;后续改 profile 定义不影响运行中 session
+
+**空态/降级**
+- 全局关闭 router → chip 灰显「直连」,tooltip 指路设置页
+- router 启动失败 → chip 警示态 + 已回退直连说明
+- i18n 全走 `t()`(zh 默认);组件 shadcn/ui(Popover/RadioGroup/Toggle/Toast)
 
 ## 5. Helper 注入机制与兜底
 
@@ -216,14 +236,14 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与
 ## 8. 实施步骤(跟做顺序)
 
 0. **Spike 三问**(§5.3),产出写入下方实施记录
-1. `packages/core`:`RouterConfig` / `SessionRouteTable` / `SubagentBinding` 类型 + 内置 subagent 花名册常量
+1. `packages/core`:`RouterConfig` / `SessionRouteTable` / `SubagentBinding` / `RouterProfile` 类型 + 内置 subagent 花名册常量 + 内置 profile 常量
 2. `src-tauri/src/router.rs`(新模块,<1000 行;超出则拆 `router/` 目录):代理服务、内存路由表(从 session store 重建 + 注册/注销 API)、`/health`、`/routes`
 3. `config.rs`:`router` 配置节(开关/端口/全局默认 bindings)+ 端口嗅探;session record 增加 `router_token` + `bindings` 快照字段(旧 record 缺省即 legacy,恢复时迁移,见 §3.4)
 4. 启动路径接入:`create_native_session`(main.rs:1220)、`build_claude_command`(runtime.rs:1129)、tmux/terminal(仅 router URL + token,无注入);恢复路径走同一注入(§3.4)
 5. helper:`buildClaudeQueryOptions` 注入 agents(双信号)、`buildClaudeQueryEnv` 指向 router
 6. IPC:`get_router_settings` / `update_router_settings` / `update_session_bindings` / `router_status`
 7. CLI wrapper:`ccem desktop create --route/--routes-json`、`ccem desktop routes`(§5.5)
-8. UI:设置页 Router 区、session 设置「模型路由」区、状态条徽标(shadcn/ui + Hugeicons + `t()`)
+8. UI(§4.5 三层):状态条路由 chip + Popover、session 设置「模型路由」区、全局设置 Router 区(含 profile 管理)、降级空态(shadcn/ui + Hugeicons + `t()`,紧凑度按用户偏好)
 9. 切主环境路径改为改路由表(§3.3),保留 router 关闭时的旧软重启
 10. 测试(§7)+ `pnpm verify`
 
