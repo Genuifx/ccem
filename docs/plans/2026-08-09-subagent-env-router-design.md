@@ -19,7 +19,7 @@
 
 - 不做 OpenAI↔Anthropic 格式转换(DeepSeek/GLM/Kimi 均有 Anthropic 原生兼容端点,只需改 base URL + 鉴权头 + model 名)
 - 不做 CCR 式的"智能改写"/transformer 管线
-- 本期不做 CLI(`ccem launch`)接入(router 是 desktop app 内嵌服务,CLI 后期复用)
+- 裸 `ccem launch --env`(不经 desktop 控制桥)本期不接 router;经 desktop 桥的发起渠道(UI / ccem skill / bot / cron)全部支持,见 §5.5
 - 不做非 Anthropic 兼容供应商的支持
 
 ## 2. 可行性依据(调研结论)
@@ -66,18 +66,27 @@ CCEM Router
 - 设置页可改端口;**改端口需重启 app 生效**(运行中 session 的 env vars 存的是实际绑定端口,不受影响)
 - 仅绑定 `127.0.0.1`
 
-### 3.2 Token 与重启持久化(用户已确认)
+### 3.2 Token 与重启持久化(用户已确认;2026-08-09 修订)
 
 - 每 session 创建时生成随机 token,**既是鉴权也是路由表 key**,多 session 并发互不串台
-- 路由表 + token 持久化到 `~/.ccem/router-state.json`(文件权限 600),app 重启后 router 原样恢复
-- session 恢复流程:重新注入当前 router 端口 + 原 token 重新注册
-- 固定端口下,tmux/外挂 session 在 app 重启后无缝续上;仅"端口被占嗅探到新端口"时,已脱离 app 的老 session 会断(UI 提示)
-- session 结束时从路由表注销 token;router-state.json 定期清理无对应存活 session 的条目
+- **token 与 bindings 快照直接存进 session record**(native record / runtime state entry);router 不单独持有会话状态——**不设 router-state.json**,内存路由表在 app 启动时从 session store 重建,session 恢复时惰性重新注册
+- session 恢复(respawn helper)时:注入**当前**实际端口 + record 中的 token 重新注册。env vars 是 spawn 时设置的,不存在陈旧端口问题
+- tmux/外挂 session 在 app 重启后:进程持有的是旧 env;固定端口不变时无缝续上;若端口已变(被占嗅探/用户改设置),旧进程下次 API 调用失败 → UI 判死后走恢复流程(同窗口 respawn + `--resume`),见 §3.4
+- session 结束时从路由表注销 token;app 启动重建时跳过已终结 session 的 record
 
 ### 3.3 与现有切环境路径的关系
 
 - `update_native_session_settings` 改主环境 → 改为只更新 router 路由表的 `default_env`,**不再软重启 SDK query**(model pins 变化由 router 转发层保证;env vars 中的 pin 仅影响请求 model 名,router 默认路由原样转发,行为兼容)
 - 旧路径(router 未启用/启动失败)保持现有软重启逻辑不变
+
+### 3.4 老会话/死会话恢复(用户已确认)
+
+场景:app 隔夜关闭后 helper 进程与 router 均已死,用户在 workspace 点开老会话。设计原则:**router 不引入新的会话生命周期状态,完全复用现有恢复路径**(`RuntimeRecoveryCandidate` / RecoveryCandidatesPanel / `--resume`)。
+
+1. 点击老会话 → 走现有 respawn 路径(重拉 helper + `--resume <claude_session_id>`)→ **与新会话完全相同的注入逻辑**:当前端口 + record 内 token 重新注册 + bindings 快照生效。无任何陈旧状态
+2. **router 前创建的旧 record 迁移**(无 token/bindings 字段):恢复时透明迁移——分配 token、从全局默认 bindings 拷贝快照、按 router 模式注入;router 未启用则保持直连旧行为
+3. 端口已变导致外挂 tmux 进程断流:UI 判死后提示恢复,respawn 即愈合
+4. claude 侧 transcript/jsonl 已丢失等失败场景:维持现有恢复错误处理,router 不改变其语义
 
 ## 4. 路由规则与配置模型
 
@@ -142,6 +151,16 @@ Spike 产出写入本文件"实施记录"节。
 - headless(`build_claude_command`):经 `--agents` 参数注入同等定义
 - tmux/terminal 交互式:无法注入,仅支持自定义 agent 自写别名;UI 标注该限制
 
+### 5.5 外部发起渠道(ccem skill / bot / cron,用户已确认)
+
+ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与 UI 创建完全相同的 desktop 后端路径**,因此 router 模式自动继承,覆盖全部 `ManagedSessionSource`(Desktop / Telegram / Weixin / Wecom / Cron)。需要新增的只是创建参数透传:
+
+- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"`(如 `--route "subagent:Explore=glm" --route "background=deepseek"`)与 `--routes-json <json>`,种子化该 session 的 bindings 快照;缺省拷全局默认
+- `ccem desktop routes <runtimeId> --json` 查看;`ccem desktop routes <runtimeId> --set "<key>=<env>"` 运行时改绑定(走"只改路由表"路径,即时生效)
+- 响应 JSON 增加 `routes` 字段,便于 skill 回报状态
+
+**边界:** Codex provider 非 Anthropic 协议,router 不适用,`--provider codex` 时忽略 route 参数并提示;裸 `ccem launch --env`(不经 desktop 桥)本期不接 router(该路径无常驻进程托管 router,且 skill 不使用它),文档注明。
+
 ## 6. 错误处理、健壮性与可观测性
 
 ### 6.1 SSE 透传健壮性(用户要求"非常健壮",一级目标)
@@ -164,7 +183,7 @@ Spike 产出写入本文件"实施记录"节。
 
 - 每请求记录:session(脱敏 token)、命中环境、model 原值/改写值、状态码、耗时;SSE `usage` 事件只读嗅探提取 token 用量(不改写字节),作为按环境分账的数据基础
 - 本地端点 `/health`、`/routes`(token 鉴权)
-- 日志不落密钥;`router-state.json` 权限 600;仅绑 127.0.0.1
+- 日志不落密钥;token 仅存于 session record(与现有敏感字段同等保护);仅绑 127.0.0.1
 
 ## 7. 测试策略
 
@@ -179,19 +198,22 @@ Spike 产出写入本文件"实施记录"节。
 
 0. **Spike 三问**(§5.3),产出写入下方实施记录
 1. `packages/core`:`RouterConfig` / `SessionRouteTable` / `SubagentBinding` 类型 + 内置 subagent 花名册常量
-2. `src-tauri/src/router.rs`(新模块,<1000 行;超出则拆 `router/` 目录):代理服务、路由表 store、`router-state.json` 持久化、`/health`、`/routes`
-3. `config.rs`:`router` 配置节读写 + 端口嗅探 + 注册/注销 token API
-4. 启动路径接入:`create_native_session`(main.rs:1220)、`build_claude_command`(runtime.rs:1129)、tmux/terminal(仅 router URL + token,无注入);恢复路径重注册
+2. `src-tauri/src/router.rs`(新模块,<1000 行;超出则拆 `router/` 目录):代理服务、内存路由表(从 session store 重建 + 注册/注销 API)、`/health`、`/routes`
+3. `config.rs`:`router` 配置节(开关/端口/全局默认 bindings)+ 端口嗅探;session record 增加 `router_token` + `bindings` 快照字段(旧 record 缺省即 legacy,恢复时迁移,见 §3.4)
+4. 启动路径接入:`create_native_session`(main.rs:1220)、`build_claude_command`(runtime.rs:1129)、tmux/terminal(仅 router URL + token,无注入);恢复路径走同一注入(§3.4)
 5. helper:`buildClaudeQueryOptions` 注入 agents(双信号)、`buildClaudeQueryEnv` 指向 router
 6. IPC:`get_router_settings` / `update_router_settings` / `update_session_bindings` / `router_status`
-7. UI:设置页 Router 区、session 设置「模型路由」区、状态条徽标(shadcn/ui + Hugeicons + `t()`)
-8. 切主环境路径改为改路由表(§3.3),保留 router 关闭时的旧软重启
-9. 测试(§7)+ `pnpm verify`
+7. CLI wrapper:`ccem desktop create --route/--routes-json`、`ccem desktop routes`(§5.5)
+8. UI:设置页 Router 区、session 设置「模型路由」区、状态条徽标(shadcn/ui + Hugeicons + `t()`)
+9. 切主环境路径改为改路由表(§3.3),保留 router 关闭时的旧软重启
+10. 测试(§7)+ `pnpm verify`
 
 ## 9. 验收标准
 
 - 单 session 内:主会话走环境 A,Explore subagent 走环境 B(上游抓包/日志证实),改 bindings 即时生效
 - app 重启后运行中 session 路由不丢;端口被占自动嗅探并提示
+- **死会话恢复**:app 隔夜关闭后在 workspace 点开老会话,恢复后路由(bindings + token)自动重建生效;router 前创建的旧 record 恢复时透明迁移
+- **外部发起**:`ccem desktop create --route "subagent:Explore=<env>"` 创建的 session 绑定生效;`ccem desktop routes` 可查可改
 - router 关闭/启动失败时所有旧行为不变(直连、软重启切环境)
 - 流式转发通过混沌专项;密钥不出现在任何日志与配置文件明文外泄面
 
