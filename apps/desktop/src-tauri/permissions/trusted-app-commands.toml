@@ -80,6 +80,7 @@ commands.allow = [
   "stop_headless_session",
   "remove_headless_session",
   "respond_headless_permission",
+  "preflight_codex_model_migration",
   "create_native_session",
   "list_native_sessions",
   "send_native_session_input",

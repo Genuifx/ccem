@@ -16,6 +16,7 @@ import type {
   BotBindingInboundRequest,
   BotBindingInfo,
   BotBindingOutboxFrame,
+  CodexModelMigrationPreflightResult,
   DesktopSettings,
   HeadlessSessionSummary,
   InteractivePromptAnnotation,
@@ -861,6 +862,16 @@ export function useTauriCommands() {
     await removeHeadlessSession(runtimeId);
   }, [removeHeadlessSession]);
 
+  const preflightCodexModelMigration = useCallback(async (
+    envName: string,
+    workingDir: string,
+  ): Promise<CodexModelMigrationPreflightResult> => {
+    return invoke<CodexModelMigrationPreflightResult>('preflight_codex_model_migration', {
+      envName,
+      workingDir,
+    });
+  }, []);
+
   const createNativeSession = useCallback(async (options: {
     provider: 'claude' | 'codex';
     envName?: string;
@@ -874,6 +885,7 @@ export function useTauriCommands() {
     providerSessionId?: string | null;
     effort?: string | null;
     seedBoundaryMessageCount?: number | null;
+    codexMigrationProofToken?: string | null;
   }): Promise<NativeSessionSummary> => {
     const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
     return invoke<NativeSessionSummary>('create_native_session', {
@@ -889,6 +901,7 @@ export function useTauriCommands() {
       providerSessionId: options.providerSessionId ?? null,
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
+      codexMigrationProofToken: options.codexMigrationProofToken ?? null,
     });
   }, [getSessionDefaults]);
 
@@ -1552,6 +1565,7 @@ export function useTauriCommands() {
     respondHeadlessPermission,
     removeHeadlessSession,
     removeManagedSession,
+    preflightCodexModelMigration,
     createNativeSession,
     listNativeSessions,
     sendNativeSessionInput,

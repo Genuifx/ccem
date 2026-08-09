@@ -8,6 +8,7 @@ mod app_updates;
 mod bot_binding;
 mod browser;
 mod channel;
+mod codex_migration;
 mod companion;
 mod config;
 mod cron;
@@ -1232,9 +1233,19 @@ async fn create_native_session(
     provider_session_id: Option<String>,
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
+    codex_migration_proof_token: Option<String>,
 ) -> Result<NativeSessionSummary, String> {
     let provider = parse_native_provider(&provider)?;
     let effective_working_dir = resolve_headless_working_dir(working_dir);
+    let verified_codex_path = if provider == NativeProvider::Codex {
+        codex_migration::runtime_path_for_verified_launch(
+            &env_name,
+            &effective_working_dir,
+            codex_migration_proof_token.as_deref(),
+        )?
+    } else {
+        None
+    };
     let effective_perm_mode = resolve_effective_perm_mode(perm_mode);
     let effective_runtime_perm_mode = runtime_perm_mode
         .map(|mode| mode.trim().to_string())
@@ -1293,7 +1304,7 @@ async fn create_native_session(
                 helper_env_vars: proxy_env_vars.clone(),
                 terminal_env_vars: proxy_env_vars,
                 claude_path: None,
-                codex_path: terminal::resolve_codex_path(),
+                codex_path: verified_codex_path.or_else(terminal::resolve_codex_path),
                 codex_base_url: None,
                 codex_api_key: None,
                 effort,
@@ -4944,6 +4955,7 @@ fn main() {
             stop_headless_session,
             remove_headless_session,
             respond_headless_permission,
+            codex_migration::preflight_codex_model_migration,
             create_native_session,
             list_native_sessions,
             send_native_session_input,

@@ -300,6 +300,13 @@ export interface TauriCommands {
     },
     void
   ];
+  preflight_codex_model_migration: [
+    {
+      envName: string;
+      workingDir: string;
+    },
+    CodexModelMigrationPreflightResult
+  ];
   create_native_session: [
     {
       provider: 'claude' | 'codex';
@@ -314,6 +321,7 @@ export interface TauriCommands {
       providerSessionId?: string | null;
       effort?: string | null;
       seedBoundaryMessageCount?: number | null;
+      codexMigrationProofToken?: string | null;
     },
     NativeSessionSummary
   ];
@@ -894,6 +902,23 @@ export interface ManagedSessionSummary {
 }
 
 export type NativeProvider = 'claude' | 'codex';
+
+export type CodexModelMigrationPreflightResult =
+  | {
+      status: 'affected';
+      model: 'gpt-5.4';
+      replacement: 'gpt-5.6-terra';
+      proofToken: string;
+    }
+  | {
+      status: 'affected';
+      model: 'gpt-5.4-mini';
+      replacement: 'gpt-5.6-luna';
+      proofToken: string;
+    }
+  | {
+      status: 'unaffected' | 'unknown';
+    };
 
 export interface PlatformCapabilities {
   os: 'windows' | 'macos' | 'linux' | 'unknown';

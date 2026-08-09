@@ -24,6 +24,7 @@ import { ProjectTree } from '@/components/workspace/ProjectTree';
 import { WorkspaceGlobalSearch } from '@/components/workspace/WorkspaceGlobalSearch';
 import { WorkspaceNativeSessionView } from '@/components/workspace/WorkspaceNativeSessionView';
 import { WorkspaceHistoryErrorBoundary } from '@/components/workspace/WorkspaceHistoryErrorBoundary';
+import { WorkspaceCodexModelMigrationDialog } from '@/components/workspace/WorkspaceCodexModelMigrationDialog';
 import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
@@ -126,6 +127,10 @@ import {
   type WorkspaceHistorySessionPreferences,
 } from '@/components/workspace/workspaceSessionPreferences';
 import { resolveComposerDispatch } from '@/components/workspace/workspaceComposerDispatch';
+import {
+  startAfterCodexModelMigrationGate,
+  type CodexModelMigrationWarning,
+} from '@/components/workspace/workspaceCodexModelMigration';
 import {
   buildWorkspaceCronAgentPrompt,
   isWorkspaceCronCommand,
@@ -347,6 +352,7 @@ export function Workspace({
     checkOpenCodeInstalled,
     setSessionTitle,
     setSessionAnnotation,
+    preflightCodexModelMigration,
     createNativeSession,
     getNativeSessionEvents,
     listNativeSessions,
@@ -411,6 +417,9 @@ export function Workspace({
   const [isCreatingNativeSession, setIsCreatingNativeSession] = useState(false);
   const [isLaunchingComposeTerminal, setIsLaunchingComposeTerminal] = useState(false);
   const [isResumingHistorySession, setIsResumingHistorySession] = useState(false);
+  const [codexModelMigrationWarning, setCodexModelMigrationWarning] = useState<CodexModelMigrationWarning | null>(null);
+  const codexModelMigrationDecisionRef = useRef<((shouldContinue: boolean) => void) | null>(null);
+  const acknowledgedCodexModelWarningsRef = useRef(new Set<string>());
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
   const [browserOpenBySessionId, setBrowserOpenBySessionId] = useState<Record<string, boolean>>({});
   const [browserPanelWidthPercent, setBrowserPanelWidthPercent] = useState(
@@ -432,6 +441,26 @@ export function Workspace({
   const persistedGeneratedTitleKeysRef = useRef(new Set<string>());
   const reviewOwnerKey = `${workspaceMode}:${selectedKey ?? ''}:${activeLiveRuntimeId ?? ''}:${composeDir ?? ''}`;
   const reviewOwnerKeyRef = useRef(reviewOwnerKey);
+
+  const requestCodexModelMigrationDecision = useCallback((
+    warning: CodexModelMigrationWarning,
+  ): Promise<boolean> => new Promise((resolve) => {
+    codexModelMigrationDecisionRef.current?.(false);
+    codexModelMigrationDecisionRef.current = resolve;
+    setCodexModelMigrationWarning(warning);
+  }), []);
+
+  const settleCodexModelMigrationDecision = useCallback((shouldContinue: boolean) => {
+    const resolve = codexModelMigrationDecisionRef.current;
+    codexModelMigrationDecisionRef.current = null;
+    setCodexModelMigrationWarning(null);
+    resolve?.(shouldContinue);
+  }, []);
+
+  useEffect(() => () => {
+    codexModelMigrationDecisionRef.current?.(false);
+    codexModelMigrationDecisionRef.current = null;
+  }, []);
 
   useLayoutEffect(() => {
     const ownerChanged = reviewOwnerKeyRef.current !== reviewOwnerKey;
@@ -2233,19 +2262,35 @@ export function Workspace({
 
     setIsCreatingNativeSession(true);
     try {
-      const summary = await createNativeSession({
+      const launch = await startAfterCodexModelMigrationGate({
         provider: composeProvider,
         envName: currentEnv,
-        permMode: dispatch.permMode,
-        runtimePermMode: dispatch.runtimePermMode,
         workingDir,
-        initialPrompt: dispatch.prompt,
-        initialDisplayPrompt: previewPrompt,
-        initialImages: images.length > 0 ? images : undefined,
-        initialAnnotations: payload?.annotations,
-        effort: normalizeEffortForProvider(composeEffort, composeProvider),
-        seedBoundaryMessageCount: 0,
+        preflight: preflightCodexModelMigration,
+        confirm: requestCodexModelMigrationDecision,
+        acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
+        start: (codexMigrationProofToken) => createNativeSession({
+          provider: composeProvider,
+          envName: currentEnv,
+          permMode: dispatch.permMode,
+          runtimePermMode: dispatch.runtimePermMode,
+          workingDir,
+          initialPrompt: dispatch.prompt,
+          initialDisplayPrompt: previewPrompt,
+          initialImages: images.length > 0 ? images : undefined,
+          initialAnnotations: payload?.annotations,
+          effort: normalizeEffortForProvider(composeEffort, composeProvider),
+          seedBoundaryMessageCount: 0,
+          codexMigrationProofToken,
+        }),
       });
+      if (!launch.started) {
+        if (launch.reason === 'preflight_changed') {
+          toast.error(t('workspace.codexModelMigrationChanged'));
+        }
+        return false;
+      }
+      const summary = launch.value;
 
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
@@ -2289,7 +2334,9 @@ export function Workspace({
     effectiveComposeDir,
     isCreatingNativeSession,
     permissionMode,
+    preflightCodexModelMigration,
     requestWorkspaceSessionTitle,
+    requestCodexModelMigrationDecision,
     resetComposePrompt,
     scheduleWorkspaceRefresh,
     setSelectedWorkingDir,
@@ -2350,20 +2397,36 @@ export function Workspace({
     setIsResumingHistorySession(true);
 
     try {
-      const summary = await createNativeSession({
+      const launch = await startAfterCodexModelMigrationGate({
         provider,
         envName: historyEnv,
-        permMode: dispatch.permMode,
-        runtimePermMode: dispatch.runtimePermMode,
         workingDir: selectedSession.project,
-        initialPrompt: dispatch.prompt,
-        initialDisplayPrompt: previewPrompt,
-        initialImages: images.length > 0 ? images : undefined,
-        initialAnnotations: payload?.annotations,
-        providerSessionId: selectedSession.id,
-        effort: normalizeEffortForProvider(historyEffort, provider),
-        seedBoundaryMessageCount: messages.length,
+        preflight: preflightCodexModelMigration,
+        confirm: requestCodexModelMigrationDecision,
+        acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
+        start: (codexMigrationProofToken) => createNativeSession({
+          provider,
+          envName: historyEnv,
+          permMode: dispatch.permMode,
+          runtimePermMode: dispatch.runtimePermMode,
+          workingDir: selectedSession.project,
+          initialPrompt: dispatch.prompt,
+          initialDisplayPrompt: previewPrompt,
+          initialImages: images.length > 0 ? images : undefined,
+          initialAnnotations: payload?.annotations,
+          providerSessionId: selectedSession.id,
+          effort: normalizeEffortForProvider(historyEffort, provider),
+          seedBoundaryMessageCount: messages.length,
+          codexMigrationProofToken,
+        }),
       });
+      if (!launch.started) {
+        if (launch.reason === 'preflight_changed') {
+          toast.error(t('workspace.codexModelMigrationChanged'));
+        }
+        return false;
+      }
+      const summary = launch.value;
 
       setLaunchClient(provider);
       upsertLiveSessionEntry(summary, {
@@ -2398,6 +2461,8 @@ export function Workspace({
     isResumingHistorySession,
     launchOpenCodeWeb,
     messages,
+    preflightCodexModelMigration,
+    requestCodexModelMigrationDecision,
     scheduleWorkspaceRefresh,
     selectedSession,
     setLaunchClient,
@@ -2895,6 +2960,13 @@ export function Workspace({
         onOpenChange={setIsGlobalSearchOpen}
         onSelectSession={handleSelect}
         onSelectProject={handleCreateForProject}
+      />
+
+      <WorkspaceCodexModelMigrationDialog
+        open={codexModelMigrationWarning !== null}
+        warning={codexModelMigrationWarning}
+        onCancel={() => settleCodexModelMigrationDecision(false)}
+        onContinue={() => settleCodexModelMigrationDecision(true)}
       />
     </div>
   );

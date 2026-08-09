@@ -1,9 +1,11 @@
 //! Terminal integration for launching Claude Code in Terminal.app or iTerm2
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -634,22 +636,33 @@ fn resolve_binary_path(binary: &str, candidates: &[String]) -> Option<String> {
 }
 
 fn parse_semver_triplet(output: &str) -> Option<(u32, u32, u32)> {
+    parse_semver_details(output).map(|details| details.triplet)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryVersionDetails {
+    triplet: (u32, u32, u32),
+    exact: String,
+    parsed: semver::Version,
+}
+
+fn parse_semver_details(output: &str) -> Option<BinaryVersionDetails> {
     output.split_whitespace().find_map(|part| {
-        let version = part
-            .trim()
-            .trim_start_matches('v')
-            .split('-')
-            .next()
-            .unwrap_or_default();
-        let mut pieces = version.split('.');
-        let major = pieces.next()?.parse::<u32>().ok()?;
-        let minor = pieces.next()?.parse::<u32>().ok()?;
-        let patch = pieces.next()?.parse::<u32>().ok()?;
-        Some((major, minor, patch))
+        let candidate = part
+            .trim_matches(|character: char| {
+                matches!(character, '(' | ')' | '[' | ']' | ',' | ';')
+            })
+            .trim_start_matches('v');
+        let parsed = semver::Version::parse(candidate).ok()?;
+        Some(BinaryVersionDetails {
+            triplet: (parsed.major as u32, parsed.minor as u32, parsed.patch as u32),
+            exact: parsed.to_string(),
+            parsed,
+        })
     })
 }
 
-fn binary_version(path: &str) -> Option<(u32, u32, u32)> {
+fn binary_version_details(path: &str) -> Option<BinaryVersionDetails> {
     let output = Command::new(path)
         .arg("--version")
         .env("PATH", get_user_path())
@@ -660,21 +673,28 @@ fn binary_version(path: &str) -> Option<(u32, u32, u32)> {
         String::from_utf8_lossy(&output.stderr).to_string(),
     ]
     .join(" ");
-    parse_semver_triplet(&text)
+    parse_semver_details(&text)
 }
 
-fn select_highest_versioned_binary_path(paths: Vec<String>) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionedBinarySelection {
+    path: String,
+    version: Option<BinaryVersionDetails>,
+}
+
+fn select_highest_versioned_binary(paths: Vec<String>) -> Option<VersionedBinarySelection> {
     let fallback = paths.first().cloned();
-    let mut best: Option<(String, (u32, u32, u32), usize)> = None;
+    let mut best: Option<(String, BinaryVersionDetails, usize)> = None;
 
     for (index, path) in paths.into_iter().enumerate() {
-        let Some(version) = binary_version(&path) else {
+        let Some(version) = binary_version_details(&path) else {
             continue;
         };
         let should_replace = best
             .as_ref()
             .map(|(_, best_version, best_index)| {
-                version > *best_version || (version == *best_version && index < *best_index)
+                version.parsed > best_version.parsed
+                    || (version.parsed == best_version.parsed && index < *best_index)
             })
             .unwrap_or(true);
         if should_replace {
@@ -682,7 +702,20 @@ fn select_highest_versioned_binary_path(paths: Vec<String>) -> Option<String> {
         }
     }
 
-    best.map(|(path, _, _)| path).or(fallback)
+    best.map(|(path, version, _)| VersionedBinarySelection {
+        path,
+        version: Some(version),
+    })
+    .or_else(|| {
+        fallback.map(|path| VersionedBinarySelection {
+            path,
+            version: None,
+        })
+    })
+}
+
+fn select_highest_versioned_binary_path(paths: Vec<String>) -> Option<String> {
+    select_highest_versioned_binary(paths).map(|selection| selection.path)
 }
 
 fn resolve_highest_versioned_binary_path(binary: &str, candidates: &[String]) -> Option<String> {
@@ -694,6 +727,92 @@ fn codex_app_bundle_candidates(home: &str) -> Vec<String> {
         "/Applications/Codex.app/Contents/Resources/codex".to_string(),
         format!("{}/Applications/Codex.app/Contents/Resources/codex", home),
     ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexBinaryFingerprint {
+    canonical_path: PathBuf,
+    byte_len: u64,
+    modified_nanos: u128,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexInstallProbe {
+    path: String,
+    version: Option<String>,
+    fingerprint: Option<CodexBinaryFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedCodexRuntime {
+    pub path: String,
+    pub version: String,
+    pub binary_sha256: String,
+}
+
+fn fingerprint_codex_binary(path: &str) -> Option<CodexBinaryFingerprint> {
+    let canonical_path = fs::canonicalize(path).ok()?;
+    let metadata = fs::metadata(&canonical_path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let mut file = fs::File::open(&canonical_path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+
+    Some(CodexBinaryFingerprint {
+        canonical_path,
+        byte_len: metadata.len(),
+        modified_nanos,
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
+fn codex_install_probe_from_selection(selection: &VersionedBinarySelection) -> CodexInstallProbe {
+    CodexInstallProbe {
+        path: selection.path.clone(),
+        version: selection
+            .version
+            .as_ref()
+            .map(|version| version.exact.clone()),
+        fingerprint: fingerprint_codex_binary(&selection.path),
+    }
+}
+
+fn resolve_codex_binary_selection() -> Option<VersionedBinarySelection> {
+    let home = dirs::home_dir()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut candidates = windows_cli_candidates("codex");
+    candidates.extend([
+        format!("{}/.local/bin/codex", home),
+        format!("{}/.npm-global/bin/codex", home),
+        format!("{}/.cargo/bin/codex", home),
+        "/usr/local/bin/codex".to_string(),
+        "/opt/homebrew/bin/codex".to_string(),
+    ]);
+    candidates.extend(codex_app_bundle_candidates(&home));
+    select_highest_versioned_binary(collect_binary_candidates("codex", &candidates))
+}
+
+fn remember_codex_install_probe(selection: &VersionedBinarySelection) {
+    let _ = CODEX_INSTALL_PROBE
+        .get_or_init(|| Some(codex_install_probe_from_selection(selection)));
 }
 
 /// Resolve the full path to the `ccem` binary.
@@ -729,19 +848,9 @@ pub fn resolve_claude_path() -> Option<String> {
 
 /// Resolve the full path to the `codex` binary.
 pub fn resolve_codex_path() -> Option<String> {
-    let home = dirs::home_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let mut candidates = windows_cli_candidates("codex");
-    candidates.extend([
-        format!("{}/.local/bin/codex", home),
-        format!("{}/.npm-global/bin/codex", home),
-        format!("{}/.cargo/bin/codex", home),
-        "/usr/local/bin/codex".to_string(),
-        "/opt/homebrew/bin/codex".to_string(),
-    ]);
-    candidates.extend(codex_app_bundle_candidates(&home));
-    resolve_highest_versioned_binary_path("codex", &candidates)
+    let selection = resolve_codex_binary_selection()?;
+    remember_codex_install_probe(&selection);
+    Some(selection.path)
 }
 
 /// Resolve the full path to the `opencode` binary.
@@ -841,15 +950,45 @@ pub fn is_claude_installed() -> bool {
     *CLAUDE_INSTALLED.get_or_init(|| resolve_claude_path().is_some())
 }
 
-/// Cached result of Codex install detection.
-static CODEX_INSTALLED: OnceLock<bool> = OnceLock::new();
+/// Cached Codex install probe. The probe is populated by the existing
+/// installation check, which already runs before Workspace launch actions.
+/// Migration preflight only reads this snapshot and never starts a process.
+static CODEX_INSTALL_PROBE: OnceLock<Option<CodexInstallProbe>> = OnceLock::new();
 
 /// Returns whether Codex is installed.
 ///
 /// This is used by the Dashboard launch picker, so cache it for the lifetime
 /// of the app to avoid repeatedly spawning a login shell on every tab visit.
 pub fn is_codex_installed() -> bool {
-    *CODEX_INSTALLED.get_or_init(|| resolve_codex_path().is_some())
+    if let Some(probe) = CODEX_INSTALL_PROBE.get() {
+        return probe.is_some();
+    }
+
+    let probe = resolve_codex_binary_selection()
+        .as_ref()
+        .map(codex_install_probe_from_selection);
+    let installed = probe.is_some();
+    let _ = CODEX_INSTALL_PROBE.set(probe);
+    installed
+}
+
+/// Return the last proven Codex runtime without executing it or resolving a
+/// login shell. If the selected binary changed since the install probe, the
+/// snapshot is rejected instead of silently trusting stale provenance.
+pub fn cached_codex_runtime() -> Option<CachedCodexRuntime> {
+    let probe = CODEX_INSTALL_PROBE.get()?.as_ref()?;
+    let version = probe.version.clone()?;
+    let expected = probe.fingerprint.as_ref()?;
+    let current = fingerprint_codex_binary(&probe.path)?;
+    if &current != expected {
+        return None;
+    }
+
+    Some(CachedCodexRuntime {
+        path: expected.canonical_path.to_string_lossy().to_string(),
+        version,
+        binary_sha256: current.sha256,
+    })
 }
 
 /// Returns whether OpenCode is installed.
@@ -2140,6 +2279,25 @@ mod tests {
             Some((2, 0, 0))
         );
         assert_eq!(parse_semver_triplet("not a version"), None);
+        assert_eq!(
+            parse_semver_details("codex-cli 0.147.0-alpha.6.5")
+                .map(|details| details.exact),
+            Some("0.147.0-alpha.6.5".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_binary_fingerprint_changes_with_contents() {
+        let root = temp_test_root("codex-fingerprint");
+        let binary = fake_binary_path(&root, "codex");
+        write_fake_binary(&binary, "0.139.0");
+        let first = fingerprint_codex_binary(binary.to_string_lossy().as_ref())
+            .expect("fingerprint first binary");
+        write_fake_binary(&binary, "0.147.0-alpha.6.5");
+        let second = fingerprint_codex_binary(binary.to_string_lossy().as_ref())
+            .expect("fingerprint changed binary");
+        assert_ne!(first.sha256, second.sha256);
+        fs::remove_dir_all(root).expect("remove fake binary directory");
     }
 
     #[test]
@@ -2149,6 +2307,25 @@ mod tests {
         let newer = fake_binary_path(&root.join("pnpm"), "claude");
         write_fake_binary(&older, "2.1.37");
         write_fake_binary(&newer, "2.1.100");
+
+        assert_eq!(
+            select_highest_versioned_binary_path(vec![
+                older.to_string_lossy().to_string(),
+                newer.to_string_lossy().to_string(),
+            ]),
+            Some(newer.to_string_lossy().to_string())
+        );
+
+        fs::remove_dir_all(root).expect("remove fake binary directory");
+    }
+
+    #[test]
+    fn highest_versioned_binary_compares_prerelease_components() {
+        let root = temp_test_root("highest-prerelease");
+        let older = fake_binary_path(&root.join("first"), "codex");
+        let newer = fake_binary_path(&root.join("second"), "codex");
+        write_fake_binary(&older, "0.147.0-alpha.6.4");
+        write_fake_binary(&newer, "0.147.0-alpha.6.5");
 
         assert_eq!(
             select_highest_versioned_binary_path(vec![
