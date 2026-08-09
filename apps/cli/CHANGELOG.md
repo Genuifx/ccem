@@ -1,5 +1,11 @@
 # ccem
 
+## 2.67.0
+
+### Minor Changes
+
+- Warn before retiring Codex model launches
+
 ## 2.66.0
 
 ### Minor Changes
