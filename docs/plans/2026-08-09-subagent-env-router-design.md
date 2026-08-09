@@ -1,8 +1,12 @@
 # Subagent 环境路由(CCEM Router)设计
 
 日期:2026-08-09
-状态:已评审(方案与标注确认),待实施
+状态:**协议修订 / Spike 中**(2026-08-09 设计评审发现 3 个阻断项,协议已据此修订;Spike B 未闭环前不放行实现)
 分支:`feat/subagent-env-router`
+
+> 修订记录:
+> - v1 初版:bearer token 路由、SDK agents 注入、env 名别名
+> - v2(当前):评审发现 3 阻断 + 2 高优后修订——①协议改**稳定逻辑键**(env 名不再固化进请求);②挂钩点从 SDK `agents` 注入改为 **PreToolUse `updatedInput`**(Spike A 已证实 agents 同名注入=完整替换,不可用);③official OAuth 通道改 **URL path 会话键 + Authorization 透传**;④token 持久化权限硬化;⑤代理入口合并 + 渠道范围收缩
 
 ## 1. 背景与目标
 
@@ -13,31 +17,33 @@
 1. 杂活(Explore 等 subagent、标题生成等小模型调用)可走便宜环境 —— 省钱提速
 2. 按能力特长分工 —— 指定 subagent 类型绑定指定供应商
 3. 分摊额度/限流 —— 不同供应商各自计费
-4. 附带红利:会话内切主环境从"软重启 SDK query"变成"改路由表",即时生效;router 天然掌握按环境分账的用量数据
+4. 附带红利:会话内切主环境即时生效(只改路由表);router 天然掌握按环境分账的用量数据
 
 **非目标(YAGNI):**
 
 - 不做 OpenAI↔Anthropic 格式转换(DeepSeek/GLM/Kimi 均有 Anthropic 原生兼容端点,只需改 base URL + 鉴权头 + model 名)
 - 不做 CCR 式的"智能改写"/transformer 管线
-- 裸 `ccem launch --env`(不经 desktop 控制桥)本期不接 router;经 desktop 桥的发起渠道(UI / ccem skill / bot / cron)全部支持,见 §5.5
+- 裸 `ccem launch --env`(不经 desktop 控制桥)本期不接 router
+- **bot(Telegram/Weixin/Wecom)/ cron 渠道本期不接**(评审修订:它们与 native workspace 不共用同一创建路径,"自动覆盖全部渠道"不成立;逐渠道接入列为后续项,见 §8)
 - 不做非 Anthropic 兼容供应商的支持
 
-## 2. 可行性依据(调研结论)
+## 2. 可行性依据(调研 + 评审实证)
 
-- Claude Code 的 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` 是进程级,subagent(Task 工具)共享主会话进程,**单进程无法按 subagent 分环境**——唯一通用解法是本地路由代理
-- Subagent 定义的 `model` 字段(frontmatter / SDK `agents` 选项)接受任意字符串并进入 API 请求体的 `model` 字段——这是路由挂钩点(claude-code-router 生态依赖同一机制)
-- Model 解析优先级:`CLAUDE_CODE_SUBAGENT_MODEL` 环境变量 > 调用时指定 > agent 定义 model > 主会话模型
-- 网上没有可靠的"subagent 名字"结构化元数据(`x-claude-code-agent-id` 头存在但只宜观测不宜路由);CCR 依赖 system 块位置嗅探的做法在版本升级后失效过(issue #1564),**按 model 字段路由最稳**
-- CCR 的兜底机制:在 agent prompt 开头放 `<CCR-SUBAGENT-MODEL>` 标签,代理识别后剥除并路由——本设计借鉴为双信号兜底
+- Subagent(Task 工具)共享主会话进程,`ANTHROPIC_*` 是进程级——**单进程无法按 subagent 分环境**,唯一通用解法是本地路由代理
+- **Spike A 实证(评审完成)**:SDK `AgentDefinition`(`sdk.d.ts:38`)的 `description`/`prompt` 为**必填**,同名注入 = 完整替换内置 agent(本地 Claude 2.1.220 mock 复现),且 `agents` 仅在 query 初始化时下发、运行中无 `setAgents`——**SDK agents 注入不能作为挂钩点**
+- **替代挂钩点(类型层已验证)**:SDK `hooks` 选项(`sdk.d.ts:1521`)支持 in-process `PreToolUse`;`PreToolUseHookInput` 携带 `tool_name` + `tool_input`(`sdk.d.ts:2248`);`PreToolUseHookSpecificOutput.updatedInput`(`sdk.d.ts:2116`)可改写工具入参——helper 可在 Task 调用前按 `subagent_type` 向 `prompt` 前置路由标签
+- Subagent 的任务 prompt 是其首条 user message,应出现在该 subagent 后续每次 API 请求体中——router 可从中识别标签(**待 Spike B 抓包证实**,见 §5.3)
+- Model 解析优先级:`CLAUDE_CODE_SUBAGENT_MODEL` 环境变量 > 调用时指定 > agent 定义 model > 主会话模型——CCEM 既有 `subagentModel` 支持(config.rs:631)与 per-type 绑定存在优先级冲突,本设计**不用**它做路由(见 §5.2)
+- 按 model 字段/请求内容路由最稳(`x-claude-code-agent-id` 头只宜观测;CCR 的 system 块位置嗅探在版本升级后失效过,issue #1564);**动态标签实际进入 user message 而非 system 块**(评审实证),router 扫描首条 user message 的 text block 精确前缀
 
 ### CCEM 现状关键落点(实施时直接参考)
 
-- 环境注册表与密钥:`apps/desktop/src-tauri/src/config.rs`(`EnvConfig` :15、`build_claude_env_vars` :609、`resolve_claude_env` :644、`MANAGED_CLAUDE_ENV_KEYS` :311、`clear_managed_claude_env` :637)
+- 环境注册表与密钥:`apps/desktop/src-tauri/src/config.rs`(`EnvConfig` :15、`build_claude_env_vars` :609、`resolve_claude_env` :644、`MANAGED_CLAUDE_ENV_KEYS` :311、`clear_managed_claude_env` :637;`CLAUDE_CODE_SUBAGENT_MODEL` :42/:72/:318/:631)
 - 会话启动:native workspace 走 `main.rs:1220 create_native_session` → `native_runtime.rs:643 create_session` → helper 进程(`packages/native-runtime-helper`);headless 走 `runtime.rs:1129 build_claude_command`;tmux/terminal 走 `terminal.rs:916` / `tmux.rs:1529`
-- helper 侧 env 组装:`packages/native-runtime-helper/src/claudeEnv.ts buildClaudeQueryEnv` :23;模型解析 `index.ts resolveClaudeRuntimeModel` :548;SDK query 选项 `index.ts buildClaudeQueryOptions` :1481
-- 会话内切环境:`main.rs:1417 update_native_session_settings` → helper `applySettingsCommand` :1413(空闲时软重启 query)
-- CCEM 已有 `CLAUDE_CODE_SUBAGENT_MODEL` 支持(单模型、同供应商),不写 `.claude/agents/*.md`
-- 前端:`store/index.ts Environment` :17、`currentEnv` :190;`useTauriCommands.ts`;`WorkspaceNativeSessionView.tsx handleEnvChange` :2415
+- helper 侧 env 组装:`claudeEnv.ts buildClaudeQueryEnv` :23;模型解析 `index.ts resolveClaudeRuntimeModel` :548;SDK query 选项 `index.ts buildClaudeQueryOptions` :1481
+- 会话内切环境:`main.rs:1417 update_native_session_settings` → helper `applySettingsCommand` :1413
+- **既有代理 `ProxyDebug`(main.rs:72)也设置 `ANTHROPIC_BASE_URL`**——与 router 的先后/鉴权/生命周期必须合并,见 §6.4
+- 前端:`store/index.ts Environment` :17、`currentEnv` :190;`useTauriCommands.ts`;`WorkspaceNativeSessionView.tsx handleEnvChange` :2415;composer plan mode 三件套 `WorkspaceSessionComposer.tsx`(plan pill :1524、+ 菜单 Switch 行 :562)
 
 ## 3. 总体架构
 
@@ -45,19 +51,24 @@
 
 ```
 Claude Code SDK query (helper 进程)
-  ANTHROPIC_BASE_URL = http://127.0.0.1:<port>
-  ANTHROPIC_AUTH_TOKEN = <每 session 随机 token>
+  ANTHROPIC_BASE_URL = http://127.0.0.1:<port>/s/<sessionKey>   ← v2:会话键走 URL path
+  (不再用 ANTHROPIC_AUTH_TOKEN 做路由键 —— 避免覆盖 official 的 OAuth)
         │ 所有 API 请求(主会话 / subagent / 标题生成)
         ▼
 CCEM Router
-  1. 按 token 识别 session → 该 session 的路由表
-  2. 按请求体 model 字段匹配:
-     "ccem:<envName>" → 转发到对应环境
-     其他             → 默认路由(session 主环境),model 原样不动
-  3. 重写:Host/base URL、鉴权头、(仅别名命中时)model 字段
-  4. 其余全部字节级透传(anthropic-beta 头、计费头、SSE 流)
+  1. 按 URL path 的 sessionKey 识别 session → 该 session 的路由表
+  2. 解析请求携带的**稳定逻辑键**(v2):
+     首条 user message 含 <CCEM-ROUTE>subagent:Explore</CCEM-ROUTE> → 逻辑键 subagent:Explore
+     model == "ccem-route:background"                             → 逻辑键 background
+     model 以 ccem: 开头(显式环境别名,用户自写)                  → 直接指定环境
+     以上均无(main 会话请求)                                     → 逻辑键 main
+  3. 用路由表把逻辑键**实时**解析为当前环境(env 名不出现在请求里,
+     改绑定即时生效 —— v2 协议的核心修正)
+  4. 鉴权:目标环境有 token → 重写 Authorization/x-api-key;
+     目标环境是 OAuth 型(official)→ **原样透传**客户端 Authorization(见 §3.5)
+  5. 标签精确剥除;其余全部字节级透传(anthropic-beta 头、计费头、SSE 流)
         ▼
-官方 Anthropic / GLM / DeepSeek / Kimi ...(全部 Anthropic 兼容端点)
+官方 Anthropic(OAuth 透传)/ GLM / DeepSeek / Kimi ...(全部 Anthropic 兼容端点)
 ```
 
 ### 3.1 端口策略(用户已确认)
@@ -66,27 +77,36 @@ CCEM Router
 - 设置页可改端口;**改端口需重启 app 生效**(运行中 session 的 env vars 存的是实际绑定端口,不受影响)
 - 仅绑定 `127.0.0.1`
 
-### 3.2 Token 与重启持久化(用户已确认;2026-08-09 修订)
+### 3.2 会话键与重启持久化(用户已确认;v2 修订)
 
-- 每 session 创建时生成随机 token,**既是鉴权也是路由表 key**,多 session 并发互不串台
-- **token 与 bindings 快照直接存进 session record**(native record / runtime state entry);router 不单独持有会话状态——**不设 router-state.json**,内存路由表在 app 启动时从 session store 重建,session 恢复时惰性重新注册
-- session 恢复(respawn helper)时:注入**当前**实际端口 + record 中的 token 重新注册。env vars 是 spawn 时设置的,不存在陈旧端口问题
-- tmux/外挂 session 在 app 重启后:进程持有的是旧 env;固定端口不变时无缝续上;若端口已变(被占嗅探/用户改设置),旧进程下次 API 调用失败 → UI 判死后走恢复流程(同窗口 respawn + `--resume`),见 §3.4
-- session 结束时从路由表注销 token;app 启动重建时跳过已终结 session 的 record
+- 每 session 创建时生成随机 `sessionKey`(opaque,仅作路由表 key),**存进 session record**;router 内存路由表在 app 启动时从 session store 重建,session 恢复时惰性重新注册——**无独立 router-state.json**
+- session 恢复(respawn helper)时注入**当前**实际端口 + record 中的 sessionKey 重新注册;env vars 是 spawn 时设置的,无陈旧端口问题
+- tmux/外挂 session 在 app 重启后:进程持有旧 env;固定端口不变时无缝续上;端口已变时旧进程断流 → UI 判死后走恢复(§3.4)
+- session 结束注销;app 启动重建时跳过已终结 session
+- **权限硬化(v2 新增,评审高优项)**:sessionKey 存于 session record,而现场 `~/.ccem` 为 0755、`runtime-state.json`/`native-runtime-state.json` 为 0644(已核实)——本机其他账号可读键并盗用路由。要求:`~/.ccem` 目录 0700;含键/密文件 0600(含既有文件迁移);原子写入不得放宽权限;补权限回归测试(§7)
 
 ### 3.3 与现有切环境路径的关系
 
-- `update_native_session_settings` 改主环境 → 改为只更新 router 路由表的 `default_env`,**不再软重启 SDK query**(model pins 变化由 router 转发层保证;env vars 中的 pin 仅影响请求 model 名,router 默认路由原样转发,行为兼容)
+- `update_native_session_settings` 改主环境 → 只更新路由表中 `main` 逻辑键的解析目标,**不再软重启 SDK query**(v2 协议下这真正成立:请求里只有逻辑键,解析在 router 实时完成)
 - 旧路径(router 未启用/启动失败)保持现有软重启逻辑不变
 
 ### 3.4 老会话/死会话恢复(用户已确认)
 
-场景:app 隔夜关闭后 helper 进程与 router 均已死,用户在 workspace 点开老会话。设计原则:**router 不引入新的会话生命周期状态,完全复用现有恢复路径**(`RuntimeRecoveryCandidate` / RecoveryCandidatesPanel / `--resume`)。
+场景:app 隔夜关闭后 helper 与 router 均已死,用户点开老会话。原则:**router 不引入新的会话生命周期状态,完全复用现有恢复路径**(`RuntimeRecoveryCandidate` / `--resume`)。
 
-1. 点击老会话 → 走现有 respawn 路径(重拉 helper + `--resume <claude_session_id>`)→ **与新会话完全相同的注入逻辑**:当前端口 + record 内 token 重新注册 + bindings 快照生效。无任何陈旧状态
-2. **router 前创建的旧 record 迁移**(无 token/bindings 字段):恢复时透明迁移——分配 token、从全局默认 bindings 拷贝快照、按 router 模式注入;router 未启用则保持直连旧行为
-3. 端口已变导致外挂 tmux 进程断流:UI 判死后提示恢复,respawn 即愈合
-4. claude 侧 transcript/jsonl 已丢失等失败场景:维持现有恢复错误处理,router 不改变其语义
+1. 点击老会话 → 现有 respawn 路径 → 与新会话完全相同的注入:当前端口 + record 内 sessionKey 重新注册 + bindings 快照生效。无陈旧状态
+2. **router 前创建的旧 record 迁移**:恢复时分配 sessionKey、从全局默认 bindings 拷贝快照;router 未启用则保持直连旧行为
+3. claude 侧 transcript 丢失等失败场景:维持现有恢复错误处理
+
+### 3.5 official(OAuth)环境的鉴权通道(v2 新增,评审阻断项)
+
+问题:official 环境无 API token,靠 Claude Code 自己的 OAuth 登录;v1 把路由 token 写进 `ANTHROPIC_AUTH_TOKEN` 会**覆盖 OAuth 通道**。v2 方案:
+
+- 会话标识走 URL path(`/s/<sessionKey>`),**不写 `ANTHROPIC_AUTH_TOKEN`** 做路由键
+- 目标环境为 OAuth 型时,router **原样透传**请求的 `Authorization`(OAuth bearer 由 Claude Code 客户端持有并刷新)
+- 目标环境为 token 型时,router 用环境 token 重写鉴权头(覆盖客户端发的任何占位值)
+- 启动模式约束:主环境为 official 的 session 必须以 OAuth 模式启动(helper 不设 token 占位,Claude Code 走正常 OAuth);**运行中把 `main` 从 token 环境切到 official 是受限操作**——仅当该 session 启动时具备 OAuth 凭证才允许(UI 校验并提示),否则上游必然 401
+- token 型主环境的 session 仍需 helper 设置占位 `ANTHROPIC_AUTH_TOKEN`(防止 SDK 回落 OAuth 交互);router 转发时重写,占位值不泄露
 
 ## 4. 路由规则与配置模型
 
@@ -94,7 +114,7 @@ CCEM Router
 
 ```jsonc
 {
-  "default_env": "official",         // 复用现有 envName 语义
+  "default_env": "official",         // 逻辑键 main 的解析目标
   "bindings": {
     "subagent:Explore": "glm",        // 内置 subagent 类型 → 环境
     "subagent:Plan": "deepseek",
@@ -104,105 +124,135 @@ CCEM Router
 }
 ```
 
-### 4.2 Router 匹配逻辑(刻意简单)
+### 4.2 协议:稳定逻辑键(v2 核心修订)
 
-1. 请求 `model` 以 `ccem:` 开头 → 按别名查环境注册表 → 转发到该环境,model 重写为目标环境的 resolved runtime model(复用 `resolveClaudeRuntimeModel` 优先级:runtimeModel → opus pin → sonnet pin → haiku pin)
-2. 其他所有 model → 走 `default_env`,**model 原样不动**(环境的 model pins 已在请求里解析好,router 不重新发明 tier 映射)
-3. 未知 `ccem:` 别名 → 400 明确错误(不静默走默认)
+请求携带的是**逻辑身份**,不是环境名;router 用 session 路由表在**请求时**解析:
+
+| 请求携带 | 逻辑键 | 解析 |
+|---|---|---|
+| 首条 user message 含 `<CCEM-ROUTE>subagent:Explore</CCEM-ROUTE>` | `subagent:Explore` | 查 bindings;未命中查 `subagent:*`;再未命中 → default_env |
+| `model == "ccem-route:background"` | `background` | 查 bindings;未命中 → default_env |
+| `model` 以 `ccem:` 开头(显式环境别名) | —(直接指定) | 直接使用该环境,**不受 bindings 影响**(用户自写的显式意图,永远生效) |
+| 以上均无 | `main` | default_env |
+
+- **`直连` profile 语义(v2 明确)**:该 session 启动时 helper 直接注入环境真实 base URL,**完全不经过 router**;显式 `ccem:` 别名在直连下自然失效(无 router 解析),UI 需说明
+- 别名/逻辑键命中后,model 重写为目标环境 resolved runtime model(复用 `resolveClaudeRuntimeModel` 优先级);`background` 逻辑键的载体:helper 将 `ANTHROPIC_SMALL_FAST_MODEL` 设为字面量 `ccem-route:background`,该值随请求 model 字段到达 router——**不复用** `CLAUDE_CODE_SUBAGENT_MODEL`(见 §5.2)
+- 未知 `ccem:` 环境名 → 400 明确错误;未知逻辑键按上表兜底规则解析,不报错
 
 ### 4.3 绑定键命名规范与自定义 agent
 
-**`subagent:` 后写的是 agent 名字本身**——即 Task 工具 `subagent_type` / agent 列表中显示的名字,原样字符串匹配(大小写敏感)。例:`subagent:Explore`、`subagent:general-purpose`、`subagent:superpowers:code-reviewer`(插件 agent,带命名空间)、`subagent:my-reviewer`(用户 `.claude/agents/my-reviewer.md`)。
+**`subagent:` 后写 agent 名字本身**——Task 工具 `subagent_type` / agent 列表中的名字,原样字符串匹配。例:`subagent:Explore`、`subagent:superpowers:code-reviewer`(带命名空间,按**第一个冒号**切分)、`subagent:my-reviewer`(用户 `.claude/agents/my-reviewer.md`)。
 
-- **内置花名册**:`packages/core` 定义常量列表(当前 `Explore` / `Plan` / `general-purpose` / `statusline-setup` 等,spike 阶段确认权威清单)。用于 UI 下拉与 `subagent:*` 展开;花名册外的名字**不报错**(向前兼容新版 Claude Code 新增类型),无对应 agent 时绑定静默不生效
-- **命名空间名字按第一个冒号切分**(`subagent:superpowers:code-reviewer` → key 为 `superpowers:code-reviewer`),解析只 split 一次
-- **自定义 agent 两通道**:(a) 按名字绑定——依赖 spike 第 2 问(SDK 注入可只覆盖 model 时可用;若必须完整重定义 prompt 则降级为仅内置花名册可用,避免弄丢用户 prompt);(b) frontmatter 自写 `model: ccem:<env>`——永远可用,router 只认别名不认名单,零配置
-- **生效优先级**:`subagent:<精确名>` > `subagent:*` > `default_env`
-- **匹配发生在注入层**(helper 按名字注入别名),router 层只看 `ccem:<env>` 别名、不知 agent 名字——这是 router 免疫 Claude Code 版本摆动的关键
+- **内置花名册**:`packages/core` 常量列表(`Explore` / `Plan` / `general-purpose` / `statusline-setup` 等,Spike 时确认权威清单),用于 UI 下拉与 `subagent:*` 展开;花名册外名字不报错(向前兼容),无对应 agent 时绑定静默不生效
+- **自定义 agent 两通道**:(a) 按名字绑定——v2 挂钩点是 PreToolUse 钩子按 `subagent_type` 匹配,**任意名字都可绑**(不再受 SDK agents 注入的完整替换限制);(b) frontmatter 自写 `model: ccem:<env>` 显式别名——永远可用
+- **生效优先级**:显式 `ccem:` 别名 > `subagent:<精确名>` > `subagent:*` > `default_env`
+- **匹配发生在注入层**(helper 的 PreToolUse 钩子),router 只解析逻辑键/别名、不知 agent 名字——免疫 Claude Code 版本摆动
 
 ### 4.4 配置分层
 
-- 全局默认 bindings:`~/.ccem/config.json` 新增 `router` 节(`enabled`、`port`、`bindings`)
+- 全局默认 bindings:`~/.ccem/config.json` 的 `router` 节(`enabled`、`port`、`bindings`、`profiles`、`dynamic_routing`)
 - 新 session 创建时拷贝快照进 session record;改全局默认**不影响**运行中 session
-- session 设置面板改 bindings → 只改路由表,即时生效,不碰 SDK query
+- session 设置/L1 入口改 bindings → 只改路由表,即时生效(v2 协议下真正即时)
 
 ### 4.5 UI 与交互(plan mode 式动态开关,用户已确认)
 
-路由状态是会话中随时想切的东西,交互完全对齐 plan mode 现有模式(`WorkspaceSessionComposer.tsx`):主界面只放最快的开关,完整控制渐进展开。
+交互完全对齐 plan mode 现有模式(`WorkspaceSessionComposer.tsx`):主界面只放最快的开关,完整控制渐进展开。
 
 **L1 即时层——三处入口,同一状态(用户已确认)**
 
-a. **状态条路由 chip**:`WorkspaceStatusStrip` 现有 env chip 旁,Route 图标 + 当前 profile 名(或「直连」),点击弹方案 Popover(profile 单选列表 + 每项一行绑定摘要 +「动态改派」开关 +「自定义绑定…」跳 L2)。切换 = 一次 `update_session_bindings` IPC,即时生效不重启 query;toast 轻提示。红利:router 模式下现有 env chip 切换也变即时生效(§3.3),两个 chip 手感统一
+a. **状态条路由 chip**:`WorkspaceStatusStrip` 现有 env chip 旁,Route 图标 + 当前 profile 名(或「直连」),点击弹方案 Popover(profile 单选列表 + 绑定摘要 +「动态改派」开关 +「自定义绑定…」跳 L2)。切换 = `update_session_bindings` IPC 改路由表,即时生效;toast 轻提示。红利:router 模式下 env chip 切换也变即时生效(§3.3)
 
-b. **Composer 状态识别**:路由生效(非直连)时,composer shell 顶部显示路由 pill——与 plan pill 同一行并列、同款样式 token(`bg-primary/[0.06] text-primary/70` 小胶囊 + Route 图标 + 方案名),**不引入第二种边框色**避免视觉噪音。点击 pill 打开同一方案 Popover。路由关闭时 pill 消失,composer 零变化
+b. **Composer 状态识别**:路由生效(非直连)时 composer shell 顶部显示路由 pill——与 plan pill 同行并列、同款样式 token(`bg-primary/[0.06] text-primary/70` 小胶囊 + Route 图标 + 方案名),**不引入第二种边框色**。点击 pill 打开同一方案 Popover;直连时 pill 消失
 
-c. **+ 快捷菜单**:新增「模型路由」行(紧跟 plan 行之后,同款 Switch 行样式):行尾显示当前方案名,点击行在**同一 Popover 内嵌展开**方案单选列表(不用嵌套 Popover),列表顶部为总开关(开 = 最近使用的方案,关 = 直连)
+c. **+ 快捷菜单**:新增「模型路由」行(紧跟 plan 行,同款 Switch 行样式):行尾显示当前方案名,点击行在**同一 Popover 内嵌展开**方案单选列表,顶部总开关(开 = 最近方案,关 = 直连)
 
 **L2 Session 设置「模型路由」区(完整控制)**
 - per-type 绑定行(内置花名册下拉 + `subagent:*` + `background`),env 下拉
 - 动态路由开关;「存为我的默认」写全局默认 bindings
 
-**L3 默认规则归属:环境管理页(用户已确认,优于独立设置区)**
-- 默认路由规则本质是"环境之间的关系",放环境管理页心智一致:新增「默认路由规则」卡片(默认 bindings 编辑 + 自定义 profile 管理)
-- 删除环境时同页提示哪些默认绑定/profile 引用了它(与 §6.2 删除回退策略呼应)
+**L3 默认规则归属:环境管理页(用户已确认)**
+- 默认路由规则本质是"环境之间的关系":环境管理页新增「默认路由规则」卡片(默认 bindings 编辑 + 自定义 profile 管理)
+- 删除环境时同页提示哪些默认绑定/profile 引用了它(呼应 §6.2 回退策略)
 - 全局设置 Router 区只留基础设施:总开关、端口(改动提示需重启)
 
 **Profile(方案)模型**
-- 内置:`直连`(本 session 不走 router)/ `省钱杂活`(`subagent:*` + `background` → 便宜环境)/ `特长分工`(推荐矩阵,如 Explore→GLM、Plan→DeepSeek)
-- 用户自定义存 `config.json router.profiles[]`:`{ id, name, bindings }`(name 走 i18n 或用户输入)
+- 内置:`直连` / `省钱杂活`(`subagent:*` + `background` → 便宜环境)/ `特长分工`(推荐矩阵)
+- 用户自定义存 `config.json router.profiles[]`:`{ id, name, bindings }`
 - profile 是 bindings 的**命名快照**:切换时展开写入 session 路由表;后续改 profile 定义不影响运行中 session
 
 **空态/降级**
 - 全局关闭 router → 三处入口灰显「直连」,tooltip 指路设置页
 - router 启动失败 → chip 警示态 + 已回退直连说明
-- i18n 全走 `t()`(zh/en 双 locale 同步);组件 shadcn/ui(Popover/RadioGroup/Switch/Toast);色板走 design token,玻璃面按 design-system 规范
+- i18n 全走 `t()`(zh/en 双 locale);shadcn/ui(Popover/RadioGroup/Switch/Toast);色板走 design token
 
-## 5. Helper 注入机制与兜底
+## 5. Helper 注入机制与兜底(v2 重写)
 
-### 5.1 绑定生效机制
+### 5.1 挂钩点:PreToolUse `updatedInput`(替代 SDK agents 注入)
 
-`buildClaudeQueryOptions`(`packages/native-runtime-helper/src/index.ts:1481`)新增 SDK `agents` 选项注入:对路由表每个绑定注入同名 agent 定义并带 `model: "ccem:<env>"`。**双信号常驻**:同时在被注入 agent 的 prompt 开头加 `<CCEM-ROUTE><envName></CCEM-ROUTE>` 标签(router 识别后精确剥除该前缀标签再转发)。
+helper(`packages/native-runtime-helper`)在 `buildClaudeQueryOptions`(:1481)注册 in-process hook:
 
-### 5.2 关键决策:不用 `CLAUDE_CODE_SUBAGENT_MODEL` 环境变量
+```ts
+hooks: {
+  PreToolUse: [{
+    matcher: 'Task',            // Spike B 确认当前版本工具名(Task/Agent)
+    hooks: [async (input) => {
+      const type = input.tool_input?.subagent_type;
+      const key = resolveBindingKey(type);   // 查 session 路由表快照:
+                                             // subagent:<type> → subagent:* → 无绑定则不注入
+      if (!key) return { continue: true };
+      return { continue: true, hookEventName: 'PreToolUse',
+        updatedInput: { ...input.tool_input,
+          prompt: `<CCEM-ROUTE>${key}</CCEM-ROUTE>\n` + input.tool_input.prompt } };
+    }],
+  }],
+}
+```
 
-该环境变量优先级最高,会压掉所有 per-type 绑定。因此统一走 agents 注入;`subagent:*` 兜底 = 展开为"所有未单独绑定的已知内置类型"(Explore / Plan / general-purpose 等花名册,定义为常量列表)。代价:用户自建 agent 不被兜底覆盖(可自写 `ccem:` 别名),语义干净可预测。
+- 标签进入 subagent 首条 user message → 该 subagent 后续每次 API 请求都携带 → router 精确前缀识别 + 剥除
+- **绑定按调用时解析**(钩子每次 Task 调用都跑),改绑定后下一次派工即用新绑定;配合 v2 逻辑键协议,运行中改绑定完全即时
+- 匹配任意 `subagent_type`(内置/插件/自定义),不触碰内置 agent 定义,无 prompt fork 风险
+- CCEM 环境配置中的 `subagentModel` 字段(config.rs:631,下发 `CLAUDE_CODE_SUBAGENT_MODEL`)与 router 模式**互斥**:router 模式 session 不下发该 env 键(在 `build_claude_env_vars` 调用侧按模式裁剪),避免最高优先级覆盖一切路由信号
 
-### 5.3 实施前置 Spike(写正式代码前第一件事,结果决定注入策略)
-1. SDK `agents` 选项能否**同名覆盖**内置 agent(Explore 等)?
-2. 覆盖是**只改 model 其余继承**,还是必须完整重定义 prompt?若必须完整重定义(内置 prompt 无法复刻)→ 降级:per-type 绑定退化为仅 catch-all + 自定义 agent 别名,UI 明示
-3. 任意字符串 model 是否原样进入 API 请求体(方案地基)?若不透传 → 走标签路由(已内置双信号,无额外成本)
+### 5.2 关键决策:不用 `CLAUDE_CODE_SUBAGENT_MODEL` 做路由
 
-Spike 产出写入本文件"实施记录"节。
+该变量优先级最高,会压掉 per-type 绑定与 frontmatter 别名。v2 仅保留一处 model 载体:`background` 逻辑键借 `ANTHROPIC_SMALL_FAST_MODEL=ccem-route:background` 传递(该变量只影响小模型杂活,无冲突)。
+
+### 5.3 实施前置 Spike(未闭环,阻断放行)
+
+- **Spike A(评审已完成 ✅)**:SDK agents 同名注入 = 完整替换内置 agent(`description`/`prompt` 必填,本地 mock 复现)——该挂钩点废弃
+- **Spike B(待做,核心)**:
+  1. PreToolUse `updatedInput` 改写的 `prompt` 是否原样成为 subagent 首条 user message 并出现在其 API 请求体(抓原始 HTTP 证明,含多轮后仍在)
+  2. 当前版本 Task 工具的 `tool_name`/`subagent_type` 字段名(matcher 写法)
+  3. `ANTHROPIC_SMALL_FAST_MODEL` 接受任意字符串并进入请求 model 字段(background 载体)
+  4. official OAuth 模式下不设 `ANTHROPIC_AUTH_TOKEN` 时请求 Authorization 形态与 router 透传可行性
+- Spike 产出写入"实施记录"节;B 关键项否证 → 回退方案:仅 `background` + 显式 `ccem:` 别名可用(per-type 绑定砍掉),UI 明示
 
 ### 5.4 运行时覆盖
 
-- native workspace session:完整注入(agents + 标签)
-- headless(`build_claude_command`):经 `--agents` 参数注入同等定义
-- tmux/terminal 交互式:无法注入,仅支持自定义 agent 自写别名;UI 标注该限制
+- native workspace session:完整支持(PreToolUse 钩子 + background 载体 + 显式别名)
+- headless(`build_claude_command`):仅支持 background 载体 + 显式别名(`claude -p` 无 in-process hook;往 settings.json 写钩子污染用户配置,不做)
+- tmux/terminal 交互式:仅显式别名;UI 标注限制
 
-### 5.5 外部发起渠道(ccem skill / bot / cron,用户已确认)
+### 5.5 外部发起渠道(v2 收缩,评审高优项)
 
-ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与 UI 创建完全相同的 desktop 后端路径**,因此 router 模式自动继承,覆盖全部 `ManagedSessionSource`(Desktop / Telegram / Weixin / Wecom / Cron)。需要新增的只是创建参数透传:
+ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥。**本期范围:native workspace session(UI 与 `ccem desktop create` 同路径)**;bot(Telegram/Weixin/Wecom)、cron 渠道**不在本期**——它们不共用同一创建路径,需逐渠道接入与验收,列为后续项(§8)。
 
-- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"` 与 `--routes-json <json>`,种子化该 session 的 bindings 快照;缺省拷全局默认。`<key>` 取值:`subagent:<内置类型>`(按类型绑定)、`subagent:*`(未单列类型兜底)、`background`(小模型杂活:标题生成/压缩等)。示例:
+- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"` 与 `--routes-json <json>`,种子化 bindings 快照;缺省拷全局默认。`<key>`:`subagent:<名字>` / `subagent:*` / `background`。示例:
 
   ```bash
   # 主会话走 official;Explore 走 glm;标题生成等小模型调用走 deepseek
   ccem desktop create --env official \
     --route "subagent:Explore=glm" --route "background=deepseek" --json
   ```
-- `ccem desktop routes <runtimeId> --json` 查看;`ccem desktop routes <runtimeId> --set "<key>=<env>"` 运行时改绑定(走"只改路由表"路径,即时生效)
-- 响应 JSON 增加 `routes` 字段,便于 skill 回报状态
 
-**边界:** Codex provider 非 Anthropic 协议,router 不适用,`--provider codex` 时忽略 route 参数并提示;裸 `ccem launch --env`(不经 desktop 桥)本期不接 router(该路径无常驻进程托管 router,且 skill 不使用它),文档注明。
+- `ccem desktop routes <runtimeId> --json` 查看;`--set "<key>=<env>"` 运行时改绑定(即时生效);响应 JSON 增加 `routes` 字段
+- **边界:** Codex provider 非 Anthropic 协议,`--provider codex` 时忽略 route 参数并提示
 
-### 5.6 主会话可见性与动态路由(用户已确认)
+### 5.6 主会话可见性与动态路由(v2 修订)
 
-主会话感知 subagent 类型的三层机制:
-
-1. **类型枚举是 Claude Code 内建的**:Task 工具描述自动枚举全部可用 subagent(内置 + `.claude/agents/` + 插件 + SDK 注入),注入的定义天然可见。**设计约束:注入覆盖时必须保留/改善原 agent 的 description**,否则主模型失去派工依据
-2. **路由信息写进 description**:注入时把 description 标注为带环境信息的形式(如 `Explore: 快速只读搜索。(路由:glm — 便宜快速,适合大批量搜索)`),让主模型把成本/特长纳入派工决策(服务"按能力特长分工")
-3. **动态路由(一次性指定)**:主模型可在 subagent prompt 开头自写 `<CCEM-ROUTE><env></CCEM-ROUTE>` 标签(复用 §5.1 同一套标签机制),实现非绑定的临时改派。helper 向 SDK query 的 system prompt 追加一段"路由菜单"(可用别名 + 各自特长 + 标签语法);菜单内容为常量,不破坏 prompt cache。Task 工具的 `model` 参数是固定枚举(sonnet/opus/haiku/…),塞不进别名,故动态选择只能走标签。该功能可通过 `router.dynamic_routing` 配置关闭(默认开)
+1. **类型枚举是 Claude Code 内建的**(Task 工具描述自动枚举),无需 CCEM 干预
+2. ~~description 标注路由信息~~(v2 删除:依赖已废弃的 agents 注入)——路由可见性全部由路由菜单承担
+3. **路由菜单 + 动态改派**:helper 向 SDK query system prompt 追加「可用模型路由」段:可用环境别名 + 各自特长 + 标签语法(主模型可在 Task prompt 开头自写 `<CCEM-ROUTE>subagent:Explore</CCEM-ROUTE>` 或显式 `<CCEM-ROUTE>ccem:glm</CCEM-ROUTE>` 一次性改派;菜单内容常量,不破坏 prompt cache)。Task 的 `model` 参数是固定枚举塞不进别名,动态选择只能走标签。`router.dynamic_routing` 可关(默认开)
 
 ## 6. 错误处理、健壮性与可观测性
 
@@ -210,56 +260,67 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与
 
 - hyper/axum 流式 body 端到端 chunk 透传,**应用层零缓冲**(不 collect)
 - 双向 abort 传播:client 断开 → cancel upstream;upstream 断开 → 终止 downstream;半开连接依赖 tokio drop 传播清理
-- **流中段绝不重试**;首字节前的连接失败也不跨 provider 自动重试(避免语义错乱),原样返回错误
-- Header 策略:默认全透传;仅重写 auth 头(目标 env token);`Host`/`Content-Length` 由 hyper 重算;不解压、不动 `Content-Encoding`
-- 连接超时(默认 10s,可配);流式读不设总超时,可选 idle timeout
-- 标签剥除仅限 system 块文本的精确前缀匹配,绝不误伤正文
+- **流中段绝不重试**;首字节前连接失败也不跨 provider 自动重试,原样返回错误
+- Header:默认全透传;仅按目标环境重写鉴权头(§3.5);`Host`/`Content-Length` 由 hyper 重算;不解压、不动 `Content-Encoding`
+- 连接超时(默认 10s 可配);流式读不设总超时,可选 idle timeout
+- 标签剥除仅限**首条 user message** text block 精确前缀,绝不误伤正文(评审实证:动态标签在 user message 而非 system 块)
 
 ### 6.2 降级与错误语义
 
-- router 启动失败(端口全被占等)→ session 启动回退直连环境(不经过 router)+ UI 警告;旧行为完全保留
+- router 启动失败(端口全被占等)→ session 回退直连 + UI 警告;旧行为完全保留
 - 绑定指向已删除环境 → 回退 `default_env` + UI 警告 + 日志
-- 目标环境 token 解密失败 → 502 + 明确错误体
+- 目标环境 token 解密失败 → 502 + 明确错误体;OAuth 型目标收到占位/缺失 Authorization → 502 明确提示该 session 未以 OAuth 启动
 - 上游错误:状态码与错误体原样透传
 
 ### 6.3 可观测性与安全
 
-- 每请求记录:session(脱敏 token)、命中环境、model 原值/改写值、状态码、耗时;SSE `usage` 事件只读嗅探提取 token 用量(不改写字节),作为按环境分账的数据基础
-- 本地端点 `/health`、`/routes`(token 鉴权)
-- 日志不落密钥;token 仅存于 session record(与现有敏感字段同等保护);仅绑 127.0.0.1
+- 每请求记录:session(脱敏 sessionKey)、命中逻辑键与环境、状态码、耗时;SSE `usage` 事件只读嗅探提取 token 用量(按环境分账的数据基础)
+- 本地端点 `/health`、`/routes`(sessionKey 鉴权)
+- 日志不落密钥;**权限硬化(§3.2):~/.ccem 0700、敏感文件 0600、原子写不放宽、迁移既有文件、回归测试**;仅绑 127.0.0.1
+
+### 6.4 与既有 ProxyDebug 的关系(v2 新增,评审高优项)
+
+`ProxyDebug`(main.rs:72)同样设置 `ANTHROPIC_BASE_URL`,两者不能各自为政。原则:**单一代理入口**——router 吸收 ProxyDebug 的流量抓取能力作为可选观测 tap(debug 开关打开时记录请求/响应元数据);实现 step 2 时先盘点 ProxyDebug 现有功能清单,明确迁移映射与删除边界,不允许两个代理串联
 
 ## 7. 测试策略
 
-- **Rust 单测**:路由匹配(别名/默认/未知别名/删除环境回退)、model 重写优先级、token→session 解析、标签精确剥除、配置迁移(无 router 节旧配置)
-- **集成测试**(mock upstream):SSE 字节逐段一致、慢 chunk/乱序 chunk、client 中途断开传播、upstream 中途断开、大 body、并发多 session 路由隔离、auth 头重写正确且不漏旧 token
-- **混沌专项**(对应"非常健壮"):随机 chunk 大小 + 随机延迟、中途 RST、30min+ 长流(心跳)、并发 100 流
-- **helper 测试**:agents 注入内容正确(双信号齐全)、env 组装指向 router、`resolveClaudeRuntimeModel` 复用一致
-- **E2E 自测**:`cd apps/desktop && pnpm tauri:dev`(遵守 Desktop Self-Test Lockfile Rule,目标 `com.ccem.desktop.dev`),建 session 绑定便宜环境,触发 Explore subagent,断言请求落到目标上游;验证改 bindings 即时生效不重启 query
-- 全量门禁:`pnpm verify`(test + build + cargo test)
+- **Rust 单测**:逻辑键解析(精确名/兜底/未绑定回退/default_env)、显式别名直达与未知别名 400、鉴权重写与 OAuth 透传分支、sessionKey→session 解析、标签精确剥除(user message 场景)、配置迁移、**文件权限回归(0600/0700、原子写)**
+- **集成测试**(mock upstream):SSE 字节逐段一致、慢/乱序 chunk、双向断开传播、大 body、并发多 session 隔离、鉴权头重写正确且不漏旧 token
+- **混沌专项**:随机 chunk 大小 + 随机延迟、中途 RST、30min+ 长流、并发 100 流
+- **helper 测试**:PreToolUse 钩子按 `subagent_type` 正确注入/不注入、标签格式、路由表快照热更新
+- **Spike B 验证脚本**:真实 SDK 抓包四项确认(§5.3),结果写入实施记录
+- **E2E 自测**:`cd apps/desktop && pnpm tauri:dev`(目标 `com.ccem.desktop.dev`),建 session 绑便宜环境,触发 Explore,断言请求落目标上游;改 bindings 后**下一次派工**即走新环境(v2 即时性);official OAuth session 全流程
+- 全量门禁:`pnpm verify`
 
 ## 8. 实施步骤(跟做顺序)
 
-0. **Spike 三问**(§5.3),产出写入下方实施记录
-1. `packages/core`:`RouterConfig` / `SessionRouteTable` / `SubagentBinding` / `RouterProfile` 类型 + 内置 subagent 花名册常量 + 内置 profile 常量
-2. `src-tauri/src/router.rs`(新模块,<1000 行;超出则拆 `router/` 目录):代理服务、内存路由表(从 session store 重建 + 注册/注销 API)、`/health`、`/routes`
-3. `config.rs`:`router` 配置节(开关/端口/全局默认 bindings)+ 端口嗅探;session record 增加 `router_token` + `bindings` 快照字段(旧 record 缺省即 legacy,恢复时迁移,见 §3.4)
-4. 启动路径接入:`create_native_session`(main.rs:1220)、`build_claude_command`(runtime.rs:1129)、tmux/terminal(仅 router URL + token,无注入);恢复路径走同一注入(§3.4)
-5. helper:`buildClaudeQueryOptions` 注入 agents(双信号)、`buildClaudeQueryEnv` 指向 router
+0. **Spike B**(§5.3 四项,抓包实证),产出写入实施记录;关键项否证 → 按回退方案缩范围
+1. `packages/core`:`RouterConfig` / `SessionRouteTable` / `SubagentBinding` / `RouterProfile` 类型 + 内置花名册 + 内置 profile 常量
+2. **代理入口合并**(§6.4):盘点 ProxyDebug 功能 → `src-tauri/src/router.rs`(或 `router/` 目录,<1000 行/文件):代理服务、内存路由表(从 session store 重建)、`/health`、`/routes`、debug tap
+3. `config.rs`:`router` 配置节 + 端口嗅探;session record 增加 `sessionKey` + `bindings` 快照;**权限硬化(~/.ccem 0700、敏感文件 0600、既有文件迁移、原子写)**;router 模式裁剪 `CLAUDE_CODE_SUBAGENT_MODEL` 下发
+4. 启动路径接入:`create_native_session`(main.rs:1220,URL path 会话键 + §3.5 启动模式约束);恢复路径同一注入(§3.4);headless/tmux 按 §5.4 裁剪
+5. helper:PreToolUse 钩子注入(§5.1)、`buildClaudeQueryEnv` 指向 router(URL path 形态)、`ANTHROPIC_SMALL_FAST_MODEL=ccem-route:background` 载体、路由菜单 system prompt 追加
 6. IPC:`get_router_settings` / `update_router_settings` / `update_session_bindings` / `router_status`
 7. CLI wrapper:`ccem desktop create --route/--routes-json`、`ccem desktop routes`(§5.5)
-8. UI(§4.5):状态条 chip + 方案 Popover、composer 路由 pill、+ 菜单「模型路由」行(内嵌展开)、session 设置「模型路由」区、环境管理页「默认路由规则」卡片(含 profile 管理)、全局设置 Router 基础设施区、降级空态(shadcn/ui + Hugeicons + `t()` 双 locale,色板走 design token)
-9. 切主环境路径改为改路由表(§3.3),保留 router 关闭时的旧软重启
+8. UI(§4.5):状态条 chip + 方案 Popover、composer 路由 pill、+ 菜单「模型路由」行、session 设置「模型路由」区、环境管理页「默认路由规则」卡片、全局设置 Router 基础设施区、降级空态(shadcn/ui + Hugeicons + `t()` 双 locale + design token)
+9. 切主环境路径改为改路由表(§3.3,含 official OAuth 切换约束 UI 校验),保留 router 关闭时旧软重启
 10. 测试(§7)+ `pnpm verify`
+11. **后续项(不在本期验收)**:bot(Telegram/Weixin/Wecom)/ cron 渠道逐渠道接入 + 验收
 
 ## 9. 验收标准
 
-- 单 session 内:主会话走环境 A,Explore subagent 走环境 B(上游抓包/日志证实),改 bindings 即时生效
+- 单 session 内:主会话走环境 A,Explore subagent 走环境 B(上游抓包/日志证实);**改 bindings 后下一次派工即生效,不重启 query**(v2 即时性)
+- official(OAuth)主会话 + 第三方 subagent 环境并发可用;token 主会话切 official 被 UI 约束拦截
 - app 重启后运行中 session 路由不丢;端口被占自动嗅探并提示
-- **死会话恢复**:app 隔夜关闭后在 workspace 点开老会话,恢复后路由(bindings + token)自动重建生效;router 前创建的旧 record 恢复时透明迁移
-- **外部发起**:`ccem desktop create --route "subagent:Explore=<env>"` 创建的 session 绑定生效;`ccem desktop routes` 可查可改
+- 死会话恢复:隔夜后点开老会话,路由(sessionKey + bindings)自动重建;旧 record 透明迁移
+- `ccem desktop create --route ...` 绑定生效;`ccem desktop routes` 可查可改
+- `~/.ccem` 0700、含键文件 0600,权限回归测试通过
 - router 关闭/启动失败时所有旧行为不变(直连、软重启切环境)
-- 流式转发通过混沌专项;密钥不出现在任何日志与配置文件明文外泄面
+- 流式转发通过混沌专项;密钥不出现在日志;ProxyDebug 能力合并为单一代理入口
 
 ## 实施记录
 
-(实施时填写:spike 结论、偏差决策、验证证据)
+- 2026-08-09 设计评审:发现 3 阻断(逻辑键协议/agents 注入挂钩点/official OAuth)+ 2 高优(文件权限/代理与渠道范围),文档 v1 → v2 修订
+- 2026-08-09 Spike A(评审代做):SDK agents 同名注入 = 完整替换(`sdk.d.ts:38` 必填 description+prompt;本地 Claude 2.1.220 mock 复现)→ 挂钩点废弃,改 PreToolUse `updatedInput`(`sdk.d.ts:1521/2116/2248` 类型层可行)
+- 2026-08-09 复核:`~/.ccem` 0755、`runtime-state.json` 等 0644 属实;PreToolUse hooks 类型签名核实
+- Spike B:待做(§5.3)
