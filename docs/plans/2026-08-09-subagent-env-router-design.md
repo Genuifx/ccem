@@ -144,7 +144,6 @@ CCEM Router
 该环境变量优先级最高,会压掉所有 per-type 绑定。因此统一走 agents 注入;`subagent:*` 兜底 = 展开为"所有未单独绑定的已知内置类型"(Explore / Plan / general-purpose 等花名册,定义为常量列表)。代价:用户自建 agent 不被兜底覆盖(可自写 `ccem:` 别名),语义干净可预测。
 
 ### 5.3 实施前置 Spike(写正式代码前第一件事,结果决定注入策略)
-
 1. SDK `agents` 选项能否**同名覆盖**内置 agent(Explore 等)?
 2. 覆盖是**只改 model 其余继承**,还是必须完整重定义 prompt?若必须完整重定义(内置 prompt 无法复刻)→ 降级:per-type 绑定退化为仅 catch-all + 自定义 agent 别名,UI 明示
 3. 任意字符串 model 是否原样进入 API 请求体(方案地基)?若不透传 → 走标签路由(已内置双信号,无额外成本)
@@ -172,6 +171,14 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与
 - 响应 JSON 增加 `routes` 字段,便于 skill 回报状态
 
 **边界:** Codex provider 非 Anthropic 协议,router 不适用,`--provider codex` 时忽略 route 参数并提示;裸 `ccem launch --env`(不经 desktop 桥)本期不接 router(该路径无常驻进程托管 router,且 skill 不使用它),文档注明。
+
+### 5.6 主会话可见性与动态路由(用户已确认)
+
+主会话感知 subagent 类型的三层机制:
+
+1. **类型枚举是 Claude Code 内建的**:Task 工具描述自动枚举全部可用 subagent(内置 + `.claude/agents/` + 插件 + SDK 注入),注入的定义天然可见。**设计约束:注入覆盖时必须保留/改善原 agent 的 description**,否则主模型失去派工依据
+2. **路由信息写进 description**:注入时把 description 标注为带环境信息的形式(如 `Explore: 快速只读搜索。(路由:glm — 便宜快速,适合大批量搜索)`),让主模型把成本/特长纳入派工决策(服务"按能力特长分工")
+3. **动态路由(一次性指定)**:主模型可在 subagent prompt 开头自写 `<CCEM-ROUTE><env></CCEM-ROUTE>` 标签(复用 §5.1 同一套标签机制),实现非绑定的临时改派。helper 向 SDK query 的 system prompt 追加一段"路由菜单"(可用别名 + 各自特长 + 标签语法);菜单内容为常量,不破坏 prompt cache。Task 工具的 `model` 参数是固定枚举(sonnet/opus/haiku/…),塞不进别名,故动态选择只能走标签。该功能可通过 `router.dynamic_routing` 配置关闭(默认开)
 
 ## 6. 错误处理、健壮性与可观测性
 
