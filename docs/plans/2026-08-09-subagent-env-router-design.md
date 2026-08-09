@@ -128,20 +128,24 @@ CCEM Router
 
 ### 4.5 UI 与交互(plan mode 式动态开关,用户已确认)
 
-路由状态是会话中随时想切的东西,交互类比 plan mode:主界面只放最快的开关,完整控制渐进展开。三层结构:
+路由状态是会话中随时想切的东西,交互完全对齐 plan mode 现有模式(`WorkspaceSessionComposer.tsx`):主界面只放最快的开关,完整控制渐进展开。
 
-**L1 状态条路由 chip(每 session,即时开关)**
-- `WorkspaceStatusStrip` 现有 env chip 旁新增 router chip(Hugeicons Route 图标 + 当前 profile 名或「直连」,单行紧凑——紧凑度按用户偏好再收一档)
-- 点击弹 Popover(shadcn):profile 单选列表(每项附一行绑定摘要)+「动态改派」开关(对应 `router.dynamic_routing`)+「自定义绑定…」入口(跳 L2)
-- 切换 = 一次 `update_session_bindings` IPC 改路由表,**即时生效不重启 query**;toast 轻提示生效内容
-- 红利:router 模式下现有 env chip 切换也变即时生效(§3.3),两个 chip 手感统一
+**L1 即时层——三处入口,同一状态(用户已确认)**
+
+a. **状态条路由 chip**:`WorkspaceStatusStrip` 现有 env chip 旁,Route 图标 + 当前 profile 名(或「直连」),点击弹方案 Popover(profile 单选列表 + 每项一行绑定摘要 +「动态改派」开关 +「自定义绑定…」跳 L2)。切换 = 一次 `update_session_bindings` IPC,即时生效不重启 query;toast 轻提示。红利:router 模式下现有 env chip 切换也变即时生效(§3.3),两个 chip 手感统一
+
+b. **Composer 状态识别**:路由生效(非直连)时,composer shell 顶部显示路由 pill——与 plan pill 同一行并列、同款样式 token(`bg-primary/[0.06] text-primary/70` 小胶囊 + Route 图标 + 方案名),**不引入第二种边框色**避免视觉噪音。点击 pill 打开同一方案 Popover。路由关闭时 pill 消失,composer 零变化
+
+c. **+ 快捷菜单**:新增「模型路由」行(紧跟 plan 行之后,同款 Switch 行样式):行尾显示当前方案名,点击行在**同一 Popover 内嵌展开**方案单选列表(不用嵌套 Popover),列表顶部为总开关(开 = 最近使用的方案,关 = 直连)
 
 **L2 Session 设置「模型路由」区(完整控制)**
 - per-type 绑定行(内置花名册下拉 + `subagent:*` + `background`),env 下拉
 - 动态路由开关;「存为我的默认」写全局默认 bindings
 
-**L3 全局设置 Router 区**
-- 总开关、端口(改动提示需重启)、全局默认 bindings、自定义 profile 管理
+**L3 默认规则归属:环境管理页(用户已确认,优于独立设置区)**
+- 默认路由规则本质是"环境之间的关系",放环境管理页心智一致:新增「默认路由规则」卡片(默认 bindings 编辑 + 自定义 profile 管理)
+- 删除环境时同页提示哪些默认绑定/profile 引用了它(与 §6.2 删除回退策略呼应)
+- 全局设置 Router 区只留基础设施:总开关、端口(改动提示需重启)
 
 **Profile(方案)模型**
 - 内置:`直连`(本 session 不走 router)/ `省钱杂活`(`subagent:*` + `background` → 便宜环境)/ `特长分工`(推荐矩阵,如 Explore→GLM、Plan→DeepSeek)
@@ -149,9 +153,9 @@ CCEM Router
 - profile 是 bindings 的**命名快照**:切换时展开写入 session 路由表;后续改 profile 定义不影响运行中 session
 
 **空态/降级**
-- 全局关闭 router → chip 灰显「直连」,tooltip 指路设置页
+- 全局关闭 router → 三处入口灰显「直连」,tooltip 指路设置页
 - router 启动失败 → chip 警示态 + 已回退直连说明
-- i18n 全走 `t()`(zh 默认);组件 shadcn/ui(Popover/RadioGroup/Toggle/Toast)
+- i18n 全走 `t()`(zh/en 双 locale 同步);组件 shadcn/ui(Popover/RadioGroup/Switch/Toast);色板走 design token,玻璃面按 design-system 规范
 
 ## 5. Helper 注入机制与兜底
 
@@ -243,7 +247,7 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与
 5. helper:`buildClaudeQueryOptions` 注入 agents(双信号)、`buildClaudeQueryEnv` 指向 router
 6. IPC:`get_router_settings` / `update_router_settings` / `update_session_bindings` / `router_status`
 7. CLI wrapper:`ccem desktop create --route/--routes-json`、`ccem desktop routes`(§5.5)
-8. UI(§4.5 三层):状态条路由 chip + Popover、session 设置「模型路由」区、全局设置 Router 区(含 profile 管理)、降级空态(shadcn/ui + Hugeicons + `t()`,紧凑度按用户偏好)
+8. UI(§4.5):状态条 chip + 方案 Popover、composer 路由 pill、+ 菜单「模型路由」行(内嵌展开)、session 设置「模型路由」区、环境管理页「默认路由规则」卡片(含 profile 管理)、全局设置 Router 基础设施区、降级空态(shadcn/ui + Hugeicons + `t()` 双 locale,色板走 design token)
 9. 切主环境路径改为改路由表(§3.3),保留 router 关闭时的旧软重启
 10. 测试(§7)+ `pnpm verify`
 
