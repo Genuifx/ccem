@@ -155,7 +155,13 @@ Spike 产出写入本文件"实施记录"节。
 
 ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥 → **与 UI 创建完全相同的 desktop 后端路径**,因此 router 模式自动继承,覆盖全部 `ManagedSessionSource`(Desktop / Telegram / Weixin / Wecom / Cron)。需要新增的只是创建参数透传:
 
-- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"`(如 `--route "subagent:Explore=glm" --route "background=deepseek"`)与 `--routes-json <json>`,种子化该 session 的 bindings 快照;缺省拷全局默认
+- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"` 与 `--routes-json <json>`,种子化该 session 的 bindings 快照;缺省拷全局默认。`<key>` 取值:`subagent:<内置类型>`(按类型绑定)、`subagent:*`(未单列类型兜底)、`background`(小模型杂活:标题生成/压缩等)。示例:
+
+  ```bash
+  # 主会话走 official;Explore 走 glm;标题生成等小模型调用走 deepseek
+  ccem desktop create --env official \
+    --route "subagent:Explore=glm" --route "background=deepseek" --json
+  ```
 - `ccem desktop routes <runtimeId> --json` 查看;`ccem desktop routes <runtimeId> --set "<key>=<env>"` 运行时改绑定(走"只改路由表"路径,即时生效)
 - 响应 JSON 增加 `routes` 字段,便于 skill 回报状态
 
