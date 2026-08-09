@@ -110,9 +110,15 @@ CCEM Router
 2. 其他所有 model → 走 `default_env`,**model 原样不动**(环境的 model pins 已在请求里解析好,router 不重新发明 tier 映射)
 3. 未知 `ccem:` 别名 → 400 明确错误(不静默走默认)
 
-### 4.3 自定义 agent 免配置
+### 4.3 绑定键命名规范与自定义 agent
 
-用户在自己项目的 `.claude/agents/*.md` frontmatter 手写 `model: ccem:<envName>` 即刻生效;router 认所有 `ccem:<envName>` 模式,不限于 UI 配置行。
+**`subagent:` 后写的是 agent 名字本身**——即 Task 工具 `subagent_type` / agent 列表中显示的名字,原样字符串匹配(大小写敏感)。例:`subagent:Explore`、`subagent:general-purpose`、`subagent:superpowers:code-reviewer`(插件 agent,带命名空间)、`subagent:my-reviewer`(用户 `.claude/agents/my-reviewer.md`)。
+
+- **内置花名册**:`packages/core` 定义常量列表(当前 `Explore` / `Plan` / `general-purpose` / `statusline-setup` 等,spike 阶段确认权威清单)。用于 UI 下拉与 `subagent:*` 展开;花名册外的名字**不报错**(向前兼容新版 Claude Code 新增类型),无对应 agent 时绑定静默不生效
+- **命名空间名字按第一个冒号切分**(`subagent:superpowers:code-reviewer` → key 为 `superpowers:code-reviewer`),解析只 split 一次
+- **自定义 agent 两通道**:(a) 按名字绑定——依赖 spike 第 2 问(SDK 注入可只覆盖 model 时可用;若必须完整重定义 prompt 则降级为仅内置花名册可用,避免弄丢用户 prompt);(b) frontmatter 自写 `model: ccem:<env>`——永远可用,router 只认别名不认名单,零配置
+- **生效优先级**:`subagent:<精确名>` > `subagent:*` > `default_env`
+- **匹配发生在注入层**(helper 按名字注入别名),router 层只看 `ccem:<env>` 别名、不知 agent 名字——这是 router 免疫 Claude Code 版本摆动的关键
 
 ### 4.4 配置分层
 
