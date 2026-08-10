@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { buildEnvVars, buildPermArgs } from '../launcher.js';
+import {
+  buildEnvVars,
+  buildPermArgs,
+  isTrustedDesktopProxyBaseUrl,
+} from '../launcher.js';
 
 describe('launcher', () => {
   describe('buildPermArgs', () => {
@@ -35,6 +39,41 @@ describe('launcher', () => {
         ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-3-5-haiku-20241022',
         ANTHROPIC_MODEL: 'opus',
       });
+    });
+
+    it('refuses direct OAuth for a third-party environment', () => {
+      expect(() => buildEnvVars('partner', {
+        ANTHROPIC_BASE_URL: 'https://partner.example.com/anthropic',
+      })).toThrow(/auth token|oauth/i);
+    });
+
+    it('refuses an official environment redirected to a third party even with a token', () => {
+      expect(() => buildEnvVars('official', {
+        ANTHROPIC_BASE_URL: 'https://partner.example.com/anthropic',
+        ANTHROPIC_AUTH_TOKEN: 'plain-test-token',
+      })).toThrow(/trusted.*official|official.*trusted/i);
+    });
+
+    it('allows only the Desktop-owned loopback proxy shape to override OAuth routing', () => {
+      const localProxy = 'http://127.0.0.1:17820/proxy/claude/session-key';
+      expect(isTrustedDesktopProxyBaseUrl(localProxy)).toBe(true);
+      expect(buildEnvVars('official', {
+        ANTHROPIC_BASE_URL: localProxy,
+      }, { allowDesktopProxyOverride: true })).toMatchObject({
+        ANTHROPIC_BASE_URL: localProxy,
+      });
+
+      for (const unsafe of [
+        'https://partner.example.com/proxy/claude/session-key',
+        'http://localhost:17820/proxy/claude/session-key',
+        'http://127.0.0.1:17820/not-router/session-key',
+        'http://user@127.0.0.1:17820/proxy/claude/session-key',
+      ]) {
+        expect(isTrustedDesktopProxyBaseUrl(unsafe)).toBe(false);
+        expect(() => buildEnvVars('official', {
+          ANTHROPIC_BASE_URL: unsafe,
+        }, { allowDesktopProxyOverride: true })).toThrow(/trusted.*official|official.*trusted/i);
+      }
     });
   });
 });

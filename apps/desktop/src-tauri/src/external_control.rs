@@ -2,7 +2,13 @@ use crate::browser::{BrowserBounds, BrowserManager, BrowserToolRequest};
 use crate::config::{self, resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::ReplayBatch;
 use crate::native_runtime::{
-    NativeProvider, NativeRuntimeManager, NativeSessionOptions, NativeSessionSummary,
+    NativeProvider, NativeRouterSeed, NativeRuntimeManager, NativeSessionOptions,
+    NativeSessionSummary,
+};
+use crate::proxy_debug::ProxyDebugManager;
+use crate::router::{
+    rename_router_config_environment, router_config_environment_references, validate_router_config,
+    RouterConfig, RouterManager, SessionRouterState, UpdateSessionRouterRequest,
 };
 use crate::session_provenance::{register_launch, SessionProvenanceUpsert, DEFAULT_CONFIG_SOURCE};
 use crate::system_proxy;
@@ -10,6 +16,7 @@ use crate::terminal;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 #[cfg(unix)]
@@ -55,6 +62,7 @@ struct PublishedControlDescriptor {
 
 pub struct ExternalControlManager {
     runtime: Mutex<Option<ExternalControlRuntime>>,
+    environment_mutations: Arc<config::EnvironmentMutationCoordinator>,
     native_runtime: Arc<NativeRuntimeManager>,
     token: String,
 }
@@ -65,6 +73,191 @@ struct JsonRpcRequest {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Debug)]
+struct ControlRpcError {
+    message: String,
+    data: Option<Value>,
+}
+
+impl ControlRpcError {
+    fn with_data(message: impl Into<String>, data: Value) -> Self {
+        Self {
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EnvironmentMutationError {
+    code: &'static str,
+    message: String,
+    references: Vec<String>,
+}
+
+impl EnvironmentMutationError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            references: Vec::new(),
+        }
+    }
+
+    fn referenced(name: &str, mut references: Vec<String>) -> Self {
+        references.sort();
+        references.dedup();
+        Self {
+            code: "ENVIRONMENT_REFERENCED",
+            message: format!(
+                "Cannot delete environment '{}'; it is referenced by {}",
+                name,
+                references.join(", ")
+            ),
+            references,
+        }
+    }
+}
+
+fn apply_environment_rename(
+    config: &mut config::CcemConfig,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), EnvironmentMutationError> {
+    if old_name.trim().is_empty() || new_name.trim().is_empty() {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_NAME_INVALID",
+            "Environment names cannot be empty.",
+        ));
+    }
+    if old_name == config::OFFICIAL_ENV_NAME {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_PROTECTED",
+            format!(
+                "Cannot rename the protected '{}' environment.",
+                config::OFFICIAL_ENV_NAME
+            ),
+        ));
+    }
+    if !config.registries.contains_key(old_name) {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_NOT_FOUND",
+            format!("Environment '{}' not found.", old_name),
+        ));
+    }
+    if config.registries.contains_key(new_name) {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_ALREADY_EXISTS",
+            format!("Environment '{}' already exists.", new_name),
+        ));
+    }
+
+    let environment = config
+        .registries
+        .remove(old_name)
+        .expect("environment existence checked above");
+    config.registries.insert(new_name.to_string(), environment);
+    if config.current.as_deref() == Some(old_name) {
+        config.current = Some(new_name.to_string());
+    }
+    rename_router_config_environment(&mut config.router, old_name, new_name);
+    Ok(())
+}
+
+fn apply_environment_delete(
+    config: &mut config::CcemConfig,
+    name: &str,
+    native_references: Vec<String>,
+) -> Result<(), EnvironmentMutationError> {
+    if name.trim().is_empty() {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_NAME_INVALID",
+            "Environment name cannot be empty.",
+        ));
+    }
+    if name == config::OFFICIAL_ENV_NAME {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_PROTECTED",
+            format!(
+                "Cannot delete the protected '{}' environment.",
+                config::OFFICIAL_ENV_NAME
+            ),
+        ));
+    }
+    if !config.registries.contains_key(name) {
+        return Err(EnvironmentMutationError::new(
+            "ENVIRONMENT_NOT_FOUND",
+            format!("Environment '{}' not found.", name),
+        ));
+    }
+
+    let mut references = router_config_environment_references(&config.router, name);
+    references.extend(native_references);
+    references.sort();
+    references.dedup();
+    if !references.is_empty() {
+        return Err(EnvironmentMutationError::referenced(name, references));
+    }
+
+    config.registries.remove(name);
+    if config.current.as_deref() == Some(name) {
+        config.current = Some(config::OFFICIAL_ENV_NAME.to_string());
+    }
+    Ok(())
+}
+
+fn environment_mutation_control_error(
+    error: EnvironmentMutationError,
+    operation: &'static str,
+    environment_name: &str,
+    new_name: Option<&str>,
+) -> ControlRpcError {
+    ControlRpcError::with_data(
+        error.message,
+        json!({
+            "code": error.code,
+            "operation": operation,
+            "environmentName": environment_name,
+            "newName": new_name,
+            "references": error.references,
+        }),
+    )
+}
+
+fn environment_system_control_error(
+    code: &'static str,
+    message: impl Into<String>,
+    operation: &'static str,
+    environment_name: &str,
+    new_name: Option<&str>,
+) -> ControlRpcError {
+    ControlRpcError::with_data(
+        message,
+        json!({
+            "code": code,
+            "operation": operation,
+            "environmentName": environment_name,
+            "newName": new_name,
+            "references": [],
+        }),
+    )
+}
+
+impl From<String> for ControlRpcError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            data: None,
+        }
+    }
+}
+
+impl From<&str> for ControlRpcError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +273,9 @@ struct CreateSessionParams {
     provider_session_id: Option<String>,
     effort: Option<String>,
     open: Option<bool>,
+    routes: Option<HashMap<String, String>>,
+    allowed_envs: Option<Vec<String>>,
+    dynamic_routing: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +290,18 @@ struct ListSessionsParams {
 #[serde(rename_all = "camelCase")]
 struct RuntimeIdParams {
     runtime_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvironmentNameParams {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameEnvironmentParams {
+    old_name: String,
+    new_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,9 +346,13 @@ struct BrowserSmokeProbeParams {
 }
 
 impl ExternalControlManager {
-    pub fn new(native_runtime: Arc<NativeRuntimeManager>) -> Self {
+    pub fn new(
+        native_runtime: Arc<NativeRuntimeManager>,
+        environment_mutations: Arc<config::EnvironmentMutationCoordinator>,
+    ) -> Self {
         Self {
             runtime: Mutex::new(None),
+            environment_mutations,
             native_runtime,
             token: generate_token(),
         }
@@ -313,11 +525,13 @@ impl ExternalControlManager {
 
         match self.handle_rpc(app, rpc) {
             Ok(result) => HttpResponse::json_result(id, result),
-            Err(error) => HttpResponse::json_error(200, id, -32000, &error),
+            Err(error) => {
+                HttpResponse::json_error_with_data(200, id, -32000, &error.message, error.data)
+            }
         }
     }
 
-    fn handle_rpc(&self, app: &AppHandle, rpc: JsonRpcRequest) -> Result<Value, String> {
+    fn handle_rpc(&self, app: &AppHandle, rpc: JsonRpcRequest) -> Result<Value, ControlRpcError> {
         match rpc.method.as_str() {
             "ccem.health" => Ok(json!({
                 "ok": true,
@@ -326,6 +540,7 @@ impl ExternalControlManager {
                 "version": env!("CARGO_PKG_VERSION"),
             })),
             "ccem.workspace.listSessions" => {
+                let _mutation_guard = self.environment_mutations.lock()?;
                 let params = deserialize_params::<ListSessionsParams>(rpc.params)?;
                 let sessions = self
                     .native_runtime
@@ -336,7 +551,26 @@ impl ExternalControlManager {
                     .collect::<Vec<_>>();
                 Ok(serde_json::to_value(sessions).map_err(|error| error.to_string())?)
             }
+            "ccem.environment.references" => {
+                let _mutation_guard = self.environment_mutations.lock()?;
+                let params = deserialize_params::<EnvironmentNameParams>(rpc.params)?;
+                let name = params.name.trim();
+                if name.is_empty() {
+                    return Err("Environment name cannot be empty".into());
+                }
+                let references = self.native_runtime.router_environment_references(name)?;
+                Ok(json!({ "references": references }))
+            }
+            "ccem.environment.rename" => {
+                let params = deserialize_params::<RenameEnvironmentParams>(rpc.params)?;
+                self.rename_environment(app, params)
+            }
+            "ccem.environment.delete" => {
+                let params = deserialize_params::<EnvironmentNameParams>(rpc.params)?;
+                self.delete_environment(params)
+            }
             "ccem.workspace.getSession" => {
+                let _mutation_guard = self.environment_mutations.lock()?;
                 let params = deserialize_params::<RuntimeIdParams>(rpc.params)?;
                 let session = self
                     .native_runtime
@@ -359,6 +593,7 @@ impl ExternalControlManager {
             }
             "ccem.workspace.sendInput" => {
                 let params = deserialize_params::<SendInputParams>(rpc.params)?;
+                let _mutation_guard = self.environment_mutations.lock()?;
                 self.native_runtime.send_user_message(
                     app,
                     &params.runtime_id,
@@ -391,12 +626,202 @@ impl ExternalControlManager {
                 let summary = self.create_session(app.clone(), params)?;
                 Ok(serde_json::to_value(summary).map_err(|error| error.to_string())?)
             }
+            "ccem.router.getSettings" => {
+                let _mutation_guard = self.environment_mutations.lock()?;
+                let settings = config::read_config()?.router;
+                Ok(serde_json::to_value(settings).map_err(|error| error.to_string())?)
+            }
+            "ccem.router.updateSettings" => {
+                let settings = deserialize_params::<RouterConfig>(rpc.params)?;
+                let _mutation_guard = self.environment_mutations.lock()?;
+                validate_router_config(&settings).map_err(|error| error.to_string())?;
+                let proxy = app
+                    .try_state::<Arc<ProxyDebugManager>>()
+                    .ok_or_else(|| "Router listener manager is unavailable.".to_string())?
+                    .inner()
+                    .clone();
+                proxy.validate_router_config_change(&settings)?;
+                config::update_ccem_config(|config| {
+                    config::validate_router_config_environment_targets(
+                        &settings,
+                        &config.registries,
+                    )?;
+                    config.router = settings.clone();
+                    Ok(())
+                })?;
+                let status = tauri::async_runtime::block_on(proxy.apply_router_config(settings))?;
+                Ok(serde_json::to_value(status).map_err(|error| error.to_string())?)
+            }
+            "ccem.router.status" => {
+                let router = app
+                    .try_state::<Arc<RouterManager>>()
+                    .ok_or_else(|| "Router manager is unavailable.".to_string())?;
+                Ok(serde_json::to_value(router.status()).map_err(|error| error.to_string())?)
+            }
+            "ccem.workspace.getRouter" => {
+                let _mutation_guard = self.environment_mutations.lock()?;
+                let params = deserialize_params::<RuntimeIdParams>(rpc.params)?;
+                let state = self
+                    .native_runtime
+                    .get_session_router(&params.runtime_id)
+                    .map_err(|error| {
+                        let data = serde_json::to_value(&error).unwrap_or(Value::Null);
+                        ControlRpcError::with_data(error.to_string(), data)
+                    })?;
+                Ok(serde_json::to_value(state).map_err(|error| error.to_string())?)
+            }
+            "ccem.workspace.updateRouter" => {
+                let request = deserialize_params::<UpdateSessionRouterRequest>(rpc.params)?;
+                let _mutation_guard = self.environment_mutations.lock()?;
+                let state = self
+                    .native_runtime
+                    .update_session_router(app, request, "externalControl")
+                    .map_err(|error| {
+                        let data = serde_json::to_value(&error).unwrap_or(Value::Null);
+                        ControlRpcError::with_data(error.to_string(), data)
+                    })?;
+                Ok(serde_json::to_value(state).map_err(|error| error.to_string())?)
+            }
+            "ccem.workspace.restartDirect" => {
+                let params = deserialize_params::<RuntimeIdParams>(rpc.params)?;
+                let _mutation_guard = self.environment_mutations.lock()?;
+                let state = self
+                    .native_runtime
+                    .restart_session_direct(app, &params.runtime_id)
+                    .map_err(|error| {
+                        let data = serde_json::to_value(&error).unwrap_or(Value::Null);
+                        ControlRpcError::with_data(error.to_string(), data)
+                    })?;
+                Ok(serde_json::to_value(state).map_err(|error| error.to_string())?)
+            }
             "ccem.browser.smokeProbe" if cfg!(debug_assertions) => {
                 let params = deserialize_params::<BrowserSmokeProbeParams>(rpc.params)?;
-                self.browser_smoke_probe(app, params)
+                self.browser_smoke_probe(app, params).map_err(Into::into)
             }
-            method => Err(format!("Unknown method: {}", method)),
+            method => Err(format!("Unknown method: {}", method).into()),
         }
+    }
+
+    fn rename_environment(
+        &self,
+        app: &AppHandle,
+        params: RenameEnvironmentParams,
+    ) -> Result<Value, ControlRpcError> {
+        let old_name = params.old_name.as_str();
+        let new_name = params.new_name.as_str();
+        let _mutation_guard = self.environment_mutations.lock().map_err(|_| {
+            environment_system_control_error(
+                "ENVIRONMENT_MUTATION_UNAVAILABLE",
+                "Environment mutation coordinator is unavailable.",
+                "rename",
+                old_name,
+                Some(new_name),
+            )
+        })?;
+        let prepare_error = RefCell::new(None);
+        let result = config::commit_environment_rename(
+            old_name,
+            new_name,
+            |next| {
+                apply_environment_rename(next, old_name, new_name).map_err(|error| {
+                    let message = error.message.clone();
+                    *prepare_error.borrow_mut() = Some(error);
+                    message
+                })
+            },
+            |from, to| {
+                self.native_runtime
+                    .rename_router_environment_references(from, to)
+            },
+        );
+        let (events, next) = result.map_err(|error| {
+            if let Some(mutation_error) = prepare_error.into_inner() {
+                return environment_mutation_control_error(
+                    mutation_error,
+                    "rename",
+                    old_name,
+                    Some(new_name),
+                );
+            }
+            let code = match error.stage {
+                config::EnvironmentRenameStage::NativeMutation => {
+                    "ENVIRONMENT_NATIVE_MUTATION_FAILED"
+                }
+                config::EnvironmentRenameStage::Rollback => "ENVIRONMENT_ROLLBACK_FAILED",
+                config::EnvironmentRenameStage::ConfigAccess => "ENVIRONMENT_CONFIG_UNAVAILABLE",
+                config::EnvironmentRenameStage::Prepare => "ENVIRONMENT_CONFIG_INVALID",
+                config::EnvironmentRenameStage::TransitionWrite
+                | config::EnvironmentRenameStage::FinalWrite => "ENVIRONMENT_CONFIG_WRITE_FAILED",
+            };
+            environment_system_control_error(
+                code,
+                error.to_string(),
+                "rename",
+                old_name,
+                Some(new_name),
+            )
+        })?;
+
+        let updated_sessions = events.len();
+        for event in events {
+            if let Err(error) = app.emit("native-session-router-updated", event) {
+                eprintln!("Failed to emit router environment rename event: {error}");
+            }
+        }
+        Ok(json!({
+            "ok": true,
+            "operation": "rename",
+            "oldName": old_name,
+            "newName": new_name,
+            "updatedSessions": updated_sessions,
+            "current": next.current,
+        }))
+    }
+
+    fn delete_environment(&self, params: EnvironmentNameParams) -> Result<Value, ControlRpcError> {
+        let name = params.name.as_str();
+        let _mutation_guard = self.environment_mutations.lock().map_err(|_| {
+            environment_system_control_error(
+                "ENVIRONMENT_MUTATION_UNAVAILABLE",
+                "Environment mutation coordinator is unavailable.",
+                "delete",
+                name,
+                None,
+            )
+        })?;
+        let current = config::update_ccem_config_transaction(|next| {
+            let native_references = self
+                .native_runtime
+                .router_environment_references(name)
+                .map_err(|error| {
+                    environment_system_control_error(
+                        "ENVIRONMENT_NATIVE_STATE_UNAVAILABLE",
+                        format!("Failed to inspect native environment references: {error}"),
+                        "delete",
+                        name,
+                        None,
+                    )
+                })?;
+            apply_environment_delete(next, name, native_references)
+                .map_err(|error| environment_mutation_control_error(error, "delete", name, None))?;
+            Ok(next.current.clone())
+        })
+        .map_err(|error| match error {
+            config::CcemConfigTransactionError::Operation(error) => error,
+            config::CcemConfigTransactionError::Storage(error) => environment_system_control_error(
+                "ENVIRONMENT_CONFIG_WRITE_FAILED",
+                format!("Failed to update environment config: {error}"),
+                "delete",
+                name,
+                None,
+            ),
+        })?;
+        Ok(json!({
+            "ok": true,
+            "operation": "delete",
+            "name": name,
+            "current": current,
+        }))
     }
 
     fn create_session(
@@ -404,6 +829,7 @@ impl ExternalControlManager {
         app: AppHandle,
         params: CreateSessionParams,
     ) -> Result<ControlCreateSessionResult, String> {
+        let mutation_guard = self.environment_mutations.lock()?;
         let provider = parse_native_provider(&params.provider)?;
         let env_name = params
             .env_name
@@ -430,6 +856,20 @@ impl ExternalControlManager {
         let options = match provider {
             NativeProvider::Claude => {
                 let resolved = resolve_claude_env(&env_name)?;
+                let router_seed = if params.routes.is_some()
+                    || params.allowed_envs.is_some()
+                    || params.dynamic_routing.is_some()
+                {
+                    Some(NativeRouterSeed {
+                        bindings: params.routes.unwrap_or_default(),
+                        allowed_envs: params.allowed_envs.unwrap_or_default(),
+                        source_profile_id: None,
+                        profile_revision: None,
+                        dynamic_routing: params.dynamic_routing,
+                    })
+                } else {
+                    None
+                };
                 NativeSessionOptions {
                     provider,
                     env_name: resolved.env_name,
@@ -449,6 +889,8 @@ impl ExternalControlManager {
                     codex_base_url: None,
                     codex_api_key: None,
                     effort: params.effort,
+                    router_seed,
+                    router_record: None,
                 }
             }
             NativeProvider::Codex => {
@@ -477,12 +919,15 @@ impl ExternalControlManager {
                     codex_base_url: None,
                     codex_api_key: None,
                     effort: params.effort,
+                    router_seed: None,
+                    router_record: None,
                 }
             }
         };
 
         let open = params.open.unwrap_or(false);
         let summary = self.native_runtime.create_session(app.clone(), options)?;
+        drop(mutation_guard);
         if let Err(error) = register_launch(SessionProvenanceUpsert {
             ccem_session_id: summary.runtime_id.clone(),
             client: summary.provider.as_str().to_string(),
@@ -1070,6 +1515,7 @@ struct ControlCreateSessionResult {
     cwd: String,
     status: String,
     link: String,
+    routes: Option<SessionRouterState>,
 }
 
 impl From<NativeSessionSummary> for ControlCreateSessionResult {
@@ -1082,6 +1528,7 @@ impl From<NativeSessionSummary> for ControlCreateSessionResult {
             cwd: summary.project_dir,
             status: summary.status,
             link,
+            routes: summary.router,
         }
     }
 }
@@ -1104,6 +1551,7 @@ struct ControlSessionSummary {
     last_event_seq: Option<u64>,
     last_error: Option<String>,
     link: String,
+    routes: Option<SessionRouterState>,
 }
 
 impl From<NativeSessionSummary> for ControlSessionSummary {
@@ -1125,6 +1573,7 @@ impl From<NativeSessionSummary> for ControlSessionSummary {
             last_event_seq: summary.last_event_seq,
             last_error: summary.last_error,
             link,
+            routes: summary.router,
         }
     }
 }
@@ -1189,15 +1638,29 @@ impl HttpResponse {
     }
 
     fn json_error(status: u16, id: Option<Value>, code: i64, message: &str) -> Self {
+        Self::json_error_with_data(status, id, code, message, None)
+    }
+
+    fn json_error_with_data(
+        status: u16,
+        id: Option<Value>,
+        code: i64,
+        message: &str,
+        data: Option<Value>,
+    ) -> Self {
+        let mut error = json!({
+            "code": code,
+            "message": message,
+        });
+        if let Some(data) = data {
+            error["data"] = data;
+        }
         Self::json(
             status,
             json!({
                 "jsonrpc": "2.0",
                 "id": id.unwrap_or(Value::Null),
-                "error": {
-                    "code": code,
-                    "message": message,
-                }
+                "error": error,
             }),
         )
     }
@@ -1683,11 +2146,20 @@ fn is_allowed_method_for_build(method: &str, debug_assertions: bool) -> bool {
         method,
         "ccem.health"
             | "ccem.workspace.listSessions"
+            | "ccem.environment.references"
+            | "ccem.environment.rename"
+            | "ccem.environment.delete"
             | "ccem.workspace.getSession"
             | "ccem.workspace.getEvents"
             | "ccem.workspace.sendInput"
             | "ccem.workspace.openSession"
             | "ccem.workspace.createSession"
+            | "ccem.router.getSettings"
+            | "ccem.router.updateSettings"
+            | "ccem.router.status"
+            | "ccem.workspace.getRouter"
+            | "ccem.workspace.updateRouter"
+            | "ccem.workspace.restartDirect"
     ) || (debug_assertions && method == "ccem.browser.smokeProbe")
 }
 
@@ -1871,11 +2343,20 @@ mod tests {
         for method in [
             "ccem.health",
             "ccem.workspace.listSessions",
+            "ccem.environment.references",
+            "ccem.environment.rename",
+            "ccem.environment.delete",
             "ccem.workspace.getSession",
             "ccem.workspace.getEvents",
             "ccem.workspace.sendInput",
             "ccem.workspace.openSession",
             "ccem.workspace.createSession",
+            "ccem.router.getSettings",
+            "ccem.router.updateSettings",
+            "ccem.router.status",
+            "ccem.workspace.getRouter",
+            "ccem.workspace.updateRouter",
+            "ccem.workspace.restartDirect",
             "ccem.browser.smokeProbe",
         ] {
             assert!(is_allowed_method(method), "{} should be allowed", method);
@@ -1898,6 +2379,60 @@ mod tests {
         assert!(!is_allowed_method(""));
         assert!(!is_allowed_method("admin.shutdown"));
         assert!(!is_allowed_method("system.execute"));
+    }
+
+    #[test]
+    fn environment_mutation_helpers_cascade_and_return_stable_errors() {
+        let mut config = config::CcemConfig::default();
+        let environment = config.registries[config::OFFICIAL_ENV_NAME].clone();
+        config.registries.insert("legacy".into(), environment);
+        config.current = Some("legacy".into());
+        config
+            .router
+            .bindings
+            .insert("background".into(), "legacy".into());
+        config.router.default_allowed_envs = vec!["official".into(), "legacy".into()];
+
+        apply_environment_rename(&mut config, "legacy", "partner").expect("rename config");
+        assert!(!config.registries.contains_key("legacy"));
+        assert!(config.registries.contains_key("partner"));
+        assert_eq!(config.current.as_deref(), Some("partner"));
+        assert_eq!(
+            config.router.bindings.get("background").map(String::as_str),
+            Some("partner")
+        );
+
+        let referenced = apply_environment_delete(&mut config, "partner", Vec::new())
+            .expect_err("router reference must reject delete");
+        assert_eq!(referenced.code, "ENVIRONMENT_REFERENCED");
+        assert!(referenced
+            .references
+            .iter()
+            .any(|reference| reference == "router.bindings.background"));
+        let rpc_error = environment_mutation_control_error(referenced, "delete", "partner", None);
+        let data = rpc_error.data.expect("structured mutation error data");
+        assert_eq!(data["code"], "ENVIRONMENT_REFERENCED");
+        assert_eq!(data["operation"], "delete");
+        assert_eq!(data["environmentName"], "partner");
+        assert_eq!(data["newName"], Value::Null);
+        assert!(data["references"]
+            .as_array()
+            .is_some_and(|references| !references.is_empty()));
+
+        config.router = RouterConfig::default();
+        let native_referenced =
+            apply_environment_delete(&mut config, "partner", vec!["session:recoverable-1".into()])
+                .expect_err("native snapshot reference must reject delete");
+        assert_eq!(native_referenced.code, "ENVIRONMENT_REFERENCED");
+        assert_eq!(
+            native_referenced.references,
+            vec!["session:recoverable-1".to_string()]
+        );
+
+        let protected =
+            apply_environment_delete(&mut config, config::OFFICIAL_ENV_NAME, Vec::new())
+                .expect_err("official must remain protected");
+        assert_eq!(protected.code, "ENVIRONMENT_PROTECTED");
     }
 
     // --- Permission mode validation --------------------------------------

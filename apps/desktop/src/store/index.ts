@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import type { PermissionModeName } from '@ccem/core/browser';
+import type { PermissionModeName, RouterConfig, RouterStatus, SessionRouterState } from '@ccem/core/browser';
 import type { UsageStats, Milestone } from '@/types/analytics';
+import { shouldApplySessionRouter } from '@/lib/routerProfiles';
 
 export interface Companion {
   name: string;
@@ -275,6 +276,16 @@ interface AppState {
   reviewEntry: ReviewEntrySummary | null;
   setReviewEntry: (entry: ReviewEntrySummary | null) => void;
 
+  // Router (CCEM Router) — authoritative state from backend / events, never optimistic.
+  // Global infra config + status, and a per-runtime session router map.
+  routerConfig: RouterConfig | null;
+  routerStatus: RouterStatus | null;
+  sessionRouters: Record<string, SessionRouterState>;
+  setRouterConfig: (config: RouterConfig | null) => void;
+  setRouterStatus: (status: RouterStatus | null) => void;
+  setSessionRouter: (runtimeId: string, router: SessionRouterState) => void;
+  removeSessionRouter: (runtimeId: string) => void;
+
   // Per-domain loading flags (skeleton screens, never spinners)
   isLoadingEnvs: boolean;
   isLoadingSessions: boolean;
@@ -468,6 +479,31 @@ export const useAppStore = create<AppState>((set) => ({
   reviewEntry: null,
   setReviewEntry: (entry) =>
     set((state) => (areReviewEntriesEqual(state.reviewEntry, entry) ? state : { reviewEntry: entry })),
+
+  // Router — revision is the authoritative change token (CAS); skip writes that
+  // don't advance revision or transport/defaultEnv to avoid redundant renders.
+  routerConfig: null,
+  routerStatus: null,
+  sessionRouters: {},
+  setRouterConfig: (config) =>
+    set((state) => (state.routerConfig === config ? state : { routerConfig: config })),
+  setRouterStatus: (status) =>
+    set((state) => (state.routerStatus === status ? state : { routerStatus: status })),
+  setSessionRouter: (runtimeId, router) =>
+    set((state) => {
+      const existing = state.sessionRouters[runtimeId];
+      if (!shouldApplySessionRouter(existing, router)) return state;
+      return {
+        sessionRouters: { ...state.sessionRouters, [runtimeId]: router },
+      };
+    }),
+  removeSessionRouter: (runtimeId) =>
+    set((state) => {
+      if (!(runtimeId in state.sessionRouters)) return state;
+      const next = { ...state.sessionRouters };
+      delete next[runtimeId];
+      return { sessionRouters: next };
+    }),
 
   // Per-domain loading flags (skeleton screens, never spinners)
   isLoadingEnvs: false,

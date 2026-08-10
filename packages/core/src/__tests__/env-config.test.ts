@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertClaudeEnvironmentAuthBoundary,
+  assertOfficialEnvironmentInvariant,
+  assertOfficialEnvironmentPresent,
   hasLegacyEnvFields,
+  isTrustedOfficialBaseUrl,
+  normalizeCcemConfig,
   normalizeEnvConfig,
   recoverEnvConfigFromLegacy,
   resolveEnvConfigForRuntime,
@@ -146,5 +151,101 @@ describe('runtime environment resolution', () => {
     expect(resolveEnvConfigForRuntime('partner', legacyOfficialDefaults)).toEqual(
       legacyOfficialDefaults
     );
+  });
+});
+
+describe('top-level config normalization', () => {
+  it('preserves an optional camelCase router section through JSON round-trip', () => {
+    const input = JSON.parse(JSON.stringify({
+      registries: {
+        primary: {
+          ANTHROPIC_BASE_URL: 'https://example.com/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'token',
+        },
+      },
+      current: 'primary',
+      defaultMode: 'dev',
+      router: {
+        enabled: true,
+        port: 17842,
+        bindings: { 'subagent:Explore': 'search-env' },
+        profiles: [],
+        dynamicRouting: false,
+        defaultAllowedEnvs: ['primary', 'search-env'],
+      },
+    }));
+
+    expect(normalizeCcemConfig(input).router).toEqual(input.router);
+  });
+
+  it('keeps router absent for configurations that predate it', () => {
+    const normalized = normalizeCcemConfig({
+      registries: {},
+      current: 'official',
+    });
+
+    expect(normalized).not.toHaveProperty('router');
+  });
+});
+
+describe('protected environment invariant', () => {
+  it('accepts an own official environment and rejects missing or inherited entries', () => {
+    expect(() => assertOfficialEnvironmentPresent({ official: {} })).not.toThrow();
+    expect(() => assertOfficialEnvironmentPresent({ glm: {} })).toThrow(/official/i);
+
+    const inherited = Object.create({ official: {} }) as Record<string, unknown>;
+    expect(() => assertOfficialEnvironmentPresent(inherited)).toThrow(/official/i);
+  });
+
+  it.each([
+    'https://api.anthropic.com',
+    'https://api.anthropic.com/',
+  ])('accepts the trusted official root URL %s', (baseUrl) => {
+    expect(isTrustedOfficialBaseUrl(baseUrl)).toBe(true);
+    expect(() => assertOfficialEnvironmentInvariant({
+      official: { ANTHROPIC_BASE_URL: baseUrl },
+    })).not.toThrow();
+  });
+
+  it.each([
+    undefined,
+    '',
+    ' http://api.anthropic.com',
+    'http://api.anthropic.com',
+    'https://api.anthropic.com:443',
+    'https://user@api.anthropic.com',
+    'https://api.anthropic.com/v1',
+    'https://api.anthropic.com/?debug=1',
+    'https://api.anthropic.com/#fragment',
+    'https://API.ANTHROPIC.COM',
+    'https://api.anthropic.com.evil.test',
+  ])('rejects an untrusted official URL %s', (baseUrl) => {
+    expect(isTrustedOfficialBaseUrl(baseUrl)).toBe(false);
+    expect(() => assertOfficialEnvironmentInvariant({
+      official: { ANTHROPIC_BASE_URL: baseUrl },
+    })).toThrow(/trusted.*official|official.*trusted/i);
+  });
+
+  it('allows OAuth only for the protected official environment', () => {
+    expect(() => assertClaudeEnvironmentAuthBoundary(
+      'official',
+      'https://api.anthropic.com/',
+      undefined,
+    )).not.toThrow();
+    expect(() => assertClaudeEnvironmentAuthBoundary(
+      'partner',
+      'https://partner.example.com/anthropic',
+      undefined,
+    )).toThrow(/auth token|oauth/i);
+    expect(() => assertClaudeEnvironmentAuthBoundary(
+      'partner',
+      'https://partner.example.com/anthropic',
+      'partner-token',
+    )).not.toThrow();
+    expect(() => assertClaudeEnvironmentAuthBoundary(
+      'official',
+      'https://partner.example.com/anthropic',
+      'explicit-token',
+    )).toThrow(/trusted.*official|official.*trusted/i);
   });
 });

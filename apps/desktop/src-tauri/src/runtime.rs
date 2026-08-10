@@ -9,6 +9,7 @@ use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionStore};
 use crate::event_dispatcher::EventDispatcher;
 use crate::notifications::{self, NotificationContext};
 use crate::remote::{RemotePeerRef, RemotePlatform};
+use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
 use crate::terminal::resolve_claude_path;
 use chrono::{DateTime, Utc};
@@ -1570,16 +1571,9 @@ pub fn write_runtime_state(state: &RuntimeStateFile) -> io::Result<()> {
 }
 
 pub fn write_runtime_state_to(path: &Path, state: &RuntimeStateFile) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let json = serde_json::to_string_pretty(state)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, json)?;
-    fs::rename(temp_path, path)?;
-    Ok(())
+    write_private_atomic(path, json.as_bytes())
 }
 
 pub fn replace_runtime_entries_for_kind(

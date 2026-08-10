@@ -18,9 +18,12 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
+import { enqueueSessionRouterMutation, resolveDisplayEnv, resolveEnvSwitchAction, resolveEnvSwitchCasPatch } from '@/lib/routerProfiles';
+import { toast } from 'sonner';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import { resolveEnvironmentIconHint } from '@/components/workspace/sessionTreeIcons';
 import { StreakUsagePopoverContent } from './StreakUsagePopover';
+import { WorkspaceRouteChip } from './WorkspaceRouter';
 import type { UsageStats } from '@/types/analytics';
 import type { Environment } from '@/store';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
@@ -67,6 +70,9 @@ interface WorkspaceStatusStripProps {
   onToggleBrowser?: () => void;
   /** Optional env context (e.g. the active history/live session env) to keep visible alongside the global current env. */
   envContext?: string;
+  /** Active native session runtimeId (live mode); the Route chip is per-session. */
+  activeRuntimeId?: string | null;
+  onNavigateSettings?: () => void;
 }
 
 function StatusChip({
@@ -133,6 +139,8 @@ export function WorkspaceStatusStrip({
   browserOpen = false,
   onToggleBrowser,
   envContext,
+  activeRuntimeId,
+  onNavigateSettings,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
   const { sessions, currentEnv, environments, enabledEnvironments, continuousUsageDays, cronTasks, usageStats } = useAppStore(
@@ -147,9 +155,15 @@ export function WorkspaceStatusStrip({
     }),
     shallow
   );
-  const statusStripCurrentEnvs = envContext
-    ? [currentEnv, envContext].filter((name): name is string => Boolean(name))
-    : currentEnv;
+  const activeRouter = useAppStore((state) =>
+    activeRuntimeId ? state.sessionRouters[activeRuntimeId] ?? null : null,
+  );
+  // Display truth: a routed session's env chip reflects its router defaultEnv
+  // (the very value a CAS edit changes), so A→B shows/checks B — never the stale
+  // global currentEnv. Direct/new sessions fall back to the global currentEnv.
+  const displayEnv = resolveDisplayEnv(currentEnv, activeRouter);
+  const statusStripCurrentEnvs = [currentEnv, envContext, displayEnv]
+    .filter((name): name is string => Boolean(name));
   const runtimeEnvironments = filterRuntimeEnvironments(environments, enabledEnvironments, {
     currentEnv: statusStripCurrentEnvs.length > 0 ? statusStripCurrentEnvs : null,
   });
@@ -170,7 +184,54 @@ export function WorkspaceStatusStrip({
     }),
     shallow
   );
-  const { switchEnvironment } = useTauriCommands();
+  const routerStatus = useAppStore((state) => state.routerStatus);
+  const { switchEnvironment, updateSessionRouter } = useTauriCommands();
+
+  // Transport truth: a routed session never falls through to the global switch.
+  //   cas     → routed + live port: CAS defaultEnv (preserves allowed/bindings)
+  //   blocked → routed but listener port gone: no state change; recover via the
+  //             route popover's restart-direct (NOT a global env switch)
+  //   global  → direct / new session: legacy global switch
+  const handleEnvSelect = useCallback(
+    async (envName: string) => {
+      if (!activeRuntimeId) {
+        await switchEnvironment(envName);
+        return;
+      }
+      const action = resolveEnvSwitchAction(activeRouter, routerStatus?.actualPort ?? null);
+      if (action === 'blocked') {
+        toast.warning(t('router.blocked'));
+        return;
+      }
+      if (action === 'global') {
+        await switchEnvironment(envName);
+        return;
+      }
+      // action === 'cas': serialize with profile/custom applies on this runtime
+      // and read the FRESH router (revision + allowedEnvs) at execution, so a
+      // rapid apply→switch lands on the bumped revision. Transport truth: even
+      // if the fresh router is missing at execution time we must NOT fall back
+      // to switchEnvironment (that would reroute a routed session globally) —
+      // fail closed instead.
+      await enqueueSessionRouterMutation(activeRuntimeId, async () => {
+        const fresh = useAppStore.getState().sessionRouters[activeRuntimeId];
+        const decision = resolveEnvSwitchCasPatch(fresh, envName);
+        if (decision.kind === 'failClosed') {
+          toast.error(t('router.loadFailed'));
+          return;
+        }
+        const result = await updateSessionRouter(activeRuntimeId, decision.router.revision, decision.patch);
+        if (result.ok) return;
+        if (result.conflict.code === 'ROUTER_REVISION_CONFLICT') {
+          // Store already rebased to conflict.current.
+          toast.warning(t('router.conflict'));
+          return;
+        }
+        toast.error(t('router.applyFailed', { message: result.conflict.message }));
+      });
+    },
+    [activeRuntimeId, activeRouter, routerStatus, updateSessionRouter, switchEnvironment, t],
+  );
 
   // Actively refresh usage stats from the backend so the streak popover
   // reflects the latest data each time it's opened.
@@ -191,7 +252,7 @@ export function WorkspaceStatusStrip({
 
   const runningSessions = sessions.filter((s) => s.status === 'running');
   const activeCronTasks = cronTasks.filter((t) => t.enabled !== false);
-  const currentEnvironment = environments.find((env) => env.name === currentEnv);
+  const displayEnvironment = environments.find((env) => env.name === displayEnv);
 
   return (
     <div
@@ -220,7 +281,7 @@ export function WorkspaceStatusStrip({
         <DropdownMenuTrigger asChild>
           <button
             type="button"
-            title={currentEnv || '—'}
+            title={displayEnv || '—'}
             className={cn(
               'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full',
               browserOpen ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
@@ -230,13 +291,13 @@ export function WorkspaceStatusStrip({
             )}
           >
             <span className="relative flex items-center justify-center">
-              <EnvironmentLobeIcon environment={currentEnvironment} size={14} />
+              <EnvironmentLobeIcon environment={displayEnvironment} size={14} />
             </span>
             <span className={cn(
               'max-w-[8.5rem] truncate whitespace-nowrap text-[12px] font-medium text-foreground transition-colors',
               !browserOpen && 'sm:max-w-[10rem] sm:text-[13px]',
             )}>
-              {currentEnv || '—'}
+              {displayEnv || '—'}
             </span>
           </button>
         </DropdownMenuTrigger>
@@ -246,7 +307,7 @@ export function WorkspaceStatusStrip({
           </div>
           <div className={cn('p-1.5 pt-0', runtimeEnvironments.length > 6 && 'max-h-[200px] overflow-y-auto')}>
             {runtimeEnvironments.map((env) => {
-              const isActive = env.name === currentEnv;
+              const isActive = env.name === displayEnv;
               return (
                 <DropdownMenuItem
                   key={env.name}
@@ -255,7 +316,7 @@ export function WorkspaceStatusStrip({
                     isActive && 'text-primary',
                   )}
                   onSelect={() => {
-                    if (!isActive) void switchEnvironment(env.name);
+                    if (!isActive) void handleEnvSelect(env.name);
                   }}
                 >
                   <EnvironmentLobeIcon environment={env} size={13} />
@@ -275,6 +336,13 @@ export function WorkspaceStatusStrip({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+
+      {/* Route chip — per-session router control (CCEM Router) */}
+      <WorkspaceRouteChip
+        runtimeId={activeRuntimeId ?? null}
+        onNavigateSettings={onNavigateSettings}
+        compact={browserOpen}
+      />
 
       {continuousUsageDays > 0 && usageStats && (
         <Popover

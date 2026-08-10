@@ -7,34 +7,55 @@ use crate::event_bus::{
 use crate::native_event_log::NativeEventLog;
 use crate::native_helper_resource::native_helper_script_path;
 use crate::prompt_image_store::PromptImageStore;
+use crate::router::{
+    apply_session_router_patch, describe_router_environment, is_valid_router_environment_alias,
+    validate_session_router_targets, LaunchAuthKind, LaunchTransport, RouterAuthCapability,
+    RouterEnvironmentAuthKind, RouterManager, RouterServiceError, SessionRouterRecord,
+    SessionRouterState, SessionRouterUpdatedEvent, UpdateSessionRouterRequest,
+    OAUTH_ROUTING_VERIFIED,
+};
+use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
 use crate::system_proxy::resolve_codex_proxy_env;
 use crate::terminal::{self, resolve_claude_path, resolve_codex_path, TerminalType};
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use shared_child::SharedChild;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{ChildStdin, Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+#[cfg(unix)]
+use std::{os::unix::process::CommandExt, os::unix::process::ExitStatusExt};
+#[cfg(windows)]
+use std::{
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    ptr,
+};
+use tauri::async_runtime::{block_on, channel, Receiver, Sender};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::{
-    process::{CommandChild, CommandEvent},
+    process::{CommandEvent, TerminatedPayload},
     ShellExt,
 };
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const NATIVE_HELPER_RETIRING_ERROR: &str = "Native runtime helper is retiring";
 const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
 const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
 const MAX_PROMPT_ANNOTATION_TOTAL_CHARS: usize = 60_000;
-static NATIVE_RUNTIME_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +107,8 @@ pub struct NativeSessionRecord {
     pub pending_handoff_terminal: Option<TerminalType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<SessionRouterRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,6 +136,8 @@ pub struct NativeSessionSummary {
     pub can_handoff_to_terminal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<SessionRouterState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +184,17 @@ pub struct NativeSessionOptions {
     pub codex_base_url: Option<String>,
     pub codex_api_key: Option<String>,
     pub effort: Option<String>,
+    pub router_seed: Option<NativeRouterSeed>,
+    pub router_record: Option<SessionRouterRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NativeRouterSeed {
+    pub bindings: HashMap<String, String>,
+    pub allowed_envs: Vec<String>,
+    pub source_profile_id: Option<String>,
+    pub profile_revision: Option<u64>,
+    pub dynamic_routing: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +360,8 @@ enum HelperInputCommand<'a> {
         effort: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         todo_snapshot_seed: Option<&'a TodoSnapshotV1>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        router: Option<&'a HelperRouterInit>,
     },
     Prompt {
         text: &'a str,
@@ -363,6 +401,15 @@ enum HelperInputCommand<'a> {
         error: Option<&'a str>,
     },
     Stop,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HelperRouterInit {
+    route_tag_nonce: String,
+    dynamic_routing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    menu: Option<String>,
 }
 
 fn is_bypass_permission_mode(mode: &str) -> bool {
@@ -484,10 +531,420 @@ enum HelperOutputEvent {
     },
 }
 
+#[derive(Debug)]
+struct NativeHelperChild {
+    inner: Arc<SharedChild>,
+    stdin: Option<ChildStdin>,
+    process_tree: Arc<NativeProcessTree>,
+}
+
+impl NativeHelperChild {
+    #[cfg(test)]
+    fn pid(&self) -> u32 {
+        self.inner.id()
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.stdin
+            .as_mut()
+            .ok_or_else(|| "Native sidecar stdin is closed".to_string())?
+            .write_all(bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn kill(mut self) -> Result<(), String> {
+        self.stdin.take();
+        let tree_result = self.process_tree.kill();
+        let _ = self.inner.kill();
+        tree_result
+    }
+}
+
+impl Drop for NativeHelperChild {
+    fn drop(&mut self) {
+        self.stdin.take();
+        let _ = self.process_tree.kill();
+        let _ = self.inner.kill();
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct NativeProcessTree {
+    process_group_id: i32,
+    terminated: Mutex<bool>,
+}
+
+fn terminate_process_tree_once(
+    terminated: &Mutex<bool>,
+    terminate: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut terminated = terminated
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *terminated {
+        return Ok(());
+    }
+    terminate()?;
+    *terminated = true;
+    Ok(())
+}
+
+#[cfg(unix)]
+impl NativeProcessTree {
+    fn attach(root_pid: u32) -> Result<Self, String> {
+        let process_group_id = i32::try_from(root_pid)
+            .ok()
+            .filter(|pid| *pid > 1)
+            .ok_or_else(|| format!("Invalid native helper pid {root_pid}"))?;
+        // SAFETY: getpgid only inspects the child spawned immediately before this call.
+        let actual_group = unsafe { libc::getpgid(process_group_id) };
+        if actual_group == -1 {
+            return Err(format!(
+                "Failed to inspect native helper process group: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if actual_group != process_group_id {
+            return Err(format!(
+                "Native helper {root_pid} did not enter its dedicated process group"
+            ));
+        }
+        Ok(Self {
+            process_group_id,
+            terminated: Mutex::new(false),
+        })
+    }
+
+    fn kill(&self) -> Result<(), String> {
+        terminate_process_tree_once(&self.terminated, || {
+            if self.process_group_id <= 1 {
+                return Err("Refusing to kill an invalid native helper process group".to_string());
+            }
+            // SAFETY: the negative PID targets only the dedicated group configured before exec.
+            let result = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+            let error = io::Error::last_os_error();
+            if result == 0 || error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to kill native helper process group {}: {error}",
+                    self.process_group_id
+                ))
+            }
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct NativeProcessTree {
+    job: OwnedHandle,
+    terminated: Mutex<bool>,
+}
+
+#[cfg(windows)]
+impl NativeProcessTree {
+    fn attach(root_pid: u32) -> Result<Self, String> {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        // SAFETY: null attributes/name create a private job owned by this process.
+        let raw_job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if raw_job.is_null() {
+            return Err(format!(
+                "Failed to create native helper job: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: raw_job is a new owned HANDLE returned by CreateJobObjectW.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw_job as _) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: limits points to a correctly sized JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle() as _,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(format!(
+                "Failed to configure native helper job: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        // The native helper protocol does not launch provider work until Init is written, so the
+        // root cannot create descendants before this assignment completes.
+        // SAFETY: OpenProcess returns a separately owned handle for the freshly spawned root PID.
+        let raw_process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                0,
+                root_pid,
+            )
+        };
+        if raw_process.is_null() {
+            return Err(format!(
+                "Failed to open native helper process {root_pid}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: raw_process is a new owned HANDLE returned by OpenProcess.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw_process as _) };
+        // SAFETY: both handles are valid for the duration of this call.
+        let assigned = unsafe {
+            AssignProcessToJobObject(job.as_raw_handle() as _, process.as_raw_handle() as _)
+        };
+        if assigned == 0 {
+            return Err(format!(
+                "Failed to assign native helper {root_pid} to its job: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        Ok(Self {
+            job,
+            terminated: Mutex::new(false),
+        })
+    }
+
+    fn kill(&self) -> Result<(), String> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        terminate_process_tree_once(&self.terminated, || {
+            // SAFETY: the handle remains owned by self for the duration of this call.
+            if unsafe { TerminateJobObject(self.job.as_raw_handle() as _, 1) } != 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to terminate native helper job: {}",
+                    io::Error::last_os_error()
+                ))
+            }
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug)]
+struct NativeProcessTree {
+    terminated: Mutex<bool>,
+}
+
+#[cfg(not(any(unix, windows)))]
+impl NativeProcessTree {
+    fn attach(_root_pid: u32) -> Result<Self, String> {
+        Ok(Self {
+            terminated: Mutex::new(false),
+        })
+    }
+
+    fn kill(&self) -> Result<(), String> {
+        terminate_process_tree_once(&self.terminated, || Ok(()))
+    }
+}
+
+fn spawn_native_helper_process(
+    mut command: StdCommand,
+) -> Result<(Receiver<CommandEvent>, NativeHelperChild), String> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_native_helper_command(&mut command);
+
+    let child = Arc::new(
+        SharedChild::spawn(&mut command)
+            .map_err(|error| format!("Failed to spawn native runtime sidecar: {error}"))?,
+    );
+    let process_tree = match NativeProcessTree::attach(child.id()) {
+        Ok(process_tree) => Arc::new(process_tree),
+        Err(error) => {
+            abort_unmanaged_native_helper(&child);
+            return Err(error);
+        }
+    };
+
+    let stdin = match child.take_stdin() {
+        Some(stdin) => stdin,
+        None => {
+            abort_managed_native_helper(&child, &process_tree);
+            return Err("Native sidecar stdin pipe is unavailable".to_string());
+        }
+    };
+    let stdout = match child.take_stdout() {
+        Some(stdout) => stdout,
+        None => {
+            abort_managed_native_helper(&child, &process_tree);
+            return Err("Native sidecar stdout pipe is unavailable".to_string());
+        }
+    };
+    let stderr = match child.take_stderr() {
+        Some(stderr) => stderr,
+        None => {
+            abort_managed_native_helper(&child, &process_tree);
+            return Err("Native sidecar stderr pipe is unavailable".to_string());
+        }
+    };
+
+    let (sender, receiver) = channel(64);
+    let drain_guard = Arc::new(RwLock::new(()));
+    let (reader_ready, readers_started) = std::sync::mpsc::sync_channel(2);
+    spawn_native_output_reader(
+        stdout,
+        sender.clone(),
+        Arc::clone(&drain_guard),
+        reader_ready.clone(),
+        CommandEvent::Stdout,
+    );
+    spawn_native_output_reader(
+        stderr,
+        sender.clone(),
+        Arc::clone(&drain_guard),
+        reader_ready,
+        CommandEvent::Stderr,
+    );
+    for _ in 0..2 {
+        if readers_started.recv().is_err() {
+            abort_managed_native_helper(&child, &process_tree);
+            return Err("Native sidecar output reader failed to start".to_string());
+        }
+    }
+
+    let wait_child = Arc::clone(&child);
+    let wait_tree = Arc::clone(&process_tree);
+    thread::spawn(move || {
+        let wait_result = wait_child.wait();
+        let cleanup_result = wait_tree.kill();
+        let _drained = drain_guard
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let event = match (wait_result, cleanup_result) {
+            (Ok(status), Ok(())) => CommandEvent::Terminated(TerminatedPayload {
+                code: status.code(),
+                signal: native_exit_signal(&status),
+            }),
+            (Err(wait_error), Ok(())) => CommandEvent::Error(format!(
+                "Failed to wait for native runtime sidecar: {wait_error}"
+            )),
+            (Ok(_), Err(cleanup_error)) => CommandEvent::Error(cleanup_error),
+            (Err(wait_error), Err(cleanup_error)) => CommandEvent::Error(format!(
+                "Failed to wait for native runtime sidecar: {wait_error}; {cleanup_error}"
+            )),
+        };
+        send_native_helper_event(&sender, event);
+    });
+
+    Ok((
+        receiver,
+        NativeHelperChild {
+            inner: child,
+            stdin: Some(stdin),
+            process_tree,
+        },
+    ))
+}
+
+#[cfg(unix)]
+fn configure_native_helper_command(command: &mut StdCommand) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_native_helper_command(_command: &mut StdCommand) {}
+
+fn abort_unmanaged_native_helper(child: &SharedChild) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn abort_managed_native_helper(child: &SharedChild, process_tree: &NativeProcessTree) {
+    let _ = process_tree.kill();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_native_output_reader<R>(
+    reader: R,
+    sender: Sender<CommandEvent>,
+    drain_guard: Arc<RwLock<()>>,
+    ready: std::sync::mpsc::SyncSender<()>,
+    wrap: fn(Vec<u8>) -> CommandEvent,
+) where
+    R: io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let _draining = drain_guard
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = ready.send(());
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut bytes = Vec::new();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => send_native_helper_event(&sender, wrap(bytes)),
+                Err(error) => {
+                    send_native_helper_event(&sender, CommandEvent::Error(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn send_native_helper_event(sender: &Sender<CommandEvent>, event: CommandEvent) {
+    let sender = sender.clone();
+    let _ = block_on(async move { sender.send(event).await });
+}
+
+#[cfg(unix)]
+fn native_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn native_exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(all(test, unix))]
+fn native_process_group_exists(process_group_id: i32) -> bool {
+    if process_group_id <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks whether a member remains in the dedicated process group.
+    let result = unsafe { libc::kill(-process_group_id, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(all(test, unix))]
+fn native_process_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks whether the exact PID exists.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 struct NativeSessionHandle {
     generation: u64,
     record: Mutex<NativeSessionRecord>,
-    child: Mutex<Option<CommandChild>>,
+    child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
     helper_env_vars: HashMap<String, String>,
     terminal_env_vars: HashMap<String, String>,
@@ -524,6 +981,7 @@ impl NativeSessionHandle {
             last_event_seq,
             can_handoff_to_terminal: record.can_handoff_to_terminal,
             last_error: record.last_error,
+            router: record.router.as_ref().map(SessionRouterState::from),
         }
     }
 }
@@ -617,35 +1075,84 @@ pub struct NativeRuntimeManager {
     state_path: PathBuf,
     event_log: NativeEventLog,
     prompt_image_store: PromptImageStore,
+    router_manager: OnceLock<Arc<RouterManager>>,
+    reconnect_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterLaunchDecision {
+    Bypass,
+    LaunchDirect,
+    LaunchRouted,
+    RejectRecovery,
+}
+
+fn router_launch_decision(
+    previous_transport: Option<LaunchTransport>,
+    router_enabled: bool,
+    router_ready: bool,
+    auth_capability: RouterAuthCapability,
+    oauth_verified: bool,
+) -> RouterLaunchDecision {
+    if !router_enabled {
+        return match previous_transport {
+            Some(LaunchTransport::Routed) => RouterLaunchDecision::RejectRecovery,
+            Some(LaunchTransport::Direct) => RouterLaunchDecision::LaunchDirect,
+            None => RouterLaunchDecision::Bypass,
+        };
+    }
+
+    let can_route =
+        router_ready && (auth_capability != RouterAuthCapability::Oauth || oauth_verified);
+    if can_route {
+        RouterLaunchDecision::LaunchRouted
+    } else if previous_transport == Some(LaunchTransport::Routed) {
+        RouterLaunchDecision::RejectRecovery
+    } else {
+        RouterLaunchDecision::LaunchDirect
+    }
 }
 
 impl Default for NativeRuntimeManager {
     fn default() -> Self {
+        Self::try_new().expect("failed to load native runtime state")
+    }
+}
+
+impl NativeRuntimeManager {
+    pub fn try_new() -> Result<Self, String> {
         let state_path = native_runtime_state_file_path();
         let records = read_native_runtime_state_from(&state_path)
-            .unwrap_or_default()
+            .map_err(|error| format!("Failed to load native runtime state: {error}"))?
             .sessions
             .into_iter()
             .map(|record| (record.runtime_id.clone(), record))
             .collect();
-        Self {
+        Ok(Self {
             records: Mutex::new(records),
             handles: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(1),
             state_path,
             event_log: NativeEventLog::default(),
             prompt_image_store: PromptImageStore::default(),
-        }
+            router_manager: OnceLock::new(),
+            reconnect_lock: Mutex::new(()),
+        })
     }
-}
 
-impl NativeRuntimeManager {
+    pub fn set_router_manager(&self, manager: Arc<RouterManager>) -> Result<(), String> {
+        self.router_manager
+            .set(manager)
+            .map_err(|_| "Native router manager was already configured".to_string())
+    }
+
     pub fn create_session(
         self: &Arc<Self>,
         app: AppHandle,
         options: NativeSessionOptions,
     ) -> Result<NativeSessionSummary, String> {
         let mut options = options;
+        self.prepare_router_launch(&mut options, false)?;
         options.initial_annotations =
             validate_prompt_annotations(options.initial_annotations.as_ref())?;
         merge_helper_env_path(&mut options.helper_env_vars, &terminal::get_user_path());
@@ -671,6 +1178,7 @@ impl NativeRuntimeManager {
             can_handoff_to_terminal: terminal::external_terminal_launch_supported(),
             pending_handoff_terminal: None,
             last_error: None,
+            router: options.router_record.clone(),
         };
 
         let handle = Arc::new(NativeSessionHandle {
@@ -687,27 +1195,262 @@ impl NativeRuntimeManager {
             alive: AtomicBool::new(true),
         });
 
-        self.insert_record(record)?;
-        self.insert_handle(runtime_id.clone(), handle.clone())?;
-        self.append_event(
-            &runtime_id,
-            SessionEventPayload::Lifecycle {
-                stage: "runtime_boot".to_string(),
-                detail: format!("Starting {} native runtime.", options.provider.as_str()),
-            },
-        )?;
-        self.append_user_prompt_event(
-            &runtime_id,
-            options
-                .display_prompt
-                .as_deref()
-                .or(options.initial_prompt.as_deref())
-                .unwrap_or_default(),
-            options.initial_images.as_ref(),
-            options.initial_annotations.as_ref(),
-        )?;
-        self.spawn_helper(app, &runtime_id, &options, handle)?;
-        self.summary_for(&runtime_id)
+        if let (Some(manager), Some(router)) = (
+            self.router_manager.get(),
+            record
+                .router
+                .as_ref()
+                .filter(|router| router.launch_transport == LaunchTransport::Routed),
+        ) {
+            manager
+                .register(&runtime_id, handle.generation, router.clone())
+                .map_err(|error| error.to_string())?;
+        }
+
+        if let Err(error) = self.insert_record(record) {
+            if let Some(manager) = self.router_manager.get() {
+                manager.unregister_generation(&runtime_id, handle.generation);
+            }
+            return Err(error);
+        }
+        let launch_result = (|| {
+            self.insert_handle(runtime_id.clone(), handle.clone())?;
+            self.append_event(
+                &runtime_id,
+                SessionEventPayload::Lifecycle {
+                    stage: "runtime_boot".to_string(),
+                    detail: format!("Starting {} native runtime.", options.provider.as_str()),
+                },
+            )?;
+            self.append_user_prompt_event(
+                &runtime_id,
+                options
+                    .display_prompt
+                    .as_deref()
+                    .or(options.initial_prompt.as_deref())
+                    .unwrap_or_default(),
+                options.initial_images.as_ref(),
+                options.initial_annotations.as_ref(),
+            )?;
+            self.spawn_helper(app, &runtime_id, &options, handle.clone())?;
+            self.summary_for(&runtime_id)
+        })();
+        match launch_result {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                let _ = self.kill_child(&runtime_id);
+                let _ = self.remove_handle(&runtime_id);
+                let _ = self.remove_record(&runtime_id);
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_router_launch(
+        &self,
+        options: &mut NativeSessionOptions,
+        recovering: bool,
+    ) -> Result<(), String> {
+        if options.provider != NativeProvider::Claude {
+            options.router_record = None;
+            return Ok(());
+        }
+        let Some(manager) = self.router_manager.get() else {
+            return Ok(());
+        };
+
+        if let Some(existing) = options.router_record.as_mut() {
+            let was_routed = existing.launch_transport == LaunchTransport::Routed;
+            let config = manager.config();
+            let status = manager.status();
+            let direct_reason = if !config.enabled {
+                Some("Router is disabled; launched this helper generation direct.".to_string())
+            } else if status.actual_port.is_none() {
+                Some(
+                    status
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Router listener is unavailable.".to_string()),
+                )
+            } else if existing.router_auth_capability == RouterAuthCapability::Oauth
+                && !OAUTH_ROUTING_VERIFIED
+            {
+                Some("OAuth routing is not verified for this runtime.".to_string())
+            } else {
+                None
+            };
+
+            match router_launch_decision(
+                Some(existing.launch_transport),
+                config.enabled,
+                status.actual_port.is_some(),
+                existing.router_auth_capability,
+                OAUTH_ROUTING_VERIFIED,
+            ) {
+                RouterLaunchDecision::RejectRecovery => {
+                    let reason = direct_reason.unwrap_or_else(|| {
+                        "Router launch decision rejected recovery without a readiness reason."
+                            .to_string()
+                    });
+                    return Err(if recovering {
+                        format!(
+                            "ROUTER_UNAVAILABLE: routed session recovery requires the router listener ({reason})"
+                        )
+                    } else {
+                        format!("ROUTER_UNAVAILABLE: {reason}")
+                    });
+                }
+                RouterLaunchDecision::LaunchDirect => {
+                    return prepare_direct_router_launch(options, direct_reason);
+                }
+                RouterLaunchDecision::LaunchRouted => {}
+                RouterLaunchDecision::Bypass => {
+                    debug_assert!(!was_routed);
+                    return Ok(());
+                }
+            }
+
+            let actual_port = status
+                .actual_port
+                .expect("router readiness checked before routed recovery");
+            let source_env = match existing.router_auth_capability {
+                RouterAuthCapability::Oauth => crate::config::OFFICIAL_ENV_NAME,
+                RouterAuthCapability::Token => existing.default_env.as_str(),
+            };
+            let source =
+                describe_router_environment(source_env).map_err(|error| error.to_string())?;
+            match (existing.router_auth_capability, source.auth_kind) {
+                (RouterAuthCapability::Oauth, RouterEnvironmentAuthKind::RequiresOauth)
+                | (RouterAuthCapability::Token, RouterEnvironmentAuthKind::Token) => {}
+                _ => {
+                    return Err(
+                        "ROUTER_AUTH_CHANGED: helper generation auth source no longer matches the persisted capability"
+                            .to_string(),
+                    )
+                }
+            }
+            validate_session_router_targets(existing, OAUTH_ROUTING_VERIFIED)
+                .map_err(|error| error.to_string())?;
+            let resolved_source = resolve_claude_env(source_env)?;
+            options.helper_env_vars = resolved_source.env_vars;
+            existing.launch_transport = LaunchTransport::Routed;
+            existing.launch_default_env = source.name;
+            existing.launch_model_pins = source.pins;
+            existing.launch_auth_kind = match existing.router_auth_capability {
+                RouterAuthCapability::Oauth => LaunchAuthKind::Oauth,
+                RouterAuthCapability::Token => LaunchAuthKind::Token,
+            };
+            existing.warnings.clear();
+            configure_routed_helper_env(&mut options.helper_env_vars, actual_port, existing);
+            return Ok(());
+        }
+
+        let config = manager.config();
+        if !config.enabled {
+            return Ok(());
+        }
+        let source =
+            describe_router_environment(&options.env_name).map_err(|error| error.to_string())?;
+        let seed = options
+            .router_seed
+            .take()
+            .unwrap_or_else(|| NativeRouterSeed {
+                bindings: config.bindings.clone(),
+                allowed_envs: config.default_allowed_envs.clone(),
+                source_profile_id: None,
+                profile_revision: None,
+                dynamic_routing: Some(config.dynamic_routing),
+            });
+        let mut allowed_envs = seed.allowed_envs;
+        allowed_envs.push(options.env_name.clone());
+        allowed_envs.extend(seed.bindings.values().cloned());
+        dedupe_nonempty(&mut allowed_envs);
+
+        let auth_capability = match source.auth_kind {
+            RouterEnvironmentAuthKind::Token => RouterAuthCapability::Token,
+            RouterEnvironmentAuthKind::RequiresOauth => RouterAuthCapability::Oauth,
+        };
+        let launch_auth_kind = match auth_capability {
+            RouterAuthCapability::Token => LaunchAuthKind::Token,
+            RouterAuthCapability::Oauth => LaunchAuthKind::Oauth,
+        };
+        let status = manager.status();
+        let mut warnings = Vec::new();
+        let launch_transport = match router_launch_decision(
+            None,
+            config.enabled,
+            status.actual_port.is_some(),
+            auth_capability,
+            OAUTH_ROUTING_VERIFIED,
+        ) {
+            RouterLaunchDecision::LaunchDirect => {
+                if status.actual_port.is_none() {
+                    warnings.push(status.error.unwrap_or_else(|| {
+                        "Router listener is unavailable; launched direct.".into()
+                    }));
+                } else {
+                    warnings.push(
+                        "OAuth routing is not verified for this runtime; launched direct."
+                            .to_string(),
+                    );
+                }
+                LaunchTransport::Direct
+            }
+            RouterLaunchDecision::LaunchRouted => LaunchTransport::Routed,
+            RouterLaunchDecision::Bypass => return Ok(()),
+            RouterLaunchDecision::RejectRecovery => {
+                unreachable!("new router sessions cannot reject a prior routed generation")
+            }
+        };
+
+        let router_record = SessionRouterRecord {
+            session_key: random_router_secret(32),
+            route_tag_nonce: random_router_secret(24),
+            default_env: options.env_name.clone(),
+            bindings: seed.bindings,
+            allowed_envs,
+            source_profile_id: seed.source_profile_id,
+            profile_revision: seed.profile_revision,
+            dynamic_routing: seed.dynamic_routing.unwrap_or(config.dynamic_routing),
+            revision: 0,
+            router_auth_capability: auth_capability,
+            launch_transport,
+            launch_auth_kind,
+            launch_default_env: source.name,
+            launch_model_pins: source.pins,
+            warnings,
+        };
+
+        validate_session_router_targets(
+            &router_record,
+            launch_transport == LaunchTransport::Direct || OAUTH_ROUTING_VERIFIED,
+        )
+        .map_err(|error| error.to_string())?;
+        if launch_transport == LaunchTransport::Routed {
+            configure_routed_helper_env(
+                &mut options.helper_env_vars,
+                status.actual_port.expect("checked router port"),
+                &router_record,
+            );
+        }
+        options.router_record = Some(router_record);
+        Ok(())
+    }
+
+    fn prepare_explicit_direct_launch(
+        &self,
+        options: &mut NativeSessionOptions,
+    ) -> Result<(), String> {
+        if options.provider != NativeProvider::Claude || options.router_record.is_none() {
+            return Err(
+                "ROUTER_SESSION_UNAVAILABLE: only routed Claude sessions can restart direct"
+                    .to_string(),
+            );
+        }
+        prepare_direct_router_launch(
+            options,
+            Some("Router bypassed by explicit restart; this helper generation is direct.".into()),
+        )
     }
 
     pub fn list_sessions(&self) -> Vec<NativeSessionSummary> {
@@ -748,6 +1491,7 @@ impl NativeRuntimeManager {
                         last_event_seq: None,
                         can_handoff_to_terminal: record.can_handoff_to_terminal,
                         last_error: record.last_error,
+                        router: record.router.as_ref().map(SessionRouterState::from),
                     }
                 }
             })
@@ -832,9 +1576,9 @@ impl NativeRuntimeManager {
 
         let mut handle = self.ensure_handle(app.clone(), runtime_id)?;
         let image_count = images.as_ref().map(|imgs| imgs.len()).unwrap_or(0);
-        if !self.mark_handle_live_if_current(runtime_id, &handle)? {
+        if !self.is_current_live_handle(runtime_id, &handle)? {
             handle = self.ensure_handle(app.clone(), runtime_id)?;
-            if !self.mark_handle_live_if_current(runtime_id, &handle)? {
+            if !self.is_current_live_handle(runtime_id, &handle)? {
                 return Err("Native runtime helper was replaced while sending prompt".to_string());
             }
         }
@@ -1016,6 +1760,596 @@ impl NativeRuntimeManager {
         Ok(())
     }
 
+    pub fn get_session_router(
+        &self,
+        runtime_id: &str,
+    ) -> Result<SessionRouterState, RouterServiceError> {
+        let records = self.records.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime record lock is poisoned.",
+            )
+        })?;
+        let record = records.get(runtime_id).ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_SESSION_NOT_FOUND",
+                format!("Native runtime {runtime_id} was not found."),
+            )
+        })?;
+        record
+            .router
+            .as_ref()
+            .map(SessionRouterState::from)
+            .ok_or_else(|| {
+                RouterServiceError::new(
+                    "ROUTER_SESSION_UNAVAILABLE",
+                    "This native session does not have router state.",
+                )
+            })
+    }
+
+    pub fn router_environment_references(&self, env_name: &str) -> Result<Vec<String>, String> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?;
+        let mut references = records
+            .values()
+            .filter_map(|record| {
+                if matches!(record.status.as_str(), "stopped" | "handoff") {
+                    return None;
+                }
+                let referenced = record.env_name == env_name
+                    || record.router.as_ref().is_some_and(|router| {
+                        router.default_env == env_name
+                            || router.launch_default_env == env_name
+                            || router
+                                .allowed_envs
+                                .iter()
+                                .any(|allowed| allowed == env_name)
+                            || router.bindings.values().any(|target| target == env_name)
+                    });
+                referenced.then(|| format!("session:{}", record.runtime_id))
+            })
+            .collect::<Vec<_>>();
+        references.sort();
+        Ok(references)
+    }
+
+    pub fn rename_router_environment_references(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<Vec<SessionRouterUpdatedEvent>, String> {
+        if old_name == new_name {
+            return Ok(Vec::new());
+        }
+        let _coordinator = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime router coordinator".to_string())?;
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?;
+        let previous_records = records.clone();
+        let mut updated_records = previous_records.clone();
+        let mut events = Vec::new();
+        for record in updated_records.values_mut() {
+            let mut record_changed = false;
+            if record.env_name == old_name {
+                record.env_name = new_name.to_string();
+                record_changed = true;
+            }
+            let Some(router) = record.router.as_mut() else {
+                if record_changed {
+                    record.updated_at = Utc::now();
+                }
+                continue;
+            };
+            let previous_router = router.clone();
+            if router.default_env == old_name {
+                router.default_env = new_name.to_string();
+            }
+            if router.launch_default_env == old_name {
+                router.launch_default_env = new_name.to_string();
+            }
+            for target in router.bindings.values_mut() {
+                if target == old_name {
+                    *target = new_name.to_string();
+                }
+            }
+            for allowed in &mut router.allowed_envs {
+                if allowed == old_name {
+                    *allowed = new_name.to_string();
+                }
+            }
+            dedupe_nonempty(&mut router.allowed_envs);
+            if *router != previous_router {
+                router.revision = previous_router
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| format!("Router revision overflow for {}", record.runtime_id))?;
+                record_changed = true;
+                events.push(SessionRouterUpdatedEvent {
+                    runtime_id: record.runtime_id.clone(),
+                    router: SessionRouterState::from(&*router),
+                    reason: "environment-rename".to_string(),
+                });
+            }
+            if record_changed {
+                record.updated_at = Utc::now();
+            }
+        }
+        let handles = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
+        *records = updated_records.clone();
+        if let Err(error) =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        {
+            *records = previous_records;
+            return Err(error);
+        }
+
+        let mut registered: Vec<(String, u64)> = Vec::new();
+        for (runtime_id, handle) in handles.iter() {
+            let Some(updated) = updated_records.get(runtime_id) else {
+                continue;
+            };
+            if let (Some(manager), Some(router)) = (
+                self.router_manager.get(),
+                updated
+                    .router
+                    .as_ref()
+                    .filter(|router| router.launch_transport == LaunchTransport::Routed),
+            ) {
+                if let Err(error) = manager.register(runtime_id, handle.generation, router.clone())
+                {
+                    *records = previous_records.clone();
+                    let rollback_error = persist_native_runtime_state_to(
+                        &self.state_path,
+                        records.values().cloned().collect(),
+                    )
+                    .err();
+                    for (registered_id, registered_generation) in registered {
+                        if let Some(previous_router) = previous_records
+                            .get(&registered_id)
+                            .and_then(|record| record.router.clone())
+                        {
+                            let _ = manager.register(
+                                &registered_id,
+                                registered_generation,
+                                previous_router,
+                            );
+                        }
+                    }
+                    return Err(match rollback_error {
+                        Some(rollback_error) => format!(
+                            "{}; failed to roll back native router state: {rollback_error}",
+                            error
+                        ),
+                        None => error.to_string(),
+                    });
+                }
+                registered.push((runtime_id.clone(), handle.generation));
+            }
+        }
+        for (runtime_id, handle) in handles.iter() {
+            if let Some(updated) = updated_records.get(runtime_id).cloned() {
+                if let Ok(mut record) = handle.record.lock() {
+                    *record = updated;
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn update_session_router(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        request: UpdateSessionRouterRequest,
+        reason: &str,
+    ) -> Result<SessionRouterState, RouterServiceError> {
+        let _coordinator = self.reconnect_lock.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime router coordinator is poisoned.",
+            )
+        })?;
+        let mut records = self.records.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime record lock is poisoned.",
+            )
+        })?;
+        let previous_record = records.get(&request.runtime_id).cloned().ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_SESSION_NOT_FOUND",
+                format!("Native runtime {} was not found.", request.runtime_id),
+            )
+        })?;
+        if previous_record.provider != NativeProvider::Claude {
+            return Err(RouterServiceError::new(
+                "ROUTER_PROVIDER_UNSUPPORTED",
+                "Session routing is only available for Claude native sessions.",
+            ));
+        }
+        let current_router = previous_record.router.as_ref().ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_SESSION_UNAVAILABLE",
+                "This native session does not have router state.",
+            )
+        })?;
+        let mut updated_router = apply_session_router_patch(
+            current_router,
+            request.expected_revision,
+            &request.patch,
+            session_router_patch_oauth_validation_enabled(current_router),
+        )?;
+
+        let default_changed = updated_router.default_env != current_router.default_env;
+        let direct_env = if default_changed
+            && updated_router.launch_transport == LaunchTransport::Direct
+        {
+            let descriptor = describe_router_environment(&updated_router.default_env)
+                .map_err(|error| RouterServiceError::new(error.code, error.message))?;
+            updated_router.launch_default_env = descriptor.name;
+            updated_router.launch_model_pins = descriptor.pins;
+            updated_router.launch_auth_kind = match descriptor.auth_kind {
+                RouterEnvironmentAuthKind::Token => LaunchAuthKind::Token,
+                RouterEnvironmentAuthKind::RequiresOauth => LaunchAuthKind::Oauth,
+            };
+            Some(
+                resolve_claude_env(&updated_router.default_env)
+                    .map_err(|error| RouterServiceError::new("ROUTER_ENV_UNAVAILABLE", error))?,
+            )
+        } else {
+            None
+        };
+        let router_manager = self.router_manager.get();
+        if updated_router.launch_transport == LaunchTransport::Routed && router_manager.is_none() {
+            return Err(RouterServiceError::new(
+                "ROUTER_UNAVAILABLE",
+                "Router manager is not configured.",
+            ));
+        }
+
+        let handles = self.handles.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime handle lock is poisoned.",
+            )
+        })?;
+        let active_handle = handles.get(&request.runtime_id).cloned();
+
+        let mut updated_record = previous_record.clone();
+        updated_record.env_name = updated_router.default_env.clone();
+        updated_record.updated_at = Utc::now();
+        updated_record.router = Some(updated_router.clone());
+        records.insert(request.runtime_id.clone(), updated_record.clone());
+        if let Err(error) =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        {
+            records.insert(request.runtime_id.clone(), previous_record.clone());
+            return Err(RouterServiceError::new("ROUTER_PERSIST_FAILED", error));
+        }
+
+        // Keep the current helper generation stable while applying the persisted
+        // router state. Recovery and route updates share reconnect_lock; the
+        // handle lock also prevents an exit callback from unregistering/replacing
+        // this generation between the check and registration.
+        let apply_result = if let Some(handle) = active_handle.as_ref() {
+            if updated_router.launch_transport == LaunchTransport::Routed {
+                router_manager
+                    .expect("routed router manager checked above")
+                    .register(
+                        &request.runtime_id,
+                        handle.generation,
+                        updated_router.clone(),
+                    )
+                    .map_err(|error| RouterServiceError::new(error.code, error.message))
+            } else if let Some(resolved) = direct_env.as_ref() {
+                self.write_to_child(
+                    handle,
+                    &HelperInputCommand::UpdateSettings {
+                        env_name: Some(&updated_router.default_env),
+                        perm_mode: None,
+                        env_vars: Some(&resolved.env_vars),
+                        effort: None,
+                    },
+                )
+                .map_err(|error| {
+                    RouterServiceError::new(
+                        "ROUTER_DIRECT_UPDATE_FAILED",
+                        format!("Failed to switch the direct helper environment: {error}"),
+                    )
+                })
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+
+        if let Err(error) = apply_result {
+            records.insert(request.runtime_id.clone(), previous_record.clone());
+            let rollback_result = persist_native_runtime_state_to(
+                &self.state_path,
+                records.values().cloned().collect(),
+            );
+            if let (Some(manager), Some(handle), Some(previous_router)) = (
+                router_manager,
+                active_handle.as_ref(),
+                previous_record.router.clone(),
+            ) {
+                if previous_router.launch_transport == LaunchTransport::Routed {
+                    let _ =
+                        manager.register(&request.runtime_id, handle.generation, previous_router);
+                }
+            }
+            return Err(if let Err(rollback_error) = rollback_result {
+                RouterServiceError::new(
+                    "ROUTER_ROLLBACK_FAILED",
+                    format!(
+                        "{}; state rollback also failed: {rollback_error}",
+                        error.message
+                    ),
+                )
+            } else {
+                error
+            });
+        }
+
+        if let Some(handle) = active_handle.as_ref() {
+            if let Ok(mut handle_record) = handle.record.lock() {
+                *handle_record = updated_record;
+            }
+        }
+        drop(handles);
+        drop(records);
+        let state = SessionRouterState::from(&updated_router);
+        let event = SessionRouterUpdatedEvent {
+            runtime_id: request.runtime_id,
+            router: state.clone(),
+            reason: reason.to_string(),
+        };
+        if let Err(error) = app.emit("native-session-router-updated", event) {
+            eprintln!(
+                "Failed to emit native-session-router-updated for {}: {}",
+                previous_record.runtime_id, error
+            );
+        }
+        Ok(state)
+    }
+
+    pub fn restart_session_direct(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+    ) -> Result<SessionRouterState, RouterServiceError> {
+        let _coordinator = self.reconnect_lock.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime router coordinator is poisoned.",
+            )
+        })?;
+        let previous_record = self
+            .records
+            .lock()
+            .map_err(|_| {
+                RouterServiceError::new(
+                    "ROUTER_STATE_UNAVAILABLE",
+                    "Native runtime record lock is poisoned.",
+                )
+            })?
+            .get(runtime_id)
+            .cloned()
+            .ok_or_else(|| {
+                RouterServiceError::new(
+                    "ROUTER_SESSION_NOT_FOUND",
+                    format!("Native runtime {runtime_id} was not found."),
+                )
+            })?;
+        if previous_record.provider != NativeProvider::Claude {
+            return Err(RouterServiceError::new(
+                "ROUTER_PROVIDER_UNSUPPORTED",
+                "Session routing is only available for Claude native sessions.",
+            ));
+        }
+        let previous_router = previous_record.router.as_ref().ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_SESSION_UNAVAILABLE",
+                "This native session does not have router state.",
+            )
+        })?;
+        if previous_router.launch_transport == LaunchTransport::Direct {
+            return Err(RouterServiceError::new(
+                "ROUTER_ALREADY_DIRECT",
+                "This helper generation is already direct.",
+            ));
+        }
+
+        let mut options = build_runtime_bootstrap_options(&previous_record)
+            .map_err(|error| RouterServiceError::new("ROUTER_ENV_UNAVAILABLE", error))?;
+        self.prepare_explicit_direct_launch(&mut options)
+            .map_err(|error| RouterServiceError::new("ROUTER_DIRECT_RESTART_INVALID", error))?;
+        let mut direct_router = options
+            .router_record
+            .clone()
+            .expect("explicit direct launch requires router state");
+        direct_router.revision = previous_router.revision.checked_add(1).ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_REVISION_OVERFLOW",
+                "Router revision cannot be incremented.",
+            )
+        })?;
+
+        let recovery_record =
+            self.retire_handle_for_direct_restart(runtime_id, previous_router.revision)?;
+        self.stage_direct_restart_record(
+            runtime_id,
+            previous_router.revision,
+            &direct_router,
+            &recovery_record,
+        )?;
+
+        self.reconnect_handle_locked_from_baseline(
+            app.clone(),
+            runtime_id,
+            true,
+            Some(&recovery_record),
+        )
+        .map_err(|error| RouterServiceError::new("ROUTER_DIRECT_RESTART_FAILED", error))?;
+        let state = SessionRouterState::from(&direct_router);
+        let event = SessionRouterUpdatedEvent {
+            runtime_id: runtime_id.to_string(),
+            router: state.clone(),
+            reason: "restart-direct".to_string(),
+        };
+        if let Err(error) = app.emit("native-session-router-updated", event) {
+            eprintln!("Failed to emit native-session-router-updated for {runtime_id}: {error}");
+        }
+        Ok(state)
+    }
+
+    fn retire_handle_for_direct_restart(
+        &self,
+        runtime_id: &str,
+        previous_revision: u64,
+    ) -> Result<NativeSessionRecord, RouterServiceError> {
+        let mut records = self.records.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime record lock is poisoned.",
+            )
+        })?;
+        let current = records.get(runtime_id).cloned().ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_SESSION_NOT_FOUND",
+                format!("Native runtime {runtime_id} was not found."),
+            )
+        })?;
+        let current_revision = current.router.as_ref().map(|router| router.revision);
+        if current_revision != Some(previous_revision) {
+            return Err(RouterServiceError::conflict(
+                current
+                    .router
+                    .as_ref()
+                    .map(SessionRouterState::from)
+                    .ok_or_else(|| {
+                        RouterServiceError::new(
+                            "ROUTER_SESSION_UNAVAILABLE",
+                            "This native session no longer has router state.",
+                        )
+                    })?,
+            ));
+        }
+
+        let mut handles = self.handles.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime handle lock is poisoned.",
+            )
+        })?;
+        let handle = handles.get(runtime_id).cloned();
+        let mut child = match handle.as_ref() {
+            Some(handle) => Some(handle.child.lock().map_err(|_| {
+                RouterServiceError::new(
+                    "ROUTER_STATE_UNAVAILABLE",
+                    "Native runtime child lock is poisoned.",
+                )
+            })?),
+            None => None,
+        };
+
+        let recovery_record = recoverable_record_after_helper_removed(&current);
+        records.insert(runtime_id.to_string(), recovery_record.clone());
+        if let Err(error) =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        {
+            records.insert(runtime_id.to_string(), current);
+            return Err(RouterServiceError::new("ROUTER_PERSIST_FAILED", error));
+        }
+
+        if let Some(handle) = handle.as_ref() {
+            handle.alive.store(false, Ordering::SeqCst);
+        }
+        if let Some(child) = child.as_mut().and_then(|child| child.take()) {
+            let _ = child.kill();
+        }
+        let removed_generation = handles.remove(runtime_id).map(|handle| handle.generation);
+        drop(child);
+        drop(handles);
+        drop(records);
+        if let (Some(manager), Some(generation)) = (self.router_manager.get(), removed_generation) {
+            manager.unregister_generation(runtime_id, generation);
+        }
+        Ok(recovery_record)
+    }
+
+    fn stage_direct_restart_record(
+        &self,
+        runtime_id: &str,
+        previous_revision: u64,
+        direct_router: &SessionRouterRecord,
+        recovery_record: &NativeSessionRecord,
+    ) -> Result<(), RouterServiceError> {
+        let mut records = self.records.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime record lock is poisoned.",
+            )
+        })?;
+        let current = records.get(runtime_id).cloned().ok_or_else(|| {
+            RouterServiceError::new(
+                "ROUTER_SESSION_NOT_FOUND",
+                format!("Native runtime {runtime_id} was not found."),
+            )
+        })?;
+        let current_revision = current.router.as_ref().map(|router| router.revision);
+        if current_revision != Some(previous_revision) {
+            return Err(RouterServiceError::conflict(
+                current
+                    .router
+                    .as_ref()
+                    .map(SessionRouterState::from)
+                    .ok_or_else(|| {
+                        RouterServiceError::new(
+                            "ROUTER_SESSION_UNAVAILABLE",
+                            "This native session no longer has router state.",
+                        )
+                    })?,
+            ));
+        }
+        let mut direct_record = current;
+        direct_record.env_name = direct_router.default_env.clone();
+        direct_record.router = Some(direct_router.clone());
+        direct_record.status = "initializing".to_string();
+        direct_record.is_active = true;
+        direct_record.updated_at = Utc::now();
+        direct_record.last_error = None;
+        records.insert(runtime_id.to_string(), direct_record);
+        if let Err(error) =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        {
+            records.insert(runtime_id.to_string(), recovery_record.clone());
+            let rollback_result = persist_native_runtime_state_to(
+                &self.state_path,
+                records.values().cloned().collect(),
+            );
+            let error = match rollback_result {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; direct restart state rollback also failed: {rollback_error}")
+                }
+            };
+            return Err(RouterServiceError::new("ROUTER_PERSIST_FAILED", error));
+        }
+        Ok(())
+    }
+
     pub fn update_session_runtime_perm_mode(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1068,53 +2402,107 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         source: Option<&str>,
     ) -> Result<(), String> {
+        self.stop_session_from_with_grace(runtime_id, source, NATIVE_STOP_GRACE_PERIOD)
+    }
+
+    fn stop_session_from_with_grace(
+        self: &Arc<Self>,
+        runtime_id: &str,
+        source: Option<&str>,
+        force_kill_grace: Duration,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let _reconnect_guard = match self.reconnect_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                errors.push("Native runtime reconnect coordinator was poisoned".to_string());
+                poisoned.into_inner()
+            }
+        };
         let stop_source = normalize_stop_source(source);
-        let stop_status = self
-            .records
-            .lock()
-            .map_err(|_| "Failed to lock native runtime records".to_string())?
-            .get(runtime_id)
-            .map(|record| record.status.clone())
-            .unwrap_or_else(|| "missing_record".to_string());
-        let stop_handle_generation = self
-            .handles
-            .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?
-            .get(runtime_id)
-            .map(|handle| handle.generation.to_string())
-            .unwrap_or_else(|| "none".to_string());
-        self.append_event(
+        let stop_status = match self.records.lock() {
+            Ok(records) => records
+                .get(runtime_id)
+                .map(|record| record.status.clone())
+                .unwrap_or_else(|| "missing_record".to_string()),
+            Err(poisoned) => {
+                errors.push("Native runtime records were poisoned during stop".to_string());
+                poisoned
+                    .into_inner()
+                    .get(runtime_id)
+                    .map(|record| record.status.clone())
+                    .unwrap_or_else(|| "missing_record".to_string())
+            }
+        };
+        let stop_handle_generation = match self.handles.lock() {
+            Ok(handles) => handles
+                .get(runtime_id)
+                .map(|handle| handle.generation.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            Err(poisoned) => {
+                errors.push("Native runtime handles were poisoned during stop".to_string());
+                poisoned
+                    .into_inner()
+                    .get(runtime_id)
+                    .map(|handle| handle.generation.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            }
+        };
+        if let Err(error) = self.append_event(
             runtime_id,
             SessionEventPayload::SessionCompleted {
                 reason: "Stopped from desktop workspace.".to_string(),
             },
-        )?;
-        self.append_lifecycle_event(
+        ) {
+            errors.push(error);
+        }
+        if let Err(error) = self.append_lifecycle_event(
             runtime_id,
             "stop_requested",
             format!(
                 "Desktop workspace requested native runtime stop. source={stop_source} status={stop_status} handle_generation={stop_handle_generation}"
             ),
-        )?;
-        if let Some(handle) = self.request_child_stop(runtime_id)? {
-            // Graceful stop — the helper aborts the current turn and stays alive.
-            // Mark as interrupted so the frontend re-enables the composer for continued use.
-            self.update_record(runtime_id, |record| {
+        ) {
+            errors.push(error);
+        }
+        let stop_handle = match self.request_child_stop(runtime_id) {
+            Ok(handle) => handle,
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        };
+        if let Some(handle) = stop_handle {
+            // The stopped generation is non-revivable. The next prompt retires its process tree
+            // and reconnects a fresh helper generation before writing user input.
+            if let Err(error) = self.update_record(runtime_id, |record| {
                 record.status = "interrupted".to_string();
                 record.updated_at = Utc::now();
-            })?;
-            self.schedule_force_kill(runtime_id.to_string(), handle);
+            }) {
+                errors.push(error);
+            }
+            // Once Stop has been written and the generation is non-live, cleanup must be
+            // scheduled even when state persistence or telemetry failed above.
+            self.schedule_force_kill_after(runtime_id.to_string(), handle, force_kill_grace);
         } else {
-            // Hard stop — the child process was already gone.
-            self.update_record(runtime_id, |record| {
+            // Hard stop — Stop could not be delivered. State persistence is best-effort, but
+            // exact-generation process cleanup is mandatory.
+            if let Err(error) = self.update_record(runtime_id, |record| {
                 record.status = "stopped".to_string();
                 record.is_active = false;
                 record.updated_at = Utc::now();
-            })?;
-            self.kill_child(runtime_id)?;
-            self.remove_handle(runtime_id)?;
+            }) {
+                errors.push(error);
+            }
+            if let Err(error) = self.retire_current_handle_locked(runtime_id) {
+                errors.push(error);
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub fn reconcile_stale_records(&self) -> Result<usize, String> {
@@ -1171,6 +2559,10 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         terminal_type: Option<TerminalType>,
     ) -> Result<NativeHandoffResult, String> {
+        let _reconnect_guard = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
         if !terminal::external_terminal_launch_supported() {
             return Err(
                 "Terminal handoff is not available on this platform; continue in the native workspace runtime.".to_string(),
@@ -1240,7 +2632,7 @@ impl NativeRuntimeManager {
         })
     }
 
-    pub fn prepare_terminal_handoff(
+    fn prepare_terminal_handoff(
         &self,
         runtime_id: &str,
         terminal_type: Option<TerminalType>,
@@ -1276,33 +2668,53 @@ impl NativeRuntimeManager {
         })
     }
 
-    pub fn complete_managed_terminal_handoff(
+    pub fn run_managed_terminal_handoff<T>(
         &self,
         runtime_id: &str,
-        terminal: TerminalType,
-    ) -> Result<(), String> {
-        let record = self.current_record(runtime_id)?;
-        self.update_record(runtime_id, |entry| {
-            entry.status = "handoff".to_string();
-            entry.is_active = false;
-            entry.updated_at = Utc::now();
-            entry.can_handoff_to_terminal = true;
-            entry.pending_handoff_terminal = None;
-        })?;
-        self.append_event(
+        terminal_type: Option<TerminalType>,
+        launch: impl FnOnce(&NativeTerminalHandoff) -> Result<T, String>,
+    ) -> Result<(NativeTerminalHandoff, T), String> {
+        let _reconnect_guard = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        let handoff = self.prepare_terminal_handoff(runtime_id, terminal_type)?;
+        let frozen_handle = self.freeze_current_handle_for_handoff(runtime_id)?;
+        let launched = match launch(&handoff) {
+            Ok(launched) => launched,
+            Err(launch_error) => {
+                let cleanup_errors = self.finish_failed_terminal_handoff(
+                    runtime_id,
+                    frozen_handle.as_ref(),
+                    &launch_error,
+                );
+                if !cleanup_errors.is_empty() {
+                    eprintln!(
+                        "Terminal handoff launch for {runtime_id} failed with cleanup warnings: {}",
+                        cleanup_errors.join("; ")
+                    );
+                }
+                return Err(launch_error);
+            }
+        };
+
+        let mut warnings = self.finish_terminal_handoff_metadata_after_launch(
             runtime_id,
-            SessionEventPayload::Lifecycle {
-                stage: "handoff".to_string(),
-                detail: format!(
-                    "Opened {} session in {}.",
-                    record.provider.as_str(),
-                    terminal.display_name()
-                ),
-            },
-        )?;
-        self.kill_child(runtime_id)?;
-        self.remove_handle(runtime_id)?;
-        Ok(())
+            handoff.provider.as_str(),
+            handoff.terminal,
+        );
+        if let Some(handle) = frozen_handle.as_ref() {
+            if let Err(error) = self.retire_handle_if_current(runtime_id, handle) {
+                warnings.push(error);
+            }
+        }
+        if !warnings.is_empty() {
+            eprintln!(
+                "Terminal handoff for {runtime_id} opened with cleanup warnings: {}",
+                warnings.join("; ")
+            );
+        }
+        Ok((handoff, launched))
     }
 
     fn current_record(&self, runtime_id: &str) -> Result<NativeSessionRecord, String> {
@@ -1360,6 +2772,7 @@ impl NativeRuntimeManager {
 
         let mut env_vars = self.terminal_env_vars_for_record(&record)?;
         inject_ccem_runtime_env(&mut env_vars, &runtime_id);
+        let frozen_handle = self.freeze_current_handle_for_handoff(&runtime_id)?;
 
         if let Err(error) = launch_terminal_for_native_handoff(
             terminal,
@@ -1374,40 +2787,124 @@ impl NativeRuntimeManager {
             Some(provider_session_id.as_str()),
             record.provider.as_str(),
         ) {
-            let _ = self.append_lifecycle_event(
-                &runtime_id,
-                "handoff_failed",
-                format!(
-                    "Failed to open {} session in {}: {}",
-                    record.provider.as_str(),
-                    terminal.display_name(),
-                    error
-                ),
-            );
+            let cleanup_errors =
+                self.finish_failed_terminal_handoff(&runtime_id, frozen_handle.as_ref(), &error);
+            if !cleanup_errors.is_empty() {
+                eprintln!(
+                    "Terminal handoff launch for {runtime_id} failed with cleanup warnings: {}",
+                    cleanup_errors.join("; ")
+                );
+            }
             return Err(error);
         }
 
-        self.update_record(&runtime_id, |entry| {
+        let mut warnings = self.finish_terminal_handoff_metadata_after_launch(
+            &runtime_id,
+            record.provider.as_str(),
+            terminal,
+        );
+        if let Some(handle) = frozen_handle.as_ref() {
+            if let Err(error) = self.retire_handle_if_current(&runtime_id, handle) {
+                warnings.push(error);
+            }
+        }
+        if !warnings.is_empty() {
+            eprintln!(
+                "Terminal handoff for {runtime_id} opened with cleanup warnings: {}",
+                warnings.join("; ")
+            );
+        }
+        // Launch is the irreversible commit boundary. Finalization warnings must not be reported
+        // as a retryable launch failure or the caller can reopen a duplicate terminal session.
+        Ok(())
+    }
+
+    /// Complete a terminal handoff after the new terminal is already open.
+    ///
+    /// The caller owns the reconnect coordinator. Metadata is best-effort at this commit boundary:
+    /// every failure is reported, but none may leave the old native helper generation alive.
+    fn finish_terminal_handoff_metadata_after_launch(
+        &self,
+        runtime_id: &str,
+        provider: &str,
+        terminal: TerminalType,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.update_record(runtime_id, |entry| {
             entry.status = "handoff".to_string();
             entry.is_active = false;
             entry.updated_at = Utc::now();
             entry.can_handoff_to_terminal = true;
             entry.pending_handoff_terminal = None;
-        })?;
-        self.append_event(
-            &runtime_id,
+        }) {
+            errors.push(error);
+        }
+        if let Err(error) = self.append_event(
+            runtime_id,
             SessionEventPayload::Lifecycle {
                 stage: "handoff".to_string(),
                 detail: format!(
                     "Opened {} session in {}.",
-                    record.provider.as_str(),
+                    provider,
                     terminal.display_name()
                 ),
             },
-        )?;
-        self.kill_child(&runtime_id)?;
-        self.remove_handle(&runtime_id)?;
-        Ok(())
+        ) {
+            errors.push(error);
+        }
+        errors
+    }
+
+    fn freeze_current_handle_for_handoff(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<Arc<NativeSessionHandle>>, String> {
+        let handles = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
+        let Some(handle) = handles.get(runtime_id).cloned() else {
+            return Ok(None);
+        };
+        let _child = handle
+            .child
+            .lock()
+            .map_err(|_| "Failed to lock native sidecar child".to_string())?;
+        handle.alive.store(false, Ordering::SeqCst);
+        drop(_child);
+        drop(handles);
+        Ok(Some(handle))
+    }
+
+    fn finish_failed_terminal_handoff(
+        &self,
+        runtime_id: &str,
+        frozen_handle: Option<&Arc<NativeSessionHandle>>,
+        launch_error: &str,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.update_record(runtime_id, |record| {
+            record.status = "interrupted".to_string();
+            record.is_active = false;
+            record.pending_handoff_terminal = None;
+            record.updated_at = Utc::now();
+            record.last_error = Some(launch_error.to_string());
+        }) {
+            errors.push(error);
+        }
+        if let Err(error) = self.append_lifecycle_event(
+            runtime_id,
+            "handoff_failed",
+            format!("Failed to open terminal session: {launch_error}"),
+        ) {
+            errors.push(error);
+        }
+        if let Some(handle) = frozen_handle {
+            if let Err(error) = self.retire_handle_if_current(runtime_id, handle) {
+                errors.push(error);
+            }
+        }
+        errors
     }
 
     fn ensure_handle(
@@ -1422,9 +2919,90 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
         {
-            return Ok(handle);
+            if handle.alive.load(Ordering::SeqCst) {
+                return Ok(handle);
+            }
         }
 
+        let _reconnect_guard = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        if let Some(handle) = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned()
+        {
+            if handle.alive.load(Ordering::SeqCst) {
+                return Ok(handle);
+            }
+            self.retire_handle_if_current(runtime_id, &handle)?;
+        }
+
+        self.reconnect_handle_locked(app, runtime_id, false)
+    }
+
+    fn reconnect_handle_locked(
+        self: &Arc<Self>,
+        app: AppHandle,
+        runtime_id: &str,
+        force_direct: bool,
+    ) -> Result<Arc<NativeSessionHandle>, String> {
+        self.reconnect_handle_locked_from_baseline(app, runtime_id, force_direct, None)
+    }
+
+    fn reconnect_handle_locked_from_baseline(
+        self: &Arc<Self>,
+        app: AppHandle,
+        runtime_id: &str,
+        force_direct: bool,
+        rollback_record: Option<&NativeSessionRecord>,
+    ) -> Result<Arc<NativeSessionHandle>, String> {
+        let rollback_record = rollback_record.map(recoverable_record_after_helper_removed);
+        let (handle, options) = self.prepare_reconnect_handle_locked(
+            runtime_id,
+            force_direct,
+            rollback_record.as_ref(),
+        )?;
+        let launch_result = self
+            .append_event(
+                runtime_id,
+                SessionEventPayload::Lifecycle {
+                    stage: "runtime_resume".to_string(),
+                    detail: format!(
+                        "Reconnected native runtime helper with generation {}.",
+                        handle.generation
+                    ),
+                },
+            )
+            .and_then(|_| self.spawn_helper(app, runtime_id, &options, handle.clone()));
+        if let Err(error) = launch_result {
+            let _ = self.kill_child(runtime_id);
+            let _ = self.remove_handle(runtime_id);
+            if let Some(rollback_record) = rollback_record.as_ref() {
+                let _ = self.rollback_reconnect_failure(runtime_id, rollback_record, error.clone());
+            } else {
+                let failure = error.clone();
+                let _ = self.update_record(runtime_id, |record| {
+                    record.status = "interrupted".to_string();
+                    record.is_active = false;
+                    record.updated_at = Utc::now();
+                    record.last_error = Some(failure);
+                });
+            }
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
+    fn prepare_reconnect_handle_locked(
+        self: &Arc<Self>,
+        runtime_id: &str,
+        force_direct: bool,
+        rollback_record: Option<&NativeSessionRecord>,
+    ) -> Result<(Arc<NativeSessionHandle>, NativeSessionOptions), String> {
         let mut record = self
             .records
             .lock()
@@ -1432,15 +3010,30 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
             .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
-
-        if reactivate_record_for_reconnect(&mut record) {
-            let reactivated = record.clone();
-            self.update_record(runtime_id, |stored| {
-                *stored = reactivated.clone();
-            })?;
+        let rollback_record = rollback_record
+            .map(recoverable_record_after_helper_removed)
+            .unwrap_or_else(|| record.clone());
+        if rollback_record.runtime_id != runtime_id {
+            return Err(format!(
+                "Reconnect rollback record {} does not match runtime {}",
+                rollback_record.runtime_id, runtime_id
+            ));
         }
 
-        let options = build_runtime_bootstrap_options(&record)?;
+        reactivate_record_for_reconnect(&mut record);
+
+        let mut options = build_runtime_bootstrap_options(&record).map_err(|error| {
+            self.rollback_reconnect_failure(runtime_id, &rollback_record, error)
+        })?;
+        let prepare_result = if force_direct {
+            self.prepare_explicit_direct_launch(&mut options)
+        } else {
+            self.prepare_router_launch(&mut options, true)
+        };
+        if let Err(error) = prepare_result {
+            return Err(self.rollback_reconnect_failure(runtime_id, &rollback_record, error));
+        }
+        record.router = options.router_record.clone();
 
         let start_seq = self
             .event_log
@@ -1466,19 +3059,89 @@ impl NativeRuntimeManager {
             alive: AtomicBool::new(true),
         });
 
-        self.insert_handle(runtime_id.to_string(), handle.clone())?;
-        self.append_event(
-            runtime_id,
-            SessionEventPayload::Lifecycle {
-                stage: "runtime_resume".to_string(),
-                detail: format!(
-                    "Reconnected native runtime helper with generation {}.",
-                    handle.generation
-                ),
-            },
-        )?;
-        self.spawn_helper(app, runtime_id, &options, handle.clone())?;
-        Ok(handle)
+        self.persist_prepared_reconnect_record(runtime_id, &record, &rollback_record)?;
+
+        if let (Some(manager), Some(router)) = (
+            self.router_manager.get(),
+            record
+                .router
+                .as_ref()
+                .filter(|router| router.launch_transport == LaunchTransport::Routed),
+        ) {
+            if let Err(error) = manager.register(runtime_id, handle.generation, router.clone()) {
+                manager.unregister_generation(runtime_id, handle.generation);
+                return Err(self.rollback_reconnect_failure(
+                    runtime_id,
+                    &rollback_record,
+                    error.to_string(),
+                ));
+            }
+        }
+
+        if let Err(error) = self.insert_handle(runtime_id.to_string(), handle.clone()) {
+            if let Some(manager) = self.router_manager.get() {
+                manager.unregister_generation(runtime_id, handle.generation);
+            }
+            return Err(self.rollback_reconnect_failure(runtime_id, &rollback_record, error));
+        }
+        Ok((handle, options))
+    }
+
+    fn persist_prepared_reconnect_record(
+        &self,
+        runtime_id: &str,
+        record: &NativeSessionRecord,
+        rollback_record: &NativeSessionRecord,
+    ) -> Result<(), String> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?;
+        if !records.contains_key(runtime_id) {
+            return Err(format!("Native runtime {} not found", runtime_id));
+        }
+        records.insert(runtime_id.to_string(), record.clone());
+        if let Err(error) =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        {
+            records.insert(runtime_id.to_string(), rollback_record.clone());
+            let rollback_result = persist_native_runtime_state_to(
+                &self.state_path,
+                records.values().cloned().collect(),
+            );
+            return Err(match rollback_result {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; reconnect state rollback also failed: {rollback_error}")
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn rollback_reconnect_failure(
+        &self,
+        runtime_id: &str,
+        rollback_record: &NativeSessionRecord,
+        error: String,
+    ) -> String {
+        let rollback_result = (|| {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "Failed to lock native runtime records".to_string())?;
+            if !records.contains_key(runtime_id) {
+                return Err(format!("Native runtime {} not found", runtime_id));
+            }
+            records.insert(runtime_id.to_string(), rollback_record.clone());
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        })();
+        match rollback_result {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}; reconnect state rollback also failed: {rollback_error}")
+            }
+        }
     }
 
     fn spawn_helper(
@@ -1489,6 +3152,11 @@ impl NativeRuntimeManager {
         handle: Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
         let todo_snapshot_seed = self.event_log.latest_todo_snapshot(runtime_id)?;
+        let helper_router_init = options
+            .router_record
+            .as_ref()
+            .filter(|router| router.launch_transport == LaunchTransport::Routed)
+            .map(build_helper_router_init);
         let helper_path = native_helper_script_path(&app)?;
         let command = app
             .shell()
@@ -1497,9 +3165,7 @@ impl NativeRuntimeManager {
             .arg(helper_path.to_string_lossy().to_string())
             .current_dir(&options.working_dir);
 
-        let (mut rx, child) = command
-            .spawn()
-            .map_err(|error| format!("Failed to spawn native runtime sidecar: {}", error))?;
+        let (mut rx, child) = spawn_native_helper_process(command.into())?;
 
         {
             let mut child_slot = handle
@@ -1531,6 +3197,7 @@ impl NativeRuntimeManager {
                 codex_api_key: handle.codex_api_key.as_deref(),
                 effort: options.effort.as_deref(),
                 todo_snapshot_seed: todo_snapshot_seed.as_ref(),
+                router: helper_router_init.as_ref(),
             },
         )?;
 
@@ -1552,25 +3219,28 @@ impl NativeRuntimeManager {
                 match event {
                     CommandEvent::Stdout(line) => {
                         for text in drain_helper_output_lines(&mut stdout_buffer, &line) {
-                            if let Err(error) = manager.process_helper_stdout_with_app(
+                            if let Err(error) = manager.process_helper_stdout_if_current(
                                 Some(&app_handle),
                                 &runtime,
                                 &text,
+                                &event_handle,
                             ) {
-                                let _ = manager.append_event(
+                                let _ = manager.append_event_if_current(
                                     &runtime,
                                     SessionEventPayload::StdErrLine {
                                         line: format!("Failed to process helper output: {}", error),
                                     },
+                                    &event_handle,
                                 );
                             }
                         }
                     }
                     CommandEvent::Stderr(line) => {
                         for text in drain_helper_output_lines(&mut stderr_buffer, &line) {
-                            let _ = manager.append_event(
+                            let _ = manager.append_event_if_current(
                                 &runtime,
                                 SessionEventPayload::StdErrLine { line: text },
+                                &event_handle,
                             );
                         }
                     }
@@ -1580,14 +3250,26 @@ impl NativeRuntimeManager {
                             &runtime,
                             &mut stdout_buffer,
                             &mut stderr_buffer,
+                            &event_handle,
                         );
-                        let _ = manager.append_event(
+                        if let Err(event_error) = manager.append_event_if_current(
                             &runtime,
                             SessionEventPayload::StdErrLine {
                                 line: format!("Native sidecar error: {}", error),
                             },
-                        );
-                        let _ = manager.mark_process_exit(&runtime, Some(1), &event_handle);
+                            &event_handle,
+                        ) {
+                            eprintln!(
+                                "Failed to append native sidecar error for {runtime}: {event_error}"
+                            );
+                        }
+                        if let Err(exit_error) =
+                            manager.mark_process_exit(&runtime, Some(1), &event_handle)
+                        {
+                            eprintln!(
+                                "Failed to finalize native sidecar error for {runtime}: {exit_error}"
+                            );
+                        }
                         break;
                     }
                     CommandEvent::Terminated(payload) => {
@@ -1596,8 +3278,15 @@ impl NativeRuntimeManager {
                             &runtime,
                             &mut stdout_buffer,
                             &mut stderr_buffer,
+                            &event_handle,
                         );
-                        let _ = manager.mark_process_exit(&runtime, payload.code, &event_handle);
+                        if let Err(error) =
+                            manager.mark_process_exit(&runtime, payload.code, &event_handle)
+                        {
+                            eprintln!(
+                                "Failed to finalize native sidecar termination for {runtime}: {error}"
+                            );
+                        }
                         break;
                     }
                     _ => {}
@@ -1610,6 +3299,23 @@ impl NativeRuntimeManager {
 
     fn process_helper_stdout(&self, runtime_id: &str, line: &str) -> Result<(), String> {
         self.process_helper_stdout_with_app(None, runtime_id, line)
+    }
+
+    fn process_helper_stdout_if_current(
+        &self,
+        app: Option<&AppHandle>,
+        runtime_id: &str,
+        line: &str,
+        handle: &Arc<NativeSessionHandle>,
+    ) -> Result<(), String> {
+        let _reconnect_guard = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        if !self.is_current_handle(runtime_id, handle)? {
+            return Ok(());
+        }
+        self.process_helper_stdout_with_app(app, runtime_id, line)
     }
 
     fn process_helper_stdout_with_app(
@@ -1859,17 +3565,50 @@ impl NativeRuntimeManager {
         exit_code: Option<i32>,
         handle: &Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
-        if !self.is_current_handle(runtime_id, handle)? {
-            return Ok(());
+        let mut errors = Vec::new();
+        let _reconnect_guard = match self.reconnect_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                errors.push("Native runtime reconnect coordinator was poisoned".to_string());
+                poisoned.into_inner()
+            }
+        };
+        let is_current = match self.handles.lock() {
+            Ok(handles) => handles
+                .get(runtime_id)
+                .map(|current| Self::same_handle(current, handle))
+                .unwrap_or(false),
+            Err(poisoned) => {
+                errors.push("Native runtime handles were poisoned during process exit".to_string());
+                poisoned
+                    .into_inner()
+                    .get(runtime_id)
+                    .map(|current| Self::same_handle(current, handle))
+                    .unwrap_or(false)
+            }
+        };
+        if !is_current {
+            if errors.is_empty() {
+                return Ok(());
+            }
+            return Err(errors.join("; "));
         }
+        handle.alive.store(false, Ordering::SeqCst);
 
-        let expected_terminal = self
-            .records
-            .lock()
-            .map_err(|_| "Failed to lock native runtime records".to_string())?
-            .get(runtime_id)
-            .map(|record| is_native_terminal_status(&record.status))
-            .unwrap_or(false);
+        let expected_terminal = match self.records.lock() {
+            Ok(records) => records
+                .get(runtime_id)
+                .map(|record| is_native_terminal_status(&record.status))
+                .unwrap_or(false),
+            Err(poisoned) => {
+                errors.push("Native runtime records were poisoned during process exit".to_string());
+                poisoned
+                    .into_inner()
+                    .get(runtime_id)
+                    .map(|record| is_native_terminal_status(&record.status))
+                    .unwrap_or(false)
+            }
+        };
 
         if !expected_terminal {
             let exit_reason = format!(
@@ -1878,14 +3617,9 @@ impl NativeRuntimeManager {
                     .map(|code| format!(" with code {}", code))
                     .unwrap_or_default()
             );
-            self.update_record(runtime_id, |record| {
+            if let Err(error) = self.update_record(runtime_id, |record| {
                 let recoverable = is_recoverable_native_process_exit(record);
-                record.status = if recoverable {
-                    "interrupted"
-                } else {
-                    "error"
-                }
-                .to_string();
+                record.status = if recoverable { "interrupted" } else { "error" }.to_string();
                 record.is_active = false;
                 record.pending_handoff_terminal = None;
                 record.can_handoff_to_terminal =
@@ -1894,16 +3628,26 @@ impl NativeRuntimeManager {
                 if record.last_error.is_none() {
                     record.last_error = Some(exit_reason.clone());
                 }
-            })?;
-            self.append_event(
+            }) {
+                errors.push(error);
+            }
+            if let Err(error) = self.append_event(
                 runtime_id,
                 SessionEventPayload::SessionCompleted {
                     reason: exit_reason,
                 },
-            )?;
+            ) {
+                errors.push(error);
+            }
         }
 
-        self.remove_handle_if_current(runtime_id, handle)
+        if let Err(error) = self.retire_handle_if_current(runtime_id, handle) {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(errors.join("; "))
     }
 
     fn write_to_child(
@@ -1911,12 +3655,32 @@ impl NativeRuntimeManager {
         handle: &Arc<NativeSessionHandle>,
         command: &HelperInputCommand<'_>,
     ) -> Result<(), String> {
+        self.write_to_child_checked(handle, command, false)
+    }
+
+    fn write_to_live_child(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        command: &HelperInputCommand<'_>,
+    ) -> Result<(), String> {
+        self.write_to_child_checked(handle, command, true)
+    }
+
+    fn write_to_child_checked(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        command: &HelperInputCommand<'_>,
+        require_live: bool,
+    ) -> Result<(), String> {
         let line = serde_json::to_string(command)
             .map_err(|error| format!("Failed to encode helper command: {}", error))?;
         let mut child_guard = handle
             .child
             .lock()
             .map_err(|_| "Failed to lock native sidecar child".to_string())?;
+        if require_live && !handle.alive.load(Ordering::SeqCst) {
+            return Err(NATIVE_HELPER_RETIRING_ERROR.to_string());
+        }
         let child = child_guard
             .as_mut()
             .ok_or_else(|| "Native sidecar child is not available".to_string())?;
@@ -1932,9 +3696,18 @@ impl NativeRuntimeManager {
         handle: Arc<NativeSessionHandle>,
         command: &HelperInputCommand<'_>,
     ) -> Result<(), String> {
-        match self.write_to_child(&handle, command) {
+        let requires_live_handle = matches!(command, HelperInputCommand::Prompt { .. });
+        let write_result = if requires_live_handle {
+            self.write_to_live_child(&handle, command)
+        } else {
+            self.write_to_child(&handle, command)
+        };
+        match write_result {
             Ok(()) => Ok(()),
-            Err(error) if is_retryable_native_child_write_error(&error) => {
+            Err(error)
+                if error == NATIVE_HELPER_RETIRING_ERROR
+                    || is_retryable_native_child_write_error(&error) =>
+            {
                 let _ = self.append_event(
                     runtime_id,
                     SessionEventPayload::Lifecycle {
@@ -1947,16 +3720,40 @@ impl NativeRuntimeManager {
                         ),
                     },
                 );
-                let _ = self.kill_child(runtime_id);
-                self.remove_handle(runtime_id)?;
-                self.update_record(runtime_id, |record| {
-                    record.status = "initializing".to_string();
-                    record.is_active = true;
-                    record.last_error = None;
-                    record.updated_at = Utc::now();
+                let _reconnect_guard = self.reconnect_lock.lock().map_err(|_| {
+                    "Failed to lock native runtime reconnect coordinator".to_string()
                 })?;
-                let next_handle = self.ensure_handle(app.clone(), runtime_id)?;
-                self.write_to_child(&next_handle, command)
+                let current = self
+                    .handles
+                    .lock()
+                    .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                    .get(runtime_id)
+                    .cloned();
+                let next_handle = match current {
+                    Some(current)
+                        if !Self::same_handle(&current, &handle)
+                            && current.alive.load(Ordering::SeqCst) =>
+                    {
+                        current
+                    }
+                    current => {
+                        if let Some(current) = current {
+                            self.retire_handle_if_current(runtime_id, &current)?;
+                        }
+                        self.update_record(runtime_id, |record| {
+                            record.status = "initializing".to_string();
+                            record.is_active = true;
+                            record.last_error = None;
+                            record.updated_at = Utc::now();
+                        })?;
+                        self.reconnect_handle_locked(app.clone(), runtime_id, false)?
+                    }
+                };
+                if requires_live_handle {
+                    self.write_to_live_child(&next_handle, command)
+                } else {
+                    self.write_to_child(&next_handle, command)
+                }
             }
             Err(error) => Err(error),
         }
@@ -1966,36 +3763,42 @@ impl NativeRuntimeManager {
         &self,
         runtime_id: &str,
     ) -> Result<Option<Arc<NativeSessionHandle>>, String> {
-        let handle = self
-            .handles
-            .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?
-            .get(runtime_id)
-            .cloned();
+        let handle = match self.handles.lock() {
+            Ok(handles) => handles.get(runtime_id).cloned(),
+            Err(poisoned) => {
+                eprintln!("Native runtime handles were poisoned while requesting stop");
+                poisoned.into_inner().get(runtime_id).cloned()
+            }
+        };
         let Some(handle) = handle else {
             return Ok(None);
         };
 
         handle.alive.store(false, Ordering::SeqCst);
-        let has_child = handle
-            .child
-            .lock()
-            .map_err(|_| "Failed to lock native sidecar child".to_string())?
-            .is_some();
+        let has_child = match handle.child.lock() {
+            Ok(child) => child.is_some(),
+            Err(poisoned) => {
+                eprintln!("Native sidecar child mutex was poisoned while requesting stop");
+                poisoned.into_inner().is_some()
+            }
+        };
         if !has_child {
             return Ok(None);
         }
 
         match self.write_to_child(&handle, &HelperInputCommand::Stop) {
             Ok(()) => {
-                self.append_lifecycle_event(
+                if let Err(error) = self.append_lifecycle_event(
                     runtime_id,
                     "stop_written",
                     format!(
                         "Native helper generation {} accepted stop command.",
                         handle.generation
                     ),
-                )?;
+                ) {
+                    // Telemetry must never prevent the exact generation's force-cleanup timer.
+                    eprintln!("Failed to append native helper stop lifecycle event: {error}");
+                }
                 Ok(Some(handle))
             }
             Err(error) => {
@@ -2015,11 +3818,20 @@ impl NativeRuntimeManager {
         }
     }
 
-    fn schedule_force_kill(self: &Arc<Self>, runtime_id: String, handle: Arc<NativeSessionHandle>) {
+    fn schedule_force_kill_after(
+        self: &Arc<Self>,
+        runtime_id: String,
+        handle: Arc<NativeSessionHandle>,
+        grace: Duration,
+    ) {
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn_blocking(move || {
-            std::thread::sleep(NATIVE_STOP_GRACE_PERIOD);
-            let _ = manager.force_kill_stopped_handle(&runtime_id, &handle);
+            std::thread::sleep(grace);
+            if let Err(error) = manager.force_kill_stopped_handle(&runtime_id, &handle) {
+                eprintln!(
+                    "Failed to finalize native helper force cleanup for {runtime_id}: {error}"
+                );
+            }
         });
     }
 
@@ -2028,57 +3840,106 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         handle: &Arc<NativeSessionHandle>,
     ) -> Result<bool, String> {
-        // Lock order is handles -> child. The child is stored as Option<CommandChild>,
-        // so take() moves the only manager-owned child handle out before kill().
-        let child_to_kill = {
-            let mut handles = self
-                .handles
-                .lock()
-                .map_err(|_| "Failed to lock native runtime handles".to_string())?;
-            let Some(current) = handles.get(runtime_id) else {
-                return Ok(false);
-            };
-            if !Self::same_handle(current, handle) || handle.alive.load(Ordering::SeqCst) {
-                return Ok(false);
+        let mut errors = Vec::new();
+        let _reconnect_guard = match self.reconnect_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                errors.push("Native runtime reconnect coordinator was poisoned".to_string());
+                poisoned.into_inner()
             }
-
-            let child_to_kill = handle
-                .child
-                .lock()
-                .map_err(|_| "Failed to lock native sidecar child".to_string())?
-                .take();
-            let detail = format!(
-                "Native helper generation {} did not settle after stop; removed stale helper handle.",
-                handle.generation
-            );
-            let record = handle
-                .events
-                .lock()
-                .map_err(|_| "Failed to lock native session store".to_string())?
-                .append(SessionEventPayload::Lifecycle {
-                    stage: "stop_force_killed".to_string(),
-                    detail,
-                });
-            if let Err(error) = self.event_log.append(&record) {
-                eprintln!(
-                    "Failed to persist native event {}:{}: {}",
-                    record.runtime_id, record.seq, error
-                );
-            }
-            handles.remove(runtime_id);
-            child_to_kill
         };
-
-        if let Some(child) = child_to_kill {
-            let _ = child.kill();
+        if handle.alive.load(Ordering::SeqCst) {
+            return Ok(false);
         }
 
-        self.update_record(runtime_id, |record| {
-            record.status = "interrupted".to_string();
-            record.is_active = false;
-            record.updated_at = Utc::now();
-        })?;
-        Ok(true)
+        let is_current = match self.handles.lock() {
+            Ok(handles) => handles
+                .get(runtime_id)
+                .map(|current| Self::same_handle(current, handle))
+                .unwrap_or(false),
+            Err(poisoned) => {
+                errors
+                    .push("Native runtime handles were poisoned during force cleanup".to_string());
+                poisoned
+                    .into_inner()
+                    .get(runtime_id)
+                    .map(|current| Self::same_handle(current, handle))
+                    .unwrap_or(false)
+            }
+        };
+
+        if is_current {
+            if let Err(error) = self.append_lifecycle_event(
+                runtime_id,
+                "stop_force_killed",
+                format!(
+                    "Native helper generation {} did not settle after stop; removed stale helper handle.",
+                    handle.generation
+                ),
+            ) {
+                errors.push(error);
+            }
+            if let Err(error) = self.update_record(runtime_id, |record| {
+                record.status = "interrupted".to_string();
+                record.is_active = false;
+                record.updated_at = Utc::now();
+            }) {
+                errors.push(error);
+            }
+        }
+
+        // Claim only the exact stopped generation. Metadata/state errors above are reported after
+        // cleanup; none may prevent removing and killing the owned process tree.
+        let removed_current = match self.handles.lock() {
+            Ok(mut handles) => {
+                let matches = handles
+                    .get(runtime_id)
+                    .map(|current| Self::same_handle(current, handle))
+                    .unwrap_or(false);
+                if matches {
+                    handles.remove(runtime_id);
+                }
+                matches
+            }
+            Err(poisoned) => {
+                errors.push(
+                    "Native runtime handles were poisoned while claiming force cleanup".to_string(),
+                );
+                let mut handles = poisoned.into_inner();
+                let matches = handles
+                    .get(runtime_id)
+                    .map(|current| Self::same_handle(current, handle))
+                    .unwrap_or(false);
+                if matches {
+                    handles.remove(runtime_id);
+                }
+                matches
+            }
+        };
+
+        if let Some(manager) = self.router_manager.get() {
+            manager.unregister_generation(runtime_id, handle.generation);
+        }
+        let child_to_kill = match handle.child.lock() {
+            Ok(mut child) => child.take(),
+            Err(poisoned) => {
+                errors.push(
+                    "Native sidecar child mutex was poisoned during force cleanup".to_string(),
+                );
+                poisoned.into_inner().take()
+            }
+        };
+        if let Some(child) = child_to_kill {
+            if let Err(error) = child.kill() {
+                errors.push(error);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(removed_current)
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     fn append_user_prompt_event(
@@ -2169,6 +4030,22 @@ impl NativeRuntimeManager {
         Ok(())
     }
 
+    fn append_event_if_current(
+        &self,
+        runtime_id: &str,
+        payload: SessionEventPayload,
+        handle: &Arc<NativeSessionHandle>,
+    ) -> Result<(), String> {
+        let _reconnect_guard = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        if !self.is_current_handle(runtime_id, handle)? {
+            return Ok(());
+        }
+        self.append_event(runtime_id, payload)
+    }
+
     fn append_lifecycle_event(
         &self,
         runtime_id: &str,
@@ -2189,7 +4066,26 @@ impl NativeRuntimeManager {
             .records
             .lock()
             .map_err(|_| "Failed to lock native runtime records".to_string())?;
-        records.insert(record.runtime_id.clone(), record);
+        let runtime_id = record.runtime_id.clone();
+        if records.contains_key(&runtime_id) {
+            return Err(format!("Native runtime {runtime_id} already exists"));
+        }
+        records.insert(runtime_id.clone(), record);
+        if let Err(error) =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        {
+            records.remove(&runtime_id);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn remove_record(&self, runtime_id: &str) -> Result<(), String> {
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?;
+        records.remove(runtime_id);
         persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
     }
 
@@ -2198,11 +4094,20 @@ impl NativeRuntimeManager {
         runtime_id: String,
         handle: Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
-        self.handles
+        let mut handles = self
+            .handles
             .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?
-            .insert(runtime_id, handle);
-        Ok(())
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
+        match handles.entry(runtime_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(handle);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Err(format!(
+                "Native runtime handle {} already exists",
+                entry.key()
+            )),
+        }
     }
 
     fn allocate_handle_generation(&self) -> u64 {
@@ -2220,7 +4125,7 @@ impl NativeRuntimeManager {
         same_generation && Arc::ptr_eq(current, handle)
     }
 
-    fn mark_handle_live_if_current(
+    fn is_current_live_handle(
         &self,
         runtime_id: &str,
         handle: &Arc<NativeSessionHandle>,
@@ -2229,39 +4134,85 @@ impl NativeRuntimeManager {
             .handles
             .lock()
             .map_err(|_| "Failed to lock native runtime handles".to_string())?;
-        let is_current = handles
+        Ok(handles
             .get(runtime_id)
-            .map(|current| Self::same_handle(current, handle))
-            .unwrap_or(false);
-        if is_current {
-            handle.alive.store(true, Ordering::SeqCst);
-        }
-        Ok(is_current)
+            .map(|current| {
+                Self::same_handle(current, handle) && handle.alive.load(Ordering::SeqCst)
+            })
+            .unwrap_or(false))
     }
 
     fn remove_handle(&self, runtime_id: &str) -> Result<(), String> {
-        self.handles
+        let removed_generation = self
+            .handles
             .lock()
             .map_err(|_| "Failed to lock native runtime handles".to_string())?
-            .remove(runtime_id);
+            .remove(runtime_id)
+            .map(|handle| handle.generation);
+        if let (Some(manager), Some(generation)) = (self.router_manager.get(), removed_generation) {
+            manager.unregister_generation(runtime_id, generation);
+        }
         Ok(())
     }
 
-    fn remove_handle_if_current(
+    fn retire_handle_if_current(
         &self,
         runtime_id: &str,
         handle: &Arc<NativeSessionHandle>,
-    ) -> Result<(), String> {
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
-        let is_current = handles
-            .get(runtime_id)
-            .map(|current| Self::same_handle(current, handle))
-            .unwrap_or(false);
-        if is_current {
-            handles.remove(runtime_id);
+    ) -> Result<bool, String> {
+        let mut errors = Vec::new();
+        let removed = {
+            let mut handles = match self.handles.lock() {
+                Ok(handles) => handles,
+                Err(poisoned) => {
+                    errors.push(
+                        "Native runtime handles were poisoned while retiring helper".to_string(),
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let is_current = handles
+                .get(runtime_id)
+                .map(|current| Self::same_handle(current, handle))
+                .unwrap_or(false);
+            is_current.then(|| handles.remove(runtime_id)).flatten()
+        };
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+
+        removed.alive.store(false, Ordering::SeqCst);
+        if let Some(manager) = self.router_manager.get() {
+            manager.unregister_generation(runtime_id, removed.generation);
+        }
+        let child = match removed.child.lock() {
+            Ok(mut child) => child.take(),
+            Err(poisoned) => {
+                errors.push(
+                    "Native sidecar child mutex was poisoned while retiring helper".to_string(),
+                );
+                poisoned.into_inner().take()
+            }
+        };
+        if let Some(child) = child {
+            if let Err(error) = child.kill() {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(true)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn retire_current_handle_locked(&self, runtime_id: &str) -> Result<(), String> {
+        let handle = match self.handles.lock() {
+            Ok(handles) => handles.get(runtime_id).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(runtime_id).cloned(),
+        };
+        if let Some(handle) = handle {
+            self.retire_handle_if_current(runtime_id, &handle)?;
         }
         Ok(())
     }
@@ -2293,7 +4244,7 @@ impl NativeRuntimeManager {
                 .map_err(|_| "Failed to lock native sidecar child".to_string())?
                 .take()
             {
-                let _ = child.kill();
+                child.kill()?;
             }
         }
         Ok(())
@@ -2382,6 +4333,7 @@ impl NativeRuntimeManager {
                 last_event_seq: None,
                 can_handoff_to_terminal: record.can_handoff_to_terminal,
                 last_error: record.last_error,
+                router: record.router.as_ref().map(SessionRouterState::from),
             })
             .ok_or_else(|| format!("Native runtime {} not found", runtime_id))
     }
@@ -2392,7 +4344,16 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         stdout_buffer: &mut Vec<u8>,
         stderr_buffer: &mut Vec<u8>,
+        handle: &Arc<NativeSessionHandle>,
     ) {
+        let Ok(_reconnect_guard) = self.reconnect_lock.lock() else {
+            return;
+        };
+        if !self.is_current_handle(runtime_id, handle).unwrap_or(false) {
+            stdout_buffer.clear();
+            stderr_buffer.clear();
+            return;
+        }
         if let Some(text) = take_remaining_helper_output_line(stdout_buffer) {
             if let Err(error) = self.process_helper_stdout_with_app(app, runtime_id, &text) {
                 let _ = self.append_event(
@@ -2547,6 +4508,21 @@ fn reactivate_record_for_reconnect(record: &mut NativeSessionRecord) -> bool {
     true
 }
 
+fn recoverable_record_after_helper_removed(record: &NativeSessionRecord) -> NativeSessionRecord {
+    let mut recovery = record.clone();
+    recovery.status = "interrupted".to_string();
+    recovery.is_active = false;
+    recovery.pending_handoff_terminal = None;
+    recovery.updated_at = Utc::now();
+    recovery.last_error =
+        Some("Direct restart was interrupted after the previous helper stopped.".to_string());
+    recovery
+}
+
+fn session_router_patch_oauth_validation_enabled(current: &SessionRouterRecord) -> bool {
+    OAUTH_ROUTING_VERIFIED || current.launch_transport == LaunchTransport::Direct
+}
+
 fn is_retryable_native_child_write_error(message: &str) -> bool {
     message == "Native sidecar child is not available"
         || message.starts_with("Failed to write to native sidecar stdin:")
@@ -2603,13 +4579,9 @@ fn non_empty_error(message: &str) -> Option<String> {
 }
 
 fn generate_runtime_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("native-{}", timestamp)
+    let mut random = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    format!("native-{}", hex::encode(random))
 }
 
 fn native_runtime_state_file_path() -> PathBuf {
@@ -2644,34 +4616,52 @@ fn persist_native_runtime_state_to(
     path: &Path,
     records: Vec<NativeSessionRecord>,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!("Failed to create native runtime state directory: {}", error)
-        })?;
-    }
-
     let state = NativeRuntimeState { sessions: records };
     let serialized = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("Failed to serialize native runtime state: {}", error))?;
-    let temp_path = native_runtime_state_temp_file_path(path);
-    fs::write(&temp_path, serialized)
-        .map_err(|error| format!("Failed to write native runtime state: {}", error))?;
-    fs::rename(&temp_path, path)
-        .map_err(|error| format!("Failed to finalize native runtime state: {}", error))
+    write_private_atomic(path, &serialized)
+        .map_err(|error| format!("Failed to persist private native runtime state: {}", error))
 }
 
-fn native_runtime_state_temp_file_path(path: &Path) -> PathBuf {
-    let counter = NATIVE_RUNTIME_STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("native-runtime-state.json");
-    path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        file_name,
-        std::process::id(),
-        counter
-    ))
+fn prepare_direct_router_launch(
+    options: &mut NativeSessionOptions,
+    warning: Option<String>,
+) -> Result<(), String> {
+    let router = options
+        .router_record
+        .as_ref()
+        .ok_or_else(|| "ROUTER_SESSION_UNAVAILABLE: session router state is missing".to_string())?;
+    let default_env = router.default_env.clone();
+    let source = describe_router_environment(&default_env).map_err(|error| error.to_string())?;
+    let resolved = resolve_claude_env(&default_env)?;
+    let runtime_id = options
+        .helper_env_vars
+        .get("CCEM_RUNTIME_ID")
+        .or_else(|| options.helper_env_vars.get("CCEM_SESSION_ID"))
+        .cloned();
+
+    options.env_name = default_env;
+    options.helper_env_vars = resolved.env_vars.clone();
+    merge_helper_env_path(&mut options.helper_env_vars, &terminal::get_user_path());
+    options.terminal_env_vars = resolved.env_vars;
+    if let Some(runtime_id) = runtime_id.as_deref() {
+        inject_ccem_runtime_env(&mut options.helper_env_vars, runtime_id);
+        inject_ccem_runtime_env(&mut options.terminal_env_vars, runtime_id);
+    }
+
+    let router = options
+        .router_record
+        .as_mut()
+        .expect("router checked before resolving direct launch");
+    router.launch_transport = LaunchTransport::Direct;
+    router.launch_auth_kind = match source.auth_kind {
+        RouterEnvironmentAuthKind::Token => LaunchAuthKind::Token,
+        RouterEnvironmentAuthKind::RequiresOauth => LaunchAuthKind::Oauth,
+    };
+    router.launch_default_env = source.name;
+    router.launch_model_pins = source.pins;
+    router.warnings = warning.into_iter().collect();
+    Ok(())
 }
 
 fn build_runtime_bootstrap_options(
@@ -2712,6 +4702,8 @@ fn build_runtime_bootstrap_options(
         codex_base_url,
         codex_api_key,
         effort: record.effort.clone(),
+        router_seed: None,
+        router_record: record.router.clone(),
     })
 }
 
@@ -2720,17 +4712,76 @@ fn inject_ccem_runtime_env(env_vars: &mut HashMap<String, String>, runtime_id: &
     env_vars.insert("CCEM_SESSION_ID".to_string(), runtime_id.to_string());
 }
 
+fn build_helper_router_init(record: &SessionRouterRecord) -> HelperRouterInit {
+    let aliases = record
+        .allowed_envs
+        .iter()
+        .filter(|name| is_valid_router_environment_alias(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let menu = (record.dynamic_routing && !aliases.is_empty()).then(|| {
+        format!(
+            "CCEM model routing: when calling Agent, you may put exactly one override at the first character of its prompt: <CCEM-ROUTE>ccem:ENV</CCEM-ROUTE>. Allowed ENV values: {}. Never invent or transform an environment name.",
+            aliases.join(", ")
+        )
+    });
+    HelperRouterInit {
+        route_tag_nonce: record.route_tag_nonce.clone(),
+        dynamic_routing: record.dynamic_routing,
+        menu,
+    }
+}
+
+fn configure_routed_helper_env(
+    env_vars: &mut HashMap<String, String>,
+    actual_port: u16,
+    record: &SessionRouterRecord,
+) {
+    for key in [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    ] {
+        env_vars.remove(key);
+    }
+    env_vars.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        format!("http://127.0.0.1:{actual_port}/s/{}", record.session_key),
+    );
+    if record.launch_auth_kind == LaunchAuthKind::Token {
+        env_vars.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            format!("ccem-router-placeholder-{}", random_router_secret(8)),
+        );
+    }
+}
+
+fn random_router_secret(bytes: usize) -> String {
+    let mut value = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut value);
+    hex::encode(value)
+}
+
+fn dedupe_nonempty(values: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|value| !value.trim().is_empty() && seen.insert(value.clone()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_browser_tool_for_record, clear_terminal_launches, drain_helper_output_lines,
-        is_retryable_native_child_write_error, merge_helper_env_path,
-        merge_path_values_with_separator, native_runtime_state_temp_file_path,
-        native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
-        launch_terminal_for_native_handoff, reactivate_record_for_reconnect,
-        read_native_runtime_state_from, take_terminal_launches, HelperInputCommand, NativeProvider,
-        NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
-        NativeTransport, PromptImage,
+        apply_session_router_patch, authorize_browser_tool_for_record, clear_terminal_launches,
+        drain_helper_output_lines, is_retryable_native_child_write_error,
+        launch_terminal_for_native_handoff, merge_helper_env_path,
+        merge_path_values_with_separator, native_session_allows_dangerously_skip_permissions,
+        native_status_allows_file_rewind, reactivate_record_for_reconnect,
+        read_native_runtime_state_from, recoverable_record_after_helper_removed,
+        router_launch_decision, session_router_patch_oauth_validation_enabled,
+        take_terminal_launches, HelperInputCommand, NativeProvider, NativeRuntimeManager,
+        NativeSessionHandle, NativeSessionOptions, NativeSessionRecord, NativeTransport,
+        PromptImage, RouterLaunchDecision,
     };
     use crate::event_bus::{
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
@@ -2738,11 +4789,21 @@ mod tests {
     };
     use crate::native_event_log::NativeEventLog;
     use crate::prompt_image_store::PromptImageStore;
+    use crate::router::{
+        LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterConfig, RouterManager,
+        RouterModelPins, SessionRouterPatch, SessionRouterRecord,
+    };
     use chrono::Utc;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     fn native_session_handle(record: NativeSessionRecord) -> Arc<NativeSessionHandle> {
         native_session_handle_with_terminal_env(record, HashMap::new())
@@ -2802,6 +4863,7 @@ mod tests {
             can_handoff_to_terminal: false,
             pending_handoff_terminal: None,
             last_error: None,
+            router: None,
         };
         let handle = native_session_handle(record.clone());
         let manager = NativeRuntimeManager {
@@ -2817,6 +4879,8 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("ccem-native-runtime-test-{runtime_id}-attachments")),
             ),
+            router_manager: OnceLock::new(),
+            reconnect_lock: Mutex::new(()),
         };
         manager
     }
@@ -2843,6 +4907,8 @@ mod tests {
             prompt_image_store: PromptImageStore::new(std::env::temp_dir().join(format!(
                 "ccem-native-runtime-reconcile-test-{runtime_id}-attachments"
             ))),
+            router_manager: OnceLock::new(),
+            reconnect_lock: Mutex::new(()),
         }
     }
 
@@ -2865,7 +4931,108 @@ mod tests {
             can_handoff_to_terminal: false,
             pending_handoff_terminal: None,
             last_error: None,
+            router: None,
         }
+    }
+
+    fn reconnect_router_record(launch_transport: LaunchTransport) -> SessionRouterRecord {
+        SessionRouterRecord {
+            session_key: "reconnect-session-key".into(),
+            route_tag_nonce: "reconnect-route-nonce".into(),
+            default_env: "official".into(),
+            bindings: HashMap::new(),
+            allowed_envs: vec!["official".into()],
+            source_profile_id: Some("profile-before-reconnect".into()),
+            profile_revision: Some(7),
+            dynamic_routing: true,
+            revision: 11,
+            router_auth_capability: RouterAuthCapability::Oauth,
+            launch_transport,
+            launch_auth_kind: LaunchAuthKind::Oauth,
+            launch_default_env: "official".into(),
+            launch_model_pins: RouterModelPins::default(),
+            warnings: vec!["generation-before-reconnect".into()],
+        }
+    }
+
+    #[test]
+    fn router_recovery_transport_matrix_is_fail_closed_and_generation_scoped() {
+        use LaunchTransport::{Direct, Routed};
+        use RouterAuthCapability::{Oauth, Token};
+        use RouterLaunchDecision::{Bypass, LaunchDirect, LaunchRouted, RejectRecovery};
+
+        let cases = [
+            (None, false, false, Token, false, Bypass),
+            (None, true, false, Token, false, LaunchDirect),
+            (None, true, true, Token, false, LaunchRouted),
+            (None, true, true, Oauth, false, LaunchDirect),
+            (None, true, true, Oauth, true, LaunchRouted),
+            (Some(Direct), true, false, Token, false, LaunchDirect),
+            (Some(Direct), true, true, Token, false, LaunchRouted),
+            (Some(Direct), true, true, Oauth, false, LaunchDirect),
+            (Some(Direct), true, true, Oauth, true, LaunchRouted),
+            (Some(Routed), true, false, Token, false, RejectRecovery),
+            (Some(Routed), true, true, Token, false, LaunchRouted),
+            (Some(Routed), true, true, Oauth, false, RejectRecovery),
+            (Some(Routed), true, true, Oauth, true, LaunchRouted),
+            (Some(Routed), false, true, Token, false, RejectRecovery),
+            (Some(Direct), false, true, Token, false, LaunchDirect),
+        ];
+
+        for (previous, enabled, ready, auth, oauth_verified, expected) in cases {
+            assert_eq!(
+                router_launch_decision(previous, enabled, ready, auth, oauth_verified),
+                expected,
+                "previous={previous:?} enabled={enabled} ready={ready} auth={auth:?} oauth_verified={oauth_verified}",
+            );
+        }
+    }
+
+    #[test]
+    fn direct_oauth_to_token_main_patch_is_not_blocked_by_the_router_oauth_gate() {
+        let mut current = reconnect_router_record(LaunchTransport::Direct);
+        current
+            .allowed_envs
+            .push("zz-ccem-missing-token-main-test".into());
+        let token_main_patch = SessionRouterPatch {
+            default_env: Some("zz-ccem-missing-token-main-test".into()),
+            ..SessionRouterPatch::default()
+        };
+
+        assert!(session_router_patch_oauth_validation_enabled(&current));
+        let error = apply_session_router_patch(
+            &current,
+            current.revision,
+            &token_main_patch,
+            session_router_patch_oauth_validation_enabled(&current),
+        )
+        .expect_err("synthetic token environment is intentionally absent");
+        assert_eq!(
+            error.code, "ROUTER_ENV_MISSING",
+            "direct patch must pass the router-only OAuth gate before environment resolution"
+        );
+    }
+
+    #[test]
+    fn routed_oauth_session_patch_keeps_the_oauth_gate_closed() {
+        let mut current = reconnect_router_record(LaunchTransport::Routed);
+        current
+            .allowed_envs
+            .push("zz-ccem-missing-token-main-test".into());
+        let token_main_patch = SessionRouterPatch {
+            default_env: Some("zz-ccem-missing-token-main-test".into()),
+            ..SessionRouterPatch::default()
+        };
+
+        assert!(!session_router_patch_oauth_validation_enabled(&current));
+        let error = apply_session_router_patch(
+            &current,
+            current.revision,
+            &token_main_patch,
+            session_router_patch_oauth_validation_enabled(&current),
+        )
+        .expect_err("routed OAuth generation must remain fail-closed");
+        assert_eq!(error.code, "ROUTER_OAUTH_NOT_VERIFIED");
     }
 
     #[test]
@@ -2906,6 +5073,8 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            router_seed: None,
+            router_record: None,
         }
     }
 
@@ -3028,22 +5197,6 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_state_temp_paths_are_unique_per_write() {
-        let state_path = std::env::temp_dir().join("ccem-native-runtime-state-test.json");
-
-        let first = native_runtime_state_temp_file_path(&state_path);
-        let second = native_runtime_state_temp_file_path(&state_path);
-
-        assert_ne!(first, second);
-        assert_eq!(first.parent(), state_path.parent());
-        assert_eq!(second.parent(), state_path.parent());
-        assert!(first
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.contains("ccem-native-runtime-state-test.json")));
-    }
-
-    #[test]
     fn helper_output_buffers_partial_json_until_newline() {
         let mut buffer = Vec::new();
         let first = drain_helper_output_lines(&mut buffer, br#"{"type":"status","status":"ready""#);
@@ -3090,6 +5243,7 @@ mod tests {
             codex_api_key: None,
             effort: None,
             todo_snapshot_seed: None,
+            router: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -3133,6 +5287,7 @@ mod tests {
             codex_api_key: None,
             effort: None,
             todo_snapshot_seed: Some(&seed),
+            router: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -3162,6 +5317,7 @@ mod tests {
             codex_api_key: None,
             effort: None,
             todo_snapshot_seed: None,
+            router: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -3212,6 +5368,8 @@ mod tests {
             prompt_image_store: PromptImageStore::new(std::env::temp_dir().join(format!(
                 "ccem-native-runtime-terminal-env-test-{runtime_id}-attachments"
             ))),
+            router_manager: OnceLock::new(),
+            reconnect_lock: Mutex::new(()),
         };
 
         let handoff = manager
@@ -3749,8 +5907,7 @@ mod tests {
                 record.status = "handoff_pending".to_string();
                 record.is_active = true;
                 record.can_handoff_to_terminal = true;
-                record.pending_handoff_terminal =
-                    Some(crate::terminal::TerminalType::TerminalApp);
+                record.pending_handoff_terminal = Some(crate::terminal::TerminalType::TerminalApp);
             })
             .expect("set pending handoff");
         let exited_handle = manager
@@ -3837,6 +5994,9 @@ mod tests {
         let replacement_record = native_record(runtime_id, "ready", true);
         let replacement_handle = native_session_handle_with_generation(replacement_record, 2);
         manager
+            .remove_handle(runtime_id)
+            .expect("retire stale handle before replacement");
+        manager
             .insert_handle(runtime_id.to_string(), replacement_handle.clone())
             .expect("insert replacement handle");
         manager
@@ -3896,6 +6056,122 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_helper_generation_unregisters_its_route() {
+        let runtime_id = "native-router-generation-exit";
+        let manager = manager_with_handle(runtime_id);
+        let router_manager = Arc::new(RouterManager::new(RouterConfig::default()));
+        manager
+            .set_router_manager(router_manager.clone())
+            .expect("set router manager");
+        let router = SessionRouterRecord {
+            session_key: "route-key".into(),
+            route_tag_nonce: "route-nonce".into(),
+            default_env: "official".into(),
+            bindings: HashMap::new(),
+            allowed_envs: vec!["official".into()],
+            source_profile_id: None,
+            profile_revision: None,
+            dynamic_routing: true,
+            revision: 0,
+            router_auth_capability: RouterAuthCapability::Oauth,
+            launch_transport: LaunchTransport::Routed,
+            launch_auth_kind: LaunchAuthKind::Oauth,
+            launch_default_env: "official".into(),
+            launch_model_pins: RouterModelPins::default(),
+            warnings: Vec::new(),
+        };
+        manager
+            .update_record(runtime_id, |record| record.router = Some(router.clone()))
+            .expect("persist router state");
+        router_manager
+            .register(runtime_id, 1, router)
+            .expect("register route");
+        assert_eq!(router_manager.route_count(), 1);
+
+        manager
+            .remove_handle(runtime_id)
+            .expect("remove helper handle");
+
+        assert_eq!(router_manager.route_count(), 0);
+    }
+
+    #[test]
+    fn environment_reference_query_covers_recoverable_snapshots_only() {
+        let mut recoverable = native_record("native-router-env-recoverable", "interrupted", false);
+        recoverable.env_name = "old env".into();
+        let mut stopped = native_record("native-router-env-stopped", "stopped", false);
+        stopped.env_name = "old env".into();
+        let mut handoff = native_record("native-router-env-handoff", "handoff", false);
+        handoff.env_name = "old env".into();
+        let manager = manager_with_records(
+            "native-router-env-reference-query",
+            vec![recoverable, stopped, handoff],
+        );
+
+        assert_eq!(
+            manager
+                .router_environment_references("old env")
+                .expect("query environment refs"),
+            vec!["session:native-router-env-recoverable"]
+        );
+    }
+
+    #[test]
+    fn environment_rename_cascades_persisted_router_snapshot() {
+        let runtime_id = "native-router-env-rename";
+        let mut record = native_record(runtime_id, "interrupted", false);
+        record.env_name = "old env".into();
+        record.router = Some(SessionRouterRecord {
+            session_key: "route-key".into(),
+            route_tag_nonce: "route-nonce".into(),
+            default_env: "old env".into(),
+            bindings: HashMap::from([("background".into(), "old env".into())]),
+            allowed_envs: vec!["old env".into(), "new env".into()],
+            source_profile_id: None,
+            profile_revision: None,
+            dynamic_routing: true,
+            revision: 0,
+            router_auth_capability: RouterAuthCapability::Token,
+            launch_transport: LaunchTransport::Direct,
+            launch_auth_kind: LaunchAuthKind::Token,
+            launch_default_env: "old env".into(),
+            launch_model_pins: RouterModelPins::default(),
+            warnings: Vec::new(),
+        });
+        let manager = manager_with_records(runtime_id, vec![record]);
+
+        let events = manager
+            .rename_router_environment_references("old env", "new env")
+            .expect("rename router refs");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].runtime_id, runtime_id);
+        assert_eq!(events[0].reason, "environment-rename");
+        assert_eq!(events[0].router.revision, 1);
+
+        assert!(manager
+            .router_environment_references("old env")
+            .expect("scan old refs")
+            .is_empty());
+        let renamed = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("record")
+            .clone();
+        assert_eq!(renamed.env_name, "new env");
+        let router = renamed.router.expect("router");
+        assert_eq!(router.default_env, "new env");
+        assert_eq!(router.launch_default_env, "new env");
+        assert_eq!(router.revision, 1);
+        assert_eq!(router.allowed_envs, vec!["new env"]);
+        assert_eq!(
+            router.bindings.get("background").map(String::as_str),
+            Some("new env")
+        );
+    }
+
+    #[test]
     fn stop_force_kill_does_not_remove_replacement_handle() {
         let runtime_id = "native-stop-force-kill-stale";
         let manager = manager_with_handle(runtime_id);
@@ -3910,6 +6186,9 @@ mod tests {
 
         let replacement_record = native_record(runtime_id, "processing", true);
         let replacement_handle = native_session_handle_with_generation(replacement_record, 2);
+        manager
+            .remove_handle(runtime_id)
+            .expect("retire stale handle before replacement");
         manager
             .insert_handle(runtime_id.to_string(), replacement_handle.clone())
             .expect("insert replacement handle");
@@ -3938,6 +6217,743 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_runtime_ids_are_unique() {
+        const THREADS: usize = 16;
+        const IDS_PER_THREAD: usize = 128;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let workers = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..IDS_PER_THREAD)
+                        .map(|_| super::generate_runtime_id())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let ids = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("runtime ID worker"))
+            .collect::<Vec<_>>();
+        let unique = ids.iter().collect::<HashSet<_>>();
+
+        assert_eq!(unique.len(), ids.len(), "runtime IDs must never collide");
+    }
+
+    #[test]
+    fn duplicate_record_insert_is_rejected_without_overwrite() {
+        let runtime_id = "native-duplicate-record";
+        let manager = manager_with_records(runtime_id, Vec::new());
+        let original = native_record(runtime_id, "initializing", true);
+        manager
+            .insert_record(original.clone())
+            .expect("insert original record");
+        let replacement = native_record(runtime_id, "error", false);
+
+        let error = manager
+            .insert_record(replacement)
+            .expect_err("duplicate runtime record must be rejected");
+
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            manager.records.lock().expect("records").get(runtime_id),
+            Some(&original)
+        );
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn duplicate_handle_insert_is_rejected_without_overwrite() {
+        let runtime_id = "native-duplicate-handle";
+        let manager = manager_with_handle(runtime_id);
+        let original = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("original handle")
+            .clone();
+        let replacement =
+            native_session_handle_with_generation(native_record(runtime_id, "processing", true), 2);
+
+        let error = manager
+            .insert_handle(runtime_id.to_string(), replacement)
+            .expect_err("duplicate runtime handle must be rejected");
+
+        assert!(error.contains("already exists"));
+        assert!(Arc::ptr_eq(
+            manager
+                .handles
+                .lock()
+                .expect("handles")
+                .get(runtime_id)
+                .expect("original handle retained"),
+            &original
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_helper_kill_reaps_shell_wrapper_and_grandchild_without_touching_sibling() {
+        let mut sibling = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated sibling");
+        let sibling_pid = sibling.id();
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"read ready
+trap '' TERM
+/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+echo "$!"
+wait"#,
+        );
+        let (mut events, mut helper) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper tree");
+        let root_pid = helper.pid();
+        helper.write(b"ready\n").expect("start helper workload");
+
+        let grandchild_pid = tauri::async_runtime::block_on(async {
+            loop {
+                match events.recv().await.expect("managed helper event") {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        let value = String::from_utf8_lossy(&bytes).trim().to_string();
+                        if let Ok(pid) = value.parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("managed helper output failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        assert_eq!(
+            unsafe { libc::getpgid(root_pid as i32) },
+            root_pid as i32,
+            "managed helper must lead its own process group"
+        );
+        assert_ne!(
+            unsafe { libc::getpgid(sibling_pid as i32) },
+            root_pid as i32,
+            "unrelated sibling must stay outside the managed group"
+        );
+
+        helper.kill().expect("kill managed helper tree");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::native_process_group_exists(root_pid as i32)
+            || super::native_process_exists(grandchild_pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "managed helper group or grandchild survived tree kill"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            sibling.try_wait().expect("poll sibling").is_none(),
+            "tree kill must not touch an unrelated sibling"
+        );
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[test]
+    fn process_tree_termination_is_serialized_and_success_is_idempotent() {
+        let terminated = Mutex::new(false);
+        let calls = AtomicUsize::new(0);
+
+        super::terminate_process_tree_once(&terminated, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("first termination");
+        super::terminate_process_tree_once(&terminated, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("idempotent termination");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_process_tree_termination_remains_retryable() {
+        let terminated = Mutex::new(false);
+        let calls = AtomicUsize::new(0);
+
+        let error = super::terminate_process_tree_once(&terminated, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("first kill failed".to_string())
+        })
+        .expect_err("first termination must fail");
+        super::terminate_process_tree_once(&terminated, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("failed termination must be retryable");
+
+        assert_eq!(error, "first kill failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_helper_drains_fast_exit_output_before_termination() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf tail-without-newline");
+        let (mut events, _helper) =
+            super::spawn_native_helper_process(command).expect("spawn fast helper");
+
+        let observed = tauri::async_runtime::block_on(async {
+            let mut observed = Vec::new();
+            while let Some(event) = events.recv().await {
+                match event {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        observed.push(String::from_utf8_lossy(&bytes).to_string());
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Terminated(_) => {
+                        observed.push("terminated".to_string());
+                        break;
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("fast helper failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+            observed
+        });
+
+        assert_eq!(observed, vec!["tail-without-newline", "terminated"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_helper_root_exit_reaps_stubborn_descendant_without_touching_sibling() {
+        let mut sibling = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated sibling");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"read ready
+/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+echo "$!"
+exit 0"#,
+        );
+        let (mut events, mut helper) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper tree");
+        let root_pid = helper.pid();
+        helper.write(b"ready\n").expect("start helper workload");
+
+        let grandchild_pid = tauri::async_runtime::block_on(async {
+            let mut grandchild_pid = None;
+            while let Some(event) = events.recv().await {
+                match event {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        grandchild_pid = String::from_utf8_lossy(&bytes).trim().parse().ok();
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Terminated(_) => break,
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("managed helper failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+            grandchild_pid.expect("grandchild pid before termination")
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::native_process_group_exists(root_pid as i32)
+            || super::native_process_exists(grandchild_pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "descendant survived natural helper root exit"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            sibling.try_wait().expect("poll sibling").is_none(),
+            "root-exit cleanup must not touch an unrelated sibling"
+        );
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_managed_helper_reaps_stubborn_descendant_without_touching_sibling() {
+        let mut sibling = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated sibling");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"read ready
+/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+echo "$!"
+wait"#,
+        );
+        let (mut events, mut helper) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper tree");
+        let root_pid = helper.pid();
+        helper.write(b"ready\n").expect("start helper workload");
+        let grandchild_pid = tauri::async_runtime::block_on(async {
+            loop {
+                match events.recv().await.expect("managed helper event") {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        if let Ok(pid) = String::from_utf8_lossy(&bytes).trim().parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("managed helper failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        drop(helper);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::native_process_group_exists(root_pid as i32)
+            || super::native_process_exists(grandchild_pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "descendant survived managed helper Drop"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            sibling.try_wait().expect("poll sibling").is_none(),
+            "Drop cleanup must not touch an unrelated sibling"
+        );
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_reaps_process_tree_even_when_state_persist_fails() {
+        let runtime_id = "native-force-kill-persist-failure";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.state_path = PathBuf::from("/dev/null/native-runtime-state.json");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+        handle.alive.store(false, Ordering::SeqCst);
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"read ready
+/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+echo "$!"
+wait"#,
+        );
+        let (mut events, mut child) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper tree");
+        let root_pid = child.pid();
+        child.write(b"ready\n").expect("start helper workload");
+        let grandchild_pid = tauri::async_runtime::block_on(async {
+            loop {
+                match events.recv().await.expect("managed helper event") {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        if let Ok(pid) = String::from_utf8_lossy(&bytes).trim().parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("managed helper failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+        *handle.child.lock().expect("child slot") = Some(child);
+        let poison_target = Arc::clone(&handle);
+        let _ = std::thread::spawn(move || {
+            let _child = poison_target.child.lock().expect("child slot");
+            panic!("poison child slot");
+        })
+        .join();
+
+        let error = manager
+            .force_kill_stopped_handle(runtime_id, &handle)
+            .expect_err("state persistence must fail");
+        let handle_removed = !manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("current handle check");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::native_process_group_exists(root_pid as i32)
+            || super::native_process_exists(grandchild_pid)
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let tree_reaped = !super::native_process_group_exists(root_pid as i32)
+            && !super::native_process_exists(grandchild_pid);
+        let _ = manager.kill_child(runtime_id);
+
+        assert!(error.contains("persist"));
+        assert!(error.contains("child mutex was poisoned"));
+        assert!(
+            handle_removed,
+            "persist failure must not retain the stopped handle"
+        );
+        assert!(
+            tree_reaped,
+            "persist failure must not skip process-tree kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_schedules_force_cleanup_even_when_state_persist_fails() {
+        let runtime_id = "native-stop-schedule-persist-failure";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.state_path = PathBuf::from("/dev/null/native-runtime-state.json");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"read ready
+/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+echo "$!"
+wait"#,
+        );
+        let (mut events, mut child) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper tree");
+        let root_pid = child.pid();
+        child.write(b"ready\n").expect("start helper workload");
+        let grandchild_pid = tauri::async_runtime::block_on(async {
+            loop {
+                match events.recv().await.expect("managed helper event") {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        if let Ok(pid) = String::from_utf8_lossy(&bytes).trim().parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("managed helper failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+        *handle.child.lock().expect("child slot") = Some(child);
+
+        let manager = Arc::new(manager);
+        let error = manager
+            .stop_session_from_with_grace(
+                runtime_id,
+                Some("regression_test"),
+                Duration::from_millis(50),
+            )
+            .expect_err("state persistence must still be reported");
+        assert!(error.contains("persist"));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while manager
+            .is_current_handle(runtime_id, &handle)
+            .unwrap_or(false)
+            || super::native_process_group_exists(root_pid as i32)
+            || super::native_process_exists(grandchild_pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "scheduled force cleanup did not retire the stopped helper tree"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_write_still_returns_cleanup_handle_when_lifecycle_store_is_poisoned() {
+        let runtime_id = "native-stop-write-poisoned-telemetry";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+        let poison_target = Arc::clone(&handle);
+        let _ = std::thread::spawn(move || {
+            let _events = poison_target.events.lock().expect("events");
+            panic!("poison lifecycle store");
+        })
+        .join();
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("read _stop; /bin/sleep 30");
+        let (_events, child) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper");
+        *handle.child.lock().expect("child slot") = Some(child);
+
+        let scheduled_handle = manager
+            .request_child_stop(runtime_id)
+            .expect("telemetry failure must not fail stop scheduling")
+            .expect("successful Stop write must return its cleanup handle");
+
+        assert!(NativeRuntimeManager::same_handle(
+            &scheduled_handle,
+            &handle
+        ));
+        assert!(!handle.alive.load(Ordering::SeqCst));
+        manager
+            .retire_handle_if_current(runtime_id, &handle)
+            .expect("cleanup stopped helper");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_terminal_handoff_reaps_old_tree_despite_metadata_failures() {
+        let runtime_id = "native-handoff-metadata-failure";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.state_path = PathBuf::from("/dev/null/native-runtime-state.json");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .provider_session_id = Some("provider-handoff-session".to_string());
+        handle
+            .record
+            .lock()
+            .expect("handle record")
+            .provider_session_id = Some("provider-handoff-session".to_string());
+        let mut sibling = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated sibling");
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            r#"read ready
+/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+echo "$!"
+wait"#,
+        );
+        let (mut events, mut child) =
+            super::spawn_native_helper_process(command).expect("spawn managed helper tree");
+        let root_pid = child.pid();
+        child.write(b"ready\n").expect("start helper workload");
+        let grandchild_pid = tauri::async_runtime::block_on(async {
+            loop {
+                match events.recv().await.expect("managed helper event") {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        if let Ok(pid) = String::from_utf8_lossy(&bytes).trim().parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("managed helper failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+        *handle.child.lock().expect("child slot") = Some(child);
+        let poison_target = Arc::clone(&handle);
+        let _ = std::thread::spawn(move || {
+            let _events = poison_target.events.lock().expect("events");
+            panic!("poison handoff event store");
+        })
+        .join();
+
+        manager
+            .run_managed_terminal_handoff(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                |_| Ok(()),
+            )
+            .expect("an opened terminal must not be reported as retryable failure");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while super::native_process_group_exists(root_pid as i32)
+            || super::native_process_exists(grandchild_pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "terminal handoff left the old native process tree alive"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("current handle check"));
+        let record = manager.current_record(runtime_id).expect("handoff record");
+        assert_eq!(record.status, "handoff");
+        assert!(!record.is_active);
+        assert!(
+            sibling.try_wait().expect("poll sibling").is_none(),
+            "handoff cleanup must not touch an unrelated sibling"
+        );
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_handoff_serializes_replacement_until_old_generation_is_retired() {
+        let runtime_id = "native-handoff-serialized-replacement";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let old_handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .provider_session_id = Some("provider-handoff-race".to_string());
+        old_handle
+            .record
+            .lock()
+            .expect("handle record")
+            .provider_session_id = Some("provider-handoff-race".to_string());
+
+        let (start_replacement, replacement_started) = std::sync::mpsc::sync_channel(0);
+        let (replacement_acquired, acquired_replacement) = std::sync::mpsc::sync_channel(1);
+        let replacement_manager = Arc::clone(&manager);
+        let replacement_runtime_id = runtime_id.to_string();
+        let replacement_thread = std::thread::spawn(move || {
+            replacement_started.recv().expect("replacement start");
+            let _coordinator = replacement_manager
+                .reconnect_lock
+                .lock()
+                .expect("replacement coordinator");
+            replacement_acquired.send(()).expect("replacement acquired");
+            let mut record = replacement_manager
+                .records
+                .lock()
+                .expect("records")
+                .get(&replacement_runtime_id)
+                .expect("record")
+                .clone();
+            record.status = "processing".to_string();
+            record.is_active = true;
+            let replacement = native_session_handle_with_generation(record, 2);
+            replacement_manager
+                .insert_handle(replacement_runtime_id, Arc::clone(&replacement))
+                .expect("insert replacement after handoff");
+            replacement
+        });
+
+        manager
+            .run_managed_terminal_handoff(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                |_| {
+                    assert!(
+                        !old_handle.alive.load(Ordering::SeqCst),
+                        "handoff must make the prepared generation non-live before launch"
+                    );
+                    start_replacement.send(()).expect("start replacement");
+                    assert!(
+                        acquired_replacement
+                            .recv_timeout(Duration::from_millis(100))
+                            .is_err(),
+                        "replacement must not enter during the external launch closure"
+                    );
+                    Ok(())
+                },
+            )
+            .expect("managed handoff");
+
+        let replacement = replacement_thread.join().expect("replacement thread");
+        assert!(manager
+            .is_current_handle(runtime_id, &replacement)
+            .expect("replacement current check"));
+        assert!(replacement.alive.load(Ordering::SeqCst));
+        assert!(!NativeRuntimeManager::same_handle(
+            &replacement,
+            &old_handle
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_managed_handoff_does_not_revive_frozen_generation() {
+        let runtime_id = "native-handoff-launch-failure-no-revive";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .provider_session_id = Some("provider-handoff-failure".to_string());
+        handle
+            .record
+            .lock()
+            .expect("handle record")
+            .provider_session_id = Some("provider-handoff-failure".to_string());
+
+        let error = manager
+            .run_managed_terminal_handoff(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                |_| Err::<(), _>("terminal open failed".to_string()),
+            )
+            .expect_err("launch failure");
+
+        assert_eq!(error, "terminal open failed");
+        assert!(!handle.alive.load(Ordering::SeqCst));
+        assert!(!manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("current handle check"));
+        let record = manager
+            .current_record(runtime_id)
+            .expect("failed handoff record");
+        assert_eq!(record.status, "interrupted");
+        assert!(!record.is_active);
+    }
+
+    #[test]
     fn stop_source_normalization_keeps_lifecycle_details_bounded() {
         assert_eq!(super::normalize_stop_source(None), "unattributed");
         assert_eq!(
@@ -3952,42 +6968,27 @@ mod tests {
     }
 
     #[test]
-    fn mark_handle_live_rejects_stale_generation() {
-        let runtime_id = "native-stale-handle-live-mark";
+    fn stopped_handle_cannot_be_revived() {
+        let runtime_id = "native-stopped-handle-no-revive";
         let manager = manager_with_handle(runtime_id);
-        let stale_handle = manager
+        let handle = manager
             .handles
             .lock()
             .expect("handles")
             .get(runtime_id)
-            .expect("stale handle")
+            .expect("handle")
             .clone();
-        stale_handle.alive.store(false, Ordering::SeqCst);
-
-        let replacement_record = native_record(runtime_id, "processing", true);
-        let replacement_handle = native_session_handle_with_generation(replacement_record, 2);
-        replacement_handle.alive.store(false, Ordering::SeqCst);
-        manager
-            .insert_handle(runtime_id.to_string(), replacement_handle.clone())
-            .expect("insert replacement handle");
+        handle.alive.store(false, Ordering::SeqCst);
 
         assert!(!manager
-            .mark_handle_live_if_current(runtime_id, &stale_handle)
-            .expect("stale live mark"));
-        assert!(!stale_handle.alive.load(Ordering::SeqCst));
-
-        assert!(manager
-            .mark_handle_live_if_current(runtime_id, &replacement_handle)
-            .expect("replacement live mark"));
-        assert!(replacement_handle.alive.load(Ordering::SeqCst));
-        assert!(manager
-            .is_current_handle(runtime_id, &replacement_handle)
-            .expect("current handle check"));
+            .is_current_live_handle(runtime_id, &handle)
+            .expect("live handle check"));
+        assert!(!handle.alive.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn mark_handle_live_and_force_kill_race_has_only_safe_outcomes() {
-        let runtime_id = "native-live-force-kill-race";
+    fn retire_and_force_kill_race_removes_stopped_generation_once() {
+        let runtime_id = "native-retire-force-kill-race";
         let manager = Arc::new(manager_with_handle(runtime_id));
         let handle = manager
             .handles
@@ -4000,15 +7001,15 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(3));
 
-        let mark_manager = Arc::clone(&manager);
-        let mark_barrier = Arc::clone(&barrier);
-        let mark_handle = Arc::clone(&handle);
-        let mark_runtime_id = runtime_id.to_string();
-        let mark_thread = std::thread::spawn(move || {
-            mark_barrier.wait();
-            mark_manager
-                .mark_handle_live_if_current(&mark_runtime_id, &mark_handle)
-                .expect("mark handle live")
+        let retire_manager = Arc::clone(&manager);
+        let retire_barrier = Arc::clone(&barrier);
+        let retire_handle = Arc::clone(&handle);
+        let retire_runtime_id = runtime_id.to_string();
+        let retire_thread = std::thread::spawn(move || {
+            retire_barrier.wait();
+            retire_manager
+                .retire_handle_if_current(&retire_runtime_id, &retire_handle)
+                .expect("retire stopped handle")
         });
 
         let kill_manager = Arc::clone(&manager);
@@ -4023,31 +7024,16 @@ mod tests {
         });
 
         barrier.wait();
-        let marked_live = mark_thread.join().expect("mark thread");
+        let retired = retire_thread.join().expect("retire thread");
         let force_killed = kill_thread.join().expect("kill thread");
 
         assert_ne!(
-            marked_live, force_killed,
-            "exactly one race participant should win the stopped handle"
+            retired, force_killed,
+            "exactly one path should remove the stopped generation"
         );
-
-        if marked_live {
-            assert!(handle.alive.load(Ordering::SeqCst));
-            assert!(manager
-                .is_current_handle(runtime_id, &handle)
-                .expect("current handle check"));
-            let summary = manager.summary_for(runtime_id).expect("summary");
-            assert_eq!(summary.status, "processing");
-            assert!(summary.is_active);
-        } else {
-            assert!(force_killed);
-            assert!(!manager
-                .is_current_handle(runtime_id, &handle)
-                .expect("current handle check"));
-            let summary = manager.summary_for(runtime_id).expect("summary");
-            assert_eq!(summary.status, "interrupted");
-            assert!(!summary.is_active);
-        }
+        assert!(!manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("current handle check"));
     }
 
     #[test]
@@ -4107,6 +7093,31 @@ mod tests {
         assert!(!manager
             .is_current_handle(runtime_id, &handle)
             .expect("current handle check"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_retires_generation_even_when_state_persist_fails() {
+        let runtime_id = "native-exit-persist-failure";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.state_path = PathBuf::from("/dev/null/native-runtime-state.json");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+
+        let error = manager
+            .mark_process_exit(runtime_id, Some(9), &handle)
+            .expect_err("state persistence must still be reported");
+
+        assert!(error.contains("persist"));
+        assert!(!manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("current handle check"));
+        assert!(!handle.alive.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -4183,6 +7194,253 @@ mod tests {
         assert_eq!(record.status, "initializing");
         assert!(record.is_active);
         assert_eq!(record.last_error, None);
+    }
+
+    #[test]
+    fn reconnect_prepare_failure_restores_the_complete_terminal_record() {
+        let runtime_id = "native-reconnect-prepare-rollback";
+        let mut record = native_record(runtime_id, "interrupted", false);
+        record.env_name = "official".into();
+        record.last_error = Some("failure before reconnect".into());
+        record.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        let original = record.clone();
+        let manager = Arc::new(manager_with_records(runtime_id, vec![record]));
+        manager
+            .set_router_manager(Arc::new(RouterManager::new(RouterConfig::default())))
+            .expect("set unavailable router manager");
+
+        let error = manager
+            .prepare_reconnect_handle_locked(runtime_id, false, None)
+            .err()
+            .expect("routed reconnect should fail while the router is unavailable");
+
+        assert!(error.contains("ROUTER_UNAVAILABLE"), "{error}");
+        let restored = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("restored record")
+            .clone();
+        assert_eq!(restored, original);
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn reconnect_insert_failure_restores_record_and_router_generation_facts() {
+        let runtime_id = "native-reconnect-insert-rollback";
+        let mut original = native_record(runtime_id, "processing", true);
+        original.env_name = "official".into();
+        original.last_error = Some("diagnostic retained across rollback".into());
+        original.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        let mut staged_direct = original.clone();
+        staged_direct.status = "initializing".into();
+        staged_direct.last_error = None;
+        let direct_router = staged_direct.router.as_mut().expect("router");
+        direct_router.launch_transport = LaunchTransport::Direct;
+        direct_router.revision += 1;
+        direct_router.warnings = vec!["staged direct generation".into()];
+        let manager = Arc::new(manager_with_records(runtime_id, vec![staged_direct]));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.handles.lock().expect("handles before poison");
+            panic!("poison handles to force insert failure");
+        }));
+
+        let error = manager
+            .prepare_reconnect_handle_locked(runtime_id, true, Some(&original))
+            .err()
+            .expect("handle insertion should fail");
+
+        assert!(
+            error.contains("Failed to lock native runtime handles"),
+            "{error}"
+        );
+        let restored = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("restored record")
+            .clone();
+        assert_eq!(restored.status, "interrupted");
+        assert!(!restored.is_active);
+        assert_eq!(restored.pending_handoff_terminal, None);
+        assert_eq!(restored.router, original.router);
+        assert_eq!(restored.env_name, original.env_name);
+        assert_eq!(restored.provider_session_id, original.provider_session_id);
+    }
+
+    #[test]
+    fn reconnect_persist_failure_keeps_killed_generation_recoverable_without_handle() {
+        let runtime_id = "native-reconnect-persist-rollback";
+        let mut original = native_record(runtime_id, "processing", true);
+        original.env_name = "official".into();
+        original.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        let mut staged_direct = original.clone();
+        staged_direct.status = "initializing".into();
+        let direct_router = staged_direct.router.as_mut().expect("router");
+        direct_router.launch_transport = LaunchTransport::Direct;
+        direct_router.revision += 1;
+
+        let unwritable_state_path = tempfile::tempdir().expect("state directory");
+        let mut manager = manager_with_records(runtime_id, vec![staged_direct]);
+        manager.state_path = unwritable_state_path.path().to_path_buf();
+        let manager = Arc::new(manager);
+
+        let error = manager
+            .prepare_reconnect_handle_locked(runtime_id, true, Some(&original))
+            .err()
+            .expect("persisting over a directory should fail");
+
+        assert!(
+            error.contains("Failed to persist private native runtime state"),
+            "{error}"
+        );
+        let restored = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("restored record")
+            .clone();
+        assert_eq!(restored.status, "interrupted");
+        assert!(!restored.is_active);
+        assert_eq!(restored.router, original.router);
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn direct_restart_stage_persist_failure_restores_routed_recovery_facts() {
+        let runtime_id = "native-direct-stage-persist-rollback";
+        let mut original = native_record(runtime_id, "processing", true);
+        original.env_name = "official".into();
+        original.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        let recovery = recoverable_record_after_helper_removed(&original);
+        let mut direct_router = original.router.clone().expect("router");
+        direct_router.launch_transport = LaunchTransport::Direct;
+        direct_router.revision += 1;
+
+        let unwritable_state_path = tempfile::tempdir().expect("state directory");
+        let mut manager = manager_with_records(runtime_id, vec![original.clone()]);
+        manager.state_path = unwritable_state_path.path().to_path_buf();
+
+        let error = manager
+            .stage_direct_restart_record(
+                runtime_id,
+                original.router.as_ref().expect("router").revision,
+                &direct_router,
+                &recovery,
+            )
+            .expect_err("persisting over a directory should fail");
+
+        assert_eq!(error.code, "ROUTER_PERSIST_FAILED");
+        let restored = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("restored record")
+            .clone();
+        assert_eq!(restored.status, "interrupted");
+        assert!(!restored.is_active);
+        assert_eq!(restored.router, original.router);
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn direct_restart_persists_recovery_before_retiring_the_handle() {
+        let runtime_id = "native-direct-retire-handle";
+        let mut manager = manager_with_handle(runtime_id);
+        let mut original = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("record")
+            .clone();
+        original.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .insert(runtime_id.to_string(), original.clone());
+        let state_dir = tempfile::tempdir().expect("state directory");
+        manager.state_path = state_dir.path().join("native-runtime-state.json");
+        manager
+            .retire_handle_for_direct_restart(
+                runtime_id,
+                original.router.as_ref().expect("router").revision,
+            )
+            .expect("retire handle");
+
+        let restored = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("record")
+            .clone();
+        assert_eq!(restored.status, "interrupted");
+        assert!(!restored.is_active);
+        assert_eq!(restored.router, original.router);
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn direct_restart_recovery_persist_failure_leaves_old_handle_active() {
+        let runtime_id = "native-direct-retire-persist-failure";
+        let mut manager = manager_with_handle(runtime_id);
+        let mut original = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("record")
+            .clone();
+        original.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .insert(runtime_id.to_string(), original.clone());
+        let unwritable_state_path = tempfile::tempdir().expect("state directory");
+        manager.state_path = unwritable_state_path.path().to_path_buf();
+        let error = manager
+            .retire_handle_for_direct_restart(
+                runtime_id,
+                original.router.as_ref().expect("router").revision,
+            )
+            .expect_err("persisting over a directory should fail before retirement");
+
+        assert_eq!(error.code, "ROUTER_PERSIST_FAILED");
+        assert_eq!(
+            manager.records.lock().expect("records").get(runtime_id),
+            Some(&original)
+        );
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("old handle retained")
+            .clone();
+        assert!(handle.alive.load(Ordering::SeqCst));
     }
 
     #[test]

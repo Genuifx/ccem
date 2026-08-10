@@ -17,11 +17,14 @@ const __dirname = path.dirname(__filename);
 const pkgPath = path.resolve(__dirname, '..', 'package.json');
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
 
-import type { EnvConfig, PermissionModeName } from '@ccem/core';
+import type { CcemConfig, EnvConfig, PermissionModeName } from '@ccem/core';
 import {
+  assertClaudeEnvironmentAuthBoundary,
+  assertOfficialEnvironmentInvariant,
   decrypt,
   encrypt,
   ENV_PRESETS,
+  normalizeCcemConfig,
   normalizeEnvConfig,
   recoverEnvConfigFromLegacy,
   resolveEnvConfigForRuntime,
@@ -31,6 +34,7 @@ import {
   getHomeDir,
   getCcemConfigPath,
   getLegacyConfigPath,
+  OFFICIAL_ENV_NAME,
 } from '@ccem/core';
 import {
   renderCompactHeader,
@@ -54,7 +58,11 @@ import {
   listAvailableModes,
   runWithTempPermissions
 } from './permissions.js';
-import { launchClaude } from './launcher.js';
+import { isTrustedDesktopProxyBaseUrl, launchClaude } from './launcher.js';
+import {
+  deleteEnvironmentWithAuthority,
+  renameEnvironmentWithAuthority,
+} from './environmentMutations.js';
 import { getUsageStats, getUsageStatsFromCache } from './usage.js';
 import { runSetupInit } from './setup.js';
 import type { UsageStats } from '@ccem/core';
@@ -77,6 +85,8 @@ import {
   readCronTasks,
 } from './cron.js';
 import {
+  getOrUpdateDesktopRoutes,
+  parseDesktopRoutes,
   parseLimitOption,
   parseSinceOption,
   printJson,
@@ -122,9 +132,17 @@ const buildResolvedEnvVars = (
   env: EnvConfig
 ): Record<string, string> => {
   const runtimeEnv = resolveEnvConfigForRuntime(envName, env);
+  const authToken = runtimeEnv.ANTHROPIC_AUTH_TOKEN
+    ? decrypt(runtimeEnv.ANTHROPIC_AUTH_TOKEN)
+    : undefined;
+  assertClaudeEnvironmentAuthBoundary(
+    envName,
+    runtimeEnv.ANTHROPIC_BASE_URL,
+    authToken,
+  );
   const resolved: Record<string, string> = {};
   if (runtimeEnv.ANTHROPIC_BASE_URL) resolved.ANTHROPIC_BASE_URL = runtimeEnv.ANTHROPIC_BASE_URL;
-  if (runtimeEnv.ANTHROPIC_AUTH_TOKEN) resolved.ANTHROPIC_AUTH_TOKEN = decrypt(runtimeEnv.ANTHROPIC_AUTH_TOKEN);
+  if (authToken) resolved.ANTHROPIC_AUTH_TOKEN = authToken;
   if (runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL) resolved.ANTHROPIC_DEFAULT_OPUS_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
   if (runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL) resolved.ANTHROPIC_DEFAULT_SONNET_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
   if (runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL) resolved.ANTHROPIC_DEFAULT_HAIKU_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
@@ -151,9 +169,9 @@ const config = new Conf({
   cwd: getCcemConfigDir(),  // 使用新路径
   defaults: {
     registries: {
-      official: DEFAULT_OFFICIAL_ENV,
+      [OFFICIAL_ENV_NAME]: DEFAULT_OFFICIAL_ENV,
     },
-    current: 'official',
+    current: OFFICIAL_ENV_NAME,
     defaultMode: null as string | null
   }
 });
@@ -185,6 +203,10 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
     return false;
   }
   return undefined;
+}
+
+function collectDesktopRoute(value: string, previous: string[]): string[] {
+  return [...previous, value];
 }
 
 const recoverRegistriesFromLegacy = (
@@ -238,9 +260,10 @@ const getRegistries = (): Record<string, EnvConfig> => {
   ]);
   const normalizedRegistries = Object.fromEntries(normalizedEntries) as Record<string, EnvConfig>;
   const repairedRegistries = recoverRegistriesFromLegacy(normalizedRegistries);
-  if (!repairedRegistries.official) {
-    repairedRegistries.official = { ...DEFAULT_OFFICIAL_ENV };
+  if (!repairedRegistries[OFFICIAL_ENV_NAME]) {
+    repairedRegistries[OFFICIAL_ENV_NAME] = { ...DEFAULT_OFFICIAL_ENV };
   }
+  assertOfficialEnvironmentInvariant(repairedRegistries);
 
   const changed =
     Object.keys(rawRegistries).length !== Object.keys(repairedRegistries).length ||
@@ -254,7 +277,19 @@ const getRegistries = (): Record<string, EnvConfig> => {
 };
 
 const setRegistries = (registries: Record<string, EnvConfig>): void => {
+  assertOfficialEnvironmentInvariant(registries);
   config.set('registries', registries);
+};
+
+const getEnvironmentMutationConfig = (
+  registries: Record<string, EnvConfig>,
+): CcemConfig => ({
+  ...(config.store as unknown as CcemConfig),
+  registries,
+});
+
+const setEnvironmentMutationConfig = (next: CcemConfig): void => {
+  config.store = next as unknown as typeof config.store;
 };
 
 const getDecryptedAuthToken = (envConfig: EnvConfig): string | undefined => {
@@ -856,25 +891,22 @@ program
 program
   .command('del <name>')
   .description('Delete an environment configuration')
-  .action((name) => {
-    const registries = getRegistries();
-    if (!registries[name]) {
-      console.log(chalk.red(`Environment '${name}' not found.`));
-      return;
-    }
-
-    if (name === 'official') {
-        console.log(chalk.red(`Cannot delete default 'official' environment.`));
-        return;
-    }
-
-    delete registries[name];
-    setRegistries(registries);
-
-    const current = config.get('current');
-    if (current === name) {
-        config.set('current', 'official');
+  .action(async (name) => {
+    const wasCurrent = config.get('current') === name;
+    try {
+      const outcome = await deleteEnvironmentWithAuthority(
+        () => getEnvironmentMutationConfig(getRegistries()),
+        name,
+      );
+      if (outcome.authority === 'local') {
+        setEnvironmentMutationConfig(outcome.config);
+      }
+      if (wasCurrent) {
         console.log(chalk.yellow(`Deleted current environment. Switched back to 'official'.`));
+      }
+    } catch (error) {
+      console.log(chalk.red(error instanceof Error ? error.message : String(error)));
+      return;
     }
 
     console.log(chalk.green(`Environment '${name}' deleted.`));
@@ -883,31 +915,19 @@ program
 program
   .command('rename <old> <new>')
   .description('Rename an environment configuration')
-  .action((oldName, newName) => {
-    const registries = getRegistries();
-
-    if (!registries[oldName]) {
-      console.log(chalk.red(`Environment '${oldName}' not found.`));
+  .action(async (oldName, newName) => {
+    try {
+      const outcome = await renameEnvironmentWithAuthority(
+        () => getEnvironmentMutationConfig(getRegistries()),
+        oldName,
+        newName,
+      );
+      if (outcome.authority === 'local') {
+        setEnvironmentMutationConfig(outcome.config);
+      }
+    } catch (error) {
+      console.log(chalk.red(error instanceof Error ? error.message : String(error)));
       return;
-    }
-
-    if (registries[newName]) {
-      console.log(chalk.red(`Environment '${newName}' already exists.`));
-      return;
-    }
-
-    if (oldName === 'official') {
-      console.log(chalk.red(`Cannot rename default 'official' environment.`));
-      return;
-    }
-
-    registries[newName] = registries[oldName];
-    delete registries[oldName];
-    setRegistries(registries);
-
-    const current = config.get('current');
-    if (current === oldName) {
-      config.set('current', newName);
     }
 
     console.log(chalk.green(`Environment '${oldName}' renamed to '${newName}'.`));
@@ -1241,8 +1261,13 @@ setupCmd
       // 确保目录存在
       ensureCcemDir();
 
-      // 复制配置
-      fs.copyFileSync(legacyConfigPath, newConfigPath);
+      const legacyRaw = JSON.parse(fs.readFileSync(legacyConfigPath, 'utf-8')) as CcemConfig;
+      const migrated = normalizeCcemConfig(legacyRaw);
+      if (!migrated.registries[OFFICIAL_ENV_NAME]) {
+        migrated.registries[OFFICIAL_ENV_NAME] = { ...DEFAULT_OFFICIAL_ENV };
+      }
+      assertOfficialEnvironmentInvariant(migrated.registries);
+      setEnvironmentMutationConfig(migrated);
       console.log(chalk.green('✓ 配置已迁移'));
       console.log(chalk.gray(`  从: ${legacyConfigPath}`));
       console.log(chalk.gray(`  到: ${newConfigPath}`));
@@ -1476,6 +1501,11 @@ program
     }
 
     const proxyBaseUrl = (opts.proxyBaseUrl || opts.anthropicBaseUrl) as string | undefined;
+    if (proxyBaseUrl && !isTrustedDesktopProxyBaseUrl(proxyBaseUrl)) {
+      console.error(chalk.red('Desktop proxy override must use the local CCEM Claude proxy endpoint.'));
+      process.exitCode = 1;
+      return;
+    }
     const launchEnvConfig = proxyBaseUrl
       ? { ...envConfig, ANTHROPIC_BASE_URL: proxyBaseUrl }
       : envConfig;
@@ -1488,6 +1518,7 @@ program
       sessionId: opts.sessionId,
       resumeSessionId: opts.resumeSession,
       silent: true,
+      allowDesktopProxyOverride: Boolean(proxyBaseUrl),
     });
   });
 
@@ -1517,12 +1548,23 @@ desktopCmd
   .option('--provider-session-id <id>', 'Provider session id to continue')
   .option('--effort <level>', 'Codex effort level')
   .option('--open <value>', 'Open the created session in Desktop (true/false)')
+  .option('--route <key=env>', 'Add a session route binding (repeatable)', collectDesktopRoute, [])
+  .option('--routes-json <json>', 'Session route bindings as a JSON object')
   .option('--json', 'Output JSON')
   .action(async function(this: any) {
     const opts = this.opts();
     const provider = String(opts.provider).trim().toLowerCase();
     if (provider !== 'claude' && provider !== 'codex') {
       throw new Error("Unsupported provider. Use 'claude' or 'codex'.");
+    }
+    const hasRouteOptions = opts.route.length > 0 || opts.routesJson !== undefined;
+    const routes = provider === 'claude'
+      ? parseDesktopRoutes(opts.route, opts.routesJson)
+      : undefined;
+    if (provider === 'codex' && hasRouteOptions) {
+      console.error(chalk.yellow(
+        'Warning: Codex sessions do not support routing; --route and --routes-json were ignored.',
+      ));
     }
     const result = await requestDesktopControl('ccem.workspace.createSession', {
       provider,
@@ -1534,7 +1576,19 @@ desktopCmd
       providerSessionId: opts.providerSessionId ?? null,
       effort: opts.effort ?? null,
       open: parseOptionalBoolean(opts.open),
+      ...(routes === undefined ? {} : { routes }),
     });
+    outputDesktopResult(result, opts);
+  });
+
+desktopCmd
+  .command('routes <runtimeId>')
+  .description('Get or update one workspace session router')
+  .option('--set <key=env>', 'Set one route binding using revision-safe CAS')
+  .option('--json', 'Output JSON')
+  .action(async function(this: any, runtimeId: string) {
+    const opts = this.opts();
+    const result = await getOrUpdateDesktopRoutes(runtimeId, opts.set);
     outputDesktopResult(result, opts);
   });
 
@@ -1724,7 +1778,7 @@ program
           await new Promise(resolve => setTimeout(resolve, 800));
         } else if (result.action === 'rename') {
           // 重命名环境
-          if (result.name === 'official') {
+          if (result.name === OFFICIAL_ENV_NAME) {
             msg.error("Cannot rename default 'official' environment.");
             await new Promise(resolve => setTimeout(resolve, 800));
           } else {
@@ -1741,14 +1795,19 @@ program
               }
             ]);
 
-            registries[newName] = registries[result.name];
-            delete registries[result.name];
-            setRegistries(registries);
-
-            if (current === result.name) {
-              config.set('current', newName);
+            try {
+              const outcome = await renameEnvironmentWithAuthority(
+                () => getEnvironmentMutationConfig(registries),
+                result.name,
+                newName,
+              );
+              if (outcome.authority === 'local') {
+                setEnvironmentMutationConfig(outcome.config);
+              }
+              msg.success(`Environment '${result.name}' renamed to '${newName}'.`);
+            } catch (error) {
+              msg.error(error instanceof Error ? error.message : String(error));
             }
-            msg.success(`Environment '${result.name}' renamed to '${newName}'.`);
             await new Promise(resolve => setTimeout(resolve, 800));
           }
         } else if (result.action === 'copy') {
@@ -1789,7 +1848,7 @@ program
           await new Promise(resolve => setTimeout(resolve, 800));
         } else if (result.action === 'delete') {
           // 删除环境
-          if (result.name === 'official') {
+          if (result.name === OFFICIAL_ENV_NAME) {
             msg.error("Cannot delete default 'official' environment.");
             await new Promise(resolve => setTimeout(resolve, 800));
           } else {
@@ -1803,14 +1862,21 @@ program
             ]);
 
             if (confirm) {
-              delete registries[result.name];
-              setRegistries(registries);
-
-              if (current === result.name) {
-                config.set('current', 'official');
-                msg.warning(`Deleted current environment. Switched back to 'official'.`);
-              } else {
-                msg.success(`Environment '${result.name}' deleted.`);
+              try {
+                const outcome = await deleteEnvironmentWithAuthority(
+                  () => getEnvironmentMutationConfig(registries),
+                  result.name,
+                );
+                if (outcome.authority === 'local') {
+                  setEnvironmentMutationConfig(outcome.config);
+                }
+                if (current === result.name) {
+                  msg.warning(`Deleted current environment. Switched back to 'official'.`);
+                } else {
+                  msg.success(`Environment '${result.name}' deleted.`);
+                }
+              } catch (error) {
+                msg.error(error instanceof Error ? error.message : String(error));
               }
             }
             await new Promise(resolve => setTimeout(resolve, 800));

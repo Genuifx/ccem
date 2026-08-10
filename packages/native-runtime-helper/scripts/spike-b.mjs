@@ -3,8 +3,8 @@
  * Spike B harness — CCEM Router 设计 §5.3(docs/plans/2026-08-09-subagent-env-router-design.md)
  *
  * 目的:抓包证实四个放行门槛。
- *   B1  PreToolUse updatedInput 改写的 prompt 是否原样成为 subagent 首条 user message
- *       并出现在其 API 请求体(含多轮后仍在)
+ *   B1  PreToolUse updatedInput 改写的 prompt 是否原样成为 subagent 独立 user text block
+ *       并出现在其 API 请求体(含强制工具调用后的下一轮仍在)
  *   B2  当前版本 Task 工具的 tool_name / subagent_type 字段名(Task vs Agent)
  *   B3  ANTHROPIC_SMALL_FAST_MODEL 任意字符串是否进入请求 model 字段
  *   B4  不设 ANTHROPIC_AUTH_TOKEN 时 Authorization 头形态(harness 只记录有无;
@@ -19,6 +19,7 @@
  * 环境变量:
  *   SPIKE_TOOL_NAME=Task|Agent   指定工具名(默认先 Task,失败后自动用 Agent 重试)
  *   SPIKE_REPORT=<path>          报告输出路径(默认 ./spike-b-report.json)
+ *   SPIKE_AUTH_MODE=dummy|none   dummy 设测试 token;none 清空 token env 观测 OAuth 头
  */
 import http from 'node:http';
 import { writeFileSync } from 'node:fs';
@@ -40,11 +41,11 @@ function sseText(id, text) {
   ].map(([e, d]) => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`).join('');
 }
 
-function sseToolUse(id, toolName) {
+function sseToolUse(id, toolName, input = TASK_INPUT, toolUseId = 'toolu_spike_1') {
   return [
     ['message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', model: 'spike-model', content: [], stop_reason: null, usage: { input_tokens: 10, output_tokens: 1 } } }],
-    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_spike_1', name: toolName, input: {} } }],
-    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(TASK_INPUT) } }],
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: toolUseId, name: toolName, input: {} } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } }],
     ['content_block_stop', { type: 'content_block_stop', index: 0 }],
     ['message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 20 } }],
     ['message_stop', { type: 'message_stop' }],
@@ -55,33 +56,46 @@ function sseToolUse(id, toolName) {
 
 function startCaptureServer(toolName) {
   const captures = [];
-  let messagesSeen = 0;
+  let mainToolIssued = false;
+  let subagentProbeIssued = false;
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
       let body = null;
       try { body = JSON.parse(raw); } catch { /* keep null */ }
+      const userMessageTexts = extractUserTexts(body);
       captures.push({
         method: req.method,
         url: req.url,
         authorization: req.headers.authorization ? 'present' : 'absent',
         xApiKey: req.headers['x-api-key'] ? 'present' : 'absent',
         model: body?.model ?? null,
-        firstUserMessageText: extractFirstUserText(body),
+        firstUserMessageText: userMessageTexts[0] ?? null,
+        userMessageTexts,
         hasToolResult: JSON.stringify(body?.messages ?? []).includes('"tool_result"'),
       });
       if (!req.url?.includes('/v1/messages')) {
         res.writeHead(404).end();
         return;
       }
-      messagesSeen += 1;
-      const isToolResultFollowUp = captures[captures.length - 1].hasToolResult;
-      const payload = messagesSeen === 1
-        ? sseToolUse('msg_spike_1', toolName)
-        : isToolResultFollowUp
-          ? sseText('msg_spike_final', 'done')
-          : sseText('msg_spike_sub', 'pong');
+      const capture = captures[captures.length - 1];
+      const isBackgroundRequest = capture.model === 'ccem-route:background';
+      const hasRouteTag = capture.userMessageTexts.some((text) => text.startsWith(TAG));
+      const payload = isBackgroundRequest
+        ? sseText('msg_spike_background', 'spike title')
+        : hasRouteTag && capture.hasToolResult
+          ? sseText('msg_spike_sub_final', 'pong')
+          : hasRouteTag && !subagentProbeIssued
+            ? (subagentProbeIssued = true, sseToolUse(
+                'msg_spike_sub_tool',
+                'Bash',
+                { command: 'printf spike-multiturn', description: 'Run the spike multi-turn probe' },
+                'toolu_spike_sub_1',
+              ))
+            : !mainToolIssued
+              ? (mainToolIssued = true, sseToolUse('msg_spike_1', toolName))
+              : sseText('msg_spike_final', 'done');
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       res.end(payload);
     });
@@ -91,12 +105,15 @@ function startCaptureServer(toolName) {
   });
 }
 
-function extractFirstUserText(body) {
-  const first = body?.messages?.find?.((m) => m.role === 'user');
-  if (!first) return null;
-  if (typeof first.content === 'string') return first.content.slice(0, 200);
-  const block = first.content?.find?.((b) => b.type === 'text');
-  return block?.text?.slice(0, 200) ?? null;
+function extractUserTexts(body) {
+  return (body?.messages ?? [])
+    .filter((message) => message.role === 'user')
+    .flatMap((message) => {
+      if (typeof message.content === 'string') return [message.content.slice(0, 4000)];
+      return (message.content ?? [])
+        .filter((block) => block.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text.slice(0, 4000));
+    });
 }
 
 // ---------- 单次运行 ----------
@@ -128,6 +145,21 @@ async function runOnce(toolName) {
     process.exit(2);
   }, 120_000);
 
+  const authMode = process.env.SPIKE_AUTH_MODE === 'none' ? 'none' : 'dummy';
+  const queryEnv = {
+    ...process.env,
+    ANTHROPIC_BASE_URL: base,
+    ANTHROPIC_MODEL: 'spike-model',
+    ANTHROPIC_SMALL_FAST_MODEL: 'ccem-route:background',
+  };
+  if (authMode === 'dummy') {
+    queryEnv.ANTHROPIC_AUTH_TOKEN = 'spike-dummy';
+  } else {
+    delete queryEnv.ANTHROPIC_AUTH_TOKEN;
+    delete queryEnv.ANTHROPIC_API_KEY;
+    delete queryEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  }
+
   let sessionError = null;
   try {
     const q = query({
@@ -136,13 +168,7 @@ async function runOnce(toolName) {
         cwd: process.cwd(),
         permissionMode: 'bypassPermissions',
         settingSources: [],
-        env: {
-          ...process.env,
-          ANTHROPIC_BASE_URL: base,
-          ANTHROPIC_AUTH_TOKEN: 'spike-dummy',
-          ANTHROPIC_MODEL: 'spike-model',
-          ANTHROPIC_SMALL_FAST_MODEL: 'ccem-route:background',
-        },
+        env: queryEnv,
         hooks: {
           PreToolUse: [
             // 既有 plan guard 的占位样例:验证多 matcher 合并后两者都存活
@@ -159,28 +185,31 @@ async function runOnce(toolName) {
     clearTimeout(timeout);
     server.close();
   }
-  return { captures, hookEvents, sessionError };
+  return { authMode, captures, hookEvents, sessionError };
 }
 
 // ---------- 断言与报告 ----------
 
-function evaluate(toolName, { captures, hookEvents, sessionError }) {
+function evaluate(toolName, { authMode, captures, hookEvents, sessionError }) {
   const tagCarrier = captures.find(
-    (c) => typeof c.firstUserMessageText === 'string' && c.firstUserMessageText.includes(TAG),
+    (c) => c.userMessageTexts?.some((text) => text.startsWith(TAG)),
   );
   const multiTurnRetention = captures.filter(
-    (c) => typeof c.firstUserMessageText === 'string' && c.firstUserMessageText.includes(TAG),
+    (c) => c.userMessageTexts?.some((text) => text.startsWith(TAG)),
   ).length;
   return {
     B1_tag_reaches_subagent_request: tagCarrier ? 'PASS' : 'FAIL',
     B1_multi_turn_tag_count: multiTurnRetention,
-    B2_tool_name_used: toolName,
+    B1_multi_turn_tag_retained: multiTurnRetention >= 2 ? 'PASS' : 'FAIL',
+    B2_tool_name_candidate: toolName,
+    B2_tool_name_observed: hookEvents[0]?.tool_name ?? null,
     B2_hook_events: hookEvents,
     B2_subagent_type_field_seen: hookEvents.some((e) => e.subagent_type === 'Explore') ? 'PASS' : 'FAIL',
     B3_background_alias_in_request: captures.some((c) => c.model === 'ccem-route:background')
       ? 'PASS'
       : 'INCONCLUSIVE (短编排会话可能未触发 side-query,需人工验证)',
-    B4_authorization_header: captures.map((c) => c.authorization).includes('present') ? 'present (dummy token 模式)' : 'absent',
+    B4_auth_mode: authMode,
+    B4_authorization_header: captures.map((c) => c.authorization).includes('present') ? 'present' : 'absent',
     session_error: sessionError,
     captures,
   };
@@ -194,7 +223,7 @@ async function main() {
     console.log(`\n=== Spike B run with tool name: ${name} ===`);
     const result = await runOnce(name);
     report = { toolName: name, ...evaluate(name, result) };
-    const toolSeen = result.hookEvents.length > 0 || result.captures.length > 1;
+    const toolSeen = result.hookEvents.length > 0;
     if (toolSeen || preferred) break;
     console.log(`(未观察到 ${name} 工具调用,尝试下一个候选名)`);
   }

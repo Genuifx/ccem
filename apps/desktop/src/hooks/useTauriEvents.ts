@@ -1,5 +1,7 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { RouterStatus } from '@ccem/core/browser';
+import type { SessionRouterUpdatedEvent } from '@/lib/tauri-ipc';
 
 /**
  * Generic Tauri event listener hook
@@ -117,6 +119,28 @@ export function usePermChangedEvent(
   handler: (permMode: string) => void
 ) {
   useTauriEvent<string>('perm-changed', handler);
+}
+
+/**
+ * Hook to listen for native-session-router-updated events.
+ * Backend emits after every successful write (IPC / external control / main-env
+ * switch) with the new public SessionRouterState — the source of truth, so the
+ * UI never assembles router state itself.
+ */
+export function useSessionRouterUpdatedEvent(
+  handler: (payload: SessionRouterUpdatedEvent) => void
+) {
+  useTauriEvent<SessionRouterUpdatedEvent>('native-session-router-updated', handler);
+}
+
+/**
+ * Hook to listen for router-status events (RouterManager lifecycle: disabled /
+ * starting / ready / degraded / failed, actual bound port, errors).
+ */
+export function useRouterStatusEvent(
+  handler: (status: RouterStatus) => void
+) {
+  useTauriEvent<RouterStatus>('router-status', handler);
 }
 
 /**

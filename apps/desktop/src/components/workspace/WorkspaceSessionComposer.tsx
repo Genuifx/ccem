@@ -97,6 +97,7 @@ import {
 } from './composerModel';
 import { composerSegmentsReferenceImageAttachment } from './composerImageReferences';
 import { WorkspaceComposerAnnotations } from './WorkspaceAnnotations';
+import { WorkspaceRoutePill, ComposerRouteMenuRow } from './WorkspaceRouter';
 import {
   buildComposerPromptWithAnnotations,
   parseWorkspacePromptAnnotations,
@@ -134,6 +135,8 @@ interface WorkspaceSessionComposerProps {
   secondaryActions?: ReactNode;
   textareaProps?: Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, 'value' | 'onChange' | 'placeholder' | 'disabled'>;
   provider?: WorkspaceComposerProvider;
+  /** Active native session runtimeId — enables the Route pill above the textarea. */
+  routeRuntimeId?: string | null;
   installedSkills?: InstalledSkill[];
   onRefreshSkills?: () => Promise<InstalledSkill[]>;
   workspaceCommands?: ComposerCommandDefinition[];
@@ -486,6 +489,7 @@ function ComposerQuickMenu({
   planModeHint,
   planModeKind,
   provider,
+  routeRuntimeId,
   onLaunchNewSession,
   onPlanModeEnabledChange,
 }: {
@@ -496,6 +500,7 @@ function ComposerQuickMenu({
   planModeHint?: string;
   planModeKind: 'session_permission' | 'command_prefix';
   provider: WorkspaceComposerProvider;
+  routeRuntimeId?: string | null;
   onLaunchNewSession?: (client: LaunchClient) => void;
   onPlanModeEnabledChange?: (enabled: boolean) => void;
 }) {
@@ -590,6 +595,10 @@ function ComposerQuickMenu({
               </TooltipContent>
             </Tooltip>
           </>
+        ) : null}
+
+        {routeRuntimeId ? (
+          <ComposerRouteMenuRow runtimeId={routeRuntimeId} />
         ) : null}
       </PopoverContent>
     </Popover>
@@ -781,6 +790,7 @@ export function WorkspaceSessionComposer({
   onRemoveAnnotation,
   onClearAnnotations,
   onAnnotationsSent,
+  routeRuntimeId = null,
 }: WorkspaceSessionComposerProps) {
   const { t } = useLocale();
   const composerShellRef = useRef<HTMLDivElement | null>(null);
@@ -1218,7 +1228,7 @@ export function WorkspaceSessionComposer({
     let text = ensureComposerImagePlaceholders(promptValue, currentAttachments);
     let displayText = ensureComposerImagePlaceholders(buildComposerDisplayText(promptValue), currentAttachments);
     let latestInstalledSkills = installedSkills;
-    if (onRefreshSkills) {
+    if (onRefreshSkills && composerTextMayContainSkillReference(promptValue)) {
       try {
         const refreshedSkills = await onRefreshSkills();
         if (refreshedSkills.length > 0) {
@@ -1521,12 +1531,15 @@ export function WorkspaceSessionComposer({
             planModeEnabled && 'border-primary/15',
           )}
         >
-          {planModeEnabled ? (
-            <div className="mb-3 flex items-center">
-              <span className="inline-flex items-center gap-1.5 rounded-[6px] bg-primary/[0.06] px-2 py-0.5 text-[10px] font-medium leading-5 text-primary/70">
-                <ListChecks className="h-3 w-3" />
-                {t('workspace.composerPlanModeShort')}
-              </span>
+          {planModeEnabled || routeRuntimeId ? (
+            <div className="mb-3 flex items-center gap-2 empty:hidden">
+              {planModeEnabled ? (
+                <span className="inline-flex items-center gap-1.5 rounded-[6px] bg-primary/[0.06] px-2 py-0.5 text-[10px] font-medium leading-5 text-primary/70">
+                  <ListChecks className="h-3 w-3" />
+                  {t('workspace.composerPlanModeShort')}
+                </span>
+              ) : null}
+              {routeRuntimeId ? <WorkspaceRoutePill runtimeId={routeRuntimeId} /> : null}
             </div>
           ) : null}
           {annotations.length > 0 && onUpdateAnnotation && onRemoveAnnotation && onClearAnnotations ? (
@@ -1622,6 +1635,7 @@ export function WorkspaceSessionComposer({
               planModeHint={planModeHint}
               planModeKind={capabilities.planModeKind}
               provider={provider}
+              routeRuntimeId={routeRuntimeId}
               onLaunchNewSession={onLaunchNewSession}
               onPlanModeEnabledChange={onPlanModeEnabledChange}
             />

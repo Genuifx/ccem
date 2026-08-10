@@ -16,9 +16,15 @@ vi.mock('@ccem/core', async (importOriginal) => {
 });
 
 const {
+  buildDesktopRouterUpdateParams,
   extractHost,
+  getOrUpdateDesktopRoutes,
+  getDesktopEnvironmentReferences,
+  deleteDesktopEnvironment,
+  renameDesktopEnvironment,
   isLoopbackHost,
   isPidAlive,
+  parseDesktopRoutes,
   parseLimitOption,
   parseSinceOption,
   requestDesktopControl,
@@ -134,6 +140,65 @@ describe('desktop control client', () => {
   // ----------------------------------------------------------------------
   // requestDesktopControl
   // ----------------------------------------------------------------------
+
+  it('queries native environment references through the dedicated RPC', async () => {
+    const requester = vi.fn(async () => ({
+      references: ['runtime:recoverable-1:defaultEnv'],
+    }));
+
+    await expect(getDesktopEnvironmentReferences('legacy', requester))
+      .resolves.toEqual(['runtime:recoverable-1:defaultEnv']);
+    expect(requester).toHaveBeenCalledWith('ccem.environment.references', { name: 'legacy' });
+  });
+
+  it('rejects malformed native environment reference responses', async () => {
+    await expect(getDesktopEnvironmentReferences(
+      'legacy',
+      vi.fn(async () => ({ references: [1] })),
+    )).rejects.toThrow(/invalid.*reference/i);
+  });
+
+  it('uses the Desktop atomic rename and delete environment RPCs', async () => {
+    const requester = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        operation: 'rename',
+        oldName: 'legacy',
+        newName: 'partner',
+        updatedSessions: 2,
+        current: 'partner',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        operation: 'delete',
+        name: 'partner',
+        current: 'official',
+      });
+
+    await expect(renameDesktopEnvironment('legacy', 'partner', requester)).resolves.toMatchObject({
+      operation: 'rename',
+      updatedSessions: 2,
+    });
+    await expect(deleteDesktopEnvironment('partner', requester)).resolves.toMatchObject({
+      operation: 'delete',
+      current: 'official',
+    });
+    expect(requester).toHaveBeenNthCalledWith(1, 'ccem.environment.rename', {
+      oldName: 'legacy',
+      newName: 'partner',
+    });
+    expect(requester).toHaveBeenNthCalledWith(2, 'ccem.environment.delete', {
+      name: 'partner',
+    });
+  });
+
+  it('rejects malformed Desktop environment mutation results', async () => {
+    await expect(renameDesktopEnvironment(
+      'legacy',
+      'partner',
+      vi.fn(async () => ({ ok: true, operation: 'delete' })),
+    )).rejects.toThrow(/invalid.*mutation/i);
+  });
 
   it('sends JSON-RPC requests with the descriptor bearer token', async () => {
     writeCurrentDescriptor();
@@ -407,6 +472,124 @@ describe('desktop control client', () => {
     it('rejects non-integer values', () => {
       expect(() => parseLimitOption('abc')).toThrow(/Invalid --limit/);
       expect(() => parseLimitOption('1.5')).toThrow(/Invalid --limit/);
+    });
+  });
+
+  describe('desktop router options', () => {
+    it('merges JSON routes with repeated --route values, with flags taking precedence', () => {
+      expect(parseDesktopRoutes(
+        ['background=deepseek', 'subagent:Explore=glm'],
+        JSON.stringify({
+          background: 'official',
+          'subagent:Plan': 'official',
+        }),
+      )).toEqual({
+        background: 'deepseek',
+        'subagent:Plan': 'official',
+        'subagent:Explore': 'glm',
+      });
+    });
+
+    it('distinguishes omitted routes from an explicitly empty JSON map', () => {
+      expect(parseDesktopRoutes([], undefined)).toBeUndefined();
+      expect(parseDesktopRoutes([], '{}')).toEqual({});
+    });
+
+    it('returns stable validation errors for invalid route inputs', () => {
+      expect(() => parseDesktopRoutes(['missing-separator'], undefined))
+        .toThrow("Invalid --route value 'missing-separator'. Expected key=env.");
+      expect(() => parseDesktopRoutes([], '[]'))
+        .toThrow('Invalid --routes-json. Expected a JSON object of key-to-environment bindings.');
+      expect(() => parseDesktopRoutes([], '{broken'))
+        .toThrow('Invalid --routes-json. Expected a JSON object of key-to-environment bindings.');
+      expect(parseDesktopRoutes(['background=Team GLM (legacy):v2'], undefined))
+        .toEqual({ background: 'Team GLM (legacy):v2' });
+      expect(() => parseDesktopRoutes(['subagent:my custom reviewer=glm'], undefined))
+        .toThrow(/Invalid route key/);
+      expect(() => parseDesktopRoutes([`subagent:${'x'.repeat(129)}=glm`], undefined))
+        .toThrow(/Invalid route key/);
+    });
+
+    it('builds a CAS update while preserving bindings and allowed environments', () => {
+      const current = {
+        launchTransport: 'routed',
+        defaultEnv: 'official',
+        bindings: {
+          background: 'deepseek',
+          'subagent:Plan': 'official',
+        },
+        allowedEnvs: ['official', 'deepseek'],
+        sourceProfileId: null,
+        profileRevision: null,
+        dynamicRouting: true,
+        revision: 7,
+        warnings: [],
+      };
+
+      expect(buildDesktopRouterUpdateParams('runtime-1', current, 'subagent:Explore=glm')).toEqual({
+        runtimeId: 'runtime-1',
+        expectedRevision: 7,
+        patch: {
+          bindings: {
+            background: 'deepseek',
+            'subagent:Plan': 'official',
+            'subagent:Explore': 'glm',
+          },
+          allowedEnvs: ['official', 'deepseek', 'glm'],
+        },
+      });
+      expect(current.bindings).not.toHaveProperty('subagent:Explore');
+      expect(current.allowedEnvs).toEqual(['official', 'deepseek']);
+    });
+
+    it('does not duplicate an existing allowed target and rejects malformed state', () => {
+      const current = {
+        revision: 2,
+        bindings: { background: 'glm' },
+        allowedEnvs: ['official', 'glm'],
+      };
+      expect(buildDesktopRouterUpdateParams('runtime-2', current, 'background=glm'))
+        .toMatchObject({ patch: { allowedEnvs: ['official', 'glm'] } });
+      expect(() => buildDesktopRouterUpdateParams('runtime-2', { revision: -1 }, 'background=glm'))
+        .toThrow('Invalid router state returned by CCEM Desktop.');
+    });
+
+    it('uses getRouter then updateRouter with the returned revision', async () => {
+      const requester = vi.fn()
+        .mockResolvedValueOnce({
+          revision: 4,
+          bindings: { background: 'official' },
+          allowedEnvs: ['official'],
+        })
+        .mockResolvedValueOnce({ revision: 5, bindings: { background: 'glm' } });
+
+      await expect(getOrUpdateDesktopRoutes(
+        'runtime-3',
+        'background=glm',
+        requester,
+      )).resolves.toEqual({ revision: 5, bindings: { background: 'glm' } });
+      expect(requester).toHaveBeenNthCalledWith(1, 'ccem.workspace.getRouter', {
+        runtimeId: 'runtime-3',
+      });
+      expect(requester).toHaveBeenNthCalledWith(2, 'ccem.workspace.updateRouter', {
+        runtimeId: 'runtime-3',
+        expectedRevision: 4,
+        patch: {
+          bindings: { background: 'glm' },
+          allowedEnvs: ['official', 'glm'],
+        },
+      });
+    });
+
+    it('only calls getRouter when --set is omitted', async () => {
+      const state = { revision: 1, bindings: {}, allowedEnvs: ['official'] };
+      const requester = vi.fn().mockResolvedValue(state);
+
+      await expect(getOrUpdateDesktopRoutes('runtime-4', undefined, requester)).resolves.toBe(state);
+      expect(requester).toHaveBeenCalledOnce();
+      expect(requester).toHaveBeenCalledWith('ccem.workspace.getRouter', {
+        runtimeId: 'runtime-4',
+      });
     });
   });
 

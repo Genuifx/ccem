@@ -176,7 +176,10 @@ export const getCcemConfigPath = (): string => {
 export const ensureCcemDir = (): string => {
   const ccemDir = getCcemConfigDir();
   if (!fs.existsSync(ccemDir)) {
-    fs.mkdirSync(ccemDir, { recursive: true });
+    fs.mkdirSync(ccemDir, { recursive: true, mode: 0o700 });
+  }
+  if (process.platform !== 'win32') {
+    fs.chmodSync(ccemDir, 0o700);
   }
   return ccemDir;
 };

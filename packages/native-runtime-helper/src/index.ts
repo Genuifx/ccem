@@ -6,10 +6,17 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { buildClaudeQueryEnv } from './claudeEnv';
+import { resolveClaudeInterruptTimeoutMs } from './claudeInterruptTimeout';
 import { applyClaudePermissionModeToQuery } from './claudePermissionControl';
 import { resolveClaudePermissionRequestId, type ClaudeToolPermissionOptions } from './claudePermissionRequests';
 import { QuerySnapshotSlot, type QuerySnapshot } from './claudeQuerySnapshotSlot';
 import { buildClaudePlanModeHooks } from './claudePlanGuard';
+import { terminateOwnedProcessGroupOnParentClose } from './parentProcessTeardown';
+import {
+  buildClaudeRouterSystemPrompt,
+  mergeClaudeRouteHooks,
+  type ClaudeRouterInit,
+} from './claudeRouteHook';
 import {
   createBrowserToolBridge,
   createCcemBrowserMcpServer,
@@ -56,6 +63,7 @@ type InitCommand = {
   allowed_tools?: string[] | null;
   disallowed_tools?: string[] | null;
   todo_snapshot_seed?: TodoSnapshotV1 | null;
+  router?: ClaudeRouterInit | null;
 };
 
 type PromptCommand = {
@@ -174,7 +182,6 @@ type ClaudeInteractivePromptResolver = {
 };
 
 const DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1000;
-const DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8_000;
 const CLAUDE_INCOMPLETE_RESPONSE_REASON = 'Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.';
 
 let initCommand: InitCommand | null = null;
@@ -296,16 +303,6 @@ function resolveClaudeIdleTtlMs() {
   return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_IDLE_TTL_MS;
 }
 
-function resolveClaudeInterruptTimeoutMs() {
-  const raw = process.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS;
-  if (raw == null || raw.trim() === '') {
-    return DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
-  }
-
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
-}
-
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   if (ms <= 0) {
     return promise;
@@ -332,7 +329,9 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 }
 
 async function interruptClaudeWithTimeout(claudeQuery: ReturnType<typeof query>) {
-  const timeoutMs = resolveClaudeInterruptTimeoutMs();
+  const timeoutMs = resolveClaudeInterruptTimeoutMs(
+    process.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS,
+  );
   return withTimeout(
     claudeQuery.interrupt(),
     timeoutMs,
@@ -1489,8 +1488,10 @@ function buildClaudeQueryOptions() {
   const env = buildClaudeQueryEnv({
     envVars: initCommand.env_vars,
     effort: initCommand.effort,
+    routerMode: Boolean(initCommand.router),
   });
   const model = resolveClaudeRuntimeModel(initCommand.env_vars);
+  const routerSystemPrompt = buildClaudeRouterSystemPrompt(initCommand.router);
 
   return {
     cwd: initCommand.working_dir,
@@ -1515,8 +1516,12 @@ function buildClaudeQueryOptions() {
       ),
     },
     ...(model ? { model } : {}),
-    hooks: buildClaudePlanModeHooks(
-      () => initCommand?.provider === 'claude' && initCommand.perm_mode === 'plan',
+    ...(routerSystemPrompt ? { systemPrompt: routerSystemPrompt } : {}),
+    hooks: mergeClaudeRouteHooks(
+      buildClaudePlanModeHooks(
+        () => initCommand?.provider === 'claude' && initCommand.perm_mode === 'plan',
+      ),
+      initCommand.router,
     ),
     canUseTool: async (toolName: string, input: unknown, options: ClaudeToolPermissionOptions) => {
       if (isClaudeAskUserQuestionTool(toolName)) {
@@ -2670,7 +2675,15 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => {
+  // Desktop launches the helper as a dedicated Unix process-group leader. Once parent stdin is
+  // gone, kill that owned group first: telemetry and SDK cleanup can throw or block on broken I/O.
+  if (terminateOwnedProcessGroupOnParentClose()) {
+    return;
+  }
   if (!stopped) {
     emitStatus('stopped', 'Native runtime helper stdin closed.');
   }
+  closeClaudeQueryForRecovery();
+  teardownCodexSession(false);
+  process.exit(0);
 });

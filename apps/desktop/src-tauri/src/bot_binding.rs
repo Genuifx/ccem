@@ -1,4 +1,5 @@
 use crate::channel::{ChannelKind, InteractiveOutputChunk, OutputChannel};
+use crate::config::EnvironmentMutationCoordinator;
 use crate::event_bus::SessionEventRecord;
 use crate::native_runtime::NativeRuntimeManager;
 use crate::remote::RemotePlatform;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 mod formatting;
 mod storage;
@@ -348,9 +349,7 @@ impl BotBindingManager {
         };
         let mut items = bindings
             .values()
-            .filter(|binding| {
-                binding_target_matches(binding, platform, bot_id.as_deref(), peer_id)
-            })
+            .filter(|binding| binding_target_matches(binding, platform, bot_id.as_deref(), peer_id))
             .cloned()
             .collect::<Vec<_>>();
         items.sort_by_key(|binding| binding.connected_at);
@@ -430,6 +429,13 @@ impl BotBindingManager {
             );
         }
 
+        // Sending can lazily reconnect a persisted native session. Join the
+        // process-wide environment mutation barrier so reconnect cannot race a
+        // delete after its reference scan.
+        let environment_mutations = app
+            .try_state::<Arc<EnvironmentMutationCoordinator>>()
+            .ok_or_else(|| "Environment mutation coordinator is unavailable".to_string())?;
+        let _mutation_guard = environment_mutations.lock()?;
         native.send_user_message(
             app,
             &info.runtime_id,

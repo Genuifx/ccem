@@ -10,6 +10,85 @@ export interface EnvConfig {
   CCEM_LIMIT_WRITE_TOOLS?: boolean;
 }
 
+export type RouterBindingKey = 'background' | `subagent:${string}`;
+
+export type RouterBindings = Partial<Record<RouterBindingKey, string>>;
+
+export interface RouterProfile {
+  id: string;
+  name: string;
+  revision: number;
+  bindings: RouterBindings;
+  allowedEnvs: string[];
+}
+
+export interface RouterConfig {
+  enabled: boolean;
+  port: number;
+  bindings: RouterBindings;
+  profiles: RouterProfile[];
+  dynamicRouting: boolean;
+  defaultAllowedEnvs: string[];
+}
+
+export interface SessionRouteTable {
+  defaultEnv: string;
+  bindings: RouterBindings;
+  allowedEnvs: string[];
+}
+
+export type RouterRuntimeState =
+  | 'disabled'
+  | 'starting'
+  | 'ready'
+  | 'degraded'
+  | 'failed';
+
+export interface RouterStatus {
+  state: RouterRuntimeState;
+  requestedPort: number;
+  actualPort: number | null;
+  error: string | null;
+  oauthRoutingEnabled: boolean;
+}
+
+export type SessionLaunchTransport = 'routed' | 'direct';
+
+/** Public router state. Secret session keys and nonces must never be added here. */
+export interface SessionRouterState extends SessionRouteTable {
+  launchTransport: SessionLaunchTransport;
+  sourceProfileId: string | null;
+  profileRevision: number | null;
+  dynamicRouting: boolean;
+  revision: number;
+  warnings: string[];
+}
+
+export type UpdateSessionRouterPatch = Partial<
+  Pick<
+    SessionRouterState,
+    | 'defaultEnv'
+    | 'bindings'
+    | 'allowedEnvs'
+    | 'sourceProfileId'
+    | 'profileRevision'
+    | 'dynamicRouting'
+  >
+>;
+
+export interface UpdateSessionRouterRequest {
+  runtimeId: string;
+  expectedRevision: number;
+  patch: UpdateSessionRouterPatch;
+}
+
+export interface CcemConfig {
+  registries: Record<string, EnvConfig>;
+  current?: string | null;
+  defaultMode?: PermissionModeName | null;
+  router?: RouterConfig;
+}
+
 export interface EnvPresetMetadata {
   displayName: {
     zh: string;

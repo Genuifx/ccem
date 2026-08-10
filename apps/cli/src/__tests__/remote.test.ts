@@ -2,7 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import crypto from 'crypto';
 import { getCcemConfigDir } from '@ccem/core';
 import Conf from 'conf';
-import { decryptWithSecret as realDecryptWithSecret, resolveLoadCredentials } from '../remote';
+import {
+  decryptWithSecret as realDecryptWithSecret,
+  getUniqueImportedEnvironmentName,
+  resolveLoadCredentials,
+} from '../remote';
 
 // Test the decryption logic that remote.ts uses
 describe('remote', () => {
@@ -384,34 +388,19 @@ describe('remote', () => {
   });
 
   describe('getUniqueName logic', () => {
-    // Test the name conflict resolution logic
-    const getUniqueName = (baseName: string, existingNames: Set<string>): string => {
-      if (!existingNames.has(baseName)) {
-        return baseName;
-      }
-
-      let suffix = 1;
-      let newName = `${baseName}-remote`;
-      while (existingNames.has(newName)) {
-        suffix++;
-        newName = `${baseName}-remote-${suffix}`;
-      }
-      return newName;
-    };
-
     it('should return original name if not exists', () => {
       const existing = new Set(['other']);
-      expect(getUniqueName('new-env', existing)).toBe('new-env');
+      expect(getUniqueImportedEnvironmentName('new-env', existing)).toBe('new-env');
     });
 
     it('should add -remote suffix if name exists', () => {
       const existing = new Set(['my-env']);
-      expect(getUniqueName('my-env', existing)).toBe('my-env-remote');
+      expect(getUniqueImportedEnvironmentName('my-env', existing)).toBe('my-env-remote');
     });
 
     it('should add numbered suffix if -remote also exists', () => {
       const existing = new Set(['my-env', 'my-env-remote']);
-      expect(getUniqueName('my-env', existing)).toBe('my-env-remote-2');
+      expect(getUniqueImportedEnvironmentName('my-env', existing)).toBe('my-env-remote-2');
     });
 
     it('should increment number until unique', () => {
@@ -421,7 +410,13 @@ describe('remote', () => {
         'my-env-remote-2',
         'my-env-remote-3',
       ]);
-      expect(getUniqueName('my-env', existing)).toBe('my-env-remote-4');
+      expect(getUniqueImportedEnvironmentName('my-env', existing)).toBe('my-env-remote-4');
+    });
+
+    it('renames an imported official environment instead of overwriting the protected entry', () => {
+      expect(getUniqueImportedEnvironmentName('official', new Set(['official']))).toBe(
+        'official-remote',
+      );
     });
   });
 

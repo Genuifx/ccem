@@ -111,6 +111,8 @@ import {
   Rocket01Icon,
   RotateLeft01Icon,
   RotateRight01Icon,
+  Route01Icon,
+  Router01Icon,
   ScissorIcon,
   ScrollIcon,
   Search01Icon,
@@ -305,6 +307,8 @@ export const RefreshCw = createIcon(RefreshIcon, 'RefreshCw');
 export const Rocket = createIcon(Rocket01Icon, 'Rocket');
 export const RotateCcw = createIcon(RotateLeft01Icon, 'RotateCcw');
 export const RotateCw = createIcon(RotateRight01Icon, 'RotateCw');
+export const Route = createIcon(Route01Icon, 'Route');
+export const Router = createIcon(Router01Icon, 'Router');
 export const Save = createIcon(FloppyDiskIcon, 'Save');
 export const Scissors = createIcon(ScissorIcon, 'Scissors');
 export const ScrollText = createIcon(ScrollIcon, 'ScrollText');

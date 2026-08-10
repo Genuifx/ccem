@@ -27405,10 +27405,23 @@ var MANAGED_CLAUDE_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_SMALL_FAST_MODEL"
 ];
+var ROUTER_BYPASS_HOSTS = ["127.0.0.1", "localhost", "::1"];
+function mergeNoProxyHosts(value) {
+  const hosts = (value ?? "").split(",").map((host) => host.trim()).filter(Boolean);
+  const seen = new Set(hosts.map((host) => host.toLowerCase()));
+  for (const host of ROUTER_BYPASS_HOSTS) {
+    if (!seen.has(host.toLowerCase())) {
+      hosts.push(host);
+      seen.add(host.toLowerCase());
+    }
+  }
+  return hosts.join(",");
+}
 function buildClaudeQueryEnv({
   envVars,
   effort,
-  baseEnv = process2.env
+  baseEnv = process2.env,
+  routerMode = false
 } = {}) {
   const cleanBaseEnv = { ...baseEnv };
   for (const key of MANAGED_CLAUDE_ENV_KEYS) {
@@ -27423,10 +27436,29 @@ function buildClaudeQueryEnv({
   if (env.ANTHROPIC_AUTH_TOKEN) {
     delete env.ANTHROPIC_API_KEY;
   }
+  if (routerMode) {
+    delete env.CLAUDE_CODE_SUBAGENT_MODEL;
+    env.ANTHROPIC_SMALL_FAST_MODEL = "ccem-route:background";
+    env.NO_PROXY = mergeNoProxyHosts(env.NO_PROXY);
+    env.no_proxy = mergeNoProxyHosts(env.no_proxy);
+  }
   if (effort) {
     env.CLAUDE_CODE_EFFORT_LEVEL = effort;
   }
   return env;
+}
+
+// src/claudeInterruptTimeout.ts
+var DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8e3;
+function resolveClaudeInterruptTimeoutMs(raw) {
+  if (raw == null || raw.trim() === "") {
+    return DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
+  }
+  return Math.min(DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS, Math.max(0, parsed));
 }
 
 // src/permissionModes.ts
@@ -27630,6 +27662,114 @@ function buildClaudePlanModeHooks(isPlanMode) {
     PreToolUse: [{
       hooks: [buildClaudePlanModePreToolUseHook(isPlanMode)]
     }]
+  };
+}
+
+// src/parentProcessTeardown.ts
+function terminateOwnedProcessGroupOnParentClose(platform = process.platform, pid = process.pid, killProcess = process.kill.bind(process)) {
+  if (platform === "win32" || !Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  try {
+    killProcess(-pid, "SIGKILL");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/claudeRouteHook.ts
+var SAFE_SUBAGENT_TYPE = /^[A-Za-z0-9._:-]{1,128}$/;
+var SAFE_ENV_ALIAS = /^[A-Za-z0-9._-]{1,64}$/;
+var SAFE_ROUTE_NONCE = /^[A-Za-z0-9._~-]{1,256}$/;
+var RAW_ENV_OVERRIDE_PREFIX = "<CCEM-ROUTE>ccem:";
+var RAW_ENV_OVERRIDE = /^<CCEM-ROUTE>ccem:([A-Za-z0-9._-]{1,64})<\/CCEM-ROUTE>(?:\r?\n)?/;
+function asRecord2(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function isSafeSubagentType(value) {
+  return typeof value === "string" && SAFE_SUBAGENT_TYPE.test(value);
+}
+function takeExactRawEnvOverride(prompt) {
+  const match = RAW_ENV_OVERRIDE.exec(prompt);
+  if (!match || !SAFE_ENV_ALIAS.test(match[1])) {
+    return null;
+  }
+  return {
+    env: match[1],
+    rest: prompt.slice(match[0].length)
+  };
+}
+function denyRoute(code, message) {
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: `${code}: ${message}`
+    }
+  };
+}
+function buildClaudeRoutePreToolUseHook(router) {
+  return async function claudeRoutePreToolUseHook(input) {
+    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Agent" || !SAFE_ROUTE_NONCE.test(router.routeTagNonce)) {
+      return { continue: true };
+    }
+    const toolInput = asRecord2(input.tool_input);
+    const subagentType = toolInput.subagent_type;
+    if (!isSafeSubagentType(subagentType)) {
+      return denyRoute(
+        "ROUTER_AGENT_TYPE_INVALID",
+        "Agent subagent_type must be 1-128 ASCII letters, numbers, '.', '_', '-', or ':'."
+      );
+    }
+    const prompt = typeof toolInput.prompt === "string" ? toolInput.prompt : "";
+    const override = takeExactRawEnvOverride(prompt);
+    if (prompt.startsWith(RAW_ENV_OVERRIDE_PREFIX) && !override) {
+      return denyRoute(
+        "ROUTER_ENV_ALIAS_INVALID",
+        "Explicit CCEM environment aliases must be 1-64 ASCII letters, numbers, '.', '_', or '-'."
+      );
+    }
+    const identity = override ? `ccem:${override.env}` : `subagent:${subagentType}`;
+    const rest = override?.rest ?? prompt;
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        updatedInput: {
+          ...toolInput,
+          prompt: `<CCEM-ROUTE nonce="${router.routeTagNonce}">${identity}</CCEM-ROUTE>
+${rest}`
+        }
+      }
+    };
+  };
+}
+function mergeClaudeRouteHooks(hooks, router) {
+  if (!router || !SAFE_ROUTE_NONCE.test(router.routeTagNonce)) {
+    return hooks;
+  }
+  return {
+    ...hooks,
+    PreToolUse: [
+      ...hooks.PreToolUse ?? [],
+      {
+        matcher: "Agent",
+        hooks: [buildClaudeRoutePreToolUseHook(router)]
+      }
+    ]
+  };
+}
+function buildClaudeRouterSystemPrompt(router) {
+  const menu = router?.menu?.trim();
+  if (!router?.dynamicRouting || !menu) {
+    return void 0;
+  }
+  return {
+    type: "preset",
+    preset: "claude_code",
+    append: menu
   };
 }
 
@@ -41724,14 +41864,14 @@ import fs3 from "node:fs";
 import os4 from "node:os";
 import path5 from "node:path";
 var TAIL_BYTES = 512 * 1024;
-function asRecord2(value) {
+function asRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
 }
 function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 function usageTotalTokens(value) {
-  const usage = asRecord2(value);
+  const usage = asRecord3(value);
   if (!usage) return null;
   const total = finiteNumber(usage.total_tokens);
   if (total !== null && total >= 0) {
@@ -41743,15 +41883,15 @@ function usageTotalTokens(value) {
   return totalFromParts > 0 ? totalFromParts : null;
 }
 function usageCategoryTokens(value, key) {
-  const usage = asRecord2(value);
+  const usage = asRecord3(value);
   return Math.max(0, finiteNumber(usage?.[key]) ?? 0);
 }
 function buildCodexContextUsageFromTokenCount(payload, fallbackModel = "codex") {
   if (payload.type !== "token_count") {
     return null;
   }
-  const info = asRecord2(payload.info);
-  const lastUsage = info ? asRecord2(info.last_token_usage) : null;
+  const info = asRecord3(payload.info);
+  const lastUsage = info ? asRecord3(info.last_token_usage) : null;
   if (!info || !lastUsage) {
     return null;
   }
@@ -41857,7 +41997,7 @@ function readLatestCodexContextUsageFromSessionFile(filePath) {
     } catch {
       continue;
     }
-    const payload = asRecord2(parsed.payload);
+    const payload = asRecord3(parsed.payload);
     if (!payload) {
       continue;
     }
@@ -42298,7 +42438,6 @@ function withSuppressedClaudeBypassShadowWarning(options, createQuery) {
 
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
-var DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8e3;
 var CLAUDE_INCOMPLETE_RESPONSE_REASON = "Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.";
 var initCommand = null;
 var stopped = false;
@@ -42398,14 +42537,6 @@ function resolveClaudeIdleTtlMs() {
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_IDLE_TTL_MS;
 }
-function resolveClaudeInterruptTimeoutMs() {
-  const raw = process5.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS;
-  if (raw == null || raw.trim() === "") {
-    return DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
-  }
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
-}
 async function withTimeout(promise2, ms, message) {
   if (ms <= 0) {
     return promise2;
@@ -42430,7 +42561,9 @@ async function withTimeout(promise2, ms, message) {
   }
 }
 async function interruptClaudeWithTimeout(claudeQuery) {
-  const timeoutMs = resolveClaudeInterruptTimeoutMs();
+  const timeoutMs = resolveClaudeInterruptTimeoutMs(
+    process5.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS
+  );
   return withTimeout(
     claudeQuery.interrupt(),
     timeoutMs,
@@ -43272,9 +43405,11 @@ function buildClaudeQueryOptions() {
   });
   const env = buildClaudeQueryEnv({
     envVars: initCommand.env_vars,
-    effort: initCommand.effort
+    effort: initCommand.effort,
+    routerMode: Boolean(initCommand.router)
   });
   const model = resolveClaudeRuntimeModel(initCommand.env_vars);
+  const routerSystemPrompt = buildClaudeRouterSystemPrompt(initCommand.router);
   return {
     cwd: initCommand.working_dir,
     env,
@@ -43298,8 +43433,12 @@ function buildClaudeQueryOptions() {
       )
     },
     ...model ? { model } : {},
-    hooks: buildClaudePlanModeHooks(
-      () => initCommand?.provider === "claude" && initCommand.perm_mode === "plan"
+    ...routerSystemPrompt ? { systemPrompt: routerSystemPrompt } : {},
+    hooks: mergeClaudeRouteHooks(
+      buildClaudePlanModeHooks(
+        () => initCommand?.provider === "claude" && initCommand.perm_mode === "plan"
+      ),
+      initCommand.router
     ),
     canUseTool: async (toolName, input, options) => {
       if (isClaudeAskUserQuestionTool(toolName)) {
@@ -44305,9 +44444,15 @@ rl2.on("line", (line) => {
   });
 });
 rl2.on("close", () => {
+  if (terminateOwnedProcessGroupOnParentClose()) {
+    return;
+  }
   if (!stopped) {
     emitStatus("stopped", "Native runtime helper stdin closed.");
   }
+  closeClaudeQueryForRecovery();
+  teardownCodexSession(false);
+  process5.exit(0);
 });
 /*! Bundled license information:
 

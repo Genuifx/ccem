@@ -46,6 +46,8 @@ import {
   useSessionUpdatedEvent,
   useTaskCompletedEvent,
   useTaskErrorEvent,
+  useRouterStatusEvent,
+  useSessionRouterUpdatedEvent,
 } from '@/hooks/useTauriEvents';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useLocale } from '@/locales';
@@ -335,6 +337,8 @@ export function Workspace({
   const workspaceReviewOpen = useAppStore((state) => state.reviewPanelOpen);
   const setWorkspaceReviewOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
+  const setSessionRouter = useAppStore((state) => state.setSessionRouter);
+  const setRouterStatus = useAppStore((state) => state.setRouterStatus);
 
   const {
     switchEnvironment,
@@ -350,6 +354,8 @@ export function Workspace({
     createNativeSession,
     getNativeSessionEvents,
     listNativeSessions,
+    loadRouterStatus,
+    loadRouterSettings,
     launchOpenCodeWeb,
     launchClaudeCode,
     openInteractiveSessionInTerminal,
@@ -660,10 +666,15 @@ export function Workspace({
       seedMessages?: ConversationMessageData[];
     } = {},
   ) => {
+    // Seed per-session router state from the summary so the chip/pill reflect
+    // reality immediately (covers create + restore + ccem/cron link paths).
+    if (session.router) {
+      setSessionRouter(session.runtime_id, session.router);
+    }
     updateLiveSessionsByRuntimeId((previous) =>
       upsertWorkspaceLiveSessionEntry(previous, session, options)
     );
-  }, [updateLiveSessionsByRuntimeId]);
+  }, [setSessionRouter, updateLiveSessionsByRuntimeId]);
 
   const setLiveSessionGeneratedTitle = useCallback((runtimeId: string, title: string) => {
     updateLiveSessionsByRuntimeId((previous) => {
@@ -690,6 +701,11 @@ export function Workspace({
 
     try {
       const nativeSessions = await listNativeSessions();
+      // Seed per-session router state from the summaries so the chip/pill render
+      // correct state immediately (before any event fires or popover is opened).
+      for (const ns of nativeSessions) {
+        if (ns.router) setSessionRouter(ns.runtime_id, ns.router);
+      }
       if (requestSeq !== nativeSessionRestoreRequestSeqRef.current) {
         return;
       }
@@ -1148,6 +1164,27 @@ export function Workspace({
   useSessionInterruptedEvent(() => {
     scheduleWorkspaceRefresh();
   });
+
+  // Router events are the source of truth — the backend emits after every
+  // successful write (IPC / external control / main-env switch). Apply directly;
+  // the store dedups by revision.
+  useSessionRouterUpdatedEvent((payload) => {
+    setSessionRouter(payload.runtimeId, payload.router);
+  });
+  useRouterStatusEvent((status) => {
+    setRouterStatus(status);
+  });
+
+  // Seed global router status + config once so the status-strip chip and
+  // Settings reflect reality before any event fires.
+  useEffect(() => {
+    void loadRouterStatus().catch(() => {
+      // Router may be disabled or unavailable; the chip handles the disabled state.
+    });
+    void loadRouterSettings().catch(() => {
+      // Best-effort; Settings will re-read on open.
+    });
+  }, [loadRouterStatus, loadRouterSettings]);
 
   const selectedSession = useMemo(() => {
     if (!selectedKey) return null;
@@ -2765,6 +2802,12 @@ export function Workspace({
             browserOpen={browserPanelOpen}
             onToggleBrowser={() => setActiveBrowserPanelOpen((open) => !open)}
             envContext={statusStripEnvContext}
+            activeRuntimeId={
+              workspaceMode === 'live' && activeLiveEntry?.session.provider === 'claude'
+                ? activeLiveRuntimeId
+                : null
+            }
+            onNavigateSettings={() => onNavigate('settings')}
           />
 
           <div

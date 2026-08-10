@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { resolveEnvConfigForRuntime } from '@ccem/core/browser';
+import type {
+  RouterConfig,
+  RouterStatus,
+  SessionRouterState,
+  UpdateSessionRouterPatch,
+} from '@ccem/core/browser';
 import { useAppStore, type Environment, type Session, type ArrangeLayout, type InstalledSkill, type CronTask, type CronTaskRun, type CronTemplate, type CronWecomNotification, type LaunchClient } from '@/store';
 import { useCallback } from 'react';
 import { toast } from 'sonner';
@@ -51,6 +57,8 @@ import type {
   WorkspaceMediaPreview,
   WorkspaceCommand,
 } from '@/lib/tauri-ipc';
+import { extractRouterServiceError, type RouterServiceError } from '@/lib/routerConflict';
+import { coordinateEnvDelete } from '@/lib/envDeleteCoordination';
 
 function makeLaunchTraceId(): string {
   return `launch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -232,6 +240,9 @@ export function useTauriCommands() {
     setCronRuns,
     setLoadingCron,
     setDefaultWorkingDir,
+    setRouterConfig,
+    setRouterStatus,
+    setSessionRouter,
   } = useAppStore(
     (state) => ({
       setEnvironments: state.setEnvironments,
@@ -253,6 +264,9 @@ export function useTauriCommands() {
       setCronRuns: state.setCronRuns,
       setLoadingCron: state.setLoadingCron,
       setDefaultWorkingDir: state.setDefaultWorkingDir,
+      setRouterConfig: state.setRouterConfig,
+      setRouterStatus: state.setRouterStatus,
+      setSessionRouter: state.setSessionRouter,
     }),
     shallow
   );
@@ -287,8 +301,10 @@ export function useTauriCommands() {
       envList.sort((a, b) => a.name.localeCompare(b.name));
       setEnvironments(envList);
       setError(null);
+      return true;
     } catch (err) {
       setError(`Failed to load environments: ${err}`);
+      return false;
     } finally {
       if (!silent) {
         setLoading(false);
@@ -380,33 +396,74 @@ export function useTauriCommands() {
         await invoke('save_enabled_environments', { names: next });
         setEnabledEnvironments(next);
       }
+      // Backend cascades RouterConfig env references on rename; refresh the
+      // authoritative routerConfig so useRouterConfigEditor (which skips
+      // refetch when cached) doesn't keep stale env names in rules/profiles.
+      if (previousName !== env.name) {
+        try {
+          const router = await invoke<RouterConfig>('get_router_settings');
+          setRouterConfig(router);
+        } catch {
+          // Router may be disabled/absent; non-fatal.
+        }
+      }
       setError(null);
     } catch (err) {
       setError(`Failed to update environment: ${err}`);
     } finally {
       setLoading(false);
     }
-  }, [loadEnvironments, loadCurrentEnv, setEnabledEnvironments, setLoading, setError]);
+  }, [loadEnvironments, loadCurrentEnv, setEnabledEnvironments, setRouterConfig, setLoading, setError]);
+
+  const getEnvironmentRouterReferences = useCallback(async (name: string): Promise<string[]> => {
+    return invoke<string[]>('get_environment_router_references', { name });
+  }, []);
 
   const deleteEnvironment = useCallback(async (name: string) => {
     setLoading(true);
     try {
-      await invoke('delete_environment', { name });
-      await loadEnvironments();
-      // Keep enable list tidy when an environment is removed.
-      const currentEnabled = useAppStore.getState().enabledEnvironments;
-      if (currentEnabled != null && currentEnabled.includes(name)) {
-        const next = currentEnabled.filter((envName) => envName !== name);
-        await invoke('save_enabled_environments', { names: next });
-        setEnabledEnvironments(next);
+      // Capture the pre-delete local state to plan the local removal. The remote
+      // delete does not mutate these, so this is correct regardless of outcome.
+      const before = useAppStore.getState();
+      const nextEnvironments = before.environments.filter((env) => env.name !== name);
+      const beforeEnabled = before.enabledEnvironments;
+      const enabledChanged = beforeEnabled != null && beforeEnabled.includes(name);
+      const nextEnabled = beforeEnabled != null
+        ? beforeEnabled.filter((n) => n !== name)
+        : null;
+
+      // coordinateEnvDelete enforces the commit boundary: only deleteRemote may
+      // throw outward (→ App keeps the dialog). Post-commit failures are captured
+      // into `partial`; the delete always resolves once committed.
+      const partial = await coordinateEnvDelete({
+        deleteRemote: () => invoke('delete_environment', { name }),
+        removeLocal: () => {
+          setEnvironments(nextEnvironments);
+          if (enabledChanged && nextEnabled != null) setEnabledEnvironments(nextEnabled);
+        },
+        persistEnabled:
+          enabledChanged && nextEnabled != null
+            ? () => invoke('save_enabled_environments', { names: nextEnabled })
+            : async () => undefined,
+        refresh: async () => {
+          if (!(await loadEnvironments())) throw new Error('environment refresh failed');
+        },
+      });
+
+      if (partial.length > 0) {
+        setError(`Environment "${name}" deleted, but: ${partial.join('; ')}.`);
+      } else {
+        setError(null);
       }
-      setError(null);
+      // Resolves post-commit (delete committed) — App closes the dialog.
     } catch (err) {
+      // deleteRemote (commit boundary) failed → surface + keep dialog (rethrow).
       setError(`Failed to delete environment: ${err}`);
+      throw err;
     } finally {
       setLoading(false);
     }
-  }, [loadEnvironments, setEnabledEnvironments, setLoading, setError]);
+  }, [loadEnvironments, setEnvironments, setEnabledEnvironments, setLoading, setError]);
 
   const loadEnabledEnvironments = useCallback(async () => {
     try {
@@ -1463,6 +1520,71 @@ export function useTauriCommands() {
     await invoke('clear_proxy_traffic');
   }, []);
 
+  // ---- Router (CCEM Router) ----
+
+  const loadRouterSettings = useCallback(async (): Promise<RouterConfig> => {
+    const config = await invoke<RouterConfig>('get_router_settings');
+    setRouterConfig(config);
+    return config;
+  }, [setRouterConfig]);
+
+  const saveRouterSettings = useCallback(async (config: RouterConfig): Promise<RouterStatus> => {
+    const status = await invoke<RouterStatus>('update_router_settings', { settings: config });
+    // update_router_settings writes config.router verbatim after validation,
+    // so the sent config is the stored config.
+    setRouterConfig(config);
+    setRouterStatus(status);
+    return status;
+  }, [setRouterConfig, setRouterStatus]);
+
+  const loadRouterStatus = useCallback(async (): Promise<RouterStatus> => {
+    const status = await invoke<RouterStatus>('router_status');
+    setRouterStatus(status);
+    return status;
+  }, [setRouterStatus]);
+
+  const getSessionRouter = useCallback(async (runtimeId: string): Promise<SessionRouterState> => {
+    const router = await invoke<SessionRouterState>('get_session_router', { runtimeId });
+    setSessionRouter(runtimeId, router);
+    return router;
+  }, [setSessionRouter]);
+
+  /**
+   * CAS update_session_router. Never throws: returns a discriminated result so
+   * the caller can rebase on conflict (the store is already updated with
+   * `conflict.current` when present) and decide whether to retry or inform.
+   */
+  const updateSessionRouter = useCallback(async (
+    runtimeId: string,
+    expectedRevision: number,
+    patch: UpdateSessionRouterPatch,
+  ): Promise<
+    | { ok: true; router: SessionRouterState }
+    | { ok: false; conflict: RouterServiceError }
+  > => {
+    try {
+      const router = await invoke<SessionRouterState>('update_session_router', {
+        request: { runtimeId, expectedRevision, patch },
+      });
+      setSessionRouter(runtimeId, router);
+      return { ok: true, router };
+    } catch (err) {
+      const conflict = extractRouterServiceError(err);
+      if (conflict.current) {
+        setSessionRouter(runtimeId, conflict.current);
+      }
+      return { ok: false, conflict };
+    }
+  }, [setSessionRouter]);
+
+  const restartNativeSessionDirect = useCallback(async (
+    runtimeId: string,
+  ): Promise<SessionRouterState> => {
+    const router = await invoke<SessionRouterState>('restart_native_session_direct', { runtimeId });
+    setSessionRouter(runtimeId, router);
+    return router;
+  }, [setSessionRouter]);
+
   const generateWorkspaceSessionTitle = useCallback(async (titleInput: string): Promise<string | null> => {
     return invoke<string | null>('generate_workspace_session_title', { titleInput });
   }, []);
@@ -1506,6 +1628,7 @@ export function useTauriCommands() {
     addEnvironment,
     updateEnvironment,
     deleteEnvironment,
+    getEnvironmentRouterReferences,
     loadEnabledEnvironments,
     saveEnabledEnvironments,
     launchClaudeCode,
@@ -1624,6 +1747,12 @@ export function useTauriCommands() {
     listProxyTraffic,
     getProxyTrafficDetail,
     clearProxyTraffic,
+    loadRouterSettings,
+    saveRouterSettings,
+    loadRouterStatus,
+    getSessionRouter,
+    updateSessionRouter,
+    restartNativeSessionDirect,
     generateWorkspaceSessionTitle,
     openTextInVSCode,
     setSessionTitle,

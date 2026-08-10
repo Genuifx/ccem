@@ -2988,6 +2988,7 @@ export function WorkspaceNativeSessionView({
         workspaceCommands={workspaceCommands}
         workingDir={session.project_dir}
         searchWorkspaceFiles={searchWorkspaceFiles}
+        routeRuntimeId={session.provider === 'claude' ? session.runtime_id : null}
         planModeEnabled={composerPlanModeEnabled}
         onPlanModeEnabledChange={handlePlanModeEnabledChange}
         planModeHint={session.provider === 'claude' && sessionRuntimePermMode === 'plan'

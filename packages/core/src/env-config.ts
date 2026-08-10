@@ -1,13 +1,90 @@
-import type { EnvConfig } from './types.js';
+import type { CcemConfig, EnvConfig, RouterConfig } from './types.js';
+import { normalizeRouterConfig } from './router.js';
+
+export const OFFICIAL_ENV_NAME = 'official';
+export const OFFICIAL_BASE_URL = 'https://api.anthropic.com';
+
+/**
+ * The protected OAuth-backed environment may only target Anthropic's root
+ * endpoint. A single trailing slash is accepted because EnvConfig stores a URL
+ * string rather than a parsed origin; all other textual variants fail closed.
+ */
+export function isTrustedOfficialBaseUrl(value: unknown): value is string {
+  return value === OFFICIAL_BASE_URL || value === `${OFFICIAL_BASE_URL}/`;
+}
+
+/** All config writers must retain CCEM's protected built-in environment. */
+export function assertOfficialEnvironmentPresent(
+  registries: unknown,
+): asserts registries is Record<string, unknown> {
+  if (
+    !registries
+    || typeof registries !== 'object'
+    || Array.isArray(registries)
+    || !Object.prototype.hasOwnProperty.call(registries, OFFICIAL_ENV_NAME)
+  ) {
+    throw new TypeError(`Cannot remove or rename the protected '${OFFICIAL_ENV_NAME}' environment`);
+  }
+}
+
+/** All persisted config writers must preserve the trusted built-in endpoint. */
+export function assertOfficialEnvironmentInvariant(
+  registries: unknown,
+): asserts registries is Record<string, EnvConfig> {
+  assertOfficialEnvironmentPresent(registries);
+  const official = registries[OFFICIAL_ENV_NAME];
+  if (
+    !official
+    || typeof official !== 'object'
+    || Array.isArray(official)
+    || !isTrustedOfficialBaseUrl(
+      (official as Record<string, unknown>).ANTHROPIC_BASE_URL,
+    )
+  ) {
+    throw new TypeError(
+      `The protected '${OFFICIAL_ENV_NAME}' environment must use the trusted official root URL`,
+    );
+  }
+}
+
+/**
+ * Prevent Claude Code from falling back to a user's local OAuth credentials at
+ * an environment-controlled third-party endpoint.
+ */
+export function assertClaudeEnvironmentAuthBoundary(
+  envName: string | undefined,
+  baseUrl: string | undefined,
+  decryptedAuthToken: string | undefined,
+): void {
+  if (envName === OFFICIAL_ENV_NAME) {
+    if (!isTrustedOfficialBaseUrl(baseUrl)) {
+      throw new TypeError(
+        `The protected '${OFFICIAL_ENV_NAME}' environment must use the trusted official root URL`,
+      );
+    }
+    return;
+  }
+
+  if (!decryptedAuthToken?.trim()) {
+    throw new TypeError(
+      `Environment '${envName ?? '<unknown>'}' requires an auth token; OAuth is only allowed for '${OFFICIAL_ENV_NAME}'`,
+    );
+  }
+}
 
 export interface LegacyEnvConfig extends EnvConfig {
   ANTHROPIC_API_KEY?: string;
   ANTHROPIC_SMALL_FAST_MODEL?: string;
 }
 
+export interface LegacyCcemConfig {
+  registries?: Record<string, Partial<LegacyEnvConfig>>;
+  current?: string | null;
+  defaultMode?: CcemConfig['defaultMode'];
+  router?: Partial<RouterConfig>;
+}
+
 const TIER_MODEL_ALIASES = new Set(['opus', 'sonnet', 'haiku']);
-const OFFICIAL_ENV_NAME = 'official';
-const OFFICIAL_BASE_URL = 'https://api.anthropic.com';
 const LEGACY_OFFICIAL_MODEL_PIN = 'claude-opus-4-1-20250805';
 const LEGACY_OFFICIAL_HAIKU_PIN = 'claude-3-5-haiku-20241022';
 const OFFICIAL_RUNTIME_ALIAS = 'opus';
@@ -72,6 +149,30 @@ export function normalizeEnvConfig(
   };
 }
 
+/** Normalize the shared config shape without dropping an optional router section. */
+export function normalizeCcemConfig(config: LegacyCcemConfig): CcemConfig {
+  const normalized: CcemConfig = {
+    registries: Object.fromEntries(
+      Object.entries(config.registries ?? {}).map(([name, env]) => [
+        name,
+        normalizeEnvConfig(env),
+      ]),
+    ),
+  };
+
+  if (config.current !== undefined) {
+    normalized.current = config.current;
+  }
+  if (config.defaultMode !== undefined) {
+    normalized.defaultMode = config.defaultMode;
+  }
+  if (config.router !== undefined) {
+    normalized.router = normalizeRouterConfig(config.router);
+  }
+
+  return normalized;
+}
+
 function shouldRecoverTierModel(model?: string): boolean {
   return !model || TIER_MODEL_ALIASES.has(model);
 }
@@ -123,7 +224,7 @@ export function resolveEnvConfigForRuntime(
   const resolved = { ...envConfig };
   const hasUntouchedLegacyOfficialPins =
     envName === OFFICIAL_ENV_NAME &&
-    resolved.ANTHROPIC_BASE_URL === OFFICIAL_BASE_URL &&
+    isTrustedOfficialBaseUrl(resolved.ANTHROPIC_BASE_URL) &&
     resolved.ANTHROPIC_DEFAULT_OPUS_MODEL === LEGACY_OFFICIAL_MODEL_PIN &&
     resolved.ANTHROPIC_DEFAULT_SONNET_MODEL === LEGACY_OFFICIAL_MODEL_PIN &&
     resolved.ANTHROPIC_DEFAULT_HAIKU_MODEL === LEGACY_OFFICIAL_HAIKU_PIN &&

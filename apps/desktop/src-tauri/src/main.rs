@@ -35,7 +35,9 @@ mod pet_window;
 mod prompt_image_store;
 mod proxy_debug;
 mod remote;
+mod router;
 mod runtime;
+mod secure_fs;
 mod session;
 mod session_annotations;
 mod session_provenance;
@@ -92,6 +94,11 @@ use proxy_debug::{
     ProxyDebugManager, ProxyDebugState, ProxyTrafficDetail, ProxyTrafficPage, RegisterRouteRequest,
 };
 use remote::RemotePlatform;
+use router::{
+    rename_router_config_environment, router_config_environment_references, validate_router_config,
+    RouterConfig, RouterManager, RouterServiceError, RouterStatus, SessionRouterPatch,
+    SessionRouterState, UpdateSessionRouterRequest,
+};
 use runtime::{
     cleanup_orphaned_runtime_processes, clear_runtime_recovery_candidates_by_claude_session_id,
     dismiss_runtime_recovery_candidate as dismiss_runtime_recovery_candidate_entry,
@@ -134,7 +141,7 @@ use workspace_search::search_workspace_files;
 static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 use tauri::window::Color;
-use tauri::{webview::PageLoadEvent, Manager, RunEvent, State, WindowEvent};
+use tauri::{webview::PageLoadEvent, Emitter, Manager, RunEvent, State, WindowEvent};
 use terminal::{
     ArrangeLayout, ArrangeSessionInfo, TerminalInfo, TerminalType, TmuxAttachTerminalInfo,
     TmuxAttachTerminalType,
@@ -257,8 +264,12 @@ fn window_control(app: tauri::AppHandle, action: WindowControlAction) -> Result<
 }
 
 #[tauri::command]
-async fn get_environments() -> Result<HashMap<String, EnvConfig>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn get_environments(
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<HashMap<String, EnvConfig>, String> {
+    let environment_mutations = environment_mutations.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
         #[cfg(debug_assertions)]
         let start = std::time::Instant::now();
         let cfg = config::read_config()?;
@@ -283,13 +294,20 @@ async fn get_environments() -> Result<HashMap<String, EnvConfig>, String> {
 }
 
 #[tauri::command]
-fn get_current_env() -> Result<String, String> {
+fn get_current_env(
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<String, String> {
+    let _mutation_guard = environment_mutations.lock()?;
     let cfg = config::read_config()?;
     Ok(cfg.current.unwrap_or_else(|| "official".to_string()))
 }
 
 #[tauri::command]
-fn set_current_env(name: String) -> Result<(), String> {
+fn set_current_env(
+    name: String,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     let mut cfg = config::read_config()?;
 
     // 校验环境是否存在
@@ -312,7 +330,9 @@ fn add_environment(
     runtime_model: Option<String>,
     subagent_model: Option<String>,
     limit_write_tools: Option<bool>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     let mut cfg = config::read_config()?;
 
     if cfg.registries.contains_key(&name) {
@@ -330,12 +350,13 @@ fn add_environment(
     )?;
     env_config.limit_write_tools = limit_write_tools.unwrap_or(false);
 
-    cfg.registries.insert(name, env_config);
+    cfg.registries.insert(name.clone(), env_config);
     config::write_config(&cfg)
 }
 
 #[tauri::command]
 fn update_environment(
+    app: tauri::AppHandle,
     old_name: String,
     name: String,
     base_url: String,
@@ -346,66 +367,138 @@ fn update_environment(
     runtime_model: Option<String>,
     subagent_model: Option<String>,
     limit_write_tools: Option<bool>,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
 ) -> Result<(), String> {
-    let mut cfg = config::read_config()?;
-
-    if !cfg.registries.contains_key(&old_name) {
-        return Err(format!("Environment '{}' does not exist", old_name));
+    config::ensure_environment_rename_allowed(&old_name, &name)?;
+    let _mutation_guard = environment_mutations.lock()?;
+    if old_name == name {
+        return config::update_ccem_config(|cfg| {
+            let previous_limit_write_tools = cfg
+                .registries
+                .get(&old_name)
+                .ok_or_else(|| format!("Environment '{}' does not exist", old_name))?
+                .limit_write_tools;
+            let mut env_config = create_env_with_encrypted_key(
+                Some(base_url),
+                auth_token,
+                Some(default_opus_model),
+                default_sonnet_model,
+                default_haiku_model,
+                runtime_model,
+                subagent_model,
+            )?;
+            env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
+            cfg.registries.insert(name, env_config);
+            Ok(())
+        });
     }
 
-    // If renaming, check that new name doesn't conflict
-    if old_name != name && cfg.registries.contains_key(&name) {
-        return Err(format!("Environment '{}' already exists", name));
-    }
-
-    let previous_limit_write_tools = cfg
-        .registries
-        .get(&old_name)
-        .map(|env| env.limit_write_tools)
-        .unwrap_or(false);
-    let mut env_config = create_env_with_encrypted_key(
-        Some(base_url),
-        auth_token,
-        Some(default_opus_model),
-        default_sonnet_model,
-        default_haiku_model,
-        runtime_model,
-        subagent_model,
-    )?;
-    env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
-
-    // Remove old key if renamed
-    if old_name != name {
-        cfg.registries.remove(&old_name);
-        // Update current env pointer if it was pointing to the old name
-        if cfg.current.as_ref() == Some(&old_name) {
-            cfg.current = Some(name.clone());
+    let (events, _final_config) = config::commit_environment_rename(
+        &old_name,
+        &name,
+        |cfg| {
+            if !cfg.registries.contains_key(&old_name) {
+                return Err(format!("Environment '{}' does not exist", old_name));
+            }
+            if cfg.registries.contains_key(&name) {
+                return Err(format!("Environment '{}' already exists", name));
+            }
+            let previous_limit_write_tools = cfg
+                .registries
+                .get(&old_name)
+                .map(|env| env.limit_write_tools)
+                .unwrap_or(false);
+            let mut env_config = create_env_with_encrypted_key(
+                Some(base_url),
+                auth_token,
+                Some(default_opus_model),
+                default_sonnet_model,
+                default_haiku_model,
+                runtime_model,
+                subagent_model,
+            )?;
+            env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
+            cfg.registries.remove(&old_name);
+            if cfg.current.as_ref() == Some(&old_name) {
+                cfg.current = Some(name.clone());
+            }
+            rename_router_config_environment(&mut cfg.router, &old_name, &name);
+            cfg.registries.insert(name.clone(), env_config);
+            Ok(())
+        },
+        |from, to| native_state.rename_router_environment_references(from, to),
+    )
+    .map_err(|error| error.to_string())?;
+    for event in events {
+        if let Err(error) = app.emit("native-session-router-updated", event) {
+            eprintln!("Failed to emit router environment rename event: {error}");
         }
     }
-
-    cfg.registries.insert(name, env_config);
-    config::write_config(&cfg)
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_environment(name: String) -> Result<(), String> {
-    if name == "official" {
-        return Err("Cannot delete the 'official' environment".to_string());
-    }
+fn get_environment_router_references(
+    name: String,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<Vec<String>, String> {
+    let _mutation_guard = environment_mutations.lock()?;
+    let cfg = config::read_config()?;
+    let native_references = native_state.router_environment_references(&name)?;
+    Ok(collect_environment_router_references(
+        &cfg.router,
+        &name,
+        native_references,
+    ))
+}
 
-    let mut cfg = config::read_config()?;
+fn collect_environment_router_references(
+    router: &RouterConfig,
+    name: &str,
+    native_references: Vec<String>,
+) -> Vec<String> {
+    let mut references = router_config_environment_references(router, name);
+    references.extend(native_references);
+    references.sort();
+    references.dedup();
+    references
+}
 
-    if !cfg.registries.contains_key(&name) {
-        return Err(format!("Environment '{}' does not exist", name));
-    }
+#[tauri::command]
+fn delete_environment(
+    name: String,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<(), String> {
+    config::ensure_environment_delete_allowed(&name)?;
+    let _mutation_guard = environment_mutations.lock()?;
 
-    cfg.registries.remove(&name);
+    config::update_ccem_config(|cfg| {
+        if !cfg.registries.contains_key(&name) {
+            return Err(format!("Environment '{}' does not exist", name));
+        }
 
-    if cfg.current.as_ref() == Some(&name) {
-        cfg.current = Some("official".to_string());
-    }
+        let references = collect_environment_router_references(
+            &cfg.router,
+            &name,
+            native_state.router_environment_references(&name)?,
+        );
+        if !references.is_empty() {
+            return Err(format!(
+                "Cannot delete environment '{}'; it is referenced by {}",
+                name,
+                references.join(", ")
+            ));
+        }
 
-    config::write_config(&cfg)
+        cfg.registries.remove(&name);
+        if cfg.current.as_ref() == Some(&name) {
+            cfg.current = Some(config::OFFICIAL_ENV_NAME.to_string());
+        }
+        Ok(())
+    })
 }
 
 // ============================================
@@ -975,9 +1068,7 @@ async fn get_workspace_session_decorations(
 
         let mut events_by_runtime = unified_sessions
             .iter()
-            .filter(|runtime| {
-                runtime.is_active && should_replay_decoration_events(&runtime.status)
-            })
+            .filter(|runtime| runtime.is_active && should_replay_decoration_events(&runtime.status))
             .filter_map(|runtime| {
                 unified_state
                     .get_session_events(&app, &runtime.id, None)
@@ -1220,6 +1311,7 @@ fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: 
 async fn create_native_session(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     provider: String,
     env_name: String,
     perm_mode: Option<String>,
@@ -1233,6 +1325,7 @@ async fn create_native_session(
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
 ) -> Result<NativeSessionSummary, String> {
+    let mutation_guard = environment_mutations.lock()?;
     let provider = parse_native_provider(&provider)?;
     let effective_working_dir = resolve_headless_working_dir(working_dir);
     let effective_perm_mode = resolve_effective_perm_mode(perm_mode);
@@ -1266,6 +1359,8 @@ async fn create_native_session(
                 codex_base_url: None,
                 codex_api_key: None,
                 effort: effort.clone(),
+                router_seed: None,
+                router_record: None,
             }
         }
         NativeProvider::Codex => {
@@ -1297,11 +1392,14 @@ async fn create_native_session(
                 codex_base_url: None,
                 codex_api_key: None,
                 effort,
+                router_seed: None,
+                router_record: None,
             }
         }
     };
 
     let summary = native_state.create_session(app, options)?;
+    drop(mutation_guard);
 
     if let Err(error) = register_launch(SessionProvenanceUpsert {
         ccem_session_id: summary.runtime_id.clone(),
@@ -1334,12 +1432,14 @@ fn list_native_sessions(
 fn send_native_session_input(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     text: String,
     display_text: Option<String>,
     images: Option<Vec<PromptImage>>,
     annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.send_user_message(
         &app,
         &runtime_id,
@@ -1354,10 +1454,12 @@ fn send_native_session_input(
 fn respond_native_session_permission(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     request_id: String,
     approved: bool,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.respond_to_permission(&app, &runtime_id, &request_id, approved)
 }
 
@@ -1365,6 +1467,7 @@ fn respond_native_session_permission(
 fn respond_native_session_prompt(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     tool_use_id: String,
     prompt_type: String,
@@ -1373,6 +1476,7 @@ fn respond_native_session_prompt(
     annotations: Option<HashMap<String, InteractivePromptAnnotation>>,
     prompt_annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.respond_to_prompt(
         &app,
         &runtime_id,
@@ -1389,9 +1493,11 @@ fn respond_native_session_prompt(
 fn rewind_native_session_files(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     checkpoint_id: String,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.rewind_files(&app, &runtime_id, &checkpoint_id)
 }
 
@@ -1417,16 +1523,55 @@ fn read_prompt_image_attachment(
 fn update_native_session_settings(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     env_name: Option<String>,
     perm_mode: Option<String>,
     effort: Option<String>,
 ) -> Result<(), String> {
+    // Settings writes can lazily reconnect an interrupted helper. Serialize the
+    // whole operation even when the environment itself is unchanged so a
+    // reconnect cannot snapshot router defaults while an environment is deleted.
+    let _environment_mutation_guard = environment_mutations.lock()?;
     let current = native_state
         .list_sessions()
         .into_iter()
         .find(|session| session.runtime_id == runtime_id)
         .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
+    if let (Some(name), Some(router)) = (env_name.as_deref(), current.router.as_ref()) {
+        if !name.trim().is_empty() {
+            let mut allowed_envs = router.allowed_envs.clone();
+            if !allowed_envs.iter().any(|allowed| allowed == name) {
+                allowed_envs.push(name.to_string());
+            }
+            native_state
+                .update_session_router(
+                    &app,
+                    UpdateSessionRouterRequest {
+                        runtime_id: runtime_id.clone(),
+                        expected_revision: router.revision,
+                        patch: SessionRouterPatch {
+                            default_env: Some(name.to_string()),
+                            allowed_envs: Some(allowed_envs),
+                            ..SessionRouterPatch::default()
+                        },
+                    },
+                    "environment",
+                )
+                .map_err(|error| error.to_string())?;
+            if perm_mode.is_none() && effort.is_none() {
+                return Ok(());
+            }
+            return native_state.update_session_settings(
+                &app,
+                &runtime_id,
+                None,
+                perm_mode.as_deref(),
+                None,
+                effort.as_deref(),
+            );
+        }
+    }
     let (resolved_env_name, env_vars) = match env_name.as_deref() {
         Some(name) if !name.trim().is_empty() => match current.provider {
             NativeProvider::Claude => {
@@ -1462,9 +1607,11 @@ fn update_native_session_settings(
 fn set_native_session_runtime_perm_mode(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     runtime_perm_mode: Option<String>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.update_session_runtime_perm_mode(&app, &runtime_id, runtime_perm_mode.as_deref())
 }
 
@@ -1487,44 +1634,43 @@ fn handoff_native_session_to_terminal(
     runtime_id: String,
     terminal_type: Option<TerminalType>,
 ) -> Result<NativeHandoffResult, String> {
-    let handoff = match native_state.prepare_terminal_handoff(&runtime_id, terminal_type) {
-        Ok(handoff) => handoff,
+    let managed_handoff =
+        native_state.run_managed_terminal_handoff(&runtime_id, terminal_type, |handoff| {
+            let attach_terminal = attach_terminal_for_native_terminal(handoff.terminal);
+            let session_manager = state.inner().clone();
+            let session = interactive_state.create_session(
+                app.clone(),
+                session_manager,
+                InteractiveSessionOptions {
+                    session_id: handoff.runtime_id.clone(),
+                    client: handoff.provider.as_str().to_string(),
+                    env_name: handoff.env_name.clone(),
+                    config_source: Some(DEFAULT_CONFIG_SOURCE.to_string()),
+                    perm_mode: handoff.perm_mode.clone(),
+                    working_dir: handoff.project_dir.clone(),
+                    resume_session_id: Some(handoff.resume_session_id.clone()),
+                    initial_prompt: None,
+                    env_vars: handoff.env_vars.clone(),
+                    launch_trace_id: format!("handoff-{}", handoff.runtime_id),
+                },
+            )?;
+
+            if let Err(error) =
+                open_tmux_backed_session_in_terminal(state.inner(), &session.id, attach_terminal)
+            {
+                let _ = interactive_state.stop_session(&session.id);
+                state.remove_session(&session.id);
+                return Err(error);
+            }
+            Ok(session)
+        });
+    let (handoff, session) = match managed_handoff {
+        Ok(result) => result,
         Err(error) if error == "Session id is not ready for terminal handoff yet" => {
             return native_state.handoff_to_terminal(&runtime_id, terminal_type);
         }
         Err(error) => return Err(error),
     };
-
-    let attach_terminal = attach_terminal_for_native_terminal(handoff.terminal);
-    let session_manager = state.inner().clone();
-    let create_result = interactive_state.create_session(
-        app.clone(),
-        session_manager,
-        InteractiveSessionOptions {
-            session_id: handoff.runtime_id.clone(),
-            client: handoff.provider.as_str().to_string(),
-            env_name: handoff.env_name.clone(),
-            config_source: Some(DEFAULT_CONFIG_SOURCE.to_string()),
-            perm_mode: handoff.perm_mode.clone(),
-            working_dir: handoff.project_dir.clone(),
-            resume_session_id: Some(handoff.resume_session_id.clone()),
-            initial_prompt: None,
-            env_vars: handoff.env_vars.clone(),
-            launch_trace_id: format!("handoff-{}", handoff.runtime_id),
-        },
-    );
-
-    let session = create_result?;
-
-    if let Err(error) =
-        open_tmux_backed_session_in_terminal(state.inner(), &session.id, attach_terminal)
-    {
-        let _ = interactive_state.stop_session(&session.id);
-        state.remove_session(&session.id);
-        return Err(error);
-    }
-
-    native_state.complete_managed_terminal_handoff(&handoff.runtime_id, handoff.terminal)?;
     if let Err(error) = browser_state.close(&app, Some(&handoff.runtime_id)) {
         eprintln!(
             "Failed to destroy preview browser for terminal handoff {}: {}",
@@ -3208,10 +3354,7 @@ fn save_language(app: tauri::AppHandle, language: String) -> Result<(), String> 
     Ok(())
 }
 
-fn apply_enabled_environments_update(
-    settings: &mut DesktopSettings,
-    names: Option<Vec<String>>,
-) {
+fn apply_enabled_environments_update(settings: &mut DesktopSettings, names: Option<Vec<String>>) {
     settings.enabled_environments = names;
 }
 
@@ -3225,9 +3368,7 @@ fn save_enabled_environments(names: Option<Vec<String>>) -> Result<(), String> {
 
 #[cfg(test)]
 mod desktop_settings_command_tests {
-    use super::{
-        apply_enabled_environments_update, merge_settings_page_update, DesktopSettings,
-    };
+    use super::{apply_enabled_environments_update, merge_settings_page_update, DesktopSettings};
 
     #[test]
     fn generic_settings_save_preserves_backend_owned_language() {
@@ -3650,6 +3791,74 @@ async fn bind_telegram_topic(
 #[tauri::command]
 fn get_proxy_debug_state(state: State<Arc<ProxyDebugManager>>) -> ProxyDebugState {
     state.get_state()
+}
+
+#[tauri::command]
+fn get_router_settings(
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<RouterConfig, String> {
+    let _mutation_guard = environment_mutations.lock()?;
+    Ok(config::read_config()?.router)
+}
+
+#[tauri::command]
+fn update_router_settings(
+    proxy_state: State<'_, Arc<ProxyDebugManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    settings: RouterConfig,
+) -> Result<RouterStatus, String> {
+    let _mutation_guard = environment_mutations.lock()?;
+    validate_router_config(&settings).map_err(|error| error.to_string())?;
+    proxy_state.validate_router_config_change(&settings)?;
+    config::update_ccem_config(|config| {
+        config::validate_router_config_environment_targets(&settings, &config.registries)?;
+        config.router = settings.clone();
+        Ok(())
+    })?;
+    tauri::async_runtime::block_on(proxy_state.apply_router_config(settings))
+}
+
+#[tauri::command]
+fn router_status(state: State<'_, Arc<RouterManager>>) -> RouterStatus {
+    state.status()
+}
+
+#[tauri::command]
+fn get_session_router(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    runtime_id: String,
+) -> Result<SessionRouterState, RouterServiceError> {
+    let _mutation_guard = environment_mutations
+        .lock()
+        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+    native_state.get_session_router(&runtime_id)
+}
+
+#[tauri::command]
+fn update_session_router(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    request: UpdateSessionRouterRequest,
+) -> Result<SessionRouterState, RouterServiceError> {
+    let _mutation_guard = environment_mutations
+        .lock()
+        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+    native_state.update_session_router(&app, request, "ipc")
+}
+
+#[tauri::command]
+fn restart_native_session_direct(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    runtime_id: String,
+) -> Result<SessionRouterState, RouterServiceError> {
+    let _mutation_guard = environment_mutations
+        .lock()
+        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+    native_state.restart_session_direct(&app, &runtime_id)
 }
 
 #[tauri::command]
@@ -4769,22 +4978,62 @@ fn main() {
         }
     };
 
+    // Router session keys live in persisted native records. Migrate and lock
+    // down storage before any manager reads state or publishes a control plane.
+    if let Err(error) = config::migrate_if_needed() {
+        eprintln!("CCEM startup blocked: config migration failed: {}", error);
+        return;
+    }
+    if let Err(error) = secure_fs::harden_ccem_storage(&config::get_ccem_dir()) {
+        eprintln!(
+            "CCEM startup blocked: private storage migration failed: {}",
+            error
+        );
+        return;
+    }
+
     // Create SessionManager from persisted sessions (or empty if first run)
     let session_manager = Arc::new(SessionManager::load_from_disk());
     let interactive_runtime_manager = Arc::new(InteractiveRuntimeManager::default());
     let headless_runtime_manager = Arc::new(HeadlessRuntimeManager::default());
-    let native_runtime_manager = Arc::new(NativeRuntimeManager::default());
+    let native_runtime_manager = match NativeRuntimeManager::try_new() {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            eprintln!("CCEM startup blocked: {}", error);
+            return;
+        }
+    };
+    let router_config = match config::read_config() {
+        Ok(config) => config.router,
+        Err(error) => {
+            eprintln!(
+                "CCEM startup blocked: failed to load router config: {}",
+                error
+            );
+            return;
+        }
+    };
+    let router_manager = Arc::new(RouterManager::new(router_config));
+    if let Err(error) = native_runtime_manager.set_router_manager(router_manager.clone()) {
+        eprintln!("CCEM startup blocked: {}", error);
+        return;
+    }
+    let environment_mutation_coordinator =
+        Arc::new(config::EnvironmentMutationCoordinator::default());
     let browser_manager = Arc::new(BrowserManager::default());
-    let external_control_manager =
-        Arc::new(ExternalControlManager::new(native_runtime_manager.clone()));
+    let external_control_manager = Arc::new(ExternalControlManager::new(
+        native_runtime_manager.clone(),
+        environment_mutation_coordinator.clone(),
+    ));
     let event_dispatcher = Arc::new(EventDispatcher::default());
     let unified_session_manager = Arc::new(UnifiedSessionManager::new(
         headless_runtime_manager.clone(),
         interactive_runtime_manager.clone(),
         event_dispatcher.clone(),
     ));
-    let proxy_debug_manager = ProxyDebugManager::new(session_manager.clone())
-        .expect("failed to initialize proxy debug manager");
+    let proxy_debug_manager =
+        ProxyDebugManager::new(session_manager.clone(), router_manager.clone())
+            .expect("failed to initialize proxy debug manager");
     let telegram_bridge_manager = Arc::new(TelegramBridgeManager::default());
     let wecom_bridge_manager = Arc::new(WecomBridgeManager::default());
     let weixin_bridge_manager = Arc::new(WeixinBridgeManager::default());
@@ -4830,6 +5079,7 @@ fn main() {
         .manage(interactive_runtime_manager.clone())
         .manage(headless_runtime_manager.clone())
         .manage(native_runtime_manager.clone())
+        .manage(environment_mutation_coordinator.clone())
         .manage(browser_manager.clone())
         .manage(external_control_manager.clone())
         .manage(event_dispatcher.clone())
@@ -4839,6 +5089,7 @@ fn main() {
         .manage(weixin_bridge_manager.clone())
         .manage(bot_binding_manager.clone())
         .manage(proxy_debug_manager.clone())
+        .manage(router_manager.clone())
         .manage(desktop_instance_lock)
         .manage(app_updates::PendingUpdate::default())
         .manage(notification_prefs_state)
@@ -4902,6 +5153,7 @@ fn main() {
             set_current_env,
             add_environment,
             update_environment,
+            get_environment_router_references,
             delete_environment,
             get_app_config,
             add_favorite,
@@ -4953,6 +5205,7 @@ fn main() {
             get_native_session_events,
             read_prompt_image_attachment,
             update_native_session_settings,
+            restart_native_session_direct,
             set_native_session_runtime_perm_mode,
             stop_native_session,
             handoff_native_session_to_terminal,
@@ -5054,6 +5307,11 @@ fn main() {
             poll_weixin_login,
             get_telegram_forum_topics,
             bind_telegram_topic,
+            get_router_settings,
+            update_router_settings,
+            router_status,
+            get_session_router,
+            update_session_router,
             get_proxy_debug_state,
             set_proxy_debug_enabled,
             update_proxy_debug_config,
@@ -5136,13 +5394,9 @@ fn main() {
             }
 
             proxy_manager_for_setup.set_app_handle(app.handle().clone());
+            tauri::async_runtime::block_on(proxy_manager_for_setup.maybe_start_on_boot());
             if let Err(error) = external_control_manager_for_setup.start(app.handle().clone()) {
                 eprintln!("External control startup warning: {}", error);
-            }
-
-            // Auto-migrate configuration if needed
-            if let Err(e) = config::migrate_if_needed() {
-                eprintln!("Config migration warning: {}", e);
             }
 
             // Load desktop settings once for startup logic
@@ -5193,12 +5447,6 @@ fn main() {
 
             // Start session monitor background task
             start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
-
-            // Start proxy debug server if enabled in settings.
-            let proxy_for_boot = proxy_manager_for_setup.clone();
-            tauri::async_runtime::spawn(async move {
-                proxy_for_boot.maybe_start_on_boot().await;
-            });
 
             // Start cron scheduler background task
             let cron_scheduler = Arc::new(CronScheduler::default());
@@ -5319,10 +5567,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_remote_load_args, build_remote_load_stdin_payload, media_kind_for_extension,
-        merge_git_numstat, normalize_git_changed_path, parse_git_status_line,
-        prepend_write_tool_limit_system_tip, RemoteEnvConfig, WorkspaceGitChangedFile,
-        WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        build_remote_load_args, build_remote_load_stdin_payload,
+        collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
+        normalize_git_changed_path, parse_git_status_line, prepend_write_tool_limit_system_tip,
+        RemoteEnvConfig, WorkspaceGitChangedFile, WRITE_TOOL_LIMIT_SYSTEM_TIP,
+    };
+    use crate::router::{
+        rename_router_config_environment, router_config_environment_references, RouterConfig,
+        RouterProfile,
     };
     use std::collections::HashMap;
 
@@ -5336,6 +5588,71 @@ mod tests {
     fn test_launch_claude_code_validates_env() {
         // 这个测试需要完整的 Tauri 上下文，暂时跳过
         // 实际测试应该在集成测试中进行
+    }
+
+    #[test]
+    fn environment_rename_cascades_router_config_references() {
+        let mut router = RouterConfig {
+            bindings: HashMap::from([("background".into(), "old env".into())]),
+            default_allowed_envs: vec!["old env".into(), "new env".into()],
+            profiles: vec![RouterProfile {
+                id: "profile".into(),
+                name: "Profile".into(),
+                revision: 1,
+                bindings: HashMap::from([("subagent:Explore".into(), "old env".into())]),
+                allowed_envs: vec!["old env".into()],
+            }],
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            router_config_environment_references(&router, "old env").len(),
+            3
+        );
+
+        rename_router_config_environment(&mut router, "old env", "new env");
+
+        assert!(router_config_environment_references(&router, "old env").is_empty());
+        assert_eq!(
+            router.bindings.get("background").map(String::as_str),
+            Some("new env")
+        );
+        assert_eq!(router.default_allowed_envs, vec!["new env"]);
+        assert_eq!(
+            router.profiles[0]
+                .bindings
+                .get("subagent:Explore")
+                .map(String::as_str),
+            Some("new env")
+        );
+    }
+
+    #[test]
+    fn environment_router_references_merge_config_and_native_without_duplicates() {
+        let router = RouterConfig {
+            bindings: HashMap::from([("background".into(), "target".into())]),
+            default_allowed_envs: vec!["target".into()],
+            ..RouterConfig::default()
+        };
+
+        let references = collect_environment_router_references(
+            &router,
+            "target",
+            vec![
+                "native-session:zeta".into(),
+                "router.bindings.background".into(),
+                "native-session:alpha".into(),
+            ],
+        );
+
+        assert_eq!(
+            references,
+            vec![
+                "native-session:alpha",
+                "native-session:zeta",
+                "router.bindings.background",
+                "router.defaultAllowedEnvs",
+            ]
+        );
     }
 
     #[test]

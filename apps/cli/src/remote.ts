@@ -2,7 +2,12 @@ import crypto from 'crypto';
 import chalk from 'chalk';
 import Conf from 'conf';
 import type { EnvConfig } from '@ccem/core';
-import { encrypt, getCcemConfigDir, normalizeEnvConfig } from '@ccem/core';
+import {
+  assertOfficialEnvironmentInvariant,
+  encrypt,
+  getCcemConfigDir,
+  normalizeEnvConfig,
+} from '@ccem/core';
 
 const config = new Conf({
   projectName: 'claude-code-env-manager',
@@ -148,7 +153,10 @@ export const decryptWithSecret = (encryptedBase64: string, secret: string): stri
 /**
  * 生成不冲突的环境名称
  */
-const getUniqueName = (baseName: string, existingNames: Set<string>): string => {
+export const getUniqueImportedEnvironmentName = (
+  baseName: string,
+  existingNames: Set<string>,
+): string => {
   if (!existingNames.has(baseName)) {
     return baseName;
   }
@@ -326,12 +334,13 @@ export const loadFromRemote = async (url: string, key: string, secret: string): 
   }
 
   // 5. 导入到本地
-  const registries = config.get('registries') as Record<string, EnvConfig>;
+  const registries = config.get('registries') as Record<string, EnvConfig> | undefined;
+  assertOfficialEnvironmentInvariant(registries);
   const existingNames = new Set(Object.keys(registries));
   const results: LoadResult[] = [];
 
   for (const [name, envConfig] of Object.entries(decrypted.environments)) {
-    const uniqueName = getUniqueName(name, existingNames);
+    const uniqueName = getUniqueImportedEnvironmentName(name, existingNames);
     const renamed = uniqueName !== name;
 
     const normalizedConfig = normalizeEnvConfig(envConfig);
@@ -350,6 +359,7 @@ export const loadFromRemote = async (url: string, key: string, secret: string): 
     });
   }
 
+  assertOfficialEnvironmentInvariant(registries);
   config.set('registries', registries);
 
   // 6. 输出结果

@@ -5,6 +5,8 @@ import {
   findProjectRoot,
   getSettingsPath,
   ensureClaudeDir,
+  ensureCcemDir,
+  getCcemConfigDir,
   getHomeDir,
   getGlobalClaudeConfigPath,
   getGlobalClaudeSettingsPath,
@@ -259,6 +261,35 @@ describe('path utilities', () => {
 
       const result = ensureClaudeDir();
       expect(result).toBe(path.join(tempDir, '.claude'));
+    });
+  });
+
+  describe('ensureCcemDir', () => {
+    it.skipIf(process.platform === 'win32')('creates the directory with POSIX mode 0700', () => {
+      process.env.HOME = tempDir;
+
+      const result = ensureCcemDir();
+
+      expect(result).toBe(getCcemConfigDir());
+      expect(fs.statSync(result).mode & 0o777).toBe(0o700);
+    });
+
+    it.skipIf(process.platform === 'win32')('repairs the root mode without changing descendants', () => {
+      process.env.HOME = tempDir;
+      const ccemDir = getCcemConfigDir();
+      const nestedDir = path.join(ccemDir, 'runtime-tools');
+      const nestedFile = path.join(nestedDir, 'helper.sh');
+      fs.mkdirSync(nestedDir, { recursive: true, mode: 0o755 });
+      fs.writeFileSync(nestedFile, '#!/bin/sh\n', { mode: 0o744 });
+      fs.chmodSync(ccemDir, 0o755);
+      fs.chmodSync(nestedDir, 0o755);
+      fs.chmodSync(nestedFile, 0o744);
+
+      ensureCcemDir();
+
+      expect(fs.statSync(ccemDir).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(nestedDir).mode & 0o777).toBe(0o755);
+      expect(fs.statSync(nestedFile).mode & 0o777).toBe(0o744);
     });
   });
 

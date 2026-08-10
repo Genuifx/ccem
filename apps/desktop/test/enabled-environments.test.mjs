@@ -97,7 +97,7 @@ test('environment enablement persists through its field-scoped command', async (
   );
 
   assert.equal(
-    source.match(/invoke\('save_enabled_environments', \{ names(?:: next)? \}\)/g)?.length,
+    source.match(/invoke\('save_enabled_environments', \{ names(?:: [A-Za-z_]\w*)? \}\)/g)?.length,
     4,
     'add, rename, delete, and explicit toggle paths must avoid stale full-settings writes',
   );

@@ -4,6 +4,7 @@ import * as path from 'path';
 import chalk from 'chalk';
 import type { EnvConfig, PermissionModeName } from '@ccem/core';
 import {
+  assertClaudeEnvironmentAuthBoundary,
   decrypt,
   PERMISSION_PRESETS,
   ensureCcemDir,
@@ -23,6 +24,12 @@ export interface LaunchOptions {
   resumeSessionId?: string;
   /** Skip UI output (used by hidden launch command) */
   silent?: boolean;
+  /** Allow only the Desktop-owned loopback Claude proxy override. */
+  allowDesktopProxyOverride?: boolean;
+}
+
+export interface BuildEnvVarsOptions {
+  allowDesktopProxyOverride?: boolean;
 }
 
 const MANAGED_CLAUDE_ENV_KEYS = [
@@ -42,18 +49,48 @@ const MANAGED_CLAUDE_ENV_KEYS = [
  */
 export function buildEnvVars(
   envName: string | undefined,
-  envConfig: EnvConfig
+  envConfig: EnvConfig,
+  options: BuildEnvVarsOptions = {},
 ): Record<string, string> {
   const runtimeEnv = resolveEnvConfigForRuntime(envName, envConfig);
+  const authToken = runtimeEnv.ANTHROPIC_AUTH_TOKEN
+    ? decrypt(runtimeEnv.ANTHROPIC_AUTH_TOKEN)
+    : undefined;
+  if (
+    !options.allowDesktopProxyOverride
+    || !isTrustedDesktopProxyBaseUrl(runtimeEnv.ANTHROPIC_BASE_URL)
+  ) {
+    assertClaudeEnvironmentAuthBoundary(
+      envName,
+      runtimeEnv.ANTHROPIC_BASE_URL,
+      authToken,
+    );
+  }
   const vars: Record<string, string> = {};
   if (runtimeEnv.ANTHROPIC_BASE_URL) vars.ANTHROPIC_BASE_URL = runtimeEnv.ANTHROPIC_BASE_URL;
-  if (runtimeEnv.ANTHROPIC_AUTH_TOKEN) vars.ANTHROPIC_AUTH_TOKEN = decrypt(runtimeEnv.ANTHROPIC_AUTH_TOKEN);
+  if (authToken) vars.ANTHROPIC_AUTH_TOKEN = authToken;
   if (runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL) vars.ANTHROPIC_DEFAULT_OPUS_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
   if (runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL) vars.ANTHROPIC_DEFAULT_SONNET_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL;
   if (runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL) vars.ANTHROPIC_DEFAULT_HAIKU_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL;
   if (runtimeEnv.ANTHROPIC_MODEL) vars.ANTHROPIC_MODEL = runtimeEnv.ANTHROPIC_MODEL;
   if (runtimeEnv.CLAUDE_CODE_SUBAGENT_MODEL) vars.CLAUDE_CODE_SUBAGENT_MODEL = runtimeEnv.CLAUDE_CODE_SUBAGENT_MODEL;
   return vars;
+}
+
+export function isTrustedDesktopProxyBaseUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:'
+      && url.hostname === '127.0.0.1'
+      && !url.username
+      && !url.password
+      && !url.search
+      && !url.hash
+      && url.pathname.startsWith('/proxy/claude/');
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -97,7 +134,16 @@ function ensureSessionsDir(): string {
  * - `ccem launch` hidden command (called by Desktop app)
  */
 export async function launchClaude(options: LaunchOptions): Promise<void> {
-  const { envName, envConfig, permMode, workingDir, sessionId, resumeSessionId, silent } = options;
+  const {
+    envName,
+    envConfig,
+    permMode,
+    workingDir,
+    sessionId,
+    resumeSessionId,
+    silent,
+    allowDesktopProxyOverride,
+  } = options;
   const ccemRuntimeId = sessionId ?? `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // Build env
@@ -106,7 +152,7 @@ export async function launchClaude(options: LaunchOptions): Promise<void> {
     delete env[key];
   }
   if (envConfig) {
-    Object.assign(env, buildEnvVars(envName, envConfig));
+    Object.assign(env, buildEnvVars(envName, envConfig, { allowDesktopProxyOverride }));
   }
   // Prevent nested session detection
   delete env.CLAUDECODE;

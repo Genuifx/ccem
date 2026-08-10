@@ -9,6 +9,12 @@
 
 import type { Environment, Session } from '@/store';
 import type { UsageStats as AnalyticsUsageStats } from '@/types/analytics';
+import type {
+  RouterConfig,
+  RouterStatus,
+  SessionRouterState,
+  UpdateSessionRouterRequest,
+} from '@ccem/core/browser';
 
 // ============================================
 // Environment Commands
@@ -49,6 +55,8 @@ export interface TauriCommands {
     void
   ];
   delete_environment: [{ name: string }, void];
+  // 权威引用清单：全局 rules/profiles + active/recoverable session 对某环境的引用
+  get_environment_router_references: [{ name: string }, string[]];
 
   // 应用配置
   get_app_config: [void, AppConfig];
@@ -107,6 +115,13 @@ export interface TauriCommands {
   list_proxy_traffic: [{ limit: number; cursor?: string | null }, ProxyTrafficPage];
   get_proxy_traffic_detail: [{ id: string }, ProxyTrafficDetail];
   clear_proxy_traffic: [void, void];
+  // 路由器 (CCEM Router) — 全局配置与每会话路由表
+  get_router_settings: [void, RouterConfig];
+  update_router_settings: [{ settings: RouterConfig }, RouterStatus];
+  router_status: [void, RouterStatus];
+  get_session_router: [{ runtimeId: string }, SessionRouterState];
+  update_session_router: [{ request: UpdateSessionRouterRequest }, SessionRouterState];
+  restart_native_session_direct: [{ runtimeId: string }, SessionRouterState];
   generate_workspace_session_title: [{ titleInput: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
   browser_set_active_session: [{ sessionId?: string | null; visible?: boolean | null }, void];
@@ -879,6 +894,20 @@ export interface ProxyMetrics {
   activeConnections: number;
 }
 
+/**
+ * Router service error returned by get/update_session_router and
+ * restart_native_session_direct. Re-exported from the pure conflict module so
+ * the CAS handling logic and its contract live together and stay unit-tested.
+ */
+export type { RouterServiceError } from './routerConflict';
+
+/** Payload of the `native-session-router-updated` event. */
+export interface SessionRouterUpdatedEvent {
+  runtimeId: string;
+  router: SessionRouterState;
+  reason: string;
+}
+
 export interface ManagedSessionSummary {
   runtime_id: string;
   claude_session_id?: string | null;
@@ -935,6 +964,8 @@ export interface NativeSessionSummary {
   seed_boundary_message_count?: number | null;
   can_handoff_to_terminal: boolean;
   last_error?: string | null;
+  /** Public router state when this session is routed (mirrors Rust field). */
+  router?: SessionRouterState | null;
 }
 
 export interface NativeHandoffResult {
