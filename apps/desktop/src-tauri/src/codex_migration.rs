@@ -379,10 +379,10 @@ fn has_project_config_surface(working_dir: &Path, user_config_path: &Path) -> bo
         if exists.is_err() {
             return true;
         }
-        match (fs::canonicalize(&candidate), user_config_canonical.as_ref()) {
-            (Ok(candidate), Some(user)) if &candidate == user => false,
-            _ => true,
-        }
+        !matches!(
+            (fs::canonicalize(&candidate), user_config_canonical.as_ref()),
+            (Ok(candidate), Some(user)) if &candidate == user
+        )
     })
 }
 
