@@ -70,11 +70,11 @@ fi
 if [ -n "${MODEL}" ]; then
   export ANTHROPIC_MODEL="${MODEL}"
 fi
-if [ -n "${API_KEY}" ] && [ "${API_KEY#enc:}" = "${API_KEY}" ]; then
-  export ANTHROPIC_API_KEY="${API_KEY}"
+if [ -n "${API_KEY}" ] && [ "${API_KEY#enc:}" != "${API_KEY}" ]; then
+  export ANTHROPIC_API_KEY="${API_KEY#enc:}"
 fi
-if [ -n "${AUTH_TOKEN}" ] && [ "${AUTH_TOKEN#enc:}" = "${AUTH_TOKEN}" ]; then
-  export ANTHROPIC_AUTH_TOKEN="${AUTH_TOKEN}"
+if [ -n "${AUTH_TOKEN}" ] && [ "${AUTH_TOKEN#enc:}" != "${AUTH_TOKEN}" ]; then
+  export ANTHROPIC_AUTH_TOKEN="${AUTH_TOKEN#enc:}"
 fi
 
 claude -p \
