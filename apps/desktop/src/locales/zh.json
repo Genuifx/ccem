@@ -469,6 +469,8 @@
     "contextCost": "预估费用",
     "copyMessage": "复制内容",
     "copied": "已复制",
+    "copyImage": "复制为图片",
+    "copyImageFailed": "图片复制失败：{error}",
     "imageStripPrev": "上一张图片",
     "imageStripNext": "下一张图片",
     "imageStripCounter": "{current} / {total}",

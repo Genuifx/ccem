@@ -469,6 +469,8 @@
     "contextCost": "Estimated cost",
     "copyMessage": "Copy message",
     "copied": "Copied",
+    "copyImage": "Copy as image",
+    "copyImageFailed": "Failed to copy image: {error}",
     "imageStripPrev": "Previous image",
     "imageStripNext": "Next image",
     "imageStripCounter": "{current} / {total}",
