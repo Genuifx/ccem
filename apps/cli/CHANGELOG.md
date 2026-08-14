@@ -1,5 +1,11 @@
 # ccem
 
+## 2.68.0
+
+### Minor Changes
+
+- Add a copy-transcript-as-image action to the desktop workspace transcript, and satisfy the Codex migration clippy gate.
+
 ## 2.67.0
 
 ### Minor Changes
