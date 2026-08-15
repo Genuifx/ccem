@@ -1307,6 +1307,7 @@ export function WorkspaceNativeSessionView({
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
+    queryNativeSessionUsage,
     stopNativeSession,
     updateNativeSessionSettings,
     setNativeSessionRuntimePermMode,
@@ -1420,6 +1421,13 @@ export function WorkspaceNativeSessionView({
   }, [handleComposerTextChange]);
 
   const sessionUsage = useMemo(() => computeSessionUsage(events), [events]);
+
+  const refreshSessionUsage = useCallback(() => {
+    if (session.provider !== 'claude') return;
+    void queryNativeSessionUsage(session.runtime_id).catch((error) => {
+      console.debug('Failed to query native session usage:', error);
+    });
+  }, [queryNativeSessionUsage, session.provider, session.runtime_id]);
   const fileCheckpoints = useMemo(() => deriveNativeFileCheckpoints(events), [events]);
 
   const clearFileRewindTimeout = useCallback(() => {
@@ -3036,7 +3044,11 @@ export function WorkspaceNativeSessionView({
         )}
         secondaryActions={(
           <>
-            <ContextWindowIndicator usage={sessionUsage} />
+            <ContextWindowIndicator
+              usage={sessionUsage}
+              provider={session.provider}
+              onRefreshUsage={refreshSessionUsage}
+            />
             {canShowFileRestorePoints ? (
               <DropdownMenu
                 modal={false}
