@@ -195,6 +195,23 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
                     .unwrap_or_else(|| "n/a".to_string())
             ),
         }),
+        SessionEventPayload::SessionUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cost_usd,
+            ..
+        } => Some(EventSummary {
+            kind: BotBindingOutboxFrameKind::EventUpdate,
+            title: "Session usage".to_string(),
+            text: format!(
+                "input: {input_tokens}\noutput: {output_tokens}\ncache_read: {cache_read_tokens}\ncache_creation: {cache_creation_tokens}\ncost_usd: {}",
+                cost_usd
+                    .map(|cost| format!("{cost:.6}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ),
+        }),
         SessionEventPayload::ContextUsage {
             used_tokens,
             max_tokens,

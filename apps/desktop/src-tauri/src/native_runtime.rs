@@ -354,6 +354,7 @@ enum HelperInputCommand<'a> {
     RewindFiles {
         checkpoint_id: &'a str,
     },
+    UsageQuery,
     BrowserToolResponse {
         request_id: &'a str,
         ok: bool,
@@ -402,6 +403,13 @@ fn native_status_allows_file_rewind(status: &str) -> bool {
     matches!(status, "idle" | "ready" | "interrupted" | "closed_idle")
 }
 
+fn native_status_allows_usage_query(status: &str) -> bool {
+    matches!(
+        status,
+        "idle" | "ready" | "interrupted" | "closed_idle" | "initializing" | "processing" | "running"
+    )
+}
+
 fn destroy_browser_session(app: Option<&AppHandle>, runtime_id: &str) {
     let Some(app) = app else {
         return;
@@ -437,6 +445,7 @@ fn helper_command_kind(command: &HelperInputCommand<'_>) -> &'static str {
         HelperInputCommand::InteractivePromptResponse { .. } => "interactive_prompt_response",
         HelperInputCommand::UpdateSettings { .. } => "update_settings",
         HelperInputCommand::RewindFiles { .. } => "rewind_files",
+        HelperInputCommand::UsageQuery => "usage_query",
         HelperInputCommand::BrowserToolResponse { .. } => "browser_tool_response",
         HelperInputCommand::Stop => "stop",
     }
@@ -973,6 +982,28 @@ impl NativeRuntimeManager {
             handle,
             &HelperInputCommand::RewindFiles { checkpoint_id },
         )
+    }
+
+    pub fn query_session_usage(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+    ) -> Result<(), String> {
+        let handle = self.ensure_handle(app.clone(), runtime_id)?;
+        let status = handle
+            .record
+            .lock()
+            .map_err(|_| "Failed to lock native session record".to_string())?
+            .status
+            .clone();
+        if !native_status_allows_usage_query(&status) {
+            return Err(format!(
+                "Cannot query usage while native session is {}.",
+                status
+            ));
+        }
+
+        self.write_to_child_with_reconnect(app, runtime_id, handle, &HelperInputCommand::UsageQuery)
     }
 
     pub fn update_session_settings(
