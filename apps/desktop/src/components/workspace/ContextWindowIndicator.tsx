@@ -70,7 +70,7 @@ export function ContextWindowIndicator({
 
   return (
     <Popover open={popoverOpen} onOpenChange={handleOpenChange}>
-      <Tooltip>
+      <Tooltip open={popoverOpen ? false : undefined}>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <button

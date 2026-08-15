@@ -476,7 +476,7 @@
     "usagePanelRateLimit": "速率限制",
     "usagePanelFiveHour": "5 小时窗口",
     "usagePanelSevenDay": "7 天窗口",
-    "usagePanelEmpty": "暂无用量数据。发送一条消息，或点击右上角刷新查询当前会话。",
+    "usagePanelEmpty": "暂无用量数据。发送一条消息后会自动统计。",
     "copyMessage": "复制内容",
     "copied": "已复制",
     "copyImage": "复制为图片",

@@ -476,7 +476,7 @@
     "usagePanelRateLimit": "Rate limits",
     "usagePanelFiveHour": "5-hour window",
     "usagePanelSevenDay": "7-day window",
-    "usagePanelEmpty": "No usage data yet. Send a message or use the refresh button to query the current session.",
+    "usagePanelEmpty": "No usage data yet. Send a message and usage will be tracked automatically.",
     "copyMessage": "Copy message",
     "copied": "Copied",
     "copyImage": "Copy as image",

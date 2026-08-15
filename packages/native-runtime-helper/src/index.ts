@@ -207,6 +207,7 @@ const claudeSeenMessageIds = new Set<string>();
 let claudeContextUsageFailureKey: string | null = null;
 let claudeSessionUsageKey: string | null = null;
 let claudeSessionUsageFailureKey: string | null = null;
+let claudeSessionUsageInFlight = false;
 let codexClient: Codex | null = null;
 let codexThread: any = null;
 let codexLastContextUsageKey: string | null = null;
@@ -1402,6 +1403,23 @@ function parseClaudeSessionUsagePayload(raw: unknown): ClaudeSessionUsageSnapsho
   };
 }
 
+function stableRateLimitsKey(rateLimits: Record<string, unknown> | null): string {
+  if (!rateLimits) {
+    return 'none';
+  }
+  const windowKey = (raw: unknown): string => {
+    if (!raw || typeof raw !== 'object') {
+      return 'null';
+    }
+    const record = raw as Record<string, unknown>;
+    return [record.utilization, record.resets_at ?? ''].join(':');
+  };
+  // Deterministic order so reordered SDK payloads don't change the key.
+  return ['five_hour', 'seven_day']
+    .map((name) => `${name}=${windowKey(rateLimits[name])}`)
+    .join(',');
+}
+
 /**
  * Actively query the current Claude session for cumulative token usage, cache
  * hits, cost and claude.ai plan rate-limit utilization via the Agent SDK's
@@ -1409,7 +1427,8 @@ function parseClaudeSessionUsagePayload(raw: unknown): ClaudeSessionUsageSnapsho
  * (with a deduped lifecycle notice) when the SDK rejects the call.
  */
 async function emitClaudeSessionUsage() {
-  if (!currentClaudeQuery) return;
+  if (!currentClaudeQuery || claudeSessionUsageInFlight) return;
+  claudeSessionUsageInFlight = true;
   try {
     const raw = await currentClaudeQuery
       .usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
@@ -1432,8 +1451,9 @@ async function emitClaudeSessionUsage() {
         entry.output_tokens,
         entry.cache_read_tokens,
         entry.cache_creation_tokens,
+        entry.cost_usd,
       ].join(':')).join(','),
-      JSON.stringify(snapshot.rate_limits ?? null),
+      stableRateLimitsKey(snapshot.rate_limits),
     ].join('|');
     if (key === claudeSessionUsageKey) {
       return;
@@ -1465,6 +1485,8 @@ async function emitClaudeSessionUsage() {
       stage: 'usage_unavailable',
       detail,
     });
+  } finally {
+    claudeSessionUsageInFlight = false;
   }
 }
 
@@ -2683,12 +2705,13 @@ async function handleCommand(command: InputCommand) {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // Report via lifecycle only — emitting a Status here would flip the
+      // session record out of 'processing'/'interrupted' mid-turn.
       emitEvent({
         type: 'lifecycle',
         stage: 'usage_unavailable',
         detail: `Claude usage query failed: ${message}`,
       });
-      emitStatus('ready', 'Usage query failed.');
     }
     return;
   }

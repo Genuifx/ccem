@@ -42322,6 +42322,7 @@ var claudeSeenMessageIds = /* @__PURE__ */ new Set();
 var claudeContextUsageFailureKey = null;
 var claudeSessionUsageKey = null;
 var claudeSessionUsageFailureKey = null;
+var claudeSessionUsageInFlight = false;
 var codexClient = null;
 var codexThread = null;
 var codexLastContextUsageKey = null;
@@ -43181,8 +43182,22 @@ function parseClaudeSessionUsagePayload(raw) {
     rate_limits: rateLimits && typeof rateLimits === "object" ? rateLimits : null
   };
 }
+function stableRateLimitsKey(rateLimits) {
+  if (!rateLimits) {
+    return "none";
+  }
+  const windowKey = (raw) => {
+    if (!raw || typeof raw !== "object") {
+      return "null";
+    }
+    const record2 = raw;
+    return [record2.utilization, record2.resets_at ?? ""].join(":");
+  };
+  return ["five_hour", "seven_day"].map((name) => `${name}=${windowKey(rateLimits[name])}`).join(",");
+}
 async function emitClaudeSessionUsage() {
-  if (!currentClaudeQuery) return;
+  if (!currentClaudeQuery || claudeSessionUsageInFlight) return;
+  claudeSessionUsageInFlight = true;
   try {
     const raw = await currentClaudeQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
     const snapshot = parseClaudeSessionUsagePayload(raw);
@@ -43201,9 +43216,10 @@ async function emitClaudeSessionUsage() {
         entry.input_tokens,
         entry.output_tokens,
         entry.cache_read_tokens,
-        entry.cache_creation_tokens
+        entry.cache_creation_tokens,
+        entry.cost_usd
       ].join(":")).join(","),
-      JSON.stringify(snapshot.rate_limits ?? null)
+      stableRateLimitsKey(snapshot.rate_limits)
     ].join("|");
     if (key === claudeSessionUsageKey) {
       return;
@@ -43234,6 +43250,8 @@ async function emitClaudeSessionUsage() {
       stage: "usage_unavailable",
       detail
     });
+  } finally {
+    claudeSessionUsageInFlight = false;
   }
 }
 function emitCodexContextUsageSnapshot(snapshot) {
@@ -44285,7 +44303,6 @@ async function handleCommand(command) {
         stage: "usage_unavailable",
         detail: `Claude usage query failed: ${message}`
       });
-      emitStatus("ready", "Usage query failed.");
     }
     return;
   }

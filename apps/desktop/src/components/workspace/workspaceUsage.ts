@@ -99,7 +99,11 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
         totalCacheCreationTokens += payload.cache_creation_tokens;
         turnCount++;
         if (typeof payload.total_cost_usd === 'number') {
-          estimatedCostUsd = (estimatedCostUsd ?? 0) + payload.total_cost_usd;
+          // turn_total cost is session-cumulative — latest event wins, never sum.
+          // Crash/error results may carry a zeroed total; keep the last non-zero value.
+          if (payload.total_cost_usd > 0 || estimatedCostUsd == null) {
+            estimatedCostUsd = payload.total_cost_usd;
+          }
         }
       } else if (!payload.scope && payload.provider !== 'claude') {
         // Codex events have no scope — always count them

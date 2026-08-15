@@ -294,6 +294,11 @@ test('usage_query degrades to a lifecycle notice when the SDK usage API fails', 
     false,
     'no session_usage event should be emitted when the SDK API fails',
   );
+  assert.equal(
+    outputs.some((output) => output.type === 'status' && /Usage query failed/.test(output.detail ?? '')),
+    false,
+    'a failed usage query must not emit Status (it would flip the session state machine)',
+  );
 });
 
 test('usage_query is a silent no-op for codex sessions', async (t) => {

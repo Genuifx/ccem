@@ -91,6 +91,35 @@ test('does not double-count Claude per-message usage when turn total exists', as
   assert.equal(usage.estimatedCostUsd, 0.0123);
 });
 
+test('turn_total cost is session-cumulative: latest event wins instead of summing', async () => {
+  const { computeSessionUsage } = await importWorkspaceUsage();
+
+  const usage = computeSessionUsage([
+    event(1, {
+      type: 'token_usage',
+      provider: 'claude',
+      input_tokens: 30,
+      output_tokens: 7,
+      cache_read_tokens: 4,
+      cache_creation_tokens: 3,
+      total_cost_usd: 0.0123,
+      scope: 'turn_total',
+    }),
+    event(2, {
+      type: 'token_usage',
+      provider: 'claude',
+      input_tokens: 20,
+      output_tokens: 6,
+      cache_read_tokens: 5,
+      cache_creation_tokens: 1,
+      total_cost_usd: 0.02,
+      scope: 'turn_total',
+    }),
+  ]);
+
+  assert.equal(usage.estimatedCostUsd, 0.02);
+});
+
 test('takes the latest session_usage snapshot and keeps the empty state otherwise', async () => {
   const { computeSessionUsage } = await importWorkspaceUsage();
 

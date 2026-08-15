@@ -84,11 +84,16 @@ export function SessionUsagePopoverContent({
   const { t } = useLocale();
 
   const snapshot = usage.sessionUsage;
-  const inputTokens = snapshot?.inputTokens ?? usage.totalInputTokens;
-  const outputTokens = snapshot?.outputTokens ?? usage.totalOutputTokens;
-  const cacheReadTokens = snapshot?.cacheReadTokens ?? usage.totalCacheReadTokens;
-  const cacheCreationTokens = snapshot?.cacheCreationTokens ?? usage.totalCacheCreationTokens;
-  const costUsd = snapshot?.costUsd ?? usage.estimatedCostUsd;
+  // The SDK snapshot can lag one turn behind (transcript flush timing), while
+  // event-derived totals are per-turn complete. Both converge to the same
+  // session totals, so per-field max keeps the panel fresh without inflating.
+  const inputTokens = Math.max(snapshot?.inputTokens ?? 0, usage.totalInputTokens);
+  const outputTokens = Math.max(snapshot?.outputTokens ?? 0, usage.totalOutputTokens);
+  const cacheReadTokens = Math.max(snapshot?.cacheReadTokens ?? 0, usage.totalCacheReadTokens);
+  const cacheCreationTokens = Math.max(snapshot?.cacheCreationTokens ?? 0, usage.totalCacheCreationTokens);
+  const costUsd = snapshot?.costUsd != null || usage.estimatedCostUsd != null
+    ? Math.max(snapshot?.costUsd ?? 0, usage.estimatedCostUsd ?? 0)
+    : null;
 
   const cacheBase = cacheReadTokens + inputTokens;
   const cacheHitPercent = cacheBase > 0
