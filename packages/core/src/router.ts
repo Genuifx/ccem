@@ -6,6 +6,12 @@ import type {
 } from './types.js';
 
 export const DEFAULT_ROUTER_PORT = 17820;
+export const DEFAULT_ONLY_ROUTER_PROFILE_ID = 'default-only';
+export const MY_DEFAULT_ROUTER_PROFILE_ID = 'my-default';
+const RESERVED_ROUTER_PROFILE_IDS = new Set([
+  DEFAULT_ONLY_ROUTER_PROFILE_ID,
+  MY_DEFAULT_ROUTER_PROFILE_ID,
+]);
 
 /**
  * Built-in Agent names observed from Claude Code 2.1.220 without plugins or
@@ -22,7 +28,7 @@ export const BUILTIN_CLAUDE_AGENT_NAMES = Object.freeze([
 export type BuiltinClaudeAgentName = typeof BUILTIN_CLAUDE_AGENT_NAMES[number];
 
 export const DEFAULT_ONLY_ROUTER_PROFILE: Readonly<RouterProfile> = Object.freeze({
-  id: 'default-only',
+  id: DEFAULT_ONLY_ROUTER_PROFILE_ID,
   name: '仅默认规则',
   revision: 1,
   bindings: Object.freeze({}) as RouterBindings,
@@ -34,7 +40,6 @@ export const BUILTIN_ROUTER_PROFILES: ReadonlyArray<Readonly<RouterProfile>> = O
 ]);
 
 export const DEFAULT_ROUTER_CONFIG: Readonly<RouterConfig> = Object.freeze({
-  enabled: false,
   port: DEFAULT_ROUTER_PORT,
   bindings: Object.freeze({}) as RouterBindings,
   profiles: Object.freeze([]) as unknown as RouterProfile[],
@@ -126,6 +131,9 @@ function normalizeProfile(value: unknown, index: number): RouterProfile {
   if (typeof value.id !== 'string' || !value.id.trim() || value.id.trim() !== value.id) {
     throw new TypeError(`${fieldName} must have a non-empty id`);
   }
+  if (RESERVED_ROUTER_PROFILE_IDS.has(value.id)) {
+    throw new TypeError(`${fieldName} id '${value.id}' is reserved`);
+  }
   if (typeof value.name !== 'string' || !value.name.trim() || value.name.trim() !== value.name) {
     throw new TypeError(`${fieldName} must have a non-empty name`);
   }
@@ -154,7 +162,6 @@ function normalizeProfile(value: unknown, index: number): RouterProfile {
 
 export function createDefaultRouterConfig(): RouterConfig {
   return {
-    enabled: DEFAULT_ROUTER_CONFIG.enabled,
     port: DEFAULT_ROUTER_CONFIG.port,
     bindings: {},
     profiles: [],
@@ -169,12 +176,6 @@ export function normalizeRouterConfig(value: Partial<RouterConfig> = {}): Router
   }
 
   const normalized = createDefaultRouterConfig();
-  if (value.enabled !== undefined) {
-    if (typeof value.enabled !== 'boolean') {
-      throw new TypeError('Router enabled must be a boolean');
-    }
-    normalized.enabled = value.enabled;
-  }
   if (value.port !== undefined) {
     if (!Number.isInteger(value.port) || value.port < 1 || value.port > 65535) {
       throw new TypeError('Router port must be an integer between 1 and 65535');

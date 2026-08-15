@@ -1,6 +1,7 @@
 use super::types::{
     RouterAuthCapability, RouterConfig, RouterModelPins, RouterServiceError, SessionRouterPatch,
-    SessionRouterRecord, SessionRouterState,
+    SessionRouterRecord, SessionRouterState, DEFAULT_ONLY_ROUTER_PROFILE_ID as DEFAULT_ONLY_ID,
+    MY_DEFAULT_ROUTER_PROFILE_ID as MY_DEFAULT_ID,
 };
 use crate::config::{self, EnvConfig, OFFICIAL_BASE_URL, OFFICIAL_ENV_NAME};
 use serde_json::Value;
@@ -8,9 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 pub const MAX_ROUTER_JSON_BODY_BYTES: usize = 32 * 1024 * 1024;
-/// This is deliberately not a user setting. Flip only after a real logged-in
-/// Desktop probe proves that Claude Code forwards OAuth Authorization through
-/// the loopback base URL for the shipped runtime version.
+/// Keep false until a logged-in Desktop probe verifies OAuth through the loopback URL.
 pub const OAUTH_ROUTING_VERIFIED: bool = false;
 const ROUTE_TAG_CLOSE: &str = "</CCEM-ROUTE>";
 const BACKGROUND_MODEL_ALIAS: &str = "ccem-route:background";
@@ -234,6 +233,10 @@ pub fn validate_router_config(config: &RouterConfig) -> Result<(), RouterService
                 "ROUTER_PROFILE_INVALID",
                 format!("Duplicate router profile id '{}'.", profile.id),
             ));
+        }
+        if matches!(profile.id.as_str(), DEFAULT_ONLY_ID | MY_DEFAULT_ID) {
+            let message = format!("Router profile id '{}' is reserved.", profile.id);
+            return Err(RouterServiceError::new("ROUTER_PROFILE_INVALID", message));
         }
         validate_binding_map(&profile.bindings)?;
         validate_environment_refs(&profile.allowed_envs)?;

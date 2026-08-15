@@ -1,6 +1,6 @@
 use super::*;
 use crate::router::types::{
-    LaunchAuthKind, LaunchTransport, RouterAuthCapability, SessionRouterRecord,
+    LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterProfile, SessionRouterRecord,
 };
 
 fn record() -> SessionRouterRecord {
@@ -387,4 +387,25 @@ fn config_validation_allows_existing_non_alias_environment_references() {
     };
     validate_router_config(&config).unwrap();
     assert!(!is_valid_router_environment_alias("Team GLM (legacy)"));
+}
+
+#[test]
+fn config_validation_rejects_reserved_profile_ids() {
+    for reserved_id in ["default-only", "my-default"] {
+        let config = RouterConfig {
+            profiles: vec![RouterProfile {
+                id: reserved_id.to_string(),
+                name: "Must not shadow built-ins".into(),
+                revision: 1,
+                bindings: HashMap::new(),
+                allowed_envs: Vec::new(),
+            }],
+            ..RouterConfig::default()
+        };
+
+        let error =
+            validate_router_config(&config).expect_err("reserved profile ids must fail closed");
+        assert_eq!(error.code, "ROUTER_PROFILE_INVALID");
+        assert!(error.message.contains("reserved"), "{}", error.message);
+    }
 }

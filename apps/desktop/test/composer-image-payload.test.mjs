@@ -22,12 +22,20 @@ function sliceBetween(source, startNeedle, endNeedle) {
 test('new and resumed workspace sessions pass all composer images as initialImages', async () => {
   const source = await readSource('pages', 'Workspace.tsx');
 
-  for (const handler of ['handleCreateNativeConversation', 'handleContinueHistorySession']) {
+  for (const handler of ['runCreateNativeConversation', 'runContinueHistorySession']) {
     const block = sliceBetween(source, `const ${handler} = useCallback`, '  }, [');
     assert.match(block, /const attachments = payload\?\.attachments \?\? \[\];/);
     assert.match(block, /const images = extractComposerImagePayloads\(attachments\);/);
     assert.match(block, /initialImages: images\.length > 0 \? images : undefined,/);
     assert.match(block, /initialAnnotations: payload\?\.annotations,/);
+  }
+
+  // The public handlers wrap the run* bodies with the synchronous in-flight
+  // guard (same-tick double submit protection); the wrappers must delegate.
+  for (const handler of ['handleCreateNativeConversation', 'handleContinueHistorySession']) {
+    const block = sliceBetween(source, `const ${handler} = useCallback`, '  }, [');
+    assert.match(block, /guard\.begin\(\)/);
+    assert.match(block, /finally \{\n      guard\.end\(\);/);
   }
 });
 

@@ -66,3 +66,30 @@ test('createReentryGuard: generic same-tick mutex for router save/generate', asy
   // Backward-compatible alias is the same factory.
   assert.equal(typeof createDeleteGuard, 'function');
 });
+
+test('submit-wrapper semantics: same-tick double call blocked, released on finally even when the run throws', async () => {
+  const { createReentryGuard } = await importAsyncGuard();
+  const guard = createReentryGuard();
+
+  const submit = async (fail) => {
+    if (!guard.begin()) return 'blocked';
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (fail) throw new Error('boom');
+      return 'ran';
+    } finally {
+      guard.end();
+    }
+  };
+
+  // Same-tick double submit: the second call must be blocked synchronously.
+  const first = submit(false);
+  const second = submit(false); // still the same tick — the guard must block it
+  assert.equal(await second, 'blocked');
+  assert.equal(await first, 'ran');
+  assert.equal(await submit(false), 'ran', 'admitted again after completion');
+
+  // A throwing run must still release the guard (finally).
+  await assert.rejects(() => submit(true), /boom/);
+  assert.equal(await submit(false), 'ran', 'guard re-armed after a failed run');
+});

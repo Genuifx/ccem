@@ -3,6 +3,8 @@ use std::collections::HashMap;
 
 pub const DEFAULT_ROUTER_PORT: u16 = 17_820;
 pub const ROUTER_PORT_SCAN_END: u16 = 17_920;
+pub const DEFAULT_ONLY_ROUTER_PROFILE_ID: &str = "default-only";
+pub const MY_DEFAULT_ROUTER_PROFILE_ID: &str = "my-default";
 
 fn default_router_port() -> u16 {
     DEFAULT_ROUTER_PORT
@@ -28,8 +30,6 @@ pub struct RouterProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RouterConfig {
-    #[serde(default)]
-    pub enabled: bool,
     #[serde(default = "default_router_port")]
     pub port: u16,
     #[serde(default)]
@@ -45,7 +45,6 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             port: DEFAULT_ROUTER_PORT,
             bindings: HashMap::new(),
             profiles: Vec::new(),
@@ -343,10 +342,24 @@ mod tests {
     #[test]
     fn router_defaults_are_safe_and_stable() {
         let config = RouterConfig::default();
-        assert!(!config.enabled);
         assert_eq!(config.port, DEFAULT_ROUTER_PORT);
         assert!(config.dynamic_routing);
         assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn legacy_enabled_field_is_ignored_and_not_serialized() {
+        let config: RouterConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "port": 18_321,
+            "dynamicRouting": false
+        }))
+        .expect("deserialize legacy router config");
+
+        let value = serde_json::to_value(config).expect("serialize router config");
+        assert_eq!(value.get("enabled"), None);
+        assert_eq!(value["port"], 18_321);
+        assert_eq!(value["dynamicRouting"], false);
     }
 
     #[test]

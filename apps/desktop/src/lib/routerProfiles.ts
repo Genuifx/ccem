@@ -16,11 +16,16 @@ import type {
   SessionRouterState,
   UpdateSessionRouterPatch,
 } from '@ccem/core/browser';
+// Value import: the reserved my-defaults source id is a shared wire contract
+// with the Rust backend, owned by @ccem/core.
+import { MY_DEFAULT_ROUTER_PROFILE_ID } from '@ccem/core/browser';
+
+export { MY_DEFAULT_ROUTER_PROFILE_ID };
 
 /** Built-in profile id meaning "no per-type bindings, default env only". */
 export const DEFAULT_ONLY_PROFILE_ID = 'default-only';
 
-export type RouteLabelKind = 'direct' | 'defaultOnly' | 'profile' | 'custom';
+export type RouteLabelKind = 'direct' | 'defaultOnly' | 'myDefault' | 'profile' | 'custom';
 
 export interface RouteLabelInfo {
   kind: RouteLabelKind;
@@ -49,6 +54,9 @@ export function resolveRouteLabel(
   if (sourceProfileId === DEFAULT_ONLY_PROFILE_ID) {
     return { kind: 'defaultOnly', profileId: sourceProfileId, profileName: null };
   }
+  if (sourceProfileId === MY_DEFAULT_ROUTER_PROFILE_ID) {
+    return { kind: 'myDefault', profileId: sourceProfileId, profileName: null };
+  }
   if (sourceProfileId) {
     const matched = profiles.find((profile) => profile.id === sourceProfileId);
     if (matched) {
@@ -61,16 +69,6 @@ export function resolveRouteLabel(
     return { kind: 'defaultOnly', profileId: null, profileName: null };
   }
   return { kind: 'custom', profileId: null, profileName: null };
-}
-
-/**
- * The composer pill is shown only for a non-default-only route — i.e. a routed
- * session that carries a named profile or at least one per-type binding.
- */
-export function hasCustomOrProfileRoute(router: SessionRouterState | null): boolean {
-  if (!router || router.launchTransport !== 'routed') return false;
-  if (router.sourceProfileId && router.sourceProfileId !== DEFAULT_ONLY_PROFILE_ID) return true;
-  return Object.keys(router.bindings).length > 0;
 }
 
 /**
@@ -97,10 +95,10 @@ export function shouldApplySessionRouter(
 
 /**
  * Transport truth: an existing session's `launchTransport` is the authoritative
- * transport, NOT the global config toggle. When the global router is turned off
- * the backend keeps already-routed helpers on their live `actualPort` (no
- * in-flight transport hot-swap), so the UI must keep showing/allowing the route
- * chip + session CAS for such sessions. Only direct/new sessions read as direct.
+ * transport. Listener failures and global default edits never rewrite a
+ * persisted session's launch transport, so the UI must keep showing/allowing
+ * the route chip + session CAS for routed sessions. Only direct/new sessions
+ * read as direct.
  */
 export function isSessionRouted(router: SessionRouterState | null): router is SessionRouterState {
   return router != null && router.launchTransport === 'routed';
@@ -252,6 +250,36 @@ export function buildProfileApplyPatch(
     sourceProfileId: profile.id,
     profileRevision: profile.revision,
     // dynamicRouting intentionally omitted → preserved by the partial patch.
+  };
+}
+
+/**
+ * Re-seed a RUNNING routed session from the user's current RouterConfig
+ * defaults — the virtual "my defaults" option in the session selectors. This
+ * is deliberately NOT a faked RouterProfile: there is no stored profile, so
+ * profileRevision stays null and the label keeps reading 「我的默认」.
+ *
+ * - The session's main env (defaultEnv) is preserved (omitted from the patch).
+ * - bindings snapshot the CURRENT config bindings.
+ * - allowedEnvs = union(current defaultEnv + config.defaultAllowedEnvs +
+ *   config binding targets), de-duplicated, empties dropped.
+ * - dynamicRouting follows the current config default.
+ */
+export function buildMyDefaultApplyPatch(
+  router: SessionRouterState,
+  config: Readonly<RouterConfig>,
+): UpdateSessionRouterPatch {
+  const bindingTargets = nonEmpty(Object.values(config.bindings));
+  const allowedEnvs = Array.from(
+    new Set(nonEmpty([router.defaultEnv, ...config.defaultAllowedEnvs, ...bindingTargets])),
+  );
+
+  return {
+    bindings: { ...config.bindings } as RouterBindings,
+    allowedEnvs,
+    sourceProfileId: MY_DEFAULT_ROUTER_PROFILE_ID,
+    profileRevision: null,
+    dynamicRouting: config.dynamicRouting,
   };
 }
 
@@ -591,8 +619,7 @@ export function enqueueSessionRouterMutation<T>(
 /**
  * Build the GLOBAL RouterConfig patch that promotes the current session draft to
  * the user's default. Writes bindings / dynamicRouting / defaultAllowedEnvs from
- * the draft; enabled / port / profiles are intentionally absent so
- * `applyConfigUpdater` (`{ ...base, ...patch }`) preserves them untouched.
+ * the draft.
  *
  * `defaultAllowedEnvs` reuses `computeFinalAllowedEnvs` so the saved default
  * carries the same forced-on default-env + binding targets + explicit

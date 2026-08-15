@@ -175,7 +175,13 @@ describe('top-level config normalization', () => {
       },
     }));
 
-    expect(normalizeCcemConfig(input).router).toEqual(input.router);
+    expect(normalizeCcemConfig(input).router).toEqual({
+      port: 17842,
+      bindings: { 'subagent:Explore': 'search-env' },
+      profiles: [],
+      dynamicRouting: false,
+      defaultAllowedEnvs: ['primary', 'search-env'],
+    });
   });
 
   it('keeps router absent for configurations that predate it', () => {

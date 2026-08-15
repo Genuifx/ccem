@@ -97,7 +97,13 @@ import {
 } from './composerModel';
 import { composerSegmentsReferenceImageAttachment } from './composerImageReferences';
 import { WorkspaceComposerAnnotations } from './WorkspaceAnnotations';
-import { WorkspaceRoutePill, ComposerRouteMenuRow } from './WorkspaceRouter';
+import {
+  WorkspaceRoutePill,
+  ComposerRouteMenuRow,
+  ComposerRouteDraftRow,
+  ComposerRouteDraftPill,
+} from './WorkspaceRouter';
+import { isRouteDraftPillVisible, isRouteDraftRowVisible, type ComposerRouteDraft } from './composerRouteDraft';
 import {
   buildComposerPromptWithAnnotations,
   parseWorkspacePromptAnnotations,
@@ -137,6 +143,13 @@ interface WorkspaceSessionComposerProps {
   provider?: WorkspaceComposerProvider;
   /** Active native session runtimeId — enables the Route pill above the textarea. */
   routeRuntimeId?: string | null;
+  /**
+   * New-session Dynamic Routing opt-in draft (compose/history composers).
+   * When provided AND the provider can route, the "+" menu gains the
+   * 「动态路由」 row and an opted-in draft shows the draft route pill.
+   */
+  routeDraft?: ComposerRouteDraft | null;
+  onRouteDraftChange?: (draft: ComposerRouteDraft) => void;
   installedSkills?: InstalledSkill[];
   onRefreshSkills?: () => Promise<InstalledSkill[]>;
   workspaceCommands?: ComposerCommandDefinition[];
@@ -490,6 +503,8 @@ function ComposerQuickMenu({
   planModeKind,
   provider,
   routeRuntimeId,
+  routeDraft,
+  onRouteDraftChange,
   onLaunchNewSession,
   onPlanModeEnabledChange,
 }: {
@@ -501,6 +516,8 @@ function ComposerQuickMenu({
   planModeKind: 'session_permission' | 'command_prefix';
   provider: WorkspaceComposerProvider;
   routeRuntimeId?: string | null;
+  routeDraft?: ComposerRouteDraft | null;
+  onRouteDraftChange?: (draft: ComposerRouteDraft) => void;
   onLaunchNewSession?: (client: LaunchClient) => void;
   onPlanModeEnabledChange?: (enabled: boolean) => void;
 }) {
@@ -599,6 +616,10 @@ function ComposerQuickMenu({
 
         {routeRuntimeId ? (
           <ComposerRouteMenuRow runtimeId={routeRuntimeId} />
+        ) : null}
+
+        {routeDraft != null && onRouteDraftChange && isRouteDraftRowVisible(provider) ? (
+          <ComposerRouteDraftRow draft={routeDraft} onDraftChange={onRouteDraftChange} />
         ) : null}
       </PopoverContent>
     </Popover>
@@ -791,6 +812,8 @@ export function WorkspaceSessionComposer({
   onClearAnnotations,
   onAnnotationsSent,
   routeRuntimeId = null,
+  routeDraft = null,
+  onRouteDraftChange,
 }: WorkspaceSessionComposerProps) {
   const { t } = useLocale();
   const composerShellRef = useRef<HTMLDivElement | null>(null);
@@ -840,6 +863,7 @@ export function WorkspaceSessionComposer({
     : (primaryActionIcon ?? <ArrowUp className="h-4 w-4" />);
   const capabilities = getComposerCapabilities(provider);
   const planButtonVisible = planModeAvailable ?? Boolean(onPlanModeEnabledChange);
+  const routeDraftPillVisible = isRouteDraftPillVisible(routeDraft, provider);
   const recentFileSuggestions = useMemo<ComposerSuggestion[]>(
     () => recentFiles.map((entry) => ({
       id: `recent-file-${entry.path}`,
@@ -1531,7 +1555,7 @@ export function WorkspaceSessionComposer({
             planModeEnabled && 'border-primary/15',
           )}
         >
-          {planModeEnabled || routeRuntimeId ? (
+          {planModeEnabled || routeRuntimeId || routeDraftPillVisible ? (
             <div className="mb-3 flex items-center gap-2 empty:hidden">
               {planModeEnabled ? (
                 <span className="inline-flex items-center gap-1.5 rounded-[6px] bg-primary/[0.06] px-2 py-0.5 text-[10px] font-medium leading-5 text-primary/70">
@@ -1540,6 +1564,9 @@ export function WorkspaceSessionComposer({
                 </span>
               ) : null}
               {routeRuntimeId ? <WorkspaceRoutePill runtimeId={routeRuntimeId} /> : null}
+              {routeDraftPillVisible && routeDraft && onRouteDraftChange ? (
+                <ComposerRouteDraftPill draft={routeDraft} onDraftChange={onRouteDraftChange} />
+              ) : null}
             </div>
           ) : null}
           {annotations.length > 0 && onUpdateAnnotation && onRemoveAnnotation && onClearAnnotations ? (
@@ -1636,6 +1663,8 @@ export function WorkspaceSessionComposer({
               planModeKind={capabilities.planModeKind}
               provider={provider}
               routeRuntimeId={routeRuntimeId}
+              routeDraft={routeDraft}
+              onRouteDraftChange={onRouteDraftChange}
               onLaunchNewSession={onLaunchNewSession}
               onPlanModeEnabledChange={onPlanModeEnabledChange}
             />

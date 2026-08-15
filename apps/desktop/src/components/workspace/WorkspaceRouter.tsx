@@ -8,18 +8,20 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import {
   DEFAULT_ONLY_PROFILE_ID,
+  MY_DEFAULT_ROUTER_PROFILE_ID,
   buildCustomEditPatch,
+  buildMyDefaultApplyPatch,
   buildProfileApplyPatch,
   buildSaveAsDefaultPatch,
   computeAutoIncludedEnvs,
   computeCandidateEnvs,
   computeFinalAllowedEnvs,
   enqueueSessionRouterMutation,
-  hasCustomOrProfileRoute,
   isSessionRouted,
   resolveRouteLabel,
 } from '@/lib/routerProfiles';
@@ -27,6 +29,11 @@ import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { toast } from 'sonner';
 import { BUILTIN_CLAUDE_AGENT_NAMES } from '@ccem/core/browser';
 import type { RouterProfile, SessionRouterState } from '@ccem/core/browser';
+import {
+  resolveRouteDraftLabel,
+  toggleComposerRouteDraft,
+  type ComposerRouteDraft,
+} from './composerRouteDraft';
 
 /** Sentinel Select value meaning "no per-type binding → fall through to default". */
 const BINDING_FOLLOW_DEFAULT = '__ccem_default__';
@@ -113,6 +120,43 @@ export function useApplyRouteProfile(runtimeId: string) {
   );
 }
 
+/**
+ * Apply the virtual "my defaults" option to a running session: same
+ * per-runtime mutation queue and fresh-revision read as profile applies, so a
+ * rapid my-default → profile (or profile → env-switch) sequence lands on the
+ * bumped revision instead of losing the user's last intent.
+ */
+export function useApplyMyDefaultRoute(runtimeId: string) {
+  const { updateSessionRouter } = useTauriCommands();
+  const { t } = useLocale();
+  return useCallback(
+    (): Promise<boolean> =>
+      enqueueSessionRouterMutation(runtimeId, async () => {
+        // FRESH router + config at execution time (config may have been edited
+        // on the Environments page after the popover opened).
+        const router = useAppStore.getState().sessionRouters[runtimeId];
+        const config = useAppStore.getState().routerConfig;
+        if (!router || !config) return false;
+        const result = await updateSessionRouter(
+          runtimeId,
+          router.revision,
+          buildMyDefaultApplyPatch(router, config),
+        );
+        if (result.ok) {
+          toast.success(t('router.applied'));
+          return true;
+        }
+        if (result.conflict.code === 'ROUTER_REVISION_CONFLICT') {
+          toast.warning(t('router.conflict'));
+        } else {
+          toast.error(t('router.applyFailed', { message: result.conflict.message }));
+        }
+        return false;
+      }),
+    [runtimeId, updateSessionRouter, t],
+  );
+}
+
 /** Localized label text for a session's route. */
 function useRouteLabelText(runtimeId: string | null) {
   const { t } = useLocale();
@@ -122,6 +166,7 @@ function useRouteLabelText(runtimeId: string | null) {
     const info = resolveRouteLabel(router, profiles);
     if (info.kind === 'direct') return t('router.direct');
     if (info.kind === 'profile') return info.profileName ?? t('router.custom');
+    if (info.kind === 'myDefault') return t('router.routeMyDefault');
     if (info.kind === 'custom') return t('router.custom');
     return t('router.defaultOnly');
   }, [router, profiles, t]);
@@ -148,6 +193,7 @@ function RoutePopoverBody({
   const { updateSessionRouter, restartNativeSessionDirect } = useTauriCommands();
   const { commit: commitGlobal } = useRouterConfigEditor();
   const applyProfile = useApplyRouteProfile(runtimeId);
+  const applyMyDefault = useApplyMyDefaultRoute(runtimeId);
 
   const existingNames = useMemo(() => environments.map((e) => e.name), [environments]);
   const candidateEnvs = useMemo(
@@ -189,6 +235,7 @@ function RoutePopoverBody({
   const profiles = routerConfig?.profiles ?? [];
   const profileOptions = useMemo(() => {
     const opts: { id: string; name: string }[] = [
+      { id: MY_DEFAULT_ROUTER_PROFILE_ID, name: t('router.routeMyDefault') },
       { id: DEFAULT_ONLY_PROFILE_ID, name: t('router.defaultOnly') },
     ];
     for (const p of profiles) opts.push({ id: p.id, name: p.name });
@@ -210,9 +257,6 @@ function RoutePopoverBody({
   const showRestart =
     router?.launchTransport === 'routed' && (state === 'degraded' || state === 'failed');
   const isDirect = router?.launchTransport === 'direct';
-  // Global router is off but this session is already routed — surface that the
-  // toggle only affects NEW sessions (transport is not hot-swapped in flight).
-  const globalOffNote = !isDirect && routerConfig?.enabled === false;
 
   const bindingRows = useMemo(() => {
     const rows: { key: string; label: string }[] = [
@@ -250,6 +294,10 @@ function RoutePopoverBody({
 
   const handleApplyProfile = useCallback(
     async (profileId: string) => {
+      if (profileId === MY_DEFAULT_ROUTER_PROFILE_ID) {
+        await applyMyDefault();
+        return;
+      }
       const profile =
         profileId === DEFAULT_ONLY_PROFILE_ID
           ? DEFAULT_ONLY_PROFILE
@@ -257,7 +305,7 @@ function RoutePopoverBody({
       if (!profile) return;
       await applyProfile(profile);
     },
-    [profiles, applyProfile],
+    [profiles, applyProfile, applyMyDefault],
   );
 
   const handleApply = useCallback(async () => {
@@ -289,12 +337,8 @@ function RoutePopoverBody({
     }
   }, [router, baseAllowed, defaultEnv, bindings, dynamic, existingNames, updateSessionRouter, runtimeId, t, onClose]);
 
-  // §4.5 L2 「存为我的默认」: promote the current session DRAFT (bindings /
-  // dynamicRouting / allowedEnvs) to the global default via the authoritative
-  // commit queue. enabled / port / profiles are preserved by the patch shape.
-  // This is INDEPENDENT of the session CAS apply — it never calls
-  // update_session_router. Failure reloads the truth and surfaces an error toast
-  // (never a fake success); the commit queue serializes concurrent global edits.
+  // Promote the current session draft to the serialized global default queue;
+  // this remains independent of the session CAS apply path.
   const handleSaveAsDefault = useCallback(async () => {
     const guard = saveGuardRef.current;
     if (!guard || !guard.begin()) return; // synchronous same-tick claim
@@ -364,12 +408,6 @@ function RoutePopoverBody({
             <RefreshCw className={cn('h-3 w-3', restarting && 'animate-spin')} />
             {restarting ? t('router.restarting') : t('router.restartDirect')}
           </Button>
-        </div>
-      ) : null}
-
-      {globalOffNote ? (
-        <div className="mx-3 mb-1 rounded-lg bg-muted/35 px-2.5 py-1.5 text-[10px] leading-4 text-muted-foreground">
-          {t('router.globalOffNote')}
         </div>
       ) : null}
 
@@ -595,19 +633,19 @@ function RouteControl({
 }
 
 /**
- * Status-strip Route chip. Transport truth = the session's launchTransport, NOT
- * the global config toggle: an existing routed session stays routed (and keeps
- * its route chip + CAS) even after the global router is turned off, because the
- * backend does not hot-swap in-flight transports. Only direct/new sessions show
- * the muted "direct" chip.
+ * Status-strip Route chip. Transport truth = the session's launchTransport:
+ * routing is opted in per Composer at creation time and never hot-swapped in
+ * flight. Only direct/new sessions show the muted "direct" chip, which points
+ * at the Environments page (default rules & profiles live there; Settings no
+ * longer exposes any router enable toggle).
  */
 export function WorkspaceRouteChip({
   runtimeId,
-  onNavigateSettings,
+  onNavigateEnvironments,
   compact = false,
 }: {
   runtimeId: string | null;
-  onNavigateSettings?: () => void;
+  onNavigateEnvironments?: () => void;
   compact?: boolean;
 }) {
   const { t } = useLocale();
@@ -622,19 +660,19 @@ export function WorkspaceRouteChip({
   const sessionDegraded = routed && (state === 'degraded' || state === 'failed');
 
   if (!routed) {
-    // Direct / new session → muted "direct" chip (click → settings).
+    // Direct / new session → muted "direct" chip (click → environments).
     const reason = routerStatus?.error;
     const title = reason ? `${t('router.directHint')} — ${reason}` : t('router.directHint');
     return (
       <button
         type="button"
         title={title}
-        onClick={onNavigateSettings}
+        onClick={onNavigateEnvironments}
         className={cn(
           'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full',
           compact ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
           'status-chip-glass opacity-70 hover:opacity-100',
-          onNavigateSettings ? 'cursor-pointer' : 'cursor-default',
+          onNavigateEnvironments ? 'cursor-pointer' : 'cursor-default',
         )}
       >
         <Route className="h-3.5 w-3.5 text-muted-foreground" />
@@ -670,7 +708,13 @@ export function WorkspaceRouteChip({
   );
 }
 
-/** Composer Route pill — focusable button, shown only for routed non-default-only routes. */
+/**
+ * Composer Route pill — focusable button, shown for EVERY routed session
+ * (named profile, my-defaults seed, default-only, or custom bindings):
+ * visibility is transport truth, not route richness. The VISIBLE text always
+ * leads with the mode itself (「动态路由」/ "Dynamic routing") followed by the
+ * current label — an icon alone is not acceptance-sufficient.
+ */
 export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) {
   const { t } = useLocale();
   const routerStatus = useAppStore((s) => s.routerStatus);
@@ -678,11 +722,11 @@ export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) 
   const labelText = useRouteLabelText(runtimeId);
 
   if (!runtimeId) return null;
-  // Transport truth: pill only for routed sessions carrying a real route.
-  if (!isSessionRouted(router) || !hasCustomOrProfileRoute(router)) return null;
+  // Transport truth: the pill is the routed session's authoritative badge.
+  if (!isSessionRouted(router)) return null;
 
   const degraded = routerStatus?.state === 'degraded' || routerStatus?.state === 'failed';
-  const label = degraded ? t('router.degraded') : labelText;
+  const label = `${t('router.routeDraftTitle')} · ${degraded ? t('router.degraded') : labelText}`;
 
   return (
     <RouteControl
@@ -691,8 +735,8 @@ export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) 
       trigger={() => (
         <button
           type="button"
-          title={t('router.title')}
-          aria-label={t('router.title')}
+          title={label}
+          aria-label={label}
           className={cn(
             'inline-flex items-center gap-1.5 rounded-[6px] px-2 py-0.5 text-[10px] font-medium leading-5 cursor-pointer',
             'transition-colors hover:bg-primary/[0.10]',
@@ -710,38 +754,35 @@ export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) 
 export { RoutePopoverBody };
 
 /**
- * Composer "+" menu row: expands an inline profile radio (default-only +
- * routerConfig.profiles) within the SAME popover. Applies via one CAS write.
- * Renders only for a routed session.
+ * Composer "+" menu row for a RUNNING routed session: expands an inline profile
+ * radio (default-only + routerConfig.profiles) within the SAME popover; each
+ * selection applies via one CAS write. There is deliberately NO on/off Switch —
+ * transport cannot be hot-toggled, and "off" would have meant clearing bindings
+ * while the session stays routed (misleading). Direct running sessions render
+ * nothing; routing is opted in at creation time via ComposerRouteDraftRow.
  */
 export function ComposerRouteMenuRow({ runtimeId }: { runtimeId: string }) {
   const { t } = useLocale();
   const router = useAppStore((s) => s.sessionRouters[runtimeId] ?? null);
   const profiles = useAppStore((s) => s.routerConfig?.profiles ?? []);
   const applyProfile = useApplyRouteProfile(runtimeId);
+  const applyMyDefault = useApplyMyDefaultRoute(runtimeId);
   const [expanded, setExpanded] = useState(false);
-
-  // Remember the most-recent non-default profile so the Switch can re-apply it.
-  const lastProfileIdRef = useRef<string | null>(null);
-  const namedActiveId =
-    router?.sourceProfileId && router.sourceProfileId !== DEFAULT_ONLY_PROFILE_ID
-      ? router.sourceProfileId
-      : null;
-  if (namedActiveId) lastProfileIdRef.current = namedActiveId;
 
   if (!router || router.launchTransport !== 'routed') return null;
 
   const profileOptions: { id: string; name: string }[] = [
+    { id: MY_DEFAULT_ROUTER_PROFILE_ID, name: t('router.routeMyDefault') },
     { id: DEFAULT_ONLY_PROFILE_ID, name: t('router.defaultOnly') },
     ...profiles.map((p) => ({ id: p.id, name: p.name })),
   ];
   const selectedId = router.sourceProfileId
     ?? (Object.keys(router.bindings).length === 0 ? DEFAULT_ONLY_PROFILE_ID : null);
-  const currentLabel = selectedId
-    ? (profileOptions.find((o) => o.id === selectedId)?.name ?? t('router.custom'))
-    : t('router.custom');
-  // Switch = non-default-only route (named profile or any per-type binding).
-  const switchedOn = hasCustomOrProfileRoute(router);
+  const currentLabel = selectedId === MY_DEFAULT_ROUTER_PROFILE_ID
+    ? t('router.routeMyDefault')
+    : selectedId
+      ? (profileOptions.find((o) => o.id === selectedId)?.name ?? t('router.custom'))
+      : t('router.custom');
 
   const resolveProfile = (id: string) =>
     id === DEFAULT_ONLY_PROFILE_ID
@@ -749,29 +790,11 @@ export function ComposerRouteMenuRow({ runtimeId }: { runtimeId: string }) {
       : profiles.find((p) => p.id === id) ?? null;
 
   const handleSelect = (id: string) => {
+    if (id === MY_DEFAULT_ROUTER_PROFILE_ID) {
+      void applyMyDefault();
+      return;
+    }
     const profile = resolveProfile(id);
-    if (profile) void applyProfile(profile);
-  };
-
-  const onSwitchChange = (on: boolean) => {
-    if (!on) {
-      // Off → default-only rule.
-      void applyProfile({
-        id: DEFAULT_ONLY_PROFILE_ID,
-        name: '',
-        revision: 1,
-        bindings: {},
-        allowedEnvs: [],
-      });
-      return;
-    }
-    // On → restore remembered profile, else first user profile, else stay off.
-    const targetId = lastProfileIdRef.current ?? profiles[0]?.id ?? null;
-    if (!targetId) {
-      toast.message(t('router.switchNoProfile'));
-      return;
-    }
-    const profile = resolveProfile(targetId);
     if (profile) void applyProfile(profile);
   };
 
@@ -789,12 +812,6 @@ export function ComposerRouteMenuRow({ runtimeId }: { runtimeId: string }) {
           <span className="truncate text-[11px] text-muted-foreground">{currentLabel}</span>
           <ChevronDown className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', expanded && 'rotate-180')} />
         </button>
-        <Switch
-          checked={switchedOn}
-          onCheckedChange={onSwitchChange}
-          aria-label={t('router.title')}
-          className="data-[state=checked]:bg-foreground data-[state=unchecked]:bg-muted/85"
-        />
       </div>
       {expanded ? (
         <div className="mb-1 ml-2 mr-1">
@@ -823,5 +840,160 @@ export function ComposerRouteMenuRow({ runtimeId }: { runtimeId: string }) {
         </div>
       ) : null}
     </>
+  );
+}
+
+/**
+ * Composer "+" menu row for a NEW-SESSION draft composer: the per-Composer
+ * Dynamic Routing opt-in. Default off. Enabling only records the opt-in and
+ * reveals the route pill above the input — the routing snapshot itself is
+ * read from the CURRENT RouterConfig at submit time (not captured here).
+ * Pure local draft state — no IPC write happens until the first submit
+ * carries it as `routerLaunchDraft`.
+ */
+export function ComposerRouteDraftRow({
+  draft,
+  onDraftChange,
+}: {
+  draft: ComposerRouteDraft;
+  onDraftChange: (draft: ComposerRouteDraft) => void;
+}) {
+  const { t } = useLocale();
+
+  return (
+    <>
+      <div className="mx-2 my-1.5 h-px border-t border-border/50" />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors glass-dropdown-item">
+            <Route className={cn(
+              'h-4 w-4 shrink-0 text-muted-foreground transition-colors',
+              draft.optIn && 'text-foreground',
+            )} />
+            <span className={cn(
+              'flex-1 text-left transition-colors',
+              draft.optIn && 'text-foreground',
+            )}>
+              {t('router.routeDraftTitle')}
+            </span>
+            <Switch
+              checked={draft.optIn}
+              onCheckedChange={(checked) => onDraftChange(toggleComposerRouteDraft(checked))}
+              aria-label={t('router.routeDraftTitle')}
+              className="data-[state=checked]:bg-foreground data-[state=unchecked]:bg-muted/85"
+            />
+          </div>
+        </TooltipTrigger>
+        <TooltipContent side="left" className="max-w-[280px] text-[12px] leading-5">
+          {t('router.routeDraftHint')}
+        </TooltipContent>
+      </Tooltip>
+    </>
+  );
+}
+
+/** Sentinel radio id meaning "my defaults" (RouterConfig snapshot). */
+const ROUTE_DRAFT_MY_DEFAULTS_ID = '__ccem_my_defaults__';
+
+/**
+ * Draft route pill above the composer input. Opens the same-style profile
+ * popover, but selections only update the LOCAL draft (no CAS write — there is
+ * no runtime yet). Options: my defaults + named profiles; no free-text entry.
+ */
+export function ComposerRouteDraftPill({
+  draft,
+  onDraftChange,
+}: {
+  draft: ComposerRouteDraft;
+  onDraftChange: (draft: ComposerRouteDraft) => void;
+}) {
+  const { t } = useLocale();
+  const routerConfig = useAppStore((s) => s.routerConfig);
+  const [open, setOpen] = useState(false);
+  const profiles = routerConfig?.profiles ?? [];
+
+  const labelInfo = resolveRouteDraftLabel(draft, routerConfig);
+  const selectionLabel = labelInfo.kind === 'profile'
+    ? labelInfo.profileName
+    : labelInfo.kind === 'missingProfile'
+      ? t('router.routeDraftProfileMissing')
+      : t('router.routeMyDefault');
+  // The mode itself must be VISIBLE in the pill (not just icon/title/aria):
+  // 「动态路由 · <当前选择>」 / "Dynamic routing · <selection>".
+  const label = `${t('router.routeDraftTitle')} · ${selectionLabel}`;
+  const statefulTitle = label;
+
+  const radioValue = draft.profileId === null ? ROUTE_DRAFT_MY_DEFAULTS_ID : draft.profileId;
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          title={statefulTitle}
+          aria-label={statefulTitle}
+          className={cn(
+            'inline-flex items-center gap-1.5 rounded-[6px] px-2 py-0.5 text-[10px] font-medium leading-5 cursor-pointer',
+            'transition-colors hover:bg-primary/[0.10]',
+            labelInfo.kind === 'missingProfile'
+              ? 'bg-warning/10 text-warning'
+              : 'bg-primary/[0.06] text-primary/70',
+          )}
+        >
+          <Route className="h-3 w-3" />
+          {label}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        sideOffset={6}
+        collisionPadding={12}
+        className="w-[260px] max-w-[calc(100vw-24px)] rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover p-0 shadow-lg"
+      >
+        <div className="p-2">
+          <div className="px-1 pb-1.5 text-[11px] font-medium text-muted-foreground">
+            {t('router.routeDraftPopoverTitle')}
+          </div>
+          <RadioGroup
+            value={radioValue}
+            onValueChange={(v) => {
+              onDraftChange(
+                v === ROUTE_DRAFT_MY_DEFAULTS_ID
+                  ? { optIn: true, profileId: null }
+                  : { optIn: true, profileId: v },
+              );
+            }}
+            className="gap-0.5"
+          >
+            <label
+              htmlFor="rd-my-defaults"
+              className={cn(
+                'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
+                draft.profileId === null ? 'text-primary' : 'text-foreground/85',
+              )}
+            >
+              <RadioGroupItem value={ROUTE_DRAFT_MY_DEFAULTS_ID} id="rd-my-defaults" />
+              <span className="min-w-0 flex-1 truncate text-left">{t('router.routeMyDefault')}</span>
+            </label>
+            {profiles.map((p) => (
+              <label
+                key={p.id}
+                htmlFor={`rd-${p.id}`}
+                className={cn(
+                  'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
+                  draft.profileId === p.id ? 'text-primary' : 'text-foreground/85',
+                )}
+              >
+                <RadioGroupItem value={p.id} id={`rd-${p.id}`} />
+                <span className="min-w-0 flex-1 truncate text-left">{p.name}</span>
+              </label>
+            ))}
+          </RadioGroup>
+          <p className="px-1 pt-1.5 text-[10px] leading-4 text-muted-foreground/80">
+            {t('router.routeDraftPopoverHint')}
+          </p>
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }

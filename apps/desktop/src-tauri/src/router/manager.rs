@@ -50,10 +50,6 @@ impl RouterManager {
             .map_err(|_| "Router status lock is poisoned".to_string())?;
         status.requested_port = config.port;
         status.oauth_routing_enabled = OAUTH_ROUTING_VERIFIED;
-        if !config.enabled && status.actual_port.is_none() {
-            status.state = RouterRunState::Disabled;
-            status.error = None;
-        }
         Ok(())
     }
 
@@ -89,14 +85,6 @@ impl RouterManager {
         }
     }
 
-    pub fn set_disabled(&self, actual_port: Option<u16>) {
-        if let Ok(mut status) = self.status.lock() {
-            status.state = RouterRunState::Disabled;
-            status.actual_port = actual_port;
-            status.error = None;
-        }
-    }
-
     pub fn set_failed(&self, error: impl Into<String>, degraded: bool) {
         if let Ok(mut status) = self.status.lock() {
             status.state = if degraded {
@@ -113,16 +101,8 @@ impl RouterManager {
         if let Ok(mut status) = self.status.lock() {
             status.actual_port = None;
             status.error = None;
-            status.state = if self.config().enabled {
-                RouterRunState::Failed
-            } else {
-                RouterRunState::Disabled
-            };
+            status.state = RouterRunState::Failed;
         }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.config().enabled
     }
 
     pub fn route_count(&self) -> usize {

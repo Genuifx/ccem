@@ -31,6 +31,7 @@ import type {
   NativePromptImageInput,
   SessionPromptAnnotation,
   NativeSessionSummary,
+  RouterLaunchDraft,
   NativeTerminalType,
   PlatformCapabilities,
   ReplayBatch,
@@ -931,6 +932,12 @@ export function useTauriCommands() {
     providerSessionId?: string | null;
     effort?: string | null;
     seedBoundaryMessageCount?: number | null;
+    /**
+     * Per-Composer Dynamic Routing opt-in snapshot. Omitted/null = legacy
+     * single-environment (direct) launch. Only meaningful for providers whose
+     * requests can be routed (Claude today).
+     */
+    routerLaunchDraft?: RouterLaunchDraft | null;
   }): Promise<NativeSessionSummary> => {
     const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
     return invoke<NativeSessionSummary>('create_native_session', {
@@ -946,6 +953,7 @@ export function useTauriCommands() {
       providerSessionId: options.providerSessionId ?? null,
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
+      routerLaunchDraft: options.routerLaunchDraft ?? null,
     });
   }, [getSessionDefaults]);
 

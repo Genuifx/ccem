@@ -23,12 +23,20 @@ export interface RouterProfile {
 }
 
 export interface RouterConfig {
-  enabled: boolean;
   port: number;
   bindings: RouterBindings;
   profiles: RouterProfile[];
   dynamicRouting: boolean;
   defaultAllowedEnvs: string[];
+}
+
+/** Explicit, per-Composer snapshot carried only by an opted-in first launch. */
+export interface RouterLaunchDraft {
+  bindings: RouterBindings;
+  allowedEnvs: string[];
+  sourceProfileId: string | null;
+  profileRevision: number | null;
+  dynamicRouting: boolean;
 }
 
 export interface SessionRouteTable {

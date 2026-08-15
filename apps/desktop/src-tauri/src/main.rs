@@ -86,7 +86,7 @@ use interactive_runtime::{
 };
 use native_runtime::{
     InteractivePromptAnnotation, NativeHandoffResult, NativeProvider, NativeRuntimeManager,
-    NativeSessionOptions, NativeSessionSummary, PromptImage,
+    NativeSessionOptions, NativeSessionSummary, PromptImage, RouterLaunchDraft,
 };
 use opencode::{snapshot_known_session_ids, track_launched_session};
 use prompt_image_store::PromptImageStore;
@@ -1324,9 +1324,16 @@ async fn create_native_session(
     provider_session_id: Option<String>,
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
+    router_launch_draft: Option<RouterLaunchDraft>,
 ) -> Result<NativeSessionSummary, String> {
     let mutation_guard = environment_mutations.lock()?;
     let provider = parse_native_provider(&provider)?;
+    if provider != NativeProvider::Claude && router_launch_draft.is_some() {
+        return Err(
+            "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
+                .to_string(),
+        );
+    }
     let effective_working_dir = resolve_headless_working_dir(working_dir);
     let effective_perm_mode = resolve_effective_perm_mode(perm_mode);
     let effective_runtime_perm_mode = runtime_perm_mode
@@ -1359,7 +1366,7 @@ async fn create_native_session(
                 codex_base_url: None,
                 codex_api_key: None,
                 effort: effort.clone(),
-                router_seed: None,
+                router_launch_draft,
                 router_record: None,
             }
         }
@@ -1392,7 +1399,7 @@ async fn create_native_session(
                 codex_base_url: None,
                 codex_api_key: None,
                 effort,
-                router_seed: None,
+                router_launch_draft: None,
                 router_record: None,
             }
         }

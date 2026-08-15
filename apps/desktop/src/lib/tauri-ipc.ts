@@ -11,6 +11,7 @@ import type { Environment, Session } from '@/store';
 import type { UsageStats as AnalyticsUsageStats } from '@/types/analytics';
 import type {
   RouterConfig,
+  RouterLaunchDraft,
   RouterStatus,
   SessionRouterState,
   UpdateSessionRouterRequest,
@@ -329,6 +330,11 @@ export interface TauriCommands {
       providerSessionId?: string | null;
       effort?: string | null;
       seedBoundaryMessageCount?: number | null;
+      /**
+       * Per-Composer Dynamic Routing opt-in snapshot (null/omitted = legacy
+       * direct launch). Core-owned wire type shared with the Rust backend.
+       */
+      routerLaunchDraft?: RouterLaunchDraft | null;
     },
     NativeSessionSummary
   ];
@@ -907,6 +913,15 @@ export interface SessionRouterUpdatedEvent {
   router: SessionRouterState;
   reason: string;
 }
+
+/**
+ * Per-Composer Dynamic Routing opt-in carried by the FIRST
+ * `create_native_session` submit. Null/omitted = legacy single-environment
+ * (direct) launch; an opted-in draft always carries the full snapshot (there
+ * is no partial frontend shape). Owned by @ccem/core (shared wire contract
+ * with the Rust backend); re-exported here for the IPC layer's convenience.
+ */
+export type { RouterLaunchDraft };
 
 export interface ManagedSessionSummary {
   runtime_id: string;

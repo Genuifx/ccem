@@ -2,8 +2,8 @@ use crate::browser::{BrowserBounds, BrowserManager, BrowserToolRequest};
 use crate::config::{self, resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::ReplayBatch;
 use crate::native_runtime::{
-    NativeProvider, NativeRouterSeed, NativeRuntimeManager, NativeSessionOptions,
-    NativeSessionSummary,
+    NativeProvider, NativeRuntimeManager, NativeSessionOptions, NativeSessionSummary,
+    RouterLaunchDraft,
 };
 use crate::proxy_debug::ProxyDebugManager;
 use crate::router::{
@@ -273,9 +273,37 @@ struct CreateSessionParams {
     provider_session_id: Option<String>,
     effort: Option<String>,
     open: Option<bool>,
+    router_launch_draft: Option<RouterLaunchDraft>,
     routes: Option<HashMap<String, String>>,
     allowed_envs: Option<Vec<String>>,
     dynamic_routing: Option<bool>,
+}
+
+fn resolve_external_router_launch_draft(
+    params: &CreateSessionParams,
+) -> Result<Option<RouterLaunchDraft>, String> {
+    let has_legacy_draft = params.routes.is_some()
+        || params.allowed_envs.is_some()
+        || params.dynamic_routing.is_some();
+    if params.router_launch_draft.is_some() && has_legacy_draft {
+        return Err(
+            "ROUTER_LAUNCH_DRAFT_CONFLICT: routerLaunchDraft cannot be combined with legacy routes, allowedEnvs, or dynamicRouting fields"
+                .to_string(),
+        );
+    }
+    if let Some(draft) = params.router_launch_draft.as_ref() {
+        return Ok(Some(draft.clone()));
+    }
+    if !has_legacy_draft {
+        return Ok(None);
+    }
+    Ok(Some(RouterLaunchDraft {
+        bindings: params.routes.clone().unwrap_or_default(),
+        allowed_envs: params.allowed_envs.clone().unwrap_or_default(),
+        source_profile_id: None,
+        profile_revision: None,
+        dynamic_routing: params.dynamic_routing,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -831,6 +859,13 @@ impl ExternalControlManager {
     ) -> Result<ControlCreateSessionResult, String> {
         let mutation_guard = self.environment_mutations.lock()?;
         let provider = parse_native_provider(&params.provider)?;
+        let router_launch_draft = resolve_external_router_launch_draft(&params)?;
+        if provider != NativeProvider::Claude && router_launch_draft.is_some() {
+            return Err(
+                "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
+                    .to_string(),
+            );
+        }
         let env_name = params
             .env_name
             .map(|value| value.trim().to_string())
@@ -856,20 +891,6 @@ impl ExternalControlManager {
         let options = match provider {
             NativeProvider::Claude => {
                 let resolved = resolve_claude_env(&env_name)?;
-                let router_seed = if params.routes.is_some()
-                    || params.allowed_envs.is_some()
-                    || params.dynamic_routing.is_some()
-                {
-                    Some(NativeRouterSeed {
-                        bindings: params.routes.unwrap_or_default(),
-                        allowed_envs: params.allowed_envs.unwrap_or_default(),
-                        source_profile_id: None,
-                        profile_revision: None,
-                        dynamic_routing: params.dynamic_routing,
-                    })
-                } else {
-                    None
-                };
                 NativeSessionOptions {
                     provider,
                     env_name: resolved.env_name,
@@ -889,7 +910,7 @@ impl ExternalControlManager {
                     codex_base_url: None,
                     codex_api_key: None,
                     effort: params.effort,
-                    router_seed,
+                    router_launch_draft,
                     router_record: None,
                 }
             }
@@ -919,7 +940,7 @@ impl ExternalControlManager {
                     codex_base_url: None,
                     codex_api_key: None,
                     effort: params.effort,
-                    router_seed: None,
+                    router_launch_draft: None,
                     router_record: None,
                 }
             }
@@ -2188,6 +2209,86 @@ fn is_loopback_ipv6_literal(literal: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_session_params(value: Value) -> CreateSessionParams {
+        deserialize_params(value).expect("deserialize create-session params")
+    }
+
+    #[test]
+    fn create_session_router_launch_draft_is_explicit_and_legacy_compatible() {
+        let omitted = create_session_params(json!({
+            "provider": "claude",
+            "prompt": "direct"
+        }));
+        assert_eq!(
+            resolve_external_router_launch_draft(&omitted).expect("resolve omitted draft"),
+            None
+        );
+
+        let nested = create_session_params(json!({
+            "provider": "claude",
+            "prompt": "routed",
+            "routerLaunchDraft": {
+                "bindings": {"background": "glm"},
+                "allowedEnvs": ["glm"],
+                "sourceProfileId": "chores",
+                "profileRevision": 3,
+                "dynamicRouting": false
+            }
+        }));
+        let nested = resolve_external_router_launch_draft(&nested)
+            .expect("resolve nested draft")
+            .expect("nested draft is explicit");
+        assert_eq!(
+            nested.bindings.get("background").map(String::as_str),
+            Some("glm")
+        );
+        assert_eq!(nested.allowed_envs, vec!["glm"]);
+        assert_eq!(nested.source_profile_id.as_deref(), Some("chores"));
+        assert_eq!(nested.profile_revision, Some(3));
+        assert_eq!(nested.dynamic_routing, Some(false));
+
+        let empty = create_session_params(json!({
+            "provider": "claude",
+            "prompt": "main environment only",
+            "routerLaunchDraft": {}
+        }));
+        let empty = resolve_external_router_launch_draft(&empty)
+            .expect("resolve empty explicit draft")
+            .expect("an empty object still opts in");
+        assert!(empty.bindings.is_empty());
+        assert!(empty.allowed_envs.is_empty());
+        assert_eq!(empty.source_profile_id, None);
+
+        let legacy = create_session_params(json!({
+            "provider": "claude",
+            "prompt": "legacy routed",
+            "routes": {},
+            "allowedEnvs": [],
+            "dynamicRouting": true
+        }));
+        let legacy = resolve_external_router_launch_draft(&legacy)
+            .expect("resolve legacy draft")
+            .expect("legacy field presence opts in");
+        assert!(legacy.bindings.is_empty());
+        assert!(legacy.allowed_envs.is_empty());
+        assert_eq!(legacy.dynamic_routing, Some(true));
+    }
+
+    #[test]
+    fn create_session_rejects_nested_and_legacy_router_drafts_together() {
+        let params = create_session_params(json!({
+            "provider": "claude",
+            "prompt": "ambiguous",
+            "routerLaunchDraft": {},
+            "routes": {}
+        }));
+
+        let error = resolve_external_router_launch_draft(&params)
+            .expect_err("ambiguous draft shapes must fail closed");
+
+        assert!(error.contains("ROUTER_LAUNCH_DRAFT_CONFLICT"), "{error}");
+    }
 
     fn loopback_stream_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

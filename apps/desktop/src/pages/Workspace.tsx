@@ -25,6 +25,13 @@ import { WorkspaceGlobalSearch } from '@/components/workspace/WorkspaceGlobalSea
 import { WorkspaceNativeSessionView } from '@/components/workspace/WorkspaceNativeSessionView';
 import { WorkspaceHistoryErrorBoundary } from '@/components/workspace/WorkspaceHistoryErrorBoundary';
 import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
+import {
+  createComposerRouteDraft,
+  isRouteDraftRowVisible,
+  resolveRouterLaunchDraft,
+  type ComposerRouteDraft,
+} from '@/components/workspace/composerRouteDraft';
+import type { RouterLaunchDraft } from '@ccem/core/browser';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
 import type { EffortLevel } from '@/components/workspace/ComposerControls';
@@ -52,6 +59,7 @@ import {
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useLocale } from '@/locales';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
+import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { cn, getProjectName } from '@/lib/utils';
 import {
   fetchConversationDetail,
@@ -391,12 +399,14 @@ export function Workspace({
   const [composePromptRevision, setComposePromptRevision] = useState(0);
   const [composeHasDraft, setComposeHasDraft] = useState(false);
   const [composePlanModeEnabled, setComposePlanModeEnabled] = useState(false);
+  const [composeRouteDraft, setComposeRouteDraft] = useState<ComposerRouteDraft>(createComposerRouteDraft);
   const [historyComposerText, setHistoryComposerText] = useState('');
   const historyComposerTextRef = useRef('');
   const historyHasDraftRef = useRef(false);
   const [historyComposerRevision, setHistoryComposerRevision] = useState(0);
   const [historyHasDraft, setHistoryHasDraft] = useState(false);
   const [historyPlanModeEnabled, setHistoryPlanModeEnabled] = useState(false);
+  const [historyRouteDraft, setHistoryRouteDraft] = useState<ComposerRouteDraft>(createComposerRouteDraft);
   const [historyEnv, setHistoryEnv] = useState('');
   const [historyPermMode, setHistoryPermMode] = useState<PermissionModeName>(permissionMode);
   const [composeEffort, setComposeEffort] = useState<EffortLevel>('max');
@@ -641,6 +651,9 @@ export function Workspace({
     setWorkspaceMode('compose');
     resetComposePrompt(composeSeed.value);
     setComposePlanModeEnabled(false);
+    // A seeded composer (/ccem-cron etc.) is a fresh Composer: routing opt-in
+    // must not leak from a previous unsent draft.
+    setComposeRouteDraft(createComposerRouteDraft());
     if (!composeDir && (selectedWorkingDir || defaultWorkingDir)) {
       setComposeDir(selectedWorkingDir || defaultWorkingDir || null);
     }
@@ -1232,7 +1245,19 @@ export function Workspace({
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
+    // Providers without env routing show no draft UI and must not carry a
+    // stale opt-in into the next create call.
+    if (composeProvider !== 'claude') {
+      setComposeRouteDraft(createComposerRouteDraft());
+    }
   }, [composeProvider]);
+
+  useEffect(() => {
+    // Switching to ANY different history session starts a fresh opt-out
+    // draft (not just provider changes) — the routing choice never leaks
+    // across conversations.
+    setHistoryRouteDraft(createComposerRouteDraft());
+  }, [selectedSession?.id]);
 
   useEffect(() => {
     if (!selectedSession) {
@@ -2044,6 +2069,8 @@ export function Workspace({
     setWorkspaceMode('compose');
     setSelectedKey(null);
     selectedKeyRef.current = null;
+    // A fresh Composer always starts with Dynamic Routing opted out.
+    setComposeRouteDraft(createComposerRouteDraft());
     if (dir) {
       setComposeDir(dir);
       setSelectedWorkingDir(dir);
@@ -2231,7 +2258,7 @@ export function Workspace({
     setSessionTitle,
   ]);
 
-  const handleCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
+  const runCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isCreatingNativeSession) {
       return false;
     }
@@ -2261,6 +2288,26 @@ export function Workspace({
     }
     const previewPrompt = buildComposerPromptPreview(displayPrompt, attachments);
 
+    // Per-Composer Dynamic Routing opt-in: resolve the launch seed from the
+    // CURRENT store config at submit time. Blocking codes keep the draft so the
+    // user can fix the selection and retry; opted-out drafts omit the param.
+    let routerLaunchDraft: RouterLaunchDraft | null = null;
+    if (composeProvider === 'claude' && composeRouteDraft.optIn) {
+      const resolution = resolveRouterLaunchDraft(
+        composeRouteDraft,
+        useAppStore.getState().routerConfig,
+      );
+      if (!resolution.ok) {
+        if (resolution.code === 'PROFILE_MISSING') {
+          toast.error(t('router.routeDraftProfileMissing'));
+        } else {
+          toast.error(t('router.routeDraftConfigUnavailable'));
+        }
+        return false;
+      }
+      routerLaunchDraft = resolution.value;
+    }
+
     const dispatch = resolveComposerDispatch({
       provider: composeProvider,
       prompt,
@@ -2282,6 +2329,7 @@ export function Workspace({
         initialAnnotations: payload?.annotations,
         effort: normalizeEffortForProvider(composeEffort, composeProvider),
         seedBoundaryMessageCount: 0,
+        routerLaunchDraft,
       });
 
       upsertLiveSessionEntry(summary, {
@@ -2304,12 +2352,23 @@ export function Workspace({
       setWorkspaceMode('live');
       resetComposePrompt('');
       setComposePlanModeEnabled(false);
+      // The next Composer starts opted out again; the launch just created
+      // carries this draft's routing snapshot in its authoritative state.
+      setComposeRouteDraft(createComposerRouteDraft());
       setSelectedWorkingDir(workingDir);
       scheduleWorkspaceRefresh(1200);
       return true;
     } catch (error) {
       console.error('Failed to create native workspace session:', error);
-      toast.error(t('workspace.nativeCreateFailed'));
+      // An opted-in launch failure must surface the backend's specific error
+      // (e.g. ROUTER_* validation), not just the generic banner — the draft is
+      // intentionally KEPT so the user can adjust and retry.
+      if (routerLaunchDraft) {
+        const detail = error instanceof Error ? error.message : String(error);
+        toast.error(detail || t('workspace.nativeCreateFailed'));
+      } else {
+        toast.error(t('workspace.nativeCreateFailed'));
+      }
       return false;
     } finally {
       setIsCreatingNativeSession(false);
@@ -2321,6 +2380,7 @@ export function Workspace({
     composeEffort,
     composeProvider,
     composePlanModeEnabled,
+    composeRouteDraft,
     createNativeSession,
     currentEnv,
     effectiveComposeDir,
@@ -2334,7 +2394,28 @@ export function Workspace({
     t,
   ]);
 
-  const handleContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
+  // Synchronous in-flight guard: React state cannot stop a second submit in
+  // the SAME tick (Enter + click / double click both read `false` before the
+  // setState flushes). `begin()` flips a closure flag synchronously; released
+  // only in `finally` so every return path (validation, failure, success)
+  // re-arms it.
+  const createConversationGuardRef = useRef<ReentryGuard | null>(null);
+  if (!createConversationGuardRef.current) {
+    createConversationGuardRef.current = createReentryGuard();
+  }
+  const handleCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
+    const guard = createConversationGuardRef.current;
+    if (!guard || !guard.begin()) {
+      return false;
+    }
+    try {
+      return await runCreateNativeConversation(payload);
+    } finally {
+      guard.end();
+    }
+  }, [runCreateNativeConversation]);
+
+  const runContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isResumingHistorySession) {
       return false;
     }
@@ -2378,6 +2459,24 @@ export function Workspace({
 
     const provider = selectedSession.source;
     const previewPrompt = buildComposerPromptPreview(displayPrompt, attachments);
+    // History-continue composers default to opted-out routing, same as the
+    // compose view; an explicit opt-in resolves against the CURRENT config.
+    let routerLaunchDraft: RouterLaunchDraft | null = null;
+    if (provider === 'claude' && historyRouteDraft.optIn) {
+      const resolution = resolveRouterLaunchDraft(
+        historyRouteDraft,
+        useAppStore.getState().routerConfig,
+      );
+      if (!resolution.ok) {
+        if (resolution.code === 'PROFILE_MISSING') {
+          toast.error(t('router.routeDraftProfileMissing'));
+        } else {
+          toast.error(t('router.routeDraftConfigUnavailable'));
+        }
+        return false;
+      }
+      routerLaunchDraft = resolution.value;
+    }
     const dispatch = resolveComposerDispatch({
       provider,
       prompt,
@@ -2400,6 +2499,7 @@ export function Workspace({
         providerSessionId: selectedSession.id,
         effort: normalizeEffortForProvider(historyEffort, provider),
         seedBoundaryMessageCount: messages.length,
+        routerLaunchDraft,
       });
 
       setLaunchClient(provider);
@@ -2413,12 +2513,18 @@ export function Workspace({
       setWorkspaceMode('live');
       resetHistoryComposerText('');
       setHistoryPlanModeEnabled(false);
+      setHistoryRouteDraft(createComposerRouteDraft());
       setSelectedWorkingDir(selectedSession.project);
       scheduleWorkspaceRefresh(1200);
       return true;
     } catch (error) {
       console.error('Failed to continue workspace history session:', error);
-      toast.error(t('workspace.nativeCreateFailed'));
+      if (routerLaunchDraft) {
+        const detail = error instanceof Error ? error.message : String(error);
+        toast.error(detail || t('workspace.nativeCreateFailed'));
+      } else {
+        toast.error(t('workspace.nativeCreateFailed'));
+      }
       return false;
     } finally {
       setIsResumingHistorySession(false);
@@ -2432,6 +2538,7 @@ export function Workspace({
     historyPermMode,
     historyPlanModeEnabled,
     historyEffort,
+    historyRouteDraft,
     isResumingHistorySession,
     launchOpenCodeWeb,
     messages,
@@ -2443,6 +2550,23 @@ export function Workspace({
     upsertLiveSessionEntry,
     t,
   ]);
+
+  // Same synchronous in-flight guard as the compose submit (see above).
+  const resumeHistoryGuardRef = useRef<ReentryGuard | null>(null);
+  if (!resumeHistoryGuardRef.current) {
+    resumeHistoryGuardRef.current = createReentryGuard();
+  }
+  const handleContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
+    const guard = resumeHistoryGuardRef.current;
+    if (!guard || !guard.begin()) {
+      return false;
+    }
+    try {
+      return await runContinueHistorySession(payload);
+    } finally {
+      guard.end();
+    }
+  }, [runContinueHistorySession]);
 
   const handleLiveSessionUpdate = useCallback((session: NativeSessionSummary) => {
     upsertLiveSessionEntry(session);
@@ -2554,6 +2678,8 @@ export function Workspace({
           searchWorkspaceFiles={searchWorkspaceFiles}
           planModeEnabled={composePlanModeEnabled}
           onPlanModeEnabledChange={setComposePlanModeEnabled}
+          routeDraft={composeRouteDraft}
+          onRouteDraftChange={setComposeRouteDraft}
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
@@ -2606,6 +2732,8 @@ export function Workspace({
     }
 
     const historyProvider = selectedSession.source === 'codex' ? 'codex' : 'claude';
+    const historyRouteDraftAvailable = selectedHistorySupportsInline
+      && isRouteDraftRowVisible(selectedSession.source);
 
     return (
       <div className="flex h-full min-h-0 flex-col">
@@ -2655,6 +2783,8 @@ export function Workspace({
           planModeEnabled={historyPlanModeEnabled}
           onPlanModeEnabledChange={selectedHistorySupportsInline ? setHistoryPlanModeEnabled : undefined}
           planModeAvailable={selectedHistorySupportsInline}
+          routeDraft={historyRouteDraftAvailable ? historyRouteDraft : null}
+          onRouteDraftChange={historyRouteDraftAvailable ? setHistoryRouteDraft : undefined}
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
@@ -2807,7 +2937,7 @@ export function Workspace({
                 ? activeLiveRuntimeId
                 : null
             }
-            onNavigateSettings={() => onNavigate('settings')}
+            onNavigateEnvironments={() => onNavigate('environments')}
           />
 
           <div
@@ -2905,6 +3035,10 @@ export function Workspace({
                           onStartNew={() => {
                             setWorkspaceMode('compose');
                             setActiveLiveRuntimeId(null);
+                            // "Start New" opens a fresh Composer: reset the
+                            // routing opt-in so a prior unsent draft never
+                            // leaks into the next launch.
+                            setComposeRouteDraft(createComposerRouteDraft());
                           }}
                       />
                       </div>

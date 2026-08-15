@@ -23,7 +23,17 @@ async function importRouterProfiles() {
   });
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-router-profiles-'));
   const outputPath = path.join(tempDir, 'routerProfiles.mjs');
-  await fs.writeFile(outputPath, output.outputText, 'utf8');
+  // The module value-imports MY_DEFAULT_ROUTER_PROFILE_ID from
+  // '@ccem/core/browser'; point that specifier at the built core dist so the
+  // transpiled copy stays importable from the temp dir.
+  const coreBrowserUrl = pathToFileURL(
+    path.join(desktopDir, '..', '..', 'packages', 'core', 'dist', 'browser.js'),
+  ).href;
+  const importable = output.outputText.replaceAll(
+    "'@ccem/core/browser'",
+    JSON.stringify(coreBrowserUrl),
+  );
+  await fs.writeFile(outputPath, importable, 'utf8');
   return import(pathToFileURL(outputPath).href);
 }
 
@@ -58,6 +68,32 @@ test('resolveRouteLabel: default-only profile id', async () => {
   assert.equal(info.kind, 'defaultOnly');
 });
 
+test('resolveRouteLabel: my-default source keeps the my-defaults label, with or without bindings', async () => {
+  const { resolveRouteLabel } = await importRouterProfiles();
+
+  const emptyBindings = resolveRouteLabel(makeRouter({ sourceProfileId: 'my-default' }), PROFILES);
+  assert.equal(emptyBindings.kind, 'myDefault');
+
+  const withBindings = resolveRouteLabel(
+    makeRouter({ sourceProfileId: 'my-default', bindings: { background: 'glm' } }),
+    PROFILES,
+  );
+  assert.equal(withBindings.kind, 'myDefault');
+});
+
+test('resolveRouteLabel: clearing the source by manual edit reads as custom, not my-default', async () => {
+  const { resolveRouteLabel } = await importRouterProfiles();
+
+  const custom = resolveRouteLabel(
+    makeRouter({ sourceProfileId: null, bindings: { background: 'glm' } }),
+    PROFILES,
+  );
+  assert.equal(custom.kind, 'custom');
+
+  const clearedEmpty = resolveRouteLabel(makeRouter({ sourceProfileId: null }), PROFILES);
+  assert.equal(clearedEmpty.kind, 'defaultOnly');
+});
+
 test('resolveRouteLabel: a state WITH bindings must NOT be mislabeled as defaultEnv', async () => {
   const { resolveRouteLabel } = await importRouterProfiles();
   // No profile, but has bindings → custom (never the bare defaultEnv string).
@@ -78,17 +114,6 @@ test('resolveRouteLabel: matched user profile surfaces its name', async () => {
 test('resolveRouteLabel: null sourceProfileId and no bindings is defaultOnly', async () => {
   const { resolveRouteLabel } = await importRouterProfiles();
   assert.equal(resolveRouteLabel(makeRouter(), PROFILES).kind, 'defaultOnly');
-});
-
-test('hasCustomOrProfileRoute: pill visibility gate', async () => {
-  const { hasCustomOrProfileRoute } = await importRouterProfiles();
-  assert.equal(hasCustomOrProfileRoute(null), false);
-  assert.equal(hasCustomOrProfileRoute(makeRouter({ launchTransport: 'direct' })), false);
-  assert.equal(hasCustomOrProfileRoute(makeRouter()), false); // routed, no bindings, no profile
-  assert.equal(hasCustomOrProfileRoute(makeRouter({ bindings: { background: 'glm' } })), true);
-  assert.equal(hasCustomOrProfileRoute(makeRouter({ sourceProfileId: 'budget' })), true);
-  // default-only profile id alone does NOT show the pill (it IS default-only).
-  assert.equal(hasCustomOrProfileRoute(makeRouter({ sourceProfileId: 'default-only' })), false);
 });
 
 test('computeCandidateEnvs: includes disabled-but-existing envs and session refs', async () => {
@@ -263,7 +288,7 @@ test('profileSetName + bumpRevision: revision bumps only on real change; caps at
 
 test('applyConfigUpdater: two queued functional updaters compose on fresh base (no stale overwrite)', async () => {
   const { applyConfigUpdater } = await importRouterProfiles();
-  const base = { enabled: false, port: 17820, bindings: {}, profiles: [PROFILE({ id: 'p1' })], dynamicRouting: true, defaultAllowedEnvs: [] };
+  const base = { port: 17820, bindings: {}, profiles: [PROFILE({ id: 'p1' })], dynamicRouting: true, defaultAllowedEnvs: [] };
   // Edit 1 (built from base): add a binding to p1.
   const u1 = (b) => ({
     profiles: b.profiles.map((p) => (p.id === 'p1' ? { ...p, bindings: { 'subagent:Explore': 'glm' } } : p)),
@@ -279,21 +304,21 @@ test('applyConfigUpdater: two queued functional updaters compose on fresh base (
 
 test('applyConfigUpdater: plain patch form still works', async () => {
   const { applyConfigUpdater } = await importRouterProfiles();
-  const base = { enabled: false, port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] };
+  const base = { port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] };
   const next = applyConfigUpdater(base, { port: 17821 });
   assert.equal(next.port, 17821);
-  assert.equal(next.enabled, false);
+  assert.deepEqual(next.bindings, {});
 });
 
-test('transport truth: routed session stays routed even when global config is off', async () => {
+test('transport truth is owned by the session, independent of global default edits', async () => {
   const { isSessionRouted, isSessionCasCapable } = await importRouterProfiles();
   const routed = makeRouter({ launchTransport: 'routed' });
   const direct = makeRouter({ launchTransport: 'direct' });
-  // config.enabled is NOT an input to these functions — only launchTransport + actualPort.
-  assert.equal(isSessionRouted(routed), true, 'routed session is routed regardless of global toggle');
+  // Only persisted launchTransport + listener actualPort determine live route capability.
+  assert.equal(isSessionRouted(routed), true, 'routed session keeps its persisted transport');
   assert.equal(isSessionRouted(direct), false, 'direct session is direct');
   assert.equal(isSessionRouted(null), false, 'no session → direct/new');
-  // routed + live port → CAS allowed (must NOT fall back to global switch).
+  // routed + live port → CAS allowed.
   assert.equal(isSessionCasCapable(routed, 17820), true);
   // routed but listener port gone → not CAS-capable (degraded).
   assert.equal(isSessionCasCapable(routed, null), false);
@@ -301,16 +326,7 @@ test('transport truth: routed session stays routed even when global config is of
   assert.equal(isSessionCasCapable(direct, 17820), false);
 });
 
-test('transport truth matrix: config off + status disabled + actualPort alive + routed → routed, not direct', async () => {
-  const { isSessionRouted, isSessionCasCapable } = await importRouterProfiles();
-  // Backend keeps the routed helper on actualPort after global enabled=false;
-  // status may report disabled while the listener is still up for the session.
-  const routed = makeRouter({ launchTransport: 'routed' });
-  assert.equal(isSessionRouted(routed), true, 'must NOT display as direct');
-  assert.equal(isSessionCasCapable(routed, 17820), true, 'must NOT fall back to global set_current_env');
-});
-
-test('resolveEnvSwitchAction: routed session never routes to the global switch', async () => {
+test('resolveEnvSwitchAction: routed session never routes to the global environment switch', async () => {
   const { resolveEnvSwitchAction } = await importRouterProfiles();
   const routed = makeRouter({ launchTransport: 'routed' });
   const direct = makeRouter({ launchTransport: 'direct' });
@@ -354,7 +370,7 @@ test('isFreshReferenceResponse: stale env-name responses are rejected', async ()
 
 test('runConfigCommit: on save failure, reload is awaited + onCommit skipped + error rethrown', async () => {
   const { runConfigCommit } = await importRouterProfiles();
-  const base = { enabled: false, port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] };
+  const base = { port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] };
   const saved = [];
   const reloaded = [];
   const committed = [];
@@ -371,7 +387,7 @@ test('runConfigCommit: on save failure, reload is awaited + onCommit skipped + e
 
 test('runConfigCommit: on success, onCommit called and next returned', async () => {
   const { runConfigCommit } = await importRouterProfiles();
-  const base = { enabled: false, port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] };
+  const base = { port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] };
   const committed = [];
   const result = await runConfigCommit({
     base,
@@ -389,7 +405,7 @@ test('createCommitQueue: a failed commit does not poison subsequent queued commi
   const q = createCommitQueue();
   const order = [];
   const t1 = q.enqueue(async () => { order.push('t1'); throw new Error('boom'); });
-  const t2 = q.enqueue(async () => { order.push('t2'); return { enabled: false, port: 1, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] }; });
+  const t2 = q.enqueue(async () => { order.push('t2'); return { port: 1, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [] }; });
   await assert.rejects(t1, /boom/);
   const r2 = await t2;
   assert.deepEqual(order, ['t1', 't2'], 'second task still ran after first failed (serialized, non-poisoning)');
@@ -402,7 +418,7 @@ test('createCommitQueue: a failed commit does not poison subsequent queued commi
 
 const EXISTING = ['official', 'glm', 'deepseek', '团队 Search / 日本'];
 
-test('buildSaveAsDefaultPatch: writes draft bindings/dynamic/allowedEnvs, preserves enabled/port/profiles', async () => {
+test('buildSaveAsDefaultPatch: writes draft bindings/dynamic/allowedEnvs, preserves port/profiles', async () => {
   const { buildSaveAsDefaultPatch } = await importRouterProfiles();
   const patch = buildSaveAsDefaultPatch({
     defaultEnv: 'official',
@@ -413,7 +429,6 @@ test('buildSaveAsDefaultPatch: writes draft bindings/dynamic/allowedEnvs, preser
   });
   // Only the three default-owned keys are touched.
   assert.deepEqual(Object.keys(patch).sort(), ['bindings', 'defaultAllowedEnvs', 'dynamicRouting']);
-  assert.equal(patch.enabled, undefined, 'must NOT touch enabled');
   assert.equal(patch.port, undefined, 'must NOT touch port');
   assert.equal(patch.profiles, undefined, 'must NOT touch profiles');
   // Draft bindings copied verbatim.
@@ -441,9 +456,8 @@ test('buildSaveAsDefaultPatch: empty bindings still yields a legal default env o
 
 test('buildSaveAsDefaultPatch: composes through applyConfigUpdater without clobbering base', async () => {
   const { buildSaveAsDefaultPatch, applyConfigUpdater } = await importRouterProfiles();
-  // A realistic global base with enabled/port/profiles that must survive.
+  // A realistic global base with port/profiles that must survive.
   const base = {
-    enabled: true,
     port: 17820,
     bindings: { background: 'deepseek' },
     profiles: [{ id: 'p1', name: 'one', revision: 2, bindings: {}, allowedEnvs: ['official'] }],
@@ -459,7 +473,6 @@ test('buildSaveAsDefaultPatch: composes through applyConfigUpdater without clobb
   });
   const next = applyConfigUpdater(base, patch);
   // Preserved Untouched.
-  assert.equal(next.enabled, true);
   assert.equal(next.port, 17820);
   assert.equal(next.profiles.length, 1);
   assert.equal(next.profiles[0].id, 'p1');
@@ -548,7 +561,7 @@ test('save-as-default failure path does not fake success: runConfigCommit reject
   // underlying contract (reload truth, rethrow, onCommit skipped) holds for a
   // patch shaped like buildSaveAsDefaultPatch output.
   const { runConfigCommit, buildSaveAsDefaultPatch } = await importRouterProfiles();
-  const base = { enabled: true, port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: ['official'] };
+  const base = { port: 17820, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: ['official'] };
   const patch = buildSaveAsDefaultPatch({ defaultEnv: 'official', bindings: { background: 'glm' }, baseAllowed: ['official'], dynamicRouting: false, existingNames: EXISTING });
   const committed = [];
   const reloaded = [];
@@ -573,7 +586,7 @@ test('save-as-default failure path does not fake success: runConfigCommit reject
 // ---------------------------------------------------------------------------
 
 function baseConfig(over = {}) {
-  return { enabled: false, port: 1, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [], ...over };
+  return { port: 1, bindings: {}, profiles: [], dynamicRouting: true, defaultAllowedEnvs: [], ...over };
 }
 function p1() {
   return { id: 'p1', name: 'one', revision: 1, bindings: {}, allowedEnvs: [] };
@@ -792,7 +805,7 @@ test('regression: WITHOUT serialization, two same-revision CAS race → second c
 });
 
 // Transport-truth fail-closed contract for the env hot-switch CAS path.
-test('resolveEnvSwitchCasPatch: missing fresh router → failClosed (NEVER a global switch)', async () => {
+test('resolveEnvSwitchCasPatch: missing fresh router → failClosed (never a global environment switch)', async () => {
   const { resolveEnvSwitchCasPatch } = await importRouterProfiles();
   assert.equal(resolveEnvSwitchCasPatch(null, 'glm').kind, 'failClosed');
   // Even with a routed session that lost its router mid-queue, we do not produce
@@ -818,4 +831,47 @@ test('resolveEnvSwitchCasPatch: unions the new main env into allowedEnvs; preser
   const present = resolveEnvSwitchCasPatch(fresh, 'kimi');
   assert.deepEqual(present.patch.allowedEnvs, ['official', 'kimi']);
   assert.equal(present.patch.defaultEnv, 'kimi');
+});
+
+test('buildMyDefaultApplyPatch: virtual my-default re-seeds from current config without faking a profile', async () => {
+  const { buildMyDefaultApplyPatch, MY_DEFAULT_ROUTER_PROFILE_ID } = await importRouterProfiles();
+
+  const config = {
+    port: 17820,
+    bindings: { 'subagent:Explore': 'glm', background: 'deepseek' },
+    profiles: [],
+    dynamicRouting: false,
+    defaultAllowedEnvs: ['official', 'kimi'],
+  };
+  // Session main env must be preserved even when absent from config defaults.
+  const router = makeRouter({ defaultEnv: 'kimi', dynamicRouting: true, revision: 4 });
+
+  const patch = buildMyDefaultApplyPatch(router, config);
+  assert.deepEqual(patch, {
+    bindings: { 'subagent:Explore': 'glm', background: 'deepseek' },
+    allowedEnvs: ['kimi', 'official', 'glm', 'deepseek'],
+    sourceProfileId: MY_DEFAULT_ROUTER_PROFILE_ID,
+    profileRevision: null,
+    dynamicRouting: false,
+  });
+  // defaultEnv is intentionally omitted (preserved by the partial patch).
+  assert.equal('defaultEnv' in patch, false);
+  assert.ok(!('revision' in patch));
+});
+
+test('buildMyDefaultApplyPatch: union de-duplicates and drops empty targets', async () => {
+  const { buildMyDefaultApplyPatch } = await importRouterProfiles();
+
+  const config = {
+    port: 17820,
+    bindings: { background: 'official', 'subagent:Plan': '  ' },
+    profiles: [],
+    dynamicRouting: true,
+    defaultAllowedEnvs: ['official', 'official'],
+  };
+  const router = makeRouter({ defaultEnv: 'official' });
+
+  const patch = buildMyDefaultApplyPatch(router, config);
+  assert.deepEqual(patch.allowedEnvs, ['official']);
+  assert.deepEqual(patch.bindings, { background: 'official', 'subagent:Plan': '  ' });
 });

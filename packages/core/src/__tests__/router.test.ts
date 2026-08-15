@@ -5,6 +5,7 @@ import {
   BUILTIN_ROUTER_PROFILES,
   DEFAULT_ONLY_ROUTER_PROFILE,
   DEFAULT_ROUTER_CONFIG,
+  MY_DEFAULT_ROUTER_PROFILE_ID,
   createDefaultRouterConfig,
   isValidRouterBindingKey,
   isValidRouterEnvironmentAlias,
@@ -17,12 +18,13 @@ import {
 describe('router shared contract', () => {
   it('exports the router contract from both Node and browser entry points', () => {
     expect(browserEntry.DEFAULT_ROUTER_CONFIG).toEqual(DEFAULT_ROUTER_CONFIG);
+    expect(browserEntry.MY_DEFAULT_ROUTER_PROFILE_ID).toBe('my-default');
+    expect(MY_DEFAULT_ROUTER_PROFILE_ID).toBe('my-default');
     expect(browserEntry.isValidRouterBindingKey('subagent:Explore')).toBe(true);
   });
 
   it('uses the frozen v2.2 defaults without naming a user environment', () => {
     expect(DEFAULT_ROUTER_CONFIG).toEqual({
-      enabled: false,
       port: 17820,
       bindings: {},
       profiles: [],
@@ -42,7 +44,6 @@ describe('router shared contract', () => {
 
     expect(second).toEqual(DEFAULT_ROUTER_CONFIG);
     expect(DEFAULT_ROUTER_CONFIG).toEqual({
-      enabled: false,
       port: 17820,
       bindings: {},
       profiles: [],
@@ -51,11 +52,13 @@ describe('router shared contract', () => {
     });
   });
 
-  it('strips backend-owned capability flags from persisted router config', () => {
+  it('strips legacy global enable and backend-owned capability flags from persisted router config', () => {
     const normalized = normalizeRouterConfig({
+      enabled: true,
       oauthRoutingEnabled: true,
     } as unknown as Parameters<typeof normalizeRouterConfig>[0]);
 
+    expect(normalized).not.toHaveProperty('enabled');
     expect(normalized).not.toHaveProperty('oauthRoutingEnabled');
   });
 
@@ -154,8 +157,7 @@ describe('router config normalization', () => {
       port: 18123,
       bindings: { 'subagent:Explore': 'search-env' },
       defaultAllowedEnvs: ['main-env', 'search-env', 'main-env'],
-    })).toEqual({
-      enabled: true,
+    } as unknown as Parameters<typeof normalizeRouterConfig>[0])).toEqual({
       port: 18123,
       bindings: { 'subagent:Explore': 'search-env' },
       profiles: [],
@@ -226,6 +228,17 @@ describe('router config normalization', () => {
         allowedEnvs: [''],
       }],
     })).toThrow(/profile/i);
+    for (const reservedId of ['default-only', 'my-default']) {
+      expect(() => normalizeRouterConfig({
+        profiles: [{
+          id: reservedId,
+          name: 'Must not shadow built-ins',
+          revision: 1,
+          bindings: {},
+          allowedEnvs: [],
+        }],
+      })).toThrow(/reserved/i);
+    }
   });
 });
 

@@ -16,7 +16,7 @@ pub use types::{
     rename_router_config_environment, router_config_environment_references, LaunchAuthKind,
     LaunchTransport, RouterAuthCapability, RouterConfig, RouterServiceError, RouterStatus,
     SessionRouterPatch, SessionRouterRecord, SessionRouterState, SessionRouterUpdatedEvent,
-    UpdateSessionRouterRequest, ROUTER_PORT_SCAN_END,
+    UpdateSessionRouterRequest, MY_DEFAULT_ROUTER_PROFILE_ID, ROUTER_PORT_SCAN_END,
 };
 
 #[cfg(test)]

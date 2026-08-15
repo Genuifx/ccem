@@ -2,14 +2,15 @@ import { useEffect, useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { useLocale } from '@/locales';
 import { useRouterConfigEditor } from '@/hooks/useRouterConfig';
-import { ToggleSetting } from '@/components/ui/ToggleSetting';
 import { DEFAULT_ROUTER_PORT } from '@ccem/core/browser';
 import { toast } from 'sonner';
 
 /**
- * Settings → Router section. Infrastructure only (per design §4.5 L3): master
- * toggle, port, status. Default bindings / allowed / dynamicRouting / profiles
- * live on the Environments page (EnvironmentsRouterRules).
+ * Settings → Router section. Infrastructure only: port + status. Routing
+ * itself is opted in per Composer (the "+"-menu 「动态路由」 row); default
+ * bindings / allowed / dynamicRouting / profiles live on the Environments
+ * page (EnvironmentsRouterRules). There is deliberately NO enable toggle —
+ * Settings must not gate routing.
  *
  * This is a dedicated child component so its hooks run only when mounted (the
  * section is active), never violating the parent Settings' hook ordering.
@@ -60,17 +61,6 @@ export function SettingsRouterSection() {
 
   return (
     <div className="space-y-5">
-      <ToggleSetting
-        title={t('settings.routerEnabled')}
-        description={t('settings.routerEnabledDesc')}
-        checked={config.enabled}
-        onChange={(enabled) => {
-          void commit({ enabled }).catch(() => toast.error(t('settings.routerSaveFailed')));
-        }}
-      />
-
-      <div className="border-t border-border-subtle" />
-
       <div>
         <label className="block text-sm font-medium text-foreground mb-1">
           {t('settings.routerPort')}

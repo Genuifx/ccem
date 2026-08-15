@@ -1,7 +1,7 @@
 # Subagent 环境路由(CCEM Router)设计
 
 日期:2026-08-09
-状态:**v2.2 token-only 代码、自动化门禁与真实 Desktop 主路径行为验收已收口;official OAuth routed gate=false,待真实已登录会话 E2E**(2026-08-10;Spike B B1-B3、后端/CLI/helper/UI 已落地;requiresOAuth routed transport 保持构建期关闭)
+状态:**v2.3 token-only Composer opt-in 代码、自动化门禁与真实 Desktop 主路径行为验收已收口;official OAuth routed gate=false,待真实已登录会话 E2E**(2026-08-15;后端/CLI/helper/UI 与 per-session opt-in 主链路已落地;requiresOAuth routed transport 保持构建期关闭)
 分支:`feat/subagent-env-router`
 
 > 修订记录:
@@ -9,6 +9,7 @@
 > - v2:评审一(3 阻断 + 2 高优)——①稳定逻辑键协议;②挂钩点改 PreToolUse `updatedInput`(Spike A 证实 agents 注入=完整替换);③official OAuth 走 URL path 会话键 + Authorization 透传;④权限硬化;⑤代理入口合并 + 渠道范围收缩
 > - v2.1:评审二(5 阻断)——①hook 返回结构修正为 `hookSpecificOutput` 嵌套并与 plan guard 合并;②helper 一律注入原始身份标签,绑定解析全部收归 router(消灭双状态);③直连改为纯路由状态(单一传输,即时切换成立,消除别名语义自相矛盾);④目标 model 解析算法独立定义(禁用 `resolveClaudeRuntimeModel`);⑤OAuth 约束改全入口 fail-closed + 透传仅限可信官方源;同轮清理:标题生成表述、headless/tmux 移后续项、双标签优先级、session 状态字段、debug tap 语义、权限迁移 fail-closed
 > - v2.2(实现基线):评审三(8 阻断 + 4 高优)——①main 跨环境同样做 source-tier→target-pin 映射;②请求 bounded JSON rewrite、响应 SSE 零缓冲;③OAuth classifier/NO_PROXY/禁 redirect/真实会话 feature gate;④持久路由能力与每 helper generation 启动事实分层;⑤UI、external control、lazy recovery 收归同一 native launch coordinator;⑥nonce 认证 marker + per-session allowed env;⑦动态关闭由 router 强制、删除手写逻辑键 override;⑧缺失环境 fail-closed;同轮冻结单 listener 兼容 legacy ProxyDebug、request-level 热更新语义、IPC DTO/revision/event、运行时故障状态
+> - v2.3(Composer opt-in):删除产品级 Router 总开关;shared listener 作为 Desktop 内部基础设施常驻。每个新 Composer 默认 direct,只有用户通过 `+ → 动态路由` 显式开启时才在首次提交原子携带 `routerLaunchDraft`;成功后 routed session 延续权威状态,下一个 Composer 重新关闭
 
 ## 1. 背景与目标
 
@@ -90,15 +91,15 @@ CCEM Router
 ### 3.3 与现有切环境路径的关系
 
 - `update_native_session_settings` 改主环境 → routed generation 只更新路由表中 `main` 逻辑键目标并按 §4.6 重写 model,**不软重启 SDK query**;direct generation 保留旧软重启路径
-- 旧路径(router 未启用/启动失败)保持现有软重启逻辑不变
+- 未为当前 Composer 显式选择动态路由的会话保持现有 direct 软重启逻辑不变;已显式选择的 routed 会话只热更新路由表
 
 ### 3.4 老会话/死会话恢复(用户已确认)
 
 场景:app 隔夜关闭后 helper 与 router 均已死,用户点开老会话。原则:复用现有 `RuntimeRecoveryCandidate` / `--resume` 生命周期,但所有 respawn 必须先经过统一 coordinator 的 transport/auth/readiness gate。
 
 1. 点击老会话 → 统一 `ClaudeNativeLaunchCoordinator` → 与新会话相同地先做 router readiness/auth gate,再写入本 generation 的 `launchTransport`/`launchAuthKind`/`launchDefaultEnv`,注入当前端口 + record 内 sessionKey/nonce并注册 bindings。不得继续由 UI、external control、lazy recovery 各自组装 env
-2. **router 前创建的旧 record 迁移**:恢复时分配 sessionKey、从全局默认 bindings 拷贝快照;router 未启用则保持直连旧行为
-3. routed record 恢复时 router 不可用:新 session 可选择 direct fallback;既有 routed record 默认返回 `ROUTER_UNAVAILABLE` 并保持可恢复,不静默改变传输/费用边界。用户显式选择「重启为直连」后才生成 direct helper
+2. **router 前创建的旧 record**:`router=None` 永远按 direct 恢复,不得因为存在全局默认规则而补分配 sessionKey 或自动升级为 routed
+3. routed record 恢复时 router 不可用:返回 `ROUTER_UNAVAILABLE` 并保持可恢复,不静默改变传输/费用边界。用户显式选择「重启为直连」后才生成 direct helper
 4. claude 侧 transcript 丢失等失败场景:维持现有恢复错误处理
 
 ### 3.5 official(OAuth)环境的鉴权通道(v2 新增;v2.1 全入口 fail-closed)
@@ -145,8 +146,8 @@ CCEM Router
 - **认证边界**:普通正文中的 raw `<CCEM-ROUTE>` 永远不可信。helper 的 `Agent` hook 用未暴露给模型的 `routeTagNonce` 把 raw `ccem:<env>` override 转成内部 marker;无 override 时注入带 nonce 的 `subagent:<实际类型>`。`subagent_type` 必须拒绝换行、控制字符与 closing-tag 注入
 - **动态 alias grammar**:只有名字满足 1..64 ASCII `[A-Za-z0-9._-]` 的环境可作为 `ccem:<env>` model/marker alias;既有不合法名字仍可作为 default/binding 目标,但动态 override 稳定返回 `ROUTER_ENV_ALIAS_INVALID`,UI 不展示 alias且建议用户重命名。禁止百分号解码或大小写折叠
 - **删除手写逻辑键 override**:主模型不得手写 `subagent:Explore` 覆盖自动身份;动态改派只保留显式环境 override,消除“自动标签在前导致手写逻辑标签永不生效”的冲突
-- **仅默认规则**:router 全局启用时 eligible native session 一律经 router;bindings 为空表示所有逻辑键走 default_env,UI 名称用「仅默认规则」而非「直连」。若 `dynamicRouting=true`,显式 override 仍可在 allowed 集合内生效
-- **真正直连传输**只由本 helper generation 的 `launchTransport=direct` 表示:全局关闭、新 session 启动时 router 失败、或用户显式「重启为直连」。运行中不热切换 transport
+- **仅默认规则**:当前 Composer 已显式 opt-in 且 bindings 为空时,所有逻辑键走 default_env,UI 名称用「仅默认规则」而非「直连」。若 `dynamicRouting=true`,显式 override 仍可在 allowed 集合内生效
+- **真正直连传输**由 session 不含 router record,或既有 record 的本 helper generation 为 `launchTransport=direct` 表示。新 Composer 默认不创建 router record;运行中不热切换 transport
 - 别名/逻辑键命中后 model 按 §4.6 算法重写;`background` 逻辑键载体:helper 将 `ANTHROPIC_SMALL_FAST_MODEL` 设为字面量 `ccem-route:background`
 - 未知/未授权 `ccem:` 目标 → 403;binding 指向缺失环境/default_env 缺失 → 502,**禁止静默 fallback**;只有“逻辑键没有 binding”可正常落 default_env
 
@@ -161,8 +162,8 @@ CCEM Router
 
 ### 4.4 配置分层、session 状态与外部 DTO(v2.2)
 
-- 全局默认 bindings:`~/.ccem/config.json` 的 `router` 节(`enabled`、`port`、`bindings`、`profiles`、`dynamic_routing`)
-- 新 session 创建时拷贝快照进 session record;改全局默认**不影响**运行中 session
+- 全局默认 bindings:`~/.ccem/config.json` 的 `router` 节(`port`、`bindings`、`profiles`、`dynamic_routing`);listener 是 Desktop 内部基础设施,不存在产品级总开关
+- 只有当前 Composer 显式 opt-in 时,首次提交才把选中的全局默认/Profile 快照作为 `routerLaunchDraft` 原子传入创建请求并写入 session record;未 opt-in 时不传 draft、保持旧 direct 行为。改全局默认**不影响**运行中 session
 - session 设置/L1 入口用 CAS `revision` 改 bindings/allowed/default/dynamic → 下一次 HTTP 请求生效;这也可能让正在运行的 subagent 后续轮切换供应商,UI 必须明确提示
 - **session record 的 `router` 子对象(v2.2;秘密字段永不序列化到外部 DTO)**:
 
@@ -223,35 +224,44 @@ type UpdateSessionRouterRequest = {
 - 唯一事件 `native-session-router-updated`:`{ runtimeId, router: SessionRouterState, reason }`;所有入口写成功后都发,前端不得自行拼状态
 - 环境 rename/delete 先扫描全局默认、profiles 与 active/recoverable session snapshots:除保留的 `official` 外,rename 原子级联这些引用;delete 若仍被引用则拒绝并返回引用清单。外部手改配置导致引用缺失时,router 请求仍按 502 fail-closed
 
-### 4.5 UI 与交互(plan mode 式动态开关,用户已确认)
+### 4.5 UI 与交互(Composer 级显式 opt-in,用户已确认)
 
-交互完全对齐 plan mode 现有模式(`WorkspaceSessionComposer.tsx`):主界面只放最快的开关,完整控制渐进展开。
+动态路由是**本次新会话的启动方式**,不是全局模式。每个新 Composer 都从现有单环境 direct 行为开始;只有用户在该 Composer 的 `+` 菜单手动开启后,该 Composer 才携带路由草稿。下一个新 Composer 重新默认关闭。
 
-**L1 即时层——三处入口,同一状态(用户已确认)**
+**首次提交前——唯一入口与可见状态**
 
-a. **状态条路由 chip**:`WorkspaceStatusStrip` 现有 env chip 旁,Route 图标 + 当前 profile 名(或「仅默认规则」),点击弹方案 Popover(profile 单选列表 + 绑定摘要 + allowed env +「动态改派」开关 +「自定义绑定…」跳 L2)。切换 = CAS `update_session_router` IPC 改路由表;toast 明示“下一次请求生效,活跃 agent 后续轮也可能切换”。红利:router 模式下 env chip 切换也不重启 query(§3.3)
+a. **+ 快捷菜单**:Claude Composer 的 plan 行后显示「动态路由」Switch。默认 off;开启只修改当前 Composer 的本地 draft,不写全局配置、不影响其他/后续 Composer,也不需要自定义指令。Codex 等尚未接入 Anthropic Router 协议的 provider 不展示该能力入口
 
-b. **Composer 状态识别**:非「仅默认规则」时 composer shell 顶部显示路由 pill——与 plan pill 同行并列、同款样式 token(`bg-primary/[0.06] text-primary/70` 小胶囊 + Route 图标 + 方案名),**不引入第二种边框色**。点击 pill 打开同一方案 Popover
+b. **开启即选“我的默认”**:Switch 打开后默认选择「我的默认」,不要求用户再选一次方案;真正的 `router.bindings/defaultAllowedEnvs/dynamicRouting` 快照在首次提交瞬间从最新配置解析。用户可以通过 pill 改选命名 Profile;主环境仍只由已有环境选择器决定,方案不得偷偷修改主环境
 
-c. **+ 快捷菜单**:新增「模型路由」行(紧跟 plan 行,同款 Switch 行样式):行尾显示当前方案名,点击行在**同一 Popover 内嵌展开**方案单选列表,顶部规则开关(开 = 最近方案,关 = 仅默认规则;不等于绕过 router)
+c. **Composer route pill**:opt-in 后在输入框上方、与 plan pill 同行显示 Route 图标 +「动态路由 · 我的默认」或方案名,使用同款 token(`bg-primary/[0.06] text-primary/70`),不放进环境/思考强度/权限选择器之间。点击 pill 打开现有方案/规则 Popover。off 时无 pill,明确等价于现有单环境 direct 行为
+
+d. **原子首发与重置**:第一次 submit 的同一个 `create_native_session` 请求同时携带 prompt、主环境和完整 `routerLaunchDraft`。创建成功后当前 draft reset 为 off;创建失败保留 draft 与具体错误供重试。新建 Composer、历史会话 continue Composer 与 provider 切换都不得继承上一个临时 opt-in
+
+**会话创建后——权威 session 状态**
+
+- routed 会话继续在 Composer pill 与状态条 route chip 显示 `SessionRouterState`;点击后通过 CAS 热更新 Profile/bindings/allowed/default/dynamic,toast 明示“下一次请求生效,活跃 agent 后续轮也可能切换”
+- direct 会话不显示可热开启的假 Switch;若要改变 transport,必须新建会话或走明确的「重启为直连」动作。旧的“关闭 Switch 只清空 bindings、transport 仍 routed”交互删除
 
 **L2 Session 设置「模型路由」区(完整控制)**
 - per-type 绑定行(内置花名册下拉 + `subagent:*` + `background`),env 下拉;绑定目标自动进入 session allowed env 集合
-- 动态路由开关;「存为我的默认」写全局默认 bindings
+- 「允许 Agent 自主改派」开关(底层字段仍为 `dynamicRouting`,它不是本会话 opt-in);「存为我的默认」写全局默认 bindings
 
 **L3 默认规则归属:环境管理页(用户已确认)**
 - 默认路由规则本质是"环境之间的关系":环境管理页新增「默认路由规则」卡片(默认 bindings 编辑 + 自定义 profile 管理)
 - 删除/重命名环境时同页列出全局默认、profile 与 active/recoverable session 引用;删除确认框先查询后端权威引用清单,有引用时禁用最终删除并引导先解除绑定;重命名走后端原子级联(§4.4)
-- 全局设置 Router 区只留基础设施:总开关、端口(改动提示需重启)
+- 全局设置 Router 区只留基础设施状态与端口(改动提示需重启),不提供会影响会话行为的总开关
 
 **Profile(方案)模型**
 - 内置只有不依赖用户环境名的「仅默认规则」;「省钱杂活」「特长分工」是参数化模板,首次应用必须由用户选择目标环境后才生成 profile
 - 用户自定义存 `config.json router.profiles[]`:`{ id, name, revision, bindings, allowedEnvs }`
 - profile 是 bindings 的**命名快照**:切换时展开写入 session 路由表;后续改 profile 定义不影响运行中 session
+- `my-default` 是保留的 provenance id,不是用户 Profile:Composer 从全局默认启动时写 `sourceProfileId=my-default`、`profileRevision=null`,使首次提交前后的 pill 都保持「动态路由 · 我的默认」。运行中手工改路由清空 provenance 后才显示「自定义」;运行中重新选择「我的默认」则应用当下最新全局默认
 
 **空态/降级**
-- 全局关闭 router 只影响后续新建/恢复 generation;当前 `launchTransport=routed` 的会话继续显示并使用既有路由,直到用户显式「重启为直连」。当前 `launchTransport=direct` 或尚无 session router state 的入口灰显「直连传输」,tooltip 指路设置页
-- router 启动失败 → 新 session chip 警示态 + 已回退直连说明;既有 routed session 显示 blocked 与「重启为直连」显式动作
+- 新 Composer off 时不显示路由状态,保持旧单环境行为;这不表示 Router 基础设施未运行
+- 用户已 opt-in 但 listener/readiness/OAuth gate 不满足时,首次提交在创建 record 前 fail-closed,显示后端具体错误并保留 draft;不得静默直连
+- 既有 routed session 的 listener 失败时显示 blocked 与「重启为直连」显式动作
 - i18n 全走 `t()`(zh/en 双 locale);shadcn/ui(Popover/RadioGroup/Switch/Toast);色板走 design token
 
 ### 4.6 目标 model 解析算法(v2.2:跨环境 main 同样映射)
@@ -346,7 +356,7 @@ hooks: {
 
 ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥。**本期范围:native workspace session(UI 与 `ccem desktop create` 同路径)**;bot(Telegram/Weixin/Wecom)、cron 渠道**不在本期**——它们不共用同一创建路径,需逐渠道接入与验收,列为后续项(§8)。
 
-- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"` 与 `--routes-json <json>`,种子化 bindings 快照;缺省拷全局默认。`<key>`:`subagent:<名字>` / `subagent:*` / `background`。示例:
+- `ccem desktop create` 新增可重复参数 `--route "<key>=<env>"` 与 `--routes-json <json>`,种子化 bindings 快照;任一路由参数显式出现才表示当前会话 opt-in,全部缺省时保持 direct。`<key>`:`subagent:<名字>` / `subagent:*` / `background`。示例:
 
   ```bash
   # 主会话走 official;Explore 走 glm;小模型 side-query 走 deepseek
@@ -379,7 +389,7 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥。**本�
 
 ### 6.2 降级与错误语义
 
-- router 启动失败(端口区间全被占等):尚未创建的新 session 可按当前 default env 直连并写 generation facts + UI 警告;既有 routed record 恢复返回 `ROUTER_UNAVAILABLE`,不得静默换传输
+- router 启动失败(端口区间全被占等):未 opt-in 的新 session 不依赖 router并保持 direct;已 opt-in 的创建在落 record 前返回 `ROUTER_UNAVAILABLE` 并保留 Composer draft,不得静默换传输;既有 routed record 恢复同样 fail-closed
 - binding/default/显式 override 指向缺失环境或目标 model 无法解析 → 502 稳定错误体 + session warning;未绑定逻辑键才允许落 default
 - 目标环境 token 解密失败/为空 → 502;token capability 访问 requiresOAuth → 403;requiresOAuth 在 feature gate 未开或客户端 Authorization 缺失 → 503/401 明确错误
 - listener/task 运行中崩溃由 supervisor 优先在**同一端口**重启;失败则 `RouterStatus=degraded`,已有 routed session blocked并提供显式「重启为直连」,不得在活跃 helper 下偷偷改 base URL
@@ -397,12 +407,13 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥。**本�
 
 - 单一 listener 同时服务 native `/s/<sessionKey>/...` 与既有 `/proxy/<client>/<routeId>/...`;现有 external terminal/tmux/Codex legacy caller 继续使用返回的 `/proxy` URL,禁止两个 listener 或串联
 - `ProxyDebugManager` 的 traffic 类型、脱敏、reduced SSE、分页/留存与 IPC 保留为 recording tap/facade;转发 listener 的生命周期归 `RouterManager`
-- listener 在 `router.enabled || debug.enabled || legacy routes 非空` 时运行。关闭 debug 只停止新 recording,不清 native route table,也不切断仍依赖 legacy route 的会话;route 释放后且 router/debug 都关才停 listener
+- shared listener 是 Desktop 内部基础设施,app setup 时在 `127.0.0.1` 无条件启动并向后扫描端口,仅 app shutdown 停止;是否存在 opt-in session 不改变 listener 生命周期。关闭 debug 只停止新 recording,不清 native route table、不停止 listener
 - native routed traffic 在 debug 开时进入同一 tap,关时不写 body/log;RouterStatus 与 ProxyDebugState 分开,但共享 actualPort
 
 ## 7. 测试策略
 
 - **Rust 单测**:exact/wildcard/default、nonce spoof、dynamic off、allowed env、missing default/target、session secret 不进 DTO、CAS revision、auth classifier/头清理、URL base-path join、model 映射矩阵、配置迁移、rename/delete 引用、**0600/0700 与 secure atomic write**
+- **opt-in 启动矩阵**:无 `routerLaunchDraft` → direct 且不创建 router record;显式空 draft → routed main-only;「我的默认」/命名 Profile 必须对 revision/bindings/allowed/dynamic 做提交时精确快照校验;Codex + draft 拒绝;listener/OAuth gate 失败在落 record 前 fail-closed;旧 None/Direct/Routed record 恢复不改变原 transport
 - **集成测试**(mock upstream):请求 JSON 改写与 marker 剥除、32 MiB 边界/413、压缩请求/415、query/base path、禁 redirect、SSE chunk 即时透传、慢 chunk、client cancel/upstream RST、多 session 隔离、旧鉴权/Cookie 不泄漏、legacy `/proxy` 回归、debug off 后 native route 仍通
 - **恢复矩阵**:prior routed/direct × router ready/fail × oauth/token;UI create 与 external-control create 产出同一 public DTO;lazy `sendInput` 恢复不能绕过 coordinator
 - **混沌专项**:用可复现 seed 覆盖随机 chunk 大小 + bounded 随机延迟、中途 RST、并发流与不伪造正常终止;作为显式 ignored 慢测试。30min+/100 流 soak 属发布前稳定性观测,不作为本期 feature merge gate,也不得由 bounded 用例冒充
@@ -434,7 +445,7 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥。**本�
 - 死会话恢复:隔夜点开 routed 记录时 secrets/bindings 自动重建;router 不可用则 blocked而非静默直连;旧 record 透明迁移
 - UI 与 `ccem desktop create --route ...` 走同一 coordinator;`ccem desktop routes` 可查/CAS 改且 external DTO 永不含秘密
 - `~/.ccem` 0700、含键文件 0600,权限回归测试通过
-- router 关闭时新 session 保留直连/软重启旧行为;运行中 router 崩溃显式 degraded并可同端口恢复
+- 新 Composer 未 opt-in 时保留 direct/软重启旧行为;opt-in 首发失败保留 prompt 与 draft;运行中 router 崩溃显式 degraded并可同端口恢复
 - JSON/request 限制、base path、redirect、abort、SSE 流式集成测试通过;debug 关闭不影响 native route;legacy `/proxy` 回归通过
 
 ## 实施记录
@@ -460,4 +471,10 @@ ccem skill 发起会话走 `ccem desktop create` → desktop 控制桥。**本�
   - 通过 Workspace UI 新建 token routed session 后,真实 `/v1/messages` 抓包依次证明 main→A、`Explore` 首轮→B、`Explore` tool-result 后续轮→B;目标 model 分别为 `fixture-a-opus` / `fixture-b-opus`,均存在 `Authorization`,且 `x-api-key` / `Cookie` 不存在
   - 通过会话路由 UI 将 `Explore` 热切到 A 并应用后,下一轮 main 与 `Explore` 均走 A、model 为 `fixture-a-opus`;helper PID 在热切前后均为 `45025`,证明 binding 更新未替换 helper generation
   - nonce 认证 marker 在所有 provider-bound 请求中均未泄漏。主会话请求仍可能包含系统提示公开的 raw `<CCEM-ROUTE>ccem:ENV</CCEM-ROUTE>` 菜单语法,这是预期的模型可见用法说明,不冒充“所有 raw `CCEM-ROUTE` 文本均不存在”
-  - 2026-08-11 现场清理完成:测试会话为 `stopped` / `is_active=false`;全局环境恢复为 `kimi-K3`;Router 恢复为 disabled、空 bindings/profiles/allowed;`zz-router-a`/`zz-router-b` 无引用后经真实确认对话删除;Dev App、mock upstream 与测试 helper 均退出,已安装正式版保持运行且未被操作。行为验收与现场清理分别留证
+  - 2026-08-11 现场清理完成:测试会话为 `stopped` / `is_active=false`;全局环境恢复为 `kimi-K3`;旧 v2.2 配置恢复为 `enabled=false`、空 bindings/profiles/allowed;`zz-router-a`/`zz-router-b` 无引用后经真实确认对话删除;Dev App、mock upstream 与测试 helper 均退出,已安装正式版保持运行且未被操作。v2.3 已删除该产品级 `enabled` 字段,listener 改为内部基础设施常驻
+- 2026-08-15 v2.3 Composer opt-in 实施与验收:
+  - 产品状态从全局开关收敛为 `routerLaunchDraft: Option<_>`:无 draft 的新 Claude Composer 保持 direct 且不生成 router record;只有 `+ → 动态路由` 显式开启后,首次 `create_native_session` 才原子携带完整快照。失败在 record 创建前 fail-closed 并保留 prompt/draft;成功后 persisted `launchTransport=routed`;旧 None/Direct/Routed record 恢复时保持原 transport
+  - shared listener 在 Desktop setup 时同步启动,不再由产品配置启停;Settings 仅展示实际端口/健康状态。`dynamicRouting` 只表示 routed 会话是否允许 Agent 自主改派。Core/Rust 删除 `RouterConfig.enabled`;旧 JSON 的该字段被忽略并在后续归一化写回时清除
+  - Composer 唯一入口、显式 pill 与 provider gate 已接入:新 Composer 默认无 pill;开启后显示「动态路由 · 我的默认/方案名」;`my-default` 保留 provenance 使首发前后标签连续;Codex/OpenCode 不展示入口;provider 切换、Start New、history/cron fresh-compose 与成功首发都会把下一个 Composer 重置为 off
+  - 自动化门禁:`pnpm verify` 通过;Core 124/124、CLI 207/207、Desktop 475/475、native helper 100/100、Rust 701 passed/3 ignored;Core/CLI/Desktop/helper build、TypeScript、i18n、文件大小、production audit 与 diff-check 全绿。新增矩阵覆盖 None/Some create、旧 record 恢复、profile/dynamic 快照陈旧、reserved provenance、同 tick 双提交、失败保留、provider/history/fresh-compose reset 与 CLI/external-control 兼容
+  - 真实 `CCEM Desktop Dev` 手势验收:在新 Claude Composer 中确认初始无 pill且 `+` 内 Switch 为 off;开启后出现「动态路由 · 我的默认」并在方案 RadioGroup 中选中「我的默认」;切换 Claude→Codex 时入口和 pill 消失,再切回 Claude 仍为 off。随后重新开启,以现有 token 环境 `GLM-5.3` 首发「只回复 OK,不调用工具」并收到 `OK`;公开 session summary 为 `status=ready`、`launchTransport=routed`、`sourceProfileId=my-default`、`defaultEnv=GLM-5.3`,运行态 Composer pill 保持一致;点击「新会话」后再次确认无 pill。已安装正式版全程未操作;Dev App 保持运行供试用

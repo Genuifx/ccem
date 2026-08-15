@@ -10,9 +10,9 @@ use crate::prompt_image_store::PromptImageStore;
 use crate::router::{
     apply_session_router_patch, describe_router_environment, is_valid_router_environment_alias,
     validate_session_router_targets, LaunchAuthKind, LaunchTransport, RouterAuthCapability,
-    RouterEnvironmentAuthKind, RouterManager, RouterServiceError, SessionRouterRecord,
-    SessionRouterState, SessionRouterUpdatedEvent, UpdateSessionRouterRequest,
-    OAUTH_ROUTING_VERIFIED,
+    RouterConfig, RouterEnvironmentAuthKind, RouterManager, RouterServiceError,
+    SessionRouterRecord, SessionRouterState, SessionRouterUpdatedEvent, UpdateSessionRouterRequest,
+    MY_DEFAULT_ROUTER_PROFILE_ID, OAUTH_ROUTING_VERIFIED,
 };
 use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
@@ -184,12 +184,13 @@ pub struct NativeSessionOptions {
     pub codex_base_url: Option<String>,
     pub codex_api_key: Option<String>,
     pub effort: Option<String>,
-    pub router_seed: Option<NativeRouterSeed>,
+    pub router_launch_draft: Option<RouterLaunchDraft>,
     pub router_record: Option<SessionRouterRecord>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NativeRouterSeed {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouterLaunchDraft {
     pub bindings: HashMap<String, String>,
     pub allowed_envs: Vec<String>,
     pub source_profile_id: Option<String>,
@@ -1084,33 +1085,73 @@ enum RouterLaunchDecision {
     Bypass,
     LaunchDirect,
     LaunchRouted,
-    RejectRecovery,
+    RejectUnavailable,
 }
 
 fn router_launch_decision(
     previous_transport: Option<LaunchTransport>,
-    router_enabled: bool,
+    launch_requested: bool,
     router_ready: bool,
     auth_capability: RouterAuthCapability,
     oauth_verified: bool,
 ) -> RouterLaunchDecision {
-    if !router_enabled {
-        return match previous_transport {
-            Some(LaunchTransport::Routed) => RouterLaunchDecision::RejectRecovery,
-            Some(LaunchTransport::Direct) => RouterLaunchDecision::LaunchDirect,
-            None => RouterLaunchDecision::Bypass,
-        };
+    match previous_transport {
+        Some(LaunchTransport::Direct) => return RouterLaunchDecision::LaunchDirect,
+        None if !launch_requested => return RouterLaunchDecision::Bypass,
+        Some(LaunchTransport::Routed) | None => {}
     }
 
     let can_route =
         router_ready && (auth_capability != RouterAuthCapability::Oauth || oauth_verified);
     if can_route {
         RouterLaunchDecision::LaunchRouted
-    } else if previous_transport == Some(LaunchTransport::Routed) {
-        RouterLaunchDecision::RejectRecovery
     } else {
-        RouterLaunchDecision::LaunchDirect
+        RouterLaunchDecision::RejectUnavailable
     }
+}
+
+fn validate_router_launch_draft_profile(
+    config: &RouterConfig,
+    draft: &RouterLaunchDraft,
+) -> Result<(), String> {
+    let Some(profile_id) = draft.source_profile_id.as_deref() else {
+        if draft.profile_revision.is_some() {
+            return Err(
+                "ROUTER_PROFILE_INVALID: profileRevision requires sourceProfileId".to_string(),
+            );
+        }
+        return Ok(());
+    };
+    if profile_id == MY_DEFAULT_ROUTER_PROFILE_ID {
+        if draft.profile_revision.is_some()
+            || draft.bindings != config.bindings
+            || draft.allowed_envs != config.default_allowed_envs
+            || draft.dynamic_routing != Some(config.dynamic_routing)
+        {
+            return Err(
+                "ROUTER_PROFILE_STALE: my-default router settings changed before launch"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    let profile = config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| {
+            format!("ROUTER_PROFILE_STALE: router profile '{profile_id}' no longer exists")
+        })?;
+    if draft.profile_revision != Some(profile.revision)
+        || draft.bindings != profile.bindings
+        || draft.allowed_envs != profile.allowed_envs
+        || draft.dynamic_routing != Some(config.dynamic_routing)
+    {
+        return Err(format!(
+            "ROUTER_PROFILE_STALE: router profile '{profile_id}' changed before launch"
+        ));
+    }
+    Ok(())
 }
 
 impl Default for NativeRuntimeManager {
@@ -1252,61 +1293,63 @@ impl NativeRuntimeManager {
         recovering: bool,
     ) -> Result<(), String> {
         if options.provider != NativeProvider::Claude {
+            if options.router_launch_draft.is_some() {
+                return Err(
+                    "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
+                        .to_string(),
+                );
+            }
             options.router_record = None;
             return Ok(());
         }
-        let Some(manager) = self.router_manager.get() else {
-            return Ok(());
-        };
 
         if let Some(existing) = options.router_record.as_mut() {
-            let was_routed = existing.launch_transport == LaunchTransport::Routed;
-            let config = manager.config();
+            options.router_launch_draft = None;
+            if existing.launch_transport == LaunchTransport::Direct {
+                let warnings = existing.warnings.clone();
+                prepare_direct_router_launch(options, None)?;
+                if let Some(router) = options.router_record.as_mut() {
+                    router.warnings = warnings;
+                }
+                return Ok(());
+            }
+            let manager = self.router_manager.get().ok_or_else(|| {
+                "ROUTER_UNAVAILABLE: routed session recovery requires the router manager"
+                    .to_string()
+            })?;
             let status = manager.status();
-            let direct_reason = if !config.enabled {
-                Some("Router is disabled; launched this helper generation direct.".to_string())
-            } else if status.actual_port.is_none() {
-                Some(
-                    status
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "Router listener is unavailable.".to_string()),
-                )
+            let unavailable_reason = if status.actual_port.is_none() {
+                status
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Router listener is unavailable.".to_string())
             } else if existing.router_auth_capability == RouterAuthCapability::Oauth
                 && !OAUTH_ROUTING_VERIFIED
             {
-                Some("OAuth routing is not verified for this runtime.".to_string())
+                "OAuth routing is not verified for this runtime.".to_string()
             } else {
-                None
+                "Router launch decision rejected recovery without a readiness reason.".to_string()
             };
 
             match router_launch_decision(
                 Some(existing.launch_transport),
-                config.enabled,
+                false,
                 status.actual_port.is_some(),
                 existing.router_auth_capability,
                 OAUTH_ROUTING_VERIFIED,
             ) {
-                RouterLaunchDecision::RejectRecovery => {
-                    let reason = direct_reason.unwrap_or_else(|| {
-                        "Router launch decision rejected recovery without a readiness reason."
-                            .to_string()
-                    });
+                RouterLaunchDecision::RejectUnavailable => {
                     return Err(if recovering {
                         format!(
-                            "ROUTER_UNAVAILABLE: routed session recovery requires the router listener ({reason})"
+                            "ROUTER_UNAVAILABLE: routed session recovery requires the router listener ({unavailable_reason})"
                         )
                     } else {
-                        format!("ROUTER_UNAVAILABLE: {reason}")
+                        format!("ROUTER_UNAVAILABLE: {unavailable_reason}")
                     });
                 }
-                RouterLaunchDecision::LaunchDirect => {
-                    return prepare_direct_router_launch(options, direct_reason);
-                }
                 RouterLaunchDecision::LaunchRouted => {}
-                RouterLaunchDecision::Bypass => {
-                    debug_assert!(!was_routed);
-                    return Ok(());
+                RouterLaunchDecision::LaunchDirect | RouterLaunchDecision::Bypass => {
+                    unreachable!("persisted routed sessions cannot bypass or launch direct")
                 }
             }
 
@@ -1345,25 +1388,19 @@ impl NativeRuntimeManager {
             return Ok(());
         }
 
-        let config = manager.config();
-        if !config.enabled {
+        let Some(draft) = options.router_launch_draft.take() else {
             return Ok(());
-        }
+        };
+        let manager = self.router_manager.get().ok_or_else(|| {
+            "ROUTER_UNAVAILABLE: explicit router launch requires the router manager".to_string()
+        })?;
+        let config = manager.config();
+        validate_router_launch_draft_profile(&config, &draft)?;
         let source =
             describe_router_environment(&options.env_name).map_err(|error| error.to_string())?;
-        let seed = options
-            .router_seed
-            .take()
-            .unwrap_or_else(|| NativeRouterSeed {
-                bindings: config.bindings.clone(),
-                allowed_envs: config.default_allowed_envs.clone(),
-                source_profile_id: None,
-                profile_revision: None,
-                dynamic_routing: Some(config.dynamic_routing),
-            });
-        let mut allowed_envs = seed.allowed_envs;
+        let mut allowed_envs = draft.allowed_envs;
         allowed_envs.push(options.env_name.clone());
-        allowed_envs.extend(seed.bindings.values().cloned());
+        allowed_envs.extend(draft.bindings.values().cloned());
         dedupe_nonempty(&mut allowed_envs);
 
         let auth_capability = match source.auth_kind {
@@ -1375,64 +1412,54 @@ impl NativeRuntimeManager {
             RouterAuthCapability::Oauth => LaunchAuthKind::Oauth,
         };
         let status = manager.status();
-        let mut warnings = Vec::new();
-        let launch_transport = match router_launch_decision(
+        match router_launch_decision(
             None,
-            config.enabled,
+            true,
             status.actual_port.is_some(),
             auth_capability,
             OAUTH_ROUTING_VERIFIED,
         ) {
-            RouterLaunchDecision::LaunchDirect => {
-                if status.actual_port.is_none() {
-                    warnings.push(status.error.unwrap_or_else(|| {
-                        "Router listener is unavailable; launched direct.".into()
-                    }));
+            RouterLaunchDecision::RejectUnavailable => {
+                let reason = if status.actual_port.is_none() {
+                    status
+                        .error
+                        .unwrap_or_else(|| "Router listener is unavailable.".to_string())
                 } else {
-                    warnings.push(
-                        "OAuth routing is not verified for this runtime; launched direct."
-                            .to_string(),
-                    );
-                }
-                LaunchTransport::Direct
+                    "OAuth routing is not verified for this runtime.".to_string()
+                };
+                return Err(format!("ROUTER_UNAVAILABLE: {reason}"));
             }
-            RouterLaunchDecision::LaunchRouted => LaunchTransport::Routed,
-            RouterLaunchDecision::Bypass => return Ok(()),
-            RouterLaunchDecision::RejectRecovery => {
-                unreachable!("new router sessions cannot reject a prior routed generation")
+            RouterLaunchDecision::LaunchRouted => {}
+            RouterLaunchDecision::LaunchDirect | RouterLaunchDecision::Bypass => {
+                unreachable!("explicit router launches cannot bypass or launch direct")
             }
-        };
+        }
 
         let router_record = SessionRouterRecord {
             session_key: random_router_secret(32),
             route_tag_nonce: random_router_secret(24),
             default_env: options.env_name.clone(),
-            bindings: seed.bindings,
+            bindings: draft.bindings,
             allowed_envs,
-            source_profile_id: seed.source_profile_id,
-            profile_revision: seed.profile_revision,
-            dynamic_routing: seed.dynamic_routing.unwrap_or(config.dynamic_routing),
+            source_profile_id: draft.source_profile_id,
+            profile_revision: draft.profile_revision,
+            dynamic_routing: draft.dynamic_routing.unwrap_or(config.dynamic_routing),
             revision: 0,
             router_auth_capability: auth_capability,
-            launch_transport,
+            launch_transport: LaunchTransport::Routed,
             launch_auth_kind,
             launch_default_env: source.name,
             launch_model_pins: source.pins,
-            warnings,
+            warnings: Vec::new(),
         };
 
-        validate_session_router_targets(
+        validate_session_router_targets(&router_record, OAUTH_ROUTING_VERIFIED)
+            .map_err(|error| error.to_string())?;
+        configure_routed_helper_env(
+            &mut options.helper_env_vars,
+            status.actual_port.expect("checked router port"),
             &router_record,
-            launch_transport == LaunchTransport::Direct || OAUTH_ROUTING_VERIFIED,
-        )
-        .map_err(|error| error.to_string())?;
-        if launch_transport == LaunchTransport::Routed {
-            configure_routed_helper_env(
-                &mut options.helper_env_vars,
-                status.actual_port.expect("checked router port"),
-                &router_record,
-            );
-        }
+        );
         options.router_record = Some(router_record);
         Ok(())
     }
@@ -4702,7 +4729,7 @@ fn build_runtime_bootstrap_options(
         codex_base_url,
         codex_api_key,
         effort: record.effort.clone(),
-        router_seed: None,
+        router_launch_draft: None,
         router_record: record.router.clone(),
     })
 }
@@ -4779,9 +4806,9 @@ mod tests {
         native_status_allows_file_rewind, reactivate_record_for_reconnect,
         read_native_runtime_state_from, recoverable_record_after_helper_removed,
         router_launch_decision, session_router_patch_oauth_validation_enabled,
-        take_terminal_launches, HelperInputCommand, NativeProvider, NativeRuntimeManager,
-        NativeSessionHandle, NativeSessionOptions, NativeSessionRecord, NativeTransport,
-        PromptImage, RouterLaunchDecision,
+        take_terminal_launches, validate_router_launch_draft_profile, HelperInputCommand,
+        NativeProvider, NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions,
+        NativeSessionRecord, NativeTransport, PromptImage, RouterLaunchDecision, RouterLaunchDraft,
     };
     use crate::event_bus::{
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
@@ -4791,7 +4818,7 @@ mod tests {
     use crate::prompt_image_store::PromptImageStore;
     use crate::router::{
         LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterConfig, RouterManager,
-        RouterModelPins, SessionRouterPatch, SessionRouterRecord,
+        RouterModelPins, RouterProfile, SessionRouterPatch, SessionRouterRecord,
     };
     use chrono::Utc;
     use std::collections::{HashMap, HashSet};
@@ -4956,36 +4983,223 @@ mod tests {
     }
 
     #[test]
-    fn router_recovery_transport_matrix_is_fail_closed_and_generation_scoped() {
+    fn router_launch_transport_matrix_is_explicit_fail_closed_and_generation_scoped() {
         use LaunchTransport::{Direct, Routed};
         use RouterAuthCapability::{Oauth, Token};
-        use RouterLaunchDecision::{Bypass, LaunchDirect, LaunchRouted, RejectRecovery};
+        use RouterLaunchDecision::{Bypass, LaunchDirect, LaunchRouted, RejectUnavailable};
 
         let cases = [
             (None, false, false, Token, false, Bypass),
-            (None, true, false, Token, false, LaunchDirect),
+            (None, false, true, Token, true, Bypass),
+            (None, true, false, Token, false, RejectUnavailable),
             (None, true, true, Token, false, LaunchRouted),
-            (None, true, true, Oauth, false, LaunchDirect),
+            (None, true, true, Oauth, false, RejectUnavailable),
             (None, true, true, Oauth, true, LaunchRouted),
             (Some(Direct), true, false, Token, false, LaunchDirect),
-            (Some(Direct), true, true, Token, false, LaunchRouted),
+            (Some(Direct), true, true, Token, false, LaunchDirect),
             (Some(Direct), true, true, Oauth, false, LaunchDirect),
-            (Some(Direct), true, true, Oauth, true, LaunchRouted),
-            (Some(Routed), true, false, Token, false, RejectRecovery),
+            (Some(Direct), true, true, Oauth, true, LaunchDirect),
+            (Some(Routed), true, false, Token, false, RejectUnavailable),
             (Some(Routed), true, true, Token, false, LaunchRouted),
-            (Some(Routed), true, true, Oauth, false, RejectRecovery),
+            (Some(Routed), true, true, Oauth, false, RejectUnavailable),
             (Some(Routed), true, true, Oauth, true, LaunchRouted),
-            (Some(Routed), false, true, Token, false, RejectRecovery),
+            (Some(Routed), false, true, Token, false, LaunchRouted),
             (Some(Direct), false, true, Token, false, LaunchDirect),
         ];
 
-        for (previous, enabled, ready, auth, oauth_verified, expected) in cases {
+        for (previous, requested, ready, auth, oauth_verified, expected) in cases {
             assert_eq!(
-                router_launch_decision(previous, enabled, ready, auth, oauth_verified),
+                router_launch_decision(previous, requested, ready, auth, oauth_verified),
                 expected,
-                "previous={previous:?} enabled={enabled} ready={ready} auth={auth:?} oauth_verified={oauth_verified}",
+                "previous={previous:?} requested={requested} ready={ready} auth={auth:?} oauth_verified={oauth_verified}",
             );
         }
+    }
+
+    #[test]
+    fn router_opt_in_is_not_inherited_by_the_next_new_session() {
+        assert_eq!(
+            router_launch_decision(None, true, true, RouterAuthCapability::Token, false,),
+            RouterLaunchDecision::LaunchRouted
+        );
+        assert_eq!(
+            router_launch_decision(None, false, true, RouterAuthCapability::Token, false,),
+            RouterLaunchDecision::Bypass
+        );
+    }
+
+    #[test]
+    fn my_default_launch_provenance_requires_an_exact_config_snapshot() {
+        let config = RouterConfig {
+            bindings: HashMap::from([("background".into(), "glm".into())]),
+            default_allowed_envs: vec!["glm".into()],
+            dynamic_routing: false,
+            ..RouterConfig::default()
+        };
+        let mut draft = RouterLaunchDraft {
+            bindings: config.bindings.clone(),
+            allowed_envs: config.default_allowed_envs.clone(),
+            source_profile_id: Some("my-default".into()),
+            profile_revision: None,
+            dynamic_routing: Some(config.dynamic_routing),
+        };
+
+        validate_router_launch_draft_profile(&config, &draft)
+            .expect("the current my-default snapshot is valid");
+
+        draft.dynamic_routing = Some(true);
+        let error = validate_router_launch_draft_profile(&config, &draft)
+            .expect_err("a stale my-default snapshot must fail closed");
+        assert!(error.contains("ROUTER_PROFILE_STALE"), "{error}");
+    }
+
+    #[test]
+    fn named_profile_launch_provenance_requires_current_dynamic_routing() {
+        let profile = RouterProfile {
+            id: "chores".into(),
+            name: "Chores".into(),
+            revision: 4,
+            bindings: HashMap::from([("background".into(), "glm".into())]),
+            allowed_envs: vec!["glm".into()],
+        };
+        let config = RouterConfig {
+            profiles: vec![profile.clone()],
+            dynamic_routing: false,
+            ..RouterConfig::default()
+        };
+        let mut draft = RouterLaunchDraft {
+            bindings: profile.bindings,
+            allowed_envs: profile.allowed_envs,
+            source_profile_id: Some(profile.id),
+            profile_revision: Some(profile.revision),
+            dynamic_routing: Some(true),
+        };
+
+        let error = validate_router_launch_draft_profile(&config, &draft)
+            .expect_err("stale dynamicRouting must fail closed");
+        assert!(error.contains("ROUTER_PROFILE_STALE"), "{error}");
+
+        draft.dynamic_routing = Some(config.dynamic_routing);
+        validate_router_launch_draft_profile(&config, &draft)
+            .expect("the current named profile snapshot is valid");
+    }
+
+    #[test]
+    fn new_session_without_router_launch_draft_stays_direct() {
+        let manager = manager_with_handle("native-router-opt-in-off");
+        manager
+            .set_router_manager(Arc::new(RouterManager::new(RouterConfig::default())))
+            .expect("set router manager");
+        let mut options = native_session_options("dev", None);
+        options.env_name = crate::config::OFFICIAL_ENV_NAME.to_string();
+
+        manager
+            .prepare_router_launch(&mut options, false)
+            .expect("an ordinary new session remains direct");
+
+        assert_eq!(options.router_record, None);
+        assert!(options.router_launch_draft.is_none());
+    }
+
+    #[test]
+    fn legacy_none_and_direct_records_keep_their_recovery_transport() {
+        let manager = manager_with_handle("native-router-legacy-recovery");
+        let router_manager = Arc::new(RouterManager::new(RouterConfig::default()));
+        router_manager.set_ready(61_235);
+        manager
+            .set_router_manager(router_manager)
+            .expect("set ready router manager");
+
+        let mut none = native_session_options("dev", None);
+        none.env_name = crate::config::OFFICIAL_ENV_NAME.to_string();
+        manager
+            .prepare_router_launch(&mut none, true)
+            .expect("legacy sessions without router state stay direct");
+        assert_eq!(none.router_record, None);
+
+        let mut direct = native_session_options("dev", None);
+        direct.env_name = crate::config::OFFICIAL_ENV_NAME.to_string();
+        direct.router_record = Some(reconnect_router_record(LaunchTransport::Direct));
+        manager
+            .prepare_router_launch(&mut direct, true)
+            .expect("legacy direct router records stay direct");
+        assert_eq!(
+            direct
+                .router_record
+                .as_ref()
+                .map(|router| router.launch_transport),
+            Some(LaunchTransport::Direct)
+        );
+    }
+
+    #[test]
+    fn explicit_router_launch_draft_fails_closed_without_listener_and_leaves_no_record() {
+        let manager = manager_with_handle("native-router-opt-in-unavailable");
+        manager
+            .set_router_manager(Arc::new(RouterManager::new(RouterConfig::default())))
+            .expect("set router manager");
+        let mut options = native_session_options("dev", None);
+        options.env_name = crate::config::OFFICIAL_ENV_NAME.to_string();
+        options.router_launch_draft = Some(RouterLaunchDraft::default());
+
+        let error = manager
+            .prepare_router_launch(&mut options, false)
+            .expect_err("an explicit router launch must fail closed");
+
+        assert!(error.contains("ROUTER_UNAVAILABLE"), "{error}");
+        assert_eq!(options.router_record, None);
+    }
+
+    #[test]
+    fn empty_router_launch_draft_routes_only_the_main_environment() {
+        let env_name = "native-empty-router-draft-token";
+        let _env_override = crate::router::register_test_router_environment(
+            env_name,
+            crate::config::EnvConfig {
+                base_url: Some("http://127.0.0.1:1".into()),
+                auth_token: Some("fixture-token".into()),
+                default_opus_model: None,
+                default_sonnet_model: None,
+                default_haiku_model: None,
+                model: None,
+                subagent_model: None,
+                limit_write_tools: false,
+            },
+        );
+        let manager = manager_with_handle("native-router-empty-draft");
+        let router_manager = Arc::new(RouterManager::new(RouterConfig::default()));
+        router_manager.set_ready(61_234);
+        manager
+            .set_router_manager(router_manager)
+            .expect("set ready router manager");
+        let mut options = native_session_options("dev", None);
+        options.env_name = env_name.to_string();
+        options.router_launch_draft = Some(RouterLaunchDraft::default());
+
+        manager
+            .prepare_router_launch(&mut options, false)
+            .expect("empty draft routes with the main environment only");
+
+        let router = options.router_record.expect("routed session record");
+        assert_eq!(router.launch_transport, LaunchTransport::Routed);
+        assert_eq!(router.default_env, env_name);
+        assert_eq!(router.allowed_envs, vec![env_name]);
+        assert!(router.bindings.is_empty());
+    }
+
+    #[test]
+    fn codex_router_launch_draft_is_rejected_instead_of_silently_cleared() {
+        let manager = manager_with_handle("native-codex-router-opt-in");
+        let mut options = native_session_options("dev", None);
+        options.provider = NativeProvider::Codex;
+        options.router_launch_draft = Some(RouterLaunchDraft::default());
+
+        let error = manager
+            .prepare_router_launch(&mut options, false)
+            .expect_err("Codex cannot opt in to the Claude router");
+
+        assert!(error.contains("ROUTER_PROVIDER_UNSUPPORTED"), "{error}");
+        assert_eq!(options.router_record, None);
     }
 
     #[test]
@@ -5073,7 +5287,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
-            router_seed: None,
+            router_launch_draft: None,
             router_record: None,
         }
     }

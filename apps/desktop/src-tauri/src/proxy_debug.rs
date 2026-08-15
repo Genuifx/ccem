@@ -393,9 +393,6 @@ impl ProxyDebugManager {
     }
 
     pub async fn maybe_start_on_boot(self: &Arc<Self>) {
-        if !self.is_enabled() && !self.router_manager.is_enabled() {
-            return;
-        }
         if let Err(err) = self.ensure_running().await {
             eprintln!("Proxy debug startup failed: {}", err);
             self.router_manager.set_failed(err, false);
@@ -431,11 +428,7 @@ impl ProxyDebugManager {
             ));
         }
         if let Some((port, true)) = current {
-            if self.router_manager.is_enabled() {
-                self.router_manager.set_ready(port);
-            } else {
-                self.router_manager.set_disabled(Some(port));
-            }
+            self.router_manager.set_ready(port);
             self.emit_status();
             return Ok(port);
         }
@@ -443,11 +436,7 @@ impl ProxyDebugManager {
         #[cfg(test)]
         widen_concurrent_listener_start_window();
 
-        if self.router_manager.is_enabled() {
-            self.router_manager.set_starting();
-        } else {
-            self.router_manager.set_disabled(None);
-        }
+        self.router_manager.set_starting();
         let requested_port = self.router_manager.config().port;
         let scan_end = ROUTER_PORT_SCAN_END.max(requested_port);
         let mut listener = None;
@@ -503,14 +492,10 @@ impl ProxyDebugManager {
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(err) => {
                         healthy_for_thread.store(false, Ordering::Relaxed);
-                        if manager.router_manager.is_enabled()
-                            || manager.router_manager.route_count() > 0
-                        {
-                            manager.router_manager.set_failed(
-                                format!("Router listener failed on port {port}: {err}"),
-                                true,
-                            );
-                        }
+                        manager.router_manager.set_failed(
+                            format!("Router listener failed on port {port}: {err}"),
+                            true,
+                        );
                         manager.emit_status();
                         drop(listener);
                         let rebound = loop {
@@ -532,11 +517,7 @@ impl ProxyDebugManager {
                         };
                         listener = rebound;
                         healthy_for_thread.store(true, Ordering::Relaxed);
-                        if manager.router_manager.is_enabled() {
-                            manager.router_manager.set_ready(port);
-                        } else {
-                            manager.router_manager.set_disabled(Some(port));
-                        }
+                        manager.router_manager.set_ready(port);
                         manager.emit_status();
                     }
                 }
@@ -551,11 +532,7 @@ impl ProxyDebugManager {
             join_handle: Some(join_handle),
         });
 
-        if self.router_manager.is_enabled() {
-            self.router_manager.set_ready(port);
-        } else {
-            self.router_manager.set_disabled(Some(port));
-        }
+        self.router_manager.set_ready(port);
 
         self.emit_status();
         Ok(port)
@@ -678,17 +655,7 @@ impl ProxyDebugManager {
         })?;
         *self.runtime_config.lock().unwrap() = RuntimeConfig::from_settings(&settings);
 
-        if enabled {
-            self.ensure_running_locked()?;
-        } else if !self.router_manager.is_enabled()
-            && self
-                .routes
-                .read()
-                .map(|routes| routes.is_empty())
-                .unwrap_or(false)
-        {
-            self.stop_runtime_locked(false);
-        }
+        self.ensure_running_locked()?;
 
         self.emit_status();
         Ok(self.get_state())
@@ -723,9 +690,7 @@ impl ProxyDebugManager {
         })?;
         *self.runtime_config.lock().unwrap() = RuntimeConfig::from_settings(&settings);
 
-        if self.is_enabled() {
-            self.ensure_running_locked()?;
-        }
+        self.ensure_running_locked()?;
 
         self.emit_status();
         Ok(self.get_state())
@@ -748,24 +713,10 @@ impl ProxyDebugManager {
         runtime_config.port = previous.port;
         self.router_manager.update_config(runtime_config)?;
 
-        if config.enabled {
-            if let Err(error) = self.ensure_running_locked() {
-                self.router_manager.set_failed(error.clone(), false);
-                self.emit_status();
-                return Err(error);
-            }
-        } else if !self.is_enabled()
-            && self
-                .routes
-                .read()
-                .map(|routes| routes.is_empty())
-                .unwrap_or(false)
-            && self.router_manager.route_count() == 0
-        {
-            self.stop_runtime_locked(false);
-        } else {
-            self.router_manager.set_disabled(self.current_port());
+        if let Err(error) = self.ensure_running_locked() {
+            self.router_manager.set_failed(error.clone(), false);
             self.emit_status();
+            return Err(error);
         }
 
         Ok(self.router_manager.status())
@@ -3178,7 +3129,7 @@ mod tests {
         .expect("create proxy debug manager")
     }
 
-    fn test_manager_with_router_enabled() -> Arc<ProxyDebugManager> {
+    fn test_manager_with_shared_listener() -> Arc<ProxyDebugManager> {
         let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve router port");
         let port = reservation
             .local_addr()
@@ -3190,7 +3141,6 @@ mod tests {
             Arc::new(crate::session::SessionManager::default()),
             Arc::new(crate::router::RouterManager::new(
                 crate::router::RouterConfig {
-                    enabled: true,
                     port,
                     ..crate::router::RouterConfig::default()
                 },
@@ -3569,7 +3519,7 @@ mod tests {
             let _env_override =
                 test_router_env(&env_name, address, "fixture-token-sse", "target-sse-sonnet");
 
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             assert!(
                 !manager.is_enabled(),
                 "proxy debug recording must be off for this native route proof"
@@ -3711,7 +3661,7 @@ mod tests {
                 "fixture-token",
                 "redirect-sonnet",
             );
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             manager
                 .router_manager
                 .register(
@@ -3764,7 +3714,6 @@ mod tests {
                 Arc::new(crate::session::SessionManager::default()),
                 Arc::new(crate::router::RouterManager::new(
                     crate::router::RouterConfig {
-                        enabled: true,
                         port: requested_port,
                         ..crate::router::RouterConfig::default()
                     },
@@ -3801,10 +3750,39 @@ mod tests {
     }
 
     #[test]
+    fn boot_starts_shared_listener_when_proxy_recording_is_disabled() {
+        with_temp_proxy_dir(|| {
+            let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve router port");
+            let port = reservation
+                .local_addr()
+                .expect("read reserved router address")
+                .port();
+            drop(reservation);
+            let manager = ProxyDebugManager::new(
+                Arc::new(crate::session::SessionManager::default()),
+                Arc::new(crate::router::RouterManager::new(
+                    crate::router::RouterConfig {
+                        port,
+                        ..crate::router::RouterConfig::default()
+                    },
+                )),
+            )
+            .expect("create shared listener manager");
+            manager.runtime_config.lock().unwrap().enabled = false;
+
+            tauri::async_runtime::block_on(manager.maybe_start_on_boot());
+
+            assert_eq!(manager.current_port(), Some(port));
+            assert_eq!(manager.router_manager.status().actual_port, Some(port));
+            tauri::async_runtime::block_on(manager.shutdown());
+        });
+    }
+
+    #[test]
     fn concurrent_ensure_running_reuses_one_listener_and_one_actual_port() {
         with_temp_proxy_dir(|| {
             const WORKERS: usize = 8;
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             let start = Arc::new(std::sync::Barrier::new(WORKERS));
             let mut workers = Vec::new();
             for _ in 0..WORKERS {
@@ -3837,7 +3815,7 @@ mod tests {
     fn concurrent_legacy_route_registration_reuses_the_tracked_listener() {
         with_temp_proxy_dir(|| {
             const WORKERS: usize = 4;
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             let start = Arc::new(std::sync::Barrier::new(WORKERS));
             let mut workers = Vec::new();
             for index in 0..WORKERS {
@@ -3880,7 +3858,6 @@ mod tests {
                 Arc::new(crate::session::SessionManager::default()),
                 Arc::new(crate::router::RouterManager::new(
                     crate::router::RouterConfig {
-                        enabled: true,
                         port,
                         ..crate::router::RouterConfig::default()
                     },
@@ -3912,7 +3889,7 @@ mod tests {
             let _override_b =
                 test_router_env(&env_b, address_b, "fixture-token-b", "target-b-sonnet");
 
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             manager
                 .router_manager
                 .register(
@@ -4306,7 +4283,7 @@ mod tests {
             let env_name = unique_router_fixture_name("router-chaos");
             let _env_override =
                 test_router_env(&env_name, upstream_address, "fixture-token", "chaos-sonnet");
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             manager
                 .router_manager
                 .register(
@@ -4393,7 +4370,7 @@ mod tests {
             let env_name = unique_router_fixture_name("router-rst");
             let _env_override =
                 test_router_env(&env_name, upstream_address, "fixture-token", "rst-sonnet");
-            let manager = test_manager_with_router_enabled();
+            let manager = test_manager_with_shared_listener();
             manager
                 .router_manager
                 .register(

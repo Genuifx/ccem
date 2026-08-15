@@ -72,7 +72,8 @@ interface WorkspaceStatusStripProps {
   envContext?: string;
   /** Active native session runtimeId (live mode); the Route chip is per-session. */
   activeRuntimeId?: string | null;
-  onNavigateSettings?: () => void;
+  /** Direct-session chip target: default rules & profiles live on Environments. */
+  onNavigateEnvironments?: () => void;
 }
 
 function StatusChip({
@@ -140,7 +141,7 @@ export function WorkspaceStatusStrip({
   onToggleBrowser,
   envContext,
   activeRuntimeId,
-  onNavigateSettings,
+  onNavigateEnvironments,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
   const { sessions, currentEnv, environments, enabledEnvironments, continuousUsageDays, cronTasks, usageStats } = useAppStore(
@@ -187,11 +188,11 @@ export function WorkspaceStatusStrip({
   const routerStatus = useAppStore((state) => state.routerStatus);
   const { switchEnvironment, updateSessionRouter } = useTauriCommands();
 
-  // Transport truth: a routed session never falls through to the global switch.
+  // Transport truth: a routed session never falls through to the global environment switch.
   //   cas     → routed + live port: CAS defaultEnv (preserves allowed/bindings)
   //   blocked → routed but listener port gone: no state change; recover via the
   //             route popover's restart-direct (NOT a global env switch)
-  //   global  → direct / new session: legacy global switch
+  //   global  → direct / new session: legacy global environment switch
   const handleEnvSelect = useCallback(
     async (envName: string) => {
       if (!activeRuntimeId) {
@@ -340,7 +341,7 @@ export function WorkspaceStatusStrip({
       {/* Route chip — per-session router control (CCEM Router) */}
       <WorkspaceRouteChip
         runtimeId={activeRuntimeId ?? null}
-        onNavigateSettings={onNavigateSettings}
+        onNavigateEnvironments={onNavigateEnvironments}
         compact={browserOpen}
       />
 
