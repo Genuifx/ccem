@@ -1,21 +1,17 @@
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from '@/components/ui/hover-card';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import type { SessionUsageState } from './workspaceUsage';
-import { formatTokenCount } from './workspaceUsage';
+import { SessionUsagePopoverContent } from './SessionUsagePopover';
 
 interface ContextWindowIndicatorProps {
   usage: SessionUsageState;
-}
-
-function getProgressColor(percentage: number): string {
-  if (percentage >= 90) return 'bg-destructive';
-  if (percentage >= 70) return 'bg-warning';
-  return 'bg-primary/80';
+  provider?: string;
+  onRefreshUsage?: () => void;
 }
 
 function getRingColor(percentage: number): string {
@@ -24,22 +20,25 @@ function getRingColor(percentage: number): string {
   return 'hsl(var(--muted-foreground) / 0.72)';
 }
 
-function formatPercent(value: number) {
-  return `${Math.round(Math.max(0, value))}%`;
-}
-
-function formatTokenLabel(tokens: number) {
-  return formatTokenCount(tokens).toLowerCase();
-}
-
-export function ContextWindowIndicator({ usage }: ContextWindowIndicatorProps) {
+/**
+ * Context ring in the composer secondary actions.
+ *
+ * Hovering the ring opens the full session usage panel; the pointer can move
+ * onto the panel (refresh button) without closing it. There is deliberately no
+ * separate hover tooltip — the panel itself is the hover surface, so the old
+ * hover-tooltip/click-popover double layer is gone.
+ */
+export function ContextWindowIndicator({
+  usage,
+  provider,
+  onRefreshUsage,
+}: ContextWindowIndicatorProps) {
   const { t } = useLocale();
 
-  if (usage.turnCount === 0 && !usage.context) return null;
+  if (usage.turnCount === 0 && !usage.context && !usage.sessionUsage) return null;
 
   const hasContext = usage.context !== null;
   const percentage = Math.max(0, Math.min(100, usage.context?.percentage ?? 0));
-  const totalTokens = usage.totalInputTokens + usage.totalOutputTokens;
   const ringColor = getRingColor(percentage);
   const ringStyle = hasContext
     ? {
@@ -47,12 +46,18 @@ export function ContextWindowIndicator({ usage }: ContextWindowIndicatorProps) {
       }
     : undefined;
 
+  const handleOpenChange = (next: boolean) => {
+    if (next) {
+      onRefreshUsage?.();
+    }
+  };
+
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
+    <HoverCard openDelay={200} closeDelay={200} onOpenChange={handleOpenChange}>
+      <HoverCardTrigger asChild>
         <button
           type="button"
-          aria-label={t('workspace.contextWindowTitle')}
+          aria-label={t('workspace.usagePanelTitle')}
           className={cn(
             'inline-flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground',
             'transition-colors hover:bg-background/70 hover:text-foreground',
@@ -67,53 +72,19 @@ export function ContextWindowIndicator({ usage }: ContextWindowIndicatorProps) {
             <span className="h-4 w-4 rounded-full border border-muted-foreground/55" />
           )}
         </button>
-      </TooltipTrigger>
-      <TooltipContent
+      </HoverCardTrigger>
+      <HoverCardContent
         side="top"
-        align="center"
+        align="end"
         sideOffset={10}
-        className="min-w-[170px] max-w-[220px] px-3 py-2 text-center text-[12px] leading-5"
+        className="w-[300px] overflow-hidden rounded-2xl border-border/45 bg-popover p-0 shadow-lg"
       >
-        {hasContext && (
-          <div className="space-y-0.5">
-            <div className="text-muted-foreground">{t('workspace.contextWindowTitle')}</div>
-            <div className="text-muted-foreground">
-              {t('workspace.contextPercentUsed').replace('{percent}', formatPercent(percentage))}
-            </div>
-            <div className="font-medium text-foreground">
-              {t('workspace.contextUsageLine')
-                .replace('{used}', formatTokenLabel(usage.context!.usedTokens))
-                .replace('{total}', formatTokenLabel(usage.context!.maxTokens))}
-            </div>
-            <div className="font-semibold text-foreground">
-              {usage.context!.isAutoCompactEnabled
-                ? t('workspace.contextAutoCompactEnabled')
-                : t('workspace.contextAutoCompactDisabled')
-              }
-            </div>
-            <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted/60">
-              <div
-                className={cn(
-                  'h-full rounded-full transition-all duration-500',
-                  getProgressColor(percentage),
-                )}
-                style={{ width: `${percentage}%` }}
-              />
-            </div>
-          </div>
-        )}
-
-        {!hasContext && (
-          <div className="space-y-0.5">
-            <div className="text-muted-foreground">{t('workspace.contextWindowTitle')}</div>
-            <div className="font-medium text-foreground">
-              {t('workspace.contextTokenFallback')
-                .replace('{tokens}', formatTokenLabel(totalTokens))}
-            </div>
-            <div className="text-muted-foreground">{t('workspace.contextWindowUnavailable')}</div>
-          </div>
-        )}
-      </TooltipContent>
-    </Tooltip>
+        <SessionUsagePopoverContent
+          usage={usage}
+          provider={provider}
+          onRefresh={onRefreshUsage}
+        />
+      </HoverCardContent>
+    </HoverCard>
   );
 }

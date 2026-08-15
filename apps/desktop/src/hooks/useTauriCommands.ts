@@ -971,6 +971,14 @@ export function useTauriCommands() {
     });
   }, []);
 
+  const queryNativeSessionUsage = useCallback(async (
+    runtimeId: string,
+  ): Promise<void> => {
+    await invoke('query_native_session_usage', {
+      runtimeId,
+    });
+  }, []);
+
   const getNativeSessionEvents = useCallback(async (
     runtimeId: string,
     sinceSeq?: number | null,
@@ -1572,6 +1580,7 @@ export function useTauriCommands() {
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
+    queryNativeSessionUsage,
     getNativeSessionEvents,
     stopNativeSession,
     updateNativeSessionSettings,

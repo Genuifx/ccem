@@ -90,3 +90,89 @@ test('does not double-count Claude per-message usage when turn total exists', as
   assert.equal(usage.totalCacheCreationTokens, 3);
   assert.equal(usage.estimatedCostUsd, 0.0123);
 });
+
+test('turn_total cost is session-cumulative: latest event wins instead of summing', async () => {
+  const { computeSessionUsage } = await importWorkspaceUsage();
+
+  const usage = computeSessionUsage([
+    event(1, {
+      type: 'token_usage',
+      provider: 'claude',
+      input_tokens: 30,
+      output_tokens: 7,
+      cache_read_tokens: 4,
+      cache_creation_tokens: 3,
+      total_cost_usd: 0.0123,
+      scope: 'turn_total',
+    }),
+    event(2, {
+      type: 'token_usage',
+      provider: 'claude',
+      input_tokens: 20,
+      output_tokens: 6,
+      cache_read_tokens: 5,
+      cache_creation_tokens: 1,
+      total_cost_usd: 0.02,
+      scope: 'turn_total',
+    }),
+  ]);
+
+  assert.equal(usage.estimatedCostUsd, 0.02);
+});
+
+test('takes the latest session_usage snapshot and keeps the empty state otherwise', async () => {
+  const { computeSessionUsage } = await importWorkspaceUsage();
+
+  const usage = computeSessionUsage([
+    event(1, {
+      type: 'session_usage',
+      provider: 'claude',
+      input_tokens: 100,
+      output_tokens: 10,
+      cache_read_tokens: 300,
+      cache_creation_tokens: 80,
+      cost_usd: 0.0042,
+      model_usage: [
+        {
+          model: 'claude-sonnet-4-5-test',
+          input_tokens: 100,
+          output_tokens: 10,
+          cache_read_tokens: 300,
+          cache_creation_tokens: 80,
+          cost_usd: 0.0042,
+        },
+      ],
+      subscription_type: 'pro',
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 12.5, resets_at: '2026-08-15T12:00:00Z' },
+        seven_day: null,
+      },
+    }),
+    event(2, {
+      type: 'session_usage',
+      provider: 'claude',
+      input_tokens: 150,
+      output_tokens: 15,
+      cache_read_tokens: 400,
+      cache_creation_tokens: 90,
+      cost_usd: null,
+      model_usage: [],
+      subscription_type: null,
+      rate_limits_available: false,
+      rate_limits: null,
+    }),
+  ]);
+
+  assert.equal(usage.sessionUsage.inputTokens, 150);
+  assert.equal(usage.sessionUsage.cacheReadTokens, 400);
+  assert.equal(usage.sessionUsage.costUsd, null);
+  assert.equal(usage.sessionUsage.modelUsage.length, 0);
+  assert.equal(usage.sessionUsage.rateLimitsAvailable, false);
+  assert.equal(usage.sessionUsage.rateLimits, null);
+
+  const empty = computeSessionUsage([]);
+  assert.equal(empty.turnCount, 0);
+  assert.equal(empty.context, null);
+  assert.equal(empty.sessionUsage, null);
+});

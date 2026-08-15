@@ -82,6 +82,17 @@ pub struct ContextUsageCategory {
     pub tokens: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionUsageModelEntry {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPromptImage {
@@ -246,6 +257,23 @@ pub enum SessionEventPayload {
         is_auto_compact_enabled: bool,
         model: String,
         categories: Vec<ContextUsageCategory>,
+    },
+    SessionUsage {
+        provider: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default)]
+        model_usage: Vec<SessionUsageModelEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subscription_type: Option<String>,
+        #[serde(default)]
+        rate_limits_available: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limits: Option<serde_json::Value>,
     },
 }
 

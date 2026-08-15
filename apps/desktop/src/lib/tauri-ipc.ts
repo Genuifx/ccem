@@ -363,6 +363,12 @@ export interface TauriCommands {
     },
     void
   ];
+  query_native_session_usage: [
+    {
+      runtimeId: string;
+    },
+    void
+  ];
   get_native_session_events: [
     {
       runtimeId: string;
@@ -1357,6 +1363,29 @@ export type SessionEventPayload =
       is_auto_compact_enabled: boolean;
       model: string;
       categories: Array<{ name: string; tokens: number }>;
+    }
+  | {
+      type: 'session_usage';
+      provider: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_creation_tokens: number;
+      cost_usd?: number | null;
+      model_usage: Array<{
+        model: string;
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_creation_tokens: number;
+        cost_usd?: number | null;
+      }>;
+      subscription_type?: string | null;
+      rate_limits_available?: boolean;
+      rate_limits?: {
+        five_hour?: { utilization: number | null; resets_at: string | null } | null;
+        seven_day?: { utilization: number | null; resets_at: string | null } | null;
+      } | null;
     };
 
 export interface ProxyTrafficPage {
