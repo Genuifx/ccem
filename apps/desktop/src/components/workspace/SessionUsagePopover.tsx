@@ -178,7 +178,7 @@ export function SessionUsagePopoverContent({
 
       {hasTotals && (
         <div className="space-y-1">
-          <SectionTitle>{t('workspace.usagePanelTitle')}</SectionTitle>
+          <SectionTitle>{t('workspace.usagePanelTotals')}</SectionTitle>
           <UsageRow
             label={t('workspace.contextInputTokens')}
             value={formatTokenCount(inputTokens)}
