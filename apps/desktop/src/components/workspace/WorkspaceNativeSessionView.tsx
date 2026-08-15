@@ -231,6 +231,7 @@ interface WorkspaceNativeSessionViewProps {
   codexInstalled?: boolean;
   opencodeInstalled?: boolean;
   onLaunchNewSession?: (client: LaunchClient) => void;
+  onNavigateEnvironments?: () => void;
 }
 
 const ACTIVE_POLL_INTERVAL_MS = 140;
@@ -1296,6 +1297,7 @@ export function WorkspaceNativeSessionView({
   codexInstalled = false,
   opencodeInstalled = false,
   onLaunchNewSession,
+  onNavigateEnvironments,
 }: WorkspaceNativeSessionViewProps) {
   const { t } = useLocale();
   const environments = useAppStore((state) => state.environments);
@@ -2989,6 +2991,7 @@ export function WorkspaceNativeSessionView({
         workingDir={session.project_dir}
         searchWorkspaceFiles={searchWorkspaceFiles}
         routeRuntimeId={session.provider === 'claude' ? session.runtime_id : null}
+        onNavigateEnvironments={onNavigateEnvironments}
         planModeEnabled={composerPlanModeEnabled}
         onPlanModeEnabledChange={handlePlanModeEnabledChange}
         planModeHint={session.provider === 'claude' && sessionRuntimePermMode === 'plan'

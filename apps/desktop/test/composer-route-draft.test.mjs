@@ -127,6 +127,23 @@ test('resolved launch seed expands the selected named profile', async () => {
   });
 });
 
+test('resolved launch seed supports the built-in main-env-only choice without faking a stored profile', async () => {
+  const { resolveRouterLaunchDraft, DEFAULT_ONLY_PROFILE_ID } = await importComposerRouteDraft();
+
+  const result = resolveRouterLaunchDraft(
+    { optIn: true, profileId: DEFAULT_ONLY_PROFILE_ID },
+    ROUTER_CONFIG,
+  );
+  assert.ok(result.ok);
+  assert.deepEqual(result.value, {
+    bindings: {},
+    allowedEnvs: [],
+    sourceProfileId: null,
+    profileRevision: null,
+    dynamicRouting: true,
+  });
+});
+
 test('opted-out drafts omit the launch seed entirely (legacy single-env launch)', async () => {
   const { createComposerRouteDraft, resolveRouterLaunchDraft } = await importComposerRouteDraft();
 
@@ -174,9 +191,13 @@ test('toggling the draft off clears the profile selection; re-enabling starts fr
 });
 
 test('draft pill label distinguishes my-defaults from a named profile', async () => {
-  const { resolveRouteDraftLabel } = await importComposerRouteDraft();
+  const { resolveRouteDraftLabel, DEFAULT_ONLY_PROFILE_ID } = await importComposerRouteDraft();
 
   assert.equal(resolveRouteDraftLabel({ optIn: true, profileId: null }, ROUTER_CONFIG).kind, 'myDefault');
+  assert.equal(
+    resolveRouteDraftLabel({ optIn: true, profileId: DEFAULT_ONLY_PROFILE_ID }, ROUTER_CONFIG).kind,
+    'defaultOnly',
+  );
   const profile = resolveRouteDraftLabel({ optIn: true, profileId: 'budget' }, ROUTER_CONFIG);
   assert.equal(profile.kind, 'profile');
   assert.equal(profile.profileName, '省钱杂活');
@@ -369,7 +390,7 @@ test('visual acceptance: both pills visibly spell out 动态路由/Dynamic routi
   }
 });
 
-test('source regression: both running-session selectors offer the virtual my-default option via the shared CAS queue', async () => {
+test('source regression: the single running-session selector offers my-default via the shared CAS queue', async () => {
   const source = await fs.readFile(
     path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
     'utf8',
@@ -385,24 +406,12 @@ test('source regression: both running-session selectors offer the virtual my-def
   assert.ok(hookBlock.includes('useAppStore.getState().sessionRouters[runtimeId]'), 'must read fresh router');
   assert.ok(hookBlock.includes('useAppStore.getState().routerConfig'), 'must read fresh config');
 
-  // Both selectors list the my-default radio and dispatch to the hook.
-  for (const marker of ['function RoutePopoverBody', 'export function ComposerRouteMenuRow']) {
-    const start = source.indexOf(marker);
-    assert.notEqual(start, -1, `${marker} must exist`);
-    // Slice to the next top-level function after the component body.
-    const nextExport = source.indexOf('\nfunction ', start + 10) === -1
-      ? source.length
-      : source.indexOf('\nfunction ', start + 10);
-    const block = source.slice(start, nextExport);
-    assert.ok(
-      block.includes(`{ id: MY_DEFAULT_ROUTER_PROFILE_ID, name: t('router.routeMyDefault') }`),
-      `${marker} must render the my-default radio option`,
-    );
-    assert.ok(
-      block.includes('applyMyDefault'),
-      `${marker} must dispatch my-default through the dedicated hook`,
-    );
-  }
+  const routeBodyStart = source.indexOf('function RoutePopoverBody');
+  const routeBody = source.slice(routeBodyStart, source.indexOf('function RouteControl', routeBodyStart));
+  assert.notEqual(routeBodyStart, -1, 'RoutePopoverBody must exist');
+  assert.ok(routeBody.includes('id: MY_DEFAULT_ROUTER_PROFILE_ID'), 'must render the my-default option');
+  assert.ok(routeBody.includes('applyMyDefault'), 'must dispatch through the dedicated hook');
+  assert.ok(!source.includes('function ComposerRouteMenuRow'), 'the + menu must not duplicate the running picker');
 
   // The patch must NOT be produced by faking a RouterProfile.
   const libSource = await fs.readFile(
@@ -430,12 +439,11 @@ test('visual layout contract: route popover owns its width and environment rules
     routerSource.indexOf('function RouteControl'),
     routerSource.indexOf('export function WorkspaceRouteChip'),
   );
-  assert.match(routeBody, /className="flex min-h-0 w-full flex-1 flex-col p-0"/);
-  assert.match(routeBody, /className="min-h-0 flex-1 overflow-y-auto"/);
-  assert.match(routeBody, /shrink-0.*border-t border-border\/35/s);
+  assert.match(routeBody, /className="flex min-h-0 w-full flex-col p-0"/);
+  assert.match(routeBody, /min-h-0.*overflow-y-auto/s);
   assert.match(routeControl, /w-\[332px\].*max-w-\[calc\(100vw-24px\)\]/s);
   assert.match(routeControl, /max-h-\[var\(--radix-popover-content-available-height\)\].*overflow-hidden/s);
-  assert.doesNotMatch(routeControl, /overflow-y-auto/);
+  assert.match(routerSource, /w-\[260px\].*max-h-\[var\(--radix-popover-content-available-height\)\].*overflow-hidden/s);
 
   const environmentsSource = await fs.readFile(
     path.join(desktopDir, 'src', 'components', 'EnvironmentsRouterRules.tsx'),
@@ -444,4 +452,74 @@ test('visual layout contract: route popover owns its width and environment rules
   assert.match(environmentsSource, /mx-auto w-full max-w-\[1240px\]/);
   assert.match(environmentsSource, /grid items-start gap-5 xl:grid-cols-\[minmax\(0,2fr\)_minmax\(320px,1fr\)\]/);
   assert.match(environmentsSource, /grid-cols-\[minmax\(0,1fr\)_minmax\(160px,240px\)\]/);
+});
+
+test('interaction contract: running-session route card is a compact immediate profile picker', async () => {
+  const source = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
+    'utf8',
+  );
+  const routeBody = source.slice(
+    source.indexOf('function RoutePopoverBody'),
+    source.indexOf('function RouteControl'),
+  );
+
+  assert.match(routeBody, /router\.routePickerHint/);
+  assert.match(routeBody, /router\.manageProfiles/);
+  assert.match(routeBody, /await applyMyDefault\(\)/);
+  assert.match(routeBody, /await applyProfile\(profile\)/);
+  assert.match(routeBody, /option\.id === selectedProfileId/);
+  assert.match(routeBody, /preventDefault\(\).*handleApplyProfile\(option\.id\)/s);
+  assert.match(routeBody, /if \(applied\) onClose\(\)/);
+  assert.match(routeBody, /onNavigateEnvironments\(\)/);
+
+  for (const removedControl of [
+    'setDefaultEnv',
+    'setBindings',
+    'setBaseAllowed',
+    'setDynamic',
+    'handleSaveAsDefault',
+    "t('router.saveAsDefault')",
+    "t('router.apply')",
+  ]) {
+    assert.ok(
+      !routeBody.includes(removedControl),
+      `Composer route card must not expose advanced control: ${removedControl}`,
+    );
+  }
+});
+
+test('interaction contract: environment route defaults use progressive disclosure', async () => {
+  const source = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'EnvironmentsRouterRules.tsx'),
+    'utf8',
+  );
+
+  assert.match(source, /showDefaultAdvanced/);
+  assert.match(source, /showDefaultAgentBindings/);
+  assert.match(source, /showProfileAdvanced/);
+  assert.match(source, /showProfileAgentBindings/);
+  assert.match(source, /environments\.routerAdvanced/);
+  assert.match(source, /environments\.routerMoreAgents/);
+  assert.match(source, /\{ key: 'background', label: t\('router\.background'\) \}/);
+  assert.match(source, /\{ key: 'subagent:Explore', label: 'Explore' \}/);
+  assert.match(source, /key: 'subagent:\*'.*router\.subagentAny/s);
+
+  assert.match(source, /useState\(false\).*showDefaultAdvanced|showDefaultAdvanced.*useState\(false\)/s);
+  assert.match(source, /aria-expanded=\{showDefaultAdvanced\}/);
+  assert.match(source, /aria-expanded=\{showDefaultAgentBindings\}/);
+  assert.match(source, /aria-expanded=\{showProfileAdvanced\}/);
+  assert.match(source, /aria-expanded=\{showProfileAgentBindings\}/);
+
+  const defaultAdvancedStart = source.indexOf('{showDefaultAdvanced ? (');
+  assert.notEqual(defaultAdvancedStart, -1, 'default advanced settings must be collapsed');
+  const profilesStart = source.indexOf('{/* Profiles CRUD */}', defaultAdvancedStart);
+  const defaultAdvancedBlock = source.slice(defaultAdvancedStart, profilesStart);
+  assert.match(defaultAdvancedBlock, /routerDefaultAllowedHint/);
+  assert.match(defaultAdvancedBlock, /routerDynamicRouting/);
+
+  const profileAdvancedStart = source.indexOf('{showProfileAdvanced ? (');
+  assert.notEqual(profileAdvancedStart, -1, 'profile authorization must be collapsed');
+  const profileAdvancedBlock = source.slice(profileAdvancedStart, source.indexOf('{/* §4.5', profileAdvancedStart));
+  assert.match(profileAdvancedBlock, /router\.allowedEnvs/);
 });

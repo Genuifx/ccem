@@ -1,8 +1,8 @@
 import type { RouterConfig, RouterLaunchDraft } from '@ccem/core/browser';
 import type { WorkspaceComposerProvider } from './composerCapabilities';
-import { MY_DEFAULT_ROUTER_PROFILE_ID } from '@/lib/routerProfiles';
+import { DEFAULT_ONLY_PROFILE_ID, MY_DEFAULT_ROUTER_PROFILE_ID } from '@/lib/routerProfiles';
 
-export { MY_DEFAULT_ROUTER_PROFILE_ID };
+export { DEFAULT_ONLY_PROFILE_ID, MY_DEFAULT_ROUTER_PROFILE_ID };
 
 /**
  * Per-Composer Dynamic Routing opt-in draft (frontend-only state).
@@ -27,6 +27,7 @@ export type RouterLaunchDraftResolution =
 
 export type ComposerRouteDraftLabel =
   | { kind: 'myDefault' }
+  | { kind: 'defaultOnly' }
   | { kind: 'profile'; profileName: string }
   | { kind: 'missingProfile' };
 
@@ -86,6 +87,19 @@ export function resolveRouterLaunchDraft(
     };
   }
 
+  if (draft.profileId === DEFAULT_ONLY_PROFILE_ID) {
+    return {
+      ok: true,
+      value: {
+        bindings: {},
+        allowedEnvs: [],
+        sourceProfileId: null,
+        profileRevision: null,
+        dynamicRouting: routerConfig.dynamicRouting,
+      },
+    };
+  }
+
   const profile = routerConfig.profiles.find((p) => p.id === draft.profileId);
   if (!profile) {
     return { ok: false, code: 'PROFILE_MISSING' };
@@ -109,6 +123,9 @@ export function resolveRouteDraftLabel(
 ): ComposerRouteDraftLabel {
   if (draft.profileId === null) {
     return { kind: 'myDefault' };
+  }
+  if (draft.profileId === DEFAULT_ONLY_PROFILE_ID) {
+    return { kind: 'defaultOnly' };
   }
   const profile = routerConfig?.profiles.find((p) => p.id === draft.profileId);
   if (!profile) {

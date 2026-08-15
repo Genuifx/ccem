@@ -3032,6 +3032,7 @@ export function Workspace({
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}
                           onLaunchNewSession={handleNewSession}
+                          onNavigateEnvironments={() => onNavigate('environments')}
                           onStartNew={() => {
                             setWorkspaceMode('compose');
                             setActiveLiveRuntimeId(null);

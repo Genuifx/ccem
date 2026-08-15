@@ -33,15 +33,39 @@ import type { RouterBindings, RouterProfile } from '@ccem/core/browser';
 const BINDING_FOLLOW_DEFAULT = '__ccem_default__';
 type BindingMap = Record<string, string>;
 
-function bindingRows(t: (k: string) => string, extra: RouterBindings | BindingMap) {
+function bindingRows(
+  t: (k: string) => string,
+  extra: RouterBindings | BindingMap,
+  includeAllAgents = false,
+) {
   const rows: { key: string; label: string }[] = [
     { key: 'background', label: t('router.background') },
-    { key: 'subagent:*', label: t('router.subagentAny') },
+    { key: 'subagent:Explore', label: 'Explore' },
   ];
-  for (const name of BUILTIN_CLAUDE_AGENT_NAMES) rows.push({ key: `subagent:${name}`, label: name });
-  const covered = new Set(rows.map((r) => r.key));
+  const covered = new Set(rows.map((row) => row.key));
+  const labelForKey = (key: string) => {
+    if (key === 'subagent:*') return t('router.subagentAny');
+    const name = key.startsWith('subagent:') ? key.slice('subagent:'.length) : key;
+    return BUILTIN_CLAUDE_AGENT_NAMES.includes(name as (typeof BUILTIN_CLAUDE_AGENT_NAMES)[number])
+      ? name
+      : key;
+  };
   for (const key of Object.keys(extra)) {
-    if (!covered.has(key)) rows.push({ key, label: key });
+    if (!covered.has(key)) {
+      rows.push({ key, label: labelForKey(key) });
+      covered.add(key);
+    }
+  }
+  if (includeAllAgents) {
+    const wildcardKey = 'subagent:*';
+    if (!covered.has(wildcardKey)) {
+      rows.push({ key: wildcardKey, label: t('router.subagentAny') });
+      covered.add(wildcardKey);
+    }
+    for (const name of BUILTIN_CLAUDE_AGENT_NAMES) {
+      const key = `subagent:${name}`;
+      if (!covered.has(key)) rows.push({ key, label: name });
+    }
   }
   return rows;
 }
@@ -117,8 +141,20 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
   const { t } = useLocale();
   const { config, commit } = useRouterConfigEditor();
   const [expandedProfile, setExpandedProfile] = useState<string | null>(null);
+  const [showDefaultAdvanced, setShowDefaultAdvanced] = useState(false);
+  const [showDefaultAgentBindings, setShowDefaultAgentBindings] = useState(false);
+  const [showProfileAdvanced, setShowProfileAdvanced] = useState(false);
+  const [showProfileAgentBindings, setShowProfileAgentBindings] = useState(false);
 
-  const defaultRows = useMemo(() => bindingRows(t, config?.bindings ?? {}), [t, config]);
+  const defaultRows = useMemo(
+    () => bindingRows(t, config?.bindings ?? {}, showDefaultAgentBindings),
+    [t, config, showDefaultAgentBindings],
+  );
+
+  useEffect(() => {
+    setShowProfileAdvanced(false);
+    setShowProfileAgentBindings(false);
+  }, [expandedProfile]);
 
   // --- §4.5 parameterized templates ("省钱杂活" / "特长分工") ---
   // Templates never hardcode an env name: the user MUST pick a target env (and,
@@ -290,81 +326,131 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
 
         <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
           <div className="min-w-0 rounded-xl border border-border-subtle bg-background/35 p-4">
-            {/* Default bindings */}
-            <div className="mb-5">
-              <label className="block text-sm font-medium text-foreground mb-1">{t('settings.routerDefaultBindings')}</label>
-              <p className="text-sm text-muted-foreground mb-2">{t('settings.routerDefaultBindingsDesc')}</p>
-              <div className="space-y-1">
-                {defaultRows.map((row) => {
-                  const value = (config.bindings as BindingMap)[row.key] ?? BINDING_FOLLOW_DEFAULT;
-                  return (
-                    <div
-                      key={row.key}
-                      className="grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(160px,240px)] items-center gap-3"
-                    >
-                      <span className="min-w-0 flex-1 truncate text-[12px] text-foreground/85" title={row.key}>{row.label}</span>
-                      <Select value={value} onValueChange={(v) => setDefaultBinding(row.key, v)}>
-                        <SelectTrigger className="h-8 w-full rounded-md border-border/40 px-2 text-[12px]">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value={BINDING_FOLLOW_DEFAULT}>{t('router.bindingDefault')}</SelectItem>
-                          {envNames.map((name) => (
-                            <SelectItem key={name} value={name}>{name}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  );
-                })}
-              </div>
+            <div className="mb-4">
+              <div className="mb-1 text-sm font-medium text-foreground">{t('router.routeMyDefault')}</div>
+              <p className="text-[12px] leading-5 text-muted-foreground">
+                {t('settings.routerDefaultBindingsDesc')}
+              </p>
             </div>
 
-            <div className="mb-5 border-t border-border-subtle" />
-
-            {/* Default allowed envs */}
-            <div className="mb-5">
-              <label className="block text-sm font-medium text-foreground mb-1">{t('router.allowedEnvs')}</label>
-              <p className="text-sm text-muted-foreground mb-2">{t('environments.routerDefaultAllowedHint')}</p>
-              <div className="flex flex-wrap gap-1">
-                {envNames.length === 0 ? (
-                  <span className="text-[12px] text-muted-foreground/70">—</span>
-                ) : (
-                  envNames.map((name) => {
-                    const forced = defaultBindingTargets.includes(name);
-                    const checked = forced || config.defaultAllowedEnvs.includes(name);
-                    return (
-                      <button
-                        key={name}
-                        type="button"
-                        disabled={forced}
-                        title={forced ? t('router.allowedForced') : undefined}
-                        onClick={() => toggleDefaultAllowed(name)}
-                        className={cn(
-                          'inline-flex items-center gap-0.5 rounded-full px-2 py-0.5 text-[11px] transition-colors',
-                          checked ? 'bg-primary/[0.10] text-primary/80' : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
-                          forced ? 'cursor-default opacity-80' : 'cursor-pointer',
-                        )}
+            <div id="router-default-agent-bindings" className="space-y-1">
+              <div className="mb-2 text-[11px] font-medium text-muted-foreground">
+                {t('settings.routerDefaultBindings')}
+              </div>
+              {defaultRows.map((row) => {
+                const value = (config.bindings as BindingMap)[row.key] ?? BINDING_FOLLOW_DEFAULT;
+                return (
+                  <div
+                    key={row.key}
+                    className="grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(160px,240px)] items-center gap-3"
+                  >
+                    <span className="min-w-0 truncate text-[12px] text-foreground/85" title={row.key}>
+                      {row.label}
+                    </span>
+                    <Select value={value} onValueChange={(next) => setDefaultBinding(row.key, next)}>
+                      <SelectTrigger
+                        className="h-8 w-full rounded-md border-border/40 px-2 text-[12px]"
+                        aria-label={`${row.label} · ${t('router.selectEnv')}`}
                       >
-                        {checked ? <Check className="h-2.5 w-2.5" /> : null}
-                        {name}
-                      </button>
-                    );
-                  })
-                )}
-              </div>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={BINDING_FOLLOW_DEFAULT}>{t('router.bindingDefault')}</SelectItem>
+                        {envNames.map((name) => (
+                          <SelectItem key={name} value={name}>{name}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                );
+              })}
             </div>
 
-            <div className="mb-5 border-t border-border-subtle" />
+            <button
+              type="button"
+              aria-expanded={showDefaultAgentBindings}
+              aria-controls="router-default-agent-bindings"
+              onClick={() => setShowDefaultAgentBindings((visible) => !visible)}
+              className="mt-2 flex w-full items-center gap-1 rounded-lg px-1 py-1.5 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronDown className={cn('h-3 w-3 transition-transform', showDefaultAgentBindings && 'rotate-180')} />
+              {t('environments.routerMoreAgents')}
+            </button>
 
-            {/* Dynamic routing default */}
-            <div className="mb-5 flex items-center gap-3">
-              <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium text-foreground">{t('settings.routerDynamicRouting')}</div>
-                <div className="text-[12px] text-muted-foreground">{t('settings.routerDynamicRoutingDesc')}</div>
+            <div className="my-3 border-t border-border-subtle" />
+
+            <button
+              type="button"
+              aria-expanded={showDefaultAdvanced}
+              aria-controls="router-default-advanced"
+              onClick={() => setShowDefaultAdvanced((visible) => !visible)}
+              className="flex w-full items-center gap-2 rounded-lg px-1 py-1.5 text-left transition-colors hover:text-foreground"
+            >
+              <ChevronDown className={cn('h-3 w-3 text-muted-foreground transition-transform', showDefaultAdvanced && 'rotate-180')} />
+              <span className="text-[12px] font-medium text-foreground">{t('environments.routerAdvanced')}</span>
+              <span className="ml-auto text-[10px] text-muted-foreground">
+                {t('environments.routerAdvancedSummary', { count: config.defaultAllowedEnvs.length })}
+              </span>
+            </button>
+
+            {showDefaultAdvanced ? (
+              <div id="router-default-advanced" className="mt-2 space-y-3 rounded-lg bg-muted/20 p-3">
+                <div className="flex items-center gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[12px] font-medium text-foreground">
+                      {t('settings.routerDynamicRouting')}
+                    </div>
+                    <div className="text-[11px] leading-4 text-muted-foreground">
+                      {t('settings.routerDynamicRoutingDesc')}
+                    </div>
+                  </div>
+                  <Switch
+                    checked={config.dynamicRouting}
+                    onCheckedChange={setDynamic}
+                    aria-label={t('settings.routerDynamicRouting')}
+                  />
+                </div>
+
+                {config.dynamicRouting ? (
+                  <div className="border-t border-border-subtle pt-3">
+                    <div className="mb-1 text-[11px] font-medium text-foreground">
+                      {t('router.allowedEnvs')}
+                    </div>
+                    <p className="mb-2 text-[10px] leading-4 text-muted-foreground">
+                      {t('environments.routerDefaultAllowedHint')}
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {envNames.length === 0 ? (
+                        <span className="text-[12px] text-muted-foreground/70">—</span>
+                      ) : (
+                        envNames.map((name) => {
+                          const forced = defaultBindingTargets.includes(name);
+                          const checked = forced || config.defaultAllowedEnvs.includes(name);
+                          return (
+                            <button
+                              key={name}
+                              type="button"
+                              disabled={forced}
+                              aria-pressed={checked}
+                              title={forced ? t('router.allowedForced') : undefined}
+                              onClick={() => toggleDefaultAllowed(name)}
+                              className={cn(
+                                'inline-flex items-center gap-0.5 rounded-full px-2 py-0.5 text-[11px] transition-colors',
+                                checked ? 'bg-primary/[0.10] text-primary/80' : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
+                                forced ? 'cursor-default opacity-80' : 'cursor-pointer',
+                              )}
+                            >
+                              {checked ? <Check className="h-2.5 w-2.5" /> : null}
+                              {name}
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                ) : null}
               </div>
-              <Switch checked={config.dynamicRouting} onCheckedChange={setDynamic} aria-label={t('settings.routerDynamicRouting')} />
-            </div>
+            ) : null}
           </div>
 
           <div className="min-w-0 rounded-xl border border-border-subtle bg-background/35 p-4">
@@ -407,6 +493,8 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                         <button
                           type="button"
                           onClick={() => setExpandedProfile(expanded ? null : profile.id)}
+                          aria-expanded={expanded}
+                          aria-controls={`router-profile-${profile.id}`}
                           className="flex min-w-0 flex-1 items-center gap-2 text-left"
                         >
                           <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', expanded && 'rotate-180')} />
@@ -426,14 +514,14 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                         </button>
                       </div>
                       {expanded ? (
-                        <div className="space-y-2 border-t border-border-subtle px-2.5 py-2.5">
+                        <div id={`router-profile-${profile.id}`} className="space-y-2 border-t border-border-subtle px-2.5 py-2.5">
                           <div className="flex items-center gap-2">
                             <label className="w-16 shrink-0 text-[11px] text-muted-foreground">{t('environments.routerProfileName')}</label>
                             <ProfileNameInput value={profile.name} onCommit={(name) => renameProfile(profile.id, name)} />
                           </div>
                           <div className="space-y-1">
                             <div className="text-[11px] font-medium text-muted-foreground">{t('router.bindings')}</div>
-                            {bindingRows(t, profile.bindings).map((row) => {
+                            {bindingRows(t, profile.bindings, showProfileAgentBindings).map((row) => {
                               const value = (profile.bindings as BindingMap)[row.key] ?? BINDING_FOLLOW_DEFAULT;
                               return (
                                 <div key={row.key} className="flex items-center gap-2">
@@ -442,7 +530,10 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                                     value={value}
                                     onValueChange={(v) => setProfileBinding(profile.id, row.key, v)}
                                   >
-                                    <SelectTrigger className="h-7 w-[150px] rounded-md border-border/40 px-2 text-[11px]">
+                                    <SelectTrigger
+                                      className="h-7 w-[150px] rounded-md border-border/40 px-2 text-[11px]"
+                                      aria-label={`${row.label} · ${t('router.selectEnv')}`}
+                                    >
                                       <SelectValue />
                                     </SelectTrigger>
                                     <SelectContent>
@@ -456,32 +547,60 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                               );
                             })}
                           </div>
-                          <div>
-                            <div className="mb-1 text-[11px] font-medium text-muted-foreground">{t('router.allowedEnvs')}</div>
-                            <div className="flex flex-wrap gap-1">
-                              {envNames.map((name) => {
-                                const forced = forcedTargets.includes(name);
-                                const checked = forced || profile.allowedEnvs.includes(name);
-                                return (
-                                  <button
-                                    key={name}
-                                    type="button"
-                                    disabled={forced}
-                                    title={forced ? t('router.allowedForced') : undefined}
-                                    onClick={() => toggleProfileAllowed(profile.id, name, !checked)}
-                                    className={cn(
-                                      'inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] transition-colors',
-                                      checked ? 'bg-primary/[0.10] text-primary/80' : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
-                                      forced ? 'cursor-default opacity-80' : 'cursor-pointer',
-                                    )}
-                                  >
-                                    {checked ? <Check className="h-2.5 w-2.5" /> : null}
-                                    {name}
-                                  </button>
-                                );
-                              })}
+
+                          <button
+                            type="button"
+                            aria-expanded={showProfileAgentBindings}
+                            onClick={() => setShowProfileAgentBindings((visible) => !visible)}
+                            className="flex w-full items-center gap-1 rounded-lg px-1 py-1 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                          >
+                            <ChevronDown className={cn('h-3 w-3 transition-transform', showProfileAgentBindings && 'rotate-180')} />
+                            {t('environments.routerMoreAgents')}
+                          </button>
+
+                          <button
+                            type="button"
+                            aria-expanded={showProfileAdvanced}
+                            aria-controls={`router-profile-advanced-${profile.id}`}
+                            onClick={() => setShowProfileAdvanced((visible) => !visible)}
+                            className="flex w-full items-center gap-1 rounded-lg border-t border-border-subtle px-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                          >
+                            <ChevronDown className={cn('h-3 w-3 transition-transform', showProfileAdvanced && 'rotate-180')} />
+                            {t('environments.routerAdvanced')}
+                            <span className="ml-auto text-[10px] font-normal">
+                              {t('environments.routerAllowedCount', { count: profile.allowedEnvs.length })}
+                            </span>
+                          </button>
+
+                          {showProfileAdvanced ? (
+                            <div id={`router-profile-advanced-${profile.id}`} className="rounded-lg bg-muted/20 p-2.5">
+                              <div className="mb-1 text-[11px] font-medium text-muted-foreground">{t('router.allowedEnvs')}</div>
+                              <div className="flex flex-wrap gap-1">
+                                {envNames.map((name) => {
+                                  const forced = forcedTargets.includes(name);
+                                  const checked = forced || profile.allowedEnvs.includes(name);
+                                  return (
+                                    <button
+                                      key={name}
+                                      type="button"
+                                      disabled={forced}
+                                      aria-pressed={checked}
+                                      title={forced ? t('router.allowedForced') : undefined}
+                                      onClick={() => toggleProfileAllowed(profile.id, name, !checked)}
+                                      className={cn(
+                                        'inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] transition-colors',
+                                        checked ? 'bg-primary/[0.10] text-primary/80' : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
+                                        forced ? 'cursor-default opacity-80' : 'cursor-pointer',
+                                      )}
+                                    >
+                                      {checked ? <Check className="h-2.5 w-2.5" /> : null}
+                                      {name}
+                                    </button>
+                                  );
+                                })}
+                              </div>
                             </div>
-                          </div>
+                          ) : null}
                         </div>
                       ) : null}
                     </div>

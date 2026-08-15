@@ -106,9 +106,22 @@ test('resolveRouteLabel: a state WITH bindings must NOT be mislabeled as default
 
 test('resolveRouteLabel: matched user profile surfaces its name', async () => {
   const { resolveRouteLabel } = await importRouterProfiles();
-  const info = resolveRouteLabel(makeRouter({ sourceProfileId: 'budget' }), PROFILES);
+  const info = resolveRouteLabel(
+    makeRouter({ sourceProfileId: 'budget', profileRevision: 3 }),
+    PROFILES,
+  );
   assert.equal(info.kind, 'profile');
   assert.equal(info.profileName, '省钱杂活');
+});
+
+test('resolveRouteLabel: a named profile with a stale revision is a custom snapshot', async () => {
+  const { resolveRouteLabel } = await importRouterProfiles();
+  const info = resolveRouteLabel(
+    makeRouter({ sourceProfileId: 'budget', profileRevision: 2 }),
+    PROFILES,
+  );
+  assert.equal(info.kind, 'custom');
+  assert.equal(info.profileId, null);
 });
 
 test('resolveRouteLabel: null sourceProfileId and no bindings is defaultOnly', async () => {
@@ -824,9 +837,12 @@ test('resolveEnvSwitchCasPatch: unions the new main env into allowedEnvs; preser
   assert.deepEqual(added.patch, {
     defaultEnv: 'glm',
     allowedEnvs: ['official', 'kimi', 'glm'],
-    sourceProfileId: null,
-    profileRevision: null,
   });
+  assert.equal(
+    'sourceProfileId' in added.patch,
+    false,
+    'changing the main env must preserve the selected task-routing profile',
+  );
   // envName already allowed → allowedEnvs unchanged (no duplicate).
   const present = resolveEnvSwitchCasPatch(fresh, 'kimi');
   assert.deepEqual(present.patch.allowedEnvs, ['official', 'kimi']);

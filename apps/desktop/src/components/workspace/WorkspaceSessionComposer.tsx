@@ -99,7 +99,6 @@ import { composerSegmentsReferenceImageAttachment } from './composerImageReferen
 import { WorkspaceComposerAnnotations } from './WorkspaceAnnotations';
 import {
   WorkspaceRoutePill,
-  ComposerRouteMenuRow,
   ComposerRouteDraftRow,
   ComposerRouteDraftPill,
 } from './WorkspaceRouter';
@@ -143,6 +142,7 @@ interface WorkspaceSessionComposerProps {
   provider?: WorkspaceComposerProvider;
   /** Active native session runtimeId — enables the Route pill above the textarea. */
   routeRuntimeId?: string | null;
+  onNavigateEnvironments?: () => void;
   /**
    * New-session Dynamic Routing opt-in draft (compose/history composers).
    * When provided AND the provider can route, the "+" menu gains the
@@ -502,7 +502,6 @@ function ComposerQuickMenu({
   planModeHint,
   planModeKind,
   provider,
-  routeRuntimeId,
   routeDraft,
   onRouteDraftChange,
   onLaunchNewSession,
@@ -515,7 +514,6 @@ function ComposerQuickMenu({
   planModeHint?: string;
   planModeKind: 'session_permission' | 'command_prefix';
   provider: WorkspaceComposerProvider;
-  routeRuntimeId?: string | null;
   routeDraft?: ComposerRouteDraft | null;
   onRouteDraftChange?: (draft: ComposerRouteDraft) => void;
   onLaunchNewSession?: (client: LaunchClient) => void;
@@ -612,10 +610,6 @@ function ComposerQuickMenu({
               </TooltipContent>
             </Tooltip>
           </>
-        ) : null}
-
-        {routeRuntimeId ? (
-          <ComposerRouteMenuRow runtimeId={routeRuntimeId} />
         ) : null}
 
         {routeDraft != null && onRouteDraftChange && isRouteDraftRowVisible(provider) ? (
@@ -812,6 +806,7 @@ export function WorkspaceSessionComposer({
   onClearAnnotations,
   onAnnotationsSent,
   routeRuntimeId = null,
+  onNavigateEnvironments,
   routeDraft = null,
   onRouteDraftChange,
 }: WorkspaceSessionComposerProps) {
@@ -1563,7 +1558,12 @@ export function WorkspaceSessionComposer({
                   {t('workspace.composerPlanModeShort')}
                 </span>
               ) : null}
-              {routeRuntimeId ? <WorkspaceRoutePill runtimeId={routeRuntimeId} /> : null}
+              {routeRuntimeId ? (
+                <WorkspaceRoutePill
+                  runtimeId={routeRuntimeId}
+                  onNavigateEnvironments={onNavigateEnvironments}
+                />
+              ) : null}
               {routeDraftPillVisible && routeDraft && onRouteDraftChange ? (
                 <ComposerRouteDraftPill draft={routeDraft} onDraftChange={onRouteDraftChange} />
               ) : null}
@@ -1662,7 +1662,6 @@ export function WorkspaceSessionComposer({
               planModeHint={planModeHint}
               planModeKind={capabilities.planModeKind}
               provider={provider}
-              routeRuntimeId={routeRuntimeId}
               routeDraft={routeDraft}
               onRouteDraftChange={onRouteDraftChange}
               onLaunchNewSession={onLaunchNewSession}

@@ -1,12 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Route, RefreshCw, AlertTriangle, Check, ChevronDown } from '@/lib/lucide-react';
+import { useCallback, useEffect, useId, useMemo, useState } from 'react';
+import { Route, RefreshCw, AlertTriangle } from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
-import { useRouterConfigEditor } from '@/hooks/useRouterConfig';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
@@ -14,32 +12,19 @@ import { cn } from '@/lib/utils';
 import {
   DEFAULT_ONLY_PROFILE_ID,
   MY_DEFAULT_ROUTER_PROFILE_ID,
-  buildCustomEditPatch,
   buildMyDefaultApplyPatch,
   buildProfileApplyPatch,
-  buildSaveAsDefaultPatch,
-  computeAutoIncludedEnvs,
-  computeCandidateEnvs,
-  computeFinalAllowedEnvs,
   enqueueSessionRouterMutation,
   isSessionRouted,
   resolveRouteLabel,
 } from '@/lib/routerProfiles';
-import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { toast } from 'sonner';
-import { BUILTIN_CLAUDE_AGENT_NAMES } from '@ccem/core/browser';
 import type { RouterProfile, SessionRouterState } from '@ccem/core/browser';
 import {
   resolveRouteDraftLabel,
   toggleComposerRouteDraft,
   type ComposerRouteDraft,
 } from './composerRouteDraft';
-
-/** Sentinel Select value meaning "no per-type binding → fall through to default". */
-const BINDING_FOLLOW_DEFAULT = '__ccem_default__';
-
-/** Editable binding map keyed by arbitrary string (avoids the `>>` tsx lexer pitfall). */
-type BindingDraft = Record<string, string>;
 
 /** Built-in default-only profile object for the radio + apply path. */
 const DEFAULT_ONLY_PROFILE: RouterProfile = {
@@ -172,194 +157,93 @@ function useRouteLabelText(runtimeId: string | null) {
   }, [router, profiles, t]);
 }
 
-/** Shared popover body: profile radio + view/edit defaultEnv/bindings/allowed/dynamic. */
+/** Compact running-session route picker. Persistent bindings and authorization live on Environments. */
 function RoutePopoverBody({
   runtimeId,
   router,
   loading,
   error,
   onClose,
+  onNavigateEnvironments,
 }: {
   runtimeId: string;
   router: SessionRouterState | null;
   loading: boolean;
   error: string | null;
   onClose: () => void;
+  onNavigateEnvironments?: () => void;
 }) {
   const { t } = useLocale();
-  const environments = useAppStore((s) => s.environments);
   const routerConfig = useAppStore((s) => s.routerConfig);
   const routerStatus = useAppStore((s) => s.routerStatus);
-  const { updateSessionRouter, restartNativeSessionDirect } = useTauriCommands();
-  const { commit: commitGlobal } = useRouterConfigEditor();
+  const { restartNativeSessionDirect } = useTauriCommands();
   const applyProfile = useApplyRouteProfile(runtimeId);
   const applyMyDefault = useApplyMyDefaultRoute(runtimeId);
-
-  const existingNames = useMemo(() => environments.map((e) => e.name), [environments]);
-  const candidateEnvs = useMemo(
-    () => computeCandidateEnvs(existingNames, router),
-    [existingNames, router],
-  );
-
-  const [defaultEnv, setDefaultEnv] = useState(router?.defaultEnv ?? candidateEnvs[0] ?? '');
-  const [bindings, setBindings] = useState<BindingDraft>({ ...(router?.bindings ?? {}) } as BindingDraft);
-  // allowedEnvs is an INDEPENDENT draft (not recompressed) so explicit
-  // dynamic-routing-only authorizations are preserved across edits.
-  const [baseAllowed, setBaseAllowed] = useState<string[]>(router?.allowedEnvs ?? []);
-  const [dynamic, setDynamic] = useState<boolean>(router?.dynamicRouting ?? true);
-  const [showBindings, setShowBindings] = useState(false);
+  const radioId = useId();
   const [applying, setApplying] = useState(false);
   const [restarting, setRestarting] = useState(false);
-  const [savingDefault, setSavingDefault] = useState(false);
-  // Synchronous same-tick mutex: React state alone cannot stop a double-submit
-  // (both handlers read `false` before the setState flushes). The guard's
-  // `begin()` flips a closure flag synchronously.
-  const saveGuardRef = useRef<ReentryGuard | null>(null);
-  if (!saveGuardRef.current) saveGuardRef.current = createReentryGuard();
-
-  // Re-sync drafts when the authoritative revision advances (event rebased the
-  // store, e.g. after a CAS conflict or a profile apply). Initial mount is a
-  // no-op because revRef is seeded from the same revision.
-  const revRef = useRef<number | null>(router?.revision ?? null);
-  useEffect(() => {
-    if (!router) return;
-    if (revRef.current !== router.revision) {
-      revRef.current = router.revision;
-      setDefaultEnv(router.defaultEnv);
-      setBindings({ ...router.bindings } as BindingDraft);
-      setBaseAllowed(router.allowedEnvs);
-      setDynamic(router.dynamicRouting);
-    }
-  }, [router]);
 
   const profiles = routerConfig?.profiles ?? [];
-  const profileOptions = useMemo(() => {
-    const opts: { id: string; name: string }[] = [
-      { id: MY_DEFAULT_ROUTER_PROFILE_ID, name: t('router.routeMyDefault') },
-      { id: DEFAULT_ONLY_PROFILE_ID, name: t('router.defaultOnly') },
-    ];
-    for (const p of profiles) opts.push({ id: p.id, name: p.name });
-    return opts;
-  }, [t, profiles]);
-
-  // Which radio option appears selected (default-only when effectively default).
-  const selectedProfileId = router
-    ? (router.sourceProfileId
-      ?? (Object.keys(router.bindings).length === 0 ? DEFAULT_ONLY_PROFILE_ID : null))
-    : null;
-
-  const autoIncluded = useMemo(
-    () => computeAutoIncludedEnvs(defaultEnv, bindings),
-    [defaultEnv, bindings],
+  const profileOptions = useMemo(
+    () => [
+      {
+        id: MY_DEFAULT_ROUTER_PROFILE_ID,
+        name: t('router.routeMyDefault'),
+        description: t('router.routeMyDefaultHint'),
+        profile: null,
+      },
+      {
+        id: DEFAULT_ONLY_PROFILE_ID,
+        name: t('router.defaultOnly'),
+        description: t('router.defaultOnlyHint'),
+        profile: DEFAULT_ONLY_PROFILE,
+      },
+      ...profiles.map((profile) => ({
+        id: profile.id,
+        name: profile.name,
+        description: t('router.profileBindingsCount', {
+          count: Object.keys(profile.bindings).length,
+        }),
+        profile,
+      })),
+    ],
+    [profiles, t],
   );
 
+  const routeLabel = resolveRouteLabel(router, profiles);
+  const selectedProfileId = routeLabel.kind === 'myDefault'
+    ? MY_DEFAULT_ROUTER_PROFILE_ID
+    : routeLabel.kind === 'profile'
+      ? routeLabel.profileId
+      : routeLabel.kind === 'defaultOnly'
+        ? DEFAULT_ONLY_PROFILE_ID
+        : null;
   const state = routerStatus?.state;
   const showRestart =
     router?.launchTransport === 'routed' && (state === 'degraded' || state === 'failed');
   const isDirect = router?.launchTransport === 'direct';
 
-  const bindingRows = useMemo(() => {
-    const rows: { key: string; label: string }[] = [
-      { key: 'background', label: t('router.background') },
-      { key: 'subagent:*', label: t('router.subagentAny') },
-    ];
-    for (const name of BUILTIN_CLAUDE_AGENT_NAMES) {
-      rows.push({ key: `subagent:${name}`, label: name });
-    }
-    const covered = new Set(rows.map((r) => r.key));
-    for (const key of Object.keys(router?.bindings ?? {})) {
-      if (!covered.has(key)) rows.push({ key, label: key });
-    }
-    return rows;
-  }, [t, router]);
-
-  const handleBindingChange = useCallback((key: string, value: string) => {
-    setBindings((prev) => {
-      const next = { ...prev };
-      if (value === BINDING_FOLLOW_DEFAULT) delete next[key];
-      else next[key] = value;
-      return next;
-    });
-  }, []);
-
-  const toggleAllowed = useCallback(
-    (env: string) => {
-      if (autoIncluded.includes(env)) return; // default/binding targets are forced-on
-      setBaseAllowed((prev) =>
-        prev.includes(env) ? prev.filter((e) => e !== env) : [...prev, env],
-      );
-    },
-    [autoIncluded],
-  );
-
   const handleApplyProfile = useCallback(
     async (profileId: string) => {
-      if (profileId === MY_DEFAULT_ROUTER_PROFILE_ID) {
-        await applyMyDefault();
-        return;
+      if (!router || applying) return;
+      setApplying(true);
+      try {
+        let applied = false;
+        if (profileId === MY_DEFAULT_ROUTER_PROFILE_ID) {
+          applied = await applyMyDefault();
+        } else {
+          const profile = profileId === DEFAULT_ONLY_PROFILE_ID
+            ? DEFAULT_ONLY_PROFILE
+            : profiles.find((candidate) => candidate.id === profileId);
+          if (profile) applied = await applyProfile(profile);
+        }
+        if (applied) onClose();
+      } finally {
+        setApplying(false);
       }
-      const profile =
-        profileId === DEFAULT_ONLY_PROFILE_ID
-          ? DEFAULT_ONLY_PROFILE
-          : profiles.find((p) => p.id === profileId);
-      if (!profile) return;
-      await applyProfile(profile);
     },
-    [profiles, applyProfile, applyMyDefault],
+    [router, applying, profiles, applyMyDefault, applyProfile, onClose],
   );
-
-  const handleApply = useCallback(async () => {
-    if (!router) return;
-    setApplying(true);
-    const finalAllowed = computeFinalAllowedEnvs(baseAllowed, defaultEnv, bindings, existingNames);
-    const patch = buildCustomEditPatch({
-      defaultEnv,
-      bindings,
-      allowedEnvs: finalAllowed,
-      dynamicRouting: dynamic,
-    });
-    // Serialize with profile applies + env hot-switch on the SAME runtime and
-    // read the FRESH revision at execution, so a rapid radio→Apply (or
-    // Apply→radio, Apply→env-switch) lands on the bumped revision.
-    const result = await enqueueSessionRouterMutation(runtimeId, async () => {
-      const fresh = useAppStore.getState().sessionRouters[runtimeId];
-      return updateSessionRouter(runtimeId, fresh ? fresh.revision : router.revision, patch);
-    });
-    setApplying(false);
-    if (result.ok) {
-      toast.success(t('router.applied'));
-      onClose();
-    } else if (result.conflict.code === 'ROUTER_REVISION_CONFLICT') {
-      // Store rebased to conflict.current; drafts re-sync via revRef.
-      toast.warning(t('router.conflict'));
-    } else {
-      toast.error(t('router.applyFailed', { message: result.conflict.message }));
-    }
-  }, [router, baseAllowed, defaultEnv, bindings, dynamic, existingNames, updateSessionRouter, runtimeId, t, onClose]);
-
-  // Promote the current session draft to the serialized global default queue;
-  // this remains independent of the session CAS apply path.
-  const handleSaveAsDefault = useCallback(async () => {
-    const guard = saveGuardRef.current;
-    if (!guard || !guard.begin()) return; // synchronous same-tick claim
-    setSavingDefault(true);
-    const patch = buildSaveAsDefaultPatch({
-      defaultEnv,
-      bindings,
-      baseAllowed,
-      dynamicRouting: dynamic,
-      existingNames,
-    });
-    try {
-      await commitGlobal(patch);
-      toast.success(t('router.savedAsDefault'));
-    } catch (err) {
-      toast.error(t('router.applyFailed', { message: err instanceof Error ? err.message : String(err) }));
-    } finally {
-      guard.end();
-      setSavingDefault(false);
-    }
-  }, [defaultEnv, bindings, baseAllowed, dynamic, existingNames, commitGlobal, t]);
 
   const handleRestartDirect = useCallback(async () => {
     setRestarting(true);
@@ -375,220 +259,119 @@ function RoutePopoverBody({
   }, [restartNativeSessionDirect, runtimeId, t, onClose]);
 
   return (
-    <div className="flex min-h-0 w-full flex-1 flex-col p-0">
-      {/* Header */}
+    <div className="flex min-h-0 w-full flex-col p-0">
       <div className="flex shrink-0 items-center gap-2 px-3 pt-3 pb-2">
         <Route className="h-3.5 w-3.5 text-primary/80" />
-        <span className="text-sm font-medium text-foreground">{t('router.title')}</span>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium text-foreground">{t('router.routeDraftTitle')}</div>
+          {!isDirect ? (
+            <p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">
+              {t('router.routePickerHint')}
+            </p>
+          ) : null}
+        </div>
         <span
           className={cn(
-            'ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium',
+            'inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
             isDirect ? 'bg-muted/60 text-muted-foreground' : 'bg-primary/[0.08] text-primary/70',
           )}
         >
           {isDirect ? t('router.directTransport') : t('router.routed')}
         </span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {showRestart ? (
-          <div className="mx-3 mb-2 rounded-lg border border-warning/25 bg-warning/10 px-2.5 py-2">
-            <div className="flex items-center gap-1.5 text-[11px] font-medium text-warning">
-              <AlertTriangle className="h-3 w-3" />
-              {t('router.blocked')}
-            </div>
-            <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{t('router.blockedHint')}</p>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="mt-2 h-7 w-full rounded-md text-[11px]"
-              disabled={restarting}
-              onClick={() => void handleRestartDirect()}
-            >
-              <RefreshCw className={cn('h-3 w-3', restarting && 'animate-spin')} />
-              {restarting ? t('router.restarting') : t('router.restartDirect')}
-            </Button>
-          </div>
-        ) : null}
 
-        {isDirect ? (
-          <div className="px-3 pb-3 text-[11px] leading-4 text-muted-foreground">
-            {t('router.directHint')}
+      {showRestart ? (
+        <div className="mx-3 mb-2 rounded-lg border border-warning/25 bg-warning/10 px-2.5 py-2">
+          <div className="flex items-center gap-1.5 text-[11px] font-medium text-warning">
+            <AlertTriangle className="h-3 w-3" />
+            {t('router.blocked')}
           </div>
-        ) : (
-          <div className="space-y-3 px-3 pb-2">
-          {/* Profile radio (default-only + routerConfig.profiles) */}
-          <div className="space-y-1">
-            <label className="text-[11px] font-medium text-muted-foreground">{t('router.profileSection')}</label>
-            <RadioGroup
-              value={selectedProfileId ?? ''}
-              onValueChange={(v) => void handleApplyProfile(v)}
-              disabled={!router || applying}
-              className="gap-0.5"
-            >
-              {profileOptions.map((opt) => (
-                <label
-                  key={opt.id}
-                  htmlFor={`rp-${opt.id}`}
-                  className={cn(
-                    'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
-                    opt.id === selectedProfileId ? 'text-primary' : 'text-foreground/85',
-                  )}
-                >
-                  <RadioGroupItem value={opt.id} id={`rp-${opt.id}`} />
-                  <span className="min-w-0 flex-1 truncate text-left">{opt.name}</span>
-                </label>
-              ))}
-            </RadioGroup>
-            {selectedProfileId === null ? (
-              <div className="px-2 py-1 text-[10px] text-muted-foreground">{t('router.custom')}</div>
-            ) : null}
-          </div>
+          <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{t('router.blockedHint')}</p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="mt-2 h-7 w-full rounded-md text-[11px]"
+            disabled={restarting}
+            onClick={() => void handleRestartDirect()}
+          >
+            <RefreshCw className={cn('h-3 w-3', restarting && 'animate-spin')} />
+            {restarting ? t('router.restarting') : t('router.restartDirect')}
+          </Button>
+        </div>
+      ) : null}
 
-          <div className="h-px bg-border/30" />
-
-          {/* Default env */}
-          <div className="space-y-1.5">
-            <label className="text-[11px] font-medium text-muted-foreground">{t('router.defaultEnv')}</label>
-            <Select value={defaultEnv} onValueChange={setDefaultEnv}>
-              <SelectTrigger className="h-8 w-full rounded-lg border-border/45 text-[12px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {candidateEnvs.map((name) => (
-                  <SelectItem key={name} value={name}>
-                    {name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Custom bindings — progressively expanded */}
-          <div className="space-y-1">
-            <button
-              type="button"
-              onClick={() => setShowBindings((v) => !v)}
-              className="flex w-full items-center gap-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
-            >
-              <ChevronDown className={cn('h-3 w-3 transition-transform', showBindings && 'rotate-180')} />
-              {t('router.expandBindings')}
-              {Object.keys(bindings).length > 0 ? (
-                <span className="ml-auto rounded-full bg-muted/50 px-1.5 text-[10px] text-foreground/70">
-                  {Object.keys(bindings).length}
-                </span>
-              ) : null}
-            </button>
-            {showBindings ? (
-              <div className="space-y-1 pt-0.5">
-                {bindingRows.map((row) => {
-                  const value = bindings[row.key] ?? BINDING_FOLLOW_DEFAULT;
-                  return (
-                    <div key={row.key} className="flex items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate text-[11px] text-foreground/85" title={row.key}>
-                        {row.label}
-                      </span>
-                      <Select value={value} onValueChange={(v) => handleBindingChange(row.key, v)}>
-                        <SelectTrigger className="h-7 w-[136px] rounded-md border-border/40 px-2 text-[11px]">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value={BINDING_FOLLOW_DEFAULT}>{t('router.bindingDefault')}</SelectItem>
-                          {candidateEnvs.map((name) => (
-                            <SelectItem key={name} value={name}>
-                              {name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
-          </div>
-
-          {/* Allowed envs — independent draft; default/binding targets forced-on */}
-          <div className="space-y-1">
-            <label className="text-[11px] font-medium text-muted-foreground">{t('router.allowedEnvs')}</label>
-            <div className="flex flex-wrap gap-1">
-              {candidateEnvs.length === 0 ? (
-                <span className="text-[10px] text-muted-foreground/70">—</span>
-              ) : (
-                candidateEnvs.map((name) => {
-                  const forced = autoIncluded.includes(name);
-                  const checked = forced || baseAllowed.includes(name);
-                  return (
-                    <button
-                      key={name}
-                      type="button"
-                      disabled={forced}
-                      title={forced ? t('router.allowedForced') : undefined}
-                      onClick={() => toggleAllowed(name)}
-                      className={cn(
-                        'inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] transition-colors',
-                        checked
-                          ? 'bg-primary/[0.10] text-primary/80'
-                          : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
-                        forced && 'cursor-default opacity-80',
-                        !forced && 'cursor-pointer',
-                      )}
-                    >
-                      {checked ? <Check className="h-2.5 w-2.5" /> : null}
-                      {name}
-                    </button>
-                  );
-                })
-              )}
-            </div>
-          </div>
-
-          {/* Dynamic routing */}
-          <div className="flex items-center gap-2.5 rounded-lg px-1 py-1">
-            <div className="min-w-0 flex-1">
-              <div className="text-[11px] font-medium text-foreground/85">{t('router.dynamicRouting')}</div>
-              <div className="text-[10px] leading-4 text-muted-foreground">{t('router.dynamicRoutingHint')}</div>
-            </div>
-            <Switch checked={dynamic} onCheckedChange={setDynamic} aria-label={t('router.dynamicRouting')} />
-          </div>
-
-          {router?.warnings && router.warnings.length > 0 ? (
-            <div className="space-y-1 rounded-lg bg-muted/35 px-2 py-1.5">
-              {router.warnings.map((w, i) => (
-                <p key={i} className="text-[10px] leading-4 text-warning">
-                  {w}
-                </p>
-              ))}
+      {isDirect ? (
+        <p className="px-3 pb-3 text-[11px] leading-4 text-muted-foreground">
+          {t('router.directHint')}
+        </p>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+          {selectedProfileId === null ? (
+            <div className="mx-1 mb-1.5 rounded-lg bg-muted/35 px-2 py-1.5 text-[10px] leading-4 text-muted-foreground">
+              {t('router.customSnapshotHint')}
             </div>
           ) : null}
+          <RadioGroup
+            value={selectedProfileId ?? ''}
+            onValueChange={(value) => void handleApplyProfile(value)}
+            disabled={!router || loading || applying}
+            aria-label={t('router.profileSection')}
+            className="gap-0.5"
+          >
+            {profileOptions.map((option) => {
+              const id = `${radioId}-${option.id}`;
+              return (
+                <label
+                  key={option.id}
+                  htmlFor={id}
+                  onClick={(event) => {
+                    if (option.id !== selectedProfileId) return;
+                    event.preventDefault();
+                    void handleApplyProfile(option.id);
+                  }}
+                  className={cn(
+                    'flex w-full cursor-pointer items-start gap-2 rounded-lg px-2 py-2 transition-colors glass-dropdown-item',
+                    option.id === selectedProfileId ? 'text-primary' : 'text-foreground/85',
+                    (loading || applying) && 'pointer-events-none opacity-60',
+                  )}
+                >
+                  <RadioGroupItem value={option.id} id={id} className="mt-0.5" />
+                  <span className="min-w-0 flex-1 text-left">
+                    <span className="block truncate text-[12px] font-medium">{option.name}</span>
+                    <span className="block truncate text-[10px] leading-4 text-muted-foreground">
+                      {option.description}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
+          </RadioGroup>
 
-            <p className="text-[10px] leading-4 text-muted-foreground/80">{t('router.nextRequestHint')}</p>
-          </div>
-        )}
+          {router?.warnings?.map((warning, index) => (
+            <p key={index} className="mx-1 mt-1 text-[10px] leading-4 text-warning">
+              {warning}
+            </p>
+          ))}
+          {error ? (
+            <p className="mx-1 mt-1 text-[10px] text-destructive">{t('router.loadFailed')}</p>
+          ) : null}
+        </div>
+      )}
 
-        {error ? <p className="px-3 pb-2 text-[10px] text-destructive">{t('router.loadFailed')}</p> : null}
-      </div>
-      {!isDirect ? (
-        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border/35 px-3 py-2">
+      {onNavigateEnvironments ? (
+        <div className="shrink-0 border-t border-border/35 p-2">
           <Button
             type="button"
             size="sm"
             variant="ghost"
-            className="h-7 rounded-md text-[11px] text-muted-foreground hover:text-foreground"
-            disabled={!router || !routerConfig || applying || loading || savingDefault}
-            title={t('router.saveAsDefaultHint')}
-            onClick={() => void handleSaveAsDefault()}
+            className="h-7 w-full justify-center rounded-md text-[11px] text-muted-foreground hover:text-foreground"
+            onClick={() => {
+              onClose();
+              onNavigateEnvironments();
+            }}
           >
-            {savingDefault ? t('router.savingDefault') : t('router.saveAsDefault')}
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 rounded-md text-[11px]"
-            disabled={!router || applying || loading}
-            onClick={() => void handleApply()}
-          >
-            {t('router.apply')}
+            {t('router.manageProfiles')}
           </Button>
         </div>
       ) : null}
@@ -601,10 +384,12 @@ function RouteControl({
   runtimeId,
   trigger,
   align,
+  onNavigateEnvironments,
 }: {
   runtimeId: string;
   trigger: () => React.ReactNode;
   align: 'start' | 'end';
+  onNavigateEnvironments?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const { router, loading, error } = useRouteEntry(runtimeId, open);
@@ -617,7 +402,6 @@ function RouteControl({
         sideOffset={6}
         collisionPadding={12}
         className="flex max-h-[var(--radix-popover-content-available-height)] w-[332px] max-w-[calc(100vw-24px)] overflow-hidden rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover p-0 shadow-lg"
-        onOpenAutoFocus={(e) => e.preventDefault()}
       >
         <RoutePopoverBody
           key={runtimeId}
@@ -626,6 +410,7 @@ function RouteControl({
           loading={loading}
           error={error}
           onClose={() => setOpen(false)}
+          onNavigateEnvironments={onNavigateEnvironments}
         />
       </PopoverContent>
     </Popover>
@@ -687,6 +472,7 @@ export function WorkspaceRouteChip({
     <RouteControl
       runtimeId={runtimeId}
       align="start"
+      onNavigateEnvironments={onNavigateEnvironments}
       trigger={() => (
         <button
           type="button"
@@ -715,7 +501,13 @@ export function WorkspaceRouteChip({
  * leads with the mode itself (「动态路由」/ "Dynamic routing") followed by the
  * current label — an icon alone is not acceptance-sufficient.
  */
-export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) {
+export function WorkspaceRoutePill({
+  runtimeId,
+  onNavigateEnvironments,
+}: {
+  runtimeId: string | null;
+  onNavigateEnvironments?: () => void;
+}) {
   const { t } = useLocale();
   const routerStatus = useAppStore((s) => s.routerStatus);
   const router = useAppStore((s) => (runtimeId ? s.sessionRouters[runtimeId] ?? null : null));
@@ -732,6 +524,7 @@ export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) 
     <RouteControl
       runtimeId={runtimeId}
       align="start"
+      onNavigateEnvironments={onNavigateEnvironments}
       trigger={() => (
         <button
           type="button"
@@ -752,96 +545,6 @@ export function WorkspaceRoutePill({ runtimeId }: { runtimeId: string | null }) 
 }
 
 export { RoutePopoverBody };
-
-/**
- * Composer "+" menu row for a RUNNING routed session: expands an inline profile
- * radio (default-only + routerConfig.profiles) within the SAME popover; each
- * selection applies via one CAS write. There is deliberately NO on/off Switch —
- * transport cannot be hot-toggled, and "off" would have meant clearing bindings
- * while the session stays routed (misleading). Direct running sessions render
- * nothing; routing is opted in at creation time via ComposerRouteDraftRow.
- */
-export function ComposerRouteMenuRow({ runtimeId }: { runtimeId: string }) {
-  const { t } = useLocale();
-  const router = useAppStore((s) => s.sessionRouters[runtimeId] ?? null);
-  const profiles = useAppStore((s) => s.routerConfig?.profiles ?? []);
-  const applyProfile = useApplyRouteProfile(runtimeId);
-  const applyMyDefault = useApplyMyDefaultRoute(runtimeId);
-  const [expanded, setExpanded] = useState(false);
-
-  if (!router || router.launchTransport !== 'routed') return null;
-
-  const profileOptions: { id: string; name: string }[] = [
-    { id: MY_DEFAULT_ROUTER_PROFILE_ID, name: t('router.routeMyDefault') },
-    { id: DEFAULT_ONLY_PROFILE_ID, name: t('router.defaultOnly') },
-    ...profiles.map((p) => ({ id: p.id, name: p.name })),
-  ];
-  const selectedId = router.sourceProfileId
-    ?? (Object.keys(router.bindings).length === 0 ? DEFAULT_ONLY_PROFILE_ID : null);
-  const currentLabel = selectedId === MY_DEFAULT_ROUTER_PROFILE_ID
-    ? t('router.routeMyDefault')
-    : selectedId
-      ? (profileOptions.find((o) => o.id === selectedId)?.name ?? t('router.custom'))
-      : t('router.custom');
-
-  const resolveProfile = (id: string) =>
-    id === DEFAULT_ONLY_PROFILE_ID
-      ? { id: DEFAULT_ONLY_PROFILE_ID, name: '', revision: 1, bindings: {}, allowedEnvs: [] }
-      : profiles.find((p) => p.id === id) ?? null;
-
-  const handleSelect = (id: string) => {
-    if (id === MY_DEFAULT_ROUTER_PROFILE_ID) {
-      void applyMyDefault();
-      return;
-    }
-    const profile = resolveProfile(id);
-    if (profile) void applyProfile(profile);
-  };
-
-  return (
-    <>
-      <div className="mx-2 my-1.5 h-px border-t border-border/50" />
-      <div className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors glass-dropdown-item">
-        <Route className="h-4 w-4 shrink-0 text-muted-foreground" />
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-        >
-          <span className="truncate">{t('router.title')}</span>
-          <span className="truncate text-[11px] text-muted-foreground">{currentLabel}</span>
-          <ChevronDown className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', expanded && 'rotate-180')} />
-        </button>
-      </div>
-      {expanded ? (
-        <div className="mb-1 ml-2 mr-1">
-          <RadioGroup
-            value={selectedId ?? ''}
-            onValueChange={(v) => handleSelect(v)}
-            className="gap-0.5"
-          >
-            {profileOptions.map((opt) => (
-              <label
-                key={opt.id}
-                htmlFor={`rm-${opt.id}`}
-                className={cn(
-                  'flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
-                  opt.id === selectedId ? 'text-primary' : 'text-foreground/85',
-                )}
-              >
-                <RadioGroupItem value={opt.id} id={`rm-${opt.id}`} />
-                <span className="min-w-0 flex-1 truncate text-left">{opt.name}</span>
-              </label>
-            ))}
-          </RadioGroup>
-          {selectedId === null ? (
-            <div className="px-2.5 py-1 text-[10px] text-muted-foreground">{t('router.custom')}</div>
-          ) : null}
-        </div>
-      ) : null}
-    </>
-  );
-}
 
 /**
  * Composer "+" menu row for a NEW-SESSION draft composer: the per-Composer
@@ -892,9 +595,6 @@ export function ComposerRouteDraftRow({
   );
 }
 
-/** Sentinel radio id meaning "my defaults" (RouterConfig snapshot). */
-const ROUTE_DRAFT_MY_DEFAULTS_ID = '__ccem_my_defaults__';
-
 /**
  * Draft route pill above the composer input. Opens the same-style profile
  * popover, but selections only update the LOCAL draft (no CAS write — there is
@@ -910,11 +610,14 @@ export function ComposerRouteDraftPill({
   const { t } = useLocale();
   const routerConfig = useAppStore((s) => s.routerConfig);
   const [open, setOpen] = useState(false);
+  const radioId = useId();
   const profiles = routerConfig?.profiles ?? [];
 
   const labelInfo = resolveRouteDraftLabel(draft, routerConfig);
   const selectionLabel = labelInfo.kind === 'profile'
     ? labelInfo.profileName
+    : labelInfo.kind === 'defaultOnly'
+      ? t('router.defaultOnly')
     : labelInfo.kind === 'missingProfile'
       ? t('router.routeDraftProfileMissing')
       : t('router.routeMyDefault');
@@ -923,7 +626,7 @@ export function ComposerRouteDraftPill({
   const label = `${t('router.routeDraftTitle')} · ${selectionLabel}`;
   const statefulTitle = label;
 
-  const radioValue = draft.profileId === null ? ROUTE_DRAFT_MY_DEFAULTS_ID : draft.profileId;
+  const radioValue = draft.profileId === null ? MY_DEFAULT_ROUTER_PROFILE_ID : draft.profileId;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -948,48 +651,72 @@ export function ComposerRouteDraftPill({
         align="start"
         sideOffset={6}
         collisionPadding={12}
-        className="w-[260px] max-w-[calc(100vw-24px)] rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover p-0 shadow-lg"
+        className="flex w-[260px] max-h-[var(--radix-popover-content-available-height)] max-w-[calc(100vw-24px)] overflow-hidden rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover p-0 shadow-lg"
       >
-        <div className="p-2">
-          <div className="px-1 pb-1.5 text-[11px] font-medium text-muted-foreground">
+        <div className="flex min-h-0 w-full flex-col p-2">
+          <div className="shrink-0 px-1 pb-1.5 text-[11px] font-medium text-muted-foreground">
             {t('router.routeDraftPopoverTitle')}
           </div>
-          <RadioGroup
-            value={radioValue}
-            onValueChange={(v) => {
-              onDraftChange(
-                v === ROUTE_DRAFT_MY_DEFAULTS_ID
-                  ? { optIn: true, profileId: null }
-                  : { optIn: true, profileId: v },
-              );
-            }}
-            className="gap-0.5"
-          >
-            <label
-              htmlFor="rd-my-defaults"
-              className={cn(
-                'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
-                draft.profileId === null ? 'text-primary' : 'text-foreground/85',
-              )}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <RadioGroup
+              value={radioValue}
+              onValueChange={(v) => {
+                onDraftChange(
+                  v === MY_DEFAULT_ROUTER_PROFILE_ID
+                    ? { optIn: true, profileId: null }
+                    : { optIn: true, profileId: v },
+                );
+                setOpen(false);
+              }}
+              className="gap-0.5"
             >
-              <RadioGroupItem value={ROUTE_DRAFT_MY_DEFAULTS_ID} id="rd-my-defaults" />
-              <span className="min-w-0 flex-1 truncate text-left">{t('router.routeMyDefault')}</span>
-            </label>
-            {profiles.map((p) => (
               <label
-                key={p.id}
-                htmlFor={`rd-${p.id}`}
+                htmlFor={`${radioId}-my-defaults`}
                 className={cn(
                   'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
-                  draft.profileId === p.id ? 'text-primary' : 'text-foreground/85',
+                  draft.profileId === null ? 'text-primary' : 'text-foreground/85',
                 )}
               >
-                <RadioGroupItem value={p.id} id={`rd-${p.id}`} />
-                <span className="min-w-0 flex-1 truncate text-left">{p.name}</span>
+                <RadioGroupItem value={MY_DEFAULT_ROUTER_PROFILE_ID} id={`${radioId}-my-defaults`} />
+                <span className="min-w-0 flex-1 text-left">
+                  <span className="block truncate">{t('router.routeMyDefault')}</span>
+                  <span className="block truncate text-[10px] text-muted-foreground">{t('router.routeMyDefaultHint')}</span>
+                </span>
               </label>
-            ))}
-          </RadioGroup>
-          <p className="px-1 pt-1.5 text-[10px] leading-4 text-muted-foreground/80">
+              <label
+                htmlFor={`${radioId}-default-only`}
+                className={cn(
+                  'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
+                  draft.profileId === DEFAULT_ONLY_PROFILE_ID ? 'text-primary' : 'text-foreground/85',
+                )}
+              >
+                <RadioGroupItem value={DEFAULT_ONLY_PROFILE_ID} id={`${radioId}-default-only`} />
+                <span className="min-w-0 flex-1 text-left">
+                  <span className="block truncate">{t('router.defaultOnly')}</span>
+                  <span className="block truncate text-[10px] text-muted-foreground">{t('router.defaultOnlyHint')}</span>
+                </span>
+              </label>
+              {profiles.map((p) => (
+                <label
+                  key={p.id}
+                  htmlFor={`${radioId}-${p.id}`}
+                  className={cn(
+                    'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] transition-colors glass-dropdown-item cursor-pointer',
+                    draft.profileId === p.id ? 'text-primary' : 'text-foreground/85',
+                  )}
+                >
+                  <RadioGroupItem value={p.id} id={`${radioId}-${p.id}`} />
+                  <span className="min-w-0 flex-1 text-left">
+                    <span className="block truncate">{p.name}</span>
+                    <span className="block truncate text-[10px] text-muted-foreground">
+                      {t('router.profileBindingsCount', { count: Object.keys(p.bindings).length })}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </RadioGroup>
+          </div>
+          <p className="shrink-0 px-1 pt-1.5 text-[10px] leading-4 text-muted-foreground/80">
             {t('router.routeDraftPopoverHint')}
           </p>
         </div>

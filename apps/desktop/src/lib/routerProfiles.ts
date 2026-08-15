@@ -59,12 +59,13 @@ export function resolveRouteLabel(
   }
   if (sourceProfileId) {
     const matched = profiles.find((profile) => profile.id === sourceProfileId);
-    if (matched) {
+    if (matched && router.profileRevision === matched.revision) {
       return { kind: 'profile', profileId: sourceProfileId, profileName: matched.name };
     }
-    // Unknown profile id → treat as custom (diverged / profile deleted).
+    // Missing or revised profile → this session still owns its older snapshot.
+    return { kind: 'custom', profileId: null, profileName: null };
   }
-  // sourceProfileId is null (custom) or pointed at a deleted profile:
+  // sourceProfileId is null: infer bare main-env-only vs custom bindings.
   if (Object.keys(router.bindings).length === 0) {
     return { kind: 'defaultOnly', profileId: null, profileName: null };
   }
@@ -452,8 +453,6 @@ export type EnvSwitchCasExecution =
       patch: {
         defaultEnv: string;
         allowedEnvs: string[];
-        sourceProfileId: null;
-        profileRevision: null;
       };
     }
   | { kind: 'failClosed' };
@@ -472,8 +471,6 @@ export function resolveEnvSwitchCasPatch(
     patch: {
       defaultEnv: envName,
       allowedEnvs,
-      sourceProfileId: null,
-      profileRevision: null,
     },
   };
 }
