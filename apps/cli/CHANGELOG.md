@@ -1,5 +1,11 @@
 # ccem
 
+## 2.69.0
+
+### Minor Changes
+
+- Add a composer usage panel with active SDK session usage query (helper `usage_query` command plus desktop session usage event channel), and a project tree sort toggle with a time-bucketed recent view.
+
 ## 2.68.0
 
 ### Minor Changes
