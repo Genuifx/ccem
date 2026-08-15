@@ -416,3 +416,32 @@ test('source regression: both running-session selectors offer the virtual my-def
   assert.ok(patchBlock.includes('dynamicRouting: config.dynamicRouting'));
   assert.ok(!patchBlock.includes('RouterProfile'), 'must not fake a RouterProfile');
 });
+
+test('visual layout contract: route popover owns its width and environment rules stay bounded', async () => {
+  const routerSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
+    'utf8',
+  );
+  const routeBody = routerSource.slice(
+    routerSource.indexOf('function RoutePopoverBody'),
+    routerSource.indexOf('function RouteControl'),
+  );
+  const routeControl = routerSource.slice(
+    routerSource.indexOf('function RouteControl'),
+    routerSource.indexOf('export function WorkspaceRouteChip'),
+  );
+  assert.match(routeBody, /className="flex min-h-0 w-full flex-1 flex-col p-0"/);
+  assert.match(routeBody, /className="min-h-0 flex-1 overflow-y-auto"/);
+  assert.match(routeBody, /shrink-0.*border-t border-border\/35/s);
+  assert.match(routeControl, /w-\[332px\].*max-w-\[calc\(100vw-24px\)\]/s);
+  assert.match(routeControl, /max-h-\[var\(--radix-popover-content-available-height\)\].*overflow-hidden/s);
+  assert.doesNotMatch(routeControl, /overflow-y-auto/);
+
+  const environmentsSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'EnvironmentsRouterRules.tsx'),
+    'utf8',
+  );
+  assert.match(environmentsSource, /mx-auto w-full max-w-\[1240px\]/);
+  assert.match(environmentsSource, /grid items-start gap-5 xl:grid-cols-\[minmax\(0,2fr\)_minmax\(320px,1fr\)\]/);
+  assert.match(environmentsSource, /grid-cols-\[minmax\(0,1fr\)_minmax\(160px,240px\)\]/);
+});

@@ -375,9 +375,9 @@ function RoutePopoverBody({
   }, [restartNativeSessionDirect, runtimeId, t, onClose]);
 
   return (
-    <div className="w-[332px] max-w-[calc(100vw-24px)] p-0">
+    <div className="flex min-h-0 w-full flex-1 flex-col p-0">
       {/* Header */}
-      <div className="flex items-center gap-2 px-3 pt-3 pb-2">
+      <div className="flex shrink-0 items-center gap-2 px-3 pt-3 pb-2">
         <Route className="h-3.5 w-3.5 text-primary/80" />
         <span className="text-sm font-medium text-foreground">{t('router.title')}</span>
         <span
@@ -389,34 +389,34 @@ function RoutePopoverBody({
           {isDirect ? t('router.directTransport') : t('router.routed')}
         </span>
       </div>
-
-      {showRestart ? (
-        <div className="mx-3 mb-2 rounded-lg border border-warning/25 bg-warning/10 px-2.5 py-2">
-          <div className="flex items-center gap-1.5 text-[11px] font-medium text-warning">
-            <AlertTriangle className="h-3 w-3" />
-            {t('router.blocked')}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {showRestart ? (
+          <div className="mx-3 mb-2 rounded-lg border border-warning/25 bg-warning/10 px-2.5 py-2">
+            <div className="flex items-center gap-1.5 text-[11px] font-medium text-warning">
+              <AlertTriangle className="h-3 w-3" />
+              {t('router.blocked')}
+            </div>
+            <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{t('router.blockedHint')}</p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="mt-2 h-7 w-full rounded-md text-[11px]"
+              disabled={restarting}
+              onClick={() => void handleRestartDirect()}
+            >
+              <RefreshCw className={cn('h-3 w-3', restarting && 'animate-spin')} />
+              {restarting ? t('router.restarting') : t('router.restartDirect')}
+            </Button>
           </div>
-          <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{t('router.blockedHint')}</p>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="mt-2 h-7 w-full rounded-md text-[11px]"
-            disabled={restarting}
-            onClick={() => void handleRestartDirect()}
-          >
-            <RefreshCw className={cn('h-3 w-3', restarting && 'animate-spin')} />
-            {restarting ? t('router.restarting') : t('router.restartDirect')}
-          </Button>
-        </div>
-      ) : null}
+        ) : null}
 
-      {isDirect ? (
-        <div className="px-3 pb-3 text-[11px] leading-4 text-muted-foreground">
-          {t('router.directHint')}
-        </div>
-      ) : (
-        <div className="space-y-3 px-3 pb-2">
+        {isDirect ? (
+          <div className="px-3 pb-3 text-[11px] leading-4 text-muted-foreground">
+            {t('router.directHint')}
+          </div>
+        ) : (
+          <div className="space-y-3 px-3 pb-2">
           {/* Profile radio (default-only + routerConfig.profiles) */}
           <div className="space-y-1">
             <label className="text-[11px] font-medium text-muted-foreground">{t('router.profileSection')}</label>
@@ -562,14 +562,14 @@ function RoutePopoverBody({
             </div>
           ) : null}
 
-          <p className="text-[10px] leading-4 text-muted-foreground/80">{t('router.nextRequestHint')}</p>
-        </div>
-      )}
+            <p className="text-[10px] leading-4 text-muted-foreground/80">{t('router.nextRequestHint')}</p>
+          </div>
+        )}
 
-      {error ? <p className="px-3 pb-2 text-[10px] text-destructive">{t('router.loadFailed')}</p> : null}
-
+        {error ? <p className="px-3 pb-2 text-[10px] text-destructive">{t('router.loadFailed')}</p> : null}
+      </div>
       {!isDirect ? (
-        <div className="flex items-center justify-between gap-2 border-t border-border/35 px-3 py-2">
+        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border/35 px-3 py-2">
           <Button
             type="button"
             size="sm"
@@ -616,7 +616,7 @@ function RouteControl({
         align={align}
         sideOffset={6}
         collisionPadding={12}
-        className="rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover p-0 shadow-lg"
+        className="flex max-h-[var(--radix-popover-content-available-height)] w-[332px] max-w-[calc(100vw-24px)] overflow-hidden rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover p-0 shadow-lg"
         onOpenAutoFocus={(e) => e.preventDefault()}
       >
         <RoutePopoverBody
