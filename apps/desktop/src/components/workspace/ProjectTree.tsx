@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Check, Copy, Link, Pin, RefreshCw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
+import { Check, Clock, Copy, FolderTree, Link, Pin, RefreshCw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion } from '@/lib/gsapMotion';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -29,10 +29,12 @@ import {
   PinnedSessionsSection,
   PROJECT_TREE_PAGE_SIZE,
   ProjectTreeContent,
+  RECENT_BUCKET_PAGE_SIZE,
 } from './ProjectTreeSections';
 import {
   buildProjectNodes,
   buildProjectPrioritySessionKeys,
+  bucketRecentSessions,
   classifyProject,
   reconcileProjectOrder,
   selectVisibleProjectSessions,
@@ -96,8 +98,19 @@ const PINNED_SESSION_KEYS_STORAGE_KEY = 'ccem-workspace-pinned-sessions';
 const PROJECT_ORDER_STORAGE_KEY = 'ccem-workspace-project-order';
 const PROJECT_CLASSIFICATION_STORAGE_KEY = 'ccem-workspace-project-classification';
 const DISMISSED_ACTIVE_TEMP_PROJECTS_STORAGE_KEY = 'ccem-workspace-dismissed-active-temp-projects';
+const SORT_MODE_STORAGE_KEY = 'ccem-workspace-project-tree-sort';
 const EMPTY_CANONICAL_KEY_MAP: Readonly<Record<string, string | undefined>> = {};
 const EMPTY_SESSION_KEY_SET: ReadonlySet<string> = new Set();
+
+export type ProjectTreeSortMode = 'project' | 'recent';
+
+function readSortMode(): ProjectTreeSortMode {
+  try {
+    return localStorage.getItem(SORT_MODE_STORAGE_KEY) === 'recent' ? 'recent' : 'project';
+  } catch {
+    return 'project';
+  }
+}
 
 function readPinnedSessionKeys(): string[] {
   try {
@@ -513,6 +526,7 @@ export const ProjectTree = memo(function ProjectTree({
   const [dismissedActiveTemporaryProjects, setDismissedActiveTemporaryProjects] = useState(
     readDismissedActiveTemporaryProjects
   );
+  const [sortMode, setSortMode] = useState<ProjectTreeSortMode>(readSortMode);
 
   const processingKeysRef = useRef<Set<string>>(new Set());
   const treeMotionRef = useRef<HTMLDivElement>(null);
@@ -585,6 +599,14 @@ export const ProjectTree = memo(function ProjectTree({
     );
   }, [dismissedActiveTemporaryProjects]);
 
+  useEffect(() => {
+    localStorage.setItem(SORT_MODE_STORAGE_KEY, sortMode);
+  }, [sortMode]);
+
+  const toggleSortMode = useCallback(() => {
+    setSortMode((previous) => (previous === 'project' ? 'recent' : 'project'));
+  }, []);
+
   // Track which sessions just finished processing
   useEffect(() => {
     setFreshDotKeys((prev) => {
@@ -633,6 +655,7 @@ export const ProjectTree = memo(function ProjectTree({
 
   const [expandedProjects, setExpandedProjects] = useState<Set<string> | null>(null);
   const [projectVisibleCount, setProjectVisibleCount] = useState<Record<string, number>>({});
+  const [recentBucketVisibleCount, setRecentBucketVisibleCount] = useState<Record<string, number>>({});
 
   const pinnedSessionKeySet = useMemo(
     () => new Set(pinnedSessionKeys.map(canonicalizeSessionKey)),
@@ -658,6 +681,17 @@ export const ProjectTree = memo(function ProjectTree({
     () => sessions.filter((session) => !pinnedSessionKeySet.has(canonicalizeSessionKey(toKey(session)))),
     [canonicalizeSessionKey, pinnedSessionKeySet, sessions]
   );
+
+  // Flat time-sorted list for the "recent" sort mode. Deduped by canonical
+  // session key (later entries win, mirroring sessionByKey resolution) while
+  // keeping first-seen position, which is the newest-timestamp order.
+  const recentSessions = useMemo(() => {
+    const byKey = new Map<string, HistorySessionItem>();
+    for (const session of [...unpinnedSessions].sort((left, right) => right.timestamp - left.timestamp)) {
+      byKey.set(canonicalizeSessionKey(toKey(session)), session);
+    }
+    return Array.from(byKey.values());
+  }, [canonicalizeSessionKey, unpinnedSessions]);
 
   const togglePinnedSession = useCallback((session: HistorySessionItem) => {
     const key = canonicalizeSessionKey(toKey(session));
@@ -976,6 +1010,52 @@ export const ProjectTree = memo(function ProjectTree({
     return keys;
   }, [activityPrioritySessionKeys, canonicalSelectedKey]);
 
+  const recentBuckets = useMemo(
+    () => bucketRecentSessions(recentSessions, activityPrioritySessionKeys, {
+      keyOf: (session) => canonicalizeSessionKey(toKey(session)),
+    }),
+    [activityPrioritySessionKeys, canonicalizeSessionKey, recentSessions]
+  );
+
+  // Per-bucket pagination keeps the flat view cheap to mount (and toggle into)
+  // even when a bucket holds a hundred-plus old sessions.
+  const visibleRecentBuckets = useMemo(
+    () => recentBuckets.map((bucket) => ({
+      ...bucket,
+      totalCount: bucket.sessions.length,
+      sessions: selectVisibleProjectSessions(
+        bucket.sessions,
+        recentBucketVisibleCount[bucket.id] ?? RECENT_BUCKET_PAGE_SIZE,
+        prioritySessionKeys,
+        canonicalKeyBySessionKey,
+      ),
+    })),
+    [
+      canonicalKeyBySessionKey,
+      prioritySessionKeys,
+      recentBucketVisibleCount,
+      recentBuckets,
+    ]
+  );
+
+  const loadMoreRecentBucket = useCallback((bucketId: string) => {
+    setRecentBucketVisibleCount((previous) => ({
+      ...previous,
+      [bucketId]: (previous[bucketId] ?? RECENT_BUCKET_PAGE_SIZE) + RECENT_BUCKET_PAGE_SIZE,
+    }));
+  }, []);
+
+  const collapseRecentBucket = useCallback((bucketId: string) => {
+    setRecentBucketVisibleCount((previous) => {
+      if (!previous[bucketId]) {
+        return previous;
+      }
+      const next = { ...previous };
+      delete next[bucketId];
+      return next;
+    });
+  }, []);
+
   const defaultExpandedProjects = useMemo(() => new Set([
     ...mainProjectNodes.slice(0, 3).map((node) => node.project),
     ...activeTemporaryProjectNodes.map((node) => node.project),
@@ -1080,10 +1160,17 @@ export const ProjectTree = memo(function ProjectTree({
 
     return [
       `loading:${isLoading}`,
+      `mode:${sortMode}`,
       `pinned:${pinnedSessions.map((session) => canonicalizeSessionKey(toKey(session))).join(',')}`,
-      ...mainProjectNodes.map((node) => serializeProjectNode('main', node)),
-      ...temporaryProjectNodes.map((node) => serializeProjectNode('temporary', node)),
-      ...activeTemporaryProjectNodes.map((node) => serializeProjectNode('activeTemporary', node)),
+      ...(sortMode === 'recent'
+        ? visibleRecentBuckets.map((bucket) => (
+            `recent:${bucket.id}:${bucket.sessions.map((session) => canonicalizeSessionKey(toKey(session))).join(',')}`
+          ))
+        : [
+            ...mainProjectNodes.map((node) => serializeProjectNode('main', node)),
+            ...temporaryProjectNodes.map((node) => serializeProjectNode('temporary', node)),
+            ...activeTemporaryProjectNodes.map((node) => serializeProjectNode('activeTemporary', node)),
+          ]),
     ].join('\n');
   }, [
     activeTemporaryProjectNodes,
@@ -1093,7 +1180,9 @@ export const ProjectTree = memo(function ProjectTree({
     isLoading,
     mainProjectNodes,
     pinnedSessions,
+    sortMode,
     temporaryProjectNodes,
+    visibleRecentBuckets,
   ]);
 
   useLayoutEffect(() => {
@@ -1234,7 +1323,11 @@ export const ProjectTree = memo(function ProjectTree({
 
   const renderSessionRow = useCallback((
     session: HistorySessionItem,
-    options: { pinnedSection?: boolean; activeTemporarySection?: boolean } = {},
+    options: {
+      pinnedSection?: boolean;
+      recentSection?: boolean;
+      activeTemporarySection?: boolean;
+    } = {},
   ) => {
     const rawKey = toKey(session);
     const key = canonicalizeSessionKey(rawKey);
@@ -1248,9 +1341,9 @@ export const ProjectTree = memo(function ProjectTree({
     // share one vocabulary across sections. The option remains in the type so
     // callers can mark intent without reintroducing a side-stripe / nested-card
     // treatment. Do NOT branch on it for chrome, padding, or selected state.
-    const rowChrome = options.pinnedSection ? 'mx-0' : 'mx-1';
-    const rowPadding = options.pinnedSection ? 'pl-2 pr-2' : 'pl-9 pr-2';
-    const editPadding = options.pinnedSection ? 'pl-2 pr-2' : 'pl-9 pr-3';
+    const rowChrome = options.pinnedSection || options.recentSection ? 'mx-0' : 'mx-1';
+    const rowPadding = options.pinnedSection || options.recentSection ? 'pl-2 pr-2' : 'pl-9 pr-2';
+    const editPadding = options.pinnedSection || options.recentSection ? 'pl-2 pr-2' : 'pl-9 pr-3';
 
     if (isEditing) {
       return (
@@ -1301,6 +1394,29 @@ export const ProjectTree = memo(function ProjectTree({
     }
 
     const sessionLink = buildCcemSessionLinkForHistorySession(session);
+    const iconContent = session.taskSticker ? (
+      <SessionAnnotationPopover
+        session={session}
+        t={t}
+        onSaveAnnotation={onSaveAnnotation}
+        variant="inline"
+      />
+    ) : (
+      <>
+        <SessionTreeItemIcon
+          session={session}
+          environment={resolveEnvironment(session)}
+          decoration={decoration}
+          isSelected={isSelected}
+        />
+        <SessionAnnotationPopover
+          session={session}
+          t={t}
+          onSaveAnnotation={onSaveAnnotation}
+          variant="badge"
+        />
+      </>
+    );
     const row = (
       <div
         key={key}
@@ -1351,37 +1467,44 @@ export const ProjectTree = memo(function ProjectTree({
           <div className="pointer-events-none absolute inset-x-1 bottom-0 z-20 h-0.5 rounded-full bg-primary shadow-[0_0_4px_hsl(var(--primary)/0.5)]" />
         )}
         <div className="flex min-w-0 items-center gap-1.5">
-          <span
-            className="relative inline-flex h-5 w-5 shrink-0 items-center justify-center"
-            title={getIconTitle(session)}
-          >
-            {session.taskSticker ? (
-              <SessionAnnotationPopover
-                session={session}
-                t={t}
-                onSaveAnnotation={onSaveAnnotation}
-                variant="inline"
-              />
-            ) : (
-              <>
-                <SessionTreeItemIcon
-                  session={session}
-                  environment={resolveEnvironment(session)}
-                  decoration={decoration}
-                  isSelected={isSelected}
-                />
-                <SessionAnnotationPopover
-                  session={session}
-                  t={t}
-                  onSaveAnnotation={onSaveAnnotation}
-                  variant="badge"
-                />
-              </>
-            )}
-          </span>
-          <span className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
-            {getHistorySessionDisplay(session, t('history.untitledSession'))}
-          </span>
+          {options.recentSection ? (
+            // Recent rows lead with the title alone; the (shrunken) client icon
+            // sits on the second line next to the project name.
+            <span
+              className="flex min-w-0 flex-1 flex-col"
+              title={`${getHistorySessionDisplay(session, t('history.untitledSession'))}\n${session.project}`}
+            >
+              <span className="min-w-0 truncate text-sm font-medium leading-tight">
+                {getHistorySessionDisplay(session, t('history.untitledSession'))}
+              </span>
+              <span className="mt-0.5 flex min-w-0 items-center gap-1">
+                <span
+                  className={cn(
+                    'relative inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center',
+                    '[&_span]:h-3.5 [&_span]:w-3.5 [&_svg]:h-3 [&_svg]:w-3'
+                  )}
+                  title={getIconTitle(session)}
+                >
+                  {iconContent}
+                </span>
+                <span className="min-w-0 truncate text-[10px] leading-none text-muted-foreground/70">
+                  {session.projectName}
+                </span>
+              </span>
+            </span>
+          ) : (
+            <>
+              <span
+                className="relative inline-flex h-5 w-5 shrink-0 items-center justify-center"
+                title={getIconTitle(session)}
+              >
+                {iconContent}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
+                {getHistorySessionDisplay(session, t('history.untitledSession'))}
+              </span>
+            </>
+          )}
           <span className="inline-flex w-10 shrink-0 items-center justify-end gap-1.5 whitespace-nowrap text-[10px] tabular-nums transition-opacity duration-150 group-hover/session:opacity-0">
             {approvalRequired ? (
               <Tooltip>
@@ -1501,16 +1624,16 @@ export const ProjectTree = memo(function ProjectTree({
         className="absolute inset-y-0 right-0 z-20 w-1.5 cursor-col-resize touch-none"
         onPointerDown={onResizeStart}
       />
-      {/* Header: New session + pinned conversations */}
+      {/* Header: unified toolbar (new session / sort / refresh) + pinned conversations */}
       <div className="shrink-0 p-2 flex flex-col gap-2">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-0.5 rounded-xl bg-surface-raised/75 p-1">
           <button
             type="button"
             onClick={onNewSession}
             className={cn(
-              'group flex flex-1 items-center justify-center gap-1.5 h-8 rounded-md',
-              'bg-primary/10 text-primary hover:bg-primary/15',
-              'text-xs font-medium',
+              'group flex h-7 flex-1 items-center justify-start gap-1.5 rounded-lg px-2.5',
+              'text-xs font-medium text-primary',
+              'hover:bg-primary/10',
               'active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
               'transition-all',
               'disabled:pointer-events-none disabled:opacity-50'
@@ -1519,23 +1642,56 @@ export const ProjectTree = memo(function ProjectTree({
             <Plus className="h-3.5 w-3.5 transition-transform duration-200 group-hover:scale-110" />
             {t('workspace.newSession')}
           </button>
-          <button
-            type="button"
-            onClick={onRefresh}
-            disabled={isRefreshing}
-            aria-label={isRefreshing ? t('workspace.refreshing') : t('workspace.refresh')}
-            title={isRefreshing ? t('workspace.refreshing') : t('workspace.refresh')}
-            className={cn(
-              'h-8 w-8 shrink-0 rounded-md',
-              'bg-surface-raised/75 hover:bg-surface-raised',
-              'flex items-center justify-center text-muted-foreground hover:text-foreground',
-              'active:scale-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
-              'disabled:cursor-default disabled:opacity-60',
-              'transition-all'
-            )}
-          >
-            <RefreshCw className={cn('w-3.5 h-3.5', isRefreshing && 'animate-spin')} />
-          </button>
+          <div className="mx-0.5 h-4 w-px shrink-0 bg-foreground/10" aria-hidden="true" />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={toggleSortMode}
+                aria-label={sortMode === 'project' ? t('workspace.sortByTime') : t('workspace.sortByProject')}
+                aria-pressed={sortMode === 'recent'}
+                className={cn(
+                  'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg',
+                  'active:scale-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
+                  'transition-all',
+                  sortMode === 'recent'
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
+                )}
+              >
+                {sortMode === 'project' ? (
+                  <Clock className="w-3.5 h-3.5" />
+                ) : (
+                  <FolderTree className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={6} className="whitespace-nowrap">
+              {sortMode === 'project' ? t('workspace.sortByTime') : t('workspace.sortByProject')}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={isRefreshing}
+                aria-label={isRefreshing ? t('workspace.refreshing') : t('workspace.refresh')}
+                className={cn(
+                  'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg',
+                  'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                  'active:scale-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
+                  'disabled:cursor-default disabled:opacity-60',
+                  'transition-all'
+                )}
+              >
+                <RefreshCw className={cn('w-3.5 h-3.5', isRefreshing && 'animate-spin')} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={6} className="whitespace-nowrap">
+              {isRefreshing ? t('workspace.refreshing') : t('workspace.refresh')}
+            </TooltipContent>
+          </Tooltip>
         </div>
 
         <PinnedSessionsSection
@@ -1558,6 +1714,10 @@ export const ProjectTree = memo(function ProjectTree({
         onDismissActiveTemporaryProject={dismissActiveTemporaryProject}
         pinnedSessionsCount={pinnedSessions.length}
         projectActions={projectActions}
+        recentBuckets={sortMode === 'recent' ? visibleRecentBuckets : undefined}
+        recentTotalCount={sortMode === 'recent' ? recentSessions.length : undefined}
+        onLoadMoreRecentBucket={loadMoreRecentBucket}
+        onCollapseRecentBucket={collapseRecentBucket}
         renderSessionRow={renderSessionRow}
         temporaryProjectNodes={temporaryProjectNodes}
         toggleProject={toggleProject}

@@ -305,14 +305,14 @@ const MISSING_RUNTIME_ID = 'native-1784217587618';
 const MISSING_PROVIDER_ID = '784591d3-62d2-4702-908e-677a934c7f61';
 const MISSING_PROVIDER_KEY = `claude:${MISSING_PROVIDER_ID}`;
 
-function historySession({ id, timestamp, display = id }) {
+function historySession({ id, timestamp, display = id, project = PROJECT, projectName = 'claude-code-env-manager' }) {
   return {
     id,
     source: 'claude',
     display,
     timestamp,
-    project: PROJECT,
-    projectName: 'claude-code-env-manager',
+    project,
+    projectName,
     envName: 'DeepSeek',
     configSource: 'ccem',
   };
@@ -452,6 +452,180 @@ test('ProjectTree keeps three ready active rows visible through runtime-to-provi
   // The migrated provider row is already visible in the JSDOM viewport, so
   // the scroll-into-view guard intentionally skips scrolling.
   assert.equal(scrollCalls.some((call) => call.key === MISSING_PROVIDER_KEY), false);
+});
+
+test('ProjectTree toggles between project groups and a time-sorted flat session list', async (t) => {
+  const { dom } = installDom();
+  const { harness, tempDir } = await importProjectTreeHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+
+  let mounted;
+  t.after(async () => {
+    await mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const OTHER_PROJECT = '/Users/wzt/G/Github/other-project';
+  // Interleaved timestamps across the two projects so only a global time sort
+  // (not per-project grouping) produces the expected flat order. All four fall
+  // into the same "older" bucket (BASE_TIMESTAMP is weeks in the past), so the
+  // flat row order below also proves bucket-internal ordering.
+  const sessions = [
+    historySession({ id: 'alpha-newest', timestamp: BASE_TIMESTAMP - 1_000 }),
+    historySession({ id: 'beta-middle', timestamp: BASE_TIMESTAMP - 2_000, project: OTHER_PROJECT, projectName: 'other-project' }),
+    historySession({ id: 'alpha-older', timestamp: BASE_TIMESTAMP - 3_000 }),
+    historySession({ id: 'beta-oldest', timestamp: BASE_TIMESTAMP - 4_000, project: OTHER_PROJECT, projectName: 'other-project' }),
+  ];
+
+  mounted = await harness.mountProjectTree(container, {
+    historySessions: sessions,
+    liveEntries: [],
+    onSelect: () => {},
+  });
+
+  const sortButton = () => container.querySelector('button[aria-label="按时间排序"], button[aria-label="按项目分组"]');
+
+  // Project mode by default: two grouped project headers are rendered.
+  const projectHeaderKeys = () => Array.from(container.querySelectorAll('[data-project-motion-key]'))
+    .map((element) => element.dataset.projectMotionKey)
+    .filter((key) => key.startsWith('project:'));
+  assert.ok(projectHeaderKeys().some((key) => key === `project:main:${PROJECT}`));
+  assert.ok(projectHeaderKeys().some((key) => key === `project:main:${OTHER_PROJECT}`));
+  assert.equal(sortButton().getAttribute('aria-pressed'), 'false');
+
+  // Switch to the time-sorted mode.
+  await mounted.click(sortButton());
+
+  assert.equal(sortButton().getAttribute('aria-label'), '按项目分组');
+  assert.equal(sortButton().getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(projectHeaderKeys(), [], 'expected no project headers in time-sorted mode');
+  assert.equal(localStorage.getItem('ccem-workspace-project-tree-sort'), 'recent');
+
+  const recentRowKeys = () => Array.from(container.querySelectorAll('[data-workspace-session-key]'))
+    .map((element) => element.dataset.workspaceSessionKey);
+  assert.deepEqual(recentRowKeys(), [
+    'claude:alpha-newest',
+    'claude:beta-middle',
+    'claude:alpha-older',
+    'claude:beta-oldest',
+  ]);
+
+  // All four fixture sessions are weeks old, so they share one "older" bucket.
+  assert.deepEqual(
+    Array.from(container.querySelectorAll('[data-recent-bucket]')).map((element) => element.dataset.recentBucket),
+    ['older'],
+  );
+
+  // Recent rows carry the project name so the flat list keeps project context.
+  const middleRow = container.querySelector('[data-workspace-session-key="claude:beta-middle"]');
+  assert.ok(middleRow);
+  assert.match(middleRow.textContent, /other-project/);
+
+  // Switch back to project grouping.
+  await mounted.click(sortButton());
+
+  assert.equal(sortButton().getAttribute('aria-pressed'), 'false');
+  assert.equal(localStorage.getItem('ccem-workspace-project-tree-sort'), 'project');
+  assert.ok(projectHeaderKeys().some((key) => key === `project:main:${PROJECT}`));
+  assert.ok(projectHeaderKeys().some((key) => key === `project:main:${OTHER_PROJECT}`));
+  assert.deepEqual(recentRowKeys().slice().sort(), [
+    'claude:alpha-newest',
+    'claude:alpha-older',
+    'claude:beta-middle',
+    'claude:beta-oldest',
+  ]);
+});
+
+test('ProjectTree recent mode buckets sessions into running-first calendar groups', async (t) => {
+  const { dom } = installDom();
+  const { harness, tempDir } = await importProjectTreeHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+
+  let mounted;
+  t.after(async () => {
+    await mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  // Anchor timestamps to the local midnight boundaries so the test cannot flake
+  // when it runs across a day change.
+  const now = Date.now();
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const today = startOfToday.getTime();
+  const DAY = 86_400_000;
+
+  const sessions = [
+    historySession({ id: 'today-active', timestamp: now - 10 * 60_000 }),
+    historySession({ id: 'today-idle', timestamp: today + 60_000 }),
+    historySession({ id: 'yesterday-one', timestamp: today - 60_000 }),
+    historySession({ id: 'week-one', timestamp: today - 3 * DAY }),
+    historySession({ id: 'older-one', timestamp: today - 9 * DAY }),
+    // 17 fillers so the "older" bucket (18 total) overflows the 15-per-page window.
+    ...Array.from({ length: 17 }, (_, index) => historySession({
+      id: `older-filler-${index}`,
+      timestamp: today - 10 * DAY - index * 60_000,
+    })),
+  ];
+  const liveEntries = [
+    liveEntry({
+      runtimeId: 'native-today-active',
+      providerSessionId: 'today-active',
+      updatedAt: new Date(now).toISOString(),
+      title: 'today active',
+    }),
+  ];
+
+  mounted = await harness.mountProjectTree(container, {
+    historySessions: sessions,
+    liveEntries,
+    onSelect: () => {},
+  });
+
+  await mounted.click(container.querySelector('button[aria-label="按时间排序"]'));
+
+  const bucketIds = () => Array.from(container.querySelectorAll('[data-recent-bucket]'))
+    .map((element) => element.dataset.recentBucket);
+  assert.deepEqual(bucketIds(), ['running', 'today', 'yesterday', 'week', 'older']);
+
+  const rowsInBucket = (bucketId) => Array.from(
+    container.querySelectorAll(`[data-recent-bucket="${bucketId}"] [data-workspace-session-key]`)
+  ).map((element) => element.dataset.workspaceSessionKey);
+
+  assert.deepEqual(rowsInBucket('running'), ['claude:today-active']);
+  // The running session is pulled out of its calendar bucket — never duplicated.
+  assert.deepEqual(rowsInBucket('today'), ['claude:today-idle']);
+  assert.equal(
+    container.querySelectorAll('[data-workspace-session-key="claude:today-active"]').length,
+    1,
+  );
+  assert.deepEqual(rowsInBucket('yesterday'), ['claude:yesterday-one']);
+  assert.deepEqual(rowsInBucket('week'), ['claude:week-one']);
+
+  // Per-bucket pagination: the 18-session "older" bucket renders its first
+  // page (15) plus a load-more control; clicking it reveals the rest.
+  const olderRows = rowsInBucket('older');
+  assert.equal(olderRows.length, 15);
+  assert.equal(olderRows[0], 'claude:older-one');
+  const olderBucket = container.querySelector('[data-recent-bucket="older"]');
+  assert.ok(olderBucket);
+  assert.match(olderBucket.textContent, /15\/18/);
+  const loadMoreButton = Array.from(olderBucket.querySelectorAll('button'))
+    .find((button) => button.textContent === '加载更多');
+  assert.ok(loadMoreButton);
+  await mounted.click(loadMoreButton);
+  assert.equal(rowsInBucket('older').length, 18);
+
+  // Bucket headers use the light section style, not project-folder headers.
+  const runningHeader = container.querySelector('[data-recent-bucket="running"]');
+  assert.ok(runningHeader);
+  assert.match(runningHeader.textContent, /运行中/);
 });
 
 test('ProjectTree scrolls a selected row into view only when it is outside the viewport', async (t) => {
