@@ -16,6 +16,10 @@ function barColor(percentage: number): string {
   return 'bg-primary/80';
 }
 
+function clampPercent(value: number) {
+  return Math.max(0, Math.min(100, value));
+}
+
 function UsageRow({
   label,
   value,
@@ -27,20 +31,21 @@ function UsageRow({
 }) {
   return (
     <div className="flex items-baseline justify-between gap-2">
-      <span className="text-[12px] text-muted-foreground">{label}</span>
-      <span className="text-[12px] font-medium text-foreground tabular-nums">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-xs font-medium font-mono tabular-nums text-foreground">
         {value}
         {hint && (
-          <span className="ml-1 font-normal text-muted-foreground/70">{hint}</span>
+          <span className="ml-1 font-sans font-normal text-muted-foreground/70">{hint}</span>
         )}
       </span>
     </div>
   );
 }
 
+/** App-wide section label idiom (ComposerControls / MetricCard): 2xs tracked caps on /70 muted. */
 function SectionTitle({ children }: { children: string }) {
   return (
-    <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80">
+    <div className="text-2xs font-medium uppercase tracking-wider text-muted-foreground/70">
       {children}
     </div>
   );
@@ -118,9 +123,11 @@ export function SessionUsagePopoverContent({
       ] as const).filter((entry) => entry.window?.utilization != null)
     : [];
 
+  const contextPercent = hasContext ? clampPercent(usage.context!.percentage) : 0;
+
   return (
-    <div className="w-[268px] space-y-3">
-      <div className="flex items-center justify-between gap-2">
+    <div className="divide-y divide-border/35">
+      <div className="flex items-center justify-between gap-2 px-4 pb-2.5 pt-3">
         <span className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
           {t('workspace.usagePanelTitle')}
         </span>
@@ -141,34 +148,34 @@ export function SessionUsagePopoverContent({
       </div>
 
       {isEmpty && (
-        <div className="text-[12px] leading-5 text-muted-foreground">
+        <div className="px-4 py-3 text-xs leading-5 text-muted-foreground">
           {t('workspace.usagePanelEmpty')}
         </div>
       )}
 
       {hasContext && (
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 px-4 py-2.5">
           <SectionTitle>{t('workspace.contextUsed')}</SectionTitle>
           <div className="flex items-baseline justify-between gap-2">
-            <span className="text-[12px] text-muted-foreground">
+            <span className="text-xs text-muted-foreground">
               {t('workspace.contextUsageLine')
                 .replace('{used}', formatTokenCount(usage.context!.usedTokens).toLowerCase())
                 .replace('{total}', formatTokenCount(usage.context!.maxTokens).toLowerCase())}
             </span>
-            <span className="text-[12px] font-semibold text-foreground tabular-nums">
-              {Math.round(Math.max(0, Math.min(100, usage.context!.percentage)))}%
+            <span className="text-xs font-semibold font-mono tabular-nums text-foreground">
+              {Math.round(contextPercent)}%
             </span>
           </div>
           <div className="h-1 overflow-hidden rounded-full bg-muted/60">
             <div
               className={cn(
                 'h-full rounded-full transition-all duration-500',
-                barColor(usage.context!.percentage),
+                barColor(contextPercent),
               )}
-              style={{ width: `${Math.max(0, Math.min(100, usage.context!.percentage))}%` }}
+              style={{ width: `${contextPercent}%` }}
             />
           </div>
-          <div className="text-[11px] text-muted-foreground/80">
+          <div className="text-2xs text-muted-foreground/70">
             {usage.context!.isAutoCompactEnabled
               ? t('workspace.contextAutoCompactEnabled')
               : t('workspace.contextAutoCompactDisabled')}
@@ -177,7 +184,7 @@ export function SessionUsagePopoverContent({
       )}
 
       {hasTotals && (
-        <div className="space-y-1">
+        <div className="space-y-1 px-4 py-2.5">
           <SectionTitle>{t('workspace.usagePanelTotals')}</SectionTitle>
           <UsageRow
             label={t('workspace.contextInputTokens')}
@@ -208,7 +215,7 @@ export function SessionUsagePopoverContent({
       )}
 
       {hasModelUsage && (
-        <div className="space-y-1">
+        <div className="space-y-1 px-4 py-2.5">
           <SectionTitle>{t('workspace.usagePanelModels')}</SectionTitle>
           {modelRows.map((entry, index) => (
             <UsageRow
@@ -221,15 +228,15 @@ export function SessionUsagePopoverContent({
       )}
 
       {hasRateLimits && (
-        <div className="space-y-1.5">
+        <div className="space-y-2 px-4 py-2.5">
           <SectionTitle>{t('workspace.usagePanelRateLimit')}</SectionTitle>
           {rateLimitRows.map((entry) => {
-            const utilization = Math.max(0, Math.min(100, entry.window!.utilization!));
+            const utilization = clampPercent(entry.window!.utilization!);
             return (
               <div key={entry.key} className="space-y-1">
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-[12px] text-muted-foreground">{entry.label}</span>
-                  <span className="text-[12px] font-medium text-foreground tabular-nums">
+                  <span className="text-xs text-muted-foreground">{entry.label}</span>
+                  <span className="text-xs font-medium font-mono tabular-nums text-foreground">
                     {Math.round(utilization)}%
                   </span>
                 </div>

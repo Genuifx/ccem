@@ -77,7 +77,7 @@ export function ContextWindowIndicator({
         side="top"
         align="end"
         sideOffset={10}
-        className="w-auto p-3"
+        className="w-[300px] overflow-hidden rounded-2xl border-border/45 bg-popover p-0 shadow-lg"
       >
         <SessionUsagePopoverContent
           usage={usage}
