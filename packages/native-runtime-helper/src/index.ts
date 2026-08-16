@@ -2898,6 +2898,10 @@ rl.on('line', (line) => {
 
 rl.on('close', () => {
   if (!stopped) {
+    stopped = true;
     emitStatus('stopped', 'Native runtime helper stdin closed.');
   }
+  // The host has closed our stdin (app exit or session close).
+  // Give the status write a moment, then exit regardless of remaining handles.
+  setTimeout(() => process.exit(0), 250);
 });
