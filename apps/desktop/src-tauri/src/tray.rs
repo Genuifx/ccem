@@ -369,13 +369,6 @@ pub fn hide_tray_cockpit(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-pub fn prepare_tray_cockpit(app: &AppHandle) -> Result<(), String> {
-    if app.get_webview_window(TRAY_COCKPIT_LABEL).is_none() {
-        let _ = build_tray_cockpit_window(app)?;
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn get_tray_runtime_snapshot(
     manager: tauri::State<'_, Arc<SessionManager>>,

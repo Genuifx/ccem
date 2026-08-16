@@ -5209,9 +5209,6 @@ fn main() {
             }
 
             let _ = create_tray(app.handle())?;
-            if let Err(error) = tray::prepare_tray_cockpit(app.handle()) {
-                eprintln!("Tray cockpit prewarm warning: {}", error);
-            }
 
             // Start session monitor background task
             start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
