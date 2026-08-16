@@ -449,9 +449,14 @@ test('visual layout contract: route popover owns its width and environment rules
     path.join(desktopDir, 'src', 'components', 'EnvironmentsRouterRules.tsx'),
     'utf8',
   );
-  assert.match(environmentsSource, /mx-auto w-full max-w-\[1240px\]/);
-  assert.match(environmentsSource, /grid items-start gap-5 xl:grid-cols-\[minmax\(0,2fr\)_minmax\(320px,1fr\)\]/);
-  assert.match(environmentsSource, /grid-cols-\[minmax\(0,1fr\)_minmax\(160px,240px\)\]/);
+  // Panel content fills the section width like sibling Environments sections
+  // (permission modes, env list) — no artificial max-width flanks.
+  assert.match(environmentsSource, /className="w-full"/);
+  assert.match(environmentsSource, /grid items-start gap-x-6 gap-y-5 xl:grid-cols-\[minmax\(0,2fr\)_minmax\(320px,1fr\)\]/);
+  // Settings-table binding rows: fixed-width control column keeps selects aligned.
+  assert.match(environmentsSource, /w-\[170px\] shrink-0 rounded-lg/);
+  assert.match(environmentsSource, /divide-y divide-border-subtle\/50/);
+  assert.match(environmentsSource, /grid grid-cols-1 2xl:grid-cols-2/);
 });
 
 test('interaction contract: running-session route card is a compact immediate profile picker', async () => {
@@ -506,10 +511,13 @@ test('interaction contract: environment route defaults use progressive disclosur
   assert.match(source, /key: 'subagent:\*'.*router\.subagentAny/s);
 
   assert.match(source, /useState\(false\).*showDefaultAdvanced|showDefaultAdvanced.*useState\(false\)/s);
-  assert.match(source, /aria-expanded=\{showDefaultAdvanced\}/);
-  assert.match(source, /aria-expanded=\{showDefaultAgentBindings\}/);
-  assert.match(source, /aria-expanded=\{showProfileAdvanced\}/);
-  assert.match(source, /aria-expanded=\{showProfileAgentBindings\}/);
+  // Shared Disclosure toggle renders the a11y attributes; each disclosure is
+  // wired to its state var via the `open` prop.
+  assert.match(source, /aria-expanded=\{open\}/);
+  assert.match(source, /open=\{showDefaultAdvanced\}/);
+  assert.match(source, /open=\{showDefaultAgentBindings\}/);
+  assert.match(source, /open=\{showProfileAdvanced\}/);
+  assert.match(source, /open=\{showProfileAgentBindings\}/);
 
   const defaultAdvancedStart = source.indexOf('{showDefaultAdvanced ? (');
   assert.notEqual(defaultAdvancedStart, -1, 'default advanced settings must be collapsed');

@@ -1,5 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CCEM Desktop Dev",
-  "identifier": "com.ccem.desktop.dev"
+  "identifier": "com.ccem.desktop.dev",
+  "app": {
+    "withGlobalTauri": true
+  }
 }

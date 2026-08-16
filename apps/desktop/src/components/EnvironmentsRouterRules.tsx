@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Route, Plus, Trash2, Check, ChevronDown, Sparkles } from '@/lib/lucide-react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Route, Router, Layers3, Plus, Trash2, Check, ChevronDown, Sparkles } from '@/lib/lucide-react';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
@@ -123,8 +123,202 @@ function ProfileNameInput({
           setDraft(value);
         }
       }}
-      className="h-8 flex-1 rounded-md border-border/40 text-[12px]"
+      className="h-7 flex-1 rounded-lg border-border/40 bg-background/50 px-2 text-[12px]"
     />
+  );
+}
+
+/**
+ * Compact env toggle chip — same visual language as the enabled-envs chips on
+ * the Environments page: bordered pill, primary tint when active.
+ */
+function EnvChip({
+  checked,
+  forced,
+  title,
+  onClick,
+  children,
+}: {
+  checked: boolean;
+  forced?: boolean;
+  title?: string;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={forced}
+      aria-pressed={checked}
+      title={title}
+      onClick={onClick}
+      className={cn(
+        'inline-flex h-6 items-center gap-1 rounded-full border px-2 text-[11px] transition-colors',
+        checked
+          ? 'border-primary/35 bg-primary/10 text-primary'
+          : 'border-border-subtle bg-background/60 text-muted-foreground hover:border-border hover:text-foreground',
+        forced ? 'cursor-default opacity-80' : 'cursor-pointer',
+      )}
+    >
+      {checked ? <Check className="h-3 w-3 shrink-0" /> : null}
+      <span className="truncate">{children}</span>
+    </button>
+  );
+}
+
+/**
+ * Full-width disclosure toggle (更多 Agent 分工 / 高级设置) — one consistent
+ * pattern instead of two ad-hoc text links.
+ */
+function Disclosure({
+  open,
+  label,
+  summary,
+  onClick,
+  ariaControls,
+  className,
+}: {
+  open: boolean;
+  label: string;
+  summary?: string;
+  onClick: () => void;
+  ariaControls?: string;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-expanded={open}
+      aria-controls={ariaControls}
+      onClick={onClick}
+      className={cn(
+        'flex h-7 w-full items-center gap-1 rounded-md px-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground',
+        className,
+      )}
+    >
+      <ChevronDown className={cn('h-3 w-3 shrink-0 transition-transform duration-150', open && 'rotate-180')} />
+      <span className="min-w-0 truncate">{label}</span>
+      {summary ? (
+        <span className="ml-auto shrink-0 text-[10px] font-normal text-muted-foreground/70">{summary}</span>
+      ) : null}
+    </button>
+  );
+}
+
+/**
+ * One shared binding row (label + env select) used by both the default bindings
+ * and profile bindings lists. Rendered as a settings-table row: leading status
+ * dot (primary when the row overrides the default), hover highlight, and a
+ * fixed-width control column so every select lines up.
+ */
+function BindingRow({
+  label,
+  rowKey,
+  value,
+  envNames,
+  onChange,
+}: {
+  label: string;
+  rowKey: string;
+  value: string;
+  envNames: string[];
+  onChange: (v: string) => void;
+}) {
+  const { t } = useLocale();
+  const customized = value !== BINDING_FOLLOW_DEFAULT;
+  return (
+    <div className="flex min-w-0 items-center gap-2.5 px-3 py-1.5 transition-colors hover:bg-surface-raised/30">
+      <span
+        className={cn('h-1.5 w-1.5 shrink-0 rounded-full', customized ? 'bg-primary' : 'bg-border')}
+        title={customized ? value : undefined}
+      />
+      <span className={cn('min-w-0 flex-1 truncate text-[12px]', customized ? 'text-foreground' : 'text-foreground/75')} title={rowKey}>
+        {label}
+      </span>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger
+          className={cn(
+            'h-7 w-[170px] shrink-0 rounded-lg border-border/40 bg-background px-2 text-[11px]',
+            customized && 'border-primary/30 text-primary',
+          )}
+          aria-label={`${label} · ${t('router.selectEnv')}`}
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={BINDING_FOLLOW_DEFAULT}>{t('router.bindingDefault')}</SelectItem>
+          {envNames.map((name) => (
+            <SelectItem key={name} value={name}>{name}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+/** Small caps-style group label used above binding lists. */
+function GroupLabel({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn('text-[10px] font-medium uppercase tracking-[0.04em] text-muted-foreground/80', className)}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Bordered settings-table for binding rows. On wide screens (2xl) the rows
+ * split into two balanced columns so label→control gaps stay modest instead
+ * of stretching across an ultra-wide panel.
+ */
+function BindingTable({
+  title,
+  rows,
+  envNames,
+  valueFor,
+  onChange,
+  id,
+}: {
+  title: string;
+  rows: { key: string; label: string }[];
+  envNames: string[];
+  valueFor: (key: string) => string;
+  onChange: (key: string, value: string) => void;
+  id?: string;
+}) {
+  const mid = Math.ceil(rows.length / 2);
+  const cols = [rows.slice(0, mid), rows.slice(mid)];
+  return (
+    <div id={id} className="overflow-hidden rounded-lg border border-border-subtle/80 bg-background/50">
+      <div className="border-b border-border-subtle/70 bg-surface-raised/40 px-3 py-1.5">
+        <GroupLabel>{title}</GroupLabel>
+      </div>
+      <div className="grid grid-cols-1 2xl:grid-cols-2">
+        {cols.map((col, i) =>
+          col.length ? (
+            <div
+              key={i}
+              className={cn(
+                'divide-y divide-border-subtle/50',
+                i === 1 && 'border-t border-border-subtle/50 2xl:border-l 2xl:border-t-0',
+              )}
+            >
+              {col.map((row) => (
+                <BindingRow
+                  key={row.key}
+                  label={row.label}
+                  rowKey={row.key}
+                  value={valueFor(row.key)}
+                  envNames={envNames}
+                  onChange={(v) => onChange(row.key, v)}
+                />
+              ))}
+            </div>
+          ) : (
+            <div key={i} className="hidden 2xl:block" />
+          ),
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -313,94 +507,67 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
 
   return (
     <section className="mt-8 mb-8 rounded-2xl border border-border-subtle bg-surface-raised/50 p-6">
-      <div className="mx-auto w-full max-w-[1240px]">
-        <div className="mb-5 flex items-center gap-2">
-          <Route className="h-4 w-4 text-primary/80" />
+      <div className="w-full">
+        <div className="mb-5 flex items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10">
+            <Route className="h-[18px] w-[18px] text-primary" />
+          </div>
           <div className="min-w-0 flex-1">
-            <h2 className="text-[17px] font-semibold text-foreground tracking-[-0.37px] mb-1">
+            <h2 className="text-[17px] font-semibold text-foreground tracking-[-0.37px]">
               {t('environments.routerRules')}
             </h2>
-            <p className="text-sm text-muted-foreground leading-relaxed">{t('environments.routerRulesHint')}</p>
+            <p className="mt-0.5 text-[12px] text-muted-foreground leading-relaxed">{t('environments.routerRulesHint')}</p>
           </div>
         </div>
 
-        <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
-          <div className="min-w-0 rounded-xl border border-border-subtle bg-background/35 p-4">
-            <div className="mb-4">
-              <div className="mb-1 text-sm font-medium text-foreground">{t('router.routeMyDefault')}</div>
-              <p className="text-[12px] leading-5 text-muted-foreground">
-                {t('settings.routerDefaultBindingsDesc')}
-              </p>
-            </div>
-
-            <div id="router-default-agent-bindings" className="space-y-1">
-              <div className="mb-2 text-[11px] font-medium text-muted-foreground">
-                {t('settings.routerDefaultBindings')}
+        <div className="grid items-start gap-x-6 gap-y-5 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
+          <div className="min-w-0">
+            <div className="mb-3 flex items-start gap-2.5">
+              <div className="mt-px flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-border-subtle bg-surface-raised/60">
+                <Router className="h-3.5 w-3.5 text-muted-foreground" />
               </div>
-              {defaultRows.map((row) => {
-                const value = (config.bindings as BindingMap)[row.key] ?? BINDING_FOLLOW_DEFAULT;
-                return (
-                  <div
-                    key={row.key}
-                    className="grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(160px,240px)] items-center gap-3"
-                  >
-                    <span className="min-w-0 truncate text-[12px] text-foreground/85" title={row.key}>
-                      {row.label}
-                    </span>
-                    <Select value={value} onValueChange={(next) => setDefaultBinding(row.key, next)}>
-                      <SelectTrigger
-                        className="h-8 w-full rounded-md border-border/40 px-2 text-[12px]"
-                        aria-label={`${row.label} · ${t('router.selectEnv')}`}
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={BINDING_FOLLOW_DEFAULT}>{t('router.bindingDefault')}</SelectItem>
-                        {envNames.map((name) => (
-                          <SelectItem key={name} value={name}>{name}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                );
-              })}
+              <div className="min-w-0">
+                <div className="text-[13px] font-medium text-foreground">{t('router.routeMyDefault')}</div>
+                <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
+                  {t('settings.routerDefaultBindingsDesc')}
+                </p>
+              </div>
             </div>
 
-            <button
-              type="button"
-              aria-expanded={showDefaultAgentBindings}
-              aria-controls="router-default-agent-bindings"
+            <BindingTable
+              id="router-default-agent-bindings"
+              title={t('settings.routerDefaultBindings')}
+              rows={defaultRows}
+              envNames={envNames}
+              valueFor={(key) => (config.bindings as BindingMap)[key] ?? BINDING_FOLLOW_DEFAULT}
+              onChange={(key, next) => setDefaultBinding(key, next)}
+            />
+
+            <Disclosure
+              open={showDefaultAgentBindings}
+              label={t('environments.routerMoreAgents')}
               onClick={() => setShowDefaultAgentBindings((visible) => !visible)}
-              className="mt-2 flex w-full items-center gap-1 rounded-lg px-1 py-1.5 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
-            >
-              <ChevronDown className={cn('h-3 w-3 transition-transform', showDefaultAgentBindings && 'rotate-180')} />
-              {t('environments.routerMoreAgents')}
-            </button>
+              className="mt-1"
+            />
 
-            <div className="my-3 border-t border-border-subtle" />
+            <div className="my-2.5 border-t border-border-subtle/70" />
 
-            <button
-              type="button"
-              aria-expanded={showDefaultAdvanced}
-              aria-controls="router-default-advanced"
+            <Disclosure
+              open={showDefaultAdvanced}
+              label={t('environments.routerAdvanced')}
+              summary={t('environments.routerAdvancedSummary', { count: config.defaultAllowedEnvs.length })}
+              ariaControls="router-default-advanced"
               onClick={() => setShowDefaultAdvanced((visible) => !visible)}
-              className="flex w-full items-center gap-2 rounded-lg px-1 py-1.5 text-left transition-colors hover:text-foreground"
-            >
-              <ChevronDown className={cn('h-3 w-3 text-muted-foreground transition-transform', showDefaultAdvanced && 'rotate-180')} />
-              <span className="text-[12px] font-medium text-foreground">{t('environments.routerAdvanced')}</span>
-              <span className="ml-auto text-[10px] text-muted-foreground">
-                {t('environments.routerAdvancedSummary', { count: config.defaultAllowedEnvs.length })}
-              </span>
-            </button>
+            />
 
             {showDefaultAdvanced ? (
-              <div id="router-default-advanced" className="mt-2 space-y-3 rounded-lg bg-muted/20 p-3">
+              <div id="router-default-advanced" className="mt-1.5 space-y-3 rounded-lg bg-surface-sunken/40 p-3">
                 <div className="flex items-center gap-3">
                   <div className="min-w-0 flex-1">
                     <div className="text-[12px] font-medium text-foreground">
                       {t('settings.routerDynamicRouting')}
                     </div>
-                    <div className="text-[11px] leading-4 text-muted-foreground">
+                    <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
                       {t('settings.routerDynamicRoutingDesc')}
                     </div>
                   </div>
@@ -412,11 +579,9 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                 </div>
 
                 {config.dynamicRouting ? (
-                  <div className="border-t border-border-subtle pt-3">
-                    <div className="mb-1 text-[11px] font-medium text-foreground">
-                      {t('router.allowedEnvs')}
-                    </div>
-                    <p className="mb-2 text-[10px] leading-4 text-muted-foreground">
+                  <div className="border-t border-border-subtle/70 pt-3">
+                    <GroupLabel className="mb-1.5">{t('router.allowedEnvs')}</GroupLabel>
+                    <p className="mb-2 text-[11px] leading-4 text-muted-foreground">
                       {t('environments.routerDefaultAllowedHint')}
                     </p>
                     <div className="flex flex-wrap gap-1">
@@ -427,22 +592,15 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                           const forced = defaultBindingTargets.includes(name);
                           const checked = forced || config.defaultAllowedEnvs.includes(name);
                           return (
-                            <button
+                            <EnvChip
                               key={name}
-                              type="button"
-                              disabled={forced}
-                              aria-pressed={checked}
+                              checked={checked}
+                              forced={forced}
                               title={forced ? t('router.allowedForced') : undefined}
                               onClick={() => toggleDefaultAllowed(name)}
-                              className={cn(
-                                'inline-flex items-center gap-0.5 rounded-full px-2 py-0.5 text-[11px] transition-colors',
-                                checked ? 'bg-primary/[0.10] text-primary/80' : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
-                                forced ? 'cursor-default opacity-80' : 'cursor-pointer',
-                              )}
                             >
-                              {checked ? <Check className="h-2.5 w-2.5" /> : null}
                               {name}
-                            </button>
+                            </EnvChip>
                           );
                         })
                       )}
@@ -453,19 +611,24 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
             ) : null}
           </div>
 
-          <div className="min-w-0 rounded-xl border border-border-subtle bg-background/35 p-4">
+          <div className="min-w-0 xl:border-l xl:border-border-subtle/60 xl:pl-6">
             {/* Profiles CRUD */}
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <label className="block text-sm font-medium text-foreground">{t('settings.routerProfiles')}</label>
-                <p className="text-[12px] text-muted-foreground">{t('settings.routerProfilesHint')}</p>
+            <div className="mb-3 flex items-start justify-between gap-2">
+              <div className="flex min-w-0 items-start gap-2.5">
+                <div className="mt-px flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-border-subtle bg-surface-raised/60">
+                  <Layers3 className="h-3.5 w-3.5 text-muted-foreground" />
+                </div>
+                <div className="min-w-0">
+                  <label className="block text-[13px] font-medium text-foreground">{t('settings.routerProfiles')}</label>
+                  <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{t('settings.routerProfilesHint')}</p>
+                </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
-                  className="h-7 rounded-full text-[11px]"
+                  className="h-7 rounded-full px-2.5 text-[11px]"
                   disabled={envNames.length === 0}
                   title={envNames.length === 0 ? t('environments.routerTemplateNoEnv') : undefined}
                   onClick={() => setTemplateOpen(true)}
@@ -473,33 +636,49 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                   <Sparkles className="h-3 w-3" />
                   {t('environments.routerFromTemplate')}
                 </Button>
-                <Button type="button" size="sm" variant="outline" className="h-7 rounded-full text-[11px]" onClick={createProfile}>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 rounded-full px-2.5 text-[11px]"
+                  onClick={createProfile}
+                >
                   <Plus className="h-3 w-3" />
                   {t('environments.routerCreateProfile')}
                 </Button>
               </div>
             </div>
 
+            {config.profiles.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-2.5 rounded-xl border border-dashed border-border-subtle bg-background/30 px-6 py-7 text-center">
+                <div className="flex h-9 w-9 items-center justify-center rounded-full border border-border-subtle bg-surface-raised/50">
+                  <Layers3 className="h-4 w-4 text-muted-foreground/70" />
+                </div>
+                <p className="max-w-[280px] text-[12px] leading-relaxed text-muted-foreground">
+                  {t('environments.routerNoProfiles')}
+                </p>
+              </div>
+            ) : (
             <div className="space-y-1.5">
-              {config.profiles.length === 0 ? (
-                <p className="text-[12px] text-muted-foreground/70 py-1">{t('environments.routerNoProfiles')}</p>
-              ) : (
-                config.profiles.map((profile) => {
+                {config.profiles.map((profile) => {
                   const expanded = expandedProfile === profile.id;
                   const forcedTargets = profileBindingTargets(profile);
                   return (
-                    <div key={profile.id} className="rounded-xl border border-border-subtle bg-background/40">
-                      <div className="flex items-center gap-2 px-2.5 py-2">
+                    <div
+                      key={profile.id}
+                      className="overflow-hidden rounded-lg border border-border-subtle bg-background/50 transition-colors hover:border-border/70"
+                    >
+                      <div className="flex items-center gap-1 py-1.5 pl-1.5 pr-1.5">
                         <button
                           type="button"
                           onClick={() => setExpandedProfile(expanded ? null : profile.id)}
                           aria-expanded={expanded}
                           aria-controls={`router-profile-${profile.id}`}
-                          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-surface-raised/40"
                         >
-                          <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', expanded && 'rotate-180')} />
-                          <span className="truncate text-[13px] font-medium text-foreground">{profile.name}</span>
-                          <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                          <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform duration-150', expanded && 'rotate-180')} />
+                          <span className="truncate text-[12px] font-medium text-foreground">{profile.name}</span>
+                          <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/80">
                             {t('environments.routerProfileSummary', { envs: profile.allowedEnvs.length, bindings: Object.keys(profile.bindings).length })}
                           </span>
                         </button>
@@ -508,94 +687,57 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                           title={t('common.delete')}
                           aria-label={t('common.delete')}
                           onClick={() => deleteProfile(profile.id)}
-                          className="rounded-full p-1 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                          className="shrink-0 rounded-md p-1 text-muted-foreground/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
                       </div>
                       {expanded ? (
-                        <div id={`router-profile-${profile.id}`} className="space-y-2 border-t border-border-subtle px-2.5 py-2.5">
+                        <div id={`router-profile-${profile.id}`} className="space-y-2 border-t border-border-subtle/70 px-2.5 py-2.5">
                           <div className="flex items-center gap-2">
-                            <label className="w-16 shrink-0 text-[11px] text-muted-foreground">{t('environments.routerProfileName')}</label>
+                            <label className="w-14 shrink-0 text-[11px] text-muted-foreground">{t('environments.routerProfileName')}</label>
                             <ProfileNameInput value={profile.name} onCommit={(name) => renameProfile(profile.id, name)} />
                           </div>
-                          <div className="space-y-1">
-                            <div className="text-[11px] font-medium text-muted-foreground">{t('router.bindings')}</div>
-                            {bindingRows(t, profile.bindings, showProfileAgentBindings).map((row) => {
-                              const value = (profile.bindings as BindingMap)[row.key] ?? BINDING_FOLLOW_DEFAULT;
-                              return (
-                                <div key={row.key} className="flex items-center gap-2">
-                                  <span className="min-w-0 flex-1 truncate text-[11px] text-foreground/85">{row.label}</span>
-                                  <Select
-                                    value={value}
-                                    onValueChange={(v) => setProfileBinding(profile.id, row.key, v)}
-                                  >
-                                    <SelectTrigger
-                                      className="h-7 w-[150px] rounded-md border-border/40 px-2 text-[11px]"
-                                      aria-label={`${row.label} · ${t('router.selectEnv')}`}
-                                    >
-                                      <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value={BINDING_FOLLOW_DEFAULT}>{t('router.bindingDefault')}</SelectItem>
-                                      {envNames.map((name) => (
-                                        <SelectItem key={name} value={name}>{name}</SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
-                                </div>
-                              );
-                            })}
-                          </div>
+                          <BindingTable
+                            title={t('router.bindings')}
+                            rows={bindingRows(t, profile.bindings, showProfileAgentBindings)}
+                            envNames={envNames}
+                            valueFor={(key) => (profile.bindings as BindingMap)[key] ?? BINDING_FOLLOW_DEFAULT}
+                            onChange={(key, v) => setProfileBinding(profile.id, key, v)}
+                          />
 
-                          <button
-                            type="button"
-                            aria-expanded={showProfileAgentBindings}
+                          <Disclosure
+                            open={showProfileAgentBindings}
+                            label={t('environments.routerMoreAgents')}
                             onClick={() => setShowProfileAgentBindings((visible) => !visible)}
-                            className="flex w-full items-center gap-1 rounded-lg px-1 py-1 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
-                          >
-                            <ChevronDown className={cn('h-3 w-3 transition-transform', showProfileAgentBindings && 'rotate-180')} />
-                            {t('environments.routerMoreAgents')}
-                          </button>
+                          />
 
-                          <button
-                            type="button"
-                            aria-expanded={showProfileAdvanced}
-                            aria-controls={`router-profile-advanced-${profile.id}`}
+                          <Disclosure
+                            open={showProfileAdvanced}
+                            label={t('environments.routerAdvanced')}
+                            summary={t('environments.routerAllowedCount', { count: profile.allowedEnvs.length })}
+                            ariaControls={`router-profile-advanced-${profile.id}`}
                             onClick={() => setShowProfileAdvanced((visible) => !visible)}
-                            className="flex w-full items-center gap-1 rounded-lg border-t border-border-subtle px-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
-                          >
-                            <ChevronDown className={cn('h-3 w-3 transition-transform', showProfileAdvanced && 'rotate-180')} />
-                            {t('environments.routerAdvanced')}
-                            <span className="ml-auto text-[10px] font-normal">
-                              {t('environments.routerAllowedCount', { count: profile.allowedEnvs.length })}
-                            </span>
-                          </button>
+                            className="border-t border-border-subtle/70 pt-1.5"
+                          />
 
                           {showProfileAdvanced ? (
-                            <div id={`router-profile-advanced-${profile.id}`} className="rounded-lg bg-muted/20 p-2.5">
-                              <div className="mb-1 text-[11px] font-medium text-muted-foreground">{t('router.allowedEnvs')}</div>
+                            <div id={`router-profile-advanced-${profile.id}`} className="rounded-lg bg-surface-sunken/40 p-2.5">
+                              <GroupLabel className="mb-1.5">{t('router.allowedEnvs')}</GroupLabel>
                               <div className="flex flex-wrap gap-1">
                                 {envNames.map((name) => {
                                   const forced = forcedTargets.includes(name);
                                   const checked = forced || profile.allowedEnvs.includes(name);
                                   return (
-                                    <button
+                                    <EnvChip
                                       key={name}
-                                      type="button"
-                                      disabled={forced}
-                                      aria-pressed={checked}
+                                      checked={checked}
+                                      forced={forced}
                                       title={forced ? t('router.allowedForced') : undefined}
                                       onClick={() => toggleProfileAllowed(profile.id, name, !checked)}
-                                      className={cn(
-                                        'inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] transition-colors',
-                                        checked ? 'bg-primary/[0.10] text-primary/80' : 'bg-muted/40 text-muted-foreground hover:bg-muted/70',
-                                        forced ? 'cursor-default opacity-80' : 'cursor-pointer',
-                                      )}
                                     >
-                                      {checked ? <Check className="h-2.5 w-2.5" /> : null}
                                       {name}
-                                    </button>
+                                    </EnvChip>
                                   );
                                 })}
                               </div>
@@ -605,9 +747,9 @@ export function EnvironmentsRouterRules({ envNames }: { envNames: string[] }) {
                       ) : null}
                     </div>
                   );
-                })
-              )}
+                })}
             </div>
+              )}
           </div>
         </div>
       </div>
