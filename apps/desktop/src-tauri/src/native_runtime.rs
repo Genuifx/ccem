@@ -10,6 +10,7 @@ use crate::prompt_image_store::PromptImageStore;
 use crate::session_provenance::bind_source_session_id;
 use crate::system_proxy::resolve_codex_proxy_env;
 use crate::terminal::{self, resolve_claude_path, resolve_codex_path, TerminalType};
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -772,6 +773,11 @@ impl NativeRuntimeManager {
         since_seq: Option<u64>,
     ) -> Result<ReplayBatch, String> {
         self.replay_events_limited(runtime_id, since_seq, None)
+    }
+
+    /// Read the persisted attention summary without replaying event history.
+    pub fn attention_summary(&self, runtime_id: &str) -> Result<AttentionSummary, String> {
+        self.event_log.attention_summary(runtime_id)
     }
 
     pub fn replay_events_limited(

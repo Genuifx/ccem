@@ -938,7 +938,6 @@ fn get_session_events(
 
 #[tauri::command]
 async fn get_workspace_session_decorations(
-    app: tauri::AppHandle,
     unified_state: State<'_, Arc<UnifiedSessionManager>>,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     session_state: State<'_, Arc<SessionManager>>,
@@ -974,19 +973,19 @@ async fn get_workspace_session_decorations(
                 .map(legacy_interactive_runtime_descriptor),
         );
 
-        let mut events_by_runtime = unified_sessions
+        let mut attention_by_runtime = unified_sessions
             .iter()
             .filter(|runtime| {
                 runtime.is_active && should_replay_decoration_events(&runtime.status)
             })
             .filter_map(|runtime| {
                 unified_state
-                    .get_session_events(&app, &runtime.id, None)
+                    .attention_summary(&runtime.id)
                     .ok()
-                    .map(|batch| (runtime.id.clone(), batch.events))
+                    .map(|summary| (runtime.id.clone(), summary))
             })
             .collect::<HashMap<_, _>>();
-        events_by_runtime.extend(
+        attention_by_runtime.extend(
             native_sessions
                 .iter()
                 .filter(|runtime| {
@@ -994,16 +993,16 @@ async fn get_workspace_session_decorations(
                 })
                 .filter_map(|runtime| {
                     native_state
-                        .replay_events(&runtime.runtime_id, None)
+                        .attention_summary(&runtime.runtime_id)
                         .ok()
-                        .map(|batch| (runtime.runtime_id.clone(), batch.events))
+                        .map(|summary| (runtime.runtime_id.clone(), summary))
                 }),
         );
 
         Ok(build_workspace_session_decorations(
             &sessions,
             &runtimes,
-            &events_by_runtime,
+            &attention_by_runtime,
         ))
     })
     .await

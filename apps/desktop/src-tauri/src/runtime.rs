@@ -11,6 +11,7 @@ use crate::notifications::{self, NotificationContext};
 use crate::remote::{RemotePeerRef, RemotePlatform};
 use crate::session_provenance::bind_source_session_id;
 use crate::terminal::resolve_claude_path;
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -424,6 +425,16 @@ impl RuntimeManager {
             .lock()
             .map_err(|_| "Failed to lock managed session events".to_string())?;
         Ok(events.events_since(since_seq))
+    }
+
+    /// Read the incrementally maintained attention summary for a session.
+    pub fn attention_summary(&self, runtime_id: &str) -> Result<AttentionSummary, String> {
+        let handle = self.get_handle(runtime_id)?;
+        let events = handle
+            .events
+            .lock()
+            .map_err(|_| "Failed to lock managed session events".to_string())?;
+        Ok(events.attention_summary())
     }
 
     pub fn stop_session(&self, app: &AppHandle, runtime_id: &str) -> Result<(), String> {

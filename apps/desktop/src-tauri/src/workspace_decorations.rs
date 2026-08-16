@@ -75,7 +75,7 @@ pub enum WorkspaceRuntimeDescriptor {
 pub fn build_workspace_session_decorations(
     sessions: &[WorkspaceDecorationSessionInput],
     runtimes: &[WorkspaceRuntimeDescriptor],
-    events_by_runtime: &HashMap<String, Vec<SessionEventRecord>>,
+    attention_by_runtime: &HashMap<String, AttentionSummary>,
 ) -> Vec<WorkspaceSessionDecoration> {
     let matched_runtime_by_session_key = build_runtime_match_map(sessions, runtimes);
     let mut decorations = Vec::new();
@@ -88,12 +88,9 @@ pub fn build_workspace_session_decorations(
         let is_active = runtime.is_active();
         let attention_kind = is_active
             .then(|| {
-                resolve_attention_kind(
-                    events_by_runtime
-                        .get(runtime.id())
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                )
+                attention_by_runtime
+                    .get(runtime.id())
+                    .and_then(|summary| summary.attention_kind())
             })
             .flatten();
 
@@ -861,11 +858,13 @@ mod tests {
                 todo_snapshot: None,
             },
         };
-        let mut events_by_runtime = HashMap::new();
-        events_by_runtime.insert("runtime-1".to_string(), vec![event]);
+        let mut attention_by_runtime = HashMap::new();
+        let mut summary = super::AttentionSummary::default();
+        summary.apply(&event);
+        attention_by_runtime.insert("runtime-1".to_string(), summary);
 
         let decorations =
-            build_workspace_session_decorations(&sessions, &runtimes, &events_by_runtime);
+            build_workspace_session_decorations(&sessions, &runtimes, &attention_by_runtime);
 
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].visual_state, "attention");
@@ -899,11 +898,13 @@ mod tests {
                 input_summary: None,
             },
         };
-        let mut events_by_runtime = HashMap::new();
-        events_by_runtime.insert("native-1".to_string(), vec![event]);
+        let mut attention_by_runtime = HashMap::new();
+        let mut summary = super::AttentionSummary::default();
+        summary.apply(&event);
+        attention_by_runtime.insert("native-1".to_string(), summary);
 
         let decorations =
-            build_workspace_session_decorations(&sessions, &runtimes, &events_by_runtime);
+            build_workspace_session_decorations(&sessions, &runtimes, &attention_by_runtime);
 
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].session_key, "claude:target");
