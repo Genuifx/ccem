@@ -1729,7 +1729,7 @@ pub fn cleanup_orphaned_runtime_processes_from(path: &Path) -> io::Result<Runtim
     Ok(updated)
 }
 
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdin(Stdio::null())
@@ -1765,7 +1765,7 @@ fn runtime_command_matches(runtime_kind: RuntimeKind, command_line: &str) -> boo
     }
 }
 
-fn terminate_process(pid: u32) -> Result<(), String> {
+pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
     send_signal(pid, "TERM")?;
 
     for _ in 0..50 {

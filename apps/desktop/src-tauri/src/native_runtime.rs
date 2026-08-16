@@ -30,6 +30,9 @@ use tauri_plugin_shell::{
 };
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+// Grace given to a helper to self-exit on stdin EOF during app shutdown
+// (the helper flushes its final status line, then exits after ~250ms).
+const NATIVE_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
 const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
@@ -86,6 +89,32 @@ pub struct NativeSessionRecord {
     pub pending_handoff_terminal: Option<TerminalType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// True while this app still owns the runtime's helper child process.
+///
+/// A COMPLETED terminal handoff (`status == "handoff"` plus inactive)
+/// transfers the session to the external terminal, so the process is no
+/// longer ours. A handoff that was only REQUESTED
+/// (`pending_handoff_terminal` set) or that failed mid-flight still owns
+/// the child and must be torn down on app exit.
+pub(crate) fn runtime_child_is_owned(record: &NativeSessionRecord) -> bool {
+    !(record.status == "handoff" && !record.is_active)
+}
+
+/// Wait until `pid` is gone, capped at `timeout`. Returns true when the
+/// process exited within the window.
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !crate::runtime::process_exists(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2330,6 +2359,70 @@ impl NativeRuntimeManager {
         Ok(())
     }
 
+    /// Tear down every native helper child this app still OWNS.
+    ///
+    /// Runtimes whose record shows a COMPLETED terminal handoff are skipped:
+    /// their process now belongs to the external terminal session. Every
+    /// owned child is asked to stop, its stdin pipe is closed (the helper
+    /// exits on its own on stdin EOF), and any survivor is TERM'd then
+    /// KILL'd. Only real app exit (`RunEvent::Exit`) may call this — window
+    /// close-to-tray keeps helpers alive on purpose.
+    pub fn shutdown_all_owned(&self) {
+        let handles: Vec<Arc<NativeSessionHandle>> = match self.handles.lock() {
+            Ok(handles) => handles.values().cloned().collect(),
+            Err(_) => return,
+        };
+
+        for handle in handles {
+            let owned = handle
+                .record
+                .lock()
+                .map(|record| runtime_child_is_owned(&record))
+                .unwrap_or(true);
+            if !owned {
+                continue;
+            }
+
+            let runtime_id = handle
+                .record
+                .lock()
+                .ok()
+                .map(|record| record.runtime_id.clone());
+            let Some(runtime_id) = runtime_id else {
+                continue;
+            };
+
+            handle.alive.store(false, Ordering::SeqCst);
+            // Graceful first (mirrors stop_session): ask the helper to stop
+            // so it can abort any in-flight SDK turn, then close its stdin
+            // so the helper's stdin-EOF handler can flush and exit.
+            let _ = self.write_to_child(&handle, &HelperInputCommand::Stop);
+            let child_pid = handle
+                .child
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .map(|child| {
+                    let pid = child.pid();
+                    // Dropping the child closes the helper's stdin pipe.
+                    drop(child);
+                    pid
+                });
+
+            if let Some(pid) = child_pid {
+                if !wait_for_process_exit(pid, NATIVE_EXIT_GRACE_PERIOD) {
+                    let _ = crate::runtime::terminate_process(pid);
+                }
+            }
+
+            let _ = self.update_record(&runtime_id, |record| {
+                record.status = "interrupted".to_string();
+                record.is_active = false;
+                record.updated_at = Utc::now();
+            });
+        }
+    }
+
     fn update_record<F>(&self, runtime_id: &str, update: F) -> Result<(), String>
     where
         F: FnOnce(&mut NativeSessionRecord),
@@ -2759,9 +2852,9 @@ mod tests {
         merge_path_values_with_separator, native_runtime_state_temp_file_path,
         native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
         launch_terminal_for_native_handoff, reactivate_record_for_reconnect,
-        read_native_runtime_state_from, take_terminal_launches, HelperInputCommand, NativeProvider,
-        NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
-        NativeTransport, PromptImage,
+        read_native_runtime_state_from, runtime_child_is_owned, take_terminal_launches,
+        HelperInputCommand, NativeProvider, NativeRuntimeManager, NativeSessionHandle,
+        NativeSessionOptions, NativeSessionRecord, NativeTransport, PromptImage,
     };
     use crate::event_bus::{
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
@@ -2875,6 +2968,60 @@ mod tests {
                 "ccem-native-runtime-reconcile-test-{runtime_id}-attachments"
             ))),
         }
+    }
+
+    #[test]
+    fn runtime_child_is_owned_covers_handoff_matrix() {
+        // Owned: an active runtime belongs to this app.
+        assert!(runtime_child_is_owned(&native_record("owned", "processing", true)));
+
+        // Handoff requested but not completed still owns the child.
+        let mut pending = native_record("pending", "processing", true);
+        pending.pending_handoff_terminal = Some(crate::terminal::TerminalType::TerminalApp);
+        assert!(runtime_child_is_owned(&pending));
+
+        // Completed handoff: status "handoff" and inactive -> not owned.
+        assert!(!runtime_child_is_owned(&native_record(
+            "handed-off",
+            "handoff",
+            false
+        )));
+
+        // Transient handoff bookkeeping (status set before the inactive
+        // flag) keeps ownership to stay on the safe side.
+        assert!(runtime_child_is_owned(&native_record(
+            "transient",
+            "handoff",
+            true
+        )));
+    }
+
+    #[test]
+    fn shutdown_all_owned_marks_owned_runtimes_interrupted() {
+        let manager = manager_with_handle("shutdown-owned");
+        manager.shutdown_all_owned();
+
+        let record = manager.current_record("shutdown-owned").expect("record");
+        assert_eq!(record.status, "interrupted");
+        assert!(!record.is_active);
+    }
+
+    #[test]
+    fn shutdown_all_owned_skips_completed_handoffs() {
+        let manager = manager_with_handle("shutdown-handed-off");
+        manager
+            .update_record("shutdown-handed-off", |record| {
+                record.status = "handoff".to_string();
+                record.is_active = false;
+            })
+            .expect("mark record handed off");
+        manager.shutdown_all_owned();
+
+        let record = manager
+            .current_record("shutdown-handed-off")
+            .expect("record");
+        assert_eq!(record.status, "handoff");
+        assert!(!record.is_active);
     }
 
     fn native_record(runtime_id: &str, status: &str, is_active: bool) -> NativeSessionRecord {
