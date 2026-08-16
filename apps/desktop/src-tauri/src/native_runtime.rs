@@ -99,7 +99,7 @@ pub struct NativeSessionRecord {
 /// (`pending_handoff_terminal` set) or that failed mid-flight still owns
 /// the child and must be torn down on app exit.
 pub(crate) fn runtime_child_is_owned(record: &NativeSessionRecord) -> bool {
-    !(record.status == "handoff" && !record.is_active)
+    record.status != "handoff" || record.is_active
 }
 
 /// Wait until `pid` is gone, capped at `timeout`. Returns true when the
