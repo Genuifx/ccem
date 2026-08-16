@@ -786,6 +786,29 @@ impl NativeRuntimeManager {
         since_seq: Option<u64>,
         limit: Option<u64>,
     ) -> Result<ReplayBatch, String> {
+        // Fast path for the common idle-poll case: nothing exists after
+        // `since_seq`. Return the same empty batch a full replay would,
+        // without running the events query. Only taken when sqlite knows the
+        // runtime (newest seq present); otherwise fall through so runtimes
+        // backed solely by the in-memory store keep their fallback.
+        if since_seq.is_some() {
+            if let Ok((pending_count, oldest_available_seq, newest_available_seq)) =
+                self.event_log.pending_since(runtime_id, since_seq)
+            {
+                if pending_count == 0 {
+                    if let Some(newest_seq) = newest_available_seq {
+                        return Ok(ReplayBatch {
+                            gap_detected: false,
+                            truncated: false,
+                            oldest_available_seq,
+                            newest_available_seq: Some(newest_seq),
+                            events: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         match self.event_log.replay(runtime_id, since_seq, limit) {
             Ok(batch) if batch.newest_available_seq.is_some() => return Ok(batch),
             Ok(_) => {}
@@ -2944,6 +2967,53 @@ mod tests {
             codex_api_key: None,
             effort: None,
         }
+    }
+
+    #[test]
+    fn replay_events_limited_returns_empty_batch_when_nothing_pending() {
+        let runtime_id = "native-replay-fastpath";
+        let manager = manager_with_handle(runtime_id);
+
+        for seq in 1..=3 {
+            manager
+                .append_event(
+                    runtime_id,
+                    SessionEventPayload::AssistantChunk {
+                        text: format!("chunk-{seq}"),
+                    },
+                )
+                .expect("append chunk");
+        }
+
+        // Zero-pending incremental replay: empty batch with accurate bounds,
+        // identical to the shape a full empty replay produces.
+        let fast = manager
+            .replay_events_limited(runtime_id, Some(3), None)
+            .expect("fast-path replay");
+        assert!(fast.events.is_empty());
+        assert!(!fast.gap_detected);
+        assert!(!fast.truncated);
+        assert_eq!(fast.oldest_available_seq, Some(1));
+        assert_eq!(fast.newest_available_seq, Some(3));
+
+        let slow = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("full replay");
+        assert_eq!(fast.oldest_available_seq, slow.oldest_available_seq);
+        assert_eq!(fast.newest_available_seq, slow.newest_available_seq);
+
+        // Pending events still replay through the normal path.
+        let incremental = manager
+            .replay_events_limited(runtime_id, Some(1), None)
+            .expect("incremental replay");
+        assert_eq!(
+            incremental
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+        );
     }
 
     #[test]

@@ -141,6 +141,46 @@ impl NativeEventLog {
         })
     }
 
+    /// Cheapest possible check for incremental replay: how many events exist
+    /// for this runtime after `since_seq`, plus the runtime's global
+    /// oldest/newest seq (matching what `event_seq_bounds` would report).
+    /// Runs after flush_pending, like replay does, so pending writer batches
+    /// stay visible. Lets callers skip the events query entirely when the
+    /// pending count is zero.
+    pub fn pending_since(
+        &self,
+        runtime_id: &str,
+        since_seq: Option<u64>,
+    ) -> Result<(u64, Option<u64>, Option<u64>), String> {
+        self.flush_pending()?;
+        self.with_conn(|conn| {
+            let since = since_seq.map(|seq| seq as i64);
+            let (pending_count, oldest, newest) = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(CASE WHEN ?2 IS NULL OR seq > ?2 THEN 1 ELSE 0 END), 0),
+                            MIN(seq), MAX(seq)
+                     FROM native_session_events
+                     WHERE runtime_id = ?1",
+                    params![runtime_id, since],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|error| {
+                    format!("Failed to count pending native session events: {}", error)
+                })?;
+            Ok((
+                pending_count as u64,
+                oldest.and_then(non_negative_i64_to_u64),
+                newest.and_then(non_negative_i64_to_u64),
+            ))
+        })
+    }
+
     pub fn latest_todo_snapshot(
         &self,
         runtime_id: &str,
@@ -670,6 +710,68 @@ mod tests {
         assert_eq!(replay.newest_available_seq, Some(2));
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.events[0].seq, 2);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_pending_since_counts_events_after_seq() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-pending-test-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+        let runtime_id = "runtime-pending";
+
+        for seq in 1..=3 {
+            log.append(&SessionEventRecord {
+                runtime_id: runtime_id.to_string(),
+                seq,
+                occurred_at: Utc::now(),
+                payload: SessionEventPayload::AssistantChunk {
+                    text: format!("chunk-{seq}"),
+                },
+            })
+            .expect("append chunk");
+        }
+
+        // Nothing pending after the newest seq; bounds still report the full range.
+        let (count, oldest, newest) = log
+            .pending_since(runtime_id, Some(3))
+            .expect("pending_since at newest");
+        assert_eq!(count, 0);
+        assert_eq!(oldest, Some(1));
+        assert_eq!(newest, Some(3));
+
+        // Two events pending after seq 1; newest stays the global max.
+        let (count, oldest, newest) = log
+            .pending_since(runtime_id, Some(1))
+            .expect("pending_since mid-range");
+        assert_eq!(count, 2);
+        assert_eq!(oldest, Some(1));
+        assert_eq!(newest, Some(3));
+
+        // Unknown runtime: no count, no bounds.
+        let (count, oldest, newest) = log
+            .pending_since("runtime-other", None)
+            .expect("pending_since unknown runtime");
+        assert_eq!(count, 0);
+        assert_eq!(oldest, None);
+        assert_eq!(newest, None);
+
+        // Bounds match what a full empty replay reports, so the zero-pending
+        // fast path can reuse them to build an identical empty batch.
+        let (_, pending_oldest, pending_newest) = log
+            .pending_since(runtime_id, Some(3))
+            .expect("pending_since for parity check");
+        let replay = log
+            .replay(runtime_id, Some(3), None)
+            .expect("replay at newest");
+        assert!(replay.events.is_empty());
+        assert!(!replay.gap_detected);
+        assert!(!replay.truncated);
+        assert_eq!(replay.oldest_available_seq, pending_oldest);
+        assert_eq!(replay.newest_available_seq, pending_newest);
 
         let _ = std::fs::remove_file(db_path);
     }
