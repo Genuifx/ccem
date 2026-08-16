@@ -1,13 +1,16 @@
 use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionEventRecord, TodoSnapshotV1};
 use crate::session_provenance::state_db_path;
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 const EVENT_LOG_FLUSH_BATCH_SIZE: usize = 64;
+const ATTENTION_SUMMARY_TAIL_FALLBACK_LIMIT: u64 = 2000;
 
 pub struct NativeEventLog {
     db_path: PathBuf,
@@ -113,17 +116,15 @@ impl NativeEventLog {
 
     pub fn has_events(&self, runtime_id: &str) -> Result<bool, String> {
         self.flush_pending()?;
-        self.with_conn(|conn| {
-            let count = conn
-                .query_row(
-                    "SELECT 1 FROM native_session_events WHERE runtime_id = ?1 LIMIT 1",
-                    [runtime_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| format!("Failed to check native session event log: {}", error))?;
-            Ok(count.is_some())
-        })
+        self.with_conn(|conn| runtime_has_events(conn, runtime_id))
+    }
+
+    /// Persisted, incrementally maintained attention summary for a runtime.
+    /// Falls back to deriving the summary once from the bounded event tail for
+    /// runtimes that predate summary persistence, then serves it from storage.
+    pub fn attention_summary(&self, runtime_id: &str) -> Result<AttentionSummary, String> {
+        self.flush_pending()?;
+        self.with_conn(|conn| load_or_seed_attention_summary(conn, runtime_id))
     }
 
     pub fn newest_seq(&self, runtime_id: &str) -> Result<Option<u64>, String> {
@@ -184,6 +185,15 @@ impl NativeEventLog {
             let tx = conn.transaction().map_err(|error| {
                 format!("Failed to begin native event log transaction: {}", error)
             })?;
+            // Seed per-runtime base summaries before inserting the batch so the
+            // tail fallback only ever folds events that already exist on disk.
+            let mut summaries: HashMap<String, AttentionSummary> = HashMap::new();
+            for record in records {
+                if !summaries.contains_key(&record.runtime_id) {
+                    let base = load_or_seed_attention_summary(&tx, &record.runtime_id)?;
+                    summaries.insert(record.runtime_id.clone(), base);
+                }
+            }
             {
                 let mut stmt = tx
                     .prepare_cached(
@@ -212,6 +222,14 @@ impl NativeEventLog {
                     ])
                     .map_err(|error| format!("Failed to append native session event: {}", error))?;
                 }
+            }
+            for record in records {
+                if let Some(summary) = summaries.get_mut(&record.runtime_id) {
+                    summary.apply(record);
+                }
+            }
+            for (runtime_id, summary) in &summaries {
+                persist_attention_summary(&tx, runtime_id, summary)?;
             }
             tx.commit().map_err(|error| {
                 format!("Failed to commit native event log transaction: {}", error)
@@ -256,6 +274,11 @@ impl NativeEventLog {
                      created_at TEXT NOT NULL,
                      PRIMARY KEY(runtime_id, seq)
                  );
+                 CREATE TABLE IF NOT EXISTS native_attention_summaries (
+                     runtime_id TEXT PRIMARY KEY,
+                     summary_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
                  PRAGMA optimize;",
             )
             .map_err(|error| format!("Failed to initialize native event log schema: {}", error))?;
@@ -275,6 +298,80 @@ fn todo_snapshot_from_payload(payload: &SessionEventPayload) -> Option<&TodoSnap
         | SessionEventPayload::ToolUseCompleted { todo_snapshot, .. } => todo_snapshot.as_ref(),
         _ => None,
     }
+}
+
+fn load_or_seed_attention_summary(
+    conn: &Connection,
+    runtime_id: &str,
+) -> Result<AttentionSummary, String> {
+    let summary_json = conn
+        .query_row(
+            "SELECT summary_json FROM native_attention_summaries WHERE runtime_id = ?1",
+            [runtime_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to query native attention summary: {}", error))?;
+
+    if let Some(summary_json) = summary_json {
+        return serde_json::from_str(&summary_json)
+            .map_err(|error| format!("Failed to parse native attention summary: {}", error));
+    }
+
+    if !runtime_has_events(conn, runtime_id)? {
+        return Ok(AttentionSummary::default());
+    }
+
+    // Upgrade path: events exist but no summary row was persisted yet. Derive
+    // it once from the bounded tail replay and persist the result so later
+    // reads and writes stay O(1).
+    eprintln!(
+        "Deriving native attention summary for {} from event tail fallback",
+        runtime_id
+    );
+    let tail = query_events_since(
+        conn,
+        runtime_id,
+        None,
+        Some(ATTENTION_SUMMARY_TAIL_FALLBACK_LIMIT),
+    )?;
+    let mut summary = AttentionSummary::default();
+    for record in &tail {
+        summary.apply(record);
+    }
+    persist_attention_summary(conn, runtime_id, &summary)?;
+    Ok(summary)
+}
+
+fn persist_attention_summary(
+    conn: &Connection,
+    runtime_id: &str,
+    summary: &AttentionSummary,
+) -> Result<(), String> {
+    let summary_json = serde_json::to_string(summary)
+        .map_err(|error| format!("Failed to serialize native attention summary: {}", error))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO native_attention_summaries (
+            runtime_id,
+            summary_json,
+            updated_at
+        ) VALUES (?1, ?2, ?3)",
+        params![runtime_id, summary_json, Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| format!("Failed to persist native attention summary: {}", error))?;
+    Ok(())
+}
+
+fn runtime_has_events(conn: &Connection, runtime_id: &str) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT 1 FROM native_session_events WHERE runtime_id = ?1 LIMIT 1",
+            [runtime_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to check native session event log: {}", error))?;
+    Ok(count.is_some())
 }
 
 fn event_seq_bounds(
@@ -524,6 +621,10 @@ fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
 #[cfg(test)]
 #[path = "native_event_log_todo_tests.rs"]
 mod todo_tests;
+
+#[cfg(test)]
+#[path = "native_event_log_attention_tests.rs"]
+mod attention_tests;
 
 #[cfg(test)]
 mod tests {
