@@ -413,20 +413,35 @@ fn discover_claude_jsonl_files() -> Vec<DiscoveredFile> {
         if !project_path.is_dir() {
             continue;
         }
-        if let Ok(dir_entries) = fs::read_dir(&project_path) {
-            for entry in dir_entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    files.push(DiscoveredFile {
-                        path,
-                        source: UsageSource::Claude,
-                    });
-                }
-            }
-        }
+        // Depth-limited walk: main transcripts sit directly in the project
+        // dir, while subagent transcripts (Task tool / dynamic routing) live
+        // under `<session-id>/subagents/agent-*.jsonl` — 2 levels deeper.
+        collect_claude_jsonl_dir(&project_path, 0, 3, &mut files);
     }
 
     files
+}
+
+fn collect_claude_jsonl_dir(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<DiscoveredFile>) {
+    if depth > max_depth {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        if is_dir {
+            collect_claude_jsonl_dir(&path, depth + 1, max_depth, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            out.push(DiscoveredFile {
+                path,
+                source: UsageSource::Claude,
+            });
+        }
+    }
 }
 
 /// Scan ~/.codex/sessions recursively for *.jsonl

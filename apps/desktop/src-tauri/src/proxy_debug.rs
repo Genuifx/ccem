@@ -2596,7 +2596,12 @@ fn list_traffic_records(limit: u32, cursor: Option<String>) -> Result<ProxyTraff
                 .into_iter()
                 .filter(|entry| cursor_allows_entry(entry, cursor.as_ref()))
             {
-                let record = read_record_at_index_entry(&entry)?;
+                // A single corrupt record at its indexed offset (e.g. a torn
+                // line from a concurrent append) must not take down the whole
+                // traffic list — skip it and keep serving readable records.
+                let Ok(record) = read_record_at_index_entry(&entry) else {
+                    continue;
+                };
                 if items.len() == limit {
                     has_more = true;
                     break;
@@ -3074,7 +3079,8 @@ fn generate_request_id() -> String {
 mod tests {
     use super::{
         append_record, bodies_dir, build_sse_reduced, compose_upstream_url, dir_size,
-        enforce_log_retention, extract_prompt_preview, list_traffic_records, parse_proxy_path,
+        enforce_log_retention, ensure_proxy_debug_dirs, extract_prompt_preview,
+        list_traffic_records, parse_proxy_path, traffic_jsonl_path,
         parse_router_path, proxy_debug_dir, read_chunked_body, read_http_request,
         read_record_by_id, recompute_reduced_detail, redact_body_bytes, redact_body_text,
         redact_headers, redact_json_value, traffic_idx_path, validate_upstream_url, ForwardMeta,
@@ -5212,5 +5218,37 @@ mod tests {
             text.contains("sk-trunc-secret"),
             "truncated JSON should pass through unchanged — this proves why we skip writing"
         );
+    }
+
+    #[test]
+    fn list_traffic_skips_corrupt_indexed_records_instead_of_failing() {
+        with_temp_proxy_dir(|| {
+            ensure_proxy_debug_dirs().expect("prepare proxy debug dir");
+            let good = sample_traffic_record(1, 1_000);
+            let _corrupt = sample_traffic_record(2, 2_000);
+
+            // Hand-write a traffic log whose first (older) line is torn JSON —
+            // the index still points both ids at their offsets, mirroring a
+            // concurrent append that interleaved bytes into one line.
+            let corrupt_line = "{\"id\":\"req-0002\",\"timestamp\":2000,\"broken";
+            let good_line = serde_json::to_string(&good).expect("serialize good record");
+            let mut traffic = String::new();
+            traffic.push_str(corrupt_line);
+            traffic.push('\n');
+            traffic.push_str(&good_line);
+            traffic.push('\n');
+            std::fs::write(traffic_jsonl_path(), traffic).expect("write traffic log");
+
+            let idx = format!(
+                "2000,req-0002,0\n1000,req-0001,{}\n",
+                corrupt_line.len() + 1
+            );
+            std::fs::write(traffic_idx_path(), idx).expect("write traffic index");
+
+            let page = list_traffic_records(50, None).expect("list must tolerate corrupt record");
+            assert_eq!(page.items.len(), 1, "only the readable record is served");
+            assert_eq!(page.items[0].id, "req-0001");
+            assert_eq!(page.next_cursor, None);
+        });
     }
 }
