@@ -1,5 +1,29 @@
 # ccem
 
+## 2.69.0
+
+### Minor Changes
+
+- Add a composer usage panel with active SDK session usage query (helper `usage_query` command plus desktop session usage event channel), and a project tree sort toggle with a time-bucketed recent view.
+
+## 2.68.0
+
+### Minor Changes
+
+- Add a copy-transcript-as-image action to the desktop workspace transcript, and satisfy the Codex migration clippy gate.
+
+## 2.67.0
+
+### Minor Changes
+
+- Warn before retiring Codex model launches
+
+## 2.66.0
+
+### Minor Changes
+
+- Remove duplicate workspace selection highlight in the desktop app.
+
 ## 2.65.0
 
 ### Minor Changes

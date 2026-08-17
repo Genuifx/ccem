@@ -209,7 +209,10 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         SessionEventPayload::ClaudeJson { .. } | SessionEventPayload::GapNotification { .. } => {
             None
         }
-        SessionEventPayload::StdErrLine { .. }
+        // Session usage snapshots duplicate the token_usage frames already
+        // forwarded per turn — don't spam bot outboxes with them.
+        SessionEventPayload::SessionUsage { .. }
+        | SessionEventPayload::StdErrLine { .. }
         | SessionEventPayload::AssistantChunk { .. } => None,
     }
 }

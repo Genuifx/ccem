@@ -316,6 +316,13 @@ export interface TauriCommands {
     },
     void
   ];
+  preflight_codex_model_migration: [
+    {
+      envName: string;
+      workingDir: string;
+    },
+    CodexModelMigrationPreflightResult
+  ];
   create_native_session: [
     {
       provider: 'claude' | 'codex';
@@ -335,6 +342,7 @@ export interface TauriCommands {
        * direct launch). Core-owned wire type shared with the Rust backend.
        */
       routerLaunchDraft?: RouterLaunchDraft | null;
+      codexMigrationProofToken?: string | null;
     },
     NativeSessionSummary
   ];
@@ -373,6 +381,12 @@ export interface TauriCommands {
     {
       runtimeId: string;
       checkpointId: string;
+    },
+    void
+  ];
+  query_native_session_usage: [
+    {
+      runtimeId: string;
     },
     void
   ];
@@ -939,6 +953,23 @@ export interface ManagedSessionSummary {
 
 export type NativeProvider = 'claude' | 'codex';
 
+export type CodexModelMigrationPreflightResult =
+  | {
+      status: 'affected';
+      model: 'gpt-5.4';
+      replacement: 'gpt-5.6-terra';
+      proofToken: string;
+    }
+  | {
+      status: 'affected';
+      model: 'gpt-5.4-mini';
+      replacement: 'gpt-5.6-luna';
+      proofToken: string;
+    }
+  | {
+      status: 'unaffected' | 'unknown';
+    };
+
 export interface PlatformCapabilities {
   os: 'windows' | 'macos' | 'linux' | 'unknown';
   isWindows: boolean;
@@ -1378,6 +1409,29 @@ export type SessionEventPayload =
       is_auto_compact_enabled: boolean;
       model: string;
       categories: Array<{ name: string; tokens: number }>;
+    }
+  | {
+      type: 'session_usage';
+      provider: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_creation_tokens: number;
+      cost_usd?: number | null;
+      model_usage: Array<{
+        model: string;
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_creation_tokens: number;
+        cost_usd?: number | null;
+      }>;
+      subscription_type?: string | null;
+      rate_limits_available?: boolean;
+      rate_limits?: {
+        five_hour?: { utilization: number | null; resets_at: string | null } | null;
+        seven_day?: { utilization: number | null; resets_at: string | null } | null;
+      } | null;
     };
 
 export interface ProxyTrafficPage {

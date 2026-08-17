@@ -509,7 +509,8 @@ fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
         | SessionEventPayload::FilesRewound { .. }
         | SessionEventPayload::FileRewindFailed { .. }
         | SessionEventPayload::TokenUsage { .. }
-        | SessionEventPayload::ContextUsage { .. } => true,
+        | SessionEventPayload::ContextUsage { .. }
+        | SessionEventPayload::SessionUsage { .. } => true,
         SessionEventPayload::ToolUseStarted {
             needs_response,
             todo_snapshot,

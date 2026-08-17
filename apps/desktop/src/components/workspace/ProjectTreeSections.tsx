@@ -21,13 +21,18 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu';
 import type { HistorySessionItem } from '@/features/conversations/types';
-import type { ProjectClassification, ProjectNode } from './workspaceProjectTreeModel';
+import type { ProjectClassification, ProjectNode, RecentSessionBucket } from './workspaceProjectTreeModel';
 
 export const PROJECT_TREE_PAGE_SIZE = 6;
+export const RECENT_BUCKET_PAGE_SIZE = 15;
 
 type RenderSessionRow = (
   session: HistorySessionItem,
-  options?: { pinnedSection?: boolean; activeTemporarySection?: boolean },
+  options?: {
+    pinnedSection?: boolean;
+    recentSection?: boolean;
+    activeTemporarySection?: boolean;
+  },
 ) => ReactNode;
 
 type ProjectActionCallbacks = {
@@ -48,27 +53,98 @@ export const PinnedSessionsSection = memo(function PinnedSessionsSection({
   renderSessionRow: RenderSessionRow;
   t: (key: string) => string;
 }) {
+  // No pinned sessions, no section — keep the sidebar free of empty placeholders.
+  if (pinnedSessions.length === 0) {
+    return null;
+  }
+
   return (
     <div className="px-0.5 pt-1">
       <div className="flex h-5 items-center justify-between px-2">
         <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           {t('workspace.pinnedSessions')}
         </span>
-        {pinnedSessions.length > 0 ? (
-          <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
-            {pinnedSessions.length}
-          </span>
-        ) : null}
+        <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
+          {pinnedSessions.length}
+        </span>
       </div>
-      {pinnedSessions.length > 0 ? (
-        <div className="mt-1 pr-0.5">
-          {pinnedSessions.map((session) => renderSessionRow(session, { pinnedSection: true }))}
-        </div>
-      ) : (
-        <div className="mt-1 px-2 py-2 text-[11px] text-muted-foreground/60">
-          {t('workspace.noPinnedSessions')}
-        </div>
-      )}
+      <div className="mt-1 pr-0.5">
+        {pinnedSessions.map((session) => renderSessionRow(session, { pinnedSection: true }))}
+      </div>
+    </div>
+  );
+});
+
+const RECENT_BUCKET_LABEL_KEYS = {
+  running: 'workspace.recentRunning',
+  today: 'workspace.recentToday',
+  yesterday: 'workspace.recentYesterday',
+  week: 'workspace.recentWeek',
+  older: 'workspace.recentOlder',
+} as const;
+
+export const RecentSessionsSection = memo(function RecentSessionsSection({
+  buckets,
+  onLoadMoreBucket,
+  onCollapseBucket,
+  renderSessionRow,
+  t,
+}: {
+  buckets: Array<RecentSessionBucket & { totalCount: number }>;
+  onLoadMoreBucket: (bucketId: RecentSessionBucket['id']) => void;
+  onCollapseBucket: (bucketId: RecentSessionBucket['id']) => void;
+  renderSessionRow: RenderSessionRow;
+  t: (key: string) => string;
+}) {
+  return (
+    <div>
+      {buckets.map((bucket) => {
+        const hasMore = bucket.totalCount > bucket.sessions.length;
+        const canCollapse = bucket.sessions.length > RECENT_BUCKET_PAGE_SIZE;
+        return (
+          <div key={bucket.id} data-recent-bucket={bucket.id} className="px-0.5 pt-1">
+            <div className="flex h-5 items-center justify-between px-2">
+              <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                {t(RECENT_BUCKET_LABEL_KEYS[bucket.id])}
+              </span>
+              <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
+                {bucket.totalCount}
+              </span>
+            </div>
+            <div className="mt-1 pr-0.5">
+              {bucket.sessions.map((session) => renderSessionRow(session, { recentSection: true }))}
+            </div>
+            {(hasMore || canCollapse) && (
+              <div className="flex items-center gap-3 pl-2 pr-2 py-1.5 text-[11px]">
+                {canCollapse && (
+                  <button
+                    type="button"
+                    onClick={() => onCollapseBucket(bucket.id)}
+                    className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    <ChevronsUp className="h-3 w-3" />
+                    {t('workspace.collapseList')}
+                  </button>
+                )}
+                {hasMore && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onLoadMoreBucket(bucket.id)}
+                      className="inline-flex items-center text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {t('workspace.loadMore')}
+                    </button>
+                    <span className="ml-auto text-[10px] tabular-nums text-muted-foreground/50">
+                      {bucket.sessions.length}/{bucket.totalCount}
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 });
@@ -85,6 +161,10 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
   onDismissActiveTemporaryProject,
   pinnedSessionsCount,
   projectActions,
+  recentBuckets,
+  recentTotalCount,
+  onLoadMoreRecentBucket,
+  onCollapseRecentBucket,
   renderSessionRow,
   temporaryProjectNodes,
   toggleProject,
@@ -103,6 +183,11 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
   onDismissActiveTemporaryProject: (project: string) => void;
   pinnedSessionsCount: number;
   projectActions: ProjectActionCallbacks;
+  /** When defined, the tree renders time-bucketed flat groups instead of project groups. */
+  recentBuckets?: Array<RecentSessionBucket & { totalCount: number }>;
+  recentTotalCount?: number;
+  onLoadMoreRecentBucket?: (bucketId: RecentSessionBucket['id']) => void;
+  onCollapseRecentBucket?: (bucketId: RecentSessionBucket['id']) => void;
   renderSessionRow: RenderSessionRow;
   temporaryProjectNodes: ProjectNode[];
   toggleProject: (project: string) => void;
@@ -110,10 +195,12 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
   loadMore: (project: string) => void;
   t: (key: string) => string;
 }) {
+  const isRecentMode = recentBuckets !== undefined;
   const hasProjectNodes =
     mainProjectNodes.length > 0
     || temporaryProjectNodes.length > 0
     || activeTemporaryProjectNodes.length > 0;
+  const hasContent = isRecentMode ? (recentTotalCount ?? 0) > 0 : hasProjectNodes;
 
   const renderProjectNode = (
     node: ProjectNode,
@@ -303,7 +390,7 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
       <ScrollArea className="flex-1 min-h-0 py-1">
         {isLoading ? (
           <ProjectTreeSkeleton />
-        ) : !hasProjectNodes ? (
+        ) : !hasContent ? (
           pinnedSessionsCount > 0 ? null : (
             <div className="flex flex-col items-center justify-center py-12 text-center px-4">
               <MessageSquare className="w-8 h-8 text-muted-foreground/40 mb-3" />
@@ -311,6 +398,14 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
               <p className="text-xs text-muted-foreground/70">{t('workspace.noHistoryHint')}</p>
             </div>
           )
+        ) : isRecentMode ? (
+          <RecentSessionsSection
+            buckets={recentBuckets ?? []}
+            onLoadMoreBucket={onLoadMoreRecentBucket ?? (() => {})}
+            onCollapseBucket={onCollapseRecentBucket ?? (() => {})}
+            renderSessionRow={renderSessionRow}
+            t={t}
+          />
         ) : (
           <>
             {mainProjectNodes.map((node) => renderProjectNode(node, 'main'))}
@@ -329,7 +424,7 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
             )}
           </>
         )}
-        {activeTemporaryProjectNodes.length > 0 && (
+        {!isRecentMode && activeTemporaryProjectNodes.length > 0 && (
           <div className="mt-2 border-t border-border/60 px-0.5 pb-1 pt-1.5">
             <div className="mb-0.5 flex h-5 items-center justify-between px-3">
               <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">

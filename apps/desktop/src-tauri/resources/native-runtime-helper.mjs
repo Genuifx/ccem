@@ -42459,6 +42459,9 @@ var claudeTurnAwaitingResult = false;
 var pendingClaudePromptReplay = null;
 var claudeSeenMessageIds = /* @__PURE__ */ new Set();
 var claudeContextUsageFailureKey = null;
+var claudeSessionUsageKey = null;
+var claudeSessionUsageFailureKey = null;
+var claudeSessionUsageInFlight = false;
 var codexClient = null;
 var codexThread = null;
 var codexLastContextUsageKey = null;
@@ -43212,6 +43215,7 @@ function handleClaudeCompactBoundary(message) {
     detail: parts.join(" ")
   });
   void emitClaudeContextUsage();
+  void emitClaudeSessionUsage();
 }
 async function emitClaudeContextUsage() {
   if (!currentClaudeQuery) return;
@@ -43245,6 +43249,142 @@ async function emitClaudeContextUsage() {
       stage: "context_usage_unavailable",
       detail
     });
+  }
+}
+function asNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function asNullableNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function asNullableString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+function parseClaudeSessionUsagePayload(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const session = raw.session;
+  if (!session || typeof session !== "object") {
+    return null;
+  }
+  const sessionRecord = session;
+  const rawModelUsage = sessionRecord.model_usage;
+  const modelUsageMap = rawModelUsage && typeof rawModelUsage === "object" ? rawModelUsage : {};
+  const modelEntries = [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
+  let costUsd = null;
+  for (const [model, usage] of Object.entries(modelUsageMap)) {
+    if (!usage || typeof usage !== "object") {
+      continue;
+    }
+    const entry = usage;
+    const entryInput = asNumber(entry.inputTokens);
+    const entryOutput = asNumber(entry.outputTokens);
+    const entryCacheRead = asNumber(entry.cacheReadInputTokens);
+    const entryCacheCreation = asNumber(entry.cacheCreationInputTokens);
+    inputTokens += entryInput;
+    outputTokens += entryOutput;
+    cacheReadTokens += entryCacheRead;
+    cacheCreationTokens += entryCacheCreation;
+    modelEntries.push({
+      model,
+      input_tokens: entryInput,
+      output_tokens: entryOutput,
+      cache_read_tokens: entryCacheRead,
+      cache_creation_tokens: entryCacheCreation,
+      cost_usd: asNullableNumber(entry.costUSD)
+    });
+  }
+  costUsd = asNullableNumber(sessionRecord.total_cost_usd);
+  modelEntries.sort((a, b) => b.input_tokens - a.input_tokens);
+  const rateLimits = raw.rate_limits;
+  const rateLimitsAvailable = raw.rate_limits_available === true;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_read_tokens: cacheReadTokens,
+    cache_creation_tokens: cacheCreationTokens,
+    cost_usd: costUsd,
+    model_usage: modelEntries,
+    subscription_type: asNullableString(raw.subscription_type),
+    rate_limits_available: rateLimitsAvailable,
+    rate_limits: rateLimits && typeof rateLimits === "object" ? rateLimits : null
+  };
+}
+function stableRateLimitsKey(rateLimits) {
+  if (!rateLimits) {
+    return "none";
+  }
+  const windowKey = (raw) => {
+    if (!raw || typeof raw !== "object") {
+      return "null";
+    }
+    const record2 = raw;
+    return [record2.utilization, record2.resets_at ?? ""].join(":");
+  };
+  return ["five_hour", "seven_day"].map((name) => `${name}=${windowKey(rateLimits[name])}`).join(",");
+}
+async function emitClaudeSessionUsage() {
+  if (!currentClaudeQuery || claudeSessionUsageInFlight) return;
+  claudeSessionUsageInFlight = true;
+  try {
+    const raw = await currentClaudeQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+    const snapshot = parseClaudeSessionUsagePayload(raw);
+    if (!snapshot) {
+      throw new Error("Claude session usage payload was not structured.");
+    }
+    claudeSessionUsageFailureKey = null;
+    const key = [
+      snapshot.input_tokens,
+      snapshot.output_tokens,
+      snapshot.cache_read_tokens,
+      snapshot.cache_creation_tokens,
+      snapshot.cost_usd,
+      snapshot.model_usage.map((entry) => [
+        entry.model,
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_read_tokens,
+        entry.cache_creation_tokens,
+        entry.cost_usd
+      ].join(":")).join(","),
+      stableRateLimitsKey(snapshot.rate_limits)
+    ].join("|");
+    if (key === claudeSessionUsageKey) {
+      return;
+    }
+    claudeSessionUsageKey = key;
+    emitEvent({
+      type: "session_usage",
+      provider: "claude",
+      input_tokens: snapshot.input_tokens,
+      output_tokens: snapshot.output_tokens,
+      cache_read_tokens: snapshot.cache_read_tokens,
+      cache_creation_tokens: snapshot.cache_creation_tokens,
+      cost_usd: snapshot.cost_usd,
+      model_usage: snapshot.model_usage,
+      subscription_type: snapshot.subscription_type,
+      rate_limits_available: snapshot.rate_limits_available,
+      rate_limits: snapshot.rate_limits
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const detail = `Claude session usage unavailable: ${message}`;
+    if (detail === claudeSessionUsageFailureKey) {
+      return;
+    }
+    claudeSessionUsageFailureKey = detail;
+    emitEvent({
+      type: "lifecycle",
+      stage: "usage_unavailable",
+      detail
+    });
+  } finally {
+    claudeSessionUsageInFlight = false;
   }
 }
 function emitCodexContextUsageSnapshot(snapshot) {
@@ -43689,6 +43829,7 @@ async function consumeClaudeMessages() {
           emitClaudeTurnCompleted(message.result || "Claude turn completed.");
           await new Promise((resolve2) => setImmediate(resolve2));
           await emitClaudeContextUsage();
+          await emitClaudeSessionUsage();
         } else {
           const reason = message.errors?.join("\n") || message.subtype;
           emitClaudeTurnCompleted(reason || "Claude turn completed.");
@@ -44282,6 +44423,26 @@ async function handleCommand(command) {
   }
   if (command.type === "rewind_files") {
     await handleRewindFilesCommand(command);
+    return;
+  }
+  if (command.type === "usage_query") {
+    if (initCommand?.provider !== "claude") {
+      return;
+    }
+    try {
+      await ensureClaudeSession();
+      if (currentClaudeQuery) {
+        await emitClaudeContextUsage();
+        await emitClaudeSessionUsage();
+      }
+    } catch (error48) {
+      const message = error48 instanceof Error ? error48.message : String(error48);
+      emitEvent({
+        type: "lifecycle",
+        stage: "usage_unavailable",
+        detail: `Claude usage query failed: ${message}`
+      });
+    }
     return;
   }
   if (command.type === "update_settings") {

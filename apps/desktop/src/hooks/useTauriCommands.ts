@@ -22,6 +22,7 @@ import type {
   BotBindingInboundRequest,
   BotBindingInfo,
   BotBindingOutboxFrame,
+  CodexModelMigrationPreflightResult,
   DesktopSettings,
   HeadlessSessionSummary,
   InteractivePromptAnnotation,
@@ -919,6 +920,16 @@ export function useTauriCommands() {
     await removeHeadlessSession(runtimeId);
   }, [removeHeadlessSession]);
 
+  const preflightCodexModelMigration = useCallback(async (
+    envName: string,
+    workingDir: string,
+  ): Promise<CodexModelMigrationPreflightResult> => {
+    return invoke<CodexModelMigrationPreflightResult>('preflight_codex_model_migration', {
+      envName,
+      workingDir,
+    });
+  }, []);
+
   const createNativeSession = useCallback(async (options: {
     provider: 'claude' | 'codex';
     envName?: string;
@@ -938,6 +949,7 @@ export function useTauriCommands() {
      * requests can be routed (Claude today).
      */
     routerLaunchDraft?: RouterLaunchDraft | null;
+    codexMigrationProofToken?: string | null;
   }): Promise<NativeSessionSummary> => {
     const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
     return invoke<NativeSessionSummary>('create_native_session', {
@@ -954,6 +966,7 @@ export function useTauriCommands() {
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
       routerLaunchDraft: options.routerLaunchDraft ?? null,
+      codexMigrationProofToken: options.codexMigrationProofToken ?? null,
     });
   }, [getSessionDefaults]);
 
@@ -1020,6 +1033,14 @@ export function useTauriCommands() {
     await invoke('rewind_native_session_files', {
       runtimeId,
       checkpointId,
+    });
+  }, []);
+
+  const queryNativeSessionUsage = useCallback(async (
+    runtimeId: string,
+  ): Promise<void> => {
+    await invoke('query_native_session_usage', {
+      runtimeId,
     });
   }, []);
 
@@ -1683,12 +1704,14 @@ export function useTauriCommands() {
     respondHeadlessPermission,
     removeHeadlessSession,
     removeManagedSession,
+    preflightCodexModelMigration,
     createNativeSession,
     listNativeSessions,
     sendNativeSessionInput,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
+    queryNativeSessionUsage,
     getNativeSessionEvents,
     stopNativeSession,
     updateNativeSessionSettings,
