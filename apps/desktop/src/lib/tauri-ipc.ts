@@ -64,7 +64,8 @@ export interface TauriCommands {
   get_app_version: [void, string];
   check_app_update: [void, AppUpdateMetadata | null];
   install_app_update: [void, void];
-  restart_app: [void, void];
+  restart_app: [{ force?: boolean | null } | void, void];
+  quit_app: [{ force?: boolean | null } | void, void];
   add_favorite: [{ path: string; name: string }, void];
   remove_favorite: [{ path: string }, void];
   add_recent: [{ path: string }, void];
@@ -413,12 +414,20 @@ export interface TauriCommands {
     },
     void
   ];
+  stop_native_background_task: [
+    {
+      runtimeId: string;
+      taskId: string;
+    },
+    void
+  ];
   update_native_session_settings: [
     {
       runtimeId: string;
       envName?: string | null;
       permMode?: string | null;
       effort?: string | null;
+      forceRestart?: boolean | null;
     },
     void
   ];
@@ -433,6 +442,7 @@ export interface TauriCommands {
     {
       runtimeId: string;
       terminalType?: NativeTerminalType | null;
+      allowBackgroundTaskTermination?: boolean | null;
     },
     NativeHandoffResult
   ];
@@ -993,6 +1003,44 @@ export type NativeTransport =
 
 export type NativeTerminalType = 'terminalapp' | 'iterm2';
 
+export type NativeBackgroundTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'stopping'
+  | 'settling'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'interrupted';
+
+export interface NativeBackgroundTaskUsage {
+  total_tokens: number;
+  tool_uses: number;
+  duration_ms: number;
+}
+
+export interface NativeBackgroundTask {
+  task_id: string;
+  tool_use_id?: string | null;
+  task_type?: string | null;
+  subagent_type?: string | null;
+  workflow_name?: string | null;
+  description: string;
+  status: NativeBackgroundTaskStatus;
+  started_at: string;
+  updated_at: string;
+  progress_summary?: string | null;
+  last_tool_name?: string | null;
+  usage?: NativeBackgroundTaskUsage | null;
+  terminal_summary?: string | null;
+  output_file?: string | null;
+  error?: string | null;
+  skip_transcript?: boolean | null;
+  stop_request_id?: string | null;
+  stop_failed?: boolean | null;
+}
+
 export interface NativeSessionSummary {
   runtime_id: string;
   provider: NativeProvider;
@@ -1003,6 +1051,8 @@ export interface NativeSessionSummary {
   perm_mode: string;
   runtime_perm_mode?: string | null;
   effort?: string | null;
+  pending_env_name?: string | null;
+  pending_effort?: string | null;
   status: string;
   created_at: string;
   updated_at: string;
@@ -1010,6 +1060,7 @@ export interface NativeSessionSummary {
   last_event_seq?: number | null;
   seed_boundary_message_count?: number | null;
   can_handoff_to_terminal: boolean;
+  background_tasks?: NativeBackgroundTask[];
   last_error?: string | null;
   /** Public router state when this session is routed (mirrors Rust field). */
   router?: SessionRouterState | null;
@@ -1355,6 +1406,7 @@ export type SessionEventPayload =
       tool_use_id?: string | null;
       tool_name: string;
       input_summary?: string | null;
+      background_task_id?: string | null;
     }
   | {
       type: 'permission_responded';
@@ -1453,7 +1505,18 @@ export type SessionEventPayload =
         five_hour?: { utilization: number | null; resets_at: string | null } | null;
         seven_day?: { utilization: number | null; resets_at: string | null } | null;
       } | null;
-    };
+    }
+  | {
+      type: 'runtime_settings_changed';
+      state: 'deferred' | 'applied';
+      request_id?: string | null;
+      env_name: string;
+      effort?: string | null;
+      pending_env_name?: string | null;
+      pending_effort?: string | null;
+    }
+  | { type: 'background_tasks_changed'; tasks: NativeBackgroundTask[] }
+  | { type: 'background_task_updated'; task: NativeBackgroundTask };
 
 export interface ProxyTrafficPage {
   items: ProxyTrafficItem[];

@@ -8,6 +8,7 @@ export interface PendingPermissionRequest {
   toolUseId?: string;
   toolName: string;
   inputSummary?: string;
+  backgroundTaskId?: string;
 }
 
 export interface PendingInteractivePrompt {
@@ -141,6 +142,11 @@ export function extractAttentionState(events: SessionEventRecord[]): NativeSessi
   for (const event of events) {
     switch (event.payload.type) {
       case 'user_prompt':
+        for (const [requestId, request] of permissions) {
+          if (!request.backgroundTaskId) {
+            permissions.delete(requestId);
+          }
+        }
         prompts.clear();
         break;
       case 'permission_required':
@@ -149,6 +155,9 @@ export function extractAttentionState(events: SessionEventRecord[]): NativeSessi
           toolUseId: event.payload.tool_use_id ?? undefined,
           toolName: event.payload.tool_name,
           inputSummary: event.payload.input_summary ?? undefined,
+          ...(event.payload.background_task_id
+            ? { backgroundTaskId: event.payload.background_task_id }
+            : {}),
         });
         break;
       case 'permission_responded':
@@ -180,7 +189,11 @@ export function extractAttentionState(events: SessionEventRecord[]): NativeSessi
         terminalPrompt = null;
         break;
       case 'session_completed':
-        permissions.clear();
+        for (const [requestId, request] of permissions) {
+          if (!request.backgroundTaskId) {
+            permissions.delete(requestId);
+          }
+        }
         prompts.clear();
         terminalPrompt = null;
         break;

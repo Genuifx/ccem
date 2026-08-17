@@ -144,6 +144,75 @@ pub struct SessionPromptAnnotation {
     pub note: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeBackgroundTaskStatus {
+    Pending,
+    Running,
+    Paused,
+    Stopping,
+    Settling,
+    Completed,
+    Failed,
+    Stopped,
+    Interrupted,
+}
+
+impl NativeBackgroundTaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Stopped | Self::Interrupted
+        )
+    }
+
+    pub fn can_stop(self) -> bool {
+        matches!(self, Self::Pending | Self::Running | Self::Paused)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeBackgroundTaskUsage {
+    pub total_tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeBackgroundTask {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    pub description: String,
+    pub status: NativeBackgroundTaskStatus,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<NativeBackgroundTaskUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_transcript: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_failed: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEventPayload {
@@ -203,6 +272,8 @@ pub enum SessionEventPayload {
         tool_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_task_id: Option<String>,
     },
     PermissionResponded {
         request_id: String,
@@ -322,6 +393,24 @@ pub enum SessionEventPayload {
         rate_limits_available: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rate_limits: Option<serde_json::Value>,
+    },
+    RuntimeSettingsChanged {
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        env_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_env_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_effort: Option<String>,
+    },
+    BackgroundTasksChanged {
+        tasks: Vec<NativeBackgroundTask>,
+    },
+    BackgroundTaskUpdated {
+        task: NativeBackgroundTask,
     },
 }
 
@@ -445,7 +534,8 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextUsageCategory, InteractiveToolPrompt, SessionEventPayload, SessionStore,
+        ContextUsageCategory, InteractiveToolPrompt, NativeBackgroundTask,
+        NativeBackgroundTaskStatus, NativeBackgroundTaskUsage, SessionEventPayload, SessionStore,
         TodoSnapshotItemV1, TodoSnapshotV1, ToolCategory, ToolQuestionOption, ToolQuestionPrompt,
         UserInputKind,
     };
@@ -613,6 +703,7 @@ mod tests {
             tool_use_id: Some("toolu-1".to_string()),
             tool_name: "Bash".to_string(),
             input_summary: Some("pnpm test".to_string()),
+            background_task_id: Some("task-1".to_string()),
         };
         let responded = SessionEventPayload::PermissionResponded {
             request_id: "req-sdk-1".to_string(),
@@ -640,6 +731,7 @@ mod tests {
                 tool_use_id: None,
                 tool_name: "Bash".to_string(),
                 input_summary: None,
+                background_task_id: None,
             }
         );
     }
@@ -718,6 +810,49 @@ mod tests {
         let decoded: SessionEventPayload =
             serde_json::from_value(encoded).expect("deserialize context usage");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn background_task_events_round_trip_with_terminal_state() {
+        let task = NativeBackgroundTask {
+            task_id: "task-1".to_string(),
+            tool_use_id: Some("toolu-1".to_string()),
+            task_type: Some("agent".to_string()),
+            subagent_type: Some("researcher".to_string()),
+            workflow_name: None,
+            description: "Inspect lifecycle".to_string(),
+            status: NativeBackgroundTaskStatus::Completed,
+            started_at: "2026-08-17T01:00:00Z".parse().expect("started at"),
+            updated_at: "2026-08-17T01:00:03Z".parse().expect("updated at"),
+            progress_summary: Some("Checked notification ordering".to_string()),
+            last_tool_name: Some("Read".to_string()),
+            usage: Some(NativeBackgroundTaskUsage {
+                total_tokens: 120,
+                tool_uses: 2,
+                duration_ms: 3_000,
+            }),
+            terminal_summary: Some("Done".to_string()),
+            output_file: Some("/tmp/task-1.output".to_string()),
+            error: None,
+            skip_transcript: Some(true),
+            stop_request_id: None,
+            stop_failed: None,
+        };
+
+        for payload in [
+            SessionEventPayload::BackgroundTasksChanged {
+                tasks: vec![task.clone()],
+            },
+            SessionEventPayload::BackgroundTaskUpdated { task: task.clone() },
+        ] {
+            let encoded = serde_json::to_value(&payload).expect("serialize background task");
+            let decoded: SessionEventPayload =
+                serde_json::from_value(encoded).expect("deserialize background task");
+            assert_eq!(decoded, payload);
+        }
+
+        assert!(task.status.is_terminal());
+        assert!(!task.status.can_stop());
     }
 
     #[test]

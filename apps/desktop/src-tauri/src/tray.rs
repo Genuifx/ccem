@@ -340,8 +340,20 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
                 }
             }
             "quit" => {
-                crate::FORCE_QUIT.store(true, Ordering::SeqCst);
-                app.exit(0);
+                let can_exit = app
+                    .try_state::<std::sync::Arc<crate::native_runtime::NativeRuntimeManager>>()
+                    .is_some_and(|manager| manager.prepare_app_termination(false).is_ok());
+                if can_exit {
+                    crate::FORCE_QUIT.store(true, Ordering::SeqCst);
+                    app.exit(0);
+                } else {
+                    if let Some(window) = app.get_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                    let _ = app.emit("native-background-task-app-action", "quit");
+                }
             }
             id if id.starts_with("session:") => {
                 let session_id = id.strip_prefix("session:").unwrap();

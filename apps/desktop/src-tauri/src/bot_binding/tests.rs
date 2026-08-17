@@ -349,6 +349,7 @@ fn permission_prompt_sanitizes_only_its_display_copy() {
         tool_use_id: Some("tool-original-1".to_string()),
         tool_name: "Bash\u{202e}".to_string(),
         input_summary: Some("printf \u{201c}safe\u{201d}\u{200b}".to_string()),
+        background_task_id: None,
     };
     let original = payload.clone();
 
@@ -370,6 +371,7 @@ fn permission_prompt_does_not_split_a_visible_escape_at_its_limit() {
         tool_use_id: Some("tool-boundary".to_string()),
         tool_name: "Bash".to_string(),
         input_summary: Some(format!("{}\u{202e}tail", "a".repeat(1177))),
+        background_task_id: None,
     };
 
     let summary = formatting::summarize_payload(&payload).expect("permission summary");

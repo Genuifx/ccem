@@ -170,3 +170,28 @@ test('permission requests preserve request and tool-use correlation ids', async 
     inputSummary: 'pnpm test',
   }]);
 });
+
+test('background task permissions remain visible without being cleared by a new human prompt', async () => {
+  const { extractAttentionState } = await importWorkspaceNativeAttention();
+
+  const attention = extractAttentionState([
+    event(1, {
+      type: 'permission_required',
+      request_id: 'req-background-1',
+      tool_use_id: 'tool-background-1',
+      tool_name: 'Bash',
+      input_summary: 'pnpm test',
+      background_task_id: 'task-background-1',
+    }),
+    event(2, { type: 'user_prompt', text: 'new foreground prompt', image_count: 0 }),
+    event(3, { type: 'session_completed', reason: 'foreground failed' }),
+  ]);
+
+  assert.deepEqual(attention.permissions, [{
+    requestId: 'req-background-1',
+    toolUseId: 'tool-background-1',
+    toolName: 'Bash',
+    inputSummary: 'pnpm test',
+    backgroundTaskId: 'task-background-1',
+  }]);
+});

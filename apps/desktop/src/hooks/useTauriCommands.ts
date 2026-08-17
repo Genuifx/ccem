@@ -1068,17 +1068,26 @@ export function useTauriCommands() {
     });
   }, []);
 
+  const stopNativeBackgroundTask = useCallback(async (
+    runtimeId: string,
+    taskId: string,
+  ): Promise<void> => {
+    await invoke('stop_native_background_task', { runtimeId, taskId });
+  }, []);
+
   const updateNativeSessionSettings = useCallback(async (
     runtimeId: string,
     envName?: string | null,
     permMode?: string | null,
     effort?: string | null,
+    forceRestart = false,
   ): Promise<void> => {
     await invoke('update_native_session_settings', {
       runtimeId,
       envName: envName ?? null,
       permMode: permMode ?? null,
       effort: effort ?? null,
+      forceRestart,
     });
   }, []);
 
@@ -1095,10 +1104,12 @@ export function useTauriCommands() {
   const handoffNativeSessionToTerminal = useCallback(async (
     runtimeId: string,
     terminalType?: NativeTerminalType,
+    allowBackgroundTaskTermination = false,
   ): Promise<NativeHandoffResult> => {
     return await invoke<NativeHandoffResult>('handoff_native_session_to_terminal', {
       runtimeId,
       terminalType: terminalType ?? null,
+      allowBackgroundTaskTermination,
     });
   }, []);
 
@@ -1716,6 +1727,7 @@ export function useTauriCommands() {
     queryNativeSessionUsage,
     getNativeSessionEvents,
     stopNativeSession,
+    stopNativeBackgroundTask,
     updateNativeSessionSettings,
     setNativeSessionRuntimePermMode,
     handoffNativeSessionToTerminal,

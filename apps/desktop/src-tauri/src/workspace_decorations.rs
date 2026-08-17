@@ -304,8 +304,14 @@ fn resolve_attention_kind(events: &[SessionEventRecord]) -> Option<String> {
 
     for event in events {
         match &event.payload {
-            SessionEventPayload::PermissionRequired { request_id, .. } => {
-                pending_permissions.insert(request_id.clone());
+            SessionEventPayload::PermissionRequired {
+                request_id,
+                background_task_id,
+                ..
+            } => {
+                if background_task_id.is_none() {
+                    pending_permissions.insert(request_id.clone());
+                }
             }
             SessionEventPayload::PermissionResponded { request_id, .. } => {
                 pending_permissions.remove(request_id);
@@ -696,6 +702,7 @@ mod tests {
                 tool_use_id: Some("tool-1".to_string()),
                 tool_name: "Bash".to_string(),
                 input_summary: None,
+                background_task_id: None,
             },
         };
         let mut events_by_runtime = HashMap::new();

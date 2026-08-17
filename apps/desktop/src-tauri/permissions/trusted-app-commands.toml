@@ -100,6 +100,7 @@ commands.allow = [
   "restart_native_session_direct",
   "set_native_session_runtime_perm_mode",
   "stop_native_session",
+  "stop_native_background_task",
   "handoff_native_session_to_terminal",
   "launch_opencode_web",
   "list_unified_sessions",

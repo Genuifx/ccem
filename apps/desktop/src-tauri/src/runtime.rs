@@ -870,6 +870,7 @@ impl RuntimeManager {
                     tool_use_id: None,
                     tool_name: request.tool_name,
                     input_summary: None,
+                    background_task_id: None,
                 },
             );
         }
