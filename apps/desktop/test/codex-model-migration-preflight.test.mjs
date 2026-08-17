@@ -619,8 +619,11 @@ test('migration dialog shows the consequence and exact replacement before either
 
 test('Workspace wires both native launch paths through the gate and preserves resume identity and drafts', async () => {
   const source = await fs.readFile(path.join(desktopDir, 'src/pages/Workspace.tsx'), 'utf8');
-  const createStart = source.indexOf('const handleCreateNativeConversation');
-  const resumeStart = source.indexOf('const handleContinueHistorySession');
+  // The subagent-router branch splits the launch bodies into `runCreate…` /
+  // `runContinue…` (reentry-guarded) with thin `handle*` wrappers; the gate
+  // wiring lives in the run* bodies.
+  const createStart = source.indexOf('const runCreateNativeConversation');
+  const resumeStart = source.indexOf('const runContinueHistorySession');
   const createBlock = source.slice(createStart, resumeStart);
   const resumeBlock = source.slice(resumeStart, source.indexOf('const handleLiveSessionUpdate', resumeStart));
 
