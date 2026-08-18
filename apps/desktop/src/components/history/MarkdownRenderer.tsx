@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
+import { Suspense, lazy, memo, useCallback, useEffect, useState } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Check, Copy, Maximize2, X } from '@/lib/lucide-react';
@@ -396,7 +396,11 @@ function MarkdownImage({
   );
 }
 
-export function MarkdownRenderer({
+// Memoized on primitive props (content/className/variant/codeTone): when the
+// surrounding transcript re-renders during streaming, unchanged message bodies
+// skip react-markdown entirely so their DOM text nodes — and any user
+// selection anchored to them — survive.
+export const MarkdownRenderer = memo(function MarkdownRenderer({
   content,
   className,
   variant = 'default',
@@ -560,4 +564,4 @@ export function MarkdownRenderer({
       </Markdown>
     </div>
   );
-}
+});

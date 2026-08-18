@@ -63,12 +63,34 @@ function findItem(root: HTMLElement, key: string): HTMLElement | null {
   return transcriptItems(root).find((item) => itemKey(item) === key) ?? null;
 }
 
+type ItemIndex = Map<string, HTMLElement>;
+
+function buildItemIndex(root: HTMLElement): ItemIndex {
+  const index: ItemIndex = new Map();
+  for (const item of transcriptItems(root)) {
+    const key = itemKey(item);
+    if (key) {
+      index.set(key, item);
+    }
+  }
+  return index;
+}
+
+function indexedFindItem(index: ItemIndex, key: string): HTMLElement | null {
+  return index.get(key) ?? null;
+}
+
 function rangeFromAnchor(
   root: HTMLElement,
   anchor: WorkspaceAnnotationAnchor,
+  index?: ItemIndex,
 ): Range | null {
-  const startItem = findItem(root, anchor.startItemKey);
-  const endItem = findItem(root, anchor.endItemKey);
+  const startItem = index
+    ? indexedFindItem(index, anchor.startItemKey)
+    : findItem(root, anchor.startItemKey);
+  const endItem = index
+    ? indexedFindItem(index, anchor.endItemKey)
+    : findItem(root, anchor.endItemKey);
   if (!startItem || !endItem) {
     return null;
   }
@@ -139,7 +161,33 @@ export function resolveWorkspaceAnnotationRange(
     if (anchoredRange && normalizeWorkspaceSelection(anchoredRange.toString()) === annotation.quote) {
       return anchoredRange;
     }
+    // The annotation was captured with an anchor but that anchor no longer
+    // resolves (item unmounted, segment switched, digest collapsed). Falling
+    // back to a first-match quote search would highlight an unrelated
+    // occurrence of the same text, so the annotation stays unanchored and is
+    // still manageable from the composer list instead.
+    return null;
   }
 
+  // Legacy annotations stored before anchors existed.
   return rangeForExactQuote(root, annotation.quote);
+}
+
+// Batch resolution for the placement pass: builds the transcript item index
+// once instead of re-querying the DOM for every annotation.
+export function resolveWorkspaceAnnotationRanges(
+  root: HTMLElement,
+  annotations: ReadonlyArray<Pick<WorkspaceAnnotation, 'quote' | 'anchor'>>,
+): Array<Range | null> {
+  const index = buildItemIndex(root);
+  return annotations.map((annotation) => {
+    if (annotation.anchor) {
+      const anchoredRange = rangeFromAnchor(root, annotation.anchor, index);
+      if (anchoredRange && normalizeWorkspaceSelection(anchoredRange.toString()) === annotation.quote) {
+        return anchoredRange;
+      }
+      return null;
+    }
+    return rangeForExactQuote(root, annotation.quote);
+  });
 }

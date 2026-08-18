@@ -177,7 +177,7 @@ interface WorkspaceSessionComposerProps {
   onRemoveQueuedMessage?: (id: string) => void;
   queueCanFlush?: boolean;
   annotations?: WorkspaceAnnotation[];
-  onUpdateAnnotation?: (id: string, note: string) => void;
+  onUpdateAnnotation?: (id: string, note: string) => boolean;
   onRemoveAnnotation?: (id: string) => void;
   onClearAnnotations?: () => void;
   onAnnotationsSent?: () => void;

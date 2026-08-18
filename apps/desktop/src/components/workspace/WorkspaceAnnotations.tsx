@@ -7,6 +7,7 @@ import {
   useState,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { toast } from 'sonner';
 import { Check, MessageSquareQuote, Pencil, Plus, Trash2, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -20,7 +21,7 @@ import {
 } from './workspaceAnnotationModel';
 import {
   captureWorkspaceAnnotationAnchor,
-  resolveWorkspaceAnnotationRange,
+  resolveWorkspaceAnnotationRanges,
 } from './workspaceAnnotationAnchors';
 import {
   visibleTextRangeRects,
@@ -28,8 +29,9 @@ import {
 } from './workspaceAnnotationRects';
 
 interface SelectionCandidate {
-  quote: string;
-  anchor: WorkspaceAnnotationAnchor;
+  quote: string | null;
+  anchor: WorkspaceAnnotationAnchor | null;
+  blocked: boolean;
   rects: ViewportRect[];
   left: number;
   top: number;
@@ -52,7 +54,7 @@ interface WorkspaceTranscriptSelectionProps {
   canAdd: boolean;
   annotations: WorkspaceAnnotation[];
   onAdd: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
-  onUpdate: (id: string, note: string) => void;
+  onUpdate: (id: string, note: string) => boolean;
   onRemove: (id: string) => void;
 }
 
@@ -60,23 +62,14 @@ function selectionNodeIsInside(root: HTMLElement, node: Node | null): boolean {
   return Boolean(node && (node === root || root.contains(node)));
 }
 
+const PLACEMENT_REFRESH_MIN_INTERVAL_MS = 120;
+
 function useAnnotationPlacements(
   rootRef: RefObject<HTMLElement | null>,
   annotations: WorkspaceAnnotation[],
   isActive: boolean,
 ): AnnotationPlacement[] {
   const [placements, setPlacements] = useState<AnnotationPlacement[]>([]);
-  const annotationKey = useMemo(
-    () => annotations.map((annotation) => [
-      annotation.id,
-      annotation.quote,
-      annotation.anchor?.startItemKey ?? '',
-      annotation.anchor?.startOffset ?? '',
-      annotation.anchor?.endItemKey ?? '',
-      annotation.anchor?.endOffset ?? '',
-    ].join(':')).join('|'),
-    [annotations],
-  );
 
   useEffect(() => {
     const root = rootRef.current;
@@ -86,10 +79,21 @@ function useAnnotationPlacements(
     }
 
     let frame: number | null = null;
+    let fallbackTimer: number | null = null;
+    let trailingTimer: number | null = null;
+    let lastRunAt = 0;
+
     const refresh = () => {
       frame = null;
-      const next = annotations.flatMap<AnnotationPlacement>((annotation, index) => {
-        const range = resolveWorkspaceAnnotationRange(root, annotation);
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      lastRunAt = Date.now();
+      // Batch resolution builds the transcript item index once per pass
+      // instead of re-querying the DOM for every annotation.
+      const ranges = resolveWorkspaceAnnotationRanges(root, annotations);
+      const next = ranges.flatMap<AnnotationPlacement>((range, index) => {
         if (!range) {
           return [];
         }
@@ -99,7 +103,7 @@ function useAnnotationPlacements(
           return [];
         }
         return [{
-          annotation,
+          annotation: annotations[index],
           index,
           rects,
           markerLeft: Math.max(12, Math.min(window.innerWidth - 32, lastRect.right + 8)),
@@ -120,11 +124,45 @@ function useAnnotationPlacements(
       });
       setPlacements(next);
     };
-    const scheduleRefresh = () => {
+
+    const clearScheduled = () => {
       if (frame !== null) {
         cancelAnimationFrame(frame);
+        frame = null;
       }
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      if (trailingTimer !== null) {
+        window.clearTimeout(trailingTimer);
+        trailingTimer = null;
+      }
+    };
+
+    const scheduleRefresh = () => {
+      // Streaming transcripts mutate constantly; cap full recomputes to one
+      // pass per interval with a trailing run so bursts stay cheap.
+      const sinceLastRun = Date.now() - lastRunAt;
+      if (sinceLastRun < PLACEMENT_REFRESH_MIN_INTERVAL_MS) {
+        if (trailingTimer === null) {
+          trailingTimer = window.setTimeout(() => {
+            trailingTimer = null;
+            refresh();
+          }, PLACEMENT_REFRESH_MIN_INTERVAL_MS - sinceLastRun);
+        }
+        return;
+      }
+      clearScheduled();
       frame = requestAnimationFrame(refresh);
+      // WKWebView suspends animation frames for occluded/background windows;
+      // the timeout fallback keeps markers updating in that state.
+      fallbackTimer = window.setTimeout(() => {
+        if (frame !== null) {
+          cancelAnimationFrame(frame);
+          refresh();
+        }
+      }, 250);
     };
 
     refresh();
@@ -138,15 +176,13 @@ function useAnnotationPlacements(
     resizeObserver?.observe(root);
 
     return () => {
-      if (frame !== null) {
-        cancelAnimationFrame(frame);
-      }
+      clearScheduled();
       root.removeEventListener('scroll', scheduleRefresh);
       window.removeEventListener('resize', scheduleRefresh);
       mutationObserver.disconnect();
       resizeObserver?.disconnect();
     };
-  }, [annotationKey, annotations, isActive, rootRef]);
+  }, [annotations, isActive, rootRef]);
 
   return placements;
 }
@@ -211,25 +247,37 @@ export function WorkspaceTranscriptSelection({
 
     const rawText = selection.toString();
     const quote = normalizeWorkspaceSelection(rawText);
+    const range = selection.getRangeAt(0);
+    const rects = visibleTextRangeRects(range, root);
+    const lastRect = rects[rects.length - 1];
+
     if (!quote) {
-      if (rawText.trim().length > MAX_WORKSPACE_SELECTION_CHARS) {
-        setCandidate(null);
+      if (rawText.trim().length > MAX_WORKSPACE_SELECTION_CHARS && lastRect) {
+        // Surface why the panel will not offer "add" instead of vanishing.
+        setCandidate({
+          quote: null,
+          anchor: null,
+          blocked: true,
+          rects,
+          left: Math.max(124, Math.min(window.innerWidth - 124, lastRect.left + lastRect.width / 2)),
+          top: Math.max(12, Math.min(window.innerHeight - 72, lastRect.bottom + 8)),
+          editing: false,
+        });
+        setNote('');
       } else if (!candidate?.editing) {
         dismiss();
       }
       return;
     }
 
-    const range = selection.getRangeAt(0);
     const anchor = captureWorkspaceAnnotationAnchor(root, range);
-    const rects = visibleTextRangeRects(range, root);
-    const lastRect = rects[rects.length - 1];
     if (!anchor || !lastRect) {
       return;
     }
     setCandidate({
       quote,
       anchor,
+      blocked: false,
       rects,
       left: Math.max(124, Math.min(window.innerWidth - 124, lastRect.left + lastRect.width / 2)),
       top: Math.max(12, Math.min(window.innerHeight - 72, lastRect.bottom + 8)),
@@ -264,6 +312,16 @@ export function WorkspaceTranscriptSelection({
     };
     const handleKeyUp = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        // Escape must not silently discard a note the user is typing; they
+        // can still close via the cancel button or by clearing the text.
+        const target = event.target;
+        if (
+          target instanceof HTMLTextAreaElement
+          && target.closest('[data-workspace-selection-action]')
+          && target.value.trim().length > 0
+        ) {
+          return;
+        }
         dismiss();
         dismissSavedEditor();
         return;
@@ -352,12 +410,14 @@ export function WorkspaceTranscriptSelection({
   }
 
   const save = () => {
-    if (!candidate || !note.trim()) {
+    if (!candidate?.quote || !note.trim()) {
       return;
     }
-    if (onAdd(candidate.quote, note, candidate.anchor)) {
+    if (onAdd(candidate.quote, note, candidate.anchor ?? undefined)) {
       window.getSelection()?.removeAllRanges();
       dismiss();
+    } else {
+      toast.error(t('workspace.annotationSaveFailed'));
     }
   };
 
@@ -451,8 +511,11 @@ export function WorkspaceTranscriptSelection({
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && editingAnnotationNote.trim()) {
                 event.preventDefault();
-                onUpdate(editingPlacement.annotation.id, editingAnnotationNote);
-                dismissSavedEditor();
+                if (onUpdate(editingPlacement.annotation.id, editingAnnotationNote)) {
+                  dismissSavedEditor();
+                } else {
+                  toast.error(t('workspace.annotationSaveFailed'));
+                }
               }
             }}
             className="min-h-[72px] w-full resize-none rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
@@ -479,8 +542,11 @@ export function WorkspaceTranscriptSelection({
                 className="h-7 rounded-full px-3"
                 disabled={!editingAnnotationNote.trim()}
                 onClick={() => {
-                  onUpdate(editingPlacement.annotation.id, editingAnnotationNote);
-                  dismissSavedEditor();
+                  if (onUpdate(editingPlacement.annotation.id, editingAnnotationNote)) {
+                    dismissSavedEditor();
+                  } else {
+                    toast.error(t('workspace.annotationSaveFailed'));
+                  }
                 }}
               >
                 {t('common.save')}
@@ -542,6 +608,10 @@ export function WorkspaceTranscriptSelection({
                 </div>
               </div>
             </div>
+          ) : candidate.blocked ? (
+            <span className="px-3 py-1.5 text-xs text-muted-foreground">
+              {t('workspace.selectionTooLong')}
+            </span>
           ) : (
             <Button
               type="button"
@@ -553,6 +623,9 @@ export function WorkspaceTranscriptSelection({
                 setCandidate((current) => current ? {
                   ...current,
                   editing: true,
+                  // The editing panel is wider than the trigger pill; keep it
+                  // fully on screen when the selection sits near an edge.
+                  left: Math.max(212, Math.min(window.innerWidth - 212, current.left)),
                   top: Math.max(12, Math.min(current.top, window.innerHeight - 230)),
                 } : current);
                 window.getSelection()?.removeAllRanges();
@@ -571,7 +644,7 @@ export function WorkspaceTranscriptSelection({
 
 interface WorkspaceComposerAnnotationsProps {
   annotations: WorkspaceAnnotation[];
-  onUpdate: (id: string, note: string) => void;
+  onUpdate: (id: string, note: string) => boolean;
   onRemove: (id: string) => void;
   onClear: () => void;
 }

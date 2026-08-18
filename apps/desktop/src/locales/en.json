@@ -434,6 +434,8 @@
     "selectionAnnotationPlaceholder": "Describe how the model should handle this selection...",
     "selectionAnnotationSubmitHint": "⌘ Enter to add",
     "selectionAnnotationLimit": "20 annotation limit reached",
+    "selectionTooLong": "Selection is too long to annotate (12,000 character limit)",
+    "annotationSaveFailed": "Failed to save annotation: session annotation limit reached",
     "composerAnnotationCount": "{count} annotations",
     "composerAnnotationsTitle": "Annotations sent with this message",
     "composerAnnotationsClear": "Clear annotations",

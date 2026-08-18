@@ -117,22 +117,21 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     return true;
   }, [annotationCharCount, annotations.length, updateItems]);
 
-  const updateAnnotation = useCallback((id: string, note: string) => {
+  const updateAnnotation = useCallback((id: string, note: string): boolean => {
     const normalizedNote = note.trim();
     if (!normalizedNote || normalizedNote.length > MAX_WORKSPACE_ANNOTATION_NOTE_CHARS) {
-      return;
+      return false;
     }
-    updateItems((items) => {
-      const next = items.map((item) => (
-        item.id === id ? { ...item, note: normalizedNote } : item
-      ));
-      const nextCharCount = next.reduce(
-        (total, annotation) => total + annotation.quote.length + annotation.note.length,
-        0,
-      );
-      return nextCharCount <= MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS ? next : items;
-    });
-  }, [updateItems]);
+    const nextCharCount = annotationCharCount + normalizedNote.length
+      - (annotations.find((item) => item.id === id)?.note.length ?? 0);
+    if (nextCharCount > MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS) {
+      return false;
+    }
+    updateItems((items) => items.map((item) => (
+      item.id === id ? { ...item, note: normalizedNote } : item
+    )));
+    return true;
+  }, [annotationCharCount, annotations, updateItems]);
 
   const removeAnnotation = useCallback((id: string) => {
     updateItems((items) => items.filter((item) => item.id !== id));

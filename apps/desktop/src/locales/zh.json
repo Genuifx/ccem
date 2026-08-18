@@ -434,6 +434,8 @@
     "selectionAnnotationPlaceholder": "写下你希望模型如何处理这段内容...",
     "selectionAnnotationSubmitHint": "⌘ Enter 添加",
     "selectionAnnotationLimit": "已达 20 条上限",
+    "selectionTooLong": "选中文本过长，无法添加注释（上限 12,000 字符）",
+    "annotationSaveFailed": "注释保存失败：超出会话注释上限",
     "composerAnnotationCount": "{count} 条注释",
     "composerAnnotationsTitle": "随消息发送的注释",
     "composerAnnotationsClear": "清空注释",

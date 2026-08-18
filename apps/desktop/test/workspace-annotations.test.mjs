@@ -345,3 +345,43 @@ test('live and history workspace paths wire transcript selections into successfu
     'the background shorthand is invalid in ::selection and would let the native blue selection layer show through',
   );
 });
+
+test('anchored annotations never fall back to first-match quote search', async () => {
+  const [anchorsSource, annotationsSource] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceAnnotationAnchors.ts'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceAnnotations.tsx'), 'utf8'),
+  ]);
+
+  const resolveStart = anchorsSource.indexOf('export function resolveWorkspaceAnnotationRange');
+  assert.ok(resolveStart >= 0, 'resolveWorkspaceAnnotationRange must exist');
+  const resolveEnd = anchorsSource.indexOf('\n}', resolveStart);
+  const resolveBody = anchorsSource.slice(resolveStart, resolveEnd);
+  assert.match(resolveBody, /if \(annotation\.anchor\)/);
+  assert.match(
+    resolveBody,
+    /return null;/,
+    'an annotation with a stale anchor must stay unanchored instead of guessing a position',
+  );
+
+  // Batch resolution powers the placement pass with a single item index.
+  assert.match(anchorsSource, /export function resolveWorkspaceAnnotationRanges/);
+  assert.match(annotationsSource, /resolveWorkspaceAnnotationRanges\(root, annotations\)/);
+
+  // Placement refreshes are throttled and survive suspended animation frames
+  // (WKWebView occluded windows never fire rAF).
+  assert.match(annotationsSource, /PLACEMENT_REFRESH_MIN_INTERVAL_MS/);
+  assert.match(annotationsSource, /fallbackTimer/);
+
+  // Escape must not discard a non-empty annotation draft.
+  assert.match(
+    annotationsSource,
+    /event\.key === 'Escape'[\s\S]*HTMLTextAreaElement[\s\S]*value\.trim\(\)\.length > 0[\s\S]*return;/,
+  );
+
+  // Oversized selections surface a hint instead of vanishing.
+  assert.match(annotationsSource, /candidate\.blocked \?/);
+  assert.match(annotationsSource, /workspace\.selectionTooLong/);
+
+  // Failed saves are reported instead of silently keeping stale state.
+  assert.match(annotationsSource, /workspace\.annotationSaveFailed/);
+});
