@@ -59,16 +59,18 @@ test('tray cockpit owns left-click while preserving the native context menu', as
   assert.match(traySource, /panel_x - TRAY_COCKPIT_SHADOW_MARGIN_X/);
   assert.match(traySource, /panel_y - TRAY_COCKPIT_SHADOW_MARGIN_TOP/);
   assert.match(traySource, /#\[tauri::command\][\s\S]*pub fn open_tray_cockpit/);
-  assert.match(traySource, /pub fn prepare_tray_cockpit/);
   assert.match(traySource, /pub async fn get_tray_runtime_snapshot/);
   assert.match(traySource, /fn schedule_tray_cockpit_build/);
   assert.match(traySource, /tauri::async_runtime::spawn_blocking/);
+  // Plan 024: the startup prewarm is gone — the cockpit webview builds lazily
+  // on first open via schedule_tray_cockpit_build.
+  assert.doesNotMatch(traySource, /pub fn prepare_tray_cockpit/);
 
   assert.match(mainSource, /use tray::\{create_tray, TRAY_COCKPIT_LABEL\}/);
   assert.match(mainSource, /tray::open_tray_cockpit/);
   assert.match(mainSource, /tray::get_tray_runtime_snapshot/);
   assert.match(mainSource, /analytics::get_tray_usage_stats/);
-  assert.match(mainSource, /tray::prepare_tray_cockpit\(app\.handle\(\)\)/);
+  assert.doesNotMatch(mainSource, /tray::prepare_tray_cockpit/);
   const trayUsageCommand = analyticsSource.match(
     /pub async fn get_tray_usage_stats\(\)[\s\S]*?\n\}/,
   )?.[0];
