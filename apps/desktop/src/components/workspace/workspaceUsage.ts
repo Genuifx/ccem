@@ -43,6 +43,32 @@ export interface SessionUsageSnapshot {
   } | null;
 }
 
+/** Aggregated OBSERVED routed usage per (logical key, env, model) — from
+ *  router request-ledger events. Observational (upstream self-reported SSE),
+ *  not a billing statement. */
+export interface RoutedEnvUsage {
+  /** Logical routing key (background / subagent:Explore / ...); '' when unknown */
+  logicalKey: string;
+  env: string;
+  model: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
+/** Router request ledger rollup: observed rows + explicit unknown remainder. */
+export interface RoutedUsageLedger {
+  /** Rows aggregated over requests that CARRIED usage. */
+  rows: RoutedEnvUsage[];
+  /** Forwarded requests whose stream had no parseable usage — counted, not
+   *  zero-filled, so they never silently vanish from the distribution. */
+  unattributedCount: number;
+  /** Incomplete streams (client cancel / upstream error mid-stream). */
+  incompleteCount: number;
+}
+
 export interface SessionUsageState {
   /** Cumulative token consumption across all turns (event-derived) */
   totalInputTokens: number;
@@ -57,6 +83,8 @@ export interface SessionUsageState {
   context: SessionContextSnapshot | null;
   /** Latest SDK session usage snapshot (from session_usage events, latest wins) */
   sessionUsage: SessionUsageSnapshot | null;
+  /** Router request-ledger rollup for dynamically routed sessions (null when not routed) */
+  routedLedger: RoutedUsageLedger | null;
 }
 
 const EMPTY_USAGE: SessionUsageState = {
@@ -68,6 +96,7 @@ const EMPTY_USAGE: SessionUsageState = {
   turnCount: 0,
   context: null,
   sessionUsage: null,
+  routedLedger: null,
 };
 
 /**
@@ -86,6 +115,20 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
   let turnCount = 0;
   let context: SessionContextSnapshot | null = null;
   let sessionUsage: SessionUsageSnapshot | null = null;
+  // Router request ledger: request_id is the stable identity — replayed or
+  // duplicated events collapse via last-write-wins, never double-count.
+  const routedRequests = new Map<string, {
+    logicalKey: string;
+    env: string;
+    model: string;
+    complete: boolean;
+    usage: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+    } | null;
+  }>();
 
   for (const event of events) {
     const { payload } = event;
@@ -134,6 +177,25 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
       };
     }
 
+    if (payload.type === 'routed_request') {
+      // One ledger entry per forwarded request; request_id dedups replay.
+      const usage = payload.usage
+        ? {
+            inputTokens: payload.usage.input_tokens,
+            outputTokens: payload.usage.output_tokens,
+            cacheReadTokens: payload.usage.cache_read_tokens,
+            cacheCreationTokens: payload.usage.cache_creation_tokens,
+          }
+        : null;
+      routedRequests.set(payload.request_id, {
+        logicalKey: payload.logical_key ?? '',
+        env: payload.target_env,
+        model: payload.model ?? '',
+        complete: payload.complete,
+        usage,
+      });
+    }
+
     if (payload.type === 'session_usage') {
       // SDK snapshots are cumulative and authoritative — latest wins.
       sessionUsage = {
@@ -173,8 +235,48 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
     }
   }
 
-  if (turnCount === 0 && !context && !sessionUsage) {
+  if (turnCount === 0 && !context && !sessionUsage && routedRequests.size === 0) {
     return EMPTY_USAGE;
+  }
+
+  // Roll up the ledger: rows only over usage-bearing requests; usage-less and
+  // incomplete requests are counted explicitly, never zero-filled.
+  let routedLedger: RoutedUsageLedger | null = null;
+  if (routedRequests.size > 0) {
+    const rows = new Map<string, RoutedEnvUsage>();
+    let unattributedCount = 0;
+    let incompleteCount = 0;
+    for (const request of routedRequests.values()) {
+      if (!request.complete) incompleteCount += 1;
+      if (!request.usage) {
+        unattributedCount += 1;
+        continue;
+      }
+      const key = `${request.logicalKey} ${request.env} ${request.model}`;
+      const row = rows.get(key) ?? {
+        logicalKey: request.logicalKey,
+        env: request.env,
+        model: request.model,
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      };
+      row.requestCount += 1;
+      row.inputTokens += request.usage.inputTokens;
+      row.outputTokens += request.usage.outputTokens;
+      row.cacheReadTokens += request.usage.cacheReadTokens;
+      row.cacheCreationTokens += request.usage.cacheCreationTokens;
+      rows.set(key, row);
+    }
+    routedLedger = {
+      rows: [...rows.values()].sort(
+        (a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens),
+      ),
+      unattributedCount,
+      incompleteCount,
+    };
   }
 
   return {
@@ -186,6 +288,7 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
     turnCount,
     context,
     sessionUsage,
+    routedLedger,
   };
 }
 

@@ -493,7 +493,12 @@
     "imageLightboxNext": "下一张",
     "imageThumbnailAlt": "附加图片 {index}",
     "imageLoadFailed": "图片不可用",
-    "markdownImageClickToExpand": "点击查看大图"
+    "markdownImageClickToExpand": "点击查看大图",
+    "usagePanelRouted": "路由分布（观测）",
+    "usagePanelRoutedMain": "主任务",
+    "usagePanelRoutedUnattributed": "未含用量的请求",
+    "usagePanelRoutedIncomplete": "中断的请求",
+    "usagePanelRoutedFootnote": "按上游响应自报用量观测，非账单口径；与会话总计口径不同。"
   },
   "sessions": {
     "subtitle": "管理运行中的 Claude Code 会话",

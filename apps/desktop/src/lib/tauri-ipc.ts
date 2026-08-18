@@ -1399,6 +1399,25 @@ export type SessionEventPayload =
       scope?: string | null;
     }
   | {
+      /** Router request LEDGER entry (one per forwarded /v1/messages request).
+       *  usage is upstream self-reported (observational, not billing) and may
+       *  be absent — never render absent usage as zero. */
+      type: 'routed_request';
+      provider: string;
+      request_id: string;
+      target_env: string;
+      model?: string | null;
+      logical_key?: string | null;
+      status: number;
+      complete: boolean;
+      usage?: {
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_creation_tokens: number;
+      } | null;
+    }
+  | {
       type: 'context_usage';
       provider: string;
       used_tokens: number;

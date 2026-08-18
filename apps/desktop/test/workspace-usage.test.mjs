@@ -176,3 +176,104 @@ test('takes the latest session_usage snapshot and keeps the empty state otherwis
   assert.equal(empty.context, null);
   assert.equal(empty.sessionUsage, null);
 });
+
+test('routes a request ledger: dedup by request_id, unattributed kept, never zero-filled', async () => {
+  const { computeSessionUsage } = await importWorkspaceUsage();
+
+  const usage = computeSessionUsage([
+    event(1, {
+      type: 'routed_request',
+      provider: 'claude',
+      request_id: 'req-1',
+      target_env: 'GLM-5.3',
+      model: 'glm-5.3',
+      logical_key: 'main',
+      status: 200,
+      complete: true,
+      usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    }),
+    event(2, {
+      type: 'routed_request',
+      provider: 'claude',
+      request_id: 'req-2',
+      target_env: 'DeepSeek-V4-Flash',
+      model: 'deepseek-v4-flash',
+      logical_key: 'subagent:Explore',
+      status: 200,
+      complete: true,
+      usage: { input_tokens: 500, output_tokens: 40, cache_read_tokens: 480, cache_creation_tokens: 0 },
+    }),
+    // Same request replayed (event bus replay / duplicate emission): must NOT double-count.
+    event(3, {
+      type: 'routed_request',
+      provider: 'claude',
+      request_id: 'req-2',
+      target_env: 'DeepSeek-V4-Flash',
+      model: 'deepseek-v4-flash',
+      logical_key: 'subagent:Explore',
+      status: 200,
+      complete: true,
+      usage: { input_tokens: 500, output_tokens: 40, cache_read_tokens: 480, cache_creation_tokens: 0 },
+    }),
+    // Usage-less request: counted as unattributed, never rendered as zeros.
+    event(4, {
+      type: 'routed_request',
+      provider: 'claude',
+      request_id: 'req-3',
+      target_env: 'DeepSeek-V4-Flash',
+      model: 'deepseek-v4-flash',
+      logical_key: 'subagent:Explore',
+      status: 200,
+      complete: true,
+      usage: null,
+    }),
+    // Interrupted stream with partial usage: row counts it, incomplete counter too.
+    event(5, {
+      type: 'routed_request',
+      provider: 'claude',
+      request_id: 'req-4',
+      target_env: 'GLM-5.3',
+      model: 'glm-5.3',
+      logical_key: 'main',
+      status: 200,
+      complete: false,
+      usage: { input_tokens: 300, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    }),
+  ]);
+
+  const ledger = usage.routedLedger;
+  assert.ok(ledger, 'ledger must exist for routed sessions');
+  assert.equal(ledger.unattributedCount, 1, 'usage-less requests are counted, not zero-filled');
+  assert.equal(ledger.incompleteCount, 1);
+
+  // Rows: Explore/DeepSeek (500+40, ONE request after dedup) and main/GLM
+  // (100+20 plus the incomplete 300+0 both under main/GLM/glm-5.3).
+  assert.equal(ledger.rows.length, 2);
+  const explore = ledger.rows[0];
+  assert.equal(explore.logicalKey, 'subagent:Explore');
+  assert.equal(explore.env, 'DeepSeek-V4-Flash');
+  assert.equal(explore.requestCount, 1, 'duplicate request_id must collapse');
+  assert.equal(explore.inputTokens, 500);
+  assert.equal(explore.cacheReadTokens, 480);
+  const mainRow = ledger.rows[1];
+  assert.equal(mainRow.logicalKey, 'main');
+  assert.equal(mainRow.requestCount, 2);
+  assert.equal(mainRow.inputTokens, 400);
+});
+
+test('non-routed sessions expose no ledger', async () => {
+  const { computeSessionUsage } = await importWorkspaceUsage();
+  const usage = computeSessionUsage([
+    event(1, {
+      type: 'token_usage',
+      provider: 'claude',
+      input_tokens: 5,
+      output_tokens: 2,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      total_cost_usd: 0.01,
+      scope: 'turn_total',
+    }),
+  ]);
+  assert.equal(usage.routedLedger, null);
+});

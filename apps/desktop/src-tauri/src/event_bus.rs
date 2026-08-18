@@ -82,6 +82,17 @@ pub struct ContextUsageCategory {
     pub tokens: u64,
 }
 
+/// Upstream self-reported usage for one routed request. Providers differ in
+/// WHERE they report (DeepSeek: message_start; GLM: message_delta cumulative),
+/// so the router normalizes with per-field max() across frames.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RoutedUsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionUsageModelEntry {
     pub model: String,
@@ -244,6 +255,31 @@ pub enum SessionEventPayload {
         total_cost_usd: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
+    },
+    /// Router request LEDGER entry for dynamically routed sessions. One event
+    /// per completed forwarded /v1/messages request. `usage` is upstream
+    /// self-reported SSE usage — OBSERVATIONAL, not a billing statement — and
+    /// is None when the stream carried no parseable usage frame (interrupted
+    /// streams, non-200, providers that omit usage). Consumers must never
+    /// render missing usage as zero or treat the sum as additive with SDK
+    /// session totals (different measurement aperture).
+    RoutedRequest {
+        provider: String,
+        /// Stable per-forward identity; retries are distinct requests.
+        request_id: String,
+        target_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Logical routing key that selected this target (background,
+        /// subagent:Explore, ...) when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_key: Option<String>,
+        status: u16,
+        /// False when the stream ended incomplete (client cancel / upstream
+        /// error mid-stream) — usage may be partial even when present.
+        complete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<RoutedUsageTotals>,
     },
     ContextUsage {
         provider: String,

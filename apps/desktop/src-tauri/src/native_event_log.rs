@@ -327,7 +327,9 @@ fn query_events_since(
         for row in rows {
             let row =
                 row.map_err(|error| format!("Failed to read native session event row: {}", error))?;
-            records.push(event_row_to_record(runtime_id, row)?);
+            if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
+                records.push(record);
+            }
         }
         return Ok(records);
     }
@@ -382,7 +384,9 @@ fn query_events_since(
         for row in rows {
             let row =
                 row.map_err(|error| format!("Failed to read native session event row: {}", error))?;
-            records.push(event_row_to_record(runtime_id, row)?);
+            if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
+                records.push(record);
+            }
         }
         return Ok(records);
     }
@@ -408,7 +412,9 @@ fn query_events_since(
     for row in rows {
         let row =
             row.map_err(|error| format!("Failed to read native session event row: {}", error))?;
-        records.push(event_row_to_record(runtime_id, row)?);
+        if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
+                records.push(record);
+            }
     }
     Ok(records)
 }
@@ -432,6 +438,25 @@ fn event_row_to_record(
         occurred_at,
         payload,
     })
+}
+
+/// Forward-compatible row conversion: persisted events written by a newer (or
+/// older) helper may carry payload types this build does not know. One such
+/// row must not blank the entire session replay — skip it with a warning and
+/// keep serving the rest.
+fn event_row_to_record_lossy(
+    runtime_id: &str,
+    row: (i64, String, String),
+) -> Option<SessionEventRecord> {
+    match event_row_to_record(runtime_id, row) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            eprintln!(
+                "Skipping unparsable native event for {runtime_id} during replay: {error}"
+            );
+            None
+        }
+    }
 }
 
 fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
@@ -531,6 +556,49 @@ mod tests {
     use crate::event_bus::{SessionEventPayload, SessionEventRecord};
     use chrono::Utc;
     use rusqlite::Connection;
+
+
+    #[test]
+    fn native_event_log_replay_skips_unknown_payload_types() {
+        // Forward compatibility: a payload type written by a different build
+        // (e.g. `background_tasks_changed`) must not blank the whole replay.
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-unknown-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+        log.append(&SessionEventRecord {
+            runtime_id: "runtime-unknown".to_string(),
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::AssistantChunk {
+                text: "before".to_string(),
+            },
+        })
+        .expect("append first");
+        drop(log);
+
+        // Hand-inject a row with a payload this build cannot decode.
+        {
+            let conn = Connection::open(&db_path).expect("open db");
+            conn.execute(
+                "INSERT INTO native_session_events (runtime_id, seq, occurred_at, payload_json, created_at)
+                 VALUES ('runtime-unknown', 2, '2026-08-18T00:00:00+00:00', ?1, '2026-08-18T00:00:00+00:00')",
+                ["{\"type\":\"background_tasks_changed\",\"count\":2}"],
+            )
+            .expect("inject unknown payload");
+        }
+
+        let reopened = NativeEventLog::new(db_path.clone());
+        let replay = reopened
+            .replay("runtime-unknown", None, None)
+            .expect("replay must tolerate unknown payload rows");
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.events[0].seq, 1);
+        assert_eq!(replay.newest_available_seq, Some(2));
+
+        let _ = std::fs::remove_file(db_path);
+    }
 
     #[test]
     fn native_event_log_replays_events_after_reopen() {

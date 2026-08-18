@@ -3514,8 +3514,15 @@ impl NativeRuntimeManager {
                 Ok(())
             }
             HelperOutputEvent::Event { payload } => {
-                let payload = serde_json::from_value::<SessionEventPayload>(payload)
-                    .map_err(|error| format!("Failed to decode helper payload: {}", error))?;
+                // A payload type this build does not know (newer helper) must
+                // not kill the stdout pump for the whole runtime — skip it.
+                let payload = match serde_json::from_value::<SessionEventPayload>(payload) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        eprintln!("Skipping unknown helper event for {runtime_id}: {error}");
+                        return Ok(());
+                    }
+                };
                 self.append_event(runtime_id, payload)
             }
             HelperOutputEvent::BrowserToolRequest {
@@ -4057,6 +4064,16 @@ impl NativeRuntimeManager {
             answers,
             annotations,
         )
+    }
+
+    /// Public bridge for OTHER managers (proxy debug router) to append an
+    /// event onto a live runtime's bus, e.g. per-request routed usage truth.
+    pub fn append_external_event(
+        &self,
+        runtime_id: &str,
+        payload: SessionEventPayload,
+    ) -> Result<(), String> {
+        self.append_event(runtime_id, payload)
     }
 
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {

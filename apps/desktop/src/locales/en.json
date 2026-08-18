@@ -493,7 +493,12 @@
     "imageLightboxNext": "Next",
     "imageThumbnailAlt": "Attached image {index}",
     "imageLoadFailed": "Image unavailable",
-    "markdownImageClickToExpand": "Click to view image"
+    "markdownImageClickToExpand": "Click to view image",
+    "usagePanelRouted": "Routed distribution (observed)",
+    "usagePanelRoutedMain": "Main thread",
+    "usagePanelRoutedUnattributed": "Requests without usage",
+    "usagePanelRoutedIncomplete": "Interrupted requests",
+    "usagePanelRoutedFootnote": "Observed from upstream self-reported usage, not a billing statement; uses a different aperture than session totals."
   },
   "sessions": {
     "subtitle": "Manage running Claude Code sessions",

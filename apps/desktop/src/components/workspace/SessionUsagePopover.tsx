@@ -53,6 +53,15 @@ function SectionTitle({ children }: { children: string }) {
 
 const MODEL_ROWS_LIMIT = 4;
 
+/** Human label for a router logical key: `subagent:Explore` → `Explore`,
+ * `background` → the localized background label, '' → main-thread label. */
+function routedRowLabel(t: (k: string) => string, logicalKey: string): string {
+  if (logicalKey.startsWith('subagent:')) return logicalKey.slice('subagent:'.length);
+  if (logicalKey === 'background') return t('router.background');
+  if (logicalKey === 'subagent:*') return t('router.subagentAny');
+  return t('workspace.usagePanelRoutedMain');
+}
+
 function buildModelRows(modelUsage: SessionUsageModelEntry[]) {
   const sorted = [...modelUsage].sort((a, b) => b.inputTokens - a.inputTokens);
   if (sorted.length <= MODEL_ROWS_LIMIT) {
@@ -107,14 +116,18 @@ export function SessionUsagePopoverContent({
 
   const hasTotals = inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0;
   const hasContext = usage.context !== null;
-  const hasModelUsage = (snapshot?.modelUsage.length ?? 0) > 0;
+  const ledger = usage.routedLedger;
+  // For dynamically routed sessions the SDK model rows attribute subagent
+  // turns to the client-side model — the router ledger is the observed truth,
+  // so it takes precedence when present.
+  const hasModelUsage = (ledger?.rows.length ?? 0) > 0 || (snapshot?.modelUsage.length ?? 0) > 0;
   const hasRateLimits = snapshot?.rateLimitsAvailable === true
     && snapshot?.rateLimits !== null
     && (snapshot!.rateLimits!.fiveHour?.utilization != null
       || snapshot!.rateLimits!.sevenDay?.utilization != null);
   const isEmpty = !hasTotals && !hasContext && !hasModelUsage && !hasRateLimits;
 
-  const modelRows = hasModelUsage ? buildModelRows(snapshot!.modelUsage) : [];
+  const modelRows = hasModelUsage && !ledger ? buildModelRows(snapshot!.modelUsage) : [];
 
   const rateLimitRows = hasRateLimits
     ? ([
@@ -214,7 +227,7 @@ export function SessionUsagePopoverContent({
         </div>
       )}
 
-      {hasModelUsage && (
+      {hasModelUsage && !ledger && (
         <div className="space-y-1 px-4 py-2.5">
           <SectionTitle>{t('workspace.usagePanelModels')}</SectionTitle>
           {modelRows.map((entry, index) => (
@@ -224,6 +237,37 @@ export function SessionUsagePopoverContent({
               value={formatTokenCount(entry.inputTokens + entry.outputTokens)}
             />
           ))}
+        </div>
+      )}
+
+      {ledger && (
+        <div className="space-y-1 px-4 py-2.5">
+          <SectionTitle>{t('workspace.usagePanelRouted')}</SectionTitle>
+          {ledger.rows.map((entry) => (
+            <UsageRow
+              key={`${entry.logicalKey}-${entry.env}-${entry.model}`}
+              label={`${routedRowLabel(t, entry.logicalKey)} · ${entry.env}`}
+              value={formatTokenCount(entry.inputTokens + entry.outputTokens)}
+              hint={`×${entry.requestCount}`}
+            />
+          ))}
+          {ledger.unattributedCount > 0 && (
+            <UsageRow
+              key="routed-unattributed"
+              label={t('workspace.usagePanelRoutedUnattributed')}
+              value={`${ledger.unattributedCount}`}
+            />
+          )}
+          {ledger.incompleteCount > 0 && (
+            <UsageRow
+              key="routed-incomplete"
+              label={t('workspace.usagePanelRoutedIncomplete')}
+              value={`${ledger.incompleteCount}`}
+            />
+          )}
+          <div className="pt-0.5 text-2xs leading-4 text-muted-foreground/70">
+            {t('workspace.usagePanelRoutedFootnote')}
+          </div>
         </div>
       )}
 

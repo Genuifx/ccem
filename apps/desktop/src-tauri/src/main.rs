@@ -5061,6 +5061,21 @@ fn main() {
     let proxy_debug_manager =
         ProxyDebugManager::new(session_manager.clone(), router_manager.clone())
             .expect("failed to initialize proxy debug manager");
+    // Router-forwarded requests carry the per-request env/model usage truth
+    // the SDK cannot see (model rewritten upstream) — publish it on the
+    // owning runtime's event bus as RoutedUsage events.
+    {
+        let native_for_router_usage = native_runtime_manager.clone();
+        proxy_debug_manager.set_routed_usage_sink(Arc::new(
+            move |runtime_id: &str, payload: event_bus::SessionEventPayload| {
+                if let Err(error) =
+                    native_for_router_usage.append_external_event(runtime_id, payload)
+                {
+                    eprintln!("Failed to append routed usage event for {runtime_id}: {error}");
+                }
+            },
+        ));
+    }
     let telegram_bridge_manager = Arc::new(TelegramBridgeManager::default());
     let wecom_bridge_manager = Arc::new(WecomBridgeManager::default());
     let weixin_bridge_manager = Arc::new(WeixinBridgeManager::default());

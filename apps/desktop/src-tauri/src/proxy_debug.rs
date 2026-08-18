@@ -113,6 +113,98 @@ pub struct ReducedStreamLog {
     pub total_stream_ms: Option<u64>,
 }
 
+/// Incremental SSE usage scanner for routed message streams. Runs on every
+/// forwarded chunk regardless of debug recording: the router is the only
+/// component that knows which environment actually served a request, so
+/// per-request usage truth must not depend on `record_mode`.
+#[derive(Debug, Default)]
+struct RoutedUsageScanner {
+    model: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    /// Partial SSE line carried across chunk boundaries.
+    carry: String,
+}
+
+impl RoutedUsageScanner {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.carry.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(idx) = self.carry.find('\n') {
+            let line: String = self.carry.drain(..=idx).collect();
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" || !data.starts_with('{') {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let event_type = value.get("type").and_then(|t| t.as_str());
+            if event_type == Some("message_start") {
+                if let Some(message) = value.get("message") {
+                    if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
+                        self.model = Some(model.to_string());
+                    }
+                    if let Some(usage) = message.get("usage") {
+                        self.input_tokens =
+                            usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        self.cache_creation_tokens = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.cache_read_tokens = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+            } else if event_type == Some("message_delta") {
+                if let Some(usage) = value.get("usage") {
+                    // message_delta carries CUMULATIVE usage. Providers differ:
+                    // DeepSeek fills message_start and reports only output here,
+                    // GLM reports zeros in message_start and the full truth here.
+                    // max() is safe for both (monotonic cumulative counters).
+                    self.input_tokens = self
+                        .input_tokens
+                        .max(usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0));
+                    self.cache_read_tokens = self.cache_read_tokens.max(
+                        usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                    self.cache_creation_tokens = self.cache_creation_tokens.max(
+                        usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                    self.output_tokens = self
+                        .output_tokens
+                        .max(usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0));
+                }
+            }
+        }
+        // Guard against a malformed stream without newlines growing forever.
+        if self.carry.len() > 1 << 20 {
+            self.carry.clear();
+        }
+    }
+
+    fn has_usage(&self) -> bool {
+        self.model.is_some()
+            || self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_creation_tokens > 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RegisterRouteRequest {
     pub session_id: String,
@@ -316,6 +408,7 @@ struct ForwardMeta {
     prompt_preview: Option<String>,
     is_sse: bool,
     record_traffic: bool,
+    logical_key: Option<String>,
 }
 
 enum ForwardReadError {
@@ -337,9 +430,33 @@ pub struct ProxyDebugManager {
     metrics: Mutex<MetricsState>,
     client: Client,
     router_client: reqwest::Client,
+    /// Optional sink receiving per-request routed usage events (runtime_id,
+    /// payload). Wired to the native runtime event bus in main.rs to avoid a
+    /// manager construction cycle.
+    routed_usage_sink:
+        Mutex<Option<Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>>>,
 }
 
 impl ProxyDebugManager {
+    /// Wire the routed-usage event sink (native runtime event bus). Called
+    /// once from main.rs after both managers exist.
+    pub fn set_routed_usage_sink(
+        &self,
+        sink: Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>,
+    ) {
+        if let Ok(mut guard) = self.routed_usage_sink.lock() {
+            *guard = Some(sink);
+        }
+    }
+
+    fn emit_routed_usage(&self, runtime_id: &str, payload: crate::event_bus::SessionEventPayload) {
+        if let Ok(guard) = self.routed_usage_sink.lock() {
+            if let Some(sink) = guard.as_ref() {
+                sink(runtime_id, payload);
+            }
+        }
+    }
+
     pub fn new(
         session_manager: Arc<SessionManager>,
         router_manager: Arc<RouterManager>,
@@ -373,6 +490,7 @@ impl ProxyDebugManager {
             metrics: Mutex::new(MetricsState::default()),
             client,
             router_client,
+            routed_usage_sink: Mutex::new(None),
         }))
     }
 
@@ -1084,6 +1202,7 @@ impl ProxyDebugManager {
             prompt_preview,
             is_sse,
             record_traffic: true,
+            logical_key: None,
         };
 
         self.forward_response_stream(
@@ -1236,6 +1355,7 @@ impl ProxyDebugManager {
             prompt_preview,
             is_sse,
             record_traffic: recording_enabled,
+            logical_key: prepared.logical_key.clone(),
         };
         self.forward_async_response_stream(stream, upstream_response, spool_state, sample, meta);
     }
@@ -1325,6 +1445,16 @@ impl ProxyDebugManager {
         let mut upstream_error = false;
         let mut first_token_ms = None;
         let mut forwarded_response_bytes = 0u64;
+        // Per-request usage truth for routed sessions (independent of
+        // recording): scan the SSE stream as it passes through. Exact segment
+        // match keeps /v1/messages/count_tokens (JSON responses) out.
+        let is_routed_message_stream =
+            !meta.session_id.is_empty() && meta.is_sse && meta.path == "/v1/messages";
+        let mut usage_scanner = if is_routed_message_stream {
+            Some(RoutedUsageScanner::default())
+        } else {
+            None
+        };
 
         loop {
             let chunk = match next_chunk() {
@@ -1345,6 +1475,10 @@ impl ProxyDebugManager {
 
             if first_token_ms.is_none() {
                 first_token_ms = Some(meta.start.elapsed().as_millis() as u64);
+            }
+
+            if let Some(scanner) = usage_scanner.as_mut() {
+                scanner.feed(&chunk);
             }
 
             forwarded_response_bytes = forwarded_response_bytes.saturating_add(chunk.len() as u64);
@@ -1400,6 +1534,36 @@ impl ProxyDebugManager {
                 client_cancelled = true;
                 eprintln!("Proxy downstream completion error: {error}");
             }
+        }
+
+        // Append one router request-ledger entry per forwarded routed message
+        // request — ALWAYS, so requests without usage stay countable instead of
+        // silently disappearing. `usage` is upstream self-reported SSE data
+        // (observational); None when no usage frame was seen.
+        if let Some(scanner) = usage_scanner {
+            let usage = scanner.has_usage().then(|| {
+                crate::event_bus::RoutedUsageTotals {
+                    input_tokens: scanner.input_tokens,
+                    output_tokens: scanner.output_tokens,
+                    cache_read_tokens: scanner.cache_read_tokens,
+                    cache_creation_tokens: scanner.cache_creation_tokens,
+                }
+            });
+            let runtime_id = meta.session_id.clone();
+            let target_env = meta.env_name.clone();
+            self.emit_routed_usage(
+                &runtime_id,
+                crate::event_bus::SessionEventPayload::RoutedRequest {
+                    provider: "claude".to_string(),
+                    request_id: meta.id.clone(),
+                    target_env,
+                    model: scanner.model,
+                    logical_key: meta.logical_key.clone(),
+                    status: meta.status,
+                    complete: !response_incomplete,
+                    usage,
+                },
+            );
         }
 
         let (log_dropped, log_partial, log_dropped_bytes, response_body_size) =
@@ -3085,7 +3249,7 @@ mod tests {
         read_record_by_id, recompute_reduced_detail, redact_body_bytes, redact_body_text,
         redact_headers, redact_json_value, traffic_idx_path, validate_upstream_url, ForwardMeta,
         ForwardReadError, ParsedRequest, ProxyDebugManager, ReducedStreamLog, RegisterRouteRequest,
-        RouteBinding, TrafficRecord, REDACTED_MARKER,
+        RouteBinding, RoutedUsageScanner, TrafficRecord, REDACTED_MARKER,
     };
     use std::collections::{HashMap, VecDeque};
     use std::fs;
@@ -3474,6 +3638,7 @@ mod tests {
             prompt_preview: None,
             is_sse: true,
             record_traffic: false,
+            logical_key: None,
         }
     }
 
@@ -3505,6 +3670,179 @@ mod tests {
             log_dropped_bytes: 0,
             reduced: None,
         }
+    }
+
+
+    #[test]
+    fn router_socket_emits_routed_request_ledger_entry_with_usage() {
+        with_temp_proxy_dir(|| {
+            // GLM-style stream: zeros in message_start, cumulative truth in
+            // message_delta — the ledger must normalize across both frames.
+            const FIRST_EVENT: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"target-glm\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n";
+            const SECOND_EVENT: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":900,\"output_tokens\":120,\"cache_read_input_tokens\":70}}\n\n";
+            let StreamingUpstream {
+                address,
+                request: _upstream_request,
+                first_chunk_sent,
+                release_second_chunk,
+                handle: upstream_handle,
+            } = spawn_streaming_upstream(FIRST_EVENT, SECOND_EVENT);
+            let env_name = unique_router_fixture_name("router-ledger");
+            let _env_override =
+                test_router_env(&env_name, address, "fixture-token-ledger", "target-glm");
+
+            let manager = test_manager_with_shared_listener();
+            let (ledger_tx, ledger_rx) = mpsc::channel();
+            manager.set_routed_usage_sink(Arc::new(
+                move |runtime_id: &str, payload: crate::event_bus::SessionEventPayload| {
+                    let _ = ledger_tx.send((runtime_id.to_string(), payload));
+                },
+            ));
+            manager
+                .router_manager
+                .register(
+                    "runtime-ledger",
+                    1,
+                    token_router_record("session-ledger", "nonce-ledger", &env_name),
+                )
+                .expect("register ledger route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "<CCEM-ROUTE nonce=\"nonce-ledger\">subagent:Explore</CCEM-ROUTE>\nledger proof"
+                    }]
+                }]
+            }))
+            .expect("encode ledger request");
+            let mut client = open_http_client(
+                running.port,
+                "/s/session-ledger/v1/messages",
+                &body,
+            );
+
+            first_chunk_sent
+                .recv_timeout(Duration::from_secs(2))
+                .expect("mock upstream first chunk");
+            release_second_chunk
+                .send(())
+                .expect("release second mock SSE chunk");
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).expect("read full response");
+            upstream_handle.join().expect("join mock upstream");
+
+            let (runtime_id, payload) = ledger_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ledger entry must be emitted");
+            assert_eq!(runtime_id, "runtime-ledger");
+            let crate::event_bus::SessionEventPayload::RoutedRequest {
+                request_id,
+                target_env,
+                model,
+                logical_key,
+                status,
+                complete,
+                usage,
+                ..
+            } = payload
+            else {
+                panic!("expected RoutedRequest ledger entry");
+            };
+            assert!(!request_id.is_empty(), "request identity must be stable");
+            assert_eq!(target_env, env_name);
+            assert_eq!(model.as_deref(), Some("target-glm"));
+            assert_eq!(logical_key.as_deref(), Some("subagent:Explore"));
+            assert_eq!(status, 200);
+            assert!(complete);
+            let usage = usage.expect("usage must be present for usage-bearing SSE");
+            assert_eq!(usage.input_tokens, 900);
+            assert_eq!(usage.output_tokens, 120);
+            assert_eq!(usage.cache_read_tokens, 70);
+            assert_eq!(usage.cache_creation_tokens, 0);
+            assert!(
+                ledger_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                "exactly one ledger entry per forwarded request"
+            );
+        });
+    }
+
+    #[test]
+    fn router_socket_emits_ledger_entry_without_usage_for_usageless_stream() {
+        with_temp_proxy_dir(|| {
+            // No usage frame anywhere: the request must still be ledgered
+            // (usage None), so it lands in the unattributed bucket instead of
+            // silently disappearing from the distribution.
+            const FIRST_EVENT: &[u8] =
+                b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n";
+            const SECOND_EVENT: &[u8] =
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            let StreamingUpstream {
+                address,
+                request: _upstream_request,
+                first_chunk_sent,
+                release_second_chunk,
+                handle: upstream_handle,
+            } = spawn_streaming_upstream(FIRST_EVENT, SECOND_EVENT);
+            let env_name = unique_router_fixture_name("router-nousage");
+            let _env_override =
+                test_router_env(&env_name, address, "fixture-token-nousage", "target-x");
+
+            let manager = test_manager_with_shared_listener();
+            let (ledger_tx, ledger_rx) = mpsc::channel();
+            manager.set_routed_usage_sink(Arc::new(
+                move |runtime_id: &str, payload: crate::event_bus::SessionEventPayload| {
+                    let _ = ledger_tx.send((runtime_id.to_string(), payload));
+                },
+            ));
+            manager
+                .router_manager
+                .register(
+                    "runtime-nousage",
+                    1,
+                    token_router_record("session-nousage", "nonce-nousage", &env_name),
+                )
+                .expect("register route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "<CCEM-ROUTE nonce=\"nonce-nousage\">subagent:Explore</CCEM-ROUTE>\nno usage"
+                    }]
+                }]
+            }))
+            .expect("encode request");
+            let mut client =
+                open_http_client(running.port, "/s/session-nousage/v1/messages", &body);
+            first_chunk_sent
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first chunk");
+            release_second_chunk.send(()).expect("release second");
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).expect("read response");
+            upstream_handle.join().expect("join upstream");
+
+            let (runtime_id, payload) = ledger_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("usage-less request must still be ledgered");
+            assert_eq!(runtime_id, "runtime-nousage");
+            let crate::event_bus::SessionEventPayload::RoutedRequest {
+                usage, status, complete, ..
+            } = &payload
+            else {
+                panic!("expected RoutedRequest ledger entry");
+            };
+            assert_eq!(*status, 200);
+            assert!(*complete);
+            assert!(usage.is_none(), "missing usage must stay None, never zero-filled");
+        });
     }
 
     #[test]
@@ -4798,9 +5136,13 @@ mod tests {
             append_record(&sample_traffic_record(2, 3_202)).expect("append second");
             fs::write(traffic_idx_path(), "3202,req-0002,0\n").expect("write stale index");
 
-            let list_err = list_traffic_records(10, None).expect_err("list should reject mismatch");
-            assert!(list_err.contains("Traffic index mismatch"));
+            // The traffic LIST tolerates a stale index entry (skips it) so one
+            // inconsistent offset cannot blank the whole Proxy Debug page…
+            let page = list_traffic_records(10, None).expect("list should tolerate mismatch");
+            assert!(page.items.is_empty());
 
+            // …while the by-id detail lookup still surfaces the mismatch
+            // loudly, so index inconsistency stays observable.
             let detail_err =
                 read_record_by_id("req-0002").expect_err("detail should reject mismatch");
             assert!(detail_err.contains("Traffic index mismatch"));
@@ -5218,6 +5560,62 @@ mod tests {
             text.contains("sk-trunc-secret"),
             "truncated JSON should pass through unchanged — this proves why we skip writing"
         );
+    }
+
+    #[test]
+    fn routed_usage_scanner_extracts_model_and_usage_across_chunk_boundaries() {
+        let mut scanner = RoutedUsageScanner::default();
+        // Split mid-line to prove the carry buffer works.
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"deepseek-v4-flash\",",
+        );
+        let start_tail = concat!(
+            "\"usage\":{\"input_tokens\":728,\"cache_creation_input_tokens\":12,\"cache_read_input_tokens\":4000}}}\n\n",
+        );
+        let delta = concat!(
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":91}}\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":150}}\n",
+            "data: [DONE]\n\n",
+        );
+        scanner.feed(start.as_bytes());
+        scanner.feed(start_tail.as_bytes());
+        scanner.feed(delta.as_bytes());
+
+        assert_eq!(scanner.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(scanner.input_tokens, 728);
+        assert_eq!(scanner.cache_creation_tokens, 12);
+        assert_eq!(scanner.cache_read_tokens, 4000);
+        assert_eq!(scanner.output_tokens, 150, "message_delta usage is cumulative");
+        assert!(scanner.has_usage());
+    }
+
+    #[test]
+    fn routed_usage_scanner_reads_delta_only_providers() {
+        // GLM-style stream: message_start carries zeros, message_delta carries
+        // the full cumulative truth.
+        let mut scanner = RoutedUsageScanner::default();
+        scanner.feed(
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"glm-5.3\",",
+                "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            )
+            .as_bytes(),
+        );
+        scanner.feed(
+            concat!(
+                "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{",
+                "\"input_tokens\":40554,\"output_tokens\":212,",
+                "\"cache_read_input_tokens\":1856}}\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(scanner.model.as_deref(), Some("glm-5.3"));
+        assert_eq!(scanner.input_tokens, 40554);
+        assert_eq!(scanner.output_tokens, 212);
+        assert_eq!(scanner.cache_read_tokens, 1856);
     }
 
     #[test]

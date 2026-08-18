@@ -31,6 +31,8 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
             title: format!("Lifecycle · {stage}"),
             text: truncate_text(detail, 1200),
         }),
+        // Router request ledger entries — telemetry-grade, not for bot chat.
+        SessionEventPayload::RoutedRequest { .. } => None,
         SessionEventPayload::StdErrLine { line } if !line.trim().is_empty() => Some(EventSummary {
             kind: BotBindingOutboxFrameKind::Error,
             title: "stderr".to_string(),
