@@ -226,7 +226,8 @@ test('renders the independent sub-route section next to SDK sections (frozen con
   // Sub-route rows by agent identity -> env, with request counts.
   assert.match(html, /Explore · DeepSeek-V4-Flash/);
   assert.match(html, />28K</);
-  assert.match(html, /×2/);
+  assert.match(html, /2 次请求/);
+  assert.doesNotMatch(html, /×2/);
   assert.match(html, /general-purpose · GLM-5\.3/);
   // Unknown semantics: unreported + interrupted counted, not zero-filled.
   assert.match(html, /未报告用量的请求/);

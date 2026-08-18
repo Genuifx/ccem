@@ -250,7 +250,7 @@ export function SessionUsagePopoverContent({
               key={`${entry.logicalKey}-${entry.env}-${entry.model}`}
               label={`${routedRowLabel(t, entry.logicalKey)} · ${entry.env}`}
               value={formatTokenCount(entry.inputTokens + entry.outputTokens)}
-              hint={`×${entry.requestCount}`}
+              hint={t('workspace.usagePanelRequestCount').replace('{count}', String(entry.requestCount))}
             />
           ))}
           {ledger.unattributedCount > 0 && (

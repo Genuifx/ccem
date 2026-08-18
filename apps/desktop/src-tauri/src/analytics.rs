@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
-const USAGE_CACHE_VERSION: u32 = 3;
+const USAGE_CACHE_VERSION: u32 = 4;
 const USAGE_SUMMARY_VERSION: u32 = 1;
 const USAGE_STATS_MEMO_TTL: Duration = Duration::from_secs(60);
 const OPENCODE_NATIVE_ENV_NAME: &str = opencode::OPENCODE_NATIVE_ENV_NAME;
@@ -442,6 +442,7 @@ fn collect_claude_jsonl_dir(dir: &Path, depth: usize, max_depth: usize, out: &mu
             });
         }
     }
+
 }
 
 /// Scan ~/.codex/sessions recursively for *.jsonl
@@ -541,11 +542,10 @@ fn parse_claude_jsonl_reader<R: BufRead>(
 ) -> CacheStats {
     let mut entries = Vec::new();
     // Claude Code appends partial assistant records as a stream progresses and
-    // again on resume: the same message.id can appear 3-4x in one file (and in
-    // <session>/subagents/agent-*.jsonl). Counting every record inflates
-    // tokens ~3x — dedup by message.id per file (records without an id are
-    // rare; keep first occurrence keyed by line index).
-    let mut seen_message_ids: HashSet<String> = HashSet::new();
+    // again on resume: the same message.id can appear 3-4x in one file. Keep
+    // replacing the entry for that id so analytics uses the final usage
+    // snapshot instead of summing partial records or retaining an early zero.
+    let mut message_entry_indexes: HashMap<String, usize> = HashMap::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -570,11 +570,7 @@ fn parse_claude_jsonl_reader<R: BufRead>(
             None => continue,
         };
 
-        if let Some(message_id) = message.id.as_deref() {
-            if !message_id.is_empty() && !seen_message_ids.insert(message_id.to_string()) {
-                continue;
-            }
-        }
+        let message_id = message.id.filter(|value| !value.is_empty());
 
         let usage = match message.usage {
             Some(usage) => usage,
@@ -600,7 +596,7 @@ fn parse_claude_jsonl_reader<R: BufRead>(
             .timestamp
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-        entries.push(CacheEntry {
+        let entry = CacheEntry {
             timestamp,
             model,
             environment: None,
@@ -611,7 +607,18 @@ fn parse_claude_jsonl_reader<R: BufRead>(
                 cache_creation_tokens,
                 cost,
             },
-        });
+        };
+
+        if let Some(message_id) = message_id {
+            if let Some(index) = message_entry_indexes.get(&message_id).copied() {
+                entries[index] = entry;
+            } else {
+                message_entry_indexes.insert(message_id, entries.len());
+                entries.push(entry);
+            }
+        } else {
+            entries.push(entry);
+        }
     }
 
     CacheStats { entries }
@@ -2265,17 +2272,33 @@ mod tests {
         // usage. Only the last record per id is meaningful for per-request
         // usage; without dedup tokens inflate ~3x.
         let jsonl = r#"
-{"type":"assistant","message":{"id":"msg_a","model":"deepseek-v4-flash","usage":{"input_tokens":10,"output_tokens":2}}}
-{"type":"assistant","message":{"id":"msg_a","model":"deepseek-v4-flash","usage":{"input_tokens":100,"output_tokens":20}}}
-{"type":"assistant","message":{"id":"msg_a","model":"deepseek-v4-flash","usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","message":{"id":"msg_a","model":"glm-5.3","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0}}}
+{"type":"assistant","message":{"id":"msg_a","model":"glm-5.3","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":30}}}
+{"type":"assistant","message":{"id":"msg_a","model":"glm-5.3","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":30}}}
 {"type":"assistant","message":{"id":"msg_b","model":"deepseek-v4-flash","usage":{"input_tokens":50,"output_tokens":5}}}
 {"type":"assistant","message":{"id":null,"model":"deepseek-v4-flash","usage":{"input_tokens":7,"output_tokens":1}}}
 "#;
         let stats = parse_claude_jsonl_reader(jsonl.as_bytes(), &HashMap::new());
         let total: u64 = stats.entries.iter().map(|e| e.usage.input_tokens).sum();
-        // first occurrence of msg_a (10) + msg_b (50) + id-less record (7)
-        assert_eq!(total, 67, "duplicate message.id records must count once");
+        let output_total: u64 = stats.entries.iter().map(|e| e.usage.output_tokens).sum();
+        let cache_read_total: u64 = stats
+            .entries
+            .iter()
+            .map(|e| e.usage.cache_read_tokens)
+            .sum();
+        // final snapshot of msg_a (100/20) + msg_b (50/5) + id-less record (7/1)
+        assert_eq!(
+            total, 157,
+            "duplicate message.id must keep its final input usage"
+        );
+        assert_eq!(
+            output_total, 26,
+            "duplicate message.id must keep its final output usage"
+        );
+        assert_eq!(
+            cache_read_total, 30,
+            "duplicate message.id must keep its final cache usage"
+        );
         assert_eq!(stats.entries.len(), 3);
     }
-
 }
