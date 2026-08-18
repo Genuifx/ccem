@@ -1341,6 +1341,14 @@ fn list_native_sessions(
 }
 
 #[tauri::command]
+fn get_native_session_summary(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+) -> Result<Option<NativeSessionSummary>, String> {
+    native_state.get_session_summary(&runtime_id)
+}
+
+#[tauri::command]
 fn send_native_session_input(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
@@ -4966,6 +4974,7 @@ fn main() {
             codex_migration::preflight_codex_model_migration,
             create_native_session,
             list_native_sessions,
+            get_native_session_summary,
             send_native_session_input,
             respond_native_session_permission,
             respond_native_session_prompt,

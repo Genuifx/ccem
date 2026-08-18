@@ -2409,6 +2409,16 @@ impl NativeRuntimeManager {
     }
 
     fn summary_for(&self, runtime_id: &str) -> Result<NativeSessionSummary, String> {
+        self.get_session_summary(runtime_id)?
+            .ok_or_else(|| format!("Native runtime {} not found", runtime_id))
+    }
+
+    /// Single-session variant of `list_sessions`: reads only this runtime's
+    /// handle or record instead of cloning the whole session map.
+    pub fn get_session_summary(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<NativeSessionSummary>, String> {
         if let Some(handle) = self
             .handles
             .lock()
@@ -2416,10 +2426,11 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
         {
-            return Ok(handle.summary());
+            return Ok(Some(handle.summary()));
         }
 
-        self.records
+        Ok(self
+            .records
             .lock()
             .map_err(|_| "Failed to lock native runtime records".to_string())?
             .get(runtime_id)
@@ -2442,8 +2453,7 @@ impl NativeRuntimeManager {
                 last_event_seq: None,
                 can_handoff_to_terminal: record.can_handoff_to_terminal,
                 last_error: record.last_error,
-            })
-            .ok_or_else(|| format!("Native runtime {} not found", runtime_id))
+            }))
     }
 
     fn flush_helper_output_buffers(
