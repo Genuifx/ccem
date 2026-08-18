@@ -44467,8 +44467,10 @@ rl2.on("line", (line) => {
 });
 rl2.on("close", () => {
   if (!stopped) {
+    stopped = true;
     emitStatus("stopped", "Native runtime helper stdin closed.");
   }
+  setTimeout(() => process5.exit(0), 250);
 });
 /*! Bundled license information:
 
