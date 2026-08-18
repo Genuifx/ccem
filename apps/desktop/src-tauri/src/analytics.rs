@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
-const USAGE_CACHE_VERSION: u32 = 2;
+const USAGE_CACHE_VERSION: u32 = 3;
 const USAGE_SUMMARY_VERSION: u32 = 1;
 const USAGE_STATS_MEMO_TTL: Duration = Duration::from_secs(60);
 const OPENCODE_NATIVE_ENV_NAME: &str = opencode::OPENCODE_NATIVE_ENV_NAME;
@@ -512,6 +512,7 @@ struct ClaudeJsonlLine {
 
 #[derive(Debug, Deserialize)]
 struct ClaudeJsonlMessage {
+    id: Option<String>,
     model: Option<String>,
     usage: Option<ClaudeJsonlUsage>,
 }
@@ -539,6 +540,12 @@ fn parse_claude_jsonl_reader<R: BufRead>(
     prices: &HashMap<String, ModelPrice>,
 ) -> CacheStats {
     let mut entries = Vec::new();
+    // Claude Code appends partial assistant records as a stream progresses and
+    // again on resume: the same message.id can appear 3-4x in one file (and in
+    // <session>/subagents/agent-*.jsonl). Counting every record inflates
+    // tokens ~3x — dedup by message.id per file (records without an id are
+    // rare; keep first occurrence keyed by line index).
+    let mut seen_message_ids: HashSet<String> = HashSet::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -562,6 +569,12 @@ fn parse_claude_jsonl_reader<R: BufRead>(
             Some(message) => message,
             None => continue,
         };
+
+        if let Some(message_id) = message.id.as_deref() {
+            if !message_id.is_empty() && !seen_message_ids.insert(message_id.to_string()) {
+                continue;
+            }
+        }
 
         let usage = match message.usage {
             Some(usage) => usage,
@@ -1826,10 +1839,11 @@ mod tests {
     use super::{
         aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
         extract_model_breakdown_bucket, format_week_bucket, normalize_usage_source,
-        parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
-        read_usage_summary_from, should_reuse_usage_stats, write_usage_summary_to, CacheEntry,
-        CacheFile, CacheFileEntry, CacheMeta, CacheStats, CacheUsage, ModelBreakdownGranularity,
-        ModelPrice, UsageStats, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
+        parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
+        parse_opencode_session_items, read_usage_summary_from, should_reuse_usage_stats,
+        write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheStats,
+        CacheUsage, ModelBreakdownGranularity, ModelPrice, UsageStats, OPENCODE_NATIVE_ENV_NAME,
+        SOURCE_CLAUDE,
     };
     use chrono::{Local, TimeZone};
     use std::collections::HashMap;
@@ -2243,4 +2257,25 @@ mod tests {
         assert_eq!(march_total.cache_creation_tokens, 0);
         assert!((march_total.cost - 3.3).abs() < 1e-9);
     }
+
+    #[test]
+    fn claude_jsonl_dedups_assistant_messages_by_message_id() {
+        // Claude Code writes partial assistant records as the stream
+        // progresses: the same message.id appears multiple times with growing
+        // usage. Only the last record per id is meaningful for per-request
+        // usage; without dedup tokens inflate ~3x.
+        let jsonl = r#"
+{"type":"assistant","message":{"id":"msg_a","model":"deepseek-v4-flash","usage":{"input_tokens":10,"output_tokens":2}}}
+{"type":"assistant","message":{"id":"msg_a","model":"deepseek-v4-flash","usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","message":{"id":"msg_a","model":"deepseek-v4-flash","usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"assistant","message":{"id":"msg_b","model":"deepseek-v4-flash","usage":{"input_tokens":50,"output_tokens":5}}}
+{"type":"assistant","message":{"id":null,"model":"deepseek-v4-flash","usage":{"input_tokens":7,"output_tokens":1}}}
+"#;
+        let stats = parse_claude_jsonl_reader(jsonl.as_bytes(), &HashMap::new());
+        let total: u64 = stats.entries.iter().map(|e| e.usage.input_tokens).sum();
+        // first occurrence of msg_a (10) + msg_b (50) + id-less record (7)
+        assert_eq!(total, 67, "duplicate message.id records must count once");
+        assert_eq!(stats.entries.len(), 3);
+    }
+
 }
