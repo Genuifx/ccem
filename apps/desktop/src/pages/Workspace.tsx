@@ -2919,7 +2919,7 @@ export function Workspace({
                           installedSkills={workspaceInstalledSkills}
                           onRefreshSkills={refreshWorkspaceInstalledSkills}
                           workspaceCommands={workspaceCommands}
-                          isVisible={isActiveLiveEntry}
+                          isVisible={isActive && isActiveLiveEntry}
                           onSessionUpdate={handleLiveSessionUpdate}
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}

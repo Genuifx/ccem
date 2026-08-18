@@ -1316,7 +1316,7 @@ export function WorkspaceNativeSessionView({
     getWorkspaceFileDiff,
     getWorkspaceMediaPreview,
     getSessionSubagents,
-    listNativeSessions,
+    getNativeSessionSummary,
     searchWorkspaceFiles,
   } = useTauriCommands();
   const [sessionEnv, setSessionEnv] = useState(session.env_name);
@@ -1759,14 +1759,11 @@ export function WorkspaceNativeSessionView({
       return;
     }
     lastSummaryRefreshTimestampRef.current = now;
-    const sessions = await listNativeSessions();
-    const next = sessions.find(
-      (candidate) => candidate.runtime_id === session.runtime_id,
-    );
+    const next = await getNativeSessionSummary(session.runtime_id);
     if (next) {
       onSessionUpdate(next);
     }
-  }, [listNativeSessions, onSessionUpdate, session.runtime_id]);
+  }, [getNativeSessionSummary, onSessionUpdate, session.runtime_id]);
 
   const backfillInitialReplay = useCallback(async () => {
     if (initialReplayBackfillRuntimeRef.current === session.runtime_id) {
