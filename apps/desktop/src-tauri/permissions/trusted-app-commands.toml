@@ -84,6 +84,7 @@ commands.allow = [
   "preflight_codex_model_migration",
   "create_native_session",
   "list_native_sessions",
+  "get_native_session_summary",
   "send_native_session_input",
   "respond_native_session_permission",
   "respond_native_session_prompt",

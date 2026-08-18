@@ -1,3 +1,4 @@
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -373,6 +374,7 @@ pub struct SessionStore {
     capacity: usize,
     next_seq: u64,
     events: VecDeque<SessionEventRecord>,
+    attention: AttentionSummary,
 }
 
 impl SessionStore {
@@ -391,6 +393,7 @@ impl SessionStore {
             capacity,
             next_seq: 1,
             events: VecDeque::with_capacity(capacity),
+            attention: AttentionSummary::default(),
         }
     }
 
@@ -400,6 +403,7 @@ impl SessionStore {
             capacity: DEFAULT_SESSION_EVENT_CAPACITY,
             next_seq: start_seq,
             events: VecDeque::with_capacity(DEFAULT_SESSION_EVENT_CAPACITY),
+            attention: AttentionSummary::default(),
         }
     }
 
@@ -411,6 +415,7 @@ impl SessionStore {
             payload,
         };
         self.next_seq += 1;
+        self.attention.apply(&record);
 
         if self.events.len() == self.capacity {
             self.events.pop_front();
@@ -418,6 +423,13 @@ impl SessionStore {
 
         self.events.push_back(record.clone());
         record
+    }
+
+    /// Incrementally maintained attention state for everything appended to
+    /// this store. Unlike the bounded event buffer, the summary is never
+    /// evicted, so it matches folding the complete event stream.
+    pub fn attention_summary(&self) -> AttentionSummary {
+        self.attention.clone()
     }
 
     pub fn events_since(&self, last_seen_seq: Option<u64>) -> ReplayBatch {
@@ -718,6 +730,81 @@ mod tests {
         let decoded: SessionEventPayload =
             serde_json::from_value(encoded).expect("deserialize context usage");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn session_store_attention_summary_matches_legacy_resolve_fold() {
+        let mut store = SessionStore::new("runtime-attention");
+        store.append(SessionEventPayload::PermissionRequired {
+            request_id: "req-1".to_string(),
+            tool_use_id: Some("toolu-perm".to_string()),
+            tool_name: "Bash".to_string(),
+            input_summary: None,
+        });
+        store.append(SessionEventPayload::PermissionResponded {
+            request_id: "req-1".to_string(),
+            tool_use_id: Some("toolu-perm".to_string()),
+            approved: true,
+            responder: "desktop".to_string(),
+        });
+        store.append(SessionEventPayload::ToolUseStarted {
+            tool_use_id: "toolu-plan".to_string(),
+            category: ToolCategory::UserInput {
+                kind: UserInputKind::PlanExit,
+                raw_name: "ExitPlanMode".to_string(),
+            },
+            raw_name: "ExitPlanMode".to_string(),
+            input_summary: String::new(),
+            needs_response: true,
+            prompt: Some(InteractiveToolPrompt::PlanExit {
+                allowed_prompts: vec![],
+                plan_summary: None,
+            }),
+            todo_snapshot: None,
+        });
+        store.append(SessionEventPayload::ToolUseCompleted {
+            tool_use_id: "toolu-plan".to_string(),
+            raw_name: "ExitPlanMode".to_string(),
+            result_summary: "user rejected the plan".to_string(),
+            result_content: None,
+            success: false,
+            todo_snapshot: None,
+        });
+
+        let records = store.events_since(None).events;
+        assert_eq!(
+            store.attention_summary().attention_kind(),
+            crate::workspace_decorations::resolve_attention_kind(&records)
+        );
+        assert_eq!(
+            store.attention_summary().attention_kind().as_deref(),
+            Some("plan_review")
+        );
+    }
+
+    #[test]
+    fn session_store_attention_summary_survives_event_buffer_eviction() {
+        let mut store = SessionStore::with_capacity("runtime-attention-evicted", 2);
+        store.append(SessionEventPayload::PermissionRequired {
+            request_id: "req-old".to_string(),
+            tool_use_id: None,
+            tool_name: "Bash".to_string(),
+            input_summary: None,
+        });
+        store.append(SessionEventPayload::AssistantChunk {
+            text: "step-1".to_string(),
+        });
+        store.append(SessionEventPayload::AssistantChunk {
+            text: "step-2".to_string(),
+        });
+
+        // The permission event has been evicted from the bounded buffer, but the
+        // incrementally maintained summary still reports it as pending.
+        assert_eq!(store.oldest_seq(), Some(2));
+        assert_eq!(
+            store.attention_summary().attention_kind().as_deref(),
+            Some("permission_required")
+        );
     }
 
     #[test]

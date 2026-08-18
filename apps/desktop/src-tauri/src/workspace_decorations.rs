@@ -75,7 +75,7 @@ pub enum WorkspaceRuntimeDescriptor {
 pub fn build_workspace_session_decorations(
     sessions: &[WorkspaceDecorationSessionInput],
     runtimes: &[WorkspaceRuntimeDescriptor],
-    events_by_runtime: &HashMap<String, Vec<SessionEventRecord>>,
+    attention_by_runtime: &HashMap<String, AttentionSummary>,
 ) -> Vec<WorkspaceSessionDecoration> {
     let matched_runtime_by_session_key = build_runtime_match_map(sessions, runtimes);
     let mut decorations = Vec::new();
@@ -88,12 +88,9 @@ pub fn build_workspace_session_decorations(
         let is_active = runtime.is_active();
         let attention_kind = is_active
             .then(|| {
-                resolve_attention_kind(
-                    events_by_runtime
-                        .get(runtime.id())
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                )
+                attention_by_runtime
+                    .get(runtime.id())
+                    .and_then(|summary| summary.attention_kind())
             })
             .flatten();
 
@@ -297,24 +294,32 @@ fn build_runtime_match_map(
     matched_by_key
 }
 
-fn resolve_attention_kind(events: &[SessionEventRecord]) -> Option<String> {
-    let mut pending_permissions = HashSet::new();
-    let mut pending_responses: HashMap<String, String> = HashMap::new();
-    let mut terminal_prompt_pending = false;
+/// Incrementally maintained attention state derived from a session's event
+/// stream. Folding events through [`AttentionSummary::apply`] is equivalent to
+/// running [`resolve_attention_kind`] over the same event sequence, without
+/// replaying history.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttentionSummary {
+    pub pending_permissions: std::collections::HashSet<String>,
+    pub pending_responses: std::collections::HashMap<String, String>, // tool_use_id -> kind
+    pub terminal_prompt_pending: bool,
+}
 
-    for event in events {
+impl AttentionSummary {
+    /// Fold one event into the summary. Mirrors resolve_attention_kind's match arms.
+    pub fn apply(&mut self, event: &SessionEventRecord) {
         match &event.payload {
             SessionEventPayload::PermissionRequired { request_id, .. } => {
-                pending_permissions.insert(request_id.clone());
+                self.pending_permissions.insert(request_id.clone());
             }
             SessionEventPayload::PermissionResponded { request_id, .. } => {
-                pending_permissions.remove(request_id);
+                self.pending_permissions.remove(request_id);
             }
             SessionEventPayload::TerminalPromptRequired { .. } => {
-                terminal_prompt_pending = true;
+                self.terminal_prompt_pending = true;
             }
             SessionEventPayload::TerminalPromptResolved { .. } => {
-                terminal_prompt_pending = false;
+                self.terminal_prompt_pending = false;
             }
             SessionEventPayload::ToolUseStarted {
                 tool_use_id,
@@ -326,49 +331,65 @@ fn resolve_attention_kind(events: &[SessionEventRecord]) -> Option<String> {
                     Some(InteractiveToolPrompt::PlanExit { .. }) => "plan_review",
                     _ => "input_required",
                 };
-                pending_responses.insert(tool_use_id.clone(), attention_kind.to_string());
+                self.pending_responses
+                    .insert(tool_use_id.clone(), attention_kind.to_string());
             }
             SessionEventPayload::ToolUseCompleted {
                 tool_use_id,
                 success,
                 ..
             } => {
-                let pending_kind = pending_responses.get(tool_use_id).map(String::as_str);
+                let pending_kind = self.pending_responses.get(tool_use_id).map(String::as_str);
                 if pending_kind != Some("plan_review") || *success {
-                    pending_responses.remove(tool_use_id);
+                    self.pending_responses.remove(tool_use_id);
                 }
             }
             SessionEventPayload::UserPrompt { .. } => {
-                pending_responses.clear();
+                self.pending_responses.clear();
             }
             SessionEventPayload::SessionCompleted { .. } => {
-                pending_permissions.clear();
-                pending_responses.clear();
-                terminal_prompt_pending = false;
+                self.pending_permissions.clear();
+                self.pending_responses.clear();
+                self.terminal_prompt_pending = false;
             }
             _ => {}
         }
     }
 
-    if !pending_permissions.is_empty() || terminal_prompt_pending {
-        return Some("permission_required".to_string());
-    }
+    /// Same priority order as resolve_attention_kind's tail.
+    pub fn attention_kind(&self) -> Option<String> {
+        if !self.pending_permissions.is_empty() || self.terminal_prompt_pending {
+            return Some("permission_required".to_string());
+        }
 
-    if pending_responses
-        .values()
-        .any(|value| value == "plan_review")
-    {
-        return Some("plan_review".to_string());
-    }
+        if self
+            .pending_responses
+            .values()
+            .any(|value| value == "plan_review")
+        {
+            return Some("plan_review".to_string());
+        }
 
-    if pending_responses
-        .values()
-        .any(|value| value == "input_required")
-    {
-        return Some("input_required".to_string());
-    }
+        if self
+            .pending_responses
+            .values()
+            .any(|value| value == "input_required")
+        {
+            return Some("input_required".to_string());
+        }
 
-    None
+        None
+    }
+}
+
+/// Compatibility fold over a full event slice. New code should maintain an
+/// [`AttentionSummary`] incrementally instead of replaying events.
+pub(crate) fn resolve_attention_kind(events: &[SessionEventRecord]) -> Option<String> {
+    let mut summary = AttentionSummary::default();
+    for event in events {
+        summary.apply(event);
+    }
+    summary.attention_kind()
 }
 
 fn is_runtime_processing(runtime: &WorkspaceRuntimeDescriptor) -> bool {
@@ -628,6 +649,183 @@ mod tests {
     }
 
     #[test]
+    fn attention_summary_fold_matches_legacy_resolve_over_representative_sequences() {
+        let sequences: Vec<Vec<SessionEventPayload>> = vec![
+            // Unresolved permission stays pending.
+            vec![permission_required_payload("req-1")],
+            // Permission that gets responded to clears.
+            vec![
+                permission_required_payload("req-1"),
+                permission_responded_payload("req-1"),
+            ],
+            // plan_review tool-use persists when completion fails.
+            vec![
+                plan_review_started_payload("toolu-plan"),
+                tool_use_completed_payload("toolu-plan", false),
+            ],
+            // plan_review tool-use clears on successful completion.
+            vec![
+                plan_review_started_payload("toolu-plan"),
+                tool_use_completed_payload("toolu-plan", true),
+            ],
+            // input_required tool-use clears on any completion.
+            vec![
+                input_required_started_payload("toolu-input"),
+                tool_use_completed_payload("toolu-input", false),
+            ],
+            // UserPrompt resets pending tool responses but not permissions.
+            vec![
+                input_required_started_payload("toolu-input"),
+                SessionEventPayload::UserPrompt {
+                    text: "next turn".to_string(),
+                    image_count: 0,
+                    images: None,
+                    annotations: None,
+                    canonical_hash: None,
+                },
+            ],
+            // Terminal prompt set/clear.
+            vec![
+                SessionEventPayload::TerminalPromptRequired {
+                    prompt_kind: crate::event_bus::TerminalPromptKind::Permission,
+                    prompt_text: "Allow Bash?".to_string(),
+                },
+                SessionEventPayload::TerminalPromptResolved {
+                    prompt_kind: crate::event_bus::TerminalPromptKind::Permission,
+                    approved: true,
+                },
+            ],
+            // SessionCompleted resets every attention channel.
+            vec![
+                permission_required_payload("req-1"),
+                plan_review_started_payload("toolu-plan"),
+                SessionEventPayload::TerminalPromptRequired {
+                    prompt_kind: crate::event_bus::TerminalPromptKind::Permission,
+                    prompt_text: "Allow Bash?".to_string(),
+                },
+                SessionEventPayload::SessionCompleted {
+                    reason: "done".to_string(),
+                },
+            ],
+            // Priority: pending permission outranks plan_review and input_required.
+            vec![
+                permission_required_payload("req-1"),
+                plan_review_started_payload("toolu-plan"),
+                input_required_started_payload("toolu-input"),
+            ],
+            // Priority: plan_review outranks input_required.
+            vec![
+                plan_review_started_payload("toolu-plan"),
+                input_required_started_payload("toolu-input"),
+            ],
+        ];
+
+        for (index, payloads) in sequences.into_iter().enumerate() {
+            let records = event_records(&payloads);
+            let mut summary = super::AttentionSummary::default();
+            for record in &records {
+                summary.apply(record);
+            }
+
+            assert_eq!(
+                summary.attention_kind(),
+                super::resolve_attention_kind(&records),
+                "incremental fold diverged from legacy resolve for sequence {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_summary_reports_expected_kinds_for_key_sequences() {
+        let pending_permission = event_records(&[permission_required_payload("req-1")]);
+        let mut permission_summary = super::AttentionSummary::default();
+        for record in &pending_permission {
+            permission_summary.apply(record);
+        }
+        assert_eq!(permission_summary.attention_kind().as_deref(), Some("permission_required"));
+
+        let mut plan_review_summary = super::AttentionSummary::default();
+        for record in event_records(&[
+            plan_review_started_payload("toolu-plan"),
+            tool_use_completed_payload("toolu-plan", false),
+        ]) {
+            plan_review_summary.apply(&record);
+        }
+        assert_eq!(plan_review_summary.attention_kind().as_deref(), Some("plan_review"));
+    }
+
+    fn event_records(payloads: &[SessionEventPayload]) -> Vec<SessionEventRecord> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| SessionEventRecord {
+                runtime_id: "runtime-attention".to_string(),
+                seq: index as u64 + 1,
+                occurred_at: Utc::now(),
+                payload: payload.clone(),
+            })
+            .collect()
+    }
+
+    fn permission_required_payload(request_id: &str) -> SessionEventPayload {
+        SessionEventPayload::PermissionRequired {
+            request_id: request_id.to_string(),
+            tool_use_id: Some("toolu-perm".to_string()),
+            tool_name: "Bash".to_string(),
+            input_summary: None,
+        }
+    }
+
+    fn permission_responded_payload(request_id: &str) -> SessionEventPayload {
+        SessionEventPayload::PermissionResponded {
+            request_id: request_id.to_string(),
+            tool_use_id: Some("toolu-perm".to_string()),
+            approved: true,
+            responder: "desktop".to_string(),
+        }
+    }
+
+    fn plan_review_started_payload(tool_use_id: &str) -> SessionEventPayload {
+        tool_use_started_payload(tool_use_id, Some(InteractiveToolPrompt::PlanExit {
+            allowed_prompts: vec![],
+            plan_summary: None,
+        }))
+    }
+
+    fn input_required_started_payload(tool_use_id: &str) -> SessionEventPayload {
+        tool_use_started_payload(tool_use_id, None)
+    }
+
+    fn tool_use_started_payload(
+        tool_use_id: &str,
+        prompt: Option<InteractiveToolPrompt>,
+    ) -> SessionEventPayload {
+        SessionEventPayload::ToolUseStarted {
+            tool_use_id: tool_use_id.to_string(),
+            category: ToolCategory::UserInput {
+                kind: crate::event_bus::UserInputKind::PlanExit,
+                raw_name: "ExitPlanMode".to_string(),
+            },
+            raw_name: "ExitPlanMode".to_string(),
+            input_summary: String::new(),
+            needs_response: true,
+            prompt,
+            todo_snapshot: None,
+        }
+    }
+
+    fn tool_use_completed_payload(tool_use_id: &str, success: bool) -> SessionEventPayload {
+        SessionEventPayload::ToolUseCompleted {
+            tool_use_id: tool_use_id.to_string(),
+            raw_name: "ExitPlanMode".to_string(),
+            result_summary: "completed".to_string(),
+            result_content: None,
+            success,
+            todo_snapshot: None,
+        }
+    }
+
+    #[test]
     fn unified_events_promote_plan_review_attention() {
         let sessions = vec![session("target", "claude", 1000, "/repo/a")];
         let runtimes = vec![WorkspaceRuntimeDescriptor::Unified {
@@ -660,11 +858,13 @@ mod tests {
                 todo_snapshot: None,
             },
         };
-        let mut events_by_runtime = HashMap::new();
-        events_by_runtime.insert("runtime-1".to_string(), vec![event]);
+        let mut attention_by_runtime = HashMap::new();
+        let mut summary = super::AttentionSummary::default();
+        summary.apply(&event);
+        attention_by_runtime.insert("runtime-1".to_string(), summary);
 
         let decorations =
-            build_workspace_session_decorations(&sessions, &runtimes, &events_by_runtime);
+            build_workspace_session_decorations(&sessions, &runtimes, &attention_by_runtime);
 
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].visual_state, "attention");
@@ -698,11 +898,13 @@ mod tests {
                 input_summary: None,
             },
         };
-        let mut events_by_runtime = HashMap::new();
-        events_by_runtime.insert("native-1".to_string(), vec![event]);
+        let mut attention_by_runtime = HashMap::new();
+        let mut summary = super::AttentionSummary::default();
+        summary.apply(&event);
+        attention_by_runtime.insert("native-1".to_string(), summary);
 
         let decorations =
-            build_workspace_session_decorations(&sessions, &runtimes, &events_by_runtime);
+            build_workspace_session_decorations(&sessions, &runtimes, &attention_by_runtime);
 
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].session_key, "claude:target");

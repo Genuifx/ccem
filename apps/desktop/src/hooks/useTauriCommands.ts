@@ -976,6 +976,14 @@ export function useTauriCommands() {
     return invoke<NativeSessionSummary[]>('list_native_sessions');
   }, []);
 
+  const getNativeSessionSummary = useCallback(async (
+    runtimeId: string,
+  ): Promise<NativeSessionSummary | null> => {
+    return invoke<NativeSessionSummary | null>('get_native_session_summary', {
+      runtimeId,
+    });
+  }, []);
+
   const sendNativeSessionInput = useCallback(async (
     runtimeId: string,
     text: string,
@@ -1709,6 +1717,7 @@ export function useTauriCommands() {
     preflightCodexModelMigration,
     createNativeSession,
     listNativeSessions,
+    getNativeSessionSummary,
     sendNativeSessionInput,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,

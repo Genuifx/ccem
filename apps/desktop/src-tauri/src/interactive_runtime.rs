@@ -11,6 +11,7 @@ use crate::runtime::{
 use crate::session::{Session, SessionManager};
 use crate::session_provenance::bind_source_session_id;
 use crate::tmux::{ClaudeTerminalState, TmuxManager, TmuxWindowInfo};
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -554,6 +555,16 @@ impl InteractiveRuntimeManager {
             .lock()
             .map_err(|_| "Failed to lock interactive event store".to_string())?;
         Ok(events.events_since(since_seq))
+    }
+
+    /// Read the incrementally maintained attention summary for a session.
+    pub fn attention_summary(&self, session_id: &str) -> Result<AttentionSummary, String> {
+        let handle = self.get_handle(session_id)?;
+        let events = handle
+            .events
+            .lock()
+            .map_err(|_| "Failed to lock interactive event store".to_string())?;
+        Ok(events.attention_summary())
     }
 
     pub fn summary(&self, session_id: &str) -> Option<InteractiveSessionSummary> {

@@ -1,13 +1,16 @@
 use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionEventRecord, TodoSnapshotV1};
 use crate::session_provenance::state_db_path;
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 const EVENT_LOG_FLUSH_BATCH_SIZE: usize = 64;
+const ATTENTION_SUMMARY_TAIL_FALLBACK_LIMIT: u64 = 2000;
 
 pub struct NativeEventLog {
     db_path: PathBuf,
@@ -113,17 +116,15 @@ impl NativeEventLog {
 
     pub fn has_events(&self, runtime_id: &str) -> Result<bool, String> {
         self.flush_pending()?;
-        self.with_conn(|conn| {
-            let count = conn
-                .query_row(
-                    "SELECT 1 FROM native_session_events WHERE runtime_id = ?1 LIMIT 1",
-                    [runtime_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| format!("Failed to check native session event log: {}", error))?;
-            Ok(count.is_some())
-        })
+        self.with_conn(|conn| runtime_has_events(conn, runtime_id))
+    }
+
+    /// Persisted, incrementally maintained attention summary for a runtime.
+    /// Falls back to deriving the summary once from the bounded event tail for
+    /// runtimes that predate summary persistence, then serves it from storage.
+    pub fn attention_summary(&self, runtime_id: &str) -> Result<AttentionSummary, String> {
+        self.flush_pending()?;
+        self.with_conn(|conn| load_or_seed_attention_summary(conn, runtime_id))
     }
 
     pub fn newest_seq(&self, runtime_id: &str) -> Result<Option<u64>, String> {
@@ -137,6 +138,46 @@ impl NativeEventLog {
                 )
                 .map_err(|error| format!("Failed to query newest native event seq: {}", error))?;
             Ok(seq.and_then(non_negative_i64_to_u64))
+        })
+    }
+
+    /// Cheapest possible check for incremental replay: how many events exist
+    /// for this runtime after `since_seq`, plus the runtime's global
+    /// oldest/newest seq (matching what `event_seq_bounds` would report).
+    /// Runs after flush_pending, like replay does, so pending writer batches
+    /// stay visible. Lets callers skip the events query entirely when the
+    /// pending count is zero.
+    pub fn pending_since(
+        &self,
+        runtime_id: &str,
+        since_seq: Option<u64>,
+    ) -> Result<(u64, Option<u64>, Option<u64>), String> {
+        self.flush_pending()?;
+        self.with_conn(|conn| {
+            let since = since_seq.map(|seq| seq as i64);
+            let (pending_count, oldest, newest) = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(CASE WHEN ?2 IS NULL OR seq > ?2 THEN 1 ELSE 0 END), 0),
+                            MIN(seq), MAX(seq)
+                     FROM native_session_events
+                     WHERE runtime_id = ?1",
+                    params![runtime_id, since],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|error| {
+                    format!("Failed to count pending native session events: {}", error)
+                })?;
+            Ok((
+                pending_count as u64,
+                oldest.and_then(non_negative_i64_to_u64),
+                newest.and_then(non_negative_i64_to_u64),
+            ))
         })
     }
 
@@ -184,6 +225,15 @@ impl NativeEventLog {
             let tx = conn.transaction().map_err(|error| {
                 format!("Failed to begin native event log transaction: {}", error)
             })?;
+            // Seed per-runtime base summaries before inserting the batch so the
+            // tail fallback only ever folds events that already exist on disk.
+            let mut summaries: HashMap<String, AttentionSummary> = HashMap::new();
+            for record in records {
+                if !summaries.contains_key(&record.runtime_id) {
+                    let base = load_or_seed_attention_summary(&tx, &record.runtime_id)?;
+                    summaries.insert(record.runtime_id.clone(), base);
+                }
+            }
             {
                 let mut stmt = tx
                     .prepare_cached(
@@ -212,6 +262,14 @@ impl NativeEventLog {
                     ])
                     .map_err(|error| format!("Failed to append native session event: {}", error))?;
                 }
+            }
+            for record in records {
+                if let Some(summary) = summaries.get_mut(&record.runtime_id) {
+                    summary.apply(record);
+                }
+            }
+            for (runtime_id, summary) in &summaries {
+                persist_attention_summary(&tx, runtime_id, summary)?;
             }
             tx.commit().map_err(|error| {
                 format!("Failed to commit native event log transaction: {}", error)
@@ -256,6 +314,11 @@ impl NativeEventLog {
                      created_at TEXT NOT NULL,
                      PRIMARY KEY(runtime_id, seq)
                  );
+                 CREATE TABLE IF NOT EXISTS native_attention_summaries (
+                     runtime_id TEXT PRIMARY KEY,
+                     summary_json TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
                  PRAGMA optimize;",
             )
             .map_err(|error| format!("Failed to initialize native event log schema: {}", error))?;
@@ -275,6 +338,80 @@ fn todo_snapshot_from_payload(payload: &SessionEventPayload) -> Option<&TodoSnap
         | SessionEventPayload::ToolUseCompleted { todo_snapshot, .. } => todo_snapshot.as_ref(),
         _ => None,
     }
+}
+
+fn load_or_seed_attention_summary(
+    conn: &Connection,
+    runtime_id: &str,
+) -> Result<AttentionSummary, String> {
+    let summary_json = conn
+        .query_row(
+            "SELECT summary_json FROM native_attention_summaries WHERE runtime_id = ?1",
+            [runtime_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to query native attention summary: {}", error))?;
+
+    if let Some(summary_json) = summary_json {
+        return serde_json::from_str(&summary_json)
+            .map_err(|error| format!("Failed to parse native attention summary: {}", error));
+    }
+
+    if !runtime_has_events(conn, runtime_id)? {
+        return Ok(AttentionSummary::default());
+    }
+
+    // Upgrade path: events exist but no summary row was persisted yet. Derive
+    // it once from the bounded tail replay and persist the result so later
+    // reads and writes stay O(1).
+    eprintln!(
+        "Deriving native attention summary for {} from event tail fallback",
+        runtime_id
+    );
+    let tail = query_events_since(
+        conn,
+        runtime_id,
+        None,
+        Some(ATTENTION_SUMMARY_TAIL_FALLBACK_LIMIT),
+    )?;
+    let mut summary = AttentionSummary::default();
+    for record in &tail {
+        summary.apply(record);
+    }
+    persist_attention_summary(conn, runtime_id, &summary)?;
+    Ok(summary)
+}
+
+fn persist_attention_summary(
+    conn: &Connection,
+    runtime_id: &str,
+    summary: &AttentionSummary,
+) -> Result<(), String> {
+    let summary_json = serde_json::to_string(summary)
+        .map_err(|error| format!("Failed to serialize native attention summary: {}", error))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO native_attention_summaries (
+            runtime_id,
+            summary_json,
+            updated_at
+        ) VALUES (?1, ?2, ?3)",
+        params![runtime_id, summary_json, Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| format!("Failed to persist native attention summary: {}", error))?;
+    Ok(())
+}
+
+fn runtime_has_events(conn: &Connection, runtime_id: &str) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT 1 FROM native_session_events WHERE runtime_id = ?1 LIMIT 1",
+            [runtime_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Failed to check native session event log: {}", error))?;
+    Ok(count.is_some())
 }
 
 fn event_seq_bounds(
@@ -551,6 +688,10 @@ fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
 mod todo_tests;
 
 #[cfg(test)]
+#[path = "native_event_log_attention_tests.rs"]
+mod attention_tests;
+
+#[cfg(test)]
 mod tests {
     use super::NativeEventLog;
     use crate::event_bus::{SessionEventPayload, SessionEventRecord};
@@ -637,6 +778,68 @@ mod tests {
         assert_eq!(replay.newest_available_seq, Some(2));
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.events[0].seq, 2);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_pending_since_counts_events_after_seq() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-pending-test-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+        let runtime_id = "runtime-pending";
+
+        for seq in 1..=3 {
+            log.append(&SessionEventRecord {
+                runtime_id: runtime_id.to_string(),
+                seq,
+                occurred_at: Utc::now(),
+                payload: SessionEventPayload::AssistantChunk {
+                    text: format!("chunk-{seq}"),
+                },
+            })
+            .expect("append chunk");
+        }
+
+        // Nothing pending after the newest seq; bounds still report the full range.
+        let (count, oldest, newest) = log
+            .pending_since(runtime_id, Some(3))
+            .expect("pending_since at newest");
+        assert_eq!(count, 0);
+        assert_eq!(oldest, Some(1));
+        assert_eq!(newest, Some(3));
+
+        // Two events pending after seq 1; newest stays the global max.
+        let (count, oldest, newest) = log
+            .pending_since(runtime_id, Some(1))
+            .expect("pending_since mid-range");
+        assert_eq!(count, 2);
+        assert_eq!(oldest, Some(1));
+        assert_eq!(newest, Some(3));
+
+        // Unknown runtime: no count, no bounds.
+        let (count, oldest, newest) = log
+            .pending_since("runtime-other", None)
+            .expect("pending_since unknown runtime");
+        assert_eq!(count, 0);
+        assert_eq!(oldest, None);
+        assert_eq!(newest, None);
+
+        // Bounds match what a full empty replay reports, so the zero-pending
+        // fast path can reuse them to build an identical empty batch.
+        let (_, pending_oldest, pending_newest) = log
+            .pending_since(runtime_id, Some(3))
+            .expect("pending_since for parity check");
+        let replay = log
+            .replay(runtime_id, Some(3), None)
+            .expect("replay at newest");
+        assert!(replay.events.is_empty());
+        assert!(!replay.gap_detected);
+        assert!(!replay.truncated);
+        assert_eq!(replay.oldest_available_seq, pending_oldest);
+        assert_eq!(replay.newest_available_seq, pending_newest);
 
         let _ = std::fs::remove_file(db_path);
     }

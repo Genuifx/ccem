@@ -18,6 +18,7 @@ use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
 use crate::system_proxy::resolve_codex_proxy_env;
 use crate::terminal::{self, resolve_claude_path, resolve_codex_path, TerminalType};
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1647,12 +1648,40 @@ impl NativeRuntimeManager {
         self.replay_events_limited(runtime_id, since_seq, None)
     }
 
+    /// Read the persisted attention summary without replaying event history.
+    pub fn attention_summary(&self, runtime_id: &str) -> Result<AttentionSummary, String> {
+        self.event_log.attention_summary(runtime_id)
+    }
+
     pub fn replay_events_limited(
         &self,
         runtime_id: &str,
         since_seq: Option<u64>,
         limit: Option<u64>,
     ) -> Result<ReplayBatch, String> {
+        // Fast path for the common idle-poll case: nothing exists after
+        // `since_seq`. Return the same empty batch a full replay would,
+        // without running the events query. Only taken when sqlite knows the
+        // runtime (newest seq present); otherwise fall through so runtimes
+        // backed solely by the in-memory store keep their fallback.
+        if since_seq.is_some() {
+            if let Ok((pending_count, oldest_available_seq, newest_available_seq)) =
+                self.event_log.pending_since(runtime_id, since_seq)
+            {
+                if pending_count == 0 {
+                    if let Some(newest_seq) = newest_available_seq {
+                        return Ok(ReplayBatch {
+                            gap_detected: false,
+                            truncated: false,
+                            oldest_available_seq,
+                            newest_available_seq: Some(newest_seq),
+                            events: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         match self.event_log.replay(runtime_id, since_seq, limit) {
             Ok(batch) if batch.newest_available_seq.is_some() => return Ok(batch),
             Ok(_) => {}
@@ -4477,6 +4506,16 @@ impl NativeRuntimeManager {
     }
 
     fn summary_for(&self, runtime_id: &str) -> Result<NativeSessionSummary, String> {
+        self.get_session_summary(runtime_id)?
+            .ok_or_else(|| format!("Native runtime {} not found", runtime_id))
+    }
+
+    /// Single-session variant of `list_sessions`: reads only this runtime's
+    /// handle or record instead of cloning the whole session map.
+    pub fn get_session_summary(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<NativeSessionSummary>, String> {
         if let Some(handle) = self
             .handles
             .lock()
@@ -4484,10 +4523,11 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
         {
-            return Ok(handle.summary());
+            return Ok(Some(handle.summary()));
         }
 
-        self.records
+        Ok(self
+            .records
             .lock()
             .map_err(|_| "Failed to lock native runtime records".to_string())?
             .get(runtime_id)
@@ -4511,8 +4551,7 @@ impl NativeRuntimeManager {
                 can_handoff_to_terminal: record.can_handoff_to_terminal,
                 last_error: record.last_error,
                 router: record.router.as_ref().map(SessionRouterState::from),
-            })
-            .ok_or_else(|| format!("Native runtime {} not found", runtime_id))
+            }))
     }
 
     fn flush_helper_output_buffers(
@@ -5725,6 +5764,53 @@ mod tests {
             router_launch_draft: None,
             router_record: None,
         }
+    }
+
+    #[test]
+    fn replay_events_limited_returns_empty_batch_when_nothing_pending() {
+        let runtime_id = "native-replay-fastpath";
+        let manager = manager_with_handle(runtime_id);
+
+        for seq in 1..=3 {
+            manager
+                .append_event(
+                    runtime_id,
+                    SessionEventPayload::AssistantChunk {
+                        text: format!("chunk-{seq}"),
+                    },
+                )
+                .expect("append chunk");
+        }
+
+        // Zero-pending incremental replay: empty batch with accurate bounds,
+        // identical to the shape a full empty replay produces.
+        let fast = manager
+            .replay_events_limited(runtime_id, Some(3), None)
+            .expect("fast-path replay");
+        assert!(fast.events.is_empty());
+        assert!(!fast.gap_detected);
+        assert!(!fast.truncated);
+        assert_eq!(fast.oldest_available_seq, Some(1));
+        assert_eq!(fast.newest_available_seq, Some(3));
+
+        let slow = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("full replay");
+        assert_eq!(fast.oldest_available_seq, slow.oldest_available_seq);
+        assert_eq!(fast.newest_available_seq, slow.newest_available_seq);
+
+        // Pending events still replay through the normal path.
+        let incremental = manager
+            .replay_events_limited(runtime_id, Some(1), None)
+            .expect("incremental replay");
+        assert_eq!(
+            incremental
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+        );
     }
 
     #[test]
