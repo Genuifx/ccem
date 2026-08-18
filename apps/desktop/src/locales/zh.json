@@ -498,7 +498,14 @@
     "usagePanelRoutedMain": "主任务",
     "usagePanelRoutedUnattributed": "未含用量的请求",
     "usagePanelRoutedIncomplete": "中断的请求",
-    "usagePanelRoutedFootnote": "按上游响应自报用量观测，非账单口径；与会话总计口径不同。"
+    "usagePanelRoutedFootnote": "按上游响应自报用量观测，非账单口径；与会话总计口径不同。",
+    "usagePanelSdkTotals": "会话总用量（SDK）",
+    "usagePanelSdkModels": "模型（SDK）",
+    "usagePanelSubRoute": "子路由用量（Router 观测）",
+    "usagePanelSubRouteUnreported": "未报告用量的请求",
+    "usagePanelSubRouteIncomplete": "中断的请求",
+    "usagePanelSubRouteFootnote": "Router 独立观测的子代理/后台请求用量，与上方 SDK 总量相互独立，不做相加或对账。",
+    "usagePanelSubRouteOther": "显式改派"
   },
   "sessions": {
     "subtitle": "管理运行中的 Claude Code 会话",

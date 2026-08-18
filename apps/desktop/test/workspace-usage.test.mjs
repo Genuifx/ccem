@@ -177,88 +177,123 @@ test('takes the latest session_usage snapshot and keeps the empty state otherwis
   assert.equal(empty.sessionUsage, null);
 });
 
-test('routes a request ledger: dedup by request_id, unattributed kept, never zero-filled', async () => {
+test('sub-route ledger: identity-based membership, idempotent, unknown kept', async () => {
   const { computeSessionUsage } = await importWorkspaceUsage();
 
   const usage = computeSessionUsage([
+    // Main-agent request through the router listener: NOT sub-route, excluded
+    // from the ledger even though it flows through the router.
     event(1, {
       type: 'routed_request',
       provider: 'claude',
-      request_id: 'req-1',
+      request_id: 'req-main',
       target_env: 'GLM-5.3',
+      sub_route: false,
       model: 'glm-5.3',
       logical_key: 'main',
       status: 200,
       complete: true,
-      usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      usage: { input_tokens: 900000, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
     }),
+    // Subagent FOLLOWING the default env: still sub-route (identity, not env-diff).
     event(2, {
       type: 'routed_request',
       provider: 'claude',
-      request_id: 'req-2',
-      target_env: 'DeepSeek-V4-Flash',
-      model: 'deepseek-v4-flash',
-      logical_key: 'subagent:Explore',
+      request_id: 'req-sub-sameenv',
+      target_env: 'GLM-5.3',
+      sub_route: true,
+      model: 'glm-5.3',
+      logical_key: 'subagent:general-purpose',
       status: 200,
       complete: true,
-      usage: { input_tokens: 500, output_tokens: 40, cache_read_tokens: 480, cache_creation_tokens: 0 },
+      usage: { input_tokens: 300, output_tokens: 30, cache_read_tokens: 0, cache_creation_tokens: 0 },
     }),
-    // Same request replayed (event bus replay / duplicate emission): must NOT double-count.
+    // Subagent routed elsewhere.
     event(3, {
       type: 'routed_request',
       provider: 'claude',
-      request_id: 'req-2',
+      request_id: 'req-sub-explore',
       target_env: 'DeepSeek-V4-Flash',
+      sub_route: true,
       model: 'deepseek-v4-flash',
       logical_key: 'subagent:Explore',
       status: 200,
       complete: true,
       usage: { input_tokens: 500, output_tokens: 40, cache_read_tokens: 480, cache_creation_tokens: 0 },
     }),
-    // Usage-less request: counted as unattributed, never rendered as zeros.
+    // Replay of req-sub-explore: dedup, no double count.
     event(4, {
       type: 'routed_request',
       provider: 'claude',
-      request_id: 'req-3',
+      request_id: 'req-sub-explore',
       target_env: 'DeepSeek-V4-Flash',
+      sub_route: true,
+      model: 'deepseek-v4-flash',
+      logical_key: 'subagent:Explore',
+      status: 200,
+      complete: true,
+      usage: { input_tokens: 500, output_tokens: 40, cache_read_tokens: 480, cache_creation_tokens: 0 },
+    }),
+    // Usage-less sub-route request: unattributed, never zero-filled.
+    event(5, {
+      type: 'routed_request',
+      provider: 'claude',
+      request_id: 'req-sub-nousage',
+      target_env: 'DeepSeek-V4-Flash',
+      sub_route: true,
       model: 'deepseek-v4-flash',
       logical_key: 'subagent:Explore',
       status: 200,
       complete: true,
       usage: null,
     }),
-    // Interrupted stream with partial usage: row counts it, incomplete counter too.
-    event(5, {
+    // Interrupted sub-route stream.
+    event(6, {
       type: 'routed_request',
       provider: 'claude',
-      request_id: 'req-4',
+      request_id: 'req-sub-cut',
       target_env: 'GLM-5.3',
+      sub_route: true,
       model: 'glm-5.3',
-      logical_key: 'main',
+      logical_key: 'subagent:general-purpose',
       status: 200,
       complete: false,
-      usage: { input_tokens: 300, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      usage: { input_tokens: 100, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    }),
+    // SDK snapshot stays an independent total — ledger must not touch it.
+    event(7, {
+      type: 'session_usage',
+      provider: 'claude',
+      input_tokens: 4242,
+      output_tokens: 99,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      cost_usd: 0.05,
+      model_usage: [{ model: 'glm-5.3[1m]', input_tokens: 4242, output_tokens: 99, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.05 }],
+      rate_limits_available: false,
     }),
   ]);
 
   const ledger = usage.routedLedger;
-  assert.ok(ledger, 'ledger must exist for routed sessions');
-  assert.equal(ledger.unattributedCount, 1, 'usage-less requests are counted, not zero-filled');
+  assert.ok(ledger, 'ledger exists for routed sessions');
+  assert.equal(ledger.unattributedCount, 1);
   assert.equal(ledger.incompleteCount, 1);
 
-  // Rows: Explore/DeepSeek (500+40, ONE request after dedup) and main/GLM
-  // (100+20 plus the incomplete 300+0 both under main/GLM/glm-5.3).
-  assert.equal(ledger.rows.length, 2);
-  const explore = ledger.rows[0];
-  assert.equal(explore.logicalKey, 'subagent:Explore');
-  assert.equal(explore.env, 'DeepSeek-V4-Flash');
-  assert.equal(explore.requestCount, 1, 'duplicate request_id must collapse');
+  // Identity filter: main (900K) must NOT appear; same-env subagent must.
+  const envs = ledger.rows.map((row) => `${row.logicalKey}@${row.env}`);
+  assert.deepEqual(
+    envs.sort(),
+    ['subagent:Explore@DeepSeek-V4-Flash', 'subagent:general-purpose@GLM-5.3'],
+  );
+  const explore = ledger.rows.find((row) => row.logicalKey === 'subagent:Explore');
+  assert.equal(explore.requestCount, 1, 'request_id replay dedups');
   assert.equal(explore.inputTokens, 500);
-  assert.equal(explore.cacheReadTokens, 480);
-  const mainRow = ledger.rows[1];
-  assert.equal(mainRow.logicalKey, 'main');
-  assert.equal(mainRow.requestCount, 2);
-  assert.equal(mainRow.inputTokens, 400);
+  const sameEnv = ledger.rows.find((row) => row.logicalKey === 'subagent:general-purpose');
+  assert.equal(sameEnv.inputTokens, 400, 'complete 300 + incomplete 100 rows merge by identity');
+
+  // Independence: SDK total untouched by ledger contents.
+  assert.equal(usage.sessionUsage.inputTokens, 4242);
+  assert.equal(usage.sessionUsage.modelUsage.length, 1);
 });
 
 test('non-routed sessions expose no ledger', async () => {

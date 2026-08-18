@@ -53,13 +53,14 @@ function SectionTitle({ children }: { children: string }) {
 
 const MODEL_ROWS_LIMIT = 4;
 
-/** Human label for a router logical key: `subagent:Explore` → `Explore`,
- * `background` → the localized background label, '' → main-thread label. */
+/** Human label for a sub-route logical key: `subagent:Explore` → `Explore`,
+ * `background` → the localized background label, '' → explicit/unclassified
+ * route override (main-thread entries never reach these rows). */
 function routedRowLabel(t: (k: string) => string, logicalKey: string): string {
   if (logicalKey.startsWith('subagent:')) return logicalKey.slice('subagent:'.length);
   if (logicalKey === 'background') return t('router.background');
   if (logicalKey === 'subagent:*') return t('router.subagentAny');
-  return t('workspace.usagePanelRoutedMain');
+  return t('workspace.usagePanelSubRouteOther');
 }
 
 function buildModelRows(modelUsage: SessionUsageModelEntry[]) {
@@ -117,17 +118,18 @@ export function SessionUsagePopoverContent({
   const hasTotals = inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0;
   const hasContext = usage.context !== null;
   const ledger = usage.routedLedger;
-  // For dynamically routed sessions the SDK model rows attribute subagent
-  // turns to the client-side model — the router ledger is the observed truth,
-  // so it takes precedence when present.
-  const hasModelUsage = (ledger?.rows.length ?? 0) > 0 || (snapshot?.modelUsage.length ?? 0) > 0;
+  // Two INDEPENDENT sections per the usage data contract: the session total
+  // comes from the SDK snapshot (product-chosen primary aperture); the router
+  // ledger below is a separate sub-route observation. They are never summed,
+  // reconciled, or substituted for one another.
+  const hasModelUsage = (snapshot?.modelUsage.length ?? 0) > 0;
   const hasRateLimits = snapshot?.rateLimitsAvailable === true
     && snapshot?.rateLimits !== null
     && (snapshot!.rateLimits!.fiveHour?.utilization != null
       || snapshot!.rateLimits!.sevenDay?.utilization != null);
   const isEmpty = !hasTotals && !hasContext && !hasModelUsage && !hasRateLimits;
 
-  const modelRows = hasModelUsage && !ledger ? buildModelRows(snapshot!.modelUsage) : [];
+  const modelRows = hasModelUsage ? buildModelRows(snapshot!.modelUsage) : [];
 
   const rateLimitRows = hasRateLimits
     ? ([
@@ -198,7 +200,7 @@ export function SessionUsagePopoverContent({
 
       {hasTotals && (
         <div className="space-y-1 px-4 py-2.5">
-          <SectionTitle>{t('workspace.usagePanelTotals')}</SectionTitle>
+          <SectionTitle>{t('workspace.usagePanelSdkTotals')}</SectionTitle>
           <UsageRow
             label={t('workspace.contextInputTokens')}
             value={formatTokenCount(inputTokens)}
@@ -227,9 +229,9 @@ export function SessionUsagePopoverContent({
         </div>
       )}
 
-      {hasModelUsage && !ledger && (
+      {hasModelUsage && (
         <div className="space-y-1 px-4 py-2.5">
-          <SectionTitle>{t('workspace.usagePanelModels')}</SectionTitle>
+          <SectionTitle>{t('workspace.usagePanelSdkModels')}</SectionTitle>
           {modelRows.map((entry, index) => (
             <UsageRow
               key={entry.model || `other-${index}`}
@@ -242,7 +244,7 @@ export function SessionUsagePopoverContent({
 
       {ledger && (
         <div className="space-y-1 px-4 py-2.5">
-          <SectionTitle>{t('workspace.usagePanelRouted')}</SectionTitle>
+          <SectionTitle>{t('workspace.usagePanelSubRoute')}</SectionTitle>
           {ledger.rows.map((entry) => (
             <UsageRow
               key={`${entry.logicalKey}-${entry.env}-${entry.model}`}
@@ -254,19 +256,19 @@ export function SessionUsagePopoverContent({
           {ledger.unattributedCount > 0 && (
             <UsageRow
               key="routed-unattributed"
-              label={t('workspace.usagePanelRoutedUnattributed')}
+              label={t('workspace.usagePanelSubRouteUnreported')}
               value={`${ledger.unattributedCount}`}
             />
           )}
           {ledger.incompleteCount > 0 && (
             <UsageRow
               key="routed-incomplete"
-              label={t('workspace.usagePanelRoutedIncomplete')}
+              label={t('workspace.usagePanelSubRouteIncomplete')}
               value={`${ledger.incompleteCount}`}
             />
           )}
           <div className="pt-0.5 text-2xs leading-4 text-muted-foreground/70">
-            {t('workspace.usagePanelRoutedFootnote')}
+            {t('workspace.usagePanelSubRouteFootnote')}
           </div>
         </div>
       )}

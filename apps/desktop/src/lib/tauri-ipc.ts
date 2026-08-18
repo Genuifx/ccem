@@ -1406,6 +1406,7 @@ export type SessionEventPayload =
       provider: string;
       request_id: string;
       target_env: string;
+      sub_route?: boolean;
       model?: string | null;
       logical_key?: string | null;
       status: number;

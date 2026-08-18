@@ -85,6 +85,12 @@ pub struct PreparedRouterRequest {
     pub runtime_id: String,
     pub target_env: String,
     pub logical_key: Option<String>,
+    /// True when the request carries a SUB-ROUTE identity (background alias,
+    /// subagent:<type> marker, or an explicit authenticated route override).
+    /// False only for the main agent thread. Identity-based: a subagent that
+    /// FOLLOWS the default environment is still a sub-route; the main agent
+    /// passing through the router listener is never one.
+    pub sub_route: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +428,7 @@ pub fn prepare_router_request(
         body: output_body,
         runtime_id: runtime_id.to_string(),
         target_env: target.name,
+        sub_route: decision.logical_key.as_deref() != Some("main"),
         logical_key: decision.logical_key,
     })
 }

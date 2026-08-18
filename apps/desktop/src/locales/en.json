@@ -498,7 +498,14 @@
     "usagePanelRoutedMain": "Main thread",
     "usagePanelRoutedUnattributed": "Requests without usage",
     "usagePanelRoutedIncomplete": "Interrupted requests",
-    "usagePanelRoutedFootnote": "Observed from upstream self-reported usage, not a billing statement; uses a different aperture than session totals."
+    "usagePanelRoutedFootnote": "Observed from upstream self-reported usage, not a billing statement; uses a different aperture than session totals.",
+    "usagePanelSdkTotals": "Session totals (SDK)",
+    "usagePanelSdkModels": "Models (SDK)",
+    "usagePanelSubRoute": "Sub-route usage (Router-observed)",
+    "usagePanelSubRouteUnreported": "Requests with unreported usage",
+    "usagePanelSubRouteIncomplete": "Interrupted requests",
+    "usagePanelSubRouteFootnote": "Independently observed by the router for subagent/background requests. Not added to or reconciled with the SDK totals above.",
+    "usagePanelSubRouteOther": "Explicit override"
   },
   "sessions": {
     "subtitle": "Manage running Claude Code sessions",

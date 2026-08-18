@@ -408,6 +408,7 @@ struct ForwardMeta {
     prompt_preview: Option<String>,
     is_sse: bool,
     record_traffic: bool,
+    sub_route: bool,
     logical_key: Option<String>,
 }
 
@@ -1202,6 +1203,7 @@ impl ProxyDebugManager {
             prompt_preview,
             is_sse,
             record_traffic: true,
+            sub_route: false,
             logical_key: None,
         };
 
@@ -1355,6 +1357,7 @@ impl ProxyDebugManager {
             prompt_preview,
             is_sse,
             record_traffic: recording_enabled,
+            sub_route: prepared.sub_route,
             logical_key: prepared.logical_key.clone(),
         };
         self.forward_async_response_stream(stream, upstream_response, spool_state, sample, meta);
@@ -1557,6 +1560,7 @@ impl ProxyDebugManager {
                     provider: "claude".to_string(),
                     request_id: meta.id.clone(),
                     target_env,
+                    sub_route: meta.sub_route,
                     model: scanner.model,
                     logical_key: meta.logical_key.clone(),
                     status: meta.status,
@@ -3638,6 +3642,7 @@ mod tests {
             prompt_preview: None,
             is_sse: true,
             record_traffic: false,
+            sub_route: false,
             logical_key: None,
         }
     }
@@ -3742,6 +3747,7 @@ mod tests {
             let crate::event_bus::SessionEventPayload::RoutedRequest {
                 request_id,
                 target_env,
+                sub_route,
                 model,
                 logical_key,
                 status,
@@ -3754,6 +3760,7 @@ mod tests {
             };
             assert!(!request_id.is_empty(), "request identity must be stable");
             assert_eq!(target_env, env_name);
+            assert!(sub_route, "subagent-marker requests are sub-route BY IDENTITY");
             assert_eq!(model.as_deref(), Some("target-glm"));
             assert_eq!(logical_key.as_deref(), Some("subagent:Explore"));
             assert_eq!(status, 200);

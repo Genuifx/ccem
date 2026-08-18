@@ -26,7 +26,14 @@ export interface SessionRateLimitWindow {
   resetsAt: string | null;
 }
 
-/** Authoritative cumulative session usage snapshot from the SDK `/usage` query */
+/**
+ * Primary session-total aperture for the usage UI — the SDK `/usage` snapshot,
+ * chosen as the product's session-total source. For routed sessions it reports
+ * the client-side view (subagent turns keyed by client model; some requests
+ * not reflected). This is a PRODUCT DECISION about which number the UI shows
+ * as the total, not a technical claim of subagent completeness — never
+ * "correct" or redistribute it from router or transcript sources.
+ */
 export interface SessionUsageSnapshot {
   provider: string;
   inputTokens: number;
@@ -58,7 +65,9 @@ export interface RoutedEnvUsage {
   cacheCreationTokens: number;
 }
 
-/** Router request ledger rollup: observed rows + explicit unknown remainder. */
+/** Sub-route ledger rollup (Router-observed, fully independent from the SDK
+ *  session total): observed rows + explicit unknown remainder. Never summed
+ *  with, reconciled against, or displayed as a delta of the SDK total. */
 export interface RoutedUsageLedger {
   /** Rows aggregated over requests that CARRIED usage. */
   rows: RoutedEnvUsage[];
@@ -129,6 +138,12 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
       cacheCreationTokens: number;
     } | null;
   }>();
+  // Sub-route membership is REQUEST IDENTITY (background / subagent:<type> /
+  // explicit authenticated route override), NOT "env differs from default":
+  // a subagent following the default env still counts; the main agent passing
+  // through the router listener never does. Main entries are kept in the raw
+  // map for observability but excluded from the sub-route rollup.
+  const isSubRoute = (payload: { sub_route?: boolean }) => payload.sub_route === true;
 
   for (const event of events) {
     const { payload } = event;
@@ -187,13 +202,15 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
             cacheCreationTokens: payload.usage.cache_creation_tokens,
           }
         : null;
-      routedRequests.set(payload.request_id, {
-        logicalKey: payload.logical_key ?? '',
-        env: payload.target_env,
-        model: payload.model ?? '',
-        complete: payload.complete,
-        usage,
-      });
+      if (isSubRoute(payload)) {
+        routedRequests.set(payload.request_id, {
+          logicalKey: payload.logical_key ?? '',
+          env: payload.target_env,
+          model: payload.model ?? '',
+          complete: payload.complete,
+          usage,
+        });
+      }
     }
 
     if (payload.type === 'session_usage') {

@@ -257,17 +257,29 @@ pub enum SessionEventPayload {
         scope: Option<String>,
     },
     /// Router request LEDGER entry for dynamically routed sessions. One event
-    /// per completed forwarded /v1/messages request. `usage` is upstream
-    /// self-reported SSE usage — OBSERVATIONAL, not a billing statement — and
-    /// is None when the stream carried no parseable usage frame (interrupted
-    /// streams, non-200, providers that omit usage). Consumers must never
-    /// render missing usage as zero or treat the sum as additive with SDK
-    /// session totals (different measurement aperture).
+    /// per completed forwarded /v1/messages request. This is an INDEPENDENT
+    /// sub-route observation channel: it never feeds, corrects, or replaces
+    /// the product's primary session total (the SDK /usage snapshot), and the
+    /// two are never summed or reconciled in the UI.
+    ///
+    /// `sub_route` classifies request IDENTITY (background alias,
+    /// subagent:<type> marker, explicit authenticated route override) — not
+    /// target-env difference. Main-agent entries (`sub_route: false`) are
+    /// retained for observability and MUST be excluded from sub-route UI.
+    ///
+    /// `usage` is upstream self-reported SSE usage — observational, not a
+    /// billing statement — and is None when the stream carried no parseable
+    /// usage frame (interrupted streams, non-200, providers that omit usage).
+    /// Consumers must never render missing usage as zero.
     RoutedRequest {
         provider: String,
         /// Stable per-forward identity; retries are distinct requests.
         request_id: String,
         target_env: String,
+        /// Identity classification: true for background/subagent/explicit
+        /// route requests, false for the main agent thread.
+        #[serde(default)]
+        sub_route: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// Logical routing key that selected this target (background,

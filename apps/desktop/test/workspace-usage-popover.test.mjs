@@ -142,8 +142,11 @@ test('renders SDK snapshot sections: totals, cache hit rate, models, rate limits
   // event-derived cumulative cost (0.05).
   assert.match(html, /\$0\.05/);
   assert.match(html, /75% 命中/); // 300 / (300 + 100)
-  assert.match(html, /模型明细/);
+  assert.match(html, /会话总用量（SDK）/);
+  assert.match(html, /模型（SDK）/);
   assert.match(html, /claude-sonnet-4-5-test/);
+  // Frozen contract: no sub-route section without router ledger data.
+  assert.doesNotMatch(html, /子路由用量/);
   assert.match(html, /速率限制/);
   assert.match(html, /5 小时窗口/);
   assert.match(html, /7 天窗口/);
@@ -165,7 +168,7 @@ test('falls back to event-derived totals without SDK snapshot sections', async (
   assert.match(html, /会话用量/);
   assert.match(html, /上下文占用/);
   assert.match(html, /缓存读取/);
-  assert.doesNotMatch(html, /模型明细/);
+  assert.doesNotMatch(html, /模型（SDK）/);
   assert.doesNotMatch(html, /速率限制/);
 });
 
@@ -183,4 +186,53 @@ test('renders an empty state when no usage data exists at all', async () => {
   });
 
   assert.match(html, /暂无用量数据/);
+});
+
+test('renders the independent sub-route section next to SDK sections (frozen contract)', async () => {
+  const { render } = await importSessionUsagePopoverRenderer();
+  const usage = fixtureUsage();
+  usage.routedLedger = {
+    rows: [
+      {
+        logicalKey: 'subagent:Explore',
+        env: 'DeepSeek-V4-Flash',
+        model: 'deepseek-v4-flash',
+        requestCount: 2,
+        inputTokens: 28147,
+        outputTokens: 114,
+        cacheReadTokens: 27904,
+        cacheCreationTokens: 0,
+      },
+      {
+        logicalKey: 'subagent:general-purpose',
+        env: 'GLM-5.3',
+        model: 'glm-5.3',
+        requestCount: 1,
+        inputTokens: 300,
+        outputTokens: 30,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      },
+    ],
+    unattributedCount: 1,
+    incompleteCount: 1,
+  };
+  const html = render(usage);
+
+  // Two independent sections, clearly separated.
+  assert.match(html, /会话总用量（SDK）/);
+  assert.match(html, /模型（SDK）/);
+  assert.match(html, /子路由用量（Router 观测）/);
+  // Sub-route rows by agent identity -> env, with request counts.
+  assert.match(html, /Explore · DeepSeek-V4-Flash/);
+  assert.match(html, />28K</);
+  assert.match(html, /×2/);
+  assert.match(html, /general-purpose · GLM-5\.3/);
+  // Unknown semantics: unreported + interrupted counted, not zero-filled.
+  assert.match(html, /未报告用量的请求/);
+  assert.match(html, /中断的请求/);
+  // No conservation/reconciliation language anywhere.
+  assert.doesNotMatch(html, /差额|守恒|合计=|总计=/);
+  // Independence footnote present.
+  assert.match(html, /不做相加或对账/);
 });
