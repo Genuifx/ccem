@@ -339,6 +339,13 @@ impl UnifiedSessionManager {
         let channel: Arc<dyn OutputChannel> = match backend.runtime_kind() {
             RuntimeKind::Headless => Arc::new(DesktopChannel::headless(app.clone())),
             RuntimeKind::Interactive => Arc::new(DesktopChannel::interactive(app.clone())),
+            // Native runtimes stream through their own event log and never
+            // attach a desktop output channel.
+            RuntimeKind::Native => {
+                return Err(
+                    "Native runtimes do not attach desktop output channels".to_string(),
+                );
+            }
         };
 
         self.attach_output_channel(runtime_id, channel)

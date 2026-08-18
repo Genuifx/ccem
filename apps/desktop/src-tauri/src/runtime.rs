@@ -81,6 +81,7 @@ struct BuildClaudeCommandResult {
 pub enum RuntimeKind {
     Interactive,
     Headless,
+    Native,
 }
 
 fn default_runtime_kind() -> RuntimeKind {
@@ -1695,7 +1696,11 @@ pub fn clear_runtime_recovery_candidates_by_claude_session_id_from(
 
 #[allow(dead_code)]
 pub fn cleanup_orphaned_runtime_processes() -> io::Result<RuntimeStateFile> {
-    cleanup_orphaned_runtime_processes_from(&runtime_state_file_path())
+    let updated = cleanup_orphaned_runtime_processes_from(&runtime_state_file_path())?;
+    // Native helpers are not tracked in the runtime state file; reap ones
+    // leaked by a crashed run of THIS installation via the anchored scan.
+    cleanup_orphaned_native_sidecars();
+    Ok(updated)
 }
 
 pub fn cleanup_orphaned_runtime_processes_from(path: &Path) -> io::Result<RuntimeStateFile> {
@@ -1734,7 +1739,7 @@ pub fn cleanup_orphaned_runtime_processes_from(path: &Path) -> io::Result<Runtim
     Ok(updated)
 }
 
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdin(Stdio::null())
@@ -1767,10 +1772,17 @@ fn runtime_command_matches(runtime_kind: RuntimeKind, command_line: &str) -> boo
     match runtime_kind {
         RuntimeKind::Interactive => normalized.contains("claude"),
         RuntimeKind::Headless => normalized.contains("claude") && normalized.contains("-p"),
+        // Native sidecars are never matched by binary name. The strict
+        // predicate below requires the process executable to be this
+        // installation's own bundled ccem-node AND the command to carry
+        // the native runtime helper marker argument.
+        RuntimeKind::Native => {
+            native_sidecar_command_matches(command_line, &native_sidecar_exe_anchor())
+        }
     }
 }
 
-fn terminate_process(pid: u32) -> Result<(), String> {
+pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
     send_signal(pid, "TERM")?;
 
     for _ in 0..50 {
@@ -1807,14 +1819,127 @@ fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
     }
 }
 
+const NATIVE_SIDECAR_EXECUTABLE_NAME: &str = "ccem-node";
+const NATIVE_HELPER_SCRIPT_MARKER: &str = "native-runtime-helper.mjs";
+
+/// The absolute path of the ccem-node sidecar bundled with THIS app
+/// installation. Tauri copies external binaries next to the main
+/// executable, so this is the only executable path native orphan matching
+/// may ever anchor to — never a bare binary-name match.
+fn native_sidecar_exe_anchor() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(NATIVE_SIDECAR_EXECUTABLE_NAME)))
+        .unwrap_or_default()
+}
+
+/// Strict orphan predicate for native runtime sidecars: the process
+/// executable must BE this installation's own ccem-node and one argument
+/// must be the native runtime helper script marker. A `node`/`ccem-node`
+/// from anywhere else never matches.
+fn native_sidecar_command_matches(command_line: &str, expected_exe: &Path) -> bool {
+    let Some(expected_exe_str) = expected_exe.to_str() else {
+        return false;
+    };
+    if expected_exe_str.is_empty() {
+        return false;
+    }
+
+    let trimmed = command_line.trim();
+    // Prefer a path-prefix compare so bundle paths containing spaces
+    // ("/Applications/CCEM Desktop.app/…") are not split mid-path.
+    if let Some(rest) = trimmed.strip_prefix(expected_exe_str) {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return rest.split_whitespace().any(is_native_helper_marker_argument);
+        }
+    }
+
+    // Prefix failed: fall back to comparing the first token as a path
+    // (canonicalize covers symlinked executable directories).
+    let mut arguments = trimmed.split_whitespace();
+    let Some(observed_exe) = arguments.next() else {
+        return false;
+    };
+    if !exe_paths_equivalent(Path::new(observed_exe), expected_exe) {
+        return false;
+    }
+    arguments.any(is_native_helper_marker_argument)
+}
+
+fn is_native_helper_marker_argument(argument: &str) -> bool {
+    Path::new(argument)
+        .file_name()
+        .is_some_and(|name| name == NATIVE_HELPER_SCRIPT_MARKER)
+}
+
+fn exe_paths_equivalent(observed: &Path, expected: &Path) -> bool {
+    if observed == expected {
+        return true;
+    }
+    match (observed.canonicalize(), expected.canonicalize()) {
+        (Ok(observed), Ok(expected)) => observed == expected,
+        _ => false,
+    }
+}
+
+/// Reap native helper sidecars orphaned by a previous crashed run of THIS
+/// app installation. Native helpers are not tracked in the runtime state
+/// file, so the only safe way to find them is the strict anchored scan:
+/// the executable must be this installation's own ccem-node and the
+/// command must carry the helper script marker. Sidecars of other CCEM
+/// installations (e.g. the release app while a dev build boots) live in a
+/// different executable directory and are never matched.
+fn cleanup_orphaned_native_sidecars() {
+    let anchor = native_sidecar_exe_anchor();
+    if anchor.as_os_str().is_empty() {
+        return;
+    }
+
+    let output = Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return;
+    };
+    let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    for pid in select_orphaned_native_sidecar_pids(&lines, &anchor, std::process::id()) {
+        let _ = terminate_process(pid);
+    }
+}
+
+fn select_orphaned_native_sidecar_pids(
+    lines: &[String],
+    expected_exe: &Path,
+    own_pid: u32,
+) -> Vec<u32> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            if pid == own_pid {
+                return None;
+            }
+            let command_line = parts.collect::<Vec<_>>().join(" ");
+            native_sidecar_command_matches(&command_line, expected_exe).then_some(pid)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_claude_command, build_permission_args,
         clear_runtime_recovery_candidates_by_claude_session_id_from,
         dismiss_runtime_recovery_candidate_from, extract_protocol_events,
-        list_runtime_recovery_candidates_from, permission_bridge_root_dir, read_runtime_state_from,
-        recover_pending_permission_from_disk, replace_runtime_entries_for_kind, status_name,
+        list_runtime_recovery_candidates_from, native_sidecar_command_matches,
+        permission_bridge_root_dir, read_runtime_state_from,
+        recover_pending_permission_from_disk, replace_runtime_entries_for_kind,
+        runtime_command_matches, select_orphaned_native_sidecar_pids, status_name,
         write_runtime_state_to, ManagedSessionOptions, ManagedSessionRecord, ManagedSessionSource,
         ManagedSessionStatus, RuntimeKind, RuntimeManager, RuntimeRecoveryCandidate,
         RuntimeStateEntry, RuntimeStateFile,
@@ -1824,7 +1949,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1843,6 +1968,101 @@ mod tests {
         ));
         let _ = fs::create_dir_all(&dir);
         dir.join("state.json")
+    }
+
+    #[test]
+    fn native_sidecar_match_anchors_to_this_installations_exe() {
+        // (a) The command's executable is exactly the anchored ccem-node
+        // path (spaces in the bundle path must not split the match).
+        let anchor = Path::new("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-node");
+        let command = "/Applications/CCEM Desktop.app/Contents/MacOS/ccem-node \
+                       /Applications/CCEM Desktop.app/Contents/Resources/native-runtime-helper.mjs";
+        assert!(native_sidecar_command_matches(command, anchor));
+    }
+
+    #[test]
+    fn native_sidecar_match_rejects_other_exe_prefixes() {
+        // (b) Same command, but anchored to a different installation's
+        // ccem-node (e.g. Homebrew) — must never match.
+        let anchor = Path::new("/opt/homebrew/bin/ccem-node");
+        let command = "/Applications/CCEM Desktop.app/Contents/MacOS/ccem-node \
+                       /Applications/CCEM Desktop.app/Contents/Resources/native-runtime-helper.mjs";
+        assert!(!native_sidecar_command_matches(command, anchor));
+    }
+
+    #[test]
+    fn native_sidecar_match_rejects_plain_node_processes() {
+        // (c) Plain node processes never match, with or without the marker.
+        let anchor = Path::new("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-node");
+        assert!(!native_sidecar_command_matches("node script.js", anchor));
+        assert!(!native_sidecar_command_matches(
+            "/usr/local/bin/node /tmp/work/server.js",
+            anchor
+        ));
+    }
+
+    #[test]
+    fn native_sidecar_match_requires_both_exe_anchor_and_marker() {
+        // Exe anchored but the argument is an MCP server, not the helper
+        // script: the helper spawns SDK/MCP children with the same
+        // executable, so the marker argument is what distinguishes them.
+        let anchor = Path::new("/some/dir/ccem-node");
+        assert!(!native_sidecar_command_matches(
+            "/some/dir/ccem-node /some/dir/mcp-server.mjs",
+            anchor
+        ));
+        // Marker present but the executable is not the anchored ccem-node.
+        assert!(!native_sidecar_command_matches(
+            "/opt/homebrew/bin/node /x/resources/native-runtime-helper.mjs",
+            anchor
+        ));
+        // Anchor is a prefix of a longer executable name: no match either.
+        assert!(!native_sidecar_command_matches(
+            "/some/dir/ccem-node-evil /x/native-runtime-helper.mjs",
+            anchor
+        ));
+    }
+
+    #[test]
+    fn orphan_scan_selects_only_anchored_sidecar_lines() {
+        let anchor = Path::new("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-node");
+        let helper_command = "/Applications/CCEM Desktop.app/Contents/MacOS/ccem-node \
+                              /Applications/CCEM Desktop.app/Contents/Resources/native-runtime-helper.mjs";
+        let lines = vec![
+            format!("  123 {helper_command}"),
+            "  456 /Applications/CCEM Desktop.app/Contents/MacOS/ccem-node \
+                 /Applications/CCEM Desktop.app/Contents/Resources/mcp-server.mjs"
+                .to_string(),
+            "  789 /usr/local/bin/node server.js".to_string(),
+            // Own pid is excluded even when anchored.
+            format!(" 999 {helper_command}"),
+        ];
+
+        assert_eq!(
+            select_orphaned_native_sidecar_pids(&lines, anchor, 999),
+            vec![123]
+        );
+    }
+
+    #[test]
+    fn runtime_command_matches_keeps_interactive_and_headless_semantics() {
+        // (d) Existing matching behavior is unchanged.
+        assert!(runtime_command_matches(
+            RuntimeKind::Interactive,
+            "/usr/local/bin/claude"
+        ));
+        assert!(!runtime_command_matches(
+            RuntimeKind::Interactive,
+            "/usr/bin/vim notes.txt"
+        ));
+        assert!(runtime_command_matches(
+            RuntimeKind::Headless,
+            "claude -p do the thing"
+        ));
+        assert!(!runtime_command_matches(
+            RuntimeKind::Headless,
+            "claude chat"
+        ));
     }
 
     #[test]

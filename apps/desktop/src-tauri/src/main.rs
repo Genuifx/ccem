@@ -5116,6 +5116,7 @@ fn main() {
     let interactive_manager_for_setup = interactive_runtime_manager.clone();
     let interactive_manager_for_run = interactive_runtime_manager.clone();
     let headless_manager_for_run = headless_runtime_manager.clone();
+    let native_manager_for_run = native_runtime_manager.clone();
     let telegram_manager_for_setup = telegram_bridge_manager.clone();
     let telegram_manager_for_run = telegram_bridge_manager.clone();
     let wecom_manager_for_setup = wecom_bridge_manager.clone();
@@ -5628,6 +5629,8 @@ fn main() {
                 weixin_manager_for_run.stop();
                 interactive_manager_for_run.shutdown_all();
                 headless_manager_for_run.shutdown_all();
+                // Real app exit only: close-to-tray keeps native helpers alive.
+                native_manager_for_run.shutdown_all_owned();
                 let proxy_for_shutdown = proxy_manager_for_run.clone();
                 tauri::async_runtime::block_on(async move {
                     proxy_for_shutdown.shutdown().await;

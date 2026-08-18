@@ -2908,9 +2908,13 @@ rl.on('close', () => {
     return;
   }
   if (!stopped) {
+    stopped = true;
     emitStatus('stopped', 'Native runtime helper stdin closed.');
   }
   closeClaudeQueryForRecovery();
   teardownCodexSession(false);
-  process.exit(0);
+  // The host has closed our stdin (app exit or session close).
+  // Give the status write and teardown a moment, then exit regardless of
+  // remaining handles.
+  setTimeout(() => process.exit(0), 250);
 });

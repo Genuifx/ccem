@@ -44609,11 +44609,12 @@ rl2.on("close", () => {
     return;
   }
   if (!stopped) {
+    stopped = true;
     emitStatus("stopped", "Native runtime helper stdin closed.");
   }
   closeClaudeQueryForRecovery();
   teardownCodexSession(false);
-  process5.exit(0);
+  setTimeout(() => process5.exit(0), 250);
 });
 /*! Bundled license information:
 
