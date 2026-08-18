@@ -64,14 +64,14 @@ test('builds provider ccem links for history sessions', async () => {
     source: 'claude',
     id: 'provider-abc',
     idKind: 'provider',
-    cwd: '/Users/wzt/project',
+    cwd: '/workspace/project',
     focus: 'history',
   });
   const parsed = parseCcemSessionLink(link);
 
   assert.equal(
     link,
-    'ccem://workspace/session?source=claude&idKind=provider&id=provider-abc&cwd=%2FUsers%2Fwzt%2Fproject&focus=history'
+    'ccem://workspace/session?source=claude&idKind=provider&id=provider-abc&cwd=%2Fworkspace%2Fproject&focus=history'
   );
   assert.deepEqual(parsed, {
     source: 'claude',
@@ -79,7 +79,7 @@ test('builds provider ccem links for history sessions', async () => {
     id: 'provider-abc',
     runtimeId: null,
     providerSessionId: null,
-    cwd: '/Users/wzt/project',
+    cwd: '/workspace/project',
     focus: 'history',
   });
   assert.equal(shouldPreferLiveSessionForCcemLink(parsed), false);
@@ -88,8 +88,19 @@ test('builds provider ccem links for history sessions', async () => {
       provider: 'claude',
       runtime_id: 'native-runtime-1',
       provider_session_id: 'provider-abc',
+      project_dir: '/workspace/project/',
     }),
     true
+  );
+  assert.equal(
+    nativeSessionMatchesCcemSessionLink(parsed, {
+      provider: 'claude',
+      runtime_id: 'native-runtime-2',
+      provider_session_id: 'provider-abc',
+      project_dir: '/workspace/other-project',
+    }),
+    false,
+    'provider ids are not authoritative across different working directories',
   );
 });
 

@@ -949,6 +949,7 @@ export function useTauriCommands() {
      * requests can be routed (Claude today).
      */
     routerLaunchDraft?: RouterLaunchDraft | null;
+    resumeRouterFromRuntimeId?: string | null;
     codexMigrationProofToken?: string | null;
   }): Promise<NativeSessionSummary> => {
     const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
@@ -966,6 +967,7 @@ export function useTauriCommands() {
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
       routerLaunchDraft: options.routerLaunchDraft ?? null,
+      resumeRouterFromRuntimeId: options.resumeRouterFromRuntimeId ?? null,
       codexMigrationProofToken: options.codexMigrationProofToken ?? null,
     });
   }, [getSessionDefaults]);

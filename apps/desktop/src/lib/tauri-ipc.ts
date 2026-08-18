@@ -342,6 +342,7 @@ export interface TauriCommands {
        * direct launch). Core-owned wire type shared with the Rust backend.
        */
       routerLaunchDraft?: RouterLaunchDraft | null;
+      resumeRouterFromRuntimeId?: string | null;
       codexMigrationProofToken?: string | null;
     },
     NativeSessionSummary

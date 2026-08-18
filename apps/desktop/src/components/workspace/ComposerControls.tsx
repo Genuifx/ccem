@@ -88,6 +88,8 @@ export interface ComposerControlsProps {
   environments: Environment[];
   /** null = legacy all-enabled; string[] = explicit enable list */
   enabledEnvironments?: string[] | null;
+  /** Exact routed-history resumes keep their frozen main environment. */
+  environmentLocked?: boolean;
   onEnvChange: (envName: string) => void;
   onPermModeChange: (mode: PermissionModeName) => void;
   onEffortChange: (effort: EffortLevel) => void;
@@ -100,6 +102,7 @@ export function ComposerControls({
   effort,
   environments,
   enabledEnvironments = null,
+  environmentLocked = false,
   onEnvChange,
   onPermModeChange,
   onEffortChange,
@@ -131,6 +134,13 @@ export function ComposerControls({
   const currentEnvironment = environments.find((e) => e.name === envName);
   const currentEnvironmentIconHint = resolveEnvironmentIconHint(currentEnvironment);
   const isCodexProvider = provider === 'codex';
+  const isEnvironmentLocked = isCodexProvider || environmentLocked;
+  const environmentLockedBadge = isCodexProvider
+    ? t('workspace.codexModelSelectorDisabledBadge')
+    : t('workspace.historyRouterEnvLockedBadge');
+  const environmentLockedHint = isCodexProvider
+    ? t('workspace.codexModelSelectorDisabledHint')
+    : t('workspace.historyRouterEnvLockedHint');
   const permissionPreview = {
     desc: t(`environments.permMode_${permissionPreviewMode}_desc`),
     detail: t(`environments.permMode_${permissionPreviewMode}_detail`),
@@ -154,14 +164,14 @@ export function ComposerControls({
             <span
               className={cn(
                 'flex min-w-0 items-center gap-2',
-                isCodexProvider && 'text-muted-foreground/65',
+                isEnvironmentLocked && 'text-muted-foreground/65',
               )}
             >
-              <span className={cn('flex shrink-0', isCodexProvider && 'opacity-45 grayscale')}>
+              <span className={cn('flex shrink-0', isEnvironmentLocked && 'opacity-45 grayscale')}>
                 <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />
               </span>
               <span className="min-w-0 max-w-[120px] truncate max-[760px]:hidden">{envName}</span>
-              {isCodexProvider && (
+              {isEnvironmentLocked && (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted/50 text-muted-foreground">
@@ -169,7 +179,7 @@ export function ComposerControls({
                     </span>
                   </TooltipTrigger>
                   <TooltipContent side="top" className="max-w-[260px] text-[12px] leading-5">
-                    {t('workspace.codexModelSelectorDisabledHint')}
+                    {environmentLockedHint}
                   </TooltipContent>
                 </Tooltip>
               )}
@@ -212,16 +222,16 @@ export function ComposerControls({
             <div className="mx-2 my-1.5 h-px border-t border-border/50" />
             <div className="flex items-center justify-between gap-3 px-2 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
               <span>{t('workspace.environmentLabel')}</span>
-              {isCodexProvider && (
+              {isEnvironmentLocked && (
                 <span className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/35 px-1.5 py-0.5 normal-case tracking-normal text-muted-foreground">
                   <Lock className="h-2.5 w-2.5" />
-                  {t('workspace.codexModelSelectorDisabledBadge')}
+                  {environmentLockedBadge}
                 </span>
               )}
             </div>
-            {isCodexProvider && (
+            {isEnvironmentLocked && (
               <p className="mx-2 mb-2 rounded-lg border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
-                {t('workspace.codexModelSelectorDisabledHint')}
+                {environmentLockedHint}
               </p>
             )}
           </div>
@@ -236,18 +246,18 @@ export function ComposerControls({
                 <button
                   key={environment.name}
                   type="button"
-                  disabled={isCodexProvider}
-                  aria-disabled={isCodexProvider}
+                  disabled={isEnvironmentLocked}
+                  aria-disabled={isEnvironmentLocked}
                   className={cn(
                     'flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none',
                     'transition-colors',
-                    isCodexProvider
+                    isEnvironmentLocked
                       ? 'cursor-not-allowed text-muted-foreground/45 opacity-55'
                       : 'cursor-pointer glass-dropdown-item',
-                    !isCodexProvider && environment.name === envName && 'text-primary',
+                    !isEnvironmentLocked && environment.name === envName && 'text-primary',
                   )}
                   onClick={() => {
-                    if (isCodexProvider) {
+                    if (isEnvironmentLocked) {
                       return;
                     }
                     onEnvChange(environment.name);

@@ -60,6 +60,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
   autoFocus = false,
   autoGrow = false,
   'aria-label': ariaLabel,
+  'aria-keyshortcuts': ariaKeyShortcuts,
   'data-test-id': dataTestId,
   images = [],
   imagePosition = 'above',
@@ -328,6 +329,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
           suppressContentEditableWarning
           role="textbox"
           aria-label={ariaLabel ?? 'Text input'}
+          aria-keyshortcuts={ariaKeyShortcuts}
           aria-multiline="true"
           aria-disabled={disabled || undefined}
           data-test-id={dataTestId}

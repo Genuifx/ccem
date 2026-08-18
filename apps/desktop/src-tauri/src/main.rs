@@ -86,8 +86,9 @@ use interactive_runtime::{
     InteractiveReplayBatch, InteractiveRuntimeManager, InteractiveSessionOptions,
 };
 use native_runtime::{
-    InteractivePromptAnnotation, NativeHandoffResult, NativeProvider, NativeRuntimeManager,
-    NativeSessionOptions, NativeSessionSummary, PromptImage, RouterLaunchDraft,
+    validate_router_create_selection, InteractivePromptAnnotation, NativeHandoffResult,
+    NativeProvider, NativeRuntimeManager, NativeSessionOptions, NativeSessionSummary, PromptImage,
+    RouterLaunchDraft,
 };
 use opencode::{snapshot_known_session_ids, track_launched_session};
 use prompt_image_store::PromptImageStore;
@@ -1326,10 +1327,15 @@ async fn create_native_session(
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
     router_launch_draft: Option<RouterLaunchDraft>,
+    resume_router_from_runtime_id: Option<String>,
     codex_migration_proof_token: Option<String>,
 ) -> Result<NativeSessionSummary, String> {
     let mutation_guard = environment_mutations.lock()?;
     let provider = parse_native_provider(&provider)?;
+    validate_router_create_selection(
+        router_launch_draft.as_ref(),
+        resume_router_from_runtime_id.as_deref(),
+    )?;
     if provider != NativeProvider::Claude && router_launch_draft.is_some() {
         return Err(
             "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
@@ -1346,6 +1352,17 @@ async fn create_native_session(
     } else {
         None
     };
+    let resumed_router_record = resume_router_from_runtime_id
+        .as_deref()
+        .map(|source_runtime_id| {
+            native_state.clone_router_record_for_history_resume(
+                source_runtime_id,
+                provider,
+                provider_session_id.as_deref(),
+                &effective_working_dir,
+            )
+        })
+        .transpose()?;
     let effective_perm_mode = resolve_effective_perm_mode(perm_mode);
     let effective_runtime_perm_mode = runtime_perm_mode
         .map(|mode| mode.trim().to_string())
@@ -1354,7 +1371,11 @@ async fn create_native_session(
 
     let options = match provider {
         NativeProvider::Claude => {
-            let resolved = resolve_claude_env(&env_name)?;
+            let effective_env_name = resumed_router_record
+                .as_ref()
+                .map(|router| router.default_env.as_str())
+                .unwrap_or(&env_name);
+            let resolved = resolve_claude_env(effective_env_name)?;
             NativeSessionOptions {
                 provider,
                 env_name: resolved.env_name,
@@ -1378,7 +1399,7 @@ async fn create_native_session(
                 codex_api_key: None,
                 effort: effort.clone(),
                 router_launch_draft,
-                router_record: None,
+                router_record: resumed_router_record,
             }
         }
         NativeProvider::Codex => {

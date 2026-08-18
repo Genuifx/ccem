@@ -29,6 +29,7 @@ import {
 } from '@/lib/lucide-react';
 import { Claude, Codex, OpenCode } from '@lobehub/icons';
 import { PromptArea } from '@/components/prompt-area';
+import { buildComposerRouteShortcutHandler } from '@/components/workspace/composerRouteShortcut';
 import { plainTextToSegments, segmentsToPlainText } from '@/components/segment-helpers';
 import { TriggerPopover } from '@/components/trigger-popover';
 import type {
@@ -102,7 +103,12 @@ import {
   ComposerRouteDraftRow,
   ComposerRouteDraftPill,
 } from './WorkspaceRouter';
-import { isRouteDraftPillVisible, isRouteDraftRowVisible, type ComposerRouteDraft } from './composerRouteDraft';
+import {
+  isRouteDraftPillVisible,
+  isRouteDraftRowVisible,
+  toggleComposerRouteDraft,
+  type ComposerRouteDraft,
+} from './composerRouteDraft';
 import {
   buildComposerPromptWithAnnotations,
   parseWorkspacePromptAnnotations,
@@ -859,6 +865,23 @@ export function WorkspaceSessionComposer({
   const capabilities = getComposerCapabilities(provider);
   const planButtonVisible = planModeAvailable ?? Boolean(onPlanModeEnabledChange);
   const routeDraftPillVisible = isRouteDraftPillVisible(routeDraft, provider);
+  const routeShortcutAvailable = provider === 'claude'
+    && routeDraft != null
+    && onRouteDraftChange != null
+    && !disabled
+    && !isSubmitting;
+  const handleRouteShortcut = useMemo(
+    () => buildComposerRouteShortcutHandler({
+      provider,
+      routeDraft,
+      onRouteDraftEnable: routeDraft && onRouteDraftChange
+        ? () => onRouteDraftChange(toggleComposerRouteDraft(true))
+        : undefined,
+      disabled,
+      isSubmitting,
+    }),
+    [provider, routeDraft, onRouteDraftChange, disabled, isSubmitting],
+  );
   const recentFileSuggestions = useMemo<ComposerSuggestion[]>(
     () => recentFiles.map((entry) => ({
       id: `recent-file-${entry.path}`,
@@ -1647,9 +1670,14 @@ export function WorkspaceSessionComposer({
                   event.preventDefault();
                   onPlanModeEnabledChange(!planModeEnabled);
                 }
+
+                // Shift+~: Dynamic Routing opt-in for routing-capable composers
+                // (idempotent enable). Local to the focused composer input.
+                handleRouteShortcut(event);
               }}
               className="ccem-prompt-area"
               aria-label={placeholder}
+              aria-keyshortcuts={routeShortcutAvailable ? 'Shift+Backquote' : undefined}
             />
           </div>
 

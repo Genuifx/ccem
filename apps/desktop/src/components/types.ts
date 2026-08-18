@@ -259,6 +259,8 @@ export type PromptAreaProps = {
   autoGrow?: boolean
   /** Accessible label for the input */
   'aria-label'?: string
+  /** Keyboard shortcuts handled while this textbox is focused. */
+  'aria-keyshortcuts'?: string
   /** data-test-id for e2e testing */
   'data-test-id'?: string
   /** Array of image attachments to display */

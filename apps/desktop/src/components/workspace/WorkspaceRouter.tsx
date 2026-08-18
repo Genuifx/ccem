@@ -24,6 +24,7 @@ import {
   resolveRouteDraftLabel,
   toggleComposerRouteDraft,
   type ComposerRouteDraft,
+  selectRouteDraftSource,
 } from './composerRouteDraft';
 
 /** Built-in default-only profile object for the radio + apply path. */
@@ -579,6 +580,9 @@ export function ComposerRouteDraftRow({
             )}>
               {t('router.routeDraftTitle')}
             </span>
+            <kbd className="shrink-0 rounded border border-border/50 bg-background/60 px-1 py-px font-mono text-[10px] text-muted-foreground">
+              ⇧~
+            </kbd>
             <Switch
               checked={draft.optIn}
               onCheckedChange={(checked) => onDraftChange(toggleComposerRouteDraft(checked))}
@@ -662,9 +666,10 @@ export function ComposerRouteDraftPill({
               value={radioValue}
               onValueChange={(v) => {
                 onDraftChange(
-                  v === MY_DEFAULT_ROUTER_PROFILE_ID
-                    ? { optIn: true, profileId: null }
-                    : { optIn: true, profileId: v },
+                  selectRouteDraftSource(
+                    draft,
+                    v === MY_DEFAULT_ROUTER_PROFILE_ID ? null : v,
+                  ),
                 );
                 setOpen(false);
               }}

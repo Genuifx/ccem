@@ -222,7 +222,7 @@ test('source regression: every fresh-Composer entry point resets the routing dra
     source.indexOf('  }, [', source.indexOf('const runCreateNativeConversation = useCallback')),
   );
   assert.ok(
-    composeBlock.includes('setComposeRouteDraft(createComposerRouteDraft())'),
+    composeBlock.includes('updateComposeRouteDraftState(createComposerRouteDraft())'),
     'compose launch success must reset the draft',
   );
 
@@ -232,7 +232,7 @@ test('source regression: every fresh-Composer entry point resets the routing dra
     source.indexOf('  }, [', source.indexOf('const runContinueHistorySession = useCallback')),
   );
   assert.ok(
-    historyBlock.includes('setHistoryRouteDraft(createComposerRouteDraft())'),
+    historyBlock.includes('updateHistoryRouteDraftState(createComposerRouteDraft())'),
     'history continue success must reset the draft',
   );
 
@@ -242,7 +242,7 @@ test('source regression: every fresh-Composer entry point resets the routing dra
     source.indexOf('  }, [', source.indexOf('const openComposer = useCallback')),
   );
   assert.ok(
-    openComposerBlock.includes('setComposeRouteDraft(createComposerRouteDraft())'),
+    openComposerBlock.includes('updateComposeRouteDraftState(createComposerRouteDraft())'),
     'openComposer must reset the draft',
   );
 
@@ -253,7 +253,7 @@ test('source regression: every fresh-Composer entry point resets the routing dra
     source.indexOf('  }, [', seedEffectStart),
   );
   assert.ok(
-    seedEffectBlock.includes('setComposeRouteDraft(createComposerRouteDraft())'),
+    seedEffectBlock.includes('updateComposeRouteDraftState(createComposerRouteDraft())'),
     'composeSeed effect must reset the draft',
   );
 
@@ -261,16 +261,38 @@ test('source regression: every fresh-Composer entry point resets the routing dra
   const startNewIndex = source.indexOf('onStartNew={() => {');
   const startNewBlock = source.slice(startNewIndex, source.indexOf('})}', startNewIndex));
   assert.ok(
-    startNewBlock.includes('setComposeRouteDraft(createComposerRouteDraft())'),
+    startNewBlock.includes('updateComposeRouteDraftState(createComposerRouteDraft())'),
     'onStartNew must reset the draft',
   );
 
-  // 6. Switching to ANY different history session resets the history draft.
-  const historyResetEffect = source.indexOf('setHistoryRouteDraft(createComposerRouteDraft());\n  }, [selectedSession?.id]');
-  assert.notEqual(
-    historyResetEffect,
-    -1,
-    'history draft must reset on selectedSession id change',
+  // 6. History sessions hydrate their own provider+id+cwd draft instead of
+  // resetting every selection to off.
+  assert.ok(
+    source.includes('const draftKey = historyRouteDraftKey(session);')
+      && source.includes('readHistoryRouteDraft(window.localStorage, draftKey)'),
+    'history selection must hydrate the keyed persisted draft',
+  );
+  assert.ok(
+    source.includes('conversationRequestSeqRef.current += 1'),
+    'a new history selection must invalidate the previous transcript request immediately',
+  );
+  const handleSelectBlock = source.slice(
+    source.indexOf('const handleSelect = useCallback'),
+    source.indexOf('const selectNativeSessionSummary = useCallback'),
+  );
+  assert.match(
+    handleSelectBlock,
+    /setMessages\(\[\]\);[\s\S]*setSegments\(\[\]\);[\s\S]*setHistoryEvents\(\[\]\);[\s\S]*setIsLoadingMessages\(true\);/,
+    'B selection must synchronously remove A transcript while B resolves',
+  );
+  assert.ok(
+    handleSelectBlock.includes('setIsLoadingMessages(false);'),
+    'a selection resolved to a live session must close the history loading state',
+  );
+  assert.ok(
+    handleSelectBlock.includes("updateHistoryRouteResolutionStatus(requiresRouteResolution ? 'resolving' : 'ready')")
+      && handleSelectBlock.includes("updateHistoryRouteResolutionStatus('failed')"),
+    'Claude history route lookup must remain blocked while pending and fail closed on lookup errors',
   );
 });
 
@@ -290,7 +312,7 @@ test('source regression: opted-in submit carries the draft; opted-out omits it; 
     'opted-in failures must surface the backend error specifically',
   );
 
-  const codexGuard = source.indexOf("if (composeProvider !== 'claude') {\n      setComposeRouteDraft(createComposerRouteDraft());");
+  const codexGuard = source.indexOf("if (composeProvider !== 'claude') {\n      updateComposeRouteDraftState(createComposerRouteDraft());");
   assert.notEqual(codexGuard, -1, 'switching to a non-routing provider must clear the draft');
 });
 
@@ -316,8 +338,22 @@ test('source regression: history routing uses the real history source, never the
   );
   assert.match(
     historyView,
-    /onRouteDraftChange=\{historyRouteDraftAvailable \? setHistoryRouteDraft : undefined\}/,
+    /onRouteDraftChange=\{historyRouteDraftAvailable \? updateHistoryRouteDraft : undefined\}/,
     'unsupported history providers must receive no route draft callback',
+  );
+  assert.ok(
+    historyView.includes('disabled={!selectedHistorySupportsInline || historyRouteResolutionBlocked}')
+      && historyView.includes('&& !historyRouteResolutionBlocked'),
+    'history Composer must remain disabled until Claude route resolution succeeds',
+  );
+
+  const continueBlock = source.slice(
+    source.indexOf('const runContinueHistorySession = useCallback'),
+    source.indexOf('  }, [', source.indexOf('const runContinueHistorySession = useCallback')),
+  );
+  assert.ok(
+    continueBlock.includes('isHistoryRouteContinuationBlocked('),
+    'submit handler must independently enforce the route-resolution gate',
   );
 });
 

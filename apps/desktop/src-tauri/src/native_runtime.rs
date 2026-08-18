@@ -1163,6 +1163,32 @@ fn validate_router_launch_draft_profile(
     Ok(())
 }
 
+pub(crate) fn validate_router_create_selection(
+    router_launch_draft: Option<&RouterLaunchDraft>,
+    resume_router_from_runtime_id: Option<&str>,
+) -> Result<(), String> {
+    if router_launch_draft.is_some() && resume_router_from_runtime_id.is_some() {
+        return Err(
+            "ROUTER_CREATE_CONFLICT: routerLaunchDraft and resumeRouterFromRuntimeId are mutually exclusive"
+                .to_string(),
+        );
+    }
+    if resume_router_from_runtime_id.is_some_and(|runtime_id| runtime_id.trim().is_empty()) {
+        return Err(
+            "ROUTER_RESUME_SOURCE_INVALID: resumeRouterFromRuntimeId must not be empty".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn native_project_dirs_match(left: &str, right: &str) -> bool {
+    fn normalize(value: &str) -> PathBuf {
+        fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value))
+    }
+
+    normalize(left) == normalize(right)
+}
+
 impl Default for NativeRuntimeManager {
     fn default() -> Self {
         Self::try_new().expect("failed to load native runtime state")
@@ -1194,6 +1220,82 @@ impl NativeRuntimeManager {
         self.router_manager
             .set(manager)
             .map_err(|_| "Native router manager was already configured".to_string())
+    }
+
+    pub(crate) fn clone_router_record_for_history_resume(
+        &self,
+        source_runtime_id: &str,
+        requested_provider: NativeProvider,
+        requested_provider_session_id: Option<&str>,
+        requested_project_dir: &str,
+    ) -> Result<SessionRouterRecord, String> {
+        if requested_provider != NativeProvider::Claude {
+            return Err(
+                "ROUTER_RESUME_PROVIDER_MISMATCH: routed history resume requires Claude"
+                    .to_string(),
+            );
+        }
+        let requested_provider_session_id = requested_provider_session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "ROUTER_RESUME_SESSION_MISMATCH: providerSessionId is required for routed history resume"
+                    .to_string()
+            })?;
+        let source = self
+            .records
+            .lock()
+            .map_err(|_| {
+                "ROUTER_STATE_UNAVAILABLE: native runtime records are unavailable".to_string()
+            })?
+            .get(source_runtime_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "ROUTER_RESUME_SOURCE_NOT_FOUND: native runtime {source_runtime_id} was not found"
+                )
+            })?;
+        if source.provider != NativeProvider::Claude || source.provider != requested_provider {
+            return Err(
+                "ROUTER_RESUME_PROVIDER_MISMATCH: source runtime provider does not match the requested provider"
+                    .to_string(),
+            );
+        }
+        let source_provider_session_id = source
+            .provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if source_provider_session_id != Some(requested_provider_session_id) {
+            return Err(
+                "ROUTER_RESUME_SESSION_MISMATCH: source runtime providerSessionId does not match the requested history session"
+                    .to_string(),
+            );
+        }
+        if !native_project_dirs_match(&source.project_dir, requested_project_dir) {
+            return Err(
+                "ROUTER_RESUME_CWD_MISMATCH: source runtime project directory does not match the requested history session"
+                    .to_string(),
+            );
+        }
+        let mut router = source.router.ok_or_else(|| {
+            "ROUTER_RESUME_SOURCE_NOT_ROUTED: source runtime has no routed state".to_string()
+        })?;
+        if router.launch_transport != LaunchTransport::Routed {
+            return Err(
+                "ROUTER_RESUME_SOURCE_NOT_ROUTED: source runtime is not routed".to_string(),
+            );
+        }
+
+        // A history continuation keeps the authoritative route/auth snapshot,
+        // but is a distinct native runtime and therefore gets independent
+        // bearer material. Generation facts are re-derived by
+        // prepare_router_launch before the record can be persisted or spawned.
+        router.session_key = random_router_secret(32);
+        router.route_tag_nonce = random_router_secret(24);
+        router.revision = 0;
+        router.warnings.clear();
+        Ok(router)
     }
 
     pub fn create_session(
@@ -4854,9 +4956,10 @@ mod tests {
         native_status_allows_file_rewind, reactivate_record_for_reconnect,
         read_native_runtime_state_from, recoverable_record_after_helper_removed,
         router_launch_decision, session_router_patch_oauth_validation_enabled,
-        take_terminal_launches, validate_router_launch_draft_profile, HelperInputCommand,
-        NativeProvider, NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions,
-        NativeSessionRecord, NativeTransport, PromptImage, RouterLaunchDecision, RouterLaunchDraft,
+        take_terminal_launches, validate_router_create_selection,
+        validate_router_launch_draft_profile, HelperInputCommand, NativeProvider,
+        NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
+        NativeTransport, PromptImage, RouterLaunchDecision, RouterLaunchDraft,
     };
     use crate::event_bus::{
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
@@ -5028,6 +5131,290 @@ mod tests {
             launch_model_pins: RouterModelPins::default(),
             warnings: vec!["generation-before-reconnect".into()],
         }
+    }
+
+    #[test]
+    fn history_router_resume_clones_authoritative_semantics_with_fresh_secrets() {
+        let project = tempfile::tempdir().expect("history router project");
+        let source_runtime_id = "native-history-router-source";
+        let mut source = native_record(source_runtime_id, "stopped", false);
+        source.provider_session_id = Some("provider-history-1".into());
+        source.project_dir = project.path().to_string_lossy().to_string();
+        let mut source_router = reconnect_router_record(LaunchTransport::Routed);
+        source_router.default_env = "token-main".into();
+        source_router.allowed_envs = vec!["token-main".into(), "token-agent".into()];
+        source_router.bindings = HashMap::from([("subagent:Explore".into(), "token-agent".into())]);
+        source_router.router_auth_capability = RouterAuthCapability::Token;
+        source_router.launch_auth_kind = LaunchAuthKind::Token;
+        source_router.launch_default_env = "token-main".into();
+        source.router = Some(source_router.clone());
+        let manager = manager_with_records(source_runtime_id, vec![source]);
+
+        let resumed = manager
+            .clone_router_record_for_history_resume(
+                source_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-1"),
+                &project.path().join(".").to_string_lossy(),
+            )
+            .expect("clone routed history semantics");
+
+        assert_ne!(resumed.session_key, source_router.session_key);
+        assert_ne!(resumed.route_tag_nonce, source_router.route_tag_nonce);
+        assert_eq!(resumed.default_env, source_router.default_env);
+        assert_eq!(resumed.bindings, source_router.bindings);
+        assert_eq!(resumed.allowed_envs, source_router.allowed_envs);
+        assert_eq!(resumed.source_profile_id, source_router.source_profile_id);
+        assert_eq!(resumed.profile_revision, source_router.profile_revision);
+        assert_eq!(resumed.dynamic_routing, source_router.dynamic_routing);
+        assert_eq!(
+            resumed.router_auth_capability,
+            source_router.router_auth_capability
+        );
+        assert_eq!(resumed.launch_transport, LaunchTransport::Routed);
+        assert_eq!(resumed.revision, 0);
+        assert!(resumed.warnings.is_empty());
+    }
+
+    #[test]
+    fn history_router_resume_rejects_identity_mismatch_and_non_routed_sources() {
+        let source_runtime_id = "native-history-router-identity";
+        let mut source = native_record(source_runtime_id, "stopped", false);
+        source.provider_session_id = Some("provider-history-identity".into());
+        source.project_dir = "/tmp/history-router-one".into();
+        source.router = Some(reconnect_router_record(LaunchTransport::Routed));
+        let manager = manager_with_records(source_runtime_id, vec![source]);
+
+        let provider_error = manager
+            .clone_router_record_for_history_resume(
+                source_runtime_id,
+                NativeProvider::Codex,
+                Some("provider-history-identity"),
+                "/tmp/history-router-one",
+            )
+            .expect_err("provider mismatch must fail closed");
+        assert!(provider_error.contains("ROUTER_RESUME_PROVIDER_MISMATCH"));
+
+        let session_error = manager
+            .clone_router_record_for_history_resume(
+                source_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-other"),
+                "/tmp/history-router-one",
+            )
+            .expect_err("provider session mismatch must fail closed");
+        assert!(session_error.contains("ROUTER_RESUME_SESSION_MISMATCH"));
+
+        let cwd_error = manager
+            .clone_router_record_for_history_resume(
+                source_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-identity"),
+                "/tmp/history-router-two",
+            )
+            .expect_err("cwd mismatch must fail closed");
+        assert!(cwd_error.contains("ROUTER_RESUME_CWD_MISMATCH"));
+
+        let direct_runtime_id = "native-history-router-direct";
+        let mut direct = native_record(direct_runtime_id, "stopped", false);
+        direct.provider_session_id = Some("provider-history-direct".into());
+        direct.project_dir = "/tmp/history-router-direct".into();
+        direct.router = Some(reconnect_router_record(LaunchTransport::Direct));
+        let direct_manager = manager_with_records(direct_runtime_id, vec![direct]);
+        let direct_error = direct_manager
+            .clone_router_record_for_history_resume(
+                direct_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-direct"),
+                "/tmp/history-router-direct",
+            )
+            .expect_err("direct source must not be upgraded to routed");
+        assert!(direct_error.contains("ROUTER_RESUME_SOURCE_NOT_ROUTED"));
+
+        let no_router_runtime_id = "native-history-router-none";
+        let mut no_router = native_record(no_router_runtime_id, "stopped", false);
+        no_router.provider_session_id = Some("provider-history-none".into());
+        no_router.project_dir = "/tmp/history-router-none".into();
+        let no_router_manager = manager_with_records(no_router_runtime_id, vec![no_router]);
+        let no_router_error = no_router_manager
+            .clone_router_record_for_history_resume(
+                no_router_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-none"),
+                "/tmp/history-router-none",
+            )
+            .expect_err("legacy direct history must stay opted out");
+        assert!(no_router_error.contains("ROUTER_RESUME_SOURCE_NOT_ROUTED"));
+    }
+
+    #[test]
+    fn history_router_resume_reuses_recovery_gates_before_any_new_record_exists() {
+        let env_name = "native-history-resume-unavailable-token";
+        let _env_override = crate::router::register_test_router_environment(
+            env_name,
+            crate::config::EnvConfig {
+                base_url: Some("http://127.0.0.1:1".into()),
+                auth_token: Some("fixture-token".into()),
+                default_opus_model: None,
+                default_sonnet_model: None,
+                default_haiku_model: None,
+                model: None,
+                subagent_model: None,
+                limit_write_tools: false,
+            },
+        );
+        let source_runtime_id = "native-history-router-unavailable";
+        let mut source = native_record(source_runtime_id, "stopped", false);
+        source.provider_session_id = Some("provider-history-unavailable".into());
+        source.project_dir = "/tmp/history-router-unavailable".into();
+        let mut source_router = reconnect_router_record(LaunchTransport::Routed);
+        source_router.default_env = env_name.into();
+        source_router.allowed_envs = vec![env_name.into()];
+        source_router.router_auth_capability = RouterAuthCapability::Token;
+        source_router.launch_auth_kind = LaunchAuthKind::Token;
+        source_router.launch_default_env = env_name.into();
+        source.router = Some(source_router.clone());
+        let manager = manager_with_records(source_runtime_id, vec![source]);
+        manager
+            .set_router_manager(Arc::new(RouterManager::new(RouterConfig::default())))
+            .expect("set unavailable router manager");
+        let resumed = manager
+            .clone_router_record_for_history_resume(
+                source_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-unavailable"),
+                "/tmp/history-router-unavailable",
+            )
+            .expect("clone authoritative record");
+        let mut options = native_session_options("dev", None);
+        options.env_name = env_name.into();
+        options.router_record = Some(resumed);
+
+        let error = manager
+            .prepare_router_launch(&mut options, false)
+            .expect_err("listener unavailability must reject the history continuation");
+
+        assert!(error.contains("ROUTER_UNAVAILABLE"), "{error}");
+        let records = manager.records.lock().expect("records");
+        assert_eq!(
+            records.len(),
+            1,
+            "resume preparation must not insert a record"
+        );
+        assert_eq!(
+            records[source_runtime_id]
+                .router
+                .as_ref()
+                .expect("source router")
+                .session_key,
+            source_router.session_key,
+            "source private state remains untouched",
+        );
+    }
+
+    #[test]
+    fn history_router_resume_revalidates_current_targets_and_auth_capability() {
+        let main_env = "native-history-resume-main-token";
+        let _main_override = crate::router::register_test_router_environment(
+            main_env,
+            crate::config::EnvConfig {
+                base_url: Some("http://127.0.0.1:1".into()),
+                auth_token: Some("fixture-token".into()),
+                default_opus_model: None,
+                default_sonnet_model: None,
+                default_haiku_model: None,
+                model: None,
+                subagent_model: None,
+                limit_write_tools: false,
+            },
+        );
+        let source_runtime_id = "native-history-router-missing-target";
+        let mut source = native_record(source_runtime_id, "stopped", false);
+        source.provider_session_id = Some("provider-history-missing-target".into());
+        source.project_dir = "/tmp/history-router-missing-target".into();
+        let mut source_router = reconnect_router_record(LaunchTransport::Routed);
+        source_router.default_env = main_env.into();
+        source_router.bindings = HashMap::from([(
+            "subagent:Explore".into(),
+            "native-history-resume-deleted-target".into(),
+        )]);
+        source_router.allowed_envs = vec![
+            main_env.into(),
+            "native-history-resume-deleted-target".into(),
+        ];
+        source_router.router_auth_capability = RouterAuthCapability::Token;
+        source_router.launch_auth_kind = LaunchAuthKind::Token;
+        source_router.launch_default_env = main_env.into();
+        source.router = Some(source_router);
+        let manager = manager_with_records(source_runtime_id, vec![source]);
+        let router_manager = Arc::new(RouterManager::new(RouterConfig::default()));
+        router_manager.set_ready(61_236);
+        manager
+            .set_router_manager(router_manager)
+            .expect("set ready router manager");
+        let resumed = manager
+            .clone_router_record_for_history_resume(
+                source_runtime_id,
+                NativeProvider::Claude,
+                Some("provider-history-missing-target"),
+                "/tmp/history-router-missing-target",
+            )
+            .expect("clone authoritative record");
+        let mut options = native_session_options("dev", None);
+        options.env_name = main_env.into();
+        options.router_record = Some(resumed);
+
+        let target_error = manager
+            .prepare_router_launch(&mut options, false)
+            .expect_err("a deleted target must fail closed");
+        assert!(
+            target_error.contains("ROUTER_ENV_MISSING"),
+            "{target_error}"
+        );
+
+        let _official_override = crate::router::register_test_router_environment(
+            crate::config::OFFICIAL_ENV_NAME,
+            crate::config::EnvConfig {
+                base_url: Some("https://api.anthropic.com".into()),
+                auth_token: None,
+                default_opus_model: None,
+                default_sonnet_model: None,
+                default_haiku_model: None,
+                model: None,
+                subagent_model: None,
+                limit_write_tools: false,
+            },
+        );
+        let auth_manager = manager_with_handle("native-history-router-auth-drift");
+        let ready = Arc::new(RouterManager::new(RouterConfig::default()));
+        ready.set_ready(61_237);
+        auth_manager
+            .set_router_manager(ready)
+            .expect("set ready auth router manager");
+        let mut auth_options = native_session_options("dev", None);
+        auth_options.env_name = crate::config::OFFICIAL_ENV_NAME.into();
+        let mut auth_drifted = reconnect_router_record(LaunchTransport::Routed);
+        auth_drifted.router_auth_capability = RouterAuthCapability::Token;
+        auth_drifted.launch_auth_kind = LaunchAuthKind::Token;
+        auth_options.router_record = Some(auth_drifted);
+
+        let auth_error = auth_manager
+            .prepare_router_launch(&mut auth_options, false)
+            .expect_err("token to OAuth auth drift must fail closed");
+        assert!(auth_error.contains("ROUTER_AUTH_CHANGED"), "{auth_error}");
+    }
+
+    #[test]
+    fn router_create_selection_rejects_draft_and_history_resume_together() {
+        let draft = RouterLaunchDraft::default();
+        let error = validate_router_create_selection(Some(&draft), Some("native-source"))
+            .expect_err("the two router launch authorities must be mutually exclusive");
+        assert!(error.contains("ROUTER_CREATE_CONFLICT"));
+
+        validate_router_create_selection(Some(&draft), None).expect("draft-only launch");
+        validate_router_create_selection(None, Some("native-source"))
+            .expect("history-resume-only launch");
+        validate_router_create_selection(None, None).expect("direct launch");
     }
 
     #[test]
