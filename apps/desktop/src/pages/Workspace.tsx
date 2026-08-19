@@ -3009,11 +3009,11 @@ export function Workspace({
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
-          annotations={historyAnnotations.annotations}
+          annotations={historyAnnotations.pendingAnnotations}
           onUpdateAnnotation={historyAnnotations.updateAnnotation}
           onRemoveAnnotation={historyAnnotations.removeAnnotation}
-          onClearAnnotations={historyAnnotations.clearAnnotations}
-          onAnnotationsSent={historyAnnotations.clearAnnotations}
+          onClearAnnotations={historyAnnotations.clearPendingAnnotations}
+          onAnnotationsSent={historyAnnotations.markAllSent}
           controls={(
             <ComposerControls
               provider={historyProvider}

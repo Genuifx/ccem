@@ -2050,7 +2050,7 @@ export function WorkspaceNativeSessionView({
   const hasAttentionPanel = hasBlockingAttention;
   const canSend = !isSending
     && !isTerminalStatus(session.status)
-    && (composerHasDraft || sessionAnnotations.annotations.length > 0);
+    && (composerHasDraft || sessionAnnotations.pendingAnnotations.length > 0);
   const canShowFileRestorePoints = session.provider === 'claude'
     && fileCheckpoints.length > 0;
   const canUseFileRestorePoints = canShowFileRestorePoints
@@ -2870,7 +2870,7 @@ export function WorkspaceNativeSessionView({
   ]);
 
   const hasComposerDraft = composerHasDraft;
-  const hasComposerInput = hasComposerDraft || sessionAnnotations.annotations.length > 0;
+  const hasComposerInput = hasComposerDraft || sessionAnnotations.pendingAnnotations.length > 0;
   const shouldGuideModel = !isTerminalStatus(session.status)
     && hasComposerInput
     && (isProcessingTurn || hasHardBlockingAttention);
@@ -3014,11 +3014,11 @@ export function WorkspaceNativeSessionView({
           setQueuedMessages((previous) => previous.filter((message) => message.id !== id));
         }}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
-        annotations={sessionAnnotations.annotations}
+        annotations={sessionAnnotations.pendingAnnotations}
         onUpdateAnnotation={sessionAnnotations.updateAnnotation}
         onRemoveAnnotation={sessionAnnotations.removeAnnotation}
-        onClearAnnotations={sessionAnnotations.clearAnnotations}
-        onAnnotationsSent={sessionAnnotations.clearAnnotations}
+        onClearAnnotations={sessionAnnotations.clearPendingAnnotations}
+        onAnnotationsSent={sessionAnnotations.markAllSent}
         aboveComposer={hasAttentionPanel ? (
           <WorkspaceAttentionPanel
             provider={session.provider}

@@ -298,7 +298,7 @@ test('live and history workspace paths wire transcript selections into successfu
 
   assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
   assert.match(composerSource, /if \(result !== false\)[\s\S]*onAnnotationsSent\?\.\(\)/);
-  assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.annotations\.length > 0/);
+  assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.pendingAnnotations\.length > 0/);
   assert.match(
     liveSource,
     /isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*requestText: text,[\s\S]*annotations,/,
@@ -317,10 +317,10 @@ test('live and history workspace paths wire transcript selections into successfu
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
   assert.match(liveSource, /isActive=\{isVisible\}/);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.annotations\}/);
-  assert.match(liveSource, /onAnnotationsSent=\{sessionAnnotations\.clearAnnotations\}/);
+  assert.match(liveSource, /onAnnotationsSent=\{sessionAnnotations\.markAllSent\}/);
   assert.match(historySource, /onAddAnnotation=\{selectedHistorySupportsInline \? historyAnnotations\.addAnnotation : undefined\}/);
   assert.match(historySource, /annotations=\{historyAnnotations\.annotations\}/);
-  assert.match(historySource, /onAnnotationsSent=\{historyAnnotations\.clearAnnotations\}/);
+  assert.match(historySource, /onAnnotationsSent=\{historyAnnotations\.markAllSent\}/);
   assert.match(detailSource, /<WorkspaceTranscriptSelection/);
   assert.match(annotationSource, /scopeKey/);
   assert.match(annotationSource, /data-workspace-annotation-marker/);
@@ -384,4 +384,54 @@ test('anchored annotations never fall back to first-match quote search', async (
 
   // Failed saves are reported instead of silently keeping stale state.
   assert.match(annotationsSource, /workspace\.annotationSaveFailed/);
+});
+
+test('sent annotations persist on the transcript instead of being cleared', async () => {
+  const { normalizeStoredWorkspaceAnnotations } = await importWorkspaceAnnotations();
+
+  // Round-trip keeps the sentAt stamp so markers survive a remount.
+  const stored = [{
+    id: 'a1',
+    quote: 'quoted text',
+    note: 'note text',
+    createdAt: '2026-08-19T00:00:00.000Z',
+    sentAt: '2026-08-19T00:01:00.000Z',
+    anchor: {
+      startItemKey: 'item-1',
+      startOffset: 0,
+      endItemKey: 'item-1',
+      endOffset: 11,
+    },
+  }];
+  const restored = normalizeStoredWorkspaceAnnotations(stored);
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0].sentAt, '2026-08-19T00:01:00.000Z');
+
+  // Invalid sentAt values are dropped without discarding the annotation.
+  const malformed = [{
+    id: 'a2',
+    quote: 'quoted',
+    note: 'note',
+    createdAt: '2026-08-19T00:00:00.000Z',
+    sentAt: 42,
+  }];
+  const restoredMalformed = normalizeStoredWorkspaceAnnotations(malformed);
+  assert.equal(restoredMalformed.length, 1);
+  assert.equal(restoredMalformed[0].sentAt, undefined);
+
+  // Sent annotations are excluded from prompt batches.
+  const { parseWorkspacePromptAnnotations } = await importWorkspaceAnnotations();
+  const parsed = parseWorkspacePromptAnnotations([
+    { quote: 'quoted', note: 'note' },
+  ]);
+  assert.equal(parsed.length, 1);
+
+  const [liveSource, historySource] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceNativeSessionView.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
+  ]);
+  assert.match(liveSource, /annotations=\{sessionAnnotations\.pendingAnnotations\}/);
+  assert.match(liveSource, /onClearAnnotations=\{sessionAnnotations\.clearPendingAnnotations\}/);
+  assert.match(historySource, /annotations=\{historyAnnotations\.pendingAnnotations\}/);
+  assert.match(historySource, /onClearAnnotations=\{historyAnnotations\.clearPendingAnnotations\}/);
 });
