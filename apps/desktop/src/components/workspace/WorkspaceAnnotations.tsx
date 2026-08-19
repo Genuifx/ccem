@@ -21,6 +21,7 @@ import {
 } from './workspaceAnnotationModel';
 import {
   captureWorkspaceAnnotationAnchor,
+  domTextBetween,
   resolveWorkspaceAnnotationRanges,
 } from './workspaceAnnotationAnchors';
 import {
@@ -246,10 +247,18 @@ export function WorkspaceTranscriptSelection({
     }
 
     const rawText = selection.toString();
-    const quote = normalizeWorkspaceSelection(rawText);
     const range = selection.getRangeAt(0);
+    const anchor = captureWorkspaceAnnotationAnchor(root, range);
     const rects = visibleTextRangeRects(range, root);
     const lastRect = rects[rects.length - 1];
+
+    // The canonical quote comes from the anchor's raw DOM text space.
+    // selection.toString() carries WebKit's synthetic block-boundary newlines
+    // which never exist in the DOM and would make the quote unresolvable on
+    // every later render.
+    const quote = anchor
+      ? normalizeWorkspaceSelection(domTextBetween(root, anchor) ?? '')
+      : null;
 
     if (!quote) {
       if (rawText.trim().length > MAX_WORKSPACE_SELECTION_CHARS && lastRect) {
@@ -270,8 +279,7 @@ export function WorkspaceTranscriptSelection({
       return;
     }
 
-    const anchor = captureWorkspaceAnnotationAnchor(root, range);
-    if (!anchor || !lastRect) {
+    if (!lastRect) {
       return;
     }
     setCandidate({
@@ -366,14 +374,9 @@ export function WorkspaceTranscriptSelection({
     };
   }, [hasSelectionCandidate, rootRef]);
 
-  useEffect(() => {
-    const root = rootRef.current;
-    if (!root) {
-      return;
-    }
-    root.addEventListener('scroll', dismiss, { passive: true });
-    return () => root.removeEventListener('scroll', dismiss);
-  }, [dismiss, rootRef]);
+  // NOTE: no scroll-to-dismiss here — streaming sessions auto-scroll
+  // continuously, which would destroy the candidate panel the instant it
+  // appears. Escape, the cancel button, or clicking elsewhere still close it.
 
   useEffect(() => {
     if (!candidate?.editing) {

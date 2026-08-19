@@ -25,7 +25,11 @@ function characterOffsetWithin(
     const prefix = document.createRange();
     prefix.selectNodeContents(item);
     prefix.setEnd(container, offset);
-    return prefix.toString().length;
+    // cloneContents().textContent concatenates raw text node data, unlike
+    // Range.toString() which WebKit augments with synthetic newlines at block
+    // boundaries. Offsets must live in the raw-text space so they round-trip
+    // through textBoundaryAt / domTextBelow.
+    return prefix.cloneContents().textContent?.length ?? null;
   } catch {
     return null;
   }
@@ -131,6 +135,41 @@ function rangeForExactQuote(root: HTMLElement, quote: string): Range | null {
   return null;
 }
 
+// Raw text-node content between the anchor's offsets. This is the canonical
+// text space for quotes: WebKit's Range/Selection.toString() inserts
+// synthetic newlines at block boundaries which never exist in the DOM, so
+// multi-line selections must be captured and re-validated in this space.
+export function domTextBetween(
+  root: HTMLElement,
+  anchor: WorkspaceAnnotationAnchor,
+  index?: ItemIndex,
+): string | null {
+  const startItem = index
+    ? indexedFindItem(index, anchor.startItemKey)
+    : findItem(root, anchor.startItemKey);
+  const endItem = index
+    ? indexedFindItem(index, anchor.endItemKey)
+    : findItem(root, anchor.endItemKey);
+  if (!startItem || !endItem) {
+    return null;
+  }
+
+  const start = textBoundaryAt(startItem, anchor.startOffset);
+  const end = textBoundaryAt(endItem, anchor.endOffset);
+  if (!start || !end) {
+    return null;
+  }
+
+  try {
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    return range.cloneContents().textContent ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function captureWorkspaceAnnotationAnchor(
   root: HTMLElement,
   range: Range,
@@ -158,7 +197,12 @@ export function resolveWorkspaceAnnotationRange(
 ): Range | null {
   if (annotation.anchor) {
     const anchoredRange = rangeFromAnchor(root, annotation.anchor);
-    if (anchoredRange && normalizeWorkspaceSelection(anchoredRange.toString()) === annotation.quote) {
+    const domText = domTextBetween(root, annotation.anchor);
+    if (
+      anchoredRange
+      && domText !== null
+      && normalizeWorkspaceSelection(domText) === annotation.quote
+    ) {
       return anchoredRange;
     }
     // The annotation was captured with an anchor but that anchor no longer
@@ -183,7 +227,12 @@ export function resolveWorkspaceAnnotationRanges(
   return annotations.map((annotation) => {
     if (annotation.anchor) {
       const anchoredRange = rangeFromAnchor(root, annotation.anchor, index);
-      if (anchoredRange && normalizeWorkspaceSelection(anchoredRange.toString()) === annotation.quote) {
+      const domText = domTextBetween(root, annotation.anchor, index);
+      if (
+        anchoredRange
+        && domText !== null
+        && normalizeWorkspaceSelection(domText) === annotation.quote
+      ) {
         return anchoredRange;
       }
       return null;
