@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { mergeToolResults } from '@/features/conversations/messageState';
 import type {
   ConversationMessageData,
@@ -13,6 +13,20 @@ import {
   type MessageSegment,
   type ToolDigestEntry,
 } from './WorkspaceMessageBubble';
+
+/**
+ * Top-windowing bounds (plan 022, step 4). Items more than this many
+ * viewports above the scroll position are replaced by an estimated-height
+ * spacer; the streaming tail always stays mounted. Expect revision.
+ */
+export const TOP_WINDOWING_VIEWPORTS_ABOVE = 8;
+/** Never window below this many rendered items (tail safety floor). */
+export const TOP_WINDOWING_MIN_RENDERED_ITEMS = 24;
+/** Fallback item height before any measurement (typical message row). */
+const TOP_WINDOWING_DEFAULT_ITEM_HEIGHT = 72;
+/** Running-average sample cap; halving keeps the mean recent but stable. */
+const TOP_WINDOWING_MAX_SAMPLES = 800;
+const TOP_SPACER_DATASET = 'workspaceTranscriptTopSpacer';
 
 export type WorkspaceTranscriptItem =
   | {
@@ -214,15 +228,27 @@ export function buildWorkspaceTranscriptItems(
 interface WorkspaceTranscriptListProps {
   messages: ConversationMessageData[];
   isAwaitingResponse?: boolean;
+  /**
+   * Opt-in top-windowing (plan 022): items far above the viewport render as an
+   * estimated-height spacer. Only the live session view enables it; history
+   * and review-detail lists keep the full render.
+   */
+  enableTopWindowing?: boolean;
+  /** Scroll container (ScrollArea viewport) — required for top-windowing. */
+  viewportRef?: RefObject<HTMLElement | null>;
 }
 
 export function WorkspaceTranscriptList({
   messages,
   isAwaitingResponse = false,
+  enableTopWindowing = false,
+  viewportRef,
 }: WorkspaceTranscriptListProps) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const seenItemKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedMotionRef = useRef(false);
+  const itemHeightStatsRef = useRef({ sum: 0, count: 0 });
+  const [topWindowCount, setTopWindowCount] = useState(0);
   const mergedMessages = useMemo(() => mergeToolResults(messages), [messages]);
   const transcriptItems = useMemo(
     () => buildWorkspaceTranscriptItems(mergedMessages),
@@ -275,8 +301,11 @@ export function WorkspaceTranscriptList({
       } as const,
     ];
   }, [isAwaitingResponse, transcriptItems]);
-  const displayItemKey = useMemo(
-    () => displayItems.map((item) => item.key).join('|'),
+  // The entrance effect only needs to know when NEW items appear at the tail
+  // (streaming appends, segment growth, pending-response toggle); a
+  // {length, lastKey} signal is O(1) where the joined key string was O(N).
+  const displayItemTailSignal = useMemo(
+    () => `${displayItems.length}:${displayItems[displayItems.length - 1]?.key ?? ''}`,
     [displayItems],
   );
 
@@ -330,12 +359,125 @@ export function WorkspaceTranscriptList({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [displayItemKey], scope: listRef });
+  }, { dependencies: [displayItemTailSignal], scope: listRef });
+
+  // --- Top windowing (opt-in) ---------------------------------------------
+  // Items more than N viewports above the scroll top collapse into a spacer
+  // of estimated height. All spacer height changes land strictly ABOVE the
+  // viewport (the buffer guarantees it), which matters because this scroll
+  // container disables browser scroll anchoring (overflow-anchor: none).
+  const averageItemHeight = useCallback(() => {
+    const stats = itemHeightStatsRef.current;
+    return stats.count > 0 ? stats.sum / stats.count : TOP_WINDOWING_DEFAULT_ITEM_HEIGHT;
+  }, []);
+
+  const recomputeTopWindow = useCallback(() => {
+    const container = viewportRef?.current;
+    const list = listRef.current;
+    if (!container || !list || displayItems.length === 0) {
+      return;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const listRect = list.getBoundingClientRect();
+    // Content-space top of the list (spacer included; the spacer is the list's
+    // first child, so the list element's top is a stable anchor).
+    const listTopInContent = container.scrollTop + (listRect.top - containerRect.top);
+    const bufferPx = TOP_WINDOWING_VIEWPORTS_ABOVE * container.clientHeight;
+    const hideablePx = container.scrollTop - bufferPx - listTopInContent;
+    let next = Math.floor(hideablePx / averageItemHeight());
+    if (!(next > 0)) {
+      next = 0;
+    }
+    const maxHidden = Math.max(0, displayItems.length - TOP_WINDOWING_MIN_RENDERED_ITEMS);
+    if (next > maxHidden) {
+      next = maxHidden;
+    }
+    setTopWindowCount((previous) => (previous === next ? previous : next));
+  }, [averageItemHeight, displayItems.length, viewportRef]);
+
+  useEffect(() => {
+    if (!enableTopWindowing) {
+      return;
+    }
+    const container = viewportRef?.current;
+    if (!container) {
+      return;
+    }
+    let frame: number | null = null;
+    const onScroll = () => {
+      if (frame != null) {
+        return;
+      }
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        recomputeTopWindow();
+      });
+    };
+    recomputeTopWindow();
+    container.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll);
+    return () => {
+      container.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      if (frame != null) {
+        cancelAnimationFrame(frame);
+      }
+    };
+  }, [enableTopWindowing, recomputeTopWindow, viewportRef]);
+
+  // Running average of measured item heights feeds the spacer estimate.
+  useLayoutEffect(() => {
+    if (!enableTopWindowing) {
+      return;
+    }
+    const list = listRef.current;
+    if (!list) {
+      return;
+    }
+    let sum = 0;
+    let count = 0;
+    for (const child of Array.from(list.children)) {
+      if (!(child instanceof HTMLElement)) {
+        continue;
+      }
+      if (child.dataset[TOP_SPACER_DATASET] !== undefined) {
+        continue;
+      }
+      sum += child.offsetHeight;
+      count += 1;
+    }
+    if (count > 0) {
+      const stats = itemHeightStatsRef.current;
+      stats.sum += sum;
+      stats.count += count;
+      if (stats.count > TOP_WINDOWING_MAX_SAMPLES) {
+        stats.sum /= 2;
+        stats.count /= 2;
+      }
+    }
+  });
+
+  const windowedItems = enableTopWindowing && topWindowCount > 0
+    ? displayItems.slice(topWindowCount)
+    : displayItems;
+  const topSpacerHeight = enableTopWindowing && topWindowCount > 0
+    ? Math.round(topWindowCount * averageItemHeight())
+    : 0;
+  const windowStartIndex = displayItems.length - windowedItems.length;
 
   return (
     <div ref={listRef}>
-      {displayItems.map((item, index) => {
-        const prevRole = index > 0 ? displayItems[index - 1].role : null;
+      {topSpacerHeight > 0 ? (
+        <div
+          key="workspace-transcript-top-spacer"
+          data-workspace-transcript-top-spacer="true"
+          style={{ height: topSpacerHeight }}
+          aria-hidden="true"
+        />
+      ) : null}
+      {windowedItems.map((item, index) => {
+        const absoluteIndex = windowStartIndex + index;
+        const prevRole = absoluteIndex > 0 ? displayItems[absoluteIndex - 1].role : null;
 
         if (item.type === 'tool-digest') {
           return (
