@@ -909,237 +909,284 @@ function attachToolResultToBlocks(
   return attached;
 }
 
-export function buildMessagesFromEvents(
-  baseMessages: ConversationMessageData[],
-  remainingPrompts: LocalUserPrompt[],
-  events: SessionEventRecord[],
-  terminalError?: string | null,
-): ConversationMessageData[] {
-  const next = [...trimSeedMessagesBeforeFirstUserPrompt(baseMessages, events)];
-  let pendingTurn: PendingAssistantTurn | null = null;
-  const hiddenInteractiveToolUseIds = new Set<string>();
-  const backgroundToolUseIds = new Set<string>();
-  const emittedErrorTexts = new Set<string>();
-  let promptQueue = [...remainingPrompts];
+/**
+ * Incremental transcript derivation state (plan 022).
+ *
+ * `deriveTranscriptReset` folds a full event list once; `deriveTranscriptAppend`
+ * folds only newly appended events into an existing state, so a streaming poll
+ * costs O(new events) instead of O(all events). `finalizeTranscriptMessages`
+ * renders a pure display view of the state WITHOUT mutating it — the pending
+ * assistant turn must stay pending across appends (flushing it per append would
+ * re-key the streaming message every batch).
+ */
+export interface TranscriptDerivationState {
+  /** Runtime whose events were folded; mismatch forces a reset. */
+  runtimeId: string | null;
+  /** Committed messages. The open pendingTurn is NOT part of this list. */
+  messages: ConversationMessageData[];
+  /** Leading messages that came from base/seed inputs (rebuildable). */
+  headLength: number;
+  pendingTurn: PendingAssistantTurn | null;
+  hiddenInteractiveToolUseIds: Set<string>;
+  /** Tool uses owned by background tasks: their completions never render as
+   *  standalone result/error rows (v2.70.0 background-task lifecycle). */
+  backgroundToolUseIds: Set<string>;
+  emittedErrorTexts: Set<string>;
+  promptQueue: LocalUserPrompt[];
+  /** Last event seq folded in; doubles as the gap-detection junction. */
+  consumedSeq: number | null;
+  /** Number of events folded so far (drives merge-vs-prune detection). */
+  consumedCount: number;
+  /** Identity token: seedMessages prop captured at reset/rebase time. */
+  seedMessages: ConversationMessageData[] | null;
+  /** Identity token: replay prompts captured at reset/rebase time. */
+  prompts: unknown;
+  /** Terminal error text, applied during finalize only (never baked in). */
+  terminalError: string | null;
+}
 
-  const flushPrompt = (prompt: LocalUserPrompt) => {
-    flushPendingTurn();
-    next.push(createUserMessage(prompt));
-  };
+export interface TranscriptDerivationTokens {
+  seedMessages?: ConversationMessageData[];
+  prompts?: unknown;
+}
 
-  const flushAnchoredPromptsBeforeEvent = (event: SessionEventRecord) => {
-    if (promptQueue.length === 0) {
-      return;
-    }
-
-    const remaining: LocalUserPrompt[] = [];
-    for (const prompt of promptQueue) {
-      if (prompt.afterEventSeq != null && event.seq > prompt.afterEventSeq) {
-        flushPrompt(prompt);
-      } else {
-        remaining.push(prompt);
-      }
-    }
-    promptQueue = remaining;
-  };
-
-  const flushFirstUnanchoredPrompt = () => {
-    const index = promptQueue.findIndex((prompt) => prompt.afterEventSeq == null);
-    if (index === -1) {
-      return false;
-    }
-    flushPrompt(promptQueue[index]!);
-    promptQueue = [
-      ...promptQueue.slice(0, index),
-      ...promptQueue.slice(index + 1),
-    ];
-    return true;
-  };
-
-  const attachToolResultToExistingMessages = (
-    toolUseId: string,
-    resultContent: string,
-    success: boolean,
-    occurredAt?: number,
-  ) => {
-    for (let index = next.length - 1; index >= 0; index -= 1) {
-      const message = next[index];
-      if (message.msgType !== 'assistant' && message.msgType !== 'ai') {
-        continue;
-      }
-      if (!Array.isArray(message.content)) {
-        continue;
-      }
-      const blocks = [...message.content];
-      if (!attachToolResultToBlocks(blocks, toolUseId, resultContent, success, occurredAt)) {
-        continue;
-      }
-      next[index] = {
-        ...message,
-        content: blocks,
-        timestamp: occurredAt ?? message.timestamp,
-      };
-      return true;
-    }
+function foldFlushPendingTurn(state: TranscriptDerivationState): boolean {
+  if (!state.pendingTurn) {
     return false;
-  };
+  }
 
-  const applyTokenUsageToMessage = (
-    message: ConversationMessageData,
-    payload: Extract<SessionEventRecord['payload'], { type: 'token_usage' }>,
-  ): ConversationMessageData => {
-    return {
+  const assistantMessage = createAssistantTurnMessage(state.pendingTurn);
+  if (assistantMessage) {
+    state.messages.push(assistantMessage);
+  }
+  state.pendingTurn = null;
+  return Boolean(assistantMessage);
+}
+
+function foldAppendErrorMessage(
+  state: TranscriptDerivationState,
+  id: string,
+  text?: string | null,
+  occurredAt?: number,
+) {
+  const trimmedText = text?.trim();
+  if (!trimmedText || state.emittedErrorTexts.has(trimmedText)) {
+    return;
+  }
+  state.emittedErrorTexts.add(trimmedText);
+  foldFlushPendingTurn(state);
+  state.messages.push(createAssistantTextMessage(id, trimmedText, occurredAt));
+}
+
+function foldRemoveTrailingCompactingSummary(state: TranscriptDerivationState) {
+  const last = state.messages[state.messages.length - 1];
+  if (last?.msgType === 'summary' && last.summary === COMPACTING_SUMMARY_TOKEN) {
+    state.messages.pop();
+  }
+}
+
+function foldAppendCompactingSummary(
+  state: TranscriptDerivationState,
+  event: SessionEventRecord,
+  occurredAt?: number,
+) {
+  const last = state.messages[state.messages.length - 1];
+  if (last?.msgType === 'summary' && last.summary === COMPACTING_SUMMARY_TOKEN) {
+    return;
+  }
+  state.messages.push(createSummaryMessage(
+    `compact-status-${event.seq}`,
+    COMPACTING_SUMMARY_TOKEN,
+    occurredAt,
+  ));
+}
+
+function foldAppendCompactBoundary(
+  state: TranscriptDerivationState,
+  event: SessionEventRecord,
+  occurredAt?: number,
+) {
+  foldRemoveTrailingCompactingSummary(state);
+  const last = state.messages[state.messages.length - 1];
+  if (last?.isCompactBoundary) {
+    return;
+  }
+  state.messages.push(createCompactBoundaryMessage(`compact-boundary-${event.seq}`, occurredAt));
+}
+
+function foldAppendTranscriptGapSummary(
+  state: TranscriptDerivationState,
+  previousSeq: number,
+  event: SessionEventRecord,
+  occurredAt?: number,
+) {
+  foldFlushPendingTurn(state);
+  const last = state.messages[state.messages.length - 1];
+  if (last?.msgType === 'summary' && last.summary === TRANSCRIPT_GAP_SUMMARY_TOKEN) {
+    return;
+  }
+  state.messages.push(createSummaryMessage(
+    `transcript-gap-${previousSeq}-${event.seq}`,
+    TRANSCRIPT_GAP_SUMMARY_TOKEN,
+    occurredAt,
+  ));
+}
+
+function foldConsumeMatchingPrompt(
+  state: TranscriptDerivationState,
+  event: SessionEventRecord,
+  text: string,
+  images: Array<unknown>,
+) {
+  const key = normalizePromptConfirmationText(text, images);
+  if (!key || state.promptQueue.length === 0) {
+    return;
+  }
+  const index = state.promptQueue.findIndex((prompt) =>
+    normalizePromptConfirmationText(prompt.text, prompt.images ?? null) === key
+    && (prompt.afterEventSeq == null || event.seq > prompt.afterEventSeq),
+  );
+  if (index === -1) {
+    return;
+  }
+  state.promptQueue = [
+    ...state.promptQueue.slice(0, index),
+    ...state.promptQueue.slice(index + 1),
+  ];
+}
+
+function foldFlushAnchoredPromptsBeforeEvent(
+  state: TranscriptDerivationState,
+  event: SessionEventRecord,
+) {
+  if (state.promptQueue.length === 0) {
+    return;
+  }
+
+  const remaining: LocalUserPrompt[] = [];
+  for (const prompt of state.promptQueue) {
+    if (prompt.afterEventSeq != null && event.seq > prompt.afterEventSeq) {
+      foldFlushPendingTurn(state);
+      state.messages.push(createUserMessage(prompt));
+    } else {
+      remaining.push(prompt);
+    }
+  }
+  state.promptQueue = remaining;
+}
+
+function foldFlushFirstUnanchoredPrompt(state: TranscriptDerivationState) {
+  const index = state.promptQueue.findIndex((prompt) => prompt.afterEventSeq == null);
+  if (index === -1) {
+    return false;
+  }
+  foldFlushPendingTurn(state);
+  state.messages.push(createUserMessage(state.promptQueue[index]!));
+  state.promptQueue = [
+    ...state.promptQueue.slice(0, index),
+    ...state.promptQueue.slice(index + 1),
+  ];
+  return true;
+}
+
+function foldAttachToolResultToExistingMessages(
+  state: TranscriptDerivationState,
+  toolUseId: string,
+  resultContent: string,
+  success: boolean,
+  occurredAt?: number,
+) {
+  const next = state.messages;
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    const message = next[index];
+    if (message.msgType !== 'assistant' && message.msgType !== 'ai') {
+      continue;
+    }
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    const blocks = [...message.content];
+    if (!attachToolResultToBlocks(blocks, toolUseId, resultContent, success, occurredAt)) {
+      continue;
+    }
+    next[index] = {
+      ...message,
+      content: blocks,
+      timestamp: occurredAt ?? message.timestamp,
+    };
+    return true;
+  }
+  return false;
+}
+
+function foldApplyTokenUsageToLatestAssistant(
+  state: TranscriptDerivationState,
+  payload: Extract<SessionEventRecord['payload'], { type: 'token_usage' }>,
+) {
+  const pendingTurn = state.pendingTurn;
+  if (pendingTurn) {
+    pendingTurn.inputTokens = payload.input_tokens;
+    pendingTurn.outputTokens = payload.output_tokens;
+    pendingTurn.cacheReadTokens = payload.cache_read_tokens;
+    pendingTurn.cacheCreationTokens = payload.cache_creation_tokens;
+    return;
+  }
+
+  const next = state.messages;
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    const message = next[index];
+    if (message.msgType !== 'assistant' && message.msgType !== 'ai') {
+      continue;
+    }
+    next[index] = {
       ...message,
       inputTokens: payload.input_tokens,
       outputTokens: payload.output_tokens,
       cacheReadTokens: payload.cache_read_tokens,
       cacheCreationTokens: payload.cache_creation_tokens,
     };
-  };
+    return;
+  }
+}
 
-  const applyTokenUsageToLatestAssistant = (
-    payload: Extract<SessionEventRecord['payload'], { type: 'token_usage' }>,
-  ) => {
-    if (pendingTurn) {
-      pendingTurn.inputTokens = payload.input_tokens;
-      pendingTurn.outputTokens = payload.output_tokens;
-      pendingTurn.cacheReadTokens = payload.cache_read_tokens;
-      pendingTurn.cacheCreationTokens = payload.cache_creation_tokens;
-      return;
-    }
+function foldEnsurePendingTurn(
+  state: TranscriptDerivationState,
+  event: SessionEventRecord,
+  occurredAt?: number,
+): PendingAssistantTurn {
+  if (!state.pendingTurn) {
+    state.pendingTurn = {
+      id: `assistant-turn-${event.seq}`,
+      timestamp: occurredAt,
+      contentBlocks: [],
+    };
+    return state.pendingTurn;
+  }
 
-    for (let index = next.length - 1; index >= 0; index -= 1) {
-      const message = next[index];
-      if (message.msgType !== 'assistant' && message.msgType !== 'ai') {
-        continue;
-      }
-      next[index] = applyTokenUsageToMessage(message, payload);
-      return;
-    }
-  };
+  if (occurredAt != null) {
+    state.pendingTurn.timestamp = occurredAt;
+  }
+  return state.pendingTurn;
+}
 
-  const ensurePendingTurn = (event: SessionEventRecord, occurredAt?: number) => {
-    if (!pendingTurn) {
-      pendingTurn = {
-        id: `assistant-turn-${event.seq}`,
-        timestamp: occurredAt,
-        contentBlocks: [],
-      };
-      return pendingTurn;
-    }
-
-    if (occurredAt != null) {
-      pendingTurn.timestamp = occurredAt;
-    }
-    return pendingTurn;
-  };
-
-  const flushPendingTurn = () => {
-    if (!pendingTurn) {
-      return false;
-    }
-
-    const assistantMessage = createAssistantTurnMessage(pendingTurn);
-    if (assistantMessage) {
-      next.push(assistantMessage);
-    }
-    pendingTurn = null;
-    return Boolean(assistantMessage);
-  };
-
-  const appendVisibleTurnDetail = (event: SessionEventRecord, occurredAt?: number) => {
-    if (event.payload.type !== 'lifecycle') {
-      return;
-    }
-    const detail = event.payload.detail?.trim();
-    if (!detail) {
-      return;
-    }
-    appendErrorMessage(`turn-detail-${event.seq}`, detail, occurredAt);
-  };
-
-  const appendErrorMessage = (id: string, text?: string | null, occurredAt?: number) => {
-    const trimmedText = text?.trim();
-    if (!trimmedText || emittedErrorTexts.has(trimmedText)) {
-      return;
-    }
-    emittedErrorTexts.add(trimmedText);
-    flushPendingTurn();
-    next.push(createAssistantTextMessage(id, trimmedText, occurredAt));
-  };
-
-  const removeTrailingCompactingSummary = () => {
-    const last = next[next.length - 1];
-    if (last?.msgType === 'summary' && last.summary === COMPACTING_SUMMARY_TOKEN) {
-      next.pop();
-    }
-  };
-
-  const appendCompactingSummary = (event: SessionEventRecord, occurredAt?: number) => {
-    const last = next[next.length - 1];
-    if (last?.msgType === 'summary' && last.summary === COMPACTING_SUMMARY_TOKEN) {
-      return;
-    }
-    next.push(createSummaryMessage(`compact-status-${event.seq}`, COMPACTING_SUMMARY_TOKEN, occurredAt));
-  };
-
-  const appendCompactBoundary = (event: SessionEventRecord, occurredAt?: number) => {
-    removeTrailingCompactingSummary();
-    const last = next[next.length - 1];
-    if (last?.isCompactBoundary) {
-      return;
-    }
-    next.push(createCompactBoundaryMessage(`compact-boundary-${event.seq}`, occurredAt));
-  };
-
-  const appendTranscriptGapSummary = (
-    previousSeq: number,
-    event: SessionEventRecord,
-    occurredAt?: number,
-  ) => {
-    flushPendingTurn();
-    const last = next[next.length - 1];
-    if (last?.msgType === 'summary' && last.summary === TRANSCRIPT_GAP_SUMMARY_TOKEN) {
-      return;
-    }
-    next.push(createSummaryMessage(
-      `transcript-gap-${previousSeq}-${event.seq}`,
-      TRANSCRIPT_GAP_SUMMARY_TOKEN,
-      occurredAt,
-    ));
-  };
-
-  const consumeMatchingPrompt = (
-    event: SessionEventRecord,
-    text: string,
-    images: Array<unknown>,
-  ) => {
-    const key = normalizePromptConfirmationText(text, images);
-    if (!key || promptQueue.length === 0) {
-      return;
-    }
-    const index = promptQueue.findIndex((prompt) =>
-      normalizePromptConfirmationText(prompt.text, prompt.images ?? null) === key
-      && (prompt.afterEventSeq == null || event.seq > prompt.afterEventSeq),
-    );
-    if (index === -1) {
-      return;
-    }
-    promptQueue = [
-      ...promptQueue.slice(0, index),
-      ...promptQueue.slice(index + 1),
-    ];
-  };
-
-  let previousEventSeq: number | null = null;
+function foldTranscriptEvents(
+  state: TranscriptDerivationState,
+  events: SessionEventRecord[],
+  suppressGapBeforeSeqs?: ReadonlySet<number>,
+): TranscriptDerivationState {
+  let previousEventSeq = state.consumedSeq;
   for (const event of events) {
     const occurredAt = parseOccurredAt(event.occurred_at);
-    if (previousEventSeq != null && event.seq > previousEventSeq + 1) {
-      appendTranscriptGapSummary(previousEventSeq, event, occurredAt);
+    if (
+      previousEventSeq != null
+      && event.seq > previousEventSeq + 1
+      && !suppressGapBeforeSeqs?.has(event.seq)
+    ) {
+      foldAppendTranscriptGapSummary(state, previousEventSeq, event, occurredAt);
     }
     previousEventSeq = event.seq;
 
-    flushAnchoredPromptsBeforeEvent(event);
+    foldFlushAnchoredPromptsBeforeEvent(state, event);
 
     switch (event.payload.type) {
       case 'user_prompt': {
@@ -1151,8 +1198,8 @@ export function buildMessagesFromEvents(
         if (!text && images.length === 0) {
           break;
         }
-        flushPendingTurn();
-        next.push(createUserMessage({
+        foldFlushPendingTurn(state);
+        state.messages.push(createUserMessage({
           id: `user-prompt-${event.seq}`,
           text,
           images,
@@ -1160,28 +1207,31 @@ export function buildMessagesFromEvents(
           timestamp: occurredAt,
         }));
         if (text) {
-          consumeMatchingPrompt(event, text, images);
+          foldConsumeMatchingPrompt(state, event, text, images);
         }
         break;
       }
       case 'system_message': {
         appendThinkingBlock(
-          ensurePendingTurn(event, occurredAt).contentBlocks,
+          foldEnsurePendingTurn(state, event, occurredAt).contentBlocks,
           event.payload.message,
           occurredAt,
         );
         break;
       }
       case 'assistant_chunk': {
-        appendTextBlock(ensurePendingTurn(event, occurredAt).contentBlocks, event.payload.text);
+        appendTextBlock(
+          foldEnsurePendingTurn(state, event, occurredAt).contentBlocks,
+          event.payload.text,
+        );
         break;
       }
       case 'tool_use_started': {
         if (event.payload.needs_response) {
-          hiddenInteractiveToolUseIds.add(event.payload.tool_use_id);
+          state.hiddenInteractiveToolUseIds.add(event.payload.tool_use_id);
           break;
         }
-        ensurePendingTurn(event, occurredAt).contentBlocks.push({
+        foldEnsurePendingTurn(state, event, occurredAt).contentBlocks.push({
           type: 'tool_use',
           id: event.payload.tool_use_id,
           name: event.payload.raw_name,
@@ -1194,26 +1244,26 @@ export function buildMessagesFromEvents(
       }
       case 'background_tasks_changed': {
         event.payload.tasks.forEach((task) => {
-          if (task.tool_use_id) backgroundToolUseIds.add(task.tool_use_id);
+          if (task.tool_use_id) state.backgroundToolUseIds.add(task.tool_use_id);
         });
         break;
       }
       case 'background_task_updated': {
         if (event.payload.task.tool_use_id) {
-          backgroundToolUseIds.add(event.payload.task.tool_use_id);
+          state.backgroundToolUseIds.add(event.payload.task.tool_use_id);
         }
         break;
       }
       case 'tool_use_completed': {
-        if (hiddenInteractiveToolUseIds.has(event.payload.tool_use_id)) {
-          hiddenInteractiveToolUseIds.delete(event.payload.tool_use_id);
+        if (state.hiddenInteractiveToolUseIds.has(event.payload.tool_use_id)) {
+          state.hiddenInteractiveToolUseIds.delete(event.payload.tool_use_id);
           break;
         }
         const resultContent = event.payload.result_content?.trim()
           ? event.payload.result_content
           : event.payload.result_summary;
         let attachedToPendingTurn = false;
-        const currentPendingTurn = pendingTurn as PendingAssistantTurn | null;
+        const currentPendingTurn = state.pendingTurn;
         if (currentPendingTurn) {
           attachedToPendingTurn = attachToolResultToBlocks(
             currentPendingTurn.contentBlocks,
@@ -1225,7 +1275,8 @@ export function buildMessagesFromEvents(
         }
         if (
           attachedToPendingTurn
-          || attachToolResultToExistingMessages(
+          || foldAttachToolResultToExistingMessages(
+            state,
             event.payload.tool_use_id,
             resultContent,
             event.payload.success,
@@ -1234,12 +1285,13 @@ export function buildMessagesFromEvents(
         ) {
           break;
         }
-        if (backgroundToolUseIds.has(event.payload.tool_use_id)) {
+        if (state.backgroundToolUseIds.has(event.payload.tool_use_id)) {
           break;
         }
         if (!event.payload.success) {
           const fallbackName = event.payload.raw_name?.trim() || 'Tool';
-          appendErrorMessage(
+          foldAppendErrorMessage(
+            state,
             `tool-result-error-${event.seq}`,
             event.payload.result_summary || `${fallbackName} failed.`,
             occurredAt,
@@ -1252,20 +1304,20 @@ export function buildMessagesFromEvents(
           content: resultContent,
           is_error: !event.payload.success,
         };
-        const last = next[next.length - 1];
+        const last = state.messages[state.messages.length - 1];
         if (
           last
           && (last.msgType === 'user' || last.msgType === 'human')
           && Array.isArray(last.content)
           && last.content.every((block) => block.type === 'tool_result')
         ) {
-          next[next.length - 1] = {
+          state.messages[state.messages.length - 1] = {
             ...last,
             content: [...last.content, resultBlock],
             timestamp: occurredAt ?? last.timestamp,
           };
         } else {
-          next.push(
+          state.messages.push(
             createToolResultMessage(
               `tool-result-${event.seq}`,
               event.payload.tool_use_id,
@@ -1278,33 +1330,38 @@ export function buildMessagesFromEvents(
         break;
       }
       case 'token_usage': {
-        applyTokenUsageToLatestAssistant(event.payload);
+        foldApplyTokenUsageToLatestAssistant(state, event.payload);
         break;
       }
       case 'stderr_line': {
-        appendErrorMessage(`runtime-error-${event.seq}`, event.payload.line, occurredAt);
+        foldAppendErrorMessage(state, `runtime-error-${event.seq}`, event.payload.line, occurredAt);
         break;
       }
       case 'lifecycle': {
         if (event.payload.stage === 'error') {
-          appendErrorMessage(`runtime-error-${event.seq}`, event.payload.detail, occurredAt);
+          foldAppendErrorMessage(
+            state,
+            `runtime-error-${event.seq}`,
+            event.payload.detail,
+            occurredAt,
+          );
           break;
         }
         if (event.payload.stage === 'compacting') {
-          flushPendingTurn();
-          appendCompactingSummary(event, occurredAt);
+          foldFlushPendingTurn(state);
+          foldAppendCompactingSummary(state, event, occurredAt);
           break;
         }
         if (event.payload.stage === 'compact_completed') {
-          flushPendingTurn();
-          appendCompactBoundary(event, occurredAt);
+          foldFlushPendingTurn(state);
+          foldAppendCompactBoundary(state, event, occurredAt);
           break;
         }
         if (event.payload.stage === 'compact_failed') {
-          flushPendingTurn();
-          removeTrailingCompactingSummary();
+          foldFlushPendingTurn(state);
+          foldRemoveTrailingCompactingSummary(state);
           const compactFailureDetail = event.payload.detail?.trim();
-          next.push(createSummaryMessage(
+          state.messages.push(createSummaryMessage(
             `compact-failed-${event.seq}`,
             compactFailureDetail && compactFailureDetail !== 'Claude failed to compact the context.'
               ? compactFailureDetail
@@ -1318,7 +1375,7 @@ export function buildMessagesFromEvents(
           || event.payload.stage === 'turn_completed'
           || event.payload.stage === 'turn_interrupted'
         ) {
-          const flushedTurn = flushPendingTurn();
+          const flushedTurn = foldFlushPendingTurn(state);
           if (
             !flushedTurn
             && (
@@ -1326,21 +1383,29 @@ export function buildMessagesFromEvents(
               || event.payload.stage === 'turn_interrupted'
             )
           ) {
-            appendVisibleTurnDetail(event, occurredAt);
+            const detail = event.payload.detail?.trim();
+            if (detail) {
+              foldAppendErrorMessage(state, `turn-detail-${event.seq}`, detail, occurredAt);
+            }
           }
         }
         if (
           (event.payload.stage === 'turn_completed' || event.payload.stage === 'turn_interrupted')
-          && promptQueue.length > 0
+          && state.promptQueue.length > 0
         ) {
-          flushFirstUnanchoredPrompt();
+          foldFlushFirstUnanchoredPrompt(state);
         }
         break;
       }
       case 'session_completed': {
-        flushPendingTurn();
+        foldFlushPendingTurn(state);
         if (!event.payload.reason.includes('Stopped from desktop workspace')) {
-          appendErrorMessage(`runtime-completed-${event.seq}`, event.payload.reason, occurredAt);
+          foldAppendErrorMessage(
+            state,
+            `runtime-completed-${event.seq}`,
+            event.payload.reason,
+            occurredAt,
+          );
         }
         break;
       }
@@ -1349,12 +1414,350 @@ export function buildMessagesFromEvents(
     }
   }
 
-  flushPendingTurn();
-  appendErrorMessage('runtime-error-terminal', terminalError);
+  state.consumedSeq = previousEventSeq;
+  state.consumedCount += events.length;
+  return state;
+}
 
-  for (const prompt of promptQueue) {
-    flushPrompt(prompt);
+/**
+ * Full-pass derivation over `events` (current pre-plan-022 behavior minus the
+ * display finalization). Used on mount, runtime switch, and whenever the event
+ * list changes in a way that is not a pure suffix extension of what the state
+ * already consumed.
+ */
+export function deriveTranscriptReset(
+  baseMessages: ConversationMessageData[],
+  remainingPrompts: LocalUserPrompt[],
+  events: SessionEventRecord[],
+  terminalError?: string | null,
+  options?: {
+    tokens?: TranscriptDerivationTokens;
+    /** Seqs where a seq jump is a known prune seam, not a real event gap. */
+    suppressGapBeforeSeqs?: ReadonlySet<number>;
+  },
+): TranscriptDerivationState {
+  const head = trimSeedMessagesBeforeFirstUserPrompt(baseMessages, events);
+  const runtimeId = events.length
+    ? events[events.length - 1]!.runtime_id
+    : null;
+  const state: TranscriptDerivationState = {
+    runtimeId,
+    messages: [...head],
+    headLength: head.length,
+    pendingTurn: null,
+    hiddenInteractiveToolUseIds: new Set(),
+    backgroundToolUseIds: new Set(),
+    emittedErrorTexts: new Set(),
+    promptQueue: [...remainingPrompts],
+    consumedSeq: null,
+    consumedCount: 0,
+    seedMessages: options?.tokens?.seedMessages ?? null,
+    prompts: options?.tokens?.prompts ?? null,
+    terminalError: terminalError ?? null,
+  };
+  return foldTranscriptEvents(state, events, options?.suppressGapBeforeSeqs);
+}
+
+/**
+ * Fold only newly appended events into an existing derivation state.
+ * `appendedEvents` must be a validated suffix (see selectTranscriptAppendEvents).
+ */
+export function deriveTranscriptAppend(
+  state: TranscriptDerivationState,
+  appendedEvents: SessionEventRecord[],
+): TranscriptDerivationState {
+  if (!appendedEvents.length) {
+    return state;
+  }
+  return foldTranscriptEvents({ ...state }, appendedEvents);
+}
+
+/**
+ * Seed/prompt inputs changed but the folded event history is still valid:
+ * rebuild only the head (base messages) and refresh the prompt queue, keeping
+ * every event-derived message object identity intact.
+ */
+export function rebaseTranscriptHead(
+  state: TranscriptDerivationState,
+  baseMessages: ConversationMessageData[],
+  events: SessionEventRecord[],
+  remainingPrompts: LocalUserPrompt[],
+  tokens?: TranscriptDerivationTokens,
+): TranscriptDerivationState {
+  const head = trimSeedMessagesBeforeFirstUserPrompt(baseMessages, events);
+  return {
+    ...state,
+    messages: [...head, ...state.messages.slice(state.headLength)],
+    headLength: head.length,
+    promptQueue: [...remainingPrompts],
+    seedMessages: tokens?.seedMessages ?? state.seedMessages,
+    prompts: tokens?.prompts ?? state.prompts,
+  };
+}
+
+/**
+ * Pure display view of a derivation state: flushes the open pending turn,
+ * appends the terminal error (once), then any queued local prompts. Never
+ * mutates the state, so calling it twice or after further appends is safe.
+ */
+export function finalizeTranscriptMessages(
+  state: TranscriptDerivationState,
+): ConversationMessageData[] {
+  const final = [...state.messages];
+  if (state.pendingTurn) {
+    const assistantMessage = createAssistantTurnMessage(state.pendingTurn);
+    if (assistantMessage) {
+      final.push(assistantMessage);
+    }
+  }
+  const terminalErrorText = state.terminalError?.trim();
+  if (terminalErrorText && !state.emittedErrorTexts.has(terminalErrorText)) {
+    final.push(createAssistantTextMessage('runtime-error-terminal', terminalErrorText));
+  }
+  for (const prompt of state.promptQueue) {
+    final.push(createUserMessage(prompt));
+  }
+  return final;
+}
+
+export type TranscriptAppendSelection =
+  | { mode: 'idle' }
+  | { mode: 'append'; appended: SessionEventRecord[] }
+  | { mode: 'reset' };
+
+/**
+ * Generic append-vs-reset detection shared by every event fold (transcript,
+ * usage, review). Decides how `events` relates to a fold that consumed
+ * `consumedSeq` over `consumedCount` events of `runtimeId`:
+ * - `append`: events is the consumed prefix (possibly pruned from the head, as
+ *   long as no NEW pre-consumed events appeared) plus a strictly-ascending
+ *   same-runtime suffix.
+ * - `reset`: consumed marker missing (replacement), old events inserted
+ *   (replay merge/backfill refilled the pruned head), or the suffix is not a
+ *   valid ascending same-runtime run.
+ * - `idle`: nothing new to fold.
+ */
+export function selectEventAppendRange(
+  events: SessionEventRecord[],
+  consumedSeq: number | null,
+  consumedCount: number,
+  runtimeId: string | null,
+): TranscriptAppendSelection {
+  if (consumedSeq == null) {
+    if (!events.length) {
+      return { mode: 'idle' };
+    }
+    if (runtimeId != null && events[0]!.runtime_id !== runtimeId) {
+      return { mode: 'reset' };
+    }
+    return validateAppendRun(events, 0, consumedSeq, runtimeId)
+      ? { mode: 'append', appended: events }
+      : { mode: 'reset' };
   }
 
-  return next;
+  // Binary search for the consumed marker (events are seq-ascending).
+  let low = 0;
+  let high = events.length - 1;
+  let markerIndex = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const seq = events[mid]!.seq;
+    if (seq === consumedSeq) {
+      markerIndex = mid;
+      low = mid + 1;
+    } else if (seq < consumedSeq) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (markerIndex < 0) {
+    return { mode: 'reset' };
+  }
+  // More pre-consumed events than we folded => the pruned head was refilled
+  // (initial replay merge / backfill). Fold the complete list from scratch.
+  if (markerIndex + 1 > consumedCount) {
+    return { mode: 'reset' };
+  }
+  const appended = events.slice(markerIndex + 1);
+  if (!appended.length) {
+    return { mode: 'idle' };
+  }
+  if (!validateAppendRun(events, markerIndex + 1, consumedSeq, runtimeId)) {
+    return { mode: 'reset' };
+  }
+  return { mode: 'append', appended };
+}
+
+/** Transcript-flavored wrapper over selectEventAppendRange. */
+export function selectTranscriptAppendEvents(
+  events: SessionEventRecord[],
+  state: TranscriptDerivationState,
+): TranscriptAppendSelection {
+  return selectEventAppendRange(events, state.consumedSeq, state.consumedCount, state.runtimeId);
+}
+
+function validateAppendRun(
+  events: SessionEventRecord[],
+  startIndex: number,
+  consumedSeq: number | null,
+  runtimeId: string | null,
+): boolean {
+  const expectedRuntimeId = runtimeId ?? events[startIndex]?.runtime_id ?? null;
+  if (expectedRuntimeId == null) {
+    return false;
+  }
+  let expectedSeq = consumedSeq;
+  for (let index = startIndex; index < events.length; index += 1) {
+    const event = events[index]!;
+    if (event.runtime_id !== expectedRuntimeId) {
+      return false;
+    }
+    if (expectedSeq != null && event.seq <= expectedSeq) {
+      return false;
+    }
+    expectedSeq = event.seq;
+  }
+  return true;
+}
+
+/**
+ * One-shot transcript derivation over a full event list. Kept for callers that
+ * do not keep derivation state (history page seeding); the live view uses the
+ * incremental API above. Output is identical to finalize(reset(events)).
+ */
+export function buildMessagesFromEvents(
+  baseMessages: ConversationMessageData[],
+  remainingPrompts: LocalUserPrompt[],
+  events: SessionEventRecord[],
+  terminalError?: string | null,
+): ConversationMessageData[] {
+  return finalizeTranscriptMessages(
+    deriveTranscriptReset(baseMessages, remainingPrompts, events, terminalError),
+  );
+}
+
+/**
+ * Raw event tail bounding (plan 022, step 3).
+ *
+ * The live `events` array keeps the newest RAW_TAIL_LIMIT events plus an anchor
+ * set of semantically load-bearing older events, so the array's resident memory
+ * stays bounded for the view's lifetime. Anchors cover every consumer that
+ * re-scans the array: prompt confirmation and seed trimming (user_prompt),
+ * file checkpoints (checkpoint_created / files_rewound / file_rewind_failed),
+ * todo snapshots (newest snapshot carrier below the tail), terminal completion,
+ * and attention state (unresolved permission / terminal prompts — resolved
+ * pairs are dropped together so the attention fold never sees a stale raise).
+ */
+export const RAW_TAIL_LIMIT = 5000;
+
+export interface RawEventTailPruneResult {
+  events: SessionEventRecord[];
+  /**
+   * Seqs of the first retained event after each pruned run. A seq jump onto
+   * one of these is a prune seam, not a real event gap; derivation resets pass
+   * them as `suppressGapBeforeSeqs` so no spurious transcript-gap chip appears.
+   */
+  seams: number[];
+  prunedCount: number;
+}
+
+function isTodoSnapshotCarrier(event: SessionEventRecord): boolean {
+  const payload = event.payload;
+  if (payload.type !== 'tool_use_started' && payload.type !== 'tool_use_completed') {
+    return false;
+  }
+  const snapshot = payload.todo_snapshot as { version?: unknown } | undefined;
+  return Boolean(snapshot) && typeof snapshot === 'object' && snapshot.version === 1;
+}
+
+/**
+ * Prune `events` to the newest `tailLimit` events plus retained anchors.
+ * Assumes a single runtime and seq-ascending order (both hold for the live
+ * view's arrays); mixed runtimes disable pruning as a safety net.
+ */
+export function pruneRawEventTail(
+  events: SessionEventRecord[],
+  tailLimit = RAW_TAIL_LIMIT,
+): RawEventTailPruneResult {
+  const limit = Math.max(0, Math.floor(tailLimit));
+  if (events.length <= limit || limit === 0) {
+    return { events, seams: [], prunedCount: 0 };
+  }
+
+  const runtimeId = events[0]!.runtime_id;
+  const dropEnd = events.length - limit;
+
+  const respondedRequestIds = new Set<string>();
+  const terminalResolvedSeqs: number[] = [];
+  let newestSnapshotIndex = -1;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!;
+    if (event.runtime_id !== runtimeId) {
+      return { events, seams: [], prunedCount: 0 };
+    }
+    const payload = event.payload;
+    if (payload.type === 'permission_responded') {
+      respondedRequestIds.add(payload.request_id);
+    } else if (payload.type === 'terminal_prompt_resolved') {
+      terminalResolvedSeqs.push(event.seq);
+    }
+    if (index < dropEnd && isTodoSnapshotCarrier(event)) {
+      newestSnapshotIndex = index;
+    }
+  }
+
+  const retained: SessionEventRecord[] = [];
+  const seams: number[] = [];
+  let skippedSinceKeep = false;
+  let previousKeptSeq: number | null = null;
+
+  const keepAnchor = (event: SessionEventRecord, index: number): boolean => {
+    const payload = event.payload;
+    switch (payload.type) {
+      case 'user_prompt':
+      case 'files_rewound':
+      case 'file_rewind_failed':
+      case 'session_completed':
+        return true;
+      case 'checkpoint_created':
+        return payload.provider === 'claude' && payload.source === 'claude-file-checkpoint';
+      case 'permission_required':
+        return !respondedRequestIds.has(payload.request_id);
+      case 'terminal_prompt_required':
+        return !terminalResolvedSeqs.some((resolvedSeq) => resolvedSeq > event.seq);
+      default:
+        return index === newestSnapshotIndex;
+    }
+  };
+
+  for (let index = 0; index < dropEnd; index += 1) {
+    const event = events[index]!;
+    if (!keepAnchor(event, index)) {
+      skippedSinceKeep = true;
+      continue;
+    }
+    if (skippedSinceKeep) {
+      seams.push(event.seq);
+      skippedSinceKeep = false;
+    }
+    previousKeptSeq = event.seq;
+    retained.push(event);
+  }
+
+  // Seam at the tail boundary when events were dropped between the last
+  // retained anchor (or array head) and the tail window.
+  if (skippedSinceKeep) {
+    const tailHead = events[dropEnd]!;
+    if (tailHead.seq !== (previousKeptSeq ?? tailHead.seq - 1) + 1) {
+      seams.push(tailHead.seq);
+    }
+  }
+
+  const pruned = events.length - retained.length - limit;
+  return {
+    events: [...retained, ...events.slice(dropEnd)],
+    seams,
+    prunedCount: pruned,
+  };
 }

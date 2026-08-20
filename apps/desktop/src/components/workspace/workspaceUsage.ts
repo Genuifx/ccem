@@ -109,24 +109,20 @@ const EMPTY_USAGE: SessionUsageState = {
 };
 
 /**
- * Compute cumulative token usage and latest context window snapshot from session events.
- *
- * - Accumulates all `token_usage` events for total consumption.
- * - Takes the latest `context_usage` event as the current context window state.
- * - Does NOT derive context occupancy from cumulative tokens (they are different metrics).
+ * Incremental usage fold (plan 022). Session usage is a running total plus
+ * latest-wins snapshots, so the live view folds only appended events instead
+ * of rescanning the (bounded) raw event array.
  */
-export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageState {
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
-  let totalCacheReadTokens = 0;
-  let totalCacheCreationTokens = 0;
-  let estimatedCostUsd: number | null = null;
-  let turnCount = 0;
-  let context: SessionContextSnapshot | null = null;
-  let sessionUsage: SessionUsageSnapshot | null = null;
-  // Router request ledger: request_id is the stable identity — replayed or
-  // duplicated events collapse via last-write-wins, never double-count.
-  const routedRequests = new Map<string, {
+export interface SessionUsageFold {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheCreationTokens: number;
+  estimatedCostUsd: number | null;
+  turnCount: number;
+  context: SessionContextSnapshot | null;
+  sessionUsage: SessionUsageSnapshot | null;
+  routedRequests: Map<string, {
     logicalKey: string;
     env: string;
     model: string;
@@ -137,7 +133,28 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
       cacheReadTokens: number;
       cacheCreationTokens: number;
     } | null;
-  }>();
+  }>;
+}
+
+/** Fold `events` into `previous` (or a fresh accumulator when null). */
+export function foldSessionUsageEvents(
+  previous: SessionUsageFold | null,
+  events: SessionEventRecord[],
+): SessionUsageFold {
+  const fold: SessionUsageFold = previous
+    ? { ...previous, routedRequests: new Map(previous.routedRequests) }
+    : {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      estimatedCostUsd: null,
+      turnCount: 0,
+      context: null,
+      sessionUsage: null,
+      routedRequests: new Map(),
+    };
+
   // Sub-route membership is REQUEST IDENTITY (background / subagent:<type> /
   // explicit authenticated route override), NOT "env differs from default":
   // a subagent following the default env still counts; the main agent passing
@@ -151,31 +168,31 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
     if (payload.type === 'token_usage') {
       // Only count turn_total scope to avoid double-counting per-step + turn_total
       if (payload.scope === 'turn_total') {
-        totalInputTokens += payload.input_tokens;
-        totalOutputTokens += payload.output_tokens;
-        totalCacheReadTokens += payload.cache_read_tokens;
-        totalCacheCreationTokens += payload.cache_creation_tokens;
-        turnCount++;
+        fold.totalInputTokens += payload.input_tokens;
+        fold.totalOutputTokens += payload.output_tokens;
+        fold.totalCacheReadTokens += payload.cache_read_tokens;
+        fold.totalCacheCreationTokens += payload.cache_creation_tokens;
+        fold.turnCount++;
         if (typeof payload.total_cost_usd === 'number') {
           // turn_total cost is session-cumulative — latest event wins, never sum.
           // Crash/error results may carry a zeroed total; keep the last non-zero value.
-          if (payload.total_cost_usd > 0 || estimatedCostUsd == null) {
-            estimatedCostUsd = payload.total_cost_usd;
+          if (payload.total_cost_usd > 0 || fold.estimatedCostUsd == null) {
+            fold.estimatedCostUsd = payload.total_cost_usd;
           }
         }
       } else if (!payload.scope && payload.provider !== 'claude') {
         // Codex events have no scope — always count them
-        totalInputTokens += payload.input_tokens;
-        totalOutputTokens += payload.output_tokens;
-        totalCacheReadTokens += payload.cache_read_tokens;
-        totalCacheCreationTokens += payload.cache_creation_tokens;
-        turnCount++;
+        fold.totalInputTokens += payload.input_tokens;
+        fold.totalOutputTokens += payload.output_tokens;
+        fold.totalCacheReadTokens += payload.cache_read_tokens;
+        fold.totalCacheCreationTokens += payload.cache_creation_tokens;
+        fold.turnCount++;
       }
       // Claude per-step events (no scope) are skipped to avoid double-counting with turn_total
     }
 
     if (payload.type === 'context_usage') {
-      context = {
+      fold.context = {
         provider: payload.provider,
         usedTokens: payload.used_tokens,
         maxTokens: payload.max_tokens,
@@ -203,7 +220,7 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
           }
         : null;
       if (isSubRoute(payload)) {
-        routedRequests.set(payload.request_id, {
+        fold.routedRequests.set(payload.request_id, {
           logicalKey: payload.logical_key ?? '',
           env: payload.target_env,
           model: payload.model ?? '',
@@ -215,7 +232,7 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
 
     if (payload.type === 'session_usage') {
       // SDK snapshots are cumulative and authoritative — latest wins.
-      sessionUsage = {
+      fold.sessionUsage = {
         provider: payload.provider,
         inputTokens: payload.input_tokens,
         outputTokens: payload.output_tokens,
@@ -252,24 +269,32 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
     }
   }
 
-  if (turnCount === 0 && !context && !sessionUsage && routedRequests.size === 0) {
+  return fold;
+}
+
+/** Assemble the display state from a fold (rollup only; O(requests + rows)). */
+export function buildSessionUsageState(fold: SessionUsageFold | null): SessionUsageState {
+  if (
+    !fold
+    || (fold.turnCount === 0 && !fold.context && !fold.sessionUsage && fold.routedRequests.size === 0)
+  ) {
     return EMPTY_USAGE;
   }
 
   // Roll up the ledger: rows only over usage-bearing requests; usage-less and
   // incomplete requests are counted explicitly, never zero-filled.
   let routedLedger: RoutedUsageLedger | null = null;
-  if (routedRequests.size > 0) {
+  if (fold.routedRequests.size > 0) {
     const rows = new Map<string, RoutedEnvUsage>();
     let unattributedCount = 0;
     let incompleteCount = 0;
-    for (const request of routedRequests.values()) {
+    for (const request of fold.routedRequests.values()) {
       if (!request.complete) incompleteCount += 1;
       if (!request.usage) {
         unattributedCount += 1;
         continue;
       }
-      const key = `${request.logicalKey} ${request.env} ${request.model}`;
+      const key = `${request.logicalKey} ${request.env} ${request.model}`;
       const row = rows.get(key) ?? {
         logicalKey: request.logicalKey,
         env: request.env,
@@ -289,7 +314,7 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
     }
     routedLedger = {
       rows: [...rows.values()].sort(
-        (a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens),
+        (a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + b.outputTokens),
       ),
       unattributedCount,
       incompleteCount,
@@ -297,16 +322,27 @@ export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageS
   }
 
   return {
-    totalInputTokens,
-    totalOutputTokens,
-    totalCacheReadTokens,
-    totalCacheCreationTokens,
-    estimatedCostUsd,
-    turnCount,
-    context,
-    sessionUsage,
+    totalInputTokens: fold.totalInputTokens,
+    totalOutputTokens: fold.totalOutputTokens,
+    totalCacheReadTokens: fold.totalCacheReadTokens,
+    totalCacheCreationTokens: fold.totalCacheCreationTokens,
+    estimatedCostUsd: fold.estimatedCostUsd,
+    turnCount: fold.turnCount,
+    context: fold.context,
+    sessionUsage: fold.sessionUsage,
     routedLedger,
   };
+}
+
+/**
+ * Compute cumulative token usage and latest context window snapshot from session events.
+ *
+ * - Accumulates all `token_usage` events for total consumption.
+ * - Takes the latest `context_usage` event as the current context window state.
+ * - Does NOT derive context occupancy from cumulative tokens (they are different metrics).
+ */
+export function computeSessionUsage(events: SessionEventRecord[]): SessionUsageState {
+  return buildSessionUsageState(foldSessionUsageEvents(null, events));
 }
 
 /** Format token count for compact display (e.g. 84000 → "84K") */

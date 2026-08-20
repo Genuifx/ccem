@@ -111,24 +111,38 @@ import {
 import {
   appendSessionEvents,
   buildBaseMessages,
-  buildMessagesFromEvents,
   createInitialLocalUserPrompts,
+  deriveTranscriptAppend,
+  deriveTranscriptReset,
+  finalizeTranscriptMessages,
   filterConfirmedLocalUserPrompts,
+  RAW_TAIL_LIMIT,
+  rebaseTranscriptHead,
+  pruneRawEventTail,
   replayBatchCoversAvailableSequenceRange,
+  selectEventAppendRange,
+  selectTranscriptAppendEvents,
   sessionEventsNeedSummaryRefresh,
   shouldTreatNativeSessionAsProcessing,
   splitLocalUserPromptsForReplay,
   stabilizeMessageRefs,
   type LocalUserPrompt,
+  type TranscriptDerivationState,
 } from './workspaceEventTranscript';
 import { ContextWindowIndicator } from './ContextWindowIndicator';
 import { WorkspaceBackgroundTasksPopover } from './WorkspaceBackgroundTasksPopover';
 import { deriveWorkspaceBackgroundTasks } from './workspaceBackgroundTasks';
-import { computeSessionUsage } from './workspaceUsage';
+import {
+  buildSessionUsageState,
+  foldSessionUsageEvents,
+  type SessionUsageFold,
+} from './workspaceUsage';
 import { LazyWorkspaceReviewPopover } from './LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
-  buildWorkspaceReviewSummary,
+  buildWorkspaceReviewSummaryFromFold,
+  foldWorkspaceReviewEvents,
+  type WorkspaceReviewEventFold,
 } from './workspaceReview';
 import {
   mergeWorkspaceReplayEvents,
@@ -255,11 +269,17 @@ const ACTIVE_POLL_INTERVAL_MS = 140;
 const IDLE_POLL_INTERVAL_MS = 700;
 const TERMINAL_POLL_INTERVAL_MS = 1100;
 const SUMMARY_REFRESH_COOLDOWN_MS = 2000;
-const CACHE_FLUSH_INTERVAL_MS = 1500;
+// Streaming flushes of the sessionStorage mirror are trailing-edge and at
+// most one per interval; idle/terminal/switch/unmount flush immediately. The
+// mirror only survives remounts within a session — backend replay refills it.
+const CACHE_FLUSH_MAX_INTERVAL_MS = 10_000;
 const FILE_REWIND_TIMEOUT_MS = 30_000;
 const INITIAL_EVENT_REPLAY_LIMIT = 1200;
 const NATIVE_EVENT_CACHE_KEY_PREFIX = 'ccem-workspace-native-events:';
 const NATIVE_EVENT_CACHE_LIMIT = 8000;
+// Prune hysteresis: only prune once the raw tail exceeds the limit by this
+// margin, so a session hovering at the boundary does not thrash setEvents.
+const RAW_TAIL_PRUNE_MARGIN = 512;
 const GUIDANCE_QUEUE_STORAGE_PREFIX = 'ccem:workspace-native-guidance-queue:v1:';
 
 class PromptAnnotationLimitError extends Error {}
@@ -476,23 +496,43 @@ function nativeEventCacheKey(runtimeId: string) {
   return `${NATIVE_EVENT_CACHE_KEY_PREFIX}${runtimeId}`;
 }
 
-function readCachedNativeEvents(runtimeId: string): SessionEventRecord[] {
+/**
+ * Cache payload: the retained event window plus the seqs where a seq jump is
+ * a known prune/anchor seam (not a real gap), so a remount derivation does
+ * not paint spurious transcript-gap chips. Legacy entries are bare arrays.
+ */
+interface NativeEventCacheRead {
+  events: SessionEventRecord[];
+  seams: number[];
+}
+
+function readCachedNativeEvents(runtimeId: string): NativeEventCacheRead {
   try {
     if (typeof sessionStorage === 'undefined') {
-      return [];
+      return { events: [], seams: [] };
     }
 
     const raw = sessionStorage.getItem(nativeEventCacheKey(runtimeId));
     if (!raw) {
-      return [];
+      return { events: [], seams: [] };
     }
 
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [];
+    const parsed: unknown = JSON.parse(raw);
+    const candidate = Array.isArray(parsed)
+      ? parsed
+      : (parsed as { events?: unknown } | null)?.events;
+    if (!Array.isArray(candidate)) {
+      return { events: [], seams: [] };
     }
 
-    return parsed.filter((event): event is SessionEventRecord =>
+    const seamsSource = Array.isArray(parsed)
+      ? []
+      : (parsed as { seams?: unknown }).seams;
+    const seams = Array.isArray(seamsSource)
+      ? seamsSource.filter((seq): seq is number => Number.isFinite(seq))
+      : [];
+
+    const events = candidate.filter((event): event is SessionEventRecord =>
       event
       && typeof event === 'object'
       && event.runtime_id === runtimeId
@@ -501,12 +541,17 @@ function readCachedNativeEvents(runtimeId: string): SessionEventRecord[] {
       && event.payload
       && typeof event.payload === 'object',
     );
+    return { events, seams };
   } catch {
-    return [];
+    return { events: [], seams: [] };
   }
 }
 
-function writeCachedNativeEvents(runtimeId: string, events: SessionEventRecord[]) {
+function writeCachedNativeEvents(
+  runtimeId: string,
+  events: SessionEventRecord[],
+  seams: number[] = [],
+) {
   try {
     if (typeof sessionStorage === 'undefined') {
       return;
@@ -515,7 +560,17 @@ function writeCachedNativeEvents(runtimeId: string, events: SessionEventRecord[]
     const key = nativeEventCacheKey(runtimeId);
     for (const limit of [NATIVE_EVENT_CACHE_LIMIT, 3000, 1000]) {
       try {
-        sessionStorage.setItem(key, JSON.stringify(selectCachedWorkspaceEvents(events, limit)));
+        const cached = selectCachedWorkspaceEvents(events, limit);
+        // Seams only matter for seqs present in the retained window. A
+        // length of limit + 1 means selectCachedWorkspaceEvents prepended the
+        // structured-snapshot event outside the tail — that jump is benign
+        // too, everything else in the window keeps its real gap semantics.
+        const cachedSeqs = new Set(cached.map((event) => event.seq));
+        const cacheSeams = seams.filter((seq) => cachedSeqs.has(seq));
+        if (cached.length === limit + 1 && !cacheSeams.includes(cached[1]!.seq)) {
+          cacheSeams.push(cached[1]!.seq);
+        }
+        sessionStorage.setItem(key, JSON.stringify({ events: cached, seams: cacheSeams }));
         return;
       } catch {
         // Try a smaller retained window before giving up.
@@ -1376,7 +1431,7 @@ export function WorkspaceNativeSessionView({
     () => isNativeSessionPlanRuntime(session),
   );
   const [events, setEvents] = useState<SessionEventRecord[]>(() =>
-    readCachedNativeEvents(session.runtime_id),
+    readCachedNativeEvents(session.runtime_id).events,
   );
   const [localUserPrompts, setLocalUserPrompts] = useState<LocalUserPrompt[]>(() =>
     createInitialLocalUserPrompts(initialPrompt, initialImages, initialAnnotations)
@@ -1425,6 +1480,29 @@ export function WorkspaceNativeSessionView({
   const lastSeenSeqRef = useRef<number | null>(latestEventSeq(events));
   const latestEventsRef = useRef<SessionEventRecord[]>(events);
   const previousMessagesRef = useRef<ConversationMessageData[]>([]);
+  // Incremental derivation state (plan 022): transcript messages, usage totals
+  // and review evidence fold only appended events; a reset refolds from
+  // scratch when the event list is not a suffix extension of what was folded.
+  const transcriptDerivationRef = useRef<TranscriptDerivationState | null>(null);
+  const sessionUsageDerivationRef = useRef<{
+    runtimeId: string | null;
+    consumedSeq: number | null;
+    consumedCount: number;
+    fold: SessionUsageFold;
+  } | null>(null);
+  const reviewFoldRef = useRef<{
+    runtimeId: string | null;
+    consumedSeq: number | null;
+    consumedCount: number;
+    fold: WorkspaceReviewEventFold;
+  } | null>(null);
+  // Seqs where a jump in the CURRENT events array is a prune/anchor seam, not
+  // a real gap. Set by cache reads and pruning; consumed by reset derivations.
+  const rawTailSeamsRef = useRef<number[]>([]);
+  // Raw-tail pruning waits until the initial replay/backfill settled for this
+  // runtime so it never prunes history the backend has not re-delivered yet.
+  const rawTailSettledRef = useRef(false);
+  const activeCacheRuntimeRef = useRef<string | null>(null);
   const cacheFlushTimerRef = useRef<number | null>(null);
   const cacheFlushIdleCancelRef = useRef<(() => void) | null>(null);
   const cacheFlushPendingRef = useRef(false);
@@ -1459,7 +1537,48 @@ export function WorkspaceNativeSessionView({
     setComposerDraftRevision((revision) => revision + 1);
   }, [handleComposerTextChange]);
 
-  const sessionUsage = useMemo(() => computeSessionUsage(events), [events]);
+  const sessionUsage = useMemo(() => {
+    const previous = sessionUsageDerivationRef.current;
+    if (!previous) {
+      const fold = foldSessionUsageEvents(null, events);
+      sessionUsageDerivationRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+      return buildSessionUsageState(fold);
+    }
+    const selection = selectEventAppendRange(
+      events,
+      previous.consumedSeq,
+      previous.consumedCount,
+      previous.runtimeId,
+    );
+    if (selection.mode === 'reset') {
+      const fold = foldSessionUsageEvents(null, events);
+      sessionUsageDerivationRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+      return buildSessionUsageState(fold);
+    }
+    if (selection.mode === 'append') {
+      const fold = foldSessionUsageEvents(previous.fold, selection.appended);
+      sessionUsageDerivationRef.current = {
+        runtimeId: previous.runtimeId,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: previous.consumedCount + selection.appended.length,
+        fold,
+      };
+      return buildSessionUsageState(fold);
+    }
+    // Idle: events unchanged for this fold (or pruned from the head — the
+    // running totals already account for pruned events).
+    return buildSessionUsageState(previous.fold);
+  }, [events]);
   const backgroundTaskModel = useMemo(
     () => deriveWorkspaceBackgroundTasks(session, events),
     [events, session.background_tasks, session.last_event_seq],
@@ -1576,7 +1695,23 @@ export function WorkspaceNativeSessionView({
   }, [getWorkspaceGitSnapshot, session.project_dir]);
 
   useEffect(() => {
-    const cachedEvents = readCachedNativeEvents(session.runtime_id);
+    // Flush the outgoing runtime's mirror immediately on session switch
+    // (under its own runtime id — latestEventsRef still holds its events).
+    if (
+      activeCacheRuntimeRef.current
+      && activeCacheRuntimeRef.current !== session.runtime_id
+      && latestEventsRef.current.length > 0
+    ) {
+      writeCachedNativeEvents(
+        activeCacheRuntimeRef.current,
+        latestEventsRef.current,
+        rawTailSeamsRef.current,
+      );
+    }
+    activeCacheRuntimeRef.current = session.runtime_id;
+
+    const cached = readCachedNativeEvents(session.runtime_id);
+    const cachedEvents = cached.events;
     const initialPrompts = createInitialLocalUserPrompts(
       initialPrompt,
       initialImages,
@@ -1586,6 +1721,11 @@ export function WorkspaceNativeSessionView({
     lastSeenSeqRef.current = latestEventSeq(cachedEvents);
     latestEventsRef.current = cachedEvents;
     previousMessagesRef.current = [];
+    transcriptDerivationRef.current = null;
+    sessionUsageDerivationRef.current = null;
+    reviewFoldRef.current = null;
+    rawTailSeamsRef.current = cached.seams;
+    rawTailSettledRef.current = false;
     initialReplayBackfillRuntimeRef.current = null;
     autoScrollDetachedRef.current = false;
     prevEventCountRef.current = 0;
@@ -1651,28 +1791,111 @@ export function WorkspaceNativeSessionView({
     [unconfirmedLocalUserPrompts],
   );
 
-  const rawMessages = useMemo(
-    () => buildMessagesFromEvents(
-      buildBaseMessages(seedMessages, replayLocalPrompts.initialPrompt),
+  const transcriptTerminalError = session.status === 'error'
+    ? session.last_error ?? null
+    : null;
+
+  const rawMessages = useMemo(() => {
+    const baseMessages = buildBaseMessages(seedMessages, replayLocalPrompts.initialPrompt);
+    const tokens = { seedMessages, prompts: replayLocalPrompts };
+    // Seam suppression only applies to resets folding a seam-carrying array
+    // (cache-restored or pruned); merges/backfills replace it with a complete
+    // array and clear the seams at their call sites. The sessionStorage
+    // fallback only applies at mount, where the ref is not hydrated yet.
+    const resetSeams = (isMount: boolean) => {
+      const seams = rawTailSeamsRef.current.length > 0
+        ? rawTailSeamsRef.current
+        : (isMount ? readCachedNativeEvents(session.runtime_id).seams : []);
+      return seams.length ? new Set(seams) : undefined;
+    };
+    const resetState = (isMount: boolean) => deriveTranscriptReset(
+      baseMessages,
       replayLocalPrompts.remainingPrompts,
       events,
-      session.status === 'error' ? session.last_error : null,
-    ),
-    [events, replayLocalPrompts, seedMessages, session.last_error, session.status],
-  );
+      transcriptTerminalError,
+      { tokens, suppressGapBeforeSeqs: resetSeams(isMount) },
+    );
+
+    const previousState = transcriptDerivationRef.current;
+    let state: TranscriptDerivationState;
+    if (!previousState) {
+      state = resetState(true);
+    } else if (
+      previousState.seedMessages !== seedMessages
+      || previousState.prompts !== replayLocalPrompts
+    ) {
+      // Seed/prompt inputs changed: rebuild only the head and refresh the
+      // prompt queue; every event-derived message keeps its identity.
+      state = rebaseTranscriptHead(
+        previousState,
+        baseMessages,
+        events,
+        replayLocalPrompts.remainingPrompts,
+        tokens,
+      );
+    } else {
+      const selection = selectTranscriptAppendEvents(events, previousState);
+      if (selection.mode === 'reset') {
+        state = resetState(false);
+      } else if (selection.mode === 'append') {
+        state = deriveTranscriptAppend(previousState, selection.appended);
+      } else {
+        state = previousState;
+      }
+    }
+    // Terminal error is a finalize-only input; never refold for it.
+    if (state.terminalError !== transcriptTerminalError) {
+      state = { ...state, terminalError: transcriptTerminalError };
+    }
+    transcriptDerivationRef.current = state;
+    return finalizeTranscriptMessages(state);
+  }, [events, replayLocalPrompts, seedMessages, transcriptTerminalError]);
 
   const messages = useMemo(
     () => stabilizeMessageRefs(rawMessages, previousMessagesRef.current),
     [rawMessages],
   );
 
-  const reviewSummary = useMemo(
-    () => buildWorkspaceReviewSummary({
+  const reviewSummary = useMemo(() => {
+    const previous = reviewFoldRef.current;
+    if (!previous) {
+      const fold = foldWorkspaceReviewEvents(null, events);
+      reviewFoldRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot);
+    }
+    const selection = selectEventAppendRange(
       events,
-      gitSnapshot,
-    }),
-    [events, gitSnapshot],
-  );
+      previous.consumedSeq,
+      previous.consumedCount,
+      previous.runtimeId,
+    );
+    let fold = previous.fold;
+    if (selection.mode === 'reset') {
+      fold = foldWorkspaceReviewEvents(null, events);
+      reviewFoldRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+    } else if (selection.mode === 'append') {
+      fold = foldWorkspaceReviewEvents(previous.fold, selection.appended);
+      reviewFoldRef.current = {
+        runtimeId: previous.runtimeId,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: previous.consumedCount + selection.appended.length,
+        fold,
+      };
+    }
+    // Idle: reuse the fold (pruned head is already accounted for). The git
+    // snapshot only participates in assembly, so git refreshes never refold.
+    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot);
+  }, [events, gitSnapshot]);
   const reviewModel = useMemo(
     () => {
       if (!isReviewPopoverOpen) {
@@ -1721,7 +1944,7 @@ export function WorkspaceNativeSessionView({
     }
 
     const write = () => {
-      writeCachedNativeEvents(session.runtime_id, latestEventsRef.current);
+      writeCachedNativeEvents(session.runtime_id, latestEventsRef.current, rawTailSeamsRef.current);
     };
 
     if (options.immediate) {
@@ -1746,7 +1969,7 @@ export function WorkspaceNativeSessionView({
       if (cacheFlushPendingRef.current) {
         flushCachedEvents();
       }
-    }, CACHE_FLUSH_INTERVAL_MS);
+    }, CACHE_FLUSH_MAX_INTERVAL_MS);
   }, [flushCachedEvents]);
 
   useEffect(() => {
@@ -1755,6 +1978,27 @@ export function WorkspaceNativeSessionView({
       scheduleCacheFlush();
     }
   }, [events, scheduleCacheFlush]);
+
+  // Bound the in-memory raw tail. Only at idle (never mid-send), only after
+  // the initial replay/backfill settled for this runtime, and only past a
+  // hysteresis margin over RAW_TAIL_LIMIT. Derivations fold incrementally, so
+  // pruning never re-derives anything: append selections stay valid because
+  // the newest events (the consumed marker) are always retained.
+  useEffect(() => {
+    if (
+      !rawTailSettledRef.current
+      || isSending
+      || events.length <= RAW_TAIL_LIMIT + RAW_TAIL_PRUNE_MARGIN
+    ) {
+      return;
+    }
+    const pruned = pruneRawEventTail(events, RAW_TAIL_LIMIT);
+    if (!pruned.prunedCount) {
+      return;
+    }
+    rawTailSeamsRef.current = pruned.seams;
+    setEvents(pruned.events);
+  }, [events, isSending]);
 
   useEffect(() => () => {
     if (cacheFlushTimerRef.current !== null) {
@@ -1770,8 +2014,14 @@ export function WorkspaceNativeSessionView({
     }
   }, [flushCachedEvents]);
 
+  // Idle/terminal sessions flush the mirror immediately; only while streaming
+  // (processing/initializing) does the 10s trailing timer govern.
   useEffect(() => {
-    if (isTerminalStatus(session.status) && latestEventsRef.current.length > 0) {
+    if (
+      session.status !== 'processing'
+      && session.status !== 'initializing'
+      && latestEventsRef.current.length > 0
+    ) {
       flushCachedEvents({ immediate: true });
     }
   }, [flushCachedEvents, session.status]);
@@ -1818,6 +2068,7 @@ export function WorkspaceNativeSessionView({
     try {
       const fullBatch = await getNativeSessionEvents(session.runtime_id, null, null);
       if (!fullBatch.events.length) {
+        rawTailSettledRef.current = true;
         return;
       }
 
@@ -1826,9 +2077,13 @@ export function WorkspaceNativeSessionView({
         lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? fullBatchLatestSeq, fullBatchLatestSeq);
       }
 
+      // The merged array is complete (backend replay is the source of truth),
+      // so prune seams from any earlier array no longer apply.
+      rawTailSeamsRef.current = [];
       startTransition(() => {
         setEvents((previous) => appendSessionEvents(fullBatch.events, previous));
       });
+      rawTailSettledRef.current = true;
 
       if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
         await refreshSummary({ force: true });
@@ -1855,6 +2110,11 @@ export function WorkspaceNativeSessionView({
     if (batchLatestSeq != null) {
       lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? batchLatestSeq, batchLatestSeq);
     }
+    // A gap-detected replacement batch comes straight from the backend
+    // (contiguous); prune seams from the replaced array no longer apply.
+    if (!isInitialReplay && batch.gap_detected) {
+      rawTailSeamsRef.current = [];
+    }
     const updateEvents = () => {
       setEvents((previous) => (
         isInitialReplay
@@ -1869,8 +2129,14 @@ export function WorkspaceNativeSessionView({
       startTransition(updateEvents);
     }
 
-    if (isInitialReplay && !replayBatchCoversAvailableSequenceRange(batch)) {
-      void backfillInitialReplay();
+    if (isInitialReplay) {
+      if (replayBatchCoversAvailableSequenceRange(batch)) {
+        // Replay covered the backend's full range: no backfill needed and the
+        // raw tail may start pruning once the session goes idle.
+        rawTailSettledRef.current = true;
+      } else {
+        void backfillInitialReplay();
+      }
     }
 
     return sessionEventsNeedSummaryRefresh(batch.events);
@@ -3067,6 +3333,8 @@ export function WorkspaceNativeSessionView({
             <WorkspaceTranscriptList
               messages={messages}
               isAwaitingResponse={isAwaitingResponse}
+              enableTopWindowing
+              viewportRef={containerRef}
             />
           )}
         </div>
