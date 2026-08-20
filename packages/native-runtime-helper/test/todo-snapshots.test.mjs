@@ -101,7 +101,7 @@ async function buildHelperWithTodoSdkEvents() {
                         }],
                       },
                     };
-                    yield { type: 'result', subtype: 'success', result: 'done', session_id: 'claude-session' };
+                    yield { type: 'result', subtype: 'success', result: 'done', user_message_uuid: next.value.uuid, session_id: 'claude-session' };
                     await new Promise(() => {});
                     return;
                   }
@@ -160,7 +160,7 @@ async function buildHelperWithTodoSdkEvents() {
                         }],
                       },
                     };
-                    yield { type: 'result', subtype: 'success', result: 'done', session_id: 'claude-session' };
+                    yield { type: 'result', subtype: 'success', result: 'done', user_message_uuid: next.value.uuid, session_id: 'claude-session' };
                     await new Promise(() => {});
                     return;
                   }
@@ -210,7 +210,7 @@ async function buildHelperWithTodoSdkEvents() {
                       content: [{ type: 'tool_result', tool_use_id: 'task-create-1', content: 'created' }],
                     },
                   };
-                  yield { type: 'result', subtype: 'success', result: 'done', session_id: 'claude-session' };
+                  yield { type: 'result', subtype: 'success', result: 'done', user_message_uuid: next.value.uuid, session_id: 'claude-session' };
                   await new Promise(() => {});
                 },
               };

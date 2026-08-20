@@ -1,8 +1,8 @@
 use crate::browser::{authorize_browser_tool, BrowserManager, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
-    ReplayBatch, SessionEventPayload, SessionPromptAnnotation, SessionPromptImage, SessionStore,
-    TodoSnapshotV1,
+    NativeBackgroundTask, NativeBackgroundTaskStatus, ReplayBatch, SessionEventPayload,
+    SessionPromptAnnotation, SessionPromptImage, SessionStore, TodoSnapshotV1,
 };
 use crate::native_event_log::NativeEventLog;
 use crate::native_helper_resource::native_helper_script_path;
@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use shared_child::SharedChild;
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -53,13 +53,47 @@ use tauri_plugin_shell::{
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const NATIVE_HELPER_RETIRING_ERROR: &str = "Native runtime helper is retiring";
-// Grace given to a helper to self-exit on stdin EOF during app shutdown
-// (the helper flushes its final status line, then exits after ~250ms).
-const NATIVE_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const ACTIVE_BACKGROUND_TASK_SHUTDOWN_ERROR: &str = "Cannot close this native runtime while Claude background tasks remain active. Retry with force after confirming their results may be lost.";
 const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
 const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
 const MAX_PROMPT_ANNOTATION_TOTAL_CHARS: usize = 60_000;
+
+fn is_background_task_shutdown_safety_error(message: &str) -> bool {
+    message.starts_with("Cannot close this native runtime while ")
+        && message.contains("Claude background task")
+        && message.contains("Retry with force")
+}
+
+#[cfg(unix)]
+fn unix_descendant_process_ids(root_pid: u32, process_table: &str) -> Vec<u32> {
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for line in process_table.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent_pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid > 1 {
+            children_by_parent.entry(parent_pid).or_default().push(pid);
+        }
+    }
+
+    let mut descendants = Vec::new();
+    let mut pending = vec![root_pid];
+    while let Some(parent_pid) = pending.pop() {
+        if let Some(children) = children_by_parent.get(&parent_pid) {
+            for child_pid in children {
+                descendants.push(*child_pid);
+                pending.push(*child_pid);
+            }
+        }
+    }
+    descendants.reverse();
+    descendants
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +109,10 @@ impl NativeProvider {
             Self::Codex => "codex",
         }
     }
+}
+
+fn app_termination_requires_idle_freeze(provider: NativeProvider) -> bool {
+    provider == NativeProvider::Claude
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +140,12 @@ pub struct NativeSessionRecord {
     pub runtime_perm_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_env_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_settings_request_id: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -109,6 +153,8 @@ pub struct NativeSessionRecord {
     pub can_handoff_to_terminal: bool,
     #[serde(default, skip_serializing)]
     pub pending_handoff_terminal: Option<TerminalType>,
+    #[serde(default, skip_serializing)]
+    pub pending_handoff_allow_background_task_termination: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,21 +170,6 @@ pub struct NativeSessionRecord {
 /// the child and must be torn down on app exit.
 pub(crate) fn runtime_child_is_owned(record: &NativeSessionRecord) -> bool {
     record.status != "handoff" || record.is_active
-}
-
-/// Wait until `pid` is gone, capped at `timeout`. Returns true when the
-/// process exited within the window.
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if !crate::runtime::process_exists(pid) {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +188,10 @@ pub struct NativeSessionSummary {
     pub runtime_perm_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_env_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_effort: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -164,6 +199,8 @@ pub struct NativeSessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event_seq: Option<u64>,
     pub can_handoff_to_terminal: bool,
+    #[serde(default)]
+    pub background_tasks: Vec<NativeBackgroundTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +229,8 @@ pub struct NativeTerminalHandoff {
     pub resume_session_id: String,
     pub terminal: TerminalType,
     pub env_vars: HashMap<String, String>,
+    pub allow_background_task_termination: bool,
+    pub preparation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +450,7 @@ enum HelperInputCommand<'a> {
         annotations: Option<&'a HashMap<String, InteractivePromptAnnotation>>,
     },
     UpdateSettings {
+        request_id: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         env_name: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -419,6 +459,7 @@ enum HelperInputCommand<'a> {
         env_vars: Option<&'a HashMap<String, String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         effort: Option<&'a str>,
+        force_restart: bool,
     },
     RewindFiles {
         checkpoint_id: &'a str,
@@ -432,7 +473,23 @@ enum HelperInputCommand<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<&'a str>,
     },
-    Stop,
+    InterruptTurn,
+    PrepareStop {
+        request_id: &'a str,
+        require_idle: bool,
+        force_background_tasks: bool,
+        finalize: bool,
+    },
+    CancelPrepareStop {
+        request_id: &'a str,
+    },
+    StopTask {
+        task_id: &'a str,
+        stop_request_id: &'a str,
+    },
+    Stop {
+        force_background_tasks: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -484,8 +541,231 @@ fn native_status_allows_file_rewind(status: &str) -> bool {
 fn native_status_allows_usage_query(status: &str) -> bool {
     matches!(
         status,
-        "idle" | "ready" | "interrupted" | "closed_idle" | "initializing" | "processing" | "running"
+        "idle"
+            | "ready"
+            | "interrupted"
+            | "closed_idle"
+            | "initializing"
+            | "processing"
+            | "running"
     )
+}
+
+fn stage_runtime_settings_update(
+    record: &mut NativeSessionRecord,
+    env_name: Option<&str>,
+    effort: Option<&str>,
+    request_id: &str,
+) {
+    if env_name.is_none() && effort.is_none() {
+        return;
+    }
+    match record.provider {
+        NativeProvider::Claude => {
+            if let Some(name) = env_name {
+                record.pending_env_name = Some(name.to_string());
+            }
+            if let Some(next_effort) = effort {
+                record.pending_effort = non_empty_error(next_effort);
+            }
+            record.pending_settings_request_id = Some(request_id.to_string());
+        }
+        NativeProvider::Codex => {
+            if let Some(name) = env_name {
+                record.env_name = name.to_string();
+            }
+            if let Some(next_effort) = effort {
+                record.effort = non_empty_error(next_effort);
+            }
+            record.pending_env_name = None;
+            record.pending_effort = None;
+            record.pending_settings_request_id = None;
+        }
+    }
+    record.updated_at = Utc::now();
+}
+
+fn apply_background_task_event(
+    handle: &NativeSessionHandle,
+    payload: &SessionEventPayload,
+) -> Result<bool, String> {
+    fn preserve_local_transition(
+        current: &NativeBackgroundTask,
+        incoming: &NativeBackgroundTask,
+    ) -> bool {
+        if current.status == NativeBackgroundTaskStatus::Settling {
+            return true;
+        }
+        if current.status != NativeBackgroundTaskStatus::Stopping {
+            return false;
+        }
+        if incoming.status == NativeBackgroundTaskStatus::Settling {
+            return false;
+        }
+        !(incoming.stop_failed == Some(true)
+            && incoming.stop_request_id.is_some()
+            && incoming.stop_request_id == current.stop_request_id)
+    }
+
+    fn preserve_transition_fields(
+        current: &NativeBackgroundTask,
+        incoming: &NativeBackgroundTask,
+    ) -> NativeBackgroundTask {
+        let mut next = incoming.clone();
+        next.status = current.status;
+        next.stop_request_id = current.stop_request_id.clone();
+        next.stop_failed = current.stop_failed;
+        if current.status == NativeBackgroundTaskStatus::Stopping {
+            next.error = current.error.clone();
+        }
+        next
+    }
+
+    match payload {
+        SessionEventPayload::BackgroundTasksChanged { tasks } => {
+            {
+                let mut background_tool_ids = handle
+                    .background_tool_use_ids
+                    .lock()
+                    .map_err(|_| "Failed to lock background tool use ids".to_string())?;
+                for task in tasks {
+                    if let Some(tool_use_id) = task.tool_use_id.as_ref() {
+                        background_tool_ids.insert(tool_use_id.clone());
+                    }
+                }
+            }
+            let terminal_ids = handle
+                .terminal_background_task_ids
+                .lock()
+                .map_err(|_| "Failed to lock terminal background task ids".to_string())?;
+            let current_tasks = handle
+                .background_tasks
+                .lock()
+                .map_err(|_| "Failed to lock native background tasks".to_string())?;
+            let mut next_tasks = HashMap::new();
+            let mut invalidated_stop_ids = Vec::new();
+            for task in tasks {
+                if task.status.is_terminal() || terminal_ids.contains(&task.task_id) {
+                    continue;
+                }
+                let mut next = task.clone();
+                if let Some(current) = current_tasks.get(&task.task_id) {
+                    if current.status == NativeBackgroundTaskStatus::Stopping
+                        && task.status == NativeBackgroundTaskStatus::Settling
+                    {
+                        next.stop_request_id = None;
+                        next.stop_failed = None;
+                        invalidated_stop_ids.push(task.task_id.clone());
+                    } else if preserve_local_transition(current, task) {
+                        next = preserve_transition_fields(current, task);
+                    }
+                }
+                next_tasks.insert(next.task_id.clone(), next);
+            }
+            for (task_id, current) in current_tasks.iter() {
+                if next_tasks.contains_key(task_id) || terminal_ids.contains(task_id) {
+                    continue;
+                }
+                let mut missing = current.clone();
+                if missing.status == NativeBackgroundTaskStatus::Stopping
+                    || missing.stop_request_id.is_some()
+                {
+                    invalidated_stop_ids.push(task_id.clone());
+                }
+                missing.status = NativeBackgroundTaskStatus::Settling;
+                missing.updated_at = Utc::now();
+                missing.stop_request_id = None;
+                missing.stop_failed = None;
+                next_tasks.insert(task_id.clone(), missing);
+            }
+            drop(current_tasks);
+            drop(terminal_ids);
+            if !invalidated_stop_ids.is_empty() {
+                let mut pending_stops = handle
+                    .pending_background_task_stops
+                    .lock()
+                    .map_err(|_| "Failed to lock pending background task stops".to_string())?;
+                for task_id in invalidated_stop_ids {
+                    pending_stops.remove(&task_id);
+                }
+            }
+            *handle
+                .background_tasks
+                .lock()
+                .map_err(|_| "Failed to lock native background tasks".to_string())? = next_tasks;
+            Ok(true)
+        }
+        SessionEventPayload::BackgroundTaskUpdated { task } => {
+            let added_tool_correlation = if let Some(tool_use_id) = task.tool_use_id.as_ref() {
+                handle
+                    .background_tool_use_ids
+                    .lock()
+                    .map_err(|_| "Failed to lock background tool use ids".to_string())?
+                    .insert(tool_use_id.clone())
+            } else {
+                false
+            };
+            let mut terminal_ids = handle
+                .terminal_background_task_ids
+                .lock()
+                .map_err(|_| "Failed to lock terminal background task ids".to_string())?;
+            let mut tasks = handle
+                .background_tasks
+                .lock()
+                .map_err(|_| "Failed to lock native background tasks".to_string())?;
+            if terminal_ids.contains(&task.task_id) {
+                return Ok(added_tool_correlation);
+            }
+            if task.status.is_terminal() {
+                terminal_ids.insert(task.task_id.clone());
+                tasks.remove(&task.task_id);
+                handle
+                    .pending_background_task_stops
+                    .lock()
+                    .map_err(|_| "Failed to lock pending background task stops".to_string())?
+                    .remove(&task.task_id);
+                return Ok(true);
+            }
+            let mut next = task.clone();
+            if let Some(current) = tasks.get(&task.task_id) {
+                if preserve_local_transition(current, task) {
+                    next = preserve_transition_fields(current, task);
+                }
+            }
+            tasks.insert(next.task_id.clone(), next);
+            if task.stop_failed == Some(true) {
+                let mut pending_stops = handle
+                    .pending_background_task_stops
+                    .lock()
+                    .map_err(|_| "Failed to lock pending background task stops".to_string())?;
+                if pending_stops
+                    .get(&task.task_id)
+                    .is_some_and(|(request_id, _)| {
+                        Some(request_id) == task.stop_request_id.as_ref()
+                    })
+                {
+                    pending_stops.remove(&task.task_id);
+                }
+            }
+            Ok(true)
+        }
+        SessionEventPayload::ToolUseCompleted { tool_use_id, .. } => {
+            if !handle
+                .background_tool_use_ids
+                .lock()
+                .map_err(|_| "Failed to lock background tool use ids".to_string())?
+                .contains(tool_use_id)
+            {
+                return Ok(true);
+            }
+            Ok(handle
+                .completed_background_tool_use_ids
+                .lock()
+                .map_err(|_| "Failed to lock completed background tool use ids".to_string())?
+                .insert(tool_use_id.clone()))
+        }
+        _ => Ok(true),
+    }
 }
 
 fn destroy_browser_session(app: Option<&AppHandle>, runtime_id: &str) {
@@ -525,7 +805,11 @@ fn helper_command_kind(command: &HelperInputCommand<'_>) -> &'static str {
         HelperInputCommand::RewindFiles { .. } => "rewind_files",
         HelperInputCommand::UsageQuery => "usage_query",
         HelperInputCommand::BrowserToolResponse { .. } => "browser_tool_response",
-        HelperInputCommand::Stop => "stop",
+        HelperInputCommand::InterruptTurn => "interrupt_turn",
+        HelperInputCommand::PrepareStop { .. } => "prepare_stop",
+        HelperInputCommand::CancelPrepareStop { .. } => "cancel_prepare_stop",
+        HelperInputCommand::StopTask { .. } => "stop_task",
+        HelperInputCommand::Stop { .. } => "stop",
     }
 }
 
@@ -568,6 +852,17 @@ enum HelperOutputEvent {
         tool: String,
         #[serde(default)]
         args: Value,
+    },
+    TeardownPrepared {
+        request_id: String,
+        ready: bool,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    BackgroundTaskStopFailed {
+        task_id: String,
+        stop_request_id: String,
+        error: String,
     },
 }
 
@@ -985,6 +1280,12 @@ struct NativeSessionHandle {
     record: Mutex<NativeSessionRecord>,
     child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
+    background_tasks: Mutex<HashMap<String, NativeBackgroundTask>>,
+    terminal_background_task_ids: Mutex<HashSet<String>>,
+    background_tool_use_ids: Mutex<HashSet<String>>,
+    completed_background_tool_use_ids: Mutex<HashSet<String>>,
+    pending_background_task_stops: Mutex<HashMap<String, (String, NativeBackgroundTaskStatus)>>,
+    teardown_preparations: Mutex<HashMap<String, Result<(), String>>>,
     helper_env_vars: HashMap<String, String>,
     terminal_env_vars: HashMap<String, String>,
     claude_path: Option<String>,
@@ -1002,6 +1303,12 @@ impl NativeSessionHandle {
             .expect("native session record poisoned")
             .clone();
         let last_event_seq = self.events.lock().ok().and_then(|store| store.newest_seq());
+        let mut background_tasks = self
+            .background_tasks
+            .lock()
+            .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        background_tasks.sort_by_key(|task| task.started_at);
         NativeSessionSummary {
             runtime_id: record.runtime_id,
             provider: record.provider,
@@ -1013,12 +1320,15 @@ impl NativeSessionHandle {
             perm_mode: record.perm_mode,
             runtime_perm_mode: record.runtime_perm_mode,
             effort: record.effort,
+            pending_env_name: record.pending_env_name,
+            pending_effort: record.pending_effort,
             status: record.status,
             created_at: record.created_at,
             updated_at: record.updated_at,
             is_active: record.is_active,
             last_event_seq,
             can_handoff_to_terminal: record.can_handoff_to_terminal,
+            background_tasks,
             last_error: record.last_error,
             router: record.router.as_ref().map(SessionRouterState::from),
         }
@@ -1116,6 +1426,10 @@ pub struct NativeRuntimeManager {
     prompt_image_store: PromptImageStore,
     router_manager: OnceLock<Arc<RouterManager>>,
     reconnect_lock: Mutex<()>,
+    settings_update_lock: Mutex<()>,
+    app_termination_lock: Mutex<()>,
+    app_termination_in_progress: AtomicBool,
+    terminal_handoff_preparations: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1242,6 +1556,10 @@ impl NativeRuntimeManager {
             prompt_image_store: PromptImageStore::default(),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            settings_update_lock: Mutex::new(()),
+            app_termination_lock: Mutex::new(()),
+            app_termination_in_progress: AtomicBool::new(false),
+            terminal_handoff_preparations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1332,6 +1650,15 @@ impl NativeRuntimeManager {
         app: AppHandle,
         options: NativeSessionOptions,
     ) -> Result<NativeSessionSummary, String> {
+        let _termination_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime termination".to_string())?;
+        if self.app_termination_in_progress.load(Ordering::SeqCst) {
+            return Err(
+                "CCEM is closing native runtimes; a new session cannot be started.".to_string(),
+            );
+        }
         let mut options = options;
         self.prepare_router_launch(&mut options, false)?;
         options.initial_annotations =
@@ -1352,12 +1679,16 @@ impl NativeRuntimeManager {
             perm_mode: options.perm_mode.clone(),
             runtime_perm_mode: options.runtime_perm_mode.clone(),
             effort: options.effort.clone(),
+            pending_env_name: None,
+            pending_effort: None,
+            pending_settings_request_id: None,
             status: "initializing".to_string(),
             created_at: now,
             updated_at: now,
             is_active: true,
             can_handoff_to_terminal: terminal::external_terminal_launch_supported(),
             pending_handoff_terminal: None,
+            pending_handoff_allow_background_task_termination: false,
             last_error: None,
             router: options.router_record.clone(),
         };
@@ -1367,6 +1698,12 @@ impl NativeRuntimeManager {
             record: Mutex::new(record.clone()),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(runtime_id.clone())),
+            background_tasks: Mutex::new(HashMap::new()),
+            terminal_background_task_ids: Mutex::new(HashSet::new()),
+            background_tool_use_ids: Mutex::new(HashSet::new()),
+            completed_background_tool_use_ids: Mutex::new(HashSet::new()),
+            pending_background_task_stops: Mutex::new(HashMap::new()),
+            teardown_preparations: Mutex::new(HashMap::new()),
             helper_env_vars: options.helper_env_vars.clone(),
             terminal_env_vars: options.terminal_env_vars.clone(),
             claude_path: options.claude_path.clone(),
@@ -1651,12 +1988,15 @@ impl NativeRuntimeManager {
                         perm_mode: record.perm_mode,
                         runtime_perm_mode: record.runtime_perm_mode,
                         effort: record.effort,
+                        pending_env_name: record.pending_env_name,
+                        pending_effort: record.pending_effort,
                         status: record.status,
                         created_at: record.created_at,
                         updated_at: record.updated_at,
                         is_active: record.is_active,
                         last_event_seq: None,
                         can_handoff_to_terminal: record.can_handoff_to_terminal,
+                        background_tasks: Vec::new(),
                         last_error: record.last_error,
                         router: record.router.as_ref().map(SessionRouterState::from),
                     }
@@ -1762,6 +2102,11 @@ impl NativeRuntimeManager {
         images: Option<&Vec<PromptImage>>,
         annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
+        let _termination_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime termination".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "send a prompt")?;
         let text = text.trim();
         let has_images = images.as_ref().is_some_and(|imgs| !imgs.is_empty());
         let annotations = validate_prompt_annotations(annotations)?;
@@ -1826,16 +2171,27 @@ impl NativeRuntimeManager {
 
     pub fn respond_to_permission(
         self: &Arc<Self>,
-        app: &AppHandle,
         runtime_id: &str,
         request_id: &str,
         approved: bool,
     ) -> Result<(), String> {
-        let handle = self.ensure_handle(app.clone(), runtime_id)?;
-        self.write_to_child_with_reconnect(
-            app,
-            runtime_id,
-            handle,
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "respond to permission")?;
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned()
+            .filter(|handle| handle.alive.load(Ordering::SeqCst))
+            .ok_or_else(|| {
+                format!("Native runtime {runtime_id} no longer has a live permission request.")
+            })?;
+        self.write_to_child(
+            &handle,
             &HelperInputCommand::PermissionResponse {
                 request_id,
                 approved,
@@ -1845,7 +2201,6 @@ impl NativeRuntimeManager {
 
     pub fn respond_to_prompt(
         self: &Arc<Self>,
-        app: &AppHandle,
         runtime_id: &str,
         tool_use_id: &str,
         prompt_type: &str,
@@ -1854,22 +2209,34 @@ impl NativeRuntimeManager {
         annotations: Option<&HashMap<String, InteractivePromptAnnotation>>,
         prompt_annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "respond to a prompt")?;
         if answers.is_empty() {
             return Err("Interactive prompt response requires at least one answer.".to_string());
         }
         let prompt_annotations = validate_prompt_annotations(prompt_annotations)?;
 
-        let handle = self.ensure_handle(app.clone(), runtime_id)?;
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned()
+            .filter(|handle| handle.alive.load(Ordering::SeqCst))
+            .ok_or_else(|| {
+                format!("Native runtime {runtime_id} no longer has a live interactive prompt.")
+            })?;
         self.deliver_and_append_interactive_prompt_response(
             runtime_id,
             display_text,
             answers,
             prompt_annotations.as_ref(),
             || {
-                self.write_to_child_with_reconnect(
-                    app,
-                    runtime_id,
-                    handle,
+                self.write_to_child(
+                    &handle,
                     &HelperInputCommand::InteractivePromptResponse {
                         tool_use_id,
                         prompt_type,
@@ -1881,12 +2248,321 @@ impl NativeRuntimeManager {
         )
     }
 
+    fn active_background_tasks(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Vec<NativeBackgroundTask>, String> {
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned();
+        let Some(handle) = handle else {
+            return Ok(Vec::new());
+        };
+        let mut tasks = handle
+            .background_tasks
+            .lock()
+            .map_err(|_| "Failed to lock native background tasks".to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| task.started_at);
+        Ok(tasks)
+    }
+
+    fn reject_background_task_termination(
+        &self,
+        runtime_id: &str,
+        action: &str,
+        force: bool,
+    ) -> Result<(), String> {
+        let tasks = self.active_background_tasks(runtime_id)?;
+        if tasks.is_empty() || force {
+            return Ok(());
+        }
+        Err(format!(
+            "Cannot {action} while {} Claude background task{} remain active. Retry with force after confirming their results may be lost.",
+            tasks.len(),
+            if tasks.len() == 1 { "" } else { "s" }
+        ))
+    }
+
+    fn interrupt_background_tasks(&self, runtime_id: &str, reason: &str) -> Result<usize, String> {
+        let tasks = self.active_background_tasks(runtime_id)?;
+        for mut task in tasks.iter().cloned() {
+            task.status = NativeBackgroundTaskStatus::Interrupted;
+            task.updated_at = Utc::now();
+            if task.error.is_none() {
+                task.error = Some(reason.to_string());
+            }
+            self.append_event(
+                runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: task.clone() },
+            )?;
+            if let Some(tool_use_id) = task.tool_use_id.as_ref() {
+                self.append_event(
+                    runtime_id,
+                    SessionEventPayload::ToolUseCompleted {
+                        tool_use_id: tool_use_id.clone(),
+                        raw_name: task
+                            .task_type
+                            .clone()
+                            .unwrap_or_else(|| "background_task".to_string()),
+                        result_summary: task.error.clone().unwrap_or_else(|| reason.to_string()),
+                        result_content: None,
+                        success: false,
+                        todo_snapshot: None,
+                    },
+                )?;
+            }
+        }
+        Ok(tasks.len())
+    }
+
+    pub fn prepare_app_termination(&self, force: bool) -> Result<usize, String> {
+        self.prepare_app_termination_with_hook(force, |_| {})
+    }
+
+    fn prepare_app_termination_with_hook<F>(
+        &self,
+        force: bool,
+        before_commit: F,
+    ) -> Result<usize, String>
+    where
+        F: FnOnce(&[String]),
+    {
+        self.prepare_app_termination_with_hooks(force, before_commit, |runtime_id, force| {
+            self.shutdown_child(runtime_id, force)
+        })
+    }
+
+    fn prepare_app_termination_with_hooks<F, S>(
+        &self,
+        force: bool,
+        before_commit: F,
+        mut shutdown_child: S,
+    ) -> Result<usize, String>
+    where
+        F: FnOnce(&[String]),
+        S: FnMut(&str, bool) -> Result<(), String>,
+    {
+        let _termination_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime termination".to_string())?;
+        if self.app_termination_in_progress.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        self.app_termination_in_progress
+            .store(true, Ordering::SeqCst);
+
+        let mut prepared_handles = Vec::new();
+        let result = (|| {
+            let handles = self
+                .handles
+                .lock()
+                .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut runtime_ids = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let record = handle
+                    .record
+                    .lock()
+                    .map_err(|_| "Failed to lock native session record".to_string())?;
+                if runtime_child_is_owned(&record) {
+                    runtime_ids.push(record.runtime_id.clone());
+                }
+            }
+            let mut tasks_by_runtime = Vec::new();
+            let mut total = 0usize;
+            for runtime_id in &runtime_ids {
+                let count = self.active_background_tasks(runtime_id)?.len();
+                if count > 0 {
+                    total += count;
+                    tasks_by_runtime.push(runtime_id.clone());
+                }
+            }
+
+            if total > 0 && !force {
+                return Err(format!(
+                    "Cannot exit while {total} Claude background task{} remain active. Retry with force after confirming their results may be lost.",
+                    if total == 1 { "" } else { "s" }
+                ));
+            }
+
+            if force {
+                for runtime_id in &tasks_by_runtime {
+                    self.interrupt_background_tasks(
+                        runtime_id,
+                        "CCEM exited before the Claude background task settled.",
+                    )?;
+                }
+            }
+
+            let preparation_id = format!(
+                "app-termination-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            );
+            if !force {
+                for (index, runtime_id) in runtime_ids.iter().enumerate() {
+                    let request_id = format!("{preparation_id}-{index}");
+                    let require_idle = app_termination_requires_idle_freeze(
+                        self.current_record(runtime_id)?.provider,
+                    );
+                    if let Some(handle) = self.request_child_prepare_stop(
+                        runtime_id,
+                        &request_id,
+                        require_idle,
+                        false,
+                        false,
+                    )? {
+                        prepared_handles.push((runtime_id.clone(), request_id, handle));
+                    }
+                }
+                for (runtime_id, request_id, handle) in &prepared_handles {
+                    if let Err(error) =
+                        self.await_child_prepare_stop(runtime_id, request_id, handle, false)
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+
+            before_commit(&runtime_ids);
+            if !force {
+                let late_task_count =
+                    runtime_ids.iter().try_fold(0usize, |count, runtime_id| {
+                        self.active_background_tasks(runtime_id)
+                            .map(|tasks| count + tasks.len())
+                    })?;
+                if late_task_count > 0 {
+                    return Err(format!(
+                        "Cannot exit while {late_task_count} Claude background task{} remain active. Retry with force after confirming their results may be lost.",
+                        if late_task_count == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+
+            let originals = runtime_ids
+                .iter()
+                .map(|runtime_id| {
+                    self.current_record(runtime_id)
+                        .map(|record| (runtime_id.clone(), record))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (runtime_id, _) in &originals {
+                let has_forced_tasks = tasks_by_runtime.contains(runtime_id);
+                self.update_record(runtime_id, |record| {
+                    record.status = if has_forced_tasks {
+                        "interrupted"
+                    } else {
+                        "app_closing"
+                    }
+                    .to_string();
+                    record.is_active = false;
+                    record.updated_at = Utc::now();
+                })?;
+            }
+
+            let mut closed_runtime_ids = HashSet::new();
+            for runtime_id in &runtime_ids {
+                let has_forced_tasks = tasks_by_runtime.contains(runtime_id);
+                if let Err(error) = shutdown_child(runtime_id, force) {
+                    if !force && is_background_task_shutdown_safety_error(&error) {
+                        for (original_runtime_id, original) in &originals {
+                            if closed_runtime_ids.contains(original_runtime_id) {
+                                continue;
+                            }
+                            let live_handle = self
+                                .handles
+                                .lock()
+                                .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                                .get(original_runtime_id)
+                                .cloned();
+                            if let Some(handle) = live_handle {
+                                let restored = original.clone();
+                                self.update_record(original_runtime_id, |record| {
+                                    *record = restored.clone();
+                                })?;
+                                handle.alive.store(true, Ordering::SeqCst);
+                            } else {
+                                self.update_record(original_runtime_id, |record| {
+                                    record.status = "interrupted".to_string();
+                                    record.is_active = false;
+                                    record.updated_at = Utc::now();
+                                    record.last_error = Some(
+                                        "Native runtime exited while a late background task blocked app termination."
+                                            .to_string(),
+                                    );
+                                })?;
+                            }
+                        }
+                        return Err(error);
+                    }
+                    self.update_record(runtime_id, |record| {
+                        record.status = "interrupted".to_string();
+                        record.is_active = false;
+                        record.updated_at = Utc::now();
+                        record.last_error = Some(format!(
+                            "Native runtime shutdown failed while CCEM was exiting: {error}"
+                        ));
+                    })?;
+                    if let Some(handle) = self
+                        .handles
+                        .lock()
+                        .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                        .get(runtime_id)
+                        .cloned()
+                    {
+                        handle.alive.store(false, Ordering::SeqCst);
+                    }
+                    self.append_event(
+                        runtime_id,
+                        SessionEventPayload::StdErrLine {
+                            line: format!(
+                                "Native runtime shutdown failed during app exit: {error}"
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
+                if !has_forced_tasks {
+                    self.update_record(runtime_id, |record| {
+                        record.status = "stopped".to_string();
+                        record.updated_at = Utc::now();
+                    })?;
+                }
+                closed_runtime_ids.insert(runtime_id.clone());
+            }
+
+            Ok(total)
+        })();
+
+        if result.is_err() {
+            for (runtime_id, request_id, _) in &prepared_handles {
+                self.cancel_child_prepare_stop(runtime_id, request_id);
+            }
+            self.app_termination_in_progress
+                .store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
     pub fn rewind_files(
         self: &Arc<Self>,
         app: &AppHandle,
         runtime_id: &str,
         checkpoint_id: &str,
     ) -> Result<(), String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "rewind files")?;
         let checkpoint_id = checkpoint_id.trim();
         if checkpoint_id.is_empty() {
             return Err("Checkpoint id is required.".to_string());
@@ -1905,6 +2581,11 @@ impl NativeRuntimeManager {
                 status
             ));
         }
+        if !self.active_background_tasks(runtime_id)?.is_empty() {
+            return Err(
+                "Cannot rewind files while Claude background tasks remain active.".to_string(),
+            );
+        }
 
         self.write_to_child_with_reconnect(
             app,
@@ -1919,6 +2600,11 @@ impl NativeRuntimeManager {
         app: &AppHandle,
         runtime_id: &str,
     ) -> Result<(), String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "query usage")?;
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
         let status = handle
             .record
@@ -1936,6 +2622,107 @@ impl NativeRuntimeManager {
         self.write_to_child_with_reconnect(app, runtime_id, handle, &HelperInputCommand::UsageQuery)
     }
 
+    pub fn stop_background_task(
+        self: &Arc<Self>,
+        runtime_id: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "stop a background task")?;
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err("Background task id is required.".to_string());
+        }
+
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned()
+            .filter(|handle| handle.alive.load(Ordering::SeqCst))
+            .ok_or_else(|| {
+                format!("Claude background task {task_id} is no longer attached to a live runtime.")
+            })?;
+        let provider = handle
+            .record
+            .lock()
+            .map_err(|_| "Failed to lock native session record".to_string())?
+            .provider;
+        if provider != NativeProvider::Claude {
+            return Err(
+                "Background task controls are only available for Claude sessions.".to_string(),
+            );
+        }
+
+        let original = handle
+            .background_tasks
+            .lock()
+            .map_err(|_| "Failed to lock native background tasks".to_string())?
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| format!("Claude background task {task_id} is not active."))?;
+        if !original.status.can_stop() {
+            return Err(format!(
+                "Claude background task {task_id} cannot be stopped while it is {:?}.",
+                original.status
+            ));
+        }
+
+        let mut stopping = original.clone();
+        let stop_request_id = format!(
+            "stop-{}-{}",
+            task_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        stopping.status = NativeBackgroundTaskStatus::Stopping;
+        stopping.updated_at = Utc::now();
+        stopping.error = None;
+        stopping.stop_request_id = Some(stop_request_id.clone());
+        stopping.stop_failed = None;
+        self.append_event(
+            runtime_id,
+            SessionEventPayload::BackgroundTaskUpdated { task: stopping },
+        )?;
+        handle
+            .pending_background_task_stops
+            .lock()
+            .map_err(|_| "Failed to lock pending background task stops".to_string())?
+            .insert(
+                task_id.to_string(),
+                (stop_request_id.clone(), original.status),
+            );
+
+        if let Err(error) = self.write_to_child(
+            &handle,
+            &HelperInputCommand::StopTask {
+                task_id,
+                stop_request_id: &stop_request_id,
+            },
+        ) {
+            handle
+                .pending_background_task_stops
+                .lock()
+                .map_err(|_| "Failed to lock pending background task stops".to_string())?
+                .remove(task_id);
+            let mut restored = original;
+            restored.updated_at = Utc::now();
+            restored.error = Some(error.clone());
+            restored.stop_request_id = Some(stop_request_id);
+            restored.stop_failed = Some(true);
+            self.append_event(
+                runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: restored },
+            )?;
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     pub fn update_session_settings(
         self: &Arc<Self>,
         app: &AppHandle,
@@ -1944,8 +2731,23 @@ impl NativeRuntimeManager {
         perm_mode: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         effort: Option<&str>,
+        force_restart: bool,
     ) -> Result<(), String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "update settings")?;
+        let _settings_guard = self
+            .settings_update_lock
+            .lock()
+            .map_err(|_| "Failed to lock native settings updates".to_string())?;
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
+        let request_id = format!(
+            "settings-{}-{}",
+            runtime_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
         if let Some(mode) = perm_mode {
             self.update_record(runtime_id, |record| {
                 record.perm_mode = mode.to_string();
@@ -1954,26 +2756,42 @@ impl NativeRuntimeManager {
             })?;
             notify_browser_policy_changed(app, runtime_id);
         }
-        self.write_to_child_with_reconnect(
+        let original_settings = handle
+            .record
+            .lock()
+            .map_err(|_| "Failed to lock native session record".to_string())?
+            .clone();
+        if env_name.is_some() || effort.is_some() {
+            self.update_record(runtime_id, |record| {
+                stage_runtime_settings_update(record, env_name, effort, &request_id);
+            })?;
+        }
+        if let Err(error) = self.write_to_child_with_reconnect(
             app,
             runtime_id,
             handle,
             &HelperInputCommand::UpdateSettings {
+                request_id: &request_id,
                 env_name,
                 perm_mode,
                 env_vars,
                 effort,
+                force_restart,
             },
-        )?;
-        self.update_record(runtime_id, |record| {
-            if let Some(name) = env_name {
-                record.env_name = name.to_string();
+        ) {
+            if env_name.is_some() || effort.is_some() {
+                self.update_record(runtime_id, |record| {
+                    record.env_name = original_settings.env_name;
+                    record.effort = original_settings.effort;
+                    record.pending_env_name = original_settings.pending_env_name;
+                    record.pending_effort = original_settings.pending_effort;
+                    record.pending_settings_request_id =
+                        original_settings.pending_settings_request_id;
+                    record.updated_at = Utc::now();
+                })?;
             }
-            if let Some(next_effort) = effort {
-                record.effort = non_empty_error(next_effort);
-            }
-            record.updated_at = Utc::now();
-        })?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -2240,9 +3058,23 @@ impl NativeRuntimeManager {
             )
         })?;
         let active_handle = handles.get(&request.runtime_id).cloned();
+        let settings_request_id = format!(
+            "router-settings-{}-{}",
+            request.runtime_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
 
         let mut updated_record = previous_record.clone();
-        updated_record.env_name = updated_router.default_env.clone();
+        if direct_env.is_some() && active_handle.is_some() {
+            stage_runtime_settings_update(
+                &mut updated_record,
+                Some(&updated_router.default_env),
+                None,
+                &settings_request_id,
+            );
+        } else {
+            updated_record.env_name = updated_router.default_env.clone();
+        }
         updated_record.updated_at = Utc::now();
         updated_record.router = Some(updated_router.clone());
         records.insert(request.runtime_id.clone(), updated_record.clone());
@@ -2271,10 +3103,12 @@ impl NativeRuntimeManager {
                 self.write_to_child(
                     handle,
                     &HelperInputCommand::UpdateSettings {
+                        request_id: &settings_request_id,
                         env_name: Some(&updated_router.default_env),
                         perm_mode: None,
                         env_vars: Some(&resolved.env_vars),
                         effort: None,
+                        force_restart: false,
                     },
                 )
                 .map_err(|error| {
@@ -2573,6 +3407,11 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         runtime_perm_mode: Option<&str>,
     ) -> Result<(), String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "update permissions")?;
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
         let display_perm_mode = {
             let record = handle
@@ -2589,6 +3428,11 @@ impl NativeRuntimeManager {
             normalized_runtime_perm_mode.as_deref(),
         )
         .to_string();
+        let request_id = format!(
+            "settings-{}-{}",
+            runtime_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
 
         self.update_record(runtime_id, |record| {
             record.runtime_perm_mode = normalized_runtime_perm_mode.clone();
@@ -2601,10 +3445,12 @@ impl NativeRuntimeManager {
             runtime_id,
             handle,
             &HelperInputCommand::UpdateSettings {
+                request_id: &request_id,
                 env_name: None,
                 perm_mode: Some(&helper_perm_mode),
                 env_vars: None,
                 effort: None,
+                force_restart: false,
             },
         )?;
         Ok(())
@@ -2637,42 +3483,31 @@ impl NativeRuntimeManager {
             }
         };
         let stop_source = normalize_stop_source(source);
-        let stop_status = match self.records.lock() {
+        let (stop_status, provider) = match self.records.lock() {
             Ok(records) => records
                 .get(runtime_id)
-                .map(|record| record.status.clone())
-                .unwrap_or_else(|| "missing_record".to_string()),
+                .map(|record| (record.status.clone(), record.provider))
+                .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?,
             Err(poisoned) => {
                 errors.push("Native runtime records were poisoned during stop".to_string());
                 poisoned
                     .into_inner()
                     .get(runtime_id)
-                    .map(|record| record.status.clone())
-                    .unwrap_or_else(|| "missing_record".to_string())
+                    .map(|record| (record.status.clone(), record.provider))
+                    .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?
             }
         };
-        let stop_handle_generation = match self.handles.lock() {
-            Ok(handles) => handles
-                .get(runtime_id)
-                .map(|handle| handle.generation.to_string())
-                .unwrap_or_else(|| "none".to_string()),
+        let stop_handle = match self.handles.lock() {
+            Ok(handles) => handles.get(runtime_id).cloned(),
             Err(poisoned) => {
                 errors.push("Native runtime handles were poisoned during stop".to_string());
-                poisoned
-                    .into_inner()
-                    .get(runtime_id)
-                    .map(|handle| handle.generation.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                poisoned.into_inner().get(runtime_id).cloned()
             }
         };
-        if let Err(error) = self.append_event(
-            runtime_id,
-            SessionEventPayload::SessionCompleted {
-                reason: "Stopped from desktop workspace.".to_string(),
-            },
-        ) {
-            errors.push(error);
-        }
+        let stop_handle_generation = stop_handle
+            .as_ref()
+            .map(|handle| handle.generation.to_string())
+            .unwrap_or_else(|| "none".to_string());
         if let Err(error) = self.append_lifecycle_event(
             runtime_id,
             "stop_requested",
@@ -2682,7 +3517,43 @@ impl NativeRuntimeManager {
         ) {
             errors.push(error);
         }
-        let stop_handle = match self.request_child_stop(runtime_id) {
+
+        if provider == NativeProvider::Claude {
+            if let Some(handle) = stop_handle {
+                if let Err(error) = self.write_to_child(&handle, &HelperInputCommand::InterruptTurn)
+                {
+                    errors.push(error);
+                } else if let Err(error) = self.append_lifecycle_event(
+                    runtime_id,
+                    "interrupt_written",
+                    format!(
+                        "Native helper generation {} accepted foreground interrupt command.",
+                        handle.generation
+                    ),
+                ) {
+                    errors.push(error);
+                }
+            } else {
+                errors.push(format!(
+                    "Native runtime {runtime_id} helper is not connected"
+                ));
+            }
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            };
+        }
+
+        if let Err(error) = self.append_event(
+            runtime_id,
+            SessionEventPayload::SessionCompleted {
+                reason: "Stopped from desktop workspace.".to_string(),
+            },
+        ) {
+            errors.push(error);
+        }
+        let stop_handle = match self.request_child_stop(runtime_id, false) {
             Ok(handle) => handle,
             Err(error) => {
                 errors.push(error);
@@ -2690,8 +3561,6 @@ impl NativeRuntimeManager {
             }
         };
         if let Some(handle) = stop_handle {
-            // The stopped generation is non-revivable. The next prompt retires its process tree
-            // and reconnects a fresh helper generation before writing user input.
             if let Err(error) = self.update_record(runtime_id, |record| {
                 record.status = "interrupted".to_string();
                 record.updated_at = Utc::now();
@@ -2739,6 +3608,17 @@ impl NativeRuntimeManager {
             .map_err(|_| "Failed to lock native runtime records".to_string())?;
 
         for record in records.values_mut() {
+            if record.pending_settings_request_id.is_some() {
+                record.pending_env_name = None;
+                record.pending_effort = None;
+                record.pending_settings_request_id = None;
+                record.last_error = Some(
+                    "Deferred Claude settings were not applied because the desktop runtime restarted."
+                        .to_string(),
+                );
+                record.updated_at = now;
+                changed += 1;
+            }
             if live_runtime_ids.contains(&record.runtime_id) {
                 continue;
             }
@@ -2775,7 +3655,15 @@ impl NativeRuntimeManager {
         &self,
         runtime_id: &str,
         terminal_type: Option<TerminalType>,
+        allow_background_task_termination: bool,
     ) -> Result<NativeHandoffResult, String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        if self.app_termination_in_progress.load(Ordering::SeqCst) {
+            return Err("CCEM is already closing native runtimes.".to_string());
+        }
         let _reconnect_guard = self
             .reconnect_lock
             .lock()
@@ -2785,6 +3673,12 @@ impl NativeRuntimeManager {
                 "Terminal handoff is not available on this platform; continue in the native workspace runtime.".to_string(),
             );
         }
+
+        self.reject_background_task_termination(
+            runtime_id,
+            "handoff this session",
+            allow_background_task_termination,
+        )?;
 
         let handle = self
             .handles
@@ -2807,6 +3701,12 @@ impl NativeRuntimeManager {
                 .cloned()
                 .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?
         };
+        if record.is_active && !native_status_allows_file_rewind(&record.status) {
+            return Err(
+                "Finish the current foreground turn before continuing this session in Terminal."
+                    .to_string(),
+            );
+        }
 
         let terminal = terminal_type.unwrap_or_else(terminal::get_preferred_terminal);
         self.append_lifecycle_event(
@@ -2819,8 +3719,47 @@ impl NativeRuntimeManager {
             ),
         )?;
 
+        let preparation_id = format!(
+            "pending-terminal-handoff-{}-{}",
+            runtime_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        self.terminal_handoff_preparations
+            .lock()
+            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+            .insert(runtime_id.to_string(), preparation_id.clone());
+
         if record.provider_session_id.is_some() {
-            self.complete_terminal_handoff(record, terminal)?;
+            let prepare_result = match self.request_child_prepare_stop(
+                runtime_id,
+                &preparation_id,
+                true,
+                allow_background_task_termination,
+                true,
+            ) {
+                Ok(Some(handle)) => self.await_child_prepare_stop(
+                    runtime_id,
+                    &preparation_id,
+                    &handle,
+                    allow_background_task_termination,
+                ),
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = prepare_result {
+                self.cancel_terminal_handoff_preparation(runtime_id, Some(&preparation_id));
+                return Err(error);
+            }
+            let result =
+                self.complete_terminal_handoff(record, terminal, allow_background_task_termination);
+            if let Err(error) = result {
+                self.fail_pending_terminal_handoff(runtime_id, &preparation_id, &error)?;
+                return Err(error);
+            }
+            self.terminal_handoff_preparations
+                .lock()
+                .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+                .remove(runtime_id);
             return Ok(NativeHandoffResult {
                 status: NativeHandoffStatus::Opened,
             });
@@ -2832,6 +3771,8 @@ impl NativeRuntimeManager {
             entry.updated_at = Utc::now();
             entry.can_handoff_to_terminal = true;
             entry.pending_handoff_terminal = Some(terminal);
+            entry.pending_handoff_allow_background_task_termination =
+                allow_background_task_termination;
             entry.last_error = None;
         })?;
         self.append_event(
@@ -2853,12 +3794,26 @@ impl NativeRuntimeManager {
         &self,
         runtime_id: &str,
         terminal_type: Option<TerminalType>,
+        allow_background_task_termination: bool,
     ) -> Result<NativeTerminalHandoff, String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        if self.app_termination_in_progress.load(Ordering::SeqCst) {
+            return Err("CCEM is already closing native runtimes.".to_string());
+        }
         if !terminal::external_terminal_launch_supported() {
             return Err(
                 "Terminal handoff is not available on this platform; continue in the native workspace runtime.".to_string(),
             );
         }
+
+        self.reject_background_task_termination(
+            runtime_id,
+            "handoff this session",
+            allow_background_task_termination,
+        )?;
 
         let terminal = terminal_type.unwrap_or_else(terminal::get_preferred_terminal);
         let record = self.current_record(runtime_id)?;
@@ -2868,6 +3823,37 @@ impl NativeRuntimeManager {
             .ok_or_else(|| "Session id is not ready for terminal handoff yet".to_string())?;
         let mut env_vars = self.terminal_env_vars_for_record(&record)?;
         inject_ccem_runtime_env(&mut env_vars, &record.runtime_id);
+        let preparation_id = format!(
+            "terminal-handoff-{}-{}",
+            runtime_id,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        if let Some(handle) = self.request_child_prepare_stop(
+            runtime_id,
+            &preparation_id,
+            true,
+            allow_background_task_termination,
+            false,
+        )? {
+            if let Err(error) = self.await_child_prepare_stop(
+                runtime_id,
+                &preparation_id,
+                &handle,
+                allow_background_task_termination,
+            ) {
+                self.cancel_child_prepare_stop(runtime_id, &preparation_id);
+                return Err(error);
+            }
+        } else if record.is_active && !native_status_allows_file_rewind(&record.status) {
+            return Err(
+                "Finish the current foreground turn before continuing this session in Terminal."
+                    .to_string(),
+            );
+        }
+        self.terminal_handoff_preparations
+            .lock()
+            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+            .insert(runtime_id.to_string(), preparation_id.clone());
 
         Ok(NativeTerminalHandoff {
             runtime_id: record.runtime_id.clone(),
@@ -2882,6 +3868,8 @@ impl NativeRuntimeManager {
             resume_session_id,
             terminal,
             env_vars,
+            allow_background_task_termination,
+            preparation_id: Some(preparation_id),
         })
     }
 
@@ -2889,49 +3877,183 @@ impl NativeRuntimeManager {
         &self,
         runtime_id: &str,
         terminal_type: Option<TerminalType>,
+        allow_background_task_termination: bool,
         launch: impl FnOnce(&NativeTerminalHandoff) -> Result<T, String>,
+        cleanup: impl FnOnce(&T),
     ) -> Result<(NativeTerminalHandoff, T), String> {
         let _reconnect_guard = self
             .reconnect_lock
             .lock()
             .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
-        let handoff = self.prepare_terminal_handoff(runtime_id, terminal_type)?;
+        let handoff = self.prepare_terminal_handoff(
+            runtime_id,
+            terminal_type,
+            allow_background_task_termination,
+        )?;
         let frozen_handle = self.freeze_current_handle_for_handoff(runtime_id)?;
         let launched = match launch(&handoff) {
             Ok(launched) => launched,
             Err(launch_error) => {
-                let cleanup_errors = self.finish_failed_terminal_handoff(
+                self.cancel_terminal_handoff_preparation(
                     runtime_id,
-                    frozen_handle.as_ref(),
-                    &launch_error,
+                    handoff.preparation_id.as_deref(),
                 );
-                if !cleanup_errors.is_empty() {
-                    eprintln!(
-                        "Terminal handoff launch for {runtime_id} failed with cleanup warnings: {}",
-                        cleanup_errors.join("; ")
-                    );
+                if let Some(handle) = frozen_handle.as_ref() {
+                    handle.alive.store(true, Ordering::SeqCst);
                 }
                 return Err(launch_error);
             }
         };
 
-        let mut warnings = self.finish_terminal_handoff_metadata_after_launch(
+        if let Err(error) = self.complete_managed_terminal_handoff(
             runtime_id,
-            handoff.provider.as_str(),
             handoff.terminal,
-        );
-        if let Some(handle) = frozen_handle.as_ref() {
-            if let Err(error) = self.retire_handle_if_current(runtime_id, handle) {
-                warnings.push(error);
+            handoff.allow_background_task_termination,
+            handoff.preparation_id.as_deref(),
+        ) {
+            cleanup(&launched);
+            if let Some(handle) = frozen_handle.as_ref() {
+                if self.is_current_handle(runtime_id, handle).unwrap_or(false) {
+                    handle.alive.store(true, Ordering::SeqCst);
+                }
             }
-        }
-        if !warnings.is_empty() {
-            eprintln!(
-                "Terminal handoff for {runtime_id} opened with cleanup warnings: {}",
-                warnings.join("; ")
-            );
+            return Err(error);
         }
         Ok((handoff, launched))
+    }
+
+    pub fn cancel_terminal_handoff_preparation(
+        &self,
+        runtime_id: &str,
+        preparation_id: Option<&str>,
+    ) {
+        let removed = self
+            .terminal_handoff_preparations
+            .lock()
+            .ok()
+            .and_then(|mut preparations| preparations.remove(runtime_id));
+        if let Some(request_id) = preparation_id.or(removed.as_deref()) {
+            self.cancel_child_prepare_stop(runtime_id, request_id);
+        }
+    }
+
+    fn fail_pending_terminal_handoff(
+        &self,
+        runtime_id: &str,
+        preparation_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
+        self.update_record(runtime_id, |record| {
+            if record.status == "handoff_pending" || record.status == "handoff_finalizing" {
+                record.status = "ready".to_string();
+                record.is_active = true;
+            }
+            record.updated_at = Utc::now();
+            record.pending_handoff_terminal = None;
+            record.pending_handoff_allow_background_task_termination = false;
+            record.last_error = Some(error.to_string());
+        })?;
+        self.append_event(
+            runtime_id,
+            SessionEventPayload::StdErrLine {
+                line: format!("Terminal handoff failed: {}", error),
+            },
+        )
+    }
+
+    pub fn complete_managed_terminal_handoff(
+        &self,
+        runtime_id: &str,
+        terminal: TerminalType,
+        allow_background_task_termination: bool,
+        preparation_id: Option<&str>,
+    ) -> Result<(), String> {
+        let record = self.current_record(runtime_id)?;
+        let expected_preparation = self
+            .terminal_handoff_preparations
+            .lock()
+            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+            .get(runtime_id)
+            .cloned();
+        if expected_preparation.as_deref() != preparation_id {
+            return Err("Terminal handoff preparation is no longer current.".to_string());
+        }
+        let preparation_id =
+            preparation_id.ok_or_else(|| "Terminal handoff preparation is missing.".to_string())?;
+        if let Some(handle) = self.request_child_prepare_stop(
+            runtime_id,
+            preparation_id,
+            true,
+            allow_background_task_termination,
+            true,
+        )? {
+            if let Err(error) = self.await_child_prepare_stop(
+                runtime_id,
+                preparation_id,
+                &handle,
+                allow_background_task_termination,
+            ) {
+                self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
+                return Err(error);
+            }
+        } else {
+            let latest_record = self.current_record(runtime_id)?;
+            if latest_record.is_active && !native_status_allows_file_rewind(&latest_record.status) {
+                self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
+                return Err(
+                    "Finish the current foreground turn before continuing this session in Terminal."
+                        .to_string(),
+                );
+            }
+        }
+        if let Err(error) = self.reject_background_task_termination(
+            runtime_id,
+            "handoff this session",
+            allow_background_task_termination,
+        ) {
+            self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
+            return Err(error);
+        }
+        self.update_record(runtime_id, |entry| {
+            entry.status = "handoff_closing".to_string();
+            entry.updated_at = Utc::now();
+        })?;
+        if let Err(error) = self.shutdown_child(runtime_id, allow_background_task_termination) {
+            self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
+            self.update_record(runtime_id, |entry| {
+                entry.status = record.status.clone();
+                entry.is_active = record.is_active;
+                entry.updated_at = Utc::now();
+                entry.last_error = Some(error.clone());
+            })?;
+            return Err(error);
+        }
+        self.update_record(runtime_id, |entry| {
+            entry.status = "handoff".to_string();
+            entry.is_active = false;
+            entry.updated_at = Utc::now();
+            entry.can_handoff_to_terminal = true;
+            entry.pending_handoff_terminal = None;
+            entry.pending_handoff_allow_background_task_termination = false;
+        })?;
+        self.append_event(
+            runtime_id,
+            SessionEventPayload::Lifecycle {
+                stage: "handoff".to_string(),
+                detail: format!(
+                    "Opened {} session in {}.",
+                    record.provider.as_str(),
+                    terminal.display_name()
+                ),
+            },
+        )?;
+        self.remove_handle(runtime_id)?;
+        self.terminal_handoff_preparations
+            .lock()
+            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+            .remove(runtime_id);
+        Ok(())
     }
 
     fn current_record(&self, runtime_id: &str) -> Result<NativeSessionRecord, String> {
@@ -2958,6 +4080,41 @@ impl NativeRuntimeManager {
             .ok_or_else(|| format!("Native runtime {} not found", runtime_id))
     }
 
+    fn reject_query_mutation_during_transition(
+        &self,
+        runtime_id: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        if self.app_termination_in_progress.load(Ordering::SeqCst) {
+            return Err(format!(
+                "Cannot {action} while CCEM is closing native runtimes."
+            ));
+        }
+        if self
+            .terminal_handoff_preparations
+            .lock()
+            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+            .contains_key(runtime_id)
+        {
+            return Err(format!(
+                "Cannot {action} while this native session is preparing to continue in Terminal."
+            ));
+        }
+        let status = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .map(|record| record.status.clone())
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if is_query_mutation_terminal_status(&status) || status.starts_with("handoff_") {
+            return Err(format!(
+                "Cannot {action} while native session {runtime_id} is {status}."
+            ));
+        }
+        Ok(())
+    }
+
     fn terminal_env_vars_for_record(
         &self,
         record: &NativeSessionRecord,
@@ -2980,16 +4137,36 @@ impl NativeRuntimeManager {
         &self,
         record: NativeSessionRecord,
         terminal: TerminalType,
+        allow_background_task_termination: bool,
     ) -> Result<(), String> {
         let runtime_id = record.runtime_id.clone();
         let provider_session_id = record
             .provider_session_id
             .clone()
             .ok_or_else(|| "Session id is not ready for terminal handoff yet".to_string())?;
+        self.reject_background_task_termination(
+            &runtime_id,
+            "handoff this session",
+            allow_background_task_termination,
+        )?;
 
         let mut env_vars = self.terminal_env_vars_for_record(&record)?;
         inject_ccem_runtime_env(&mut env_vars, &runtime_id);
         let frozen_handle = self.freeze_current_handle_for_handoff(&runtime_id)?;
+
+        self.update_record(&runtime_id, |entry| {
+            entry.status = "handoff_closing".to_string();
+            entry.updated_at = Utc::now();
+        })?;
+        if let Err(error) = self.shutdown_child(&runtime_id, allow_background_task_termination) {
+            self.update_record(&runtime_id, |entry| {
+                entry.status = record.status.clone();
+                entry.is_active = record.is_active;
+                entry.updated_at = Utc::now();
+                entry.last_error = Some(error.clone());
+            })?;
+            return Err(error);
+        }
 
         if let Err(error) = launch_terminal_for_native_handoff(
             terminal,
@@ -3053,6 +4230,7 @@ impl NativeRuntimeManager {
             entry.updated_at = Utc::now();
             entry.can_handoff_to_terminal = true;
             entry.pending_handoff_terminal = None;
+            entry.pending_handoff_allow_background_task_termination = false;
         }) {
             errors.push(error);
         }
@@ -3104,6 +4282,7 @@ impl NativeRuntimeManager {
             record.status = "interrupted".to_string();
             record.is_active = false;
             record.pending_handoff_terminal = None;
+            record.pending_handoff_allow_background_task_termination = false;
             record.updated_at = Utc::now();
             record.last_error = Some(launch_error.to_string());
         }) {
@@ -3267,6 +4446,12 @@ impl NativeRuntimeManager {
                 runtime_id.to_string(),
                 start_seq,
             )),
+            background_tasks: Mutex::new(HashMap::new()),
+            terminal_background_task_ids: Mutex::new(HashSet::new()),
+            background_tool_use_ids: Mutex::new(HashSet::new()),
+            completed_background_tool_use_ids: Mutex::new(HashSet::new()),
+            pending_background_task_stops: Mutex::new(HashMap::new()),
+            teardown_preparations: Mutex::new(HashMap::new()),
             helper_env_vars: options.helper_env_vars.clone(),
             terminal_env_vars: options.terminal_env_vars.clone(),
             claude_path: options.claude_path.clone(),
@@ -3570,6 +4755,7 @@ impl NativeRuntimeManager {
                 provider_session_id,
             } => {
                 let mut pending_handoff_terminal = None;
+                let mut pending_handoff_allow_background_task_termination = false;
                 let provider = self
                     .records
                     .lock()
@@ -3582,6 +4768,8 @@ impl NativeRuntimeManager {
                     record.provider_session_id = Some(provider_session_id.clone());
                     record.can_handoff_to_terminal = terminal::external_terminal_launch_supported();
                     pending_handoff_terminal = record.pending_handoff_terminal;
+                    pending_handoff_allow_background_task_termination =
+                        record.pending_handoff_allow_background_task_termination;
                     record.updated_at = Utc::now();
                 })?;
 
@@ -3595,29 +4783,59 @@ impl NativeRuntimeManager {
                 }
 
                 if let Some(terminal) = pending_handoff_terminal {
-                    let record = self
-                        .records
-                        .lock()
-                        .map_err(|_| "Failed to lock native runtime records".to_string())?
-                        .get(runtime_id)
-                        .cloned()
-                        .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
-                    match self.complete_terminal_handoff(record, terminal) {
-                        Ok(()) => destroy_browser_session(app, runtime_id),
-                        Err(error) => {
-                            self.update_record(runtime_id, |record| {
-                                record.status = "ready".to_string();
-                                record.is_active = true;
-                                record.updated_at = Utc::now();
-                                record.pending_handoff_terminal = None;
-                                record.last_error = Some(error.clone());
+                    let preparation_id = {
+                        let mut preparations =
+                            self.terminal_handoff_preparations.lock().map_err(|_| {
+                                "Failed to lock native terminal handoff state".to_string()
                             })?;
-                            self.append_event(
-                                runtime_id,
-                                SessionEventPayload::StdErrLine {
-                                    line: format!("Terminal handoff failed: {}", error),
-                                },
-                            )?;
+                        preparations
+                            .entry(runtime_id.to_string())
+                            .or_insert_with(|| {
+                                format!(
+                                    "pending-terminal-handoff-{}-{}",
+                                    runtime_id,
+                                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                                )
+                            })
+                            .clone()
+                    };
+                    match self.request_child_prepare_stop(
+                        runtime_id,
+                        &preparation_id,
+                        true,
+                        pending_handoff_allow_background_task_termination,
+                        true,
+                    ) {
+                        Ok(Some(_)) => {
+                            self.update_record(runtime_id, |record| {
+                                record.status = "handoff_finalizing".to_string();
+                                record.updated_at = Utc::now();
+                            })?;
+                        }
+                        Ok(None) => {
+                            let record = self.current_record(runtime_id)?;
+                            let result = self.complete_terminal_handoff(
+                                record,
+                                terminal,
+                                pending_handoff_allow_background_task_termination,
+                            );
+                            self.terminal_handoff_preparations
+                                .lock()
+                                .map_err(|_| {
+                                    "Failed to lock native terminal handoff state".to_string()
+                                })?
+                                .remove(runtime_id);
+                            match result {
+                                Ok(()) => destroy_browser_session(app, runtime_id),
+                                Err(error) => self.fail_pending_terminal_handoff(
+                                    runtime_id,
+                                    &preparation_id,
+                                    &error,
+                                )?,
+                            }
+                        }
+                        Err(error) => {
+                            self.fail_pending_terminal_handoff(runtime_id, &preparation_id, &error)?
                         }
                     }
                 }
@@ -3631,7 +4849,15 @@ impl NativeRuntimeManager {
                     .filter(|value| !value.is_empty());
                 let mut applied = false;
                 let mut next_status = status.clone();
+                let handoff_in_progress = self
+                    .terminal_handoff_preparations
+                    .lock()
+                    .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+                    .contains_key(runtime_id);
                 self.update_record(runtime_id, |record| {
+                    if handoff_in_progress && status != "error" {
+                        return;
+                    }
                     if status == "error"
                         && is_recoverable_native_helper_error(record, normalized_detail.as_deref())
                     {
@@ -3697,7 +4923,153 @@ impl NativeRuntimeManager {
                     args,
                 },
             ),
+            HelperOutputEvent::TeardownPrepared {
+                request_id,
+                ready,
+                detail,
+            } => {
+                let pending_handoff = {
+                    let expected = self
+                        .terminal_handoff_preparations
+                        .lock()
+                        .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+                        .get(runtime_id)
+                        .cloned();
+                    if expected.as_deref() != Some(request_id.as_str()) {
+                        None
+                    } else {
+                        let record = self.current_record(runtime_id)?;
+                        if record.status == "handoff_finalizing" {
+                            record.pending_handoff_terminal.map(|terminal| {
+                                (
+                                    terminal,
+                                    record.pending_handoff_allow_background_task_termination,
+                                )
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some((terminal, allow_background_task_termination)) = pending_handoff {
+                    if !ready {
+                        let error = detail
+                            .unwrap_or_else(|| "Native helper is not safe to close.".to_string());
+                        return self.fail_pending_terminal_handoff(runtime_id, &request_id, &error);
+                    }
+                    let record = self.current_record(runtime_id)?;
+                    let result = self.complete_terminal_handoff(
+                        record,
+                        terminal,
+                        allow_background_task_termination,
+                    );
+                    self.terminal_handoff_preparations
+                        .lock()
+                        .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
+                        .remove(runtime_id);
+                    match result {
+                        Ok(()) => {
+                            destroy_browser_session(app, runtime_id);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            return self.fail_pending_terminal_handoff(
+                                runtime_id,
+                                &request_id,
+                                &error,
+                            );
+                        }
+                    }
+                }
+
+                let handles = self
+                    .handles
+                    .lock()
+                    .map_err(|_| "Failed to lock native runtime handles".to_string())?;
+                let Some(handle) = handles.get(runtime_id) else {
+                    return Ok(());
+                };
+                handle
+                    .teardown_preparations
+                    .lock()
+                    .map_err(|_| "Failed to lock native teardown preparation".to_string())?
+                    .insert(
+                        request_id,
+                        if ready {
+                            Ok(())
+                        } else {
+                            Err(detail.unwrap_or_else(|| {
+                                "Native helper is not safe to close.".to_string()
+                            }))
+                        },
+                    );
+                Ok(())
+            }
+            HelperOutputEvent::BackgroundTaskStopFailed {
+                task_id,
+                stop_request_id,
+                error,
+            } => self.restore_rejected_background_task_stop(
+                runtime_id,
+                &task_id,
+                &stop_request_id,
+                &error,
+            ),
         }
+    }
+
+    fn restore_rejected_background_task_stop(
+        &self,
+        runtime_id: &str,
+        task_id: &str,
+        stop_request_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned()
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        let prior_status = {
+            let mut pending_stops = handle
+                .pending_background_task_stops
+                .lock()
+                .map_err(|_| "Failed to lock pending background task stops".to_string())?;
+            let Some((request_id, status)) = pending_stops.get(task_id).cloned() else {
+                return Ok(());
+            };
+            if request_id != stop_request_id {
+                return Ok(());
+            }
+            pending_stops.remove(task_id);
+            status
+        };
+        let restored = {
+            let tasks = handle
+                .background_tasks
+                .lock()
+                .map_err(|_| "Failed to lock native background tasks".to_string())?;
+            let Some(current) = tasks.get(task_id) else {
+                return Ok(());
+            };
+            if current.status != NativeBackgroundTaskStatus::Stopping
+                || current.stop_request_id.as_deref() != Some(stop_request_id)
+            {
+                return Ok(());
+            }
+            let mut restored = current.clone();
+            restored.status = prior_status;
+            restored.updated_at = Utc::now();
+            restored.error = Some(error.trim().to_string());
+            restored.stop_failed = Some(true);
+            restored
+        };
+        self.append_event(
+            runtime_id,
+            SessionEventPayload::BackgroundTaskUpdated { task: restored },
+        )
     }
 
     fn handle_browser_tool_request(
@@ -3819,6 +5191,16 @@ impl NativeRuntimeManager {
         }
         handle.alive.store(false, Ordering::SeqCst);
 
+        let exit_reason = format!(
+            "Native runtime sidecar exited unexpectedly{}.",
+            exit_code
+                .map(|code| format!(" with code {}", code))
+                .unwrap_or_default()
+        );
+        if let Err(error) = self.interrupt_background_tasks(runtime_id, &exit_reason) {
+            errors.push(error);
+        }
+
         let expected_terminal = match self.records.lock() {
             Ok(records) => records
                 .get(runtime_id)
@@ -3835,17 +5217,21 @@ impl NativeRuntimeManager {
         };
 
         if !expected_terminal {
-            let exit_reason = format!(
-                "Native runtime sidecar exited unexpectedly{}.",
-                exit_code
-                    .map(|code| format!(" with code {}", code))
-                    .unwrap_or_default()
-            );
             if let Err(error) = self.update_record(runtime_id, |record| {
                 let recoverable = is_recoverable_native_process_exit(record);
                 record.status = if recoverable { "interrupted" } else { "error" }.to_string();
                 record.is_active = false;
                 record.pending_handoff_terminal = None;
+                record.pending_handoff_allow_background_task_termination = false;
+                if record.pending_settings_request_id.is_some() {
+                    record.pending_env_name = None;
+                    record.pending_effort = None;
+                    record.pending_settings_request_id = None;
+                    record.last_error = Some(
+                        "Deferred Claude settings were not applied because the helper exited."
+                            .to_string(),
+                    );
+                }
                 record.can_handoff_to_terminal =
                     recoverable && terminal::external_terminal_launch_supported();
                 record.updated_at = Utc::now();
@@ -3986,6 +5372,7 @@ impl NativeRuntimeManager {
     fn request_child_stop(
         &self,
         runtime_id: &str,
+        force_background_tasks: bool,
     ) -> Result<Option<Arc<NativeSessionHandle>>, String> {
         let handle = match self.handles.lock() {
             Ok(handles) => handles.get(runtime_id).cloned(),
@@ -4010,7 +5397,12 @@ impl NativeRuntimeManager {
             return Ok(None);
         }
 
-        match self.write_to_child(&handle, &HelperInputCommand::Stop) {
+        match self.write_to_child(
+            &handle,
+            &HelperInputCommand::Stop {
+                force_background_tasks,
+            },
+        ) {
             Ok(()) => {
                 if let Err(error) = self.append_lifecycle_event(
                     runtime_id,
@@ -4040,6 +5432,101 @@ impl NativeRuntimeManager {
                 Ok(None)
             }
         }
+    }
+
+    fn request_child_prepare_stop(
+        &self,
+        runtime_id: &str,
+        request_id: &str,
+        require_idle: bool,
+        force_background_tasks: bool,
+        finalize: bool,
+    ) -> Result<Option<Arc<NativeSessionHandle>>, String> {
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned();
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let has_child = handle
+            .child
+            .lock()
+            .map_err(|_| "Failed to lock native sidecar child".to_string())?
+            .is_some();
+        if !has_child {
+            return Ok(None);
+        }
+        handle
+            .teardown_preparations
+            .lock()
+            .map_err(|_| "Failed to lock native teardown preparation".to_string())?
+            .remove(request_id);
+        self.write_to_child(
+            &handle,
+            &HelperInputCommand::PrepareStop {
+                request_id,
+                require_idle,
+                force_background_tasks,
+                finalize,
+            },
+        )?;
+        Ok(Some(handle))
+    }
+
+    fn await_child_prepare_stop(
+        &self,
+        runtime_id: &str,
+        request_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        allow_background_tasks: bool,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + NATIVE_STOP_GRACE_PERIOD;
+        while std::time::Instant::now() < deadline {
+            if !self.is_current_handle(runtime_id, handle)? {
+                return Err(format!(
+                    "Native runtime {runtime_id} exited while preparing app termination."
+                ));
+            }
+            if !allow_background_tasks && !self.active_background_tasks(runtime_id)?.is_empty() {
+                return Err(
+                    "A Claude background task started while preparing app termination.".to_string(),
+                );
+            }
+            if let Some(result) = handle
+                .teardown_preparations
+                .lock()
+                .map_err(|_| "Failed to lock native teardown preparation".to_string())?
+                .remove(request_id)
+            {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err(format!(
+            "Native runtime {runtime_id} did not become safe to close before the deadline."
+        ))
+    }
+
+    fn cancel_child_prepare_stop(&self, runtime_id: &str, request_id: &str) {
+        let handle = self
+            .handles
+            .lock()
+            .ok()
+            .and_then(|handles| handles.get(runtime_id).cloned());
+        let Some(handle) = handle else {
+            return;
+        };
+        if let Ok(mut preparations) = handle.teardown_preparations.lock() {
+            preparations.remove(request_id);
+        }
+        let _ = self.write_to_child(
+            &handle,
+            &HelperInputCommand::CancelPrepareStop { request_id },
+        );
+        handle.alive.store(true, Ordering::SeqCst);
     }
 
     fn schedule_force_kill_after(
@@ -4237,6 +5724,24 @@ impl NativeRuntimeManager {
 
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {
         let last_error = payload_last_error(&payload);
+        let settings_change = match &payload {
+            SessionEventPayload::RuntimeSettingsChanged {
+                state,
+                request_id,
+                env_name,
+                effort,
+                pending_env_name,
+                pending_effort,
+            } => Some((
+                state.clone(),
+                request_id.clone(),
+                env_name.clone(),
+                effort.clone(),
+                pending_env_name.clone(),
+                pending_effort.clone(),
+            )),
+            _ => None,
+        };
         let handles = self
             .handles
             .lock()
@@ -4244,6 +5749,9 @@ impl NativeRuntimeManager {
         let Some(handle) = handles.get(runtime_id) else {
             return Ok(());
         };
+        if !apply_background_task_event(handle, &payload)? {
+            return Ok(());
+        }
         {
             let mut store = handle
                 .events
@@ -4258,6 +5766,27 @@ impl NativeRuntimeManager {
             }
         }
         drop(handles);
+        if let Some((state, request_id, env_name, effort, pending_env_name, pending_effort)) =
+            settings_change
+        {
+            self.update_record(runtime_id, |record| {
+                let request_matches =
+                    request_id.is_some() && request_id == record.pending_settings_request_id;
+                if state == "applied" {
+                    record.env_name = env_name;
+                    record.effort = effort;
+                    if request_matches || record.pending_settings_request_id.is_none() {
+                        record.pending_env_name = None;
+                        record.pending_effort = None;
+                        record.pending_settings_request_id = None;
+                    }
+                } else if state == "deferred" && request_matches {
+                    record.pending_env_name = pending_env_name;
+                    record.pending_effort = pending_effort;
+                }
+                record.updated_at = Utc::now();
+            })?;
+        }
         if let Some(message) = last_error {
             self.set_last_error(runtime_id, message)?;
         }
@@ -4466,6 +5995,10 @@ impl NativeRuntimeManager {
     }
 
     fn kill_child(&self, runtime_id: &str) -> Result<(), String> {
+        self.interrupt_background_tasks(
+            runtime_id,
+            "Claude runtime closed before the background task settled.",
+        )?;
         let handles = self
             .handles
             .lock()
@@ -4484,68 +6017,43 @@ impl NativeRuntimeManager {
         Ok(())
     }
 
-    /// Tear down every native helper child this app still OWNS.
-    ///
-    /// Runtimes whose record shows a COMPLETED terminal handoff are skipped:
-    /// their process now belongs to the external terminal session. Every
-    /// owned child is asked to stop, its stdin pipe is closed (the helper
-    /// exits on its own on stdin EOF), and any survivor is TERM'd then
-    /// KILL'd. Only real app exit (`RunEvent::Exit`) may call this — window
-    /// close-to-tray keeps helpers alive on purpose.
-    pub fn shutdown_all_owned(&self) {
-        let handles: Vec<Arc<NativeSessionHandle>> = match self.handles.lock() {
-            Ok(handles) => handles.values().cloned().collect(),
-            Err(_) => return,
+    fn shutdown_child(&self, runtime_id: &str, force_background_tasks: bool) -> Result<(), String> {
+        if !runtime_child_is_owned(&self.current_record(runtime_id)?) {
+            return Ok(());
+        }
+        self.reject_background_task_termination(
+            runtime_id,
+            "close this native runtime",
+            force_background_tasks,
+        )?;
+        let Some(handle) = self.request_child_stop(runtime_id, force_background_tasks)? else {
+            self.reject_background_task_termination(
+                runtime_id,
+                "close this native runtime",
+                force_background_tasks,
+            )?;
+            self.kill_child(runtime_id)?;
+            return Ok(());
         };
 
-        for handle in handles {
-            let owned = handle
-                .record
-                .lock()
-                .map(|record| runtime_child_is_owned(&record))
-                .unwrap_or(true);
-            if !owned {
-                continue;
+        let deadline = std::time::Instant::now() + NATIVE_STOP_GRACE_PERIOD;
+        while std::time::Instant::now() < deadline {
+            if !self.is_current_handle(runtime_id, &handle)? {
+                return Ok(());
             }
-
-            let runtime_id = handle
-                .record
-                .lock()
-                .ok()
-                .map(|record| record.runtime_id.clone());
-            let Some(runtime_id) = runtime_id else {
-                continue;
-            };
-
-            handle.alive.store(false, Ordering::SeqCst);
-            // Graceful first (mirrors stop_session): ask the helper to stop
-            // so it can abort any in-flight SDK turn, then close its stdin
-            // so the helper's stdin-EOF handler can flush and exit.
-            let _ = self.write_to_child(&handle, &HelperInputCommand::Stop);
-            let child_pid = handle
-                .child
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take())
-                .map(|child| {
-                    let pid = child.pid();
-                    // Dropping the child closes the helper's stdin pipe.
-                    drop(child);
-                    pid
-                });
-
-            if let Some(pid) = child_pid {
-                if !wait_for_process_exit(pid, NATIVE_EXIT_GRACE_PERIOD) {
-                    let _ = crate::runtime::terminate_process(pid);
-                }
+            if !force_background_tasks && !self.active_background_tasks(runtime_id)?.is_empty() {
+                handle.alive.store(true, Ordering::SeqCst);
+                return Err(ACTIVE_BACKGROUND_TASK_SHUTDOWN_ERROR.to_string());
             }
-
-            let _ = self.update_record(&runtime_id, |record| {
-                record.status = "interrupted".to_string();
-                record.is_active = false;
-                record.updated_at = Utc::now();
-            });
+            std::thread::sleep(Duration::from_millis(25));
         }
+
+        self.reject_background_task_termination(
+            runtime_id,
+            "close this native runtime",
+            force_background_tasks,
+        )?;
+        self.kill_child(runtime_id)
     }
 
     fn update_record<F>(&self, runtime_id: &str, update: F) -> Result<(), String>
@@ -4635,12 +6143,15 @@ impl NativeRuntimeManager {
                 perm_mode: record.perm_mode,
                 runtime_perm_mode: record.runtime_perm_mode,
                 effort: record.effort,
+                pending_env_name: record.pending_env_name,
+                pending_effort: record.pending_effort,
                 status: record.status,
                 created_at: record.created_at,
                 updated_at: record.updated_at,
                 is_active: record.is_active,
                 last_event_seq: None,
                 can_handoff_to_terminal: record.can_handoff_to_terminal,
+                background_tasks: Vec::new(),
                 last_error: record.last_error,
                 router: record.router.as_ref().map(SessionRouterState::from),
             }))
@@ -4778,7 +6289,20 @@ fn is_context_usage_probe_error(message: &str) -> bool {
 fn is_native_terminal_status(status: &str) -> bool {
     matches!(
         status,
-        "stopped" | "error" | "handoff" | "interrupted" | "closed_idle"
+        "stopped"
+            | "error"
+            | "handoff"
+            | "handoff_closing"
+            | "app_closing"
+            | "interrupted"
+            | "closed_idle"
+    )
+}
+
+fn is_query_mutation_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "stopped" | "error" | "handoff" | "handoff_closing" | "app_closing"
     )
 }
 
@@ -5079,21 +6603,24 @@ fn dedupe_nonempty(values: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::unix_descendant_process_ids;
     use super::{
         apply_session_router_patch, authorize_browser_tool_for_record, clear_terminal_launches,
         drain_helper_output_lines, is_retryable_native_child_write_error,
         launch_terminal_for_native_handoff, merge_helper_env_path,
-        merge_path_values_with_separator,
-        native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
-        reactivate_record_for_reconnect, read_native_runtime_state_from,
-        recoverable_record_after_helper_removed, router_launch_decision,
-        runtime_child_is_owned, session_router_patch_oauth_validation_enabled,
+        merge_path_values_with_separator, native_session_allows_dangerously_skip_permissions,
+        native_status_allows_file_rewind, reactivate_record_for_reconnect,
+        read_native_runtime_state_from, recoverable_record_after_helper_removed,
+        router_launch_decision, runtime_child_is_owned,
+        session_router_patch_oauth_validation_enabled, stage_runtime_settings_update,
         take_terminal_launches, validate_router_create_selection,
         validate_router_launch_draft_profile, HelperInputCommand, NativeProvider,
         NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
         NativeTransport, PromptImage, RouterLaunchDecision, RouterLaunchDraft,
     };
     use crate::event_bus::{
+        NativeBackgroundTask, NativeBackgroundTaskStatus, NativeBackgroundTaskUsage,
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
         TodoSnapshotV1,
     };
@@ -5117,6 +6644,24 @@ mod tests {
 
     fn native_session_handle(record: NativeSessionRecord) -> Arc<NativeSessionHandle> {
         native_session_handle_with_terminal_env(record, HashMap::new())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_stop_enumerates_descendants_children_first() {
+        let mut descendants =
+            unix_descendant_process_ids(100, "100 1\n101 100\n102 101\n103 100\n104 999\n");
+        let child_index = descendants
+            .iter()
+            .position(|pid| *pid == 101)
+            .expect("direct child");
+        let grandchild_index = descendants
+            .iter()
+            .position(|pid| *pid == 102)
+            .expect("grandchild");
+        assert!(grandchild_index < child_index);
+        descendants.sort_unstable();
+        assert_eq!(descendants, vec![101, 102, 103]);
     }
 
     fn native_session_handle_with_generation(
@@ -5144,6 +6689,12 @@ mod tests {
             record: Mutex::new(record),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(&runtime_id)),
+            background_tasks: Mutex::new(HashMap::new()),
+            terminal_background_task_ids: Mutex::new(HashSet::new()),
+            background_tool_use_ids: Mutex::new(HashSet::new()),
+            completed_background_tool_use_ids: Mutex::new(HashSet::new()),
+            pending_background_task_stops: Mutex::new(HashMap::new()),
+            teardown_preparations: Mutex::new(HashMap::new()),
             helper_env_vars: HashMap::new(),
             terminal_env_vars,
             claude_path: None,
@@ -5166,12 +6717,16 @@ mod tests {
             perm_mode: "dev".to_string(),
             runtime_perm_mode: None,
             effort: None,
+            pending_env_name: None,
+            pending_effort: None,
+            pending_settings_request_id: None,
             status: "processing".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             is_active: true,
             can_handoff_to_terminal: false,
             pending_handoff_terminal: None,
+            pending_handoff_allow_background_task_termination: false,
             last_error: None,
             router: None,
         };
@@ -5191,6 +6746,10 @@ mod tests {
             ),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            settings_update_lock: Mutex::new(()),
+            app_termination_lock: Mutex::new(()),
+            app_termination_in_progress: AtomicBool::new(false),
+            terminal_handoff_preparations: Mutex::new(HashMap::new()),
         };
         manager
     }
@@ -5219,6 +6778,10 @@ mod tests {
             ))),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            settings_update_lock: Mutex::new(()),
+            app_termination_lock: Mutex::new(()),
+            app_termination_in_progress: AtomicBool::new(false),
+            terminal_handoff_preparations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -5249,31 +6812,35 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_all_owned_marks_owned_runtimes_interrupted() {
-        let manager = manager_with_handle("shutdown-owned");
-        manager.shutdown_all_owned();
-
-        let record = manager.current_record("shutdown-owned").expect("record");
-        assert_eq!(record.status, "interrupted");
-        assert!(!record.is_active);
-    }
-
-    #[test]
-    fn shutdown_all_owned_skips_completed_handoffs() {
-        let manager = manager_with_handle("shutdown-handed-off");
+    fn shutdown_child_skips_completed_handoff_ownership() {
+        let runtime_id = "shutdown-handed-off";
+        let manager = manager_with_handle(runtime_id);
         manager
-            .update_record("shutdown-handed-off", |record| {
+            .update_record(runtime_id, |record| {
                 record.status = "handoff".to_string();
                 record.is_active = false;
             })
             .expect("mark record handed off");
-        manager.shutdown_all_owned();
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![background_task(
+                        "task-owned-by-terminal",
+                        NativeBackgroundTaskStatus::Running,
+                    )],
+                },
+            )
+            .expect("append handed-off background task");
 
-        let record = manager
-            .current_record("shutdown-handed-off")
-            .expect("record");
+        manager
+            .shutdown_child(runtime_id, true)
+            .expect("unowned runtime is left untouched");
+
+        let record = manager.current_record(runtime_id).expect("record");
         assert_eq!(record.status, "handoff");
         assert!(!record.is_active);
+        assert_eq!(manager.active_background_tasks(runtime_id).unwrap().len(), 1);
     }
 
     fn native_record(runtime_id: &str, status: &str, is_active: bool) -> NativeSessionRecord {
@@ -5288,14 +6855,45 @@ mod tests {
             perm_mode: "dev".to_string(),
             runtime_perm_mode: None,
             effort: None,
+            pending_env_name: None,
+            pending_effort: None,
+            pending_settings_request_id: None,
             status: status.to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             is_active,
             can_handoff_to_terminal: false,
             pending_handoff_terminal: None,
+            pending_handoff_allow_background_task_termination: false,
             last_error: None,
             router: None,
+        }
+    }
+
+    fn background_task(task_id: &str, status: NativeBackgroundTaskStatus) -> NativeBackgroundTask {
+        NativeBackgroundTask {
+            task_id: task_id.to_string(),
+            tool_use_id: Some(format!("tool-{task_id}")),
+            task_type: Some("bash".to_string()),
+            subagent_type: None,
+            workflow_name: None,
+            description: format!("Background task {task_id}"),
+            status,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            progress_summary: None,
+            last_tool_name: None,
+            usage: Some(NativeBackgroundTaskUsage {
+                total_tokens: 0,
+                tool_uses: 1,
+                duration_ms: 10,
+            }),
+            terminal_summary: None,
+            output_file: None,
+            error: None,
+            skip_transcript: Some(true),
+            stop_request_id: None,
+            stop_failed: None,
         }
     }
 
@@ -5995,6 +7593,33 @@ mod tests {
     }
 
     #[test]
+    fn helper_teardown_preparation_ack_is_correlated_by_request_id() {
+        let runtime_id = "native-teardown-prepared";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"teardown_prepared","request_id":"prepare-1","ready":true}"#,
+            )
+            .expect("process teardown preparation");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("handle");
+        assert_eq!(
+            handle
+                .teardown_preparations
+                .lock()
+                .expect("preparations")
+                .remove("prepare-1"),
+            Some(Ok(()))
+        );
+    }
+
+    #[test]
     fn helper_token_usage_records_official_token_counts() {
         let runtime_id = "native-token-usage";
         let manager = manager_with_handle(runtime_id);
@@ -6252,10 +7877,18 @@ mod tests {
             ))),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            settings_update_lock: Mutex::new(()),
+            app_termination_lock: Mutex::new(()),
+            app_termination_in_progress: AtomicBool::new(false),
+            terminal_handoff_preparations: Mutex::new(HashMap::new()),
         };
 
         let handoff = manager
-            .prepare_terminal_handoff(runtime_id, Some(crate::terminal::TerminalType::TerminalApp))
+            .prepare_terminal_handoff(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                false,
+            )
             .expect("handoff should be ready");
 
         assert_eq!(handoff.resume_session_id, "provider-session-bridge");
@@ -6275,6 +7908,28 @@ mod tests {
                 .map(String::as_str),
             Some("connected")
         );
+        assert!(handoff.preparation_id.is_some());
+    }
+
+    #[test]
+    fn terminal_handoff_rejects_a_processing_foreground_without_a_live_helper_ack() {
+        let runtime_id = "native-handoff-processing";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .update_record(runtime_id, |record| {
+                record.status = "processing".to_string();
+                record.provider_session_id = Some("provider-session-processing".to_string());
+            })
+            .expect("set processing handoff record");
+
+        let error = manager
+            .prepare_terminal_handoff(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                false,
+            )
+            .expect_err("processing foreground must block handoff");
+        assert!(error.contains("Finish the current foreground turn"));
     }
 
     #[test]
@@ -6473,9 +8128,58 @@ mod tests {
 
     #[test]
     fn helper_stop_serializes_shutdown_command() {
-        let serialized = serde_json::to_value(HelperInputCommand::Stop).expect("serialize stop");
+        let serialized = serde_json::to_value(HelperInputCommand::Stop {
+            force_background_tasks: true,
+        })
+        .expect("serialize stop");
 
         assert_eq!(serialized["type"], "stop");
+        assert_eq!(serialized["force_background_tasks"], true);
+
+        let prepare = serde_json::to_value(HelperInputCommand::PrepareStop {
+            request_id: "prepare-1",
+            require_idle: true,
+            force_background_tasks: true,
+            finalize: true,
+        })
+        .expect("serialize prepare stop");
+        let cancel = serde_json::to_value(HelperInputCommand::CancelPrepareStop {
+            request_id: "prepare-1",
+        })
+        .expect("serialize cancel prepare stop");
+        assert_eq!(prepare["type"], "prepare_stop");
+        assert_eq!(prepare["request_id"], "prepare-1");
+        assert_eq!(prepare["require_idle"], true);
+        assert_eq!(prepare["force_background_tasks"], true);
+        assert_eq!(prepare["finalize"], true);
+        assert_eq!(cancel["type"], "cancel_prepare_stop");
+        assert_eq!(cancel["request_id"], "prepare-1");
+    }
+
+    #[test]
+    fn app_termination_idle_freeze_is_claude_only() {
+        assert!(super::app_termination_requires_idle_freeze(
+            NativeProvider::Claude
+        ));
+        assert!(!super::app_termination_requires_idle_freeze(
+            NativeProvider::Codex
+        ));
+    }
+
+    #[test]
+    fn helper_foreground_interrupt_and_single_task_stop_are_distinct_commands() {
+        let interrupt = serde_json::to_value(HelperInputCommand::InterruptTurn)
+            .expect("serialize foreground interrupt");
+        let stop_task = serde_json::to_value(HelperInputCommand::StopTask {
+            task_id: "task-1",
+            stop_request_id: "stop-task-1",
+        })
+        .expect("serialize task stop");
+
+        assert_eq!(interrupt["type"], "interrupt_turn");
+        assert_eq!(stop_task["type"], "stop_task");
+        assert_eq!(stop_task["task_id"], "task-1");
+        assert_eq!(stop_task["stop_request_id"], "stop-task-1");
     }
 
     #[test]
@@ -6504,6 +8208,668 @@ mod tests {
         ] {
             assert!(!native_status_allows_file_rewind(status), "{status}");
         }
+    }
+
+    #[test]
+    fn live_summary_replaces_background_tasks_and_terminal_state_never_regresses() {
+        let runtime_id = format!(
+            "native-background-summary-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let mut running = background_task("task-1", NativeBackgroundTaskStatus::Running);
+        running.tool_use_id = None;
+
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![running.clone()],
+                },
+            )
+            .expect("append running snapshot");
+        assert_eq!(
+            manager
+                .summary_for(&runtime_id)
+                .expect("running summary")
+                .background_tasks,
+            vec![running.clone()]
+        );
+
+        let mut completed = running.clone();
+        completed.status = NativeBackgroundTaskStatus::Completed;
+        completed.terminal_summary = Some("done".to_string());
+        completed.updated_at = Utc::now();
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated {
+                    task: completed.clone(),
+                },
+            )
+            .expect("append terminal task");
+        let terminal_seq = manager
+            .summary_for(&runtime_id)
+            .expect("terminal summary")
+            .last_event_seq;
+        assert!(manager
+            .summary_for(&runtime_id)
+            .expect("terminal summary")
+            .background_tasks
+            .is_empty());
+
+        let mut enriched_terminal = completed.clone();
+        enriched_terminal.tool_use_id = Some("tool-task-1-late".to_string());
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated {
+                    task: enriched_terminal,
+                },
+            )
+            .expect("persist late terminal tool correlation");
+        let enriched_terminal_seq = manager
+            .summary_for(&runtime_id)
+            .expect("enriched terminal summary")
+            .last_event_seq;
+        assert!(enriched_terminal_seq > terminal_seq);
+
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: running },
+            )
+            .expect("ignore late running update");
+        let mut late_failed = completed.clone();
+        late_failed.status = NativeBackgroundTaskStatus::Failed;
+        late_failed.error = Some("late failure".to_string());
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: late_failed },
+            )
+            .expect("ignore late terminal update");
+        let after_late = manager.summary_for(&runtime_id).expect("late summary");
+        assert!(after_late.background_tasks.is_empty());
+        assert_eq!(after_late.last_event_seq, enriched_terminal_seq);
+
+        let replay = manager
+            .replay_events(&runtime_id, None)
+            .expect("replay background events");
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::BackgroundTaskUpdated { task }
+                if task.status == NativeBackgroundTaskStatus::Completed
+                    && task.tool_use_id.as_deref() == Some("tool-task-1-late")
+        )));
+    }
+
+    #[test]
+    fn stopping_task_ignores_stale_progress_and_only_matching_stop_failure_restores() {
+        let runtime_id = format!(
+            "native-background-stop-race-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let running = background_task("task-stop", NativeBackgroundTaskStatus::Running);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![running.clone()],
+                },
+            )
+            .expect("append running task");
+
+        let mut stopping = running.clone();
+        stopping.status = NativeBackgroundTaskStatus::Stopping;
+        stopping.stop_request_id = Some("stop-new".to_string());
+        stopping.updated_at = Utc::now();
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated {
+                    task: stopping.clone(),
+                },
+            )
+            .expect("append stopping task");
+
+        let mut stale_failure = running.clone();
+        stale_failure.error = Some("old stop failed".to_string());
+        stale_failure.stop_request_id = Some("stop-old".to_string());
+        stale_failure.stop_failed = Some(true);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![stale_failure],
+                },
+            )
+            .expect("append stale snapshot");
+        let preserved = manager
+            .summary_for(&runtime_id)
+            .expect("stopping summary")
+            .background_tasks
+            .pop()
+            .expect("stopping task");
+        assert_eq!(preserved.status, NativeBackgroundTaskStatus::Stopping);
+        assert_eq!(preserved.stop_request_id.as_deref(), Some("stop-new"));
+        assert_eq!(preserved.error, None);
+
+        let mut matching_failure = running;
+        matching_failure.error = Some("new stop failed".to_string());
+        matching_failure.stop_request_id = Some("stop-new".to_string());
+        matching_failure.stop_failed = Some(true);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated {
+                    task: matching_failure,
+                },
+            )
+            .expect("append matching stop failure");
+        let restored = manager
+            .summary_for(&runtime_id)
+            .expect("restored summary")
+            .background_tasks
+            .pop()
+            .expect("restored task");
+        assert_eq!(restored.status, NativeBackgroundTaskStatus::Running);
+        assert_eq!(restored.error.as_deref(), Some("new stop failed"));
+    }
+
+    #[test]
+    fn settling_snapshot_advances_stopping_task_and_invalidates_stop_failure_restore() {
+        let runtime_id = format!(
+            "native-background-stop-settling-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let running = background_task("task-stop", NativeBackgroundTaskStatus::Running);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![running.clone()],
+                },
+            )
+            .expect("append running task");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(&runtime_id)
+            .cloned()
+            .expect("handle");
+        handle
+            .pending_background_task_stops
+            .lock()
+            .expect("pending stops")
+            .insert(
+                "task-stop".to_string(),
+                (
+                    "stop-current".to_string(),
+                    NativeBackgroundTaskStatus::Running,
+                ),
+            );
+        let mut stopping = running.clone();
+        stopping.status = NativeBackgroundTaskStatus::Stopping;
+        stopping.stop_request_id = Some("stop-current".to_string());
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: stopping },
+            )
+            .expect("append stopping task");
+
+        let mut settling_snapshot = running.clone();
+        settling_snapshot.status = NativeBackgroundTaskStatus::Settling;
+        settling_snapshot.stop_request_id = None;
+        settling_snapshot.stop_failed = None;
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![settling_snapshot],
+                },
+            )
+            .expect("append settling live snapshot");
+        let settling = manager
+            .active_background_tasks(&runtime_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(settling.status, NativeBackgroundTaskStatus::Settling);
+        assert_eq!(settling.stop_request_id, None);
+        assert!(handle
+            .pending_background_task_stops
+            .lock()
+            .expect("pending stops")
+            .is_empty());
+
+        let mut late_failure = running;
+        late_failure.error = Some("late stop failure".to_string());
+        late_failure.stop_request_id = Some("stop-current".to_string());
+        late_failure.stop_failed = Some(true);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: late_failure },
+            )
+            .expect("ignore invalidated stop failure");
+        assert_eq!(
+            manager.active_background_tasks(&runtime_id).unwrap()[0].status,
+            NativeBackgroundTaskStatus::Settling
+        );
+    }
+
+    #[test]
+    fn foreground_interrupt_failure_events_preserve_live_background_tasks() {
+        let runtime_id = "native-interrupt-failed-with-background";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![background_task(
+                        "task-survives-interrupt-failure",
+                        NativeBackgroundTaskStatus::Running,
+                    )],
+                },
+            )
+            .expect("append running background task");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"lifecycle","stage":"interrupt_failed","detail":"mock interrupt rejected"}}"#,
+            )
+            .expect("append scoped interrupt failure");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"status","status":"processing","detail":"Claude interrupt failed; the foreground turn and background tasks remain attached."}"#,
+            )
+            .expect("keep runtime processing");
+
+        let summary = manager.summary_for(runtime_id).expect("live summary");
+        assert_eq!(summary.status, "processing");
+        assert!(summary.is_active);
+        assert_eq!(summary.background_tasks.len(), 1);
+        assert_eq!(
+            summary.background_tasks[0].status,
+            NativeBackgroundTaskStatus::Running
+        );
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live helper");
+        assert!(handle.alive.load(Ordering::SeqCst));
+        let replay = manager.replay_events(runtime_id, None).expect("replay");
+        assert!(!replay.events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::BackgroundTaskUpdated { task }
+                if task.status == NativeBackgroundTaskStatus::Interrupted
+        )));
+        assert!(!replay.events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::ToolUseCompleted { tool_use_id, .. }
+                if tool_use_id == "tool-task-survives-interrupt-failure"
+        )));
+    }
+
+    #[test]
+    fn active_background_tasks_block_destructive_actions_without_force() {
+        let runtime_id = format!(
+            "native-background-guard-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![background_task(
+                        "task-guard",
+                        NativeBackgroundTaskStatus::Running,
+                    )],
+                },
+            )
+            .expect("append active task");
+
+        let error = manager
+            .reject_background_task_termination(&runtime_id, "handoff this session", false)
+            .expect_err("handoff must require force");
+        assert!(error.contains("1 Claude background task"));
+        manager
+            .reject_background_task_termination(&runtime_id, "handoff this session", true)
+            .expect("confirmed handoff may proceed");
+        assert_eq!(
+            manager.active_background_tasks(&runtime_id).unwrap().len(),
+            1
+        );
+
+        assert!(manager.prepare_app_termination(false).is_err());
+        assert_eq!(manager.prepare_app_termination(true).unwrap(), 1);
+        assert!(manager
+            .active_background_tasks(&runtime_id)
+            .unwrap()
+            .is_empty());
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::ToolUseCompleted {
+                    tool_use_id: "tool-task-guard".to_string(),
+                    raw_name: "bash".to_string(),
+                    result_summary: "duplicate helper teardown completion".to_string(),
+                    result_content: None,
+                    success: false,
+                    todo_snapshot: None,
+                },
+            )
+            .expect("ignore duplicate background tool completion");
+        assert_eq!(
+            manager
+                .replay_events(&runtime_id, None)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    SessionEventPayload::ToolUseCompleted { tool_use_id, .. }
+                        if tool_use_id == "tool-task-guard"
+                ))
+                .count(),
+            1
+        );
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| matches!(
+                &event.payload,
+                SessionEventPayload::BackgroundTaskUpdated { task }
+                    if task.status == NativeBackgroundTaskStatus::Interrupted
+            )));
+    }
+
+    #[test]
+    fn app_termination_guards_only_desktop_owned_background_tasks() {
+        let owned_runtime_id = "native-app-exit-owned";
+        let handed_off_runtime_id = "native-app-exit-handed-off";
+        let manager = manager_with_handle(owned_runtime_id);
+        let handed_off_record = native_record(handed_off_runtime_id, "handoff", false);
+        manager
+            .insert_record(handed_off_record.clone())
+            .expect("insert handed-off record");
+        manager
+            .insert_handle(
+                handed_off_runtime_id.to_string(),
+                native_session_handle(handed_off_record),
+            )
+            .expect("insert handed-off handle");
+
+        for (runtime_id, task_id) in [
+            (owned_runtime_id, "task-owned-by-desktop"),
+            (handed_off_runtime_id, "task-owned-by-terminal"),
+        ] {
+            manager
+                .append_event(
+                    runtime_id,
+                    SessionEventPayload::BackgroundTasksChanged {
+                        tasks: vec![background_task(
+                            task_id,
+                            NativeBackgroundTaskStatus::Running,
+                        )],
+                    },
+                )
+                .expect("append active background task");
+        }
+
+        let error = manager
+            .prepare_app_termination(false)
+            .expect_err("owned background task must block normal exit");
+        assert!(error.contains("1 Claude background task"));
+        assert!(!error.contains("2 Claude background tasks"));
+
+        assert_eq!(manager.prepare_app_termination(true).unwrap(), 1);
+        assert!(manager
+            .active_background_tasks(owned_runtime_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            manager
+                .active_background_tasks(handed_off_runtime_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let handed_off = manager
+            .current_record(handed_off_runtime_id)
+            .expect("handed-off record");
+        assert_eq!(handed_off.status, "handoff");
+        assert!(!handed_off.is_active);
+    }
+
+    #[test]
+    fn app_termination_preparation_blocks_all_teardown_when_a_late_task_appears() {
+        let first_runtime_id = format!(
+            "native-app-exit-first-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let second_runtime_id = format!(
+            "native-app-exit-second-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&first_runtime_id);
+        let second_record = native_record(&second_runtime_id, "ready", true);
+        manager
+            .insert_record(second_record.clone())
+            .expect("insert second record");
+        manager
+            .insert_handle(
+                second_runtime_id.clone(),
+                native_session_handle(second_record),
+            )
+            .expect("insert second handle");
+        let late_runtime_id = Mutex::new(None::<String>);
+
+        let error = manager
+            .prepare_app_termination_with_hook(false, |runtime_ids| {
+                let runtime_id = runtime_ids.last().expect("runtime selected");
+                *late_runtime_id.lock().expect("late runtime id") = Some(runtime_id.to_string());
+                manager
+                    .append_event(
+                        runtime_id,
+                        SessionEventPayload::BackgroundTaskUpdated {
+                            task: background_task(
+                                "task-started-during-exit",
+                                NativeBackgroundTaskStatus::Running,
+                            ),
+                        },
+                    )
+                    .expect("append late background task");
+            })
+            .expect_err("late task must cancel non-forced app termination");
+        assert!(error.contains("background task"));
+        assert!(!manager.app_termination_in_progress.load(Ordering::SeqCst));
+
+        for runtime_id in [&first_runtime_id, &second_runtime_id] {
+            let summary = manager.summary_for(runtime_id).expect("restored summary");
+            assert!(summary.is_active);
+            assert!(matches!(summary.status.as_str(), "processing" | "ready"));
+            let handle = manager
+                .handles
+                .lock()
+                .expect("handles")
+                .get(runtime_id)
+                .cloned()
+                .expect("restored handle");
+            assert!(handle.alive.load(Ordering::SeqCst));
+        }
+        let late_runtime_id = late_runtime_id
+            .lock()
+            .expect("late runtime id")
+            .clone()
+            .expect("late runtime selected");
+        assert_eq!(
+            manager
+                .active_background_tasks(&late_runtime_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn app_termination_commit_never_swallows_a_late_background_task_guard() {
+        let runtime_id = "native-app-exit-shutdown-task-race";
+        let manager = manager_with_handle(runtime_id);
+
+        let error = manager
+            .prepare_app_termination_with_hooks(
+                false,
+                |_| {},
+                |shutdown_runtime_id, _| {
+                    manager.append_event(
+                        shutdown_runtime_id,
+                        SessionEventPayload::BackgroundTaskUpdated {
+                            task: background_task(
+                                "task-started-at-shutdown",
+                                NativeBackgroundTaskStatus::Running,
+                            ),
+                        },
+                    )?;
+                    Err(super::ACTIVE_BACKGROUND_TASK_SHUTDOWN_ERROR.to_string())
+                },
+            )
+            .expect_err("a late task safety guard must abort non-forced app termination");
+
+        assert!(super::is_background_task_shutdown_safety_error(&error));
+        assert!(!manager.app_termination_in_progress.load(Ordering::SeqCst));
+        let summary = manager
+            .summary_for(runtime_id)
+            .expect("restored live summary");
+        assert_eq!(summary.status, "processing");
+        assert!(summary.is_active);
+        assert_eq!(summary.background_tasks.len(), 1);
+        assert!(manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("live helper remains")
+            .alive
+            .load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn app_termination_commit_failure_never_restores_already_closed_runtimes() {
+        let first_runtime_id = "native-app-exit-commit-first";
+        let second_runtime_id = "native-app-exit-commit-second";
+        let manager = manager_with_handle(first_runtime_id);
+        let second_record = native_record(second_runtime_id, "ready", true);
+        manager
+            .insert_record(second_record.clone())
+            .expect("insert second record");
+        manager
+            .insert_handle(
+                second_runtime_id.to_string(),
+                native_session_handle(second_record),
+            )
+            .expect("insert second handle");
+        let shutdown_order = Mutex::new(Vec::<String>::new());
+
+        manager
+            .prepare_app_termination_with_hooks(
+                false,
+                |_| {},
+                |runtime_id, _| {
+                    let mut order = shutdown_order.lock().expect("shutdown order");
+                    order.push(runtime_id.to_string());
+                    if order.len() == 1 {
+                        drop(order);
+                        manager.remove_handle(runtime_id)?;
+                        Ok(())
+                    } else {
+                        Err("simulated second runtime shutdown failure".to_string())
+                    }
+                },
+            )
+            .expect("commit failures are terminal and app exit continues");
+
+        let order = shutdown_order.lock().expect("shutdown order");
+        assert_eq!(order.len(), 2);
+        let closed = manager.summary_for(&order[0]).expect("closed summary");
+        assert_eq!(closed.status, "stopped");
+        assert!(!closed.is_active);
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(&order[0]));
+        let failed = manager.summary_for(&order[1]).expect("failed summary");
+        assert_eq!(failed.status, "interrupted");
+        assert!(!failed.is_active);
+        assert!(failed
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("simulated second runtime shutdown failure")));
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(&order[1])
+            .expect("failed handle retained for diagnostics")
+            .alive
+            .load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn helper_process_exit_persists_active_tasks_as_interrupted() {
+        let runtime_id = format!(
+            "native-background-exit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        manager
+            .append_event(
+                &runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![background_task(
+                        "task-exit",
+                        NativeBackgroundTaskStatus::Running,
+                    )],
+                },
+            )
+            .expect("append active task");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(&runtime_id)
+            .cloned()
+            .expect("live handle");
+
+        manager
+            .mark_process_exit(&runtime_id, Some(9), &handle)
+            .expect("mark helper exit");
+
+        let summary = manager.summary_for(&runtime_id).expect("record summary");
+        assert!(summary.background_tasks.is_empty());
+        let replay = manager
+            .replay_events(&runtime_id, None)
+            .expect("replay interrupted task");
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::BackgroundTaskUpdated { task }
+                if task.task_id == "task-exit"
+                    && task.status == NativeBackgroundTaskStatus::Interrupted
+        )));
     }
 
     #[test]
@@ -6549,6 +8915,245 @@ mod tests {
         let summary = manager.summary_for("native-effort").expect("summary");
 
         assert_eq!(summary.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn codex_settings_update_effective_values_immediately_while_claude_waits_for_ack() {
+        let mut codex = native_record("native-codex-settings", "ready", true);
+        codex.provider = NativeProvider::Codex;
+        codex.env_name = "old-codex".to_string();
+        codex.effort = Some("medium".to_string());
+        stage_runtime_settings_update(
+            &mut codex,
+            Some("new-codex"),
+            Some("high"),
+            "settings-codex",
+        );
+        assert_eq!(codex.env_name, "new-codex");
+        assert_eq!(codex.effort.as_deref(), Some("high"));
+        assert_eq!(codex.pending_env_name, None);
+        assert_eq!(codex.pending_effort, None);
+        assert_eq!(codex.pending_settings_request_id, None);
+
+        let mut claude = native_record("native-claude-settings", "ready", true);
+        claude.env_name = "old-claude".to_string();
+        claude.effort = Some("medium".to_string());
+        stage_runtime_settings_update(
+            &mut claude,
+            Some("new-claude"),
+            Some("high"),
+            "settings-claude",
+        );
+        assert_eq!(claude.env_name, "old-claude");
+        assert_eq!(claude.effort.as_deref(), Some("medium"));
+        assert_eq!(claude.pending_env_name.as_deref(), Some("new-claude"));
+        assert_eq!(claude.pending_effort.as_deref(), Some("high"));
+        assert_eq!(
+            claude.pending_settings_request_id.as_deref(),
+            Some("settings-claude")
+        );
+    }
+
+    #[test]
+    fn helper_stop_rejection_restores_only_the_matching_local_stopping_request() {
+        let runtime_id = "native-stop-rejection";
+        let manager = manager_with_handle(runtime_id);
+        let running = background_task("task-rejected", NativeBackgroundTaskStatus::Running);
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::BackgroundTasksChanged {
+                    tasks: vec![running.clone()],
+                },
+            )
+            .expect("append running task");
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("handle");
+        handle
+            .pending_background_task_stops
+            .lock()
+            .expect("pending stops")
+            .insert(
+                "task-rejected".to_string(),
+                (
+                    "stop-current".to_string(),
+                    NativeBackgroundTaskStatus::Running,
+                ),
+            );
+        let mut stopping = running;
+        stopping.status = NativeBackgroundTaskStatus::Stopping;
+        stopping.stop_request_id = Some("stop-current".to_string());
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::BackgroundTaskUpdated { task: stopping },
+            )
+            .expect("append stopping task");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"background_task_stop_failed","task_id":"task-rejected","stop_request_id":"stop-stale","error":"stale"}"#,
+            )
+            .expect("ignore stale rejection");
+        assert_eq!(
+            manager.active_background_tasks(runtime_id).unwrap()[0].status,
+            NativeBackgroundTaskStatus::Stopping
+        );
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"background_task_stop_failed","task_id":"task-rejected","stop_request_id":"stop-current","error":"task already settling"}"#,
+            )
+            .expect("restore matching rejection");
+        let restored = manager
+            .active_background_tasks(runtime_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(restored.status, NativeBackgroundTaskStatus::Running);
+        assert_eq!(restored.error.as_deref(), Some("task already settling"));
+        assert_eq!(restored.stop_failed, Some(true));
+    }
+
+    #[test]
+    fn stopping_a_stale_task_never_restarts_a_missing_runtime_handle() {
+        let runtime_id = "native-stale-background-stop";
+        let manager = Arc::new(manager_with_records(
+            runtime_id,
+            vec![native_record(runtime_id, "ready", true)],
+        ));
+
+        let error = manager
+            .stop_background_task(runtime_id, "task-stale")
+            .expect_err("a stale task cannot recreate its helper");
+
+        assert!(error.contains("no longer attached to a live runtime"));
+        assert!(manager.handles.lock().expect("handles").is_empty());
+        let summary = manager.summary_for(runtime_id).expect("summary");
+        assert_eq!(summary.status, "ready");
+        assert!(summary.background_tasks.is_empty());
+
+        let permission_error = manager
+            .respond_to_permission(runtime_id, "request-stale", true)
+            .expect_err("a stale permission cannot recreate its helper");
+        assert!(permission_error.contains("no longer has a live permission request"));
+        let prompt_error = manager
+            .respond_to_prompt(
+                runtime_id,
+                "tool-stale",
+                "ask_user_question",
+                Some("answer"),
+                &HashMap::from([("question".to_string(), "answer".to_string())]),
+                None,
+                None,
+            )
+            .expect_err("a stale interactive prompt cannot recreate its helper");
+        assert!(prompt_error.contains("no longer has a live interactive prompt"));
+        assert!(manager.handles.lock().expect("handles").is_empty());
+    }
+
+    #[test]
+    fn terminal_handoff_record_rejects_query_mutations_without_recreating_a_handle() {
+        let runtime_id = "native-completed-handoff-gate";
+        let manager = manager_with_records(
+            runtime_id,
+            vec![native_record(runtime_id, "handoff", false)],
+        );
+
+        for action in [
+            "send a prompt",
+            "respond to permission",
+            "respond to a prompt",
+            "update settings",
+            "rewind files",
+            "query usage",
+            "stop a background task",
+        ] {
+            assert!(manager
+                .reject_query_mutation_during_transition(runtime_id, action)
+                .expect_err("terminal handoff must reject query mutation")
+                .contains("is handoff"));
+        }
+        assert!(manager.handles.lock().expect("handles").is_empty());
+        assert_eq!(manager.summary_for(runtime_id).unwrap().status, "handoff");
+    }
+
+    #[test]
+    fn recoverable_disconnected_statuses_allow_query_reconnect_but_not_stale_responses() {
+        for status in ["interrupted", "closed_idle"] {
+            let runtime_id = format!("native-recoverable-query-gate-{status}");
+            let manager = Arc::new(manager_with_records(
+                &runtime_id,
+                vec![native_record(&runtime_id, status, false)],
+            ));
+
+            manager
+                .reject_query_mutation_during_transition(&runtime_id, "send a prompt")
+                .expect("a new prompt may reconnect a recoverable runtime");
+            manager
+                .reject_query_mutation_during_transition(&runtime_id, "update settings")
+                .expect("settings may reconnect a recoverable runtime");
+
+            let permission_error = manager
+                .respond_to_permission(&runtime_id, "request-from-old-helper", true)
+                .expect_err("a response cannot reconnect an old permission request");
+            assert!(permission_error.contains("no longer has a live permission request"));
+            let prompt_error = manager
+                .respond_to_prompt(
+                    &runtime_id,
+                    "tool-from-old-helper",
+                    "ask_user_question",
+                    Some("answer"),
+                    &HashMap::from([("question".to_string(), "answer".to_string())]),
+                    None,
+                    None,
+                )
+                .expect_err("a response cannot reconnect an old interactive prompt");
+            assert!(prompt_error.contains("no longer has a live interactive prompt"));
+            assert!(manager.handles.lock().expect("handles").is_empty());
+        }
+
+        let error_runtime_id = "native-query-gate-error";
+        let error_manager = manager_with_records(
+            error_runtime_id,
+            vec![native_record(error_runtime_id, "error", false)],
+        );
+        assert!(error_manager
+            .reject_query_mutation_during_transition(error_runtime_id, "send a prompt")
+            .expect_err("an error session keeps the existing new-session UI contract")
+            .contains("is error"));
+    }
+
+    #[test]
+    fn reconcile_stale_records_reports_deferred_effort_clear_after_restart() {
+        let mut record = native_record("native-effort-clear", "stopped", false);
+        record.effort = Some("max".to_string());
+        record.pending_effort = None;
+        record.pending_settings_request_id = Some("settings-clear-effort".to_string());
+        let serialized = serde_json::to_value(&record).expect("serialize pending settings");
+        assert_eq!(
+            serialized["pending_settings_request_id"],
+            "settings-clear-effort"
+        );
+        let manager = manager_with_records("native-effort-clear", vec![record]);
+
+        assert_eq!(manager.reconcile_stale_records().unwrap(), 1);
+        let summary = manager
+            .summary_for("native-effort-clear")
+            .expect("summary after restart reconciliation");
+        assert_eq!(summary.effort.as_deref(), Some("max"));
+        assert_eq!(summary.pending_effort, None);
+        assert!(summary
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not applied")));
     }
 
     #[test]
@@ -6677,19 +9282,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn handoff_without_provider_session_waits_for_session_meta() {
+    fn handoff_without_provider_session_rejects_an_active_foreground_turn() {
         let runtime_id = "native-fresh-handoff";
         let manager = manager_with_handle(runtime_id);
         clear_terminal_launches();
 
-        manager
-            .handoff_to_terminal(runtime_id, Some(crate::terminal::TerminalType::TerminalApp))
-            .expect("handoff should enter pending state");
+        let error = manager
+            .handoff_to_terminal(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                false,
+            )
+            .expect_err("active foreground handoff must wait for the turn to finish");
+        assert!(error.contains("Finish the current foreground turn"));
 
         assert!(take_terminal_launches().is_empty());
 
         let summary = manager.summary_for(runtime_id).expect("summary");
-        assert_eq!(summary.status, "handoff_pending");
+        assert_eq!(summary.status, "processing");
         assert!(summary.is_active);
         assert_eq!(summary.provider_session_id, None);
         assert!(manager
@@ -6698,6 +9308,106 @@ mod tests {
             .expect("handles")
             .get(runtime_id)
             .is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_handoff_gates_query_mutations_until_session_meta_completes_it() {
+        let runtime_id = "native-pending-handoff-gate";
+        let manager = manager_with_handle(runtime_id);
+        clear_terminal_launches();
+        manager
+            .update_record(runtime_id, |record| {
+                record.status = "ready".to_string();
+                record.is_active = true;
+            })
+            .expect("set ready record");
+
+        let result = manager
+            .handoff_to_terminal(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                false,
+            )
+            .expect("queue pending handoff");
+        assert_eq!(result.status, super::NativeHandoffStatus::Pending);
+        assert!(manager
+            .terminal_handoff_preparations
+            .lock()
+            .expect("handoff preparations")
+            .contains_key(runtime_id));
+        assert_eq!(
+            manager.summary_for(runtime_id).unwrap().status,
+            "handoff_pending"
+        );
+        for action in [
+            "send a prompt",
+            "update settings",
+            "rewind files",
+            "query usage",
+            "respond to permission",
+            "respond to a prompt",
+            "stop a background task",
+        ] {
+            assert!(manager
+                .reject_query_mutation_during_transition(runtime_id, action)
+                .expect_err("pending handoff must gate mutations")
+                .contains("preparing to continue in Terminal"));
+        }
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"provider-session-gated"}"#,
+            )
+            .expect("complete pending handoff");
+        assert_eq!(take_terminal_launches().len(), 1);
+        assert_eq!(manager.summary_for(runtime_id).unwrap().status, "handoff");
+        assert!(!manager
+            .terminal_handoff_preparations
+            .lock()
+            .expect("handoff preparations")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn rejected_pending_handoff_finalization_reopens_the_native_session() {
+        let runtime_id = "native-pending-handoff-rejected";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .update_record(runtime_id, |record| {
+                record.status = "handoff_finalizing".to_string();
+                record.pending_handoff_terminal = Some(crate::terminal::TerminalType::TerminalApp);
+            })
+            .expect("set finalizing handoff");
+        manager
+            .terminal_handoff_preparations
+            .lock()
+            .expect("handoff preparations")
+            .insert(
+                runtime_id.to_string(),
+                "pending-handoff-request".to_string(),
+            );
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"teardown_prepared","request_id":"pending-handoff-request","ready":false,"detail":"foreground still running"}"#,
+            )
+            .expect("reject pending handoff");
+
+        let summary = manager.summary_for(runtime_id).expect("summary");
+        assert_eq!(summary.status, "ready");
+        assert!(summary.is_active);
+        assert!(summary
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("foreground still running")));
+        assert!(!manager
+            .terminal_handoff_preparations
+            .lock()
+            .expect("handoff preparations")
+            .contains_key(runtime_id));
     }
 
     #[test]
@@ -7516,6 +10226,14 @@ wait"#,
             .get(runtime_id)
             .expect("handle")
             .clone();
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .provider = NativeProvider::Codex;
+        handle.record.lock().expect("handle record").provider = NativeProvider::Codex;
 
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(
@@ -7596,7 +10314,7 @@ wait"#,
         *handle.child.lock().expect("child slot") = Some(child);
 
         let scheduled_handle = manager
-            .request_child_stop(runtime_id)
+            .request_child_stop(runtime_id, false)
             .expect("telemetry failure must not fail stop scheduling")
             .expect("successful Stop write must return its cleanup handle");
 
@@ -7674,13 +10392,21 @@ wait"#,
         })
         .join();
 
+        let frozen_handle = manager
+            .freeze_current_handle_for_handoff(runtime_id)
+            .expect("freeze current helper");
+        let warnings = manager.finish_terminal_handoff_metadata_after_launch(
+            runtime_id,
+            NativeProvider::Claude.as_str(),
+            crate::terminal::TerminalType::TerminalApp,
+        );
+        assert!(
+            !warnings.is_empty(),
+            "poisoned metadata stores must be reported as warnings"
+        );
         manager
-            .run_managed_terminal_handoff(
-                runtime_id,
-                Some(crate::terminal::TerminalType::TerminalApp),
-                |_| Ok(()),
-            )
-            .expect("an opened terminal must not be reported as retryable failure");
+            .retire_handle_if_current(runtime_id, frozen_handle.as_ref().expect("frozen helper"))
+            .expect("retire old helper tree");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while super::native_process_group_exists(root_pid as i32)
@@ -7730,6 +10456,14 @@ wait"#,
             .lock()
             .expect("handle record")
             .provider_session_id = Some("provider-handoff-race".to_string());
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .status = "ready".to_string();
+        old_handle.record.lock().expect("handle record").status = "ready".to_string();
 
         let (start_replacement, replacement_started) = std::sync::mpsc::sync_channel(0);
         let (replacement_acquired, acquired_replacement) = std::sync::mpsc::sync_channel(1);
@@ -7762,6 +10496,7 @@ wait"#,
             .run_managed_terminal_handoff(
                 runtime_id,
                 Some(crate::terminal::TerminalType::TerminalApp),
+                false,
                 |_| {
                     assert!(
                         !old_handle.alive.load(Ordering::SeqCst),
@@ -7776,6 +10511,7 @@ wait"#,
                     );
                     Ok(())
                 },
+                |_| {},
             )
             .expect("managed handoff");
 
@@ -7792,7 +10528,7 @@ wait"#,
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn failed_managed_handoff_does_not_revive_frozen_generation() {
+    fn failed_managed_handoff_restores_the_frozen_generation() {
         let runtime_id = "native-handoff-launch-failure-no-revive";
         let manager = manager_with_handle(runtime_id);
         let handle = manager
@@ -7814,25 +10550,35 @@ wait"#,
             .lock()
             .expect("handle record")
             .provider_session_id = Some("provider-handoff-failure".to_string());
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .status = "ready".to_string();
+        handle.record.lock().expect("handle record").status = "ready".to_string();
 
         let error = manager
             .run_managed_terminal_handoff(
                 runtime_id,
                 Some(crate::terminal::TerminalType::TerminalApp),
+                false,
                 |_| Err::<(), _>("terminal open failed".to_string()),
+                |_| {},
             )
             .expect_err("launch failure");
 
         assert_eq!(error, "terminal open failed");
-        assert!(!handle.alive.load(Ordering::SeqCst));
-        assert!(!manager
+        assert!(handle.alive.load(Ordering::SeqCst));
+        assert!(manager
             .is_current_handle(runtime_id, &handle)
             .expect("current handle check"));
         let record = manager
             .current_record(runtime_id)
             .expect("failed handoff record");
-        assert_eq!(record.status, "interrupted");
-        assert!(!record.is_active);
+        assert_eq!(record.status, "ready");
+        assert!(record.is_active);
     }
 
     #[test]

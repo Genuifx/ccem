@@ -309,8 +309,14 @@ impl AttentionSummary {
     /// Fold one event into the summary. Mirrors resolve_attention_kind's match arms.
     pub fn apply(&mut self, event: &SessionEventRecord) {
         match &event.payload {
-            SessionEventPayload::PermissionRequired { request_id, .. } => {
-                self.pending_permissions.insert(request_id.clone());
+            SessionEventPayload::PermissionRequired {
+                request_id,
+                background_task_id,
+                ..
+            } => {
+                if background_task_id.is_none() {
+                    self.pending_permissions.insert(request_id.clone());
+                }
             }
             SessionEventPayload::PermissionResponded { request_id, .. } => {
                 self.pending_permissions.remove(request_id);
@@ -773,6 +779,7 @@ mod tests {
             tool_use_id: Some("toolu-perm".to_string()),
             tool_name: "Bash".to_string(),
             input_summary: None,
+            background_task_id: None,
         }
     }
 
@@ -896,6 +903,7 @@ mod tests {
                 tool_use_id: Some("tool-1".to_string()),
                 tool_name: "Bash".to_string(),
                 input_summary: None,
+                background_task_id: None,
             },
         };
         let mut attention_by_runtime = HashMap::new();

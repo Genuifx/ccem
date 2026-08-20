@@ -282,6 +282,10 @@ fn build_session_event_draft(
                 },
             )),
         },
+        SessionEventPayload::PermissionRequired {
+            background_task_id: Some(_),
+            ..
+        } => None,
         SessionEventPayload::PermissionRequired { tool_name, .. } => {
             Some(build_action_required_draft(
                 context,
@@ -540,6 +544,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "Bash".to_string(),
             input_summary: None,
+            background_task_id: None,
         };
         let english = build_session_event_draft(&context(), &payload, NotificationLanguage::En)
             .expect("expected English approval notification");

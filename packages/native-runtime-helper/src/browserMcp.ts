@@ -34,7 +34,26 @@ type BrowserBridgePending = {
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
+  owner: string;
 };
+
+function stableRequestValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableRequestValue);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, stableRequestValue(entry)]),
+  );
+}
+
+function browserRequestOwnerKey(toolName: BrowserToolName, args: Record<string, unknown>) {
+  return `${toolName}\u0000${JSON.stringify(stableRequestValue(args))}`;
+}
 
 const READ_TOOLS = new Set<BrowserToolName>([
   'get_url',
@@ -110,11 +129,26 @@ function toToolResult(value: unknown) {
 export function createBrowserToolBridge(
   emitRequest: (request: BrowserToolRequestOutput) => void,
   timeoutMs = 30_000,
+  resolveOwner: () => string = () => 'foreground',
 ) {
   const pending = new Map<string, BrowserBridgePending>();
+  const queuedOwners = new Map<string, string[]>();
+
+  function recordOwner(toolName: BrowserToolName, args: Record<string, unknown>, owner: string) {
+    const key = browserRequestOwnerKey(toolName, args);
+    const queue = queuedOwners.get(key) ?? [];
+    queue.push(owner);
+    queuedOwners.set(key, queue);
+  }
 
   function sendBrowserToolRequest(toolName: BrowserToolName, args: Record<string, unknown>) {
     const requestId = randomUUID();
+    const ownerKey = browserRequestOwnerKey(toolName, args);
+    const ownerQueue = queuedOwners.get(ownerKey);
+    const owner = ownerQueue?.shift() ?? resolveOwner();
+    if (ownerQueue?.length === 0) {
+      queuedOwners.delete(ownerKey);
+    }
     emitRequest({
       type: 'browser_tool_request',
       request_id: requestId,
@@ -127,7 +161,7 @@ export function createBrowserToolBridge(
         pending.delete(requestId);
         reject(new Error(`Browser tool ${toolName} timed out.`));
       }, timeoutMs);
-      pending.set(requestId, { resolve, reject, timeout });
+      pending.set(requestId, { resolve, reject, timeout, owner });
     });
   }
 
@@ -147,6 +181,7 @@ export function createBrowserToolBridge(
   }
 
   function rejectAll(message: string) {
+    queuedOwners.clear();
     for (const [requestId, waiter] of pending.entries()) {
       pending.delete(requestId);
       clearTimeout(waiter.timeout);
@@ -154,10 +189,31 @@ export function createBrowserToolBridge(
     }
   }
 
+  function rejectOwned(owner: string, message: string) {
+    for (const [key, owners] of queuedOwners.entries()) {
+      const remaining = owners.filter((queuedOwner) => queuedOwner !== owner);
+      if (remaining.length > 0) {
+        queuedOwners.set(key, remaining);
+      } else {
+        queuedOwners.delete(key);
+      }
+    }
+    for (const [requestId, waiter] of pending.entries()) {
+      if (waiter.owner !== owner) {
+        continue;
+      }
+      pending.delete(requestId);
+      clearTimeout(waiter.timeout);
+      waiter.reject(new Error(message));
+    }
+  }
+
   return {
+    recordOwner,
     sendBrowserToolRequest,
     handleBrowserToolResponse,
     rejectAll,
+    rejectOwned,
   };
 }
 

@@ -1,0 +1,82 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const desktopDir = path.resolve(__dirname, '..');
+
+async function readSource(...parts) {
+  return fs.readFile(path.join(desktopDir, ...parts), 'utf8');
+}
+
+test('Claude background task panel exposes activity, terminal history, and confirmed single-task stop', async () => {
+  const panel = await readSource(
+    'src',
+    'components',
+    'workspace',
+    'WorkspaceBackgroundTasksPopover.tsx',
+  );
+
+  assert.match(panel, /data-ccem-background-tasks-trigger/);
+  assert.match(panel, /data-ccem-background-tasks-attention/);
+  assert.match(panel, /data-ccem-background-tasks-popover/);
+  assert.match(panel, /data-ccem-background-task-stop-dialog/);
+  assert.match(panel, /canStopBackgroundTask\(task\)/);
+  assert.match(panel, /activeTasks\.find\(\(task\) => task\.task_id === stopTargetId\)/);
+  assert.match(panel, /!canStopBackgroundTask\(stopTarget\)/);
+  assert.match(panel, /await onStopTask\(stopTarget\.task_id\)/);
+  assert.match(panel, /task\.output_file/);
+  assert.doesNotMatch(panel, /readFile|tail\s*\(/i);
+});
+
+test('Workspace keeps foreground composition independent and guards task-destructive actions', async () => {
+  const workspace = await readSource(
+    'src',
+    'components',
+    'workspace',
+    'WorkspaceNativeSessionView.tsx',
+  );
+
+  const canSendBlock = workspace.match(/const canSend =[\s\S]*?;\n  const canShowFileRestorePoints/)?.[0] ?? '';
+  assert.doesNotMatch(canSendBlock, /activeBackgroundTaskCount/);
+  assert.match(workspace, /activeBackgroundTaskCount === 0/);
+  assert.match(workspace, /data-ccem-background-task-risk-dialog/);
+  assert.match(workspace, /performEnvChange\(action\.envName, force\)/);
+  assert.match(workspace, /performEffortChange\(action\.effort, force\)/);
+  assert.match(workspace, /performHandoff\(true\)/);
+  assert.match(workspace, /disabled=\{isHandingOff \|\| isHandoffPending \|\| isProcessingTurn\}/);
+  assert.match(workspace, /attentionState\.permissions\.some\([\s\S]*?!request\.backgroundTaskId/);
+  assert.match(workspace, /const hasBackgroundTaskPanel = session\.provider === 'claude'/);
+  assert.match(workspace, /hasAttentionPanel = attentionState\.permissions\.length > 0[\s\S]*?\|\| hasBackgroundTaskPanel/);
+
+  const backgroundTaskPanelIndex = workspace.indexOf('<WorkspaceBackgroundTasksPopover');
+  const aboveComposerIndex = workspace.indexOf('aboveComposer=');
+  const composerControlsIndex = workspace.indexOf('controls={(', aboveComposerIndex);
+  const secondaryActionsIndex = workspace.indexOf('secondaryActions={(', composerControlsIndex);
+  assert.ok(backgroundTaskPanelIndex > aboveComposerIndex);
+  assert.ok(backgroundTaskPanelIndex < composerControlsIndex);
+  assert.ok(secondaryActionsIndex > backgroundTaskPanelIndex);
+  assert.equal(workspace.match(/<WorkspaceBackgroundTasksPopover/g)?.length, 1);
+});
+
+test('app quit and restart share the background-task confirmation guard', async () => {
+  const guard = await readSource('src', 'components', 'NativeBackgroundTaskAppGuard.tsx');
+  const updater = await readSource(
+    'src',
+    'components',
+    'app-update',
+    'AppUpdateProvider.tsx',
+  );
+  const app = await readSource('src', 'App.tsx');
+
+  assert.match(guard, /list_native_sessions/);
+  assert.match(guard, /native-background-task-app-action/);
+  assert.match(guard, /data-ccem-background-task-app-guard/);
+  assert.match(guard, /setTaskCount\(count\);\s*setPendingAction\(action\);/);
+  assert.match(guard, /taskCount > 0[\s\S]*nativeRuntimeUnsafeActionWarningTitle/);
+  assert.match(guard, /execute\(pendingAction, true\)/);
+  assert.match(updater, /await requestRestart\(\)/);
+  assert.match(app, /'meta\+q': \(\) => \{ void requestQuit\(\); \}/);
+});

@@ -882,6 +882,7 @@ impl RuntimeManager {
                     tool_use_id: None,
                     tool_name: request.tool_name,
                     input_summary: None,
+                    background_task_id: None,
                 },
             );
         }
@@ -1782,7 +1783,7 @@ fn runtime_command_matches(runtime_kind: RuntimeKind, command_line: &str) -> boo
     }
 }
 
-pub(crate) fn terminate_process(pid: u32) -> Result<(), String> {
+fn terminate_process(pid: u32) -> Result<(), String> {
     send_signal(pid, "TERM")?;
 
     for _ in 0..50 {

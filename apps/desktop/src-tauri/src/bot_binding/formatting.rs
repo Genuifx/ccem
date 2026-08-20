@@ -214,6 +214,9 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         // Session usage snapshots duplicate the token_usage frames already
         // forwarded per turn — don't spam bot outboxes with them.
         SessionEventPayload::SessionUsage { .. }
+        | SessionEventPayload::RuntimeSettingsChanged { .. }
+        | SessionEventPayload::BackgroundTasksChanged { .. }
+        | SessionEventPayload::BackgroundTaskUpdated { .. }
         | SessionEventPayload::StdErrLine { .. }
         | SessionEventPayload::AssistantChunk { .. } => None,
     }

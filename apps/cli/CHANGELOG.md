@@ -1,5 +1,11 @@
 # ccem
 
+## 2.70.0
+
+### Minor Changes
+
+- Add native subagent environment routing (CCEM Router): dynamic routing composer, environments router panel redesign, Shift+~ route shortcut with history route restore, and binding-key naming spec. Fix routed usage analytics including transcript usage dedup by message.id (2-3.5x inflation), subagent transcript counting with corrupt traffic line tolerance, usage aperture freezing with independent sub-route ledger, and Claude background task lifecycle tracking.
+
 ## 2.69.0
 
 ### Minor Changes
