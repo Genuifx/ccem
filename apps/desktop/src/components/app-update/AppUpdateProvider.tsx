@@ -15,6 +15,7 @@ import {
   type AppUpdateContextValue,
   type CheckForUpdateOptions,
 } from './appUpdateContext';
+import { useNativeBackgroundTaskAppGuard } from '@/components/NativeBackgroundTaskAppGuard';
 
 function formatMessage(template: string, values: Record<string, string>) {
   return Object.entries(values).reduce(
@@ -25,6 +26,7 @@ function formatMessage(template: string, values: Record<string, string>) {
 
 export function AppUpdateProvider({ children }: { children: ReactNode }) {
   const { t } = useLocale();
+  const { requestRestart } = useNativeBackgroundTaskAppGuard();
   const [state, dispatch] = useReducer(reduceUpdateState, initialAppUpdateState);
   const stateRef = useRef(state);
   const autoCheckStartedRef = useRef(false);
@@ -39,8 +41,8 @@ export function AppUpdateProvider({ children }: { children: ReactNode }) {
   });
 
   const restartForUpdate = useCallback(async () => {
-    await invoke('restart_app');
-  }, []);
+    await requestRestart();
+  }, [requestRestart]);
 
   const checkForUpdate = useCallback(async (options: CheckForUpdateOptions = {}) => {
     dispatch({ type: 'check-start' });

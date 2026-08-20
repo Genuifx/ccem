@@ -121,7 +121,13 @@ async function buildHelperWithWarningMock() {
                     toolUseID: 'toolu-ask-yolo',
                   });
                   process.stderr.write('ASK_USER_RESULT ' + JSON.stringify(result) + '\\n');
-                  yield { type: 'result', subtype: 'success', result: 'done', session_id };
+                  yield {
+                    type: 'result',
+                    subtype: 'success',
+                    result: 'done',
+                    user_message_uuid: next.value.uuid,
+                    session_id,
+                  };
                 },
               };
             }

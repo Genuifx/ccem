@@ -34,6 +34,7 @@ fn native_event_log_persists_and_restores_attention_summary() {
             tool_use_id: Some("toolu-perm".to_string()),
             tool_name: "Bash".to_string(),
             input_summary: None,
+            background_task_id: None,
         },
     })
     .expect("append permission request");
@@ -114,6 +115,7 @@ fn native_event_log_attention_summary_fallback_derives_from_existing_events() {
         tool_use_id: None,
         tool_name: "Bash".to_string(),
         input_summary: None,
+        background_task_id: None,
     };
     let conn = Connection::open(&db_path).expect("open sqlite db");
     conn.execute(

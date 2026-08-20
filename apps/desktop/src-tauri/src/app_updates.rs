@@ -6,6 +6,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::native_runtime::NativeRuntimeManager;
+
 const RELEASE_URL_PREFIX: &str =
     "https://github.com/Genuifx/claude-code-env-manager/releases/tag/v";
 
@@ -116,8 +118,13 @@ pub async fn install_app_update(
 }
 
 #[tauri::command]
-pub fn restart_app(app: AppHandle) {
-    app.restart();
+pub fn restart_app(
+    app: AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    force: Option<bool>,
+) -> Result<(), String> {
+    native_state.prepare_app_termination(force.unwrap_or(false))?;
+    app.restart()
 }
 
 fn parse_version(raw: &str) -> Result<Version, String> {

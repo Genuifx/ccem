@@ -179,6 +179,31 @@ test('live transcript attaches full subagent result content when available', asy
   ]);
 });
 
+test('orphaned background tool completions stay out of the top-level transcript', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const base = [
+    { msgType: 'user', uuid: 'user-1', content: 'start background work', segmentIndex: 0, isCompactBoundary: false },
+  ];
+  const task = (taskId, toolUseId, status) => ({
+    task_id: taskId,
+    tool_use_id: toolUseId,
+    task_type: 'bash',
+    description: taskId,
+    status,
+    started_at: '2026-05-01T00:00:00.000Z',
+    updated_at: '2026-05-01T00:01:00.000Z',
+  });
+
+  const messages = buildMessagesFromEvents(base, [], [
+    event(1, { type: 'background_task_updated', task: task('task-ok', 'tool-ok', 'completed') }),
+    event(2, { type: 'tool_use_completed', tool_use_id: 'tool-ok', raw_name: 'Bash', result_summary: 'done', success: true }),
+    event(3, { type: 'background_task_updated', task: task('task-failed', 'tool-failed', 'failed') }),
+    event(4, { type: 'tool_use_completed', tool_use_id: 'tool-failed', raw_name: 'Bash', result_summary: 'failed', success: false }),
+  ]);
+
+  assert.deepEqual(messages, base);
+});
+
 test('live transcript appends streaming thinking deltas without inserting paragraph breaks', async () => {
   const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
 
@@ -486,6 +511,51 @@ test('session summary refresh treats runtime error events as boundary events', a
       success: false,
     }),
   ]), true);
+  assert.equal(sessionEventsNeedSummaryRefresh([
+    event(6, { type: 'background_tasks_changed', tasks: [] }),
+  ]), true);
+  assert.equal(sessionEventsNeedSummaryRefresh([
+    event(7, {
+      type: 'background_task_updated',
+      task: { task_id: 'task-1', status: 'completed' },
+    }),
+  ]), true);
+});
+
+test('background task events and empty turn boundaries stay out of the top-level transcript', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+
+  const messages = buildMessagesFromEvents(
+    [],
+    [],
+    [
+      event(1, { type: 'user_prompt', text: '继续当前工作', image_count: 0 }),
+      event(2, { type: 'lifecycle', stage: 'turn_started', detail: '' }),
+      event(3, {
+        type: 'background_tasks_changed',
+        tasks: [{ task_id: 'task-1', status: 'running', description: '后台 Bash' }],
+      }),
+      event(4, {
+        type: 'background_task_updated',
+        task: {
+          task_id: 'task-1',
+          status: 'completed',
+          terminal_summary: 'background output',
+        },
+      }),
+      event(5, { type: 'lifecycle', stage: 'turn_completed', detail: '' }),
+      event(6, { type: 'lifecycle', stage: 'ready', detail: '' }),
+    ],
+  );
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].msgType, 'user');
+  assert.equal(messages[0].content, '继续当前工作');
+  assert.equal(
+    JSON.stringify(messages).includes('Claude turn completed.'),
+    false,
+  );
+  assert.equal(JSON.stringify(messages).includes('background output'), false);
 });
 
 test('native processing state falls back to event boundaries when the summary is stale', async () => {
@@ -512,6 +582,18 @@ test('native processing state falls back to event boundaries when the summary is
   assert.equal(shouldTreatNativeSessionAsProcessing('processing', [
     event(1, { type: 'lifecycle', stage: 'turn_started', detail: 'Claude is processing a turn.' }),
   ], Date.parse('2026-05-01T00:02:00.000Z')), true);
+
+  for (const stage of ['interrupt_requested', 'stop_requested', 'stop_written']) {
+    assert.equal(shouldTreatNativeSessionAsProcessing('processing', [
+      event(1, { type: 'lifecycle', stage: 'turn_started', detail: 'Claude is processing a turn.' }),
+      event(2, { type: 'lifecycle', stage, detail: 'Interrupt is still in flight.' }),
+    ], Date.parse('2026-05-01T00:00:03.000Z')), true, stage);
+  }
+
+  assert.equal(shouldTreatNativeSessionAsProcessing('processing', [
+    event(1, { type: 'lifecycle', stage: 'interrupt_requested', detail: 'Interrupt is still in flight.' }),
+    event(2, { type: 'lifecycle', stage: 'turn_interrupted', detail: 'Interrupted.' }),
+  ], Date.parse('2026-05-01T00:00:03.000Z')), false);
 
   assert.equal(shouldTreatNativeSessionAsProcessing('processing', []), true);
   assert.equal(shouldTreatNativeSessionAsProcessing('ready', [

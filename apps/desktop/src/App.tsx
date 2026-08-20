@@ -24,6 +24,10 @@ import type { PetOpenSessionRequest } from '@/types/pet';
 import { AppUpdateProvider } from '@/components/app-update/AppUpdateProvider';
 import { runExclusiveLaunch } from '@/components/sessions/sessionLaunchAction';
 import {
+  NativeBackgroundTaskAppGuardProvider,
+  useNativeBackgroundTaskAppGuard,
+} from '@/components/NativeBackgroundTaskAppGuard';
+import {
   formatInteractiveSessionLaunchError,
   isInteractiveSessionTerminalOpenError,
 } from '@/lib/interactiveSessionLaunch';
@@ -93,6 +97,7 @@ function calculateContinuousUsageDays(dailyHistory: UsageStats['dailyHistory']):
 
 function AppContent() {
   const { t } = useLocale();
+  const { requestQuit } = useNativeBackgroundTaskAppGuard();
   const FOCUS_SYNC_INTERVAL_MS = 5000;
   const FOCUS_SYNC_DELAY_MS = 180;
   const perfAutopilotEnabled = import.meta.env.DEV && import.meta.env.VITE_PERF_AUTOPILOT === '1';
@@ -698,8 +703,8 @@ function AppContent() {
     'meta+enter': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
     'meta+n': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
     'meta+,': () => navigateToTab('settings'),
-    'meta+q': () => invoke('quit_app'),
-  }), [handleLaunch, navigateToTab, surfaceBackgroundTerminalPartial]);
+    'meta+q': () => { void requestQuit(); },
+  }), [handleLaunch, navigateToTab, requestQuit, surfaceBackgroundTerminalPartial]);
 
   useKeyboardShortcuts(globalShortcuts);
 
@@ -902,7 +907,9 @@ function AppContent() {
 function App() {
   return (
     <LocaleProvider>
-      <AppContent />
+      <NativeBackgroundTaskAppGuardProvider>
+        <AppContent />
+      </NativeBackgroundTaskAppGuardProvider>
     </LocaleProvider>
   );
 }

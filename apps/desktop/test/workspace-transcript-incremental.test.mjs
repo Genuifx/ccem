@@ -229,6 +229,84 @@ test('gap inside appended events still emits the transcript gap summary', async 
   ));
 });
 
+test('background-task tool completions stay suppressed across incremental appends', async () => {
+  const mod = await importTranscriptModule();
+  const task = (toolUseId) => ({
+    task_id: `task-${toolUseId}`,
+    tool_use_id: toolUseId,
+    description: `background ${toolUseId}`,
+    status: 'running',
+    started_at: new Date(BASE_TS).toISOString(),
+    updated_at: new Date(BASE_TS + 5000).toISOString(),
+  });
+  const events = [
+    ev(1, { type: 'user_prompt', text: 'start background work' }),
+    ev(2, {
+      type: 'background_tasks_changed',
+      tasks: [task('bg-tool-1'), task('bg-tool-2')],
+    }),
+    ev(3, {
+      type: 'background_task_updated',
+      task: { ...task('bg-tool-3'), status: 'running' },
+    }),
+    // Background completions that never attach to a visible block must not
+    // fall through to standalone error/result rows.
+    ev(4, {
+      type: 'tool_use_completed',
+      tool_use_id: 'bg-tool-1',
+      raw_name: 'Task',
+      result_summary: 'background boom',
+      success: false,
+    }),
+    ev(5, {
+      type: 'tool_use_completed',
+      tool_use_id: 'bg-tool-2',
+      raw_name: 'Task',
+      result_summary: 'background done',
+      success: true,
+    }),
+    ev(6, {
+      type: 'tool_use_started',
+      tool_use_id: 'fg-tool-1',
+      raw_name: 'Read',
+      input_summary: 'src/main.ts',
+      needs_response: false,
+      category: { category: 'file_op', raw_name: 'Read' },
+    }),
+    ev(7, {
+      type: 'tool_use_completed',
+      tool_use_id: 'fg-tool-1',
+      raw_name: 'Read',
+      result_content: 'file body',
+      result_summary: 'file body',
+      success: true,
+    }),
+  ];
+
+  const oneShot = mod.buildMessagesFromEvents(baseMessages(), [], events, null);
+  assert.ok(!oneShot.some((message) => message.content === 'background boom'),
+    'failed background completion must not render an error row');
+  assert.ok(!oneShot.some((message) =>
+    Array.isArray(message.content)
+    && message.content.some((block) => block.type === 'tool_result' && block.tool_use_id === 'bg-tool-2')),
+    'successful background completion must not render a result row');
+
+  // Incremental: fold the background registration first, then append the
+  // completions — the accumulator must survive exactly like one-shot.
+  const state = mod.deriveTranscriptReset(baseMessages(), [], events.slice(0, 3), null);
+  const incremental = mod.finalizeTranscriptMessages(
+    mod.deriveTranscriptAppend(state, events.slice(3)),
+  );
+  assert.deepEqual(incremental, oneShot);
+
+  // Registration arriving IN the appended batch works too (streaming case).
+  const lateState = mod.deriveTranscriptReset(baseMessages(), [], events.slice(0, 1), null);
+  const lateIncremental = mod.finalizeTranscriptMessages(
+    mod.deriveTranscriptAppend(lateState, events.slice(1)),
+  );
+  assert.deepEqual(lateIncremental, oneShot);
+});
+
 test('head rebase and terminal error finalize without refolding', async () => {
   const mod = await importTranscriptModule();
   const events = buildFixture(50);

@@ -605,6 +605,9 @@ export function sessionEventsNeedSummaryRefresh(events: SessionEventRecord[]) {
       case 'permission_responded':
       case 'terminal_prompt_required':
       case 'terminal_prompt_resolved':
+      case 'runtime_settings_changed':
+      case 'background_tasks_changed':
+      case 'background_task_updated':
         return true;
       case 'tool_use_completed':
         return event.payload.success === false;
@@ -637,6 +640,9 @@ const ACTIVE_TURN_LIFECYCLE_STAGES = new Set([
   'prompt_send_requested',
   'prompt_send_written',
   'processing',
+  'interrupt_requested',
+  'stop_requested',
+  'stop_written',
   'turn_started',
 ]);
 
@@ -648,13 +654,10 @@ const CLOSED_TURN_LIFECYCLE_STAGES = new Set([
   'idle',
   'idle_stop',
   'interrupted',
-  'interrupt_requested',
   'interrupt_timeout',
   'ready',
   'stopped',
   'stop_force_killed',
-  'stop_requested',
-  'stop_written',
   'turn_completed',
   'turn_interrupted',
 ]);
@@ -925,6 +928,9 @@ export interface TranscriptDerivationState {
   headLength: number;
   pendingTurn: PendingAssistantTurn | null;
   hiddenInteractiveToolUseIds: Set<string>;
+  /** Tool uses owned by background tasks: their completions never render as
+   *  standalone result/error rows (v2.70.0 background-task lifecycle). */
+  backgroundToolUseIds: Set<string>;
   emittedErrorTexts: Set<string>;
   promptQueue: LocalUserPrompt[];
   /** Last event seq folded in; doubles as the gap-detection junction. */
@@ -1236,6 +1242,18 @@ function foldTranscriptEvents(
         });
         break;
       }
+      case 'background_tasks_changed': {
+        event.payload.tasks.forEach((task) => {
+          if (task.tool_use_id) state.backgroundToolUseIds.add(task.tool_use_id);
+        });
+        break;
+      }
+      case 'background_task_updated': {
+        if (event.payload.task.tool_use_id) {
+          state.backgroundToolUseIds.add(event.payload.task.tool_use_id);
+        }
+        break;
+      }
       case 'tool_use_completed': {
         if (state.hiddenInteractiveToolUseIds.has(event.payload.tool_use_id)) {
           state.hiddenInteractiveToolUseIds.delete(event.payload.tool_use_id);
@@ -1265,6 +1283,9 @@ function foldTranscriptEvents(
             occurredAt,
           )
         ) {
+          break;
+        }
+        if (state.backgroundToolUseIds.has(event.payload.tool_use_id)) {
           break;
         }
         if (!event.payload.success) {
@@ -1425,6 +1446,7 @@ export function deriveTranscriptReset(
     headLength: head.length,
     pendingTurn: null,
     hiddenInteractiveToolUseIds: new Set(),
+    backgroundToolUseIds: new Set(),
     emittedErrorTexts: new Set(),
     promptQueue: [...remainingPrompts],
     consumedSeq: null,

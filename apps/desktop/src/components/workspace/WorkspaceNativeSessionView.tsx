@@ -15,7 +15,17 @@ import {
   SquarePen,
   Terminal,
 } from '@/lib/lucide-react';
-import { Suspense, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  Suspense,
+  startTransition,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import {
@@ -120,6 +130,8 @@ import {
   type TranscriptDerivationState,
 } from './workspaceEventTranscript';
 import { ContextWindowIndicator } from './ContextWindowIndicator';
+import { WorkspaceBackgroundTasksPopover } from './WorkspaceBackgroundTasksPopover';
+import { deriveWorkspaceBackgroundTasks } from './workspaceBackgroundTasks';
 import {
   buildSessionUsageState,
   foldSessionUsageEvents,
@@ -229,6 +241,11 @@ type QueuedGuidanceState = {
 type QueuedGuidanceMessagesUpdate =
   | QueuedGuidanceMessage[]
   | ((previous: QueuedGuidanceMessage[]) => QueuedGuidanceMessage[]);
+
+type PendingBackgroundTaskRiskAction =
+  | { kind: 'environment'; envName: string }
+  | { kind: 'effort'; effort: EffortLevel }
+  | { kind: 'handoff' };
 
 interface WorkspaceNativeSessionViewProps {
   session: NativeSessionSummary;
@@ -412,7 +429,10 @@ function resolveGuidanceMessagesUpdate(
 }
 
 function isTerminalStatus(status: string) {
-  return status === 'stopped' || status === 'error' || status === 'handoff';
+  return status === 'stopped'
+    || status === 'error'
+    || status === 'handoff'
+    || status.startsWith('handoff_');
 }
 
 function formatCheckpointRelativeTime(
@@ -717,6 +737,7 @@ function buildAskUserQuestionResponse(
 function WorkspaceAttentionPanel({
   provider,
   attentionState,
+  backgroundTasks,
   respondingRequestId,
   isSubmittingPrompt,
   onPermission,
@@ -724,6 +745,7 @@ function WorkspaceAttentionPanel({
 }: {
   provider: string;
   attentionState: NativeSessionAttentionState;
+  backgroundTasks: ReactNode;
   respondingRequestId: string | null;
   isSubmittingPrompt: boolean;
   onPermission: (requestId: string, approved: boolean) => void;
@@ -733,11 +755,18 @@ function WorkspaceAttentionPanel({
   const [promptStates, setPromptStates] = useState<Record<string, InteractivePromptState>>({});
   const [collapsedPromptIds, setCollapsedPromptIds] = useState<Set<string>>(new Set());
   const attentionPanelRef = useRef<HTMLDivElement | null>(null);
+  const hasBackgroundTasks = Boolean(backgroundTasks);
   const attentionMotionKey = useMemo(() => [
     attentionState.permissions.map((request) => request.requestId).join('|'),
     attentionState.prompts.map((prompt) => prompt.toolUseId).join('|'),
     attentionState.terminalPrompt ? 'terminal' : 'no-terminal',
-  ].join('::'), [attentionState.permissions, attentionState.prompts, attentionState.terminalPrompt]);
+    hasBackgroundTasks ? 'background-tasks' : 'no-background-tasks',
+  ].join('::'), [
+    attentionState.permissions,
+    attentionState.prompts,
+    attentionState.terminalPrompt,
+    hasBackgroundTasks,
+  ]);
 
   useEffect(() => {
     const activePromptIds = new Set(attentionState.prompts.map((prompt) => prompt.toolUseId));
@@ -832,6 +861,7 @@ function WorkspaceAttentionPanel({
     attentionState.permissions.length === 0
     && attentionState.prompts.length === 0
     && !attentionState.terminalPrompt
+    && !hasBackgroundTasks
   ) {
     return null;
   }
@@ -1333,6 +1363,8 @@ function WorkspaceAttentionPanel({
           </p>
         </div>
       ) : null}
+
+      {backgroundTasks}
     </div>
   );
 }
@@ -1366,6 +1398,7 @@ export function WorkspaceNativeSessionView({
     rewindNativeSessionFiles,
     queryNativeSessionUsage,
     stopNativeSession,
+    stopNativeBackgroundTask,
     updateNativeSessionSettings,
     setNativeSessionRuntimePermMode,
     handoffNativeSessionToTerminal,
@@ -1406,6 +1439,10 @@ export function WorkspaceNativeSessionView({
   const [isSending, setIsSending] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isHandingOff, setIsHandingOff] = useState(false);
+  const [pendingBackgroundTaskRiskAction, setPendingBackgroundTaskRiskAction] =
+    useState<PendingBackgroundTaskRiskAction | null>(null);
+  const [isApplyingBackgroundTaskRiskAction, setIsApplyingBackgroundTaskRiskAction] =
+    useState(false);
   const [isWecomBindDialogOpen, setIsWecomBindDialogOpen] = useState(false);
   const [isExternalActionsOpen, setIsExternalActionsOpen] = useState(false);
   const [isFileRestoreMenuOpen, setIsFileRestoreMenuOpen] = useState(false);
@@ -1542,6 +1579,11 @@ export function WorkspaceNativeSessionView({
     // running totals already account for pruned events).
     return buildSessionUsageState(previous.fold);
   }, [events]);
+  const backgroundTaskModel = useMemo(
+    () => deriveWorkspaceBackgroundTasks(session, events),
+    [events, session.background_tasks, session.last_event_seq],
+  );
+  const activeBackgroundTaskCount = backgroundTaskModel.active.length;
 
   const refreshSessionUsage = useCallback(() => {
     if (session.provider !== 'claude') return;
@@ -2306,11 +2348,17 @@ export function WorkspaceNativeSessionView({
     [attentionState.prompts],
   );
   const hasPlanExitPrompt = planExitPromptIds.length > 0;
-  const hasHardBlockingAttention = attentionState.permissions.length > 0
+  const hasHardBlockingAttention = attentionState.permissions.some(
+    (request) => !request.backgroundTaskId,
+  )
     || Boolean(attentionState.terminalPrompt)
     || hasAskUserQuestionPrompt;
   const hasBlockingAttention = hasHardBlockingAttention || hasQuickReplyPrompt;
-  const hasAttentionPanel = hasBlockingAttention;
+  const hasBackgroundTaskPanel = session.provider === 'claude'
+    && (backgroundTaskModel.active.length > 0 || backgroundTaskModel.recent.length > 0);
+  const hasAttentionPanel = attentionState.permissions.length > 0
+    || hasBlockingAttention
+    || hasBackgroundTaskPanel;
   const canSend = !isSending
     && !isTerminalStatus(session.status)
     && (composerHasDraft || sessionAnnotations.pendingAnnotations.length > 0);
@@ -2320,11 +2368,14 @@ export function WorkspaceNativeSessionView({
     && !isTerminalStatus(session.status)
     && !isProcessingTurn
     && !hasBlockingAttention
+    && activeBackgroundTaskCount === 0
     && !isRewindingFiles;
   const fileRestoreDisabledReason = canUseFileRestorePoints
     ? null
     : isRewindingFiles
       ? t('common.loading')
+      : activeBackgroundTaskCount > 0
+        ? t('workspace.nativeRestoreBackgroundBusy')
       : hasBlockingAttention
         ? t('workspace.nativeRestoreBlocked')
         : isProcessingTurn
@@ -2685,21 +2736,24 @@ export function WorkspaceNativeSessionView({
     return true;
   }, []);
 
-  const handleEnvChange = useCallback((envName: string) => {
-    const previousEnv = sessionEnv;
+  const performEnvChange = useCallback((envName: string, forceRestart = false) => {
     const runtimeId = session.runtime_id;
     const requestSeq = environmentUpdateRequestSeqRef.current + 1;
     const previousUpdate = pendingEnvironmentUpdateRef.current;
     environmentUpdateRequestSeqRef.current = requestSeq;
-    setSessionEnv(envName);
-
     let updatePromise: Promise<boolean>;
     updatePromise = (async () => {
       if (previousUpdate) {
         await previousUpdate;
       }
       try {
-        await updateNativeSessionSettings(runtimeId, envName, undefined);
+        await updateNativeSessionSettings(
+          runtimeId,
+          envName,
+          undefined,
+          undefined,
+          forceRestart,
+        );
         if (environmentUpdateRequestSeqRef.current === requestSeq) {
           await refreshSummary({ force: true });
         }
@@ -2707,7 +2761,6 @@ export function WorkspaceNativeSessionView({
       } catch (error) {
         console.error('Failed to update native session environment:', error);
         if (environmentUpdateRequestSeqRef.current === requestSeq) {
-          setSessionEnv(previousEnv);
           toast.error(t('workspace.nativeSettingsFailed'));
         }
         return false;
@@ -2718,7 +2771,16 @@ export function WorkspaceNativeSessionView({
       }
     });
     pendingEnvironmentUpdateRef.current = updatePromise;
-  }, [refreshSummary, session.runtime_id, sessionEnv, t, updateNativeSessionSettings]);
+    return updatePromise;
+  }, [refreshSummary, session.runtime_id, t, updateNativeSessionSettings]);
+
+  const handleEnvChange = useCallback((envName: string) => {
+    if (activeBackgroundTaskCount > 0) {
+      setPendingBackgroundTaskRiskAction({ kind: 'environment', envName });
+      return;
+    }
+    performEnvChange(envName);
+  }, [activeBackgroundTaskCount, performEnvChange]);
 
   const handlePermModeChange = useCallback((mode: PermissionModeName) => {
     const previousRuntimeMode = sessionRuntimePermMode;
@@ -2748,18 +2810,33 @@ export function WorkspaceNativeSessionView({
     void applyRuntimePlanModeChange(enabled);
   }, [applyRuntimePlanModeChange]);
 
-  const handleEffortChange = useCallback((effort: EffortLevel) => {
+  const performEffortChange = useCallback((effort: EffortLevel, forceRestart = false) => {
     const nextEffort = normalizeEffortForProvider(effort, session.provider);
-    const previousEffort = sessionEffort;
-    setSessionEffort(nextEffort);
-    void updateNativeSessionSettings(session.runtime_id, undefined, undefined, nextEffort)
-      .then(() => refreshSummary({ force: true }))
+    return updateNativeSessionSettings(
+      session.runtime_id,
+      undefined,
+      undefined,
+      nextEffort,
+      forceRestart,
+    )
+      .then(async () => {
+        await refreshSummary({ force: true });
+        return true;
+      })
       .catch((error) => {
         console.error('Failed to update native session effort:', error);
-        setSessionEffort(previousEffort);
         toast.error(t('workspace.nativeSettingsFailed'));
+        return false;
       });
-  }, [refreshSummary, session.provider, session.runtime_id, sessionEffort, t, updateNativeSessionSettings]);
+  }, [refreshSummary, session.provider, session.runtime_id, t, updateNativeSessionSettings]);
+
+  const handleEffortChange = useCallback((effort: EffortLevel) => {
+    if (activeBackgroundTaskCount > 0) {
+      setPendingBackgroundTaskRiskAction({ kind: 'effort', effort });
+      return;
+    }
+    performEffortChange(effort);
+  }, [activeBackgroundTaskCount, performEffortChange]);
 
   const handleSend = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isSending) {
@@ -3002,23 +3079,82 @@ export function WorkspaceNativeSessionView({
     }
   }, [refreshSummary, session.runtime_id, stopNativeSession, t]);
 
-  const handleHandoff = useCallback(async () => {
+  const handleStopBackgroundTask = useCallback(async (taskId: string) => {
+    await stopNativeBackgroundTask(session.runtime_id, taskId);
+    await pollEvents();
+    await refreshSummary({ force: true });
+  }, [pollEvents, refreshSummary, session.runtime_id, stopNativeBackgroundTask]);
+
+  const performHandoff = useCallback(async (allowBackgroundTaskTermination = false) => {
     setIsHandingOff(true);
     try {
-      const result = await handoffNativeSessionToTerminal(session.runtime_id);
+      const result = await handoffNativeSessionToTerminal(
+        session.runtime_id,
+        undefined,
+        allowBackgroundTaskTermination,
+      );
       await refreshSummary({ force: true });
       toast.success(
         t(result.status === 'pending'
           ? 'workspace.nativeHandoffPending'
           : 'workspace.nativeHandoffDone'),
       );
+      return true;
     } catch (error) {
       console.error('Failed to handoff native session:', error);
       toast.error(t('workspace.nativeHandoffFailed'));
+      return false;
     } finally {
       setIsHandingOff(false);
     }
   }, [handoffNativeSessionToTerminal, refreshSummary, session.runtime_id, t]);
+
+  const handleHandoff = useCallback(() => {
+    if (activeBackgroundTaskCount > 0) {
+      setPendingBackgroundTaskRiskAction({ kind: 'handoff' });
+      return;
+    }
+    void performHandoff();
+  }, [activeBackgroundTaskCount, performHandoff]);
+
+  const applyPendingBackgroundTaskRiskAction = useCallback(async (force: boolean) => {
+    const action = pendingBackgroundTaskRiskAction;
+    if (!action || isApplyingBackgroundTaskRiskAction) {
+      return;
+    }
+    setIsApplyingBackgroundTaskRiskAction(true);
+    try {
+      if (!force && action.kind !== 'handoff') {
+        const succeeded = action.kind === 'environment'
+          ? await performEnvChange(action.envName, false)
+          : await performEffortChange(action.effort, false);
+        if (!succeeded) return;
+        setPendingBackgroundTaskRiskAction(null);
+        toast.info(t('workspace.backgroundTasksDeferred'));
+        return;
+      }
+      let succeeded = false;
+      if (action.kind === 'environment') {
+        succeeded = await performEnvChange(action.envName, force);
+      } else if (action.kind === 'effort') {
+        succeeded = await performEffortChange(action.effort, force);
+      } else if (force) {
+        succeeded = await performHandoff(true);
+      }
+      if (succeeded) {
+        setPendingBackgroundTaskRiskAction(null);
+      }
+    } finally {
+      setIsApplyingBackgroundTaskRiskAction(false);
+    }
+  }, [
+    isApplyingBackgroundTaskRiskAction,
+    pendingBackgroundTaskRiskAction,
+    performEffortChange,
+    performEnvChange,
+    performHandoff,
+    t,
+  ]);
 
   const handleRestoreFileCheckpoint = useCallback(async () => {
     if (!selectedFileCheckpoint || !canUseFileRestorePoints) {
@@ -3288,6 +3424,13 @@ export function WorkspaceNativeSessionView({
           <WorkspaceAttentionPanel
             provider={session.provider}
             attentionState={attentionState}
+            backgroundTasks={hasBackgroundTaskPanel ? (
+              <WorkspaceBackgroundTasksPopover
+                activeTasks={backgroundTaskModel.active}
+                recentTasks={backgroundTaskModel.recent}
+                onStopTask={handleStopBackgroundTask}
+              />
+            ) : null}
             respondingRequestId={respondingRequestId}
             isSubmittingPrompt={isSending}
             onPermission={(requestId, approved) => {
@@ -3472,7 +3615,7 @@ export function WorkspaceNativeSessionView({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="gap-2.5"
-                  disabled={isHandingOff || isHandoffPending}
+                  disabled={isHandingOff || isHandoffPending || isProcessingTurn}
                   onSelect={() => {
                     closeExternalActionsMenu();
                     void handleHandoff();
@@ -3491,6 +3634,66 @@ export function WorkspaceNativeSessionView({
         )}
       />
     </div>
+    <Dialog
+      open={Boolean(pendingBackgroundTaskRiskAction)}
+      onOpenChange={(open) => {
+        if (!open && !isApplyingBackgroundTaskRiskAction) {
+          setPendingBackgroundTaskRiskAction(null);
+        }
+      }}
+    >
+      <DialogContent
+        data-ccem-background-task-risk-dialog
+        className="frosted-panel glass-noise max-w-[440px] border-none p-5"
+      >
+        <DialogHeader>
+          <DialogTitle>{t('workspace.backgroundTasksRestartWarningTitle')}</DialogTitle>
+          <DialogDescription>
+            {t(
+              pendingBackgroundTaskRiskAction?.kind === 'handoff'
+                ? 'workspace.backgroundTasksHandoffWarningBody'
+                : 'workspace.backgroundTasksRestartWarningBody',
+              { count: activeBackgroundTaskCount },
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            className="glass-btn-outline"
+            disabled={isApplyingBackgroundTaskRiskAction}
+            onClick={() => setPendingBackgroundTaskRiskAction(null)}
+          >
+            {t('workspace.backgroundTasksCancel')}
+          </Button>
+          {pendingBackgroundTaskRiskAction?.kind !== 'handoff' ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isApplyingBackgroundTaskRiskAction}
+              onClick={() => void applyPendingBackgroundTaskRiskAction(false)}
+            >
+              {t('workspace.backgroundTasksDefer')}
+            </Button>
+          ) : null}
+          <Button
+            type="button"
+            variant="destructive"
+            className="gap-2"
+            disabled={isApplyingBackgroundTaskRiskAction}
+            onClick={() => void applyPendingBackgroundTaskRiskAction(true)}
+          >
+            {isApplyingBackgroundTaskRiskAction ? (
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+            ) : (
+              <ShieldAlert className="h-4 w-4" />
+            )}
+            {t('workspace.backgroundTasksContinue')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
     <Dialog
       open={isRestoreDialogOpen}
       onOpenChange={(open) => {

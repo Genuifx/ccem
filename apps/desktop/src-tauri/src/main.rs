@@ -1498,7 +1498,6 @@ fn send_native_session_input(
 
 #[tauri::command]
 fn respond_native_session_permission(
-    app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
@@ -1506,12 +1505,11 @@ fn respond_native_session_permission(
     approved: bool,
 ) -> Result<(), String> {
     let _mutation_guard = environment_mutations.lock()?;
-    native_state.respond_to_permission(&app, &runtime_id, &request_id, approved)
+    native_state.respond_to_permission(&runtime_id, &request_id, approved)
 }
 
 #[tauri::command]
 fn respond_native_session_prompt(
-    app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
@@ -1524,7 +1522,6 @@ fn respond_native_session_prompt(
 ) -> Result<(), String> {
     let _mutation_guard = environment_mutations.lock()?;
     native_state.respond_to_prompt(
-        &app,
         &runtime_id,
         &tool_use_id,
         &prompt_type,
@@ -1583,6 +1580,7 @@ fn update_native_session_settings(
     env_name: Option<String>,
     perm_mode: Option<String>,
     effort: Option<String>,
+    force_restart: Option<bool>,
 ) -> Result<(), String> {
     // Settings writes can lazily reconnect an interrupted helper. Serialize the
     // whole operation even when the environment itself is unchanged so a
@@ -1624,6 +1622,7 @@ fn update_native_session_settings(
                 perm_mode.as_deref(),
                 None,
                 effort.as_deref(),
+                force_restart.unwrap_or(false),
             );
         }
     }
@@ -1655,6 +1654,7 @@ fn update_native_session_settings(
         perm_mode.as_deref(),
         env_vars.as_ref(),
         effort.as_deref(),
+        force_restart.unwrap_or(false),
     )
 }
 
@@ -1680,6 +1680,15 @@ fn stop_native_session(
 }
 
 #[tauri::command]
+fn stop_native_background_task(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    task_id: String,
+) -> Result<(), String> {
+    native_state.stop_background_task(&runtime_id, &task_id)
+}
+
+#[tauri::command]
 fn handoff_native_session_to_terminal(
     app: tauri::AppHandle,
     state: State<'_, Arc<SessionManager>>,
@@ -1688,9 +1697,14 @@ fn handoff_native_session_to_terminal(
     browser_state: State<'_, Arc<BrowserManager>>,
     runtime_id: String,
     terminal_type: Option<TerminalType>,
+    allow_background_task_termination: Option<bool>,
 ) -> Result<NativeHandoffResult, String> {
-    let managed_handoff =
-        native_state.run_managed_terminal_handoff(&runtime_id, terminal_type, |handoff| {
+    let allow_background_task_termination = allow_background_task_termination.unwrap_or(false);
+    let managed_handoff = native_state.run_managed_terminal_handoff(
+        &runtime_id,
+        terminal_type,
+        allow_background_task_termination,
+        |handoff| {
             let attach_terminal = attach_terminal_for_native_terminal(handoff.terminal);
             let session_manager = state.inner().clone();
             let session = interactive_state.create_session(
@@ -1718,11 +1732,20 @@ fn handoff_native_session_to_terminal(
                 return Err(error);
             }
             Ok(session)
-        });
+        },
+        |session| {
+            let _ = interactive_state.stop_session(&session.id);
+            state.remove_session(&session.id);
+        },
+    );
     let (handoff, session) = match managed_handoff {
         Ok(result) => result,
         Err(error) if error == "Session id is not ready for terminal handoff yet" => {
-            return native_state.handoff_to_terminal(&runtime_id, terminal_type);
+            return native_state.handoff_to_terminal(
+                &runtime_id,
+                terminal_type,
+                allow_background_task_termination,
+            );
         }
         Err(error) => return Err(error),
     };
@@ -5019,9 +5042,15 @@ async fn copy_image_to_clipboard(app: tauri::AppHandle, base64_png: String) -> R
 /// Force-quit the app, bypassing closeToTray.
 /// Called from frontend Cmd+Q handler.
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
+fn quit_app(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    force: Option<bool>,
+) -> Result<(), String> {
+    native_state.prepare_app_termination(force.unwrap_or(false))?;
     FORCE_QUIT.store(true, Ordering::SeqCst);
     app.exit(0);
+    Ok(())
 }
 
 fn main() {
@@ -5116,7 +5145,6 @@ fn main() {
     let interactive_manager_for_setup = interactive_runtime_manager.clone();
     let interactive_manager_for_run = interactive_runtime_manager.clone();
     let headless_manager_for_run = headless_runtime_manager.clone();
-    let native_manager_for_run = native_runtime_manager.clone();
     let telegram_manager_for_setup = telegram_bridge_manager.clone();
     let telegram_manager_for_run = telegram_bridge_manager.clone();
     let wecom_manager_for_setup = wecom_bridge_manager.clone();
@@ -5282,6 +5310,7 @@ fn main() {
             restart_native_session_direct,
             set_native_session_runtime_perm_mode,
             stop_native_session,
+            stop_native_background_task,
             handoff_native_session_to_terminal,
             launch_opencode_web,
             list_unified_sessions,
@@ -5428,6 +5457,17 @@ fn main() {
                         if close_to_tray {
                             api.prevent_close();
                             let _ = window.hide();
+                        } else {
+                            let app = window.app_handle();
+                            let has_active_background_tasks = app
+                                .try_state::<Arc<NativeRuntimeManager>>()
+                                .is_some_and(|manager| {
+                                    manager.prepare_app_termination(false).is_err()
+                                });
+                            if has_active_background_tasks {
+                                api.prevent_close();
+                                let _ = app.emit("native-background-task-app-action", "quit");
+                            }
                         }
                     }
                 _ => {}
@@ -5620,14 +5660,29 @@ fn main() {
                 return;
             }
 
+            if let RunEvent::ExitRequested { api, .. } = &event {
+                let has_active_background_tasks = !FORCE_QUIT.load(Ordering::SeqCst)
+                    && app_handle
+                        .try_state::<Arc<NativeRuntimeManager>>()
+                        .is_some_and(|manager| manager.prepare_app_termination(false).is_err());
+                if has_active_background_tasks {
+                    api.prevent_exit();
+                    if let Some(window) = app_handle.get_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                    let _ = app_handle.emit("native-background-task-app-action", "quit");
+                    return;
+                }
+            }
+
             if let RunEvent::Exit = event {
                 telegram_manager_for_run.stop();
                 wecom_manager_for_run.stop();
                 weixin_manager_for_run.stop();
                 interactive_manager_for_run.shutdown_all();
                 headless_manager_for_run.shutdown_all();
-                // Real app exit only: close-to-tray keeps native helpers alive.
-                native_manager_for_run.shutdown_all_owned();
                 let proxy_for_shutdown = proxy_manager_for_run.clone();
                 tauri::async_runtime::block_on(async move {
                     proxy_for_shutdown.shutdown().await;
