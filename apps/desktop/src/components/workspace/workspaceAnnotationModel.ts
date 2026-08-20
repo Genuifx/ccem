@@ -17,6 +17,12 @@ export interface WorkspaceAnnotation {
   quote: string;
   note: string;
   createdAt: string;
+  /**
+   * Set when the annotation has been sent with a prompt. Sent annotations
+   * keep their transcript highlight + marker but are no longer attached to
+   * subsequent prompts.
+   */
+  sentAt?: string;
   anchor?: WorkspaceAnnotationAnchor;
 }
 
@@ -109,11 +115,15 @@ export function normalizeStoredWorkspaceAnnotations(value: unknown): WorkspaceAn
     })
     .map((annotation) => {
       const anchor = normalizeWorkspaceAnnotationAnchor(annotation.anchor);
+      const sentAt = typeof annotation.sentAt === 'string' && annotation.sentAt.length > 0
+        ? annotation.sentAt
+        : undefined;
       return {
         id: annotation.id,
         quote: annotation.quote.trim(),
         note: annotation.note.trim(),
         createdAt: annotation.createdAt,
+        ...(sentAt ? { sentAt } : {}),
         ...(anchor ? { anchor } : {}),
       };
     });

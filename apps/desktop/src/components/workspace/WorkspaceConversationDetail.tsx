@@ -31,7 +31,7 @@ interface WorkspaceConversationDetailProps {
   canAddAnnotation?: boolean;
   annotations?: WorkspaceAnnotation[];
   onAddAnnotation?: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
-  onUpdateAnnotation?: (id: string, note: string) => void;
+  onUpdateAnnotation?: (id: string, note: string) => boolean;
   onRemoveAnnotation?: (id: string) => void;
 }
 
