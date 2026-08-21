@@ -13,19 +13,15 @@ import {
   type MessageSegment,
   type ToolDigestEntry,
 } from './WorkspaceMessageBubble';
+import {
+  computeNextTopWindowCount,
+  computeTopSpacerHeight,
+  createTranscriptItemHeightCache,
+  isWindowingViewportMeasurable,
+  transcriptItemIntersectsViewport,
+  type TranscriptItemHeightCache,
+} from './workspaceTranscriptTopWindowing';
 
-/**
- * Top-windowing bounds (plan 022, step 4). Items more than this many
- * viewports above the scroll position are replaced by an estimated-height
- * spacer; the streaming tail always stays mounted. Expect revision.
- */
-export const TOP_WINDOWING_VIEWPORTS_ABOVE = 8;
-/** Never window below this many rendered items (tail safety floor). */
-export const TOP_WINDOWING_MIN_RENDERED_ITEMS = 24;
-/** Fallback item height before any measurement (typical message row). */
-const TOP_WINDOWING_DEFAULT_ITEM_HEIGHT = 72;
-/** Running-average sample cap; halving keeps the mean recent but stable. */
-const TOP_WINDOWING_MAX_SAMPLES = 800;
 const TOP_SPACER_DATASET = 'workspaceTranscriptTopSpacer';
 
 export type WorkspaceTranscriptItem =
@@ -88,6 +84,31 @@ const processedMessageSegmentsCache = new WeakMap<
 
 const fallbackMessageKeys = new WeakMap<ConversationMessageData, string>();
 let nextFallbackMessageKey = 0;
+
+/**
+ * Outer flow height of one transcript item: element height plus its vertical
+ * margins. The spacer replaces the item's full flow box, and the `mt-*`
+ * spacing classes live outside offsetHeight, so margins must be counted.
+ * Returns 0-equivalent (just the margin) for unmeasurable rows.
+ */
+function measureTranscriptItemOuterHeight(
+  element: HTMLElement,
+  key: string,
+  cache: TranscriptItemHeightCache,
+): number {
+  let margin = cache.margins.get(key);
+  if (margin == null) {
+    const style = window.getComputedStyle(element);
+    margin = Math.max(0, Number.parseFloat(style.marginTop) || 0)
+      + Math.max(0, Number.parseFloat(style.marginBottom) || 0);
+    cache.margins.set(key, margin);
+  }
+  // offsetHeight is the flow-box height. getBoundingClientRect includes GSAP
+  // transforms, so measuring during an entrance animation can cache a scaled
+  // (and therefore stale) value that ResizeObserver will not correct because
+  // transforms do not change layout size.
+  return element.offsetHeight + margin;
+}
 
 function getStableMessageKey(message: ConversationMessageData): string {
   if (message.uuid) {
@@ -247,7 +268,19 @@ export function WorkspaceTranscriptList({
   const listRef = useRef<HTMLDivElement | null>(null);
   const seenItemKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedMotionRef = useRef(false);
-  const itemHeightStatsRef = useRef({ sum: 0, count: 0 });
+  /** Per-item-key measured heights; stable estimates immune to one giant row. */
+  const heightCacheRef = useRef<TranscriptItemHeightCache>(createTranscriptItemHeightCache());
+  /** Pending reading anchor to re-apply after the window/spacer shifts. */
+  const windowAnchorRef = useRef<{
+    key: string;
+    viewportTopOffset: number;
+    fromWindowCount: number;
+  } | null>(null);
+  const topWindowCountRef = useRef(0);
+  const wasViewportMeasurableRef = useRef(false);
+  const lastVisibleScrollTopRef = useRef(0);
+  const itemResizeObserverRef = useRef<ResizeObserver | null>(null);
+  const observedItemKeysRef = useRef<Set<string>>(new Set());
   const [topWindowCount, setTopWindowCount] = useState(0);
   const mergedMessages = useMemo(() => mergeToolResults(messages), [messages]);
   const transcriptItems = useMemo(
@@ -301,6 +334,10 @@ export function WorkspaceTranscriptList({
       } as const,
     ];
   }, [isAwaitingResponse, transcriptItems]);
+  const displayItemKeys = useMemo(
+    () => displayItems.map((item) => item.key),
+    [displayItems],
+  );
   // The entrance effect only needs to know when NEW items appear at the tail
   // (streaming appends, segment growth, pending-response toggle); a
   // {length, lastKey} signal is O(1) where the joined key string was O(N).
@@ -362,13 +399,116 @@ export function WorkspaceTranscriptList({
   }, { dependencies: [displayItemTailSignal], scope: listRef });
 
   // --- Top windowing (opt-in) ---------------------------------------------
-  // Items more than N viewports above the scroll top collapse into a spacer
-  // of estimated height. All spacer height changes land strictly ABOVE the
-  // viewport (the buffer guarantees it), which matters because this scroll
-  // container disables browser scroll anchoring (overflow-anchor: none).
-  const averageItemHeight = useCallback(() => {
-    const stats = itemHeightStatsRef.current;
-    return stats.count > 0 ? stats.sum / stats.count : TOP_WINDOWING_DEFAULT_ITEM_HEIGHT;
+  // Items more than N viewports above the scroll top collapse into a spacer.
+  // Heights are cached per item key (stable across sessions switches); the
+  // spacer sums cached heights and falls back to the MEDIAN measured height
+  // for rows never measured — one dynamically expanded digest only affects
+  // its own key and can no longer re-estimate every other row.
+  // All spacer height changes land strictly ABOVE the viewport (the buffer
+  // guarantees it), which matters because this scroll container disables
+  // browser scroll anchoring (overflow-anchor: none).
+
+  /** Remember the first visible item so a window change can hold it in place. */
+  const captureFirstVisibleAnchor = useCallback((fromWindowCount: number) => {
+    const container = viewportRef?.current;
+    const list = listRef.current;
+    windowAnchorRef.current = null;
+    if (!container || !list) {
+      return;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const children = list.querySelectorAll<HTMLElement>('[data-transcript-item-key]');
+    for (const child of Array.from(children)) {
+      const rect = child.getBoundingClientRect();
+      if (transcriptItemIntersectsViewport(
+        rect.top,
+        rect.bottom,
+        containerRect.top,
+        containerRect.bottom,
+      )) {
+        windowAnchorRef.current = {
+          key: child.dataset.transcriptItemKey ?? '',
+          viewportTopOffset: rect.top - containerRect.top,
+          fromWindowCount,
+        };
+        return;
+      }
+    }
+  }, [viewportRef]);
+
+  /** Width change invalidates every cached height: re-anchor, drop, un-window. */
+  const resetHeightCacheForWidth = useCallback((width: number) => {
+    captureFirstVisibleAnchor(topWindowCountRef.current);
+    const fresh = createTranscriptItemHeightCache();
+    fresh.width = width;
+    heightCacheRef.current = fresh;
+    if (topWindowCountRef.current !== 0) {
+      topWindowCountRef.current = 0;
+      setTopWindowCount(0);
+    }
+  }, [captureFirstVisibleAnchor]);
+
+  /**
+   * Keep the ResizeObserver pointed at exactly the rendered items. A dep-less
+   * layout effect only sees heights that change alongside a parent commit;
+   * a tool digest expanding its own internal state re-renders nothing here,
+   * so the observer is what keeps that item's cached height honest (and the
+   * spacer accurate once the row is windowed away later).
+   */
+  const syncItemResizeObserver = useCallback((
+    children: Array<{ key: string; element: HTMLElement }>,
+  ) => {
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observed = observedItemKeysRef.current;
+    const currentKeys = new Set(children.map((child) => child.key));
+    let staleObservations = observed.size !== currentKeys.size;
+    if (!staleObservations) {
+      for (const key of currentKeys) {
+        if (!observed.has(key)) {
+          staleObservations = true;
+          break;
+        }
+      }
+    }
+    if (staleObservations) {
+      itemResizeObserverRef.current?.disconnect();
+      observed.clear();
+    }
+    if (!itemResizeObserverRef.current) {
+      itemResizeObserverRef.current = new ResizeObserver((entries) => {
+        const cache = heightCacheRef.current;
+        for (const entry of entries) {
+          const target = entry.target;
+          if (!(target instanceof HTMLElement)) {
+            continue;
+          }
+          const key = target.dataset.transcriptItemKey;
+          if (!key) {
+            continue;
+          }
+          const outerHeight = measureTranscriptItemOuterHeight(target, key, cache);
+          const margin = cache.margins.get(key) ?? 0;
+          if (outerHeight > margin) {
+            cache.heights.set(key, outerHeight);
+          }
+        }
+      });
+    }
+    for (const { key, element } of children) {
+      if (observed.has(key)) {
+        continue;
+      }
+      itemResizeObserverRef.current.observe(element);
+      observed.add(key);
+    }
+  }, []);
+
+  useEffect(() => () => {
+    itemResizeObserverRef.current?.disconnect();
+    itemResizeObserverRef.current = null;
+    observedItemKeysRef.current.clear();
   }, []);
 
   const recomputeTopWindow = useCallback(() => {
@@ -377,23 +517,38 @@ export function WorkspaceTranscriptList({
     if (!container || !list || displayItems.length === 0) {
       return;
     }
+    if (!isWindowingViewportMeasurable(container)) {
+      return;
+    }
+    if (heightCacheRef.current.width !== container.clientWidth) {
+      // Width moved since the last measurement: heights are stale. Reset and
+      // un-window now (the resize path may run before any re-render commits).
+      resetHeightCacheForWidth(container.clientWidth);
+      return;
+    }
     const containerRect = container.getBoundingClientRect();
     const listRect = list.getBoundingClientRect();
     // Content-space top of the list (spacer included; the spacer is the list's
     // first child, so the list element's top is a stable anchor).
     const listTopInContent = container.scrollTop + (listRect.top - containerRect.top);
-    const bufferPx = TOP_WINDOWING_VIEWPORTS_ABOVE * container.clientHeight;
-    const hideablePx = container.scrollTop - bufferPx - listTopInContent;
-    let next = Math.floor(hideablePx / averageItemHeight());
-    if (!(next > 0)) {
-      next = 0;
+    const next = computeNextTopWindowCount({
+      scrollTop: container.scrollTop,
+      listTopInContent,
+      viewportHeight: container.clientHeight,
+      itemKeys: displayItemKeys,
+      heightCache: heightCacheRef.current,
+    });
+    const previous = topWindowCountRef.current;
+    if (next === previous) {
+      return;
     }
-    const maxHidden = Math.max(0, displayItems.length - TOP_WINDOWING_MIN_RENDERED_ITEMS);
-    if (next > maxHidden) {
-      next = maxHidden;
-    }
-    setTopWindowCount((previous) => (previous === next ? previous : next));
-  }, [averageItemHeight, displayItems.length, viewportRef]);
+    // Capture the reading anchor BEFORE the state update; the layout effect
+    // below re-applies it from the real post-render rect, so compensation is
+    // exact even when cached heights already match the spacer change.
+    captureFirstVisibleAnchor(previous);
+    topWindowCountRef.current = next;
+    setTopWindowCount(next);
+  }, [captureFirstVisibleAnchor, displayItemKeys, resetHeightCacheForWidth, viewportRef]);
 
   useEffect(() => {
     if (!enableTopWindowing) {
@@ -405,6 +560,12 @@ export function WorkspaceTranscriptList({
     }
     let frame: number | null = null;
     const onScroll = () => {
+      // A hidden (display:none) container reports scrollTop 0 — never save
+      // that, it would clobber the reading position restored on switch-back.
+      if (!isWindowingViewportMeasurable(container)) {
+        return;
+      }
+      lastVisibleScrollTopRef.current = container.scrollTop;
       if (frame != null) {
         return;
       }
@@ -413,7 +574,7 @@ export function WorkspaceTranscriptList({
         recomputeTopWindow();
       });
     };
-    recomputeTopWindow();
+    onScroll();
     container.addEventListener('scroll', onScroll, { passive: true });
     window.addEventListener('resize', onScroll);
     return () => {
@@ -425,17 +586,64 @@ export function WorkspaceTranscriptList({
     };
   }, [enableTopWindowing, recomputeTopWindow, viewportRef]);
 
-  // Running average of measured item heights feeds the spacer estimate.
+  // Visibility + width + per-item height maintenance. Runs on every commit:
+  // hidden (display:none) sessions report zero geometry, so while hidden
+  // nothing is measured (zero heights must never pollute the cache) and on
+  // the hidden->visible transition the saved scroll position is restored and
+  // the window re-derived — a stale spacer must not blank the switched-back
+  // view. A container width change invalidates every cached height: re-anchor,
+  // drop the cache and un-window so rows re-measure at the new width.
+  // Heights are OUTER heights (offsetHeight + vertical margins): the spacer
+  // replaces each item's full flow box and the `mt-*` spacing classes live
+  // outside offsetHeight (offsetHeight itself ignores GSAP transforms).
+  // A dep-less effect cannot see heights that change without a parent
+  // re-render (a tool digest expanding its own internal state), so rendered
+  // items are also observed with a ResizeObserver while visible; the observer
+  // only refreshes the cache — a rendered item's height never moves the
+  // spacer, so no re-render or compensation is needed for those changes.
   useLayoutEffect(() => {
     if (!enableTopWindowing) {
       return;
     }
+    const container = viewportRef?.current;
     const list = listRef.current;
-    if (!list) {
+    if (!container || !list) {
       return;
     }
-    let sum = 0;
-    let count = 0;
+    if (!isWindowingViewportMeasurable(container)) {
+      wasViewportMeasurableRef.current = false;
+      if (itemResizeObserverRef.current) {
+        itemResizeObserverRef.current.disconnect();
+        observedItemKeysRef.current.clear();
+      }
+      return;
+    }
+
+    if (!wasViewportMeasurableRef.current) {
+      wasViewportMeasurableRef.current = true;
+      const savedScrollTop = lastVisibleScrollTopRef.current;
+      if (savedScrollTop > 0 && container.scrollTop === 0) {
+        container.scrollTop = savedScrollTop;
+      }
+      recomputeTopWindow();
+    }
+
+    const width = container.clientWidth;
+    if (heightCacheRef.current.width == null) {
+      // First measurement at this width: adopt it and measure below in the
+      // same commit (nothing to invalidate — the cache is still empty).
+      const fresh = createTranscriptItemHeightCache();
+      fresh.width = width;
+      heightCacheRef.current = fresh;
+    } else if (heightCacheRef.current.width !== width) {
+      // Real width change: re-anchor, drop the cache, un-window. Children are
+      // already laid out at the new width, so keep measuring this commit; the
+      // un-window re-render then re-measures the full list before paint.
+      resetHeightCacheForWidth(width);
+    }
+
+    const cache = heightCacheRef.current;
+    const measuredChildren: Array<{ key: string; element: HTMLElement }> = [];
     for (const child of Array.from(list.children)) {
       if (!(child instanceof HTMLElement)) {
         continue;
@@ -443,17 +651,49 @@ export function WorkspaceTranscriptList({
       if (child.dataset[TOP_SPACER_DATASET] !== undefined) {
         continue;
       }
-      sum += child.offsetHeight;
-      count += 1;
-    }
-    if (count > 0) {
-      const stats = itemHeightStatsRef.current;
-      stats.sum += sum;
-      stats.count += count;
-      if (stats.count > TOP_WINDOWING_MAX_SAMPLES) {
-        stats.sum /= 2;
-        stats.count /= 2;
+      const key = child.dataset.transcriptItemKey;
+      if (!key) {
+        continue;
       }
+      const outerHeight = measureTranscriptItemOuterHeight(child, key, cache);
+      if (outerHeight > (cache.margins.get(key) ?? 0)) {
+        cache.heights.set(key, outerHeight);
+      }
+      measuredChildren.push({ key, element: child });
+    }
+
+    syncItemResizeObserver(measuredChildren);
+
+    lastVisibleScrollTopRef.current = container.scrollTop;
+  });
+
+  // Anchor compensation: after a window/spacer change lands in the DOM, shift
+  // scrollTop by the FIRST VISIBLE ITEM's real rect delta (not by the spacer
+  // delta — when cached heights already match the spacer the content did not
+  // move, and adding the spacer delta would over-scroll).
+  useLayoutEffect(() => {
+    const anchor = windowAnchorRef.current;
+    if (!anchor || topWindowCount === anchor.fromWindowCount) {
+      return;
+    }
+    windowAnchorRef.current = null;
+    const container = viewportRef?.current;
+    const list = listRef.current;
+    if (!container || !list || !anchor.key) {
+      return;
+    }
+    const children = list.querySelectorAll<HTMLElement>('[data-transcript-item-key]');
+    for (const child of Array.from(children)) {
+      if (child.dataset.transcriptItemKey !== anchor.key) {
+        continue;
+      }
+      const delta = child.getBoundingClientRect().top - container.getBoundingClientRect().top
+        - anchor.viewportTopOffset;
+      if (Math.abs(delta) >= 1) {
+        container.scrollTop += delta;
+        lastVisibleScrollTopRef.current = container.scrollTop;
+      }
+      break;
     }
   });
 
@@ -461,7 +701,10 @@ export function WorkspaceTranscriptList({
     ? displayItems.slice(topWindowCount)
     : displayItems;
   const topSpacerHeight = enableTopWindowing && topWindowCount > 0
-    ? Math.round(topWindowCount * averageItemHeight())
+    ? computeTopSpacerHeight(
+      displayItemKeys.slice(0, topWindowCount),
+      heightCacheRef.current,
+    )
     : 0;
   const windowStartIndex = displayItems.length - windowedItems.length;
 

@@ -85,6 +85,7 @@ import {
   type ComposerSubmitPayload,
 } from './composerAttachments';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
+import { shouldPreserveRestoredReadingPosition } from './workspaceTranscriptTopWindowing';
 import { WorkspaceSessionComposer } from './WorkspaceSessionComposer';
 import {
   ComposerControls,
@@ -1518,6 +1519,7 @@ export function WorkspaceNativeSessionView({
   const pendingRewindCheckpointIdRef = useRef<string | null>(null);
   const pendingRewindStartSeqRef = useRef(0);
   const prevEventCountRef = useRef(0);
+  const wasVisibleForAutoScrollRef = useRef(isVisible);
   const tickInFlightRef = useRef(false);
   const initialReplayRuntimeRef = useRef<string | null>(null);
   const initialReplayBackfillRuntimeRef = useRef<string | null>(null);
@@ -2255,6 +2257,13 @@ export function WorkspaceNativeSessionView({
     }
 
     const handleScroll = () => {
+      // `display:none` live-session panes can emit a scroll event while their
+      // geometry and scrollTop collapse to zero. That is not a user gesture:
+      // treating it as one can clear the detached reading state, so the
+      // parent auto-scroll races the transcript's switch-back restoration.
+      if (!isVisible || container.clientWidth <= 0 || container.clientHeight <= 0) {
+        return;
+      }
       if (programmaticScrollRef.current) {
         return;
       }
@@ -2273,7 +2282,7 @@ export function WorkspaceNativeSessionView({
       container.removeEventListener('scroll', handleScroll);
       container.removeEventListener('wheel', handleWheel);
     };
-  }, [cancelPendingAutoScroll, session.runtime_id]);
+  }, [cancelPendingAutoScroll, isVisible, session.runtime_id]);
 
   // Clean up any pending scroll animation frame on unmount
   useEffect(() => () => {
@@ -2284,6 +2293,8 @@ export function WorkspaceNativeSessionView({
   // We watch events.length (not messages.length) because streaming deltas grow
   // existing message content without increasing the message count.
   useLayoutEffect(() => {
+    const wasVisible = wasVisibleForAutoScrollRef.current;
+    wasVisibleForAutoScrollRef.current = isVisible;
     if (!isVisible || !containerRef.current) {
       return;
     }
@@ -2291,9 +2302,25 @@ export function WorkspaceNativeSessionView({
     const container = containerRef.current;
     const prevCount = prevEventCountRef.current;
     prevEventCountRef.current = events.length;
+    const becameVisible = !wasVisible;
 
     // Nothing to scroll to
     if (messages.length === 0) {
+      return;
+    }
+
+    // The transcript child restores its saved scrollTop during its layout
+    // effect before this parent effect runs. On a hidden -> visible return,
+    // treat that restored non-bottom position as authoritative even if a
+    // hidden zero-geometry scroll event previously disturbed the detached
+    // flag. This check is transition-only: applying it on every append would
+    // mistake newly grown streaming content for a user scroll-away.
+    if (shouldPreserveRestoredReadingPosition({
+      becameVisible,
+      previousEventCount: prevCount,
+      isNearBottom: isNearBottom(container),
+    })) {
+      autoScrollDetachedRef.current = true;
       return;
     }
 

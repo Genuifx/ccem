@@ -14,9 +14,10 @@ async function transcribe(...parts) {
 }
 
 async function importTranscriptModule() {
-  const [source, identitySource] = await Promise.all([
+  const [source, identitySource, attentionSource] = await Promise.all([
     transcribe('src', 'components', 'workspace', 'workspaceEventTranscript.ts'),
     transcribe('src', 'components', 'workspace', 'transcriptIdentity.ts'),
+    transcribe('src', 'components', 'workspace', 'workspaceNativeAttention.ts'),
   ]);
   const compile = (text) => ts.transpileModule(text, {
     compilerOptions: {
@@ -29,12 +30,16 @@ async function importTranscriptModule() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-transcript-incremental-'));
   const outputPath = path.join(tempDir, 'workspaceEventTranscript.mjs');
   const identityPath = path.join(tempDir, 'transcriptIdentity.mjs');
+  const attentionPath = path.join(tempDir, 'workspaceNativeAttention.mjs');
   await fs.writeFile(
     outputPath,
-    compile(source).replace("from './transcriptIdentity'", "from './transcriptIdentity.mjs'"),
+    compile(source)
+      .replaceAll("from './transcriptIdentity'", "from './transcriptIdentity.mjs'")
+      .replaceAll("from './workspaceNativeAttention'", "from './workspaceNativeAttention.mjs'"),
     'utf8',
   );
   await fs.writeFile(identityPath, compile(identitySource), 'utf8');
+  await fs.writeFile(attentionPath, compile(attentionSource), 'utf8');
   return import(pathToFileURL(outputPath).href);
 }
 
