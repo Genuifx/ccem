@@ -354,6 +354,7 @@
     "backgroundTasksRunning": "运行中",
     "backgroundTasksRecent": "最近完成",
     "backgroundTasksNone": "当前没有运行中的后台任务",
+    "backgroundTasksDismiss": "关闭后台任务提醒",
     "backgroundTaskLastTool": "最近工具：{tool}",
     "backgroundTaskToolUses": "{count} 次工具调用",
     "backgroundTaskStop": "停止任务",

@@ -354,6 +354,7 @@
     "backgroundTasksRunning": "Running",
     "backgroundTasksRecent": "Recently finished",
     "backgroundTasksNone": "No background tasks are running",
+    "backgroundTasksDismiss": "Dismiss background tasks reminder",
     "backgroundTaskLastTool": "Last tool: {tool}",
     "backgroundTaskToolUses": "{count} tool calls",
     "backgroundTaskStop": "Stop task",
