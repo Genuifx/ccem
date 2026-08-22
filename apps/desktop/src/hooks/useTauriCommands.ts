@@ -1200,6 +1200,11 @@ export function useTauriCommands() {
     }
   }, [setError]);
 
+  const recordRecentProject = useCallback(async (path: string) => {
+    await invoke('add_recent', { path });
+    await loadAppConfig();
+  }, [loadAppConfig]);
+
   const searchWorkspaceFiles = useCallback(async (
     workingDir: string,
     query?: string,
@@ -1749,6 +1754,7 @@ export function useTauriCommands() {
     addFavoriteProject,
     removeFavoriteProject,
     openDirectoryPicker,
+    recordRecentProject,
     searchWorkspaceFiles,
     syncVSCodeProjects,
     syncJetBrainsProjects,

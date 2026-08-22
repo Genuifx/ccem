@@ -293,6 +293,8 @@
     "annotationStickerArchived": "Archived",
     "composeTitle": "Start Building",
     "composeSelectFolder": "Select Folder",
+    "composeRecentFolders": "Recent folders",
+    "composeBrowseFolders": "Browse other folders…",
     "composePlaceholder": "Describe what you want Claude or Codex to do in this workspace...",
     "composeSend": "Start Session",
     "browserTitle": "Preview Browser",
