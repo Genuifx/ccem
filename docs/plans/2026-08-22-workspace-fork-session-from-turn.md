@@ -71,3 +71,19 @@ Rust: `event_bus.rs`、`native_runtime.rs`、`main.rs`
 ## 非目标
 
 - 不做 codex/opencode 分叉；不做文件系统回退（checkpoint 已有）；不做原会话内 rewind；不做分叉谱系 UI（provenance 已记录，后续可做）。
+
+## 附：外部调研记录（交付后补全行业案例腿）
+
+原语选型阶段已查官方文档（Agent SDK sessions 页、TS SDK 参考、changelog 版本核对 0.3.220↔CLI 2.1.220）并本地实证 spike；行业案例腿为交付后补查，结论与已交付设计吻合：
+
+| 方案 | 适用前提 | 主要风险 | 来源 |
+|---|---|---|---|
+| SDK `forkSession(id, {upToMessageId})` 本地切片（已采用） | SDK ≥0.3.220；切点需真实 assistant uuid | 依赖 SDK 私有文件布局（已实证） | sdk.d.ts + 官方 sessions 文档 |
+| `query({resume, resumeSessionAt, forkSession})` | fork 时愿付一次模型调用 | CLI 2.1.223+ 的 resumeDropsTurn 校验当前缺失，可能被拒 | 同上 changelog |
+| Rust 手工截断 JSONL | 无 | 需重写每行 uuid/sessionId，重复造轮子 | — |
+
+行业案例：
+- LibreChat fork：per-message 入口 → 新会话 + 复制前缀 + 原会话不动（与本案一致）。UX 差异：LibreChat 为"先分叉后输入"，本案为"输入第一条消息后分叉"（受 create_native_session 必填 initial_prompt 约束）——若演进为前者，helper 的 ensureClaudeSession 无 prompt 路径可用。来源：https://www.librechat.ai/docs/features/fork 、https://github.com/danny-avila/LibreChat/discussions/2908
+- Claude Code /rewind：每次 rewind 自动创建 conversation fork 而非截断原件，社区反向求"不要 fork"（#9279）——印证"fork 不动原件"是默认安全语义。来源：https://code.claude.com/docs/en/checkpointing 、https://github.com/anthropics/claude-code/issues/9279
+
+过程教训：官方原语解决了"怎么分叉"，但 UX 形态（"先分叉还是带输入分叉"）本应在实现前查行业案例定夺——本次该腿跳过得过早，止损规则被用得过激。
