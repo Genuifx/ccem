@@ -943,6 +943,8 @@ export function useTauriCommands() {
     providerSessionId?: string | null;
     effort?: string | null;
     seedBoundaryMessageCount?: number | null;
+    /** Claude only: fork the parent transcript up to and including this message uuid. */
+    forkFromMessageId?: string | null;
     /**
      * Per-Composer Dynamic Routing opt-in snapshot. Omitted/null = legacy
      * single-environment (direct) launch. Only meaningful for providers whose
@@ -966,6 +968,7 @@ export function useTauriCommands() {
       providerSessionId: options.providerSessionId ?? null,
       effort: options.effort ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
+      forkFromMessageId: options.forkFromMessageId ?? null,
       routerLaunchDraft: options.routerLaunchDraft ?? null,
       resumeRouterFromRuntimeId: options.resumeRouterFromRuntimeId ?? null,
       codexMigrationProofToken: options.codexMigrationProofToken ?? null,

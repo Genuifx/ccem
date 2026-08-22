@@ -257,6 +257,11 @@ interface WorkspaceTranscriptListProps {
   enableTopWindowing?: boolean;
   /** Scroll container (ScrollArea viewport) — required for top-windowing. */
   viewportRef?: RefObject<HTMLElement | null>;
+  /**
+   * Fork-session-from-turn action for model-output bubbles. Must be a stable
+   * callback: bubbles are memoized on message identity only.
+   */
+  onForkTurn?: (message: ConversationMessageData) => void;
 }
 
 export function WorkspaceTranscriptList({
@@ -264,6 +269,7 @@ export function WorkspaceTranscriptList({
   isAwaitingResponse = false,
   enableTopWindowing = false,
   viewportRef,
+  onForkTurn,
 }: WorkspaceTranscriptListProps) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const seenItemKeysRef = useRef<Set<string>>(new Set());
@@ -761,6 +767,7 @@ export function WorkspaceTranscriptList({
             <WorkspaceMessageBubble
               message={item.message}
               prevRole={prevRole}
+              onForkTurn={onForkTurn}
             />
           </div>
         );

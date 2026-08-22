@@ -338,6 +338,8 @@ export interface TauriCommands {
       providerSessionId?: string | null;
       effort?: string | null;
       seedBoundaryMessageCount?: number | null;
+      /** Claude only: fork the parent transcript up to and including this message uuid. */
+      forkFromMessageId?: string | null;
       /**
        * Per-Composer Dynamic Routing opt-in snapshot (null/omitted = legacy
        * direct launch). Core-owned wire type shared with the Rust backend.
@@ -1377,7 +1379,7 @@ export type SessionEventPayload =
       canonical_hash?: string | null;
     }
   | { type: 'system_message'; message: string }
-  | { type: 'lifecycle'; stage: string; detail: string }
+  | { type: 'lifecycle'; stage: string; detail: string; assistant_message_uuid?: string }
   | { type: 'claude_json'; message_type?: string | null; raw_json: string }
   | { type: 'stderr_line'; line: string }
   | { type: 'assistant_chunk'; text: string }

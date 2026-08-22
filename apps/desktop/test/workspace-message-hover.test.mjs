@@ -203,7 +203,7 @@ test('workspace message actions are revealed by explicit transcript content hove
   );
   assert.match(
     component,
-    /<MessageMetaBar message=\{message\} isUser=\{false\} visible=\{showMessageActions\} t=\{t\} \/>/,
+    /<MessageMetaBar\s+message=\{message\}\s+isUser=\{false\}\s+visible=\{showMessageActions\}\s+t=\{t\}\s+onForkTurn=\{onForkTurn && hasProviderMessageUuid\(message\) \? onForkTurn : undefined\}\s+\/>/,
   );
 });
 

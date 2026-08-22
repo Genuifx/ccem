@@ -549,7 +549,14 @@
     "usagePanelSubRouteUnreported": "Requests with unreported usage",
     "usagePanelSubRouteIncomplete": "Interrupted requests",
     "usagePanelSubRouteFootnote": "Independently observed by the router for subagent/background requests. Not added to or reconciled with the SDK totals above.",
-    "usagePanelSubRouteOther": "Explicit override"
+    "usagePanelSubRouteOther": "Explicit override",
+    "forkTurnAction": "Fork a session from this turn",
+    "forkTurnDialogTitle": "Fork a new session",
+    "forkTurnDialogBody": "The new session carries the full context up to this turn; the original stays unchanged.",
+    "forkTurnPromptPlaceholder": "First message for the forked session…",
+    "forkTurnSubmit": "Create fork",
+    "forkTurnSubmitting": "Creating…",
+    "forkTurnCreateFailed": "Failed to fork the session"
   },
   "sessions": {
     "subtitle": "Manage running Claude Code sessions",

@@ -39,6 +39,8 @@ interface PendingAssistantTurn {
   outputTokens?: number;
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
+  /** Provider message uuid of the turn's last main-chain assistant message (fork anchor). */
+  providerMessageUuid?: string;
 }
 
 function parseOccurredAt(occurredAt: string): number | undefined {
@@ -509,7 +511,7 @@ function createAssistantTurnMessage(
   }
 
   if (contentBlocks.length === 1 && contentBlocks[0]?.type === 'text') {
-    return createAssistantTextMessage(
+    const textMessage = createAssistantTextMessage(
       pendingTurn.id,
       contentBlocks[0].text || '',
       pendingTurn.timestamp,
@@ -520,11 +522,15 @@ function createAssistantTurnMessage(
         cacheReadTokens: pendingTurn.cacheReadTokens,
       },
     );
+    if (textMessage && pendingTurn.providerMessageUuid) {
+      textMessage.uuid = pendingTurn.providerMessageUuid;
+    }
+    return textMessage;
   }
 
   return {
     msgType: 'assistant',
-    uuid: pendingTurn.id,
+    uuid: pendingTurn.providerMessageUuid ?? pendingTurn.id,
     content: contentBlocks,
     timestamp: pendingTurn.timestamp,
     segmentIndex: 0,
@@ -1376,6 +1382,10 @@ function foldTranscriptEvents(
           || event.payload.stage === 'turn_completed'
           || event.payload.stage === 'turn_interrupted'
         ) {
+          const providerMessageUuid = event.payload.assistant_message_uuid?.trim();
+          if (providerMessageUuid && state.pendingTurn) {
+            state.pendingTurn.providerMessageUuid = providerMessageUuid;
+          }
           const flushedTurn = foldFlushPendingTurn(state);
           if (
             !flushedTurn
