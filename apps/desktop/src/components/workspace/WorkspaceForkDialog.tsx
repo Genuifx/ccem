@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { GitFork } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -14,8 +14,6 @@ import type { ConversationMessageData } from '@/features/conversations/types';
 export interface WorkspaceForkTarget {
   /** Turn preview shown as the fork point (assistant text excerpt). */
   turnPreview: string;
-  /** Human label of the session being forked from. */
-  sessionLabel: string | null;
 }
 
 const FORK_TURN_PREVIEW_LIMIT = 200;
@@ -60,7 +58,6 @@ export function WorkspaceForkDialog({
 }: WorkspaceForkDialogProps) {
   const { t } = useLocale();
   const [prompt, setPrompt] = useState('');
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -97,7 +94,6 @@ export function WorkspaceForkDialog({
             {target?.turnPreview ?? ''}
           </p>
           <textarea
-            ref={textareaRef}
             autoFocus
             maxLength={8_000}
             value={prompt}

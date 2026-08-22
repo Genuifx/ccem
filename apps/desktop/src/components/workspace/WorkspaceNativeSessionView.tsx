@@ -275,7 +275,7 @@ interface WorkspaceNativeSessionViewProps {
       workingDir?: string | null;
       effort?: string | null;
     },
-    target: { turnPreview: string; sessionLabel: string | null },
+    target: { turnPreview: string },
   ) => void;
   onNavigateEnvironments?: () => void;
 }
@@ -1901,7 +1901,6 @@ export function WorkspaceNativeSessionView({
         effort: session.effort ?? null,
       },
       {
-        sessionLabel: null,
         turnPreview: getWorkspaceForkTurnPreview(message),
       },
     );

@@ -2853,7 +2853,6 @@ export function Workspace({
       workingDir: selectedSession.project,
       effort: normalizeEffortForProvider(historyEffort, 'claude'),
     }, {
-      sessionLabel: selectedSession.display ?? null,
       turnPreview: getWorkspaceForkTurnPreview(message),
     });
   };
