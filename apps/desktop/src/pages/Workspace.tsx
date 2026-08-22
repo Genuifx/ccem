@@ -12,8 +12,10 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
+  Check,
   ChevronDown,
   FolderOpen,
+  FolderSearch,
   LoaderCircle,
   Terminal,
 } from '@/lib/lucide-react';
@@ -55,6 +57,14 @@ import {
 } from '@/components/workspace/composerAttachments';
 import { WorkspaceSkeleton } from '@/components/ui/skeleton-states';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useAppStore } from '@/store';
 import type { InstalledSkill, LaunchClient } from '@/store';
@@ -71,7 +81,7 @@ import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useLocale } from '@/locales';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
 import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
-import { cn, getProjectName } from '@/lib/utils';
+import { cn, getProjectName, truncatePath } from '@/lib/utils';
 import {
   fetchConversationDetail,
   fetchWorkspaceOverviewSnapshot,
@@ -342,6 +352,7 @@ export function Workspace({
     defaultWorkingDir,
     launchClient,
     installedSkills,
+    recent,
     setSelectedWorkingDir,
     setLaunchClient,
     setPermissionMode,
@@ -357,6 +368,7 @@ export function Workspace({
       defaultWorkingDir: state.defaultWorkingDir,
       launchClient: state.launchClient,
       installedSkills: state.installedSkills,
+      recent: state.recent,
       setSelectedWorkingDir: state.setSelectedWorkingDir,
       setLaunchClient: state.setLaunchClient,
       setPermissionMode: state.setPermissionMode,
@@ -372,6 +384,7 @@ export function Workspace({
   const {
     switchEnvironment,
     openDirectoryPicker,
+    recordRecentProject,
     loadCronTasks,
     loadInstalledSkills,
     loadWorkspaceSkills,
@@ -1619,6 +1632,7 @@ export function Workspace({
 
   const effectiveComposeDir = composeDir || selectedWorkingDir || defaultWorkingDir || null;
   const effectiveComposeDirLabel = effectiveComposeDir ? getProjectName(effectiveComposeDir) : null;
+  const recentComposeFolders = useMemo(() => recent.slice(0, 5), [recent]);
   const shouldRenderWorkspaceReview = workspaceMode !== 'live' || !activeLiveEntry;
   const workspaceReviewEvents = useMemo(
     () => workspaceMode === 'history' && selectedSession ? historyEvents : [],
@@ -2234,17 +2248,22 @@ export function Workspace({
     t,
   ]);
 
+  const applyComposeDir = useCallback((dir: string) => {
+    setComposeDir(dir);
+    setSelectedWorkingDir(dir);
+    void recordRecentProject(dir);
+  }, [recordRecentProject, setSelectedWorkingDir]);
+
   const handlePickComposeDir = useCallback(async () => {
     try {
       const dir = await openDirectoryPicker();
       if (dir) {
-        setComposeDir(dir);
-        setSelectedWorkingDir(dir);
+        applyComposeDir(dir);
       }
     } catch (error) {
       console.error('Failed to open directory dialog:', error);
     }
-  }, [openDirectoryPicker, setSelectedWorkingDir]);
+  }, [applyComposeDir, openDirectoryPicker]);
 
   const showWorkspaceTerminalLaunchError = useCallback((error: unknown) => {
     if (!isInteractiveSessionTerminalOpenError(error)) {
@@ -2853,17 +2872,51 @@ export function Workspace({
           <h2 className="shrink-0 whitespace-nowrap text-2xl font-semibold tracking-tight text-foreground">
             {t('workspace.composeTitle')}
           </h2>
-          <button
-            type="button"
-            onClick={() => void handlePickComposeDir()}
-            className="inline-flex min-w-0 max-w-full items-center justify-center gap-1.5 text-2xl font-semibold tracking-tight text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <FolderOpen className="h-4 w-4 shrink-0" />
-            <span className="min-w-0 max-w-[300px] truncate">
-              {effectiveComposeDirLabel || t('workspace.composeSelectFolder')}
-            </span>
-            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-          </button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="inline-flex min-w-0 max-w-full items-center justify-center gap-1.5 text-2xl font-semibold tracking-tight text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <FolderOpen className="h-4 w-4 shrink-0" />
+                <span className="min-w-0 max-w-[300px] truncate">
+                  {effectiveComposeDirLabel || t('workspace.composeSelectFolder')}
+                </span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="center" side="bottom" className="min-w-[260px]">
+              {recentComposeFolders.length > 0 && (
+                <>
+                  <DropdownMenuLabel className="px-2.5 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {t('workspace.composeRecentFolders')}
+                  </DropdownMenuLabel>
+                  {recentComposeFolders.map((project) => (
+                    <DropdownMenuItem
+                      key={project.path}
+                      onSelect={() => applyComposeDir(project.path)}
+                    >
+                      <FolderOpen className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="flex min-w-0 flex-1 flex-col">
+                        <span className="truncate text-sm">{getProjectName(project.path)}</span>
+                        <span className="truncate text-xs text-muted-foreground">
+                          {truncatePath(project.path)}
+                        </span>
+                      </span>
+                      {effectiveComposeDir === project.path && (
+                        <Check className="ml-2 h-4 w-4 shrink-0 text-foreground" />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              <DropdownMenuItem onSelect={() => void handlePickComposeDir()}>
+                <FolderSearch className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                <span>{t('workspace.composeBrowseFolders')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 

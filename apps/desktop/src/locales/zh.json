@@ -293,6 +293,8 @@
     "annotationStickerArchived": "归档",
     "composeTitle": "开始构建",
     "composeSelectFolder": "选择文件夹",
+    "composeRecentFolders": "最近的文件夹",
+    "composeBrowseFolders": "浏览其他文件夹…",
     "composePlaceholder": "描述你想让 Claude 或 Codex 在这个工作区里完成的任务...",
     "composeSend": "开始会话",
     "browserTitle": "预览浏览器",
