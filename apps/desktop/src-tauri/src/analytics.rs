@@ -1344,11 +1344,17 @@ fn collect_usage_snapshot() -> CacheFile {
 /// `USAGE_REFRESH_INFLIGHT` → (`USAGE_REFRESH_LOCK` → file lock) inside
 /// `refresh_usage_cache`; nothing acquires the inflight lock while holding
 /// the snapshot or refresh locks, so the layers cannot deadlock.
-fn shared_usage_cache() -> Arc<CacheFile> {
+///
+/// `min_collected_at` carries force semantics: `Some(request_started)` (a
+/// force refresh) never reuses a snapshot collected BEFORE this request
+/// started, but does reuse one collected after it — including by a concurrent
+/// refresh — so concurrent force requests still merge into a single
+/// collection. `None` keeps the plain TTL behaviour.
+fn shared_usage_cache(min_collected_at: Option<Instant>) -> Arc<CacheFile> {
     {
         let snapshot = lock_usage_snapshot();
         if let Some(current) = snapshot.as_ref() {
-            if snapshot_is_fresh(current.collected_at) {
+            if snapshot_satisfies_request(current.collected_at, min_collected_at) {
                 return current.cache.clone();
             }
         }
@@ -1360,7 +1366,7 @@ fn shared_usage_cache() -> Arc<CacheFile> {
     {
         let snapshot = lock_usage_snapshot();
         if let Some(current) = snapshot.as_ref() {
-            if snapshot_is_fresh(current.collected_at) {
+            if snapshot_satisfies_request(current.collected_at, min_collected_at) {
                 return current.cache.clone();
             }
         }
@@ -1372,6 +1378,15 @@ fn shared_usage_cache() -> Arc<CacheFile> {
         collected_at: Instant::now(),
     });
     cache
+}
+
+/// Non-force requests reuse any snapshot inside the TTL window. Force
+/// requests only reuse snapshots collected at/after their request start.
+fn snapshot_satisfies_request(collected_at: Instant, min_collected_at: Option<Instant>) -> bool {
+    match min_collected_at {
+        Some(min) => collected_at >= min,
+        None => snapshot_is_fresh(collected_at),
+    }
 }
 
 #[cfg(test)]
@@ -2177,7 +2192,11 @@ pub async fn get_usage_stats(
             }
         }
 
-        let cache = shared_usage_cache();
+        // Force must also hold at the SHARED snapshot layer: a snapshot
+        // collected before this request started is not reusable even when it
+        // is still TTL-fresh; one collected after (by a concurrent refresh)
+        // is, preserving single-flight for concurrent force requests.
+        let cache = shared_usage_cache(force_requested.then_some(request_started));
         let stats = aggregate_cache(&cache, source_filter);
         if source_filter.is_none() {
             write_usage_summary(&stats);
@@ -2204,7 +2223,7 @@ pub async fn get_usage_history(
 ) -> Result<UsageHistory, String> {
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
-        let cache = shared_usage_cache();
+        let cache = shared_usage_cache(None);
         let stats = aggregate_cache(&cache, source_filter);
 
         Ok(UsageHistory {
@@ -2224,7 +2243,7 @@ pub async fn get_usage_model_breakdown(
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
         let granularity = ModelBreakdownGranularity::parse(&granularity)?;
-        let cache = shared_usage_cache();
+        let cache = shared_usage_cache(None);
         Ok(aggregate_model_breakdown(
             &cache,
             source_filter,
@@ -2240,7 +2259,7 @@ pub async fn get_usage_model_breakdown(
 pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, String> {
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
-        let cache = shared_usage_cache();
+        let cache = shared_usage_cache(None);
         let stats = aggregate_cache(&cache, source_filter);
         Ok(calculate_streak(&stats.daily_history))
     })
@@ -2251,15 +2270,16 @@ pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, St
 mod tests {
     use super::{
         aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
-        extract_model_breakdown_bucket, format_week_bucket, normalize_usage_source,
+        extract_model_breakdown_bucket, format_week_bucket, full_parse_jsonl, get_file_meta,
+        lock_usage_snapshot, lock_usage_stats_memo, normalize_usage_source,
         parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
-        parse_opencode_session_items, read_usage_summary_from, read_usage_cache_at,
-        refresh_discovered_entry, shared_usage_cache, should_reuse_usage_stats,
-        snapshot_is_fresh, write_json_atomic, write_usage_summary_to, full_parse_jsonl,
-        get_file_meta, lock_usage_snapshot, ANALYTICS_SHADOW_INCREMENTAL, TEST_SNAPSHOT_REFRESH,
-        CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheStats, CacheUsage,
-        ClaudeParseState, CodexParseState, DiscoveredFile, ModelBreakdownGranularity, ModelPrice,
-        UsageSource, UsageStats, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
+        parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
+        refresh_discovered_entry, shared_usage_cache, should_reuse_usage_stats, snapshot_is_fresh,
+        write_json_atomic, write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry,
+        CacheMeta, CacheStats, CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
+        ModelBreakdownGranularity, ModelPrice, UsageSource, UsageStats,
+        ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
+        TEST_SNAPSHOT_REFRESH,
     };
     use chrono::{Local, TimeZone};
     use std::collections::HashMap;
@@ -2837,15 +2857,18 @@ mod tests {
     #[test]
     fn test_shared_usage_cache_single_flight_and_command_sharing() {
         *lock_usage_snapshot() = None;
+        lock_usage_stats_memo().by_source.clear();
         SNAPSHOT_REFRESH_COUNT.store(0, Ordering::SeqCst);
-        *TEST_SNAPSHOT_REFRESH.get_or_init(|| Mutex::new(None)).lock().unwrap() =
-            Some(counting_snapshot_stub);
+        *TEST_SNAPSHOT_REFRESH
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(counting_snapshot_stub);
 
         // Concurrent callers: exactly one refresh runs.
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 thread::spawn(|| {
-                    let cache = shared_usage_cache();
+                    let cache = shared_usage_cache(None);
                     assert_eq!(cache.files.len(), 1);
                 })
             })
@@ -2857,7 +2880,7 @@ mod tests {
 
         // Sequential callers within the TTL reuse the snapshot.
         for _ in 0..5 {
-            assert_eq!(shared_usage_cache().files.len(), 1);
+            assert_eq!(shared_usage_cache(None).files.len(), 1);
         }
         assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 1);
 
@@ -2871,7 +2894,10 @@ mod tests {
         ))
         .expect("usage history from shared snapshot");
         assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(history.daily.get("2026-03-01").map(|v| v.input_tokens), Some(120));
+        assert_eq!(
+            history.daily.get("2026-03-01").map(|v| v.input_tokens),
+            Some(120)
+        );
 
         let breakdown = tauri::async_runtime::block_on(super::get_usage_model_breakdown(
             "day".to_string(),
@@ -2879,9 +2905,61 @@ mod tests {
         ))
         .expect("model breakdown from shared snapshot");
         assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 1);
-        assert!(breakdown.values().any(|models| models.contains_key("claude-sonnet-4-5")));
+        assert!(breakdown
+            .values()
+            .any(|models| models.contains_key("claude-sonnet-4-5")));
 
-        *TEST_SNAPSHOT_REFRESH.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+        // Force must bypass the TTL-fresh shared snapshot collected BEFORE
+        // the request started: the analysis page Refresh button re-collects
+        // even inside the 60s window. (Source filter keeps the command from
+        // writing the usage summary file in tests.)
+        let forced = tauri::async_runtime::block_on(super::get_usage_stats(
+            Some("claude".to_string()),
+            Some(true),
+        ))
+        .expect("forced usage stats re-collect");
+        assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 2);
+        assert!(!forced.last_updated.is_empty());
+
+        // Non-force right after still reuses the fresh snapshot.
+        let _ = tauri::async_runtime::block_on(super::get_usage_model_breakdown(
+            "day".to_string(),
+            None,
+        ))
+        .expect("non-force breakdown reuses snapshot");
+        assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 2);
+
+        // Concurrent force requests merge into ONE collection: every waiter
+        // accepts the first snapshot collected after their shared floor.
+        let concurrent_floor = Instant::now();
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                thread::spawn(move || {
+                    let cache = shared_usage_cache(Some(concurrent_floor));
+                    assert_eq!(cache.files.len(), 1);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("concurrent force worker thread");
+        }
+        assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 3);
+
+        // A force whose floor is NEWER than the last collection (a serial
+        // follow-up refresh) collects again.
+        let serial_floor = Instant::now();
+        assert_eq!(shared_usage_cache(Some(serial_floor)).files.len(), 1);
+        assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 4);
+
+        // Plain TTL reads keep reusing without collecting.
+        assert_eq!(shared_usage_cache(None).files.len(), 1);
+        assert_eq!(SNAPSHOT_REFRESH_COUNT.load(Ordering::SeqCst), 4);
+
+        *TEST_SNAPSHOT_REFRESH
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = None;
+        lock_usage_stats_memo().by_source.clear();
         *lock_usage_snapshot() = None;
     }
 

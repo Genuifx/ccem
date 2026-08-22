@@ -16,6 +16,7 @@ import {
   promptTimestampsAreCompatible,
   stripRenderedImageMarkers,
 } from './transcriptIdentity';
+import { extractAttentionState } from './workspaceNativeAttention';
 
 export const COMPACTING_SUMMARY_TOKEN = '__ccem_context_compacting__';
 export const COMPACT_FAILED_SUMMARY_TOKEN = '__ccem_context_compact_failed__';
@@ -1647,7 +1648,11 @@ export function buildMessagesFromEvents(
  * file checkpoints (checkpoint_created / files_rewound / file_rewind_failed),
  * todo snapshots (newest snapshot carrier below the tail), terminal completion,
  * and attention state (unresolved permission / terminal prompts — resolved
- * pairs are dropped together so the attention fold never sees a stale raise).
+ * pairs are dropped together so the attention fold never sees a stale raise —
+ * plus tool_use_started events whose AskUserQuestion / plan_exit prompt is
+ * still pending in the attention fold, so the fold can rebuild it after
+ * pruning; resolved ones, including failures that clear the prompt and
+ * user_prompt / session_completed resets, stay prunable).
  */
 export const RAW_TAIL_LIMIT = 5000;
 
@@ -1690,6 +1695,15 @@ export function pruneRawEventTail(
 
   const respondedRequestIds = new Set<string>();
   const terminalResolvedSeqs: number[] = [];
+  // Unresolved interactive prompts (AskUserQuestion / plan_exit) must survive
+  // pruning: the attention fold rebuilds them from the retained start events,
+  // so a start that is STILL pending in the full-array fold is an anchor.
+  // Resolution semantics come from extractAttentionState itself (completed,
+  // failed non-plan exits, user responses and session_completed all clear),
+  // which keeps the prune decision and the rebuild in one place.
+  const pendingPromptToolUseIds = new Set(
+    extractAttentionState(events).prompts.map((prompt) => prompt.toolUseId),
+  );
   let newestSnapshotIndex = -1;
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index]!;
@@ -1726,6 +1740,13 @@ export function pruneRawEventTail(
         return !respondedRequestIds.has(payload.request_id);
       case 'terminal_prompt_required':
         return !terminalResolvedSeqs.some((resolvedSeq) => resolvedSeq > event.seq);
+      case 'tool_use_started':
+        // The newest todo snapshot carrier is also a tool_use_started event.
+        if (index === newestSnapshotIndex) {
+          return true;
+        }
+        return Boolean(payload.needs_response && payload.prompt)
+          && pendingPromptToolUseIds.has(payload.tool_use_id);
       default:
         return index === newestSnapshotIndex;
     }

@@ -10,9 +10,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
 async function importTranscriptModule() {
-  const [source, identitySource] = await Promise.all([
+  const [source, identitySource, attentionSource] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceEventTranscript.ts'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'transcriptIdentity.ts'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceNativeAttention.ts'), 'utf8'),
   ]);
   const compile = (text) => ts.transpileModule(text, {
     compilerOptions: {
@@ -25,12 +26,38 @@ async function importTranscriptModule() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-transcript-tail-bound-'));
   const outputPath = path.join(tempDir, 'workspaceEventTranscript.mjs');
   const identityPath = path.join(tempDir, 'transcriptIdentity.mjs');
+  const attentionPath = path.join(tempDir, 'workspaceNativeAttention.mjs');
   await fs.writeFile(
     outputPath,
-    compile(source).replace("from './transcriptIdentity'", "from './transcriptIdentity.mjs'"),
+    compile(source)
+      .replaceAll("from './transcriptIdentity'", "from './transcriptIdentity.mjs'")
+      .replaceAll("from './workspaceNativeAttention'", "from './workspaceNativeAttention.mjs'"),
     'utf8',
   );
   await fs.writeFile(identityPath, compile(identitySource), 'utf8');
+  await fs.writeFile(attentionPath, compile(attentionSource), 'utf8');
+  return import(pathToFileURL(outputPath).href);
+}
+
+async function importAttentionModule() {
+  const sourcePath = path.join(
+    desktopDir,
+    'src',
+    'components',
+    'workspace',
+    'workspaceNativeAttention.ts',
+  );
+  const source = await fs.readFile(sourcePath, 'utf8');
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ES2022,
+      target: ts.ScriptTarget.ES2022,
+      isolatedModules: true,
+    },
+  });
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-native-attention-tail-'));
+  const outputPath = path.join(tempDir, 'workspaceNativeAttention.mjs');
+  await fs.writeFile(outputPath, output.outputText, 'utf8');
   return import(pathToFileURL(outputPath).href);
 }
 
@@ -223,4 +250,140 @@ test('append selection survives pruning and refills trigger a reset', async () =
   const refilled = [...events, ev(TOTAL + 1, { type: 'assistant_chunk', text: 'more ' })];
   selection = mod.selectTranscriptAppendEvents(refilled, state);
   assert.equal(selection.mode, 'reset');
+});
+
+// ---------------------------------------------------------------------------
+// Unresolved interactive prompts (AskUserQuestion / plan_exit) must survive
+// tail pruning: workspaceNativeAttention rebuilds pending prompts from the
+// retained tool_use_started events, so pruning them away would silently drop
+// a waiting interaction. Resolved ones must stay prunable.
+// ---------------------------------------------------------------------------
+
+const ASK_PROMPT = {
+  prompt_type: 'ask_user_question',
+  questions: [{ question: 'Proceed?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+};
+
+const SYNTHETIC_PLAN_EXIT_PROMPT = {
+  prompt_type: 'plan_exit',
+  allowed_prompts: ['继续执行'],
+  plan_summary: 'Claude is ready to run Agent. Confirm before leaving Plan mode.',
+};
+
+function promptStart(toolUseId, prompt) {
+  return {
+    type: 'tool_use_started',
+    tool_use_id: toolUseId,
+    raw_name: toolUseId.startsWith('plan') ? 'ExitPlanMode' : 'AskUserQuestion',
+    input_summary: 'interactive prompt',
+    needs_response: true,
+    prompt,
+    category: { category: 'user_input', raw_name: 'AskUserQuestion' },
+  };
+}
+
+function promptDone(toolUseId, success) {
+  return {
+    type: 'tool_use_completed',
+    tool_use_id: toolUseId,
+    raw_name: 'AskUserQuestion',
+    result_summary: 'answered',
+    success,
+  };
+}
+
+function promptPayloadFor(seq) {
+  // user_prompt and session_completed clear ALL pending prompts, so the
+  // still-pending scenarios (5_000+) must come after the last clear-all at
+  // 4_001 — exactly like a real session where a fresh interaction opened and
+  // nothing has resolved it yet. Plan exits are single-slot in the attention
+  // fold, so at most one plan_exit scenario can be pending: the failed one.
+  if (seq === 1_000) {
+    return promptStart('ask-resolved', ASK_PROMPT);
+  }
+  if (seq === 1_001) {
+    return promptDone('ask-resolved', true);
+  }
+  if (seq === 2_000) {
+    return promptStart('ask-failed', ASK_PROMPT);
+  }
+  if (seq === 2_001) {
+    // A FAILED AskUserQuestion still clears the prompt (only plan_exit survives failure).
+    return promptDone('ask-failed', false);
+  }
+  if (seq === 2_500) {
+    return promptStart('plan-exit-approved', SYNTHETIC_PLAN_EXIT_PROMPT);
+  }
+  if (seq === 2_501) {
+    return promptDone('plan-exit-approved', true);
+  }
+  if (seq === 3_000) {
+    return promptStart('ask-answered', ASK_PROMPT);
+  }
+  if (seq === 3_001) {
+    return { type: 'user_prompt', text: 'the answer', image_count: 0 };
+  }
+  if (seq === 4_000) {
+    return promptStart('ask-session-done', ASK_PROMPT);
+  }
+  if (seq === 4_001) {
+    return { type: 'session_completed', reason: 'Stopped from desktop workspace' };
+  }
+  if (seq === 5_000) {
+    return promptStart('plan-exit-failed', SYNTHETIC_PLAN_EXIT_PROMPT);
+  }
+  if (seq === 5_001) {
+    // A FAILED plan_exit intentionally leaves the prompt pending (retry affordance).
+    return promptDone('plan-exit-failed', false);
+  }
+  if (seq === 6_000) {
+    // Unresolved AskUserQuestion: no completion ever arrives.
+    return promptStart('ask-unresolved', ASK_PROMPT);
+  }
+  return { type: 'assistant_chunk', text: `chunk ${seq} ` };
+}
+
+function buildPromptFixture() {
+  const events = [];
+  for (let seq = 1; seq <= TOTAL; seq += 1) {
+    events.push(ev(seq, promptPayloadFor(seq)));
+  }
+  return events;
+}
+
+test('pruning keeps unresolved interactive prompt starts and drops resolved ones', async () => {
+  const mod = await importTranscriptModule();
+  const attentionMod = await importAttentionModule();
+  const events = buildPromptFixture();
+
+  const pruned = mod.pruneRawEventTail(events, TAIL_LIMIT);
+  assert.ok(pruned.prunedCount > 10_000, 'a real head was pruned');
+  const retained = anchorSeqs(pruned.events);
+
+  // Still-pending interactions survive: the attention fold needs their starts.
+  assert.ok(retained.has(5_000), 'failed plan_exit stays pending and is kept');
+  assert.ok(retained.has(6_000), 'unresolved AskUserQuestion start kept');
+
+  // Resolved / cleared interactions stay prunable.
+  assert.ok(!retained.has(1_000) && !retained.has(1_001), 'completed AskUserQuestion pair dropped');
+  assert.ok(!retained.has(2_000) && !retained.has(2_001), 'failed AskUserQuestion pair dropped');
+  assert.ok(!retained.has(2_500) && !retained.has(2_501), 'approved plan_exit pair dropped');
+  assert.ok(!retained.has(3_000), 'start cleared by a user response dropped');
+  assert.ok(retained.has(3_001), 'clearing user_prompt itself is an anchor');
+  assert.ok(!retained.has(4_000), 'start cleared by session_completed dropped');
+  assert.ok(retained.has(4_001), 'clearing session_completed itself is an anchor');
+
+  // The rebuild after pruning sees exactly the same pending prompts as the
+  // full-array fold — no stale raises, no lost interactions — and the pending
+  // set is exactly the two unresolved interactions.
+  const ids = (state) => state.prompts.map((prompt) => prompt.toolUseId).sort();
+  assert.deepEqual(
+    ids(attentionMod.extractAttentionState(pruned.events)),
+    ids(attentionMod.extractAttentionState(events)),
+    'attention state survives pruning',
+  );
+  assert.deepEqual(ids(attentionMod.extractAttentionState(pruned.events)), [
+    'ask-unresolved',
+    'plan-exit-failed',
+  ]);
 });
