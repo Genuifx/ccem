@@ -483,6 +483,7 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
   const foregroundNotificationOnly = options.foregroundNotificationOnly ?? false;
   const peerIngressOnly = options.peerIngressOnly ?? false;
   const notificationStreamWaitsForQueuedHumanPrompt = options.notificationStreamWaitsForQueuedHumanPrompt ?? false;
+  const foregroundPlanAfterTaskNotification = options.foregroundPlanAfterTaskNotification ?? false;
 
   await build({
     entryPoints: [path.join(packageDir, 'src', 'index.ts')],
@@ -505,6 +506,7 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
             const foregroundNotificationOnly = ${JSON.stringify(foregroundNotificationOnly)};
             const peerIngressOnly = ${JSON.stringify(peerIngressOnly)};
             const notificationStreamWaitsForQueuedHumanPrompt = ${JSON.stringify(notificationStreamWaitsForQueuedHumanPrompt)};
+            const foregroundPlanAfterTaskNotification = ${JSON.stringify(foregroundPlanAfterTaskNotification)};
             export function tool(name, description, inputSchema, handler) {
               return { name, description, inputSchema, handler };
             }
@@ -521,7 +523,7 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
               throw new Error('forkSession should not be called in this test');
             }
 
-            export function query({ prompt }) {
+            export function query({ prompt, options: queryOptions }) {
               let closed = false;
               return {
                 close() { closed = true; },
@@ -538,6 +540,164 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
                     const promptUuid = next.value.uuid;
                     yield { ...next.value, session_id };
                     yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
+
+                    if (foregroundPlanAfterTaskNotification && turn === 1) {
+                      const input = {
+                        questions: [{
+                          question: 'Which runtime strategy?',
+                          header: 'Runtime',
+                          multiSelect: false,
+                          options: [{
+                            label: 'Managed',
+                            description: 'Let CCEM manage the runtime.',
+                          }],
+                        }],
+                      };
+                      yield {
+                        type: 'user',
+                        origin: { kind: 'task-notification' },
+                        uuid: 'queued-task-notification-during-plan',
+                        shouldQuery: true,
+                        session_id,
+                        message: {
+                          content: '<task-notification>\\n<task-id>research-agent</task-id>\\n<status>completed</status>\\n</task-notification>',
+                        },
+                      };
+
+                      const firstPrompt = queryOptions.canUseTool(
+                        'AskUserQuestion',
+                        input,
+                        { toolUseID: 'ask-after-task-notification' },
+                      );
+                      const redeliveredPrompt = queryOptions.canUseTool(
+                        'AskUserQuestion',
+                        input,
+                        { toolUseID: 'ask-after-task-notification' },
+                      );
+
+                      yield {
+                        type: 'assistant',
+                        parent_tool_use_id: null,
+                        session_id,
+                        message: {
+                          content: [{
+                            type: 'text',
+                            text: 'Foreground plan survives the task notification',
+                          }, {
+                            type: 'tool_use',
+                            id: 'ask-after-task-notification',
+                            name: 'AskUserQuestion',
+                            input,
+                          }],
+                        },
+                      };
+
+                      const [firstResult, redeliveredResult] = await Promise.all([
+                        firstPrompt,
+                        redeliveredPrompt,
+                      ]);
+                      process.stderr.write(
+                        'INTERACTIVE_RESULTS '
+                        + firstResult.behavior
+                        + ' '
+                        + redeliveredResult.behavior
+                        + '\\n',
+                      );
+                      yield {
+                        type: 'user',
+                        session_id,
+                        message: {
+                          content: [{
+                            type: 'tool_result',
+                            tool_use_id: 'ask-after-task-notification',
+                            content: 'User answered the runtime question.',
+                          }],
+                        },
+                      };
+                      yield {
+                        type: 'assistant',
+                        parent_tool_use_id: null,
+                        session_id,
+                        message: {
+                          content: [{
+                            type: 'text',
+                            text: 'Foreground plan continues after the answer',
+                          }],
+                        },
+                      };
+                      const planInput = {
+                        plan: 'Use the managed runtime strategy.',
+                        allowedPrompts: ['Implement the approved plan.'],
+                      };
+                      const planExit = queryOptions.canUseTool(
+                        'ExitPlanMode',
+                        planInput,
+                        { toolUseID: 'exit-after-task-notification' },
+                      );
+                      const planExitResult = await planExit;
+                      process.stderr.write(
+                        'PLAN_EXIT_RESULT ' + planExitResult.behavior + '\\n',
+                      );
+                      yield {
+                        type: 'assistant',
+                        parent_tool_use_id: null,
+                        session_id,
+                        message: {
+                          content: [{
+                            type: 'text',
+                            text: 'Foreground plan is ready for review',
+                          }, {
+                            type: 'tool_use',
+                            id: 'exit-after-task-notification',
+                            name: 'ExitPlanMode',
+                            input: planInput,
+                          }],
+                        },
+                      };
+                      yield {
+                        type: 'user',
+                        session_id,
+                        message: {
+                          content: [{
+                            type: 'tool_result',
+                            tool_use_id: 'exit-after-task-notification',
+                            content: 'User approved the plan.',
+                          }],
+                        },
+                      };
+                      yield {
+                        type: 'result',
+                        subtype: 'success',
+                        result: 'plan question answered',
+                        origin: { kind: 'human' },
+                        user_message_uuid: promptUuid,
+                        session_id,
+                      };
+                      yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
+                      continue;
+                    }
+
+                    if (foregroundPlanAfterTaskNotification) {
+                      yield {
+                        type: 'assistant',
+                        parent_tool_use_id: null,
+                        session_id,
+                        message: {
+                          content: [{
+                            type: 'text',
+                            text: 'Next foreground turn remains visible',
+                          }],
+                        },
+                      };
+                      yield {
+                        type: 'result',
+                        subtype: 'success',
+                        result: 'next foreground turn completed',
+                        session_id,
+                      };
+                      yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
+                      continue;
+                    }
 
                     if (peerIngressOnly) {
                       yield {
@@ -1047,6 +1207,150 @@ function waitForProcessExit(child, description) {
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test('task notification cannot hide or duplicate an active foreground plan question', async (t) => {
+  const helperPath = await buildHelperWithBackgroundRaceMock({
+    foregroundPlanAfterTaskNotification: true,
+  });
+  const helper = spawn(process.execPath, [helperPath], {
+    env: {
+      ...process.env,
+      CCEM_NATIVE_CLAUDE_IDLE_TTL_MS: '60000',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(() => helper.kill('SIGTERM'));
+
+  const outputs = [];
+  const stderrRef = { value: '' };
+  let stdoutBuffer = '';
+  helper.stdout.setEncoding('utf8');
+  helper.stdout.on('data', (chunk) => {
+    stdoutBuffer += chunk;
+    let newlineIndex = stdoutBuffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = stdoutBuffer.slice(0, newlineIndex).trim();
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line) outputs.push(JSON.parse(line));
+      newlineIndex = stdoutBuffer.indexOf('\n');
+    }
+  });
+  helper.stderr.setEncoding('utf8');
+  helper.stderr.on('data', (chunk) => { stderrRef.value += chunk; });
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    perm_mode: 'plan',
+    working_dir: os.tmpdir(),
+    initial_prompt: 'research in parallel, then ask for my runtime choice',
+  })}\n`);
+
+  const promptEvent = await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'tool_use_started'
+      && output.payload.tool_use_id === 'ask-after-task-notification'
+      && output.payload.needs_response === true,
+    stderrRef,
+    'foreground plan question after a task notification',
+  );
+  assert.equal(promptEvent.payload.prompt?.prompt_type, 'ask_user_question');
+  assert.equal(
+    promptEvent.payload.prompt?.questions?.[0]?.question,
+    'Which runtime strategy?',
+  );
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'interactive_prompt_response',
+    tool_use_id: 'ask-after-task-notification',
+    prompt_type: 'ask_user_question',
+    answers: { 'Which runtime strategy?': 'Managed' },
+  })}\n`);
+
+  const planExitEvent = await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'tool_use_started'
+      && output.payload.tool_use_id === 'exit-after-task-notification'
+      && output.payload.needs_response === true,
+    stderrRef,
+    'foreground plan review after the question answer',
+  );
+  assert.equal(planExitEvent.payload.prompt?.prompt_type, 'plan_exit');
+  assert.equal(
+    planExitEvent.payload.prompt?.plan_summary,
+    'Use the managed runtime strategy.',
+  );
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'interactive_prompt_response',
+    tool_use_id: 'exit-after-task-notification',
+    prompt_type: 'plan_exit',
+    answers: { decision: 'approve' },
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_completed'
+      && output.payload.detail === 'plan question answered',
+    stderrRef,
+    'foreground plan turn completion',
+  );
+  await waitForOutput(
+    outputs,
+    () => stderrRef.value.includes('INTERACTIVE_RESULTS allow allow')
+      && stderrRef.value.includes('PLAN_EXIT_RESULT allow'),
+    stderrRef,
+    'question redelivery and plan exit callbacks to resolve',
+  );
+
+  const promptEvents = outputs.filter((output) => output.type === 'event'
+    && output.payload?.type === 'tool_use_started'
+    && output.payload.tool_use_id === 'ask-after-task-notification');
+  assert.equal(promptEvents.length, 1, 'callback redelivery and assistant stream must upsert one card');
+
+  const firstPlanTextIndex = outputs.findIndex((output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk'
+    && output.payload.text === 'Foreground plan survives the task notification');
+  const promptIndex = outputs.indexOf(promptEvent);
+  assert.ok(firstPlanTextIndex >= 0, 'foreground plan text must remain visible');
+  assert.ok(promptIndex < firstPlanTextIndex, 'interactive callback must create the card before stream rendering');
+  assert.equal(outputs.some((output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk'
+    && output.payload.text === 'Foreground plan continues after the answer'), true);
+  const planReviewTextIndex = outputs.findIndex((output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk'
+    && output.payload.text === 'Foreground plan is ready for review');
+  assert.ok(planReviewTextIndex >= 0, 'foreground plan review text must remain visible');
+  assert.ok(
+    outputs.indexOf(planExitEvent) < planReviewTextIndex,
+    'ExitPlanMode callback must create the review card before stream rendering',
+  );
+  assert.equal(outputs.filter((output) => output.type === 'event'
+    && output.payload?.type === 'tool_use_started'
+    && output.payload.tool_use_id === 'exit-after-task-notification').length, 1);
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'prompt',
+    text: 'continue with a legacy result frame',
+  })}\n`);
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_completed'
+      && output.payload.detail === 'next foreground turn completed',
+    stderrRef,
+    'next foreground turn after notification bookkeeping is cleared',
+  );
+  assert.equal(outputs.some((output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk'
+    && output.payload.text === 'Next foreground turn remains visible'), true);
+});
 
 test('background task result cannot complete a queued human turn', async (t) => {
   const helperPath = await buildHelperWithBackgroundRaceMock();
