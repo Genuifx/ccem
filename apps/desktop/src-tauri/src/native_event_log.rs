@@ -1038,6 +1038,7 @@ mod tests {
             payload: SessionEventPayload::Lifecycle {
                 stage: "runtime_boot".to_string(),
                 detail: "Starting claude native runtime.".to_string(),
+                assistant_message_uuid: None,
             },
         })
         .expect("append runtime anchor");

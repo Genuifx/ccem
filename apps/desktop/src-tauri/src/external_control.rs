@@ -912,6 +912,7 @@ impl ExternalControlManager {
                     effort: params.effort,
                     router_launch_draft,
                     router_record: None,
+                    fork_from_message_id: None,
                 }
             }
             NativeProvider::Codex => {
@@ -942,6 +943,7 @@ impl ExternalControlManager {
                     effort: params.effort,
                     router_launch_draft: None,
                     router_record: None,
+                    fork_from_message_id: None,
                 }
             }
         };

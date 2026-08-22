@@ -85,6 +85,7 @@ import {
   type ComposerSubmitPayload,
 } from './composerAttachments';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
+import { getWorkspaceForkTurnPreview } from './WorkspaceForkDialog';
 import { shouldPreserveRestoredReadingPosition } from './workspaceTranscriptTopWindowing';
 import { WorkspaceSessionComposer } from './WorkspaceSessionComposer';
 import {
@@ -263,6 +264,19 @@ interface WorkspaceNativeSessionViewProps {
   codexInstalled?: boolean;
   opencodeInstalled?: boolean;
   onLaunchNewSession?: (client: LaunchClient) => void;
+  /** Opens the fork-from-turn dialog (Claude sessions with a provider session id). */
+  onForkTurnRequest?: (
+    request: {
+      providerSessionId: string;
+      forkFromMessageId: string;
+      seedMessages: ConversationMessageData[];
+      envName?: string;
+      permMode?: string;
+      workingDir?: string | null;
+      effort?: string | null;
+    },
+    target: { turnPreview: string },
+  ) => void;
   onNavigateEnvironments?: () => void;
 }
 
@@ -1385,6 +1399,7 @@ export function WorkspaceNativeSessionView({
   codexInstalled = false,
   opencodeInstalled = false,
   onLaunchNewSession,
+  onForkTurnRequest,
   onNavigateEnvironments,
 }: WorkspaceNativeSessionViewProps) {
   const { t } = useLocale();
@@ -1857,6 +1872,42 @@ export function WorkspaceNativeSessionView({
     () => stabilizeMessageRefs(rawMessages, previousMessagesRef.current),
     [rawMessages],
   );
+
+  // Fork-from-turn anchor: rebuilt every render from the latest session and
+  // transcript, but the callback handed to memoized bubbles stays stable.
+  const forkTurnImplRef = useRef<(message: ConversationMessageData) => void>(() => {});
+  forkTurnImplRef.current = (message: ConversationMessageData) => {
+    if (!onForkTurnRequest) {
+      return;
+    }
+    if (session.provider !== 'claude' || !session.provider_session_id?.trim()) {
+      return;
+    }
+    if (!message.uuid || message.uuid.startsWith('assistant-turn-')) {
+      return;
+    }
+    const index = messages.findIndex((candidate) => candidate.uuid === message.uuid);
+    if (index < 0) {
+      return;
+    }
+    onForkTurnRequest(
+      {
+        providerSessionId: session.provider_session_id,
+        forkFromMessageId: message.uuid,
+        seedMessages: messages.slice(0, index + 1),
+        envName: session.env_name,
+        permMode: session.perm_mode,
+        workingDir: session.project_dir,
+        effort: session.effort ?? null,
+      },
+      {
+        turnPreview: getWorkspaceForkTurnPreview(message),
+      },
+    );
+  };
+  const handleForkTurn = useCallback((message: ConversationMessageData) => {
+    forkTurnImplRef.current(message);
+  }, []);
 
   const reviewSummary = useMemo(() => {
     const previous = reviewFoldRef.current;
@@ -3362,6 +3413,7 @@ export function WorkspaceNativeSessionView({
               isAwaitingResponse={isAwaitingResponse}
               enableTopWindowing
               viewportRef={containerRef}
+              onForkTurn={onForkTurnRequest ? handleForkTurn : undefined}
             />
           )}
         </div>

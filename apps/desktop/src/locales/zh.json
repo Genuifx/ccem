@@ -551,7 +551,14 @@
     "usagePanelSubRouteUnreported": "未报告用量的请求",
     "usagePanelSubRouteIncomplete": "中断的请求",
     "usagePanelSubRouteFootnote": "Router 独立观测的子代理/后台请求用量，与上方 SDK 总量相互独立，不做相加或对账。",
-    "usagePanelSubRouteOther": "显式改派"
+    "usagePanelSubRouteOther": "显式改派",
+    "forkTurnAction": "从这一轮分叉新会话",
+    "forkTurnDialogTitle": "分叉出新会话",
+    "forkTurnDialogBody": "新会话将携带截至这一轮的完整上下文，原会话不受影响。",
+    "forkTurnPromptPlaceholder": "输入新会话的第一条消息…",
+    "forkTurnSubmit": "创建分叉会话",
+    "forkTurnSubmitting": "创建中…",
+    "forkTurnCreateFailed": "分叉会话创建失败"
   },
   "sessions": {
     "subtitle": "管理运行中的 Claude Code 会话",

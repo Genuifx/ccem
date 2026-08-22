@@ -90,6 +90,10 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const launchBackgroundTaskBeforeInterrupt = ${JSON.stringify(launchBackgroundTaskBeforeInterrupt)};
             let queryCount = 0;
             let setModelCalled = false;
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt, options }) {
               if (expectedQueryModel !== null && options.model !== expectedQueryModel) {
                 throw new Error('expected query model ' + expectedQueryModel + ', got ' + options.model);
@@ -513,6 +517,10 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
                 },
               };
             }
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt }) {
               let closed = false;
               return {

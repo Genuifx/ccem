@@ -1325,6 +1325,7 @@ async fn create_native_session(
     provider_session_id: Option<String>,
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
+    fork_from_message_id: Option<String>,
     router_launch_draft: Option<RouterLaunchDraft>,
     resume_router_from_runtime_id: Option<String>,
     codex_migration_proof_token: Option<String>,
@@ -1335,6 +1336,21 @@ async fn create_native_session(
         router_launch_draft.as_ref(),
         resume_router_from_runtime_id.as_deref(),
     )?;
+    if fork_from_message_id.is_some() {
+        if provider != NativeProvider::Claude {
+            return Err(
+                "FORK_PROVIDER_UNSUPPORTED: forking from a message is only available for Claude sessions"
+                    .to_string(),
+            );
+        }
+        if provider_session_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return Err(
+                "FORK_MISSING_PARENT: forking requires provider_session_id of the parent session"
+                    .to_string(),
+            );
+        }
+    }
+    let fork_from_message_id = fork_from_message_id.filter(|value| !value.trim().is_empty());
     if provider != NativeProvider::Claude && router_launch_draft.is_some() {
         return Err(
             "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
@@ -1389,6 +1405,7 @@ async fn create_native_session(
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
+                fork_from_message_id,
                 seed_boundary_message_count,
                 helper_env_vars: resolved.env_vars.clone(),
                 terminal_env_vars: resolved.env_vars,
@@ -1422,6 +1439,7 @@ async fn create_native_session(
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
+                fork_from_message_id: None,
                 seed_boundary_message_count,
                 helper_env_vars: proxy_env_vars.clone(),
                 terminal_env_vars: proxy_env_vars,

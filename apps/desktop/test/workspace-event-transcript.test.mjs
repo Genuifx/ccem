@@ -1417,3 +1417,31 @@ test('stabilizes unchanged message references but updates visible tool metadata 
   const timingStabilized = stabilizeMessageRefs(changedTiming, first);
   assert.notEqual(timingStabilized[1], first[1]);
 });
+
+test('turn_completed assistant_message_uuid replaces the synthetic turn uuid', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const messages = buildMessagesFromEvents([], [], [
+    event(1, { type: 'lifecycle', stage: 'turn_started', detail: '' }),
+    event(2, { type: 'assistant_chunk', text: 'First reply part.' }),
+    event(3, { type: 'assistant_chunk', text: ' Second reply part.' }),
+    event(4, { type: 'lifecycle', stage: 'turn_completed', detail: '', assistant_message_uuid: 'provider-assistant-uuid-1' }),
+  ]);
+
+  const assistant = messages.find((message) => message.msgType === 'assistant');
+  assert.ok(assistant, 'assistant turn should be flushed');
+  assert.equal(assistant?.uuid, 'provider-assistant-uuid-1');
+  assert.notEqual(assistant?.uuid, 'assistant-turn-2');
+});
+
+test('turn_completed without assistant_message_uuid keeps the synthetic uuid', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const messages = buildMessagesFromEvents([], [], [
+    event(1, { type: 'lifecycle', stage: 'turn_started', detail: '' }),
+    event(2, { type: 'assistant_chunk', text: 'Legacy reply.' }),
+    event(3, { type: 'lifecycle', stage: 'turn_completed', detail: '' }),
+  ]);
+
+  const assistant = messages.find((message) => message.msgType === 'assistant');
+  assert.ok(assistant);
+  assert.match(String(assistant?.uuid), /^assistant-turn-/);
+});

@@ -120,7 +120,7 @@ impl WecomChannel {
                     state.finished = true;
                     force_flush = true;
                 }
-                SessionEventPayload::Lifecycle { stage, detail }
+                SessionEventPayload::Lifecycle { stage, detail, .. }
                     if matches!(stage.as_str(), "process_failure" | "stderr_error") =>
                 {
                     state.stderr.push(detail.clone());

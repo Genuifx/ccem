@@ -134,6 +134,10 @@ async function buildHelperWithPermissionMock() {
               return value;
             }
 
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt, options }) {
               return {
                 close() {},

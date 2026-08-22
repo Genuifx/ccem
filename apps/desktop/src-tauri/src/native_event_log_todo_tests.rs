@@ -83,6 +83,7 @@ fn native_event_log_keeps_latest_todo_snapshot_anchor_in_limited_replay() {
         SessionEventPayload::Lifecycle {
             stage: "runtime_boot".to_string(),
             detail: "Starting claude native runtime.".to_string(),
+            assistant_message_uuid: None,
         },
         todo_snapshot_started_payload(1, "stale snapshot"),
         SessionEventPayload::AssistantChunk {
@@ -138,6 +139,7 @@ fn native_event_log_keeps_pre_tail_todo_snapshot_when_newer_snapshot_is_in_tail(
         SessionEventPayload::Lifecycle {
             stage: "runtime_boot".to_string(),
             detail: "Starting claude native runtime.".to_string(),
+            assistant_message_uuid: None,
         },
         todo_snapshot_started_payload(1, "pre-tail snapshot"),
         SessionEventPayload::AssistantChunk {

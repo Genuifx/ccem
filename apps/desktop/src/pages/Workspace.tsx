@@ -29,6 +29,11 @@ import { WorkspaceHistoryErrorBoundary } from '@/components/workspace/WorkspaceH
 import { WorkspaceCodexModelMigrationDialog } from '@/components/workspace/WorkspaceCodexModelMigrationDialog';
 import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
 import {
+  WorkspaceForkDialog,
+  getWorkspaceForkTurnPreview,
+  type WorkspaceForkTarget,
+} from '@/components/workspace/WorkspaceForkDialog';
+import {
   createComposerRouteDraft,
   isHistoryRouteContinuationBlocked,
   isRouteDraftRowVisible,
@@ -185,6 +190,20 @@ const LazyHistoryDetail = lazy(async () =>
 );
 
 type WorkspaceViewMode = 'compose' | 'live' | 'history';
+
+/** Everything needed to launch a forked Claude session from a model-output turn. */
+interface WorkspaceForkTurnRequest {
+  /** Parent provider session (transcript to slice). */
+  providerSessionId: string;
+  /** Cut point: last assistant message uuid kept in the fork (inclusive). */
+  forkFromMessageId: string;
+  /** Transcript prefix to hydrate the forked session view. */
+  seedMessages: ConversationMessageData[];
+  envName?: string;
+  permMode?: string;
+  workingDir?: string | null;
+  effort?: string | null;
+}
 
 const ACTIVE_LIVE_RUNTIME_STORAGE_KEY = 'ccem-workspace-live-runtime';
 const LIVE_RUNTIME_SET_STORAGE_KEY = 'ccem-workspace-live-runtimes';
@@ -2764,6 +2783,102 @@ export function Workspace({
     t,
   ]);
 
+  // ---- Fork session from a model-output turn (Claude only) ----
+  const [forkDialog, setForkDialog] = useState<{
+    request: WorkspaceForkTurnRequest;
+    target: WorkspaceForkTarget;
+  } | null>(null);
+  const [isForkingTurn, setIsForkingTurn] = useState(false);
+
+  const openForkTurn = useCallback((
+    request: WorkspaceForkTurnRequest,
+    target: WorkspaceForkTarget,
+  ) => {
+    setForkDialog({ request, target });
+  }, []);
+
+  const closeForkTurnDialog = useCallback(() => {
+    setForkDialog((current) => (isForkingTurn ? current : null));
+  }, [isForkingTurn]);
+
+  const runForkFromTurn = useCallback(async (firstPrompt: string) => {
+    if (!forkDialog || isForkingTurn) {
+      return;
+    }
+    setIsForkingTurn(true);
+    const { request } = forkDialog;
+    try {
+      const summary = await createNativeSession({
+        provider: 'claude',
+        envName: request.envName,
+        permMode: request.permMode,
+        workingDir: request.workingDir ?? null,
+        initialPrompt: firstPrompt,
+        providerSessionId: request.providerSessionId,
+        forkFromMessageId: request.forkFromMessageId,
+        effort: request.effort ?? null,
+        seedBoundaryMessageCount: request.seedMessages.length,
+      });
+      setLaunchClient('claude');
+      upsertLiveSessionEntry(summary, {
+        initialPrompt: firstPrompt,
+        initialImages: null,
+        initialAnnotations: null,
+        seedMessages: request.seedMessages,
+      });
+      setActiveLiveRuntimeId(summary.runtime_id);
+      setWorkspaceMode('live');
+      scheduleWorkspaceRefresh(1200);
+      setForkDialog(null);
+    } catch (error) {
+      console.error('Failed to fork session from turn:', error);
+      const detail = error instanceof Error ? error.message : String(error);
+      toast.error(detail || t('workspace.forkTurnCreateFailed'));
+    } finally {
+      setIsForkingTurn(false);
+    }
+  }, [
+    createNativeSession,
+    forkDialog,
+    isForkingTurn,
+    scheduleWorkspaceRefresh,
+    setLaunchClient,
+    upsertLiveSessionEntry,
+    t,
+  ]);
+
+  // History-mode fork anchor: built from current selection each render, but the
+  // callback handed to memoized bubbles must stay identity-stable.
+  const handleForkHistoryTurnImpl = useRef<(message: ConversationMessageData) => void>(() => {});
+  handleForkHistoryTurnImpl.current = (message: ConversationMessageData) => {
+    if (!selectedSession || selectedSession.source !== 'claude' || !selectedSession.project) {
+      return;
+    }
+    if (!message.uuid || message.uuid.startsWith('assistant-turn-')) {
+      return;
+    }
+    // Bubbles render merged/windowed messages; match by uuid against the raw
+    // transcript array that seeds the forked session view.
+    const index = messages.findIndex((candidate) => candidate.uuid === message.uuid);
+    if (index < 0) {
+      return;
+    }
+    openForkTurn({
+      providerSessionId: selectedSession.id,
+      forkFromMessageId: message.uuid,
+      seedMessages: messages.slice(0, index + 1),
+      envName: historyEnv,
+      permMode: historyPermMode,
+      workingDir: selectedSession.project,
+      effort: normalizeEffortForProvider(historyEffort, 'claude'),
+    }, {
+      turnPreview: getWorkspaceForkTurnPreview(message),
+    });
+  };
+  const handleForkHistoryTurn = useCallback((message: ConversationMessageData) => {
+    handleForkHistoryTurnImpl.current(message);
+  }, []);
+
   // All user route-draft edits for the history composer flow through here so
   // the keyed store stays in sync (A/B/A retention). UI edits never carry a
   // restored snapshot by construction; the restore path saves its own entry.
@@ -3020,6 +3135,7 @@ export function Workspace({
               onAddAnnotation={selectedHistorySupportsInline ? historyAnnotations.addAnnotation : undefined}
               onUpdateAnnotation={selectedHistorySupportsInline ? historyAnnotations.updateAnnotation : undefined}
               onRemoveAnnotation={selectedHistorySupportsInline ? historyAnnotations.removeAnnotation : undefined}
+              onForkTurn={selectedSession.source === 'claude' ? handleForkHistoryTurn : undefined}
             />
           </WorkspaceHistoryErrorBoundary>
         </Suspense>
@@ -3307,6 +3423,7 @@ export function Workspace({
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}
                           onLaunchNewSession={handleNewSession}
+                          onForkTurnRequest={openForkTurn}
                           onNavigateEnvironments={() => onNavigate('environments')}
                           onStartNew={() => {
                             setWorkspaceMode('compose');
@@ -3341,6 +3458,20 @@ export function Workspace({
           />
         ) : null}
       </div>
+
+      <WorkspaceForkDialog
+        open={forkDialog !== null}
+        target={forkDialog?.target ?? null}
+        submitting={isForkingTurn}
+        onOpenChange={(next) => {
+          if (!next) {
+            closeForkTurnDialog();
+          }
+        }}
+        onSubmit={(firstPrompt) => {
+          void runForkFromTurn(firstPrompt);
+        }}
+      />
 
       <WorkspaceGlobalSearch
         sessions={sessions}

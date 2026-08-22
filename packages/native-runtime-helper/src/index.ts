@@ -1,4 +1,4 @@
-import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { forkSession, query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { Codex } from '@openai/codex-sdk';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
@@ -62,6 +62,8 @@ type InitCommand = {
   initial_prompt?: string | null;
   initial_images?: PromptImage[] | null;
   provider_session_id?: string | null;
+  fork_session?: boolean | null;
+  fork_at_message_id?: string | null;
   claude_path?: string | null;
   codex_path?: string | null;
   codex_base_url?: string | null;
@@ -258,6 +260,7 @@ let runtimeTeardownPreparationId: string | null = null;
 let claudeSawPartialText = false;
 let claudeSawPartialThinking = false;
 let claudeTurnCompletionEmitted = false;
+let claudeLastAssistantMessageUuid: string | null = null;
 let claudeTurnAwaitingResult = false;
 let claudeForegroundPromptUuid: string | null = null;
 let claudeForegroundPromptAccepted = false;
@@ -1033,6 +1036,7 @@ function resetClaudeContentTracking() {
 function resetClaudeTurnTracking() {
   resetClaudeContentTracking();
   claudeTurnCompletionEmitted = false;
+  claudeLastAssistantMessageUuid = null;
 }
 
 function emitClaudeTurnCompleted(detail: string) {
@@ -1047,6 +1051,9 @@ function emitClaudeTurnCompleted(detail: string) {
     type: 'lifecycle',
     stage: 'turn_completed',
     detail,
+    ...(claudeLastAssistantMessageUuid
+      ? { assistant_message_uuid: claudeLastAssistantMessageUuid }
+      : {}),
   });
   if (applyPendingClaudeSettingsAfterTurn()) {
     emitStatus('ready', 'Settings applied.');
@@ -1071,6 +1078,9 @@ function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop 
       type: 'lifecycle',
       stage: 'turn_interrupted',
       detail,
+      ...(claudeLastAssistantMessageUuid
+        ? { assistant_message_uuid: claudeLastAssistantMessageUuid }
+        : {}),
     });
   }
   if (applyPendingClaudeSettingsAfterTurn()) {
@@ -2391,6 +2401,16 @@ async function consumeClaudeMessages() {
           propagateClaudeHiddenToolOwnership(message);
           continue;
         }
+        // Main-chain assistant messages only (subagent output rides parent_tool_use_id)
+        // and only the latest one matters: it is the fork cut point for the turn.
+        const assistantMessageUuid = (message as { uuid?: unknown }).uuid;
+        if (
+          typeof assistantMessageUuid === 'string'
+          && assistantMessageUuid
+          && !claudeMessageParentToolUseId(message)
+        ) {
+          claudeLastAssistantMessageUuid = assistantMessageUuid;
+        }
         // Emit token_usage per unique message (parallel tool calls share the same id)
         const msgId = (message as { message?: { id?: string; usage?: Record<string, unknown> } }).message?.id;
         const msgUsage = (message as { message?: { id?: string; usage?: Record<string, unknown> } }).message?.usage;
@@ -3469,6 +3489,9 @@ async function handleCommand(command: InputCommand) {
 
   if (command.type === 'init') {
     initCommand = command;
+    const forkRequested = command.provider === 'claude'
+      && Boolean(command.fork_session)
+      && Boolean(command.provider_session_id?.trim());
     const resumedClaudeWithoutTodoSeed = command.provider === 'claude'
       && Boolean(command.provider_session_id?.trim())
       && !command.todo_snapshot_seed;
@@ -3476,7 +3499,21 @@ async function handleCommand(command: InputCommand) {
       command.todo_snapshot_seed,
       !resumedClaudeWithoutTodoSeed,
     );
-    currentProviderSessionId = command.provider_session_id ?? null;
+    let initProviderSessionId = command.provider_session_id ?? null;
+    if (forkRequested) {
+      const parentSessionId = command.provider_session_id!.trim();
+      try {
+        const forked = await forkSession(parentSessionId, {
+          upToMessageId: command.fork_at_message_id?.trim() || undefined,
+          dir: command.working_dir,
+        });
+        initProviderSessionId = forked.sessionId;
+      } catch (error) {
+        emitStatus('error', `Failed to fork session: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    currentProviderSessionId = initProviderSessionId;
     browserEvaluateApprovedForSession = false;
     if (currentProviderSessionId) {
       emitSessionMeta(currentProviderSessionId);
