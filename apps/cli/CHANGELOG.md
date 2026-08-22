@@ -1,5 +1,11 @@
 # ccem
 
+## 2.71.0
+
+### Minor Changes
+
+- Release v2.71.0: native runtime stability and workspace performance improvements — ownership-aware sidecar shutdown with orphan reaping, incremental attention summaries and single-flight analytics parsing, lazy tray cockpit, workspace selection annotation stabilization, and bounded live transcript pipeline.
+
 ## 2.70.0
 
 ### Minor Changes
