@@ -13,7 +13,7 @@
     "perf:smoke": "node scripts/perf-smoke.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json -- --locked"
+    "tauri:dev": "node scripts/tauri-dev.mjs"
   },
   "dependencies": {
     "@ccem/core": "workspace:*",

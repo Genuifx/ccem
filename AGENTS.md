@@ -109,26 +109,23 @@ Minimum expected path:
 3. Drive the changed flow yourself
 4. Check the actual rendered state, not just backend logs
 
-#### Parallel worktree ownership rule
+#### Parallel worktree development contract
 
-The canonical desktop development stack is currently single-owner across all linked worktrees. Vite binds `127.0.0.1:1421` with `strictPort`, debug builds acquire the shared `~/.ccem/desktop-app-dev.lock`, and every worktree uses the same `com.ccem.desktop.dev` application identity. A second plain `pnpm tauri:dev` is therefore not an independent instance.
+The canonical `pnpm tauri:dev` launcher supports concurrent development apps from different linked worktrees. It derives a stable namespace from the absolute worktree path and supplies that instance with its own Vite port, bundle identifier/product name, Rust instance lock, and 100-port Tauri MCP block. If a preferred port is occupied, it selects another free port without terminating the owner.
 
-Before starting it, check both shared resources:
+At startup the launcher prints the instance ID, Vite URL, MCP base port, bundle identifier, and an ignored manifest path under `.artifacts/tauri-dev/`. Use the manifest's `launcherPid`, `identifier`, and `mcpPort` to target the exact instance. A second launch from the same worktree is rejected with the live owner PID.
 
-```bash
-lsof -nP -iTCP:1421 -sTCP:LISTEN
-lsof -nP ~/.ccem/desktop-app-dev.lock
-```
+A task may reuse or stop only the dev stack it spawned and still owns. Stop it in its original terminal or target that exact `launcherPid`; never use `pkill`, `killall`, port cleanup, lock deletion, or an installed-app quit as a shortcut. An occupied port or lock is evidence to inspect, not permission to kill another task.
 
-No owner from either check is the precondition for starting a new dev stack. If another task or worktree owns either resource, do not start another stack and do not terminate, kill, `pkill`, `killall`, clean the port, or delete the lock. Continue non-app verification while the owner is active, then retry after it exits; if it remains occupied, report the desktop self-test as a specific coverage gap. Treat `EADDRINUSE` and `Another CCEM Desktop process is already running` the same way if two starts race.
+Named dev instances default `CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=0`. This prevents automatic runtime cleanup/reconciliation, proxy boot, system autostart sync, session monitoring, cron execution, bot request watching, and Telegram/Weixin/WeCom bridge startup from racing through shared machine state. For a targeted single-owner test of those services, opt in explicitly with `CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1 pnpm tauri:dev`.
 
-A task may reuse or stop only the dev stack that it spawned in the same worktree and still owns. Record its PID/worktree when starting it, and target that exact process when stopping it. Changing only the Vite port does not make parallel runs safe; true multi-instance support must also isolate the instance lock, application identity, MCP/control endpoint, and shared runtime data.
+Parallel process infrastructure does not clone the user's `~/.ccem` product data. Manual config/settings/session mutations from different instances still target shared data, so coordinate tests that write the same records even though the apps themselves can run concurrently.
 
 Manual reasoning alone is not considered enough for app-facing changes when Tauri MCP can exercise the flow.
 
-The `tauri:dev` script applies `src-tauri/tauri.dev.conf.json`, giving the development app its own `CCEM Desktop Dev` product name and `com.ccem.desktop.dev` bundle identifier. It also passes `--locked` to Cargo, so desktop self-tests cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
+The `tauri:dev` script merges `src-tauri/tauri.dev.conf.json` with a generated per-worktree config. Each development app therefore has a release-distinct and worktree-distinct product name and bundle identifier. It also passes `--locked` to Cargo, so desktop self-tests cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
 
-The installed release is outside the self-test process boundary. Agents must not quit, terminate, or kill `/Applications/CCEM Desktop.app` to disambiguate a development build. If desktop automation reports multiple matching apps, target the development app by its `com.ccem.desktop.dev` identifier, exact development app path, or Tauri MCP port. If none of those targets is available, stop the self-test and report the targeting failure instead of disturbing the release app.
+The installed release is outside the self-test process boundary. Agents must not quit, terminate, or kill `/Applications/CCEM Desktop.app` to disambiguate a development build. If desktop automation reports multiple matching apps, use the generated manifest to target the exact development bundle identifier or Tauri MCP port. If neither target is available, stop the self-test and report the targeting failure instead of disturbing the release app.
 
 If the locked self-test fails because the lockfile needs to change, do not remove `--locked` to get past the failure. Inspect the dependency or version change first. If the lock update is intentional, regenerate it explicitly with `cd apps/desktop/src-tauri && cargo generate-lockfile --offline`, review the diff, and include `apps/desktop/src-tauri/Cargo.lock` in the related commit. If the change is only verification noise from a local run, restore the lockfile before cleanup and re-check `git status --short -- apps/desktop/src-tauri/Cargo.lock`.
 

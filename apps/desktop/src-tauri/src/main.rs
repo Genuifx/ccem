@@ -14,6 +14,7 @@ mod config;
 mod cron;
 mod crypto;
 mod desktop_instance_lock;
+mod dev_instance;
 mod diagnostic_log;
 mod doctor;
 mod event_bus;
@@ -3386,8 +3387,9 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
         Err(e) => errors.push(format!("read config: {}", e)),
     }
 
-    // Sync autostart with system
-    {
+    // A named development instance must not rewrite the machine-level launch
+    // agent while an installed release or another worktree is running.
+    if dev_instance::automatic_background_services_enabled() {
         use tauri_plugin_autostart::ManagerExt;
         let autostart = app.autolaunch();
         let result = if settings.auto_start {
@@ -5072,6 +5074,8 @@ fn quit_app(
 }
 
 fn main() {
+    let automatic_background_services_enabled =
+        dev_instance::automatic_background_services_enabled();
     let desktop_instance_lock = match desktop_instance_lock::acquire_desktop_instance_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -5189,7 +5193,11 @@ fn main() {
     ));
 
     #[cfg(debug_assertions)]
-    let builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+    let builder = builder.plugin(
+        tauri_plugin_mcp_bridge::Builder::new()
+            .base_port(dev_instance::mcp_base_port())
+            .build(),
+    );
 
     builder
         .manage(session_manager.clone())
@@ -5492,41 +5500,52 @@ fn main() {
             }
         })
         .setup(move |app| {
-            if let Err(error) = cleanup_orphaned_runtime_processes() {
-                eprintln!("Runtime orphan cleanup warning: {}", error);
-            }
-
-            // Clean up stale exit files not belonging to any persisted session
-            cleanup_stale_exit_files_except(&session_manager_for_setup);
-
-            // Validate persisted sessions against actual terminal state
-            session_manager_for_setup.validate_and_reconcile();
-            match native_runtime_manager.reconcile_stale_records() {
-                Ok(count) if count > 0 => {
-                    eprintln!("Reconciled {} stale native runtime record(s)", count);
+            if automatic_background_services_enabled {
+                if let Err(error) = cleanup_orphaned_runtime_processes() {
+                    eprintln!("Runtime orphan cleanup warning: {}", error);
                 }
-                Ok(_) => {}
-                Err(error) => eprintln!("Native runtime reconcile warning: {}", error),
-            }
-            if let Err(error) = interactive_manager_for_setup
-                .rehydrate_existing(app.handle().clone(), session_manager_for_setup.clone())
-            {
-                eprintln!("Interactive tmux rehydrate warning: {}", error);
-            }
-            match interactive_manager_for_setup.cleanup_orphaned_tmux_sessions() {
-                Ok(cleaned) if !cleaned.is_empty() => {
-                    eprintln!(
-                        "Cleaned {} orphaned CCEM tmux target(s): {}",
-                        cleaned.len(),
-                        cleaned.join(", ")
-                    );
+
+                // Clean up stale exit files not belonging to any persisted session
+                cleanup_stale_exit_files_except(&session_manager_for_setup);
+
+                // Validate persisted sessions against actual terminal state
+                session_manager_for_setup.validate_and_reconcile();
+                match native_runtime_manager.reconcile_stale_records() {
+                    Ok(count) if count > 0 => {
+                        eprintln!("Reconciled {} stale native runtime record(s)", count);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Native runtime reconcile warning: {}", error),
                 }
-                Ok(_) => {}
-                Err(error) => eprintln!("Interactive tmux orphan cleanup warning: {}", error),
+                if let Err(error) = interactive_manager_for_setup
+                    .rehydrate_existing(app.handle().clone(), session_manager_for_setup.clone())
+                {
+                    eprintln!("Interactive tmux rehydrate warning: {}", error);
+                }
+                match interactive_manager_for_setup.cleanup_orphaned_tmux_sessions() {
+                    Ok(cleaned) if !cleaned.is_empty() => {
+                        eprintln!(
+                            "Cleaned {} orphaned CCEM tmux target(s): {}",
+                            cleaned.len(),
+                            cleaned.join(", ")
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Interactive tmux orphan cleanup warning: {}", error),
+                }
             }
 
             proxy_manager_for_setup.set_app_handle(app.handle().clone());
-            tauri::async_runtime::block_on(proxy_manager_for_setup.maybe_start_on_boot());
+            if automatic_background_services_enabled {
+                tauri::async_runtime::block_on(proxy_manager_for_setup.maybe_start_on_boot());
+            } else {
+                eprintln!(
+                    "CCEM named dev instance: automatic shared background services are disabled; \
+                     set CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1 for a targeted self-test"
+                );
+            }
+            // Debug control servers already use private random endpoints and do
+            // not publish the shared descriptor unless explicitly requested.
             if let Err(error) = external_control_manager_for_setup.start(app.handle().clone()) {
                 eprintln!("External control startup warning: {}", error);
             }
@@ -5534,8 +5553,8 @@ fn main() {
             // Load desktop settings once for startup logic
             let startup_settings = config::read_settings().unwrap_or_default();
 
-            // Sync autostart state from settings
-            {
+            // Sync autostart state from settings only for a single-owner run.
+            if automatic_background_services_enabled {
                 use tauri_plugin_autostart::ManagerExt;
                 let autostart = app.autolaunch();
                 if startup_settings.auto_start {
@@ -5574,38 +5593,42 @@ fn main() {
 
             let _ = create_tray(app.handle())?;
 
-            // Start session monitor background task
-            start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
-
-            // Start cron scheduler background task
+            // Commands always need the managed scheduler state, even when its
+            // automatic background loop is disabled for a named dev instance.
             let cron_scheduler = Arc::new(CronScheduler::default());
             app.manage(cron_scheduler.clone());
-            let cron_app = app.handle().clone();
-            start_cron_scheduler(cron_app, cron_scheduler, unified_session_manager.clone());
-            bot_binding_manager_for_setup.start_request_watcher(
-                app.handle().clone(),
-                unified_session_manager.clone(),
-                native_runtime_manager.clone(),
-                {
-                    let bot_binding_manager = bot_binding_manager_for_setup.clone();
-                    let wecom_manager = wecom_manager_for_setup.clone();
-                    move |infos| {
-                        for info in infos {
-                            if info.send_task_card {
-                                let _ = deliver_bot_binding_task_card(
-                                    &bot_binding_manager,
-                                    &wecom_manager,
-                                    &info,
-                                );
+
+            if automatic_background_services_enabled {
+                start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
+
+                let cron_app = app.handle().clone();
+                start_cron_scheduler(cron_app, cron_scheduler, unified_session_manager.clone());
+                bot_binding_manager_for_setup.start_request_watcher(
+                    app.handle().clone(),
+                    unified_session_manager.clone(),
+                    native_runtime_manager.clone(),
+                    {
+                        let bot_binding_manager = bot_binding_manager_for_setup.clone();
+                        let wecom_manager = wecom_manager_for_setup.clone();
+                        move |infos| {
+                            for info in infos {
+                                if info.send_task_card {
+                                    let _ = deliver_bot_binding_task_card(
+                                        &bot_binding_manager,
+                                        &wecom_manager,
+                                        &info,
+                                    );
+                                }
                             }
                         }
-                    }
-                },
-            );
+                    },
+                );
+            }
 
             if let Ok(settings) = telegram::read_telegram_settings() {
                 telegram_manager_for_setup.sync_settings(&settings);
-                if settings.enabled
+                if automatic_background_services_enabled
+                    && settings.enabled
                     && settings
                         .bot_token
                         .as_ref()
@@ -5623,7 +5646,8 @@ fn main() {
 
             if let Ok(settings) = weixin::read_weixin_settings() {
                 weixin_manager_for_setup.sync_settings(&settings);
-                if settings.enabled
+                if automatic_background_services_enabled
+                    && settings.enabled
                     && settings
                         .bot_token
                         .as_ref()
@@ -5640,7 +5664,8 @@ fn main() {
 
             if let Ok(settings) = wecom::read_wecom_settings() {
                 wecom_manager_for_setup.sync_settings(&settings);
-                if settings.enabled
+                if automatic_background_services_enabled
+                    && settings.enabled
                     && settings.bots.iter().any(|bot| {
                         bot.enabled
                             && !bot.bot_id.trim().is_empty()
