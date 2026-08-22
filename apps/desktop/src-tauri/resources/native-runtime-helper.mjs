@@ -43509,6 +43509,9 @@ function isClaudeBackgroundOwnedMessage(message) {
   }
   return isClaudeNonHumanIngress();
 }
+function taskNotificationSharesActiveForegroundTurn(originKind) {
+  return originKind === "task-notification" && claudeTurnAwaitingResult && claudeForegroundPromptAccepted && (claudeIngressOriginKind === null || claudeIngressOriginKind === "human");
+}
 function propagateClaudeHiddenToolOwnership(message) {
   const record2 = message;
   const parentToolUseId = claudeMessageParentToolUseId(message);
@@ -44097,6 +44100,9 @@ function emitClaudeToolUseStarted(payload) {
   if (!payload.toolUseId) {
     return;
   }
+  if (completedToolUseIds.has(payload.toolUseId)) {
+    return;
+  }
   if (payload.input) {
     pendingClaudeToolInputs.set(payload.toolUseId, payload.input);
     if (payload.input.run_in_background === true) {
@@ -44220,23 +44226,33 @@ function summarizePlanExitFeedback(answers) {
   const feedback = answers.feedback?.trim() || Object.values(answers).map((value) => value.trim()).find(Boolean) || "Please revise the plan.";
   return truncateSummary2(`User requested plan changes: ${feedback}`, 240);
 }
-async function waitForAskUserQuestionResponse(input, toolUseId, agentId) {
-  return await new Promise((resolve2) => {
-    pendingClaudeInteractivePrompts.set(toolUseId, {
-      input,
-      resolve: resolve2,
-      agentId
-    });
+function waitForClaudeInteractivePromptResponse(toolName, input, toolUseId, agentId) {
+  const prompt = parseClaudeInteractiveToolPrompt(toolName, input);
+  const emitPrompt = () => emitClaudeToolUseStarted({
+    toolUseId,
+    rawName: toolName,
+    inputSummary: summarizeClaudeToolInput(toolName, input),
+    needsResponse: true,
+    input,
+    prompt
   });
-}
-async function waitForPlanExitApproval(input, toolUseId, agentId) {
-  return await new Promise((resolve2) => {
-    pendingClaudeInteractivePrompts.set(toolUseId, {
-      input,
-      resolve: resolve2,
-      agentId
-    });
+  const existing = pendingClaudeInteractivePrompts.get(toolUseId);
+  if (existing) {
+    emitPrompt();
+    return existing.promise;
+  }
+  let resolvePrompt;
+  const promise2 = new Promise((resolve2) => {
+    resolvePrompt = resolve2;
   });
+  pendingClaudeInteractivePrompts.set(toolUseId, {
+    input,
+    promise: promise2,
+    resolve: resolvePrompt,
+    agentId
+  });
+  emitPrompt();
+  return promise2;
 }
 async function waitForPermission(toolName, input, options) {
   const toolUseId = options.toolUseID;
@@ -44772,7 +44788,12 @@ function buildClaudeQueryOptions() {
             "Background tasks cannot pause the foreground workspace for user questions."
           );
         }
-        return waitForAskUserQuestionResponse(input, options.toolUseID, options.agentID);
+        return waitForClaudeInteractivePromptResponse(
+          toolName,
+          input,
+          options.toolUseID,
+          options.agentID
+        );
       }
       if (isClaudePlanExitTool(toolName)) {
         if (backgroundTaskId) {
@@ -44781,7 +44802,12 @@ function buildClaudeQueryOptions() {
             "Background tasks cannot request foreground plan approval."
           );
         }
-        return waitForPlanExitApproval(input, options.toolUseID, options.agentID);
+        return waitForClaudeInteractivePromptResponse(
+          toolName,
+          input,
+          options.toolUseID,
+          options.agentID
+        );
       }
       if (isClaudeInteractiveUserInputTool(toolName)) {
         return buildAllowedClaudeToolResult(input, options.toolUseID);
@@ -44991,7 +45017,7 @@ async function consumeClaudeMessages() {
             claudeIngressOriginKind = "human";
           }
         } else if (originKind) {
-          if (shouldQuery || !claudeForegroundPromptAccepted) {
+          if (!taskNotificationSharesActiveForegroundTurn(originKind) && (shouldQuery || !claudeForegroundPromptAccepted)) {
             claudeIngressOriginKind = originKind;
           }
           if (shouldQuery && originKind !== "human") {
@@ -45220,6 +45246,7 @@ async function consumeClaudeMessages() {
           continue;
         }
         claudeIngressOriginKind = null;
+        claudePendingNonHumanResultCount = 0;
         claudeTurnAwaitingResult = false;
         pendingClaudePromptReplay = null;
         if (claudeInterruptRequested) {

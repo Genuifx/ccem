@@ -222,19 +222,22 @@ type PermissionResolver = {
   backgroundTaskId?: string;
 };
 
+type ClaudeInteractivePromptResult = {
+  behavior: 'allow';
+  updatedInput: Record<string, unknown>;
+  toolUseID: string;
+} | {
+  behavior: 'deny';
+  message: string;
+  toolUseID: string;
+};
+
 type ClaudeInteractivePromptResolver = {
   input: Record<string, unknown>;
   agentId?: string;
   backgroundTaskId?: string;
-  resolve: (result: {
-    behavior: 'allow';
-    updatedInput: Record<string, unknown>;
-    toolUseID: string;
-  } | {
-    behavior: 'deny';
-    message: string;
-    toolUseID: string;
-  }) => void;
+  promise: Promise<ClaudeInteractivePromptResult>;
+  resolve: (result: ClaudeInteractivePromptResult) => void;
 };
 
 const DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1000;
@@ -506,9 +509,16 @@ function isClaudeBackgroundOwnedMessage(message: unknown) {
   }
   // Assistant/stream frames do not carry origin. A preceding peer/channel/
   // coordinator user frame establishes their top-level turn owner until its
-  // Result boundary. Background task notifications intentionally never set
-  // this fallback, so they cannot hide an interleaved human stream.
+  // Result boundary. Task notifications may establish that fallback only
+  // outside an accepted foreground human turn.
   return isClaudeNonHumanIngress();
+}
+
+function taskNotificationSharesActiveForegroundTurn(originKind: string) {
+  return originKind === 'task-notification'
+    && claudeTurnAwaitingResult
+    && claudeForegroundPromptAccepted
+    && (claudeIngressOriginKind === null || claudeIngressOriginKind === 'human');
 }
 
 function propagateClaudeHiddenToolOwnership(message: unknown) {
@@ -1331,6 +1341,10 @@ function emitClaudeToolUseStarted(payload: {
     return;
   }
 
+  if (completedToolUseIds.has(payload.toolUseId)) {
+    return;
+  }
+
   if (payload.input) {
     pendingClaudeToolInputs.set(payload.toolUseId, payload.input);
     if (payload.input.run_in_background === true) {
@@ -1514,40 +1528,45 @@ function summarizePlanExitFeedback(answers: Record<string, string>) {
   return truncateSummary(`User requested plan changes: ${feedback}`, 240);
 }
 
-async function waitForAskUserQuestionResponse(
+function waitForClaudeInteractivePromptResponse(
+  toolName: string,
   input: Record<string, unknown>,
   toolUseId: string,
   agentId?: string,
 ) {
-  return await new Promise<ReturnType<typeof buildAllowedClaudeToolResult> | {
-    behavior: 'deny';
-    message: string;
-    toolUseID: string;
-  }>((resolve) => {
-    pendingClaudeInteractivePrompts.set(toolUseId, {
-      input,
-      resolve,
-      agentId,
-    });
+  // canUseTool is the SDK's authoritative interactive control channel. Emit
+  // from it so the desktop never depends on an assistant tool_use frame that
+  // can arrive later or be routed away with background-owned stream content.
+  const prompt = parseClaudeInteractiveToolPrompt(toolName, input);
+  const emitPrompt = () => emitClaudeToolUseStarted({
+    toolUseId,
+    rawName: toolName,
+    inputSummary: summarizeClaudeToolInput(toolName, input),
+    needsResponse: true,
+    input,
+    prompt,
   });
-}
 
-async function waitForPlanExitApproval(
-  input: Record<string, unknown>,
-  toolUseId: string,
-  agentId?: string,
-) {
-  return await new Promise<ReturnType<typeof buildAllowedClaudeToolResult> | {
-    behavior: 'deny';
-    message: string;
-    toolUseID: string;
-  }>((resolve) => {
-    pendingClaudeInteractivePrompts.set(toolUseId, {
-      input,
-      resolve,
-      agentId,
-    });
+  const existing = pendingClaudeInteractivePrompts.get(toolUseId);
+  if (existing) {
+    // Reconnect/reinitialize can redeliver a pending request with the same id.
+    // Reuse its promise so one desktop answer resumes every SDK waiter.
+    emitPrompt();
+    return existing.promise;
+  }
+
+  let resolvePrompt!: (result: ClaudeInteractivePromptResult) => void;
+  const promise = new Promise<ClaudeInteractivePromptResult>((resolve) => {
+    resolvePrompt = resolve;
   });
+  pendingClaudeInteractivePrompts.set(toolUseId, {
+    input,
+    promise,
+    resolve: resolvePrompt,
+    agentId,
+  });
+  emitPrompt();
+  return promise;
 }
 
 async function waitForPermission(
@@ -2227,7 +2246,12 @@ function buildClaudeQueryOptions() {
             'Background tasks cannot pause the foreground workspace for user questions.',
           );
         }
-        return waitForAskUserQuestionResponse(input, options.toolUseID, options.agentID);
+        return waitForClaudeInteractivePromptResponse(
+          toolName,
+          input,
+          options.toolUseID,
+          options.agentID,
+        );
       }
       if (isClaudePlanExitTool(toolName)) {
         if (backgroundTaskId) {
@@ -2236,7 +2260,12 @@ function buildClaudeQueryOptions() {
             'Background tasks cannot request foreground plan approval.',
           );
         }
-        return waitForPlanExitApproval(input, options.toolUseID, options.agentID);
+        return waitForClaudeInteractivePromptResponse(
+          toolName,
+          input,
+          options.toolUseID,
+          options.agentID,
+        );
       }
       if (isClaudeInteractiveUserInputTool(toolName)) {
         return buildAllowedClaudeToolResult(input, options.toolUseID);
@@ -2495,7 +2524,10 @@ async function consumeClaudeMessages() {
             claudeIngressOriginKind = 'human';
           }
         } else if (originKind) {
-          if (shouldQuery || !claudeForegroundPromptAccepted) {
+          if (
+            !taskNotificationSharesActiveForegroundTurn(originKind)
+            && (shouldQuery || !claudeForegroundPromptAccepted)
+          ) {
             claudeIngressOriginKind = originKind;
           }
           if (shouldQuery && originKind !== 'human') {
@@ -2756,6 +2788,7 @@ async function consumeClaudeMessages() {
         }
 
         claudeIngressOriginKind = null;
+        claudePendingNonHumanResultCount = 0;
         claudeTurnAwaitingResult = false;
         pendingClaudePromptReplay = null;
         if (claudeInterruptRequested) {
