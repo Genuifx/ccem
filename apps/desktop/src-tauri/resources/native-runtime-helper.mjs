@@ -65,8 +65,15 @@ import { isAbsolute as Mte } from "path";
 import { existsSync as bxe } from "fs";
 import { once as F1 } from "events";
 import { createWriteStream as nEe } from "fs";
+import { open as z1, lstat as oft, readdir as MT, realpath as oEe, rename as ift, stat as iEe } from "fs/promises";
+import { dirname as aft, join as Bp } from "path";
 import { execFile as eEe } from "child_process";
 import { promisify as tEe } from "util";
+import { execFileSync as GSe } from "child_process";
+import { lstatSync as WSe } from "fs";
+import { join as VSe } from "path";
+import { randomUUID as n_ } from "crypto";
+import { join as HT } from "path";
 import { createHash as ZEe } from "crypto";
 import { homedir as tmt, userInfo as JEe } from "os";
 import { join as U0e } from "path";
@@ -8775,6 +8782,11 @@ var Os = ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "N
 function qy(e) {
   return e.charAt(0).toUpperCase() + e.slice(1);
 }
+function FO(e, t) {
+  if (e.length <= t) return e;
+  let r = e.slice(0, t), n = r.charCodeAt(t - 1);
+  return zO(n >= 55296 && n <= 56319 ? r.slice(0, -1) : r);
+}
 function Gy(e, t) {
   if (e.length <= t) return e;
   let r = e.slice(-t), n = r.charCodeAt(0);
@@ -8785,6 +8797,37 @@ function zO(e) {
 }
 var $O = typeof String.prototype.isWellFormed === "function" ? Function.prototype.call.bind(String.prototype.isWellFormed) : void 0;
 var qUe = typeof String.prototype.toWellFormed === "function" ? Function.prototype.call.bind(String.prototype.toWellFormed) : void 0;
+var VW = /^(?:\s*<[a-z][\w-]*[\s>]|\[Request interrupted by user[^\]]*\])/;
+var KW = /<command-name>(.*?)<\/command-name>/;
+function Xc(e, t) {
+  if (e.type !== "user") return;
+  if (e.isMeta === true || e.isCompactSummary === true) return;
+  let r = e.message;
+  if (!r) return;
+  let n = r.content, o = [];
+  if (typeof n === "string") o.push(n);
+  else if (Array.isArray(n)) for (let i of n) {
+    if (!i || typeof i !== "object") continue;
+    if (i.type === "tool_result") return;
+    if (i.type === "text" && typeof i.text === "string") o.push(i.text);
+  }
+  for (let i of o) {
+    let s = i.replaceAll(`
+`, " ").trim();
+    if (!s) continue;
+    let a = KW.exec(s);
+    if (a) {
+      if (!t.commandFallback) t.commandFallback = a[1];
+      continue;
+    }
+    let c = /<bash-input>([\s\S]*?)<\/bash-input>/.exec(s);
+    if (c) return `! ${c[1].trim()}`;
+    if (VW.test(s)) continue;
+    if (s.length > 200) s = FO(s, 200).trim() + "\u2026";
+    return s;
+  }
+  return;
+}
 var It = class extends Error {
 };
 function Cs() {
@@ -23049,11 +23092,111 @@ var Bw = class {
   }
 };
 var Dy = Zc(U1(), 1);
+function KSe() {
+  return process.platform === "win32";
+}
+var uc = /* @__PURE__ */ new Map();
+var ZSe = 5e3;
+function $1(e) {
+  try {
+    return WSe(e, { throwIfNoEntry: false }) === void 0;
+  } catch {
+    return false;
+  }
+}
+var JSe = /* @__PURE__ */ new Set([".com", ".exe", ".bat", ".cmd"]);
+function YSe(e) {
+  let t = e.toLowerCase().replace(/.*[\\/]/, "").replace(/[. ]+$/, ""), r = t.lastIndexOf(".");
+  return r > 0 && JSe.has(t.slice(r));
+}
+function XSe(e, t = false) {
+  let r = uc.get(e);
+  if (r !== void 0) if (r !== null) {
+    if (!$1(r)) return r;
+    uc.delete(e);
+  } else {
+    if (!t) return r;
+    uc.delete(e);
+  }
+  let n = Hr.SYSTEMROOT || "C:\\Windows", o = VSe(n, "System32", "where.exe");
+  try {
+    let s = GSe(o, [e], { stdio: "pipe", encoding: "utf8", timeout: ZSe, windowsHide: true, env: process.env }).trim().split(/\r?\n/).filter(Boolean), a = process.cwd(), c = false;
+    for (let u of s) {
+      if ($1(u)) continue;
+      if (Hd(u, a)) {
+        c = true;
+        continue;
+      }
+      if (!YSe(u)) continue;
+      return uc.set(e, u), u;
+    }
+    if (s.length > 0 && !c) uc.set(e, null);
+    return null;
+  } catch (i) {
+    if (QSe(i)) uc.set(e, null);
+    return null;
+  }
+}
+function QSe(e) {
+  if (e === null || typeof e !== "object") return false;
+  let t = "status" in e ? e.status : void 0, r = "signal" in e ? e.signal : void 0, n = "code" in e ? e.code : void 0;
+  return t === 1 && !r && !n;
+}
+function j1(e, t = false) {
+  if (!KSe()) return e;
+  if (e.includes("/") || e.includes("\\")) return e;
+  return XSe(e, t);
+}
 var rEe = tEe(eEe);
+async function ao(e) {
+  let t = j1("git");
+  if (t === null) return [];
+  try {
+    let { stdout: r } = await rEe(t, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "worktree", "list", "--porcelain"], { cwd: e, timeout: 5e3, windowsHide: true });
+    if (!r) return [];
+    return r.split(`
+`).filter((n) => n.startsWith("worktree ")).map((n) => xr(n.slice(9)));
+  } catch {
+    return [];
+  }
+}
+var dn = 65536;
 var aEe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function ze(e) {
   if (typeof e !== "string") return null;
   return aEe.test(e) ? e : null;
+}
+function H1(e) {
+  if (!e.includes("\\")) return e;
+  try {
+    return JSON.parse(`"${e}"`);
+  } catch {
+    return e;
+  }
+}
+function er(e, t) {
+  let r = [`"${t}":"`, `"${t}": "`], n, o = -1;
+  for (let i of r) {
+    let s = 0;
+    while (true) {
+      let a = e.indexOf(i, s);
+      if (a < 0) break;
+      let c = a + i.length, u = c;
+      while (u < e.length) {
+        if (e[u] === "\\") {
+          u += 2;
+          continue;
+        }
+        if (e[u] === '"') {
+          if (a > o) n = H1(e.slice(c, u)), o = a;
+          break;
+        }
+        u++;
+      }
+      s = u + 1;
+    }
+  }
+  return n;
 }
 async function qp(e, t) {
   return cEe(e, t, "w");
@@ -23068,6 +23211,33 @@ async function cEe(e, t, r) {
     throw n.destroy(), o;
   }
 }
+function t_(e) {
+  let t = 0, r = { commandFallback: "" };
+  while (t < e.length) {
+    let n = e.indexOf(`
+`, t), o = n >= 0 ? e.slice(t, n) : e.slice(t);
+    if (t = n >= 0 ? n + 1 : e.length, !o.includes('"type":"user"') && !o.includes('"type": "user"')) continue;
+    if (o.includes('"tool_result"')) continue;
+    if (o.includes('"isMeta":true') || o.includes('"isMeta": true')) continue;
+    if (o.includes('"isCompactSummary":true') || o.includes('"isCompactSummary": true')) continue;
+    try {
+      let i = JSON.parse(o), s = Xc(i, r);
+      if (s !== void 0) return s;
+    } catch {
+      continue;
+    }
+  }
+  return r.commandFallback;
+}
+function G1(e) {
+  let t = { commandFallback: "" };
+  for (let r of e) {
+    if (typeof r !== "object" || r === null) continue;
+    let n = Xc(r, t);
+    if (n !== void 0) return n;
+  }
+  return t.commandFallback;
+}
 var dc = 200;
 function lEe(e) {
   return Math.abs(lE(e)).toString(36);
@@ -23077,10 +23247,181 @@ function us(e) {
   if (t.length <= dc) return t;
   return `${t.slice(0, dc)}-${lEe(e)}`;
 }
+function fn() {
+  return Bp(Yt(), "projects");
+}
+function uEe(e) {
+  return Bp(fn(), us(e));
+}
+async function Jo(e) {
+  try {
+    return xr(await oEe(e));
+  } catch {
+    return xr(e);
+  }
+}
+async function fr(e) {
+  let t = uEe(e), r = [];
+  try {
+    await MT(t), r.push(t);
+  } catch {
+  }
+  let n = us(e);
+  if (n.length <= dc) return r;
+  let o = n.slice(0, dc) + "-", i = fn();
+  try {
+    for (let s of await MT(i, { withFileTypes: true })) {
+      if (!s.isDirectory() || !s.name.startsWith(o)) continue;
+      let a = Bp(i, s.name);
+      if (a !== t) r.push(a);
+    }
+  } catch {
+  }
+  return r;
+}
 var e_ = Buffer.from('{"type":"attribution-snapshot"');
 var mEe = Buffer.from('{"type":"system"');
 var Hp = 10;
 var gEe = Buffer.from([Hp]);
+async function FEe(e, t) {
+  let r = `${e}.jsonl`;
+  async function n(s) {
+    try {
+      let a = await ma().readBytes(HT(s, r));
+      if (a.length === 0) return null;
+      return { buf: a, projectDir: s };
+    } catch {
+      return null;
+    }
+  }
+  if (t) {
+    let s = await Jo(t);
+    for (let c of await fr(s)) {
+      let u = await n(c);
+      if (u) return u;
+    }
+    let a;
+    try {
+      a = await ao(s);
+    } catch {
+      a = [];
+    }
+    for (let c of a) {
+      if (c === s) continue;
+      for (let u of await fr(c)) {
+        let d = await n(u);
+        if (d) return d;
+      }
+    }
+    return null;
+  }
+  let o = fn(), i;
+  try {
+    i = await ma().list(o);
+  } catch {
+    return null;
+  }
+  for (let s of i) {
+    let a = await n(HT(o, s));
+    if (a) return a;
+  }
+  return null;
+}
+var zEe = /* @__PURE__ */ new Set(["user", "assistant", "attachment", "system", "progress"]);
+function BEe(e, t) {
+  let r = [], n = [], o, i = 10, s = e.length, a = 0;
+  while (a < s) {
+    let c = e.indexOf(10, a);
+    if (c === -1) c = s;
+    let u = a;
+    while (u < c && e[u] <= 32) u++;
+    if (a = c + 1, u >= c) continue;
+    let d = e.toString("utf-8", u, c);
+    try {
+      o = pF(yt(d), t, r, n) ?? o;
+    } catch {
+    }
+  }
+  return { transcript: r, contentReplacements: n, relocatedCwd: o };
+}
+function HEe(e, t) {
+  let r = [], n = [], o;
+  for (let i of e) {
+    if (typeof i !== "object" || i === null) continue;
+    o = pF(i, t, r, n) ?? o;
+  }
+  return { transcript: r, contentReplacements: n, relocatedCwd: o };
+}
+function pF(e, t, r, n) {
+  if (zEe.has(e.type) && typeof e.uuid === "string") r.push(e);
+  else if (e.type === "content-replacement" && e.sessionId === t && Array.isArray(e.replacements)) n.push(...e.replacements);
+  else if (e.type === "relocated" && e.sessionId === t && typeof e.relocatedCwd === "string") return e.relocatedCwd;
+  return;
+}
+async function dF(e, t = {}) {
+  if (!ze(e)) throw new Xt(`Invalid sessionId: ${e}`, "forkSession: invalid sessionId (not a UUID)");
+  if (t.upToMessageId && !ze(t.upToMessageId)) throw new Xt(`Invalid upToMessageId: ${t.upToMessageId}`, "forkSession: invalid upToMessageId (not a UUID)");
+  let r = await FEe(e, t.dir);
+  if (!r) throw Error(t.dir ? `Session ${e} not found in project directory for ${t.dir}` : `Session ${e} not found`);
+  let { entries: n, forkedSessionId: o } = qEe(r.buf, e, t);
+  return await qp(HT(r.projectDir, `${o}.jsonl`), n), { sessionId: o };
+}
+function qEe(e, t, r) {
+  let n = BEe(e, t);
+  return mF(n, t, r, () => {
+    let i = e.length, s = e.toString("utf-8", 0, Math.min(i, dn)), a = e.toString("utf-8", Math.max(0, i - dn));
+    return er(a, "customTitle") || er(s, "customTitle") || er(a, "aiTitle") || er(s, "aiTitle") || t_(s);
+  });
+}
+function fF(e, t, r) {
+  let n = HEe(e, t);
+  return mF(n, t, r, () => GEe(e));
+}
+function GEe(e) {
+  let t, r;
+  for (let n of e) {
+    if (typeof n !== "object" || n === null) continue;
+    let o = n;
+    if (typeof o.customTitle === "string" && o.customTitle) t = o.customTitle;
+    if (typeof o.aiTitle === "string" && o.aiTitle) r = o.aiTitle;
+  }
+  return t || r || G1(e) || void 0;
+}
+function mF(e, t, r, n) {
+  let o = e.transcript.filter((m) => !m.isSidechain);
+  if (o.length === 0) throw Error(`Session ${t} has no messages to fork`);
+  if (r.upToMessageId) {
+    let m = o.findIndex((g) => g.uuid === r.upToMessageId);
+    if (m === -1) throw Error(`Message ${r.upToMessageId} not found in session ${t}`);
+    o = o.slice(0, m + 1);
+  }
+  let i = /* @__PURE__ */ new Map();
+  for (let m of o) i.set(m.uuid, n_());
+  let s = o.filter((m) => m.type !== "progress");
+  if (s.length === 0) throw Error(`Session ${t} has no messages to fork`);
+  let a = /* @__PURE__ */ new Map();
+  for (let m of o) a.set(m.uuid, m);
+  let c = n_(), u = (/* @__PURE__ */ new Date()).toISOString(), d = [];
+  for (let m = 0; m < s.length; m++) {
+    let g = s[m], h = i.get(g.uuid), _ = null, y = g.parentUuid;
+    while (y) {
+      let P = a.get(y);
+      if (!P) break;
+      if (P.type !== "progress") {
+        _ = i.get(y) ?? null;
+        break;
+      }
+      y = P.parentUuid;
+    }
+    let b = m === s.length - 1 ? u : g.timestamp, T = g.logicalParentUuid == null ? g.logicalParentUuid : i.get(g.logicalParentUuid) ?? null, w = g.type === "system" && g.subtype === "model_refusal_fallback" ? { neutralizedByFork: true } : void 0, k = { ...g, ...w, uuid: h, parentUuid: _, logicalParentUuid: T, sessionId: c, timestamp: b, isSidechain: false, teamName: void 0, agentName: void 0, sessionKind: void 0, slug: void 0, sourceToolAssistantUUID: void 0, forkedFrom: { sessionId: t, messageUuid: g.uuid } };
+    d.push(k);
+  }
+  if (e.contentReplacements.length > 0) d.push({ type: "content-replacement", sessionId: c, replacements: e.contentReplacements, uuid: n_(), timestamp: u });
+  if (e.relocatedCwd) d.push({ type: "relocated", sessionId: c, relocatedCwd: e.relocatedCwd });
+  let f = r.title?.trim();
+  if (!f) f = `${n() || "Forked session"} (fork)`;
+  return d.push({ type: "custom-title", sessionId: c, customTitle: f, uuid: n_(), timestamp: u }), { entries: d, forkedSessionId: c };
+}
 var xF = "-credentials";
 function vF(e = "") {
   let t = process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, r = t !== void 0 ? !t : !process.env.CLAUDE_CONFIG_DIR, n = t !== void 0 ? t.normalize("NFC") : Yt(), o = r ? "" : `-${ZEe("sha256").update(n).digest("hex").substring(0, 8)}`;
@@ -26831,6 +27172,10 @@ function bUe(e, t) {
     n.spawnAbort(m), r.setError(m);
   }), dO(r, n, e, o), r;
 }
+async function Mkt(e, t) {
+  if (t?.sessionStore) return OUe(t.sessionStore, e, t);
+  return dF(e, t);
+}
 function cW(e) {
   let t = zd(e ?? "."), r;
   try {
@@ -26845,6 +27190,14 @@ function Jr(e) {
 }
 function cO(e) {
   return typeof e === "object" && e !== null && "type" in e && e.type === "agent_metadata";
+}
+async function OUe(e, t, r) {
+  if (!ze(t)) throw new Xt(`Invalid sessionId: ${t}`, "forkSession: invalid sessionId (must be a UUID)");
+  if (r.upToMessageId && !ze(r.upToMessageId)) throw new Xt(`Invalid upToMessageId: ${r.upToMessageId}`, "forkSession: invalid upToMessageId (must be a UUID)");
+  let n = Jr(r.dir), o = await e.load({ projectKey: n, sessionId: t });
+  if (!o || o.length === 0) throw Error(`Session ${t} not found`);
+  let { entries: i, forkedSessionId: s } = fF(o, t, r);
+  return await e.append({ projectKey: n, sessionId: s }, i), { sessionId: s };
 }
 function rW(e, t) {
   let r = sW(t, e), n = r.split(uO);
@@ -28336,8 +28689,8 @@ function $constructor(name, initializer3, params) {
     const inst = params?.Parent ? new Definition() : this;
     init(inst, def);
     (_a3 = inst._zod).deferred ?? (_a3.deferred = []);
-    for (const fn of inst._zod.deferred) {
-      fn();
+    for (const fn2 of inst._zod.deferred) {
+      fn2();
     }
     return inst;
   }
@@ -29987,9 +30340,9 @@ var Doc = class {
     if (this)
       this.args = args;
   }
-  indented(fn) {
+  indented(fn2) {
     this.indent += 1;
-    fn(this);
+    fn2(this);
     this.indent -= 1;
   }
   write(arg) {
@@ -30034,8 +30387,8 @@ var $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
     checks.unshift(inst);
   }
   for (const ch2 of checks) {
-    for (const fn of ch2._zod.onattach) {
-      fn(inst);
+    for (const fn2 of ch2._zod.onattach) {
+      fn2(inst);
     }
   }
   if (checks.length === 0) {
@@ -30858,8 +31211,8 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
     }
     doc.write(`payload.value = newResult;`);
     doc.write(`return payload;`);
-    const fn = doc.compile();
-    return (payload, ctx) => fn(shape, payload, ctx);
+    const fn2 = doc.compile();
+    return (payload, ctx) => fn2(shape, payload, ctx);
   };
   let fastpass;
   const isObject2 = isObject;
@@ -38422,10 +38775,10 @@ function _file(Class2, params) {
   });
 }
 // @__NO_SIDE_EFFECTS__
-function _transform(Class2, fn) {
+function _transform(Class2, fn2) {
   return new Class2({
     type: "transform",
-    transform: fn
+    transform: fn2
   });
 }
 // @__NO_SIDE_EFFECTS__
@@ -38513,29 +38866,29 @@ function _promise(Class2, innerType) {
   });
 }
 // @__NO_SIDE_EFFECTS__
-function _custom(Class2, fn, _params) {
+function _custom(Class2, fn2, _params) {
   const norm = normalizeParams(_params);
   norm.abort ?? (norm.abort = true);
   const schema = new Class2({
     type: "custom",
     check: "custom",
-    fn,
+    fn: fn2,
     ...norm
   });
   return schema;
 }
 // @__NO_SIDE_EFFECTS__
-function _refine(Class2, fn, _params) {
+function _refine(Class2, fn2, _params) {
   const schema = new Class2({
     type: "custom",
     check: "custom",
-    fn,
+    fn: fn2,
     ...normalizeParams(_params)
   });
   return schema;
 }
 // @__NO_SIDE_EFFECTS__
-function _superRefine(fn) {
+function _superRefine(fn2) {
   const ch2 = /* @__PURE__ */ _check((payload) => {
     payload.addIssue = (issue2) => {
       if (typeof issue2 === "string") {
@@ -38551,17 +38904,17 @@ function _superRefine(fn) {
         payload.issues.push(issue(_issue));
       }
     };
-    return fn(payload.value, payload);
+    return fn2(payload.value, payload);
   });
   return ch2;
 }
 // @__NO_SIDE_EFFECTS__
-function _check(fn, params) {
+function _check(fn2, params) {
   const ch2 = new $ZodCheck({
     check: "custom",
     ...normalizeParams(params)
   });
-  ch2._zod.check = fn;
+  ch2._zod.check = fn2;
   return ch2;
 }
 // @__NO_SIDE_EFFECTS__
@@ -39983,7 +40336,7 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   inst.safeDecodeAsync = async (data, params) => safeDecodeAsync2(inst, data, params);
   inst.refine = (check2, params) => inst.check(refine(check2, params));
   inst.superRefine = (refinement) => inst.check(superRefine(refinement));
-  inst.overwrite = (fn) => inst.check(_overwrite(fn));
+  inst.overwrite = (fn2) => inst.check(_overwrite(fn2));
   inst.optional = () => optional(inst);
   inst.exactOptional = () => exactOptional(inst);
   inst.nullable = () => nullable(inst);
@@ -40019,7 +40372,7 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   };
   inst.isOptional = () => inst.safeParse(void 0).success;
   inst.isNullable = () => inst.safeParse(null).success;
-  inst.apply = (fn) => fn(inst);
+  inst.apply = (fn2) => fn2(inst);
   return inst;
 });
 var _ZodString = /* @__PURE__ */ $constructor("_ZodString", (inst, def) => {
@@ -40745,10 +41098,10 @@ var ZodTransform = /* @__PURE__ */ $constructor("ZodTransform", (inst, def) => {
     return payload;
   };
 });
-function transform(fn) {
+function transform(fn2) {
   return new ZodTransform({
     type: "transform",
-    transform: fn
+    transform: fn2
   });
 }
 var ZodOptional = /* @__PURE__ */ $constructor("ZodOptional", (inst, def) => {
@@ -40961,22 +41314,22 @@ var ZodCustom = /* @__PURE__ */ $constructor("ZodCustom", (inst, def) => {
   ZodType.init(inst, def);
   inst._zod.processJSONSchema = (ctx, json2, params) => customProcessor(inst, ctx, json2, params);
 });
-function check(fn) {
+function check(fn2) {
   const ch2 = new $ZodCheck({
     check: "custom"
     // ...util.normalizeParams(params),
   });
-  ch2._zod.check = fn;
+  ch2._zod.check = fn2;
   return ch2;
 }
-function custom(fn, _params) {
-  return _custom(ZodCustom, fn ?? (() => true), _params);
+function custom(fn2, _params) {
+  return _custom(ZodCustom, fn2 ?? (() => true), _params);
 }
-function refine(fn, _params = {}) {
-  return _refine(ZodCustom, fn, _params);
+function refine(fn2, _params = {}) {
+  return _refine(ZodCustom, fn2, _params);
 }
-function superRefine(fn) {
-  return _superRefine(fn);
+function superRefine(fn2) {
+  return _superRefine(fn2);
 }
 var describe2 = describe;
 var meta2 = meta;
@@ -41013,8 +41366,8 @@ function json(params) {
   });
   return jsonSchema;
 }
-function preprocess(fn, schema) {
-  return pipe(transform(fn), schema);
+function preprocess(fn2, schema) {
+  return pipe(transform(fn2), schema);
 }
 
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/classic/compat.js
@@ -42966,6 +43319,7 @@ var runtimeTeardownPreparationId = null;
 var claudeSawPartialText = false;
 var claudeSawPartialThinking = false;
 var claudeTurnCompletionEmitted = false;
+var claudeLastAssistantMessageUuid = null;
 var claudeTurnAwaitingResult = false;
 var claudeForegroundPromptUuid = null;
 var claudeForegroundPromptAccepted = false;
@@ -43534,6 +43888,7 @@ function resetClaudeContentTracking() {
 function resetClaudeTurnTracking() {
   resetClaudeContentTracking();
   claudeTurnCompletionEmitted = false;
+  claudeLastAssistantMessageUuid = null;
 }
 function emitClaudeTurnCompleted(detail) {
   if (claudeTurnCompletionEmitted) {
@@ -43545,7 +43900,8 @@ function emitClaudeTurnCompleted(detail) {
   emitEvent({
     type: "lifecycle",
     stage: "turn_completed",
-    detail
+    detail,
+    ...claudeLastAssistantMessageUuid ? { assistant_message_uuid: claudeLastAssistantMessageUuid } : {}
   });
   if (applyPendingClaudeSettingsAfterTurn()) {
     emitStatus("ready", "Settings applied.");
@@ -43568,7 +43924,8 @@ function emitClaudeTurnInterrupted(detail = "Claude turn interrupted by desktop 
     emitEvent({
       type: "lifecycle",
       stage: "turn_interrupted",
-      detail
+      detail,
+      ...claudeLastAssistantMessageUuid ? { assistant_message_uuid: claudeLastAssistantMessageUuid } : {}
     });
   }
   if (applyPendingClaudeSettingsAfterTurn()) {
@@ -44561,6 +44918,10 @@ async function consumeClaudeMessages() {
           propagateClaudeHiddenToolOwnership(message);
           continue;
         }
+        const assistantMessageUuid = message.uuid;
+        if (typeof assistantMessageUuid === "string" && assistantMessageUuid && !claudeMessageParentToolUseId(message)) {
+          claudeLastAssistantMessageUuid = assistantMessageUuid;
+        }
         const msgId = message.message?.id;
         const msgUsage = message.message?.usage;
         if (msgId && !claudeSeenMessageIds.has(msgId) && msgUsage) {
@@ -45486,12 +45847,27 @@ async function handleCommand(command) {
   }
   if (command.type === "init") {
     initCommand = command;
+    const forkRequested = command.provider === "claude" && Boolean(command.fork_session) && Boolean(command.provider_session_id?.trim());
     const resumedClaudeWithoutTodoSeed = command.provider === "claude" && Boolean(command.provider_session_id?.trim()) && !command.todo_snapshot_seed;
     todoSnapshotTracker.reset(
       command.todo_snapshot_seed,
       !resumedClaudeWithoutTodoSeed
     );
-    currentProviderSessionId = command.provider_session_id ?? null;
+    let initProviderSessionId = command.provider_session_id ?? null;
+    if (forkRequested) {
+      const parentSessionId = command.provider_session_id.trim();
+      try {
+        const forked = await Mkt(parentSessionId, {
+          upToMessageId: command.fork_at_message_id?.trim() || void 0,
+          dir: command.working_dir
+        });
+        initProviderSessionId = forked.sessionId;
+      } catch (error48) {
+        emitStatus("error", `Failed to fork session: ${error48 instanceof Error ? error48.message : String(error48)}`);
+        return;
+      }
+    }
+    currentProviderSessionId = initProviderSessionId;
     browserEvaluateApprovedForSession = false;
     if (currentProviderSessionId) {
       emitSessionMeta(currentProviderSessionId);

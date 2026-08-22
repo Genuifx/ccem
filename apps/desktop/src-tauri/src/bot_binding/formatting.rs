@@ -26,7 +26,7 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
             title: "System message".to_string(),
             text: truncate_text(message, 1200),
         }),
-        SessionEventPayload::Lifecycle { stage, detail } => Some(EventSummary {
+        SessionEventPayload::Lifecycle { stage, detail, .. } => Some(EventSummary {
             kind: BotBindingOutboxFrameKind::EventUpdate,
             title: format!("Lifecycle · {stage}"),
             text: truncate_text(detail, 1200),

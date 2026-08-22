@@ -245,6 +245,7 @@ pub struct NativeSessionOptions {
     pub initial_images: Option<Vec<PromptImage>>,
     pub initial_annotations: Option<Vec<SessionPromptAnnotation>>,
     pub provider_session_id: Option<String>,
+    pub fork_from_message_id: Option<String>,
     pub seed_boundary_message_count: Option<u64>,
     pub helper_env_vars: HashMap<String, String>,
     pub terminal_env_vars: HashMap<String, String>,
@@ -418,6 +419,10 @@ enum HelperInputCommand<'a> {
         initial_images: Option<&'a [PromptImage]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_session_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fork_session: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fork_at_message_id: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         claude_path: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1738,6 +1743,7 @@ impl NativeRuntimeManager {
                 SessionEventPayload::Lifecycle {
                     stage: "runtime_boot".to_string(),
                     detail: format!("Starting {} native runtime.", options.provider.as_str()),
+                    assistant_message_uuid: None,
                 },
             )?;
             self.append_user_prompt_event(
@@ -3783,6 +3789,7 @@ impl NativeRuntimeManager {
                     "Terminal handoff will open in {} when the provider session id is ready.",
                     terminal.display_name()
                 ),
+                assistant_message_uuid: None,
             },
         )?;
         Ok(NativeHandoffResult {
@@ -4046,6 +4053,7 @@ impl NativeRuntimeManager {
                     record.provider.as_str(),
                     terminal.display_name()
                 ),
+                assistant_message_uuid: None,
             },
         )?;
         self.remove_handle(runtime_id)?;
@@ -4243,6 +4251,7 @@ impl NativeRuntimeManager {
                     provider,
                     terminal.display_name()
                 ),
+                assistant_message_uuid: None,
             },
         ) {
             errors.push(error);
@@ -4371,6 +4380,7 @@ impl NativeRuntimeManager {
                         "Reconnected native runtime helper with generation {}.",
                         handle.generation
                     ),
+                    assistant_message_uuid: None,
                 },
             )
             .and_then(|_| self.spawn_helper(app, runtime_id, &options, handle.clone()));
@@ -4593,6 +4603,8 @@ impl NativeRuntimeManager {
                 initial_prompt: options.initial_prompt.as_deref(),
                 initial_images: options.initial_images.as_deref(),
                 provider_session_id: options.provider_session_id.as_deref(),
+                fork_session: options.fork_from_message_id.as_ref().map(|_| true),
+                fork_at_message_id: options.fork_from_message_id.as_deref(),
                 claude_path: handle.claude_path.as_deref(),
                 codex_path: handle.codex_path.as_deref(),
                 codex_base_url: handle.codex_base_url.as_deref(),
@@ -4890,6 +4902,7 @@ impl NativeRuntimeManager {
                         SessionEventPayload::Lifecycle {
                             stage: next_status,
                             detail,
+                            assistant_message_uuid: None,
                         },
                     )?;
                 }
@@ -5328,6 +5341,7 @@ impl NativeRuntimeManager {
                             helper_command_kind(command),
                             error
                         ),
+                        assistant_message_uuid: None,
                     },
                 );
                 let _reconnect_guard = self.reconnect_lock.lock().map_err(|_| {
@@ -5820,6 +5834,7 @@ impl NativeRuntimeManager {
             SessionEventPayload::Lifecycle {
                 stage: stage.to_string(),
                 detail: detail.into(),
+                assistant_message_uuid: None,
             },
         )
     }
@@ -6268,7 +6283,7 @@ fn payload_last_error(payload: &SessionEventPayload) -> Option<String> {
         SessionEventPayload::StdErrLine { line } if !is_context_usage_probe_error(line) => {
             non_empty_error(line)
         }
-        SessionEventPayload::Lifecycle { stage, detail } if stage == "error" => {
+        SessionEventPayload::Lifecycle { stage, detail, .. } if stage == "error" => {
             non_empty_error(detail)
         }
         SessionEventPayload::SessionCompleted { reason }
@@ -6536,6 +6551,7 @@ fn build_runtime_bootstrap_options(
         effort: record.effort.clone(),
         router_launch_draft: None,
         router_record: record.router.clone(),
+        fork_from_message_id: None,
     })
 }
 
@@ -7508,6 +7524,7 @@ mod tests {
             effort: None,
             router_launch_draft: None,
             router_record: None,
+            fork_from_message_id: None,
         }
     }
 
@@ -7726,6 +7743,67 @@ mod tests {
     }
 
     #[test]
+    fn helper_init_serializes_fork_fields_only_when_forking() {
+        let env_vars = HashMap::new();
+        let command = HelperInputCommand::Init {
+            provider: "claude",
+            env_name: "default",
+            perm_mode: "dev",
+            allow_dangerously_skip_permissions: false,
+            working_dir: "/tmp/project",
+            env_vars: &env_vars,
+            initial_prompt: Some("fork from here"),
+            initial_images: None,
+            provider_session_id: Some("parent-session-id"),
+            fork_session: Some(true),
+            fork_at_message_id: Some("cut-message-uuid"),
+            claude_path: None,
+            codex_path: None,
+            codex_base_url: None,
+            codex_api_key: None,
+            effort: None,
+            todo_snapshot_seed: None,
+            router: None,
+        };
+
+        let serialized = serde_json::to_value(&command).expect("serialize fork init command");
+        assert_eq!(serialized["provider_session_id"], "parent-session-id");
+        assert_eq!(serialized["fork_session"], true);
+        assert_eq!(serialized["fork_at_message_id"], "cut-message-uuid");
+
+        let plain = HelperInputCommand::Init {
+            provider: "claude",
+            env_name: "default",
+            perm_mode: "dev",
+            allow_dangerously_skip_permissions: false,
+            working_dir: "/tmp/project",
+            env_vars: &env_vars,
+            initial_prompt: Some("continue"),
+            initial_images: None,
+            provider_session_id: Some("parent-session-id"),
+            fork_session: None,
+            fork_at_message_id: None,
+            claude_path: None,
+            codex_path: None,
+            codex_base_url: None,
+            codex_api_key: None,
+            effort: None,
+            todo_snapshot_seed: None,
+            router: None,
+        };
+
+        let plain_serialized = serde_json::to_value(&plain).expect("serialize plain init command");
+        assert!(
+            plain_serialized.get("fork_session").is_none(),
+            "fork_session must be omitted when not forking"
+        );
+        assert!(
+            plain_serialized.get("fork_at_message_id").is_none(),
+            "fork_at_message_id must be omitted when not forking"
+        );
+    }
+
+    #[test]
     fn helper_init_serializes_initial_images_for_first_turn() {
         let env_vars = HashMap::new();
         let images = vec![PromptImage {
@@ -7751,6 +7829,8 @@ mod tests {
             effort: None,
             todo_snapshot_seed: None,
             router: None,
+            fork_at_message_id: None,
+            fork_session: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -7795,6 +7875,8 @@ mod tests {
             effort: None,
             todo_snapshot_seed: Some(&seed),
             router: None,
+            fork_at_message_id: None,
+            fork_session: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -7825,6 +7907,8 @@ mod tests {
             effort: None,
             todo_snapshot_seed: None,
             router: None,
+            fork_at_message_id: None,
+            fork_session: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");

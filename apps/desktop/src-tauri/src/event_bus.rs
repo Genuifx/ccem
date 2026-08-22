@@ -233,6 +233,8 @@ pub enum SessionEventPayload {
     Lifecycle {
         stage: String,
         detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_message_uuid: Option<String>,
     },
     ClaudeJson {
         message_type: Option<String>,

@@ -144,7 +144,7 @@ impl WeixinChannel {
                     state.pending_stderr.push(line.clone());
                     state.saw_stderr_this_turn = true;
                 }
-                SessionEventPayload::Lifecycle { stage, detail } => {
+                SessionEventPayload::Lifecycle { stage, detail, .. } => {
                     if matches!(
                         stage.as_str(),
                         "stderr_error" | "stdout_error" | "process_failure"

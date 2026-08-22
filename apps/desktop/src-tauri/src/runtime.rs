@@ -763,6 +763,7 @@ impl RuntimeManager {
             SessionEventPayload::Lifecycle {
                 stage: stage.into(),
                 detail: detail.into(),
+                assistant_message_uuid: None,
             },
         );
     }
