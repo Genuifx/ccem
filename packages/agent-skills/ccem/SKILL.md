@@ -34,6 +34,26 @@ dev build with the opt-in flag when you need the CLI/skill to talk to it:
 CCEM_DESKTOP_PUBLISH_CONTROL_DESCRIPTOR=1 pnpm tauri:dev
 ```
 
+The canonical dev stack is single-owner across linked worktrees. Vite uses
+`127.0.0.1:1421` with `strictPort`, debug builds share
+`~/.ccem/desktop-app-dev.lock`, and all worktrees use the same development app
+identity. Before starting it, run both checks:
+
+```bash
+lsof -nP -iTCP:1421 -sTCP:LISTEN
+lsof -nP ~/.ccem/desktop-app-dev.lock
+```
+
+If another task or worktree owns either resource, do not start a second stack
+and do not terminate, kill, `pkill`, `killall`, clean the port, or delete the
+lock. Continue non-app verification and retry after the owner exits; otherwise
+report the desktop self-test as a coverage gap. A task may reuse or stop only
+the exact dev process it spawned in the same worktree. `EADDRINUSE` or
+`Another CCEM Desktop process is already running` is an ownership conflict,
+not permission to clean up another task. Changing only the Vite port does not
+isolate the instance lock, application identity, MCP/control endpoint, or
+shared runtime data.
+
 Release builds always publish the descriptor. Do not edit or read
 `~/.ccem/control.json` directly — let the CLI wrapper negotiate the
 descriptor for you.

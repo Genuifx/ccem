@@ -109,6 +109,21 @@ Minimum expected path:
 3. Drive the changed flow yourself
 4. Check the actual rendered state, not just backend logs
 
+#### Parallel worktree ownership rule
+
+The canonical desktop development stack is currently single-owner across all linked worktrees. Vite binds `127.0.0.1:1421` with `strictPort`, debug builds acquire the shared `~/.ccem/desktop-app-dev.lock`, and every worktree uses the same `com.ccem.desktop.dev` application identity. A second plain `pnpm tauri:dev` is therefore not an independent instance.
+
+Before starting it, check both shared resources:
+
+```bash
+lsof -nP -iTCP:1421 -sTCP:LISTEN
+lsof -nP ~/.ccem/desktop-app-dev.lock
+```
+
+No owner from either check is the precondition for starting a new dev stack. If another task or worktree owns either resource, do not start another stack and do not terminate, kill, `pkill`, `killall`, clean the port, or delete the lock. Continue non-app verification while the owner is active, then retry after it exits; if it remains occupied, report the desktop self-test as a specific coverage gap. Treat `EADDRINUSE` and `Another CCEM Desktop process is already running` the same way if two starts race.
+
+A task may reuse or stop only the dev stack that it spawned in the same worktree and still owns. Record its PID/worktree when starting it, and target that exact process when stopping it. Changing only the Vite port does not make parallel runs safe; true multi-instance support must also isolate the instance lock, application identity, MCP/control endpoint, and shared runtime data.
+
 Manual reasoning alone is not considered enough for app-facing changes when Tauri MCP can exercise the flow.
 
 The `tauri:dev` script applies `src-tauri/tauri.dev.conf.json`, giving the development app its own `CCEM Desktop Dev` product name and `com.ccem.desktop.dev` bundle identifier. It also passes `--locked` to Cargo, so desktop self-tests cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.

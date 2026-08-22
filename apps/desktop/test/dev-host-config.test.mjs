@@ -60,3 +60,18 @@ test('agent guidance protects the installed release during desktop self-test', a
     assert.match(guide, /must not (?:quit|terminate|kill)/i);
   }
 });
+
+test('agent guidance serializes canonical Tauri dev runs across worktrees', async () => {
+  const [agentsGuide, claudeGuide, bundledSkill] = await Promise.all([
+    fs.readFile(path.join(repoRoot, 'AGENTS.md'), 'utf8'),
+    fs.readFile(path.join(repoRoot, 'CLAUDE.md'), 'utf8'),
+    fs.readFile(path.join(repoRoot, 'packages', 'agent-skills', 'ccem', 'SKILL.md'), 'utf8'),
+  ]);
+
+  for (const guide of [agentsGuide, claudeGuide, bundledSkill]) {
+    assert.match(guide, /desktop-app-dev\.lock/);
+    assert.match(guide, /iTCP:1421/);
+    assert.match(guide, /another task or worktree/i);
+    assert.match(guide, /coverage gap/i);
+  }
+});
