@@ -72,6 +72,10 @@ async function buildHelperWithMockClaudeSdk() {
               }
             }
 
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt, options }) {
               assertCheckpointOptions(options);
               let closed = false;

@@ -98,6 +98,10 @@ async function buildHelperWithMockClaudeSdk({ usageBehavior }) {
               };
             }
 
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt, options }) {
               if (!options.env || options.env.CLAUDE_AGENT_SDK_CLIENT_APP !== 'ccem-desktop') {
                 throw new Error('SDK query should use the desktop client app env');

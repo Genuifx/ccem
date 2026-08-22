@@ -64,6 +64,10 @@ async function buildHelperWithWarningMock() {
               };
             }
 
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt, options }) {
               process.emitWarning(${JSON.stringify(bypassWarning)}, {
                 code: ${JSON.stringify(shadowedWarningCode)},
