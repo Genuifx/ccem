@@ -1,5 +1,11 @@
 # ccem
 
+## 2.72.0
+
+### Minor Changes
+
+- Workspace: fork a Claude session from any model-output turn, with recent folders in the compose directory picker. Desktop: bounded live transcript pipeline for smoother large transcripts, redesigned background-task attention row with dismiss, and preserved Claude plan prompts across task notifications.
+
 ## 2.71.0
 
 ### Minor Changes
