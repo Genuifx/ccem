@@ -22,6 +22,7 @@ test('Claude background task panel exposes activity, terminal history, and confi
   assert.match(panel, /data-ccem-background-tasks-trigger/);
   assert.match(panel, /data-ccem-background-tasks-attention/);
   assert.match(panel, /data-ccem-background-tasks-popover/);
+  assert.match(panel, /data-ccem-background-tasks-dismiss/);
   assert.match(panel, /data-ccem-background-task-stop-dialog/);
   assert.match(panel, /canStopBackgroundTask\(task\)/);
   assert.match(panel, /activeTasks\.find\(\(task\) => task\.task_id === stopTargetId\)/);
@@ -49,6 +50,9 @@ test('Workspace keeps foreground composition independent and guards task-destruc
   assert.match(workspace, /disabled=\{isHandingOff \|\| isHandoffPending \|\| isProcessingTurn\}/);
   assert.match(workspace, /attentionState\.permissions\.some\([\s\S]*?!request\.backgroundTaskId/);
   assert.match(workspace, /const hasBackgroundTaskPanel = session\.provider === 'claude'/);
+  assert.match(workspace, /&& !bgTasksDismissed/);
+  assert.match(workspace, /if \(backgroundTaskModel\.active\.length > 0\) setBgTasksDismissed\(false\)/);
+  assert.match(workspace, /onDismiss=\{\(\) => setBgTasksDismissed\(true\)\}/);
   assert.match(workspace, /hasAttentionPanel = attentionState\.permissions\.length > 0[\s\S]*?\|\| hasBackgroundTaskPanel/);
 
   const backgroundTaskPanelIndex = workspace.indexOf('<WorkspaceBackgroundTasksPopover');

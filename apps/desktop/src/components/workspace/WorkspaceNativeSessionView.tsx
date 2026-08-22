@@ -1601,6 +1601,10 @@ export function WorkspaceNativeSessionView({
     [events, session.background_tasks, session.last_event_seq],
   );
   const activeBackgroundTaskCount = backgroundTaskModel.active.length;
+  const [bgTasksDismissed, setBgTasksDismissed] = useState(false);
+  useEffect(() => {
+    if (backgroundTaskModel.active.length > 0) setBgTasksDismissed(false);
+  }, [backgroundTaskModel.active.length]);
 
   const refreshSessionUsage = useCallback(() => {
     if (session.provider !== 'claude') return;
@@ -2433,7 +2437,8 @@ export function WorkspaceNativeSessionView({
     || hasAskUserQuestionPrompt;
   const hasBlockingAttention = hasHardBlockingAttention || hasQuickReplyPrompt;
   const hasBackgroundTaskPanel = session.provider === 'claude'
-    && (backgroundTaskModel.active.length > 0 || backgroundTaskModel.recent.length > 0);
+    && (backgroundTaskModel.active.length > 0 || backgroundTaskModel.recent.length > 0)
+    && !bgTasksDismissed;
   const hasAttentionPanel = attentionState.permissions.length > 0
     || hasBlockingAttention
     || hasBackgroundTaskPanel;
@@ -3508,6 +3513,7 @@ export function WorkspaceNativeSessionView({
                 activeTasks={backgroundTaskModel.active}
                 recentTasks={backgroundTaskModel.recent}
                 onStopTask={handleStopBackgroundTask}
+                onDismiss={() => setBgTasksDismissed(true)}
               />
             ) : null}
             respondingRequestId={respondingRequestId}
