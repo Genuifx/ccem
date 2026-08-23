@@ -7991,6 +7991,7 @@ mod tests {
         assert!(handoff.preparation_id.is_some());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn terminal_handoff_rejects_a_processing_foreground_without_a_live_helper_ack() {
         let runtime_id = "native-handoff-processing";
@@ -8010,6 +8011,22 @@ mod tests {
             )
             .expect_err("processing foreground must block handoff");
         assert!(error.contains("Finish the current foreground turn"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn terminal_handoff_rejects_an_unsupported_platform() {
+        let runtime_id = "native-handoff-unsupported-platform";
+        let manager = manager_with_handle(runtime_id);
+
+        let error = manager
+            .prepare_terminal_handoff(
+                runtime_id,
+                Some(crate::terminal::TerminalType::TerminalApp),
+                false,
+            )
+            .expect_err("unsupported platforms must block terminal handoff");
+        assert!(error.contains("not available on this platform"));
     }
 
     #[test]
