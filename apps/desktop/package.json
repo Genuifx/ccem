@@ -8,7 +8,7 @@
     "prebuild": "node scripts/prepare-native-runtime-sidecar.mjs",
     "build": "tsc && vite build",
     "test": "node --test test/*.test.mjs",
-    "test:run": "node --test test/*.test.mjs",
+    "test:run": "pnpm --filter @ccem/core build && node --test test/*.test.mjs",
     "test:e2e": "node test/opencode.mcp.e2e.mjs",
     "perf:smoke": "node scripts/perf-smoke.mjs",
     "preview": "vite preview",
