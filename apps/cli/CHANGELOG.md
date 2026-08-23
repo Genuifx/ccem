@@ -1,5 +1,11 @@
 # ccem
 
+## 2.72.2
+
+### Patch Changes
+
+- c5129e9: Restore live Workspace transcript updates for newly started and continued Desktop sessions so replies appear without restarting the app, and keep clean cross-platform release gates green by building the shared core package before Desktop tests.
+
 ## 2.72.1
 
 ### Patch Changes
