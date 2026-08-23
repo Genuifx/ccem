@@ -64,6 +64,7 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
   const alpha = describe(alphaRoot);
   const alphaAgain = describe(alphaRoot);
   const beta = describe('/tmp/ccem-worktree-beta');
+  const sameBasenameDifferentRoot = describe('/tmp/nested/ccem-worktree-alpha');
   const alphaHash = alpha.instanceId.slice(-8);
 
   assert.deepEqual(alphaAgain, alpha, 'the same resolved worktree must keep a stable namespace');
@@ -71,6 +72,8 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
   assert.match(alpha.instanceId, /^ccem-worktree-alpha-[a-f0-9]{8}$/);
   assert.equal(alpha.productName, 'CCEM Desktop Dev ccem-worktree-alpha');
   assert.equal(alpha.identifier, `com.ccem.desktop.dev.i${alphaHash}`);
+  assert.equal(alpha.tauriConfig.productName, alpha.productName);
+  assert.equal(alpha.tauriConfig.identifier, alpha.identifier);
   assert.ok(alpha.vitePort >= 14000 && alpha.vitePort < 24000);
   assert.ok(alpha.mcpPort >= 30000 && alpha.mcpPort < 60000);
   assert.equal(alpha.mcpPort % 100, 0);
@@ -86,6 +89,9 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
   assert.notEqual(alpha.vitePort, beta.vitePort);
   assert.notEqual(alpha.mcpPort, beta.mcpPort);
   assert.notEqual(alpha.identifier, beta.identifier);
+  assert.equal(sameBasenameDifferentRoot.productName, alpha.productName);
+  assert.notEqual(sameBasenameDifferentRoot.instanceId, alpha.instanceId);
+  assert.notEqual(sameBasenameDifferentRoot.identifier, alpha.identifier);
   assert.equal(
     describe('/tmp/ccem-worktree-alpha', {
       CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: 'true',
