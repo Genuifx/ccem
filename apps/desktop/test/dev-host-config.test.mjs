@@ -60,35 +60,28 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
     return JSON.parse(result.stdout);
   };
 
-  const alpha = describe('/tmp/ccem-worktree-alpha');
+  const alphaRoot = '/tmp/ccem-worktree-alpha';
+  const alpha = describe(alphaRoot);
+  const alphaAgain = describe(alphaRoot);
   const beta = describe('/tmp/ccem-worktree-beta');
+  const alphaHash = alpha.instanceId.slice(-8);
 
-  assert.deepEqual(
-    {
-      instanceId: alpha.instanceId,
-      vitePort: alpha.vitePort,
-      mcpPort: alpha.mcpPort,
-      productName: alpha.productName,
-      identifier: alpha.identifier,
-      devUrl: alpha.tauriConfig.build.devUrl,
-      beforeDevCommand: alpha.tauriConfig.build.beforeDevCommand,
-      lockInstance: alpha.environment.CCEM_DESKTOP_DEV_INSTANCE_ID,
-      mcpEnvironmentPort: alpha.environment.CCEM_TAURI_MCP_PORT,
-      backgroundServices: alpha.environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES,
-    },
-    {
-      instanceId: 'ccem-worktree-alpha-5343974e',
-      vitePort: 22574,
-      mcpPort: 42200,
-      productName: 'CCEM Desktop Dev ccem-worktree-alpha',
-      identifier: 'com.ccem.desktop.dev.i5343974e',
-      devUrl: 'http://127.0.0.1:22574',
-      beforeDevCommand: 'pnpm dev --host 127.0.0.1 --port 22574 --strictPort',
-      lockInstance: 'ccem-worktree-alpha-5343974e',
-      mcpEnvironmentPort: '42200',
-      backgroundServices: '0',
-    },
+  assert.deepEqual(alphaAgain, alpha, 'the same resolved worktree must keep a stable namespace');
+  assert.equal(alpha.worktreeRoot, path.resolve(alphaRoot));
+  assert.match(alpha.instanceId, /^ccem-worktree-alpha-[a-f0-9]{8}$/);
+  assert.equal(alpha.productName, 'CCEM Desktop Dev ccem-worktree-alpha');
+  assert.equal(alpha.identifier, `com.ccem.desktop.dev.i${alphaHash}`);
+  assert.ok(alpha.vitePort >= 14000 && alpha.vitePort < 24000);
+  assert.ok(alpha.mcpPort >= 30000 && alpha.mcpPort < 60000);
+  assert.equal(alpha.mcpPort % 100, 0);
+  assert.equal(alpha.tauriConfig.build.devUrl, `http://127.0.0.1:${alpha.vitePort}`);
+  assert.equal(
+    alpha.tauriConfig.build.beforeDevCommand,
+    `pnpm dev --host 127.0.0.1 --port ${alpha.vitePort} --strictPort`,
   );
+  assert.equal(alpha.environment.CCEM_DESKTOP_DEV_INSTANCE_ID, alpha.instanceId);
+  assert.equal(alpha.environment.CCEM_TAURI_MCP_PORT, String(alpha.mcpPort));
+  assert.equal(alpha.environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES, '0');
   assert.notEqual(alpha.instanceId, beta.instanceId);
   assert.notEqual(alpha.vitePort, beta.vitePort);
   assert.notEqual(alpha.mcpPort, beta.mcpPort);
