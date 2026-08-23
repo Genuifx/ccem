@@ -1853,6 +1853,7 @@ export function WorkspaceNativeSessionView({
         events,
         replayLocalPrompts.remainingPrompts,
         tokens,
+        resetSeams(false),
       );
     } else {
       const selection = selectTranscriptAppendEvents(events, previousState);

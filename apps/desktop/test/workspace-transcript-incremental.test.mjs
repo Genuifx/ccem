@@ -357,3 +357,87 @@ test('head rebase and terminal error finalize without refolding', async () => {
   const finalized = mod.finalizeTranscriptMessages(withError);
   assert.equal(finalized[finalized.length - 1].content, 'runtime exploded');
 });
+
+test('head rebase consumes events that confirm the optimistic prompt in the same render', async () => {
+  const mod = await importTranscriptModule();
+  const seed = [];
+  const initialPrompt = {
+    id: 'initial-user',
+    text: 'first prompt',
+    timestamp: BASE_TS,
+  };
+  const initialReplay = {
+    initialPrompt,
+    remainingPrompts: [],
+  };
+  const initialState = mod.deriveTranscriptReset(
+    mod.buildBaseMessages(seed, initialReplay.initialPrompt),
+    initialReplay.remainingPrompts,
+    [],
+    null,
+    { seedMessages: seed, prompts: initialReplay },
+  );
+  const completedEvents = [
+    ev(1, { type: 'user_prompt', text: 'first prompt' }),
+    ev(2, { type: 'assistant_chunk', text: 'CCEM_FIRST_OK' }),
+    ev(3, {
+      type: 'lifecycle',
+      stage: 'turn_completed',
+      assistant_message_uuid: 'assistant-first',
+    }),
+  ];
+  const confirmedReplay = {
+    initialPrompt: undefined,
+    remainingPrompts: [],
+  };
+
+  const rebased = mod.rebaseTranscriptHead(
+    initialState,
+    mod.buildBaseMessages(seed, confirmedReplay.initialPrompt),
+    completedEvents,
+    confirmedReplay.remainingPrompts,
+    { seedMessages: seed, prompts: confirmedReplay },
+  );
+  const messages = mod.finalizeTranscriptMessages(rebased);
+
+  assert.equal(rebased.consumedSeq, 3);
+  assert.deepEqual(
+    messages.map((message) => ({
+      msgType: message.msgType,
+      content: message.content,
+    })),
+    [
+      { msgType: 'user', content: 'first prompt' },
+      { msgType: 'assistant', content: 'CCEM_FIRST_OK' },
+    ],
+  );
+});
+
+test('head rebase resets when replay backfills events below the consumed marker', async () => {
+  const mod = await importTranscriptModule();
+  const completeEvents = buildFixture(50);
+  const cachedTail = completeEvents.slice(10);
+  const seed = baseMessages();
+  const initialTokens = { seedMessages: seed, prompts: { revision: 1 } };
+  const cachedState = mod.deriveTranscriptReset(
+    mod.buildBaseMessages(seed, undefined),
+    [],
+    cachedTail,
+    null,
+    { tokens: initialTokens },
+  );
+
+  const rebased = mod.rebaseTranscriptHead(
+    cachedState,
+    mod.buildBaseMessages(seed, undefined),
+    completeEvents,
+    [],
+    { seedMessages: seed, prompts: { revision: 2 } },
+  );
+
+  assert.equal(rebased.consumedCount, completeEvents.length);
+  assert.deepEqual(
+    mod.finalizeTranscriptMessages(rebased),
+    mod.buildMessagesFromEvents(seed, [], completeEvents, null),
+  );
+});

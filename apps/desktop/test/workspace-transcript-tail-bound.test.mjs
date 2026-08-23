@@ -252,6 +252,41 @@ test('append selection survives pruning and refills trigger a reset', async () =
   assert.equal(selection.mode, 'reset');
 });
 
+test('head rebase reset preserves known prune seams', async () => {
+  const mod = await importTranscriptModule();
+  const events = buildFixture();
+  const pruned = mod.pruneRawEventTail(events, TAIL_LIMIT);
+  const seed = [];
+  const initialTokens = { seedMessages: seed, prompts: { revision: 1 } };
+  const initialState = mod.deriveTranscriptReset(
+    seed,
+    [],
+    pruned.events,
+    null,
+    {
+      tokens: initialTokens,
+      suppressGapBeforeSeqs: new Set(pruned.seams),
+    },
+  );
+  const shortenedEvents = pruned.events.slice(0, -1);
+  const shortenedSeqs = new Set(shortenedEvents.map((event) => event.seq));
+  const shortenedSeams = new Set(pruned.seams.filter((seq) => shortenedSeqs.has(seq)));
+
+  const rebased = mod.rebaseTranscriptHead(
+    initialState,
+    seed,
+    shortenedEvents,
+    [],
+    { seedMessages: seed, prompts: { revision: 2 } },
+    shortenedSeams,
+  );
+  const gapIds = mod.finalizeTranscriptMessages(rebased)
+    .filter((message) => message.summary === mod.TRANSCRIPT_GAP_SUMMARY_TOKEN)
+    .map((message) => message.uuid);
+
+  assert.deepEqual(gapIds, ['transcript-gap-5000-5005']);
+});
+
 // ---------------------------------------------------------------------------
 // Unresolved interactive prompts (AskUserQuestion / plan_exit) must survive
 // tail pruning: workspaceNativeAttention rebuilds pending prompts from the

@@ -1484,9 +1484,10 @@ export function deriveTranscriptAppend(
 }
 
 /**
- * Seed/prompt inputs changed but the folded event history is still valid:
- * rebuild only the head (base messages) and refresh the prompt queue, keeping
- * every event-derived message object identity intact.
+ * Seed/prompt inputs can change in the same render as the event list (for
+ * example when a persisted user_prompt confirms an optimistic prompt). Rebase
+ * the head first, then consume a new suffix or reset after replay backfill so
+ * that the token-reference change never skips those events.
  */
 export function rebaseTranscriptHead(
   state: TranscriptDerivationState,
@@ -1494,9 +1495,10 @@ export function rebaseTranscriptHead(
   events: SessionEventRecord[],
   remainingPrompts: LocalUserPrompt[],
   tokens?: TranscriptDerivationTokens,
+  suppressGapBeforeSeqs?: ReadonlySet<number>,
 ): TranscriptDerivationState {
   const head = trimSeedMessagesBeforeFirstUserPrompt(baseMessages, events);
-  return {
+  const rebased = {
     ...state,
     messages: [...head, ...state.messages.slice(state.headLength)],
     headLength: head.length,
@@ -1504,6 +1506,20 @@ export function rebaseTranscriptHead(
     seedMessages: tokens?.seedMessages ?? state.seedMessages,
     prompts: tokens?.prompts ?? state.prompts,
   };
+  const selection = selectTranscriptAppendEvents(events, rebased);
+  if (selection.mode === 'append') {
+    return deriveTranscriptAppend(rebased, selection.appended);
+  }
+  if (selection.mode === 'reset') {
+    return deriveTranscriptReset(
+      baseMessages,
+      remainingPrompts,
+      events,
+      state.terminalError,
+      { tokens, suppressGapBeforeSeqs },
+    );
+  }
+  return rebased;
 }
 
 /**
