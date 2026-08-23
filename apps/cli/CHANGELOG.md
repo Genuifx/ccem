@@ -1,5 +1,11 @@
 # ccem
 
+## 2.72.1
+
+### Patch Changes
+
+- Fix live Workspace transcript updates for new and continued Desktop sessions so replies appear without restarting the app.
+
 ## 2.72.0
 
 ### Minor Changes
