@@ -2430,11 +2430,7 @@ impl NativeRuntimeManager {
                     }
                 }
                 for (runtime_id, request_id, handle) in &prepared_handles {
-                    if let Err(error) =
-                        self.await_child_prepare_stop(runtime_id, request_id, handle, false)
-                    {
-                        return Err(error);
-                    }
+                    self.await_child_prepare_stop(runtime_id, request_id, handle, false)?;
                 }
             }
 

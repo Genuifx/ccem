@@ -949,9 +949,9 @@ fn parse_jsonl_tail(
     prices: &HashMap<String, ModelPrice>,
 ) -> JsonlTailStats {
     let ParseResume {
-        entries: mut entries,
-        claude_state: mut claude_state,
-        codex_state: mut codex_state,
+        mut entries,
+        mut claude_state,
+        mut codex_state,
     } = resume;
 
     let mut line_start = 0usize;

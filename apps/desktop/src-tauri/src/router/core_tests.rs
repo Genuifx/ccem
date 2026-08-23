@@ -361,6 +361,8 @@ fn cas_conflict_returns_only_the_current_public_state() {
     assert_eq!(error.code, "ROUTER_REVISION_CONFLICT");
     assert_eq!(error.current.as_ref().map(|state| state.revision), Some(7));
     let serialized = serde_json::to_string(&error).unwrap();
+    let serialized_value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(serialized_value["current"]["revision"], 7);
     assert!(!serialized.contains(&current.session_key));
     assert!(!serialized.contains(&current.route_tag_nonce));
 }

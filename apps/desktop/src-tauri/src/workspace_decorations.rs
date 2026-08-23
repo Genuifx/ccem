@@ -311,12 +311,10 @@ impl AttentionSummary {
         match &event.payload {
             SessionEventPayload::PermissionRequired {
                 request_id,
-                background_task_id,
+                background_task_id: None,
                 ..
             } => {
-                if background_task_id.is_none() {
-                    self.pending_permissions.insert(request_id.clone());
-                }
+                self.pending_permissions.insert(request_id.clone());
             }
             SessionEventPayload::PermissionResponded { request_id, .. } => {
                 self.pending_permissions.remove(request_id);

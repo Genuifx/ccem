@@ -278,7 +278,7 @@ pub struct RouterServiceError {
     pub code: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current: Option<SessionRouterState>,
+    pub current: Option<Box<SessionRouterState>>,
 }
 
 impl RouterServiceError {
@@ -297,7 +297,7 @@ impl RouterServiceError {
                 "Router revision changed; retry from revision {}.",
                 current.revision
             ),
-            current: Some(current),
+            current: Some(Box::new(current)),
         }
     }
 }

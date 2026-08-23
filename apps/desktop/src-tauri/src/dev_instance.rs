@@ -38,7 +38,7 @@ fn background_services_enabled(
         );
     }
 
-    !instance_id.is_some_and(|value| !value.trim().is_empty())
+    instance_id.is_none_or(|value| value.trim().is_empty())
 }
 
 #[cfg(test)]

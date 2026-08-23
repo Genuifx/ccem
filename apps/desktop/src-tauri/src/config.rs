@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::path::PathBuf; // 文件锁支持
+use std::path::{Path, PathBuf}; // 文件锁支持
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
@@ -651,7 +651,7 @@ fn read_raw_config_file(
 }
 
 fn write_config_locked(
-    config_path: &PathBuf,
+    config_path: &Path,
     _lock_file: &File,
     config: &CcemConfig,
 ) -> Result<(), String> {

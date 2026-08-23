@@ -9,6 +9,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
+async function readSource(...segments) {
+  const source = await fs.readFile(path.join(desktopDir, 'src', ...segments), 'utf8');
+  return source.replace(/\r\n?/g, '\n');
+}
+
 async function importComposerRouteDraft() {
   const compileOptions = {
     compilerOptions: {
@@ -17,14 +22,8 @@ async function importComposerRouteDraft() {
       isolatedModules: true,
     },
   };
-  const draftSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'composerRouteDraft.ts'),
-    'utf8',
-  );
-  const profilesSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'lib', 'routerProfiles.ts'),
-    'utf8',
-  );
+  const draftSource = await readSource('components', 'workspace', 'composerRouteDraft.ts');
+  const profilesSource = await readSource('lib', 'routerProfiles.ts');
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-composer-route-draft-'));
   const profilesPath = path.join(tempDir, 'routerProfiles.mjs');
   const draftPath = path.join(tempDir, 'composerRouteDraft.mjs');
@@ -211,10 +210,7 @@ test('draft label never claims a profile that no longer exists', async () => {
 });
 
 test('source regression: every fresh-Composer entry point resets the routing draft', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'),
-    'utf8',
-  );
+  const source = await readSource('pages', 'Workspace.tsx');
 
   // 1. Successful compose launch resets the draft (next Composer starts off).
   const composeBlock = source.slice(
@@ -297,10 +293,7 @@ test('source regression: every fresh-Composer entry point resets the routing dra
 });
 
 test('source regression: opted-in submit carries the draft; opted-out omits it; failures keep it', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'),
-    'utf8',
-  );
+  const source = await readSource('pages', 'Workspace.tsx');
   const composeBlock = source.slice(
     source.indexOf('const runCreateNativeConversation = useCallback'),
     source.indexOf('  }, [', source.indexOf('const runCreateNativeConversation = useCallback')),
@@ -317,10 +310,7 @@ test('source regression: opted-in submit carries the draft; opted-out omits it; 
 });
 
 test('source regression: history routing uses the real history source, never the OpenCode-as-Claude display fallback', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'),
-    'utf8',
-  );
+  const source = await readSource('pages', 'Workspace.tsx');
   const historyView = source.slice(
     source.indexOf('const renderHistoryView = () => {'),
     source.indexOf('\n  if (isLoadingEnvs', source.indexOf('const renderHistoryView = () => {')),
@@ -358,7 +348,7 @@ test('source regression: history routing uses the real history source, never the
 });
 
 test('wire contract: create_native_session request type carries the Core-owned routerLaunchDraft', async () => {
-  const source = await fs.readFile(path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'), 'utf8');
+  const source = await readSource('lib', 'tauri-ipc.ts');
 
   const commandStart = source.indexOf('create_native_session: [');
   const commandBlock = source.slice(commandStart, source.indexOf('];', commandStart));
@@ -380,10 +370,7 @@ test('wire contract: create_native_session request type carries the Core-owned r
   );
 
   // The hook actually sends it.
-  const hookSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'hooks', 'useTauriCommands.ts'),
-    'utf8',
-  );
+  const hookSource = await readSource('hooks', 'useTauriCommands.ts');
   assert.match(
     hookSource,
     /routerLaunchDraft: options\.routerLaunchDraft \?\? null,/,
@@ -392,10 +379,7 @@ test('wire contract: create_native_session request type carries the Core-owned r
 });
 
 test('visual acceptance: both pills visibly spell out 动态路由/Dynamic routing plus the current state', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
-    'utf8',
-  );
+  const source = await readSource('components', 'workspace', 'WorkspaceRouter.tsx');
 
   // Running routed-session pill: mode prefix + label, degraded variant included.
   const runningPillStart = source.indexOf('export function WorkspaceRoutePill');
@@ -417,20 +401,14 @@ test('visual acceptance: both pills visibly spell out 动态路由/Dynamic routi
 
   // The i18n mode word itself exists in both locales.
   for (const loc of ['zh', 'en']) {
-    const locale = JSON.parse(await fs.readFile(
-      path.join(desktopDir, 'src', 'locales', `${loc}.json`),
-      'utf8',
-    ));
+    const locale = JSON.parse(await readSource('locales', `${loc}.json`));
     assert.ok(locale.router.routeDraftTitle, `${loc} router.routeDraftTitle must exist`);
     assert.ok(locale.router.degraded, `${loc} router.degraded must exist`);
   }
 });
 
 test('source regression: the single running-session selector offers my-default via the shared CAS queue', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
-    'utf8',
-  );
+  const source = await readSource('components', 'workspace', 'WorkspaceRouter.tsx');
 
   // Dedicated hook routes through the SAME per-runtime mutation queue and
   // reads FRESH router + config at execution time.
@@ -450,10 +428,7 @@ test('source regression: the single running-session selector offers my-default v
   assert.ok(!source.includes('function ComposerRouteMenuRow'), 'the + menu must not duplicate the running picker');
 
   // The patch must NOT be produced by faking a RouterProfile.
-  const libSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'lib', 'routerProfiles.ts'),
-    'utf8',
-  );
+  const libSource = await readSource('lib', 'routerProfiles.ts');
   const patchStart = libSource.indexOf('export function buildMyDefaultApplyPatch');
   const patchBlock = libSource.slice(patchStart, libSource.indexOf('\n}', patchStart));
   assert.ok(patchBlock.includes('sourceProfileId: MY_DEFAULT_ROUTER_PROFILE_ID'));
@@ -463,10 +438,7 @@ test('source regression: the single running-session selector offers my-default v
 });
 
 test('visual layout contract: route popover owns its width and environment rules stay bounded', async () => {
-  const routerSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
-    'utf8',
-  );
+  const routerSource = await readSource('components', 'workspace', 'WorkspaceRouter.tsx');
   const routeBody = routerSource.slice(
     routerSource.indexOf('function RoutePopoverBody'),
     routerSource.indexOf('function RouteControl'),
@@ -481,10 +453,7 @@ test('visual layout contract: route popover owns its width and environment rules
   assert.match(routeControl, /max-h-\[var\(--radix-popover-content-available-height\)\].*overflow-hidden/s);
   assert.match(routerSource, /w-\[260px\].*max-h-\[var\(--radix-popover-content-available-height\)\].*overflow-hidden/s);
 
-  const environmentsSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'EnvironmentsRouterRules.tsx'),
-    'utf8',
-  );
+  const environmentsSource = await readSource('components', 'EnvironmentsRouterRules.tsx');
   // Panel content fills the section width like sibling Environments sections
   // (permission modes, env list) — no artificial max-width flanks.
   assert.match(environmentsSource, /className="w-full"/);
@@ -496,10 +465,7 @@ test('visual layout contract: route popover owns its width and environment rules
 });
 
 test('interaction contract: running-session route card is a compact immediate profile picker', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceRouter.tsx'),
-    'utf8',
-  );
+  const source = await readSource('components', 'workspace', 'WorkspaceRouter.tsx');
   const routeBody = source.slice(
     source.indexOf('function RoutePopoverBody'),
     source.indexOf('function RouteControl'),
@@ -531,10 +497,7 @@ test('interaction contract: running-session route card is a compact immediate pr
 });
 
 test('interaction contract: environment route defaults use progressive disclosure', async () => {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'EnvironmentsRouterRules.tsx'),
-    'utf8',
-  );
+  const source = await readSource('components', 'EnvironmentsRouterRules.tsx');
 
   assert.match(source, /showDefaultAdvanced/);
   assert.match(source, /showDefaultAgentBindings/);

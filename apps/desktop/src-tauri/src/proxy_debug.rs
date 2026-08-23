@@ -417,6 +417,9 @@ enum ForwardReadError {
     ClientCancelled,
 }
 
+type RoutedUsageSink =
+    Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>;
+
 pub struct ProxyDebugManager {
     session_manager: Arc<SessionManager>,
     router_manager: Arc<RouterManager>,
@@ -434,17 +437,13 @@ pub struct ProxyDebugManager {
     /// Optional sink receiving per-request routed usage events (runtime_id,
     /// payload). Wired to the native runtime event bus in main.rs to avoid a
     /// manager construction cycle.
-    routed_usage_sink:
-        Mutex<Option<Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>>>,
+    routed_usage_sink: Mutex<Option<RoutedUsageSink>>,
 }
 
 impl ProxyDebugManager {
     /// Wire the routed-usage event sink (native runtime event bus). Called
     /// once from main.rs after both managers exist.
-    pub fn set_routed_usage_sink(
-        &self,
-        sink: Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>,
-    ) {
+    pub fn set_routed_usage_sink(&self, sink: RoutedUsageSink) {
         if let Ok(mut guard) = self.routed_usage_sink.lock() {
             *guard = Some(sink);
         }
@@ -1544,7 +1543,7 @@ impl ProxyDebugManager {
         // silently disappearing. `usage` is upstream self-reported SSE data
         // (observational); None when no usage frame was seen.
         if let Some(scanner) = usage_scanner {
-            let usage = scanner.has_usage().then(|| {
+            let usage = scanner.has_usage().then_some({
                 crate::event_bus::RoutedUsageTotals {
                     input_tokens: scanner.input_tokens,
                     output_tokens: scanner.output_tokens,
