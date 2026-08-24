@@ -17,6 +17,7 @@ mod desktop_instance_lock;
 mod dev_instance;
 mod diagnostic_log;
 mod doctor;
+mod dsh_history;
 mod event_bus;
 mod event_dispatcher;
 mod external_control;

@@ -43,7 +43,8 @@
       "binaries/ccem-node"
     ],
     "resources": [
-      "resources/native-runtime-helper.mjs"
+      "resources/native-runtime-helper.mjs",
+      "resources/dsh-history/"
     ],
     "targets": [
       "dmg",
