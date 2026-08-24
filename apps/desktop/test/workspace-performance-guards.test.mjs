@@ -239,7 +239,7 @@ test('history search is routed through Rust for non-empty queries', async () => 
 
   assert.match(
     historyList,
-    /searchHistorySessions\(normalizedDeferredSearch, sourceFilter, 120\)/,
+    /searchHistorySessionsWithDiagnostics\(normalizedDeferredSearch, sourceFilter, 120\)/,
     'HistoryList should send non-empty search queries to Rust',
   );
   assert.match(

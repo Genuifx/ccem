@@ -1,10 +1,11 @@
 import { useDeferredValue, useState, useMemo, useRef, useEffect, type KeyboardEvent } from 'react';
 import { Search, MessageSquare } from '@/lib/lucide-react';
-import { Claude, Codex, OpenCode } from '@lobehub/icons';
+import { Claude, Codex, DeepSeek, OpenCode } from '@lobehub/icons';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { searchHistorySessions } from '@/features/conversations/historyData';
+import { searchHistorySessionsWithDiagnostics, normalizeHistoryError } from '@/features/conversations/historyData';
+import type { SourceDiagnostic, HistoryCommandError } from '@/features/conversations/historyData';
 import type { HistorySessionItem, HistorySource } from '@/features/conversations/types';
 import { getHistorySessionDisplay } from './historySession';
 
@@ -22,13 +23,25 @@ function getSessionKey(session: HistorySessionItem): string {
 }
 
 function SourceIcon({ source }: { source: HistorySource }) {
-  if (source === 'codex') {
-    return <Codex.Color size={12} />;
+  switch (source) {
+    case 'codex':
+      return <Codex.Color size={12} />;
+    case 'opencode':
+      return <OpenCode size={12} className="h-3 w-3" />;
+    case 'dsh':
+      return <DeepSeek className="h-3 w-3" color="#4D6BFE" />;
+    case 'claude':
+      return <Claude size={12} style={{ color: '#D97757' }} />;
   }
-  if (source === 'opencode') {
-    return <OpenCode size={12} className="h-3 w-3" />;
+}
+
+function sourceLabel(source: HistorySource): string {
+  switch (source) {
+    case 'claude': return 'Claude';
+    case 'codex': return 'Codex (OpenAI)';
+    case 'opencode': return 'OpenCode';
+    case 'dsh': return 'DeepSeek';
   }
-  return <Claude size={12} style={{ color: '#D97757' }} />;
 }
 
 function formatRelativeTime(timestamp: number, t: (key: string) => string): string {
@@ -103,8 +116,11 @@ export function HistoryList({
   const deferredSearch = useDeferredValue(search);
   const normalizedDeferredSearch = deferredSearch.trim();
   const [searchResults, setSearchResults] = useState<HistorySessionItem[] | null>(null);
+  const [searchError, setSearchError] = useState<HistoryCommandError | null>(null);
+  const [searchDiagnostics, setSearchDiagnostics] = useState<SourceDiagnostic[]>([]);
   const [projectFilter, setProjectFilter] = useState<string>('all');
   const listRef = useRef<HTMLDivElement>(null);
+  const searchGenRef = useRef(0);
 
   // Extract unique project names for filter
   const projectNames = useMemo(() => {
@@ -118,21 +134,33 @@ export function HistoryList({
   useEffect(() => {
     if (!normalizedDeferredSearch) {
       setSearchResults(null);
+      setSearchError(null);
+      setSearchDiagnostics([]);
       return;
     }
 
+    // Bump generation so any in-flight Retry promise for a prior query/source is ignored.
+    searchGenRef.current += 1;
+    // Clear stale diagnostics and error at the start of each new request.
+    // The cancelled flag (via React cleanup) protects effect re-runs;
+    // the generation ref protects event-handler (Retry) promises.
     let cancelled = false;
     setSearchResults(null);
-    searchHistorySessions(normalizedDeferredSearch, sourceFilter, 120)
-      .then((results) => {
+    setSearchError(null);
+    setSearchDiagnostics([]);
+    searchHistorySessionsWithDiagnostics(normalizedDeferredSearch, sourceFilter, 120)
+      .then((result) => {
         if (!cancelled) {
-          setSearchResults(results);
+          setSearchResults(result.sessions);
+          setSearchDiagnostics(result.diagnostics);
         }
       })
       .catch((error) => {
         if (!cancelled) {
           console.error('Failed to search conversation history:', error);
+          setSearchError(normalizeHistoryError(error));
           setSearchResults(null);
+          setSearchDiagnostics([]);
         }
       });
 
@@ -218,6 +246,45 @@ export function HistoryList({
         )}
       </div>
 
+      {/* Search error */}
+      {searchError && normalizedDeferredSearch && (
+        <div className="px-3 py-1.5 border-b border-destructive/20 bg-destructive/5">
+          <div className="text-xs text-destructive flex items-center gap-1.5">
+            <span className="truncate">{searchError.message}</span>
+            <button
+              className="ml-auto shrink-0 text-[10px] underline opacity-70 hover:opacity-100"
+              data-testid="history-search-retry"
+              onClick={() => {
+                const gen = searchGenRef.current;
+                setSearchError(null);
+                setSearchDiagnostics([]);
+                searchHistorySessionsWithDiagnostics(normalizedDeferredSearch, sourceFilter, 120)
+                  .then((result) => {
+                    if (searchGenRef.current !== gen) return; // stale
+                    setSearchResults(result.sessions);
+                    setSearchDiagnostics(result.diagnostics);
+                  })
+                  .catch((err) => {
+                    if (searchGenRef.current !== gen) return; // stale
+                    setSearchError(normalizeHistoryError(err));
+                    setSearchDiagnostics([]);
+                  });
+              }}
+            >
+              {t('history.retry')}
+            </button>
+          </div>
+        </div>
+      )}
+      {/* Search diagnostics (partial failure in All mode) */}
+      {searchDiagnostics.length > 0 && normalizedDeferredSearch && (
+        <div className="px-3 py-1">
+          {searchDiagnostics.map((d, i) => (
+            <div key={i} className="text-[10px] text-amber-400/80 truncate">⚠ {d.message}</div>
+          ))}
+        </div>
+      )}
+
       {/* Session list */}
       <div ref={listRef} className="flex-1 overflow-y-auto">
         {filtered.length === 0 ? (
@@ -258,20 +325,8 @@ export function HistoryList({
                       {sourceFilter === 'all' && (
                         <span
                           className="shrink-0"
-                          title={
-                            session.source === 'codex'
-                              ? 'Codex (OpenAI)'
-                              : session.source === 'opencode'
-                                ? 'OpenCode'
-                                : 'Claude'
-                          }
-                          aria-label={
-                            session.source === 'codex'
-                              ? 'Codex (OpenAI)'
-                              : session.source === 'opencode'
-                                ? 'OpenCode'
-                                : 'Claude'
-                          }
+                          title={sourceLabel(session.source)}
+                          aria-label={sourceLabel(session.source)}
                         >
                           <SourceIcon source={session.source} />
                         </span>

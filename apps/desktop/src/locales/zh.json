@@ -1324,7 +1324,13 @@
     "sessionId": "会话 ID",
     "tokensTotal": "总 Token",
     "tokensInput": "输入",
-    "tokensOutput": "输出"
+    "tokensOutput": "输出",
+    "sourceDsh": "DeepSeek",
+    "readOnly": "只读",
+    "dshLoadError": "DSH 读取失败",
+    "loadError": "加载历史记录失败",
+    "detailLoadError": "加载会话详情失败",
+    "retry": "重试"
   },
   "sideRail": {
     "workspace": "工作间",

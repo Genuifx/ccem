@@ -1324,7 +1324,13 @@
     "sessionId": "Session ID",
     "tokensTotal": "Total Tokens",
     "tokensInput": "Input",
-    "tokensOutput": "Output"
+    "tokensOutput": "Output",
+    "sourceDsh": "DeepSeek",
+    "readOnly": "Read-only",
+    "dshLoadError": "DSH read failed",
+    "loadError": "Failed to load history",
+    "detailLoadError": "Failed to load session detail",
+    "retry": "Retry"
   },
   "sideRail": {
     "workspace": "Workspace",

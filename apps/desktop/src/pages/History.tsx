@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState, useTransition } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import { MessageSquare } from '@/lib/lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
@@ -15,18 +15,22 @@ import {
 import {
   fetchConversationDetail,
   fetchHistorySessions,
+  fetchHistorySessionsWithDiagnostics,
   getCachedHistorySessions,
+  getCachedDiagnostics,
   invalidateHistoryCache,
   isHistoryCacheFresh,
+  normalizeHistoryError,
   primeHistoryPage,
 } from '@/features/conversations/historyData';
+import type { HistoryCommandError, SourceDiagnostic } from '@/features/conversations/historyData';
 import type {
   ConversationMessageData,
   HistorySegment,
   HistorySessionItem,
   HistorySourceFilter,
 } from '@/features/conversations/types';
-import { toSessionKey } from '@/features/conversations/types';
+import { toSessionKey, isResumableHistorySource } from '@/features/conversations/types';
 
 const LazyHistoryDetail = lazy(async () =>
   import('@/components/history/HistoryDetail').then((m) => ({ default: m.HistoryDetail }))
@@ -72,7 +76,16 @@ export function History() {
   const [visibleSessionKeys, setVisibleSessionKeys] = useState<string[] | null>(null);
   const [launched, setLaunched] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<HistorySourceFilter>('all');
+  const [diagnostics, setDiagnostics] = useState<SourceDiagnostic[]>(() => getCachedDiagnostics('all'));
+  const [listError, setListError] = useState<HistoryCommandError | null>(null);
+  const [detailError, setDetailError] = useState<HistoryCommandError | null>(null);
+  const [detailWarnings, setDetailWarnings] = useState<string[]>([]);
   const [, startTransition] = useTransition();
+
+  // Generation refs for race protection: event-handler promises (Retry clicks)
+  // check these to avoid overwriting state after source/query/selection changes.
+  const listGenRef = useRef(0);
+  const detailGenRef = useRef(0);
 
   const syncSessionState = useCallback((nextSessions: HistorySessionItem[]) => {
     setSessions(nextSessions);
@@ -86,13 +99,20 @@ export function History() {
 
   useEffect(() => {
     setVisibleSessionKeys(null);
+    // Clear error immediately on source transition — prevents stale error from
+    // one source (e.g. DSH) persisting under another source's cached data.
+    setListError(null);
+    // Bump generation so any in-flight Retry promise from the old source is ignored.
+    listGenRef.current += 1;
 
     const cached = getCachedHistorySessions(sourceFilter);
     if (cached) {
       syncSessionState(cached);
+      setDiagnostics(getCachedDiagnostics(sourceFilter));
       setIsLoadingSessions(false);
     } else {
       setSessions([]);
+      setDiagnostics([]);
       setIsLoadingSessions(true);
     }
 
@@ -101,14 +121,17 @@ export function History() {
     }
 
     let cancelled = false;
-    fetchHistorySessions(sourceFilter)
-      .then((normalized) => {
+    fetchHistorySessionsWithDiagnostics(sourceFilter)
+      .then((result) => {
         if (cancelled) return;
-        syncSessionState(normalized);
+        syncSessionState(result.sessions);
+        setDiagnostics(result.diagnostics);
+        setListError(null);
       })
       .catch((err) => {
         if (!cancelled) {
           console.error('Failed to load conversation history:', err);
+          setListError(normalizeHistoryError(err));
         }
       })
       .finally(() => {
@@ -126,6 +149,8 @@ export function History() {
 
   const handleResume = useCallback(async () => {
     if (!selectedSession) return;
+    // DSH sessions are read-only — never allow resume.
+    if (!isResumableHistorySource(selectedSession.source)) return;
     try {
       await launchClaudeCode(
         selectedSession.project || undefined,
@@ -222,14 +247,25 @@ export function History() {
     setIsLoadingMessages(true);
     setMessages([]);
     setSegments([]);
+    setDetailError(null);
+    setDetailWarnings([]);
+    // Bump detail generation so prior in-flight detail requests are ignored
+    detailGenRef.current += 1;
+    const gen = detailGenRef.current;
     try {
-      const { messages: msgs, segments: segs } = await fetchConversationDetail(session);
+      const { messages: msgs, segments: segs, warnings } = await fetchConversationDetail(session);
+      if (detailGenRef.current !== gen) return; // stale — selection changed
       setMessages(msgs);
       setSegments(segs);
+      setDetailWarnings(warnings ?? []);
     } catch (err) {
+      if (detailGenRef.current !== gen) return; // stale
       console.error('Failed to load conversation:', err);
+      setDetailError(normalizeHistoryError(err));
     } finally {
-      setIsLoadingMessages(false);
+      if (detailGenRef.current === gen) {
+        setIsLoadingMessages(false);
+      }
     }
   }, []);
 
@@ -298,7 +334,7 @@ export function History() {
       <div className="w-[300px] shrink-0 flex flex-col glass-subtle glass-noise border-r border-white/[0.06]">
         <div className="border-b border-white/[0.06] px-4 pt-3 pb-1">
           <div className="flex items-center gap-4">
-            {(['all', 'claude', 'codex', 'opencode'] as HistorySourceFilter[]).map((source) => (
+            {(['all', 'claude', 'codex', 'opencode', 'dsh'] as HistorySourceFilter[]).map((source) => (
               <button
                 key={source}
                 data-testid={`history-filter-${source}`}
@@ -315,10 +351,64 @@ export function History() {
                 {source === 'claude' && t('history.sourceClaude')}
                 {source === 'codex' && t('history.sourceCodex')}
                 {source === 'opencode' && t('history.sourceOpencode')}
+                {source === 'dsh' && t('history.sourceDsh')}
               </button>
             ))}
           </div>
         </div>
+        {diagnostics.length > 0 && (
+          <div className="px-3 py-1.5">
+            {diagnostics.map((d, i) => (
+              <div key={i} className="text-xs text-amber-400/80 flex items-center gap-1.5">
+                <span className="shrink-0">⚠</span>
+                <span className="truncate">{d.message}</span>
+                <button
+                  className="ml-auto shrink-0 text-[10px] underline opacity-70 hover:opacity-100"
+                  onClick={() => {
+                    fetchHistorySessionsWithDiagnostics(sourceFilter, true)
+                      .then((result) => { syncSessionState(result.sessions); setDiagnostics(result.diagnostics); setListError(null); })
+                      .catch((retryErr) => { setListError(normalizeHistoryError(retryErr)); });
+                  }}
+                >
+                  {t('history.retry')}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {listError && (
+          <div className="px-3 py-2 border-b border-destructive/20 bg-destructive/5">
+            <div className="text-xs text-destructive flex items-center gap-1.5">
+              <span className="truncate">{listError.message}</span>
+              <button
+                className="ml-auto shrink-0 text-[10px] underline opacity-70 hover:opacity-100"
+                data-testid="history-list-retry"
+                onClick={() => {
+                  const gen = listGenRef.current;
+                  setListError(null);
+                  setIsLoadingSessions(true);
+                  fetchHistorySessionsWithDiagnostics(sourceFilter, true)
+                    .then((result) => {
+                      if (listGenRef.current !== gen) return; // stale
+                      syncSessionState(result.sessions);
+                      setDiagnostics(result.diagnostics);
+                      setListError(null);
+                    })
+                    .catch((retryErr) => {
+                      if (listGenRef.current !== gen) return; // stale
+                      setListError(normalizeHistoryError(retryErr));
+                    })
+                    .finally(() => {
+                      if (listGenRef.current !== gen) return; // stale
+                      setIsLoadingSessions(false);
+                    });
+                }}
+              >
+                {t('history.retry')}
+              </button>
+            </div>
+          </div>
+        )}
         {isLoadingSessions && sessions.length === 0 ? (
           <div className="flex-1 flex flex-col gap-2 p-3">
             {Array.from({ length: 8 }).map((_, i) => (
@@ -358,6 +448,9 @@ export function History() {
               activeSegment={activeSegment}
               onActiveSegmentChange={setActiveSegment}
               isLoadingMessages={isLoadingMessages}
+              detailError={detailError}
+              detailWarnings={detailWarnings}
+              onRetryDetail={() => selectedSession && handleSelect(selectedSession)}
               onExport={handleExport}
               onResume={handleResume}
               launched={launched}

@@ -8,13 +8,57 @@ import type {
   WorkspaceOverviewSnapshot,
   WorkspaceOverviewSnapshotPayload,
 } from './types';
+import { isResumableHistorySource } from './types';
 
 const HISTORY_CACHE_TTL_MS = 60_000;
 
+/** Diagnostic from a partial source failure (e.g. DSH in source=all). */
+export interface SourceDiagnostic {
+  source: string;
+  code: string;
+  message: string;
+}
+
+/** Structured error from backend history commands. */
+export interface HistoryCommandError {
+  code: string;
+  message: string;
+}
+
+/** Backend envelope for list/search results. */
+interface HistoryListResult {
+  sessions: HistorySessionItem[];
+  diagnostics: SourceDiagnostic[];
+}
+
+/** Result including diagnostics for the caller to surface. */
+export interface HistoryFetchResult {
+  sessions: HistorySessionItem[];
+  diagnostics: SourceDiagnostic[];
+}
+
+/**
+ * Normalize a backend error into a HistoryCommandError.
+ * Tauri serializes structured errors as objects; legacy strings become generic errors.
+ */
+export function normalizeHistoryError(err: unknown): HistoryCommandError {
+  if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+    return { code: String((err as any).code), message: String((err as any).message) };
+  }
+  if (typeof err === 'string') {
+    return { code: 'unknown', message: err };
+  }
+  if (err instanceof Error) {
+    return { code: 'unknown', message: err.message };
+  }
+  return { code: 'unknown', message: String(err) };
+}
+
 interface HistorySessionCacheEntry {
   data: HistorySessionItem[];
+  diagnostics: SourceDiagnostic[];
   fetchedAt: number;
-  promise?: Promise<HistorySessionItem[]>;
+  promise?: Promise<HistoryFetchResult>;
 }
 
 interface WorkspaceOverviewCacheEntry {
@@ -39,28 +83,40 @@ function historySessionCacheKey(
     : `${sourceFilter}:full`;
 }
 
-function normalizeHistorySource(value: unknown): HistorySource {
-  switch (typeof value === 'string' ? value.toLowerCase() : '') {
+export function normalizeHistorySource(value: unknown): HistorySource | null {
+  if (typeof value !== 'string') return null;
+  switch (value.toLowerCase()) {
+    case 'claude':
+      return 'claude';
     case 'codex':
       return 'codex';
     case 'opencode':
       return 'opencode';
+    case 'dsh':
+      return 'dsh';
     default:
-      return 'claude';
+      // Unknown source — never fallback to claude.
+      return null;
   }
 }
 
-function normalizeHistorySessions(data: HistorySessionItem[]): HistorySessionItem[] {
-  return data.map((session) => ({
-    ...session,
-    source: normalizeHistorySource(session.source),
-  }));
+export function normalizeHistorySessions(data: HistorySessionItem[]): HistorySessionItem[] {
+  return data
+    .map((session) => {
+      const source = normalizeHistorySource(session.source);
+      if (source === null) return null; // Drop sessions with unknown source
+      return { ...session, source };
+    })
+    .filter((session): session is HistorySessionItem => session !== null);
 }
 
-function normalizeWorkspaceOverviewSnapshot(
+export function normalizeWorkspaceOverviewSnapshot(
   data: WorkspaceOverviewSnapshotPayload,
 ): WorkspaceOverviewSnapshot {
-  const sessions = normalizeHistorySessions(data.sessions);
+  // Workspace never shows DSH — filter at normalization as a second defense line.
+  const sessions = normalizeHistorySessions(data.sessions).filter(
+    (session) => isResumableHistorySource(session.source),
+  );
   const sessionByKey = new Map(sessions.map((session) => [`${session.source}:${session.id}`, session]));
   const projectNodes = data.projectNodes.map((node) => ({
     project: node.project,
@@ -70,9 +126,11 @@ function normalizeWorkspaceOverviewSnapshot(
       ? node.sessionKeys
           .map((sessionKey) => sessionByKey.get(sessionKey))
           .filter((session): session is HistorySessionItem => Boolean(session))
-      : normalizeHistorySessions(node.sessions ?? []).map((session) =>
-          sessionByKey.get(`${session.source}:${session.id}`) ?? session
-        ),
+      : normalizeHistorySessions(node.sessions ?? [])
+          .filter((session) => isResumableHistorySource(session.source))
+          .map((session) =>
+            sessionByKey.get(`${session.source}:${session.id}`) ?? session
+          ),
   }));
 
   return {
@@ -89,6 +147,13 @@ export function getCachedHistorySessions(
   return historySessionCache.get(historySessionCacheKey(sourceFilter, options))?.data ?? null;
 }
 
+export function getCachedDiagnostics(
+  sourceFilter: HistorySourceFilter,
+  options: FetchHistorySessionsOptions = {},
+): SourceDiagnostic[] {
+  return historySessionCache.get(historySessionCacheKey(sourceFilter, options))?.diagnostics ?? [];
+}
+
 export function isHistoryCacheFresh(
   sourceFilter: HistorySourceFilter,
   options: FetchHistorySessionsOptions = {},
@@ -102,28 +167,39 @@ export async function fetchHistorySessions(
   force = false,
   options: FetchHistorySessionsOptions = {},
 ): Promise<HistorySessionItem[]> {
+  const result = await fetchHistorySessionsWithDiagnostics(sourceFilter, force, options);
+  return result.sessions;
+}
+
+export async function fetchHistorySessionsWithDiagnostics(
+  sourceFilter: HistorySourceFilter,
+  force = false,
+  options: FetchHistorySessionsOptions = {},
+): Promise<HistoryFetchResult> {
   const cacheKey = historySessionCacheKey(sourceFilter, options);
   const cached = historySessionCache.get(cacheKey);
 
   if (!force && cached?.data && isHistoryCacheFresh(sourceFilter, options)) {
-    return cached.data;
+    return { sessions: cached.data, diagnostics: cached.diagnostics };
   }
 
   if (!force && cached?.promise) {
     return cached.promise;
   }
 
-  const request = invoke<HistorySessionItem[]>('get_conversation_history', {
+  const request = invoke<HistoryListResult>('get_conversation_history', {
     source: sourceFilter === 'all' ? null : sourceFilter,
     limit: options.limit ?? null,
   })
-    .then((data) => {
-      const normalized = normalizeHistorySessions(data);
+    .then((result) => {
+      const normalized = normalizeHistorySessions(result.sessions);
+      const diagnostics = result.diagnostics ?? [];
       historySessionCache.set(cacheKey, {
         data: normalized,
+        diagnostics,
         fetchedAt: Date.now(),
       });
-      return normalized;
+      return { sessions: normalized, diagnostics };
     })
     .catch((err) => {
       if (cached?.data) {
@@ -136,6 +212,7 @@ export async function fetchHistorySessions(
 
   historySessionCache.set(cacheKey, {
     data: cached?.data ?? [],
+    diagnostics: cached?.diagnostics ?? [],
     fetchedAt: cached?.fetchedAt ?? 0,
     promise: request,
   });
@@ -170,6 +247,7 @@ export async function fetchWorkspaceOverviewSnapshot(
       });
       historySessionCache.set(cacheKey, {
         data: snapshot.sessions,
+        diagnostics: [],
         fetchedAt: Date.now(),
       });
       return snapshot;
@@ -202,12 +280,24 @@ export async function searchHistorySessions(
   sourceFilter: HistorySourceFilter = 'all',
   limit = 120,
 ): Promise<HistorySessionItem[]> {
-  const data = await invoke<HistorySessionItem[]>('search_conversation_history', {
+  const result = await searchHistorySessionsWithDiagnostics(query, sourceFilter, limit);
+  return result.sessions;
+}
+
+export async function searchHistorySessionsWithDiagnostics(
+  query: string,
+  sourceFilter: HistorySourceFilter = 'all',
+  limit = 120,
+): Promise<HistoryFetchResult> {
+  const result = await invoke<HistoryListResult>('search_conversation_history', {
     query,
     source: sourceFilter === 'all' ? null : sourceFilter,
     limit,
   });
-  return normalizeHistorySessions(data);
+  return {
+    sessions: normalizeHistorySessions(result.sessions),
+    diagnostics: result.diagnostics ?? [],
+  };
 }
 
 export async function fetchConversationDetail(session: Pick<HistorySessionItem, 'id' | 'source'>) {
@@ -224,6 +314,7 @@ export async function fetchConversationDetail(session: Pick<HistorySessionItem, 
     messages,
     segments: detail.segments,
     toolResultsMerged: detail.toolResultsMerged === true,
+    warnings: (detail as any).warnings ?? [],
   };
 }
 

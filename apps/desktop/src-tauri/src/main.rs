@@ -592,12 +592,7 @@ async fn launch_claude_code(
     resume_session_id: Option<String>,
     client: Option<String>,
 ) -> Result<Session, String> {
-    let client_name = client
-        .unwrap_or_else(|| "claude".to_string())
-        .to_lowercase();
-    if client_name != "claude" && client_name != "codex" && client_name != "opencode" {
-        return Err(format!("Unsupported client '{}'", client_name));
-    }
+    let client_name = history::validate_launch_client(client.as_deref())?;
 
     println!("=== launch_claude_code called ===");
     println!(
@@ -1849,14 +1844,12 @@ async fn create_interactive_session(
 ) -> Result<Session, String> {
     let trace_id = launch_trace_id
         .unwrap_or_else(|| format!("backend-{}", chrono::Utc::now().timestamp_millis()));
-    let client_name = client
-        .unwrap_or_else(|| "claude".to_string())
-        .to_lowercase();
+    let raw_client = client.as_deref().unwrap_or("claude");
     diagnostic_log::append_session_launch_event(
         "backend.create_interactive_session.entry",
         serde_json::json!({
             "trace_id": &trace_id,
-            "client": &client_name,
+            "client": raw_client,
             "env_name": &env_name,
             "perm_mode": &perm_mode,
             "working_dir": &working_dir,
@@ -1864,17 +1857,19 @@ async fn create_interactive_session(
             "initial_prompt": initial_prompt.as_ref().is_some_and(|value| !value.trim().is_empty()),
         }),
     );
-    if client_name != "claude" && client_name != "codex" && client_name != "opencode" {
-        diagnostic_log::append_session_launch_event(
-            "backend.create_interactive_session.unsupported_client",
-            serde_json::json!({
-                "trace_id": &trace_id,
-                "client": &client_name,
-            }),
-        );
-        return Err(format!("Unsupported client '{}'", client_name));
-    }
-
+    let client_name = match history::validate_launch_client(client.as_deref()) {
+        Ok(name) => name,
+        Err(e) => {
+            diagnostic_log::append_session_launch_event(
+                "backend.create_interactive_session.unsupported_client",
+                serde_json::json!({
+                    "trace_id": &trace_id,
+                    "client": raw_client,
+                }),
+            );
+            return Err(e);
+        }
+    };
     if tmux::TmuxManager::check_tmux_installed().is_err() {
         println!(
             "tmux unavailable, falling back to external terminal launch for {}",
