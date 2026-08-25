@@ -289,6 +289,33 @@ export function Analytics() {
   }, [loadRealData]);
 
   useEffect(() => {
+    if (usageSource !== 'all' || useAppStore.getState().usageStats !== null) {
+      return;
+    }
+
+    let cancelled = false;
+    void invoke<UsageStats | null>('get_tray_usage_stats')
+      .then((summary) => {
+        if (cancelled || !summary || useAppStore.getState().usageStats !== null) {
+          return;
+        }
+        const result = {
+          stats: summary,
+          streakDays: calculateStreakDays(summary.dailyHistory),
+        };
+        primeAnalyticsSourceCache('all', summary);
+        applyAnalyticsData(result, 'all');
+      })
+      .catch((error) => {
+        console.debug('Cached analytics summary is not available:', error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyAnalyticsData, usageSource]);
+
+  useEffect(() => {
     loadRealData();
   }, [loadRealData]);
 

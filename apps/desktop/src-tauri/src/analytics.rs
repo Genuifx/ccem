@@ -404,11 +404,29 @@ fn normalize_model_name(model: &str) -> String {
     s
 }
 
+#[cfg(test)]
+thread_local! {
+    static MODEL_PRICE_LOOKUP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_model_price_lookup_count() {
+    MODEL_PRICE_LOOKUP_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn model_price_lookup_count() -> usize {
+    MODEL_PRICE_LOOKUP_COUNT.with(std::cell::Cell::get)
+}
+
 /// Look up model price: direct -> normalized -> fuzzy -> keyword fallback (Claude only).
 fn get_model_price<'a>(
     model: &str,
     prices: &'a HashMap<String, ModelPrice>,
 ) -> Option<&'a ModelPrice> {
+    #[cfg(test)]
+    MODEL_PRICE_LOOKUP_COUNT.with(|count| count.set(count.get() + 1));
+
     if let Some(p) = prices.get(model) {
         return Some(p);
     }
@@ -1182,9 +1200,9 @@ fn read_usage_cache() -> CacheFile {
     read_usage_cache_at(&usage_cache_path())
 }
 
-/// Read a usage cache from an explicit path (test seam). A cache stamped with
-/// any version other than the current one is discarded and treated as empty,
-/// so a version bump triggers a one-time full rebuild.
+/// Read a usage cache from an explicit path (test seam). Version 6 only adds
+/// optional DSH metadata, so version 5 can be upgraded in memory without
+/// throwing away the legacy parse state. Other versions fail closed.
 fn read_usage_cache_at(path: &Path) -> CacheFile {
     if !path.exists() {
         return CacheFile::default();
@@ -1195,6 +1213,10 @@ fn read_usage_cache_at(path: &Path) -> CacheFile {
     };
     match serde_json::from_str::<CacheFile>(&content) {
         Ok(cache) if cache.version == USAGE_CACHE_VERSION => cache,
+        Ok(mut cache) if cache.version == 5 => {
+            cache.version = USAGE_CACHE_VERSION;
+            cache
+        }
         _ => CacheFile::default(),
     }
 }
@@ -2325,6 +2347,7 @@ fn aggregate_cache(
             .unwrap_or_else(|| now.to_rfc3339()),
         ..Default::default()
     };
+    let mut price_by_model: HashMap<&str, Option<&ModelPrice>> = HashMap::new();
 
     for (file_path, file_entry) in &cache.files {
         if let Some(filter) = source_filter {
@@ -2341,7 +2364,10 @@ fn aggregate_cache(
 
             // Category-aware unpriced detection: check which token categories
             // lack a known rate for this model.
-            let unpriced_tokens = match get_model_price(&entry.model, prices) {
+            let price = *price_by_model
+                .entry(entry.model.as_str())
+                .or_insert_with(|| get_model_price(&entry.model, prices));
+            let unpriced_tokens = match price {
                 None => {
                     // No price entry at all — all tokens are unpriced
                     total_entry_tokens
@@ -2430,6 +2456,7 @@ fn aggregate_model_breakdown(
     prices: &HashMap<String, ModelPrice>,
 ) -> ModelBreakdownHistory {
     let mut breakdown: ModelBreakdownHistory = HashMap::new();
+    let mut price_by_model: HashMap<&str, Option<&ModelPrice>> = HashMap::new();
 
     for (file_path, file_entry) in &cache.files {
         if let Some(filter) = source_filter {
@@ -2449,7 +2476,10 @@ fn aggregate_model_breakdown(
                 + entry.usage.cache_read_tokens
                 + entry.usage.cache_creation_tokens;
 
-            let unpriced_tokens = match get_model_price(&entry.model, prices) {
+            let price = *price_by_model
+                .entry(entry.model.as_str())
+                .or_insert_with(|| get_model_price(&entry.model, prices));
+            let unpriced_tokens = match price {
                 None => total_entry_tokens,
                 Some(price) => {
                     let mut unpriced = 0u64;
@@ -2633,12 +2663,14 @@ mod tests {
         aggregate_cache, aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
         detect_source_from_path, dsh_provider_to_environment, extract_model_breakdown_bucket,
         format_week_bucket, full_parse_jsonl, get_file_meta, lock_usage_snapshot,
-        lock_usage_stats_memo, normalize_usage_source, parse_claude_jsonl_reader,
+        lock_usage_stats_memo, model_price_lookup_count, normalize_usage_source,
+        parse_claude_jsonl_reader,
         parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
         read_usage_cache_at, read_usage_summary_from, refresh_discovered_entry,
-        shared_usage_cache, should_reuse_usage_stats, snapshot_is_fresh, write_json_atomic,
-        write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheStats,
-        CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
+        reset_model_price_lookup_count, shared_usage_cache, should_reuse_usage_stats,
+        snapshot_is_fresh, write_json_atomic, write_usage_summary_to, CacheEntry, CacheFile,
+        CacheFileEntry, CacheMeta, CacheStats, CacheUsage, ClaudeParseState, CodexParseState,
+        DiscoveredFile,
         ModelBreakdownGranularity, ModelPrice, TokenUsageWithCost, UsageSource, UsageStats,
         ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE, SOURCE_DSH,
         TEST_SNAPSHOT_REFRESH, USAGE_CACHE_VERSION, USAGE_SUMMARY_VERSION,
@@ -3653,7 +3685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_cache_version_guard_discards_stale_version() {
+    fn test_usage_cache_version_guard_migrates_v5_and_discards_older_versions() {
         let temp = tempfile::tempdir().expect("version tempdir");
         let cache_path = temp.path().join("usage-cache.json");
 
@@ -3682,17 +3714,29 @@ mod tests {
             revision: None,
         };
 
-        // A cache stamped with an old version is discarded wholesale.
-        let stale = CacheFile {
+        // Version 6 only added optional DSH fields, so a v5 cache remains a
+        // valid legacy-source baseline and must not trigger a full disk scan.
+        let v5 = CacheFile {
             version: super::USAGE_CACHE_VERSION - 1,
+            files: HashMap::from([("legacy.jsonl".to_string(), entry.clone())]),
+            last_updated: None,
+        };
+        write_json_atomic(&cache_path, &v5).expect("write v5 cache");
+        let migrated = read_usage_cache_at(&cache_path);
+        assert_eq!(migrated.version, super::USAGE_CACHE_VERSION);
+        assert!(
+            migrated.files.contains_key("legacy.jsonl"),
+            "v5 entries must survive the additive v6 migration"
+        );
+
+        // Older schemas are not known to be compatible and still fail closed.
+        let stale = CacheFile {
+            version: super::USAGE_CACHE_VERSION - 2,
             files: HashMap::from([("stale.jsonl".to_string(), entry.clone())]),
             last_updated: None,
         };
         write_json_atomic(&cache_path, &stale).expect("write stale cache");
-        assert!(
-            read_usage_cache_at(&cache_path).files.is_empty(),
-            "stale version must be discarded and rebuilt"
-        );
+        assert!(read_usage_cache_at(&cache_path).files.is_empty());
 
         // A current-version cache round-trips the parse continuation state.
         let current = CacheFile {
@@ -3889,6 +3933,79 @@ mod tests {
         // Unpriced tokens from the zero-cost entry
         assert_eq!(stats.total.unpriced_tokens, 3300); // 2000+1000+200+100
         assert!(stats.total.cost_incomplete);
+    }
+
+    #[test]
+    fn test_aggregate_cache_resolves_repeated_model_price_once() {
+        let repeated_entry = CacheEntry {
+            timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+            model: "unknown-model".to_string(),
+            environment: Some("dsh".to_string()),
+            usage: CacheUsage {
+                input_tokens: 1,
+                ..Default::default()
+            },
+        };
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([(
+                "dsh://inst1/sess1".to_string(),
+                CacheFileEntry {
+                    stats: CacheStats {
+                        entries: vec![repeated_entry; 128],
+                    },
+                    ..Default::default()
+                },
+            )]),
+            last_updated: None,
+        };
+
+        reset_model_price_lookup_count();
+        let stats = aggregate_cache(&cache, None, &default_prices());
+
+        assert_eq!(stats.total.input_tokens, 128);
+        assert_eq!(model_price_lookup_count(), 1);
+    }
+
+    #[test]
+    fn test_model_breakdown_resolves_repeated_model_price_once() {
+        let repeated_entry = CacheEntry {
+            timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+            model: "unknown-model".to_string(),
+            environment: Some("dsh".to_string()),
+            usage: CacheUsage {
+                input_tokens: 1,
+                ..Default::default()
+            },
+        };
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([(
+                "dsh://inst1/sess1".to_string(),
+                CacheFileEntry {
+                    stats: CacheStats {
+                        entries: vec![repeated_entry; 128],
+                    },
+                    ..Default::default()
+                },
+            )]),
+            last_updated: None,
+        };
+
+        reset_model_price_lookup_count();
+        let breakdown = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Day,
+            fixed_now(),
+            &default_prices(),
+        );
+
+        assert_eq!(
+            breakdown["2026-08-20"]["unknown-model"].input_tokens,
+            128
+        );
+        assert_eq!(model_price_lookup_count(), 1);
     }
 
     #[test]

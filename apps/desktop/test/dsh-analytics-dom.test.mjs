@@ -6,7 +6,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { build, stop as stopEsbuild } from 'esbuild';
 import { JSDOM } from 'jsdom';
@@ -76,6 +75,15 @@ function useAppStore(selector) {
 useAppStore.getState = () => storeState;
 useAppStore._mock = _mock;
 useAppStore._setState = (partial) => Object.assign(storeState, partial);
+useAppStore._reset = () => {
+  storeState.usageStats = null;
+  storeState.milestones = [];
+  storeState.continuousUsageDays = 0;
+  storeState.isLoadingStats = false;
+  _mock.setUsageStatsCalls.length = 0;
+  _mock.lastUsageStats = null;
+};
+globalThis.__analyticsStore = useAppStore;
 export { useAppStore };
 export default useAppStore;
 `;
@@ -101,6 +109,16 @@ const externalStubPlugin = {
     }));
     builder.onLoad({ filter: /^tauri-stub$/, namespace: 'analytics-stubs' }, () => ({
       loader: 'js', contents: INVOKE_STUB,
+    }));
+    builder.onResolve({ filter: /^@\/locales$/ }, () => ({
+      path: 'locale-stub', namespace: 'analytics-stubs',
+    }));
+    builder.onLoad({ filter: /^locale-stub$/, namespace: 'analytics-stubs' }, () => ({
+      loader: 'js',
+      contents: `
+        export function useLocale() { return { t: (key) => key, lang: 'zh' }; }
+        export function LocaleProvider({ children }) { return children; }
+      `,
     }));
     builder.onResolve({ filter: /\/store/ }, async (args) => {
       if (args.path.includes('@/store') || args.path.endsWith('/store')) {
@@ -190,6 +208,18 @@ function installDom(dom) {
   g.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
   g.requestAnimationFrame = (cb) => setTimeout(cb, 0);
   g.cancelAnimationFrame = (id) => clearTimeout(id);
+  for (const [name, value] of Object.entries({
+    window: g,
+    document: g.document,
+    navigator: g.navigator,
+    HTMLElement: g.HTMLElement,
+    Node: g.Node,
+    localStorage: g.localStorage,
+    requestAnimationFrame: g.requestAnimationFrame,
+    cancelAnimationFrame: g.cancelAnimationFrame,
+  })) {
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  }
 }
 
 function makeUsageStats({ costIncomplete = false, unpricedTokens = 0, cost = 5.0 } = {}) {
@@ -217,7 +247,9 @@ function makeUsageStats({ costIncomplete = false, unpricedTokens = 0, cost = 5.0
 
 async function buildHarness() {
   if (cachedHarness) return cachedHarness;
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-analytics-dom-'));
+  const artifactsDir = path.join(desktopDir, '.artifacts');
+  await fs.mkdir(artifactsDir, { recursive: true });
+  const tempDir = await fs.mkdtemp(path.join(artifactsDir, 'dsh-analytics-dom-'));
   const outfile = path.join(tempDir, 'analytics-bundle.mjs');
 
   await build({
@@ -233,7 +265,7 @@ async function buildHarness() {
       'import.meta.env.MODE': '"test"',
       'import.meta.env.PROD': 'true',
     },
-    plugins: [aliasPlugin, externalStubPlugin],
+    plugins: [externalStubPlugin, aliasPlugin],
     external: ['react', 'react-dom', 'react-dom/client', 'react/jsx-runtime'],
     logLevel: 'error',
   });
@@ -255,15 +287,51 @@ async function createTestEnv() {
   const g = dom.window;
   const React = await import('react');
   const ReactDOM = await import('react-dom/client');
-  const ReactDOMTestUtils = await import('react-dom/test-utils');
   g.React = React;
 
   // Load the bundle
   const bundleUrl = pathToFileURL(outfile).href;
   const mod = await import(bundleUrl);
 
-  return { dom, mod, React, ReactDOM, act: ReactDOMTestUtils.act, g };
+  return { dom, mod, React, ReactDOM, act: React.act, g };
 }
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test('Analytics hydrates cached summary before a slow fresh refresh resolves', async () => {
+  const summary = makeUsageStats({ cost: 12.5 });
+  let resolveFresh;
+  const fresh = new Promise((resolve) => { resolveFresh = resolve; });
+  globalThis.__testInvokeHandler = (cmd) => {
+    if (cmd === 'get_tray_usage_stats') return Promise.resolve(summary);
+    if (cmd === 'get_usage_stats') return fresh;
+    return Promise.resolve(null);
+  };
+
+  const { dom, mod, React, ReactDOM, act } = await createTestEnv();
+  globalThis.__analyticsStore._reset();
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  const root = ReactDOM.createRoot(dom.window.document.getElementById('root'));
+
+  await act(async () => {
+    root.render(React.createElement(mod.Analytics));
+    await flush();
+  });
+
+  assert.deepEqual(
+    globalThis.__analyticsStore._mock.setUsageStatsCalls,
+    [summary],
+    'the cached summary should leave the skeleton path without waiting for the full refresh',
+  );
+
+  await act(async () => {
+    resolveFresh(summary);
+    await flush();
+    root.unmount();
+  });
+  dom.window.close();
+  delete globalThis.__testInvokeHandler;
+});
 
 // PLACEHOLDER_TESTS
 
