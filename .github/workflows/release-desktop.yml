@@ -192,7 +192,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'CCEM v__VERSION__'
           releaseBody: ${{ needs.prepare-release.outputs.release_body }}
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
+          releaseDraft: true
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
@@ -209,19 +209,56 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'CCEM v__VERSION__'
           releaseBody: ${{ needs.prepare-release.outputs.release_body }}
-          releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
+          releaseDraft: true
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+      - name: Smoke DSH helper from final macOS app bundle
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          app_bundle="$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_bundle" ]]; then
+            echo "macOS app bundle was not produced under $bundle_root" >&2
+            exit 1
+          fi
+          node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs \
+            --app-bundle "$app_bundle" \
+            --evidence "$RUNNER_TEMP/dsh-bundle-smoke-${{ matrix.target }}.json"
+
+      - name: Smoke DSH helper from final Windows installer
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $bundleRoot = "apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
+          $installer = Get-ChildItem -Path $bundleRoot -Filter "*.exe" -File | Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows NSIS installer was not produced under $bundleRoot"
+          }
+          $evidence = Join-Path $env:RUNNER_TEMP "dsh-bundle-smoke-${{ matrix.target }}.json"
+          node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs --nsis-installer $installer.FullName --evidence $evidence
+
+      - name: Upload DSH bundle smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-bundle-smoke-${{ matrix.target }}
+          path: ${{ runner.temp }}/dsh-bundle-smoke-${{ matrix.target }}.json
+          if-no-files-found: error
 
   publish-updater-manifest:
     name: Publish Updater Manifest
     needs: [prepare-release, build-desktop]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
+    outputs:
+      release_id: ${{ steps.publish-updater.outputs.release_id }}
 
     steps:
       - name: Publish combined latest.json
+        id: publish-updater
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -237,11 +274,27 @@ jobs:
             -H "Accept: application/vnd.github+json"
             -H "X-GitHub-Api-Version: 2022-11-28"
           )
+          asset_download_headers=(
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "Accept: application/octet-stream"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
 
           release_json="$(mktemp)"
-          curl -fsSL "${auth_headers[@]}" "${api}/releases/tags/${TAG_NAME}" > "$release_json"
+          curl -fsSL "${auth_headers[@]}" "${api}/releases?per_page=100" \
+            | jq --arg tag "$TAG_NAME" '[.[] | select(.tag_name == $tag and .draft == true)][0] // empty' \
+            > "$release_json"
+          if [[ ! -s "$release_json" ]]; then
+            echo "Draft release ${TAG_NAME} was not found" >&2
+            exit 1
+          fi
 
           release_id="$(jq -r '.id' "$release_json")"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Draft release ${TAG_NAME} has an invalid id" >&2
+            exit 1
+          fi
+          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
           upload_url="$(jq -r '.upload_url' "$release_json" | sed 's/{.*//')"
 
           asset_url() {
@@ -266,14 +319,36 @@ jobs:
               "$release_json" | head -n1
           }
 
-          aarch64_bundle_url="$(asset_url_any 'CCEM.Desktop_aarch64.app.tar.gz' 'CCEM Desktop_aarch64.app.tar.gz')"
-          aarch64_sig_url="$(asset_url_any 'CCEM.Desktop_aarch64.app.tar.gz.sig' 'CCEM Desktop_aarch64.app.tar.gz.sig')"
-          x64_bundle_url="$(asset_url_any 'CCEM.Desktop_x64.app.tar.gz' 'CCEM Desktop_x64.app.tar.gz')"
-          x64_sig_url="$(asset_url_any 'CCEM.Desktop_x64.app.tar.gz.sig' 'CCEM Desktop_x64.app.tar.gz.sig')"
-          windows_bundle_url="$(asset_url_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)$')"
-          windows_sig_url="$(asset_url_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)\.sig$')"
+          asset_id() {
+            jq -r --arg name "$1" '.assets[] | select(.name == $name) | .id' "$release_json" | head -n1
+          }
 
-          for value in "$aarch64_bundle_url" "$aarch64_sig_url" "$x64_bundle_url" "$x64_sig_url" "$windows_bundle_url" "$windows_sig_url"; do
+          asset_id_any() {
+            local candidate
+            for candidate in "$@"; do
+              local id
+              id="$(asset_id "$candidate")"
+              if [[ -n "$id" && "$id" != "null" ]]; then
+                echo "$id"
+                return 0
+              fi
+            done
+          }
+
+          asset_id_regex() {
+            jq -r --arg pattern "$1" \
+              '.assets[] | select(.name | test($pattern)) | .id' \
+              "$release_json" | head -n1
+          }
+
+          aarch64_bundle_url="$(asset_url_any 'CCEM.Desktop_aarch64.app.tar.gz' 'CCEM Desktop_aarch64.app.tar.gz')"
+          aarch64_sig_id="$(asset_id_any 'CCEM.Desktop_aarch64.app.tar.gz.sig' 'CCEM Desktop_aarch64.app.tar.gz.sig')"
+          x64_bundle_url="$(asset_url_any 'CCEM.Desktop_x64.app.tar.gz' 'CCEM Desktop_x64.app.tar.gz')"
+          x64_sig_id="$(asset_id_any 'CCEM.Desktop_x64.app.tar.gz.sig' 'CCEM Desktop_x64.app.tar.gz.sig')"
+          windows_bundle_url="$(asset_url_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)$')"
+          windows_sig_id="$(asset_id_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)\.sig$')"
+
+          for value in "$aarch64_bundle_url" "$aarch64_sig_id" "$x64_bundle_url" "$x64_sig_id" "$windows_bundle_url" "$windows_sig_id"; do
             if [[ -z "$value" || "$value" == "null" ]]; then
               echo "Missing updater bundle or signature asset for ${TAG_NAME}" >&2
               jq -r '.assets[].name' "$release_json" >&2
@@ -281,9 +356,9 @@ jobs:
             fi
           done
 
-          aarch64_sig="$(curl -fsSL "$aarch64_sig_url" | tr -d '\r\n')"
-          x64_sig="$(curl -fsSL "$x64_sig_url" | tr -d '\r\n')"
-          windows_sig="$(curl -fsSL "$windows_sig_url" | tr -d '\r\n')"
+          aarch64_sig="$(curl -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${aarch64_sig_id}" | tr -d '\r\n')"
+          x64_sig="$(curl -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${x64_sig_id}" | tr -d '\r\n')"
+          windows_sig="$(curl -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${windows_sig_id}" | tr -d '\r\n')"
           pub_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           notes="See https://github.com/${REPO}/releases/tag/${TAG_NAME}"
 
@@ -327,6 +402,41 @@ jobs:
             -H "Content-Type: application/json" \
             --data-binary @latest.json \
             "${upload_url}?name=latest.json"
+
+  publish-release:
+    name: Publish Verified Release
+    needs: [prepare-release, build-desktop, publish-updater-manifest]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ !cancelled()
+          && needs.build-desktop.result == 'success'
+          && needs.publish-updater-manifest.result == 'success'
+          && (github.event_name != 'workflow_dispatch' || inputs.draft == 'false') }}
+
+    steps:
+      - name: Publish verified draft release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.publish-updater-manifest.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPO}"
+          auth_headers=(
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Verified draft release id is invalid" >&2
+            exit 1
+          fi
+          curl -fsSL -X PATCH \
+            "${auth_headers[@]}" \
+            -H "Content-Type: application/json" \
+            --data '{"draft":false}' \
+            "${api}/releases/${RELEASE_ID}"
 
   # Universal binary (optional — combines both architectures)
   create-universal:

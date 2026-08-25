@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/native-runtime-helper.mjs && esbuild src/dshHistory.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/dsh-history-helper.mjs --external:koffi",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:run": "pnpm build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",
