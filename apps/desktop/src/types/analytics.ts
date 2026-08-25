@@ -9,6 +9,14 @@ export interface TokenUsage {
 
 export interface TokenUsageWithCost extends TokenUsage {
   cost: number;
+  unpricedTokens: number;
+  costIncomplete: boolean;
+}
+
+export interface DshSourceStatus {
+  available: boolean;
+  error: string | null;
+  sessionCount: number;
 }
 
 export type ModelBreakdownHistory = Record<string, Record<string, TokenUsageWithCost>>;
@@ -23,6 +31,7 @@ export interface UsageStats {
   byModel: Record<string, TokenUsageWithCost>;
   byEnvironment: Record<string, TokenUsageWithCost>;
   lastUpdated: string;
+  dshStatus?: DshSourceStatus;
 }
 
 export interface DailyActivity {

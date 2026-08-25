@@ -14,7 +14,7 @@ import { ccemMotion, clearMotionProps, getMotionTargets, gsap, shouldReduceMotio
 import type { DailyActivity, UsageStats } from '@/types/analytics';
 import { shallow } from 'zustand/shallow';
 
-type UsageSourceFilter = 'all' | 'claude' | 'codex' | 'opencode';
+type UsageSourceFilter = 'all' | 'claude' | 'codex' | 'opencode' | 'dsh';
 const ANALYTICS_CACHE_TTL_MS = 60_000;
 
 interface AnalyticsCacheResult {
@@ -166,6 +166,7 @@ export function Analytics() {
   const [loadError, setLoadError] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [usageSource, setUsageSource] = useState<UsageSourceFilter>('all');
+  const [localViewStats, setLocalViewStats] = useState<UsageStats | null>(null);
   const [showSharePoster, setShowSharePoster] = useState(false);
   const requestSeqRef = useRef(0);
   const analyticsMotionRef = useRef<HTMLDivElement>(null);
@@ -175,6 +176,8 @@ export function Analytics() {
   const buildMilestones = useCallback((stats: UsageStats, streakDays: number) => {
     const totalTokens = stats.total.inputTokens + stats.total.outputTokens + stats.total.cacheReadTokens + stats.total.cacheCreationTokens;
     const totalCost = stats.total.cost;
+    // Cost milestones only trigger when cost is fully priced (not incomplete)
+    const costFullyPriced = !stats.total.costIncomplete;
 
     return [
       {
@@ -211,7 +214,7 @@ export function Analytics() {
         description: t('analytics.firstTenDesc'),
         target: 10,
         current: totalCost,
-        achieved: totalCost >= 10,
+        achieved: costFullyPriced && totalCost >= 10,
       },
       {
         id: 'cost-100',
@@ -220,7 +223,7 @@ export function Analytics() {
         description: t('analytics.hundredDesc'),
         target: 100,
         current: totalCost,
-        achieved: totalCost >= 100,
+        achieved: costFullyPriced && totalCost >= 100,
       },
       {
         id: 'streak-7',
@@ -234,25 +237,31 @@ export function Analytics() {
     ];
   }, [t]);
 
-  const applyAnalyticsData = useCallback((result: AnalyticsCacheResult) => {
-    setUsageStats(result.stats);
+  const applyAnalyticsData = useCallback((result: AnalyticsCacheResult, source: UsageSourceFilter) => {
+    if (source === 'all') {
+      setUsageStats(result.stats);
+      setContinuousUsageDays(result.streakDays);
+      setMilestones(buildMilestones(result.stats, result.streakDays));
+      setLocalViewStats(null);
+    } else {
+      setLocalViewStats(result.stats);
+    }
     setIsUsingMockData(false);
-    setContinuousUsageDays(result.streakDays);
-    setMilestones(buildMilestones(result.stats, result.streakDays));
   }, [buildMilestones, setContinuousUsageDays, setMilestones, setUsageStats]);
 
   const loadRealData = useCallback(async (force = false) => {
     const requestSeq = ++requestSeqRef.current;
+    const currentSource = usageSource;
 
     try {
       setLoadError(false);
-      const result = await fetchAnalyticsSource(usageSource, force);
+      const result = await fetchAnalyticsSource(currentSource, force);
 
       if (requestSeq !== requestSeqRef.current) {
         return;
       }
 
-      applyAnalyticsData(result);
+      applyAnalyticsData(result, currentSource);
     } catch (err) {
       if (requestSeq !== requestSeqRef.current) {
         return;
@@ -342,14 +351,20 @@ export function Analytics() {
     );
   }, { scope: analyticsMotionRef, dependencies: [analyticsMotionKey] });
 
-  const totalTokensRaw = usageStats
-    ? usageStats.total.inputTokens + usageStats.total.outputTokens + usageStats.total.cacheReadTokens + usageStats.total.cacheCreationTokens
+  // For filtered sources, use local view stats; for 'all', use global store
+  const viewStats = usageSource === 'all' ? usageStats : (localViewStats ?? usageStats);
+
+  const totalTokensRaw = viewStats
+    ? viewStats.total.inputTokens + viewStats.total.outputTokens + viewStats.total.cacheReadTokens + viewStats.total.cacheCreationTokens
     : 0;
-  const weeklyTokensRaw = usageStats
-    ? usageStats.week.inputTokens + usageStats.week.outputTokens + usageStats.week.cacheReadTokens + usageStats.week.cacheCreationTokens
+  const weeklyTokensRaw = viewStats
+    ? viewStats.week.inputTokens + viewStats.week.outputTokens + viewStats.week.cacheReadTokens + viewStats.week.cacheCreationTokens
     : 0;
-  const totalCostRaw = usageStats?.total.cost ?? 0;
-  const weeklyCostRaw = usageStats?.week.cost ?? 0;
+  const totalCostRaw = viewStats?.total.cost ?? 0;
+  const weeklyCostRaw = viewStats?.week.cost ?? 0;
+  const totalCostIncomplete = viewStats?.total.costIncomplete ?? false;
+  const totalUnpricedTokens = viewStats?.total.unpricedTokens ?? 0;
+  const weeklyCostIncomplete = viewStats?.week.costIncomplete ?? false;
   const streakDays = continuousUsageDays ?? 0;
 
   const animatedTotalTokens = useCountUp(totalTokensRaw);
@@ -359,11 +374,11 @@ export function Analytics() {
   const animatedStreakDays = useCountUp(streakDays);
 
   const tokenChange = useMemo(() => {
-    if (!usageStats) {
+    if (!viewStats) {
       return null;
     }
 
-    const sorted = Object.entries(usageStats.dailyHistory)
+    const sorted = Object.entries(viewStats.dailyHistory)
       .sort(([a], [b]) => a.localeCompare(b));
     const thisWeekEntries = sorted.slice(-7);
     const prevWeekEntries = sorted.slice(-14, -7);
@@ -378,14 +393,14 @@ export function Analytics() {
     return prevWeekEntries.length > 0 && prevWeekTokens > 0
       ? ((thisWeekTokens - prevWeekTokens) / prevWeekTokens) * 100
       : null;
-  }, [usageStats]);
+  }, [viewStats]);
 
   const dailyActivities: DailyActivity[] = useMemo(() => {
-    if (!usageStats?.dailyHistory) {
+    if (!viewStats?.dailyHistory) {
       return [];
     }
 
-    const entries = Object.entries(usageStats.dailyHistory);
+    const entries = Object.entries(viewStats.dailyHistory);
     const tokenCounts = entries.map(([, usage]) => (
       usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreationTokens
     ));
@@ -420,7 +435,7 @@ export function Analytics() {
     }
 
     return result;
-  }, [usageStats]);
+  }, [viewStats]);
 
   if (isLoadingStats || !usageStats) {
     return <AnalyticsSkeleton />;
@@ -452,7 +467,7 @@ export function Analytics() {
         {/* Source filter + actions row */}
         <div className="mb-5 flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:flex-nowrap sm:overflow-x-auto sm:[scrollbar-width:none] sm:[&::-webkit-scrollbar]:hidden" role="radiogroup" aria-label="Source filter">
-            {(['all', 'claude', 'codex', 'opencode'] as UsageSourceFilter[]).map((source) => (
+            {(['all', 'claude', 'codex', 'opencode', 'dsh'] as UsageSourceFilter[]).map((source) => (
               <button
                 key={source}
                 data-testid={`analytics-filter-${source}`}
@@ -473,6 +488,7 @@ export function Analytics() {
                 {source === 'claude' && t('analytics.sourceClaude')}
                 {source === 'codex' && t('analytics.sourceCodex')}
                 {source === 'opencode' && t('analytics.sourceOpencode')}
+                {source === 'dsh' && 'DSH'}
               </button>
             ))}
           </div>
@@ -511,11 +527,12 @@ export function Analytics() {
             />
             <MetricCell
               value={`$${(animatedTotalCostCents / 100).toFixed(2)}`}
-              label={t('analytics.costTotal')}
+              label={totalCostIncomplete ? t('analytics.costKnown') : t('analytics.costTotal')}
+              annotation={totalCostIncomplete ? `+${totalUnpricedTokens.toLocaleString()} unpriced tokens` : undefined}
             />
             <MetricCell
               value={`$${(animatedWeeklyCostCents / 100).toFixed(2)}`}
-              label={t('analytics.costThisWeek')}
+              label={weeklyCostIncomplete ? t('analytics.costKnown') : t('analytics.costThisWeek')}
             />
             <MetricCell
               value={animatedWeeklyTokens.toLocaleString()}
@@ -535,17 +552,58 @@ export function Analytics() {
             />
           </div>
 
+          {/* DSH source status indicator */}
+          {viewStats?.dshStatus && (usageSource === 'all' || usageSource === 'dsh') && !viewStats.dshStatus.available && (
+            <div data-testid="dsh-source-status" className="col-span-full mt-2 rounded-lg border border-[hsl(var(--warning)/0.3)] bg-[hsl(var(--warning)/0.06)] px-4 py-2 text-xs text-[hsl(var(--warning-foreground))]">
+              DSH: {viewStats.dshStatus.error ?? 'unavailable'}
+            </div>
+          )}
+
           <div className="min-w-0">
             <HeatmapCalendar activities={dailyActivities} compact={false} />
           </div>
         </div>
       </section>
 
+      {/* Provider / Environment distribution */}
+      {viewStats && Object.keys(viewStats.byEnvironment).length > 0 && (
+        <section data-testid="provider-distribution" data-analytics-motion-panel className="mt-6 rounded-2xl border border-border-subtle bg-[hsl(var(--surface))] px-5 py-5 sm:px-8 sm:py-6">
+          <h3
+            className="mb-4 text-sm font-medium text-muted-foreground"
+            style={{ fontFamily: 'system-ui, -apple-system, sans-serif', letterSpacing: '-0.01em' }}
+          >
+            {t('analytics.providerDistribution')}
+          </h3>
+          <div className="space-y-2.5">
+            {Object.entries(viewStats.byEnvironment)
+              .sort(([, a], [, b]) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
+              .map(([env, usage]) => {
+                const envTokens = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
+                const pct = totalTokensRaw > 0 ? (envTokens / totalTokensRaw) * 100 : 0;
+                return (
+                  <div key={env} data-testid={`provider-row-${env}`} className="flex items-center gap-3">
+                    <span className="w-24 shrink-0 truncate text-xs font-medium text-foreground">{env}</span>
+                    <div className="relative h-5 flex-1 overflow-hidden rounded-full bg-[hsl(var(--surface-sunken))]">
+                      <div
+                        className="absolute inset-y-0 left-0 rounded-full bg-primary/70 transition-all duration-300"
+                        style={{ width: `${Math.max(pct, 0.5)}%` }}
+                      />
+                    </div>
+                    <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                      {pct.toFixed(1)}%
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        </section>
+      )}
+
       {/* Charts Section — white surface */}
       <section data-analytics-motion-panel className="mt-8">
         <Suspense fallback={<AnalyticsInsightsFallback />}>
           <LazyAnalyticsInsights
-            usageStats={usageStats}
+            usageStats={viewStats!}
             usageSource={usageSource}
             enableModelBreakdown={!isUsingMockData}
             milestones={milestones}
@@ -576,6 +634,7 @@ function MetricCell({
   label,
   trend,
   suffix,
+  annotation,
   featured = false,
   className,
 }: {
@@ -583,6 +642,7 @@ function MetricCell({
   label: string;
   trend?: number | null;
   suffix?: React.ReactNode;
+  annotation?: string;
   featured?: boolean;
   className?: string;
 }) {
@@ -629,6 +689,11 @@ function MetricCell({
       >
         {label}
       </span>
+      {annotation && (
+        <span data-testid="cost-incomplete-annotation" className="mt-0.5 block text-xs text-[hsl(var(--warning-foreground))]">
+          {annotation}
+        </span>
+      )}
     </div>
   );
 }

@@ -169,7 +169,7 @@ export function PosterCardTerminal({
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, margin: '5px 0', color: '#2aaa2a' }}>
             <span>COST</span>
-            <span style={{ color: '#33ff33' }}>${usageStats.total.cost.toFixed(2)}</span>
+            <span style={{ color: '#33ff33' }}>{usageStats.total.costIncomplete ? '≥' : ''}${usageStats.total.cost.toFixed(2)}</span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, margin: '5px 0', color: '#2aaa2a' }}>
             <span>TOTAL</span>

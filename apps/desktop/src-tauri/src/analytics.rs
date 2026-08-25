@@ -1,8 +1,9 @@
 // apps/desktop/src-tauri/src/analytics.rs
 //
-// Native JSONL scanner for Claude, Codex, and OpenCode usage.
+// Native JSONL scanner for Claude, Codex, OpenCode, and DSH usage.
 
 use crate::config;
+use crate::dsh_history;
 use crate::opencode;
 use chrono::{Datelike, Local, NaiveDate};
 use fs2::FileExt;
@@ -20,14 +21,13 @@ use std::time::{Duration, Instant};
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
-// Version 5 adds per-file parse continuation state to `CacheFileEntry`
-// (`parseOffset`, `lastLineComplete`, `codexState`, `claudeState`) and
-// supersedes the v4 usage-accounting changes (message.id final-snapshot
-// dedup, subagent transcript discovery). Caches stamped with an older
-// version are discarded on read and rebuilt from scratch (one-time full
-// parse after upgrade).
-const USAGE_CACHE_VERSION: u32 = 5;
-const USAGE_SUMMARY_VERSION: u32 = 1;
+const SOURCE_DSH: &str = "dsh";
+// Version 6 adds DSH virtual-key entries (`dsh://<sourceInstanceId>/<sessionId>`)
+// with an opaque `revision` field for cache reuse, and `unpriced_tokens` /
+// `cost_incomplete` to TokenUsageWithCost/UsageStats. Caches stamped with an
+// older version are discarded on read and rebuilt from scratch.
+const USAGE_CACHE_VERSION: u32 = 6;
+const USAGE_SUMMARY_VERSION: u32 = 2;
 const USAGE_STATS_MEMO_TTL: Duration = Duration::from_secs(60);
 const OPENCODE_NATIVE_ENV_NAME: &str = opencode::OPENCODE_NATIVE_ENV_NAME;
 /// Shadow-compare gate: when enabled, every incremental parse also runs a
@@ -58,6 +58,10 @@ pub struct TokenUsageWithCost {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cost: f64,
+    #[serde(default)]
+    pub unpriced_tokens: u64,
+    #[serde(default)]
+    pub cost_incomplete: bool,
 }
 
 impl TokenUsageWithCost {
@@ -67,6 +71,8 @@ impl TokenUsageWithCost {
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_creation_tokens += other.cache_creation_tokens;
         self.cost += other.cost;
+        self.unpriced_tokens += other.unpriced_tokens;
+        self.cost_incomplete |= other.cost_incomplete;
     }
 }
 
@@ -82,6 +88,17 @@ pub struct UsageStats {
     pub by_model: HashMap<String, TokenUsageWithCost>,
     pub by_environment: HashMap<String, TokenUsageWithCost>,
     pub last_updated: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_status: Option<DshSourceStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DshSourceStatus {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub session_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +212,9 @@ struct CacheFileEntry {
     codex_state: Option<CodexParseState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_state: Option<ClaudeParseState>,
+    /// Opaque revision string for DSH entries — used for cache reuse/invalidation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
 }
 
 fn default_last_line_complete() -> bool {
@@ -212,6 +232,7 @@ impl CacheFileEntry {
             last_line_complete: true,
             codex_state: None,
             claude_state: None,
+            revision: None,
         }
     }
 }
@@ -1053,6 +1074,7 @@ fn source_aware_entry(
             UsageSource::Claude => Some(claude_state.unwrap_or_default()),
             UsageSource::Codex => None,
         },
+        revision: None,
     }
 }
 
@@ -1488,6 +1510,13 @@ fn refresh_usage_cache_locked() -> CacheFile {
         new_cache.files.insert(path_key, entry);
     }
 
+    // DSH usage — virtual keys dsh://<sourceInstanceId>/<sessionId>
+    let dsh_result = load_dsh_usage_data(&prices, &existing_cache);
+    *lock_dsh_status() = Some(dsh_result.status);
+    for (path_key, entry) in dsh_result.entries {
+        new_cache.files.insert(path_key, entry);
+    }
+
     if !cache_files_have_same_meta(&existing_cache.files, &new_cache.files) {
         write_usage_cache(&new_cache);
     }
@@ -1876,6 +1905,268 @@ fn normalize_unix_timestamp(timestamp: u64) -> u64 {
 }
 
 // ============================================================================
+// DSH usage discovery and cache integration
+// ============================================================================
+
+/// Result of attempting to load DSH usage data.
+struct DshLoadResult {
+    entries: HashMap<String, CacheFileEntry>,
+    status: DshSourceStatus,
+}
+
+/// Map DSH provider name to environment display name.
+fn dsh_provider_to_environment(provider: Option<&str>) -> Option<String> {
+    match provider.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let lower = p.to_ascii_lowercase();
+            if lower.contains("deepseek") {
+                Some("DeepSeek".to_string())
+            } else {
+                Some(p.to_string())
+            }
+        }
+        None => None,
+    }
+}
+
+/// Convert a millisecond timestamp to ISO 8601 (local time).
+fn ms_to_iso(ms: i64) -> String {
+    use chrono::TimeZone;
+    let secs = ms / 1000;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    match Local.timestamp_opt(secs, nanos) {
+        chrono::LocalResult::Single(dt) => dt.to_rfc3339(),
+        _ => {
+            // Fallback: just use the seconds
+            Local.timestamp_opt(secs, 0)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| format!("1970-01-01T00:00:00+00:00"))
+        }
+    }
+}
+
+/// Load DSH usage entries from the helper (blocking, no AppHandle).
+/// On failure: returns empty entries with error status.
+fn load_dsh_usage_data(
+    prices: &HashMap<String, ModelPrice>,
+    existing_cache: &CacheFile,
+) -> DshLoadResult {
+    let source = match dsh_history::resolve_dsh_source() {
+        Ok(s) => s,
+        Err(dsh_history::DshHistoryError::Absent) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: None,
+                    session_count: 0,
+                },
+            };
+        }
+        Err(e) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some(e.to_string()),
+                    session_count: 0,
+                },
+            };
+        }
+    };
+
+    let roots = vec![source.sessions_root.to_string_lossy().to_string()];
+    let request = dsh_history::DshHistoryRequest::Usage { roots: roots.clone() };
+
+    let helper_path = match resolve_dsh_helper_for_analytics() {
+        Some(p) => p,
+        None => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some("DSH helper not found".to_string()),
+                    session_count: 0,
+                },
+            };
+        }
+    };
+
+    let ccem_node = match resolve_ccem_node_for_analytics() {
+        Some(p) => p,
+        None => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some("ccem-node sidecar not found".to_string()),
+                    session_count: 0,
+                },
+            };
+        }
+    };
+
+    let request_json = match serde_json::to_string(&request) {
+        Ok(j) => j,
+        Err(e) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some(format!("serialize error: {e}")),
+                    session_count: 0,
+                },
+            };
+        }
+    };
+    let roots_json = serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string());
+
+    let usage_entries: Vec<dsh_history::DshUsageEntry> = match dsh_history::process::invoke_helper_core(
+        helper_path,
+        ccem_node,
+        request_json,
+        roots_json,
+        &dsh_history::InvocationLimits::production(),
+    ) {
+        Ok((entries, _warnings)) => entries,
+        Err(e) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some(e.to_string()),
+                    session_count: 0,
+                },
+            };
+        }
+    };
+
+    let session_count = usage_entries.len() as u32;
+    let mut entries = HashMap::new();
+
+    for usage_entry in &usage_entries {
+        let path_key = format!(
+            "dsh://{}/{}",
+            usage_entry.source_instance_id, usage_entry.session_id
+        );
+
+        // Check cache: if revision matches, reuse
+        if let Some(cached) = existing_cache.files.get(&path_key) {
+            if cached.revision.as_deref() == usage_entry.revision.as_deref()
+                && usage_entry.revision.is_some()
+            {
+                entries.insert(path_key, cached.clone());
+                continue;
+            }
+        }
+
+        // Build stats from steps
+        let stats = build_dsh_cache_stats(&usage_entry.steps, prices);
+        entries.insert(
+            path_key,
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 0.0, size: 0 },
+                stats,
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: usage_entry.revision.clone(),
+            },
+        );
+    }
+
+    DshLoadResult {
+        entries,
+        status: DshSourceStatus {
+            available: true,
+            error: None,
+            session_count,
+        },
+    }
+}
+
+/// Build CacheStats from DSH usage steps.
+fn build_dsh_cache_stats(
+    steps: &[dsh_history::DshUsageStep],
+    prices: &HashMap<String, ModelPrice>,
+) -> CacheStats {
+    let mut entries = Vec::with_capacity(steps.len());
+    for step in steps {
+        let model = step.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let environment = dsh_provider_to_environment(step.provider.as_deref());
+        let cost = calculate_cost_or_zero(
+            &model,
+            step.input_tokens,
+            step.output_tokens,
+            step.cache_read_tokens,
+            step.cache_write_tokens,
+            prices,
+        );
+        let timestamp = step
+            .time
+            .map(|t| ms_to_iso(t))
+            .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
+
+        entries.push(CacheEntry {
+            timestamp,
+            model,
+            environment,
+            usage: CacheUsage {
+                input_tokens: step.input_tokens,
+                output_tokens: step.output_tokens,
+                cache_read_tokens: step.cache_read_tokens,
+                cache_creation_tokens: step.cache_write_tokens,
+                cost,
+            },
+        });
+    }
+    CacheStats { entries }
+}
+
+/// Resolve DSH helper script path without AppHandle.
+fn resolve_dsh_helper_for_analytics() -> Option<PathBuf> {
+    // In debug: try source path first
+    if cfg!(debug_assertions) {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("dsh-history")
+            .join("lib/dsh-history-helper.mjs");
+        if source.exists() {
+            return Some(source);
+        }
+    }
+
+    // Release: next to executable
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidates = [
+        exe_dir.join("../Resources/resources/dsh-history/lib/dsh-history-helper.mjs"),
+        exe_dir.join("resources/dsh-history/lib/dsh-history-helper.mjs"),
+        exe_dir.join("dsh-history/lib/dsh-history-helper.mjs"),
+    ];
+    candidates.iter().find(|p| p.exists()).cloned()
+}
+
+/// Resolve ccem-node sidecar path without AppHandle.
+fn resolve_ccem_node_for_analytics() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let name = if cfg!(windows) { "ccem-node.exe" } else { "ccem-node" };
+    let path = exe_dir.join(name);
+    if path.exists() { Some(path) } else { None }
+}
+
+/// Global DSH source status — populated during each cache refresh.
+static DSH_SOURCE_STATUS: OnceLock<Mutex<Option<DshSourceStatus>>> = OnceLock::new();
+
+fn lock_dsh_status() -> MutexGuard<'static, Option<DshSourceStatus>> {
+    DSH_SOURCE_STATUS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+// ============================================================================
 // Timestamp helpers
 // ============================================================================
 
@@ -1984,6 +2275,9 @@ fn detect_source_from_path(path: &str) -> Option<&'static str> {
     if path.starts_with("opencode://") {
         return Some(SOURCE_OPENCODE);
     }
+    if path.starts_with("dsh://") {
+        return Some(SOURCE_DSH);
+    }
     None
 }
 
@@ -2002,14 +2296,19 @@ fn normalize_usage_source(source: Option<&str>) -> Result<Option<&'static str>, 
         SOURCE_CLAUDE => Ok(Some(SOURCE_CLAUDE)),
         SOURCE_CODEX => Ok(Some(SOURCE_CODEX)),
         SOURCE_OPENCODE => Ok(Some(SOURCE_OPENCODE)),
+        SOURCE_DSH => Ok(Some(SOURCE_DSH)),
         _ => Err(format!(
-            "Unsupported source '{}'. Use claude, codex, opencode, or all.",
+            "Unsupported source '{}'. Use claude, codex, opencode, dsh, or all.",
             raw
         )),
     }
 }
 
-fn aggregate_cache(cache: &CacheFile, source_filter: Option<&'static str>) -> UsageStats {
+fn aggregate_cache(
+    cache: &CacheFile,
+    source_filter: Option<&'static str>,
+    prices: &HashMap<String, ModelPrice>,
+) -> UsageStats {
     let now = Local::now();
     let today_str = now.format("%Y-%m-%d").to_string();
 
@@ -2035,12 +2334,40 @@ fn aggregate_cache(cache: &CacheFile, source_filter: Option<&'static str>) -> Us
         }
 
         for entry in &file_entry.stats.entries {
+            let total_entry_tokens = entry.usage.input_tokens
+                + entry.usage.output_tokens
+                + entry.usage.cache_read_tokens
+                + entry.usage.cache_creation_tokens;
+
+            // Category-aware unpriced detection: check which token categories
+            // lack a known rate for this model.
+            let unpriced_tokens = match get_model_price(&entry.model, prices) {
+                None => {
+                    // No price entry at all — all tokens are unpriced
+                    total_entry_tokens
+                }
+                Some(price) => {
+                    // Check each category: if the category has tokens but no rate, those are unpriced
+                    let mut unpriced = 0u64;
+                    if entry.usage.cache_read_tokens > 0 && price.cache_read_input_token_cost.is_none() {
+                        unpriced += entry.usage.cache_read_tokens;
+                    }
+                    if entry.usage.cache_creation_tokens > 0 && price.cache_creation_input_token_cost.is_none() {
+                        unpriced += entry.usage.cache_creation_tokens;
+                    }
+                    unpriced
+                }
+            };
+            let is_unpriced = unpriced_tokens > 0;
+
             let token_usage = TokenUsageWithCost {
                 input_tokens: entry.usage.input_tokens,
                 output_tokens: entry.usage.output_tokens,
                 cache_read_tokens: entry.usage.cache_read_tokens,
                 cache_creation_tokens: entry.usage.cache_creation_tokens,
                 cost: entry.usage.cost,
+                unpriced_tokens,
+                cost_incomplete: is_unpriced,
             };
 
             stats.total.add(&token_usage);
@@ -2100,6 +2427,7 @@ fn aggregate_model_breakdown(
     source_filter: Option<&'static str>,
     granularity: ModelBreakdownGranularity,
     now: chrono::DateTime<Local>,
+    prices: &HashMap<String, ModelPrice>,
 ) -> ModelBreakdownHistory {
     let mut breakdown: ModelBreakdownHistory = HashMap::new();
 
@@ -2116,12 +2444,34 @@ fn aggregate_model_breakdown(
                 continue;
             };
 
+            let total_entry_tokens = entry.usage.input_tokens
+                + entry.usage.output_tokens
+                + entry.usage.cache_read_tokens
+                + entry.usage.cache_creation_tokens;
+
+            let unpriced_tokens = match get_model_price(&entry.model, prices) {
+                None => total_entry_tokens,
+                Some(price) => {
+                    let mut unpriced = 0u64;
+                    if entry.usage.cache_read_tokens > 0 && price.cache_read_input_token_cost.is_none() {
+                        unpriced += entry.usage.cache_read_tokens;
+                    }
+                    if entry.usage.cache_creation_tokens > 0 && price.cache_creation_input_token_cost.is_none() {
+                        unpriced += entry.usage.cache_creation_tokens;
+                    }
+                    unpriced
+                }
+            };
+            let is_unpriced = unpriced_tokens > 0;
+
             let token_usage = TokenUsageWithCost {
                 input_tokens: entry.usage.input_tokens,
                 output_tokens: entry.usage.output_tokens,
                 cache_read_tokens: entry.usage.cache_read_tokens,
                 cache_creation_tokens: entry.usage.cache_creation_tokens,
                 cost: entry.usage.cost,
+                unpriced_tokens,
+                cost_incomplete: is_unpriced,
             };
 
             breakdown
@@ -2197,7 +2547,14 @@ pub async fn get_usage_stats(
         // is still TTL-fresh; one collected after (by a concurrent refresh)
         // is, preserving single-flight for concurrent force requests.
         let cache = shared_usage_cache(force_requested.then_some(request_started));
-        let stats = aggregate_cache(&cache, source_filter);
+        let prices = load_model_prices();
+        let mut stats = aggregate_cache(&cache, source_filter, &prices);
+
+        // Attach DSH source status for 'all' or 'dsh' queries
+        if source_filter.is_none() || source_filter == Some(SOURCE_DSH) {
+            stats.dsh_status = lock_dsh_status().clone();
+        }
+
         if source_filter.is_none() {
             write_usage_summary(&stats);
         }
@@ -2224,7 +2581,8 @@ pub async fn get_usage_history(
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
         let cache = shared_usage_cache(None);
-        let stats = aggregate_cache(&cache, source_filter);
+        let prices = load_model_prices();
+        let stats = aggregate_cache(&cache, source_filter, &prices);
 
         Ok(UsageHistory {
             daily: stats.daily_history,
@@ -2244,11 +2602,13 @@ pub async fn get_usage_model_breakdown(
         let source_filter = normalize_usage_source(source.as_deref())?;
         let granularity = ModelBreakdownGranularity::parse(&granularity)?;
         let cache = shared_usage_cache(None);
+        let prices = load_model_prices();
         Ok(aggregate_model_breakdown(
             &cache,
             source_filter,
             granularity,
             Local::now(),
+            &prices,
         ))
     })
     .await
@@ -2260,7 +2620,8 @@ pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, St
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
         let cache = shared_usage_cache(None);
-        let stats = aggregate_cache(&cache, source_filter);
+        let prices = load_model_prices();
+        let stats = aggregate_cache(&cache, source_filter, &prices);
         Ok(calculate_streak(&stats.daily_history))
     })
     .await
@@ -2269,17 +2630,18 @@ pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, St
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
-        extract_model_breakdown_bucket, format_week_bucket, full_parse_jsonl, get_file_meta,
-        lock_usage_snapshot, lock_usage_stats_memo, normalize_usage_source,
-        parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
-        parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
-        refresh_discovered_entry, shared_usage_cache, should_reuse_usage_stats, snapshot_is_fresh,
-        write_json_atomic, write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry,
-        CacheMeta, CacheStats, CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
-        ModelBreakdownGranularity, ModelPrice, UsageSource, UsageStats,
-        ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
-        TEST_SNAPSHOT_REFRESH,
+        aggregate_cache, aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
+        detect_source_from_path, dsh_provider_to_environment, extract_model_breakdown_bucket,
+        format_week_bucket, full_parse_jsonl, get_file_meta, lock_usage_snapshot,
+        lock_usage_stats_memo, normalize_usage_source, parse_claude_jsonl_reader,
+        parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
+        read_usage_cache_at, read_usage_summary_from, refresh_discovered_entry,
+        shared_usage_cache, should_reuse_usage_stats, snapshot_is_fresh, write_json_atomic,
+        write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheStats,
+        CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
+        ModelBreakdownGranularity, ModelPrice, TokenUsageWithCost, UsageSource, UsageStats,
+        ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE, SOURCE_DSH,
+        TEST_SNAPSHOT_REFRESH, USAGE_CACHE_VERSION, USAGE_SUMMARY_VERSION,
     };
     use chrono::{Local, TimeZone};
     use std::collections::HashMap;
@@ -2611,6 +2973,7 @@ mod tests {
             Some(SOURCE_CLAUDE),
             ModelBreakdownGranularity::Hour,
             fixed_now(),
+            &default_prices(),
         );
 
         assert!(result.contains_key(&visible_bucket));
@@ -2681,19 +3044,19 @@ mod tests {
         );
 
         let day_result =
-            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Day, fixed_now());
+            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Day, fixed_now(), &default_prices());
         assert_eq!(day_result.len(), 7);
         assert!(!day_result.contains_key("2026-02-27"));
         assert_eq!(day_result["2026-03-06"]["claude-opus-4-5"].input_tokens, 80);
 
         let week_result =
-            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Week, fixed_now());
+            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Week, fixed_now(), &default_prices());
         assert!(week_result.contains_key(&format_week_bucket(
             chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap()
         )));
 
         let month_result =
-            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Month, fixed_now());
+            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Month, fixed_now(), &default_prices());
         let march_total = &month_result["2026-03"]["claude-opus-4-5"];
         assert_eq!(march_total.input_tokens, 330);
         assert_eq!(march_total.output_tokens, 0);
@@ -3316,6 +3679,7 @@ mod tests {
             claude_state: Some(ClaudeParseState {
                 message_entry_indexes: HashMap::from([("msg_roundtrip".to_string(), 3)]),
             }),
+            revision: None,
         };
 
         // A cache stamped with an old version is discarded wholesale.
@@ -3396,5 +3760,473 @@ mod tests {
         .stats;
         let codex_reader = parse_codex_jsonl_reader(BufReader::new(codex_content.as_bytes()), &prices);
         assert_eq!(codex_byte_core, codex_reader);
+    }
+
+    // ── Phase 3: DSH Analytics Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_dsh_source_detection_from_virtual_key() {
+        // dsh:// virtual keys should resolve to SOURCE_DSH
+        let source = detect_source_from_path("dsh://instance123/session456");
+        assert_eq!(source, Some(SOURCE_DSH));
+    }
+
+    #[test]
+    fn test_dsh_normalize_usage_source() {
+        assert_eq!(
+            normalize_usage_source(Some("dsh")),
+            Ok(Some(SOURCE_DSH))
+        );
+    }
+
+    #[test]
+    fn test_unpriced_tokens_propagation_via_add() {
+        let mut a = TokenUsageWithCost {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 5,
+            cost: 0.5,
+            unpriced_tokens: 0,
+            cost_incomplete: false,
+        };
+        let b = TokenUsageWithCost {
+            input_tokens: 200,
+            output_tokens: 100,
+            cache_read_tokens: 20,
+            cache_creation_tokens: 10,
+            cost: 0.0,
+            unpriced_tokens: 330,
+            cost_incomplete: true,
+        };
+        a.add(&b);
+        assert_eq!(a.input_tokens, 300);
+        assert_eq!(a.output_tokens, 150);
+        assert!((a.cost - 0.5).abs() < 0.001);
+        assert_eq!(a.unpriced_tokens, 330);
+        assert!(a.cost_incomplete);
+    }
+
+    #[test]
+    fn test_unpriced_tokens_both_incomplete() {
+        let mut a = TokenUsageWithCost {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: 0.0,
+            unpriced_tokens: 150,
+            cost_incomplete: true,
+        };
+        let b = TokenUsageWithCost {
+            input_tokens: 200,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: 0.0,
+            unpriced_tokens: 200,
+            cost_incomplete: true,
+        };
+        a.add(&b);
+        assert_eq!(a.unpriced_tokens, 350);
+        assert!(a.cost_incomplete);
+    }
+
+    #[test]
+    fn test_unpriced_tokens_mixed_pricing_in_aggregate() {
+        // Build a CacheFile with one priced and one unpriced entry
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![
+                        CacheEntry {
+                            timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+                            model: "claude-sonnet-4-5".to_string(),
+                            environment: Some("official".to_string()),
+                            usage: CacheUsage {
+                                input_tokens: 1000,
+                                output_tokens: 500,
+                                cache_read_tokens: 100,
+                                cache_creation_tokens: 50,
+                                cost: 0.02,
+                            },
+                        },
+                        CacheEntry {
+                            timestamp: "2026-08-20T11:00:00.000Z".to_string(),
+                            model: "unknown-model".to_string(),
+                            environment: Some("dsh".to_string()),
+                            usage: CacheUsage {
+                                input_tokens: 2000,
+                                output_tokens: 1000,
+                                cache_read_tokens: 200,
+                                cache_creation_tokens: 100,
+                                cost: 0.0,
+                            },
+                        },
+                    ],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&cache, None, &default_prices());
+        // Total should include all tokens
+        assert_eq!(stats.total.input_tokens, 3000);
+        assert_eq!(stats.total.output_tokens, 1500);
+        // Cost should only be from priced entry
+        assert!((stats.total.cost - 0.02).abs() < 0.001);
+        // Unpriced tokens from the zero-cost entry
+        assert_eq!(stats.total.unpriced_tokens, 3300); // 2000+1000+200+100
+        assert!(stats.total.cost_incomplete);
+    }
+
+    #[test]
+    fn test_fully_priced_has_no_unpriced_tokens() {
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 100,
+                            cache_creation_tokens: 50,
+                            cost: 0.02,
+                        },
+                    }],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(stats.total.unpriced_tokens, 0);
+        assert!(!stats.total.cost_incomplete);
+    }
+
+    #[test]
+    fn test_dsh_provider_to_environment_mapping() {
+        assert_eq!(dsh_provider_to_environment(Some("anthropic")), Some("anthropic".to_string()));
+        assert_eq!(dsh_provider_to_environment(Some("Anthropic")), Some("Anthropic".to_string()));
+        assert_eq!(dsh_provider_to_environment(Some("openai")), Some("openai".to_string()));
+        assert_eq!(dsh_provider_to_environment(Some("DeepSeek-chat")), Some("DeepSeek".to_string()));
+        assert_eq!(dsh_provider_to_environment(Some("some-custom")), Some("some-custom".to_string()));
+        assert_eq!(dsh_provider_to_environment(None), None);
+        assert_eq!(dsh_provider_to_environment(Some("")), None);
+    }
+
+    #[test]
+    fn test_usage_cache_version_is_6() {
+        assert_eq!(USAGE_CACHE_VERSION, 6);
+    }
+
+    #[test]
+    fn test_usage_summary_version_is_2() {
+        assert_eq!(USAGE_SUMMARY_VERSION, 2);
+    }
+
+    #[test]
+    fn test_dsh_cache_entry_revision_reuse() {
+        // CacheFileEntry with a revision should preserve it through serialization
+        let entry = CacheFileEntry {
+            meta: CacheMeta { mtime: 1.0, size: 10 },
+            stats: CacheStats { entries: vec![] },
+            parse_offset: 0,
+            last_line_complete: true,
+            codex_state: None,
+            claude_state: None,
+            revision: Some("rev_abc123".to_string()),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let deser: CacheFileEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.revision, Some("rev_abc123".to_string()));
+    }
+
+    #[test]
+    fn test_dsh_cache_entry_revision_none_round_trip() {
+        let entry = CacheFileEntry {
+            meta: CacheMeta { mtime: 1.0, size: 10 },
+            stats: CacheStats { entries: vec![] },
+            parse_offset: 0,
+            last_line_complete: true,
+            codex_state: None,
+            claude_state: None,
+            revision: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let deser: CacheFileEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.revision, None);
+    }
+
+    #[test]
+    fn test_dsh_source_filter_excludes_non_dsh() {
+        let mut files = HashMap::new();
+        // Legacy claude entry
+        files.insert(
+            "/home/user/.claude/projects/foo/usage.jsonl".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 5000,
+                            output_tokens: 2000,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            cost: 0.10,
+                        },
+                    }],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        // DSH entry
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-20T11:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 3000,
+                            output_tokens: 1000,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            cost: 0.05,
+                        },
+                    }],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            last_updated: None,
+        };
+
+        // Filter by DSH: only DSH entry
+        let dsh_stats = aggregate_cache(&cache, Some(SOURCE_DSH), &default_prices());
+        assert_eq!(dsh_stats.total.input_tokens, 3000);
+        assert!((dsh_stats.total.cost - 0.05).abs() < 0.001);
+
+        // No filter (all): both entries
+        let all_stats = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(all_stats.total.input_tokens, 8000);
+        assert!((all_stats.total.cost - 0.15).abs() < 0.001);
+
+        // DSH == All minus legacy baseline
+        assert_eq!(
+            all_stats.total.input_tokens - dsh_stats.total.input_tokens,
+            5000
+        );
+    }
+
+    #[test]
+    fn test_category_aware_pricing_partial_rate_gap() {
+        // A model with input/output rates but no cache_read/cache_creation rates:
+        // only cache tokens should be unpriced, and costIncomplete should be set.
+        let mut custom_prices = HashMap::new();
+        custom_prices.insert(
+            "partial-model".to_string(),
+            ModelPrice {
+                input_cost_per_token: 1e-6,
+                output_cost_per_token: 2e-6,
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+            },
+        );
+
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-25T10:00:00.000Z".to_string(),
+                        model: "partial-model".to_string(),
+                        environment: Some("custom".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 200,
+                            cache_creation_tokens: 100,
+                            cost: 0.002,
+                        },
+                    }],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&cache, None, &custom_prices);
+        // Only cache tokens (200 + 100 = 300) are unpriced
+        assert_eq!(stats.total.unpriced_tokens, 300);
+        assert!(stats.total.cost_incomplete);
+        // Cost is still non-zero (from input+output)
+        assert!((stats.total.cost - 0.002).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_category_aware_pricing_fully_covered_model() {
+        // A model with all rates defined: no unpriced tokens even with cache tokens
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-25T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 200,
+                            cache_creation_tokens: 100,
+                            cost: 0.01,
+                        },
+                    }],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            last_updated: None,
+        };
+        // claude-sonnet-4-5 has all 4 rates defined
+        let stats = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(stats.total.unpriced_tokens, 0);
+        assert!(!stats.total.cost_incomplete);
+    }
+
+    /// Regression: production aggregators must use user-provided prices, not just
+    /// default_prices(). A custom price table that lacks cache rates must yield
+    /// cost_incomplete even when default_prices() would fully cover the model.
+    #[test]
+    fn test_production_path_uses_user_prices_not_defaults() {
+        // Build a cache with cache_read_tokens for claude-sonnet-4-5
+        let mut files = HashMap::new();
+        files.insert(
+            "file1.jsonl".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta { mtime: 1.0, size: 10 },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-25T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 300,
+                            cache_creation_tokens: 0,
+                            cost: 0.01,
+                        },
+                    }],
+                },
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            last_updated: None,
+        };
+
+        // With default prices (full coverage), no unpriced tokens
+        let stats_default = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(stats_default.total.unpriced_tokens, 0);
+        assert!(!stats_default.total.cost_incomplete);
+
+        // With custom user prices that omit cache_read rate for this model
+        let mut custom_prices = HashMap::new();
+        custom_prices.insert(
+            "claude-sonnet-4-5".to_string(),
+            ModelPrice {
+                input_cost_per_token: 3.0,
+                output_cost_per_token: 15.0,
+                cache_read_input_token_cost: None, // user hasn't configured this
+                cache_creation_input_token_cost: Some(3.75),
+            },
+        );
+        let stats_custom = aggregate_cache(&cache, None, &custom_prices);
+        // The 300 cache_read_tokens should be unpriced
+        assert_eq!(stats_custom.total.unpriced_tokens, 300);
+        assert!(stats_custom.total.cost_incomplete);
+
+        // Model breakdown also consistent with user prices
+        let breakdown = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Day,
+            fixed_now(),
+            &custom_prices,
+        );
+        // HashMap<bucket, HashMap<model, TokenUsageWithCost>>
+        let all_model_entries: Vec<_> = breakdown.values().flat_map(|m| m.values()).collect();
+        assert!(!all_model_entries.is_empty());
+        let entry = &all_model_entries[0];
+        assert_eq!(entry.unpriced_tokens, 300);
+        assert!(entry.cost_incomplete);
     }
 }
