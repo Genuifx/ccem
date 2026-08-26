@@ -1604,8 +1604,10 @@ impl From<NativeSessionSummary> for ControlSessionSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlReplayBatch {
+    source_available: bool,
     gap_detected: bool,
     truncated: bool,
+    unloaded_gap_starts: Vec<u64>,
     oldest_available_seq: Option<u64>,
     newest_available_seq: Option<u64>,
     events: Vec<Value>,
@@ -1614,8 +1616,10 @@ struct ControlReplayBatch {
 impl From<ReplayBatch> for ControlReplayBatch {
     fn from(batch: ReplayBatch) -> Self {
         Self {
+            source_available: batch.source_available,
             gap_detected: batch.gap_detected,
             truncated: batch.truncated,
+            unloaded_gap_starts: batch.unloaded_gap_starts,
             oldest_available_seq: batch.oldest_available_seq,
             newest_available_seq: batch.newest_available_seq,
             events: batch

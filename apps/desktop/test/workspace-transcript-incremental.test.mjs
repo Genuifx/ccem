@@ -234,6 +234,54 @@ test('gap inside appended events still emits the transcript gap summary', async 
   ));
 });
 
+test('limited replay suppresses only backend-proven unloaded seams, not real holes', async () => {
+  const mod = await importTranscriptModule();
+  const sparseReplay = [
+    ev(1, { type: 'lifecycle', stage: 'runtime_boot' }),
+    ev(2, { type: 'user_prompt', text: 'inspect the workspace' }),
+    ev(7, {
+      type: 'checkpoint_created',
+      checkpoint_id: 'checkpoint-1',
+      provider: 'claude',
+      source: 'claude-file-checkpoint',
+    }),
+    ev(8170, { type: 'assistant_chunk', text: 'recent tail' }),
+  ];
+  const gapStarts = mod.eventSequenceGapStarts?.(sparseReplay) ?? [];
+
+  assert.deepEqual(gapStarts, [7, 8170]);
+  const unloadedGapStarts = new Set([8170]);
+
+  const messages = mod.finalizeTranscriptMessages(
+    mod.deriveTranscriptReset(
+      [],
+      [],
+      sparseReplay,
+      null,
+      { suppressGapBeforeSeqs: unloadedGapStarts },
+    ),
+  );
+  assert.equal(
+    messages.filter((message) => message.summary === mod.TRANSCRIPT_GAP_SUMMARY_TOKEN).length,
+    1,
+  );
+
+  const initialState = mod.deriveTranscriptReset([], [], sparseReplay.slice(0, 2));
+  const incrementallyAppended = mod.finalizeTranscriptMessages(
+    mod.deriveTranscriptAppend(
+      initialState,
+      sparseReplay.slice(2),
+      unloadedGapStarts,
+    ),
+  );
+  assert.equal(
+    incrementallyAppended.filter(
+      (message) => message.summary === mod.TRANSCRIPT_GAP_SUMMARY_TOKEN,
+    ).length,
+    1,
+  );
+});
+
 test('background-task tool completions stay suppressed across incremental appends', async () => {
   const mod = await importTranscriptModule();
   const task = (toolUseId) => ({

@@ -96,6 +96,13 @@ impl NativeEventLog {
             };
 
             let events = query_events_since(conn, runtime_id, since_seq, limit)?;
+            let unloaded_gap_starts = if since_seq.is_none()
+                && limit.is_some_and(|value| value > 0)
+            {
+                limited_replay_unloaded_gap_starts(conn, runtime_id, &events)?
+            } else {
+                Vec::new()
+            };
             let truncated = replay_batch_is_truncated(
                 &events,
                 since_seq,
@@ -105,8 +112,10 @@ impl NativeEventLog {
             );
 
             Ok(ReplayBatch {
+                source_available: true,
                 gap_detected,
                 truncated,
+                unloaded_gap_starts,
                 oldest_available_seq,
                 newest_available_seq,
                 events,
@@ -612,7 +621,15 @@ fn replay_batch_is_truncated(
     gap_detected: bool,
 ) -> bool {
     if events.is_empty() {
-        return false;
+        if gap_detected {
+            return true;
+        }
+        let Some(newest_available_seq) = newest_available_seq else {
+            return false;
+        };
+        return since_seq
+            .map(|last_seen| last_seen < newest_available_seq)
+            .unwrap_or(oldest_available_seq.is_some());
     }
 
     if gap_detected {
@@ -654,6 +671,42 @@ fn replay_batch_is_truncated(
         };
         next.seq != previous.seq.saturating_add(1)
     })
+}
+
+fn limited_replay_unloaded_gap_starts(
+    conn: &Connection,
+    runtime_id: &str,
+    events: &[SessionEventRecord],
+) -> Result<Vec<u64>, String> {
+    let mut unloaded_gap_starts = Vec::new();
+    for window in events.windows(2) {
+        let [previous, next] = window else {
+            continue;
+        };
+        if next.seq <= previous.seq.saturating_add(1) {
+            continue;
+        }
+
+        let contains_omitted_event = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM native_session_events
+                    WHERE runtime_id = ?1 AND seq > ?2 AND seq < ?3
+                    LIMIT 1
+                 )",
+                params![runtime_id, previous.seq as i64, next.seq as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                format!("Failed to classify native event replay gap: {}", error)
+            })?
+            != 0;
+        if contains_omitted_event {
+            unloaded_gap_starts.push(next.seq);
+        }
+    }
+    Ok(unloaded_gap_starts)
 }
 
 fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
@@ -737,6 +790,44 @@ mod tests {
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.events[0].seq, 1);
         assert_eq!(replay.newest_available_seq, Some(2));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_marks_nonempty_bounds_with_no_decodable_rows_truncated() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-all-invalid-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+        log.append(&SessionEventRecord {
+            runtime_id: "runtime-all-invalid".to_string(),
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::AssistantChunk {
+                text: "before-corruption".to_string(),
+            },
+        })
+        .expect("append event");
+        drop(log);
+
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute(
+            "UPDATE native_session_events SET payload_json = ?1 WHERE runtime_id = ?2",
+            ["{\"type\":\"unknown-future-payload\"}", "runtime-all-invalid"],
+        )
+        .expect("corrupt stored payload");
+        drop(conn);
+
+        let reopened = NativeEventLog::new(db_path.clone());
+        let replay = reopened
+            .replay("runtime-all-invalid", None, None)
+            .expect("lossy replay");
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.oldest_available_seq, Some(1));
+        assert_eq!(replay.newest_available_seq, Some(1));
+        assert!(replay.truncated);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -921,6 +1012,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 4, 5],
         );
+        assert_eq!(replay.unloaded_gap_starts, vec![4]);
 
         let conn = Connection::open(&db_path).expect("open sqlite db");
         let duplicate_index_exists = conn
@@ -931,6 +1023,40 @@ mod tests {
             )
             .unwrap_or(false);
         assert!(!duplicate_index_exists);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_does_not_suppress_a_real_hole_in_limited_replay() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-real-hole-test-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+
+        for seq in [1, 4, 5] {
+            log.append(&SessionEventRecord {
+                runtime_id: "runtime-real-hole".to_string(),
+                seq,
+                occurred_at: Utc::now(),
+                payload: SessionEventPayload::AssistantChunk {
+                    text: format!("chunk-{seq}"),
+                },
+            })
+            .expect("append sparse chunk");
+        }
+
+        let replay = log
+            .replay("runtime-real-hole", None, Some(2))
+            .expect("replay sparse tail");
+
+        assert!(replay.truncated);
+        assert_eq!(
+            replay.events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 4, 5],
+        );
+        assert!(replay.unloaded_gap_starts.is_empty());
 
         let _ = std::fs::remove_file(db_path);
     }

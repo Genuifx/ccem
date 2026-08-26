@@ -2045,8 +2045,10 @@ impl NativeRuntimeManager {
                 if pending_count == 0 {
                     if let Some(newest_seq) = newest_available_seq {
                         return Ok(ReplayBatch {
+                            source_available: true,
                             gap_detected: false,
                             truncated: false,
+                            unloaded_gap_starts: Vec::new(),
                             oldest_available_seq,
                             newest_available_seq: Some(newest_seq),
                             events: Vec::new(),
@@ -2056,14 +2058,18 @@ impl NativeRuntimeManager {
             }
         }
 
-        match self.event_log.replay(runtime_id, since_seq, limit) {
+        let sqlite_empty_batch = match self.event_log.replay(runtime_id, since_seq, limit) {
             Ok(batch) if batch.newest_available_seq.is_some() => return Ok(batch),
-            Ok(_) => {}
-            Err(error) => eprintln!(
-                "Failed to replay native events from sqlite for {}: {}",
-                runtime_id, error
-            ),
-        }
+            Ok(batch) => Some(batch),
+            Err(error) => {
+                eprintln!(
+                    "Failed to replay native events from sqlite for {}: {}",
+                    runtime_id, error
+                );
+                None
+            }
+        };
+        let persisted_source_available = sqlite_empty_batch.is_some();
 
         let handles = self
             .handles
@@ -2071,13 +2077,15 @@ impl NativeRuntimeManager {
             .map_err(|_| "Failed to lock native runtime handles".to_string())?;
         let Some(handle) = handles.get(runtime_id) else {
             if self.has_record(runtime_id)? {
-                return Ok(ReplayBatch {
+                return Ok(sqlite_empty_batch.unwrap_or_else(|| ReplayBatch {
+                    source_available: false,
                     gap_detected: false,
-                    truncated: false,
+                    truncated: true,
+                    unloaded_gap_starts: Vec::new(),
                     oldest_available_seq: None,
                     newest_available_seq: None,
                     events: Vec::new(),
-                });
+                }));
             }
             return Err(format!("Native runtime {} not found", runtime_id));
         };
@@ -2087,6 +2095,17 @@ impl NativeRuntimeManager {
             .map_err(|_| "Failed to lock native session events".to_string())
             .map(|store| {
                 let mut batch = store.events_since(since_seq);
+                // The live store is a readable fallback, not an authoritative
+                // replacement for persisted history. Keep its tail visible,
+                // but report a partial result whenever SQLite could not be
+                // read so the frontend preserves any cached older rows.
+                // A successful but empty SQLite read is only authoritative
+                // when the live store is empty too. Rows present solely in
+                // memory prove that at least one persistence write was lost.
+                if !persisted_source_available || !batch.events.is_empty() {
+                    batch.source_available = false;
+                    batch.truncated = true;
+                }
                 if since_seq.is_none() {
                     if let Some(limit) = limit.and_then(|value| usize::try_from(value).ok()) {
                         if limit > 0 && batch.events.len() > limit {
@@ -7546,6 +7565,7 @@ mod tests {
             .replay_events_limited(runtime_id, Some(3), None)
             .expect("fast-path replay");
         assert!(fast.events.is_empty());
+        assert!(fast.source_available);
         assert!(!fast.gap_detected);
         assert!(!fast.truncated);
         assert_eq!(fast.oldest_available_seq, Some(1));
@@ -7569,6 +7589,132 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3],
         );
+    }
+
+    #[test]
+    fn replay_events_marks_record_only_fallback_unavailable_after_sqlite_failure() {
+        let runtime_id = "native-replay-unavailable";
+        let record = native_record(runtime_id, "idle", false);
+        let mut manager = manager_with_records(runtime_id, vec![record]);
+        manager.event_log = NativeEventLog::new(std::env::temp_dir());
+
+        let replay = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("record-only fallback");
+
+        assert!(!replay.source_available);
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.oldest_available_seq, None);
+        assert_eq!(replay.newest_available_seq, None);
+    }
+
+    #[test]
+    fn replay_events_marks_live_memory_fallback_partial_after_sqlite_failure() {
+        let runtime_id = "native-replay-live-memory-fallback";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.event_log = NativeEventLog::new(std::env::temp_dir());
+        let handle = manager
+            .handles
+            .lock()
+            .expect("lock handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live handle");
+        handle
+            .events
+            .lock()
+            .expect("lock in-memory events")
+            .append(SessionEventPayload::AssistantChunk {
+                text: "readable in-memory tail".to_string(),
+            });
+
+        let replay = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("live memory fallback");
+
+        assert!(!replay.source_available);
+        assert!(replay.truncated);
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.oldest_available_seq, Some(1));
+        assert_eq!(replay.newest_available_seq, Some(1));
+    }
+
+    #[test]
+    fn replay_events_marks_memory_only_rows_partial_when_sqlite_is_empty() {
+        let runtime_id = "native-replay-memory-only-after-write-failure";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("lock handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live handle");
+        handle
+            .events
+            .lock()
+            .expect("lock in-memory events")
+            .append(SessionEventPayload::AssistantChunk {
+                text: "memory-only row".to_string(),
+            });
+
+        let replay = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("memory-only fallback");
+
+        assert!(!replay.source_available);
+        assert!(replay.truncated);
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.oldest_available_seq, Some(1));
+        assert_eq!(replay.newest_available_seq, Some(1));
+    }
+
+    #[test]
+    fn replay_events_never_marks_evicted_memory_tail_complete_after_sqlite_failure() {
+        let runtime_id = "native-replay-evicted-memory-fallback";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.event_log = NativeEventLog::new(std::env::temp_dir());
+        let handle = manager
+            .handles
+            .lock()
+            .expect("lock handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live handle");
+        let mut events = handle.events.lock().expect("lock in-memory events");
+        for seq in 1..=501 {
+            events.append(SessionEventPayload::AssistantChunk {
+                text: format!("chunk-{seq}"),
+            });
+        }
+        drop(events);
+
+        let replay = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("evicted memory fallback");
+
+        assert!(!replay.source_available);
+        assert!(replay.truncated);
+        assert_eq!(replay.events.len(), 500);
+        assert_eq!(replay.oldest_available_seq, Some(2));
+        assert_eq!(replay.newest_available_seq, Some(501));
+    }
+
+    #[test]
+    fn replay_events_marks_successful_empty_sqlite_replay_available() {
+        let runtime_id = "native-replay-known-empty";
+        let record = native_record(runtime_id, "idle", false);
+        let manager = manager_with_records(runtime_id, vec![record]);
+
+        let replay = manager
+            .replay_events_limited(runtime_id, None, None)
+            .expect("known empty sqlite replay");
+
+        assert!(replay.source_available);
+        assert!(!replay.truncated);
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.oldest_available_seq, None);
+        assert_eq!(replay.newest_available_seq, None);
     }
 
     #[test]
