@@ -1,5 +1,11 @@
 # ccem
 
+## 2.73.0
+
+### Minor Changes
+
+- Release v2.73.0
+
 ## 2.72.2
 
 ### Patch Changes
