@@ -1311,6 +1311,7 @@
     "sourceAll": "All",
     "sourceClaude": "Claude",
     "sourceCodex": "Codex",
+    "sourceOther": "Other",
     "sourceOpencode": "OpenCode",
     "you": "You",
     "assistant": "Assistant",

@@ -1,7 +1,8 @@
 /**
  * JSDOM + React act() behavior tests for DSH History integration.
  * Tests production components with controlled deferred IPC promises to verify
- * race protection, error states, retry behavior, and DSH-specific rendering.
+ * race protection, error states, retry behavior, DSH-specific rendering, and
+ * source filter interactions.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -309,6 +310,221 @@ async function flush() {
 // ==========================================================================
 // Tests
 // ==========================================================================
+
+test('History folds OpenCode and DeepSeek into the Other source dropdown', async () => {
+  installDom();
+  const { harness } = await getHarness();
+  const { _mock, act } = harness;
+  const requestedSources = [];
+  _mock.fetchHistorySessionsWithDiagnostics = (source) => {
+    requestedSources.push(source);
+    return Promise.resolve({
+      sessions: [{
+        id: 'filter-test',
+        source: 'claude',
+        display: 'Filter Test',
+        project: '/p',
+        projectName: 'p',
+        timestamp: Date.now(),
+      }],
+      diagnostics: [],
+    });
+  };
+
+  const container = document.getElementById('root');
+  const app = harness.mountHistory(container);
+  await act(async () => { await flush(); });
+  const result = {
+    hasAll: Boolean(container.querySelector('[data-testid="history-filter-all"]')),
+    hasClaude: Boolean(container.querySelector('[data-testid="history-filter-claude"]')),
+    hasCodex: Boolean(container.querySelector('[data-testid="history-filter-codex"]')),
+    hasDirectOpenCode: Boolean(container.querySelector('[data-testid="history-filter-opencode"]')),
+    hasDirectDsh: Boolean(container.querySelector('[data-testid="history-filter-dsh"]')),
+    hasOther: false,
+    otherLabel: '',
+    hasOpenCodeOption: false,
+    hasDshOption: false,
+    selectedOpenCode: false,
+    selectedDsh: false,
+    activeOther: false,
+  };
+
+  const otherTrigger = container.querySelector('[data-testid="history-filter-other"]');
+  if (otherTrigger) {
+    result.hasOther = true;
+    result.otherLabel = otherTrigger.textContent;
+    await act(async () => {
+      otherTrigger.dispatchEvent(new window.PointerEvent('pointerdown', {
+        bubbles: true,
+        button: 0,
+      }));
+      otherTrigger.click();
+      await flush();
+    });
+    const openCodeOption = document.querySelector('[data-testid="history-filter-opencode-option"]');
+    const dshOption = document.querySelector('[data-testid="history-filter-dsh-option"]');
+    result.hasOpenCodeOption = Boolean(openCodeOption);
+    result.hasDshOption = Boolean(dshOption);
+    if (openCodeOption) {
+      await act(async () => { openCodeOption.click(); await flush(); });
+      result.selectedOpenCode = requestedSources.at(-1) === 'opencode'
+        && /(OpenCode|sourceOpencode)/.test(otherTrigger.textContent);
+      result.activeOther = otherTrigger.className.includes('border-primary');
+
+      await act(async () => {
+        otherTrigger.dispatchEvent(new window.PointerEvent('pointerdown', {
+          bubbles: true,
+          button: 0,
+        }));
+        otherTrigger.click();
+        await flush();
+      });
+      const reopenedDshOption = document.querySelector('[data-testid="history-filter-dsh-option"]');
+      if (reopenedDshOption) {
+        await act(async () => { reopenedDshOption.click(); await flush(); });
+        result.selectedDsh = requestedSources.at(-1) === 'dsh'
+          && /(DeepSeek|sourceDsh)/.test(otherTrigger.textContent);
+      }
+    }
+  }
+
+  app.unmount();
+
+  assert.equal(result.hasAll, true);
+  assert.equal(result.hasClaude, true);
+  assert.equal(result.hasCodex, true);
+  assert.equal(result.hasDirectOpenCode, false);
+  assert.equal(result.hasDirectDsh, false);
+  assert.equal(result.hasOther, true, 'Other dropdown trigger is visible');
+  assert.match(result.otherLabel, /(其他|Other|sourceOther)/);
+  assert.equal(result.hasOpenCodeOption, true, 'OpenCode is available in the Other menu');
+  assert.equal(result.hasDshOption, true, 'DeepSeek is available in the Other menu');
+  assert.equal(result.selectedOpenCode, true, 'Selecting OpenCode updates the active source');
+  assert.equal(result.selectedDsh, true, 'Selecting DeepSeek updates the active source');
+  assert.equal(result.activeOther, true, 'Other trigger shows the active source state');
+});
+
+test('History source controls never arm keyboard session selection', async () => {
+  installDom();
+  const { harness } = await getHarness();
+  const { _mock, act } = harness;
+  const requestedSources = [];
+  let detailRequests = 0;
+  _mock.fetchHistorySessionsWithDiagnostics = (source) => {
+    requestedSources.push(source);
+    return Promise.resolve({
+      sessions: [{
+        id: 'keyboard-filter-test',
+        source: 'claude',
+        display: 'Keyboard Filter Test',
+        project: '/p',
+        projectName: 'p',
+        timestamp: Date.now(),
+      }],
+      diagnostics: [],
+    });
+  };
+  _mock.fetchConversationDetail = () => {
+    detailRequests += 1;
+    return Promise.resolve({ messages: [], segments: [], warnings: [] });
+  };
+
+  const container = document.getElementById('root');
+  const app = harness.mountHistory(container);
+  await act(async () => { await flush(); });
+  const otherTrigger = container.querySelector('[data-testid="history-filter-other"]');
+  const sessionItem = container.querySelector('[data-testid="history-session-item"]');
+  assert.ok(otherTrigger);
+  assert.ok(sessionItem);
+  await act(async () => {
+    otherTrigger.focus();
+    otherTrigger.dispatchEvent(new window.KeyboardEvent('keydown', {
+      key: 'ArrowDown',
+      bubbles: true,
+      cancelable: true,
+    }));
+    await flush();
+  });
+  const sessionArmed = sessionItem.className.includes('ring-1');
+  const activeOption = document.activeElement;
+  assert.equal(activeOption?.getAttribute('role'), 'menuitemradio');
+  await act(async () => {
+    activeOption.dispatchEvent(new window.KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    }));
+    await flush();
+  });
+
+  const result = {
+    sessionArmed,
+    selectedSecondarySource: requestedSources.at(-1) === 'opencode'
+      || requestedSources.at(-1) === 'dsh',
+    detailRequests,
+  };
+  app.unmount();
+
+  assert.equal(result.sessionArmed, false, 'dropdown navigation does not focus a history row');
+  assert.equal(result.selectedSecondarySource, true, 'Enter selects the focused dropdown source');
+  assert.equal(result.detailRequests, 0, 'dropdown selection does not open a history session');
+});
+
+test('History session rows keep their j and arrow keyboard navigation', async () => {
+  installDom();
+  const { harness } = await getHarness();
+  const { _mock, act } = harness;
+  _mock.fetchHistorySessionsWithDiagnostics = () => Promise.resolve({
+    sessions: [
+      {
+        id: 'keyboard-row-one',
+        source: 'claude',
+        display: 'Keyboard Row One',
+        project: '/p',
+        projectName: 'p',
+        timestamp: Date.now(),
+      },
+      {
+        id: 'keyboard-row-two',
+        source: 'claude',
+        display: 'Keyboard Row Two',
+        project: '/p',
+        projectName: 'p',
+        timestamp: Date.now() - 1,
+      },
+    ],
+    diagnostics: [],
+  });
+
+  const container = document.getElementById('root');
+  const app = harness.mountHistory(container);
+  await act(async () => { await flush(); });
+  const sessionItems = container.querySelectorAll('[data-testid="history-session-item"]');
+  assert.equal(sessionItems.length, 2);
+  await act(async () => {
+    sessionItems[0].focus();
+    sessionItems[0].dispatchEvent(new window.KeyboardEvent('keydown', {
+      key: 'ArrowDown',
+      bubbles: true,
+      cancelable: true,
+    }));
+    await flush();
+  });
+  const firstRowFocused = sessionItems[0].className.includes('ring-1');
+  await act(async () => {
+    sessionItems[0].dispatchEvent(new window.KeyboardEvent('keydown', {
+      key: 'ArrowDown',
+      bubbles: true,
+      cancelable: true,
+    }));
+    await flush();
+  });
+  const secondRowFocused = sessionItems[1].className.includes('ring-1');
+  app.unmount();
+
+  assert.equal(firstRowFocused, true, 'first ArrowDown focuses the first history row');
+  assert.equal(secondRowFocused, true, 'ArrowDown advances focus to the next history row');
+});
 
 test('DSH session: no Resume button, Export available, read-only label', async () => {
   installDom();

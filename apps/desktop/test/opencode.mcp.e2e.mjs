@@ -353,13 +353,19 @@ async function main() {
     await clickSelector(bridge, '[data-testid="nav-history"]');
     await waitFor(async () => (
       (await bridge.executeJs(
-        "Boolean(document.querySelector('[data-testid=\"history-filter-opencode\"]'))"
+        "Boolean(document.querySelector('[data-testid=\"history-filter-other\"]'))"
       )) ? true : null
     ), { timeoutMs: 15000, description: 'the history page filter bar' });
 
-    await clickSelector(bridge, '[data-testid="history-filter-opencode"]');
+    await clickSelector(bridge, '[data-testid="history-filter-other"]');
+    await waitFor(async () => (
+      (await bridge.executeJs(
+        "Boolean(document.querySelector('[data-testid=\"history-filter-opencode-option\"]'))"
+      )) ? true : null
+    ), { timeoutMs: 5000, description: 'the Other source dropdown' });
+    await clickSelector(bridge, '[data-testid="history-filter-opencode-option"]');
     const historyFilterActive = await bridge.executeJs(
-      "document.querySelector('[data-testid=\"history-filter-opencode\"]')?.className.includes('border-primary') || false"
+      "Boolean(document.querySelector('[data-testid=\"history-filter-other\"]')?.className.includes('border-primary') && document.querySelector('[data-testid=\"history-filter-other\"]')?.textContent.includes('OpenCode'))"
     );
     assert.equal(historyFilterActive, true);
 

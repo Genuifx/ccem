@@ -1,10 +1,17 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
-import { MessageSquare } from '@/lib/lucide-react';
+import { ChevronDown, MessageSquare } from '@/lib/lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { HistoryList } from '@/components/history/HistoryList';
 import { getHistorySessionDisplay } from '@/components/history/historySession';
 import { EmptyState } from '@/components/ui/EmptyState';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
@@ -286,7 +293,10 @@ export function History() {
   const navigableSessionKeys = visibleSessionKeys ?? sessionKeys;
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if ((e.target as HTMLElement).tagName === 'INPUT') return;
+    if (e.defaultPrevented) return;
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT') return;
+    if (target.closest('[data-history-source-control], [role="menu"], [role^="menuitem"]')) return;
     if (navigableSessionKeys.length === 0 && e.key !== '/') return;
 
     switch (e.key) {
@@ -334,10 +344,11 @@ export function History() {
       <div className="w-[300px] shrink-0 flex flex-col glass-subtle glass-noise border-r border-white/[0.06]">
         <div className="border-b border-white/[0.06] px-4 pt-3 pb-1">
           <div className="flex items-center gap-4">
-            {(['all', 'claude', 'codex', 'opencode', 'dsh'] as HistorySourceFilter[]).map((source) => (
+            {(['all', 'claude', 'codex'] as HistorySourceFilter[]).map((source) => (
               <button
                 key={source}
                 data-testid={`history-filter-${source}`}
+                data-history-source-control
                 type="button"
                 onClick={() => startTransition(() => setSourceFilter(source))}
                 className={cn(
@@ -350,10 +361,53 @@ export function History() {
                 {source === 'all' && t('history.sourceAll')}
                 {source === 'claude' && t('history.sourceClaude')}
                 {source === 'codex' && t('history.sourceCodex')}
-                {source === 'opencode' && t('history.sourceOpencode')}
-                {source === 'dsh' && t('history.sourceDsh')}
               </button>
             ))}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  data-testid="history-filter-other"
+                  data-history-source-control
+                  type="button"
+                  className={cn(
+                    'flex items-center gap-1 border-b-2 pb-1 text-xs transition-colors duration-150',
+                    sourceFilter === 'opencode' || sourceFilter === 'dsh'
+                      ? 'border-primary font-medium text-foreground'
+                      : 'border-transparent text-muted-foreground hover:text-foreground'
+                  )}
+                >
+                  <span>
+                    {t('history.sourceOther')}
+                    {sourceFilter === 'opencode' && ` · ${t('history.sourceOpencode')}`}
+                    {sourceFilter === 'dsh' && ` · ${t('history.sourceDsh')}`}
+                  </span>
+                  <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="min-w-[132px]">
+                <DropdownMenuRadioGroup
+                  value={sourceFilter === 'opencode' || sourceFilter === 'dsh' ? sourceFilter : ''}
+                  onValueChange={(value) => {
+                    if (value === 'opencode' || value === 'dsh') {
+                      startTransition(() => setSourceFilter(value));
+                    }
+                  }}
+                >
+                  <DropdownMenuRadioItem
+                    data-testid="history-filter-opencode-option"
+                    value="opencode"
+                  >
+                    {t('history.sourceOpencode')}
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem
+                    data-testid="history-filter-dsh-option"
+                    value="dsh"
+                  >
+                    {t('history.sourceDsh')}
+                  </DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
         {diagnostics.length > 0 && (
