@@ -221,11 +221,32 @@ pub fn read_session_metadata(session_id: &str) -> Option<OpenCodeSessionMetadata
 
 pub fn list_local_sessions() -> Result<Vec<LocalOpenCodeSession>, String> {
     let metadata = read_session_metadata_map();
-    let mut sessions_by_id: HashMap<String, LocalOpenCodeSession> = HashMap::new();
+    Ok(scan_local_sessions(discover_storage_db_paths(), &metadata).0)
+}
 
-    for db_path in discover_storage_db_paths() {
-        let Ok(conn) = Connection::open(&db_path) else {
-            continue;
+/// Analytics needs to distinguish a successful empty inventory from a
+/// partial/failed scan. Other callers keep the historical best-effort API
+/// above, while this variant exposes completeness without discarding usable
+/// sessions returned by healthy databases.
+pub fn list_local_sessions_with_completeness() -> (Vec<LocalOpenCodeSession>, bool) {
+    let metadata = read_session_metadata_map();
+    scan_local_sessions(discover_storage_db_paths(), &metadata)
+}
+
+fn scan_local_sessions(
+    db_paths: Vec<PathBuf>,
+    metadata: &HashMap<String, OpenCodeSessionMetadata>,
+) -> (Vec<LocalOpenCodeSession>, bool) {
+    let mut sessions_by_id: HashMap<String, LocalOpenCodeSession> = HashMap::new();
+    let mut complete = true;
+
+    for db_path in db_paths {
+        let conn = match Connection::open(&db_path) {
+            Ok(conn) => conn,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         let inferred_project = storage_project_from_db_path(&db_path);
 
@@ -239,7 +260,10 @@ pub fn list_local_sessions() -> Result<Vec<LocalOpenCodeSession>, String> {
              WHERE s.parent_session_id IS NULL",
         ) {
             Ok(stmt) => stmt,
-            Err(_) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
 
         let rows = match stmt.query_map([], |row| {
@@ -258,10 +282,20 @@ pub fn list_local_sessions() -> Result<Vec<LocalOpenCodeSession>, String> {
             })
         }) {
             Ok(rows) => rows,
-            Err(_) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
 
-        for row in rows.flatten() {
+        for row in rows {
+            let row = match row {
+                Ok(row) => row,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             let metadata_entry = metadata.get(&row.id);
             let merged = apply_metadata_to_local_session(row, metadata_entry);
             match sessions_by_id.get(&merged.id) {
@@ -275,7 +309,7 @@ pub fn list_local_sessions() -> Result<Vec<LocalOpenCodeSession>, String> {
 
     let mut sessions: Vec<_> = sessions_by_id.into_values().collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
-    Ok(sessions)
+    (sessions, complete)
 }
 
 pub fn load_local_messages(session_id: &str) -> Result<Option<Vec<LocalOpenCodeMessage>>, String> {
@@ -676,11 +710,11 @@ fn current_timestamp_millis() -> u64 {
 mod tests {
     use super::{
         extract_text_from_parts_json, list_local_sessions, load_local_messages,
-        read_session_metadata, storage_project_from_db_path, track_launched_session,
-        OPENCODE_NATIVE_ENV_NAME,
+        read_session_metadata, scan_local_sessions, storage_project_from_db_path,
+        track_launched_session, OPENCODE_NATIVE_ENV_NAME,
     };
     use rusqlite::Connection;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
 
@@ -807,6 +841,23 @@ mod tests {
         );
 
         std::env::remove_var("CCEM_OPENCODE_DATA_DIR");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_local_db_marks_session_inventory_incomplete() {
+        let root = temp_root("corrupt-db");
+        let db_path = root.join("opencode.db");
+        fs::write(&db_path, b"not a sqlite database").expect("write corrupt db fixture");
+
+        let (sessions, complete) = scan_local_sessions(vec![db_path], &HashMap::new());
+
+        assert!(sessions.is_empty());
+        assert!(
+            !complete,
+            "a discovered but unreadable DB must not become an authoritative empty inventory"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

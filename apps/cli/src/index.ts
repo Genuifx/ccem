@@ -93,6 +93,7 @@ import {
   requestDesktopControl,
   StaleDesktopControlDescriptorError,
 } from './desktopControl.js';
+import { registerDshCommands } from './dsh/cli.js';
 
 const program = new Command();
 
@@ -1940,5 +1941,10 @@ function handleCliError(error: unknown): void {
   console.error(chalk.red(String(error)));
   process.exit(1);
 }
+
+registerDshCommands(program, {
+  getRegistries,
+  getCurrentEnvName: () => (config.get('current') as string | undefined) ?? '',
+});
 
 await program.parseAsync(process.argv).catch(handleCliError);

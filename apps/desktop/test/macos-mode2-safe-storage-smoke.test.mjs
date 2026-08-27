@@ -635,13 +635,11 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
   const safeStorageGateIndex = desktopLib.indexOf(
     'macos_safe_storage_smoke::gate_from_process_environment()',
   );
-  const nativeHelperIndex = desktopLib.indexOf(
-    'native_runtime::run_native_helper_launcher_if_requested()',
-  );
+  const nativeRuntimeIndex = desktopLib.indexOf('NativeRuntimeManager::try_new()');
   assert.ok(
     updaterGateIndex > 0
       && updaterGateIndex < safeStorageGateIndex
-      && safeStorageGateIndex < nativeHelperIndex,
+      && safeStorageGateIndex < nativeRuntimeIndex,
   );
   assert.match(desktopLib, /macos_safe_storage_smoke::rejection_json\(&error\)/u);
   assert.match(desktopLib, /macos_safe_storage_smoke::EXIT_GATE_REJECTED/u);

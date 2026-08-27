@@ -1,13 +1,16 @@
 // apps/desktop/src-tauri/src/analytics.rs
 //
-// Native JSONL scanner for Claude, Codex, and OpenCode usage.
+// Native JSONL scanner for Claude, Codex, OpenCode, and DSH usage.
 
 use crate::config;
+use crate::dsh_history;
 use crate::opencode;
 use chrono::{Datelike, Local, NaiveDate};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 #[cfg(test)]
@@ -20,14 +23,12 @@ use std::time::{Duration, Instant};
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
-// Version 5 adds per-file parse continuation state to `CacheFileEntry`
-// (`parseOffset`, `lastLineComplete`, `codexState`, `claudeState`) and
-// supersedes the v4 usage-accounting changes (message.id final-snapshot
-// dedup, subagent transcript discovery). Caches stamped with an older
-// version are discarded on read and rebuilt from scratch (one-time full
-// parse after upgrade).
-const USAGE_CACHE_VERSION: u32 = 5;
-const USAGE_SUMMARY_VERSION: u32 = 1;
+const SOURCE_DSH: &str = "dsh";
+// Version 7 stores compact per-source rollups plus one materialized global
+// rollup. Unchanged history is therefore never folded row-by-row when an
+// Analytics view opens. Versions 5 and 6 are migrated once in memory.
+const USAGE_CACHE_VERSION: u32 = 7;
+const USAGE_SUMMARY_VERSION: u32 = 2;
 const USAGE_STATS_MEMO_TTL: Duration = Duration::from_secs(60);
 const OPENCODE_NATIVE_ENV_NAME: &str = opencode::OPENCODE_NATIVE_ENV_NAME;
 /// Shadow-compare gate: when enabled, every incremental parse also runs a
@@ -58,6 +59,10 @@ pub struct TokenUsageWithCost {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cost: f64,
+    #[serde(default)]
+    pub unpriced_tokens: u64,
+    #[serde(default)]
+    pub cost_incomplete: bool,
 }
 
 impl TokenUsageWithCost {
@@ -67,6 +72,8 @@ impl TokenUsageWithCost {
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_creation_tokens += other.cache_creation_tokens;
         self.cost += other.cost;
+        self.unpriced_tokens += other.unpriced_tokens;
+        self.cost_incomplete |= other.cost_incomplete;
     }
 }
 
@@ -82,6 +89,17 @@ pub struct UsageStats {
     pub by_model: HashMap<String, TokenUsageWithCost>,
     pub by_environment: HashMap<String, TokenUsageWithCost>,
     pub last_updated: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_status: Option<DshSourceStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DshSourceStatus {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub session_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,7 +153,8 @@ impl ModelBreakdownGranularity {
 }
 
 // ============================================================================
-// Cache types — shared with ~/.ccem/usage-cache.json
+// Cache types — Desktop-owned compact cache. The legacy shared cache is only
+// read once for migration and is never overwritten by Desktop v7.
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -145,6 +164,8 @@ struct CacheFile {
     version: u32,
     #[serde(default)]
     files: HashMap<String, CacheFileEntry>,
+    #[serde(default)]
+    global_rollup: CacheRollup,
     #[serde(default)]
     last_updated: Option<String>,
 }
@@ -158,6 +179,7 @@ impl Default for CacheFile {
         Self {
             version: USAGE_CACHE_VERSION,
             files: HashMap::new(),
+            global_rollup: CacheRollup::default(),
             last_updated: None,
         }
     }
@@ -188,6 +210,8 @@ struct CacheFileEntry {
     #[serde(default)]
     stats: CacheStats,
     #[serde(default)]
+    rollup: CacheRollup,
+    #[serde(default)]
     parse_offset: u64,
     #[serde(default = "default_last_line_complete")]
     last_line_complete: bool,
@@ -195,6 +219,14 @@ struct CacheFileEntry {
     codex_state: Option<CodexParseState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_state: Option<ClaudeParseState>,
+    /// Bounded hash of the consumed prefix's head and tail. It distinguishes
+    /// true append-only growth from same-path rewrites without re-reading a
+    /// whole multi-gigabyte transcript on every append.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    append_anchor: Option<String>,
+    /// Opaque revision string for DSH entries — used for cache reuse/invalidation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
 }
 
 fn default_last_line_complete() -> bool {
@@ -204,14 +236,21 @@ fn default_last_line_complete() -> bool {
 impl CacheFileEntry {
     /// Entry for sources that are never incrementally parsed (opencode):
     /// parse continuation fields get inert values.
-    fn from_meta_stats(meta: CacheMeta, stats: CacheStats) -> Self {
+    fn from_meta_stats(meta: CacheMeta, mut stats: CacheStats, source: &str) -> Self {
+        let rollup = CacheRollup::from_entries(source, &stats.entries);
+        if source != SOURCE_CLAUDE {
+            stats.entries.clear();
+        }
         Self {
             meta,
             stats,
+            rollup,
             parse_offset: 0,
             last_line_complete: true,
             codex_state: None,
             claude_state: None,
+            append_anchor: None,
+            revision: None,
         }
     }
 }
@@ -226,7 +265,7 @@ struct CacheMeta {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 struct CacheStats {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     entries: Vec<CacheEntry>,
 }
 
@@ -252,6 +291,174 @@ struct CacheUsage {
     cache_creation_tokens: u64,
     #[serde(default)]
     cost: f64,
+}
+
+impl CacheUsage {
+    fn add(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cost += other.cost;
+    }
+
+    fn subtract(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_sub(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_sub(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_sub(other.cache_read_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_sub(other.cache_creation_tokens);
+        self.cost -= other.cost;
+        if self.cost.abs() < 1e-12 {
+            self.cost = 0.0;
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CacheRollup {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    buckets: Vec<CacheRollupBucket>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CacheRollupBucket {
+    source: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    hour: Option<String>,
+    model: String,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default)]
+    usage: CacheUsage,
+    #[serde(default)]
+    entry_count: u64,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct RollupKey {
+    source: String,
+    date: Option<String>,
+    hour: Option<String>,
+    model: String,
+    environment: Option<String>,
+}
+
+impl From<&CacheRollupBucket> for RollupKey {
+    fn from(bucket: &CacheRollupBucket) -> Self {
+        Self {
+            source: bucket.source.clone(),
+            date: bucket.date.clone(),
+            hour: bucket.hour.clone(),
+            model: bucket.model.clone(),
+            environment: bucket.environment.clone(),
+        }
+    }
+}
+
+impl CacheRollup {
+    fn from_entries(source: &str, entries: &[CacheEntry]) -> Self {
+        let mut buckets: HashMap<RollupKey, CacheRollupBucket> = HashMap::new();
+        for entry in entries {
+            let key = RollupKey {
+                source: source.to_string(),
+                date: extract_date(&entry.timestamp),
+                hour: extract_hour(&entry.timestamp),
+                model: entry.model.clone(),
+                environment: entry
+                    .environment
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned(),
+            };
+            let bucket = buckets
+                .entry(key.clone())
+                .or_insert_with(|| CacheRollupBucket {
+                    source: key.source.clone(),
+                    date: key.date.clone(),
+                    hour: key.hour.clone(),
+                    model: key.model.clone(),
+                    environment: key.environment.clone(),
+                    ..Default::default()
+                });
+            bucket.usage.add(&entry.usage);
+            bucket.entry_count += 1;
+        }
+        Self::from_bucket_map(buckets)
+    }
+
+    fn from_file_entries(files: &HashMap<String, CacheFileEntry>) -> Self {
+        let mut accumulator = RollupAccumulator::default();
+        for entry in files.values() {
+            accumulator.add(&entry.rollup);
+        }
+        accumulator.finish()
+    }
+
+    fn from_bucket_map(buckets: HashMap<RollupKey, CacheRollupBucket>) -> Self {
+        let mut buckets = buckets.into_values().collect::<Vec<_>>();
+        buckets.sort_by_key(|bucket| RollupKey::from(bucket));
+        Self { buckets }
+    }
+}
+
+#[derive(Default)]
+struct RollupAccumulator {
+    buckets: HashMap<RollupKey, CacheRollupBucket>,
+}
+
+impl RollupAccumulator {
+    fn from_rollup(rollup: &CacheRollup) -> Self {
+        let mut accumulator = Self::default();
+        accumulator.add(rollup);
+        accumulator
+    }
+
+    fn add(&mut self, rollup: &CacheRollup) {
+        for incoming in &rollup.buckets {
+            let key = RollupKey::from(incoming);
+            let bucket = self
+                .buckets
+                .entry(key)
+                .or_insert_with(|| CacheRollupBucket {
+                    source: incoming.source.clone(),
+                    date: incoming.date.clone(),
+                    hour: incoming.hour.clone(),
+                    model: incoming.model.clone(),
+                    environment: incoming.environment.clone(),
+                    ..Default::default()
+                });
+            bucket.usage.add(&incoming.usage);
+            bucket.entry_count += incoming.entry_count;
+        }
+    }
+
+    fn subtract(&mut self, rollup: &CacheRollup) {
+        for outgoing in &rollup.buckets {
+            let key = RollupKey::from(outgoing);
+            let remove = if let Some(bucket) = self.buckets.get_mut(&key) {
+                bucket.usage.subtract(&outgoing.usage);
+                bucket.entry_count = bucket.entry_count.saturating_sub(outgoing.entry_count);
+                bucket.entry_count == 0
+            } else {
+                false
+            };
+            if remove {
+                self.buckets.remove(&key);
+            }
+        }
+    }
+
+    fn finish(self) -> CacheRollup {
+        CacheRollup::from_bucket_map(self.buckets)
+    }
 }
 
 /// Claude parse continuation state persisted in the cache entry (see the
@@ -383,11 +590,29 @@ fn normalize_model_name(model: &str) -> String {
     s
 }
 
+#[cfg(test)]
+thread_local! {
+    static MODEL_PRICE_LOOKUP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_model_price_lookup_count() {
+    MODEL_PRICE_LOOKUP_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn model_price_lookup_count() -> usize {
+    MODEL_PRICE_LOOKUP_COUNT.with(std::cell::Cell::get)
+}
+
 /// Look up model price: direct -> normalized -> fuzzy -> keyword fallback (Claude only).
 fn get_model_price<'a>(
     model: &str,
     prices: &'a HashMap<String, ModelPrice>,
 ) -> Option<&'a ModelPrice> {
+    #[cfg(test)]
+    MODEL_PRICE_LOOKUP_COUNT.with(|count| count.set(count.get() + 1));
+
     if let Some(p) = prices.get(model) {
         return Some(p);
     }
@@ -473,32 +698,50 @@ struct DiscoveredFile {
     source: UsageSource,
 }
 
-fn discover_jsonl_files() -> Vec<DiscoveredFile> {
-    let mut files = Vec::new();
-    files.extend(discover_claude_jsonl_files());
-    files.extend(discover_codex_jsonl_files());
-    files
+struct JsonlDiscovery {
+    files: Vec<DiscoveredFile>,
+    claude_complete: bool,
+    codex_complete: bool,
+}
+
+fn discover_jsonl_files() -> JsonlDiscovery {
+    let (mut files, claude_complete) = discover_claude_jsonl_files();
+    let (codex_files, codex_complete) = discover_codex_jsonl_files();
+    files.extend(codex_files);
+    JsonlDiscovery {
+        files,
+        claude_complete,
+        codex_complete,
+    }
 }
 
 /// Scan ~/.claude/projects/*/*.jsonl
-fn discover_claude_jsonl_files() -> Vec<DiscoveredFile> {
+fn discover_claude_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
     let mut files = Vec::new();
     let home = match dirs::home_dir() {
         Some(h) => h,
-        None => return files,
+        None => return (files, false),
     };
 
     let projects_dir = home.join(".claude").join("projects");
     if !projects_dir.exists() {
-        return files;
+        return (files, true);
     }
 
     let projects = match fs::read_dir(&projects_dir) {
         Ok(entries) => entries,
-        Err(_) => return files,
+        Err(_) => return (files, false),
     };
 
-    for project_entry in projects.flatten() {
+    let mut complete = true;
+    for project_entry in projects {
+        let project_entry = match project_entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
         let project_path = project_entry.path();
         if !project_path.is_dir() {
             continue;
@@ -506,10 +749,10 @@ fn discover_claude_jsonl_files() -> Vec<DiscoveredFile> {
         // Depth-limited walk: main transcripts sit directly in the project
         // dir, while subagent transcripts (Task tool / dynamic routing) live
         // under `<session-id>/subagents/agent-*.jsonl` — 2 levels deeper.
-        collect_claude_jsonl_dir(&project_path, 0, 3, &mut files);
+        complete &= collect_claude_jsonl_dir(&project_path, 0, 3, &mut files);
     }
 
-    files
+    (files, complete)
 }
 
 fn collect_claude_jsonl_dir(
@@ -517,19 +760,27 @@ fn collect_claude_jsonl_dir(
     depth: usize,
     max_depth: usize,
     out: &mut Vec<DiscoveredFile>,
-) {
+) -> bool {
     if depth > max_depth {
-        return;
+        return true;
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return,
+        Err(_) => return false,
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
         let path = entry.path();
         let is_dir = path.is_dir();
         if is_dir {
-            collect_claude_jsonl_dir(&path, depth + 1, max_depth, out);
+            complete &= collect_claude_jsonl_dir(&path, depth + 1, max_depth, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(DiscoveredFile {
                 path,
@@ -537,29 +788,41 @@ fn collect_claude_jsonl_dir(
             });
         }
     }
+    complete
 }
 
 /// Scan ~/.codex/sessions recursively for *.jsonl
-fn discover_codex_jsonl_files() -> Vec<DiscoveredFile> {
+fn discover_codex_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
     let mut files = Vec::new();
     let home = match dirs::home_dir() {
         Some(h) => h,
-        None => return files,
+        None => return (files, false),
     };
 
     let sessions_dir = home.join(".codex").join("sessions");
     if !sessions_dir.exists() {
-        return files;
+        return (files, true);
     }
 
+    let mut complete = true;
     let mut stack = vec![sessions_dir];
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
@@ -575,7 +838,7 @@ fn discover_codex_jsonl_files() -> Vec<DiscoveredFile> {
         }
     }
 
-    files
+    (files, complete)
 }
 
 // ============================================================================
@@ -996,6 +1259,38 @@ fn read_jsonl_tail(path: &Path, offset: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+const APPEND_ANCHOR_WINDOW: u64 = 64 * 1024;
+
+/// Hash a bounded sample of the bytes already consumed by the incremental
+/// parser. Most session files fit entirely inside the two windows. Large files
+/// hash both the head and the bytes immediately before `offset`, catching the
+/// normal same-path rewrite/rotation shapes while keeping append validation
+/// constant-time.
+fn compute_append_anchor(path: &Path, offset: u64) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() < offset {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(offset.to_le_bytes());
+
+    let head_len = offset.min(APPEND_ANCHOR_WINDOW) as usize;
+    let mut head = vec![0u8; head_len];
+    file.read_exact(&mut head).ok()?;
+    hasher.update(&head);
+
+    if offset > APPEND_ANCHOR_WINDOW {
+        let tail_start = offset.saturating_sub(APPEND_ANCHOR_WINDOW);
+        file.seek(SeekFrom::Start(tail_start)).ok()?;
+        let mut tail = vec![0u8; (offset - tail_start) as usize];
+        file.read_exact(&mut tail).ok()?;
+        hasher.update(&tail);
+    }
+
+    Some(hex::encode(hasher.finalize()))
+}
+
 /// Verify `offset` sits on a line boundary by checking the preceding byte is
 /// `\n` (offset 0 is trivially a boundary). Detects same-path rewrites that
 /// would otherwise make the cached offset point mid-line.
@@ -1025,7 +1320,7 @@ fn full_parse_jsonl(
 ) -> CacheFileEntry {
     let bytes = read_jsonl_tail(path, 0).unwrap_or_default();
     let tail = parse_jsonl_tail(source, &bytes, 0, ParseResume::default(), prices);
-    source_aware_entry(
+    let mut entry = source_aware_entry(
         meta,
         tail.stats,
         tail.consumed_offset,
@@ -1033,21 +1328,32 @@ fn full_parse_jsonl(
         Some(tail.codex_state),
         Some(tail.claude_state),
         source,
-    )
+    );
+    entry.append_anchor = compute_append_anchor(path, entry.parse_offset);
+    entry
 }
 
 fn source_aware_entry(
     meta: CacheMeta,
-    stats: CacheStats,
+    mut stats: CacheStats,
     parse_offset: u64,
     last_line_complete: bool,
     codex_state: Option<CodexParseState>,
     claude_state: Option<ClaudeParseState>,
     source: UsageSource,
 ) -> CacheFileEntry {
+    let source_name = match source {
+        UsageSource::Claude => SOURCE_CLAUDE,
+        UsageSource::Codex => SOURCE_CODEX,
+    };
+    let rollup = CacheRollup::from_entries(source_name, &stats.entries);
+    if source == UsageSource::Codex {
+        stats.entries.clear();
+    }
     CacheFileEntry {
         meta,
         stats,
+        rollup,
         parse_offset,
         last_line_complete,
         codex_state: match source {
@@ -1058,6 +1364,8 @@ fn source_aware_entry(
             UsageSource::Claude => Some(claude_state.unwrap_or_default()),
             UsageSource::Codex => None,
         },
+        append_anchor: None,
+        revision: None,
     }
 }
 
@@ -1071,7 +1379,11 @@ fn refresh_discovered_entry(
 ) -> CacheFileEntry {
     if let Some(cached) = cached {
         if (cached.meta.mtime - meta.mtime).abs() < 1.0 && cached.meta.size == meta.size {
-            return cached.clone();
+            let mut entry = cached.clone();
+            if entry.append_anchor.is_none() {
+                entry.append_anchor = compute_append_anchor(&discovered.path, entry.parse_offset);
+            }
+            return entry;
         }
         if let Some(entry) = incremental_refresh_entry(cached, discovered, &meta, prices) {
             return entry;
@@ -1101,6 +1413,12 @@ fn incremental_refresh_entry(
     if !offset_is_line_boundary(&discovered.path, cached.parse_offset) {
         return None;
     }
+    let cached_anchor = cached.append_anchor.as_deref()?;
+    if compute_append_anchor(&discovered.path, cached.parse_offset).as_deref()
+        != Some(cached_anchor)
+    {
+        return None;
+    }
 
     let bytes = read_jsonl_tail(&discovered.path, cached.parse_offset)?;
     // Resume from the cached entries + accumulator states instead of
@@ -1112,14 +1430,18 @@ fn incremental_refresh_entry(
         &bytes,
         cached.parse_offset,
         ParseResume {
-            entries: cached.stats.entries.clone(),
+            entries: if discovered.source == UsageSource::Claude {
+                cached.stats.entries.clone()
+            } else {
+                Vec::new()
+            },
             claude_state: cached.claude_state.clone().unwrap_or_default(),
             codex_state: cached.codex_state.clone().unwrap_or_default(),
         },
         prices,
     );
 
-    let entry = source_aware_entry(
+    let mut entry = source_aware_entry(
         meta.clone(),
         tail.stats,
         tail.consumed_offset,
@@ -1129,20 +1451,33 @@ fn incremental_refresh_entry(
         discovered.source,
     );
 
+    if discovered.source == UsageSource::Codex {
+        let mut accumulator = RollupAccumulator::from_rollup(&cached.rollup);
+        accumulator.add(&entry.rollup);
+        entry.rollup = accumulator.finish();
+    }
+    entry.append_anchor = compute_append_anchor(&discovered.path, entry.parse_offset);
+
     if ANALYTICS_SHADOW_INCREMENTAL {
         let full = full_parse_jsonl(discovered.source, &discovered.path, meta.clone(), prices);
-        if entry.stats != full.stats {
+        if entry.stats != full.stats || entry.rollup != full.rollup {
             eprintln!(
                 "analytics shadow mismatch for {}: incremental {:?} != full {:?}",
                 discovered.path.display(),
-                entry.stats,
-                full.stats
+                entry.rollup,
+                full.rollup
             );
         }
         debug_assert_eq!(
             entry.stats,
             full.stats,
-            "incremental parse diverged from full parse for {}",
+            "incremental entries diverged from full parse for {}",
+            discovered.path.display()
+        );
+        debug_assert_eq!(
+            entry.rollup,
+            full.rollup,
+            "incremental rollup diverged from full parse for {}",
             discovered.path.display()
         );
     }
@@ -1155,6 +1490,10 @@ fn incremental_refresh_entry(
 // ============================================================================
 
 fn usage_cache_path() -> PathBuf {
+    config::get_ccem_dir().join("usage-cache-desktop.json")
+}
+
+fn legacy_usage_cache_path() -> PathBuf {
     config::get_ccem_dir().join("usage-cache.json")
 }
 
@@ -1163,22 +1502,56 @@ fn usage_summary_path() -> PathBuf {
 }
 
 fn read_usage_cache() -> CacheFile {
-    read_usage_cache_at(&usage_cache_path())
+    let desktop_path = usage_cache_path();
+    if desktop_path.exists() {
+        read_usage_cache_at(&desktop_path)
+    } else {
+        // One-way, read-only import. The CLI and older Desktop releases keep
+        // owning usage-cache.json; v7 never overwrites it.
+        read_usage_cache_at(&legacy_usage_cache_path())
+    }
 }
 
-/// Read a usage cache from an explicit path (test seam). A cache stamped with
-/// any version other than the current one is discarded and treated as empty,
-/// so a version bump triggers a one-time full rebuild.
+fn compact_cache(mut cache: CacheFile) -> CacheFile {
+    for (path, entry) in &mut cache.files {
+        let Some(source) = detect_source_from_path(path) else {
+            continue;
+        };
+        if entry.rollup.buckets.is_empty() && !entry.stats.entries.is_empty() {
+            entry.rollup = CacheRollup::from_entries(source, &entry.stats.entries);
+        }
+        if source != SOURCE_CLAUDE {
+            entry.stats.entries.clear();
+        }
+    }
+    cache.global_rollup = CacheRollup::from_file_entries(&cache.files);
+    cache.version = USAGE_CACHE_VERSION;
+    cache
+}
+
+/// Read a usage cache from an explicit path (test seam). Versions 5 and 6
+/// are compacted once into v7. Older versions fail closed.
 fn read_usage_cache_at(path: &Path) -> CacheFile {
     if !path.exists() {
         return CacheFile::default();
     }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(_) => return CacheFile::default(),
     };
-    match serde_json::from_str::<CacheFile>(&content) {
-        Ok(cache) if cache.version == USAGE_CACHE_VERSION => cache,
+    match serde_json::from_reader::<_, CacheFile>(std::io::BufReader::new(file)) {
+        Ok(cache) if cache.version == USAGE_CACHE_VERSION => {
+            if cache.global_rollup.buckets.is_empty()
+                && cache.files.values().any(|entry| {
+                    !entry.rollup.buckets.is_empty() || !entry.stats.entries.is_empty()
+                })
+            {
+                compact_cache(cache)
+            } else {
+                cache
+            }
+        }
+        Ok(cache) if matches!(cache.version, 5 | 6) => compact_cache(cache),
         _ => CacheFile::default(),
     }
 }
@@ -1431,8 +1804,87 @@ fn cache_files_have_same_meta(
             existing.get(path).is_some_and(|cached| {
                 (cached.meta.mtime - entry.meta.mtime).abs() < 1.0
                     && cached.meta.size == entry.meta.size
+                    && cached.stats == entry.stats
+                    && cached.rollup == entry.rollup
+                    && cached.parse_offset == entry.parse_offset
+                    && cached.last_line_complete == entry.last_line_complete
+                    && cached.codex_state == entry.codex_state
+                    && cached.claude_state == entry.claude_state
+                    && cached.append_anchor == entry.append_anchor
+                    && cached.revision == entry.revision
             })
         })
+}
+
+/// Apply only changed file contributions to the persisted global rollup.
+/// The returned counter is the number of compact buckets added/subtracted;
+/// callers ignore it in production, while tests use it to prove unchanged
+/// histories do not enter the aggregation path.
+fn update_global_rollup(
+    existing: &CacheFile,
+    next_files: &HashMap<String, CacheFileEntry>,
+) -> (CacheRollup, usize) {
+    let baseline = if existing.global_rollup.buckets.is_empty() {
+        CacheRollup::from_file_entries(&existing.files)
+    } else {
+        existing.global_rollup.clone()
+    };
+    let mut accumulator = RollupAccumulator::from_rollup(&baseline);
+    let mut bucket_mutations = 0usize;
+
+    for (path, old_entry) in &existing.files {
+        match next_files.get(path) {
+            None => {
+                accumulator.subtract(&old_entry.rollup);
+                bucket_mutations += old_entry.rollup.buckets.len();
+            }
+            Some(next_entry) if next_entry.rollup != old_entry.rollup => {
+                accumulator.subtract(&old_entry.rollup);
+                accumulator.add(&next_entry.rollup);
+                bucket_mutations +=
+                    old_entry.rollup.buckets.len() + next_entry.rollup.buckets.len();
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (path, next_entry) in next_files {
+        if !existing.files.contains_key(path) {
+            accumulator.add(&next_entry.rollup);
+            bucket_mutations += next_entry.rollup.buckets.len();
+        }
+    }
+
+    (accumulator.finish(), bucket_mutations)
+}
+
+/// A failed or partial enumeration is not evidence that previously cached
+/// sessions were deleted. Preserve unseen entries for that source until a
+/// later authoritative enumeration succeeds.
+fn retain_incomplete_source_entries(
+    existing: &CacheFile,
+    source: &str,
+    next: &mut HashMap<String, CacheFileEntry>,
+    complete: bool,
+) {
+    if complete {
+        return;
+    }
+    for (path, entry) in &existing.files {
+        if detect_source_from_path(path) == Some(source) {
+            next.entry(path.clone()).or_insert_with(|| entry.clone());
+        }
+    }
+}
+
+fn should_write_usage_cache(
+    desktop_cache_exists: bool,
+    existing: &CacheFile,
+    next: &CacheFile,
+) -> bool {
+    !desktop_cache_exists
+        || !cache_files_have_same_meta(&existing.files, &next.files)
+        || existing.global_rollup != next.global_rollup
 }
 
 // ============================================================================
@@ -1443,7 +1895,7 @@ fn cache_files_have_same_meta(
 fn refresh_usage_cache() -> CacheFile {
     let _process_guard = lock_usage_refresh();
     let _ = config::ensure_ccem_dir();
-    let lock_path = config::get_ccem_dir().join("usage-cache.lock");
+    let lock_path = config::get_ccem_dir().join("usage-cache-desktop.lock");
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1467,58 +1919,119 @@ fn refresh_usage_cache() -> CacheFile {
 
 fn refresh_usage_cache_locked() -> CacheFile {
     let prices = load_model_prices();
-    let jsonl_files = discover_jsonl_files();
+    let discovery = discover_jsonl_files();
+    let mut claude_complete = discovery.claude_complete;
+    let mut codex_complete = discovery.codex_complete;
+    let desktop_cache_exists = usage_cache_path().exists();
     let existing_cache = read_usage_cache();
 
     let mut new_cache = CacheFile {
         version: USAGE_CACHE_VERSION,
         files: HashMap::new(),
+        global_rollup: CacheRollup::default(),
         last_updated: Some(Local::now().to_rfc3339()),
     };
 
-    for discovered in jsonl_files {
+    for discovered in discovery.files {
         let path_str = discovered.path.to_string_lossy().to_string();
 
         let meta = match get_file_meta(&discovered.path) {
             Some(m) => m,
-            None => continue,
+            None => {
+                match discovered.source {
+                    UsageSource::Claude => claude_complete = false,
+                    UsageSource::Codex => codex_complete = false,
+                }
+                continue;
+            }
         };
 
         let cached = existing_cache.files.get(&path_str);
         let entry = refresh_discovered_entry(cached, &discovered, meta, &prices);
+        if entry.append_anchor.is_none() {
+            match discovered.source {
+                UsageSource::Claude => claude_complete = false,
+                UsageSource::Codex => codex_complete = false,
+            }
+            continue;
+        }
 
         new_cache.files.insert(path_str, entry);
     }
 
-    for (path_key, entry) in load_opencode_cache_entries(&prices, &existing_cache) {
+    retain_incomplete_source_entries(
+        &existing_cache,
+        SOURCE_CLAUDE,
+        &mut new_cache.files,
+        claude_complete,
+    );
+    retain_incomplete_source_entries(
+        &existing_cache,
+        SOURCE_CODEX,
+        &mut new_cache.files,
+        codex_complete,
+    );
+
+    let opencode_result = load_opencode_cache_entries(&prices, &existing_cache);
+    for (path_key, entry) in opencode_result.entries {
         new_cache.files.insert(path_key, entry);
     }
+    retain_incomplete_source_entries(
+        &existing_cache,
+        SOURCE_OPENCODE,
+        &mut new_cache.files,
+        opencode_result.complete,
+    );
 
-    if !cache_files_have_same_meta(&existing_cache.files, &new_cache.files) {
+    // DSH usage — virtual keys dsh://<sourceInstanceId>/<sessionId>
+    let dsh_result = load_dsh_usage_data(&prices, &existing_cache);
+    *lock_dsh_status() = Some(dsh_result.status);
+    for (path_key, entry) in dsh_result.entries {
+        new_cache.files.insert(path_key, entry);
+    }
+    retain_incomplete_source_entries(
+        &existing_cache,
+        SOURCE_DSH,
+        &mut new_cache.files,
+        dsh_result.complete,
+    );
+
+    new_cache.global_rollup = update_global_rollup(&existing_cache, &new_cache.files).0;
+
+    if should_write_usage_cache(desktop_cache_exists, &existing_cache, &new_cache) {
         write_usage_cache(&new_cache);
     }
     new_cache
 }
 
+struct SourceCacheLoad {
+    entries: HashMap<String, CacheFileEntry>,
+    complete: bool,
+}
+
 fn load_opencode_cache_entries(
     prices: &HashMap<String, ModelPrice>,
     existing_cache: &CacheFile,
-) -> HashMap<String, CacheFileEntry> {
-    let local_sessions = opencode::list_local_sessions()
-        .unwrap_or_default()
+) -> SourceCacheLoad {
+    let (local_sessions, local_complete) = opencode::list_local_sessions_with_completeness();
+    let local_sessions = local_sessions
         .into_iter()
         .map(|session| (session.id.clone(), session))
         .collect::<HashMap<_, _>>();
 
-    let Some(session_list) = opencode::load_session_list_value_from_cli_or_fixture()
-        .ok()
-        .flatten()
-    else {
-        return build_local_opencode_cache_entries(&local_sessions, existing_cache);
+    let session_list_result = opencode::load_session_list_value_from_cli_or_fixture();
+    let Some(session_list) = session_list_result.ok().flatten() else {
+        return SourceCacheLoad {
+            entries: build_local_opencode_cache_entries(&local_sessions, existing_cache),
+            complete: local_complete,
+        };
     };
 
     let Some(items) = parse_opencode_session_items(&session_list) else {
-        return build_local_opencode_cache_entries(&local_sessions, existing_cache);
+        return SourceCacheLoad {
+            entries: build_local_opencode_cache_entries(&local_sessions, existing_cache),
+            complete: local_complete,
+        };
     };
 
     let mut entries = HashMap::new();
@@ -1537,18 +2050,30 @@ fn load_opencode_cache_entries(
             (cached.meta.mtime - meta.mtime).abs() < 1.0 && cached.meta.size == meta.size
         });
 
-        let stats = if cache_valid {
-            existing_cache.files[&path_key].stats.clone()
-        } else {
-            opencode::load_export_from_cli_or_fixture(&session.id)
-                .ok()
-                .flatten()
-                .map(|value| parse_opencode_export_stats(&value, &session.environment, prices))
-                .or_else(|| local_session.map(local_opencode_session_to_cache_stats))
-                .unwrap_or_default()
+        if cache_valid {
+            let mut cached = existing_cache.files[&path_key].clone();
+            cached.meta = meta;
+            entries.insert(path_key, cached);
+            continue;
+        }
+
+        let stats = opencode::load_export_from_cli_or_fixture(&session.id)
+            .ok()
+            .flatten()
+            .map(|value| parse_opencode_export_stats(&value, &session.environment, prices))
+            .or_else(|| local_session.map(local_opencode_session_to_cache_stats));
+
+        let Some(stats) = stats else {
+            if let Some(cached) = existing_cache.files.get(&path_key) {
+                entries.insert(path_key, cached.clone());
+            }
+            continue;
         };
 
-        entries.insert(path_key, CacheFileEntry::from_meta_stats(meta, stats));
+        entries.insert(
+            path_key,
+            CacheFileEntry::from_meta_stats(meta, stats, SOURCE_OPENCODE),
+        );
     }
 
     for (session_id, session) in &local_sessions {
@@ -1566,16 +2091,27 @@ fn load_opencode_cache_entries(
             (cached.meta.mtime - meta.mtime).abs() < 1.0 && cached.meta.size == meta.size
         });
 
-        let stats = if cache_valid {
-            existing_cache.files[&path_key].stats.clone()
-        } else {
-            local_opencode_session_to_cache_stats(session)
-        };
+        if cache_valid {
+            let mut cached = existing_cache.files[&path_key].clone();
+            cached.meta = meta;
+            entries.insert(path_key, cached);
+            continue;
+        }
 
-        entries.insert(path_key, CacheFileEntry::from_meta_stats(meta, stats));
+        let stats = local_opencode_session_to_cache_stats(session);
+
+        entries.insert(
+            path_key,
+            CacheFileEntry::from_meta_stats(meta, stats, SOURCE_OPENCODE),
+        );
     }
 
-    entries
+    SourceCacheLoad {
+        entries,
+        // A valid CLI list is the authoritative session inventory even when
+        // the optional local mirror was unavailable.
+        complete: true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1602,13 +2138,19 @@ fn build_local_opencode_cache_entries(
             (cached.meta.mtime - meta.mtime).abs() < 1.0 && cached.meta.size == meta.size
         });
 
-        let stats = if cache_valid {
-            existing_cache.files[&path_key].stats.clone()
-        } else {
-            local_opencode_session_to_cache_stats(session)
-        };
+        if cache_valid {
+            let mut cached = existing_cache.files[&path_key].clone();
+            cached.meta = meta;
+            entries.insert(path_key, cached);
+            continue;
+        }
 
-        entries.insert(path_key, CacheFileEntry::from_meta_stats(meta, stats));
+        let stats = local_opencode_session_to_cache_stats(session);
+
+        entries.insert(
+            path_key,
+            CacheFileEntry::from_meta_stats(meta, stats, SOURCE_OPENCODE),
+        );
     }
 
     entries
@@ -1882,6 +2424,295 @@ fn normalize_unix_timestamp(timestamp: u64) -> u64 {
 }
 
 // ============================================================================
+// DSH usage discovery and cache integration
+// ============================================================================
+
+/// Result of attempting to load DSH usage data.
+struct DshLoadResult {
+    entries: HashMap<String, CacheFileEntry>,
+    status: DshSourceStatus,
+    complete: bool,
+}
+
+/// Map DSH provider name to environment display name.
+fn dsh_provider_to_environment(provider: Option<&str>) -> Option<String> {
+    match provider.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let lower = p.to_ascii_lowercase();
+            if lower.contains("deepseek") {
+                Some("DeepSeek".to_string())
+            } else {
+                Some(p.to_string())
+            }
+        }
+        None => None,
+    }
+}
+
+/// Convert a millisecond timestamp to ISO 8601 (local time).
+fn ms_to_iso(ms: i64) -> String {
+    use chrono::TimeZone;
+    let secs = ms / 1000;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    match Local.timestamp_opt(secs, nanos) {
+        chrono::LocalResult::Single(dt) => dt.to_rfc3339(),
+        _ => {
+            // Fallback: just use the seconds
+            Local
+                .timestamp_opt(secs, 0)
+                .single()
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| format!("1970-01-01T00:00:00+00:00"))
+        }
+    }
+}
+
+/// Load DSH usage entries from the helper (blocking, no AppHandle).
+/// On failure: returns empty entries with error status.
+fn load_dsh_usage_data(
+    prices: &HashMap<String, ModelPrice>,
+    existing_cache: &CacheFile,
+) -> DshLoadResult {
+    let source = match dsh_history::resolve_dsh_source() {
+        Ok(s) => s,
+        Err(dsh_history::DshHistoryError::Absent) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: None,
+                    session_count: 0,
+                },
+                complete: true,
+            };
+        }
+        Err(e) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some(e.to_string()),
+                    session_count: 0,
+                },
+                complete: false,
+            };
+        }
+    };
+
+    let roots = vec![source.sessions_root.to_string_lossy().to_string()];
+    let request = dsh_history::DshHistoryRequest::Usage {
+        roots: roots.clone(),
+    };
+
+    let helper_path = match resolve_dsh_helper_for_analytics() {
+        Some(p) => p,
+        None => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some("DSH helper not found".to_string()),
+                    session_count: 0,
+                },
+                complete: false,
+            };
+        }
+    };
+
+    let ccem_node = match resolve_ccem_node_for_analytics() {
+        Some(p) => p,
+        None => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some("ccem-node sidecar not found".to_string()),
+                    session_count: 0,
+                },
+                complete: false,
+            };
+        }
+    };
+
+    let request_json = match serde_json::to_string(&request) {
+        Ok(j) => j,
+        Err(e) => {
+            return DshLoadResult {
+                entries: HashMap::new(),
+                status: DshSourceStatus {
+                    available: false,
+                    error: Some(format!("serialize error: {e}")),
+                    session_count: 0,
+                },
+                complete: false,
+            };
+        }
+    };
+    let roots_json = serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_string());
+
+    let usage_entries: Vec<dsh_history::DshUsageEntry> =
+        match dsh_history::process::invoke_helper_core(
+            helper_path,
+            ccem_node,
+            request_json,
+            roots_json,
+            &dsh_history::InvocationLimits::production(),
+        ) {
+            Ok((entries, _warnings)) => entries,
+            Err(e) => {
+                return DshLoadResult {
+                    entries: HashMap::new(),
+                    status: DshSourceStatus {
+                        available: false,
+                        error: Some(e.to_string()),
+                        session_count: 0,
+                    },
+                    complete: false,
+                };
+            }
+        };
+
+    let session_count = usage_entries.len() as u32;
+    let mut entries = HashMap::new();
+
+    for usage_entry in &usage_entries {
+        let path_key = format!(
+            "dsh://{}/{}",
+            usage_entry.source_instance_id, usage_entry.session_id
+        );
+
+        // Check cache: if revision matches, reuse
+        if let Some(cached) = existing_cache.files.get(&path_key) {
+            if cached.revision.as_deref() == usage_entry.revision.as_deref()
+                && usage_entry.revision.is_some()
+            {
+                entries.insert(path_key, cached.clone());
+                continue;
+            }
+        }
+
+        // Build stats from steps
+        let mut stats = build_dsh_cache_stats(&usage_entry.steps, prices);
+        let rollup = CacheRollup::from_entries(SOURCE_DSH, &stats.entries);
+        stats.entries.clear();
+        entries.insert(
+            path_key,
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 0.0,
+                    size: 0,
+                },
+                stats,
+                rollup,
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: usage_entry.revision.clone(),
+            },
+        );
+    }
+
+    DshLoadResult {
+        entries,
+        status: DshSourceStatus {
+            available: true,
+            error: None,
+            session_count,
+        },
+        complete: true,
+    }
+}
+
+/// Build CacheStats from DSH usage steps.
+fn build_dsh_cache_stats(
+    steps: &[dsh_history::DshUsageStep],
+    prices: &HashMap<String, ModelPrice>,
+) -> CacheStats {
+    let mut entries = Vec::with_capacity(steps.len());
+    for step in steps {
+        let model = step.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let environment = dsh_provider_to_environment(step.provider.as_deref());
+        let cost = calculate_cost_or_zero(
+            &model,
+            step.input_tokens,
+            step.output_tokens,
+            step.cache_read_tokens,
+            step.cache_write_tokens,
+            prices,
+        );
+        let timestamp = step
+            .time
+            .map(|t| ms_to_iso(t))
+            .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
+
+        entries.push(CacheEntry {
+            timestamp,
+            model,
+            environment,
+            usage: CacheUsage {
+                input_tokens: step.input_tokens,
+                output_tokens: step.output_tokens,
+                cache_read_tokens: step.cache_read_tokens,
+                cache_creation_tokens: step.cache_write_tokens,
+                cost,
+            },
+        });
+    }
+    CacheStats { entries }
+}
+
+/// Resolve DSH helper script path without AppHandle.
+fn resolve_dsh_helper_for_analytics() -> Option<PathBuf> {
+    // In debug: try source path first
+    if cfg!(debug_assertions) {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("dsh-history")
+            .join("lib/dsh-history-helper.mjs");
+        if source.exists() {
+            return Some(source);
+        }
+    }
+
+    // Release: next to executable
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidates = [
+        exe_dir.join("../Resources/resources/dsh-history/lib/dsh-history-helper.mjs"),
+        exe_dir.join("resources/dsh-history/lib/dsh-history-helper.mjs"),
+        exe_dir.join("dsh-history/lib/dsh-history-helper.mjs"),
+    ];
+    candidates.iter().find(|p| p.exists()).cloned()
+}
+
+/// Resolve ccem-node sidecar path without AppHandle.
+fn resolve_ccem_node_for_analytics() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let name = if cfg!(windows) {
+        "ccem-node.exe"
+    } else {
+        "ccem-node"
+    };
+    let path = exe_dir.join(name);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Global DSH source status — populated during each cache refresh.
+static DSH_SOURCE_STATUS: OnceLock<Mutex<Option<DshSourceStatus>>> = OnceLock::new();
+
+fn lock_dsh_status() -> MutexGuard<'static, Option<DshSourceStatus>> {
+    DSH_SOURCE_STATUS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+// ============================================================================
 // Timestamp helpers
 // ============================================================================
 
@@ -1990,6 +2821,9 @@ fn detect_source_from_path(path: &str) -> Option<&'static str> {
     if path.starts_with("opencode://") {
         return Some(SOURCE_OPENCODE);
     }
+    if path.starts_with("dsh://") {
+        return Some(SOURCE_DSH);
+    }
     None
 }
 
@@ -2008,14 +2842,80 @@ fn normalize_usage_source(source: Option<&str>) -> Result<Option<&'static str>, 
         SOURCE_CLAUDE => Ok(Some(SOURCE_CLAUDE)),
         SOURCE_CODEX => Ok(Some(SOURCE_CODEX)),
         SOURCE_OPENCODE => Ok(Some(SOURCE_OPENCODE)),
+        SOURCE_DSH => Ok(Some(SOURCE_DSH)),
         _ => Err(format!(
-            "Unsupported source '{}'. Use claude, codex, opencode, or all.",
+            "Unsupported source '{}'. Use claude, codex, opencode, dsh, or all.",
             raw
         )),
     }
 }
 
-fn aggregate_cache(cache: &CacheFile, source_filter: Option<&'static str>) -> UsageStats {
+fn effective_cache_rollup(cache: &CacheFile) -> Cow<'_, CacheRollup> {
+    if !cache.global_rollup.buckets.is_empty() {
+        return Cow::Borrowed(&cache.global_rollup);
+    }
+
+    // Compatibility fallback for in-memory callers and tests that construct
+    // legacy entries directly. Persisted v7 caches always take the branch
+    // above and never visit raw rows.
+    let mut accumulator = RollupAccumulator::default();
+    for (path, entry) in &cache.files {
+        if !entry.rollup.buckets.is_empty() {
+            accumulator.add(&entry.rollup);
+            continue;
+        }
+        if !entry.stats.entries.is_empty() {
+            let source = detect_source_from_path(path).unwrap_or("unknown");
+            accumulator.add(&CacheRollup::from_entries(source, &entry.stats.entries));
+        }
+    }
+    Cow::Owned(accumulator.finish())
+}
+
+fn bucket_token_usage<'a>(
+    bucket: &CacheRollupBucket,
+    prices: &'a HashMap<String, ModelPrice>,
+    price_by_model: &mut HashMap<String, Option<&'a ModelPrice>>,
+) -> TokenUsageWithCost {
+    let total_tokens = bucket.usage.input_tokens
+        + bucket.usage.output_tokens
+        + bucket.usage.cache_read_tokens
+        + bucket.usage.cache_creation_tokens;
+    let price = *price_by_model
+        .entry(bucket.model.clone())
+        .or_insert_with(|| get_model_price(&bucket.model, prices));
+    let unpriced_tokens = match price {
+        None => total_tokens,
+        Some(price) => {
+            let mut unpriced = 0u64;
+            if bucket.usage.cache_read_tokens > 0 && price.cache_read_input_token_cost.is_none() {
+                unpriced += bucket.usage.cache_read_tokens;
+            }
+            if bucket.usage.cache_creation_tokens > 0
+                && price.cache_creation_input_token_cost.is_none()
+            {
+                unpriced += bucket.usage.cache_creation_tokens;
+            }
+            unpriced
+        }
+    };
+
+    TokenUsageWithCost {
+        input_tokens: bucket.usage.input_tokens,
+        output_tokens: bucket.usage.output_tokens,
+        cache_read_tokens: bucket.usage.cache_read_tokens,
+        cache_creation_tokens: bucket.usage.cache_creation_tokens,
+        cost: bucket.usage.cost,
+        unpriced_tokens,
+        cost_incomplete: unpriced_tokens > 0,
+    }
+}
+
+fn aggregate_cache(
+    cache: &CacheFile,
+    source_filter: Option<&'static str>,
+    prices: &HashMap<String, ModelPrice>,
+) -> UsageStats {
     let now = Local::now();
     let today_str = now.format("%Y-%m-%d").to_string();
 
@@ -2032,69 +2932,61 @@ fn aggregate_cache(cache: &CacheFile, source_filter: Option<&'static str>) -> Us
             .unwrap_or_else(|| now.to_rfc3339()),
         ..Default::default()
     };
+    let mut price_by_model: HashMap<String, Option<&ModelPrice>> = HashMap::new();
+    let rollup = effective_cache_rollup(cache);
 
-    for (file_path, file_entry) in &cache.files {
-        if let Some(filter) = source_filter {
-            if detect_source_from_path(file_path) != Some(filter) {
-                continue;
+    for bucket in &rollup.buckets {
+        if source_filter.is_some_and(|filter| bucket.source != filter) {
+            continue;
+        }
+
+        let token_usage = bucket_token_usage(bucket, prices, &mut price_by_model);
+
+        stats.total.add(&token_usage);
+        stats
+            .by_model
+            .entry(bucket.model.clone())
+            .or_default()
+            .add(&token_usage);
+        if let Some(environment) = bucket
+            .environment
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            stats
+                .by_environment
+                .entry(environment.clone())
+                .or_default()
+                .add(&token_usage);
+        }
+
+        if let Some(date_str) = bucket.date.clone() {
+            stats
+                .daily_history
+                .entry(date_str.clone())
+                .or_default()
+                .add(&token_usage);
+
+            if date_str == today_str {
+                stats.today.add(&token_usage);
+            }
+
+            if let Ok(entry_date) = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                if entry_date >= week_start && entry_date <= today_date {
+                    stats.week.add(&token_usage);
+                }
+                if entry_date >= month_start && entry_date <= today_date {
+                    stats.month.add(&token_usage);
+                }
             }
         }
 
-        for entry in &file_entry.stats.entries {
-            let token_usage = TokenUsageWithCost {
-                input_tokens: entry.usage.input_tokens,
-                output_tokens: entry.usage.output_tokens,
-                cache_read_tokens: entry.usage.cache_read_tokens,
-                cache_creation_tokens: entry.usage.cache_creation_tokens,
-                cost: entry.usage.cost,
-            };
-
-            stats.total.add(&token_usage);
+        if let Some(hour_key) = bucket.hour.clone() {
             stats
-                .by_model
-                .entry(entry.model.clone())
+                .hourly_history
+                .entry(hour_key)
                 .or_default()
                 .add(&token_usage);
-            if let Some(environment) = entry
-                .environment
-                .as_ref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                stats
-                    .by_environment
-                    .entry(environment.clone())
-                    .or_default()
-                    .add(&token_usage);
-            }
-
-            if let Some(date_str) = extract_date(&entry.timestamp) {
-                stats
-                    .daily_history
-                    .entry(date_str.clone())
-                    .or_default()
-                    .add(&token_usage);
-
-                if date_str == today_str {
-                    stats.today.add(&token_usage);
-                }
-
-                if let Ok(entry_date) = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
-                    if entry_date >= week_start && entry_date <= today_date {
-                        stats.week.add(&token_usage);
-                    }
-                    if entry_date >= month_start && entry_date <= today_date {
-                        stats.month.add(&token_usage);
-                    }
-                }
-            }
-
-            if let Some(hour_key) = extract_hour(&entry.timestamp) {
-                stats
-                    .hourly_history
-                    .entry(hour_key.clone())
-                    .or_default()
-                    .add(&token_usage);
-            }
         }
     }
 
@@ -2106,37 +2998,42 @@ fn aggregate_model_breakdown(
     source_filter: Option<&'static str>,
     granularity: ModelBreakdownGranularity,
     now: chrono::DateTime<Local>,
+    prices: &HashMap<String, ModelPrice>,
 ) -> ModelBreakdownHistory {
     let mut breakdown: ModelBreakdownHistory = HashMap::new();
+    let mut price_by_model: HashMap<String, Option<&ModelPrice>> = HashMap::new();
+    let rollup = effective_cache_rollup(cache);
 
-    for (file_path, file_entry) in &cache.files {
-        if let Some(filter) = source_filter {
-            if detect_source_from_path(file_path) != Some(filter) {
-                continue;
-            }
+    for bucket in &rollup.buckets {
+        if source_filter.is_some_and(|filter| bucket.source != filter) {
+            continue;
         }
+        let bucket_key = match granularity {
+            ModelBreakdownGranularity::Hour => bucket.hour.clone(),
+            ModelBreakdownGranularity::Day => bucket.date.clone(),
+            ModelBreakdownGranularity::Week => bucket.date.as_ref().and_then(|date| {
+                NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                    .ok()
+                    .map(format_week_bucket)
+            }),
+            ModelBreakdownGranularity::Month => bucket.date.as_ref().and_then(|date| {
+                NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                    .ok()
+                    .map(|date| date.format("%Y-%m").to_string())
+            }),
+        };
+        let Some(bucket_key) = bucket_key else {
+            continue;
+        };
 
-        for entry in &file_entry.stats.entries {
-            let Some(bucket_key) = extract_model_breakdown_bucket(&entry.timestamp, granularity)
-            else {
-                continue;
-            };
+        let token_usage = bucket_token_usage(bucket, prices, &mut price_by_model);
 
-            let token_usage = TokenUsageWithCost {
-                input_tokens: entry.usage.input_tokens,
-                output_tokens: entry.usage.output_tokens,
-                cache_read_tokens: entry.usage.cache_read_tokens,
-                cache_creation_tokens: entry.usage.cache_creation_tokens,
-                cost: entry.usage.cost,
-            };
-
-            breakdown
-                .entry(bucket_key)
-                .or_default()
-                .entry(entry.model.clone())
-                .or_default()
-                .add(&token_usage);
-        }
+        breakdown
+            .entry(bucket_key)
+            .or_default()
+            .entry(bucket.model.clone())
+            .or_default()
+            .add(&token_usage);
     }
 
     trim_model_breakdown_to_visible_window(&mut breakdown, granularity, now);
@@ -2203,7 +3100,14 @@ pub async fn get_usage_stats(
         // is still TTL-fresh; one collected after (by a concurrent refresh)
         // is, preserving single-flight for concurrent force requests.
         let cache = shared_usage_cache(force_requested.then_some(request_started));
-        let stats = aggregate_cache(&cache, source_filter);
+        let prices = load_model_prices();
+        let mut stats = aggregate_cache(&cache, source_filter, &prices);
+
+        // Attach DSH source status for 'all' or 'dsh' queries
+        if source_filter.is_none() || source_filter == Some(SOURCE_DSH) {
+            stats.dsh_status = lock_dsh_status().clone();
+        }
+
         if source_filter.is_none() {
             write_usage_summary(&stats);
         }
@@ -2230,7 +3134,8 @@ pub async fn get_usage_history(
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
         let cache = shared_usage_cache(None);
-        let stats = aggregate_cache(&cache, source_filter);
+        let prices = load_model_prices();
+        let stats = aggregate_cache(&cache, source_filter, &prices);
 
         Ok(UsageHistory {
             daily: stats.daily_history,
@@ -2250,11 +3155,13 @@ pub async fn get_usage_model_breakdown(
         let source_filter = normalize_usage_source(source.as_deref())?;
         let granularity = ModelBreakdownGranularity::parse(&granularity)?;
         let cache = shared_usage_cache(None);
+        let prices = load_model_prices();
         Ok(aggregate_model_breakdown(
             &cache,
             source_filter,
             granularity,
             Local::now(),
+            &prices,
         ))
     })
     .await
@@ -2266,7 +3173,8 @@ pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, St
     run_blocking(move || {
         let source_filter = normalize_usage_source(source.as_deref())?;
         let cache = shared_usage_cache(None);
-        let stats = aggregate_cache(&cache, source_filter);
+        let prices = load_model_prices();
+        let stats = aggregate_cache(&cache, source_filter, &prices);
         Ok(calculate_streak(&stats.daily_history))
     })
     .await
@@ -2275,17 +3183,22 @@ pub async fn get_continuous_usage_days(source: Option<String>) -> Result<u32, St
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_model_breakdown, cache_files_have_same_meta, default_prices,
-        extract_model_breakdown_bucket, format_week_bucket, full_parse_jsonl, get_file_meta,
-        lock_usage_snapshot, lock_usage_stats_memo, normalize_usage_source,
-        parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
-        parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
-        refresh_discovered_entry, shared_usage_cache, should_reuse_usage_stats, snapshot_is_fresh,
-        write_json_atomic, write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry,
-        CacheMeta, CacheStats, CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
-        ModelBreakdownGranularity, ModelPrice, UsageSource, UsageStats,
-        ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE,
-        TEST_SNAPSHOT_REFRESH,
+        aggregate_cache, aggregate_model_breakdown, build_local_opencode_cache_entries,
+        cache_files_have_same_meta, calculate_streak, default_prices, detect_source_from_path,
+        dsh_provider_to_environment, extract_model_breakdown_bucket, format_week_bucket,
+        full_parse_jsonl, get_file_meta, lock_usage_snapshot, lock_usage_stats_memo,
+        model_price_lookup_count, normalize_usage_source, parse_claude_jsonl_reader,
+        parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
+        read_usage_cache_at, read_usage_summary_from, refresh_discovered_entry,
+        reset_model_price_lookup_count, retain_incomplete_source_entries, shared_usage_cache,
+        should_reuse_usage_stats, should_write_usage_cache, snapshot_is_fresh,
+        update_global_rollup, usage_cache_path, write_json_atomic, write_usage_summary_to,
+        CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheRollup, CacheRollupBucket,
+        CacheStats, CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
+        ModelBreakdownGranularity, ModelPrice, TokenUsageWithCost, UsageSource, UsageStats,
+        ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE, SOURCE_CODEX,
+        SOURCE_DSH, SOURCE_OPENCODE, TEST_SNAPSHOT_REFRESH, USAGE_CACHE_VERSION,
+        USAGE_SUMMARY_VERSION,
     };
     use chrono::{Local, TimeZone};
     use std::collections::HashMap;
@@ -2572,6 +3485,7 @@ mod tests {
         CacheFile {
             version: 1,
             files,
+            global_rollup: CacheRollup::default(),
             last_updated: None,
         }
     }
@@ -2617,6 +3531,7 @@ mod tests {
             Some(SOURCE_CLAUDE),
             ModelBreakdownGranularity::Hour,
             fixed_now(),
+            &default_prices(),
         );
 
         assert!(result.contains_key(&visible_bucket));
@@ -2686,20 +3601,35 @@ mod tests {
             Vec::new(),
         );
 
-        let day_result =
-            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Day, fixed_now());
+        let day_result = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Day,
+            fixed_now(),
+            &default_prices(),
+        );
         assert_eq!(day_result.len(), 7);
         assert!(!day_result.contains_key("2026-02-27"));
         assert_eq!(day_result["2026-03-06"]["claude-opus-4-5"].input_tokens, 80);
 
-        let week_result =
-            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Week, fixed_now());
+        let week_result = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Week,
+            fixed_now(),
+            &default_prices(),
+        );
         assert!(week_result.contains_key(&format_week_bucket(
             chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap()
         )));
 
-        let month_result =
-            aggregate_model_breakdown(&cache, None, ModelBreakdownGranularity::Month, fixed_now());
+        let month_result = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Month,
+            fixed_now(),
+            &default_prices(),
+        );
         let march_total = &month_result["2026-03"]["claude-opus-4-5"];
         assert_eq!(march_total.input_tokens, 330);
         assert_eq!(march_total.output_tokens, 0);
@@ -2811,6 +3741,16 @@ mod tests {
         .stats
     }
 
+    fn full_rollup(discovered: &DiscoveredFile) -> CacheRollup {
+        full_parse_jsonl(
+            discovered.source,
+            &discovered.path,
+            meta_of(&discovered.path),
+            &default_prices(),
+        )
+        .rollup
+    }
+
     fn input_total(stats: &CacheStats) -> u64 {
         stats
             .entries
@@ -2860,10 +3800,12 @@ mod tests {
                     },
                 }],
             },
+            SOURCE_CLAUDE,
         );
         CacheFile {
             version: super::USAGE_CACHE_VERSION,
             files: HashMap::from([("/tmp/fixture-session.jsonl".to_string(), entry)]),
+            global_rollup: CacheRollup::default(),
             last_updated: None,
         }
     }
@@ -3039,11 +3981,12 @@ mod tests {
 
         let codex = discovered_at(&codex_path, UsageSource::Codex);
         let codex_first = refresh_round(None, &codex);
-        assert_eq!(codex_first.stats.entries.len(), 1);
-        assert_eq!(codex_first.stats.entries[0].usage.input_tokens, 80);
-        assert_eq!(codex_first.stats.entries[0].usage.cache_read_tokens, 20);
-        assert_eq!(codex_first.stats.entries[0].usage.output_tokens, 15);
-        assert_eq!(codex_first.stats.entries[0].model, "gpt-5.3-codex");
+        assert!(codex_first.stats.entries.is_empty());
+        assert_eq!(codex_first.rollup.buckets.len(), 1);
+        assert_eq!(codex_first.rollup.buckets[0].usage.input_tokens, 80);
+        assert_eq!(codex_first.rollup.buckets[0].usage.cache_read_tokens, 20);
+        assert_eq!(codex_first.rollup.buckets[0].usage.output_tokens, 15);
+        assert_eq!(codex_first.rollup.buckets[0].model, "gpt-5.3-codex");
         assert_eq!(codex_first.parse_offset, meta_of(&codex_path).size);
         let codex_state = codex_first
             .codex_state
@@ -3051,7 +3994,7 @@ mod tests {
             .expect("codex continuation state persisted");
         assert_eq!(codex_state.current_model.as_deref(), Some("gpt-5.3-codex"));
         assert!(codex_state.last_total.is_some());
-        assert_eq!(codex_first.stats, full_stats(&codex));
+        assert_eq!(codex_first.rollup, full_rollup(&codex));
 
         append_bytes(
             &codex_path,
@@ -3061,13 +4004,14 @@ mod tests {
             ),
         );
         let codex_second = refresh_round(Some(&codex_first), &codex);
-        assert_eq!(codex_second.stats.entries.len(), 2);
-        assert_eq!(codex_second.stats.entries[1].usage.input_tokens, 20);
-        assert_eq!(codex_second.stats.entries[1].usage.cache_read_tokens, 30);
-        assert_eq!(codex_second.stats.entries[1].usage.output_tokens, 18);
-        assert_eq!(codex_second.stats.entries[1].model, "gpt-5.3-codex");
+        assert!(codex_second.stats.entries.is_empty());
+        assert_eq!(codex_second.rollup.buckets.len(), 1);
+        assert_eq!(codex_second.rollup.buckets[0].usage.input_tokens, 100);
+        assert_eq!(codex_second.rollup.buckets[0].usage.cache_read_tokens, 50);
+        assert_eq!(codex_second.rollup.buckets[0].usage.output_tokens, 33);
+        assert_eq!(codex_second.rollup.buckets[0].model, "gpt-5.3-codex");
         assert_eq!(codex_second.parse_offset, meta_of(&codex_path).size);
-        assert_eq!(codex_second.stats, full_stats(&codex));
+        assert_eq!(codex_second.rollup, full_rollup(&codex));
     }
 
     #[test]
@@ -3295,6 +4239,35 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_larger_rewrite_falls_back_to_full_reparse() {
+        let temp = tempfile::tempdir().expect("larger rewrite tempdir");
+        let path = temp.path().join("larger-rewrite.jsonl");
+        let original = format!("{}\n", claude_line("2026-03-05T00:00:01.000Z", 100, 10));
+        fs::write(&path, &original).expect("write original fixture");
+
+        let discovered = discovered_at(&path, UsageSource::Claude);
+        let first = refresh_round(None, &discovered);
+        assert_eq!(input_total(&first.stats), 100);
+
+        // Rewrite the consumed prefix with the same byte length, then append
+        // another valid line. Size/mtime/newline checks alone misclassify this
+        // as append-only growth and retain the stale 100-token contribution.
+        thread::sleep(Duration::from_millis(15));
+        let rewritten_prefix = original.replace(r#""input_tokens":100"#, r#""input_tokens":900"#);
+        assert_eq!(rewritten_prefix.len(), original.len());
+        let rewritten = format!(
+            "{}{}\n",
+            rewritten_prefix,
+            claude_line("2026-03-05T00:00:02.000Z", 50, 5)
+        );
+        fs::write(&path, &rewritten).expect("write larger replacement fixture");
+
+        let second = refresh_round(Some(&first), &discovered);
+        assert_eq!(input_total(&second.stats), 950);
+        assert_eq!(second.stats, full_stats(&discovered));
+    }
+
+    #[test]
     fn test_incremental_older_mtime_falls_back_to_full_reparse() {
         let temp = tempfile::tempdir().expect("rotation tempdir");
         let path = temp.path().join("rotated.jsonl");
@@ -3341,7 +4314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_cache_version_guard_discards_stale_version() {
+    fn test_usage_cache_version_guard_migrates_v5_v6_and_discards_older_versions() {
         let temp = tempfile::tempdir().expect("version tempdir");
         let cache_path = temp.path().join("usage-cache.json");
 
@@ -3358,6 +4331,7 @@ mod tests {
                     usage: CacheUsage::default(),
                 }],
             },
+            rollup: CacheRollup::default(),
             parse_offset: 42,
             last_line_complete: false,
             codex_state: Some(CodexParseState {
@@ -3367,24 +4341,51 @@ mod tests {
             claude_state: Some(ClaudeParseState {
                 message_entry_indexes: HashMap::from([("msg_roundtrip".to_string(), 3)]),
             }),
+            append_anchor: None,
+            revision: None,
         };
 
-        // A cache stamped with an old version is discarded wholesale.
-        let stale = CacheFile {
-            version: super::USAGE_CACHE_VERSION - 1,
+        let v6 = CacheFile {
+            version: 6,
+            files: HashMap::from([("legacy.jsonl".to_string(), entry.clone())]),
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+        write_json_atomic(&cache_path, &v6).expect("write v6 cache");
+        let migrated = read_usage_cache_at(&cache_path);
+        assert_eq!(migrated.version, super::USAGE_CACHE_VERSION);
+        assert!(
+            migrated.files.contains_key("legacy.jsonl"),
+            "v6 entries must survive the compact v7 migration"
+        );
+
+        let v5 = CacheFile {
+            version: 5,
             files: HashMap::from([("stale.jsonl".to_string(), entry.clone())]),
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+        write_json_atomic(&cache_path, &v5).expect("write v5 cache");
+        assert_eq!(
+            read_usage_cache_at(&cache_path).version,
+            USAGE_CACHE_VERSION
+        );
+
+        // Older schemas are not known to be compatible and still fail closed.
+        let stale = CacheFile {
+            version: 4,
+            files: HashMap::from([("stale.jsonl".to_string(), entry.clone())]),
+            global_rollup: CacheRollup::default(),
             last_updated: None,
         };
         write_json_atomic(&cache_path, &stale).expect("write stale cache");
-        assert!(
-            read_usage_cache_at(&cache_path).files.is_empty(),
-            "stale version must be discarded and rebuilt"
-        );
+        assert!(read_usage_cache_at(&cache_path).files.is_empty());
 
         // A current-version cache round-trips the parse continuation state.
         let current = CacheFile {
             version: super::USAGE_CACHE_VERSION,
             files: HashMap::from([("current.jsonl".to_string(), entry)]),
+            global_rollup: CacheRollup::default(),
             last_updated: None,
         };
         write_json_atomic(&cache_path, &current).expect("write current cache");
@@ -3410,6 +4411,390 @@ mod tests {
             Some(3),
             "claude message-id dedup map must round-trip through the cache"
         );
+    }
+
+    #[test]
+    fn v6_migration_compacts_codex_rows_without_changing_analytics() {
+        let temp = tempfile::tempdir().expect("v6 migration tempdir");
+        let cache_path = temp.path().join("usage-cache.json");
+        let legacy = serde_json::json!({
+            "version": 6,
+            "files": {
+                "/tmp/.codex/sessions/2026/03/06/session.jsonl": {
+                    "meta": { "mtime": 1000.0, "size": 2048 },
+                    "stats": {
+                        "entries": [
+                            {
+                                "timestamp": "2026-03-06T10:15:00+08:00",
+                                "model": "gpt-5.4",
+                                "environment": "Local Codex",
+                                "usage": {
+                                    "inputTokens": 100,
+                                    "outputTokens": 20,
+                                    "cacheReadTokens": 30,
+                                    "cacheCreationTokens": 0,
+                                    "cost": 0.5
+                                }
+                            },
+                            {
+                                "timestamp": "2026-03-06T10:45:00+08:00",
+                                "model": "gpt-5.4",
+                                "environment": "Local Codex",
+                                "usage": {
+                                    "inputTokens": 50,
+                                    "outputTokens": 10,
+                                    "cacheReadTokens": 5,
+                                    "cacheCreationTokens": 0,
+                                    "cost": 0.25
+                                }
+                            }
+                        ]
+                    },
+                    "parseOffset": 2048,
+                    "lastLineComplete": true,
+                    "codexState": { "currentModel": "gpt-5.4" }
+                }
+            },
+            "lastUpdated": "2026-03-06T11:00:00+08:00"
+        });
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&legacy).expect("serialize legacy fixture"),
+        )
+        .expect("write legacy fixture");
+
+        let migrated = read_usage_cache_at(&cache_path);
+        let persisted_shape = serde_json::to_value(&migrated).expect("serialize migrated cache");
+        let file_shape = &persisted_shape["files"]["/tmp/.codex/sessions/2026/03/06/session.jsonl"];
+
+        assert_eq!(persisted_shape["version"], 7);
+        assert!(
+            file_shape["stats"].get("entries").is_none(),
+            "v7 must not retain compactable Codex usage rows"
+        );
+        assert_eq!(
+            file_shape["rollup"]["buckets"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        let stats = aggregate_cache(&migrated, Some(SOURCE_CODEX), &default_prices());
+        assert_eq!(stats.total.input_tokens, 150);
+        assert_eq!(stats.total.output_tokens, 30);
+        assert_eq!(stats.total.cache_read_tokens, 35);
+        assert!((stats.total.cost - 0.75).abs() < 1e-9);
+        assert_eq!(stats.daily_history["2026-03-06"].input_tokens, 150);
+        assert_eq!(stats.hourly_history["2026-03-06T10"].input_tokens, 150);
+        assert_eq!(stats.by_model["gpt-5.4"].input_tokens, 150);
+        assert_eq!(stats.by_environment["Local Codex"].input_tokens, 150);
+    }
+
+    #[test]
+    fn current_v7_compact_cache_serves_views_without_raw_entries() {
+        let temp = tempfile::tempdir().expect("v7 compact tempdir");
+        let cache_path = temp.path().join("usage-cache-desktop.json");
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let today_key = today.format("%Y-%m-%d").to_string();
+        let yesterday_key = yesterday.format("%Y-%m-%d").to_string();
+        let today_hour = format!("{today_key}T09");
+        let compact = serde_json::json!({
+            "version": 7,
+            "files": {
+                "/tmp/.codex/sessions/session.jsonl": {
+                    "meta": { "mtime": 1000.0, "size": 2048 },
+                    "stats": {},
+                    "rollup": {
+                        "buckets": [
+                            {
+                                "source": "codex",
+                                "date": today_key,
+                                "hour": today_hour,
+                                "model": "gpt-5.4",
+                                "environment": "Local Codex",
+                                "usage": {
+                                    "inputTokens": 120,
+                                    "outputTokens": 30,
+                                    "cacheReadTokens": 10,
+                                    "cacheCreationTokens": 0,
+                                    "cost": 0.6
+                                },
+                                "entryCount": 2
+                            },
+                            {
+                                "source": "codex",
+                                "date": yesterday_key,
+                                "hour": null,
+                                "model": "gpt-5.4",
+                                "environment": null,
+                                "usage": {
+                                    "inputTokens": 0,
+                                    "outputTokens": 0,
+                                    "cacheReadTokens": 0,
+                                    "cacheCreationTokens": 0,
+                                    "cost": 0.0
+                                },
+                                "entryCount": 1
+                            }
+                        ]
+                    },
+                    "parseOffset": 2048,
+                    "lastLineComplete": true,
+                    "codexState": { "currentModel": "gpt-5.4" }
+                }
+            },
+            "globalRollup": {
+                "buckets": [
+                    {
+                        "source": "codex",
+                        "date": today_key,
+                        "hour": today_hour,
+                        "model": "gpt-5.4",
+                        "environment": "Local Codex",
+                        "usage": {
+                            "inputTokens": 120,
+                            "outputTokens": 30,
+                            "cacheReadTokens": 10,
+                            "cacheCreationTokens": 0,
+                            "cost": 0.6
+                        },
+                        "entryCount": 2
+                    },
+                    {
+                        "source": "codex",
+                        "date": yesterday_key,
+                        "hour": null,
+                        "model": "gpt-5.4",
+                        "environment": null,
+                        "usage": {
+                            "inputTokens": 0,
+                            "outputTokens": 0,
+                            "cacheReadTokens": 0,
+                            "cacheCreationTokens": 0,
+                            "cost": 0.0
+                        },
+                        "entryCount": 1
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&compact).expect("serialize compact fixture"),
+        )
+        .expect("write compact fixture");
+
+        let cache = read_usage_cache_at(&cache_path);
+        assert!(cache
+            .files
+            .values()
+            .all(|entry| entry.stats.entries.is_empty()));
+
+        let stats = aggregate_cache(&cache, Some(SOURCE_CODEX), &default_prices());
+        assert_eq!(stats.total.input_tokens, 120);
+        assert_eq!(stats.daily_history[&today_key].input_tokens, 120);
+        assert!(stats.daily_history.contains_key(&yesterday_key));
+        assert_eq!(calculate_streak(&stats.daily_history), 2);
+
+        let breakdown = aggregate_model_breakdown(
+            &cache,
+            Some(SOURCE_CODEX),
+            ModelBreakdownGranularity::Day,
+            Local::now(),
+            &default_prices(),
+        );
+        assert_eq!(breakdown[&today_key]["gpt-5.4"].input_tokens, 120);
+    }
+
+    #[test]
+    fn desktop_usage_cache_has_an_independent_filename() {
+        assert_eq!(
+            usage_cache_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("usage-cache-desktop.json")
+        );
+    }
+
+    #[test]
+    fn legacy_import_is_written_once_even_when_sources_are_unchanged() {
+        let files = HashMap::from([(
+            "/tmp/.codex/sessions/session.jsonl".to_string(),
+            CacheFileEntry {
+                rollup: CacheRollup {
+                    buckets: vec![CacheRollupBucket {
+                        source: SOURCE_CODEX.to_string(),
+                        model: "gpt-5.4".to_string(),
+                        entry_count: 1,
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            },
+        )]);
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files,
+            last_updated: None,
+        };
+
+        assert!(should_write_usage_cache(false, &cache, &cache));
+        assert!(!should_write_usage_cache(true, &cache, &cache));
+    }
+
+    #[test]
+    fn unchanged_opencode_session_reuses_its_compact_rollup() {
+        let session = crate::opencode::LocalOpenCodeSession {
+            id: "oc-1".to_string(),
+            title: "fixture".to_string(),
+            updated_at: 1234,
+            created_at: 1200,
+            project: None,
+            env_name: Some("OpenCode Native".to_string()),
+            config_source: Some("native".to_string()),
+            prompt_tokens: 999,
+            completion_tokens: 111,
+            cost: 0.42,
+            model: Some("fixture-model".to_string()),
+        };
+        let stats = CacheStats {
+            entries: vec![CacheEntry {
+                timestamp: "2026-03-06T10:00:00+08:00".to_string(),
+                model: "fixture-model".to_string(),
+                environment: Some("OpenCode Native".to_string()),
+                usage: CacheUsage {
+                    input_tokens: 999,
+                    output_tokens: 111,
+                    cost: 0.42,
+                    ..Default::default()
+                },
+            }],
+        };
+        let cached = CacheFileEntry {
+            meta: CacheMeta {
+                mtime: 1234.0,
+                size: 0,
+            },
+            rollup: CacheRollup::from_entries(SOURCE_OPENCODE, &stats.entries),
+            ..Default::default()
+        };
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([("opencode://session/oc-1".to_string(), cached.clone())]),
+            global_rollup: cached.rollup.clone(),
+            last_updated: None,
+        };
+
+        let refreshed = build_local_opencode_cache_entries(
+            &HashMap::from([("oc-1".to_string(), session)]),
+            &existing,
+        );
+
+        assert_eq!(refreshed["opencode://session/oc-1"].rollup, cached.rollup);
+    }
+
+    #[test]
+    fn incomplete_source_load_retains_cached_rollups_until_authoritative_success() {
+        let cached = CacheFileEntry {
+            rollup: CacheRollup {
+                buckets: vec![CacheRollupBucket {
+                    source: SOURCE_DSH.to_string(),
+                    model: "deepseek-v4".to_string(),
+                    entry_count: 1,
+                    ..Default::default()
+                }],
+            },
+            revision: Some("rev-1".to_string()),
+            ..Default::default()
+        };
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([("dsh://source/session-1".to_string(), cached.clone())]),
+            global_rollup: cached.rollup.clone(),
+            last_updated: None,
+        };
+
+        let mut transient_failure = HashMap::new();
+        retain_incomplete_source_entries(&existing, SOURCE_DSH, &mut transient_failure, false);
+        assert_eq!(
+            transient_failure["dsh://source/session-1"].rollup, cached.rollup,
+            "a failed enumeration must not masquerade as an authoritative deletion"
+        );
+
+        let mut authoritative_empty = HashMap::new();
+        retain_incomplete_source_entries(&existing, SOURCE_DSH, &mut authoritative_empty, true);
+        assert!(
+            authoritative_empty.is_empty(),
+            "a successful empty enumeration must still delete stale sessions"
+        );
+    }
+
+    #[test]
+    fn global_rollup_replaces_changed_files_and_removes_deleted_files() {
+        let entry = |path: &str, timestamp: &str, model: &str, tokens: u64| {
+            let stats = CacheStats {
+                entries: vec![CacheEntry {
+                    timestamp: timestamp.to_string(),
+                    model: model.to_string(),
+                    environment: Some(format!("env-{model}")),
+                    usage: CacheUsage {
+                        input_tokens: tokens,
+                        ..Default::default()
+                    },
+                }],
+            };
+            (
+                path.to_string(),
+                CacheFileEntry {
+                    rollup: CacheRollup::from_entries(SOURCE_CODEX, &stats.entries),
+                    stats: CacheStats::default(),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let old_files = HashMap::from([
+            entry("a", "2026-03-05T10:00:00+08:00", "old-model", 10),
+            entry("b", "2026-03-05T11:00:00+08:00", "deleted-model", 0),
+            entry("unchanged", "2026-03-05T12:00:00+08:00", "same-model", 5),
+        ]);
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: CacheRollup::from_file_entries(&old_files),
+            files: old_files.clone(),
+            last_updated: None,
+        };
+        let new_files = HashMap::from([
+            entry("a", "2026-03-06T09:00:00+08:00", "new-model", 25),
+            old_files
+                .get_key_value("unchanged")
+                .map(|(path, value)| (path.clone(), value.clone()))
+                .expect("unchanged fixture"),
+        ]);
+
+        let (rollup, bucket_mutations) = update_global_rollup(&existing, &new_files);
+        let updated = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: new_files,
+            global_rollup: rollup,
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&updated, Some(SOURCE_CODEX), &default_prices());
+
+        assert_eq!(
+            bucket_mutations, 3,
+            "unchanged file buckets must not be revisited"
+        );
+        assert_eq!(stats.total.input_tokens, 30);
+        assert!(
+            !stats.daily_history.contains_key("2026-03-05")
+                || stats.daily_history["2026-03-05"].input_tokens == 5
+        );
+        assert_eq!(stats.daily_history["2026-03-06"].input_tokens, 25);
+        assert!(!stats.by_model.contains_key("old-model"));
+        assert!(!stats.by_model.contains_key("deleted-model"));
+        assert_eq!(stats.by_model["new-model"].input_tokens, 25);
+        assert_eq!(stats.by_model["same-model"].input_tokens, 5);
     }
 
     #[test]
@@ -3446,10 +4831,616 @@ mod tests {
             &codex_path,
             meta_of(&codex_path),
             &prices,
-        )
-        .stats;
+        );
         let codex_reader =
             parse_codex_jsonl_reader(BufReader::new(codex_content.as_bytes()), &prices);
-        assert_eq!(codex_byte_core, codex_reader);
+        assert!(codex_byte_core.stats.entries.is_empty());
+        assert_eq!(
+            codex_byte_core.rollup,
+            CacheRollup::from_entries(SOURCE_CODEX, &codex_reader.entries)
+        );
+    }
+
+    // ── Phase 3: DSH Analytics Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_dsh_source_detection_from_virtual_key() {
+        // dsh:// virtual keys should resolve to SOURCE_DSH
+        let source = detect_source_from_path("dsh://instance123/session456");
+        assert_eq!(source, Some(SOURCE_DSH));
+    }
+
+    #[test]
+    fn test_dsh_normalize_usage_source() {
+        assert_eq!(normalize_usage_source(Some("dsh")), Ok(Some(SOURCE_DSH)));
+    }
+
+    #[test]
+    fn test_unpriced_tokens_propagation_via_add() {
+        let mut a = TokenUsageWithCost {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 5,
+            cost: 0.5,
+            unpriced_tokens: 0,
+            cost_incomplete: false,
+        };
+        let b = TokenUsageWithCost {
+            input_tokens: 200,
+            output_tokens: 100,
+            cache_read_tokens: 20,
+            cache_creation_tokens: 10,
+            cost: 0.0,
+            unpriced_tokens: 330,
+            cost_incomplete: true,
+        };
+        a.add(&b);
+        assert_eq!(a.input_tokens, 300);
+        assert_eq!(a.output_tokens, 150);
+        assert!((a.cost - 0.5).abs() < 0.001);
+        assert_eq!(a.unpriced_tokens, 330);
+        assert!(a.cost_incomplete);
+    }
+
+    #[test]
+    fn test_unpriced_tokens_both_incomplete() {
+        let mut a = TokenUsageWithCost {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: 0.0,
+            unpriced_tokens: 150,
+            cost_incomplete: true,
+        };
+        let b = TokenUsageWithCost {
+            input_tokens: 200,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: 0.0,
+            unpriced_tokens: 200,
+            cost_incomplete: true,
+        };
+        a.add(&b);
+        assert_eq!(a.unpriced_tokens, 350);
+        assert!(a.cost_incomplete);
+    }
+
+    #[test]
+    fn test_unpriced_tokens_mixed_pricing_in_aggregate() {
+        // Build a CacheFile with one priced and one unpriced entry
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![
+                        CacheEntry {
+                            timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+                            model: "claude-sonnet-4-5".to_string(),
+                            environment: Some("official".to_string()),
+                            usage: CacheUsage {
+                                input_tokens: 1000,
+                                output_tokens: 500,
+                                cache_read_tokens: 100,
+                                cache_creation_tokens: 50,
+                                cost: 0.02,
+                            },
+                        },
+                        CacheEntry {
+                            timestamp: "2026-08-20T11:00:00.000Z".to_string(),
+                            model: "unknown-model".to_string(),
+                            environment: Some("dsh".to_string()),
+                            usage: CacheUsage {
+                                input_tokens: 2000,
+                                output_tokens: 1000,
+                                cache_read_tokens: 200,
+                                cache_creation_tokens: 100,
+                                cost: 0.0,
+                            },
+                        },
+                    ],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&cache, None, &default_prices());
+        // Total should include all tokens
+        assert_eq!(stats.total.input_tokens, 3000);
+        assert_eq!(stats.total.output_tokens, 1500);
+        // Cost should only be from priced entry
+        assert!((stats.total.cost - 0.02).abs() < 0.001);
+        // Unpriced tokens from the zero-cost entry
+        assert_eq!(stats.total.unpriced_tokens, 3300); // 2000+1000+200+100
+        assert!(stats.total.cost_incomplete);
+    }
+
+    #[test]
+    fn test_aggregate_cache_resolves_repeated_model_price_once() {
+        let repeated_entry = CacheEntry {
+            timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+            model: "unknown-model".to_string(),
+            environment: Some("dsh".to_string()),
+            usage: CacheUsage {
+                input_tokens: 1,
+                ..Default::default()
+            },
+        };
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([(
+                "dsh://inst1/sess1".to_string(),
+                CacheFileEntry {
+                    stats: CacheStats {
+                        entries: vec![repeated_entry; 128],
+                    },
+                    ..Default::default()
+                },
+            )]),
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        reset_model_price_lookup_count();
+        let stats = aggregate_cache(&cache, None, &default_prices());
+
+        assert_eq!(stats.total.input_tokens, 128);
+        assert_eq!(model_price_lookup_count(), 1);
+    }
+
+    #[test]
+    fn test_model_breakdown_resolves_repeated_model_price_once() {
+        let repeated_entry = CacheEntry {
+            timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+            model: "unknown-model".to_string(),
+            environment: Some("dsh".to_string()),
+            usage: CacheUsage {
+                input_tokens: 1,
+                ..Default::default()
+            },
+        };
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([(
+                "dsh://inst1/sess1".to_string(),
+                CacheFileEntry {
+                    stats: CacheStats {
+                        entries: vec![repeated_entry; 128],
+                    },
+                    ..Default::default()
+                },
+            )]),
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        reset_model_price_lookup_count();
+        let breakdown = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Day,
+            fixed_now(),
+            &default_prices(),
+        );
+
+        assert_eq!(breakdown["2026-08-20"]["unknown-model"].input_tokens, 128);
+        assert_eq!(model_price_lookup_count(), 1);
+    }
+
+    #[test]
+    fn test_fully_priced_has_no_unpriced_tokens() {
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 100,
+                            cache_creation_tokens: 50,
+                            cost: 0.02,
+                        },
+                    }],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(stats.total.unpriced_tokens, 0);
+        assert!(!stats.total.cost_incomplete);
+    }
+
+    #[test]
+    fn test_dsh_provider_to_environment_mapping() {
+        assert_eq!(
+            dsh_provider_to_environment(Some("anthropic")),
+            Some("anthropic".to_string())
+        );
+        assert_eq!(
+            dsh_provider_to_environment(Some("Anthropic")),
+            Some("Anthropic".to_string())
+        );
+        assert_eq!(
+            dsh_provider_to_environment(Some("openai")),
+            Some("openai".to_string())
+        );
+        assert_eq!(
+            dsh_provider_to_environment(Some("DeepSeek-chat")),
+            Some("DeepSeek".to_string())
+        );
+        assert_eq!(
+            dsh_provider_to_environment(Some("some-custom")),
+            Some("some-custom".to_string())
+        );
+        assert_eq!(dsh_provider_to_environment(None), None);
+        assert_eq!(dsh_provider_to_environment(Some("")), None);
+    }
+
+    #[test]
+    fn test_usage_cache_version_is_7() {
+        assert_eq!(USAGE_CACHE_VERSION, 7);
+    }
+
+    #[test]
+    fn test_usage_summary_version_is_2() {
+        assert_eq!(USAGE_SUMMARY_VERSION, 2);
+    }
+
+    #[test]
+    fn test_dsh_cache_entry_revision_reuse() {
+        // CacheFileEntry with a revision should preserve it through serialization
+        let entry = CacheFileEntry {
+            meta: CacheMeta {
+                mtime: 1.0,
+                size: 10,
+            },
+            stats: CacheStats { entries: vec![] },
+            rollup: CacheRollup::default(),
+            parse_offset: 0,
+            last_line_complete: true,
+            codex_state: None,
+            claude_state: None,
+            append_anchor: None,
+            revision: Some("rev_abc123".to_string()),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let deser: CacheFileEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.revision, Some("rev_abc123".to_string()));
+    }
+
+    #[test]
+    fn test_dsh_cache_entry_revision_none_round_trip() {
+        let entry = CacheFileEntry {
+            meta: CacheMeta {
+                mtime: 1.0,
+                size: 10,
+            },
+            stats: CacheStats { entries: vec![] },
+            rollup: CacheRollup::default(),
+            parse_offset: 0,
+            last_line_complete: true,
+            codex_state: None,
+            claude_state: None,
+            append_anchor: None,
+            revision: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let deser: CacheFileEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.revision, None);
+    }
+
+    #[test]
+    fn test_dsh_source_filter_excludes_non_dsh() {
+        let mut files = HashMap::new();
+        // Legacy claude entry
+        files.insert(
+            "/home/user/.claude/projects/foo/usage.jsonl".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-20T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 5000,
+                            output_tokens: 2000,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            cost: 0.10,
+                        },
+                    }],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        // DSH entry
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-20T11:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 3000,
+                            output_tokens: 1000,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            cost: 0.05,
+                        },
+                    }],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        // Filter by DSH: only DSH entry
+        let dsh_stats = aggregate_cache(&cache, Some(SOURCE_DSH), &default_prices());
+        assert_eq!(dsh_stats.total.input_tokens, 3000);
+        assert!((dsh_stats.total.cost - 0.05).abs() < 0.001);
+
+        // No filter (all): both entries
+        let all_stats = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(all_stats.total.input_tokens, 8000);
+        assert!((all_stats.total.cost - 0.15).abs() < 0.001);
+
+        // DSH == All minus legacy baseline
+        assert_eq!(
+            all_stats.total.input_tokens - dsh_stats.total.input_tokens,
+            5000
+        );
+    }
+
+    #[test]
+    fn test_category_aware_pricing_partial_rate_gap() {
+        // A model with input/output rates but no cache_read/cache_creation rates:
+        // only cache tokens should be unpriced, and costIncomplete should be set.
+        let mut custom_prices = HashMap::new();
+        custom_prices.insert(
+            "partial-model".to_string(),
+            ModelPrice {
+                input_cost_per_token: 1e-6,
+                output_cost_per_token: 2e-6,
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+            },
+        );
+
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-25T10:00:00.000Z".to_string(),
+                        model: "partial-model".to_string(),
+                        environment: Some("custom".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 200,
+                            cache_creation_tokens: 100,
+                            cost: 0.002,
+                        },
+                    }],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&cache, None, &custom_prices);
+        // Only cache tokens (200 + 100 = 300) are unpriced
+        assert_eq!(stats.total.unpriced_tokens, 300);
+        assert!(stats.total.cost_incomplete);
+        // Cost is still non-zero (from input+output)
+        assert!((stats.total.cost - 0.002).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_category_aware_pricing_fully_covered_model() {
+        // A model with all rates defined: no unpriced tokens even with cache tokens
+        let mut files = HashMap::new();
+        files.insert(
+            "dsh://inst1/sess1".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-25T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 200,
+                            cache_creation_tokens: 100,
+                            cost: 0.01,
+                        },
+                    }],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+        // claude-sonnet-4-5 has all 4 rates defined
+        let stats = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(stats.total.unpriced_tokens, 0);
+        assert!(!stats.total.cost_incomplete);
+    }
+
+    /// Regression: production aggregators must use user-provided prices, not just
+    /// default_prices(). A custom price table that lacks cache rates must yield
+    /// cost_incomplete even when default_prices() would fully cover the model.
+    #[test]
+    fn test_production_path_uses_user_prices_not_defaults() {
+        // Build a cache with cache_read_tokens for claude-sonnet-4-5
+        let mut files = HashMap::new();
+        files.insert(
+            "file1.jsonl".to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 10,
+                },
+                stats: CacheStats {
+                    entries: vec![CacheEntry {
+                        timestamp: "2026-08-25T10:00:00.000Z".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        environment: Some("official".to_string()),
+                        usage: CacheUsage {
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_read_tokens: 300,
+                            cache_creation_tokens: 0,
+                            cost: 0.01,
+                        },
+                    }],
+                },
+                rollup: CacheRollup::default(),
+                parse_offset: 0,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        // With default prices (full coverage), no unpriced tokens
+        let stats_default = aggregate_cache(&cache, None, &default_prices());
+        assert_eq!(stats_default.total.unpriced_tokens, 0);
+        assert!(!stats_default.total.cost_incomplete);
+
+        // With custom user prices that omit cache_read rate for this model
+        let mut custom_prices = HashMap::new();
+        custom_prices.insert(
+            "claude-sonnet-4-5".to_string(),
+            ModelPrice {
+                input_cost_per_token: 3.0,
+                output_cost_per_token: 15.0,
+                cache_read_input_token_cost: None, // user hasn't configured this
+                cache_creation_input_token_cost: Some(3.75),
+            },
+        );
+        let stats_custom = aggregate_cache(&cache, None, &custom_prices);
+        // The 300 cache_read_tokens should be unpriced
+        assert_eq!(stats_custom.total.unpriced_tokens, 300);
+        assert!(stats_custom.total.cost_incomplete);
+
+        // Model breakdown also consistent with user prices
+        let breakdown = aggregate_model_breakdown(
+            &cache,
+            None,
+            ModelBreakdownGranularity::Day,
+            fixed_now(),
+            &custom_prices,
+        );
+        // HashMap<bucket, HashMap<model, TokenUsageWithCost>>
+        let all_model_entries: Vec<_> = breakdown.values().flat_map(|m| m.values()).collect();
+        assert!(!all_model_entries.is_empty());
+        let entry = &all_model_entries[0];
+        assert_eq!(entry.unpriced_tokens, 300);
+        assert!(entry.cost_incomplete);
     }
 }

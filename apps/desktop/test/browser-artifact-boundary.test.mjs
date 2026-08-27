@@ -31,24 +31,20 @@ test('Mode 2 agent browser artifacts are app-owned and routed through the exact 
   assert.match(artifactSource, /canonical_path\.parent\(\) != Some\(canonical_root\.as_path\(\)\)/);
 });
 
-test('interaction refs require the matching generation-safe snapshot id', async () => {
-  const [toolSource, registrySource, helperSource] = await Promise.all([
-    fs.readFile(path.join(rustDir, 'browser', 'tools.rs'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'browser', 'registry.rs'), 'utf8'),
+test('Mode 2 interaction refs are opaque and invalidated with their guarded document', async () => {
+  const [agentServiceSource, semanticsSource, navigationSource, helperSource] = await Promise.all([
+    fs.readFile(path.join(rustDir, 'browser', 'login', 'agent_service.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'browser', 'login', 'cdp', 'semantics.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'browser', 'login', 'cdp', 'semantics', 'navigation.rs'), 'utf8'),
     fs.readFile(path.join(repoDir, 'packages', 'native-runtime-helper', 'src', 'browserMcp.ts'), 'utf8'),
   ]);
 
-  assert.match(toolSource, /required_string_arg\(&request\.args, "snapshotId"\)/);
-  assert.match(toolSource, /validate_interaction_snapshot/);
-  assert.match(toolSource, /__ccemSnapshot_/);
-  assert.match(toolSource, /hidden_text_count/);
-  assert.match(toolSource, /value_redacted/);
+  assert.match(agentServiceSource, /required_string\(&request\.args, "elementRef"\)/);
+  assert.match(semanticsSource, /self\.elements\.resolve\(element_ref\)/);
+  assert.match(semanticsSource, /revalidate_guarded_document/);
+  assert.match(navigationSource, /self\.invalidate_document\(\)/);
   assert.doesNotMatch(helperSource, /accessibility-style snapshot/);
-  assert.match(helperSource, /snapshotId: z\.string\(\)\.min\(1\)/);
-
-  const navigation = registrySource.match(
-    /pub fn mark_navigation\([\s\S]*?Ok\(\(session\.clone\(\), token\)\)/,
-  )?.[0] ?? '';
-  assert.match(navigation, /latest_snapshot = None/);
-  assert.match(registrySource, /token\.navigation_seq != session\.navigation_seq/);
+  assert.match(helperSource, /elementRef: z\.string\(\)\.min\(1\)/);
+  assert.doesNotMatch(helperSource, /snapshotId: z\.string\(\)\.min\(1\)/);
+  assert.doesNotMatch(helperSource, /ref: z\.number\(\)/);
 });

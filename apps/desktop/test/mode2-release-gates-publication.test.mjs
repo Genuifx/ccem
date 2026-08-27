@@ -642,8 +642,9 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(buildJob, /inputs\.export_release_payload == true/u);
 
   const transactionJob = workflow.slice(transactionJobIndex, universalJobIndex);
-  assert.match(transactionJob, /needs: \[prepare-release, signed-producer\]/u);
+  assert.match(transactionJob, /needs: \[prepare-release, signed-producer, dsh_bundle_smoke\]/u);
   assert.match(transactionJob, /needs\.signed-producer\.result == 'success'/u);
+  assert.match(transactionJob, /needs\.dsh_bundle_smoke\.result == 'success'/u);
   assert.match(transactionJob, /actions: read\n\s+contents: write/u);
   const payloadVerifyIndex = transactionJob.indexOf('- name: Verify exact three immutable payloads and eight assets');
   const draftIndex = transactionJob.indexOf('- name: Create or resume the exact current-run draft release');

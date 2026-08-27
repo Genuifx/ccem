@@ -185,11 +185,113 @@ jobs:
       export_release_payload: true
       release_tag: ${{ needs.prepare-release.outputs.current_tag }}
 
+  dsh_bundle_smoke:
+    name: Verify DSH in Exact Signed Payload (${{ matrix.target }})
+    needs: signed-producer
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - name: Download this attempt's exact signed target payload
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: release-payload
+
+      - name: Smoke DSH helper from exact macOS updater app
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          updater_relative="$(
+            node -e '
+              const fs = require("node:fs");
+              const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              const value = manifest?.assets?.updater?.relativePath;
+              if (typeof value !== "string" || !new RegExp("^assets/[^/]+$", "u").test(value)) {
+                throw new Error("payload manifest has no exact updater asset");
+              }
+              process.stdout.write(value);
+            ' release-payload/payload-manifest.json
+          )"
+          updater_path="release-payload/${updater_relative}"
+          [[ -f "$updater_path" ]] || {
+            echo "Signed macOS updater payload is missing: $updater_path" >&2
+            exit 1
+          }
+          extract_root="$RUNNER_TEMP/dsh-payload-${{ matrix.target }}"
+          rm -rf "$extract_root"
+          mkdir -p "$extract_root"
+          tar -xzf "$updater_path" -C "$extract_root"
+          shopt -s nullglob
+          app_matches=("$extract_root"/*.app)
+          if [[ "${#app_matches[@]}" -ne 1 ]]; then
+            echo "Expected exactly one app in signed updater payload; found ${#app_matches[@]}" >&2
+            printf '%s\n' "${app_matches[@]}" >&2
+            exit 1
+          fi
+          node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs \
+            --app-bundle "${app_matches[0]}" \
+            --evidence "$RUNNER_TEMP/dsh-bundle-smoke-${{ matrix.target }}.json"
+
+      - name: Smoke DSH helper from exact Windows installer
+        if: ${{ matrix.platform == 'windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payloadRoot = (Resolve-Path 'release-payload').Path
+          $manifest = Get-Content -LiteralPath (Join-Path $payloadRoot 'payload-manifest.json') -Raw | ConvertFrom-Json
+          $relative = [string]$manifest.assets.updater.relativePath
+          if ($relative -notmatch '^assets/[^/]+$') {
+            throw 'Payload manifest has no exact updater asset'
+          }
+          $installer = Join-Path $payloadRoot ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Signed Windows updater payload is missing: $installer"
+          }
+          $evidence = Join-Path $env:RUNNER_TEMP "dsh-bundle-smoke-${{ matrix.target }}.json"
+          node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs --nsis-installer $installer --evidence $evidence
+
+      - name: Retain DSH signed-payload smoke evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dsh-bundle-smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/dsh-bundle-smoke-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 90
+
   publish-updater-manifest:
     name: Mutate and Publish Exact Release
-    needs: [prepare-release, signed-producer]
+    needs: [prepare-release, signed-producer, dsh_bundle_smoke]
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' && needs.dsh_bundle_smoke.result == 'success' }}
     permissions:
       actions: read
       contents: write

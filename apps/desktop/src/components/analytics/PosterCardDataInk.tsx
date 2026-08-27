@@ -157,7 +157,7 @@ export function PosterCardDataInk({
           </div>
         </div>
         <div>
-          <div style={{ fontSize: 24, fontWeight: 700, color: '#1a1a2e' }}>${usageStats.total.cost.toFixed(2)}</div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: '#1a1a2e' }}>{usageStats.total.costIncomplete ? '≥' : ''}${usageStats.total.cost.toFixed(2)}</div>
           <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 2, textTransform: 'uppercase', letterSpacing: 0.5 }}>
             {t('analytics.shareTotalCost')}
           </div>

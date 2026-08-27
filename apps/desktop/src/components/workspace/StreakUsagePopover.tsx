@@ -36,6 +36,7 @@ export function StreakUsagePopoverContent({
   );
   const todayTokens = sumTokens(usageStats.today);
   const todayCost = usageStats.today.cost ?? 0;
+  const todayCostIncomplete = usageStats.today.costIncomplete;
 
   return (
     <div className="p-4">
@@ -54,7 +55,7 @@ export function StreakUsagePopoverContent({
           <span className="font-semibold text-foreground">{formatTokens(todayTokens)}</span>
           <span className="ml-0.5 text-muted-foreground/70">·</span>
           <span className="ml-1 font-semibold text-foreground">
-            ${todayCost.toFixed(2)}
+            {todayCostIncomplete ? '≥' : ''}${todayCost.toFixed(2)}
           </span>
         </span>
       </div>

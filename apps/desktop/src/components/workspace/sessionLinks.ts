@@ -1,10 +1,12 @@
 import type { HistorySessionItem, HistorySource } from '@/features/conversations/types';
 
+export type CcemSessionLinkSource = Extract<HistorySource, 'claude' | 'codex' | 'opencode'>;
+
 export type CcemSessionLinkIdKind = 'runtime' | 'provider';
 export type CcemSessionLinkFocus = 'events' | 'history' | 'live';
 
 export interface CcemSessionLinkRef {
-  source: Extract<HistorySource, 'claude' | 'codex' | 'opencode'>;
+  source: CcemSessionLinkSource;
   id: string;
   idKind: CcemSessionLinkIdKind;
   runtimeId?: string | null;
@@ -14,7 +16,7 @@ export interface CcemSessionLinkRef {
 }
 
 export interface ParsedCcemSessionLink {
-  source: Extract<HistorySource, 'claude' | 'codex' | 'opencode'>;
+  source: CcemSessionLinkSource;
   idKind: CcemSessionLinkIdKind;
   id: string;
   runtimeId: string | null;
@@ -24,13 +26,22 @@ export interface ParsedCcemSessionLink {
 }
 
 export interface CcemSessionLinkNativeSessionRef {
-  provider: Extract<HistorySource, 'claude' | 'codex' | 'opencode'> | string;
+  provider: CcemSessionLinkSource | string;
   runtime_id: string;
   provider_session_id?: string | null;
   project_dir?: string | null;
 }
 
-const VALID_SOURCES = new Set(['claude', 'codex', 'opencode']);
+/** Exhaustive narrowing — explicitly enumerates valid link sources. Unknown/dsh → null. */
+function toLinkSource(source: string): CcemSessionLinkSource | null {
+  switch (source) {
+    case 'claude': return 'claude';
+    case 'codex': return 'codex';
+    case 'opencode': return 'opencode';
+    default: return null; // dsh, unknown — fail closed
+  }
+}
+
 const VALID_ID_KINDS = new Set(['runtime', 'provider']);
 const VALID_FOCUS = new Set(['events', 'history', 'live']);
 
@@ -59,10 +70,13 @@ export function buildCcemSessionLink(ref: CcemSessionLinkRef): string {
   return `ccem://workspace/session?${params.toString().replace(/\+/g, '%20')}`;
 }
 
-export function buildCcemSessionLinkForHistorySession(session: HistorySessionItem): string {
+export function buildCcemSessionLinkForHistorySession(session: HistorySessionItem): string | null {
+  // Exhaustive narrowing — dsh/unknown fail closed (returns null).
+  const source = toLinkSource(session.source);
+  if (!source) return null;
   const idKind = inferCcemSessionIdKind(session);
   return buildCcemSessionLink({
-    source: session.source,
+    source,
     idKind,
     id: session.id,
     runtimeId: idKind === 'runtime' ? session.id : null,
@@ -96,9 +110,11 @@ export function parseCcemSessionLink(rawLink: string): ParsedCcemSessionLink | n
   const source = readRequiredString(url.searchParams, 'source');
   const idKind = readRequiredString(url.searchParams, 'idKind');
   const id = readRequiredString(url.searchParams, 'id');
-  if (!source || !idKind || !id || !VALID_SOURCES.has(source) || !VALID_ID_KINDS.has(idKind)) {
+  if (!source || !idKind || !id || !VALID_ID_KINDS.has(idKind)) {
     return null;
   }
+  const narrowedSource = toLinkSource(source);
+  if (!narrowedSource) return null;
 
   const focus = readOptionalString(url.searchParams, 'focus');
   if (focus && !VALID_FOCUS.has(focus)) {
@@ -106,7 +122,7 @@ export function parseCcemSessionLink(rawLink: string): ParsedCcemSessionLink | n
   }
 
   return {
-    source: source as ParsedCcemSessionLink['source'],
+    source: narrowedSource,
     idKind: idKind as CcemSessionLinkIdKind,
     id,
     runtimeId: readOptionalString(url.searchParams, 'runtimeId'),

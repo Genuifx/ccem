@@ -255,8 +255,9 @@ test('release caller keeps the only write token behind the shared producer', asy
   assert.match(producer, /actions: read\n\s+contents: read/u);
   assert.doesNotMatch(producer, /contents: write/u);
   const publisher = jobBlock(source, 'publish-updater-manifest', 'create-universal');
-  assert.match(publisher, /needs: \[prepare-release, signed-producer\]/u);
+  assert.match(publisher, /needs: \[prepare-release, signed-producer, dsh_bundle_smoke\]/u);
   assert.match(publisher, /needs\.signed-producer\.result == 'success'/u);
+  assert.match(publisher, /needs\.dsh_bundle_smoke\.result == 'success'/u);
   assert.match(publisher, /actions: read\n\s+contents: write/u);
   assert.match(publisher, /pattern: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\*/u);
   assert.match(publisher, /ensure-draft-github-release\.mjs/u);

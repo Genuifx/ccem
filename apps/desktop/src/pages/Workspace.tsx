@@ -2666,6 +2666,11 @@ export function Workspace({
       return false;
     }
 
+    // DSH sessions are read-only — never allow continuation in Workspace.
+    if (selectedSession.source === 'dsh') {
+      return false;
+    }
+
     if (isHistoryRouteContinuationBlocked(
       selectedSession.source,
       historyRouteResolutionStatusRef.current,
@@ -3198,6 +3203,12 @@ export function Workspace({
 
   const renderHistoryView = () => {
     if (!selectedSession) {
+      return null;
+    }
+
+    // DSH sessions should never appear in Workspace (backend legacy-only loader + frontend filter).
+    // Guard defensively for type narrowing.
+    if (selectedSession.source === 'dsh') {
       return null;
     }
 

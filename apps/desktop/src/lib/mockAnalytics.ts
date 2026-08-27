@@ -8,6 +8,8 @@ export function generateMockUsageStats(): UsageStats {
     cacheReadTokens: 8000,
     cacheCreationTokens: 4000,
     cost: 0.24,
+    unpricedTokens: 0,
+    costIncomplete: false,
   };
 
   const week = {
@@ -16,6 +18,8 @@ export function generateMockUsageStats(): UsageStats {
     cacheReadTokens: 45000,
     cacheCreationTokens: 22000,
     cost: 1.86,
+    unpricedTokens: 0,
+    costIncomplete: false,
   };
 
   const month = {
@@ -24,6 +28,8 @@ export function generateMockUsageStats(): UsageStats {
     cacheReadTokens: 180000,
     cacheCreationTokens: 88000,
     cost: 7.44,
+    unpricedTokens: 0,
+    costIncomplete: false,
   };
 
   const total = {
@@ -32,6 +38,8 @@ export function generateMockUsageStats(): UsageStats {
     cacheReadTokens: 620000,
     cacheCreationTokens: 300000,
     cost: 24.80,
+    unpricedTokens: 0,
+    costIncomplete: false,
   };
 
   // Generate daily history for last 30 days
@@ -47,6 +55,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: Math.floor(Math.random() * 12000) + 3000,
       cacheCreationTokens: Math.floor(Math.random() * 6000) + 1500,
       cost: Math.random() * 0.5 + 0.1,
+      unpricedTokens: 0,
+      costIncomplete: false,
     };
   }
 
@@ -62,6 +72,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: Math.floor(Math.random() * 2000) + 300,
       cacheCreationTokens: Math.floor(Math.random() * 1000) + 100,
       cost: Math.random() * 0.08 + 0.01,
+      unpricedTokens: 0,
+      costIncomplete: false,
     };
   }
 
@@ -72,6 +84,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 300000,
       cacheCreationTokens: 150000,
       cost: 12.50,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
     'claude-sonnet-4-5': {
       inputTokens: 800000,
@@ -79,6 +93,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 200000,
       cacheCreationTokens: 100000,
       cost: 8.30,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
     'glm-4-flash': {
       inputTokens: 400000,
@@ -86,6 +102,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 100000,
       cacheCreationTokens: 40000,
       cost: 3.20,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
     'deepseek-chat': {
       inputTokens: 80000,
@@ -93,6 +111,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 20000,
       cacheCreationTokens: 10000,
       cost: 0.80,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
   };
 
@@ -103,6 +123,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 375000,
       cacheCreationTokens: 187500,
       cost: 15.60,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
     'GLM-4': {
       inputTokens: 600000,
@@ -110,6 +132,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 150000,
       cacheCreationTokens: 75000,
       cost: 6.20,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
     DeepSeek: {
       inputTokens: 380000,
@@ -117,6 +141,8 @@ export function generateMockUsageStats(): UsageStats {
       cacheReadTokens: 95000,
       cacheCreationTokens: 37500,
       cost: 3.00,
+      unpricedTokens: 0,
+      costIncomplete: false,
     },
   };
 

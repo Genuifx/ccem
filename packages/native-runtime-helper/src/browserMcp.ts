@@ -275,21 +275,17 @@ export function createCcemBrowserMcpServer(
       )),
       ...maybe('click', tool(
         'click',
-        'Click an element from the latest snapshot using Preview snapshotId/ref or Login Browser elementRef.',
+        'Click an element from the latest embedded-browser snapshot using its opaque elementRef.',
         {
-          snapshotId: z.string().min(1).optional(),
-          ref: z.number().int().positive().optional(),
-          elementRef: z.string().min(1).optional(),
+          elementRef: z.string().min(1),
         },
         async (args) => toToolResult(await sendAuthorizedBrowserToolRequest('click', args)),
       )),
       ...maybe('type', tool(
         'type',
-        'Type text using Preview snapshotId/ref or the Login Browser opaque elementRef.',
+        'Type text into an element from the latest embedded-browser snapshot using its opaque elementRef.',
         {
-          snapshotId: z.string().min(1).optional(),
-          ref: z.number().int().positive().optional(),
-          elementRef: z.string().min(1).optional(),
+          elementRef: z.string().min(1),
           text: z.string(),
           replace: z.boolean().optional(),
         },

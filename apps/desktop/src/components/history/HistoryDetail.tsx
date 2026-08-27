@@ -11,7 +11,9 @@ import type {
   HistorySegment,
   HistorySessionItem,
 } from '@/features/conversations/types';
+import { isResumableHistorySource } from '@/features/conversations/types';
 import { getHistorySessionDisplay } from './historySession';
+import type { HistoryCommandError } from '@/features/conversations/historyData';
 
 interface HistoryDetailProps {
   selectedSession: HistorySessionItem;
@@ -20,8 +22,11 @@ interface HistoryDetailProps {
   activeSegment: number | null;
   onActiveSegmentChange: (segment: number | null) => void;
   isLoadingMessages: boolean;
+  detailError?: HistoryCommandError | null;
+  detailWarnings?: string[];
+  onRetryDetail?: () => void;
   onExport: () => void;
-  onResume: () => void;
+  onResume?: () => void;
   launched: boolean;
   /** When true, auto-scrolls to the bottom on session load (dashboard mode).
    *  When false (default), scrolls to the top (history mode). */
@@ -47,6 +52,9 @@ export function HistoryDetail({
   activeSegment,
   onActiveSegmentChange,
   isLoadingMessages,
+  detailError,
+  detailWarnings,
+  onRetryDetail,
   onExport,
   onResume,
   launched,
@@ -289,20 +297,29 @@ export function HistoryDetail({
               className="h-8 gap-1.5 px-3 text-xs"
               onClick={onExport}
               disabled={isLoadingMessages}
+              data-testid="history-export-btn"
             >
               <Download className="h-3.5 w-3.5" />
               {t('history.export')}
             </Button>
-            <Button
-              size="sm"
-              variant={launched ? 'ghost' : 'outline'}
-              className="h-8 gap-1.5 px-3 text-xs"
-              onClick={onResume}
-              disabled={launched}
-            >
-              {launched ? <Check className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-              {launched ? t('history.resumed') : t('history.resume')}
-            </Button>
+            {isResumableHistorySource(selectedSession.source) && onResume && (
+              <Button
+                size="sm"
+                variant={launched ? 'ghost' : 'outline'}
+                className="h-8 gap-1.5 px-3 text-xs"
+                onClick={onResume}
+                disabled={launched}
+                data-testid="history-resume-btn"
+              >
+                {launched ? <Check className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                {launched ? t('history.resumed') : t('history.resume')}
+              </Button>
+            )}
+            {!isResumableHistorySource(selectedSession.source) && (
+              <span className="text-[11px] text-muted-foreground/60 px-2" data-testid="history-read-only-label">
+                {t('history.readOnly')}
+              </span>
+            )}
           </div>
         </div>
         <div className="mt-1 flex items-center gap-3">
@@ -358,6 +375,19 @@ export function HistoryDetail({
                 </div>
               ))}
             </div>
+          ) : detailError ? (
+            <div className="flex min-h-[240px] flex-col items-center justify-center gap-3" data-testid="history-detail-error">
+              <p className="text-xs text-destructive">{detailError.message}</p>
+              {onRetryDetail && (
+                <button
+                  className="text-xs underline text-muted-foreground hover:text-foreground"
+                  onClick={onRetryDetail}
+                  data-testid="history-detail-retry"
+                >
+                  {t('history.retry')}
+                </button>
+              )}
+            </div>
           ) : visibleMessages.length === 0 ? (
             <div className="flex min-h-[240px] items-center justify-center">
               <p className="text-xs text-muted-foreground">{t('history.noMessages')}</p>
@@ -394,8 +424,16 @@ export function HistoryDetail({
             </div>
           )}
 
-          {!isLoadingMessages && (
-            <div className="mt-8 flex justify-center">
+          {!isLoadingMessages && !detailError && (
+            <>
+              {detailWarnings && detailWarnings.length > 0 && (
+                <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2">
+                  {detailWarnings.map((w, i) => (
+                    <p key={i} className="text-xs text-amber-400/80">⚠ {w}</p>
+                  ))}
+                </div>
+              )}
+              <div className="mt-8 flex justify-center">
               <div className="glass-subtle glass-noise w-full max-w-sm rounded-xl border border-border/40 px-4 py-4 text-center shadow-[0_8px_30px_rgba(0,0,0,0.08)]">
                 <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-muted-foreground/40">
                   {t('history.sessionInfo')}
@@ -413,6 +451,7 @@ export function HistoryDetail({
                 </p>
               </div>
             </div>
+            </>
           )}
         </div>
       </div>

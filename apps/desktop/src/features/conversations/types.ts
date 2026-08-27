@@ -1,4 +1,12 @@
-export type HistorySource = 'claude' | 'codex' | 'opencode';
+export type HistorySource = 'claude' | 'codex' | 'opencode' | 'dsh';
+
+/** Sources that support session resume (DSH is read-only, never resumable). */
+export type ResumableHistorySource = Exclude<HistorySource, 'dsh'>;
+
+/** Type guard: returns true if the source supports resume. */
+export function isResumableHistorySource(source: HistorySource): source is ResumableHistorySource {
+  return source === 'claude' || source === 'codex' || source === 'opencode';
+}
 
 export type HistorySourceFilter = 'all' | HistorySource;
 

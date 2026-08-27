@@ -341,14 +341,14 @@ fn detector_source_has_no_process_network_or_write_dependencies() {
         );
     }
 
-    let main_source = include_str!("main.rs");
-    let verify = main_source
+    let desktop_source = include_str!("lib.rs");
+    let verify = desktop_source
         .find("runtime_path_for_verified_launch")
         .expect("create command should verify proof");
-    let resolve = main_source
+    let resolve = desktop_source
         .find("resolve_codex_runtime(&env_name)")
         .expect("create command should resolve runtime");
-    let create = main_source
+    let create = desktop_source
         .find("native_state.create_session")
         .expect("create command should create session");
     assert!(verify < resolve && resolve < create);

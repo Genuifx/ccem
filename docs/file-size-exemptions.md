@@ -7,12 +7,15 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src-tauri/src/browser.rs`: Browser instance ownership, runtime-alias fencing, and Agent tool routing remain together while the per-conversation Mode 2 identity contract is stabilized.
 - `apps/desktop/src-tauri/src/browser/login/cef/surface/macos.rs`: The macOS CEF child-view lifecycle and callback/FFI boundary remain co-located until signed runtime smoke coverage can validate a safe split.
 - `apps/desktop/src-tauri/src/browser/login/cef/surface/windows.rs`: The Windows CEF child-view lifecycle and callback/FFI boundary remain co-located until signed runtime smoke coverage can validate a safe split.
+- `apps/desktop/src-tauri/src/browser/login/cef/debug_smoke/runtime.rs`: The isolated Mock Keychain Mode 2 debug host keeps its multi-instance production-runtime scenario in one auditable harness while that gate is stabilized.
+- `apps/desktop/src-tauri/src/browser/login/surface_commands/production_smoke.rs`: Cross-platform Mode 2 semantic smoke orchestration remains co-located so lease, storage, and exact-actor assertions share one production-path fixture.
 - `apps/desktop/src-tauri/src/browser/login/surface_commands.rs`: Per-instance surface lifecycle, shared-profile membership, and command linearization remain centralized while the multi-session contract is stabilized.
 - `apps/desktop/src-tauri/src/browser/tools.rs`: Browser tool validation, authority fencing, dispatch, and result projection remain centralized during the Mode 2 security-boundary rollout.
-- `apps/desktop/src/pages/TrayCockpit.tsx`: Tray cockpit UI orchestration, diagnostics, and preview browser controls remain bundled while the tray surface is being iterated.
+- `apps/desktop/src/pages/TrayCockpit.tsx`: Tray cockpit UI orchestration, runtime status, and diagnostics remain bundled while the tray surface is being iterated.
 - `apps/desktop/src-tauri/src/config.rs`: Configuration migration, recovery, and runtime resolution still share one module.
 - `apps/desktop/src-tauri/src/cron.rs`: Cron scheduling and execution orchestration is still a large legacy module.
 - `apps/desktop/src-tauri/src/external_control.rs`: Desktop external-control server, descriptor publishing, security boundary checks, and unit coverage remain centralized during the control API hardening.
+- `apps/desktop/src-tauri/src/event_bus.rs`: Cross-provider runtime event normalization and delivery remain centralized while background-task and DSH event shapes converge.
 - `apps/desktop/src-tauri/src/history.rs`: History parsing and projection code is still coupled in one file.
 - `apps/desktop/src-tauri/src/interactive_runtime.rs`: Interactive runtime capture, replay, and prompt monitoring remain centralized while terminal and native-session flows are still converging.
 - `apps/desktop/src-tauri/src/lib.rs`: Tauri command wiring and app bootstrap were mechanically moved from the former large binary entrypoint so Windows can expose the official CEF bootstrap client DLL; split this legacy orchestration incrementally after the bootstrap migration lands.
@@ -28,9 +31,9 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src-tauri/src/wecom/mod.rs`: WeCom bot bridge integration is currently a large module and needs phased extraction.
 - `apps/desktop/src-tauri/src/weixin/mod.rs`: Weixin bridge integration remains a large monolith and needs phased extraction.
 - `apps/desktop/src-tauri/resources/native-runtime-helper.mjs`: Generated bundled sidecar resource mirrors the native-runtime-helper build output and is not maintained as hand-written source.
+- `apps/desktop/src-tauri/resources/dsh-history/lib/dsh-history-helper.mjs`: Generated DSH history sidecar resource mirrors the bundled helper build output and is not maintained as hand-written source.
 - `apps/desktop/src/components/analytics/SharePosterDialog.tsx`: Share poster generation UI is still implemented in one large component.
 - `apps/desktop/src/components/use-prompt-area.ts`: Vendored Prompt Area registry hook is kept intact while composer rich-input behavior is validated.
-- `apps/desktop/src/components/workspace/BrowserPanel.tsx`: Preview and Login panel rendering still share exact native-surface lease and visibility orchestration while the unified browser workspace is stabilized.
 - `apps/desktop/src/components/workspace/WorkspaceMessageBubble.tsx`: Workspace transcript rendering is still bundled with attachment, diff, and tool-call presentation during the workspace redesign.
 - `apps/desktop/src/components/workspace/workspaceEventTranscript.ts`: Workspace event transcript projection remains concentrated while native/runtime event shapes are still being unified.
 - `apps/desktop/src/components/workspace/ProjectTree.tsx`: Workspace project tree rendering and navigation state remain concentrated during the workspace redesign.
@@ -45,3 +48,4 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/test/draft-release-uploader.test.mjs`: Draft-release publication coverage keeps its stateful GitHub API fixture and immutable-release matrix together for end-to-end readability.
 - `packages/native-runtime-helper/src/index.ts`: Bundled helper protocol, Claude SDK bridge, and Codex SDK bridge are still packaged as one sidecar entrypoint.
 - `packages/native-runtime-helper/test/claude-session-restart.test.mjs`: Existing restart and recovery integration scenarios share a large stateful fixture suite.
+- `packages/native-runtime-helper/test/dsh-history.test.mjs`: DSH helper protocol, corruption handling, portability, and source-immutability scenarios share one end-to-end fixture suite.

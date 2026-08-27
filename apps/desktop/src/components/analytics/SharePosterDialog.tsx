@@ -357,6 +357,8 @@ function createEmptyUsage(): TokenUsageWithCost {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     cost: 0,
+    unpricedTokens: 0,
+    costIncomplete: false,
   };
 }
 

@@ -368,7 +368,8 @@ test('release DAG keeps builders read-only and defers one privileged transaction
   assert.doesNotMatch(callJob, /contents: write|secrets:\s*inherit/u);
 
   const transaction = releaseWorkflow.slice(transactionIndex, universalIndex);
-  assert.match(transaction, /needs: \[prepare-release, signed-producer\]/u);
+  assert.match(transaction, /needs: \[prepare-release, signed-producer, dsh_bundle_smoke\]/u);
+  assert.match(transaction, /needs\.dsh_bundle_smoke\.result == 'success'/u);
   assert.match(transaction, /actions: read\n\s+contents: write/u);
   assert.equal(releaseWorkflow.match(/contents: write/gu)?.length, 1);
   assert.match(transaction, /pattern: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\*/u);

@@ -110,10 +110,10 @@ test('browser MCP exposes interactive tools for development modes', async () => 
   });
 
   const click = server.instance._registeredTools.click.handler;
-  const clickResult = await click({ snapshotId: 'snapshot-1', ref: 7 });
+  const clickResult = await click({ elementRef: 'element-7-opaque' });
   assert.deepEqual(JSON.parse(clickResult.content[0].text), {
     toolName: 'click',
-    args: { snapshotId: 'snapshot-1', ref: 7 },
+    args: { elementRef: 'element-7-opaque' },
   });
 
   const readNetworkLog = server.instance._registeredTools.read_network_log.handler;
