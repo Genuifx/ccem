@@ -800,7 +800,9 @@
     "subtitle": "Token usage statistics and cost analysis",
     "tokenThisWeek": "Tokens (This Week, incl. cache)",
     "costTotal": "Estimated Cost (Total)",
+    "costKnown": "Known Cost (Partial)",
     "costThisWeek": "Estimated Cost (This Week)",
+    "providerDistribution": "Provider Distribution",
     "vsLastWeek": "vs last week",
     "streak": "Streak",
     "days": "days",
@@ -1312,6 +1314,7 @@
     "sourceAll": "All",
     "sourceClaude": "Claude",
     "sourceCodex": "Codex",
+    "sourceOther": "Other",
     "sourceOpencode": "OpenCode",
     "you": "You",
     "assistant": "Assistant",
@@ -1327,7 +1330,13 @@
     "sessionId": "Session ID",
     "tokensTotal": "Total Tokens",
     "tokensInput": "Input",
-    "tokensOutput": "Output"
+    "tokensOutput": "Output",
+    "sourceDsh": "DeepSeek",
+    "readOnly": "Read-only",
+    "dshLoadError": "DSH read failed",
+    "loadError": "Failed to load history",
+    "detailLoadError": "Failed to load session detail",
+    "retry": "Retry"
   },
   "sideRail": {
     "workspace": "Workspace",

@@ -87,6 +87,8 @@ const EMPTY_USAGE: TokenUsageWithCost = {
   cacheReadTokens: 0,
   cacheCreationTokens: 0,
   cost: 0,
+  unpricedTokens: 0,
+  costIncomplete: false,
 };
 
 const AUTO_REFRESH_MIN_INTERVAL_MS = 1_000;
@@ -593,7 +595,8 @@ function TrayCockpitContent() {
   };
 
   const updatedLabel = t('trayCockpit.updated').replace('{time}', formatRelativeTime(snapshot.usage.lastUpdated));
-  const monthCostLabel = t('trayCockpit.monthCost').replace('{cost}', formatCost(snapshot.usage.month.cost));
+  const monthCostIncomplete = snapshot.usage.month.costIncomplete;
+  const monthCostLabel = t('trayCockpit.monthCost').replace('{cost}', (monthCostIncomplete ? '≥' : '') + formatCost(snapshot.usage.month.cost));
 
   return (
     <div ref={cockpitRef} className="tray-cockpit-window flex min-h-screen w-full items-start justify-center bg-transparent px-[32px] pb-[48px] pt-2 font-sans">
@@ -635,7 +638,7 @@ function TrayCockpitContent() {
             <MetricTile
               accent
               label={t('trayCockpit.costToday')}
-              value={formatCost(snapshot.usage.today.cost)}
+              value={(snapshot.usage.today.costIncomplete ? '≥' : '') + formatCost(snapshot.usage.today.cost)}
               detail={monthCostLabel}
             />
           </div>

@@ -51,7 +51,7 @@ objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSBi
 objc2-web-kit = { version = "0.2.2", default-features = false, features = ["block2", "WKNavigation", "WKSnapshotConfiguration", "WKWebView"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [features]
 default = ["custom-protocol"]

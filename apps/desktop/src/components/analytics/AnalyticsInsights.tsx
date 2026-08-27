@@ -15,7 +15,7 @@ import type {
 } from '@/types/analytics';
 
 type TimeGranularity = 'hour' | 'day' | 'week' | 'month';
-type AnalyticsUsageSource = 'all' | 'claude' | 'codex' | 'opencode';
+type AnalyticsUsageSource = 'all' | 'claude' | 'codex' | 'opencode' | 'dsh';
 const MODEL_BREAKDOWN_CACHE_TTL_MS = 60_000;
 
 interface ModelBreakdownCacheEntry {
@@ -66,6 +66,8 @@ function createEmptyUsage(): TokenUsageWithCost {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     cost: 0,
+    unpricedTokens: 0,
+    costIncomplete: false,
   };
 }
 

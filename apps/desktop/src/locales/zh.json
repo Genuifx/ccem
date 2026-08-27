@@ -800,7 +800,9 @@
     "subtitle": "Token 使用统计和成本分析",
     "tokenThisWeek": "Token（本周，含缓存）",
     "costTotal": "预估费用（累计）",
+    "costKnown": "已知费用（部分）",
     "costThisWeek": "预估费用（本周）",
+    "providerDistribution": "Provider 分布",
     "vsLastWeek": "较上周",
     "streak": "连续使用",
     "days": "天",
@@ -1312,6 +1314,7 @@
     "sourceAll": "全部",
     "sourceClaude": "Claude",
     "sourceCodex": "Codex",
+    "sourceOther": "其他",
     "sourceOpencode": "OpenCode",
     "you": "你",
     "assistant": "助手",
@@ -1327,7 +1330,13 @@
     "sessionId": "会话 ID",
     "tokensTotal": "总 Token",
     "tokensInput": "输入",
-    "tokensOutput": "输出"
+    "tokensOutput": "输出",
+    "sourceDsh": "DeepSeek",
+    "readOnly": "只读",
+    "dshLoadError": "DSH 读取失败",
+    "loadError": "加载历史记录失败",
+    "detailLoadError": "加载会话详情失败",
+    "retry": "重试"
   },
   "sideRail": {
     "workspace": "工作间",
