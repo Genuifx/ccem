@@ -30,6 +30,7 @@ jobs:
       release_body: ${{ steps.release-notes.outputs.release_body }}
       current_tag: ${{ steps.release-notes.outputs.current_tag }}
       version: ${{ steps.release-notes.outputs.version }}
+      release_id: ${{ steps.draft-release.outputs.release_id }}
 
     steps:
       - uses: actions/checkout@v6
@@ -94,6 +95,103 @@ jobs:
         env:
           EXPECTED_VERSION: ${{ steps.release-notes.outputs.version }}
         run: node scripts/ci/check-release-version.mjs "$EXPECTED_VERSION"
+
+      - name: Create or reuse single draft release
+        id: draft-release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.release-notes.outputs.current_tag }}
+          VERSION: ${{ steps.release-notes.outputs.version }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.release_body }}
+          TARGET_COMMITISH: ${{ github.sha }}
+          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+        run: |
+          set -euo pipefail
+
+          api="https://api.github.com/repos/${REPO}"
+          auth_headers=(
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+          curl_retry_args=(
+            --retry 3
+            --retry-delay 2
+            --retry-max-time 60
+          )
+          matching_releases="$(mktemp)"
+          create_response="$(mktemp)"
+
+          for attempt in 1 2 3 4; do
+            curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
+              "${api}/releases?per_page=100" \
+              | jq --arg tag "$TAG_NAME" '[.[] | select(.tag_name == $tag)]' \
+              > "$matching_releases"
+
+            release_count="$(jq 'length' "$matching_releases")"
+            if (( release_count > 1 )); then
+              echo "Multiple releases already exist for ${TAG_NAME}; refusing to split matrix uploads" >&2
+              jq -r '.[] | [.id, .draft, .html_url] | @tsv' "$matching_releases" >&2
+              exit 1
+            fi
+
+            if (( release_count == 1 )); then
+              if [[ "$(jq -r '.[0].draft' "$matching_releases")" != "true" ]]; then
+                echo "Release ${TAG_NAME} is already published; refusing to overwrite it" >&2
+                exit 1
+              fi
+              release_id="$(jq -r '.[0].id' "$matching_releases")"
+              if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+                echo "Draft release ${TAG_NAME} has an invalid id" >&2
+                exit 1
+              fi
+              echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            payload="$(jq -n \
+              --arg tag_name "$TAG_NAME" \
+              --arg target_commitish "$TARGET_COMMITISH" \
+              --arg name "CCEM v${VERSION}" \
+              --arg body "$RELEASE_BODY" \
+              --argjson prerelease "$PRERELEASE" \
+              '{
+                tag_name: $tag_name,
+                target_commitish: $target_commitish,
+                name: $name,
+                body: $body,
+                draft: true,
+                prerelease: $prerelease
+              }')"
+
+            create_status="000"
+            if create_status="$(curl -sS -o "$create_response" -w '%{http_code}' -X POST \
+              "${auth_headers[@]}" \
+              -H "Content-Type: application/json" \
+              --data-binary "$payload" \
+              "${api}/releases")"; then
+              :
+            fi
+            if [[ "$create_status" == "201" ]]; then
+              release_id="$(jq -r '.id' "$create_response")"
+              if [[ "$release_id" =~ ^[0-9]+$ ]]; then
+                echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+
+            echo "Draft release creation attempt ${attempt} failed (HTTP ${create_status})" >&2
+            head -c 1000 "$create_response" >&2 || true
+            echo >&2
+            if (( attempt < 4 )); then
+              sleep "$((1 << (attempt - 1)))"
+            fi
+          done
+
+          echo "Failed to create or recover draft release ${TAG_NAME}" >&2
+          exit 1
 
   build-desktop:
     name: Build Desktop (${{ matrix.target }})
@@ -175,8 +273,10 @@ jobs:
           fi
 
       - name: Build and release (signed)
+        id: build-release-signed
         if: ${{ matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        uses: tauri-apps/tauri-action@v0
+        continue-on-error: true
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -189,30 +289,173 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
+          releaseId: ${{ needs.prepare-release.outputs.release_id }}
           tagName: v__VERSION__
           releaseName: 'CCEM v__VERSION__'
           releaseBody: ${{ needs.prepare-release.outputs.release_body }}
           releaseDraft: true
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          includeUpdaterJson: true
+          includeUpdaterJson: false
+          retryAttempts: 2
           args: ${{ matrix.args }}
 
       - name: Build and release (unsigned)
+        id: build-release-unsigned
         if: ${{ !matrix.appleSigning || steps.apple-signing.outputs.enabled != 'true' }}
-        uses: tauri-apps/tauri-action@v0
+        continue-on-error: true
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
+          releaseId: ${{ needs.prepare-release.outputs.release_id }}
           tagName: v__VERSION__
           releaseName: 'CCEM v__VERSION__'
           releaseBody: ${{ needs.prepare-release.outputs.release_body }}
           releaseDraft: true
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          includeUpdaterJson: true
+          includeUpdaterJson: false
+          retryAttempts: 2
           args: ${{ matrix.args }}
+
+      # GitHub can persist an asset while the upload client still reports an error.
+      # Recover only when every remote asset exactly matches this run's local SHA-256.
+      - name: Verify uploaded assets after action failure
+        if: ${{ steps.build-release-signed.outcome == 'failure' || steps.build-release-unsigned.outcome == 'failure' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.prepare-release.outputs.release_id }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          api="https://api.github.com/repos/${REPO}"
+          auth_headers=(
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Prepared draft release has an invalid id" >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          bundle_root="apps/desktop/src-tauri/target/${TARGET}/release/bundle"
+          artifact_files=()
+          contract_valid=true
+          case "$TARGET" in
+            aarch64-apple-darwin)
+              dmg_files=("$bundle_root"/dmg/*.dmg)
+              updater_files=("$bundle_root"/macos/*.app.tar.gz)
+              signature_files=("$bundle_root"/macos/*.app.tar.gz.sig)
+              if (( ${#dmg_files[@]} != 1 || ${#updater_files[@]} != 1 || ${#signature_files[@]} != 1 )); then
+                contract_valid=false
+              else
+                artifact_files=("${dmg_files[@]}" "${updater_files[@]}" "${signature_files[@]}")
+              fi
+              ;;
+            x86_64-apple-darwin)
+              dmg_files=("$bundle_root"/dmg/*.dmg)
+              updater_files=("$bundle_root"/macos/*.app.tar.gz)
+              signature_files=("$bundle_root"/macos/*.app.tar.gz.sig)
+              if (( ${#dmg_files[@]} != 1 || ${#updater_files[@]} != 1 || ${#signature_files[@]} != 1 )); then
+                contract_valid=false
+              else
+                artifact_files=("${dmg_files[@]}" "${updater_files[@]}" "${signature_files[@]}")
+              fi
+              ;;
+            x86_64-pc-windows-msvc)
+              installer_files=("$bundle_root"/nsis/*-setup.exe)
+              signature_files=("$bundle_root"/nsis/*-setup.exe.sig)
+              if (( ${#installer_files[@]} != 1 || ${#signature_files[@]} != 1 )); then
+                contract_valid=false
+              else
+                artifact_files=("${installer_files[@]}" "${signature_files[@]}")
+              fi
+              ;;
+            *)
+              echo "No release asset contract is defined for ${TARGET}" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$contract_valid" != "true" ]]; then
+            echo "tauri-action failed and ${TARGET} did not produce exactly one artifact of every required type" >&2
+            find "$bundle_root" -maxdepth 3 -type f -print >&2 || true
+            exit 1
+          fi
+
+          remote_assets_json="$(mktemp)"
+          verified=false
+          for verification_attempt in 1 2 3 4; do
+            curl --retry 3 --retry-delay 2 --retry-max-time 60 -fsSL \
+              "${auth_headers[@]}" "${api}/releases/${RELEASE_ID}/assets?per_page=100" \
+              > "$remote_assets_json"
+
+            verified=true
+            for artifact_file in "${artifact_files[@]}"; do
+              if [[ ! -s "$artifact_file" ]]; then
+                echo "Required local release asset is empty: ${artifact_file}" >&2
+                verified=false
+                break
+              fi
+
+              read -r asset_name asset_size asset_digest < <(
+                node -e '
+                  const { createHash } = require("node:crypto");
+                  const { readFileSync, statSync } = require("node:fs");
+                  const { basename } = require("node:path");
+                  const file = process.argv[1];
+                  const target = process.argv[2];
+                  const updaterExt = [".app.tar.gz.sig", ".app.tar.gz"].find((ext) => file.endsWith(ext));
+                  const arch = target.startsWith("aarch64-") ? "aarch64" : "x64";
+                  const uploadName = updaterExt
+                    ? `${basename(file, updaterExt)}_${arch}${updaterExt}`
+                    : basename(file);
+                  const name = uploadName
+                    .trim()
+                    .replace(/[ ()[\]{}]/g, ".")
+                    .replace(/\.\./g, ".")
+                    .normalize("NFD")
+                    .replace(/[\u0300-\u036f]/g, "");
+                  const size = statSync(file).size;
+                  const digest = `sha256:${createHash("sha256").update(readFileSync(file)).digest("hex")}`;
+                  console.log(`${name}\t${size}\t${digest}`);
+                ' "$artifact_file" "$TARGET"
+              )
+
+              if ! jq -e \
+                --arg name "$asset_name" \
+                --arg digest "$asset_digest" \
+                --argjson size "$asset_size" \
+                'map(select(.name == $name and .state == "uploaded" and .size == $size and .digest == $digest)) | length == 1' \
+                "$remote_assets_json" >/dev/null; then
+                echo "Remote asset does not match this run: ${asset_name} (${asset_digest})" >&2
+                verified=false
+                break
+              fi
+            done
+
+            if [[ "$verified" == "true" ]]; then
+              break
+            fi
+            if (( verification_attempt < 4 )); then
+              sleep "$((1 << (verification_attempt - 1)))"
+            fi
+          done
+
+          if [[ "$verified" != "true" ]]; then
+            echo "tauri-action failed and remote assets do not match this run's ${TARGET} artifacts" >&2
+            jq -r '.[] | [.name, .state, .size, (.digest // "no-digest")] | @tsv' "$remote_assets_json" >&2
+            exit 1
+          fi
+
+          echo "tauri-action reported a client error, but every ${TARGET} asset matches this run byte-for-byte."
 
       - name: Smoke DSH helper from final macOS app bundle
         if: ${{ runner.os == 'macOS' }}
@@ -265,6 +508,7 @@ jobs:
           REPO: ${{ github.repository }}
           TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
           VERSION: ${{ needs.prepare-release.outputs.version }}
+          RELEASE_ID: ${{ needs.prepare-release.outputs.release_id }}
         run: |
           set -euo pipefail
 
@@ -279,19 +523,24 @@ jobs:
             -H "Accept: application/octet-stream"
             -H "X-GitHub-Api-Version: 2022-11-28"
           )
+          curl_retry_args=(
+            --retry 3
+            --retry-delay 2
+            --retry-max-time 60
+          )
 
-          release_json="$(mktemp)"
-          curl -fsSL "${auth_headers[@]}" "${api}/releases?per_page=100" \
-            | jq --arg tag "$TAG_NAME" '[.[] | select(.tag_name == $tag and .draft == true)][0] // empty' \
-            > "$release_json"
-          if [[ ! -s "$release_json" ]]; then
-            echo "Draft release ${TAG_NAME} was not found" >&2
+          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Prepared draft release id is invalid" >&2
             exit 1
           fi
 
-          release_id="$(jq -r '.id' "$release_json")"
-          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-            echo "Draft release ${TAG_NAME} has an invalid id" >&2
+          release_id="$RELEASE_ID"
+          release_json="$(mktemp)"
+          curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
+            "${api}/releases/${release_id}" > "$release_json"
+          if ! jq -e --arg tag "$TAG_NAME" --argjson id "$release_id" \
+            '.id == $id and .tag_name == $tag and .draft == true' "$release_json" >/dev/null; then
+            echo "Prepared release ${release_id} is not the expected draft for ${TAG_NAME}" >&2
             exit 1
           fi
           echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
@@ -301,52 +550,40 @@ jobs:
             jq -r --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n1
           }
 
-          asset_url_any() {
-            local candidate
-            for candidate in "$@"; do
-              local url
-              url="$(asset_url "$candidate")"
-              if [[ -n "$url" && "$url" != "null" ]]; then
-                echo "$url"
-                return 0
-              fi
-            done
-          }
-
-          asset_url_regex() {
-            jq -r --arg pattern "$1" \
-              '.assets[] | select(.name | test($pattern)) | .browser_download_url' \
-              "$release_json" | head -n1
-          }
-
           asset_id() {
             jq -r --arg name "$1" '.assets[] | select(.name == $name) | .id' "$release_json" | head -n1
           }
 
-          asset_id_any() {
+          asset_name_any() {
             local candidate
             for candidate in "$@"; do
               local id
               id="$(asset_id "$candidate")"
               if [[ -n "$id" && "$id" != "null" ]]; then
-                echo "$id"
+                echo "$candidate"
                 return 0
               fi
             done
           }
 
-          asset_id_regex() {
+          asset_name_regex() {
             jq -r --arg pattern "$1" \
-              '.assets[] | select(.name | test($pattern)) | .id' \
+              '.assets[] | select(.name | test($pattern)) | .name' \
               "$release_json" | head -n1
           }
 
-          aarch64_bundle_url="$(asset_url_any 'CCEM.Desktop_aarch64.app.tar.gz' 'CCEM Desktop_aarch64.app.tar.gz')"
-          aarch64_sig_id="$(asset_id_any 'CCEM.Desktop_aarch64.app.tar.gz.sig' 'CCEM Desktop_aarch64.app.tar.gz.sig')"
-          x64_bundle_url="$(asset_url_any 'CCEM.Desktop_x64.app.tar.gz' 'CCEM Desktop_x64.app.tar.gz')"
-          x64_sig_id="$(asset_id_any 'CCEM.Desktop_x64.app.tar.gz.sig' 'CCEM Desktop_x64.app.tar.gz.sig')"
-          windows_bundle_url="$(asset_url_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)$')"
-          windows_sig_id="$(asset_id_regex '(x64|x86_64).*(setup\.exe|(nsis|msi)\.zip)\.sig$')"
+          aarch64_bundle_name="$(asset_name_any 'CCEM.Desktop_aarch64.app.tar.gz' 'CCEM Desktop_aarch64.app.tar.gz')"
+          aarch64_bundle_url="$(asset_url "$aarch64_bundle_name")"
+          aarch64_sig_id="$(asset_id "${aarch64_bundle_name}.sig")"
+          x64_bundle_name="$(asset_name_any 'CCEM.Desktop_x64.app.tar.gz' 'CCEM Desktop_x64.app.tar.gz')"
+          x64_bundle_url="$(asset_url "$x64_bundle_name")"
+          x64_sig_id="$(asset_id "${x64_bundle_name}.sig")"
+          windows_bundle_name="$(asset_name_regex '(x64|x86_64).*setup\.exe$')"
+          if [[ -z "$windows_bundle_name" || "$windows_bundle_name" == "null" ]]; then
+            windows_bundle_name="$(asset_name_regex '(x64|x86_64).*(nsis|msi)\.zip$')"
+          fi
+          windows_bundle_url="$(asset_url "$windows_bundle_name")"
+          windows_sig_id="$(asset_id "${windows_bundle_name}.sig")"
 
           for value in "$aarch64_bundle_url" "$aarch64_sig_id" "$x64_bundle_url" "$x64_sig_id" "$windows_bundle_url" "$windows_sig_id"; do
             if [[ -z "$value" || "$value" == "null" ]]; then
@@ -356,9 +593,9 @@ jobs:
             fi
           done
 
-          aarch64_sig="$(curl -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${aarch64_sig_id}" | tr -d '\r\n')"
-          x64_sig="$(curl -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${x64_sig_id}" | tr -d '\r\n')"
-          windows_sig="$(curl -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${windows_sig_id}" | tr -d '\r\n')"
+          aarch64_sig="$(curl "${curl_retry_args[@]}" -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${aarch64_sig_id}" | tr -d '\r\n')"
+          x64_sig="$(curl "${curl_retry_args[@]}" -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${x64_sig_id}" | tr -d '\r\n')"
+          windows_sig="$(curl "${curl_retry_args[@]}" -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${windows_sig_id}" | tr -d '\r\n')"
           pub_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           notes="See https://github.com/${REPO}/releases/tag/${TAG_NAME}"
 
@@ -392,16 +629,73 @@ jobs:
               }
             }' > latest.json
 
-          existing_latest_id="$(jq -r '.assets[] | select(.name == "latest.json") | .id' "$release_json" | head -n1)"
-          if [[ -n "$existing_latest_id" && "$existing_latest_id" != "null" ]]; then
-            curl -fsSL -X DELETE "${auth_headers[@]}" "${api}/releases/assets/${existing_latest_id}"
-          fi
+          latest_assets_json="$(mktemp)"
+          delete_response="$(mktemp)"
+          upload_response="$(mktemp)"
+          latest_size="$(wc -c < latest.json | tr -d ' ')"
+          latest_digest="sha256:$(node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write(createHash("sha256").update(readFileSync("latest.json")).digest("hex"));')"
+          uploaded=false
 
-          curl -fsSL -X POST \
-            "${auth_headers[@]}" \
-            -H "Content-Type: application/json" \
-            --data-binary @latest.json \
-            "${upload_url}?name=latest.json"
+          for attempt in 1 2 3 4; do
+            curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
+              "${api}/releases/${release_id}/assets?per_page=100" > "$latest_assets_json"
+            existing_latest_id="$(jq -r 'map(select(.name == "latest.json")) | first | .id // empty' "$latest_assets_json")"
+
+            if [[ -n "$existing_latest_id" ]]; then
+              delete_status="000"
+              if delete_status="$(curl "${curl_retry_args[@]}" -sS -o "$delete_response" -w '%{http_code}' \
+                -X DELETE "${auth_headers[@]}" "${api}/releases/assets/${existing_latest_id}")"; then
+                :
+              fi
+              if [[ "$delete_status" != "204" && "$delete_status" != "404" ]]; then
+                echo "Failed to delete existing latest.json (HTTP ${delete_status})" >&2
+                head -c 1000 "$delete_response" >&2 || true
+                echo >&2
+                if (( attempt == 4 )); then
+                  exit 1
+                fi
+                sleep "$((1 << (attempt - 1)))"
+                continue
+              fi
+            fi
+
+            upload_status="000"
+            if upload_status="$(curl -sS -o "$upload_response" -w '%{http_code}' -X POST \
+              "${auth_headers[@]}" \
+              -H "Content-Type: application/json" \
+              --data-binary @latest.json \
+              "${upload_url}?name=latest.json")"; then
+              :
+            fi
+            if [[ "$upload_status" == "201" ]]; then
+              uploaded=true
+              break
+            fi
+
+            echo "latest.json upload attempt ${attempt} failed (HTTP ${upload_status})" >&2
+            head -c 1000 "$upload_response" >&2 || true
+            echo >&2
+
+            if curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
+              "${api}/releases/${release_id}/assets?per_page=100" > "$latest_assets_json" \
+              && jq -e --argjson size "$latest_size" --arg digest "$latest_digest" \
+                'map(select(.name == "latest.json" and .state == "uploaded" and .size == $size and .digest == $digest)) | length == 1' \
+                "$latest_assets_json" >/dev/null; then
+              echo "latest.json is uploaded and complete despite the client-side error."
+              uploaded=true
+              break
+            fi
+
+            if (( attempt == 4 )); then
+              break
+            fi
+            sleep "$((1 << (attempt - 1)))"
+          done
+
+          if [[ "$uploaded" != "true" ]]; then
+            echo "Failed to upload latest.json after 4 attempts" >&2
+            exit 1
+          fi
 
   publish-release:
     name: Publish Verified Release
@@ -432,7 +726,7 @@ jobs:
             echo "Verified draft release id is invalid" >&2
             exit 1
           fi
-          curl -fsSL -X PATCH \
+          curl --retry 3 --retry-delay 2 --retry-max-time 60 -fsSL -X PATCH \
             "${auth_headers[@]}" \
             -H "Content-Type: application/json" \
             --data '{"draft":false}' \
