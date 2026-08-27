@@ -1,7 +1,8 @@
 /**
  * JSDOM + React act() behavior tests for DSH Analytics integration (Phase 3).
  * Verifies: DSH filter presence, source guard (only 'all' updates global store),
- * costIncomplete/unpriced state visibility, and provider distribution.
+ * costIncomplete/unpriced state visibility, and the intentionally omitted
+ * provider distribution card.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -456,14 +457,21 @@ test('PosterCardTerminal adapts cost display for costIncomplete', async () => {
   assert.match(source, /costIncomplete/);
 });
 
-// ── Blocker 1 regression: Provider distribution section ────────────────────
-test('Provider distribution section rendered with testid and env rows', async () => {
-  const analyticsSource = await fs.readFile(
-    path.join(desktopDir, 'src/pages/Analytics.tsx'), 'utf-8'
+// ── Provider distribution is intentionally omitted from Analytics ──────────
+test('Analytics omits the provider distribution card even when provider data exists', async () => {
+  const stats = makeUsageStats();
+  const { dom, mod, React } = await createTestEnv();
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  globalThis.__analyticsStore._reset();
+  globalThis.__analyticsStore._setState({ usageStats: stats });
+  const html = renderToStaticMarkup(React.createElement(mod.Analytics));
+
+  assert.equal(
+    html.includes('data-testid="provider-distribution"'),
+    false,
   );
-  assert.match(analyticsSource, /data-testid="provider-distribution"/);
-  assert.match(analyticsSource, /data-testid=\{`provider-row-\$\{env\}`\}/);
-  assert.match(analyticsSource, /byEnvironment/);
+
+  dom.window.close();
 });
 
 // ── Blocker 2 regression: dshStatus visible for both all and dsh sources ───

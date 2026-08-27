@@ -592,40 +592,6 @@ export function Analytics() {
         </div>
       </section>
 
-      {/* Provider / Environment distribution */}
-      {viewStats && Object.keys(viewStats.byEnvironment).length > 0 && (
-        <section data-testid="provider-distribution" data-analytics-motion-panel className="mt-6 rounded-2xl border border-border-subtle bg-[hsl(var(--surface))] px-5 py-5 sm:px-8 sm:py-6">
-          <h3
-            className="mb-4 text-sm font-medium text-muted-foreground"
-            style={{ fontFamily: 'system-ui, -apple-system, sans-serif', letterSpacing: '-0.01em' }}
-          >
-            {t('analytics.providerDistribution')}
-          </h3>
-          <div className="space-y-2.5">
-            {Object.entries(viewStats.byEnvironment)
-              .sort(([, a], [, b]) => (b.inputTokens + b.outputTokens) - (a.inputTokens + a.outputTokens))
-              .map(([env, usage]) => {
-                const envTokens = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
-                const pct = totalTokensRaw > 0 ? (envTokens / totalTokensRaw) * 100 : 0;
-                return (
-                  <div key={env} data-testid={`provider-row-${env}`} className="flex items-center gap-3">
-                    <span className="w-24 shrink-0 truncate text-xs font-medium text-foreground">{env}</span>
-                    <div className="relative h-5 flex-1 overflow-hidden rounded-full bg-[hsl(var(--surface-sunken))]">
-                      <div
-                        className="absolute inset-y-0 left-0 rounded-full bg-primary/70 transition-all duration-300"
-                        style={{ width: `${Math.max(pct, 0.5)}%` }}
-                      />
-                    </div>
-                    <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-                      {pct.toFixed(1)}%
-                    </span>
-                  </div>
-                );
-              })}
-          </div>
-        </section>
-      )}
-
       {/* Charts Section — white surface */}
       <section data-analytics-motion-panel className="mt-8">
         <Suspense fallback={<AnalyticsInsightsFallback />}>
