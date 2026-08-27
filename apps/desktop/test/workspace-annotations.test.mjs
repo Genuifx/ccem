@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 
 const desktopDir = path.resolve(import.meta.dirname, '..');
@@ -17,7 +18,7 @@ async function importWorkspaceAnnotations() {
     format: 'esm',
     platform: 'node',
   });
-  return import(`${outfile}?v=${Date.now()}`);
+  return import(`${pathToFileURL(outfile).href}?v=${Date.now()}`);
 }
 
 async function importWorkspaceAnnotationRects() {
@@ -30,7 +31,7 @@ async function importWorkspaceAnnotationRects() {
     format: 'esm',
     platform: 'node',
   });
-  return import(`${outfile}?v=${Date.now()}`);
+  return import(`${pathToFileURL(outfile).href}?v=${Date.now()}`);
 }
 
 test('annotation highlights use selected text boxes instead of broad layout boxes', async () => {
@@ -297,7 +298,7 @@ test('live and history workspace paths wire transcript selections into successfu
 
   assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
   assert.match(composerSource, /if \(result !== false\)[\s\S]*onAnnotationsSent\?\.\(\)/);
-  assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.annotations\.length > 0/);
+  assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.pendingAnnotations\.length > 0/);
   assert.match(
     liveSource,
     /isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*requestText: text,[\s\S]*annotations,/,
@@ -316,10 +317,10 @@ test('live and history workspace paths wire transcript selections into successfu
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
   assert.match(liveSource, /isActive=\{isVisible\}/);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.annotations\}/);
-  assert.match(liveSource, /onAnnotationsSent=\{sessionAnnotations\.clearAnnotations\}/);
+  assert.match(liveSource, /onAnnotationsSent=\{sessionAnnotations\.markAllSent\}/);
   assert.match(historySource, /onAddAnnotation=\{selectedHistorySupportsInline \? historyAnnotations\.addAnnotation : undefined\}/);
   assert.match(historySource, /annotations=\{historyAnnotations\.annotations\}/);
-  assert.match(historySource, /onAnnotationsSent=\{historyAnnotations\.clearAnnotations\}/);
+  assert.match(historySource, /onAnnotationsSent=\{historyAnnotations\.markAllSent\}/);
   assert.match(detailSource, /<WorkspaceTranscriptSelection/);
   assert.match(annotationSource, /scopeKey/);
   assert.match(annotationSource, /data-workspace-annotation-marker/);
@@ -329,5 +330,108 @@ test('live and history workspace paths wire transcript selections into successfu
   assert.match(annotationSource, /document\.addEventListener\('mousedown', handleMouseDown, true\)/);
   assert.match(annotationSource, /event\.shiftKey[\s\S]*'Home'[\s\S]*'PageDown'[\s\S]*\.includes\(event\.key\)/);
   assert.match(annotationSource, /event\.metaKey \|\| event\.ctrlKey/);
-  assert.match(styleSource, /data-workspace-selection-highlight-active/);
+  const suppressionRuleStart = styleSource.indexOf('[data-workspace-selection-highlight-active');
+  assert.ok(suppressionRuleStart >= 0, 'native selection suppression rule must exist');
+  const suppressionRuleEnd = styleSource.indexOf('}', suppressionRuleStart);
+  const suppressionRule = styleSource.slice(suppressionRuleStart, suppressionRuleEnd + 1);
+  assert.match(
+    suppressionRule,
+    /background-color:\s*transparent/,
+    'selection suppression must paint the native ::selection background transparent via the background-color longhand',
+  );
+  assert.doesNotMatch(
+    suppressionRule,
+    /background:\s*transparent/,
+    'the background shorthand is invalid in ::selection and would let the native blue selection layer show through',
+  );
+});
+
+test('anchored annotations never fall back to first-match quote search', async () => {
+  const [anchorsSource, annotationsSource] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceAnnotationAnchors.ts'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceAnnotations.tsx'), 'utf8'),
+  ]);
+
+  const resolveStart = anchorsSource.indexOf('export function resolveWorkspaceAnnotationRange');
+  assert.ok(resolveStart >= 0, 'resolveWorkspaceAnnotationRange must exist');
+  const resolveEnd = anchorsSource.indexOf('\n}', resolveStart);
+  const resolveBody = anchorsSource.slice(resolveStart, resolveEnd);
+  assert.match(resolveBody, /if \(annotation\.anchor\)/);
+  assert.match(
+    resolveBody,
+    /return null;/,
+    'an annotation with a stale anchor must stay unanchored instead of guessing a position',
+  );
+
+  // Batch resolution powers the placement pass with a single item index.
+  assert.match(anchorsSource, /export function resolveWorkspaceAnnotationRanges/);
+  assert.match(annotationsSource, /resolveWorkspaceAnnotationRanges\(root, annotations\)/);
+
+  // Placement refreshes are throttled and survive suspended animation frames
+  // (WKWebView occluded windows never fire rAF).
+  assert.match(annotationsSource, /PLACEMENT_REFRESH_MIN_INTERVAL_MS/);
+  assert.match(annotationsSource, /fallbackTimer/);
+
+  // Escape must not discard a non-empty annotation draft.
+  assert.match(
+    annotationsSource,
+    /event\.key === 'Escape'[\s\S]*HTMLTextAreaElement[\s\S]*value\.trim\(\)\.length > 0[\s\S]*return;/,
+  );
+
+  // Oversized selections surface a hint instead of vanishing.
+  assert.match(annotationsSource, /candidate\.blocked \?/);
+  assert.match(annotationsSource, /workspace\.selectionTooLong/);
+
+  // Failed saves are reported instead of silently keeping stale state.
+  assert.match(annotationsSource, /workspace\.annotationSaveFailed/);
+});
+
+test('sent annotations persist on the transcript instead of being cleared', async () => {
+  const { normalizeStoredWorkspaceAnnotations } = await importWorkspaceAnnotations();
+
+  // Round-trip keeps the sentAt stamp so markers survive a remount.
+  const stored = [{
+    id: 'a1',
+    quote: 'quoted text',
+    note: 'note text',
+    createdAt: '2026-08-19T00:00:00.000Z',
+    sentAt: '2026-08-19T00:01:00.000Z',
+    anchor: {
+      startItemKey: 'item-1',
+      startOffset: 0,
+      endItemKey: 'item-1',
+      endOffset: 11,
+    },
+  }];
+  const restored = normalizeStoredWorkspaceAnnotations(stored);
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0].sentAt, '2026-08-19T00:01:00.000Z');
+
+  // Invalid sentAt values are dropped without discarding the annotation.
+  const malformed = [{
+    id: 'a2',
+    quote: 'quoted',
+    note: 'note',
+    createdAt: '2026-08-19T00:00:00.000Z',
+    sentAt: 42,
+  }];
+  const restoredMalformed = normalizeStoredWorkspaceAnnotations(malformed);
+  assert.equal(restoredMalformed.length, 1);
+  assert.equal(restoredMalformed[0].sentAt, undefined);
+
+  // Sent annotations are excluded from prompt batches.
+  const { parseWorkspacePromptAnnotations } = await importWorkspaceAnnotations();
+  const parsed = parseWorkspacePromptAnnotations([
+    { quote: 'quoted', note: 'note' },
+  ]);
+  assert.equal(parsed.length, 1);
+
+  const [liveSource, historySource] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceNativeSessionView.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
+  ]);
+  assert.match(liveSource, /annotations=\{sessionAnnotations\.pendingAnnotations\}/);
+  assert.match(liveSource, /onClearAnnotations=\{sessionAnnotations\.clearPendingAnnotations\}/);
+  assert.match(historySource, /annotations=\{historyAnnotations\.pendingAnnotations\}/);
+  assert.match(historySource, /onClearAnnotations=\{historyAnnotations\.clearPendingAnnotations\}/);
 });

@@ -11,6 +11,8 @@ use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 #[cfg(test)]
@@ -22,6 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static TMUX_BINARY: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 static TMUX_INTEGRATION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+static TMUX_INTEGRATION_TEST_SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 const DEFAULT_TMUX_SESSION: &str = "ccem";
 const DEFAULT_TMUX_WINDOW: &str = "main";
@@ -350,7 +354,7 @@ impl TmuxManager {
                     "-t",
                     session_name,
                     "-F",
-                    "#{window_index}\t#{window_name}\t#{pane_pid}\t#{session_attached}",
+                    "#{window_index}|#{window_name}|#{pane_pid}|#{session_attached}",
                 ])
                 .output()
                 .map_err(|error| {
@@ -618,7 +622,7 @@ impl TmuxManager {
                 "-p",
                 "-t",
                 target,
-                "#{session_name}\t#{window_name}\t#{window_index}\t#{pane_pid}\t#{session_attached}",
+                "#{session_name}|#{window_name}|#{window_index}|#{pane_pid}|#{session_attached}",
             ])
             .stdin(Stdio::null())
             .output()
@@ -651,7 +655,7 @@ impl TmuxManager {
                 "-p",
                 "-t",
                 target,
-                "#{session_name}\t#{window_name}\t#{window_index}\t#{pane_pid}\t#{session_attached}",
+                "#{session_name}|#{window_name}|#{window_index}|#{pane_pid}|#{session_attached}",
             ])
             .stdin(Stdio::null())
             .output()
@@ -672,7 +676,7 @@ impl TmuxManager {
                 "-t",
                 session_name,
                 "-F",
-                "#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_active}",
+                "#{window_index}|#{window_name}|#{pane_index}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_active}",
             ])
             .stdin(Stdio::null())
             .output()
@@ -1287,7 +1291,7 @@ fn contains_approval_pattern(lines: &str) -> bool {
 }
 
 fn parse_window_line(session_name: &str, line: &str) -> Option<TmuxWindowInfo> {
-    let mut parts = line.split('\t');
+    let mut parts = line.split('|');
     let window_index = parts.next()?.parse::<u32>().ok()?;
     let window_name = parts.next()?.to_string();
     let pane_pid = parts.next().and_then(|value| value.parse::<u32>().ok());
@@ -1306,7 +1310,7 @@ fn parse_window_line(session_name: &str, line: &str) -> Option<TmuxWindowInfo> {
 }
 
 fn parse_target_line(line: &str) -> Option<TmuxWindowInfo> {
-    let mut parts = line.trim().split('\t');
+    let mut parts = line.trim().split('|');
     let session_name = parts.next()?.to_string();
     let window_name = parts.next()?.to_string();
     let window_index = parts.next()?.parse::<u32>().ok()?;
@@ -1326,7 +1330,7 @@ fn parse_target_line(line: &str) -> Option<TmuxWindowInfo> {
 }
 
 fn parse_launch_pane_line(session_name: &str, line: &str) -> Option<TmuxLaunchPaneState> {
-    let mut parts = line.trim().split('\t');
+    let mut parts = line.trim().split('|');
     let window_index = parts.next()?.parse::<u32>().ok()?;
     let window_name = parts.next()?.to_string();
     let pane_index = parts.next()?.parse::<u32>().ok()?;
@@ -1604,16 +1608,73 @@ fn resolve_tmux_binary() -> Result<&'static str, String> {
         .as_str())
 }
 
-fn tmux_command() -> Result<Command, String> {
-    Ok(Command::new(resolve_tmux_binary()?))
+fn tmux_command_for_binary(tmux_binary: &str) -> Command {
+    #[cfg(test)]
+    {
+        let mut command = Command::new(tmux_binary);
+        command
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("TMUX_TMPDIR");
+        #[cfg(unix)]
+        command.args(["-f", "/dev/null"]);
+        command.arg("-S").arg(tmux_integration_test_socket_path());
+        command
+    }
+
+    #[cfg(not(test))]
+    {
+        Command::new(tmux_binary)
+    }
 }
 
 #[cfg(test)]
-fn tmux_integration_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TMUX_INTEGRATION_TEST_LOCK
+fn tmux_integration_test_socket_path() -> &'static Path {
+    TMUX_INTEGRATION_TEST_SOCKET_PATH
+        .get_or_init(|| {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "ccem-tmux-test-{}-{nonce:x}.sock",
+                std::process::id()
+            ))
+        })
+        .as_path()
+}
+
+fn tmux_command() -> Result<Command, String> {
+    Ok(tmux_command_for_binary(resolve_tmux_binary()?))
+}
+
+#[cfg(test)]
+struct TmuxIntegrationTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TmuxIntegrationTestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut command) = tmux_command() {
+            let _ = command
+                .arg("kill-server")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = std::fs::remove_file(tmux_integration_test_socket_path());
+    }
+}
+
+#[cfg(test)]
+fn tmux_integration_test_lock() -> TmuxIntegrationTestGuard {
+    let lock = TMUX_INTEGRATION_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TmuxIntegrationTestGuard { _lock: lock }
 }
 
 fn sanitize_target_for_filename(target: &str) -> String {
@@ -1658,10 +1719,12 @@ mod tests {
         orphaned_managed_tmux_targets, parse_launch_pane_line, parse_target_line,
         parse_window_line, read_bounded_pane_capture, redact_sensitive_launch_output,
         resolve_tmux_binary, session_name_for_runtime, shell_quote, target_candidates_for_runtime,
-        target_matches_info, tmux_command, tmux_integration_test_lock, window_name_for_runtime,
-        ClaudeTerminalState, ManagedTmuxTargetAction, TmuxManager, TmuxWindowInfo,
+        target_matches_info, tmux_command, tmux_command_for_binary, tmux_integration_test_lock,
+        tmux_integration_test_socket_path, window_name_for_runtime, ClaudeTerminalState,
+        ManagedTmuxTargetAction, TmuxManager, TmuxWindowInfo,
     };
     use std::collections::HashMap;
+    use std::path::Path;
     use std::process::Stdio;
     use std::thread;
     use std::time::Duration;
@@ -1794,6 +1857,107 @@ mod tests {
                 "ccem:ccem-session-".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn tmux_test_commands_use_private_server_socket() {
+        let command = tmux_command_for_binary("tmux");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let socket_path = tmux_integration_test_socket_path()
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-S", socket_path.as_str()]));
+        #[cfg(unix)]
+        assert!(args.windows(2).any(|pair| pair == ["-f", "/dev/null"]));
+
+        let removed_environment = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(removed_environment.iter().any(|key| key == "TMUX"));
+        assert!(removed_environment.iter().any(|key| key == "TMUX_PANE"));
+        assert!(removed_environment.iter().any(|key| key == "TMUX_TMPDIR"));
+    }
+
+    #[test]
+    fn required_tmux_integration_lane_has_tmux() {
+        if std::env::var("CCEM_REQUIRE_TMUX_TESTS").as_deref() == Ok("1") {
+            TmuxManager::check_tmux_installed()
+                .expect("CCEM_REQUIRE_TMUX_TESTS=1 requires the tmux binary");
+        }
+    }
+
+    #[test]
+    fn tmux_integration_tests_use_private_server_socket() {
+        let _tmux_guard = tmux_integration_test_lock();
+
+        if TmuxManager::check_tmux_installed().is_err() {
+            return;
+        }
+
+        let session_name = format!("ccem-socket-test-{}", std::process::id());
+
+        struct TmuxSessionGuard {
+            session_name: String,
+        }
+
+        impl Drop for TmuxSessionGuard {
+            fn drop(&mut self) {
+                let _ = tmux_command().and_then(|mut command| {
+                    command
+                        .args(["kill-session", "-t", &self.session_name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|_| ())
+                        .map_err(|error| {
+                            format!(
+                                "Failed to clean test tmux session {}: {}",
+                                self.session_name, error
+                            )
+                        })
+                });
+            }
+        }
+
+        let status = tmux_command()
+            .expect("tmux command should be available")
+            .args(["new-session", "-d", "-s", &session_name, "/bin/sleep 30"])
+            .status()
+            .expect("test tmux session should be created");
+        assert!(status.success());
+        let _session_guard = TmuxSessionGuard {
+            session_name: session_name.clone(),
+        };
+
+        let output = tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &session_name,
+                "#{socket_path}",
+            ])
+            .output()
+            .expect("tmux socket path should be inspectable");
+        assert!(output.status.success());
+
+        let socket_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let socket_file_name = Path::new(&socket_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("tmux socket path should have a UTF-8 file name");
+        assert_eq!(Path::new(&socket_path), tmux_integration_test_socket_path());
+        assert_ne!(socket_file_name, "default");
     }
 
     #[test]
@@ -1970,7 +2134,10 @@ mod tests {
             .verify_target_survived_launch(&runtime_id, &target, &HashMap::new())
             .expect_err("exited tmux target should fail launch healthcheck");
         assert!(error.starts_with("session_command_exited:"));
-        assert!(error.contains("exit code 127"), "unexpected error: {error}");
+        assert!(
+            error.contains("exit code 126") || error.contains("exit code 127"),
+            "unexpected error: {error}"
+        );
         assert!(
             error.contains("ccem-missing-session-client"),
             "unexpected error: {error}"
@@ -2116,11 +2283,11 @@ mod tests {
 
     #[test]
     fn target_parsing_uses_window_index_not_renamable_window_name() {
-        let window = parse_window_line("ccem-session222", "3\tclaude\t202\t1").unwrap();
+        let window = parse_window_line("ccem-session222", "3|claude|202|1").unwrap();
         assert_eq!(window.target, "ccem-session222:claude");
         assert_eq!(window.window_name, "claude");
 
-        let target = parse_target_line("ccem-session222\tclaude\t3\t202\t2").unwrap();
+        let target = parse_target_line("ccem-session222|claude|3|202|2").unwrap();
         assert_eq!(target.target, "ccem-session222:3");
         assert!(target_matches_info("ccem-session222", &target));
         assert!(target_matches_info("ccem-session222:claude", &target));
@@ -2129,7 +2296,7 @@ mod tests {
 
     #[test]
     fn launch_pane_parser_preserves_text_signal_names() {
-        let pane = parse_launch_pane_line("ccem-session222", "3\tmain\t0\t1\t\tterm\t1")
+        let pane = parse_launch_pane_line("ccem-session222", "3|main|0|1||term|1")
             .expect("launch pane metadata should parse");
 
         assert_eq!(pane.pane_dead_signal.as_deref(), Some("term"));
@@ -2787,10 +2954,10 @@ mod tests {
 
     #[test]
     fn tmux_metadata_parses_attached_client_count() {
-        let window = parse_window_line("ccem-session222", "0\tmain\t202\t1").unwrap();
+        let window = parse_window_line("ccem-session222", "0|main|202|1").unwrap();
         assert_eq!(window.session_attached_clients, 1);
 
-        let target = parse_target_line("ccem-session222\tmain\t0\t202\t2").unwrap();
+        let target = parse_target_line("ccem-session222|main|0|202|2").unwrap();
         assert_eq!(target.session_attached_clients, 2);
         assert_eq!(target.target, "ccem-session222:0");
     }

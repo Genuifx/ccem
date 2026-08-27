@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -9,7 +9,8 @@ use tauri::{
 };
 
 use crate::config;
-use crate::session::SessionManager;
+use crate::cron::{self, CronTask};
+use crate::session::{Session, SessionManager};
 use crate::terminal;
 
 /// Event payload for environment changes
@@ -28,6 +29,16 @@ pub struct PermChangedPayload {
 #[derive(Clone, Serialize)]
 pub struct SessionFocusPayload {
     pub session_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayRuntimeSnapshot {
+    pub current_env: String,
+    pub permission_mode: String,
+    pub theme: String,
+    pub sessions: Vec<Session>,
+    pub cron_tasks: Vec<CronTask>,
 }
 
 /// Read environments and current permission mode from config
@@ -242,6 +253,15 @@ fn build_tray_menu(app: &AppHandle) -> Result<Menu<tauri::Wry>, tauri::Error> {
 /// Tray icon ID constant for rebuilding
 const TRAY_ID: &str = "main_tray";
 pub const TRAY_COCKPIT_LABEL: &str = "tray-cockpit";
+static TRAY_COCKPIT_BUILDING: AtomicBool = AtomicBool::new(false);
+
+struct TrayCockpitBuildGuard;
+
+impl Drop for TrayCockpitBuildGuard {
+    fn drop(&mut self) {
+        TRAY_COCKPIT_BUILDING.store(false, Ordering::SeqCst);
+    }
+}
 
 const TRAY_COCKPIT_PANEL_WIDTH: f64 = 390.0;
 const TRAY_COCKPIT_PANEL_HEIGHT: f64 = 700.0;
@@ -320,8 +340,20 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
                 }
             }
             "quit" => {
-                crate::FORCE_QUIT.store(true, Ordering::SeqCst);
-                app.exit(0);
+                let can_exit = app
+                    .try_state::<std::sync::Arc<crate::native_runtime::NativeRuntimeManager>>()
+                    .is_some_and(|manager| manager.prepare_app_termination(false).is_ok());
+                if can_exit {
+                    crate::FORCE_QUIT.store(true, Ordering::SeqCst);
+                    app.exit(0);
+                } else {
+                    if let Some(window) = app.get_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                    let _ = app.emit("native-background-task-app-action", "quit");
+                }
             }
             id if id.starts_with("session:") => {
                 let session_id = id.strip_prefix("session:").unwrap();
@@ -349,10 +381,40 @@ pub fn hide_tray_cockpit(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_tray_runtime_snapshot(
+    manager: tauri::State<'_, Arc<SessionManager>>,
+) -> Result<TrayRuntimeSnapshot, String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = config::read_config().unwrap_or_default();
+        let settings = config::read_settings().unwrap_or_default();
+        let current_env = cfg.current.unwrap_or_else(|| "official".to_string());
+        let permission_mode = cfg
+            .default_mode
+            .or(settings.default_mode)
+            .unwrap_or_else(|| "dev".to_string());
+
+        Ok(TrayRuntimeSnapshot {
+            current_env,
+            permission_mode,
+            theme: settings.theme,
+            sessions: manager.list_sessions(),
+            cron_tasks: cron::list_cron_tasks().unwrap_or_default(),
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to join tray snapshot task: {error}"))?
+}
+
 fn toggle_tray_cockpit(app: &AppHandle, anchor: TrayCockpitAnchor) -> Result<(), String> {
+    if TRAY_COCKPIT_BUILDING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
     let window = match app.get_webview_window(TRAY_COCKPIT_LABEL) {
         Some(window) => window,
-        None => build_tray_cockpit_window(app)?,
+        None => return schedule_tray_cockpit_build(app, anchor),
     };
 
     if window.is_visible().unwrap_or(false) {
@@ -367,6 +429,10 @@ fn toggle_tray_cockpit(app: &AppHandle, anchor: TrayCockpitAnchor) -> Result<(),
 
 #[tauri::command]
 pub fn open_tray_cockpit(app: AppHandle, x: Option<f64>, y: Option<f64>) -> Result<(), String> {
+    if TRAY_COCKPIT_BUILDING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
     let position = match (x, y) {
         (Some(x), Some(y)) => PhysicalPosition { x, y },
         _ => app
@@ -376,10 +442,33 @@ pub fn open_tray_cockpit(app: AppHandle, x: Option<f64>, y: Option<f64>) -> Resu
     let anchor = TrayCockpitAnchor::point(position);
     let window = match app.get_webview_window(TRAY_COCKPIT_LABEL) {
         Some(window) => window,
-        None => build_tray_cockpit_window(&app)?,
+        None => {
+            schedule_tray_cockpit_build(&app, anchor)?;
+            return Ok(());
+        }
     };
 
     show_tray_cockpit_window(&window, anchor)
+}
+
+fn schedule_tray_cockpit_build(app: &AppHandle, anchor: TrayCockpitAnchor) -> Result<(), String> {
+    if TRAY_COCKPIT_BUILDING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _build_guard = TrayCockpitBuildGuard;
+        let result = build_tray_cockpit_window(&app)
+            .and_then(|window| show_tray_cockpit_window(&window, anchor));
+        if let Err(error) = result {
+            eprintln!("Failed to asynchronously build tray cockpit: {error}");
+        }
+    });
+    Ok(())
 }
 
 fn show_tray_cockpit_window(

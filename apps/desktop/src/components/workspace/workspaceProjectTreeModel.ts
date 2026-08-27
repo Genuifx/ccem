@@ -314,6 +314,72 @@ export function buildProjectPrioritySessionKeys(
   return priorities;
 }
 
+export type RecentSessionBucketId = 'running' | 'today' | 'yesterday' | 'week' | 'older';
+
+export interface RecentSessionBucket {
+  id: RecentSessionBucketId;
+  sessions: HistorySessionItem[];
+}
+
+function startOfDay(timestamp: number): number {
+  const date = new Date(timestamp);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+/**
+ * Group a time-descending session list into calendar buckets for the flat
+ * "recent" sidebar mode: running sessions first (pulled out of time buckets
+ * so they never appear twice), then today / yesterday / previous 7 days /
+ * older. Empty buckets are skipped. Day boundaries use local midnight.
+ */
+export function bucketRecentSessions(
+  sessions: HistorySessionItem[],
+  runningKeys: ReadonlySet<string>,
+  options: {
+    now?: number;
+    keyOf?: (session: HistorySessionItem) => string;
+  } = {},
+): RecentSessionBucket[] {
+  const now = options.now ?? Date.now();
+  const keyOf = options.keyOf ?? ((session: HistorySessionItem) => `${session.source}:${session.id}`);
+  const day = 86_400_000;
+  const startToday = startOfDay(now);
+  const startYesterday = startOfDay(startToday - 1);
+  const startWeek = startOfDay(startToday - 7 * day);
+
+  const running: HistorySessionItem[] = [];
+  const today: HistorySessionItem[] = [];
+  const yesterday: HistorySessionItem[] = [];
+  const week: HistorySessionItem[] = [];
+  const older: HistorySessionItem[] = [];
+
+  for (const session of sessions) {
+    if (runningKeys.has(keyOf(session))) {
+      running.push(session);
+      continue;
+    }
+    if (session.timestamp >= startToday) {
+      today.push(session);
+    } else if (session.timestamp >= startYesterday) {
+      yesterday.push(session);
+    } else if (session.timestamp >= startWeek) {
+      week.push(session);
+    } else {
+      older.push(session);
+    }
+  }
+
+  const buckets: RecentSessionBucket[] = [
+    { id: 'running', sessions: running },
+    { id: 'today', sessions: today },
+    { id: 'yesterday', sessions: yesterday },
+    { id: 'week', sessions: week },
+    { id: 'older', sessions: older },
+  ];
+  return buckets.filter((bucket) => bucket.sessions.length > 0);
+}
+
 export function reconcileProjectOrder(
   previousOrder: string[],
   projectsByPreferredAppendOrder: string[],

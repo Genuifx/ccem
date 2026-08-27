@@ -31,8 +31,10 @@ interface WorkspaceConversationDetailProps {
   canAddAnnotation?: boolean;
   annotations?: WorkspaceAnnotation[];
   onAddAnnotation?: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
-  onUpdateAnnotation?: (id: string, note: string) => void;
+  onUpdateAnnotation?: (id: string, note: string) => boolean;
   onRemoveAnnotation?: (id: string) => void;
+  /** Fork-session-from-turn action for model-output bubbles (stable callback). */
+  onForkTurn?: (message: ConversationMessageData) => void;
 }
 
 function isNearBottom(container: HTMLDivElement): boolean {
@@ -53,6 +55,7 @@ export function WorkspaceConversationDetail({
   onAddAnnotation,
   onUpdateAnnotation,
   onRemoveAnnotation,
+  onForkTurn,
 }: WorkspaceConversationDetailProps) {
   const { t } = useLocale();
   const [, startTransition] = useTransition();
@@ -297,7 +300,7 @@ export function WorkspaceConversationDetail({
           ) : (
             <div>
               {hasMoreMessages ? <div ref={loadMoreSentinelRef} className="h-px" /> : null}
-              <WorkspaceTranscriptList messages={displayedMessages} />
+              <WorkspaceTranscriptList messages={displayedMessages} onForkTurn={onForkTurn} />
             </div>
           )}
         </div>

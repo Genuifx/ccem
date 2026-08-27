@@ -1,25 +1,97 @@
 use super::*;
 
 #[test]
-fn smoke_host_identity_rejects_release_identity_and_installed_executable() {
-    validate_smoke_host_identity(
+fn smoke_host_identity_accepts_legacy_and_canonical_dev_instances() {
+    let legacy = validate_smoke_host_identity(
         Some("CCEM Desktop Dev"),
         "com.ccem.desktop.dev",
         Path::new("/private/tmp/CCEM Mode 2 Smoke.app/Contents/MacOS/ccem-desktop"),
+        None,
     )
     .expect("isolated Dev identity");
+    assert_eq!(legacy.product_name, "CCEM Desktop Dev");
+    assert_eq!(legacy.bundle_identifier, "com.ccem.desktop.dev");
 
+    let canonical = validate_smoke_host_identity(
+        Some("CCEM Desktop Dev agent-browser-mode2-mainline"),
+        "com.ccem.desktop.dev.iae338401",
+        Path::new("/private/tmp/CCEM Mode 2 Smoke.app/Contents/MacOS/ccem-desktop"),
+        Some("agent-browser-mode2-mainline-ae338401"),
+    )
+    .expect("canonical per-worktree Dev identity");
+    assert_eq!(
+        canonical.product_name,
+        "CCEM Desktop Dev agent-browser-mode2-mainline"
+    );
+    assert_eq!(
+        canonical.bundle_identifier,
+        "com.ccem.desktop.dev.iae338401"
+    );
+
+    // tauri-dev truncates the normalized basename after 32 bytes, so a
+    // delimiter at that exact boundary can legitimately leave a trailing '-'.
+    let truncated = validate_smoke_host_identity(
+        Some("CCEM Desktop Dev aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"),
+        "com.ccem.desktop.dev.i1234abcd",
+        Path::new("/private/tmp/CCEM Mode 2 Smoke.app/Contents/MacOS/ccem-desktop"),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa--1234abcd"),
+    )
+    .expect("canonical truncated Dev identity");
+    assert_eq!(
+        truncated.product_name,
+        "CCEM Desktop Dev aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-"
+    );
+}
+
+#[test]
+fn smoke_host_identity_rejects_unbound_or_malformed_dev_instances() {
+    for (product_name, bundle_identifier, instance_id) in [
+        (
+            "CCEM Desktop Dev agent-browser-mode2-mainline",
+            "com.ccem.desktop.dev.iae338401",
+            None,
+        ),
+        (
+            "CCEM Desktop Dev agent-browser-mode2-mainline",
+            "com.ccem.desktop.dev.iae338402",
+            Some("agent-browser-mode2-mainline-ae338401"),
+        ),
+        (
+            "CCEM Desktop Dev agent-browser-mode2-mainline",
+            "com.ccem.desktop.dev.iae338401",
+            Some("agent-browser-mode2-mainline-AE338401"),
+        ),
+        (
+            "CCEM Desktop Dev agent--browser",
+            "com.ccem.desktop.dev.iae338401",
+            Some("agent--browser-ae338401"),
+        ),
+    ] {
+        assert!(validate_smoke_host_identity(
+            Some(product_name),
+            bundle_identifier,
+            Path::new("/private/tmp/ccem-desktop"),
+            instance_id,
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn smoke_host_identity_rejects_release_identity_and_installed_executable() {
     assert!(validate_smoke_host_identity(
         Some("CCEM Desktop"),
         "com.ccem.desktop",
         Path::new("/private/tmp/ccem-desktop"),
+        None,
     )
     .unwrap_err()
     .contains("CCEM Desktop Dev"));
     assert!(validate_smoke_host_identity(
-        Some("CCEM Desktop Dev"),
-        "com.ccem.desktop.dev",
+        Some("CCEM Desktop Dev agent-browser-mode2-mainline"),
+        "com.ccem.desktop.dev.iae338401",
         Path::new("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop"),
+        Some("agent-browser-mode2-mainline-ae338401"),
     )
     .unwrap_err()
     .contains("installed release"));

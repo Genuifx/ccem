@@ -26,11 +26,13 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
             title: "System message".to_string(),
             text: truncate_text(message, 1200),
         }),
-        SessionEventPayload::Lifecycle { stage, detail } => Some(EventSummary {
+        SessionEventPayload::Lifecycle { stage, detail, .. } => Some(EventSummary {
             kind: BotBindingOutboxFrameKind::EventUpdate,
             title: format!("Lifecycle · {stage}"),
             text: truncate_text(detail, 1200),
         }),
+        // Router request ledger entries — telemetry-grade, not for bot chat.
+        SessionEventPayload::RoutedRequest { .. } => None,
         SessionEventPayload::StdErrLine { line } if !line.trim().is_empty() => Some(EventSummary {
             kind: BotBindingOutboxFrameKind::Error,
             title: "stderr".to_string(),
@@ -209,7 +211,14 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         SessionEventPayload::ClaudeJson { .. } | SessionEventPayload::GapNotification { .. } => {
             None
         }
-        SessionEventPayload::StdErrLine { .. } | SessionEventPayload::AssistantChunk { .. } => None,
+        // Session usage snapshots duplicate the token_usage frames already
+        // forwarded per turn — don't spam bot outboxes with them.
+        SessionEventPayload::SessionUsage { .. }
+        | SessionEventPayload::RuntimeSettingsChanged { .. }
+        | SessionEventPayload::BackgroundTasksChanged { .. }
+        | SessionEventPayload::BackgroundTaskUpdated { .. }
+        | SessionEventPayload::StdErrLine { .. }
+        | SessionEventPayload::AssistantChunk { .. } => None,
     }
 }
 

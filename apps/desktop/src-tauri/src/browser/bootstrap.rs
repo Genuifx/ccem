@@ -50,7 +50,7 @@ pub(crate) fn create_login_browser_surface_manager(
     if !sessions.is_available() {
         return Arc::new(
             login::surface_commands::LoginBrowserSurfaceManager::unavailable(
-                "Login Browser session state is unavailable. Preview Browser remains available.",
+                "Embedded Browser session state is unavailable.",
             ),
         );
     }
@@ -64,9 +64,11 @@ pub(crate) fn create_login_browser_surface_manager(
         Ok(manager) => Arc::new(manager),
         Err(error) => {
             eprintln!("Embedded Login Browser recovery is unavailable: {error}");
-            Arc::new(login::surface_commands::LoginBrowserSurfaceManager::unavailable(
-                "Login Browser recovery state requires attention. Preview Browser remains available.",
-            ))
+            Arc::new(
+                login::surface_commands::LoginBrowserSurfaceManager::unavailable(
+                    "Embedded Browser recovery state requires attention.",
+                ),
+            )
         }
     }
 }
@@ -80,7 +82,7 @@ pub(crate) fn create_cef_host_controller() -> Arc<CefHostController> {
         Err(error) => {
             eprintln!("Embedded CEF host is unavailable: {error}");
             Arc::new(CefHostController::unavailable(
-                "Embedded Login Browser is unavailable. Preview Browser remains available.",
+                "Embedded Browser is unavailable.",
             ))
         }
     }

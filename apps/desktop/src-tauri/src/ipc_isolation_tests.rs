@@ -23,12 +23,38 @@ fn request(command: &str, url: &str, body: serde_json::Value) -> InvokeRequest {
     }
 }
 
+fn local_app_origin() -> &'static str {
+    if cfg!(any(windows, target_os = "android")) {
+        "http://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    }
+}
+
+#[test]
+fn trusted_app_acl_manifest_includes_environment_router_references() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../gen/schemas/acl-manifests.json"))
+            .expect("generated ACL manifest must be valid JSON");
+    let allowed = manifest
+        .pointer("/__app-acl__/permissions/trusted-app-commands/commands/allow")
+        .and_then(serde_json::Value::as_array)
+        .expect("trusted app command allowlist");
+
+    assert!(allowed
+        .iter()
+        .any(|command| { command.as_str() == Some("get_environment_router_references") }));
+}
+
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
     // Keep a single generate_context! expansion in the macOS test binary. Each expansion embeds
     // the same exported Info.plist symbol, so expanding it independently in every test prevents
     // the test harness from linking.
     tauri::test::mock_builder()
-        .invoke_handler(tauri::generate_handler![super::greet])
+        .invoke_handler(tauri::generate_handler![
+            super::greet,
+            super::get_environment_router_references
+        ])
         .build(tauri::generate_context!())
         .expect("build mock CCEM app")
 }
@@ -48,7 +74,7 @@ fn trusted_app_webviews_can_invoke_app_and_core_commands() {
 
         let greeting = tauri::test::get_ipc_response(
             &webview,
-            request("greet", "tauri://localhost", json!({ "name": "IPC test" })),
+            request("greet", local_app_origin(), json!({ "name": "IPC test" })),
         )
         .unwrap_or_else(|error| panic!("trusted {label} app command denied: {error}"))
         .deserialize::<String>()
@@ -57,7 +83,7 @@ fn trusted_app_webviews_can_invoke_app_and_core_commands() {
 
         tauri::test::get_ipc_response(
             &webview,
-            request("plugin:app|version", "tauri://localhost", json!({})),
+            request("plugin:app|version", local_app_origin(), json!({})),
         )
         .unwrap_or_else(|error| panic!("trusted {label} core command denied: {error}"));
     }
@@ -86,8 +112,12 @@ fn remote_browser_child_webview_cannot_invoke_app_or_plugin_commands() {
             .expect("build untrusted browser child webview"),
     );
 
-    for origin in ["https://example.test", "tauri://localhost"] {
-        for command in ["greet", "plugin:app|version"] {
+    for origin in ["https://example.test", local_app_origin()] {
+        for command in [
+            "greet",
+            "get_environment_router_references",
+            "plugin:app|version",
+        ] {
             let response = tauri::test::get_ipc_response(
                 &browser,
                 request(command, origin, json!({ "name": "blocked" })),

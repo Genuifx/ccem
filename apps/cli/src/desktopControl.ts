@@ -18,7 +18,45 @@ export interface DesktopCreateSessionInput {
   providerSessionId?: string | null;
   effort?: string | null;
   open?: boolean;
+  routes?: Record<string, string>;
 }
+
+export interface DesktopSessionRouterState {
+  revision: number;
+  bindings: Record<string, string>;
+  allowedEnvs: string[];
+  [key: string]: unknown;
+}
+
+export interface DesktopRouterUpdateParams {
+  runtimeId: string;
+  expectedRevision: number;
+  patch: {
+    bindings: Record<string, string>;
+    allowedEnvs: string[];
+  };
+}
+
+export interface DesktopEnvironmentRenameResult {
+  ok: true;
+  operation: 'rename';
+  oldName: string;
+  newName: string;
+  updatedSessions: number;
+  current: string | null;
+}
+
+export interface DesktopEnvironmentDeleteResult {
+  ok: true;
+  operation: 'delete';
+  name: string;
+  current: string | null;
+}
+
+export type DesktopControlRequester = (
+  method: string,
+  params?: unknown,
+) => Promise<unknown>;
 
 export interface RequestDesktopControlOptions {
   /** AbortSignal provided by the caller. */
@@ -40,6 +78,7 @@ const ENDPOINT_UNREACHABLE_CODES = new Set([
   'EHOSTUNREACH',
   'ECONNABORTED',
 ]);
+const ROUTER_BINDING_KEY = /^(?:background|subagent:\*|subagent:[A-Za-z0-9._:-]{1,128})$/;
 
 type StaleDescriptorReason = 'dead-pid' | 'endpoint-unreachable' | 'request-timeout';
 
@@ -90,6 +129,18 @@ export class StaleDesktopControlDescriptorError extends Error {
     if (details.cause !== undefined) {
       this.cause = details.cause;
     }
+  }
+}
+
+export class DesktopControlRpcError extends Error {
+  readonly code: number | undefined;
+  readonly data: unknown;
+
+  constructor(message: string, code?: number, data?: unknown) {
+    super(message);
+    this.name = 'DesktopControlRpcError';
+    this.code = code;
+    this.data = data;
   }
 }
 
@@ -365,10 +416,14 @@ export async function requestDesktopControl<T = unknown>(
 
   const payload = await response.json() as {
     result?: T;
-    error?: { code?: number; message?: string };
+    error?: { code?: number; message?: string; data?: unknown };
   };
   if (payload.error) {
-    throw new Error(payload.error.message || `CCEM Desktop control error ${payload.error.code ?? ''}`.trim());
+    throw new DesktopControlRpcError(
+      payload.error.message || `CCEM Desktop control error ${payload.error.code ?? ''}`.trim(),
+      payload.error.code,
+      payload.error.data,
+    );
   }
   return payload.result as T;
 }
@@ -402,6 +457,175 @@ export function parseLimitOption(raw: string | undefined): number | null {
     );
   }
   return value;
+}
+
+function parseRouteBinding(raw: string, optionName: '--route' | '--set') {
+  const separator = raw.indexOf('=');
+  const key = separator > 0 ? raw.slice(0, separator).trim() : '';
+  const env = separator > 0 ? raw.slice(separator + 1).trim() : '';
+  if (!key || !env) {
+    throw new Error(`Invalid ${optionName} value '${raw}'. Expected key=env.`);
+  }
+  if (!ROUTER_BINDING_KEY.test(key)) {
+    throw new Error(
+      `Invalid route key '${key}' in ${optionName}. Expected background, subagent:*, or subagent:<safe-agent-name>.`,
+    );
+  }
+  return { key, env };
+}
+
+function parseRoutesJson(raw: string): Record<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('Invalid --routes-json. Expected a JSON object of key-to-environment bindings.');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid --routes-json. Expected a JSON object of key-to-environment bindings.');
+  }
+
+  const routes: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string') {
+      throw new Error('Invalid --routes-json. Expected a JSON object of key-to-environment bindings.');
+    }
+    const binding = parseRouteBinding(`${key}=${value}`, '--route');
+    routes[binding.key] = binding.env;
+  }
+  return routes;
+}
+
+export function parseDesktopRoutes(
+  routeValues: string[] = [],
+  routesJson?: string,
+): Record<string, string> | undefined {
+  if (routesJson === undefined && routeValues.length === 0) {
+    return undefined;
+  }
+
+  const routes = routesJson === undefined ? {} : parseRoutesJson(routesJson);
+  for (const raw of routeValues) {
+    const binding = parseRouteBinding(raw, '--route');
+    routes[binding.key] = binding.env;
+  }
+  return routes;
+}
+
+function isDesktopSessionRouterState(value: unknown): value is DesktopSessionRouterState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const state = value as Partial<DesktopSessionRouterState>;
+  if (!Number.isSafeInteger(state.revision) || (state.revision as number) < 0) return false;
+  if (!state.bindings || typeof state.bindings !== 'object' || Array.isArray(state.bindings)) return false;
+  if (!Object.entries(state.bindings).every(([key, env]) => key.trim() && typeof env === 'string')) {
+    return false;
+  }
+  return Array.isArray(state.allowedEnvs)
+    && state.allowedEnvs.every((env) => typeof env === 'string');
+}
+
+export function buildDesktopRouterUpdateParams(
+  runtimeId: string,
+  current: unknown,
+  setValue: string,
+): DesktopRouterUpdateParams {
+  if (!isDesktopSessionRouterState(current)) {
+    throw new Error('Invalid router state returned by CCEM Desktop.');
+  }
+  const binding = parseRouteBinding(setValue, '--set');
+  const bindings = { ...current.bindings, [binding.key]: binding.env };
+  const allowedEnvs = current.allowedEnvs.includes(binding.env)
+    ? [...current.allowedEnvs]
+    : [...current.allowedEnvs, binding.env];
+  return {
+    runtimeId,
+    expectedRevision: current.revision,
+    patch: { bindings, allowedEnvs },
+  };
+}
+
+export async function getOrUpdateDesktopRoutes(
+  runtimeId: string,
+  setValue: string | undefined,
+  requester: DesktopControlRequester = requestDesktopControl,
+): Promise<unknown> {
+  const current = await requester('ccem.workspace.getRouter', { runtimeId });
+  if (setValue === undefined) {
+    return current;
+  }
+  const update = buildDesktopRouterUpdateParams(runtimeId, current, setValue);
+  return requester('ccem.workspace.updateRouter', update);
+}
+
+export async function getDesktopEnvironmentReferences(
+  name: string,
+  requester: DesktopControlRequester = requestDesktopControl,
+): Promise<string[]> {
+  const result = await requester('ccem.environment.references', { name });
+  if (
+    !result
+    || typeof result !== 'object'
+    || Array.isArray(result)
+    || !Array.isArray((result as { references?: unknown }).references)
+    || !(result as { references: unknown[] }).references.every(
+      (reference) => typeof reference === 'string' && reference.trim().length > 0,
+    )
+  ) {
+    throw new Error('Invalid environment reference response from CCEM Desktop.');
+  }
+  return [...(result as { references: string[] }).references];
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+function isDesktopEnvironmentRenameResult(
+  value: unknown,
+): value is DesktopEnvironmentRenameResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Partial<DesktopEnvironmentRenameResult>;
+  return result.ok === true
+    && result.operation === 'rename'
+    && typeof result.oldName === 'string'
+    && typeof result.newName === 'string'
+    && Number.isSafeInteger(result.updatedSessions)
+    && (result.updatedSessions as number) >= 0
+    && isNullableString(result.current);
+}
+
+function isDesktopEnvironmentDeleteResult(
+  value: unknown,
+): value is DesktopEnvironmentDeleteResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Partial<DesktopEnvironmentDeleteResult>;
+  return result.ok === true
+    && result.operation === 'delete'
+    && typeof result.name === 'string'
+    && isNullableString(result.current);
+}
+
+export async function renameDesktopEnvironment(
+  oldName: string,
+  newName: string,
+  requester: DesktopControlRequester = requestDesktopControl,
+): Promise<DesktopEnvironmentRenameResult> {
+  const result = await requester('ccem.environment.rename', { oldName, newName });
+  if (!isDesktopEnvironmentRenameResult(result)) {
+    throw new Error('Invalid environment mutation response from CCEM Desktop.');
+  }
+  return result;
+}
+
+export async function deleteDesktopEnvironment(
+  name: string,
+  requester: DesktopControlRequester = requestDesktopControl,
+): Promise<DesktopEnvironmentDeleteResult> {
+  const result = await requester('ccem.environment.delete', { name });
+  if (!isDesktopEnvironmentDeleteResult(result)) {
+    throw new Error('Invalid environment mutation response from CCEM Desktop.');
+  }
+  return result;
 }
 
 export function printJson(value: unknown): void {

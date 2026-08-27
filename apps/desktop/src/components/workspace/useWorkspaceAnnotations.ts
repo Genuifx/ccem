@@ -66,6 +66,12 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
   }, [sessionKey]);
 
   const annotations = state.sessionKey === sessionKey ? state.items : [];
+  // Annotations not yet sent with a prompt — these are what the composer
+  // attaches; sent ones stay on the transcript as markers only.
+  const pendingAnnotations = useMemo(
+    () => annotations.filter((annotation) => !annotation.sentAt),
+    [annotations],
+  );
   const annotationCharCount = useMemo(
     () => annotations.reduce(
       (total, annotation) => total + annotation.quote.length + annotation.note.length,
@@ -117,22 +123,21 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     return true;
   }, [annotationCharCount, annotations.length, updateItems]);
 
-  const updateAnnotation = useCallback((id: string, note: string) => {
+  const updateAnnotation = useCallback((id: string, note: string): boolean => {
     const normalizedNote = note.trim();
     if (!normalizedNote || normalizedNote.length > MAX_WORKSPACE_ANNOTATION_NOTE_CHARS) {
-      return;
+      return false;
     }
-    updateItems((items) => {
-      const next = items.map((item) => (
-        item.id === id ? { ...item, note: normalizedNote } : item
-      ));
-      const nextCharCount = next.reduce(
-        (total, annotation) => total + annotation.quote.length + annotation.note.length,
-        0,
-      );
-      return nextCharCount <= MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS ? next : items;
-    });
-  }, [updateItems]);
+    const nextCharCount = annotationCharCount + normalizedNote.length
+      - (annotations.find((item) => item.id === id)?.note.length ?? 0);
+    if (nextCharCount > MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS) {
+      return false;
+    }
+    updateItems((items) => items.map((item) => (
+      item.id === id ? { ...item, note: normalizedNote } : item
+    )));
+    return true;
+  }, [annotationCharCount, annotations, updateItems]);
 
   const removeAnnotation = useCallback((id: string) => {
     updateItems((items) => items.filter((item) => item.id !== id));
@@ -142,19 +147,38 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     updateItems(() => []);
   }, [updateItems]);
 
+  // Sending a prompt stamps sentAt instead of wiping the list: the highlight
+  // and numbered marker stay at the original text, but the annotation is not
+  // re-attached to later prompts.
+  const markAllSent = useCallback(() => {
+    updateItems((items) => items.map((item) => (
+      item.sentAt ? item : { ...item, sentAt: new Date().toISOString() }
+    )));
+  }, [updateItems]);
+
+  const clearPendingAnnotations = useCallback(() => {
+    updateItems((items) => items.filter((item) => item.sentAt));
+  }, [updateItems]);
+
   return useMemo(() => ({
     annotations,
+    pendingAnnotations,
     canAddAnnotation: annotations.length < MAX_WORKSPACE_ANNOTATIONS
       && annotationCharCount < MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS,
     addAnnotation,
     updateAnnotation,
     removeAnnotation,
     clearAnnotations,
+    markAllSent,
+    clearPendingAnnotations,
   }), [
     addAnnotation,
     annotations,
     annotationCharCount,
     clearAnnotations,
+    clearPendingAnnotations,
+    markAllSent,
+    pendingAnnotations,
     removeAnnotation,
     updateAnnotation,
   ]);

@@ -1,5 +1,77 @@
 # ccem
 
+## 2.73.0
+
+### Minor Changes
+
+- Release v2.73.0
+
+## 2.72.2
+
+### Patch Changes
+
+- c5129e9: Restore live Workspace transcript updates for newly started and continued Desktop sessions so replies appear without restarting the app, and keep clean cross-platform release gates green by building the shared core package before Desktop tests.
+
+## 2.72.1
+
+### Patch Changes
+
+- Fix live Workspace transcript updates for new and continued Desktop sessions so replies appear without restarting the app.
+
+## 2.72.0
+
+### Minor Changes
+
+- Workspace: fork a Claude session from any model-output turn, with recent folders in the compose directory picker. Desktop: bounded live transcript pipeline for smoother large transcripts, redesigned background-task attention row with dismiss, and preserved Claude plan prompts across task notifications.
+
+## 2.71.0
+
+### Minor Changes
+
+- Release v2.71.0: native runtime stability and workspace performance improvements — ownership-aware sidecar shutdown with orphan reaping, incremental attention summaries and single-flight analytics parsing, lazy tray cockpit, workspace selection annotation stabilization, and bounded live transcript pipeline.
+
+## 2.70.0
+
+### Minor Changes
+
+- Add native subagent environment routing (CCEM Router): dynamic routing composer, environments router panel redesign, Shift+~ route shortcut with history route restore, and binding-key naming spec. Fix routed usage analytics including transcript usage dedup by message.id (2-3.5x inflation), subagent transcript counting with corrupt traffic line tolerance, usage aperture freezing with independent sub-route ledger, and Claude background task lifecycle tracking.
+
+## 2.69.0
+
+### Minor Changes
+
+- Add a composer usage panel with active SDK session usage query (helper `usage_query` command plus desktop session usage event channel), and a project tree sort toggle with a time-bucketed recent view.
+
+## 2.68.0
+
+### Minor Changes
+
+- Add a copy-transcript-as-image action to the desktop workspace transcript, and satisfy the Codex migration clippy gate.
+
+## 2.67.0
+
+### Minor Changes
+
+- Warn before retiring Codex model launches
+
+## 2.66.0
+
+### Minor Changes
+
+- Remove duplicate workspace selection highlight in the desktop app.
+
+## 2.65.0
+
+### Minor Changes
+
+- Suppress false yolo permission warnings on desktop, restore tmux 3.6+ session target parsing, and resolve production audit advisories in fast-uri and ip-address.
+
+## 2.64.0
+
+### Minor Changes
+
+- Stabilize Desktop session launches and Chinese IME input, upgrade the Claude runtime, refresh OpenRouter Claude 5 presets, optimize tray analytics startup, and harden cross-platform release validation.
+
 ## 2.63.0
 
 ### Minor Changes

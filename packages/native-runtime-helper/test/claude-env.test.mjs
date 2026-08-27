@@ -89,3 +89,45 @@ test('does not restore omitted official model pins from the desktop process envi
   assert.equal(env.ANTHROPIC_MODEL, 'opus');
   assert.equal(env.PATH, '/usr/bin');
 });
+
+test('prepares routed Claude queries without leaking the subagent override', async () => {
+  const { buildClaudeQueryEnv } = await importClaudeEnvModule();
+
+  const env = buildClaudeQueryEnv({
+    baseEnv: {
+      PATH: '/usr/bin',
+      NO_PROXY: 'internal.example',
+      no_proxy: 'legacy.example,localhost',
+    },
+    envVars: {
+      CLAUDE_CODE_SUBAGENT_MODEL: 'forced-subagent-model',
+      ANTHROPIC_SMALL_FAST_MODEL: 'old-background-model',
+    },
+    routerMode: true,
+  });
+
+  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_SMALL_FAST_MODEL, 'ccem-route:background');
+  assert.equal(env.NO_PROXY, 'internal.example,127.0.0.1,localhost,::1');
+  assert.equal(env.no_proxy, 'legacy.example,localhost,127.0.0.1,::1');
+});
+
+test('keeps direct Claude query environments unchanged', async () => {
+  const { buildClaudeQueryEnv } = await importClaudeEnvModule();
+
+  const env = buildClaudeQueryEnv({
+    baseEnv: {
+      PATH: '/usr/bin',
+      NO_PROXY: 'internal.example',
+    },
+    envVars: {
+      CLAUDE_CODE_SUBAGENT_MODEL: 'forced-subagent-model',
+      ANTHROPIC_SMALL_FAST_MODEL: 'direct-background-model',
+    },
+  });
+
+  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'forced-subagent-model');
+  assert.equal(env.ANTHROPIC_SMALL_FAST_MODEL, 'direct-background-model');
+  assert.equal(env.NO_PROXY, 'internal.example');
+  assert.equal(env.no_proxy, undefined);
+});

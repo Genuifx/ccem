@@ -1,6 +1,6 @@
 [package]
 name = "ccem-desktop"
-version = "2.63.0"
+version = "2.73.0"
 description = "CCEM Desktop Application"
 authors = ["Genuifx"]
 edition = "2021"
@@ -58,6 +58,7 @@ fs2 = "0.4"  # 文件锁支持
 libc = "0.2"
 tauri-plugin-updater = "2"
 semver = "1"
+shared_child = "1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cef = { version = "=150.0.0", default-features = false, features = ["sandbox", "build-util"] }
@@ -70,7 +71,7 @@ objc2-foundation = { version = "0.2.2", default-features = false, features = ["N
 objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSBitmapImageRep", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSWindow"] }
 objc2-web-kit = { version = "0.2.2", default-features = false, features = ["block2", "WKNavigation", "WKSnapshotConfiguration", "WKWebView"] }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 cef = { version = "=150.0.0", default-features = false, features = ["sandbox", "build-util"] }
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Security_WinTrust", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }

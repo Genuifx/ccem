@@ -1,6 +1,8 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { DeleteEnvConfirmDialog } from '@/components/DeleteEnvConfirmDialog';
+import { createDeleteGuard } from '@/lib/asyncGuard';
 import { ENV_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { AppLayout } from '@/components/layout';
@@ -21,7 +23,10 @@ import { StartupSplash } from '@/components/layout/StartupSplash';
 import type { PetOpenSessionRequest } from '@/types/pet';
 import { AppUpdateProvider } from '@/components/app-update/AppUpdateProvider';
 import { runExclusiveLaunch } from '@/components/sessions/sessionLaunchAction';
-import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
+import {
+  NativeBackgroundTaskAppGuardProvider,
+  useNativeBackgroundTaskAppGuard,
+} from '@/components/NativeBackgroundTaskAppGuard';
 import {
   formatInteractiveSessionLaunchError,
   isInteractiveSessionTerminalOpenError,
@@ -92,6 +97,7 @@ function calculateContinuousUsageDays(dailyHistory: UsageStats['dailyHistory']):
 
 function AppContent() {
   const { t } = useLocale();
+  const { requestQuit } = useNativeBackgroundTaskAppGuard();
   const FOCUS_SYNC_INTERVAL_MS = 5000;
   const FOCUS_SYNC_DELAY_MS = 180;
   const perfAutopilotEnabled = import.meta.env.DEV && import.meta.env.VITE_PERF_AUTOPILOT === '1';
@@ -100,6 +106,10 @@ function AppContent() {
   const [dialogMode, setDialogMode] = useState<'add' | 'edit'>('add');
   const [editingEnvName, setEditingEnvName] = useState<string | undefined>();
   const [pendingDeleteEnv, setPendingDeleteEnv] = useState<string | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // Synchronous re-entry guard: React state can't block a second confirm within
+  // the same tick, so a fast double-submit would hit the backend twice.
+  const deleteEnvGuardRef = useRef(createDeleteGuard());
   const [startupReady, setStartupReady] = useState(false);
   const [startupSplashVisible, setStartupSplashVisible] = useState(true);
   const [petOpenRequest, setPetOpenRequest] = useState<PetOpenSessionRequest | null>(null);
@@ -693,8 +703,8 @@ function AppContent() {
     'meta+enter': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
     'meta+n': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
     'meta+,': () => navigateToTab('settings'),
-    'meta+q': () => invoke('quit_app'),
-  }), [handleLaunch, navigateToTab, surfaceBackgroundTerminalPartial]);
+    'meta+q': () => { void requestQuit(); },
+  }), [handleLaunch, navigateToTab, requestQuit, surfaceBackgroundTerminalPartial]);
 
   useKeyboardShortcuts(globalShortcuts);
 
@@ -734,12 +744,23 @@ function AppContent() {
 
   const confirmDeleteEnv = async () => {
     if (!pendingDeleteEnv) return;
+    // Atomic re-entry guard: a second confirm in the same tick (fast double
+    // submit) is dropped synchronously before any backend call.
+    if (!deleteEnvGuardRef.current.begin()) return;
+    setConfirmingDelete(true);
     try {
       await deleteEnvironment(pendingDeleteEnv);
+      // Success → close the confirm dialog.
+      setPendingDeleteEnv(null);
     } catch (err) {
+      // deleteEnvironment already routed the failure through the global error
+      // state (surfaced as a toast by the global error effect) and rethrew. Do
+      // NOT toast again here (would double-notify). Keep the dialog open so the
+      // user can resolve references (or a TOCTOU new reference) and retry.
       console.error('Delete failed:', err);
     } finally {
-      setPendingDeleteEnv(null);
+      deleteEnvGuardRef.current.end();
+      setConfirmingDelete(false);
     }
   };
 
@@ -870,6 +891,7 @@ function AppContent() {
           {pendingDeleteEnv && (
             <DeleteEnvConfirmDialog
               envName={pendingDeleteEnv}
+              confirming={confirmingDelete}
               onConfirm={confirmDeleteEnv}
               onCancel={() => setPendingDeleteEnv(null)}
             />
@@ -885,7 +907,9 @@ function AppContent() {
 function App() {
   return (
     <LocaleProvider>
-      <AppContent />
+      <NativeBackgroundTaskAppGuardProvider>
+        <AppContent />
+      </NativeBackgroundTaskAppGuardProvider>
     </LocaleProvider>
   );
 }
@@ -898,48 +922,6 @@ function PageFallback({ activeTab }: { activeTab: string }) {
   return (
     <div className="min-h-[320px] w-full flex items-center justify-center text-sm text-muted-foreground">
       Loading...
-    </div>
-  );
-}
-
-/** Inline confirmation dialog for environment deletion — rendered inside LocaleProvider */
-function DeleteEnvConfirmDialog({
-  envName,
-  onConfirm,
-  onCancel,
-}: {
-  envName: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const gatedOpen = useNativeSurfaceOcclusion(true);
-  const { t } = useLocale();
-  const message = t('environments.confirmDelete').replace('{name}', envName);
-
-  if (!gatedOpen) return null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onCancel}>
-      <div
-        className="frosted-panel glass-noise rounded-xl p-6 max-w-sm w-full mx-4 space-y-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <p className="text-foreground text-sm">{message}</p>
-        <div className="flex justify-end gap-2">
-          <button
-            className="px-4 py-2 text-sm rounded-lg glass-outline-btn text-foreground transition-colors"
-            onClick={onCancel}
-          >
-            {t('common.cancel')}
-          </button>
-          <button
-            className="px-4 py-2 text-sm rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
-            onClick={onConfirm}
-          >
-            {t('common.delete')}
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

@@ -7,37 +7,28 @@ const desktopDir = path.resolve(import.meta.dirname, '..');
 const rustDir = path.join(desktopDir, 'src-tauri', 'src');
 const repoDir = path.resolve(desktopDir, '..', '..');
 
-test('agent browser artifacts are app-owned while UI screenshot remains inline', async () => {
-  const [artifactSource, commandSource, toolSource, nativeRuntimeSource] = await Promise.all([
-    fs.readFile(path.join(rustDir, 'browser', 'artifacts.rs'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'browser', 'commands.rs'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'browser', 'tools.rs'), 'utf8'),
+test('Mode 2 agent browser artifacts are app-owned and routed through the exact handoff', async () => {
+  const [agentServiceSource, artifactSource, nativeRuntimeSource] = await Promise.all([
+    fs.readFile(path.join(rustDir, 'browser', 'login', 'agent_service.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'browser', 'login', 'agent_service', 'artifacts.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'native_runtime.rs'), 'utf8'),
   ]);
-
-  const agentScreenshot = toolSource.match(
-    /"screenshot"\s*=>[\s\S]*?"evaluate"\s*=>/,
-  )?.[0] ?? '';
-  assert.match(agentScreenshot, /capture_screenshot_artifact/);
-  assert.doesNotMatch(agentScreenshot, /screenshot_base64|"data"/);
-
-  const uiScreenshot = commandSource.match(
-    /pub async fn browser_screenshot\([\s\S]*?\n\}/,
-  )?.[0] ?? '';
-  assert.match(uiScreenshot, /screenshot_base64/);
 
   assert.match(nativeRuntimeSource, /record\.project_dir\.clone\(\)/);
   assert.match(
     nativeRuntimeSource,
-    /browser\.run_tool_with_permission\(\s*app,\s*runtime_id,\s*&workspace_dir,\s*&request,\s*&authority,?\s*\)/,
+    /prepare_agent_tool_if_handed_off\([\s\S]*&workspace_dir,[\s\S]*&browser_actor_id,[\s\S]*authority,[\s\S]*&request/,
   );
+  assert.match(nativeRuntimeSource, /login\.execute_prepared_agent_tool\(&request, prepared\)/);
+  assert.doesNotMatch(nativeRuntimeSource, /browser\.run_tool_with_permission/);
 
-  assert.match(artifactSource, /config::get_ccem_dir\(\)\.join\("browser"\)/);
-  assert.match(artifactSource, /join\("workspaces"\)[\s\S]*join\("sessions"\)[\s\S]*join\("artifacts"\)/);
+  assert.match(agentServiceSource, /serialize_agent_result\(result, &lease\.artifact_root\)/);
+  assert.match(agentServiceSource, /resolve_screenshot_artifact\(/);
+  assert.match(agentServiceSource, /insert_artifact_path\(&mut value, path\)/);
+  assert.match(artifactSource, /Agent input can neither choose the path/);
   assert.match(artifactSource, /Sha256::digest/);
-  assert.match(artifactSource, /create_new\(true\)/);
-  assert.match(artifactSource, /from_mode\(0o700\)/);
-  assert.match(artifactSource, /from_mode\(0o600\)/);
+  assert.match(artifactSource, /canonicalize\(\)/);
+  assert.match(artifactSource, /canonical_path\.parent\(\) != Some\(canonical_root\.as_path\(\)\)/);
 });
 
 test('interaction refs require the matching generation-safe snapshot id', async () => {

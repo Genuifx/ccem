@@ -16,8 +16,10 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/desktop/src-tauri/src/history.rs`: History parsing and projection code is still coupled in one file.
 - `apps/desktop/src-tauri/src/interactive_runtime.rs`: Interactive runtime capture, replay, and prompt monitoring remain centralized while terminal and native-session flows are still converging.
 - `apps/desktop/src-tauri/src/lib.rs`: Tauri command wiring and app bootstrap were mechanically moved from the former large binary entrypoint so Windows can expose the official CEF bootstrap client DLL; split this legacy orchestration incrementally after the bootstrap migration lands.
+- `apps/desktop/src-tauri/src/native_event_log.rs`: Native event log persistence and attention-summary writes remain bundled while the native event pipeline is still converging.
 - `apps/desktop/src-tauri/src/native_runtime.rs`: Native SDK runtime lifecycle, event replay, and helper orchestration are still centralized.
 - `apps/desktop/src-tauri/src/proxy_debug.rs`: Proxy debug parsing and reduction logic still lives in one module.
+- `apps/desktop/src-tauri/src/router/core.rs`: Router request preparation, route decision, model pin resolution, and history resume cloning remain in one module during the dynamic-routing iteration.
 - `apps/desktop/src-tauri/src/runtime.rs`: Runtime management remains a large central orchestrator.
 - `apps/desktop/src-tauri/src/skills.rs`: Skill discovery, metadata parsing, provider-specific projection, install, uninstall, and curated metadata handling remain bundled in one backend module.
 - `apps/desktop/src-tauri/src/telegram/mod.rs`: Telegram bot integration is currently a large monolith and needs phased extraction.

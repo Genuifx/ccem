@@ -74,6 +74,7 @@ async function fetchAnalyticsSource(source: UsageSourceFilter, force = false): P
 
   const request = invoke<UsageStats>('get_usage_stats', {
     source: source === 'all' ? null : source,
+    force,
   })
     .then((stats) => {
       const result = {

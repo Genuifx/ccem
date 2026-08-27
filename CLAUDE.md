@@ -26,9 +26,13 @@ pnpm --filter @ccem/cli test -- --run src/__tests__/usage.test.ts  # single test
 
 ## Desktop Self-Test Lockfile Rule
 
-Use `cd apps/desktop && pnpm tauri:dev` for desktop self-tests. This script applies `src-tauri/tauri.dev.conf.json`, so the development app uses the distinct `CCEM Desktop Dev` product name and `com.ccem.desktop.dev` bundle identifier. It also passes `--locked` to Cargo, so a Tauri dev run cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
+Use `cd apps/desktop && pnpm tauri:dev` for desktop self-tests. The worktree-aware launcher merges `src-tauri/tauri.dev.conf.json` with a generated config and derives a distinct Vite port, product name/bundle identifier, Rust lock, and 100-port MCP block from the absolute worktree path. It also passes `--locked` to Cargo, so a dev run cannot silently rewrite `apps/desktop/src-tauri/Cargo.lock`.
 
-The installed release is outside the self-test process boundary. Agents must not quit, terminate, or kill `/Applications/CCEM Desktop.app` to make a development app easier to target. If automation sees multiple apps, target `com.ccem.desktop.dev`, the exact development app path, or the Tauri MCP port; otherwise stop and report the targeting failure without disturbing the release app.
+Different worktrees may run concurrently. Startup prints an ignored `.artifacts/tauri-dev/` manifest containing the exact `launcherPid`, `identifier`, and `mcpPort`; use those values to target the instance. The same worktree remains single-owner and a duplicate start reports its live PID. Stop only the process launched by the current task, via its original terminal or exact `launcherPid`; never use `pkill`, `killall`, port cleanup, lock deletion, or an installed-app quit. A collision is evidence to inspect, not permission to kill another task.
+
+Named dev instances disable automatic shared background services by default: runtime cleanup/reconciliation, proxy boot, system autostart sync, session monitoring, cron, bot request watching, and chat bridge auto-start. Use `CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1 pnpm tauri:dev` only for a targeted single-owner test. The launcher does not clone `~/.ccem`; manual settings/config/session writes remain shared and concurrent tests that mutate the same records must still be coordinated.
+
+The installed release is outside the self-test process boundary. Agents must not quit, terminate, or kill `/Applications/CCEM Desktop.app` to make a development app easier to target. If automation sees multiple apps, target the exact generated bundle identifier or Tauri MCP port from the manifest; otherwise stop and report the targeting failure without disturbing the release app.
 
 If that command fails because the lockfile needs to change, inspect the dependency or version change instead of dropping `--locked`. For an intentional lock update, run `cd apps/desktop/src-tauri && cargo generate-lockfile --offline`, review the diff, and commit `apps/desktop/src-tauri/Cargo.lock` with the related change. For verification-only noise, restore the lockfile before worktree cleanup.
 

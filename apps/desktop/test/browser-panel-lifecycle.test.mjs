@@ -309,24 +309,11 @@ function installDom() {
 function createBridge() {
   let loginGeneration = 0;
   let loginServerSequence = 100;
-  let previewAliasBindingId = 0;
-  let previewOpenGate = null;
-  let resolvePreviewOpenGate = null;
   const calls = [];
   const bridge = {
     calls,
     toasts: [],
     translate: (key) => `zh:${key}`,
-    deferPreviewOpen() {
-      previewOpenGate = new Promise((resolve) => {
-        resolvePreviewOpenGate = resolve;
-      });
-    },
-    resolvePreviewOpen() {
-      resolvePreviewOpenGate?.();
-      previewOpenGate = null;
-      resolvePreviewOpenGate = null;
-    },
     async listen(eventName, handler) {
       calls.push({ command: `listen:${eventName}`, args: { handler } });
       return () => {};
@@ -337,56 +324,6 @@ function createBridge() {
     async invoke(command, args = {}) {
       calls.push({ command, args });
       switch (command) {
-        case 'browser_open': {
-          if (previewOpenGate) await previewOpenGate;
-          const aliasLease = args.aliasSessionId
-            ? {
-                alias_session_id: args.aliasSessionId,
-                session_id: args.sessionId,
-                generation: 1,
-                binding_id: ++previewAliasBindingId,
-              }
-            : null;
-          return {
-            label: 'Preview',
-            session_id: args.sessionId,
-            url: args.url ?? 'https://example.test/current',
-            title: 'Example',
-            visible: Boolean(args.visible),
-            can_go_back: false,
-            can_go_forward: false,
-            lifecycle: 'ready',
-            loading: false,
-            error: null,
-            control: 'user',
-            paused: false,
-            generation: 1,
-            created_at: 1,
-            updated_at: 1,
-            alias_lease: aliasLease,
-          };
-        }
-        case 'browser_info':
-        case 'browser_health_check':
-          return {
-            label: 'Preview',
-            session_id: args.sessionId,
-            url: args.url ?? 'https://example.test/current',
-            title: 'Example',
-            visible: Boolean(args.visible),
-            can_go_back: false,
-            can_go_forward: false,
-            lifecycle: 'ready',
-            loading: false,
-            error: null,
-            control: 'user',
-            paused: false,
-            generation: 1,
-            created_at: 1,
-            updated_at: 1,
-          };
-        case 'browser_recent_activity':
-          return { artifacts: [] };
         case 'browser_surface_acquire': {
           loginGeneration += 1;
           return {
@@ -417,12 +354,9 @@ function createBridge() {
             },
           };
         }
-        case 'browser_set_visible':
-        case 'browser_set_bounds':
         case 'browser_surface_sync':
         case 'browser_surface_release':
         case 'browser_surface_navigate':
-        case 'browser_unbind_preview_alias':
           return undefined;
         case 'browser_surface_control':
           return {
@@ -437,13 +371,6 @@ function createBridge() {
               recovery_states: [],
               popup_active: false,
             },
-          };
-        case 'browser_bind_preview_alias':
-          return {
-            alias_session_id: args.aliasSessionId,
-            session_id: args.sessionId,
-            generation: 1,
-            binding_id: ++previewAliasBindingId,
           };
         default:
           throw new Error(`Unexpected BrowserPanel command: ${command}`);
@@ -461,130 +388,6 @@ function createBridge() {
 function callsFor(bridge, command) {
   return bridge.calls.filter((call) => call.command === command);
 }
-
-test('Preview visibility and presentation updates retain one live browser instance', async (t) => {
-  const dom = installDom();
-  const bridge = createBridge();
-  bridge.deferPreviewOpen();
-  const { harness, tempDir } = await importBrowserPanelHarness();
-  const container = document.querySelector('#root');
-  assert.ok(container);
-  let mounted;
-
-  t.after(async () => {
-    mounted?.unmount();
-    dom.window.close();
-    await fs.rm(tempDir, { recursive: true, force: true });
-    await stopEsbuild();
-  });
-
-  const initialProps = {
-    locale: 'zh',
-    backend: 'preview',
-    sessionId: 'runtime:a:1',
-    defaultUrl: 'https://example.test/initial',
-    presentationRevision: 1,
-    isActiveSurface: false,
-    surfaceOccluded: true,
-    onClose() {},
-  };
-  mounted = harness.mountBrowserPanel(container, initialProps);
-  await harness.flushEffects();
-  assert.equal(callsFor(bridge, 'browser_open').length, 1);
-
-  mounted.render({
-    ...initialProps,
-    presentationRevision: 2,
-    isActiveSurface: true,
-    surfaceOccluded: false,
-  });
-  await harness.flushEffects();
-  bridge.resolvePreviewOpen();
-  await harness.flushEffects();
-  await harness.flushEffects();
-  const visibleAfterReady = callsFor(bridge, 'browser_set_visible').at(-1);
-  assert.ok(visibleAfterReady, 'ready Preview must receive a visibility mutation');
-  assert.equal(visibleAfterReady.args.visible, true);
-  assert.equal(
-    visibleAfterReady.args.presentationRevision,
-    2,
-    'ready Preview must use the latest presentation revision',
-  );
-
-  mounted.render({
-    ...initialProps,
-    presentationRevision: 3,
-    isActiveSurface: false,
-    surfaceOccluded: true,
-  });
-  await harness.flushEffects();
-  mounted.render({
-    ...initialProps,
-    presentationRevision: 4,
-    isActiveSurface: true,
-    surfaceOccluded: false,
-  });
-  await harness.flushEffects();
-
-  const opens = callsFor(bridge, 'browser_open');
-  assert.equal(opens.length, 1, 'A-to-B-to-A visibility changes must not reopen Preview');
-  assert.equal(opens[0].args.url, 'https://example.test/initial');
-  assert.equal(callsFor(bridge, 'browser_close').length, 0);
-});
-
-test('Preview retires an open-time alias when the runtime id changes before open resolves', async (t) => {
-  const dom = installDom();
-  const bridge = createBridge();
-  bridge.deferPreviewOpen();
-  const { harness, tempDir } = await importBrowserPanelHarness();
-  const container = document.querySelector('#root');
-  assert.ok(container);
-  let mounted;
-
-  t.after(async () => {
-    mounted?.unmount();
-    dom.window.close();
-    await fs.rm(tempDir, { recursive: true, force: true });
-    await stopEsbuild();
-  });
-
-  const initialProps = {
-    locale: 'zh',
-    backend: 'preview',
-    sessionId: 'conversation:a:browser:1',
-    agentSessionId: 'runtime-a',
-    defaultUrl: 'https://example.test/initial',
-    presentationRevision: 1,
-    isActiveSurface: false,
-    surfaceOccluded: true,
-    onClose() {},
-  };
-  mounted = harness.mountBrowserPanel(container, initialProps);
-  await harness.flushEffects();
-  assert.equal(callsFor(bridge, 'browser_open').length, 1);
-  assert.equal(callsFor(bridge, 'browser_open')[0].args.aliasSessionId, 'runtime-a');
-
-  mounted.render({
-    ...initialProps,
-    agentSessionId: 'runtime-b',
-  });
-  await harness.flushEffects();
-  bridge.resolvePreviewOpen();
-  await harness.flushEffects();
-  await harness.flushEffects();
-
-  const retiredOpenAlias = callsFor(bridge, 'browser_unbind_preview_alias')
-    .find((call) => call.args.aliasSessionId === 'runtime-a');
-  assert.ok(retiredOpenAlias, 'the stale alias returned by browser_open must be explicitly retired');
-  const replacementBinding = callsFor(bridge, 'browser_bind_preview_alias')
-    .find((call) => call.args.aliasSessionId === 'runtime-b');
-  assert.ok(replacementBinding, 'the current runtime alias must bind to the retained physical Browser');
-  assert.ok(
-    bridge.calls.indexOf(retiredOpenAlias) < bridge.calls.indexOf(replacementBinding),
-    'retiring the open-time alias must invalidate in-flight Agent work before binding its replacement',
-  );
-  assert.equal(callsFor(bridge, 'browser_open').length, 1);
-});
 
 test('Login locale changes retain its lease until the panel actually unmounts', async (t) => {
   const dom = installDom();

@@ -27,6 +27,7 @@ export interface CcemSessionLinkNativeSessionRef {
   provider: Extract<HistorySource, 'claude' | 'codex' | 'opencode'> | string;
   runtime_id: string;
   provider_session_id?: string | null;
+  project_dir?: string | null;
 }
 
 const VALID_SOURCES = new Set(['claude', 'codex', 'opencode']);
@@ -126,6 +127,13 @@ export function nativeSessionMatchesCcemSessionLink(
   if (session.provider !== parsed.source) {
     return false;
   }
+  if (
+    parsed.cwd
+    && normalizeCcemSessionProject(session.project_dir ?? '')
+      !== normalizeCcemSessionProject(parsed.cwd)
+  ) {
+    return false;
+  }
 
   const targetRuntimeId = parsed.runtimeId || (parsed.idKind === 'runtime' ? parsed.id : null);
   const targetProviderSessionId = parsed.providerSessionId || (parsed.idKind === 'provider' ? parsed.id : null);
@@ -137,4 +145,8 @@ export function nativeSessionMatchesCcemSessionLink(
     return true;
   }
   return false;
+}
+
+function normalizeCcemSessionProject(project: string): string {
+  return project.replace(/\\/g, '/').replace(/\/+$/, '').trim();
 }

@@ -138,8 +138,10 @@ export function TriggerPopover({
               role="option"
               aria-selected={index === selectedIndex}
               className={cn(
-                'flex w-full items-start gap-1.5 rounded-[16px] px-1.5 py-1 text-left transition-colors',
-                index === selectedIndex ? 'bg-surface' : 'hover:bg-surface/65',
+                'flex w-full items-start gap-1.5 rounded-lg px-1.5 py-1 text-left transition-colors',
+                index === selectedIndex
+                  ? 'bg-primary/[0.08] ring-1 ring-inset ring-primary/30'
+                  : 'hover:bg-primary/[0.045]',
                 suggestion.disabled && 'cursor-not-allowed opacity-55',
               )}
               onMouseDown={(e) => {

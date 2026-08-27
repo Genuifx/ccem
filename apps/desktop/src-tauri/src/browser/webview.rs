@@ -1,8 +1,10 @@
+#[cfg(target_os = "macos")]
 use super::logs::BROWSER_CONSOLE_INIT_SCRIPT;
 use super::registry::{BrowserNavigationToken, BrowserSessionRegistry};
+use super::{emit_browser_state, BrowserBounds, BrowserHistoryDirection, BrowserPageMetadata};
+#[cfg(target_os = "macos")]
 use super::{
-    emit_browser_state, is_allowed_browser_navigation, parse_browser_url, BrowserBounds,
-    BrowserHistoryDirection, BrowserHistoryState, BrowserPageMetadata, SAFARI_DESKTOP_UA,
+    is_allowed_browser_navigation, parse_browser_url, BrowserHistoryState, SAFARI_DESKTOP_UA,
 };
 use std::sync::Arc;
 use std::time::Duration;

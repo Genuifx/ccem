@@ -188,6 +188,7 @@ fn parse_jsonl_line(
                 vec![SessionEventPayload::Lifecycle {
                     stage: subtype.to_string(),
                     detail: value.to_string(),
+                    assistant_message_uuid: None,
                 }]
             })
             .unwrap_or_default(),
@@ -651,6 +652,7 @@ fn parse_progress_line(value: &Value) -> Vec<SessionEventPayload> {
         return vec![SessionEventPayload::Lifecycle {
             stage: "hook_progress".to_string(),
             detail: value.to_string(),
+            assistant_message_uuid: None,
         }];
     }
 

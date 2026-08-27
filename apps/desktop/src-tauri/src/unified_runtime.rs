@@ -7,6 +7,7 @@ use crate::runtime::{
 };
 use crate::tmux::ClaudeTerminalState;
 use crate::unified_session::{RuntimeInput, UnifiedSessionDebugComparison, UnifiedSessionInfo};
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -274,6 +275,26 @@ impl UnifiedSessionManager {
             .replay_events(since_seq)
     }
 
+    /// Read the incrementally maintained attention summary for a unified
+    /// session without replaying its event buffer.
+    pub fn attention_summary(&self, runtime_id: &str) -> Result<AttentionSummary, String> {
+        if self.headless_runtime_manager.summary(runtime_id).is_some() {
+            return self.headless_runtime_manager.attention_summary(runtime_id);
+        }
+
+        if self
+            .interactive_runtime_manager
+            .summary(runtime_id)
+            .is_some()
+        {
+            return self
+                .interactive_runtime_manager
+                .attention_summary(runtime_id);
+        }
+
+        Err(format!("Unified session not found: {}", runtime_id))
+    }
+
     pub fn get_session_info(
         &self,
         app: &AppHandle,
@@ -320,6 +341,11 @@ impl UnifiedSessionManager {
         let channel: Arc<dyn OutputChannel> = match backend.runtime_kind() {
             RuntimeKind::Headless => Arc::new(DesktopChannel::headless(app.clone())),
             RuntimeKind::Interactive => Arc::new(DesktopChannel::interactive(app.clone())),
+            // Native runtimes stream through their own event log and never
+            // attach a desktop output channel.
+            RuntimeKind::Native => {
+                return Err("Native runtimes do not attach desktop output channels".to_string());
+            }
         };
 
         self.attach_output_channel(runtime_id, channel)

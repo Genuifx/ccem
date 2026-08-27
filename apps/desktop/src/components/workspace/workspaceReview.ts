@@ -388,6 +388,224 @@ function buildToolEvidence(events: SessionEventRecord[]): ReviewToolEvidence[] {
   return Array.from(tools.values()).sort((left, right) => left.seq - right.seq);
 }
 
+/**
+ * Incremental review fold (plan 022). The status-strip summary needs full
+ * session history (changed-file and tool evidence totals), but the live view's
+ * raw event array is bounded — so events fold into this accumulator and the
+ * summary assembles from (fold, gitSnapshot) without rescanning events.
+ */
+export interface WorkspaceReviewEventFold {
+  /** SDK/file-op-derived file mentions, insertion order = first mention. */
+  sdkFiles: Map<string, {
+    status: string;
+    toolUseIds: string[];
+    sourceSeqs: number[];
+  }>;
+  /** Newest execution/file_op/file_change tool start, for git fallback attribution. */
+  lastMutatingTool: { toolUseId: string; seq: number } | null;
+  /** Tool evidence keyed by tool_use_id (starts updated by completions). */
+  tools: Map<string, ReviewToolEvidence>;
+}
+
+function isMutatingToolStart(payload: SessionEventRecord['payload']): boolean {
+  return payload.type === 'tool_use_started'
+    && (
+      payload.category.category === 'execution'
+      || payload.category.category === 'file_op'
+      || payload.raw_name === 'file_change'
+    );
+}
+
+/** Fold `events` into `previous` (or a fresh accumulator when null). */
+export function foldWorkspaceReviewEvents(
+  previous: WorkspaceReviewEventFold | null,
+  events: SessionEventRecord[],
+): WorkspaceReviewEventFold {
+  const fold: WorkspaceReviewEventFold = previous
+    ? {
+      sdkFiles: new Map(previous.sdkFiles),
+      lastMutatingTool: previous.lastMutatingTool,
+      tools: new Map(previous.tools),
+    }
+    : { sdkFiles: new Map(), lastMutatingTool: null, tools: new Map() };
+
+  const addSdkFile = (
+    path: string,
+    status: string,
+    toolUseId: string,
+    sourceSeq: number,
+  ) => {
+    const current = fold.sdkFiles.get(path);
+    if (current) {
+      if (!current.toolUseIds.includes(toolUseId)) {
+        current.toolUseIds.push(toolUseId);
+      }
+      if (!current.sourceSeqs.includes(sourceSeq)) {
+        current.sourceSeqs.push(sourceSeq);
+      }
+      return;
+    }
+    fold.sdkFiles.set(path, {
+      status,
+      toolUseIds: [toolUseId],
+      sourceSeqs: [sourceSeq],
+    });
+  };
+
+  for (const event of events) {
+    const { payload } = event;
+
+    if (payload.type === 'tool_use_started' && isMutatingToolStart(payload)) {
+      fold.lastMutatingTool = { toolUseId: payload.tool_use_id, seq: event.seq };
+    }
+
+    if (payload.type === 'tool_use_started' || payload.type === 'tool_use_completed') {
+      const isFileEvent = payload.raw_name === 'file_change'
+        || (
+          payload.type === 'tool_use_started'
+          && payload.category.category === 'file_op'
+        );
+      if (isFileEvent) {
+        const summary = payload.type === 'tool_use_started'
+          ? payload.input_summary
+          : payload.result_summary;
+        const structuredChanges = structuredFileChanges(summary);
+        if (structuredChanges.length > 0) {
+          for (const change of structuredChanges) {
+            addSdkFile(change.path, change.status, payload.tool_use_id, event.seq);
+          }
+        } else {
+          const path = toolPathFromSummary(summary);
+          if (path) {
+            addSdkFile(path, 'sdk', payload.tool_use_id, event.seq);
+          }
+        }
+      }
+    }
+
+    if (payload.type === 'tool_use_started') {
+      fold.tools.set(payload.tool_use_id, {
+        id: payload.tool_use_id,
+        seq: event.seq,
+        toolUseId: payload.tool_use_id,
+        rawName: payload.raw_name,
+        category: categoryName(payload.category),
+        inputSummary: payload.input_summary,
+        startedAt: event.occurred_at,
+      });
+      continue;
+    }
+    if (payload.type === 'tool_use_completed') {
+      const current = fold.tools.get(payload.tool_use_id);
+      if (current) {
+        current.resultSummary = payload.result_summary;
+        current.success = payload.success;
+        current.completedAt = event.occurred_at;
+      } else {
+        fold.tools.set(payload.tool_use_id, {
+          id: payload.tool_use_id,
+          seq: event.seq,
+          toolUseId: payload.tool_use_id,
+          rawName: payload.raw_name,
+          category: 'unknown',
+          inputSummary: '',
+          resultSummary: payload.result_summary,
+          success: payload.success,
+          completedAt: event.occurred_at,
+        });
+      }
+    }
+  }
+
+  return fold;
+}
+
+/** Assemble the status-strip summary from a fold plus the git snapshot. */
+export function buildWorkspaceReviewSummaryFromFold(
+  fold: WorkspaceReviewEventFold | null,
+  gitSnapshot?: WorkspaceGitSnapshot | null,
+): WorkspaceReviewSummary {
+  if (!fold) {
+    const artifactsFromGit = buildArtifacts(
+      (gitSnapshot?.files ?? []).map((file) => ({
+        path: file.path,
+        status: gitStatusLabel(file.status),
+        source: 'git' as const,
+        additions: file.additions,
+        deletions: file.deletions,
+        toolUseIds: [],
+        sourceSeqs: [],
+      })),
+    );
+    return {
+      failedTools: 0,
+      changedFiles: gitSnapshot?.files.length ?? 0,
+      artifacts: artifactsFromGit.length,
+    };
+  }
+
+  const files = new Map<string, ReviewChangedFile>();
+  for (const file of gitSnapshot?.files ?? []) {
+    files.set(file.path, {
+      path: file.path,
+      status: gitStatusLabel(file.status),
+      source: 'git',
+      additions: file.additions,
+      deletions: file.deletions,
+      toolUseIds: [],
+      sourceSeqs: [],
+    });
+  }
+
+  for (const [path, sdkFile] of fold.sdkFiles) {
+    const current = files.get(path);
+    if (current) {
+      current.source = current.source === 'git' ? 'matched' : current.source;
+      for (const toolUseId of sdkFile.toolUseIds) {
+        if (!current.toolUseIds.includes(toolUseId)) {
+          current.toolUseIds.push(toolUseId);
+        }
+      }
+      for (const sourceSeq of sdkFile.sourceSeqs) {
+        if (!current.sourceSeqs.includes(sourceSeq)) {
+          current.sourceSeqs.push(sourceSeq);
+        }
+      }
+      continue;
+    }
+    files.set(path, {
+      path,
+      status: sdkFile.status,
+      source: 'sdk',
+      additions: null,
+      deletions: null,
+      toolUseIds: [...sdkFile.toolUseIds],
+      sourceSeqs: [...sdkFile.sourceSeqs],
+    });
+  }
+
+  const fallbackTool = fold.lastMutatingTool;
+  if (fallbackTool) {
+    for (const file of files.values()) {
+      if (file.source !== 'git' || file.toolUseIds.length > 0) {
+        continue;
+      }
+      file.toolUseIds.push(fallbackTool.toolUseId);
+      file.sourceSeqs.push(fallbackTool.seq);
+    }
+  }
+
+  const changedFiles = Array.from(files.values())
+    .sort((left, right) => left.path.localeCompare(right.path));
+
+  return {
+    failedTools: Array.from(fold.tools.values())
+      .reduce((count, tool) => count + (tool.success === false ? 1 : 0), 0),
+    changedFiles: changedFiles.length,
+    artifacts: buildArtifacts(changedFiles).length,
+  };
+}
+
 export function buildWorkspaceReviewSummary({
   events,
   gitSnapshot,
@@ -395,14 +613,10 @@ export function buildWorkspaceReviewSummary({
   events: SessionEventRecord[];
   gitSnapshot?: WorkspaceGitSnapshot | null;
 }): WorkspaceReviewSummary {
-  const changedFiles = buildChangedFiles(events, gitSnapshot);
-  const tools = buildToolEvidence(events);
-
-  return {
-    failedTools: tools.reduce((count, tool) => count + (tool.success === false ? 1 : 0), 0),
-    changedFiles: changedFiles.length,
-    artifacts: buildArtifacts(changedFiles).length,
-  };
+  return buildWorkspaceReviewSummaryFromFold(
+    foldWorkspaceReviewEvents(null, events),
+    gitSnapshot,
+  );
 }
 
 export function buildWorkspaceReviewModel({

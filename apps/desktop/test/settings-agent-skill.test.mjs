@@ -26,7 +26,7 @@ test('bundled CCEM agent skill teaches agents to use the JSON desktop CLI wrappe
     'utf8',
   );
 
-  assert.match(skillSource, /^---\nname: ccem\n/ms);
+  assert.match(skillSource, /^---\r?\nname: ccem\r?\n/ms);
   assert.match(skillSource, /ccem desktop health --json/);
   assert.match(skillSource, /ccem desktop create/);
   assert.match(skillSource, /--json/);

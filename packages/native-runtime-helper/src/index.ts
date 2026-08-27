@@ -1,16 +1,25 @@
-import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { forkSession, query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { Codex } from '@openai/codex-sdk';
+import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { buildClaudeQueryEnv } from './claudeEnv';
+import { resolveClaudeInterruptTimeoutMs } from './claudeInterruptTimeout';
 import { applyClaudePermissionModeToQuery } from './claudePermissionControl';
 import { resolveClaudePermissionRequestId, type ClaudeToolPermissionOptions } from './claudePermissionRequests';
 import { QuerySnapshotSlot, type QuerySnapshot } from './claudeQuerySnapshotSlot';
 import { buildClaudePlanModeHooks } from './claudePlanGuard';
+import { terminateOwnedProcessGroupOnParentClose } from './parentProcessTeardown';
 import {
+  buildClaudeRouterSystemPrompt,
+  mergeClaudeRouteHooks,
+  type ClaudeRouterInit,
+} from './claudeRouteHook';
+import {
+  BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
   createBrowserToolBridge,
   createCcemBrowserMcpServer,
   ensureBrowserMcpToolsAllowed,
@@ -33,6 +42,13 @@ import {
 import { buildClaudeFileCheckpointEvent } from './claudeFileCheckpoints';
 import { TodoSnapshotTracker, type TodoSnapshotV1 } from './todoSnapshots';
 import { formatPermissionPreview } from './permissionPreview';
+import { withSuppressedClaudeBypassShadowWarning } from './claudeSdkWarnings';
+import {
+  backgroundTaskSnapshotKey,
+  ClaudeBackgroundTaskTracker,
+  isBackgroundLaunchResult,
+  type ClaudeBackgroundTask,
+} from './claudeBackgroundTasks';
 
 type NativeProvider = 'claude' | 'codex';
 
@@ -47,6 +63,8 @@ type InitCommand = {
   initial_prompt?: string | null;
   initial_images?: PromptImage[] | null;
   provider_session_id?: string | null;
+  fork_session?: boolean | null;
+  fork_at_message_id?: string | null;
   claude_path?: string | null;
   codex_path?: string | null;
   codex_base_url?: string | null;
@@ -55,6 +73,7 @@ type InitCommand = {
   allowed_tools?: string[] | null;
   disallowed_tools?: string[] | null;
   todo_snapshot_seed?: TodoSnapshotV1 | null;
+  router?: ClaudeRouterInit | null;
 };
 
 type PromptCommand = {
@@ -84,11 +103,12 @@ type BrowserToolResponseInputCommand = BrowserToolResponseCommand;
 
 type UpdateSettingsCommand = {
   type: 'update_settings';
-  request_id: string;
+  request_id?: string;
   env_name?: string;
   perm_mode?: string;
   env_vars?: Record<string, string>;
   effort?: string;
+  force_restart?: boolean;
 };
 
 type RewindFilesCommand = {
@@ -107,14 +127,44 @@ type TitleQueryCommand = {
 };
 
 type RuntimeSettingsPatch = {
+  requestId?: string;
   envName?: string;
   permMode?: string;
   envVars?: Record<string, string>;
   effort?: string;
+  forceRestart?: boolean;
+};
+
+type UsageQueryCommand = {
+  type: 'usage_query';
 };
 
 type StopCommand = {
   type: 'stop';
+  force_background_tasks?: boolean;
+};
+
+type InterruptTurnCommand = {
+  type: 'interrupt_turn';
+};
+
+type PrepareStopCommand = {
+  type: 'prepare_stop';
+  request_id: string;
+  require_idle?: boolean;
+  force_background_tasks?: boolean;
+  finalize?: boolean;
+};
+
+type CancelPrepareStopCommand = {
+  type: 'cancel_prepare_stop';
+  request_id: string;
+};
+
+type StopTaskCommand = {
+  type: 'stop_task';
+  task_id: string;
+  stop_request_id: string;
 };
 
 type InputCommand =
@@ -126,6 +176,11 @@ type InputCommand =
   | UpdateSettingsCommand
   | RewindFilesCommand
   | TitleQueryCommand
+  | UsageQueryCommand
+  | InterruptTurnCommand
+  | PrepareStopCommand
+  | CancelPrepareStopCommand
+  | StopTaskCommand
   | StopCommand;
 
 type ClaudePermissionRequestOptions = ClaudeToolPermissionOptions & {
@@ -160,27 +215,39 @@ type HelperOutput =
       outcome: 'applied' | 'failed' | 'deferred';
       detail?: string;
     }
+  | {
+      type: 'teardown_prepared';
+      request_id: string;
+      ready: boolean;
+      detail?: string;
+    }
   | BrowserToolRequestOutput;
 
 type PermissionResolver = {
   resolve: (approved: boolean) => void;
+  agentId?: string;
+  backgroundTaskId?: string;
+};
+
+type ClaudeInteractivePromptResult = {
+  behavior: 'allow';
+  updatedInput: Record<string, unknown>;
+  toolUseID: string;
+} | {
+  behavior: 'deny';
+  message: string;
+  toolUseID: string;
 };
 
 type ClaudeInteractivePromptResolver = {
   input: Record<string, unknown>;
-  resolve: (result: {
-    behavior: 'allow';
-    updatedInput: Record<string, unknown>;
-    toolUseID: string;
-  } | {
-    behavior: 'deny';
-    message: string;
-    toolUseID: string;
-  }) => void;
+  agentId?: string;
+  backgroundTaskId?: string;
+  promise: Promise<ClaudeInteractivePromptResult>;
+  resolve: (result: ClaudeInteractivePromptResult) => void;
 };
 
 const DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1000;
-const DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS = 8_000;
 const CLAUDE_INCOMPLETE_RESPONSE_REASON = 'Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.';
 
 let initCommand: InitCommand | null = null;
@@ -199,13 +266,28 @@ let claudeIdleCloseTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeLastSessionState: 'idle' | 'running' | 'requires_action' | null = null;
 let claudeInterruptRequested = false;
 let claudeInterruptCompletionEmitted = false;
+let runtimeTeardownPreparationId: string | null = null;
 let claudeSawPartialText = false;
 let claudeSawPartialThinking = false;
 let claudeTurnCompletionEmitted = false;
+let claudeLastAssistantMessageUuid: string | null = null;
 let claudeTurnAwaitingResult = false;
-let pendingClaudePromptReplay: { text: string; images?: PromptImage[] | null } | null = null;
+let claudeForegroundPromptUuid: string | null = null;
+let claudeForegroundPromptAccepted = false;
+let claudeIngressOriginKind: string | null = null;
+let claudePendingNonHumanResultCount = 0;
+const claudeSeenNonHumanResultKeys = new Set<string>();
+let pendingClaudePromptReplay: {
+  text: string;
+  images?: PromptImage[] | null;
+  messageUuid: string;
+} | null = null;
 const claudeSeenMessageIds = new Set<string>();
+const claudeHiddenToolUseIds = new Set<string>();
 let claudeContextUsageFailureKey: string | null = null;
+let claudeSessionUsageKey: string | null = null;
+let claudeSessionUsageFailureKey: string | null = null;
+let claudeSessionUsageInFlight = false;
 let codexClient: Codex | null = null;
 let codexThread: any = null;
 let codexLastContextUsageKey: string | null = null;
@@ -216,8 +298,15 @@ const pendingClaudeInteractivePrompts = new Map<string, ClaudeInteractivePromptR
 const startedToolNames = new Map<string, string>();
 const completedToolUseIds = new Set<string>();
 const pendingClaudeToolInputs = new Map<string, Record<string, unknown>>();
+const claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
+const claudeTaskProgressEmittedAt = new Map<string, number>();
+let claudeBackgroundSnapshotKey = '';
 const todoSnapshotTracker = new TodoSnapshotTracker();
-const browserToolBridge = createBrowserToolBridge((request) => emit(request));
+const browserToolBridge = createBrowserToolBridge(
+  (request) => emit(request),
+  BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
+  () => 'foreground',
+);
 let browserEvaluateApprovedForSession = false;
 
 type ClaudeQuerySnapshot = QuerySnapshot<ReturnType<typeof query>, AsyncMessageQueue<SDKUserMessage>>;
@@ -281,10 +370,15 @@ function emitStatus(status: string, detail?: string) {
 }
 
 function emitSettingsUpdateResult(
-  requestId: string,
+  requestId: string | undefined,
   outcome: 'applied' | 'failed' | 'deferred',
   detail?: string,
 ) {
+  // New desktop runtimes always provide a correlation id. Keep accepting
+  // legacy commands without one, but do not emit an uncorrelatable ack.
+  if (requestId === undefined) {
+    return;
+  }
   emit({
     type: 'settings_update_result',
     request_id: requestId,
@@ -305,6 +399,278 @@ function emitSessionMeta(providerSessionId: string) {
   emit({ type: 'session_meta', provider_session_id: providerSessionId });
 }
 
+function emitClaudeBackgroundTasksChanged(
+  tasks = claudeBackgroundTasks.activeTasks(),
+  force = false,
+) {
+  const key = backgroundTaskSnapshotKey(tasks);
+  if (!force && key === claudeBackgroundSnapshotKey) {
+    return false;
+  }
+  claudeBackgroundSnapshotKey = key;
+  emitEvent({
+    type: 'background_tasks_changed',
+    tasks,
+  });
+  return true;
+}
+
+function emitClaudeBackgroundTaskUpdated(task: ClaudeBackgroundTask | null) {
+  if (!task) {
+    return;
+  }
+  emitEvent({
+    type: 'background_task_updated',
+    task,
+  });
+}
+
+function completeClaudeBackgroundToolIfTerminal(task: ClaudeBackgroundTask | null) {
+  if (!task?.tool_use_id
+    || !['completed', 'failed', 'stopped', 'interrupted'].includes(task.status)) {
+    return;
+  }
+  emitClaudeToolUseCompleted(
+    task.tool_use_id,
+    task.terminal_summary ?? task.error ?? `Background task ${task.status}.`,
+    task.status === 'completed',
+  );
+}
+
+function interruptClaudeBackgroundTasks(reason: string) {
+  const interrupted = claudeBackgroundTasks.interruptAll(reason);
+  interrupted.forEach((task) => {
+    rejectBackgroundTaskInteractions(task.task_id, reason);
+    emitClaudeBackgroundTaskUpdated(task);
+    completeClaudeBackgroundToolIfTerminal(task);
+  });
+  if (interrupted.length > 0) {
+    emitClaudeBackgroundTasksChanged([]);
+  }
+  claudeTaskProgressEmittedAt.clear();
+  return interrupted;
+}
+
+function markClaudeToolUseBackgrounded(toolUseId: string) {
+  claudeBackgroundTasks.markToolBackgroundCandidate(toolUseId);
+  const taskId = claudeBackgroundTasks.taskIdForToolUse(toolUseId);
+  if (!taskId) {
+    return;
+  }
+  emitClaudeBackgroundTaskUpdated(claudeBackgroundTasks.getTask(taskId));
+  emitClaudeBackgroundTasksChanged();
+}
+
+function applyPendingClaudeSettingsAfterBackgroundTaskChange() {
+  if (applyPendingClaudeSettingsAfterTurn()) {
+    emitStatus('ready', 'Settings applied.');
+    return;
+  }
+  scheduleClaudeIdleClose();
+}
+
+function hasUnsettledClaudeBackgroundTasks() {
+  return claudeBackgroundTasks.hasUnsettledTasks();
+}
+
+function claudeMessageOriginKind(message: unknown) {
+  const origin = (message as { origin?: { kind?: unknown } } | undefined)?.origin;
+  if (typeof origin?.kind === 'string') {
+    return origin.kind;
+  }
+
+  const record = message as {
+    type?: unknown;
+    message?: { content?: unknown };
+  } | undefined;
+  if (record?.type !== 'user') {
+    return null;
+  }
+  const content = record.message?.content;
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content
+        .filter((block): block is { type: 'text'; text: string } => Boolean(
+          block
+          && typeof block === 'object'
+          && (block as { type?: unknown }).type === 'text'
+          && typeof (block as { text?: unknown }).text === 'string',
+        ))
+        .map((block) => block.text)
+        .join('')
+      : '';
+  return /^\s*<task-notification>\s*<task-id>[^<]+<\/task-id>/u.test(text)
+    ? 'task-notification'
+    : null;
+}
+
+function isClaudeNonHumanIngress() {
+  return claudeIngressOriginKind !== null && claudeIngressOriginKind !== 'human';
+}
+
+function claudeMessageParentToolUseId(message: unknown) {
+  const parentToolUseId = (message as { parent_tool_use_id?: unknown } | undefined)
+    ?.parent_tool_use_id;
+  return typeof parentToolUseId === 'string' && parentToolUseId.trim()
+    ? parentToolUseId.trim()
+    : null;
+}
+
+function isClaudeBackgroundOwnedMessage(message: unknown) {
+  const originKind = claudeMessageOriginKind(message);
+  if (originKind && originKind !== 'human') {
+    return true;
+  }
+  const parentToolUseId = claudeMessageParentToolUseId(message);
+  if (parentToolUseId && (
+    claudeBackgroundTasks.backgroundTaskIdForOwner(parentToolUseId)
+    || claudeHiddenToolUseIds.has(parentToolUseId)
+  )) {
+    return true;
+  }
+  if (originKind === 'human') {
+    return false;
+  }
+  // Assistant/stream frames do not carry origin. A preceding peer/channel/
+  // coordinator user frame establishes their top-level turn owner until its
+  // Result boundary. Task notifications may establish that fallback only
+  // outside an accepted foreground human turn.
+  return isClaudeNonHumanIngress();
+}
+
+function taskNotificationSharesActiveForegroundTurn(originKind: string) {
+  return originKind === 'task-notification'
+    && claudeTurnAwaitingResult
+    && claudeForegroundPromptAccepted
+    && (claudeIngressOriginKind === null || claudeIngressOriginKind === 'human');
+}
+
+function propagateClaudeHiddenToolOwnership(message: unknown) {
+  const record = message as {
+    type?: unknown;
+    tool_use_id?: unknown;
+    task_id?: unknown;
+    agent_id?: unknown;
+    subagent_retry?: { agent_id?: unknown };
+    message?: unknown;
+  } | undefined;
+  const parentToolUseId = claudeMessageParentToolUseId(message);
+  const explicitTaskId = typeof record?.task_id === 'string'
+    ? claudeBackgroundTasks.backgroundTaskIdForOwner(record.task_id)
+    : null;
+  const ownerTaskId = explicitTaskId
+    ?? claudeBackgroundTasks.backgroundTaskIdForOwner(parentToolUseId);
+  if (ownerTaskId) {
+    const messageAgentId = typeof record?.agent_id === 'string'
+      ? record.agent_id
+      : typeof record?.subagent_retry?.agent_id === 'string'
+        ? record.subagent_retry.agent_id
+        : null;
+    claudeBackgroundTasks.associateOwnerWithTask(messageAgentId, ownerTaskId);
+  }
+  if (record?.type === 'tool_progress' && typeof record.tool_use_id === 'string') {
+    claudeHiddenToolUseIds.add(record.tool_use_id);
+    if (ownerTaskId) {
+      claudeBackgroundTasks.associateOwnerWithTask(record.tool_use_id, ownerTaskId);
+      claudeBackgroundTasks.associateChildToolWithParent(record.tool_use_id, parentToolUseId);
+    }
+    return;
+  }
+  for (const block of getClaudeContentBlocks(record?.message)) {
+    if (block.type === 'tool_use' && typeof block.id === 'string') {
+      claudeHiddenToolUseIds.add(block.id);
+      if (ownerTaskId) {
+        claudeBackgroundTasks.associateOwnerWithTask(block.id, ownerTaskId);
+        claudeBackgroundTasks.associateChildToolWithParent(block.id, parentToolUseId);
+      }
+    } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+      claudeHiddenToolUseIds.add(block.tool_use_id);
+      if (ownerTaskId) {
+        claudeBackgroundTasks.associateOwnerWithTask(block.tool_use_id, ownerTaskId);
+        claudeBackgroundTasks.associateChildToolWithParent(block.tool_use_id, parentToolUseId);
+      }
+    }
+  }
+}
+
+function resolveClaudeBackgroundTaskId(toolUseId?: string, agentId?: string) {
+  const taskId = claudeBackgroundTasks.backgroundTaskIdForOwner(toolUseId)
+    ?? claudeBackgroundTasks.backgroundTaskIdForOwner(agentId);
+  if (taskId && agentId) {
+    claudeBackgroundTasks.associateOwnerWithTask(agentId, taskId);
+  }
+  return taskId;
+}
+
+function isCurrentClaudeHumanPromptEcho(message: unknown) {
+  if (claudeMessageOriginKind(message) !== 'human' || !claudeTurnAwaitingResult) {
+    return false;
+  }
+  const messageUuid = (message as { uuid?: unknown } | undefined)?.uuid;
+  if (typeof messageUuid === 'string' && claudeForegroundPromptUuid) {
+    return messageUuid === claudeForegroundPromptUuid;
+  }
+  return true;
+}
+
+function claudeUserMessageHasToolResult(message: unknown) {
+  const record = message as { message?: unknown } | undefined;
+  return getClaudeContentBlocks(record?.message).some((block) => block.type === 'tool_result');
+}
+
+function claudeNonHumanResultKey(message: unknown, originKind: string | null) {
+  const record = message as {
+    uuid?: unknown;
+    subtype?: unknown;
+    result?: unknown;
+    errors?: unknown;
+  } | undefined;
+  if (typeof record?.uuid === 'string' && record.uuid.trim()) {
+    return `uuid:${record.uuid.trim()}`;
+  }
+  if (!originKind || originKind === 'human') {
+    return null;
+  }
+  return JSON.stringify([
+    originKind,
+    record?.subtype ?? null,
+    record?.result ?? null,
+    record?.errors ?? null,
+  ]);
+}
+
+function isForegroundClaudeResult(message: unknown) {
+  if (!claudeTurnAwaitingResult) {
+    return false;
+  }
+  const originKind = claudeMessageOriginKind(message);
+  if (originKind && originKind !== 'human') {
+    return false;
+  }
+
+  const resultPromptUuid = (message as { user_message_uuid?: unknown } | undefined)?.user_message_uuid;
+  if (typeof resultPromptUuid === 'string' && claudeForegroundPromptUuid) {
+    return resultPromptUuid === claudeForegroundPromptUuid;
+  }
+
+  if (originKind === 'human') {
+    return claudeForegroundPromptAccepted;
+  }
+
+  if (claudePendingNonHumanResultCount > 0) {
+    return false;
+  }
+
+  if (claudeIngressOriginKind && claudeIngressOriginKind !== 'human') {
+    return false;
+  }
+
+  // Older SDK/CLI pairs omit both result fields. Their result is accepted only
+  // after the matching human prompt echo has established foreground ownership.
+  return claudeForegroundPromptAccepted;
+}
+
 function resolveClaudeIdleTtlMs() {
   const raw = process.env.CCEM_NATIVE_CLAUDE_IDLE_TTL_MS;
   if (raw == null || raw.trim() === '') {
@@ -313,16 +679,6 @@ function resolveClaudeIdleTtlMs() {
 
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_IDLE_TTL_MS;
-}
-
-function resolveClaudeInterruptTimeoutMs() {
-  const raw = process.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS;
-  if (raw == null || raw.trim() === '') {
-    return DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
-  }
-
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS;
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -351,7 +707,9 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 }
 
 async function interruptClaudeWithTimeout(claudeQuery: ReturnType<typeof query>) {
-  const timeoutMs = resolveClaudeInterruptTimeoutMs();
+  const timeoutMs = resolveClaudeInterruptTimeoutMs(
+    process.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS,
+  );
   return withTimeout(
     claudeQuery.interrupt(),
     timeoutMs,
@@ -390,18 +748,38 @@ function clearAllClaudeQueryState() {
   claudeQuerySlot.clear();
   currentClaudeQuery = null;
   claudeInputQueue = null;
+  claudeHiddenToolUseIds.clear();
 }
 
-function closeClaudeQueryForRecovery(snapshot = captureCurrentClaudeQuerySnapshot()) {
+function closeClaudeQueryForRecovery(
+  snapshot = captureCurrentClaudeQuerySnapshot(),
+  options: {
+    interruptBackgroundTasks?: boolean;
+    allowUnsafeClose?: boolean;
+    reason?: string;
+  } = {},
+) {
+  if (!options.allowUnsafeClose && !isClaudeForegroundAndSdkIdle()) {
+    return false;
+  }
+  if (hasUnsettledClaudeBackgroundTasks() && options.interruptBackgroundTasks !== true) {
+    return false;
+  }
+
+  if (hasUnsettledClaudeBackgroundTasks()) {
+    interruptClaudeBackgroundTasks(options.reason ?? 'Claude query closed before the background task settled.');
+  }
   clearClaudeIdleCloseTimer();
   pendingClaudePromptReplay = null;
 
   if (!snapshot) {
-    return;
+    return true;
   }
 
   if (isCurrentClaudeQuerySnapshot(snapshot)) {
     claudeTurnAwaitingResult = false;
+    claudeForegroundPromptUuid = null;
+    claudeForegroundPromptAccepted = false;
   }
 
   const queueToClose = snapshot.inputQueue;
@@ -416,6 +794,7 @@ function closeClaudeQueryForRecovery(snapshot = captureCurrentClaudeQuerySnapsho
 
   queryToClose.close();
   clearCurrentClaudeQuerySnapshot(snapshot);
+  return true;
 }
 
 function shouldInterruptCurrentClaudeTurn(
@@ -427,10 +806,23 @@ function shouldInterruptCurrentClaudeTurn(
     && claudeTurnAwaitingResult;
 }
 
+function isClaudeForegroundAndSdkIdle() {
+  return !claudeTurnAwaitingResult && claudeLastSessionState === 'idle';
+}
+
+function isClaudeRuntimeSafeToClose() {
+  return isClaudeForegroundAndSdkIdle() && !hasUnsettledClaudeBackgroundTasks();
+}
+
 function scheduleClaudeIdleClose() {
   clearClaudeIdleCloseTimer();
 
-  if (!currentClaudeQuery || !claudeInputQueue || initCommand?.provider !== 'claude') {
+  if (
+    !currentClaudeQuery
+    || !claudeInputQueue
+    || initCommand?.provider !== 'claude'
+    || !isClaudeRuntimeSafeToClose()
+  ) {
     return;
   }
 
@@ -454,7 +846,10 @@ function scheduleClaudeIdleClose() {
     ) {
       return;
     }
-    if (!claudeTurnCompletionEmitted && !claudeInterruptCompletionEmitted) {
+    if (
+      (!claudeTurnCompletionEmitted && !claudeInterruptCompletionEmitted)
+      || !isClaudeRuntimeSafeToClose()
+    ) {
       return;
     }
 
@@ -667,11 +1062,16 @@ function uniqueNonEmptyTextEntries(values: string[]): string[] {
   return next;
 }
 
-function resetClaudeTurnTracking() {
+function resetClaudeContentTracking() {
   claudeSawPartialText = false;
   claudeSawPartialThinking = false;
-  claudeTurnCompletionEmitted = false;
   claudeSeenMessageIds.clear();
+}
+
+function resetClaudeTurnTracking() {
+  resetClaudeContentTracking();
+  claudeTurnCompletionEmitted = false;
+  claudeLastAssistantMessageUuid = null;
 }
 
 function emitClaudeTurnCompleted(detail: string) {
@@ -680,10 +1080,15 @@ function emitClaudeTurnCompleted(detail: string) {
   }
 
   claudeTurnCompletionEmitted = true;
+  claudeForegroundPromptAccepted = false;
+  claudeForegroundPromptUuid = null;
   emitEvent({
     type: 'lifecycle',
     stage: 'turn_completed',
     detail,
+    ...(claudeLastAssistantMessageUuid
+      ? { assistant_message_uuid: claudeLastAssistantMessageUuid }
+      : {}),
   });
   if (applyPendingClaudeSettingsAfterTurn()) {
     emitStatus('ready', 'Settings applied.');
@@ -696,7 +1101,10 @@ function emitClaudeTurnCompleted(detail: string) {
 
 function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop workspace.') {
   claudeTurnAwaitingResult = false;
+  claudeForegroundPromptAccepted = false;
+  claudeForegroundPromptUuid = null;
   claudeLastSessionState = 'idle';
+  claudeInterruptRequested = false;
   resetClaudeTurnTracking();
   claudeTurnCompletionEmitted = true;
   if (!claudeInterruptCompletionEmitted) {
@@ -705,6 +1113,9 @@ function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop 
       type: 'lifecycle',
       stage: 'turn_interrupted',
       detail,
+      ...(claudeLastAssistantMessageUuid
+        ? { assistant_message_uuid: claudeLastAssistantMessageUuid }
+        : {}),
     });
   }
   if (applyPendingClaudeSettingsAfterTurn()) {
@@ -721,6 +1132,8 @@ function emitClaudeIncompleteResponse() {
   }
 
   claudeTurnAwaitingResult = false;
+  claudeForegroundPromptUuid = null;
+  claudeForegroundPromptAccepted = false;
   claudeLastSessionState = 'idle';
   claudeTurnCompletionEmitted = true;
   emitEvent({
@@ -953,8 +1366,15 @@ function emitClaudeToolUseStarted(payload: {
     return;
   }
 
+  if (completedToolUseIds.has(payload.toolUseId)) {
+    return;
+  }
+
   if (payload.input) {
     pendingClaudeToolInputs.set(payload.toolUseId, payload.input);
+    if (payload.input.run_in_background === true) {
+      claudeBackgroundTasks.markToolBackgroundCandidate(payload.toolUseId);
+    }
   }
 
   if (startedToolNames.has(payload.toolUseId)) {
@@ -1133,36 +1553,45 @@ function summarizePlanExitFeedback(answers: Record<string, string>) {
   return truncateSummary(`User requested plan changes: ${feedback}`, 240);
 }
 
-async function waitForAskUserQuestionResponse(
+function waitForClaudeInteractivePromptResponse(
+  toolName: string,
   input: Record<string, unknown>,
   toolUseId: string,
+  agentId?: string,
 ) {
-  return await new Promise<ReturnType<typeof buildAllowedClaudeToolResult> | {
-    behavior: 'deny';
-    message: string;
-    toolUseID: string;
-  }>((resolve) => {
-    pendingClaudeInteractivePrompts.set(toolUseId, {
-      input,
-      resolve,
-    });
+  // canUseTool is the SDK's authoritative interactive control channel. Emit
+  // from it so the desktop never depends on an assistant tool_use frame that
+  // can arrive later or be routed away with background-owned stream content.
+  const prompt = parseClaudeInteractiveToolPrompt(toolName, input);
+  const emitPrompt = () => emitClaudeToolUseStarted({
+    toolUseId,
+    rawName: toolName,
+    inputSummary: summarizeClaudeToolInput(toolName, input),
+    needsResponse: true,
+    input,
+    prompt,
   });
-}
 
-async function waitForPlanExitApproval(
-  input: Record<string, unknown>,
-  toolUseId: string,
-) {
-  return await new Promise<ReturnType<typeof buildAllowedClaudeToolResult> | {
-    behavior: 'deny';
-    message: string;
-    toolUseID: string;
-  }>((resolve) => {
-    pendingClaudeInteractivePrompts.set(toolUseId, {
-      input,
-      resolve,
-    });
+  const existing = pendingClaudeInteractivePrompts.get(toolUseId);
+  if (existing) {
+    // Reconnect/reinitialize can redeliver a pending request with the same id.
+    // Reuse its promise so one desktop answer resumes every SDK waiter.
+    emitPrompt();
+    return existing.promise;
+  }
+
+  let resolvePrompt!: (result: ClaudeInteractivePromptResult) => void;
+  const promise = new Promise<ClaudeInteractivePromptResult>((resolve) => {
+    resolvePrompt = resolve;
   });
+  pendingClaudeInteractivePrompts.set(toolUseId, {
+    input,
+    promise,
+    resolve: resolvePrompt,
+    agentId,
+  });
+  emitPrompt();
+  return promise;
 }
 
 async function waitForPermission(
@@ -1173,24 +1602,33 @@ async function waitForPermission(
   const toolUseId = options.toolUseID;
   const requestId = resolveClaudePermissionRequestId(options);
   const inputSummary = summarizeClaudeToolInput(toolName, input, options);
+  const backgroundTaskId = resolveClaudeBackgroundTaskId(toolUseId, options.agentID)
+    ?? undefined;
 
-  emitClaudeToolUseStarted({
-    toolUseId,
-    rawName: toolName,
-    inputSummary,
-    needsResponse: false,
-    input,
-  });
+  if (!backgroundTaskId) {
+    emitClaudeToolUseStarted({
+      toolUseId,
+      rawName: toolName,
+      inputSummary,
+      needsResponse: false,
+      input,
+    });
+  }
   emitEvent({
     type: 'permission_required',
     request_id: requestId,
     tool_use_id: toolUseId,
     tool_name: formatPermissionPreview(options.displayName || toolName, 80),
     input_summary: inputSummary,
+    ...(backgroundTaskId ? { background_task_id: backgroundTaskId } : {}),
   });
 
   const approved = await new Promise<boolean>((resolve) => {
-    pendingPermissions.set(requestId, { resolve });
+    pendingPermissions.set(requestId, {
+      resolve,
+      agentId: options.agentID,
+      backgroundTaskId,
+    });
   });
 
   emitEvent({
@@ -1201,7 +1639,7 @@ async function waitForPermission(
     responder: 'desktop',
   });
 
-  if (!approved) {
+  if (!approved && !backgroundTaskId) {
     emitClaudeToolUseCompleted(toolUseId, 'Permission denied in desktop workspace.', false);
   }
 
@@ -1210,9 +1648,15 @@ async function waitForPermission(
     : buildDeniedClaudeToolResult(toolUseId, 'Permission denied in desktop workspace.');
 }
 
-function handleClaudePartialEvent(rawEvent: Record<string, unknown>) {
+function handleClaudePartialEvent(
+  rawEvent: Record<string, unknown>,
+  backgroundOwned = false,
+) {
+  if (backgroundOwned) {
+    return;
+  }
   if (rawEvent.type === 'message_start') {
-    resetClaudeTurnTracking();
+    resetClaudeContentTracking();
     return;
   }
 
@@ -1269,6 +1713,7 @@ function handleClaudeCompactBoundary(message: Record<string, unknown>) {
 
   // Emit fresh context snapshot after compaction
   void emitClaudeContextUsage();
+  void emitClaudeSessionUsage();
 }
 
 async function emitClaudeContextUsage() {
@@ -1305,6 +1750,198 @@ async function emitClaudeContextUsage() {
       stage: 'context_usage_unavailable',
       detail,
     });
+  }
+}
+
+function asNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+interface ClaudeSessionUsageModelEntry {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number | null;
+}
+
+interface ClaudeSessionUsageSnapshot {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number | null;
+  model_usage: ClaudeSessionUsageModelEntry[];
+  subscription_type: string | null;
+  rate_limits_available: boolean;
+  rate_limits: Record<string, unknown> | null;
+}
+
+function parseClaudeSessionUsagePayload(raw: unknown): ClaudeSessionUsageSnapshot | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const session = (raw as { session?: unknown }).session;
+  if (!session || typeof session !== 'object') {
+    return null;
+  }
+
+  const sessionRecord = session as Record<string, unknown>;
+  const rawModelUsage = sessionRecord.model_usage;
+  const modelUsageMap = rawModelUsage && typeof rawModelUsage === 'object'
+    ? rawModelUsage as Record<string, unknown>
+    : {};
+
+  const modelEntries: ClaudeSessionUsageModelEntry[] = [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
+  let costUsd: number | null = null;
+
+  for (const [model, usage] of Object.entries(modelUsageMap)) {
+    if (!usage || typeof usage !== 'object') {
+      continue;
+    }
+
+    const entry = usage as Record<string, unknown>;
+    const entryInput = asNumber(entry.inputTokens);
+    const entryOutput = asNumber(entry.outputTokens);
+    const entryCacheRead = asNumber(entry.cacheReadInputTokens);
+    const entryCacheCreation = asNumber(entry.cacheCreationInputTokens);
+
+    inputTokens += entryInput;
+    outputTokens += entryOutput;
+    cacheReadTokens += entryCacheRead;
+    cacheCreationTokens += entryCacheCreation;
+
+    modelEntries.push({
+      model,
+      input_tokens: entryInput,
+      output_tokens: entryOutput,
+      cache_read_tokens: entryCacheRead,
+      cache_creation_tokens: entryCacheCreation,
+      cost_usd: asNullableNumber(entry.costUSD),
+    });
+  }
+
+  // SDK session cost is authoritative when present; per-model costs are informational.
+  costUsd = asNullableNumber(sessionRecord.total_cost_usd);
+
+  modelEntries.sort((a, b) => b.input_tokens - a.input_tokens);
+
+  const rateLimits = (raw as { rate_limits?: unknown }).rate_limits;
+  const rateLimitsAvailable = (raw as { rate_limits_available?: unknown }).rate_limits_available === true;
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_read_tokens: cacheReadTokens,
+    cache_creation_tokens: cacheCreationTokens,
+    cost_usd: costUsd,
+    model_usage: modelEntries,
+    subscription_type: asNullableString((raw as { subscription_type?: unknown }).subscription_type),
+    rate_limits_available: rateLimitsAvailable,
+    rate_limits: rateLimits && typeof rateLimits === 'object'
+      ? rateLimits as Record<string, unknown>
+      : null,
+  };
+}
+
+function stableRateLimitsKey(rateLimits: Record<string, unknown> | null): string {
+  if (!rateLimits) {
+    return 'none';
+  }
+  const windowKey = (raw: unknown): string => {
+    if (!raw || typeof raw !== 'object') {
+      return 'null';
+    }
+    const record = raw as Record<string, unknown>;
+    return [record.utilization, record.resets_at ?? ''].join(':');
+  };
+  // Deterministic order so reordered SDK payloads don't change the key.
+  return ['five_hour', 'seven_day']
+    .map((name) => `${name}=${windowKey(rateLimits[name])}`)
+    .join(',');
+}
+
+/**
+ * Actively query the current Claude session for cumulative token usage, cache
+ * hits, cost and claude.ai plan rate-limit utilization via the Agent SDK's
+ * structured `/usage` API. Emits a `session_usage` event; degrades silently
+ * (with a deduped lifecycle notice) when the SDK rejects the call.
+ */
+async function emitClaudeSessionUsage() {
+  if (!currentClaudeQuery || claudeSessionUsageInFlight) return;
+  claudeSessionUsageInFlight = true;
+  try {
+    const raw = await currentClaudeQuery
+      .usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+    const snapshot = parseClaudeSessionUsagePayload(raw);
+    if (!snapshot) {
+      throw new Error('Claude session usage payload was not structured.');
+    }
+
+    claudeSessionUsageFailureKey = null;
+
+    const key = [
+      snapshot.input_tokens,
+      snapshot.output_tokens,
+      snapshot.cache_read_tokens,
+      snapshot.cache_creation_tokens,
+      snapshot.cost_usd,
+      snapshot.model_usage.map((entry) => [
+        entry.model,
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_read_tokens,
+        entry.cache_creation_tokens,
+        entry.cost_usd,
+      ].join(':')).join(','),
+      stableRateLimitsKey(snapshot.rate_limits),
+    ].join('|');
+    if (key === claudeSessionUsageKey) {
+      return;
+    }
+    claudeSessionUsageKey = key;
+
+    emitEvent({
+      type: 'session_usage',
+      provider: 'claude',
+      input_tokens: snapshot.input_tokens,
+      output_tokens: snapshot.output_tokens,
+      cache_read_tokens: snapshot.cache_read_tokens,
+      cache_creation_tokens: snapshot.cache_creation_tokens,
+      cost_usd: snapshot.cost_usd,
+      model_usage: snapshot.model_usage,
+      subscription_type: snapshot.subscription_type,
+      rate_limits_available: snapshot.rate_limits_available,
+      rate_limits: snapshot.rate_limits,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const detail = `Claude session usage unavailable: ${message}`;
+    if (detail === claudeSessionUsageFailureKey) {
+      return;
+    }
+    claudeSessionUsageFailureKey = detail;
+    emitEvent({
+      type: 'lifecycle',
+      stage: 'usage_unavailable',
+      detail,
+    });
+  } finally {
+    claudeSessionUsageInFlight = false;
   }
 }
 
@@ -1349,6 +1986,19 @@ function emitCodexContextUsageFromTokenCount(payload: Record<string, unknown>) {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForClaudeInterruptToSettle() {
+  while (claudeInterruptRequested) {
+    await sleep(10);
+  }
+}
+
+function finishClaudeRuntimeTeardown() {
+  queueMicrotask(() => {
+    rl.close();
+    process.stdin.destroy();
+  });
 }
 
 async function emitCodexContextUsageFromSessionFile(
@@ -1426,26 +2076,58 @@ function applyPendingSettingsToInitCommand() {
   if (!pendingSettings) return false;
   const settings = pendingSettings;
   pendingSettings = null;
-  return applySettingsToInitCommand(settings);
+  const applied = applySettingsToInitCommand(settings);
+  if (applied && initCommand?.provider === 'claude') {
+    emitClaudeRuntimeSettingsChanged('applied', settings.requestId);
+  }
+  return applied;
 }
 
 function applySettingsCommand(command: UpdateSettingsCommand) {
-  return applySettingsToInitCommand({
+  const applied = applySettingsToInitCommand({
+    requestId: command.request_id,
     envName: command.env_name,
     permMode: command.perm_mode,
     envVars: command.env_vars,
     effort: command.effort,
+  });
+  if (applied && initCommand?.provider === 'claude') {
+    emitClaudeRuntimeSettingsChanged('applied', command.request_id);
+  }
+  return applied;
+}
+
+function emitClaudeRuntimeSettingsChanged(
+  state: 'deferred' | 'applied',
+  requestId?: string,
+) {
+  if (!initCommand || initCommand.provider !== 'claude') {
+    return;
+  }
+  emitEvent({
+    type: 'runtime_settings_changed',
+    state,
+    request_id: requestId ?? null,
+    env_name: initCommand.env_name,
+    effort: initCommand.effort ?? null,
+    pending_env_name: state === 'deferred' ? pendingSettings?.envName ?? null : null,
+    pending_effort: state === 'deferred' ? pendingSettings?.effort ?? null : null,
   });
 }
 
 function queuePendingSettings(command: UpdateSettingsCommand) {
   pendingSettings = {
     ...pendingSettings,
+    ...(command.request_id !== undefined ? { requestId: command.request_id } : {}),
     ...(command.env_name !== undefined ? { envName: command.env_name } : {}),
     ...(command.perm_mode !== undefined ? { permMode: command.perm_mode } : {}),
     ...(command.env_vars !== undefined ? { envVars: command.env_vars } : {}),
     ...(command.effort !== undefined ? { effort: command.effort } : {}),
+    ...(command.force_restart !== undefined ? { forceRestart: command.force_restart } : {}),
   };
+  if (initCommand?.provider === 'claude') {
+    emitClaudeRuntimeSettingsChanged('deferred', command.request_id);
+  }
 }
 
 function isClaudePermissionOnlySettingsCommand(command: UpdateSettingsCommand) {
@@ -1489,18 +2171,34 @@ function applyPendingClaudeSettingsAfterTurn() {
     return false;
   }
 
+  const forceRestart = pendingSettings.forceRestart === true;
+  if (!isClaudeForegroundAndSdkIdle()
+    || (hasUnsettledClaudeBackgroundTasks() && !forceRestart)) {
+    return false;
+  }
+
   applyPendingSettingsToInitCommand();
-  closeClaudeQueryForRecovery();
+  closeClaudeQueryForRecovery(captureCurrentClaudeQuerySnapshot(), {
+    interruptBackgroundTasks: forceRestart,
+    reason: 'Claude settings changed before the background task settled.',
+  });
   return true;
 }
 
 function applyClaudeSettingsByRestartingIdleRuntime(command: UpdateSettingsCommand) {
-  if (shouldInterruptCurrentClaudeTurn()) {
+  if (!isClaudeForegroundAndSdkIdle()) {
+    return false;
+  }
+
+  if (hasUnsettledClaudeBackgroundTasks() && command.force_restart !== true) {
     return false;
   }
 
   applySettingsCommand(command);
-  closeClaudeQueryForRecovery();
+  closeClaudeQueryForRecovery(captureCurrentClaudeQuerySnapshot(), {
+    interruptBackgroundTasks: command.force_restart === true,
+    reason: 'Claude settings changed before the background task settled.',
+  });
   return true;
 }
 
@@ -1515,8 +2213,10 @@ function buildClaudeQueryOptions() {
   const env = buildClaudeQueryEnv({
     envVars: initCommand.env_vars,
     effort: initCommand.effort,
+    routerMode: Boolean(initCommand.router),
   });
   const model = resolveClaudeRuntimeModel(initCommand.env_vars);
+  const routerSystemPrompt = buildClaudeRouterSystemPrompt(initCommand.router);
 
   return {
     cwd: initCommand.working_dir,
@@ -1541,22 +2241,70 @@ function buildClaudeQueryOptions() {
       ),
     },
     ...(model ? { model } : {}),
-    hooks: buildClaudePlanModeHooks(
-      () => initCommand?.provider === 'claude' && initCommand.perm_mode === 'plan',
+    ...(routerSystemPrompt ? { systemPrompt: routerSystemPrompt } : {}),
+    hooks: mergeClaudeRouteHooks(
+      buildClaudePlanModeHooks(
+        () => initCommand?.provider === 'claude' && initCommand.perm_mode === 'plan',
+      ),
+      initCommand.router,
     ),
     canUseTool: async (toolName: string, input: unknown, options: ClaudeToolPermissionOptions) => {
+      const backgroundTaskId = resolveClaudeBackgroundTaskId(
+        options.toolUseID,
+        options.agentID,
+      );
+      const browserToolName = toolName.startsWith('mcp__ccem-browser__')
+        ? toolName.slice('mcp__ccem-browser__'.length) as Parameters<
+          typeof browserToolBridge.recordOwner
+        >[0]
+        : null;
+      const rememberBrowserOwner = <T extends { behavior: string }>(result: T) => {
+        if (browserToolName && result.behavior === 'allow') {
+          const owner = backgroundTaskId
+            ? `background:${backgroundTaskId}`
+            : 'foreground';
+          browserToolBridge.recordOwner(
+            browserToolName,
+            input as Record<string, unknown>,
+            owner,
+          );
+        }
+        return result;
+      };
       if (isClaudeAskUserQuestionTool(toolName)) {
-        return waitForAskUserQuestionResponse(input, options.toolUseID);
+        if (backgroundTaskId) {
+          return buildDeniedClaudeToolResult(
+            options.toolUseID,
+            'Background tasks cannot pause the foreground workspace for user questions.',
+          );
+        }
+        return waitForClaudeInteractivePromptResponse(
+          toolName,
+          input,
+          options.toolUseID,
+          options.agentID,
+        );
       }
       if (isClaudePlanExitTool(toolName)) {
-        return waitForPlanExitApproval(input, options.toolUseID);
+        if (backgroundTaskId) {
+          return buildDeniedClaudeToolResult(
+            options.toolUseID,
+            'Background tasks cannot request foreground plan approval.',
+          );
+        }
+        return waitForClaudeInteractivePromptResponse(
+          toolName,
+          input,
+          options.toolUseID,
+          options.agentID,
+        );
       }
       if (isClaudeInteractiveUserInputTool(toolName)) {
         return buildAllowedClaudeToolResult(input, options.toolUseID);
       }
       if (isBrowserEvaluateToolName(toolName)) {
         if (permission.allowDangerouslySkipPermissions || browserEvaluateApprovedForSession) {
-          return buildAllowedClaudeToolResult(input, options.toolUseID);
+          return rememberBrowserOwner(buildAllowedClaudeToolResult(input, options.toolUseID));
         }
         const result = await waitForPermission(toolName, input, {
           ...options,
@@ -1567,9 +2315,9 @@ function buildClaudeQueryOptions() {
         if (result.behavior === 'allow') {
           browserEvaluateApprovedForSession = true;
         }
-        return result;
+        return rememberBrowserOwner(result);
       }
-      return waitForPermission(toolName, input, options);
+      return rememberBrowserOwner(await waitForPermission(toolName, input, options));
     },
     ...permission,
   };
@@ -1580,6 +2328,16 @@ function denyPendingPermissions() {
     pending.resolve(false);
   }
   pendingPermissions.clear();
+}
+
+function denyPendingForegroundPermissions() {
+  for (const [requestId, pending] of pendingPermissions.entries()) {
+    if (pending.backgroundTaskId) {
+      continue;
+    }
+    pendingPermissions.delete(requestId);
+    pending.resolve(false);
+  }
 }
 
 function denyPendingClaudeInteractivePrompts(message: string) {
@@ -1593,12 +2351,59 @@ function denyPendingClaudeInteractivePrompts(message: string) {
   pendingClaudeInteractivePrompts.clear();
 }
 
+function denyPendingForegroundClaudeInteractivePrompts(message: string) {
+  for (const [toolUseId, pending] of pendingClaudeInteractivePrompts.entries()) {
+    if (pending.backgroundTaskId) {
+      continue;
+    }
+    pendingClaudeInteractivePrompts.delete(toolUseId);
+    emitClaudeToolUseCompleted(toolUseId, message, false);
+    pending.resolve({
+      behavior: 'deny',
+      message,
+      toolUseID: toolUseId,
+    });
+  }
+}
+
+function rejectBackgroundTaskInteractions(taskId: string, message: string) {
+  for (const [requestId, pending] of pendingPermissions.entries()) {
+    if (pending.backgroundTaskId !== taskId) {
+      continue;
+    }
+    pendingPermissions.delete(requestId);
+    pending.resolve(false);
+  }
+  for (const [toolUseId, pending] of pendingClaudeInteractivePrompts.entries()) {
+    if (pending.backgroundTaskId !== taskId) {
+      continue;
+    }
+    pendingClaudeInteractivePrompts.delete(toolUseId);
+    pending.resolve({
+      behavior: 'deny',
+      message,
+      toolUseID: toolUseId,
+    });
+  }
+  browserToolBridge.rejectOwned(
+    `background:${taskId}`,
+    message,
+  );
+}
+
 function teardownClaudeSession() {
   browserToolBridge.rejectAll('Claude runtime session was closed before the browser tool completed.');
   browserEvaluateApprovedForSession = false;
-  closeClaudeQueryForRecovery();
+  closeClaudeQueryForRecovery(captureCurrentClaudeQuerySnapshot(), {
+    interruptBackgroundTasks: true,
+    allowUnsafeClose: true,
+    reason: 'Claude runtime session closed before the background task settled.',
+  });
   clearAllClaudeQueryState();
   claudeConsumeLoop = null;
+  claudeIngressOriginKind = null;
+  claudePendingNonHumanResultCount = 0;
+  claudeSeenNonHumanResultKeys.clear();
   resetClaudeTurnTracking();
 }
 
@@ -1616,36 +2421,56 @@ async function consumeClaudeMessages() {
   claudeContextUsageFailureKey = null;
 
   const inputQueue = new AsyncMessageQueue<SDKUserMessage>();
-  const claudeQuery = query({
+  const options = buildClaudeQueryOptions();
+  const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => query({
     prompt: inputQueue,
-    options: buildClaudeQueryOptions(),
-  });
+    options,
+  }));
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
+  if (hasUnsettledClaudeBackgroundTasks()) {
+    interruptClaudeBackgroundTasks('Claude query process was replaced before the background task settled.');
+  }
+  claudeIngressOriginKind = null;
+  claudePendingNonHumanResultCount = 0;
+  claudeSeenNonHumanResultKeys.clear();
+  claudeHiddenToolUseIds.clear();
+  emitClaudeBackgroundTasksChanged([], true);
   let incompleteResponse = false;
 
   try {
     for await (const message of claudeQuery) {
+      if (!isCurrentClaudeQuerySnapshot(querySnapshot)) {
+        continue;
+      }
       const sessionId = (message as { session_id?: string } | undefined)?.session_id;
       if (sessionId) {
         emitSessionMeta(sessionId);
       }
 
       if (message.type === 'stream_event') {
-        if (isCurrentClaudeQuerySnapshot(querySnapshot)) {
-          pendingClaudePromptReplay = null;
-        }
         const event = (message as { event?: Record<string, unknown> }).event;
         if (event) {
-          handleClaudePartialEvent(event);
+          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
         }
         continue;
       }
 
       if (message.type === 'assistant') {
-        if (isCurrentClaudeQuerySnapshot(querySnapshot)) {
-          pendingClaudePromptReplay = null;
+        if (isClaudeBackgroundOwnedMessage(message)) {
+          propagateClaudeHiddenToolOwnership(message);
+          continue;
+        }
+        // Main-chain assistant messages only (subagent output rides parent_tool_use_id)
+        // and only the latest one matters: it is the fork cut point for the turn.
+        const assistantMessageUuid = (message as { uuid?: unknown }).uuid;
+        if (
+          typeof assistantMessageUuid === 'string'
+          && assistantMessageUuid
+          && !claudeMessageParentToolUseId(message)
+        ) {
+          claudeLastAssistantMessageUuid = assistantMessageUuid;
         }
         // Emit token_usage per unique message (parallel tool calls share the same id)
         const msgId = (message as { message?: { id?: string; usage?: Record<string, unknown> } }).message?.id;
@@ -1714,9 +2539,46 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'user') {
-        const checkpoint = buildClaudeFileCheckpointEvent(message, currentProviderSessionId);
+        const originKind = claudeMessageOriginKind(message);
+        const shouldQuery = (message as { shouldQuery?: unknown }).shouldQuery !== false;
+        const hasToolResult = claudeUserMessageHasToolResult(message);
+        const currentHumanEcho = !hasToolResult && isCurrentClaudeHumanPromptEcho(message);
+        if (originKind === 'human' && !hasToolResult && !currentHumanEcho) {
+          // A stale human echo from an earlier prompt must not take ownership
+          // of the current turn, create a checkpoint, or expose peer output.
+          continue;
+        }
+        const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+        if (originKind === 'human') {
+          if (currentHumanEcho) {
+            claudeIngressOriginKind = 'human';
+          } else if (!backgroundOwned && claudeForegroundPromptAccepted) {
+            claudeIngressOriginKind = 'human';
+          }
+        } else if (originKind) {
+          if (
+            !taskNotificationSharesActiveForegroundTurn(originKind)
+            && (shouldQuery || !claudeForegroundPromptAccepted)
+          ) {
+            claudeIngressOriginKind = originKind;
+          }
+          if (shouldQuery && originKind !== 'human') {
+            claudePendingNonHumanResultCount += 1;
+          }
+        }
+        if (currentHumanEcho) {
+          claudeForegroundPromptAccepted = true;
+          pendingClaudePromptReplay = null;
+        }
+        const checkpoint = backgroundOwned
+          ? null
+          : buildClaudeFileCheckpointEvent(message, currentProviderSessionId);
         if (checkpoint) {
           emitEvent(checkpoint);
+        }
+        if (backgroundOwned) {
+          propagateClaudeHiddenToolOwnership(message);
+          continue;
         }
 
         const contentBlocks = getClaudeContentBlocks(message.message);
@@ -1727,6 +2589,22 @@ async function consumeClaudeMessages() {
           const success = block.is_error !== true;
           const rawName = startedToolNames.get(block.tool_use_id) ?? 'tool';
           const input = pendingClaudeToolInputs.get(block.tool_use_id);
+          if (isBackgroundLaunchResult(rawName, input, message.tool_use_result, success)) {
+            const task = claudeBackgroundTasks.applyLaunchReceipt(
+              block.tool_use_id,
+              rawName,
+              input,
+              message.tool_use_result,
+            );
+            if (task) {
+              emitClaudeBackgroundTaskUpdated(task);
+              emitClaudeBackgroundTasksChanged();
+              completeClaudeBackgroundToolIfTerminal(task);
+            } else {
+              markClaudeToolUseBackgrounded(block.tool_use_id);
+            }
+            return;
+          }
           const todoSnapshot = success && input
             ? todoSnapshotTracker.fromClaudeToolCompleted(
               rawName,
@@ -1745,6 +2623,10 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'tool_progress') {
+        if (isClaudeBackgroundOwnedMessage(message)) {
+          propagateClaudeHiddenToolOwnership(message);
+          continue;
+        }
         emitClaudeToolUseStarted({
           toolUseId: message.tool_use_id,
           rawName: message.tool_name,
@@ -1755,18 +2637,106 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'tool_use_summary') {
+        if (isClaudeBackgroundOwnedMessage(message)) {
+          continue;
+        }
         for (const toolUseId of message.preceding_tool_use_ids) {
+          if (
+            claudeBackgroundTasks.isBackgroundToolUse(toolUseId)
+            || claudeHiddenToolUseIds.has(toolUseId)
+          ) {
+            continue;
+          }
           emitClaudeToolUseCompleted(toolUseId, message.summary, true);
         }
         continue;
       }
 
+      if (message.type === 'system' && message.subtype === 'task_started') {
+        const task = claudeBackgroundTasks.applyStarted(message);
+        emitClaudeBackgroundTaskUpdated(task);
+        completeClaudeBackgroundToolIfTerminal(task);
+        if (task) {
+          emitClaudeBackgroundTasksChanged();
+        }
+        continue;
+      }
+
+      if (message.type === 'system' && message.subtype === 'task_progress') {
+        const task = claudeBackgroundTasks.applyProgress(message);
+        if (task) {
+          const lastEmittedAt = claudeTaskProgressEmittedAt.get(task.task_id) ?? 0;
+          const now = Date.now();
+          if (now - lastEmittedAt >= 1_000) {
+            claudeTaskProgressEmittedAt.set(task.task_id, now);
+            emitClaudeBackgroundTaskUpdated(task);
+            emitClaudeBackgroundTasksChanged();
+          }
+          completeClaudeBackgroundToolIfTerminal(task);
+        }
+        continue;
+      }
+
+      if (message.type === 'system' && message.subtype === 'task_updated') {
+        const task = claudeBackgroundTasks.applyUpdated(message);
+        emitClaudeBackgroundTaskUpdated(task);
+        if (task) {
+          emitClaudeBackgroundTasksChanged();
+          completeClaudeBackgroundToolIfTerminal(task);
+          if (['completed', 'failed', 'stopped', 'interrupted'].includes(task.status)) {
+            applyPendingClaudeSettingsAfterBackgroundTaskChange();
+          }
+        }
+        continue;
+      }
+
+      if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
+        const change = claudeBackgroundTasks.applySnapshot(message.tasks);
+        const promotedTerminalTasks = change.changed.filter((task) =>
+          ['completed', 'failed', 'stopped', 'interrupted'].includes(task.status));
+        promotedTerminalTasks.forEach((task) => {
+          emitClaudeBackgroundTaskUpdated(task);
+          completeClaudeBackgroundToolIfTerminal(task);
+        });
+        emitClaudeBackgroundTasksChanged(change.tasks);
+        if (promotedTerminalTasks.length > 0) {
+          applyPendingClaudeSettingsAfterBackgroundTaskChange();
+        }
+        continue;
+      }
+
+      if (message.type === 'system' && message.subtype === 'task_notification') {
+        const task = claudeBackgroundTasks.applyNotification(message);
+        if (!task) {
+          continue;
+        }
+        rejectBackgroundTaskInteractions(
+          task.task_id,
+          task.error ?? task.terminal_summary ?? `Background task ${task.status}.`,
+        );
+        if (claudeIngressOriginKind === 'task-notification') {
+          claudeIngressOriginKind = null;
+        }
+        emitClaudeBackgroundTaskUpdated(task);
+        emitClaudeBackgroundTasksChanged();
+        claudeTaskProgressEmittedAt.delete(task.task_id);
+        completeClaudeBackgroundToolIfTerminal(task);
+        applyPendingClaudeSettingsAfterBackgroundTaskChange();
+        continue;
+      }
+
       if (message.type === 'system' && message.subtype === 'compact_boundary') {
+        if (isClaudeBackgroundOwnedMessage(message)) {
+          continue;
+        }
         handleClaudeCompactBoundary(message as Record<string, unknown>);
         continue;
       }
 
       if (message.type === 'system' && message.subtype === 'status') {
+        if (isClaudeBackgroundOwnedMessage(message)) {
+          continue;
+        }
         if (handleClaudeStatusMessage(message as Record<string, unknown>)) {
           continue;
         }
@@ -1780,12 +2750,14 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'system' && message.subtype === 'session_state_changed') {
-        if (message.state === 'running') {
-          pendingClaudePromptReplay = null;
-        }
+        const nonHumanStateIngress = isClaudeBackgroundOwnedMessage(message);
         if (message.state !== claudeLastSessionState) {
-          if (message.state === 'running') {
-            resetClaudeTurnTracking();
+          if (
+            message.state === 'running'
+            && claudeTurnAwaitingResult
+            && !nonHumanStateIngress
+          ) {
+            resetClaudeContentTracking();
             emitEvent({
               type: 'lifecycle',
               stage: 'turn_started',
@@ -1795,22 +2767,62 @@ async function consumeClaudeMessages() {
           }
 
           if (message.state === 'idle') {
-            if (claudeInterruptRequested) {
+            if (claudeInterruptRequested && !nonHumanStateIngress) {
               emitClaudeTurnInterrupted();
             }
           }
         }
 
         claudeLastSessionState = message.state;
+        if (message.state === 'idle' && !claudeTurnAwaitingResult) {
+          if (applyPendingClaudeSettingsAfterTurn()) {
+            emitStatus('ready', 'Settings applied.');
+          } else {
+            scheduleClaudeIdleClose();
+          }
+        }
 
         continue;
       }
 
       if (message.type === 'result') {
-        if (isCurrentClaudeQuerySnapshot(querySnapshot)) {
-          claudeTurnAwaitingResult = false;
-          pendingClaudePromptReplay = null;
+        if (!isCurrentClaudeQuerySnapshot(querySnapshot)) {
+          continue;
         }
+        const resultOriginKind = claudeMessageOriginKind(message);
+        const priorNonHumanResultKey = claudeNonHumanResultKey(message, resultOriginKind);
+        if (priorNonHumanResultKey
+          && claudeSeenNonHumanResultKeys.has(priorNonHumanResultKey)) {
+          continue;
+        }
+        const foregroundResult = isForegroundClaudeResult(message);
+        if (!foregroundResult) {
+          const resultPromptUuid = (message as { user_message_uuid?: unknown }).user_message_uuid;
+          const hasHumanProvenance = resultOriginKind === 'human'
+            || (!resultOriginKind && typeof resultPromptUuid === 'string');
+          // A mismatched or stale human Result is unrelated to the current
+          // non-human queue and must have no lifecycle side effects.
+          if (!hasHumanProvenance) {
+            const resultKey = priorNonHumanResultKey;
+            if (resultKey && claudeSeenNonHumanResultKeys.has(resultKey)) {
+              continue;
+            }
+            if (resultKey) {
+              claudeSeenNonHumanResultKeys.add(resultKey);
+            }
+            claudePendingNonHumanResultCount = Math.max(
+              0,
+              claudePendingNonHumanResultCount - 1,
+            );
+            claudeIngressOriginKind = null;
+          }
+          continue;
+        }
+
+        claudeIngressOriginKind = null;
+        claudePendingNonHumanResultCount = 0;
+        claudeTurnAwaitingResult = false;
+        pendingClaudePromptReplay = null;
         if (claudeInterruptRequested) {
           emitClaudeTurnInterrupted();
           claudeInterruptRequested = false;
@@ -1835,14 +2847,15 @@ async function consumeClaudeMessages() {
         }
 
         if (message.subtype === 'success') {
-          emitClaudeTurnCompleted(message.result || 'Claude turn completed.');
+          emitClaudeTurnCompleted(message.result?.trim() ?? '');
           // Defer context usage fetch to next tick — SDK internal state may not
           // be fully updated until after the result message is consumed.
           await new Promise(resolve => setImmediate(resolve));
           await emitClaudeContextUsage();
+          await emitClaudeSessionUsage();
         } else {
           const reason = message.errors?.join('\n') || message.subtype;
-          emitClaudeTurnCompleted(reason || 'Claude turn completed.');
+          emitClaudeTurnCompleted(reason);
           emitEvent({
             type: 'session_completed',
             reason,
@@ -1864,6 +2877,9 @@ async function consumeClaudeMessages() {
       && !claudeInterruptRequested
       && isCurrentClaudeQuerySnapshot(querySnapshot);
   } finally {
+    if (claudeQuerySlot.isCurrent(querySnapshot) && hasUnsettledClaudeBackgroundTasks()) {
+      interruptClaudeBackgroundTasks('Claude query process ended before the background task settled.');
+    }
     if (claudeInputQueue === inputQueue) {
       claudeInputQueue = null;
     }
@@ -1950,7 +2966,7 @@ async function replayPendingClaudePromptIfNeeded() {
   const prompt = pendingClaudePromptReplay;
   pendingClaudePromptReplay = null;
   await ensureClaudePromptQueueReady();
-  enqueueClaudePrompt(prompt.text, prompt.images);
+  enqueueClaudePrompt(prompt.text, prompt.images, prompt.messageUuid);
 }
 
 async function ensureClaudePromptQueueReady() {
@@ -1962,14 +2978,20 @@ async function ensureClaudePromptQueueReady() {
   }
 }
 
-function enqueueClaudePrompt(text: string, images?: PromptImage[] | null) {
+function enqueueClaudePrompt(
+  text: string,
+  images?: PromptImage[] | null,
+  messageUuid = randomUUID(),
+) {
   if (!claudeInputQueue) {
     throw new Error('Claude streaming input queue is not ready');
   }
 
-  pendingClaudePromptReplay = { text, images };
+  pendingClaudePromptReplay = { text, images, messageUuid };
   claudeInterruptRequested = false;
   claudeInterruptCompletionEmitted = false;
+  claudeForegroundPromptUuid = messageUuid;
+  claudeForegroundPromptAccepted = false;
   const parts = buildPromptContentParts(text, images);
   const hasImages = parts.some((part) => part.type === 'image');
   const content = hasImages
@@ -1991,6 +3013,7 @@ function enqueueClaudePrompt(text: string, images?: PromptImage[] | null) {
   resetClaudeTurnTracking();
   claudeInputQueue.push({
     type: 'user',
+    uuid: messageUuid as SDKUserMessage['uuid'],
     origin: { kind: 'human' },
     message: {
       role: 'user',
@@ -2013,6 +3036,9 @@ async function rewindClaudeFiles(checkpointId: string) {
   if (pendingPermissions.size > 0 || pendingClaudeInteractivePrompts.size > 0) {
     throw new Error('Cannot rewind while a permission or user prompt is waiting.');
   }
+  if (hasUnsettledClaudeBackgroundTasks()) {
+    throw new Error('Cannot rewind files while Claude background tasks are still running or settling.');
+  }
   if (currentClaudeQuery && claudeLastSessionState !== 'idle' && !claudeTurnCompletionEmitted) {
     throw new Error('Cannot rewind while Claude is processing or starting a turn.');
   }
@@ -2025,10 +3051,11 @@ async function rewindClaudeFiles(checkpointId: string) {
     throw new Error('Cannot rewind before Claude provides a session id.');
   }
 
-  const rewindQuery = query({
+  const options = buildClaudeQueryOptions();
+  const rewindQuery = withSuppressedClaudeBypassShadowWarning(options, () => query({
     prompt: '',
-    options: buildClaudeQueryOptions(),
-  });
+    options,
+  }));
 
   try {
     for await (const message of rewindQuery) {
@@ -2392,6 +3419,133 @@ async function runQueuedTurns() {
   }
 }
 
+function rejectForegroundInteractionsForInterrupt() {
+  denyPendingForegroundPermissions();
+  denyPendingForegroundClaudeInteractivePrompts(
+    'Claude foreground turn was interrupted before user responded.',
+  );
+  browserToolBridge.rejectOwned(
+    'foreground',
+    'Claude foreground turn was interrupted before the browser tool completed.',
+  );
+}
+
+function emitTeardownPrepared(requestId: string, ready: boolean, detail?: string) {
+  emit({
+    type: 'teardown_prepared',
+    request_id: requestId,
+    ready,
+    ...(detail ? { detail } : {}),
+  });
+}
+
+function emitClaudeBackgroundTaskStopFailed(
+  taskId: string,
+  stopRequestId: string,
+  error: string,
+) {
+  emit({
+    type: 'background_task_stop_failed',
+    task_id: taskId,
+    stop_request_id: stopRequestId,
+    error,
+  });
+}
+
+async function prepareNativeRuntimeStop(
+  requestId: string,
+  requireIdle = false,
+  forceBackgroundTasks = false,
+  finalize = false,
+) {
+  const normalizedRequestId = requestId.trim();
+  if (!normalizedRequestId) {
+    return;
+  }
+  if (runtimeTeardownPreparationId && runtimeTeardownPreparationId !== normalizedRequestId) {
+    emitTeardownPrepared(
+      normalizedRequestId,
+      false,
+      'Another native runtime close is already being prepared.',
+    );
+    return;
+  }
+  runtimeTeardownPreparationId = normalizedRequestId;
+
+  if (initCommand?.provider === 'claude') {
+    const hasBackgroundTasks = hasUnsettledClaudeBackgroundTasks();
+    if (hasBackgroundTasks && !forceBackgroundTasks) {
+      emitTeardownPrepared(
+        normalizedRequestId,
+        false,
+        'Claude background tasks are still running.',
+      );
+      return;
+    }
+
+    if (requireIdle && (
+      claudeTurnAwaitingResult
+      || claudeInterruptRequested
+      || claudeLastSessionState !== 'idle'
+    )) {
+      emitTeardownPrepared(
+        normalizedRequestId,
+        false,
+        'Claude foreground turn must be idle before terminal handoff.',
+      );
+      return;
+    }
+
+    if (
+      !claudeTurnAwaitingResult
+      && !claudeInterruptRequested
+      && claudeLastSessionState !== null
+      && claudeLastSessionState !== 'idle'
+    ) {
+      emitTeardownPrepared(
+        normalizedRequestId,
+        false,
+        'Claude SDK is not idle.',
+      );
+      return;
+    }
+
+    if (requireIdle) {
+      // A forced handoff keeps existing background work alive while the new
+      // terminal is being created. The final prepare closes the Query and
+      // marks any remaining tasks interrupted only after that succeeds.
+      if (!(hasBackgroundTasks && forceBackgroundTasks && !finalize)) {
+        const frozen = closeClaudeQueryForRecovery(
+          captureCurrentClaudeQuerySnapshot(),
+          forceBackgroundTasks && finalize
+            ? {
+              interruptBackgroundTasks: true,
+              reason: 'Terminal handoff interrupted the Claude background task before it settled.',
+            }
+            : {},
+        );
+        if (!frozen) {
+          emitTeardownPrepared(
+            normalizedRequestId,
+            false,
+            'Claude SDK could not be frozen for terminal handoff.',
+          );
+          return;
+        }
+      }
+    }
+  } else if (requireIdle && activeTurn) {
+    emitTeardownPrepared(
+      normalizedRequestId,
+      false,
+      'Codex foreground turn must finish before terminal handoff.',
+    );
+    return;
+  }
+
+  emitTeardownPrepared(normalizedRequestId, true);
+}
+
 async function handleCommand(command: InputCommand) {
   if (command.type === 'title_query') {
     await runWorkspaceTitleQuery(command);
@@ -2400,6 +3554,9 @@ async function handleCommand(command: InputCommand) {
 
   if (command.type === 'init') {
     initCommand = command;
+    const forkRequested = command.provider === 'claude'
+      && Boolean(command.fork_session)
+      && Boolean(command.provider_session_id?.trim());
     const resumedClaudeWithoutTodoSeed = command.provider === 'claude'
       && Boolean(command.provider_session_id?.trim())
       && !command.todo_snapshot_seed;
@@ -2407,7 +3564,21 @@ async function handleCommand(command: InputCommand) {
       command.todo_snapshot_seed,
       !resumedClaudeWithoutTodoSeed,
     );
-    currentProviderSessionId = command.provider_session_id ?? null;
+    let initProviderSessionId = command.provider_session_id ?? null;
+    if (forkRequested) {
+      const parentSessionId = command.provider_session_id!.trim();
+      try {
+        const forked = await forkSession(parentSessionId, {
+          upToMessageId: command.fork_at_message_id?.trim() || undefined,
+          dir: command.working_dir,
+        });
+        initProviderSessionId = forked.sessionId;
+      } catch (error) {
+        emitStatus('error', `Failed to fork session: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    currentProviderSessionId = initProviderSessionId;
     browserEvaluateApprovedForSession = false;
     if (currentProviderSessionId) {
       emitSessionMeta(currentProviderSessionId);
@@ -2513,8 +3684,56 @@ async function handleCommand(command: InputCommand) {
     return;
   }
 
+  if (command.type === 'usage_query') {
+    if (initCommand?.provider !== 'claude') {
+      // Codex sessions have no SDK usage API — they stay event-derived.
+      return;
+    }
+    try {
+      // Rehydrate the Claude runtime when it idled out, then actively query.
+      await ensureClaudeSession();
+      if (currentClaudeQuery) {
+        await emitClaudeContextUsage();
+        await emitClaudeSessionUsage();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Report via lifecycle only — emitting a Status here would flip the
+      // session record out of 'processing'/'interrupted' mid-turn.
+      emitEvent({
+        type: 'lifecycle',
+        stage: 'usage_unavailable',
+        detail: `Claude usage query failed: ${message}`,
+      });
+    }
+    return;
+  }
+
+  if (command.type === 'prepare_stop') {
+    await prepareNativeRuntimeStop(
+      command.request_id,
+      command.require_idle === true,
+      command.force_background_tasks === true,
+      command.finalize === true,
+    );
+    return;
+  }
+
+  if (command.type === 'cancel_prepare_stop') {
+    if (runtimeTeardownPreparationId === command.request_id) {
+      runtimeTeardownPreparationId = null;
+      stopped = false;
+      emitStatus(
+        claudeTurnAwaitingResult || activeTurn ? 'processing' : 'ready',
+        'Native runtime close was cancelled.',
+      );
+    }
+    return;
+  }
+
   if (command.type === 'update_settings') {
-    if (!isValidSettingsUpdateRequestId(command.request_id)) {
+    if (command.request_id !== undefined
+      && !isValidSettingsUpdateRequestId(command.request_id)) {
       emitEvent({
         type: 'stderr_line',
         line: 'Rejected update_settings command with an invalid request id.',
@@ -2598,8 +3817,18 @@ async function handleCommand(command: InputCommand) {
     if (!command.text.trim() && !hasImages) {
       return;
     }
+    if (runtimeTeardownPreparationId) {
+      throw new Error('Native runtime is preparing to close and cannot accept a new prompt.');
+    }
     if (initCommand?.provider === 'claude') {
+      await waitForClaudeInterruptToSettle();
+      if (stopped || runtimeTeardownPreparationId) {
+        throw new Error('Claude runtime is stopping and cannot accept a new prompt.');
+      }
       await ensureClaudePromptQueueReady();
+      if (stopped || runtimeTeardownPreparationId) {
+        throw new Error('Claude runtime is stopping and cannot accept a new prompt.');
+      }
       enqueueClaudePrompt(command.text.trim(), command.images);
     } else {
       promptQueue.push({ text: command.text.trim(), images: command.images });
@@ -2608,41 +3837,140 @@ async function handleCommand(command: InputCommand) {
     return;
   }
 
-  if (command.type === 'stop') {
-    stopped = true;
+  if (command.type === 'stop_task') {
+    const taskId = command.task_id.trim();
+    const stopRequestId = command.stop_request_id.trim();
+    const task = claudeBackgroundTasks.markStopping(taskId, stopRequestId);
+    if (!task) {
+      const reason = taskId
+        ? `Background task ${taskId} is not running in this Claude process.`
+        : 'Missing background task id.';
+      emitEvent({
+        type: 'lifecycle',
+        stage: 'background_task_stop_failed',
+        detail: reason,
+      });
+      emitClaudeBackgroundTaskStopFailed(taskId, stopRequestId, reason);
+      return;
+    }
+
+    if (!currentClaudeQuery) {
+      const reason = `Background task ${taskId} is not attached to a live Claude query.`;
+      emitClaudeBackgroundTaskUpdated(
+        claudeBackgroundTasks.restoreStopFailure(taskId, stopRequestId, reason),
+      );
+      emitClaudeBackgroundTasksChanged();
+      emitEvent({
+        type: 'lifecycle',
+        stage: 'background_task_stop_failed',
+        detail: reason,
+      });
+      return;
+    }
+
+    emitClaudeBackgroundTaskUpdated(task);
+    emitClaudeBackgroundTasksChanged();
+    try {
+      await currentClaudeQuery.stopTask(taskId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      emitClaudeBackgroundTaskUpdated(
+        claudeBackgroundTasks.restoreStopFailure(taskId, stopRequestId, reason),
+      );
+      emitClaudeBackgroundTasksChanged();
+      emitEvent({
+        type: 'lifecycle',
+        stage: 'background_task_stop_failed',
+        detail: reason,
+      });
+    }
+    return;
+  }
+
+  if (command.type === 'stop' || command.type === 'interrupt_turn') {
+    const runtimeTeardown = command.type === 'stop';
+    const forceBackgroundTasks = runtimeTeardown
+      && command.force_background_tasks === true;
+    stopped = runtimeTeardown;
+    if (runtimeTeardown) {
+      runtimeTeardownPreparationId = null;
+    }
     clearClaudeIdleCloseTimer();
     pendingClaudePromptReplay = null;
-    denyPendingPermissions();
-    denyPendingClaudeInteractivePrompts('Native runtime turn was interrupted before user responded.');
-    browserToolBridge.rejectAll('Native runtime turn was interrupted before the browser tool completed.');
 
     if (initCommand?.provider === 'claude') {
+      if (runtimeTeardown && hasUnsettledClaudeBackgroundTasks() && !forceBackgroundTasks) {
+        stopped = false;
+        emitEvent({
+          type: 'lifecycle',
+          stage: 'teardown_blocked',
+          detail: 'Claude runtime teardown was blocked by active background tasks.',
+        });
+        emitStatus(
+          claudeTurnAwaitingResult ? 'processing' : 'ready',
+          'Claude background tasks are still running.',
+        );
+        return;
+      }
+
       const stopTarget = captureCurrentClaudeQuerySnapshot();
       if (!shouldInterruptCurrentClaudeTurn(stopTarget)) {
+        if (!runtimeTeardown) {
+          stopped = false;
+          emitEvent({
+            type: 'lifecycle',
+            stage: 'interrupt_ignored',
+            detail: 'Claude has no active foreground turn to interrupt.',
+          });
+          emitStatus('ready', 'Ready for the next prompt.');
+          return;
+        }
         emitEvent({
           type: 'lifecycle',
           stage: 'idle_stop',
           detail: 'Desktop workspace stopped an idle Claude runtime after the turn had completed.',
         });
-        closeClaudeQueryForRecovery(stopTarget);
+        denyPendingPermissions();
+        denyPendingClaudeInteractivePrompts('Native runtime session was closed before user responded.');
+        browserToolBridge.rejectAll('Native runtime session was closed before the browser tool completed.');
+        closeClaudeQueryForRecovery(stopTarget, {
+          interruptBackgroundTasks: forceBackgroundTasks,
+          allowUnsafeClose: true,
+          reason: 'Claude runtime was stopped before the background task settled.',
+        });
         activeTurn = false;
         currentAbortController = null;
-        stopped = false;
         emitStatus('closed_idle', 'Claude runtime stopped after completed turn.');
+        finishClaudeRuntimeTeardown();
         return;
       }
 
       claudeInterruptRequested = true;
       claudeInterruptCompletionEmitted = false;
+      if (!runtimeTeardown) {
+        rejectForegroundInteractionsForInterrupt();
+      }
       try {
         if (!shouldInterruptCurrentClaudeTurn(stopTarget)) {
+          if (!runtimeTeardown) {
+            emitStatus('ready', 'Ready for the next prompt.');
+            return;
+          }
           emitEvent({
             type: 'lifecycle',
             stage: 'idle_stop',
             detail: 'Desktop workspace stopped an idle Claude runtime after the turn had completed.',
           });
-          closeClaudeQueryForRecovery(stopTarget);
+          denyPendingPermissions();
+          denyPendingClaudeInteractivePrompts('Native runtime session was closed before user responded.');
+          browserToolBridge.rejectAll('Native runtime session was closed before the browser tool completed.');
+          closeClaudeQueryForRecovery(stopTarget, {
+            interruptBackgroundTasks: forceBackgroundTasks,
+            allowUnsafeClose: true,
+            reason: 'Claude runtime was stopped before the background task settled.',
+          });
           emitStatus('closed_idle', 'Claude runtime stopped after completed turn.');
+          finishClaudeRuntimeTeardown();
           return;
         }
         emitEvent({
@@ -2652,10 +3980,41 @@ async function handleCommand(command: InputCommand) {
         });
         await interruptClaudeWithTimeout(stopTarget.query);
         emitClaudeTurnInterrupted();
+        if (runtimeTeardown) {
+          if (hasUnsettledClaudeBackgroundTasks() && !forceBackgroundTasks) {
+            stopped = false;
+            emitEvent({
+              type: 'lifecycle',
+              stage: 'teardown_blocked',
+              detail: 'Claude runtime teardown was blocked by a background task started during interrupt.',
+            });
+            return;
+          }
+          denyPendingPermissions();
+          denyPendingClaudeInteractivePrompts('Native runtime session was closed before user responded.');
+          browserToolBridge.rejectAll('Native runtime session was closed before the browser tool completed.');
+          closeClaudeQueryForRecovery(stopTarget, {
+            interruptBackgroundTasks: forceBackgroundTasks,
+            allowUnsafeClose: true,
+            reason: 'Claude runtime was stopped before the background task settled.',
+          });
+          emitStatus('closed_idle', 'Claude runtime stopped after interrupting the active turn.');
+          finishClaudeRuntimeTeardown();
+        }
       } catch (error) {
         claudeInterruptRequested = false;
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof Error && error.name === 'TimeoutError') {
+          if (hasUnsettledClaudeBackgroundTasks() && !forceBackgroundTasks) {
+            stopped = false;
+            emitEvent({
+              type: 'lifecycle',
+              stage: 'interrupt_timeout_background_tasks_preserved',
+              detail: `${message}; background tasks remain attached to the existing Claude query.`,
+            });
+            emitStatus('processing', 'Claude interrupt timed out; background tasks remain running.');
+            return;
+          }
           claudeLastSessionState = 'idle';
           resetClaudeTurnTracking();
           claudeTurnCompletionEmitted = true;
@@ -2669,19 +4028,62 @@ async function handleCommand(command: InputCommand) {
             stage: 'interrupt_timeout',
             detail: message,
           });
-          closeClaudeQueryForRecovery(stopTarget);
+          closeClaudeQueryForRecovery(stopTarget, {
+            interruptBackgroundTasks: forceBackgroundTasks,
+            allowUnsafeClose: true,
+            reason: 'Claude runtime stop timed out before the background task settled.',
+          });
           emitStatus('interrupted', 'Claude interrupt timed out; runtime will reconnect on the next prompt.');
+          if (runtimeTeardown) {
+            finishClaudeRuntimeTeardown();
+          }
         } else {
           emitEvent({
             type: 'stderr_line',
             line: `Failed to interrupt Claude turn: ${message}`,
           });
-          emitStatus('error', message);
+          emitEvent({
+            type: 'lifecycle',
+            stage: 'interrupt_failed',
+            detail: message,
+          });
+          if (!runtimeTeardown) {
+            emitStatus(
+              'processing',
+              'Claude interrupt failed; the foreground turn and background tasks remain attached.',
+            );
+            return;
+          }
+          if (hasUnsettledClaudeBackgroundTasks() && !forceBackgroundTasks) {
+            stopped = false;
+            emitEvent({
+              type: 'lifecycle',
+              stage: 'teardown_blocked',
+              detail: 'Claude runtime teardown was blocked after interrupt failed.',
+            });
+            emitStatus(
+              'processing',
+              'Claude runtime teardown was blocked; background tasks remain attached.',
+            );
+            return;
+          }
+          denyPendingPermissions();
+          denyPendingClaudeInteractivePrompts('Native runtime session was closed before user responded.');
+          browserToolBridge.rejectAll('Native runtime session was closed before the browser tool completed.');
+          closeClaudeQueryForRecovery(stopTarget, {
+            interruptBackgroundTasks: forceBackgroundTasks,
+            allowUnsafeClose: true,
+            reason: 'Claude runtime stop failed before the background task settled.',
+          });
+          emitStatus('closed_idle', 'Claude runtime closed after its interrupt request failed.');
+          finishClaudeRuntimeTeardown();
         }
       } finally {
         activeTurn = false;
         currentAbortController = null;
-        stopped = false;
+        if (!runtimeTeardown) {
+          stopped = false;
+        }
       }
       return;
     }
@@ -2692,9 +4094,13 @@ async function handleCommand(command: InputCommand) {
     teardownCodexSession(false);
     activeTurn = false;
     currentAbortController = null;
-    stopped = false;
-
-    emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
+    if (runtimeTeardown) {
+      emitStatus('closed_idle', 'Codex runtime stopped.');
+      finishClaudeRuntimeTeardown();
+    } else {
+      stopped = false;
+      emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
+    }
     return;
   }
 }
@@ -2731,7 +4137,19 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => {
+  // Desktop launches the helper as a dedicated Unix process-group leader. Once parent stdin is
+  // gone, kill that owned group first: telemetry and SDK cleanup can throw or block on broken I/O.
+  if (terminateOwnedProcessGroupOnParentClose()) {
+    return;
+  }
   if (!stopped) {
+    stopped = true;
     emitStatus('stopped', 'Native runtime helper stdin closed.');
   }
+  closeClaudeQueryForRecovery();
+  teardownCodexSession(false);
+  // The host has closed our stdin (app exit or session close).
+  // Give the status write and teardown a moment, then exit regardless of
+  // remaining handles.
+  setTimeout(() => process.exit(0), 250);
 });

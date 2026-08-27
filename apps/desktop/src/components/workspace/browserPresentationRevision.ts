@@ -1,7 +1,6 @@
 export interface BrowserPresentationIntent {
   ownerSessionId: string;
   surfaceSessionId: string;
-  backend: 'preview' | 'login' | null;
   occluded: boolean;
 }
 
@@ -9,7 +8,6 @@ function intentKey(intent: BrowserPresentationIntent): string {
   return [
     intent.ownerSessionId,
     intent.surfaceSessionId,
-    intent.backend ?? 'none',
     intent.occluded ? 'occluded' : 'visible',
   ].join('\u0000');
 }

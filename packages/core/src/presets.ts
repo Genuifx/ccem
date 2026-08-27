@@ -60,9 +60,9 @@ export const ENV_PRESETS: Record<
     ANTHROPIC_MODEL: 'opus'
   },
   'OpenRouter': {
-    ANTHROPIC_BASE_URL: 'https://openrouter.ai/api/v1',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'anthropic/claude-opus-4.7',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'anthropic/claude-sonnet-4.6',
+    ANTHROPIC_BASE_URL: 'https://openrouter.ai/api',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'anthropic/claude-opus-5',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'anthropic/claude-sonnet-5',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'anthropic/claude-haiku-4.5',
     ANTHROPIC_MODEL: 'opus'
   },

@@ -1,6 +1,6 @@
 import type { NativeBrowserBounds } from '@/components/workspace/browserPanelGeometry';
 
-export type BrowserSurfaceBackend = 'preview' | 'login';
+export type BrowserSurfaceBackend = 'login';
 
 export type BrowserSurfaceRecoveryState =
   | 'retained_live_host'
@@ -20,13 +20,12 @@ export type BrowserSurfaceProfileSelection =
 
 export type BrowserSurfaceAcquireRequest = {
   panelSessionId: string;
+  backend: 'login';
+  workingDir: string;
   initialUrl?: string | null;
   viewport: NativeBrowserBounds;
   clientRevision: number;
-} & (
-  | { backend: 'preview'; workingDir?: never; profileMode?: never; profileId?: never }
-  | ({ backend: 'login'; workingDir: string } & BrowserSurfaceProfileSelection)
-);
+} & BrowserSurfaceProfileSelection;
 
 export interface BrowserSurfaceSnapshot {
   url?: string | null;

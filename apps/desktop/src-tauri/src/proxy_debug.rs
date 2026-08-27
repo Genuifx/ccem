@@ -9,20 +9,25 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{self, DesktopSettings};
+use crate::router::{
+    validate_router_config, RouterConfig, RouterManager, RouterStatus, ROUTER_PORT_SCAN_END,
+};
 use crate::session::SessionManager;
 
-const FIXED_PROXY_PORT: u16 = 17890;
 const DEFAULT_OVERLOAD_THRESHOLD: u64 = 200;
 const DEFAULT_CODEX_UPSTREAM: &str = "https://api.openai.com/v1";
 const DEFAULT_LOG_MAX_BYTES: u64 = 500 * 1024 * 1024;
 const HEADER_READ_LIMIT: usize = 8 * 1024 * 1024;
 const BODY_READ_LIMIT: usize = 64 * 1024 * 1024;
+const ROUTER_BODY_READ_LIMIT: usize = 32 * 1024 * 1024;
+const CHUNK_LINE_READ_LIMIT: usize = 8 * 1024;
 const LIST_LIMIT_MAX: usize = 200;
 const LOG_SAMPLE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -106,6 +111,106 @@ pub struct ReducedStreamLog {
     pub stream_status: String,
     pub first_token_ms: Option<u64>,
     pub total_stream_ms: Option<u64>,
+}
+
+/// Incremental SSE usage scanner for routed message streams. Runs on every
+/// forwarded chunk regardless of debug recording: the router is the only
+/// component that knows which environment actually served a request, so
+/// per-request usage truth must not depend on `record_mode`.
+#[derive(Debug, Default)]
+struct RoutedUsageScanner {
+    model: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    /// Partial SSE line carried across chunk boundaries.
+    carry: String,
+}
+
+impl RoutedUsageScanner {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.carry.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(idx) = self.carry.find('\n') {
+            let line: String = self.carry.drain(..=idx).collect();
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" || !data.starts_with('{') {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let event_type = value.get("type").and_then(|t| t.as_str());
+            if event_type == Some("message_start") {
+                if let Some(message) = value.get("message") {
+                    if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
+                        self.model = Some(model.to_string());
+                    }
+                    if let Some(usage) = message.get("usage") {
+                        self.input_tokens = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.cache_creation_tokens = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.cache_read_tokens = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+            } else if event_type == Some("message_delta") {
+                if let Some(usage) = value.get("usage") {
+                    // message_delta carries CUMULATIVE usage. Providers differ:
+                    // DeepSeek fills message_start and reports only output here,
+                    // GLM reports zeros in message_start and the full truth here.
+                    // max() is safe for both (monotonic cumulative counters).
+                    self.input_tokens = self.input_tokens.max(
+                        usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                    self.cache_read_tokens = self.cache_read_tokens.max(
+                        usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                    self.cache_creation_tokens = self.cache_creation_tokens.max(
+                        usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                    self.output_tokens = self.output_tokens.max(
+                        usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                }
+            }
+        }
+        // Guard against a malformed stream without newlines growing forever.
+        if self.carry.len() > 1 << 20 {
+            self.carry.clear();
+        }
+    }
+
+    fn has_usage(&self) -> bool {
+        self.model.is_some()
+            || self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_creation_tokens > 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,8 +356,16 @@ struct MetricsState {
 
 struct ProxyRuntime {
     port: u16,
+    healthy: Arc<AtomicBool>,
     shutdown_flag: Arc<AtomicBool>,
     join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+fn widen_concurrent_listener_start_window() {
+    // Make the check-then-start race deterministic in the concurrency regression:
+    // every worker that observes `runtime == None` gets a chance to reach the bind.
+    thread::sleep(Duration::from_millis(25));
 }
 
 #[derive(Clone)]
@@ -262,6 +375,13 @@ struct ParsedProxyPath {
     upstream_path: String,
 }
 
+#[derive(Clone)]
+struct ParsedRouterPath {
+    session_key: String,
+    upstream_path: String,
+}
+
+#[derive(Debug)]
 struct ParsedRequest {
     method: String,
     target: String,
@@ -295,39 +415,89 @@ struct ForwardMeta {
     status: u16,
     prompt_preview: Option<String>,
     is_sse: bool,
+    record_traffic: bool,
+    sub_route: bool,
+    logical_key: Option<String>,
 }
+
+enum ForwardReadError {
+    Upstream(String),
+    ClientCancelled,
+}
+
+type RoutedUsageSink = Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>;
 
 pub struct ProxyDebugManager {
     session_manager: Arc<SessionManager>,
+    router_manager: Arc<RouterManager>,
     app_handle: Mutex<Option<AppHandle>>,
+    /// Serializes listener start/stop decisions and legacy route registration.
+    /// Never hold `runtime` while waiting for this lock; the order is always
+    /// lifecycle -> runtime/config/routes.
+    lifecycle: Mutex<()>,
     runtime: Mutex<Option<ProxyRuntime>>,
     runtime_config: Mutex<RuntimeConfig>,
     routes: RwLock<HashMap<String, RouteBinding>>,
     metrics: Mutex<MetricsState>,
     client: Client,
+    router_client: reqwest::Client,
+    /// Optional sink receiving per-request routed usage events (runtime_id,
+    /// payload). Wired to the native runtime event bus in main.rs to avoid a
+    /// manager construction cycle.
+    routed_usage_sink: Mutex<Option<RoutedUsageSink>>,
 }
 
 impl ProxyDebugManager {
-    pub fn new(session_manager: Arc<SessionManager>) -> Result<Arc<Self>, String> {
+    /// Wire the routed-usage event sink (native runtime event bus). Called
+    /// once from main.rs after both managers exist.
+    pub fn set_routed_usage_sink(&self, sink: RoutedUsageSink) {
+        if let Ok(mut guard) = self.routed_usage_sink.lock() {
+            *guard = Some(sink);
+        }
+    }
+
+    fn emit_routed_usage(&self, runtime_id: &str, payload: crate::event_bus::SessionEventPayload) {
+        if let Ok(guard) = self.routed_usage_sink.lock() {
+            if let Some(sink) = guard.as_ref() {
+                sink(runtime_id, payload);
+            }
+        }
+    }
+
+    pub fn new(
+        session_manager: Arc<SessionManager>,
+        router_manager: Arc<RouterManager>,
+    ) -> Result<Arc<Self>, String> {
         let settings = config::read_settings().unwrap_or_default();
         let runtime_config = RuntimeConfig::from_settings(&settings);
         ensure_proxy_debug_dirs()?;
 
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(60 * 60))
+            .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("Failed to build proxy client: {}", e))?;
+        let router_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("Failed to build router client: {}", e))?;
 
         Ok(Arc::new(Self {
             session_manager,
+            router_manager,
             app_handle: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             runtime: Mutex::new(None),
             runtime_config: Mutex::new(runtime_config),
             routes: RwLock::new(HashMap::new()),
             metrics: Mutex::new(MetricsState::default()),
             client,
+            router_client,
+            routed_usage_sink: Mutex::new(None),
         }))
     }
 
@@ -348,29 +518,73 @@ impl ProxyDebugManager {
     }
 
     pub async fn maybe_start_on_boot(self: &Arc<Self>) {
-        if !self.is_enabled() {
-            return;
-        }
         if let Err(err) = self.ensure_running().await {
             eprintln!("Proxy debug startup failed: {}", err);
+            self.router_manager.set_failed(err, false);
             self.emit_status();
         }
     }
 
     pub async fn shutdown(self: &Arc<Self>) {
-        self.stop_runtime();
+        self.stop_runtime(true);
     }
 
     pub async fn ensure_running(self: &Arc<Self>) -> Result<u16, String> {
-        if let Some(port) = self.current_port() {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "Proxy listener lifecycle lock is poisoned".to_string())?;
+        self.ensure_running_locked()
+    }
+
+    /// Start or reuse the listener while the caller holds `self.lifecycle`.
+    /// The runtime mutex is held only for short state reads/writes, never bind,
+    /// thread creation, or shutdown joins.
+    fn ensure_running_locked(self: &Arc<Self>) -> Result<u16, String> {
+        let current = self
+            .runtime
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|runtime| (runtime.port, runtime.healthy.load(Ordering::Relaxed)));
+        if let Some((port, false)) = current {
+            return Err(format!(
+                "Router listener on 127.0.0.1:{port} is recovering from a runtime failure."
+            ));
+        }
+        if let Some((port, true)) = current {
+            self.router_manager.set_ready(port);
+            self.emit_status();
             return Ok(port);
         }
 
-        let listener = match TcpListener::bind(("127.0.0.1", FIXED_PROXY_PORT)) {
-            Ok(listener) => listener,
-            Err(_) => TcpListener::bind(("127.0.0.1", 0))
-                .map_err(|e| format!("Failed to bind proxy listener: {}", e))?,
-        };
+        #[cfg(test)]
+        widen_concurrent_listener_start_window();
+
+        self.router_manager.set_starting();
+        let requested_port = self.router_manager.config().port;
+        let scan_end = ROUTER_PORT_SCAN_END.max(requested_port);
+        let mut listener = None;
+        let mut last_error = None;
+        for port in requested_port..=scan_end {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let listener = listener.ok_or_else(|| {
+            format!(
+                "Failed to bind router listener on 127.0.0.1:{}..={}: {}",
+                requested_port,
+                scan_end,
+                last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no ports attempted".to_string())
+            )
+        })?;
 
         listener
             .set_nonblocking(true)
@@ -382,11 +596,14 @@ impl ProxyDebugManager {
             .port();
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let healthy = Arc::new(AtomicBool::new(true));
         let manager = Arc::clone(self);
         let shutdown_for_thread = Arc::clone(&shutdown_flag);
+        let healthy_for_thread = Arc::clone(&healthy);
 
         let join_handle = thread::spawn(move || {
-            while !shutdown_for_thread.load(Ordering::Relaxed) {
+            let mut listener = listener;
+            'serve: while !shutdown_for_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         let manager = Arc::clone(&manager);
@@ -397,33 +614,77 @@ impl ProxyDebugManager {
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(20));
                     }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(err) => {
-                        eprintln!("Proxy accept error: {}", err);
-                        thread::sleep(Duration::from_millis(50));
+                        healthy_for_thread.store(false, Ordering::Relaxed);
+                        manager.router_manager.set_failed(
+                            format!("Router listener failed on port {port}: {err}"),
+                            true,
+                        );
+                        manager.emit_status();
+                        drop(listener);
+                        let rebound = loop {
+                            if shutdown_for_thread.load(Ordering::Relaxed) {
+                                break 'serve;
+                            }
+                            match TcpListener::bind(("127.0.0.1", port)) {
+                                Ok(rebound) => match rebound.set_nonblocking(true) {
+                                    Ok(()) => break rebound,
+                                    Err(rebind_error) => eprintln!(
+                                        "Failed to restore router listener nonblocking mode: {rebind_error}"
+                                    ),
+                                },
+                                Err(rebind_error) => eprintln!(
+                                    "Router listener same-port recovery failed on {port}: {rebind_error}"
+                                ),
+                            }
+                            thread::sleep(Duration::from_millis(250));
+                        };
+                        listener = rebound;
+                        healthy_for_thread.store(true, Ordering::Relaxed);
+                        manager.router_manager.set_ready(port);
+                        manager.emit_status();
                     }
                 }
             }
+            healthy_for_thread.store(false, Ordering::Relaxed);
         });
 
         *self.runtime.lock().unwrap() = Some(ProxyRuntime {
             port,
+            healthy,
             shutdown_flag,
             join_handle: Some(join_handle),
         });
+
+        self.router_manager.set_ready(port);
 
         self.emit_status();
         Ok(port)
     }
 
-    fn stop_runtime(&self) {
+    fn stop_runtime(&self, clear_routes: bool) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stop_runtime_locked(clear_routes);
+    }
+
+    /// Stop the tracked listener while the caller holds `self.lifecycle`.
+    fn stop_runtime_locked(&self, clear_routes: bool) {
         let runtime = self.runtime.lock().unwrap().take();
         if let Some(mut runtime) = runtime {
+            runtime.healthy.store(false, Ordering::Relaxed);
             runtime.shutdown_flag.store(true, Ordering::Relaxed);
             if let Some(handle) = runtime.join_handle.take() {
                 let _ = handle.join();
             }
         }
-        self.routes.write().unwrap().clear();
+        if clear_routes {
+            self.routes.write().unwrap().clear();
+        }
+        self.router_manager.set_stopped();
         self.emit_status();
     }
 
@@ -437,7 +698,11 @@ impl ProxyDebugManager {
     ) -> Result<String, String> {
         validate_upstream_url(&req.upstream_base_url)?;
 
-        let port = self.ensure_running().await?;
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "Proxy listener lifecycle lock is poisoned".to_string())?;
+        let port = self.ensure_running_locked()?;
         let route_id = generate_route_id();
         let binding = RouteBinding {
             session_id: req.session_id,
@@ -459,6 +724,10 @@ impl ProxyDebugManager {
     }
 
     pub fn remove_session_routes(&self, session_id: &str) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut routes = self.routes.write().unwrap();
         routes.retain(|_, route| route.session_id != session_id);
         drop(routes);
@@ -476,11 +745,14 @@ impl ProxyDebugManager {
             .checked_div(metrics_guard.success_requests)
             .unwrap_or(0);
 
-        let listen_port = runtime_guard.as_ref().map(|runtime| runtime.port);
+        let listen_port = runtime_guard
+            .as_ref()
+            .filter(|runtime| runtime.healthy.load(Ordering::Relaxed))
+            .map(|runtime| runtime.port);
 
         ProxyDebugState {
             enabled: runtime_config.enabled,
-            running: runtime_guard.is_some(),
+            running: listen_port.is_some(),
             listen_port,
             base_url: listen_port.map(|p| format!("http://127.0.0.1:{}", p)),
             codex_upstream_base_url: runtime_config.codex_upstream_base_url,
@@ -499,16 +771,16 @@ impl ProxyDebugManager {
     }
 
     pub async fn set_enabled(self: &Arc<Self>, enabled: bool) -> Result<ProxyDebugState, String> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "Proxy listener lifecycle lock is poisoned".to_string())?;
         let settings = config::update_settings(|settings| {
             settings.proxy_debug_enabled = enabled;
         })?;
         *self.runtime_config.lock().unwrap() = RuntimeConfig::from_settings(&settings);
 
-        if enabled {
-            self.ensure_running().await?;
-        } else {
-            self.stop_runtime();
-        }
+        self.ensure_running_locked()?;
 
         self.emit_status();
         Ok(self.get_state())
@@ -520,6 +792,10 @@ impl ProxyDebugManager {
         record_mode: Option<String>,
     ) -> Result<ProxyDebugState, String> {
         validate_upstream_url(&codex_upstream_base_url)?;
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "Proxy listener lifecycle lock is poisoned".to_string())?;
 
         let selected_mode = match record_mode.as_deref() {
             Some(raw) if raw.eq_ignore_ascii_case("full") => RecordMode::Full,
@@ -539,12 +815,41 @@ impl ProxyDebugManager {
         })?;
         *self.runtime_config.lock().unwrap() = RuntimeConfig::from_settings(&settings);
 
-        if self.is_enabled() {
-            self.ensure_running().await?;
-        }
+        self.ensure_running_locked()?;
 
         self.emit_status();
         Ok(self.get_state())
+    }
+
+    pub async fn apply_router_config(
+        self: &Arc<Self>,
+        config: RouterConfig,
+    ) -> Result<RouterStatus, String> {
+        self.validate_router_config_change(&config)?;
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| "Proxy listener lifecycle lock is poisoned".to_string())?;
+        let previous = self.router_manager.config();
+        let mut runtime_config = config.clone();
+        // Port changes are persisted for the next app start. Restarting the
+        // shared listener here would cut both native `/s` and legacy `/proxy`
+        // callers whose helper environment embeds the current port.
+        runtime_config.port = previous.port;
+        self.router_manager.update_config(runtime_config)?;
+
+        if let Err(error) = self.ensure_running_locked() {
+            self.router_manager.set_failed(error.clone(), false);
+            self.emit_status();
+            return Err(error);
+        }
+
+        Ok(self.router_manager.status())
+    }
+
+    pub fn validate_router_config_change(&self, config: &RouterConfig) -> Result<(), String> {
+        validate_router_config(config).map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn list_traffic(
@@ -589,6 +894,7 @@ impl ProxyDebugManager {
     fn emit_status(&self) {
         if let Some(app) = self.app_handle.lock().unwrap().as_ref() {
             let _ = app.emit("proxy-status", self.get_state());
+            let _ = app.emit("router-status", self.router_manager.status());
         }
     }
 
@@ -616,21 +922,117 @@ impl ProxyDebugManager {
             metrics.active_connections = metrics.active_connections.saturating_add(1);
         }
 
-        let req = match read_http_request(&mut stream) {
+        let req = match read_http_request_with_preflight(&mut stream, |method, target, headers| {
+            let (raw_path, _) = split_target(target);
+            if raw_path == "/health" {
+                if headers.contains_key("transfer-encoding")
+                    || headers
+                        .get("content-length")
+                        .is_some_and(|length| length != "0")
+                {
+                    return Err("BAD_REQUEST: health endpoint does not accept a body".to_string());
+                }
+                return Ok(());
+            }
+            if let Some(parsed) = parse_router_path(raw_path) {
+                if !self
+                    .router_manager
+                    .contains_session_key(&parsed.session_key)
+                {
+                    return Err("ROUTE_NOT_FOUND: router session was not found".to_string());
+                }
+                if method != "POST" {
+                    return Err(
+                        "ROUTER_METHOD_NOT_ALLOWED: router requests must use POST".to_string()
+                    );
+                }
+                if !matches!(
+                    parsed.upstream_path.trim_end_matches('/'),
+                    "/v1/messages" | "/v1/messages/count_tokens"
+                ) {
+                    return Err(
+                        "ROUTER_ENDPOINT_NOT_ALLOWED: router endpoint is not allowed".to_string(),
+                    );
+                }
+                let content_encoding = headers
+                    .get("content-encoding")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                if !content_encoding.is_empty()
+                    && !content_encoding.eq_ignore_ascii_case("identity")
+                {
+                    return Err("ROUTER_UNSUPPORTED_CONTENT_ENCODING: compressed router request bodies are not supported".to_string());
+                }
+                return Ok(());
+            }
+            if let Some(parsed) = parse_proxy_path(raw_path) {
+                return self
+                    .routes
+                    .read()
+                    .map_err(|_| {
+                        "ROUTE_STATE_UNAVAILABLE: proxy route lock is poisoned".to_string()
+                    })?
+                    .contains_key(&parsed.route_id)
+                    .then_some(())
+                    .ok_or_else(|| "ROUTE_NOT_FOUND: proxy route was not found".to_string());
+            }
+            Err("ROUTE_NOT_FOUND: route not found".to_string())
+        }) {
             Ok(req) => req,
             Err(err) => {
                 self.finish_failed_request(None);
+                let (status, code) = if err.contains("exceeds limit") {
+                    (413, "PAYLOAD_TOO_LARGE")
+                } else if err.starts_with("ROUTE_NOT_FOUND:") {
+                    (404, "ROUTE_NOT_FOUND")
+                } else if err.starts_with("ROUTER_METHOD_NOT_ALLOWED:") {
+                    (405, "ROUTER_METHOD_NOT_ALLOWED")
+                } else if err.starts_with("ROUTER_ENDPOINT_NOT_ALLOWED:") {
+                    (404, "ROUTER_ENDPOINT_NOT_ALLOWED")
+                } else if err.starts_with("ROUTER_UNSUPPORTED_CONTENT_ENCODING:") {
+                    (415, "ROUTER_UNSUPPORTED_CONTENT_ENCODING")
+                } else if err.starts_with("ROUTE_STATE_UNAVAILABLE:") {
+                    (500, "ROUTE_STATE_UNAVAILABLE")
+                } else {
+                    (400, "BAD_REQUEST")
+                };
                 let _ = write_error_response(
                     &mut stream,
-                    400,
-                    "BAD_REQUEST",
+                    status,
+                    code,
                     &format!("Failed to parse request: {}", err),
                 );
                 return;
             }
         };
 
-        let (raw_path, query) = split_target(&req.target);
+        let request_target = req.target.clone();
+        let (raw_path, query) = split_target(&request_target);
+        if raw_path == "/health" {
+            let status = self.router_manager.status();
+            let http_status = if status.actual_port.is_some() {
+                200
+            } else {
+                503
+            };
+            let payload = serde_json::json!({
+                "ready": http_status == 200,
+                "actualPort": status.actual_port,
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            let result = write_json_response(&mut stream, http_status, &payload);
+            if result.is_ok() {
+                self.finish_success_request(0, false);
+            } else {
+                self.finish_failed_request(None);
+            }
+            return;
+        }
+        if let Some(parsed) = parse_router_path(raw_path) {
+            self.handle_router_request(&mut stream, req, parsed, query);
+            return;
+        }
         let parsed = match parse_proxy_path(raw_path) {
             Some(parsed) => parsed,
             None => {
@@ -806,6 +1208,9 @@ impl ProxyDebugManager {
             status: status_code,
             prompt_preview,
             is_sse,
+            record_traffic: true,
+            sub_route: false,
+            logical_key: None,
         };
 
         self.forward_response_stream(
@@ -817,6 +1222,153 @@ impl ProxyDebugManager {
         );
     }
 
+    fn handle_router_request(
+        &self,
+        stream: &mut TcpStream,
+        req: ParsedRequest,
+        parsed: ParsedRouterPath,
+        query: Option<&str>,
+    ) {
+        let prepared = match self.router_manager.prepare(
+            &parsed.session_key,
+            &req.method,
+            &parsed.upstream_path,
+            query,
+            &req.headers,
+            &req.body,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.finish_failed_request(None);
+                let _ = write_error_response(stream, error.status, error.code, &error.message);
+                return;
+            }
+        };
+
+        let method = match Method::from_bytes(req.method.as_bytes()) {
+            Ok(method) => method,
+            Err(error) => {
+                self.finish_failed_request(None);
+                let _ = write_error_response(
+                    stream,
+                    400,
+                    "BAD_REQUEST",
+                    &format!("Unsupported HTTP method: {error}"),
+                );
+                return;
+            }
+        };
+
+        let recording_enabled = self.is_enabled();
+        let config = self.runtime_config.lock().unwrap().clone();
+        let start = Instant::now();
+        let timestamp = now_ms();
+        let request_id = generate_request_id();
+        let redacted_body = recording_enabled.then(|| redact_body_bytes(&prepared.body));
+        let prompt_preview = redacted_body
+            .as_deref()
+            .and_then(|body| extract_prompt_preview("claude", body));
+        let request_body_file = if recording_enabled && config.record_mode == RecordMode::Full {
+            let relative = format!("bodies/{}-req.bin", request_id);
+            let full = proxy_debug_dir().join(&relative);
+            if fs::write(&full, redacted_body.as_deref().unwrap_or_default()).is_ok() {
+                apply_private_file_permissions(&full);
+                Some(relative)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut upstream_builder = self
+            .router_client
+            .request(method, prepared.upstream_url.clone());
+        for (name, value) in &prepared.headers {
+            if should_skip_request_header(name) {
+                continue;
+            }
+            upstream_builder = upstream_builder.header(name, value);
+        }
+        upstream_builder = upstream_builder.body(prepared.body.clone());
+
+        let upstream_response =
+            match tauri::async_runtime::block_on(async { upstream_builder.send().await }) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.finish_failed_request(None);
+                    let (status, code) = if error.is_timeout() {
+                        (504, "UPSTREAM_TIMEOUT")
+                    } else {
+                        (502, "UPSTREAM_CONNECT_ERROR")
+                    };
+                    let _ = write_error_response(
+                        stream,
+                        status,
+                        code,
+                        &format!("Failed to connect upstream: {error}"),
+                    );
+                    return;
+                }
+            };
+
+        let status_code = upstream_response.status().as_u16();
+        let response_headers = headers_to_map(upstream_response.headers());
+        let is_sse = response_headers
+            .get("content-type")
+            .map(|value| value.contains("text/event-stream"))
+            .unwrap_or(false);
+        let (response_file_final, spool_state, sample) =
+            if recording_enabled && config.record_mode == RecordMode::Full {
+                let final_path = proxy_debug_dir().join(format!("bodies/{}-res.bin", request_id));
+                (
+                    Some(final_path),
+                    Some(Arc::new(LogSpoolState::default())),
+                    Some(Arc::new(Mutex::new(Vec::new()))),
+                )
+            } else {
+                (None, None, None)
+            };
+
+        if let Err(error) = write_response_headers(
+            stream,
+            status_code,
+            upstream_response
+                .status()
+                .canonical_reason()
+                .unwrap_or("OK"),
+            upstream_response.headers(),
+        ) {
+            self.finish_failed_request(None);
+            eprintln!("Failed to write router response headers: {error}");
+            return;
+        }
+
+        let meta = ForwardMeta {
+            id: request_id,
+            timestamp,
+            client: "claude".to_string(),
+            session_id: prepared.runtime_id,
+            env_name: prepared.target_env,
+            method: req.method,
+            path: parsed.upstream_path,
+            query: query.map(str::to_string),
+            request_headers: redact_headers(&req.headers),
+            response_headers: redact_headers(&response_headers),
+            request_body_size: prepared.body.len() as u64,
+            request_body_file,
+            response_file_final,
+            start,
+            status: status_code,
+            prompt_preview,
+            is_sse,
+            record_traffic: recording_enabled,
+            sub_route: prepared.sub_route,
+            logical_key: prepared.logical_key.clone(),
+        };
+        self.forward_async_response_stream(stream, upstream_response, spool_state, sample, meta);
+    }
+
     fn forward_response_stream(
         &self,
         stream: &mut TcpStream,
@@ -825,6 +1377,75 @@ impl ProxyDebugManager {
         sample: Option<Arc<Mutex<Vec<u8>>>>,
         meta: ForwardMeta,
     ) {
+        let mut read_buf = [0u8; 8192];
+        self.forward_response_chunks(
+            stream,
+            spool_state,
+            sample,
+            meta,
+            || match upstream_response.read(&mut read_buf) {
+                Ok(0) => Ok(None),
+                Ok(n) => Ok(Some(read_buf[..n].to_vec())),
+                Err(error) => Err(ForwardReadError::Upstream(error.to_string())),
+            },
+        );
+    }
+
+    fn forward_async_response_stream(
+        &self,
+        stream: &mut TcpStream,
+        mut upstream_response: reqwest::Response,
+        spool_state: Option<Arc<LogSpoolState>>,
+        sample: Option<Arc<Mutex<Vec<u8>>>>,
+        meta: ForwardMeta,
+    ) {
+        let (chunk_sender, chunk_receiver) = mpsc::sync_channel(1);
+        let upstream_task = tauri::async_runtime::spawn(async move {
+            loop {
+                let next = upstream_response
+                    .chunk()
+                    .await
+                    .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+                    .map_err(|error| error.to_string());
+                let complete = matches!(next, Ok(None) | Err(_));
+                if chunk_sender.send(next).is_err() || complete {
+                    break;
+                }
+            }
+        });
+        let disconnect_probe = stream.try_clone().ok();
+        self.forward_response_chunks(stream, spool_state, sample, meta, || loop {
+            match chunk_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(chunk)) => return Ok(chunk),
+                Ok(Err(error)) => return Err(ForwardReadError::Upstream(error)),
+                Err(RecvTimeoutError::Timeout) => {
+                    if disconnect_probe
+                        .as_ref()
+                        .is_some_and(client_socket_disconnected)
+                    {
+                        return Err(ForwardReadError::ClientCancelled);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ForwardReadError::Upstream(
+                        "Upstream response task stopped unexpectedly".to_string(),
+                    ));
+                }
+            }
+        });
+        upstream_task.abort();
+    }
+
+    fn forward_response_chunks<F>(
+        &self,
+        stream: &mut TcpStream,
+        spool_state: Option<Arc<LogSpoolState>>,
+        sample: Option<Arc<Mutex<Vec<u8>>>>,
+        meta: ForwardMeta,
+        mut next_chunk: F,
+    ) where
+        F: FnMut() -> Result<Option<Vec<u8>>, ForwardReadError>,
+    {
         // Buffer the full response body in memory. No data touches disk until
         // the complete body is redacted — there is no temp file to leak from.
         let mut response_buffer: Vec<u8> = Vec::new();
@@ -832,16 +1453,31 @@ impl ProxyDebugManager {
         let mut client_cancelled = false;
         let mut upstream_error = false;
         let mut first_token_ms = None;
+        let mut forwarded_response_bytes = 0u64;
+        // Per-request usage truth for routed sessions (independent of
+        // recording): scan the SSE stream as it passes through. Exact segment
+        // match keeps /v1/messages/count_tokens (JSON responses) out.
+        let is_routed_message_stream =
+            !meta.session_id.is_empty() && meta.is_sse && meta.path == "/v1/messages";
+        let mut usage_scanner = if is_routed_message_stream {
+            Some(RoutedUsageScanner::default())
+        } else {
+            None
+        };
 
-        let mut read_buf = [0u8; 8192];
         loop {
-            let n = match upstream_response.read(&mut read_buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(err) => {
+            let chunk = match next_chunk() {
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk,
+                Err(ForwardReadError::Upstream(err)) => {
                     upstream_error = true;
                     response_incomplete = true;
                     eprintln!("Upstream read error: {}", err);
+                    break;
+                }
+                Err(ForwardReadError::ClientCancelled) => {
+                    client_cancelled = true;
+                    response_incomplete = true;
                     break;
                 }
             };
@@ -850,7 +1486,11 @@ impl ProxyDebugManager {
                 first_token_ms = Some(meta.start.elapsed().as_millis() as u64);
             }
 
-            let chunk = &read_buf[..n];
+            if let Some(scanner) = usage_scanner.as_mut() {
+                scanner.feed(&chunk);
+            }
+
+            forwarded_response_bytes = forwarded_response_bytes.saturating_add(chunk.len() as u64);
 
             if let Some(sample) = &sample {
                 let mut guard = sample.lock().unwrap();
@@ -871,7 +1511,7 @@ impl ProxyDebugManager {
                 // Accumulate response body in memory for post-stream redaction.
                 // No data touches disk until the complete body is redacted.
                 if response_buffer.len() + chunk.len() <= RESPONSE_BUFFER_LIMIT {
-                    response_buffer.extend_from_slice(chunk);
+                    response_buffer.extend_from_slice(&chunk);
                 } else {
                     let remaining = RESPONSE_BUFFER_LIMIT.saturating_sub(response_buffer.len());
                     if remaining > 0 {
@@ -885,7 +1525,7 @@ impl ProxyDebugManager {
                 }
             }
 
-            if let Err(err) = write_chunk(stream, chunk) {
+            if let Err(err) = write_chunk(stream, &chunk) {
                 response_incomplete = true;
                 client_cancelled = true;
                 eprintln!("Proxy downstream write error: {}", err);
@@ -893,8 +1533,48 @@ impl ProxyDebugManager {
             }
         }
 
-        let _ = write_chunk_end(stream);
-        let _ = stream.flush();
+        if !response_incomplete {
+            if let Err(error) = write_chunk_end(stream).and_then(|_| {
+                stream
+                    .flush()
+                    .map_err(|flush_error| format!("Failed to flush response: {flush_error}"))
+            }) {
+                response_incomplete = true;
+                client_cancelled = true;
+                eprintln!("Proxy downstream completion error: {error}");
+            }
+        }
+
+        // Append one router request-ledger entry per forwarded routed message
+        // request — ALWAYS, so requests without usage stay countable instead of
+        // silently disappearing. `usage` is upstream self-reported SSE data
+        // (observational); None when no usage frame was seen.
+        if let Some(scanner) = usage_scanner {
+            let usage = scanner.has_usage().then_some({
+                crate::event_bus::RoutedUsageTotals {
+                    input_tokens: scanner.input_tokens,
+                    output_tokens: scanner.output_tokens,
+                    cache_read_tokens: scanner.cache_read_tokens,
+                    cache_creation_tokens: scanner.cache_creation_tokens,
+                }
+            });
+            let runtime_id = meta.session_id.clone();
+            let target_env = meta.env_name.clone();
+            self.emit_routed_usage(
+                &runtime_id,
+                crate::event_bus::SessionEventPayload::RoutedRequest {
+                    provider: "claude".to_string(),
+                    request_id: meta.id.clone(),
+                    target_env,
+                    sub_route: meta.sub_route,
+                    model: scanner.model,
+                    logical_key: meta.logical_key.clone(),
+                    status: meta.status,
+                    complete: !response_incomplete,
+                    usage,
+                },
+            );
+        }
 
         let (log_dropped, log_partial, log_dropped_bytes, response_body_size) =
             if let Some(ref spool_state) = spool_state {
@@ -905,7 +1585,7 @@ impl ProxyDebugManager {
                     spool_state.response_bytes.load(Ordering::Relaxed),
                 )
             } else {
-                (false, false, 0, 0)
+                (false, false, 0, forwarded_response_bytes)
             };
 
         let reduced = if meta.is_sse {
@@ -960,6 +1640,7 @@ impl ProxyDebugManager {
 
         let duration_ms = meta.start.elapsed().as_millis() as u64;
 
+        let record_traffic = meta.record_traffic;
         let record = TrafficRecord {
             id: meta.id,
             timestamp: meta.timestamp,
@@ -985,14 +1666,16 @@ impl ProxyDebugManager {
             reduced,
         };
 
-        if let Err(err) = append_record(&record) {
-            eprintln!("Failed to append proxy traffic record: {}", err);
-        } else {
-            let item = record.to_item();
-            self.emit_traffic(&item);
-            let max_bytes = self.runtime_config.lock().unwrap().log_max_bytes;
-            if let Err(err) = enforce_log_retention(max_bytes) {
-                eprintln!("Failed to enforce proxy log retention: {}", err);
+        if record_traffic {
+            if let Err(err) = append_record(&record) {
+                eprintln!("Failed to append proxy traffic record: {}", err);
+            } else {
+                let item = record.to_item();
+                self.emit_traffic(&item);
+                let max_bytes = self.runtime_config.lock().unwrap().log_max_bytes;
+                if let Err(err) = enforce_log_retention(max_bytes) {
+                    eprintln!("Failed to enforce proxy log retention: {}", err);
+                }
             }
         }
 
@@ -1112,12 +1795,38 @@ fn write_error_response(
         .map_err(|e| format!("Failed to flush error response: {}", e))
 }
 
+fn write_json_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    payload: &Value,
+) -> Result<(), String> {
+    let payload = serde_json::to_vec(payload)
+        .map_err(|error| format!("Failed to encode JSON response: {error}"))?;
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        status_code,
+        status_reason(status_code),
+        payload.len()
+    )
+    .map_err(|error| format!("Failed to write JSON response headers: {error}"))?;
+    stream
+        .write_all(&payload)
+        .and_then(|_| stream.flush())
+        .map_err(|error| format!("Failed to write JSON response: {error}"))
+}
+
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         410 => "Gone",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -1127,6 +1836,17 @@ fn status_reason(status: u16) -> &'static str {
 }
 
 fn read_http_request<R: Read>(stream: &mut R) -> Result<ParsedRequest, String> {
+    read_http_request_with_preflight(stream, |_, _, _| Ok(()))
+}
+
+fn read_http_request_with_preflight<R, F>(
+    stream: &mut R,
+    preflight: F,
+) -> Result<ParsedRequest, String>
+where
+    R: Read,
+    F: FnOnce(&str, &str, &HashMap<String, String>) -> Result<(), String>,
+{
     let started_at = Instant::now();
     let mut raw = Vec::<u8>::new();
     let mut buf = [0u8; 8192];
@@ -1173,24 +1893,71 @@ fn read_http_request<R: Read>(stream: &mut R) -> Result<ParsedRequest, String> {
     let _version = request_line_parts
         .next()
         .ok_or_else(|| "Missing HTTP version".to_string())?;
+    let body_limit = if split_target(&target).0.starts_with("/s/") {
+        ROUTER_BODY_READ_LIMIT
+    } else {
+        BODY_READ_LIMIT
+    };
 
     let mut headers = HashMap::new();
+    let mut content_length = None;
+    let mut transfer_encoding_chunked = false;
+    let mut content_encoding_seen = false;
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "Malformed request header".to_string())?;
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err("Malformed request header".to_string());
         }
-    }
+        let value = value.trim();
 
-    let body = if is_chunked_request(&headers) {
-        read_chunked_body(stream, &mut body_rest)?
-    } else if let Some(content_length) = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        if content_length > BODY_READ_LIMIT {
+        match name.as_str() {
+            "content-length" => {
+                if content_length.is_some() {
+                    return Err("Duplicate Content-Length headers are not allowed".to_string());
+                }
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err("Invalid Content-Length header".to_string());
+                }
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid Content-Length header".to_string())?,
+                );
+            }
+            "transfer-encoding" => {
+                if transfer_encoding_chunked || headers.contains_key("transfer-encoding") {
+                    return Err("Duplicate Transfer-Encoding headers are not allowed".to_string());
+                }
+                if !value.eq_ignore_ascii_case("chunked") {
+                    return Err("Unsupported Transfer-Encoding header".to_string());
+                }
+                transfer_encoding_chunked = true;
+            }
+            "content-encoding" => {
+                if content_encoding_seen {
+                    return Err("Duplicate Content-Encoding headers are not allowed".to_string());
+                }
+                content_encoding_seen = true;
+            }
+            _ => {}
+        }
+        headers.insert(name, value.to_string());
+    }
+    if transfer_encoding_chunked && content_length.is_some() {
+        return Err("Transfer-Encoding and Content-Length cannot be combined".to_string());
+    }
+    preflight(&method, &target, &headers)?;
+
+    let body = if transfer_encoding_chunked {
+        read_chunked_body(stream, &mut body_rest, body_limit)?
+    } else if let Some(content_length) = content_length {
+        if content_length > body_limit {
             return Err("Request body exceeds limit".to_string());
         }
 
@@ -1216,7 +1983,11 @@ fn read_http_request<R: Read>(stream: &mut R) -> Result<ParsedRequest, String> {
     })
 }
 
-fn read_chunked_body<R: Read>(stream: &mut R, remain: &mut Vec<u8>) -> Result<Vec<u8>, String> {
+fn read_chunked_body<R: Read>(
+    stream: &mut R,
+    remain: &mut Vec<u8>,
+    body_limit: usize,
+) -> Result<Vec<u8>, String> {
     let started_at = Instant::now();
     let mut out = Vec::new();
 
@@ -1227,17 +1998,29 @@ fn read_chunked_body<R: Read>(stream: &mut R, remain: &mut Vec<u8>) -> Result<Ve
             .map_err(|e| format!("Invalid chunk size '{}': {}", size_hex, e))?;
 
         if size == 0 {
-            // Consume trailing CRLF and optional trailer headers.
-            let _ = read_line_from_buffer_or_stream(stream, remain, started_at)?;
+            // Consume optional trailer headers through the terminating empty line.
+            loop {
+                if read_line_from_buffer_or_stream(stream, remain, started_at)?.is_empty() {
+                    break;
+                }
+            }
             break;
         }
 
-        let chunk_with_crlf = read_exact_bytes(stream, remain, size + 2, started_at)?;
-        out.extend_from_slice(&chunk_with_crlf[..size]);
-
-        if out.len() > BODY_READ_LIMIT {
+        let remaining_capacity = body_limit
+            .checked_sub(out.len())
+            .ok_or_else(|| "Chunked request body exceeds limit".to_string())?;
+        if size > remaining_capacity {
             return Err("Chunked request body exceeds limit".to_string());
         }
+        let encoded_size = size
+            .checked_add(2)
+            .ok_or_else(|| "Chunk size exceeds platform limits".to_string())?;
+        let chunk_with_crlf = read_exact_bytes(stream, remain, encoded_size, started_at)?;
+        if &chunk_with_crlf[size..] != b"\r\n" {
+            return Err("Chunk data is missing its CRLF terminator".to_string());
+        }
+        out.extend_from_slice(&chunk_with_crlf[..size]);
     }
 
     Ok(out)
@@ -1256,6 +2039,10 @@ fn read_line_from_buffer_or_stream<R: Read>(
                 .map_err(|e| format!("Invalid UTF-8 in chunked line: {}", e));
         }
 
+        if remain.len() > CHUNK_LINE_READ_LIMIT {
+            return Err("Chunked request line exceeds limit".to_string());
+        }
+
         let mut buf = [0u8; 4096];
         let n = read_stream_with_retry(stream, &mut buf, started_at, "chunked line")?;
         if n == 0 {
@@ -1263,6 +2050,28 @@ fn read_line_from_buffer_or_stream<R: Read>(
         }
         remain.extend_from_slice(&buf[..n]);
     }
+}
+
+fn client_socket_disconnected(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let result = match stream.peek(&mut probe) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+    };
+    let _ = stream.set_nonblocking(false);
+    result
 }
 
 fn read_exact_bytes<R: Read>(
@@ -1340,6 +2149,31 @@ fn parse_proxy_path(path: &str) -> Option<ParsedProxyPath> {
     Some(ParsedProxyPath {
         client,
         route_id,
+        upstream_path,
+    })
+}
+
+fn parse_router_path(path: &str) -> Option<ParsedRouterPath> {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if segments.len() < 2 || segments[0] != "s" {
+        return None;
+    }
+    let session_key = segments[1];
+    if session_key.is_empty()
+        || session_key.len() > 256
+        || !session_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let upstream_path = if segments.len() > 2 {
+        format!("/{}", segments[2..].join("/"))
+    } else {
+        "/".to_string()
+    };
+    Some(ParsedRouterPath {
+        session_key: session_key.to_string(),
         upstream_path,
     })
 }
@@ -1514,13 +2348,6 @@ fn redact_json_value(value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(redact_json_value).collect()),
         _ => value.clone(),
     }
-}
-
-fn is_chunked_request(headers: &HashMap<String, String>) -> bool {
-    headers
-        .get("transfer-encoding")
-        .map(|value| value.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
 }
 
 fn find_double_crlf(bytes: &[u8]) -> Option<usize> {
@@ -1794,7 +2621,18 @@ fn append_chat_completion_content(value: &Value, output: &mut Vec<String>) {
 }
 
 fn proxy_debug_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_PROXY_DEBUG_DIR.with(|path| path.borrow().clone()) {
+        return path;
+    }
+
     config::get_ccem_dir().join("proxy-debug")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PROXY_DEBUG_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn bodies_dir() -> PathBuf {
@@ -1932,7 +2770,12 @@ fn list_traffic_records(limit: u32, cursor: Option<String>) -> Result<ProxyTraff
                 .into_iter()
                 .filter(|entry| cursor_allows_entry(entry, cursor.as_ref()))
             {
-                let record = read_record_at_index_entry(&entry)?;
+                // A single corrupt record at its indexed offset (e.g. a torn
+                // line from a concurrent append) must not take down the whole
+                // traffic list — skip it and keep serving readable records.
+                let Ok(record) = read_record_at_index_entry(&entry) else {
+                    continue;
+                };
                 if items.len() == limit {
                     has_more = true;
                     break;
@@ -2410,45 +3253,404 @@ fn generate_request_id() -> String {
 mod tests {
     use super::{
         append_record, bodies_dir, build_sse_reduced, compose_upstream_url, dir_size,
-        enforce_log_retention, extract_prompt_preview, list_traffic_records, parse_proxy_path,
-        proxy_debug_dir, read_http_request, read_record_by_id, recompute_reduced_detail,
+        enforce_log_retention, ensure_proxy_debug_dirs, extract_prompt_preview,
+        list_traffic_records, parse_proxy_path, parse_router_path, proxy_debug_dir,
+        read_chunked_body, read_http_request, read_record_by_id, recompute_reduced_detail,
         redact_body_bytes, redact_body_text, redact_headers, redact_json_value, traffic_idx_path,
-        validate_upstream_url, ReducedStreamLog, TrafficRecord, REDACTED_MARKER,
+        traffic_jsonl_path, validate_upstream_url, ForwardMeta, ForwardReadError, ParsedRequest,
+        ProxyDebugManager, ReducedStreamLog, RegisterRouteRequest, RouteBinding,
+        RoutedUsageScanner, TrafficRecord, REDACTED_MARKER,
     };
     use std::collections::{HashMap, VecDeque};
     use std::fs;
-    use std::io::{self, ErrorKind, Read};
-    use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
+    use std::io::{self, ErrorKind, Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    struct HomeEnvGuard {
-        previous: Option<std::ffi::OsString>,
+    static ROUTER_SOCKET_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct ProxyDebugDirGuard {
+        previous: Option<std::path::PathBuf>,
     }
 
-    impl HomeEnvGuard {
-        fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
+    impl ProxyDebugDirGuard {
+        fn set(path: std::path::PathBuf) -> Self {
+            let previous = super::TEST_PROXY_DEBUG_DIR.with(|current| current.replace(Some(path)));
             Self { previous }
         }
     }
 
-    impl Drop for HomeEnvGuard {
+    impl Drop for ProxyDebugDirGuard {
         fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var("HOME", previous);
-            } else {
-                std::env::remove_var("HOME");
-            }
+            super::TEST_PROXY_DEBUG_DIR.with(|current| {
+                let _ = current.replace(self.previous.take());
+            });
         }
     }
 
-    fn with_temp_proxy_home<T>(f: impl FnOnce() -> T) -> T {
-        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _lock = HOME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let temp = tempfile::tempdir().expect("create temp home");
-        let _home = HomeEnvGuard::set(temp.path());
+    fn with_temp_proxy_dir<T>(f: impl FnOnce() -> T) -> T {
+        let temp = tempfile::tempdir().expect("create temp proxy directory");
+        let expected = temp.path().join("proxy-debug");
+        let _dir = ProxyDebugDirGuard::set(expected.clone());
+        assert_eq!(proxy_debug_dir(), expected);
         f()
+    }
+
+    fn test_manager() -> Arc<ProxyDebugManager> {
+        ProxyDebugManager::new(
+            Arc::new(crate::session::SessionManager::default()),
+            Arc::new(crate::router::RouterManager::new(
+                crate::router::RouterConfig::default(),
+            )),
+        )
+        .expect("create proxy debug manager")
+    }
+
+    fn test_manager_with_shared_listener() -> Arc<ProxyDebugManager> {
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve router port");
+        let port = reservation
+            .local_addr()
+            .expect("read reserved router address")
+            .port();
+        drop(reservation);
+
+        let manager = ProxyDebugManager::new(
+            Arc::new(crate::session::SessionManager::default()),
+            Arc::new(crate::router::RouterManager::new(
+                crate::router::RouterConfig {
+                    port,
+                    ..crate::router::RouterConfig::default()
+                },
+            )),
+        )
+        .expect("create routed proxy manager");
+        manager.runtime_config.lock().unwrap().enabled = false;
+        manager
+    }
+
+    struct RunningProxy {
+        manager: Arc<ProxyDebugManager>,
+        port: u16,
+    }
+
+    impl RunningProxy {
+        fn start(manager: Arc<ProxyDebugManager>) -> Self {
+            let port = tauri::async_runtime::block_on(manager.ensure_running())
+                .expect("start shared router listener");
+            Self { manager, port }
+        }
+    }
+
+    impl Drop for RunningProxy {
+        fn drop(&mut self) {
+            self.manager.stop_runtime(false);
+        }
+    }
+
+    fn unique_router_fixture_name(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            ROUTER_SOCKET_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn test_router_env(
+        name: &str,
+        upstream_address: std::net::SocketAddr,
+        token: &str,
+        sonnet_model: &str,
+    ) -> impl Drop {
+        crate::router::register_test_router_environment(
+            name,
+            crate::config::EnvConfig {
+                base_url: Some(format!("http://{upstream_address}")),
+                auth_token: Some(token.to_string()),
+                default_opus_model: None,
+                default_sonnet_model: Some(sonnet_model.to_string()),
+                default_haiku_model: None,
+                model: Some(sonnet_model.to_string()),
+                subagent_model: None,
+                limit_write_tools: false,
+            },
+        )
+    }
+
+    fn token_router_record(
+        session_key: &str,
+        route_nonce: &str,
+        target_env: &str,
+    ) -> crate::router::SessionRouterRecord {
+        crate::router::SessionRouterRecord {
+            session_key: session_key.to_string(),
+            route_tag_nonce: route_nonce.to_string(),
+            default_env: target_env.to_string(),
+            bindings: HashMap::from([("subagent:Explore".to_string(), target_env.to_string())]),
+            allowed_envs: vec![target_env.to_string()],
+            source_profile_id: None,
+            profile_revision: None,
+            dynamic_routing: true,
+            revision: 0,
+            router_auth_capability: crate::router::RouterAuthCapability::Token,
+            launch_transport: crate::router::LaunchTransport::Routed,
+            launch_auth_kind: crate::router::LaunchAuthKind::Token,
+            launch_default_env: "launch-origin".to_string(),
+            launch_model_pins: crate::router::RouterModelPins {
+                default_sonnet_model: Some("launch-sonnet".to_string()),
+                ..crate::router::RouterModelPins::default()
+            },
+            warnings: Vec::new(),
+        }
+    }
+
+    fn open_http_client(port: u16, target: &str, body: &[u8]) -> TcpStream {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect router listener");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set router client read timeout");
+        write!(
+            client,
+            "POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAnthropic-Version: 2023-06-01\r\nAuthorization: Bearer stale-client-token\r\nX-Api-Key: stale-client-key\r\nCookie: stale-client-cookie\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .expect("write router request headers");
+        client.write_all(body).expect("write router request body");
+        client.flush().expect("flush router request");
+        client
+    }
+
+    fn read_complete_http_response(mut client: TcpStream) -> Vec<u8> {
+        let mut wire = Vec::new();
+        client
+            .read_to_end(&mut wire)
+            .expect("read complete proxy response");
+        wire
+    }
+
+    fn assert_immediate_status_without_body(
+        manager: Arc<ProxyDebugManager>,
+        request_headers: &str,
+        expected_status_line: &str,
+        expected_code: &str,
+    ) {
+        let (mut client, server) = loopback_pair();
+        client
+            .set_read_timeout(Some(Duration::from_millis(750)))
+            .expect("set immediate-response timeout");
+        let handler = thread::spawn(move || manager.handle_connection(server));
+        client
+            .write_all(request_headers.as_bytes())
+            .expect("write request headers without body");
+        client.flush().expect("flush request headers without body");
+
+        let mut response = Vec::new();
+        match client.read_to_end(&mut response) {
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                let _ = client.shutdown(Shutdown::Both);
+                handler.join().expect("join timed-out request handler");
+                panic!("handler waited for declared body before returning {expected_status_line}");
+            }
+            Err(error) => panic!("read immediate response: {error}"),
+        }
+        handler.join().expect("join immediate-response handler");
+
+        let response = String::from_utf8(response).expect("immediate response is UTF-8");
+        assert!(
+            response.starts_with(expected_status_line),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains(&format!("\"code\":\"{expected_code}\"")),
+            "unexpected error payload: {response}"
+        );
+    }
+
+    fn decode_chunked_response(wire: &[u8]) -> (String, Vec<u8>) {
+        let header_end = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response header terminator");
+        let headers =
+            String::from_utf8(wire[..header_end].to_vec()).expect("response headers are UTF-8");
+        let mut body_reader = &wire[header_end + 4..];
+        let mut remain = Vec::new();
+        let body = read_chunked_body(&mut body_reader, &mut remain, 1024 * 1024)
+            .expect("decode downstream chunked response");
+        (headers, body)
+    }
+
+    fn spawn_json_upstream(
+        response_body: &'static [u8],
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::Receiver<ParsedRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock JSON upstream");
+        let address = listener
+            .local_addr()
+            .expect("read mock JSON upstream address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept routed JSON request");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set mock JSON upstream read timeout");
+            let request = read_http_request(&mut socket).expect("parse routed JSON request");
+            request_tx.send(request).expect("capture routed request");
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .expect("write mock JSON response headers");
+            socket
+                .write_all(response_body)
+                .expect("write mock JSON response body");
+            socket.flush().expect("flush mock JSON response");
+        });
+        (address, request_rx, handle)
+    }
+
+    struct StreamingUpstream {
+        address: std::net::SocketAddr,
+        request: mpsc::Receiver<ParsedRequest>,
+        first_chunk_sent: mpsc::Receiver<()>,
+        release_second_chunk: mpsc::Sender<()>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn spawn_streaming_upstream(first: &'static [u8], second: &'static [u8]) -> StreamingUpstream {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock SSE upstream");
+        let address = listener.local_addr().expect("read mock SSE address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept routed SSE request");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set mock SSE upstream read timeout");
+            let request = read_http_request(&mut socket).expect("parse routed SSE request");
+            request_tx
+                .send(request)
+                .expect("capture routed SSE request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .expect("write mock SSE headers");
+            super::write_chunk(&mut socket, first).expect("write first upstream SSE chunk");
+            first_tx.send(()).expect("signal first upstream chunk");
+            release_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("release second upstream SSE chunk");
+            super::write_chunk(&mut socket, second).expect("write second upstream SSE chunk");
+            super::write_chunk_end(&mut socket).expect("finish upstream SSE chunks");
+            socket.flush().expect("flush complete mock SSE response");
+        });
+        StreamingUpstream {
+            address,
+            request: request_rx,
+            first_chunk_sent: first_rx,
+            release_second_chunk: release_tx,
+            handle,
+        }
+    }
+
+    fn register_test_router(manager: &ProxyDebugManager, session_key: &str) {
+        manager
+            .router_manager
+            .register(
+                "test-runtime",
+                1,
+                crate::router::SessionRouterRecord {
+                    session_key: session_key.to_string(),
+                    route_tag_nonce: "test-nonce".to_string(),
+                    default_env: "official".to_string(),
+                    bindings: HashMap::new(),
+                    allowed_envs: vec!["official".to_string()],
+                    source_profile_id: None,
+                    profile_revision: None,
+                    dynamic_routing: true,
+                    revision: 0,
+                    router_auth_capability: crate::router::RouterAuthCapability::Oauth,
+                    launch_transport: crate::router::LaunchTransport::Routed,
+                    launch_auth_kind: crate::router::LaunchAuthKind::Oauth,
+                    launch_default_env: "official".to_string(),
+                    launch_model_pins: crate::router::RouterModelPins::default(),
+                    warnings: Vec::new(),
+                },
+            )
+            .expect("register test router session");
+    }
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let address = listener.local_addr().expect("read loopback address");
+        let client = TcpStream::connect(address).expect("connect loopback client");
+        let (server, _) = listener.accept().expect("accept loopback client");
+        (client, server)
+    }
+
+    fn parse_request_over_loopback(request: &[u8]) -> Result<ParsedRequest, String> {
+        let (mut client, mut server) = loopback_pair();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set parser socket read timeout");
+        let parser = thread::spawn(move || read_http_request(&mut server));
+        client.write_all(request).expect("write parser request");
+        client.flush().expect("flush parser request");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("close parser request write side");
+        parser.join().expect("join request parser")
+    }
+
+    fn read_chunked_over_loopback(wire: &[u8], body_limit: usize) -> Result<Vec<u8>, String> {
+        let (mut client, mut server) = loopback_pair();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set chunk parser socket read timeout");
+        let parser = thread::spawn(move || {
+            let mut remain = Vec::new();
+            read_chunked_body(&mut server, &mut remain, body_limit)
+        });
+        client.write_all(wire).expect("write chunked wire bytes");
+        client.flush().expect("flush chunked wire bytes");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("close chunk parser write side");
+        parser.join().expect("join chunk parser")
+    }
+
+    fn test_forward_meta() -> ForwardMeta {
+        ForwardMeta {
+            id: "test-request".to_string(),
+            timestamp: 0,
+            client: "claude".to_string(),
+            session_id: "test-session".to_string(),
+            env_name: "official".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            query: None,
+            request_headers: HashMap::new(),
+            response_headers: HashMap::new(),
+            request_body_size: 0,
+            request_body_file: None,
+            response_file_final: None,
+            start: Instant::now(),
+            status: 200,
+            prompt_preview: None,
+            is_sse: true,
+            record_traffic: false,
+            sub_route: false,
+            logical_key: None,
+        }
     }
 
     fn sample_traffic_record(index: usize, timestamp: i64) -> TrafficRecord {
@@ -2482,11 +3684,1326 @@ mod tests {
     }
 
     #[test]
+    fn router_socket_emits_routed_request_ledger_entry_with_usage() {
+        with_temp_proxy_dir(|| {
+            // GLM-style stream: zeros in message_start, cumulative truth in
+            // message_delta — the ledger must normalize across both frames.
+            const FIRST_EVENT: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"target-glm\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n";
+            const SECOND_EVENT: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":900,\"output_tokens\":120,\"cache_read_input_tokens\":70}}\n\n";
+            let StreamingUpstream {
+                address,
+                request: _upstream_request,
+                first_chunk_sent,
+                release_second_chunk,
+                handle: upstream_handle,
+            } = spawn_streaming_upstream(FIRST_EVENT, SECOND_EVENT);
+            let env_name = unique_router_fixture_name("router-ledger");
+            let _env_override =
+                test_router_env(&env_name, address, "fixture-token-ledger", "target-glm");
+
+            let manager = test_manager_with_shared_listener();
+            let (ledger_tx, ledger_rx) = mpsc::channel();
+            manager.set_routed_usage_sink(Arc::new(
+                move |runtime_id: &str, payload: crate::event_bus::SessionEventPayload| {
+                    let _ = ledger_tx.send((runtime_id.to_string(), payload));
+                },
+            ));
+            manager
+                .router_manager
+                .register(
+                    "runtime-ledger",
+                    1,
+                    token_router_record("session-ledger", "nonce-ledger", &env_name),
+                )
+                .expect("register ledger route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "<CCEM-ROUTE nonce=\"nonce-ledger\">subagent:Explore</CCEM-ROUTE>\nledger proof"
+                    }]
+                }]
+            }))
+            .expect("encode ledger request");
+            let mut client = open_http_client(running.port, "/s/session-ledger/v1/messages", &body);
+
+            first_chunk_sent
+                .recv_timeout(Duration::from_secs(2))
+                .expect("mock upstream first chunk");
+            release_second_chunk
+                .send(())
+                .expect("release second mock SSE chunk");
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).expect("read full response");
+            upstream_handle.join().expect("join mock upstream");
+
+            let (runtime_id, payload) = ledger_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ledger entry must be emitted");
+            assert_eq!(runtime_id, "runtime-ledger");
+            let crate::event_bus::SessionEventPayload::RoutedRequest {
+                request_id,
+                target_env,
+                sub_route,
+                model,
+                logical_key,
+                status,
+                complete,
+                usage,
+                ..
+            } = payload
+            else {
+                panic!("expected RoutedRequest ledger entry");
+            };
+            assert!(!request_id.is_empty(), "request identity must be stable");
+            assert_eq!(target_env, env_name);
+            assert!(
+                sub_route,
+                "subagent-marker requests are sub-route BY IDENTITY"
+            );
+            assert_eq!(model.as_deref(), Some("target-glm"));
+            assert_eq!(logical_key.as_deref(), Some("subagent:Explore"));
+            assert_eq!(status, 200);
+            assert!(complete);
+            let usage = usage.expect("usage must be present for usage-bearing SSE");
+            assert_eq!(usage.input_tokens, 900);
+            assert_eq!(usage.output_tokens, 120);
+            assert_eq!(usage.cache_read_tokens, 70);
+            assert_eq!(usage.cache_creation_tokens, 0);
+            assert!(
+                ledger_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                "exactly one ledger entry per forwarded request"
+            );
+        });
+    }
+
+    #[test]
+    fn router_socket_emits_ledger_entry_without_usage_for_usageless_stream() {
+        with_temp_proxy_dir(|| {
+            // No usage frame anywhere: the request must still be ledgered
+            // (usage None), so it lands in the unattributed bucket instead of
+            // silently disappearing from the distribution.
+            const FIRST_EVENT: &[u8] =
+                b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n";
+            const SECOND_EVENT: &[u8] =
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            let StreamingUpstream {
+                address,
+                request: _upstream_request,
+                first_chunk_sent,
+                release_second_chunk,
+                handle: upstream_handle,
+            } = spawn_streaming_upstream(FIRST_EVENT, SECOND_EVENT);
+            let env_name = unique_router_fixture_name("router-nousage");
+            let _env_override =
+                test_router_env(&env_name, address, "fixture-token-nousage", "target-x");
+
+            let manager = test_manager_with_shared_listener();
+            let (ledger_tx, ledger_rx) = mpsc::channel();
+            manager.set_routed_usage_sink(Arc::new(
+                move |runtime_id: &str, payload: crate::event_bus::SessionEventPayload| {
+                    let _ = ledger_tx.send((runtime_id.to_string(), payload));
+                },
+            ));
+            manager
+                .router_manager
+                .register(
+                    "runtime-nousage",
+                    1,
+                    token_router_record("session-nousage", "nonce-nousage", &env_name),
+                )
+                .expect("register route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "<CCEM-ROUTE nonce=\"nonce-nousage\">subagent:Explore</CCEM-ROUTE>\nno usage"
+                    }]
+                }]
+            }))
+            .expect("encode request");
+            let mut client =
+                open_http_client(running.port, "/s/session-nousage/v1/messages", &body);
+            first_chunk_sent
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first chunk");
+            release_second_chunk.send(()).expect("release second");
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).expect("read response");
+            upstream_handle.join().expect("join upstream");
+
+            let (runtime_id, payload) = ledger_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("usage-less request must still be ledgered");
+            assert_eq!(runtime_id, "runtime-nousage");
+            let crate::event_bus::SessionEventPayload::RoutedRequest {
+                usage,
+                status,
+                complete,
+                ..
+            } = &payload
+            else {
+                panic!("expected RoutedRequest ledger entry");
+            };
+            assert_eq!(*status, 200);
+            assert!(*complete);
+            assert!(
+                usage.is_none(),
+                "missing usage must stay None, never zero-filled"
+            );
+        });
+    }
+
+    #[test]
+    fn native_router_socket_rewrites_token_model_and_streams_complete_sse_when_debug_is_off() {
+        with_temp_proxy_dir(|| {
+            const FIRST_EVENT: &[u8] =
+                b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"first\"}}\n\n";
+            const SECOND_EVENT: &[u8] =
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            let StreamingUpstream {
+                address,
+                request: upstream_request,
+                first_chunk_sent,
+                release_second_chunk,
+                handle: upstream_handle,
+            } = spawn_streaming_upstream(FIRST_EVENT, SECOND_EVENT);
+            let env_name = unique_router_fixture_name("router-sse");
+            let _env_override =
+                test_router_env(&env_name, address, "fixture-token-sse", "target-sse-sonnet");
+
+            let manager = test_manager_with_shared_listener();
+            assert!(
+                !manager.is_enabled(),
+                "proxy debug recording must be off for this native route proof"
+            );
+            manager
+                .router_manager
+                .register(
+                    "runtime-sse",
+                    1,
+                    token_router_record("session-sse", "nonce-sse", &env_name),
+                )
+                .expect("register native SSE route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "<CCEM-ROUTE nonce=\"nonce-sse\">subagent:Explore</CCEM-ROUTE>\ninspect transport"
+                    }]
+                }]
+            }))
+            .expect("encode routed SSE request");
+            let mut client = open_http_client(
+                running.port,
+                "/s/session-sse/v1/messages?beta=socket-proof",
+                &body,
+            );
+
+            first_chunk_sent
+                .recv_timeout(Duration::from_secs(2))
+                .expect("mock upstream should emit first SSE chunk");
+            let mut partial_wire = Vec::new();
+            let mut read_buf = [0u8; 1024];
+            while !partial_wire
+                .windows(FIRST_EVENT.len())
+                .any(|window| window == FIRST_EVENT)
+            {
+                let read = client
+                    .read(&mut read_buf)
+                    .expect("read first streamed downstream bytes");
+                assert!(read > 0, "proxy closed before forwarding first SSE chunk");
+                partial_wire.extend_from_slice(&read_buf[..read]);
+            }
+            assert!(
+                !partial_wire
+                    .windows(SECOND_EVENT.len())
+                    .any(|window| window == SECOND_EVENT),
+                "second SSE event arrived before the upstream released it"
+            );
+
+            release_second_chunk
+                .send(())
+                .expect("release second mock SSE chunk");
+            client
+                .read_to_end(&mut partial_wire)
+                .expect("read remaining streamed downstream bytes");
+            let (response_headers, response_body) = decode_chunked_response(&partial_wire);
+            assert!(response_headers.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(response_headers.contains("content-type: text/event-stream"));
+            assert_eq!(
+                response_body,
+                [FIRST_EVENT, SECOND_EVENT].concat(),
+                "the downstream stream must contain both upstream SSE chunks intact"
+            );
+
+            let request = upstream_request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capture rewritten upstream SSE request");
+            assert_eq!(request.target, "/v1/messages?beta=socket-proof");
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer fixture-token-sse")
+            );
+            assert!(!request.headers.contains_key("x-api-key"));
+            assert!(!request.headers.contains_key("cookie"));
+            assert_eq!(
+                request.headers.get("anthropic-version").map(String::as_str),
+                Some("2023-06-01")
+            );
+            let request_json: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("parse rewritten upstream body");
+            assert_eq!(request_json["model"], "target-sse-sonnet");
+            assert_eq!(
+                request_json["messages"][0]["content"][0]["text"],
+                "inspect transport"
+            );
+            assert!(
+                !String::from_utf8_lossy(&request.body).contains("CCEM-ROUTE"),
+                "authenticated route markers must not reach the upstream"
+            );
+
+            upstream_handle.join().expect("join mock SSE upstream");
+            drop(running);
+            let state = manager.get_state();
+            assert_eq!(state.metrics.success_requests, 1);
+        });
+    }
+
+    #[test]
+    fn native_router_returns_upstream_302_without_following_redirect() {
+        with_temp_proxy_dir(|| {
+            let redirect_destination =
+                TcpListener::bind(("127.0.0.1", 0)).expect("bind redirect destination");
+            let redirect_destination_address = redirect_destination
+                .local_addr()
+                .expect("read redirect destination address");
+            redirect_destination
+                .set_nonblocking(true)
+                .expect("set redirect destination nonblocking");
+
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind redirect upstream");
+            let upstream_address = upstream
+                .local_addr()
+                .expect("read redirect upstream address");
+            let upstream_handle = thread::spawn(move || {
+                let (mut socket, _) = upstream.accept().expect("accept routed redirect request");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set redirect upstream read timeout");
+                let _request = read_http_request(&mut socket).expect("parse redirect request");
+                let body = b"redirect-must-pass-through";
+                write!(
+                    socket,
+                    "HTTP/1.1 302 Found\r\nlocation: http://{redirect_destination_address}/must-not-follow\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write 302 response headers");
+                socket.write_all(body).expect("write 302 response body");
+                socket.flush().expect("flush 302 response");
+            });
+
+            let env_name = unique_router_fixture_name("router-redirect");
+            let _env_override = test_router_env(
+                &env_name,
+                upstream_address,
+                "fixture-token",
+                "redirect-sonnet",
+            );
+            let manager = test_manager_with_shared_listener();
+            manager
+                .router_manager
+                .register(
+                    "runtime-redirect",
+                    1,
+                    token_router_record("session-redirect", "nonce-redirect", &env_name),
+                )
+                .expect("register redirect route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "messages": [{"role": "user", "content": "redirect proof"}]
+            }))
+            .expect("encode redirect request");
+
+            let wire = read_complete_http_response(open_http_client(
+                running.port,
+                "/s/session-redirect/v1/messages",
+                &body,
+            ));
+            let (headers, response_body) = decode_chunked_response(&wire);
+            assert!(headers.starts_with("HTTP/1.1 302 Found\r\n"));
+            assert!(headers.contains(&format!(
+                "location: http://{redirect_destination_address}/must-not-follow"
+            )));
+            assert_eq!(response_body, b"redirect-must-pass-through");
+
+            upstream_handle.join().expect("join redirect upstream");
+            thread::sleep(Duration::from_millis(100));
+            match redirect_destination.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("router client followed an upstream redirect"),
+                Err(error) => panic!("probe redirect destination: {error}"),
+            }
+        });
+    }
+
+    #[test]
+    fn occupied_requested_port_scans_forward_and_reports_actual_port() {
+        with_temp_proxy_dir(|| {
+            let (requested_port, reservation) = (17_820..17_920)
+                .find_map(|port| {
+                    let reservation = TcpListener::bind(("127.0.0.1", port)).ok()?;
+                    let next = TcpListener::bind(("127.0.0.1", port + 1)).ok()?;
+                    drop(next);
+                    Some((port, reservation))
+                })
+                .expect("find two consecutive router test ports");
+            let manager = ProxyDebugManager::new(
+                Arc::new(crate::session::SessionManager::default()),
+                Arc::new(crate::router::RouterManager::new(
+                    crate::router::RouterConfig {
+                        port: requested_port,
+                        ..crate::router::RouterConfig::default()
+                    },
+                )),
+            )
+            .expect("create port scan manager");
+            manager.runtime_config.lock().unwrap().enabled = false;
+
+            let running = RunningProxy::start(Arc::clone(&manager));
+            assert!(running.port > requested_port);
+            assert!(running.port <= crate::router::ROUTER_PORT_SCAN_END);
+            let status = manager.router_manager.status();
+            assert_eq!(status.requested_port, requested_port);
+            assert_eq!(status.actual_port, Some(running.port));
+            let state = manager.get_state();
+            assert_eq!(state.listen_port, Some(running.port));
+
+            let mut health = TcpStream::connect(("127.0.0.1", running.port))
+                .expect("connect scanned router port");
+            health
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set health response timeout");
+            health
+                .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+                .expect("write health request");
+            health.flush().expect("flush health request");
+            let response = String::from_utf8(read_complete_http_response(health))
+                .expect("health response is UTF-8");
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(response.contains(&format!("\"actualPort\":{}", running.port)));
+
+            drop(reservation);
+        });
+    }
+
+    #[test]
+    fn boot_starts_shared_listener_when_proxy_recording_is_disabled() {
+        with_temp_proxy_dir(|| {
+            let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve router port");
+            let port = reservation
+                .local_addr()
+                .expect("read reserved router address")
+                .port();
+            drop(reservation);
+            let manager = ProxyDebugManager::new(
+                Arc::new(crate::session::SessionManager::default()),
+                Arc::new(crate::router::RouterManager::new(
+                    crate::router::RouterConfig {
+                        port,
+                        ..crate::router::RouterConfig::default()
+                    },
+                )),
+            )
+            .expect("create shared listener manager");
+            manager.runtime_config.lock().unwrap().enabled = false;
+
+            tauri::async_runtime::block_on(manager.maybe_start_on_boot());
+
+            assert_eq!(manager.current_port(), Some(port));
+            assert_eq!(manager.router_manager.status().actual_port, Some(port));
+            tauri::async_runtime::block_on(manager.shutdown());
+        });
+    }
+
+    #[test]
+    fn concurrent_ensure_running_reuses_one_listener_and_one_actual_port() {
+        with_temp_proxy_dir(|| {
+            const WORKERS: usize = 8;
+            let manager = test_manager_with_shared_listener();
+            let start = Arc::new(std::sync::Barrier::new(WORKERS));
+            let mut workers = Vec::new();
+            for _ in 0..WORKERS {
+                let manager = Arc::clone(&manager);
+                let start = Arc::clone(&start);
+                workers.push(thread::spawn(move || {
+                    start.wait();
+                    tauri::async_runtime::block_on(manager.ensure_running())
+                        .expect("start shared router listener")
+                }));
+            }
+
+            let ports = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("join concurrent listener starter"))
+                .collect::<Vec<_>>();
+            let tracked_port = manager.current_port().expect("tracked listener port");
+            tauri::async_runtime::block_on(manager.shutdown());
+
+            assert!(
+                ports.iter().all(|port| *port == tracked_port),
+                "all concurrent starts must reuse one tracked listener; got {ports:?}, tracked={tracked_port}"
+            );
+            TcpListener::bind(("127.0.0.1", tracked_port))
+                .expect("stopping the tracked runtime must release its only listener");
+        });
+    }
+
+    #[test]
+    fn concurrent_legacy_route_registration_reuses_the_tracked_listener() {
+        with_temp_proxy_dir(|| {
+            const WORKERS: usize = 4;
+            let manager = test_manager_with_shared_listener();
+            let start = Arc::new(std::sync::Barrier::new(WORKERS));
+            let mut workers = Vec::new();
+            for index in 0..WORKERS {
+                let manager = Arc::clone(&manager);
+                let start = Arc::clone(&start);
+                workers.push(thread::spawn(move || {
+                    start.wait();
+                    tauri::async_runtime::block_on(manager.register_route(RegisterRouteRequest {
+                        session_id: format!("legacy-session-{index}"),
+                        client: "claude".to_string(),
+                        env_name: "legacy-env".to_string(),
+                        upstream_base_url: "http://127.0.0.1:1".to_string(),
+                    }))
+                    .expect("register legacy route")
+                }));
+            }
+
+            let urls = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("join legacy route registrar"))
+                .collect::<Vec<_>>();
+            let tracked_port = manager.current_port().expect("tracked listener port");
+            assert!(urls.iter().all(|url| {
+                reqwest::Url::parse(url).expect("parse route URL").port() == Some(tracked_port)
+            }));
+            assert_eq!(manager.get_state().route_count, WORKERS);
+
+            tauri::async_runtime::block_on(manager.shutdown());
+            TcpListener::bind(("127.0.0.1", tracked_port))
+                .expect("shutdown must release the registered routes' only listener");
+        });
+    }
+
+    #[test]
+    fn failed_listener_start_remains_retryable() {
+        with_temp_proxy_dir(|| {
+            let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port");
+            let port = reservation.local_addr().expect("reserved address").port();
+            let manager = ProxyDebugManager::new(
+                Arc::new(crate::session::SessionManager::default()),
+                Arc::new(crate::router::RouterManager::new(
+                    crate::router::RouterConfig {
+                        port,
+                        ..crate::router::RouterConfig::default()
+                    },
+                )),
+            )
+            .expect("create retry manager");
+
+            let first = tauri::async_runtime::block_on(manager.ensure_running());
+            assert!(first.is_err());
+            assert_eq!(manager.current_port(), None);
+
+            drop(reservation);
+            let retried = tauri::async_runtime::block_on(manager.ensure_running())
+                .expect("retry listener start after the port is released");
+            assert_eq!(retried, port);
+            tauri::async_runtime::block_on(manager.shutdown());
+        });
+    }
+
+    #[test]
+    fn native_router_socket_keeps_two_session_keys_and_upstreams_isolated() {
+        with_temp_proxy_dir(|| {
+            let (address_a, request_a, upstream_a) = spawn_json_upstream(b"{\"route\":\"a\"}");
+            let (address_b, request_b, upstream_b) = spawn_json_upstream(b"{\"route\":\"b\"}");
+            let env_a = unique_router_fixture_name("router-a");
+            let env_b = unique_router_fixture_name("router-b");
+            let _override_a =
+                test_router_env(&env_a, address_a, "fixture-token-a", "target-a-sonnet");
+            let _override_b =
+                test_router_env(&env_b, address_b, "fixture-token-b", "target-b-sonnet");
+
+            let manager = test_manager_with_shared_listener();
+            manager
+                .router_manager
+                .register(
+                    "runtime-a",
+                    1,
+                    token_router_record("session-isolated-a", "nonce-a", &env_a),
+                )
+                .expect("register session A route");
+            manager
+                .router_manager
+                .register(
+                    "runtime-b",
+                    1,
+                    token_router_record("session-isolated-b", "nonce-b", &env_b),
+                )
+                .expect("register session B route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "messages": [{"role": "user", "content": "session isolation"}]
+            }))
+            .expect("encode isolation request");
+            let wire_a = read_complete_http_response(open_http_client(
+                running.port,
+                "/s/session-isolated-a/v1/messages",
+                &body,
+            ));
+            let wire_b = read_complete_http_response(open_http_client(
+                running.port,
+                "/s/session-isolated-b/v1/messages",
+                &body,
+            ));
+            let (headers_a, response_a) = decode_chunked_response(&wire_a);
+            let (headers_b, response_b) = decode_chunked_response(&wire_b);
+            assert!(headers_a.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(headers_b.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert_eq!(response_a, b"{\"route\":\"a\"}");
+            assert_eq!(response_b, b"{\"route\":\"b\"}");
+
+            let captured_a = request_a
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capture session A upstream request");
+            let captured_b = request_b
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capture session B upstream request");
+            assert_eq!(
+                captured_a.headers.get("authorization").map(String::as_str),
+                Some("Bearer fixture-token-a")
+            );
+            assert_eq!(
+                captured_b.headers.get("authorization").map(String::as_str),
+                Some("Bearer fixture-token-b")
+            );
+            let captured_json_a: serde_json::Value =
+                serde_json::from_slice(&captured_a.body).expect("parse session A upstream body");
+            let captured_json_b: serde_json::Value =
+                serde_json::from_slice(&captured_b.body).expect("parse session B upstream body");
+            assert_eq!(captured_json_a["model"], "target-a-sonnet");
+            assert_eq!(captured_json_b["model"], "target-b-sonnet");
+
+            upstream_a.join().expect("join session A upstream");
+            upstream_b.join().expect("join session B upstream");
+            drop(running);
+            assert_eq!(manager.get_state().metrics.success_requests, 2);
+        });
+    }
+
+    #[test]
+    fn legacy_proxy_socket_success_path_still_forwards_and_returns_response() {
+        with_temp_proxy_dir(|| {
+            let (upstream_address, upstream_request, upstream_handle) =
+                spawn_json_upstream(b"{\"legacy\":true}");
+            let manager = test_manager();
+            manager
+                .session_manager
+                .sessions
+                .lock()
+                .unwrap()
+                .push(crate::session::Session {
+                    id: "legacy-runtime".to_string(),
+                    pid: None,
+                    client: "claude".to_string(),
+                    env_name: "legacy-fixture".to_string(),
+                    config_source: None,
+                    perm_mode: "dev".to_string(),
+                    working_dir: "/tmp".to_string(),
+                    start_time: "fixture".to_string(),
+                    status: "running".to_string(),
+                    terminal_type: None,
+                    window_id: None,
+                    iterm_session_id: None,
+                    tmux_target: None,
+                });
+            manager.routes.write().unwrap().insert(
+                "legacy-route".to_string(),
+                RouteBinding {
+                    session_id: "legacy-runtime".to_string(),
+                    client: "claude".to_string(),
+                    env_name: "legacy-fixture".to_string(),
+                    upstream_base_url: format!("http://{upstream_address}"),
+                },
+            );
+
+            let body = br#"{"model":"legacy-model","messages":[]}"#.to_vec();
+            let (mut downstream_client, downstream_server) = loopback_pair();
+            downstream_client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set legacy client read timeout");
+            let client_thread = thread::spawn(move || {
+                write!(
+                    downstream_client,
+                    "POST /proxy/claude/legacy-route/v1/messages?legacy=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Bearer legacy-fixture-token\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write legacy proxy request headers");
+                downstream_client
+                    .write_all(&body)
+                    .expect("write legacy proxy request body");
+                downstream_client
+                    .flush()
+                    .expect("flush legacy proxy request");
+                read_complete_http_response(downstream_client)
+            });
+
+            Arc::clone(&manager).handle_connection(downstream_server);
+            let wire = client_thread.join().expect("join legacy proxy client");
+            let (response_headers, response_body) = decode_chunked_response(&wire);
+            assert!(response_headers.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert_eq!(response_body, b"{\"legacy\":true}");
+
+            let request = upstream_request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capture legacy upstream request");
+            assert_eq!(request.target, "/v1/messages?legacy=1");
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer legacy-fixture-token")
+            );
+            assert_eq!(request.body, br#"{"model":"legacy-model","messages":[]}"#);
+            upstream_handle.join().expect("join legacy mock upstream");
+            assert_eq!(manager.get_state().metrics.success_requests, 1);
+        });
+    }
+
+    #[test]
     fn parse_proxy_path_extracts_components() {
         let parsed = parse_proxy_path("/proxy/claude/route-1/v1/messages").unwrap();
         assert_eq!(parsed.client, "claude");
         assert_eq!(parsed.route_id, "route-1");
         assert_eq!(parsed.upstream_path, "/v1/messages");
+    }
+
+    #[test]
+    fn parse_router_path_rejects_invalid_keys_and_preserves_upstream_path() {
+        let parsed = parse_router_path("/s/session_key-1/v1/messages").unwrap();
+        assert_eq!(parsed.session_key, "session_key-1");
+        assert_eq!(parsed.upstream_path, "/v1/messages");
+        assert!(parse_router_path("/s/bad%2Fkey/v1/messages").is_none());
+        assert!(parse_router_path("/s//v1/messages").is_none());
+    }
+
+    #[test]
+    fn router_content_length_is_rejected_at_transport_limit_before_body_read() {
+        let request = b"POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 33554433\r\n\r\n";
+        let error = read_http_request(&mut &request[..]).expect_err("oversized router body");
+        assert_eq!(error, "Request body exceeds limit");
+    }
+
+    #[test]
+    fn chunked_declared_size_is_rejected_before_allocating_or_waiting_for_body() {
+        let request = b"POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n2000001\r\n";
+        let error = read_http_request(&mut &request[..]).expect_err("oversized chunk");
+        assert_eq!(error, "Chunked request body exceeds limit");
+    }
+
+    #[test]
+    fn ambiguous_or_invalid_request_framing_is_rejected_over_real_sockets() {
+        for request in [
+            b"POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ntest".as_slice(),
+            b"POST /proxy/claude/route-1/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\ncontent-length: 5\r\n\r\ntest!".as_slice(),
+        ] {
+            let error = parse_request_over_loopback(request)
+                .expect_err("duplicate Content-Length must fail closed");
+            assert_eq!(error, "Duplicate Content-Length headers are not allowed");
+        }
+
+        for value in ["", "+4", "-1", "4, 4", "four", "184467440737095516160"] {
+            let request = format!(
+                "POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {value}\r\n\r\n"
+            );
+            let error = parse_request_over_loopback(request.as_bytes())
+                .expect_err("invalid Content-Length must fail closed");
+            assert_eq!(error, "Invalid Content-Length header");
+        }
+
+        let error = parse_request_over_loopback(
+            b"POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n4\r\ntest\r\n0\r\n\r\n",
+        )
+        .expect_err("Transfer-Encoding plus Content-Length must fail closed");
+        assert_eq!(
+            error,
+            "Transfer-Encoding and Content-Length cannot be combined"
+        );
+
+        for value in ["gzip", "identity", "gzip, chunked", "chunked, gzip"] {
+            let request = format!(
+                "POST /proxy/claude/route-1/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: {value}\r\n\r\n0\r\n\r\n"
+            );
+            let error = parse_request_over_loopback(request.as_bytes())
+                .expect_err("unsupported Transfer-Encoding must fail closed");
+            assert_eq!(error, "Unsupported Transfer-Encoding header");
+        }
+
+        let error = parse_request_over_loopback(
+            b"POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .expect_err("duplicate Transfer-Encoding must fail closed");
+        assert_eq!(error, "Duplicate Transfer-Encoding headers are not allowed");
+    }
+
+    #[test]
+    fn ambiguous_framing_returns_400_before_the_declared_body_arrives() {
+        for headers in [
+            "Content-Length: 16\r\nContent-Length: 16",
+            "Transfer-Encoding: chunked\r\nContent-Length: 16",
+        ] {
+            let manager = test_manager();
+            register_test_router(&manager, "session-key");
+            let (mut client, server) = loopback_pair();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set client read timeout");
+            let handler = thread::spawn(move || manager.handle_connection(server));
+
+            let started_at = Instant::now();
+            client
+                .write_all(
+                    format!(
+                        "POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("write ambiguous framing headers");
+            client.flush().expect("flush ambiguous framing headers");
+            // Keep the write side open and send none of the declared body.
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .expect("read immediate ambiguous-framing response");
+            let response = String::from_utf8(response).expect("response is UTF-8");
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "handler waited for ambiguous request body bytes"
+            );
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains("\"code\":\"BAD_REQUEST\""));
+            handler.join().expect("join ambiguous-framing handler");
+        }
+    }
+
+    #[test]
+    fn chunked_size_arithmetic_and_cumulative_limit_fail_before_missing_bytes_are_read() {
+        let cumulative = read_chunked_over_loopback(b"3\r\nabc\r\n3\r\n", 5)
+            .expect_err("cumulative chunk size must be bounded");
+        assert_eq!(cumulative, "Chunked request body exceeds limit");
+
+        let overflow_declaration = format!("{:X}\r\n", usize::MAX);
+        let overflow = read_chunked_over_loopback(overflow_declaration.as_bytes(), usize::MAX)
+            .expect_err("chunk framing addition must be checked");
+        assert_eq!(overflow, "Chunk size exceeds platform limits");
+    }
+
+    #[test]
+    fn legal_content_length_and_chunked_bodies_parse_for_router_and_legacy_paths() {
+        for target in [
+            "/s/session-key/v1/messages",
+            "/proxy/claude/route-1/v1/messages",
+        ] {
+            let content_length = format!(
+                "POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 005\r\n\r\nhello"
+            );
+            let parsed = parse_request_over_loopback(content_length.as_bytes())
+                .expect("legal Content-Length request");
+            assert_eq!(parsed.target, target);
+            assert_eq!(parsed.body, b"hello");
+
+            let chunked = format!(
+                "POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: Chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n"
+            );
+            let parsed =
+                parse_request_over_loopback(chunked.as_bytes()).expect("legal chunked request");
+            assert_eq!(parsed.target, target);
+            assert_eq!(parsed.body, b"hello");
+        }
+    }
+
+    #[test]
+    fn upstream_midstream_failure_never_emits_a_normal_chunk_terminator() {
+        with_temp_proxy_dir(|| {
+            let manager = test_manager();
+            let (mut downstream_client, mut downstream_server) = loopback_pair();
+            downstream_client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set downstream read timeout");
+
+            let mut reads = 0;
+            manager.forward_response_chunks(
+                &mut downstream_server,
+                None,
+                None,
+                test_forward_meta(),
+                || {
+                    reads += 1;
+                    if reads == 1 {
+                        Ok(Some(b"partial".to_vec()))
+                    } else {
+                        Err(ForwardReadError::Upstream(
+                            "mock upstream reset mid-stream".to_string(),
+                        ))
+                    }
+                },
+            );
+            drop(downstream_server);
+
+            let mut wire = Vec::new();
+            downstream_client
+                .read_to_end(&mut wire)
+                .expect("read downstream wire bytes");
+            assert_eq!(wire, b"7\r\npartial\r\n");
+            assert!(
+                !wire.windows(5).any(|window| window == b"0\r\n\r\n"),
+                "an incomplete upstream response must not look normally terminated"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "bounded chaos suite; run explicitly for transport acceptance"]
+    fn router_transport_bounded_chaos_random_chunks_long_and_concurrent_streams() {
+        with_temp_proxy_dir(|| {
+            const STREAM_COUNT: usize = 6;
+            const RESPONSE_BYTES: usize = 256 * 1024;
+            let expected: Arc<Vec<u8>> = Arc::new(
+                (0..RESPONSE_BYTES)
+                    .map(|index| ((index * 31) % 251) as u8)
+                    .collect(),
+            );
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind chaos upstream");
+            let upstream_address = upstream.local_addr().expect("read chaos upstream address");
+            let upstream_expected = Arc::clone(&expected);
+            let upstream_handle = thread::spawn(move || {
+                let mut handlers = Vec::new();
+                for stream_index in 0..STREAM_COUNT {
+                    let (mut socket, _) = upstream.accept().expect("accept chaos stream");
+                    let body = Arc::clone(&upstream_expected);
+                    handlers.push(thread::spawn(move || {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .expect("set chaos upstream read timeout");
+                        let _request =
+                            read_http_request(&mut socket).expect("parse chaos upstream request");
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                            )
+                            .expect("write chaos response headers");
+
+                        let mut offset = 0usize;
+                        let mut state = (stream_index as u64 + 1) * 0x9E37_79B9;
+                        while offset < body.len() {
+                            state = state
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1);
+                            let chunk_len = (1 + ((state >> 24) as usize % 4096))
+                                .min(body.len() - offset);
+                            super::write_chunk(&mut socket, &body[offset..offset + chunk_len])
+                                .expect("write randomized chaos chunk");
+                            offset += chunk_len;
+                            thread::sleep(Duration::from_millis((state >> 61) & 0x3));
+                        }
+                        super::write_chunk_end(&mut socket).expect("finish chaos stream");
+                        socket.flush().expect("flush chaos stream");
+                    }));
+                }
+                for handler in handlers {
+                    handler.join().expect("join chaos upstream stream");
+                }
+            });
+
+            let env_name = unique_router_fixture_name("router-chaos");
+            let _env_override =
+                test_router_env(&env_name, upstream_address, "fixture-token", "chaos-sonnet");
+            let manager = test_manager_with_shared_listener();
+            manager
+                .router_manager
+                .register(
+                    "runtime-chaos",
+                    1,
+                    token_router_record("session-chaos", "nonce-chaos", &env_name),
+                )
+                .expect("register chaos route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+
+            let mut clients = Vec::new();
+            for stream_index in 0..STREAM_COUNT {
+                let port = running.port;
+                let expected = Arc::clone(&expected);
+                clients.push(thread::spawn(move || {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "model": "launch-sonnet",
+                        "messages": [{"role": "user", "content": format!("chaos-{stream_index}")}]
+                    }))
+                    .expect("encode chaos request");
+                    let wire = read_complete_http_response(open_http_client(
+                        port,
+                        "/s/session-chaos/v1/messages",
+                        &body,
+                    ));
+                    let (headers, response_body) = decode_chunked_response(&wire);
+                    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+                    assert_eq!(response_body, *expected);
+                }));
+            }
+            for client in clients {
+                client.join().expect("join chaos downstream stream");
+            }
+            upstream_handle.join().expect("join chaos upstream");
+            assert_eq!(
+                manager.get_state().metrics.success_requests,
+                STREAM_COUNT as u64
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "bounded chaos suite; run explicitly for transport acceptance"]
+    fn router_transport_bounded_chaos_midstream_rst_is_incomplete() {
+        use std::os::fd::AsRawFd;
+
+        with_temp_proxy_dir(|| {
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind RST upstream");
+            let upstream_address = upstream.local_addr().expect("read RST upstream address");
+            let upstream_handle = thread::spawn(move || {
+                let (mut socket, _) = upstream.accept().expect("accept RST stream");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set RST upstream read timeout");
+                let _request = read_http_request(&mut socket).expect("parse RST request");
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .expect("write RST response headers");
+                super::write_chunk(&mut socket, b"data: partial-before-rst\n\n")
+                    .expect("write partial RST chunk");
+                socket.flush().expect("flush partial RST chunk");
+                thread::sleep(Duration::from_millis(75));
+
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                let result = unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        &linger as *const libc::linger as *const libc::c_void,
+                        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0, "configure abortive upstream close");
+                drop(socket);
+            });
+
+            let env_name = unique_router_fixture_name("router-rst");
+            let _env_override =
+                test_router_env(&env_name, upstream_address, "fixture-token", "rst-sonnet");
+            let manager = test_manager_with_shared_listener();
+            manager
+                .router_manager
+                .register(
+                    "runtime-rst",
+                    1,
+                    token_router_record("session-rst", "nonce-rst", &env_name),
+                )
+                .expect("register RST route");
+            let running = RunningProxy::start(Arc::clone(&manager));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "launch-sonnet",
+                "stream": true,
+                "messages": [{"role": "user", "content": "rst proof"}]
+            }))
+            .expect("encode RST request");
+            let wire = read_complete_http_response(open_http_client(
+                running.port,
+                "/s/session-rst/v1/messages",
+                &body,
+            ));
+            upstream_handle.join().expect("join RST upstream");
+
+            assert!(wire.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert!(wire
+                .windows(b"data: partial-before-rst\n\n".len())
+                .any(|window| window == b"data: partial-before-rst\n\n"));
+            assert!(
+                !wire.windows(5).any(|window| window == b"0\r\n\r\n"),
+                "midstream RST must not be translated into a normal stream terminator"
+            );
+            assert_eq!(manager.get_state().metrics.failed_requests, 1);
+        });
+    }
+
+    #[test]
+    fn idle_upstream_is_aborted_promptly_after_downstream_disconnects() {
+        with_temp_proxy_dir(|| {
+            let manager = test_manager();
+            let upstream_listener =
+                TcpListener::bind(("127.0.0.1", 0)).expect("bind mock upstream");
+            let upstream_address = upstream_listener
+                .local_addr()
+                .expect("read mock upstream address");
+            let (upstream_closed_tx, upstream_closed_rx) = mpsc::channel();
+            let upstream_thread = thread::spawn(move || {
+                let (mut socket, _) = upstream_listener.accept().expect("accept proxy request");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set mock upstream read timeout");
+
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).expect("read proxy request");
+                    assert!(read > 0, "proxy closed before sending request headers");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .expect("write idle upstream headers");
+                socket.flush().expect("flush idle upstream headers");
+
+                let mut probe = [0u8; 1];
+                let closed = match socket.read(&mut probe) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        false
+                    }
+                    Err(_) => true,
+                };
+                let _ = upstream_closed_tx.send(closed);
+            });
+
+            let upstream_response = tauri::async_runtime::block_on(async {
+                manager
+                    .router_client
+                    .get(format!("http://{upstream_address}/v1/messages"))
+                    .send()
+                    .await
+            })
+            .expect("receive mock upstream headers");
+
+            let (downstream_client, mut downstream_server) = loopback_pair();
+            let (forward_started_tx, forward_started_rx) = mpsc::channel();
+            let (forward_done_tx, forward_done_rx) = mpsc::channel();
+            let forward_manager = Arc::clone(&manager);
+            let forward_thread = thread::spawn(move || {
+                let started_at = Instant::now();
+                forward_started_tx
+                    .send(())
+                    .expect("signal forwarding start");
+                forward_manager.forward_async_response_stream(
+                    &mut downstream_server,
+                    upstream_response,
+                    None,
+                    None,
+                    test_forward_meta(),
+                );
+                let _ = forward_done_tx.send(started_at.elapsed());
+            });
+
+            forward_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("forwarder should start");
+            thread::sleep(Duration::from_millis(150));
+            drop(downstream_client);
+
+            let elapsed = forward_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("downstream cancellation must not wait for the 60 second upstream timeout");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "forwarder took {elapsed:?} to notice downstream cancellation"
+            );
+            assert!(
+                upstream_closed_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("mock upstream should observe proxy cancellation"),
+                "aborting the upstream body task should close the incomplete upstream connection"
+            );
+
+            forward_thread.join().expect("join forwarder");
+            upstream_thread.join().expect("join mock upstream");
+        });
+    }
+
+    #[test]
+    fn router_chunked_oversize_is_rejected_with_413_before_body_arrives() {
+        with_temp_proxy_dir(|| {
+            let manager = test_manager();
+            register_test_router(&manager, "session-key");
+            let (mut client, server) = loopback_pair();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set client read timeout");
+            let (handler_done_tx, handler_done_rx) = mpsc::channel();
+            let handler = thread::spawn(move || {
+                manager.handle_connection(server);
+                let _ = handler_done_tx.send(());
+            });
+
+            let started_at = Instant::now();
+            client
+                .write_all(
+                    b"POST /s/session-key/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n2000001\r\n",
+                )
+                .expect("write oversized chunk declaration");
+            client.flush().expect("flush oversized chunk declaration");
+            // Keep the write side open and deliberately send no chunk body. A
+            // compliant parser must reject from the declared size alone.
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .expect("read immediate oversized-body response");
+            let response = String::from_utf8(response).expect("response is UTF-8");
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "handler waited for chunk bytes instead of rejecting the declaration"
+            );
+            assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+            assert!(response.contains("\"code\":\"PAYLOAD_TOO_LARGE\""));
+
+            handler_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("oversized request handler should finish");
+            handler.join().expect("join oversized request handler");
+        });
+    }
+
+    #[test]
+    fn unknown_routes_return_404_before_declared_body_arrives() {
+        for target in [
+            "/s/unknown-session/v1/messages",
+            "/proxy/claude/unknown-route/v1/messages",
+        ] {
+            let manager = test_manager();
+            let (mut client, server) = loopback_pair();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set client read timeout");
+            let (handler_done_tx, handler_done_rx) = mpsc::channel();
+            let handler = thread::spawn(move || {
+                manager.handle_connection(server);
+                let _ = handler_done_tx.send(());
+            });
+
+            let started_at = Instant::now();
+            client
+                .write_all(
+                    format!(
+                        "POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 16\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("write unknown-route headers");
+            client.flush().expect("flush unknown-route headers");
+            // Keep the write side open and deliberately send none of the declared
+            // body. Route lookup must reject from the headers alone.
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .expect("read immediate unknown-route response");
+            let response = String::from_utf8(response).expect("response is UTF-8");
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "handler waited for body bytes before rejecting {target}"
+            );
+            assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+            assert!(response.contains("\"code\":\"ROUTE_NOT_FOUND\""));
+
+            handler_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("unknown-route handler should finish");
+            handler.join().expect("join unknown-route handler");
+        }
+    }
+
+    #[test]
+    fn registered_router_rejects_wrong_method_path_and_encoding_before_body_read() {
+        for (request_line, extra_headers, expected_status, expected_code) in [
+            (
+                "GET /s/session-key/v1/messages HTTP/1.1",
+                "",
+                "HTTP/1.1 405 Method Not Allowed\r\n",
+                "ROUTER_METHOD_NOT_ALLOWED",
+            ),
+            (
+                "POST /s/session-key/v1/complete HTTP/1.1",
+                "",
+                "HTTP/1.1 404 Not Found\r\n",
+                "ROUTER_ENDPOINT_NOT_ALLOWED",
+            ),
+            (
+                "POST /s/session-key/v1/messages HTTP/1.1",
+                "Content-Encoding: gzip\r\n",
+                "HTTP/1.1 415 Unsupported Media Type\r\n",
+                "ROUTER_UNSUPPORTED_CONTENT_ENCODING",
+            ),
+            (
+                "POST /s/session-key/v1/messages HTTP/1.1",
+                "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n",
+                "HTTP/1.1 400 Bad Request\r\n",
+                "BAD_REQUEST",
+            ),
+        ] {
+            let manager = test_manager();
+            register_test_router(&manager, "session-key");
+            assert_immediate_status_without_body(
+                manager,
+                &format!(
+                    "{request_line}\r\nHost: 127.0.0.1\r\n{extra_headers}Content-Length: 16\r\n\r\n"
+                ),
+                expected_status,
+                expected_code,
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_router_session_stays_404_before_method_or_path_disclosure_and_body_read() {
+        let manager = test_manager();
+        assert_immediate_status_without_body(
+            manager,
+            "GET /s/unknown-session/v1/complete HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Encoding: gzip\r\nContent-Length: 16\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\n",
+            "ROUTE_NOT_FOUND",
+        );
     }
 
     #[test]
@@ -2551,7 +5068,7 @@ mod tests {
 
     #[test]
     fn traffic_index_pages_many_records_with_timestamp_cursor() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             for index in 0..250 {
                 append_record(&sample_traffic_record(index, 1_000 + index as i64))
                     .expect("append record");
@@ -2573,7 +5090,7 @@ mod tests {
 
     #[test]
     fn traffic_detail_uses_index_offset_for_id_lookup() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             for index in 0..25 {
                 append_record(&sample_traffic_record(index, 2_000 + index as i64))
                     .expect("append record");
@@ -2589,7 +5106,7 @@ mod tests {
 
     #[test]
     fn traffic_index_bad_lines_fall_back_to_jsonl_when_unusable() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             append_record(&sample_traffic_record(1, 3_001)).expect("append first");
             append_record(&sample_traffic_record(2, 3_002)).expect("append second");
             fs::write(traffic_idx_path(), "not,a,valid,offset\nalso bad\n").expect("corrupt index");
@@ -2610,7 +5127,7 @@ mod tests {
 
     #[test]
     fn traffic_index_missing_file_falls_back_to_jsonl() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             append_record(&sample_traffic_record(1, 3_101)).expect("append first");
             append_record(&sample_traffic_record(2, 3_102)).expect("append second");
             fs::remove_file(traffic_idx_path()).expect("remove index");
@@ -2631,14 +5148,18 @@ mod tests {
 
     #[test]
     fn traffic_index_offset_mismatch_returns_clear_error() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             append_record(&sample_traffic_record(1, 3_201)).expect("append first");
             append_record(&sample_traffic_record(2, 3_202)).expect("append second");
             fs::write(traffic_idx_path(), "3202,req-0002,0\n").expect("write stale index");
 
-            let list_err = list_traffic_records(10, None).expect_err("list should reject mismatch");
-            assert!(list_err.contains("Traffic index mismatch"));
+            // The traffic LIST tolerates a stale index entry (skips it) so one
+            // inconsistent offset cannot blank the whole Proxy Debug page…
+            let page = list_traffic_records(10, None).expect("list should tolerate mismatch");
+            assert!(page.items.is_empty());
 
+            // …while the by-id detail lookup still surfaces the mismatch
+            // loudly, so index inconsistency stays observable.
             let detail_err =
                 read_record_by_id("req-0002").expect_err("detail should reject mismatch");
             assert!(detail_err.contains("Traffic index mismatch"));
@@ -2647,7 +5168,7 @@ mod tests {
 
     #[test]
     fn traffic_retention_rewrites_index_offsets_consistently() {
-        with_temp_proxy_home(|| {
+        with_temp_proxy_dir(|| {
             for index in 0..40 {
                 let mut record = sample_traffic_record(index, 4_000 + index as i64);
                 let body_file = format!("bodies/req-{index:04}-res.bin");
@@ -3056,5 +5577,96 @@ mod tests {
             text.contains("sk-trunc-secret"),
             "truncated JSON should pass through unchanged — this proves why we skip writing"
         );
+    }
+
+    #[test]
+    fn routed_usage_scanner_extracts_model_and_usage_across_chunk_boundaries() {
+        let mut scanner = RoutedUsageScanner::default();
+        // Split mid-line to prove the carry buffer works.
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"deepseek-v4-flash\",",
+        );
+        let start_tail = concat!(
+            "\"usage\":{\"input_tokens\":728,\"cache_creation_input_tokens\":12,\"cache_read_input_tokens\":4000}}}\n\n",
+        );
+        let delta = concat!(
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":91}}\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":150}}\n",
+            "data: [DONE]\n\n",
+        );
+        scanner.feed(start.as_bytes());
+        scanner.feed(start_tail.as_bytes());
+        scanner.feed(delta.as_bytes());
+
+        assert_eq!(scanner.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(scanner.input_tokens, 728);
+        assert_eq!(scanner.cache_creation_tokens, 12);
+        assert_eq!(scanner.cache_read_tokens, 4000);
+        assert_eq!(
+            scanner.output_tokens, 150,
+            "message_delta usage is cumulative"
+        );
+        assert!(scanner.has_usage());
+    }
+
+    #[test]
+    fn routed_usage_scanner_reads_delta_only_providers() {
+        // GLM-style stream: message_start carries zeros, message_delta carries
+        // the full cumulative truth.
+        let mut scanner = RoutedUsageScanner::default();
+        scanner.feed(
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"model\":\"glm-5.3\",",
+                "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            )
+            .as_bytes(),
+        );
+        scanner.feed(
+            concat!(
+                "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{",
+                "\"input_tokens\":40554,\"output_tokens\":212,",
+                "\"cache_read_input_tokens\":1856}}\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(scanner.model.as_deref(), Some("glm-5.3"));
+        assert_eq!(scanner.input_tokens, 40554);
+        assert_eq!(scanner.output_tokens, 212);
+        assert_eq!(scanner.cache_read_tokens, 1856);
+    }
+
+    #[test]
+    fn list_traffic_skips_corrupt_indexed_records_instead_of_failing() {
+        with_temp_proxy_dir(|| {
+            ensure_proxy_debug_dirs().expect("prepare proxy debug dir");
+            let good = sample_traffic_record(1, 1_000);
+            let _corrupt = sample_traffic_record(2, 2_000);
+
+            // Hand-write a traffic log whose first (older) line is torn JSON —
+            // the index still points both ids at their offsets, mirroring a
+            // concurrent append that interleaved bytes into one line.
+            let corrupt_line = "{\"id\":\"req-0002\",\"timestamp\":2000,\"broken";
+            let good_line = serde_json::to_string(&good).expect("serialize good record");
+            let mut traffic = String::new();
+            traffic.push_str(corrupt_line);
+            traffic.push('\n');
+            traffic.push_str(&good_line);
+            traffic.push('\n');
+            std::fs::write(traffic_jsonl_path(), traffic).expect("write traffic log");
+
+            let idx = format!(
+                "2000,req-0002,0\n1000,req-0001,{}\n",
+                corrupt_line.len() + 1
+            );
+            std::fs::write(traffic_idx_path(), idx).expect("write traffic index");
+
+            let page = list_traffic_records(50, None).expect("list must tolerate corrupt record");
+            assert_eq!(page.items.len(), 1, "only the readable record is served");
+            assert_eq!(page.items[0].id, "req-0001");
+            assert_eq!(page.next_cursor, None);
+        });
     }
 }

@@ -10,10 +10,11 @@ import {
   useState,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import {
+  Check,
   ChevronDown,
   FolderOpen,
+  FolderSearch,
   LoaderCircle,
   Terminal,
 } from '@/lib/lucide-react';
@@ -24,7 +25,30 @@ import { ProjectTree } from '@/components/workspace/ProjectTree';
 import { WorkspaceGlobalSearch } from '@/components/workspace/WorkspaceGlobalSearch';
 import { WorkspaceNativeSessionView } from '@/components/workspace/WorkspaceNativeSessionView';
 import { WorkspaceHistoryErrorBoundary } from '@/components/workspace/WorkspaceHistoryErrorBoundary';
+import { WorkspaceCodexModelMigrationDialog } from '@/components/workspace/WorkspaceCodexModelMigrationDialog';
 import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
+import {
+  WorkspaceForkDialog,
+  getWorkspaceForkTurnPreview,
+  type WorkspaceForkTarget,
+} from '@/components/workspace/WorkspaceForkDialog';
+import {
+  createComposerRouteDraft,
+  isHistoryRouteContinuationBlocked,
+  isRouteDraftRowVisible,
+  resolveRouterLaunchDraft,
+  resolveHistoryRouteRestore,
+  type ComposerRouteDraft,
+  type HistoryRouteResolutionStatus,
+} from '@/components/workspace/composerRouteDraft';
+import {
+  clearHistoryRouteDraft,
+  historyRouteDraftKey,
+  normalizeHistoryRouteProject,
+  readHistoryRouteDraft,
+  writeHistoryRouteDraft,
+} from '@/components/workspace/historyRouteDraftStore';
+import type { RouterLaunchDraft } from '@ccem/core/browser';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
 import type { EffortLevel } from '@/components/workspace/ComposerControls';
@@ -37,6 +61,14 @@ import {
 } from '@/components/workspace/composerAttachments';
 import { WorkspaceSkeleton } from '@/components/ui/skeleton-states';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useAppStore } from '@/store';
 import type { InstalledSkill, LaunchClient } from '@/store';
@@ -46,14 +78,16 @@ import {
   useSessionUpdatedEvent,
   useTaskCompletedEvent,
   useTaskErrorEvent,
+  useRouterStatusEvent,
+  useSessionRouterUpdatedEvent,
 } from '@/hooks/useTauriEvents';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { dispatchAppZoomCommand } from '@/hooks/useZoom';
 import { useLocale } from '@/locales';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
 import { useNativeSurfaceOccluded } from '@/lib/nativeSurfaceOcclusion';
-import { PREVIEW_ACTIVE_SESSION_SCOPE, previewSurfaceOrdering } from '@/lib/previewSurfaceOrdering';
-import { cn, getProjectName } from '@/lib/utils';
+import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
+import { cn, getProjectName, truncatePath } from '@/lib/utils';
 import {
   fetchConversationDetail,
   fetchWorkspaceOverviewSnapshot,
@@ -110,19 +144,14 @@ import {
   calculateBrowserPanelWidthPercent,
   clampBrowserPanelWidthPercent,
 } from '@/components/workspace/browserPanelLayout';
-import type {
-  BrowserPanelTarget,
-  LoginBrowserPanelRequest,
-} from '@/components/workspace/browserPanelTarget';
+import type { BrowserPanelTarget } from '@/components/workspace/browserPanelTarget';
 import {
-  createBrowserPanelSurfaceSessionId,
   createBrowserPanelSessionKeyRegistry,
-  findBrowserPanelOwnerSessionIdBySurfaceSessionId,
   isBrowserPanelTargetVisible,
   rebindBrowserPanelTarget,
+  retireBrowserPanelTargetForWorkingDirChange,
   resolveActiveBrowserAgentSessionId,
-  setBrowserPanelTargetVisible,
-  setPreviewBrowserPanelAgentSessionId,
+  toggleDefaultBrowserPanelTarget,
   WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
 } from '@/components/workspace/browserPanelTarget';
 import { createBrowserPresentationRevisionAllocator } from '@/components/workspace/browserPresentationRevision';
@@ -147,6 +176,10 @@ import {
 } from '@/components/workspace/workspaceSessionPreferences';
 import { resolveComposerDispatch } from '@/components/workspace/workspaceComposerDispatch';
 import {
+  startAfterCodexModelMigrationGate,
+  type CodexModelMigrationWarning,
+} from '@/components/workspace/workspaceCodexModelMigration';
+import {
   buildWorkspaceCronAgentPrompt,
   isWorkspaceCronCommand,
 } from '@/components/workspace/workspaceCronCommand';
@@ -170,6 +203,20 @@ const LazyHistoryDetail = lazy(async () =>
 );
 
 type WorkspaceViewMode = 'compose' | 'live' | 'history';
+
+/** Everything needed to launch a forked Claude session from a model-output turn. */
+interface WorkspaceForkTurnRequest {
+  /** Parent provider session (transcript to slice). */
+  providerSessionId: string;
+  /** Cut point: last assistant message uuid kept in the fork (inclusive). */
+  forkFromMessageId: string;
+  /** Transcript prefix to hydrate the forked session view. */
+  seedMessages: ConversationMessageData[];
+  envName?: string;
+  permMode?: string;
+  workingDir?: string | null;
+  effort?: string | null;
+}
 
 const ACTIVE_LIVE_RUNTIME_STORAGE_KEY = 'ccem-workspace-live-runtime';
 const LIVE_RUNTIME_SET_STORAGE_KEY = 'ccem-workspace-live-runtimes';
@@ -283,8 +330,14 @@ function nativeSessionMatchesHistorySession(
   if (nativeSession.provider !== session.source) {
     return false;
   }
-  if (runtimeId) {
-    return nativeSession.runtime_id === runtimeId;
+  if (
+    normalizeHistoryRouteProject(nativeSession.project_dir)
+    !== normalizeHistoryRouteProject(session.project)
+  ) {
+    return false;
+  }
+  if (runtimeId && nativeSession.runtime_id !== runtimeId) {
+    return false;
   }
   return nativeSession.runtime_id === session.id
     || nativeSession.provider_session_id === session.id;
@@ -330,6 +383,7 @@ export function Workspace({
     defaultWorkingDir,
     launchClient,
     installedSkills,
+    recent,
     setSelectedWorkingDir,
     setLaunchClient,
     setPermissionMode,
@@ -345,6 +399,7 @@ export function Workspace({
       defaultWorkingDir: state.defaultWorkingDir,
       launchClient: state.launchClient,
       installedSkills: state.installedSkills,
+      recent: state.recent,
       setSelectedWorkingDir: state.setSelectedWorkingDir,
       setLaunchClient: state.setLaunchClient,
       setPermissionMode: state.setPermissionMode,
@@ -354,10 +409,13 @@ export function Workspace({
   const workspaceReviewOpen = useAppStore((state) => state.reviewPanelOpen);
   const setWorkspaceReviewOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
+  const setSessionRouter = useAppStore((state) => state.setSessionRouter);
+  const setRouterStatus = useAppStore((state) => state.setRouterStatus);
 
   const {
     switchEnvironment,
     openDirectoryPicker,
+    recordRecentProject,
     loadCronTasks,
     loadInstalledSkills,
     loadWorkspaceSkills,
@@ -366,9 +424,12 @@ export function Workspace({
     checkOpenCodeInstalled,
     setSessionTitle,
     setSessionAnnotation,
+    preflightCodexModelMigration,
     createNativeSession,
     getNativeSessionEvents,
     listNativeSessions,
+    loadRouterStatus,
+    loadRouterSettings,
     launchOpenCodeWeb,
     launchClaudeCode,
     openInteractiveSessionInTerminal,
@@ -404,12 +465,20 @@ export function Workspace({
   const [composePromptRevision, setComposePromptRevision] = useState(0);
   const [composeHasDraft, setComposeHasDraft] = useState(false);
   const [composePlanModeEnabled, setComposePlanModeEnabled] = useState(false);
+  const [composeRouteDraft, setComposeRouteDraft] = useState<ComposerRouteDraft>(createComposerRouteDraft);
+  const composeRouteDraftRef = useRef<ComposerRouteDraft>(composeRouteDraft);
   const [historyComposerText, setHistoryComposerText] = useState('');
   const historyComposerTextRef = useRef('');
   const historyHasDraftRef = useRef(false);
   const [historyComposerRevision, setHistoryComposerRevision] = useState(0);
   const [historyHasDraft, setHistoryHasDraft] = useState(false);
   const [historyPlanModeEnabled, setHistoryPlanModeEnabled] = useState(false);
+  const [historyRouteDraft, setHistoryRouteDraft] = useState<ComposerRouteDraft>(createComposerRouteDraft);
+  const historyRouteDraftRef = useRef<ComposerRouteDraft>(historyRouteDraft);
+  const [historyRouteResolutionStatus, setHistoryRouteResolutionStatus] =
+    useState<HistoryRouteResolutionStatus>('idle');
+  const historyRouteResolutionStatusRef = useRef<HistoryRouteResolutionStatus>('idle');
+  const historySelectionRequestSeqRef = useRef(0);
   const [historyEnv, setHistoryEnv] = useState('');
   const [historyPermMode, setHistoryPermMode] = useState<PermissionModeName>(permissionMode);
   const [composeEffort, setComposeEffort] = useState<EffortLevel>('max');
@@ -430,13 +499,14 @@ export function Workspace({
   const [isCreatingNativeSession, setIsCreatingNativeSession] = useState(false);
   const [isLaunchingComposeTerminal, setIsLaunchingComposeTerminal] = useState(false);
   const [isResumingHistorySession, setIsResumingHistorySession] = useState(false);
+  const [codexModelMigrationWarning, setCodexModelMigrationWarning] = useState<CodexModelMigrationWarning | null>(null);
+  const codexModelMigrationDecisionRef = useRef<((shouldContinue: boolean) => void) | null>(null);
+  const acknowledgedCodexModelWarningsRef = useRef(new Set<string>());
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
   const [browserTargetBySessionId, setBrowserTargetBySessionId] = useState<
     Record<string, BrowserPanelTarget | undefined>
   >({});
-  const [browserHostOverlayOpen, setBrowserHostOverlayOpen] = useState(false);
   const browserPanelInstanceSeqRef = useRef(0);
-  const browserNavigationRequestSeqRef = useRef(0);
   const browserPanelSessionKeyRegistryRef = useRef(createBrowserPanelSessionKeyRegistry());
   const browserPresentationRevisionAllocatorRef = useRef(
     createBrowserPresentationRevisionAllocator(),
@@ -460,6 +530,41 @@ export function Workspace({
   const persistedGeneratedTitleKeysRef = useRef(new Set<string>());
   const reviewOwnerKey = `${workspaceMode}:${selectedKey ?? ''}:${activeLiveRuntimeId ?? ''}:${composeDir ?? ''}`;
   const reviewOwnerKeyRef = useRef(reviewOwnerKey);
+
+  const updateComposeRouteDraftState = useCallback((next: ComposerRouteDraft) => {
+    composeRouteDraftRef.current = next;
+    setComposeRouteDraft(next);
+  }, []);
+
+  const updateHistoryRouteDraftState = useCallback((next: ComposerRouteDraft) => {
+    historyRouteDraftRef.current = next;
+    setHistoryRouteDraft(next);
+  }, []);
+
+  const updateHistoryRouteResolutionStatus = useCallback((next: HistoryRouteResolutionStatus) => {
+    historyRouteResolutionStatusRef.current = next;
+    setHistoryRouteResolutionStatus(next);
+  }, []);
+
+  const requestCodexModelMigrationDecision = useCallback((
+    warning: CodexModelMigrationWarning,
+  ): Promise<boolean> => new Promise((resolve) => {
+    codexModelMigrationDecisionRef.current?.(false);
+    codexModelMigrationDecisionRef.current = resolve;
+    setCodexModelMigrationWarning(warning);
+  }), []);
+
+  const settleCodexModelMigrationDecision = useCallback((shouldContinue: boolean) => {
+    const resolve = codexModelMigrationDecisionRef.current;
+    codexModelMigrationDecisionRef.current = null;
+    setCodexModelMigrationWarning(null);
+    resolve?.(shouldContinue);
+  }, []);
+
+  useEffect(() => () => {
+    codexModelMigrationDecisionRef.current?.(false);
+    codexModelMigrationDecisionRef.current = null;
+  }, []);
 
   useLayoutEffect(() => {
     const ownerChanged = reviewOwnerKeyRef.current !== reviewOwnerKey;
@@ -606,85 +711,6 @@ export function Workspace({
   }, []);
 
   useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-
-    void listen<{
-      sessionId?: string;
-      session_id?: string;
-      agentSessionId?: string;
-      agent_session_id?: string;
-      cause?: string;
-    }>('browser_panel_requested', (event) => {
-      if (event.payload?.cause && event.payload.cause !== 'agent_reveal') {
-        return;
-      }
-      const requestedSurfaceSessionId = event.payload?.sessionId
-        ?? event.payload?.session_id;
-      const requestedSessionId = requestedSurfaceSessionId
-        ?? WORKSPACE_BROWSER_COMPOSE_SESSION_ID;
-      const requestedLiveEntry = liveSessionsByRuntimeIdRef.current[requestedSessionId];
-      const requestedAgentSessionId = event.payload?.agentSessionId
-        ?? event.payload?.agent_session_id
-        ?? (requestedLiveEntry ? requestedSessionId : undefined);
-      const browserSessionId = requestedLiveEntry
-        ? browserPanelSessionKeyRegistryRef.current.resolveLive({
-          provider: requestedLiveEntry.session.provider,
-          providerSessionId: requestedLiveEntry.session.provider_session_id,
-          runtimeId: requestedLiveEntry.session.runtime_id,
-        })
-        : requestedSessionId;
-      setBrowserTargetBySessionId((previous) => {
-        const existingOwnerSessionId = requestedSurfaceSessionId
-          ? findBrowserPanelOwnerSessionIdBySurfaceSessionId(previous, requestedSurfaceSessionId)
-          : undefined;
-        const ownerSessionId = existingOwnerSessionId ?? browserSessionId;
-        const existing = previous[ownerSessionId];
-        if (existing) {
-          const visibleExisting = setBrowserPanelTargetVisible(existing, true);
-          const nextExisting = requestedAgentSessionId
-            ? setPreviewBrowserPanelAgentSessionId(
-              visibleExisting,
-              requestedAgentSessionId,
-            )
-            : visibleExisting;
-          if (nextExisting === existing) return previous;
-          return {
-            ...previous,
-            [ownerSessionId]: nextExisting,
-          };
-        }
-        const instanceId = browserPanelInstanceSeqRef.current += 1;
-        return {
-          ...previous,
-          [ownerSessionId]: {
-            backend: 'preview',
-            instanceId,
-            surfaceSessionId: requestedSurfaceSessionId
-              ?? createBrowserPanelSurfaceSessionId(ownerSessionId, instanceId),
-            ...(requestedAgentSessionId
-              ? { agentSessionId: requestedAgentSessionId }
-              : {}),
-          },
-        };
-      });
-    }).then((nextUnlisten) => {
-      if (disposed) {
-        nextUnlisten();
-        return;
-      }
-      unlisten = nextUnlisten;
-    }).catch((error) => {
-      console.error('Failed to listen for browser panel requests:', error);
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
-  useEffect(() => {
     return () => {
       if (refreshTimerRef.current) {
         clearTimeout(refreshTimerRef.current);
@@ -706,6 +732,9 @@ export function Workspace({
     setWorkspaceMode('compose');
     resetComposePrompt(composeSeed.value);
     setComposePlanModeEnabled(false);
+    // A seeded composer (/ccem-cron etc.) is a fresh Composer: routing opt-in
+    // must not leak from a previous unsent draft.
+    updateComposeRouteDraftState(createComposerRouteDraft());
     if (!composeDir && (selectedWorkingDir || defaultWorkingDir)) {
       setComposeDir(selectedWorkingDir || defaultWorkingDir || null);
     }
@@ -731,10 +760,15 @@ export function Workspace({
       seedMessages?: ConversationMessageData[];
     } = {},
   ) => {
+    // Seed per-session router state from the summary so the chip/pill reflect
+    // reality immediately (covers create + restore + ccem/cron link paths).
+    if (session.router) {
+      setSessionRouter(session.runtime_id, session.router);
+    }
     updateLiveSessionsByRuntimeId((previous) =>
       upsertWorkspaceLiveSessionEntry(previous, session, options)
     );
-  }, [updateLiveSessionsByRuntimeId]);
+  }, [setSessionRouter, updateLiveSessionsByRuntimeId]);
 
   const setLiveSessionGeneratedTitle = useCallback((runtimeId: string, title: string) => {
     updateLiveSessionsByRuntimeId((previous) => {
@@ -761,6 +795,11 @@ export function Workspace({
 
     try {
       const nativeSessions = await listNativeSessions();
+      // Seed per-session router state from the summaries so the chip/pill render
+      // correct state immediately (before any event fires or popover is opened).
+      for (const ns of nativeSessions) {
+        if (ns.router) setSessionRouter(ns.runtime_id, ns.router);
+      }
       if (requestSeq !== nativeSessionRestoreRequestSeqRef.current) {
         return;
       }
@@ -1220,6 +1259,27 @@ export function Workspace({
     scheduleWorkspaceRefresh();
   });
 
+  // Router events are the source of truth — the backend emits after every
+  // successful write (IPC / external control / main-env switch). Apply directly;
+  // the store dedups by revision.
+  useSessionRouterUpdatedEvent((payload) => {
+    setSessionRouter(payload.runtimeId, payload.router);
+  });
+  useRouterStatusEvent((status) => {
+    setRouterStatus(status);
+  });
+
+  // Seed global router status + config once so the status-strip chip and
+  // Settings reflect reality before any event fires.
+  useEffect(() => {
+    void loadRouterStatus().catch(() => {
+      // Router may be disabled or unavailable; the chip handles the disabled state.
+    });
+    void loadRouterSettings().catch(() => {
+      // Best-effort; Settings will re-read on open.
+    });
+  }, [loadRouterStatus, loadRouterSettings]);
+
   const selectedSession = useMemo(() => {
     if (!selectedKey) return null;
     return sessions.find((session) => toSessionKey(session) === selectedKey) ?? null;
@@ -1277,16 +1337,13 @@ export function Workspace({
   const browserPanelOpen = activeVisibleBrowserTarget !== null;
   const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
   const browserSurfaceOccluded = !isActive
-    || browserHostOverlayOpen
     || isGlobalSearchOpen
     || nativeSurfaceModalOccluded;
-  const activeBrowserSurfaceSessionId = activeVisibleBrowserTarget?.surfaceSessionId ?? null;
   const presentationSurfaceSessionId = activeBrowserTarget?.surfaceSessionId
     ?? activeBrowserSessionId;
   const browserPresentationRevision = browserPresentationRevisionAllocatorRef.current.observe({
     ownerSessionId: activeBrowserSessionId,
     surfaceSessionId: presentationSurfaceSessionId,
-    backend: activeVisibleBrowserTarget?.backend ?? null,
     occluded: activeVisibleBrowserTarget ? browserSurfaceOccluded : false,
   });
 
@@ -1299,113 +1356,28 @@ export function Workspace({
     });
   }, []);
 
-  useEffect(() => {
-    setBrowserTargetBySessionId((previous) => {
-      const existing = previous[activeBrowserSessionId];
-      if (!existing || existing.backend !== 'preview') return previous;
-      const next = setPreviewBrowserPanelAgentSessionId(
-        existing,
-        activeBrowserAgentSessionId,
-      );
-      return next === existing
-        ? previous
-        : { ...previous, [activeBrowserSessionId]: next };
-    });
-  }, [activeBrowserAgentSessionId, activeBrowserSessionId]);
-
-  const toggleActivePreviewBrowser = useCallback(() => {
-    setBrowserTargetBySessionId((previous) => {
-      const existing = previous[activeBrowserSessionId];
-      if (existing?.backend === 'preview') {
-        const withAgentSession = setPreviewBrowserPanelAgentSessionId(
-          existing,
-          activeBrowserAgentSessionId,
-        );
-        return {
-          ...previous,
-          [activeBrowserSessionId]: setBrowserPanelTargetVisible(
-            withAgentSession,
-            !isBrowserPanelTargetVisible(existing),
-          ),
-        };
-      }
-      if (existing) {
-        return previous;
-      }
-      const instanceId = browserPanelInstanceSeqRef.current += 1;
-      return {
-        ...previous,
-        [activeBrowserSessionId]: {
-          backend: 'preview',
-          instanceId,
-          surfaceSessionId: createBrowserPanelSurfaceSessionId(activeBrowserSessionId, instanceId),
-          visible: true,
-          ...(activeBrowserAgentSessionId
-            ? { agentSessionId: activeBrowserAgentSessionId }
-            : {}),
-        },
-      };
-    });
-  }, [activeBrowserAgentSessionId, activeBrowserSessionId]);
-
-  const openActiveLoginBrowser = useCallback((request: LoginBrowserPanelRequest) => {
-    setBrowserTargetBySessionId((previous) => {
-      const existing = previous[activeBrowserSessionId];
-      if (existing) {
-        if (existing.backend !== 'login') {
-          return previous;
-        }
-        const visibleExisting = setBrowserPanelTargetVisible(existing, true);
-        if (!request.initialUrl) {
-          return visibleExisting === existing
-            ? previous
-            : { ...previous, [activeBrowserSessionId]: visibleExisting };
-        }
-        return {
-          ...previous,
-          [activeBrowserSessionId]: {
-            ...visibleExisting,
-            navigationRequestId: browserNavigationRequestSeqRef.current += 1,
-            navigationUrl: request.initialUrl,
-          },
-        };
-      }
-      const instanceId = browserPanelInstanceSeqRef.current += 1;
-      return {
-        ...previous,
-        [activeBrowserSessionId]: {
-          backend: 'login',
-          instanceId,
-          surfaceSessionId: createBrowserPanelSurfaceSessionId(activeBrowserSessionId, instanceId),
-          visible: true,
-          ...request,
-        },
-      };
-    });
-  }, [activeBrowserSessionId]);
-
-  useEffect(() => {
-    if (!activeBrowserSurfaceSessionId) {
+  const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
+    if (!workingDir?.trim()) {
+      toast.error(t('workspace.loginBrowserNeedsWorkspace'));
       return;
     }
-    const owner = previewSurfaceOrdering.claim(PREVIEW_ACTIVE_SESSION_SCOPE);
-    void previewSurfaceOrdering.enqueue(owner, () => invoke('browser_set_active_session', {
-      sessionId: activeBrowserSurfaceSessionId,
-      visible: activeVisibleBrowserTarget?.backend === 'preview' && !browserSurfaceOccluded,
-      presentationRevision: browserPresentationRevision,
-    })).catch((error) => {
-      console.error('Failed to sync active browser session:', error);
+    setBrowserTargetBySessionId((previous) => {
+      return toggleDefaultBrowserPanelTarget(
+        previous,
+        activeBrowserSessionId,
+        workingDir,
+        () => browserPanelInstanceSeqRef.current += 1,
+      );
     });
-    return () => previewSurfaceOrdering.release(owner);
-  }, [
-    activeBrowserSurfaceSessionId,
-    activeVisibleBrowserTarget?.backend,
-    browserPresentationRevision,
-    browserSurfaceOccluded,
-  ]);
+  }, [activeBrowserSessionId, t]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
+    // Providers without env routing show no draft UI and must not carry a
+    // stale opt-in into the next create call.
+    if (composeProvider !== 'claude') {
+      updateComposeRouteDraftState(createComposerRouteDraft());
+    }
   }, [composeProvider]);
 
   useEffect(() => {
@@ -1521,11 +1493,22 @@ export function Workspace({
     const sessionKey = toSessionKey(session);
     const runtimeId = decorationsBySessionKey[sessionKey]?.runtimeId;
 
-    if (runtimeId && liveSessionsByRuntimeId[runtimeId]) {
+    if (
+      runtimeId
+      && liveSessionsByRuntimeId[runtimeId]
+      && nativeSessionMatchesHistorySession(
+        liveSessionsByRuntimeId[runtimeId].session,
+        session,
+        runtimeId,
+      )
+    ) {
       return liveSessionsByRuntimeId[runtimeId];
     }
 
-    return findLiveEntryForSidebarSession(liveSessionEntries, session);
+    const candidate = findLiveEntryForSidebarSession(liveSessionEntries, session);
+    return candidate && nativeSessionMatchesHistorySession(candidate.session, session)
+      ? candidate
+      : null;
   }, [decorationsBySessionKey, liveSessionEntries, liveSessionsByRuntimeId]);
 
   const shouldHydrateLiveEntryFromHistory = useCallback((entry: WorkspaceLiveSessionEntry | null | undefined) => {
@@ -1632,27 +1615,10 @@ export function Workspace({
       };
     }
 
-    const runtimeId = decorationsBySessionKey[toSessionKey(session)]?.runtimeId;
-    const nativeSessions = await listNativeSessions();
-    const matchingSession = nativeSessions
-      .filter((nativeSession) => {
-        if (!canRestoreWorkspaceLiveSession(nativeSession)) {
-          return false;
-        }
-
-        if (runtimeId) {
-          return nativeSession.runtime_id === runtimeId;
-        }
-
-        return nativeSession.provider === session.source
-          && (
-            nativeSession.runtime_id === session.id
-            || nativeSession.provider_session_id === session.id
-          );
-      })
-      .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0];
-
-    if (!matchingSession) {
+    // Pick one deterministic authoritative record first, then decide whether
+    // it is recoverable. Never hunt for an older routed/recoverable sibling.
+    const matchingSession = await findNativeHistorySessionForSession(session);
+    if (!matchingSession || !canRestoreWorkspaceLiveSession(matchingSession)) {
       return null;
     }
 
@@ -1666,10 +1632,9 @@ export function Workspace({
       seedMessages: hydratedMessages ?? [],
     };
   }, [
-    decorationsBySessionKey,
+    findNativeHistorySessionForSession,
     findLiveEntryForSession,
     hydrateLiveEntryFromHistory,
-    listNativeSessions,
     shouldHydrateLiveEntryFromHistory,
     upsertLiveSessionEntry,
   ]);
@@ -1716,6 +1681,7 @@ export function Workspace({
 
   const effectiveComposeDir = composeDir || selectedWorkingDir || defaultWorkingDir || null;
   const effectiveComposeDirLabel = effectiveComposeDir ? getProjectName(effectiveComposeDir) : null;
+  const recentComposeFolders = useMemo(() => recent.slice(0, 5), [recent]);
   const shouldRenderWorkspaceReview = workspaceMode !== 'live' || !activeLiveEntry;
   const workspaceReviewEvents = useMemo(
     () => workspaceMode === 'history' && selectedSession ? historyEvents : [],
@@ -1917,6 +1883,17 @@ export function Workspace({
   ]);
 
   useEffect(() => {
+    if (workspaceMode !== 'compose') return;
+    setBrowserTargetBySessionId((previous) => (
+      retireBrowserPanelTargetForWorkingDirChange(
+        previous,
+        WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
+        skillsContext.workingDir,
+      )
+    ));
+  }, [skillsContext.workingDir, workspaceMode]);
+
+  useEffect(() => {
     let cancelled = false;
     void loadWorkspaceSkills({
       workingDir: skillsContext.workingDir,
@@ -1984,12 +1961,48 @@ export function Workspace({
       },
     ) => {
       const key = toSessionKey(session);
+      const selectionRequestSeq = ++historySelectionRequestSeqRef.current;
+      const requiresRouteResolution = session.source === 'claude';
+      updateHistoryRouteResolutionStatus(requiresRouteResolution ? 'resolving' : 'ready');
+      // Invalidate any transcript request started by the previously selected
+      // session before awaiting native/history lookups for this one. Without
+      // this, a slow A request can still overwrite B after B becomes live.
+      conversationRequestSeqRef.current += 1;
+      // Clear A synchronously as soon as B is selected. Merely invalidating
+      // A's request is not enough: its already-rendered transcript would sit
+      // under B's title while B's native lookup is pending (or if it fails).
+      setMessages([]);
+      setSegments([]);
+      setHistoryEvents([]);
+      setActiveSegment(null);
+      setIsLoadingMessages(true);
+      const selectionIsCurrent = () =>
+        historySelectionRequestSeqRef.current === selectionRequestSeq
+        && selectedKeyRef.current === key;
       setSelectedKey(key);
       selectedKeyRef.current = key;
 
-      const liveEntry = options?.forceHistory ? null : await ensureLiveEntryForSession(session);
-      await markPetNotificationReadForSession(session, liveEntry);
+      // Apply the user's unsubmitted per-history choice synchronously with
+      // selection. If none exists, start off until the authoritative native
+      // record lookup below proves this exact history session was routed.
+      const draftKey = historyRouteDraftKey(session);
+      const explicitChoice = readHistoryRouteDraft(window.localStorage, draftKey);
+      updateHistoryRouteDraftState(explicitChoice ?? createComposerRouteDraft());
+
+      const liveEntry = options?.forceHistory
+        ? null
+        : await ensureLiveEntryForSession(session).catch((error) => {
+          console.error('Failed to resolve native session for history selection:', error);
+          return null;
+        });
+      if (!selectionIsCurrent()) return;
+      await markPetNotificationReadForSession(session, liveEntry).catch((error) => {
+        console.error('Failed to mark selected history session read:', error);
+      });
+      if (!selectionIsCurrent()) return;
       if (liveEntry && canRestoreWorkspaceLiveSession(liveEntry.session)) {
+        updateHistoryRouteResolutionStatus('ready');
+        setIsLoadingMessages(false);
         setActiveLiveRuntimeId(liveEntry.session.runtime_id);
         setComposeDir(liveEntry.session.project_dir);
         setSelectedWorkingDir(liveEntry.session.project_dir);
@@ -1998,10 +2011,44 @@ export function Workspace({
       }
 
       const shouldLookupNativeHistory = options?.nativeHistorySession === undefined;
+      let nativeHistoryLookupFailed = false;
       const nativeHistorySession = shouldLookupNativeHistory
-        ? await findNativeHistorySessionForSession(session)
+        ? await findNativeHistorySessionForSession(session).catch((error) => {
+          nativeHistoryLookupFailed = true;
+          console.error('Failed to resolve routed history state:', error);
+          return null;
+        })
         : options.nativeHistorySession ?? null;
+      if (!selectionIsCurrent()) return;
 
+      if (requiresRouteResolution && nativeHistoryLookupFailed) {
+        updateHistoryRouteResolutionStatus('failed');
+        setWorkspaceMode('history');
+        toast.error(t('workspace.historyRouterResolveFailed'));
+        await loadConversation(session, {
+          resetBeforeLoad: true,
+          showLoading: true,
+        });
+        return;
+      }
+
+      const restored = session.source === 'claude'
+        ? resolveHistoryRouteRestore(nativeHistorySession)
+        : { kind: 'off' as const };
+      updateHistoryRouteDraftState(
+        explicitChoice
+        ?? (restored.kind === 'restored' ? restored.draft : createComposerRouteDraft()),
+      );
+
+      if (
+        explicitChoice === null
+        && restored.kind === 'restored'
+        && nativeHistorySession?.router?.defaultEnv
+      ) {
+        setHistoryEnv(nativeHistorySession.router.defaultEnv);
+      }
+
+      updateHistoryRouteResolutionStatus('ready');
       setWorkspaceMode('history');
       await loadConversation(session, {
         resetBeforeLoad: true,
@@ -2015,6 +2062,9 @@ export function Workspace({
       loadConversation,
       markPetNotificationReadForSession,
       setSelectedWorkingDir,
+      t,
+      updateHistoryRouteDraftState,
+      updateHistoryRouteResolutionStatus,
     ]
   );
 
@@ -2085,6 +2135,13 @@ export function Workspace({
 
     const matchesParsedSession = (session: HistorySessionItem) => {
       if (session.source !== parsed.source) {
+        return false;
+      }
+      if (
+        parsed.cwd
+        && normalizeHistoryRouteProject(session.project)
+          !== normalizeHistoryRouteProject(parsed.cwd)
+      ) {
         return false;
       }
       if (session.id === parsed.id) {
@@ -2218,6 +2275,8 @@ export function Workspace({
     setWorkspaceMode('compose');
     setSelectedKey(null);
     selectedKeyRef.current = null;
+    // A fresh Composer always starts with Dynamic Routing opted out.
+    updateComposeRouteDraftState(createComposerRouteDraft());
     if (dir) {
       setComposeDir(dir);
       setSelectedWorkingDir(dir);
@@ -2249,17 +2308,22 @@ export function Workspace({
     t,
   ]);
 
+  const applyComposeDir = useCallback((dir: string) => {
+    setComposeDir(dir);
+    setSelectedWorkingDir(dir);
+    void recordRecentProject(dir);
+  }, [recordRecentProject, setSelectedWorkingDir]);
+
   const handlePickComposeDir = useCallback(async () => {
     try {
       const dir = await openDirectoryPicker();
       if (dir) {
-        setComposeDir(dir);
-        setSelectedWorkingDir(dir);
+        applyComposeDir(dir);
       }
     } catch (error) {
       console.error('Failed to open directory dialog:', error);
     }
-  }, [openDirectoryPicker, setSelectedWorkingDir]);
+  }, [applyComposeDir, openDirectoryPicker]);
 
   const showWorkspaceTerminalLaunchError = useCallback((error: unknown) => {
     if (!isInteractiveSessionTerminalOpenError(error)) {
@@ -2405,7 +2469,7 @@ export function Workspace({
     setSessionTitle,
   ]);
 
-  const handleCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
+  const runCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isCreatingNativeSession) {
       return false;
     }
@@ -2435,6 +2499,27 @@ export function Workspace({
     }
     const previewPrompt = buildComposerPromptPreview(displayPrompt, attachments);
 
+    // Per-Composer Dynamic Routing opt-in: resolve the launch seed from the
+    // CURRENT store config at submit time. Blocking codes keep the draft so the
+    // user can fix the selection and retry; opted-out drafts omit the param.
+    let routerLaunchDraft: RouterLaunchDraft | null = null;
+    const routeDraft = composeRouteDraftRef.current;
+    if (composeProvider === 'claude' && routeDraft.optIn) {
+      const resolution = resolveRouterLaunchDraft(
+        routeDraft,
+        useAppStore.getState().routerConfig,
+      );
+      if (!resolution.ok) {
+        if (resolution.code === 'PROFILE_MISSING') {
+          toast.error(t('router.routeDraftProfileMissing'));
+        } else {
+          toast.error(t('router.routeDraftConfigUnavailable'));
+        }
+        return false;
+      }
+      routerLaunchDraft = resolution.value;
+    }
+
     const dispatch = resolveComposerDispatch({
       provider: composeProvider,
       prompt,
@@ -2444,19 +2529,36 @@ export function Workspace({
 
     setIsCreatingNativeSession(true);
     try {
-      const summary = await createNativeSession({
+      const launch = await startAfterCodexModelMigrationGate({
         provider: composeProvider,
         envName: currentEnv,
-        permMode: dispatch.permMode,
-        runtimePermMode: dispatch.runtimePermMode,
         workingDir,
-        initialPrompt: dispatch.prompt,
-        initialDisplayPrompt: previewPrompt,
-        initialImages: images.length > 0 ? images : undefined,
-        initialAnnotations: payload?.annotations,
-        effort: normalizeEffortForProvider(composeEffort, composeProvider),
-        seedBoundaryMessageCount: 0,
+        preflight: preflightCodexModelMigration,
+        confirm: requestCodexModelMigrationDecision,
+        acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
+        start: (codexMigrationProofToken) => createNativeSession({
+          provider: composeProvider,
+          envName: currentEnv,
+          permMode: dispatch.permMode,
+          runtimePermMode: dispatch.runtimePermMode,
+          workingDir,
+          initialPrompt: dispatch.prompt,
+          initialDisplayPrompt: previewPrompt,
+          initialImages: images.length > 0 ? images : undefined,
+          initialAnnotations: payload?.annotations,
+          effort: normalizeEffortForProvider(composeEffort, composeProvider),
+          seedBoundaryMessageCount: 0,
+          routerLaunchDraft,
+          codexMigrationProofToken,
+        }),
       });
+      if (!launch.started) {
+        if (launch.reason === 'preflight_changed') {
+          toast.error(t('workspace.codexModelMigrationChanged'));
+        }
+        return false;
+      }
+      const summary = launch.value;
 
       const liveBrowserSessionId = browserPanelSessionKeyRegistryRef.current.resolveLive({
         provider: summary.provider,
@@ -2464,20 +2566,11 @@ export function Workspace({
         runtimeId: summary.runtime_id,
       });
       setBrowserTargetBySessionId((previous) => {
-        const rebound = rebindBrowserPanelTarget(
+        return rebindBrowserPanelTarget(
           previous,
           WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
           liveBrowserSessionId,
         );
-        const reboundTarget = rebound[liveBrowserSessionId];
-        if (!reboundTarget || reboundTarget.backend !== 'preview') return rebound;
-        const withAgentSession = setPreviewBrowserPanelAgentSessionId(
-          reboundTarget,
-          summary.runtime_id,
-        );
-        return withAgentSession === reboundTarget
-          ? rebound
-          : { ...rebound, [liveBrowserSessionId]: withAgentSession };
       });
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
@@ -2499,12 +2592,23 @@ export function Workspace({
       setWorkspaceMode('live');
       resetComposePrompt('');
       setComposePlanModeEnabled(false);
+      // The next Composer starts opted out again; the launch just created
+      // carries this draft's routing snapshot in its authoritative state.
+      updateComposeRouteDraftState(createComposerRouteDraft());
       setSelectedWorkingDir(workingDir);
       scheduleWorkspaceRefresh(1200);
       return true;
     } catch (error) {
       console.error('Failed to create native workspace session:', error);
-      toast.error(t('workspace.nativeCreateFailed'));
+      // An opted-in launch failure must surface the backend's specific error
+      // (e.g. ROUTER_* validation), not just the generic banner — the draft is
+      // intentionally KEPT so the user can adjust and retry.
+      if (routerLaunchDraft) {
+        const detail = error instanceof Error ? error.message : String(error);
+        toast.error(detail || t('workspace.nativeCreateFailed'));
+      } else {
+        toast.error(t('workspace.nativeCreateFailed'));
+      }
       return false;
     } finally {
       setIsCreatingNativeSession(false);
@@ -2522,7 +2626,9 @@ export function Workspace({
     effectiveComposeDir,
     isCreatingNativeSession,
     permissionMode,
+    preflightCodexModelMigration,
     requestWorkspaceSessionTitle,
+    requestCodexModelMigrationDecision,
     resetComposePrompt,
     scheduleWorkspaceRefresh,
     setSelectedWorkingDir,
@@ -2530,12 +2636,44 @@ export function Workspace({
     t,
   ]);
 
-  const handleContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
+  // Synchronous in-flight guard: React state cannot stop a second submit in
+  // the SAME tick (Enter + click / double click both read `false` before the
+  // setState flushes). `begin()` flips a closure flag synchronously; released
+  // only in `finally` so every return path (validation, failure, success)
+  // re-arms it.
+  const createConversationGuardRef = useRef<ReentryGuard | null>(null);
+  if (!createConversationGuardRef.current) {
+    createConversationGuardRef.current = createReentryGuard();
+  }
+  const handleCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
+    const guard = createConversationGuardRef.current;
+    if (!guard || !guard.begin()) {
+      return false;
+    }
+    try {
+      return await runCreateNativeConversation(payload);
+    } finally {
+      guard.end();
+    }
+  }, [runCreateNativeConversation]);
+
+  const runContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isResumingHistorySession) {
       return false;
     }
 
     if (!selectedSession) {
+      return false;
+    }
+
+    if (isHistoryRouteContinuationBlocked(
+      selectedSession.source,
+      historyRouteResolutionStatusRef.current,
+    )) {
+      const key = historyRouteResolutionStatusRef.current === 'failed'
+        ? 'workspace.historyRouterResolveFailed'
+        : 'workspace.historyRouterResolving';
+      toast.error(t(key));
       return false;
     }
 
@@ -2574,6 +2712,34 @@ export function Workspace({
 
     const provider = selectedSession.source;
     const previewPrompt = buildComposerPromptPreview(displayPrompt, attachments);
+    // History sessions without an authoritative routed record default to off;
+    // an explicit opt-in resolves against the CURRENT config.
+    // A RESTORED draft instead references the authoritative routed runtime:
+    // the backend clones its private route/auth record and mints fresh
+    // secrets — the public summary is never replayed as a launch draft.
+    let routerLaunchDraft: RouterLaunchDraft | null = null;
+    let resumeRouterFromRuntimeId: string | null = null;
+    const routeDraft = historyRouteDraftRef.current;
+    if (provider === 'claude' && routeDraft.optIn) {
+      const restored = routeDraft.restoredSource;
+      if (restored) {
+        resumeRouterFromRuntimeId = restored.runtimeId;
+      } else {
+        const resolution = resolveRouterLaunchDraft(
+          routeDraft,
+          useAppStore.getState().routerConfig,
+        );
+        if (!resolution.ok) {
+          if (resolution.code === 'PROFILE_MISSING') {
+            toast.error(t('router.routeDraftProfileMissing'));
+          } else {
+            toast.error(t('router.routeDraftConfigUnavailable'));
+          }
+          return false;
+        }
+        routerLaunchDraft = resolution.value;
+      }
+    }
     const dispatch = resolveComposerDispatch({
       provider,
       prompt,
@@ -2583,20 +2749,38 @@ export function Workspace({
     setIsResumingHistorySession(true);
 
     try {
-      const summary = await createNativeSession({
+      const launch = await startAfterCodexModelMigrationGate({
         provider,
         envName: historyEnv,
-        permMode: dispatch.permMode,
-        runtimePermMode: dispatch.runtimePermMode,
         workingDir: selectedSession.project,
-        initialPrompt: dispatch.prompt,
-        initialDisplayPrompt: previewPrompt,
-        initialImages: images.length > 0 ? images : undefined,
-        initialAnnotations: payload?.annotations,
-        providerSessionId: selectedSession.id,
-        effort: normalizeEffortForProvider(historyEffort, provider),
-        seedBoundaryMessageCount: messages.length,
+        preflight: preflightCodexModelMigration,
+        confirm: requestCodexModelMigrationDecision,
+        acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
+        start: (codexMigrationProofToken) => createNativeSession({
+          provider,
+          envName: historyEnv,
+          permMode: dispatch.permMode,
+          runtimePermMode: dispatch.runtimePermMode,
+          workingDir: selectedSession.project,
+          initialPrompt: dispatch.prompt,
+          initialDisplayPrompt: previewPrompt,
+          initialImages: images.length > 0 ? images : undefined,
+          initialAnnotations: payload?.annotations,
+          providerSessionId: selectedSession.id,
+          effort: normalizeEffortForProvider(historyEffort, provider),
+          seedBoundaryMessageCount: messages.length,
+          routerLaunchDraft,
+          resumeRouterFromRuntimeId,
+          codexMigrationProofToken,
+        }),
       });
+      if (!launch.started) {
+        if (launch.reason === 'preflight_changed') {
+          toast.error(t('workspace.codexModelMigrationChanged'));
+        }
+        return false;
+      }
+      const summary = launch.value;
 
       setLaunchClient(provider);
       upsertLiveSessionEntry(summary, {
@@ -2609,12 +2793,22 @@ export function Workspace({
       setWorkspaceMode('live');
       resetHistoryComposerText('');
       setHistoryPlanModeEnabled(false);
+      clearHistoryRouteDraft(
+        window.localStorage,
+        historyRouteDraftKey(selectedSession),
+      );
+      updateHistoryRouteDraftState(createComposerRouteDraft());
       setSelectedWorkingDir(selectedSession.project);
       scheduleWorkspaceRefresh(1200);
       return true;
     } catch (error) {
       console.error('Failed to continue workspace history session:', error);
-      toast.error(t('workspace.nativeCreateFailed'));
+      if (routerLaunchDraft || resumeRouterFromRuntimeId) {
+        const detail = error instanceof Error ? error.message : String(error);
+        toast.error(detail || t('workspace.nativeCreateFailed'));
+      } else {
+        toast.error(t('workspace.nativeCreateFailed'));
+      }
       return false;
     } finally {
       setIsResumingHistorySession(false);
@@ -2631,14 +2825,144 @@ export function Workspace({
     isResumingHistorySession,
     launchOpenCodeWeb,
     messages,
+    preflightCodexModelMigration,
+    requestCodexModelMigrationDecision,
     scheduleWorkspaceRefresh,
     selectedSession,
     setLaunchClient,
     setSelectedWorkingDir,
     resetHistoryComposerText,
+    updateHistoryRouteDraftState,
     upsertLiveSessionEntry,
     t,
   ]);
+
+  // ---- Fork session from a model-output turn (Claude only) ----
+  const [forkDialog, setForkDialog] = useState<{
+    request: WorkspaceForkTurnRequest;
+    target: WorkspaceForkTarget;
+  } | null>(null);
+  const [isForkingTurn, setIsForkingTurn] = useState(false);
+
+  const openForkTurn = useCallback((
+    request: WorkspaceForkTurnRequest,
+    target: WorkspaceForkTarget,
+  ) => {
+    setForkDialog({ request, target });
+  }, []);
+
+  const closeForkTurnDialog = useCallback(() => {
+    setForkDialog((current) => (isForkingTurn ? current : null));
+  }, [isForkingTurn]);
+
+  const runForkFromTurn = useCallback(async (firstPrompt: string) => {
+    if (!forkDialog || isForkingTurn) {
+      return;
+    }
+    setIsForkingTurn(true);
+    const { request } = forkDialog;
+    try {
+      const summary = await createNativeSession({
+        provider: 'claude',
+        envName: request.envName,
+        permMode: request.permMode,
+        workingDir: request.workingDir ?? null,
+        initialPrompt: firstPrompt,
+        providerSessionId: request.providerSessionId,
+        forkFromMessageId: request.forkFromMessageId,
+        effort: request.effort ?? null,
+        seedBoundaryMessageCount: request.seedMessages.length,
+      });
+      setLaunchClient('claude');
+      upsertLiveSessionEntry(summary, {
+        initialPrompt: firstPrompt,
+        initialImages: null,
+        initialAnnotations: null,
+        seedMessages: request.seedMessages,
+      });
+      setActiveLiveRuntimeId(summary.runtime_id);
+      setWorkspaceMode('live');
+      scheduleWorkspaceRefresh(1200);
+      setForkDialog(null);
+    } catch (error) {
+      console.error('Failed to fork session from turn:', error);
+      const detail = error instanceof Error ? error.message : String(error);
+      toast.error(detail || t('workspace.forkTurnCreateFailed'));
+    } finally {
+      setIsForkingTurn(false);
+    }
+  }, [
+    createNativeSession,
+    forkDialog,
+    isForkingTurn,
+    scheduleWorkspaceRefresh,
+    setLaunchClient,
+    upsertLiveSessionEntry,
+    t,
+  ]);
+
+  // History-mode fork anchor: built from current selection each render, but the
+  // callback handed to memoized bubbles must stay identity-stable.
+  const handleForkHistoryTurnImpl = useRef<(message: ConversationMessageData) => void>(() => {});
+  handleForkHistoryTurnImpl.current = (message: ConversationMessageData) => {
+    if (!selectedSession || selectedSession.source !== 'claude' || !selectedSession.project) {
+      return;
+    }
+    if (!message.uuid || message.uuid.startsWith('assistant-turn-')) {
+      return;
+    }
+    // Bubbles render merged/windowed messages; match by uuid against the raw
+    // transcript array that seeds the forked session view.
+    const index = messages.findIndex((candidate) => candidate.uuid === message.uuid);
+    if (index < 0) {
+      return;
+    }
+    openForkTurn({
+      providerSessionId: selectedSession.id,
+      forkFromMessageId: message.uuid,
+      seedMessages: messages.slice(0, index + 1),
+      envName: historyEnv,
+      permMode: historyPermMode,
+      workingDir: selectedSession.project,
+      effort: normalizeEffortForProvider(historyEffort, 'claude'),
+    }, {
+      turnPreview: getWorkspaceForkTurnPreview(message),
+    });
+  };
+  const handleForkHistoryTurn = useCallback((message: ConversationMessageData) => {
+    handleForkHistoryTurnImpl.current(message);
+  }, []);
+
+  // All user route-draft edits for the history composer flow through here so
+  // the keyed store stays in sync (A/B/A retention). UI edits never carry a
+  // restored snapshot by construction; the restore path saves its own entry.
+  const updateHistoryRouteDraft = useCallback((next: ComposerRouteDraft) => {
+    if (selectedSession) {
+      writeHistoryRouteDraft(
+        window.localStorage,
+        historyRouteDraftKey(selectedSession),
+        next,
+      );
+    }
+    updateHistoryRouteDraftState(next);
+  }, [selectedSession, updateHistoryRouteDraftState]);
+
+  // Same synchronous in-flight guard as the compose submit (see above).
+  const resumeHistoryGuardRef = useRef<ReentryGuard | null>(null);
+  if (!resumeHistoryGuardRef.current) {
+    resumeHistoryGuardRef.current = createReentryGuard();
+  }
+  const handleContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
+    const guard = resumeHistoryGuardRef.current;
+    if (!guard || !guard.begin()) {
+      return false;
+    }
+    try {
+      return await runContinueHistorySession(payload);
+    } finally {
+      guard.end();
+    }
+  }, [runContinueHistorySession]);
 
   const handleLiveSessionUpdate = useCallback((session: NativeSessionSummary) => {
     upsertLiveSessionEntry(session);
@@ -2757,17 +3081,51 @@ export function Workspace({
           <h2 className="shrink-0 whitespace-nowrap text-2xl font-semibold tracking-tight text-foreground">
             {t('workspace.composeTitle')}
           </h2>
-          <button
-            type="button"
-            onClick={() => void handlePickComposeDir()}
-            className="inline-flex min-w-0 max-w-full items-center justify-center gap-1.5 text-2xl font-semibold tracking-tight text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <FolderOpen className="h-4 w-4 shrink-0" />
-            <span className="min-w-0 max-w-[300px] truncate">
-              {effectiveComposeDirLabel || t('workspace.composeSelectFolder')}
-            </span>
-            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-          </button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="inline-flex min-w-0 max-w-full items-center justify-center gap-1.5 text-2xl font-semibold tracking-tight text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <FolderOpen className="h-4 w-4 shrink-0" />
+                <span className="min-w-0 max-w-[300px] truncate">
+                  {effectiveComposeDirLabel || t('workspace.composeSelectFolder')}
+                </span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="center" side="bottom" className="min-w-[260px]">
+              {recentComposeFolders.length > 0 && (
+                <>
+                  <DropdownMenuLabel className="px-2.5 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {t('workspace.composeRecentFolders')}
+                  </DropdownMenuLabel>
+                  {recentComposeFolders.map((project) => (
+                    <DropdownMenuItem
+                      key={project.path}
+                      onSelect={() => applyComposeDir(project.path)}
+                    >
+                      <FolderOpen className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="flex min-w-0 flex-1 flex-col">
+                        <span className="truncate text-sm">{getProjectName(project.path)}</span>
+                        <span className="truncate text-xs text-muted-foreground">
+                          {truncatePath(project.path)}
+                        </span>
+                      </span>
+                      {effectiveComposeDir === project.path && (
+                        <Check className="ml-2 h-4 w-4 shrink-0 text-foreground" />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                </>
+              )}
+              <DropdownMenuItem onSelect={() => void handlePickComposeDir()}>
+                <FolderSearch className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                <span>{t('workspace.composeBrowseFolders')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
@@ -2790,6 +3148,8 @@ export function Workspace({
           searchWorkspaceFiles={searchWorkspaceFiles}
           planModeEnabled={composePlanModeEnabled}
           onPlanModeEnabledChange={setComposePlanModeEnabled}
+          routeDraft={composeRouteDraft}
+          onRouteDraftChange={updateComposeRouteDraftState}
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
@@ -2842,6 +3202,12 @@ export function Workspace({
     }
 
     const historyProvider = selectedSession.source === 'codex' ? 'codex' : 'claude';
+    const historyRouteDraftAvailable = selectedHistorySupportsInline
+      && isRouteDraftRowVisible(selectedSession.source);
+    const historyRouteResolutionBlocked = isHistoryRouteContinuationBlocked(
+      selectedSession.source,
+      historyRouteResolutionStatus,
+    );
 
     return (
       <div className="flex h-full min-h-0 flex-col">
@@ -2863,6 +3229,7 @@ export function Workspace({
               onAddAnnotation={selectedHistorySupportsInline ? historyAnnotations.addAnnotation : undefined}
               onUpdateAnnotation={selectedHistorySupportsInline ? historyAnnotations.updateAnnotation : undefined}
               onRemoveAnnotation={selectedHistorySupportsInline ? historyAnnotations.removeAnnotation : undefined}
+              onForkTurn={selectedSession.source === 'claude' ? handleForkHistoryTurn : undefined}
             />
           </WorkspaceHistoryErrorBoundary>
         </Suspense>
@@ -2873,12 +3240,21 @@ export function Workspace({
           onValueChange={handleHistoryComposerTextChange}
           onSubmit={handleContinueHistorySession}
           placeholder={
-            selectedHistorySupportsInline
+            historyRouteResolutionStatus === 'resolving'
+              ? t('workspace.historyRouterResolving')
+              : historyRouteResolutionStatus === 'failed'
+                ? t('workspace.historyRouterResolveFailed')
+                : selectedHistorySupportsInline
               ? t('workspace.composePlaceholder')
               : t('workspace.historyContinueUnsupported')
           }
-          disabled={!selectedHistorySupportsInline}
-          canSubmit={selectedHistorySupportsInline && historyHasDraft && !isResumingHistorySession}
+          disabled={!selectedHistorySupportsInline || historyRouteResolutionBlocked}
+          canSubmit={
+            selectedHistorySupportsInline
+            && !historyRouteResolutionBlocked
+            && historyHasDraft
+            && !isResumingHistorySession
+          }
           isSubmitting={isResumingHistorySession}
           submitLabel={selectedHistorySupportsInline ? t('workspace.composeSend') : t('workspace.openCodeWeb')}
           loadingLabel={t('common.loading')}
@@ -2891,14 +3267,16 @@ export function Workspace({
           planModeEnabled={historyPlanModeEnabled}
           onPlanModeEnabledChange={selectedHistorySupportsInline ? setHistoryPlanModeEnabled : undefined}
           planModeAvailable={selectedHistorySupportsInline}
+          routeDraft={historyRouteDraftAvailable ? historyRouteDraft : null}
+          onRouteDraftChange={historyRouteDraftAvailable ? updateHistoryRouteDraft : undefined}
           codexInstalled={codexInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
-          annotations={historyAnnotations.annotations}
+          annotations={historyAnnotations.pendingAnnotations}
           onUpdateAnnotation={historyAnnotations.updateAnnotation}
           onRemoveAnnotation={historyAnnotations.removeAnnotation}
-          onClearAnnotations={historyAnnotations.clearAnnotations}
-          onAnnotationsSent={historyAnnotations.clearAnnotations}
+          onClearAnnotations={historyAnnotations.clearPendingAnnotations}
+          onAnnotationsSent={historyAnnotations.markAllSent}
           controls={(
             <ComposerControls
               provider={historyProvider}
@@ -2907,6 +3285,7 @@ export function Workspace({
               effort={historyEffort}
               environments={environments}
               enabledEnvironments={enabledEnvironments}
+              environmentLocked={Boolean(historyRouteDraft.restoredSource)}
               onEnvChange={handleHistoryEnvChange}
               onPermModeChange={handleHistoryPermModeChange}
               onEffortChange={handleHistoryEffortChange}
@@ -3036,12 +3415,14 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={browserPanelOpen}
-            browserBackend={activeVisibleBrowserTarget?.backend ?? null}
-            browserWorkingDir={skillsContext.workingDir}
-            onTogglePreviewBrowser={toggleActivePreviewBrowser}
-            onOpenLoginBrowser={openActiveLoginBrowser}
-            onBrowserHostOverlayChange={setBrowserHostOverlayOpen}
+            onToggleBrowser={() => toggleActiveBrowser(skillsContext.workingDir)}
             envContext={statusStripEnvContext}
+            activeRuntimeId={
+              workspaceMode === 'live' && activeLiveEntry?.session.provider === 'claude'
+                ? activeLiveRuntimeId
+                : null
+            }
+            onNavigateEnvironments={() => onNavigate('environments')}
           />
 
           <div
@@ -3131,14 +3512,20 @@ export function Workspace({
                           installedSkills={workspaceInstalledSkills}
                           onRefreshSkills={refreshWorkspaceInstalledSkills}
                           workspaceCommands={workspaceCommands}
-                          isVisible={isActiveLiveEntry}
+                          isVisible={isActive && isActiveLiveEntry}
                           onSessionUpdate={handleLiveSessionUpdate}
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}
                           onLaunchNewSession={handleNewSession}
+                          onForkTurnRequest={openForkTurn}
+                          onNavigateEnvironments={() => onNavigate('environments')}
                           onStartNew={() => {
                             setWorkspaceMode('compose');
                             setActiveLiveRuntimeId(null);
+                            // "Start New" opens a fresh Composer: reset the
+                            // routing opt-in so a prior unsent draft never
+                            // leaks into the next launch.
+                            updateComposeRouteDraftState(createComposerRouteDraft());
                           }}
                       />
                       </div>
@@ -3182,29 +3569,34 @@ export function Workspace({
                 minWidth: BROWSER_PANEL_MIN_WIDTH_PX,
               } : undefined}
             >
-              {target.backend === 'login' ? (
-                <BrowserPanel
-                  key={panelKey}
-                  {...target}
-                  {...panelProps}
-                  agentSessionId={
-                    sessionId === activeBrowserSessionId
-                      ? activeBrowserAgentSessionId ?? undefined
-                      : undefined
-                  }
-                />
-              ) : (
-                <BrowserPanel
-                  key={panelKey}
-                  {...panelProps}
-                  backend="preview"
-                  agentSessionId={target.agentSessionId}
-                />
-              )}
+              <BrowserPanel
+                key={panelKey}
+                {...target}
+                {...panelProps}
+                agentSessionId={
+                  sessionId === activeBrowserSessionId
+                    ? activeBrowserAgentSessionId ?? undefined
+                    : undefined
+                }
+              />
             </div>
           );
         })}
       </div>
+
+      <WorkspaceForkDialog
+        open={forkDialog !== null}
+        target={forkDialog?.target ?? null}
+        submitting={isForkingTurn}
+        onOpenChange={(next) => {
+          if (!next) {
+            closeForkTurnDialog();
+          }
+        }}
+        onSubmit={(firstPrompt) => {
+          void runForkFromTurn(firstPrompt);
+        }}
+      />
 
       <WorkspaceGlobalSearch
         sessions={sessions}
@@ -3212,6 +3604,13 @@ export function Workspace({
         onOpenChange={setIsGlobalSearchOpen}
         onSelectSession={handleSelect}
         onSelectProject={handleCreateForProject}
+      />
+
+      <WorkspaceCodexModelMigrationDialog
+        open={codexModelMigrationWarning !== null}
+        warning={codexModelMigrationWarning}
+        onCancel={() => settleCodexModelMigrationDecision(false)}
+        onContinue={() => settleCodexModelMigrationDecision(true)}
       />
     </div>
   );

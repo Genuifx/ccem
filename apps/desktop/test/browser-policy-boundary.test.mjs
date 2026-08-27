@@ -24,12 +24,13 @@ test('browser tool dispatch uses a current revision-bound native permission auth
   assert.match(dispatch, /browser_permission_sync[\s\S]*current_ticket/);
   assert.match(dispatch, /effective_native_perm_mode[\s\S]*authority\.mode\(\)/);
   assert.ok(dispatch.indexOf('current_ticket') < dispatch.indexOf('prepare_agent_tool_if_handed_off'));
-  assert.match(dispatch, /authority\.validate_current\(\)/);
-  assert.match(dispatch, /authorize_browser_tool\(authority\.mode\(\), &request\.tool\)/);
   assert.match(
     dispatch,
-    /browser\.run_tool_with_permission\([\s\S]*?&request,[\s\S]*?&authority/,
+    /prepare_agent_tool_if_handed_off\([\s\S]*?&workspace_dir,[\s\S]*?&browser_actor_id,[\s\S]*?authority,[\s\S]*?&request/,
   );
+  assert.match(dispatch, /Mode 2 browser is not handed off to this exact session actor/);
+  assert.match(dispatch, /login\.execute_prepared_agent_tool\(&request, prepared\)/);
+  assert.doesNotMatch(dispatch, /browser\.run_tool_with_permission/);
 
   assert.match(policySource, /"readonly" \| "audit" \| "plan" \| "safe" \| "ci"/);
   assert.match(policySource, /READ_ONLY_BROWSER_TOOLS\.contains\(&tool\)/);
@@ -47,6 +48,7 @@ test('browser actions require exact visible session control and support cancella
   assert.match(toolsSource, /main_visible[\s\S]*get_webview[\s\S]*is_visible_for_agent/);
   assert.match(registrySource, /active_session_id == session_id[\s\S]*session\.visible && !session\.paused/);
   assert.match(registrySource, /cancel_epoch = session\.cancel_epoch\.saturating_add\(1\)/);
-  assert.match(panelSource, /browser_set_paused/);
+  assert.match(panelSource, /browserSurfaceClient\.control/);
+  assert.match(panelSource, /action: 'handoff' \| 'pause' \| 'takeover'/);
   assert.match(panelSource, /browserAgentControlling/);
 });

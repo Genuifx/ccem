@@ -1,6 +1,6 @@
 {
   "name": "@ccem/desktop",
-  "version": "2.63.0",
+  "version": "2.73.0",
   "type": "module",
   "scripts": {
     "predev": "node scripts/prepare-native-runtime-sidecar.mjs",
@@ -8,12 +8,12 @@
     "prebuild": "node scripts/prepare-native-runtime-sidecar.mjs",
     "build": "tsc && vite build",
     "test": "node --test test/*.test.mjs",
-    "test:run": "node --test test/*.test.mjs",
+    "test:run": "pnpm --filter @ccem/core build && node --test test/*.test.mjs",
     "test:e2e": "node test/opencode.mcp.e2e.mjs",
     "perf:smoke": "node scripts/perf-smoke.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json -- --locked"
+    "tauri:dev": "node scripts/tauri-dev.mjs"
   },
   "dependencies": {
     "@ccem/core": "workspace:*",
@@ -24,8 +24,10 @@
     "@radix-ui/react-context-menu": "^2.3.1",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-hover-card": "^1.1.23",
     "@radix-ui/react-label": "^2.1.8",
     "@radix-ui/react-popover": "^1.1.15",
+    "@radix-ui/react-radio-group": "^1.4.7",
     "@radix-ui/react-scroll-area": "^1.2.10",
     "@radix-ui/react-select": "^2.2.6",
     "@radix-ui/react-separator": "^1.1.8",

@@ -109,30 +109,14 @@ interface BrowserPanelTargetBase {
   /** Immutable native handle; semantic session ownership may be rebound. */
   surfaceSessionId: string;
   initialUrl?: string | null;
-  /** A later launcher URL reuses the instance and is handled as navigate. */
-  navigationRequestId?: number;
-  navigationUrl?: string | null;
   /** Hidden panels retain their mounted React component and native lease. */
   visible?: boolean;
 }
 
-export interface PreviewBrowserPanelTarget extends BrowserPanelTargetBase {
-  backend: 'preview';
-  /** Native runtime alias whose Agent browser tools must resolve to this physical instance. */
-  agentSessionId?: string;
-}
-
-export type LoginBrowserPanelRequest = {
-  workingDir: string;
-  initialUrl?: string | null;
-} & BrowserSurfaceProfileSelection;
-
-export type LoginBrowserPanelTarget = BrowserPanelTargetBase & {
+export type BrowserPanelTarget = BrowserPanelTargetBase & {
   backend: 'login';
   workingDir: string;
 } & BrowserSurfaceProfileSelection;
-
-export type BrowserPanelTarget = PreviewBrowserPanelTarget | LoginBrowserPanelTarget;
 
 export function resolveActiveBrowserAgentSessionId(
   session: Pick<NativeSessionSummary, 'runtime_id' | 'status' | 'is_active'> | null | undefined,
@@ -159,25 +143,62 @@ export function setBrowserPanelTargetVisible(
   return target.visible === visible ? target : { ...target, visible };
 }
 
-export function setPreviewBrowserPanelAgentSessionId(
-  target: BrowserPanelTarget,
-  agentSessionId: string | null | undefined,
-): BrowserPanelTarget {
-  if (target.backend !== 'preview') return target;
-  const normalized = agentSessionId?.trim() || undefined;
-  return target.agentSessionId === normalized
-    ? target
-    : { ...target, agentSessionId: normalized };
+/**
+ * The Browser button has one behavior: retain and toggle the current Mode 2
+ * instance, or create the default shared-profile instance when none exists.
+ */
+export function toggleDefaultBrowserPanelTarget(
+  targets: Record<string, BrowserPanelTarget | undefined>,
+  ownerSessionId: string,
+  workingDir: string,
+  allocateInstanceId: () => number,
+): Record<string, BrowserPanelTarget | undefined> {
+  const normalizedWorkingDir = workingDir.trim();
+  if (!normalizedWorkingDir) return targets;
+
+  const existing = targets[ownerSessionId];
+  if (existing) {
+    // Workspace retires a compose target before its working directory changes.
+    // Refuse to repurpose the old lease if a click races that retirement effect.
+    if (existing.workingDir.trim() !== normalizedWorkingDir) return targets;
+    return {
+      ...targets,
+      [ownerSessionId]: setBrowserPanelTargetVisible(
+        existing,
+        !isBrowserPanelTargetVisible(existing),
+      ),
+    };
+  }
+
+  const instanceId = allocateInstanceId();
+  return {
+    ...targets,
+    [ownerSessionId]: {
+      backend: 'login',
+      instanceId,
+      surfaceSessionId: createBrowserPanelSurfaceSessionId(ownerSessionId, instanceId),
+      visible: true,
+      workingDir: normalizedWorkingDir,
+      profileMode: 'default',
+    },
+  };
 }
 
-/** Finds the semantic owner for a native event emitted by a retained surface. */
-export function findBrowserPanelOwnerSessionIdBySurfaceSessionId(
+/**
+ * A compose draft has a stable semantic owner id. Retire its mounted Mode 2
+ * target when the selected folder changes so the old native lease cannot be
+ * reused under a different workspace identity.
+ */
+export function retireBrowserPanelTargetForWorkingDirChange(
   targets: Record<string, BrowserPanelTarget | undefined>,
-  surfaceSessionId: string,
-): string | null {
-  return Object.entries(targets).find(([, target]) => (
-    target?.surfaceSessionId === surfaceSessionId
-  ))?.[0] ?? null;
+  ownerSessionId: string,
+  workingDir: string | null | undefined,
+): Record<string, BrowserPanelTarget | undefined> {
+  const existing = targets[ownerSessionId];
+  if (!existing || existing.workingDir.trim() === workingDir?.trim()) return targets;
+  const next = { ...targets };
+  delete next[ownerSessionId];
+  return next;
 }
 
 /**

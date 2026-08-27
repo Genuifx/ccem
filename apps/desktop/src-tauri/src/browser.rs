@@ -36,7 +36,9 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
-use url::{is_allowed_browser_navigation, parse_browser_url};
+#[cfg(target_os = "macos")]
+use url::is_allowed_browser_navigation;
+use url::parse_browser_url;
 use webview::{
     apply_browser_bounds, ensure_browser_webview, eval_webview_js, navigate_browser_history,
     probe_webview_health, require_browser_webview, snapshot_webview_png,

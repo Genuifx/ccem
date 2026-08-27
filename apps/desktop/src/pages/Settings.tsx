@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { Moon, Sun, MonitorSmartphone, Lightbulb, Terminal, CheckCircle2, XCircle, Copy, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Search, FolderOpen, X, Sparkles, Clock, Image, BellRing, RefreshCw, Download, RotateCw, Palette, AppWindow, Info, Bot, Gauge } from '@/lib/lucide-react';
+import { Moon, Sun, MonitorSmartphone, Lightbulb, Terminal, CheckCircle2, XCircle, Copy, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Search, FolderOpen, X, Sparkles, Clock, Image, BellRing, RefreshCw, Download, RotateCw, Palette, AppWindow, Info, Bot, Gauge, Router } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
+import { ToggleSetting } from '@/components/ui/ToggleSetting';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import { useAppStore } from '@/store';
 import { invoke } from '@tauri-apps/api/core';
@@ -8,6 +9,7 @@ import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
+import { SettingsRouterSection } from '@/components/SettingsRouterSection';
 import { useLocale } from '../locales';
 import { SettingsSkeleton } from '@/components/ui/skeleton-states';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
@@ -59,7 +61,7 @@ interface InstallStatusState {
   tmux: boolean | null;
 }
 
-type SectionId = 'appearance' | 'application' | 'notifications' | 'agentSkill' | 'ai' | 'permission' | 'about';
+type SectionId = 'appearance' | 'application' | 'notifications' | 'agentSkill' | 'ai' | 'permission' | 'router' | 'about';
 
 const CCEM_REPO_URL = 'https://github.com/Genuifx/claude-code-env-manager';
 
@@ -440,10 +442,12 @@ export function Settings() {
     { id: 'agentSkill', icon: Bot, label: t('settings.agentSkill') },
     { id: 'ai', icon: Sparkles, label: t('settings.aiEnhancement') },
     { id: 'permission', icon: Shield, label: t('settings.defaultPermission') },
+    { id: 'router', icon: Router, label: t('settings.router') },
     { id: 'about', icon: Info, label: t('settings.about') },
   ];
 
   const activeSectionLabel = sections.find((s) => s.id === activeSection)?.label ?? '';
+
 
   const renderAppearanceSection = () => (
     <div className="space-y-5">
@@ -1003,6 +1007,8 @@ export function Settings() {
         return renderAiSection();
       case 'permission':
         return renderPermissionSection();
+      case 'router':
+        return <SettingsRouterSection />;
       case 'about':
         return renderAboutSection();
       default:
@@ -1360,41 +1366,6 @@ function DiagnosticsPanel({ active }: { active: boolean }) {
           {t('settings.diagnosticsClear')}
         </Button>
       </div>
-    </div>
-  );
-}
-
-function ToggleSetting({ checked, onChange, title, description }: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  title: string;
-  description: string;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <div className="min-w-0">
-        <div className="text-sm font-medium text-foreground">
-          {title}
-        </div>
-        <div className="text-sm text-muted-foreground">
-          {description}
-        </div>
-      </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors duration-200 ease-in-out ${
-          checked ? 'bg-primary' : 'bg-muted-foreground/30'
-        }`}
-      >
-        <span
-          className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-            checked ? 'translate-x-[22px]' : 'translate-x-[2px]'
-          } mt-[2px]`}
-        />
-      </button>
     </div>
   );
 }

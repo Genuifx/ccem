@@ -7,11 +7,13 @@ mod app_updates;
 mod bot_binding;
 mod browser;
 mod channel;
+mod codex_migration;
 mod companion;
 mod config;
 mod cron;
 mod crypto;
 mod desktop_instance_lock;
+mod dev_instance;
 mod diagnostic_log;
 mod doctor;
 mod event_bus;
@@ -34,7 +36,9 @@ mod pet_window;
 mod prompt_image_store;
 mod proxy_debug;
 mod remote;
+mod router;
 mod runtime;
+mod secure_fs;
 mod session;
 mod session_annotations;
 mod session_provenance;
@@ -86,8 +90,9 @@ use interactive_runtime::{
     InteractiveReplayBatch, InteractiveRuntimeManager, InteractiveSessionOptions,
 };
 use native_runtime::{
-    InteractivePromptAnnotation, NativeHandoffResult, NativeProvider, NativeRuntimeManager,
-    NativeSessionOptions, NativeSessionSummary, PromptImage,
+    validate_router_create_selection, InteractivePromptAnnotation, NativeHandoffResult,
+    NativeProvider, NativeRuntimeManager, NativeSessionOptions, NativeSessionSummary, PromptImage,
+    RouterLaunchDraft,
 };
 use opencode::{snapshot_known_session_ids, track_launched_session};
 use prompt_image_store::PromptImageStore;
@@ -95,6 +100,11 @@ use proxy_debug::{
     ProxyDebugManager, ProxyDebugState, ProxyTrafficDetail, ProxyTrafficPage, RegisterRouteRequest,
 };
 use remote::RemotePlatform;
+use router::{
+    rename_router_config_environment, router_config_environment_references, validate_router_config,
+    RouterConfig, RouterManager, RouterServiceError, RouterStatus, SessionRouterPatch,
+    SessionRouterState, UpdateSessionRouterRequest,
+};
 use runtime::{
     cleanup_orphaned_runtime_processes, clear_runtime_recovery_candidates_by_claude_session_id,
     dismiss_runtime_recovery_candidate as dismiss_runtime_recovery_candidate_entry,
@@ -137,7 +147,7 @@ use workspace_search::search_workspace_files;
 static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 use tauri::window::Color;
-use tauri::{webview::PageLoadEvent, Manager, RunEvent, State, WindowEvent};
+use tauri::{webview::PageLoadEvent, Emitter, Manager, RunEvent, State, WindowEvent};
 use terminal::{
     ArrangeLayout, ArrangeSessionInfo, TerminalInfo, TerminalType, TmuxAttachTerminalInfo,
     TmuxAttachTerminalType,
@@ -260,8 +270,12 @@ fn window_control(app: tauri::AppHandle, action: WindowControlAction) -> Result<
 }
 
 #[tauri::command]
-async fn get_environments() -> Result<HashMap<String, EnvConfig>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn get_environments(
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<HashMap<String, EnvConfig>, String> {
+    let environment_mutations = environment_mutations.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
         #[cfg(debug_assertions)]
         let start = std::time::Instant::now();
         let cfg = config::read_config()?;
@@ -286,13 +300,20 @@ async fn get_environments() -> Result<HashMap<String, EnvConfig>, String> {
 }
 
 #[tauri::command]
-fn get_current_env() -> Result<String, String> {
+fn get_current_env(
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<String, String> {
+    let _mutation_guard = environment_mutations.lock()?;
     let cfg = config::read_config()?;
     Ok(cfg.current.unwrap_or_else(|| "official".to_string()))
 }
 
 #[tauri::command]
-fn set_current_env(name: String) -> Result<(), String> {
+fn set_current_env(
+    name: String,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     let mut cfg = config::read_config()?;
 
     // 校验环境是否存在
@@ -315,7 +336,9 @@ fn add_environment(
     runtime_model: Option<String>,
     subagent_model: Option<String>,
     limit_write_tools: Option<bool>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     let mut cfg = config::read_config()?;
 
     if cfg.registries.contains_key(&name) {
@@ -333,12 +356,13 @@ fn add_environment(
     )?;
     env_config.limit_write_tools = limit_write_tools.unwrap_or(false);
 
-    cfg.registries.insert(name, env_config);
+    cfg.registries.insert(name.clone(), env_config);
     config::write_config(&cfg)
 }
 
 #[tauri::command]
 fn update_environment(
+    app: tauri::AppHandle,
     old_name: String,
     name: String,
     base_url: String,
@@ -349,66 +373,138 @@ fn update_environment(
     runtime_model: Option<String>,
     subagent_model: Option<String>,
     limit_write_tools: Option<bool>,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
 ) -> Result<(), String> {
-    let mut cfg = config::read_config()?;
-
-    if !cfg.registries.contains_key(&old_name) {
-        return Err(format!("Environment '{}' does not exist", old_name));
+    config::ensure_environment_rename_allowed(&old_name, &name)?;
+    let _mutation_guard = environment_mutations.lock()?;
+    if old_name == name {
+        return config::update_ccem_config(|cfg| {
+            let previous_limit_write_tools = cfg
+                .registries
+                .get(&old_name)
+                .ok_or_else(|| format!("Environment '{}' does not exist", old_name))?
+                .limit_write_tools;
+            let mut env_config = create_env_with_encrypted_key(
+                Some(base_url),
+                auth_token,
+                Some(default_opus_model),
+                default_sonnet_model,
+                default_haiku_model,
+                runtime_model,
+                subagent_model,
+            )?;
+            env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
+            cfg.registries.insert(name, env_config);
+            Ok(())
+        });
     }
 
-    // If renaming, check that new name doesn't conflict
-    if old_name != name && cfg.registries.contains_key(&name) {
-        return Err(format!("Environment '{}' already exists", name));
-    }
-
-    let previous_limit_write_tools = cfg
-        .registries
-        .get(&old_name)
-        .map(|env| env.limit_write_tools)
-        .unwrap_or(false);
-    let mut env_config = create_env_with_encrypted_key(
-        Some(base_url),
-        auth_token,
-        Some(default_opus_model),
-        default_sonnet_model,
-        default_haiku_model,
-        runtime_model,
-        subagent_model,
-    )?;
-    env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
-
-    // Remove old key if renamed
-    if old_name != name {
-        cfg.registries.remove(&old_name);
-        // Update current env pointer if it was pointing to the old name
-        if cfg.current.as_ref() == Some(&old_name) {
-            cfg.current = Some(name.clone());
+    let (events, _final_config) = config::commit_environment_rename(
+        &old_name,
+        &name,
+        |cfg| {
+            if !cfg.registries.contains_key(&old_name) {
+                return Err(format!("Environment '{}' does not exist", old_name));
+            }
+            if cfg.registries.contains_key(&name) {
+                return Err(format!("Environment '{}' already exists", name));
+            }
+            let previous_limit_write_tools = cfg
+                .registries
+                .get(&old_name)
+                .map(|env| env.limit_write_tools)
+                .unwrap_or(false);
+            let mut env_config = create_env_with_encrypted_key(
+                Some(base_url),
+                auth_token,
+                Some(default_opus_model),
+                default_sonnet_model,
+                default_haiku_model,
+                runtime_model,
+                subagent_model,
+            )?;
+            env_config.limit_write_tools = limit_write_tools.unwrap_or(previous_limit_write_tools);
+            cfg.registries.remove(&old_name);
+            if cfg.current.as_ref() == Some(&old_name) {
+                cfg.current = Some(name.clone());
+            }
+            rename_router_config_environment(&mut cfg.router, &old_name, &name);
+            cfg.registries.insert(name.clone(), env_config);
+            Ok(())
+        },
+        |from, to| native_state.rename_router_environment_references(from, to),
+    )
+    .map_err(|error| error.to_string())?;
+    for event in events {
+        if let Err(error) = app.emit("native-session-router-updated", event) {
+            eprintln!("Failed to emit router environment rename event: {error}");
         }
     }
-
-    cfg.registries.insert(name, env_config);
-    config::write_config(&cfg)
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_environment(name: String) -> Result<(), String> {
-    if name == "official" {
-        return Err("Cannot delete the 'official' environment".to_string());
-    }
+fn get_environment_router_references(
+    name: String,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<Vec<String>, String> {
+    let _mutation_guard = environment_mutations.lock()?;
+    let cfg = config::read_config()?;
+    let native_references = native_state.router_environment_references(&name)?;
+    Ok(collect_environment_router_references(
+        &cfg.router,
+        &name,
+        native_references,
+    ))
+}
 
-    let mut cfg = config::read_config()?;
+fn collect_environment_router_references(
+    router: &RouterConfig,
+    name: &str,
+    native_references: Vec<String>,
+) -> Vec<String> {
+    let mut references = router_config_environment_references(router, name);
+    references.extend(native_references);
+    references.sort();
+    references.dedup();
+    references
+}
 
-    if !cfg.registries.contains_key(&name) {
-        return Err(format!("Environment '{}' does not exist", name));
-    }
+#[tauri::command]
+fn delete_environment(
+    name: String,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<(), String> {
+    config::ensure_environment_delete_allowed(&name)?;
+    let _mutation_guard = environment_mutations.lock()?;
 
-    cfg.registries.remove(&name);
+    config::update_ccem_config(|cfg| {
+        if !cfg.registries.contains_key(&name) {
+            return Err(format!("Environment '{}' does not exist", name));
+        }
 
-    if cfg.current.as_ref() == Some(&name) {
-        cfg.current = Some("official".to_string());
-    }
+        let references = collect_environment_router_references(
+            &cfg.router,
+            &name,
+            native_state.router_environment_references(&name)?,
+        );
+        if !references.is_empty() {
+            return Err(format!(
+                "Cannot delete environment '{}'; it is referenced by {}",
+                name,
+                references.join(", ")
+            ));
+        }
 
-    config::write_config(&cfg)
+        cfg.registries.remove(&name);
+        if cfg.current.as_ref() == Some(&name) {
+            cfg.current = Some(config::OFFICIAL_ENV_NAME.to_string());
+        }
+        Ok(())
+    })
 }
 
 // ============================================
@@ -940,7 +1036,6 @@ fn get_session_events(
 
 #[tauri::command]
 async fn get_workspace_session_decorations(
-    app: tauri::AppHandle,
     unified_state: State<'_, Arc<UnifiedSessionManager>>,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     session_state: State<'_, Arc<SessionManager>>,
@@ -976,17 +1071,17 @@ async fn get_workspace_session_decorations(
                 .map(legacy_interactive_runtime_descriptor),
         );
 
-        let mut events_by_runtime = unified_sessions
+        let mut attention_by_runtime = unified_sessions
             .iter()
             .filter(|runtime| runtime.is_active && should_replay_decoration_events(&runtime.status))
             .filter_map(|runtime| {
                 unified_state
-                    .get_session_events(&app, &runtime.id, None)
+                    .attention_summary(&runtime.id)
                     .ok()
-                    .map(|batch| (runtime.id.clone(), batch.events))
+                    .map(|summary| (runtime.id.clone(), summary))
             })
             .collect::<HashMap<_, _>>();
-        events_by_runtime.extend(
+        attention_by_runtime.extend(
             native_sessions
                 .iter()
                 .filter(|runtime| {
@@ -994,16 +1089,16 @@ async fn get_workspace_session_decorations(
                 })
                 .filter_map(|runtime| {
                     native_state
-                        .replay_events(&runtime.runtime_id, None)
+                        .attention_summary(&runtime.runtime_id)
                         .ok()
-                        .map(|batch| (runtime.runtime_id.clone(), batch.events))
+                        .map(|summary| (runtime.runtime_id.clone(), summary))
                 }),
         );
 
         Ok(build_workspace_session_decorations(
             &sessions,
             &runtimes,
-            &events_by_runtime,
+            &attention_by_runtime,
         ))
     })
     .await
@@ -1221,6 +1316,7 @@ fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: 
 async fn create_native_session(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     provider: String,
     env_name: String,
     perm_mode: Option<String>,
@@ -1233,9 +1329,64 @@ async fn create_native_session(
     provider_session_id: Option<String>,
     effort: Option<String>,
     seed_boundary_message_count: Option<u64>,
+    fork_from_message_id: Option<String>,
+    router_launch_draft: Option<RouterLaunchDraft>,
+    resume_router_from_runtime_id: Option<String>,
+    codex_migration_proof_token: Option<String>,
 ) -> Result<NativeSessionSummary, String> {
+    let mutation_guard = environment_mutations.lock()?;
     let provider = parse_native_provider(&provider)?;
+    validate_router_create_selection(
+        router_launch_draft.as_ref(),
+        resume_router_from_runtime_id.as_deref(),
+    )?;
+    if fork_from_message_id.is_some() {
+        if provider != NativeProvider::Claude {
+            return Err(
+                "FORK_PROVIDER_UNSUPPORTED: forking from a message is only available for Claude sessions"
+                    .to_string(),
+            );
+        }
+        if provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(
+                "FORK_MISSING_PARENT: forking requires provider_session_id of the parent session"
+                    .to_string(),
+            );
+        }
+    }
+    let fork_from_message_id = fork_from_message_id.filter(|value| !value.trim().is_empty());
+    if provider != NativeProvider::Claude && router_launch_draft.is_some() {
+        return Err(
+            "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
+                .to_string(),
+        );
+    }
     let effective_working_dir = resolve_headless_working_dir(working_dir);
+    let verified_codex_path = if provider == NativeProvider::Codex {
+        codex_migration::runtime_path_for_verified_launch(
+            &env_name,
+            &effective_working_dir,
+            codex_migration_proof_token.as_deref(),
+        )?
+    } else {
+        None
+    };
+    let resumed_router_record = resume_router_from_runtime_id
+        .as_deref()
+        .map(|source_runtime_id| {
+            native_state.clone_router_record_for_history_resume(
+                source_runtime_id,
+                provider,
+                provider_session_id.as_deref(),
+                &effective_working_dir,
+            )
+        })
+        .transpose()?;
     let effective_perm_mode = resolve_effective_perm_mode(perm_mode);
     let effective_runtime_perm_mode = runtime_perm_mode
         .map(|mode| mode.trim().to_string())
@@ -1244,7 +1395,11 @@ async fn create_native_session(
 
     let options = match provider {
         NativeProvider::Claude => {
-            let resolved = resolve_claude_env(&env_name)?;
+            let effective_env_name = resumed_router_record
+                .as_ref()
+                .map(|router| router.default_env.as_str())
+                .unwrap_or(&env_name);
+            let resolved = resolve_claude_env(effective_env_name)?;
             NativeSessionOptions {
                 provider,
                 env_name: resolved.env_name,
@@ -1259,6 +1414,7 @@ async fn create_native_session(
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
+                fork_from_message_id,
                 seed_boundary_message_count,
                 helper_env_vars: resolved.env_vars.clone(),
                 terminal_env_vars: resolved.env_vars,
@@ -1267,6 +1423,8 @@ async fn create_native_session(
                 codex_base_url: None,
                 codex_api_key: None,
                 effort: effort.clone(),
+                router_launch_draft,
+                router_record: resumed_router_record,
             }
         }
         NativeProvider::Codex => {
@@ -1290,19 +1448,23 @@ async fn create_native_session(
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
+                fork_from_message_id: None,
                 seed_boundary_message_count,
                 helper_env_vars: proxy_env_vars.clone(),
                 terminal_env_vars: proxy_env_vars,
                 claude_path: None,
-                codex_path: terminal::resolve_codex_path(),
+                codex_path: verified_codex_path.or_else(terminal::resolve_codex_path),
                 codex_base_url: None,
                 codex_api_key: None,
                 effort,
+                router_launch_draft: None,
+                router_record: None,
             }
         }
     };
 
     let summary = native_state.create_session(app, options)?;
+    drop(mutation_guard);
 
     if let Err(error) = register_launch(SessionProvenanceUpsert {
         ccem_session_id: summary.runtime_id.clone(),
@@ -1332,15 +1494,25 @@ fn list_native_sessions(
 }
 
 #[tauri::command]
+fn get_native_session_summary(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+) -> Result<Option<NativeSessionSummary>, String> {
+    native_state.get_session_summary(&runtime_id)
+}
+
+#[tauri::command]
 fn send_native_session_input(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     text: String,
     display_text: Option<String>,
     images: Option<Vec<PromptImage>>,
     annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.send_user_message(
         &app,
         &runtime_id,
@@ -1353,19 +1525,20 @@ fn send_native_session_input(
 
 #[tauri::command]
 fn respond_native_session_permission(
-    app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     request_id: String,
     approved: bool,
 ) -> Result<(), String> {
-    native_state.respond_to_permission(&app, &runtime_id, &request_id, approved)
+    let _mutation_guard = environment_mutations.lock()?;
+    native_state.respond_to_permission(&runtime_id, &request_id, approved)
 }
 
 #[tauri::command]
 fn respond_native_session_prompt(
-    app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     tool_use_id: String,
     prompt_type: String,
@@ -1374,8 +1547,8 @@ fn respond_native_session_prompt(
     annotations: Option<HashMap<String, InteractivePromptAnnotation>>,
     prompt_annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.respond_to_prompt(
-        &app,
         &runtime_id,
         &tool_use_id,
         &prompt_type,
@@ -1390,10 +1563,21 @@ fn respond_native_session_prompt(
 fn rewind_native_session_files(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     checkpoint_id: String,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.rewind_files(&app, &runtime_id, &checkpoint_id)
+}
+
+#[tauri::command]
+fn query_native_session_usage(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+) -> Result<(), String> {
+    native_state.query_session_usage(&app, &runtime_id)
 }
 
 #[tauri::command]
@@ -1418,16 +1602,57 @@ fn read_prompt_image_attachment(
 fn update_native_session_settings(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     env_name: Option<String>,
     perm_mode: Option<String>,
     effort: Option<String>,
+    force_restart: Option<bool>,
 ) -> Result<(), String> {
+    // Settings writes can lazily reconnect an interrupted helper. Serialize the
+    // whole operation even when the environment itself is unchanged so a
+    // reconnect cannot snapshot router defaults while an environment is deleted.
+    let _environment_mutation_guard = environment_mutations.lock()?;
     let current = native_state
         .list_sessions()
         .into_iter()
         .find(|session| session.runtime_id == runtime_id)
         .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
+    if let (Some(name), Some(router)) = (env_name.as_deref(), current.router.as_ref()) {
+        if !name.trim().is_empty() {
+            let mut allowed_envs = router.allowed_envs.clone();
+            if !allowed_envs.iter().any(|allowed| allowed == name) {
+                allowed_envs.push(name.to_string());
+            }
+            native_state
+                .update_session_router(
+                    &app,
+                    UpdateSessionRouterRequest {
+                        runtime_id: runtime_id.clone(),
+                        expected_revision: router.revision,
+                        patch: SessionRouterPatch {
+                            default_env: Some(name.to_string()),
+                            allowed_envs: Some(allowed_envs),
+                            ..SessionRouterPatch::default()
+                        },
+                    },
+                    "environment",
+                )
+                .map_err(|error| error.to_string())?;
+            if perm_mode.is_none() && effort.is_none() {
+                return Ok(());
+            }
+            return native_state.update_session_settings(
+                &app,
+                &runtime_id,
+                None,
+                perm_mode.as_deref(),
+                None,
+                effort.as_deref(),
+                force_restart.unwrap_or(false),
+            );
+        }
+    }
     let (resolved_env_name, env_vars) = match env_name.as_deref() {
         Some(name) if !name.trim().is_empty() => match current.provider {
             NativeProvider::Claude => {
@@ -1456,6 +1681,7 @@ fn update_native_session_settings(
         perm_mode.as_deref(),
         env_vars.as_ref(),
         effort.as_deref(),
+        force_restart.unwrap_or(false),
     )
 }
 
@@ -1463,9 +1689,11 @@ fn update_native_session_settings(
 fn set_native_session_runtime_perm_mode(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     runtime_perm_mode: Option<String>,
 ) -> Result<(), String> {
+    let _mutation_guard = environment_mutations.lock()?;
     native_state.update_session_runtime_perm_mode(&app, &runtime_id, runtime_perm_mode.as_deref())
 }
 
@@ -1480,6 +1708,15 @@ fn stop_native_session(
 }
 
 #[tauri::command]
+fn stop_native_background_task(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    task_id: String,
+) -> Result<(), String> {
+    native_state.stop_background_task(&runtime_id, &task_id)
+}
+
+#[tauri::command]
 fn handoff_native_session_to_terminal(
     app: tauri::AppHandle,
     state: State<'_, Arc<SessionManager>>,
@@ -1487,46 +1724,58 @@ fn handoff_native_session_to_terminal(
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     runtime_id: String,
     terminal_type: Option<TerminalType>,
+    allow_background_task_termination: Option<bool>,
 ) -> Result<NativeHandoffResult, String> {
-    let handoff = match native_state.prepare_terminal_handoff(&runtime_id, terminal_type) {
-        Ok(handoff) => handoff,
+    let allow_background_task_termination = allow_background_task_termination.unwrap_or(false);
+    let managed_handoff = native_state.run_managed_terminal_handoff(
+        &runtime_id,
+        terminal_type,
+        allow_background_task_termination,
+        |handoff| {
+            let attach_terminal = attach_terminal_for_native_terminal(handoff.terminal);
+            let session_manager = state.inner().clone();
+            let session = interactive_state.create_session(
+                app.clone(),
+                session_manager,
+                InteractiveSessionOptions {
+                    session_id: handoff.runtime_id.clone(),
+                    client: handoff.provider.as_str().to_string(),
+                    env_name: handoff.env_name.clone(),
+                    config_source: Some(DEFAULT_CONFIG_SOURCE.to_string()),
+                    perm_mode: handoff.perm_mode.clone(),
+                    working_dir: handoff.project_dir.clone(),
+                    resume_session_id: Some(handoff.resume_session_id.clone()),
+                    initial_prompt: None,
+                    env_vars: handoff.env_vars.clone(),
+                    launch_trace_id: format!("handoff-{}", handoff.runtime_id),
+                },
+            )?;
+
+            if let Err(error) =
+                open_tmux_backed_session_in_terminal(state.inner(), &session.id, attach_terminal)
+            {
+                let _ = interactive_state.stop_session(&session.id);
+                state.remove_session(&session.id);
+                return Err(error);
+            }
+            Ok(session)
+        },
+        |session| {
+            let _ = interactive_state.stop_session(&session.id);
+            state.remove_session(&session.id);
+        },
+    );
+    let (handoff, session) = match managed_handoff {
+        Ok(result) => result,
         Err(error) if error == "Session id is not ready for terminal handoff yet" => {
-            return native_state.handoff_to_terminal(&runtime_id, terminal_type);
+            return native_state.handoff_to_terminal(
+                &runtime_id,
+                terminal_type,
+                allow_background_task_termination,
+            );
         }
         Err(error) => return Err(error),
     };
-
-    let attach_terminal = attach_terminal_for_native_terminal(handoff.terminal);
-    let session_manager = state.inner().clone();
-    let create_result = interactive_state.create_session(
-        app.clone(),
-        session_manager,
-        InteractiveSessionOptions {
-            session_id: handoff.runtime_id.clone(),
-            client: handoff.provider.as_str().to_string(),
-            env_name: handoff.env_name.clone(),
-            config_source: Some(DEFAULT_CONFIG_SOURCE.to_string()),
-            perm_mode: handoff.perm_mode.clone(),
-            working_dir: handoff.project_dir.clone(),
-            resume_session_id: Some(handoff.resume_session_id.clone()),
-            initial_prompt: None,
-            env_vars: handoff.env_vars.clone(),
-            launch_trace_id: format!("handoff-{}", handoff.runtime_id),
-        },
-    );
-
-    let session = create_result?;
-
-    if let Err(error) =
-        open_tmux_backed_session_in_terminal(state.inner(), &session.id, attach_terminal)
-    {
-        let _ = interactive_state.stop_session(&session.id);
-        state.remove_session(&session.id);
-        return Err(error);
-    }
-
-    native_state.complete_managed_terminal_handoff(&handoff.runtime_id, handoff.terminal)?;
-
     if let Err(error) = register_launch(SessionProvenanceUpsert {
         ccem_session_id: session.id.clone(),
         client: session.client.clone(),
@@ -3139,8 +3388,9 @@ fn save_settings(app: tauri::AppHandle, settings: DesktopSettings) -> Result<(),
         Err(e) => errors.push(format!("read config: {}", e)),
     }
 
-    // Sync autostart with system
-    {
+    // A named development instance must not rewrite the machine-level launch
+    // agent while an installed release or another worktree is running.
+    if dev_instance::automatic_background_services_enabled() {
         use tauri_plugin_autostart::ManagerExt;
         let autostart = app.autolaunch();
         let result = if settings.auto_start {
@@ -3640,6 +3890,74 @@ async fn bind_telegram_topic(
 #[tauri::command]
 fn get_proxy_debug_state(state: State<Arc<ProxyDebugManager>>) -> ProxyDebugState {
     state.get_state()
+}
+
+#[tauri::command]
+fn get_router_settings(
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+) -> Result<RouterConfig, String> {
+    let _mutation_guard = environment_mutations.lock()?;
+    Ok(config::read_config()?.router)
+}
+
+#[tauri::command]
+fn update_router_settings(
+    proxy_state: State<'_, Arc<ProxyDebugManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    settings: RouterConfig,
+) -> Result<RouterStatus, String> {
+    let _mutation_guard = environment_mutations.lock()?;
+    validate_router_config(&settings).map_err(|error| error.to_string())?;
+    proxy_state.validate_router_config_change(&settings)?;
+    config::update_ccem_config(|config| {
+        config::validate_router_config_environment_targets(&settings, &config.registries)?;
+        config.router = settings.clone();
+        Ok(())
+    })?;
+    tauri::async_runtime::block_on(proxy_state.apply_router_config(settings))
+}
+
+#[tauri::command]
+fn router_status(state: State<'_, Arc<RouterManager>>) -> RouterStatus {
+    state.status()
+}
+
+#[tauri::command]
+fn get_session_router(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    runtime_id: String,
+) -> Result<SessionRouterState, RouterServiceError> {
+    let _mutation_guard = environment_mutations
+        .lock()
+        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+    native_state.get_session_router(&runtime_id)
+}
+
+#[tauri::command]
+fn update_session_router(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    request: UpdateSessionRouterRequest,
+) -> Result<SessionRouterState, RouterServiceError> {
+    let _mutation_guard = environment_mutations
+        .lock()
+        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+    native_state.update_session_router(&app, request, "ipc")
+}
+
+#[tauri::command]
+fn restart_native_session_direct(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    runtime_id: String,
+) -> Result<SessionRouterState, RouterServiceError> {
+    let _mutation_guard = environment_mutations
+        .lock()
+        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+    native_state.restart_session_direct(&app, &runtime_id)
 }
 
 #[tauri::command]
@@ -4745,9 +5063,15 @@ async fn copy_image_to_clipboard(app: tauri::AppHandle, base64_png: String) -> R
 /// Force-quit the app, bypassing closeToTray.
 /// Called from frontend Cmd+Q handler.
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
+fn quit_app(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    force: Option<bool>,
+) -> Result<(), String> {
+    native_state.prepare_app_termination(force.unwrap_or(false))?;
     FORCE_QUIT.store(true, Ordering::SeqCst);
     app.exit(0);
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -4788,8 +5112,6 @@ pub fn run_desktop_app() -> i32 {
             return browser::login::cef::macos_safe_storage_smoke::EXIT_GATE_REJECTED;
         }
     }
-
-    native_runtime::run_native_helper_launcher_if_requested();
 
     match browser::login::cef::debug_smoke::gate_from_process_environment() {
         browser::login::cef::debug_smoke::MacosDebugMode2SmokeGate::Disabled => {}
@@ -4832,7 +5154,8 @@ pub fn run_desktop_app() -> i32 {
         },
         None => None,
     };
-
+    let automatic_background_services_enabled =
+        dev_instance::automatic_background_services_enabled();
     let desktop_instance_lock = match desktop_instance_lock::acquire_desktop_instance_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -4845,11 +5168,48 @@ pub fn run_desktop_app() -> i32 {
         }
     };
 
+    // Router session keys live in persisted native records. Migrate and lock
+    // down storage before any manager reads state or publishes a control plane.
+    if let Err(error) = config::migrate_if_needed() {
+        eprintln!("CCEM startup blocked: config migration failed: {}", error);
+        return 0;
+    }
+    if let Err(error) = secure_fs::harden_ccem_storage(&config::get_ccem_dir()) {
+        eprintln!(
+            "CCEM startup blocked: private storage migration failed: {}",
+            error
+        );
+        return 0;
+    }
+
     // Create SessionManager from persisted sessions (or empty if first run)
     let session_manager = Arc::new(SessionManager::load_from_disk());
     let interactive_runtime_manager = Arc::new(InteractiveRuntimeManager::default());
     let headless_runtime_manager = Arc::new(HeadlessRuntimeManager::default());
-    let native_runtime_manager = Arc::new(NativeRuntimeManager::default());
+    let native_runtime_manager = match NativeRuntimeManager::try_new() {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            eprintln!("CCEM startup blocked: {}", error);
+            return 0;
+        }
+    };
+    let router_config = match config::read_config() {
+        Ok(config) => config.router,
+        Err(error) => {
+            eprintln!(
+                "CCEM startup blocked: failed to load router config: {}",
+                error
+            );
+            return 0;
+        }
+    };
+    let router_manager = Arc::new(RouterManager::new(router_config));
+    if let Err(error) = native_runtime_manager.set_router_manager(router_manager.clone()) {
+        eprintln!("CCEM startup blocked: {}", error);
+        return 0;
+    }
+    let environment_mutation_coordinator =
+        Arc::new(config::EnvironmentMutationCoordinator::default());
     let browser_manager = Arc::new(BrowserManager::default());
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     let login_browser_session_manager = windows_mode2_ci_runtime
@@ -4875,16 +5235,34 @@ pub fn run_desktop_app() -> i32 {
         .unwrap_or_else(browser::create_cef_host_controller);
     #[cfg(any(target_os = "macos", all(target_os = "windows", debug_assertions)))]
     let cef_host_controller = browser::create_cef_host_controller();
-    let external_control_manager =
-        Arc::new(ExternalControlManager::new(native_runtime_manager.clone()));
+    let external_control_manager = Arc::new(ExternalControlManager::new(
+        native_runtime_manager.clone(),
+        environment_mutation_coordinator.clone(),
+    ));
     let event_dispatcher = Arc::new(EventDispatcher::default());
     let unified_session_manager = Arc::new(UnifiedSessionManager::new(
         headless_runtime_manager.clone(),
         interactive_runtime_manager.clone(),
         event_dispatcher.clone(),
     ));
-    let proxy_debug_manager = ProxyDebugManager::new(session_manager.clone())
-        .expect("failed to initialize proxy debug manager");
+    let proxy_debug_manager =
+        ProxyDebugManager::new(session_manager.clone(), router_manager.clone())
+            .expect("failed to initialize proxy debug manager");
+    // Router-forwarded requests carry the per-request env/model usage truth
+    // the SDK cannot see (model rewritten upstream) — publish it on the
+    // owning runtime's event bus as RoutedUsage events.
+    {
+        let native_for_router_usage = native_runtime_manager.clone();
+        proxy_debug_manager.set_routed_usage_sink(Arc::new(
+            move |runtime_id: &str, payload: event_bus::SessionEventPayload| {
+                if let Err(error) =
+                    native_for_router_usage.append_external_event(runtime_id, payload)
+                {
+                    eprintln!("Failed to append routed usage event for {runtime_id}: {error}");
+                }
+            },
+        ));
+    }
     let telegram_bridge_manager = Arc::new(TelegramBridgeManager::default());
     let wecom_bridge_manager = Arc::new(WecomBridgeManager::default());
     let weixin_bridge_manager = Arc::new(WeixinBridgeManager::default());
@@ -4948,13 +5326,18 @@ pub fn run_desktop_app() -> i32 {
     ));
 
     #[cfg(debug_assertions)]
-    let builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+    let builder = builder.plugin(
+        tauri_plugin_mcp_bridge::Builder::new()
+            .base_port(dev_instance::mcp_base_port())
+            .build(),
+    );
 
     let builder = builder
         .manage(session_manager.clone())
         .manage(interactive_runtime_manager.clone())
         .manage(headless_runtime_manager.clone())
         .manage(native_runtime_manager.clone())
+        .manage(environment_mutation_coordinator.clone())
         .manage(browser_manager.clone())
         .manage(login_browser_session_manager.clone())
         .manage(login_browser_surface_manager.clone())
@@ -4966,6 +5349,7 @@ pub fn run_desktop_app() -> i32 {
         .manage(weixin_bridge_manager.clone())
         .manage(bot_binding_manager.clone())
         .manage(proxy_debug_manager.clone())
+        .manage(router_manager.clone())
         .manage(desktop_instance_lock)
         .manage(app_updates::PendingUpdate::default())
         .manage(notification_prefs_state);
@@ -5277,21 +5661,6 @@ pub fn run_desktop_app() -> i32 {
             pet_notifications::open_pet_notification,
             pet_window::resize_pet_window,
             pet_window::set_pet_window_content_visible,
-            browser::commands::browser_set_active_session,
-            browser::commands::browser_open,
-            browser::commands::browser_bind_preview_alias,
-            browser::commands::browser_unbind_preview_alias,
-            browser::commands::browser_set_bounds,
-            browser::commands::browser_set_visible,
-            browser::commands::browser_close,
-            browser::commands::browser_navigate,
-            browser::commands::browser_reload,
-            browser::commands::browser_back,
-            browser::commands::browser_forward,
-            browser::commands::browser_info,
-            browser::commands::browser_health_check,
-            browser::commands::browser_set_paused,
-            browser::commands::browser_recent_activity,
             browser::login::surface_commands::ipc::browser_surface_acquire,
             browser::login::surface_commands::ipc::browser_surface_sync,
             browser::login::surface_commands::ipc::browser_surface_release,
@@ -5302,9 +5671,8 @@ pub fn run_desktop_app() -> i32 {
             browser::login_commands::browser_login_profile_recent_activity,
             browser::login_commands::browser_login_reset_profile,
             browser::login_commands::browser_login_delete_profile,
-            browser::commands::browser_snapshot,
-            browser::commands::browser_screenshot,
             tray::open_tray_cockpit,
+            tray::get_tray_runtime_snapshot,
             app_updates::get_app_version,
             app_updates::check_app_update,
             app_updates::install_app_update,
@@ -5317,6 +5685,7 @@ pub fn run_desktop_app() -> i32 {
             set_current_env,
             add_environment,
             update_environment,
+            get_environment_router_references,
             delete_environment,
             get_app_config,
             add_favorite,
@@ -5359,17 +5728,22 @@ pub fn run_desktop_app() -> i32 {
             stop_headless_session,
             remove_headless_session,
             respond_headless_permission,
+            codex_migration::preflight_codex_model_migration,
             create_native_session,
             list_native_sessions,
+            get_native_session_summary,
             send_native_session_input,
             respond_native_session_permission,
             respond_native_session_prompt,
             rewind_native_session_files,
+            query_native_session_usage,
             get_native_session_events,
             read_prompt_image_attachment,
             update_native_session_settings,
+            restart_native_session_direct,
             set_native_session_runtime_perm_mode,
             stop_native_session,
+            stop_native_background_task,
             handoff_native_session_to_terminal,
             launch_opencode_web,
             list_unified_sessions,
@@ -5395,6 +5769,7 @@ pub fn run_desktop_app() -> i32 {
             sync_vscode_projects,
             sync_jetbrains_projects,
             get_usage_stats,
+            analytics::get_tray_usage_stats,
             get_usage_history,
             get_usage_model_breakdown,
             get_continuous_usage_days,
@@ -5468,6 +5843,11 @@ pub fn run_desktop_app() -> i32 {
             poll_weixin_login,
             get_telegram_forum_topics,
             bind_telegram_topic,
+            get_router_settings,
+            update_router_settings,
+            router_status,
+            get_session_router,
+            update_session_router,
             get_proxy_debug_state,
             set_proxy_debug_enabled,
             update_proxy_debug_config,
@@ -5510,60 +5890,78 @@ pub fn run_desktop_app() -> i32 {
                         if close_to_tray {
                             api.prevent_close();
                             let _ = window.hide();
+                        } else {
+                            let app = window.app_handle();
+                            let has_active_background_tasks = app
+                                .try_state::<Arc<NativeRuntimeManager>>()
+                                .is_some_and(|manager| {
+                                    manager.prepare_app_termination(false).is_err()
+                                });
+                            if has_active_background_tasks {
+                                api.prevent_close();
+                                let _ = app.emit("native-background-task-app-action", "quit");
+                            }
                         }
                     }
                 _ => {}
             }
         })
         .setup(move |app| {
-            if let Err(error) = cleanup_orphaned_runtime_processes() {
-                eprintln!("Runtime orphan cleanup warning: {}", error);
-            }
-
-            // Clean up stale exit files not belonging to any persisted session
-            cleanup_stale_exit_files_except(&session_manager_for_setup);
-
-            // Validate persisted sessions against actual terminal state
-            session_manager_for_setup.validate_and_reconcile();
-            match native_runtime_manager.reconcile_stale_records() {
-                Ok(count) if count > 0 => {
-                    eprintln!("Reconciled {} stale native runtime record(s)", count);
+            if automatic_background_services_enabled {
+                if let Err(error) = cleanup_orphaned_runtime_processes() {
+                    eprintln!("Runtime orphan cleanup warning: {}", error);
                 }
-                Ok(_) => {}
-                Err(error) => eprintln!("Native runtime reconcile warning: {}", error),
-            }
-            if let Err(error) = interactive_manager_for_setup
-                .rehydrate_existing(app.handle().clone(), session_manager_for_setup.clone())
-            {
-                eprintln!("Interactive tmux rehydrate warning: {}", error);
-            }
-            match interactive_manager_for_setup.cleanup_orphaned_tmux_sessions() {
-                Ok(cleaned) if !cleaned.is_empty() => {
-                    eprintln!(
-                        "Cleaned {} orphaned CCEM tmux target(s): {}",
-                        cleaned.len(),
-                        cleaned.join(", ")
-                    );
+
+                // Clean up stale exit files not belonging to any persisted session
+                cleanup_stale_exit_files_except(&session_manager_for_setup);
+
+                // Validate persisted sessions against actual terminal state
+                session_manager_for_setup.validate_and_reconcile();
+                match native_runtime_manager.reconcile_stale_records() {
+                    Ok(count) if count > 0 => {
+                        eprintln!("Reconciled {} stale native runtime record(s)", count);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Native runtime reconcile warning: {}", error),
                 }
-                Ok(_) => {}
-                Err(error) => eprintln!("Interactive tmux orphan cleanup warning: {}", error),
+                if let Err(error) = interactive_manager_for_setup
+                    .rehydrate_existing(app.handle().clone(), session_manager_for_setup.clone())
+                {
+                    eprintln!("Interactive tmux rehydrate warning: {}", error);
+                }
+                match interactive_manager_for_setup.cleanup_orphaned_tmux_sessions() {
+                    Ok(cleaned) if !cleaned.is_empty() => {
+                        eprintln!(
+                            "Cleaned {} orphaned CCEM tmux target(s): {}",
+                            cleaned.len(),
+                            cleaned.join(", ")
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("Interactive tmux orphan cleanup warning: {}", error),
+                }
             }
 
             proxy_manager_for_setup.set_app_handle(app.handle().clone());
+            if automatic_background_services_enabled {
+                tauri::async_runtime::block_on(proxy_manager_for_setup.maybe_start_on_boot());
+            } else {
+                eprintln!(
+                    "CCEM named dev instance: automatic shared background services are disabled; \
+                     set CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1 for a targeted self-test"
+                );
+            }
+            // Debug control servers already use private random endpoints and do
+            // not publish the shared descriptor unless explicitly requested.
             if let Err(error) = external_control_manager_for_setup.start(app.handle().clone()) {
                 eprintln!("External control startup warning: {}", error);
-            }
-
-            // Auto-migrate configuration if needed
-            if let Err(e) = config::migrate_if_needed() {
-                eprintln!("Config migration warning: {}", e);
             }
 
             // Load desktop settings once for startup logic
             let startup_settings = config::read_settings().unwrap_or_default();
 
-            // Sync autostart state from settings
-            {
+            // Sync autostart state from settings only for a single-owner run.
+            if automatic_background_services_enabled {
                 use tauri_plugin_autostart::ManagerExt;
                 let autostart = app.autolaunch();
                 if startup_settings.auto_start {
@@ -5616,44 +6014,42 @@ pub fn run_desktop_app() -> i32 {
 
             let _ = create_tray(app.handle())?;
 
-            // Start session monitor background task
-            start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
-
-            // Start proxy debug server if enabled in settings.
-            let proxy_for_boot = proxy_manager_for_setup.clone();
-            tauri::async_runtime::spawn(async move {
-                proxy_for_boot.maybe_start_on_boot().await;
-            });
-
-            // Start cron scheduler background task
+            // Commands always need the managed scheduler state, even when its
+            // automatic background loop is disabled for a named dev instance.
             let cron_scheduler = Arc::new(CronScheduler::default());
             app.manage(cron_scheduler.clone());
-            let cron_app = app.handle().clone();
-            start_cron_scheduler(cron_app, cron_scheduler, unified_session_manager.clone());
-            bot_binding_manager_for_setup.start_request_watcher(
-                app.handle().clone(),
-                unified_session_manager.clone(),
-                native_runtime_manager.clone(),
-                {
-                    let bot_binding_manager = bot_binding_manager_for_setup.clone();
-                    let wecom_manager = wecom_manager_for_setup.clone();
-                    move |infos| {
-                        for info in infos {
-                            if info.send_task_card {
-                                let _ = deliver_bot_binding_task_card(
-                                    &bot_binding_manager,
-                                    &wecom_manager,
-                                    &info,
-                                );
+
+            if automatic_background_services_enabled {
+                start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
+
+                let cron_app = app.handle().clone();
+                start_cron_scheduler(cron_app, cron_scheduler, unified_session_manager.clone());
+                bot_binding_manager_for_setup.start_request_watcher(
+                    app.handle().clone(),
+                    unified_session_manager.clone(),
+                    native_runtime_manager.clone(),
+                    {
+                        let bot_binding_manager = bot_binding_manager_for_setup.clone();
+                        let wecom_manager = wecom_manager_for_setup.clone();
+                        move |infos| {
+                            for info in infos {
+                                if info.send_task_card {
+                                    let _ = deliver_bot_binding_task_card(
+                                        &bot_binding_manager,
+                                        &wecom_manager,
+                                        &info,
+                                    );
+                                }
                             }
                         }
-                    }
-                },
-            );
+                    },
+                );
+            }
 
             if let Ok(settings) = telegram::read_telegram_settings() {
                 telegram_manager_for_setup.sync_settings(&settings);
-                if settings.enabled
+                if automatic_background_services_enabled
+                    && settings.enabled
                     && settings
                         .bot_token
                         .as_ref()
@@ -5671,7 +6067,8 @@ pub fn run_desktop_app() -> i32 {
 
             if let Ok(settings) = weixin::read_weixin_settings() {
                 weixin_manager_for_setup.sync_settings(&settings);
-                if settings.enabled
+                if automatic_background_services_enabled
+                    && settings.enabled
                     && settings
                         .bot_token
                         .as_ref()
@@ -5688,7 +6085,8 @@ pub fn run_desktop_app() -> i32 {
 
             if let Ok(settings) = wecom::read_wecom_settings() {
                 wecom_manager_for_setup.sync_settings(&settings);
-                if settings.enabled
+                if automatic_background_services_enabled
+                    && settings.enabled
                     && settings.bots.iter().any(|bot| {
                         bot.enabled
                             && !bot.bot_id.trim().is_empty()
@@ -5713,9 +6111,6 @@ pub fn run_desktop_app() -> i32 {
         .expect("error while building tauri application");
 
     let exit_code = app.run_return(move |app_handle, event| {
-        #[cfg(not(any(target_os = "macos", windows)))]
-        let _ = &app_handle;
-
         #[cfg(target_os = "macos")]
         if let RunEvent::Reopen { .. } = &event {
             // macOS Dock icon click should reopen/show the main window.
@@ -5727,71 +6122,93 @@ pub fn run_desktop_app() -> i32 {
             return;
         }
 
-        #[cfg(any(target_os = "macos", windows))]
         if let RunEvent::ExitRequested { code, api, .. } = &event {
             let restarting = *code == Some(tauri::RESTART_EXIT_CODE);
             if restarting {
-                // `restart_app` performs the asynchronous session drain before it requests this
-                // non-preventable Tauri restart event. Keep a synchronous fallback for any future
-                // restart source, but never start worker cleanup after the event loop is committed
-                // to exiting.
-                if !cef_exit_prepare_attempted_for_run.swap(true, Ordering::SeqCst) {
-                    if let Err(error) =
-                        cef_host_controller_for_exit_prepare.prepare_shutdown_current_thread()
-                    {
-                        eprintln!("CEF restart preparation warning: {error}");
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    // `restart_app` performs the asynchronous session drain before it requests this
+                    // non-preventable Tauri restart event. Keep a synchronous fallback for any future
+                    // restart source, but never start worker cleanup after the event loop is committed
+                    // to exiting.
+                    if !cef_exit_prepare_attempted_for_run.swap(true, Ordering::SeqCst) {
+                        if let Err(error) =
+                            cef_host_controller_for_exit_prepare.prepare_shutdown_current_thread()
+                        {
+                            eprintln!("CEF restart preparation warning: {error}");
+                        }
                     }
                 }
                 return;
             }
 
-            if cef_exit_prepare_attempted_for_run.swap(true, Ordering::SeqCst) {
+            let has_active_background_tasks = !FORCE_QUIT.load(Ordering::SeqCst)
+                && app_handle
+                    .try_state::<Arc<NativeRuntimeManager>>()
+                    .is_some_and(|manager| manager.prepare_app_termination(false).is_err());
+            if has_active_background_tasks {
+                api.prevent_exit();
+                if let Some(window) = app_handle.get_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+                let _ = app_handle.emit("native-background-task-app-action", "quit");
                 return;
             }
 
-            // The native event loop must remain alive while semantic owners ask the UI thread to close
-            // exact CEF child surfaces. Prevent this first quit request, drain on a worker, then
-            // prepare global CEF shutdown and issue one final quit request.
-            api.prevent_exit();
-            if let Err(error) = login_browser_surface_manager_for_exit.begin_shutdown() {
-                eprintln!("Login Browser surface shutdown gate warning: {error}");
-            }
-            let shutdown_app = app_handle.clone();
-            let shutdown_sessions = login_browser_session_manager_for_exit.clone();
-            let shutdown_cef = cef_host_controller_for_exit_prepare.clone();
-            let requested_code = code.unwrap_or(0);
-            let spawn_result = std::thread::Builder::new()
-                .name("ccem-login-browser-exit".to_string())
-                .spawn(move || {
-                    match shutdown_sessions.shutdown_all() {
-                        Ok(report) if !report.failures.is_empty() => eprintln!(
-                            "Login Browser exit drain retained {} cleanup-required session(s)",
-                            report.failures.len()
-                        ),
-                        Ok(_) => {}
-                        Err(error) => eprintln!("Login Browser exit drain warning: {error}"),
-                    }
-                    if let Err(error) = shutdown_cef.prepare_shutdown(&shutdown_app) {
-                        eprintln!("CEF shutdown preparation warning: {error}");
-                    }
-                    // A global close may have supplied the missing native terminal callback for a
-                    // failed owner. Retry only the retained cleanup records before leaving.
-                    if let Ok(report) = shutdown_sessions.shutdown_all() {
-                        if !report.failures.is_empty() {
-                            eprintln!(
-                                "Login Browser exit left {} profile(s) cleanup-required",
+            #[cfg(any(target_os = "macos", windows))]
+            {
+                if cef_exit_prepare_attempted_for_run.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+
+                // The native event loop must remain alive while semantic owners ask the UI thread to close
+                // exact CEF child surfaces. Prevent this first quit request, drain on a worker, then
+                // prepare global CEF shutdown and issue one final quit request.
+                api.prevent_exit();
+                if let Err(error) = login_browser_surface_manager_for_exit.begin_shutdown() {
+                    eprintln!("Login Browser surface shutdown gate warning: {error}");
+                }
+                let shutdown_app = app_handle.clone();
+                let shutdown_sessions = login_browser_session_manager_for_exit.clone();
+                let shutdown_cef = cef_host_controller_for_exit_prepare.clone();
+                let requested_code = code.unwrap_or(0);
+                let spawn_result = std::thread::Builder::new()
+                    .name("ccem-login-browser-exit".to_string())
+                    .spawn(move || {
+                        match shutdown_sessions.shutdown_all() {
+                            Ok(report) if !report.failures.is_empty() => eprintln!(
+                                "Login Browser exit drain retained {} cleanup-required session(s)",
                                 report.failures.len()
-                            );
+                            ),
+                            Ok(_) => {}
+                            Err(error) => eprintln!("Login Browser exit drain warning: {error}"),
                         }
-                    }
-                    shutdown_app.exit(requested_code);
-                });
-            if let Err(error) = spawn_result {
-                eprintln!("spawn Login Browser exit drain: {error}");
-                cef_exit_prepare_attempted_for_run.store(false, Ordering::SeqCst);
-                app_handle.exit(requested_code);
+                        if let Err(error) = shutdown_cef.prepare_shutdown(&shutdown_app) {
+                            eprintln!("CEF shutdown preparation warning: {error}");
+                        }
+                        // A global close may have supplied the missing native terminal callback for a
+                        // failed owner. Retry only the retained cleanup records before leaving.
+                        if let Ok(report) = shutdown_sessions.shutdown_all() {
+                            if !report.failures.is_empty() {
+                                eprintln!(
+                                    "Login Browser exit left {} profile(s) cleanup-required",
+                                    report.failures.len()
+                                );
+                            }
+                        }
+                        shutdown_app.exit(requested_code);
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("spawn Login Browser exit drain: {error}");
+                    // Keep the terminal flag set. Retrying the same worker spawn on the
+                    // next ExitRequested event can trap the app in an infinite prevent/exit loop
+                    // under thread-resource exhaustion; process exit remains the cleanup fallback.
+                    app_handle.exit(requested_code);
+                }
+                return;
             }
-            return;
         }
 
         if let RunEvent::Exit = event {
@@ -5818,10 +6235,14 @@ pub fn run_desktop_app() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_remote_load_args, build_remote_load_stdin_payload, media_kind_for_extension,
-        merge_git_numstat, normalize_git_changed_path, parse_git_status_line,
-        prepend_write_tool_limit_system_tip, RemoteEnvConfig, WorkspaceGitChangedFile,
-        WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        build_remote_load_args, build_remote_load_stdin_payload,
+        collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
+        normalize_git_changed_path, parse_git_status_line, prepend_write_tool_limit_system_tip,
+        RemoteEnvConfig, WorkspaceGitChangedFile, WRITE_TOOL_LIMIT_SYSTEM_TIP,
+    };
+    use crate::router::{
+        rename_router_config_environment, router_config_environment_references, RouterConfig,
+        RouterProfile,
     };
     use std::collections::HashMap;
 
@@ -5835,6 +6256,71 @@ mod tests {
     fn test_launch_claude_code_validates_env() {
         // 这个测试需要完整的 Tauri 上下文，暂时跳过
         // 实际测试应该在集成测试中进行
+    }
+
+    #[test]
+    fn environment_rename_cascades_router_config_references() {
+        let mut router = RouterConfig {
+            bindings: HashMap::from([("background".into(), "old env".into())]),
+            default_allowed_envs: vec!["old env".into(), "new env".into()],
+            profiles: vec![RouterProfile {
+                id: "profile".into(),
+                name: "Profile".into(),
+                revision: 1,
+                bindings: HashMap::from([("subagent:Explore".into(), "old env".into())]),
+                allowed_envs: vec!["old env".into()],
+            }],
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            router_config_environment_references(&router, "old env").len(),
+            3
+        );
+
+        rename_router_config_environment(&mut router, "old env", "new env");
+
+        assert!(router_config_environment_references(&router, "old env").is_empty());
+        assert_eq!(
+            router.bindings.get("background").map(String::as_str),
+            Some("new env")
+        );
+        assert_eq!(router.default_allowed_envs, vec!["new env"]);
+        assert_eq!(
+            router.profiles[0]
+                .bindings
+                .get("subagent:Explore")
+                .map(String::as_str),
+            Some("new env")
+        );
+    }
+
+    #[test]
+    fn environment_router_references_merge_config_and_native_without_duplicates() {
+        let router = RouterConfig {
+            bindings: HashMap::from([("background".into(), "target".into())]),
+            default_allowed_envs: vec!["target".into()],
+            ..RouterConfig::default()
+        };
+
+        let references = collect_environment_router_references(
+            &router,
+            "target",
+            vec![
+                "native-session:zeta".into(),
+                "router.bindings.background".into(),
+                "native-session:alpha".into(),
+            ],
+        );
+
+        assert_eq!(
+            references,
+            vec![
+                "native-session:alpha",
+                "native-session:zeta",
+                "router.bindings.background",
+                "router.defaultAllowedEnvs",
+            ]
+        );
     }
 
     #[test]

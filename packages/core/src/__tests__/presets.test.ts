@@ -72,9 +72,10 @@ describe('presets', () => {
       expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('qwen3.7-plus');
       expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('qwen3.7-plus');
 
-      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('anthropic/claude-opus-4.7');
+      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_BASE_URL).toBe('https://openrouter.ai/api');
+      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('anthropic/claude-opus-5');
       expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(
-        'anthropic/claude-sonnet-4.6',
+        'anthropic/claude-sonnet-5',
       );
       expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe(
         'anthropic/claude-haiku-4.5',

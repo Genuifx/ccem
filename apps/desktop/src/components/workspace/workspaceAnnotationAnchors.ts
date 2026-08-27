@@ -25,7 +25,11 @@ function characterOffsetWithin(
     const prefix = document.createRange();
     prefix.selectNodeContents(item);
     prefix.setEnd(container, offset);
-    return prefix.toString().length;
+    // cloneContents().textContent concatenates raw text node data, unlike
+    // Range.toString() which WebKit augments with synthetic newlines at block
+    // boundaries. Offsets must live in the raw-text space so they round-trip
+    // through textBoundaryAt / domTextBelow.
+    return prefix.cloneContents().textContent?.length ?? null;
   } catch {
     return null;
   }
@@ -63,12 +67,34 @@ function findItem(root: HTMLElement, key: string): HTMLElement | null {
   return transcriptItems(root).find((item) => itemKey(item) === key) ?? null;
 }
 
+type ItemIndex = Map<string, HTMLElement>;
+
+function buildItemIndex(root: HTMLElement): ItemIndex {
+  const index: ItemIndex = new Map();
+  for (const item of transcriptItems(root)) {
+    const key = itemKey(item);
+    if (key) {
+      index.set(key, item);
+    }
+  }
+  return index;
+}
+
+function indexedFindItem(index: ItemIndex, key: string): HTMLElement | null {
+  return index.get(key) ?? null;
+}
+
 function rangeFromAnchor(
   root: HTMLElement,
   anchor: WorkspaceAnnotationAnchor,
+  index?: ItemIndex,
 ): Range | null {
-  const startItem = findItem(root, anchor.startItemKey);
-  const endItem = findItem(root, anchor.endItemKey);
+  const startItem = index
+    ? indexedFindItem(index, anchor.startItemKey)
+    : findItem(root, anchor.startItemKey);
+  const endItem = index
+    ? indexedFindItem(index, anchor.endItemKey)
+    : findItem(root, anchor.endItemKey);
   if (!startItem || !endItem) {
     return null;
   }
@@ -109,6 +135,41 @@ function rangeForExactQuote(root: HTMLElement, quote: string): Range | null {
   return null;
 }
 
+// Raw text-node content between the anchor's offsets. This is the canonical
+// text space for quotes: WebKit's Range/Selection.toString() inserts
+// synthetic newlines at block boundaries which never exist in the DOM, so
+// multi-line selections must be captured and re-validated in this space.
+export function domTextBetween(
+  root: HTMLElement,
+  anchor: WorkspaceAnnotationAnchor,
+  index?: ItemIndex,
+): string | null {
+  const startItem = index
+    ? indexedFindItem(index, anchor.startItemKey)
+    : findItem(root, anchor.startItemKey);
+  const endItem = index
+    ? indexedFindItem(index, anchor.endItemKey)
+    : findItem(root, anchor.endItemKey);
+  if (!startItem || !endItem) {
+    return null;
+  }
+
+  const start = textBoundaryAt(startItem, anchor.startOffset);
+  const end = textBoundaryAt(endItem, anchor.endOffset);
+  if (!start || !end) {
+    return null;
+  }
+
+  try {
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    return range.cloneContents().textContent ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function captureWorkspaceAnnotationAnchor(
   root: HTMLElement,
   range: Range,
@@ -136,10 +197,46 @@ export function resolveWorkspaceAnnotationRange(
 ): Range | null {
   if (annotation.anchor) {
     const anchoredRange = rangeFromAnchor(root, annotation.anchor);
-    if (anchoredRange && normalizeWorkspaceSelection(anchoredRange.toString()) === annotation.quote) {
+    const domText = domTextBetween(root, annotation.anchor);
+    if (
+      anchoredRange
+      && domText !== null
+      && normalizeWorkspaceSelection(domText) === annotation.quote
+    ) {
       return anchoredRange;
     }
+    // The annotation was captured with an anchor but that anchor no longer
+    // resolves (item unmounted, segment switched, digest collapsed). Falling
+    // back to a first-match quote search would highlight an unrelated
+    // occurrence of the same text, so the annotation stays unanchored and is
+    // still manageable from the composer list instead.
+    return null;
   }
 
+  // Legacy annotations stored before anchors existed.
   return rangeForExactQuote(root, annotation.quote);
+}
+
+// Batch resolution for the placement pass: builds the transcript item index
+// once instead of re-querying the DOM for every annotation.
+export function resolveWorkspaceAnnotationRanges(
+  root: HTMLElement,
+  annotations: ReadonlyArray<Pick<WorkspaceAnnotation, 'quote' | 'anchor'>>,
+): Array<Range | null> {
+  const index = buildItemIndex(root);
+  return annotations.map((annotation) => {
+    if (annotation.anchor) {
+      const anchoredRange = rangeFromAnchor(root, annotation.anchor, index);
+      const domText = domTextBetween(root, annotation.anchor, index);
+      if (
+        anchoredRange
+        && domText !== null
+        && normalizeWorkspaceSelection(domText) === annotation.quote
+      ) {
+        return anchoredRange;
+      }
+      return null;
+    }
+    return rangeForExactQuote(root, annotation.quote);
+  });
 }

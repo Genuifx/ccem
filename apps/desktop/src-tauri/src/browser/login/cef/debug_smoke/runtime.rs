@@ -52,10 +52,19 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 // operations. Keep the process watchdog above that complete valid envelope so it catches hangs
 // without rejecting a slow debug machine.
 const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(480);
-const DEV_PRODUCT_NAME: &str = "CCEM Desktop Dev";
-const DEV_BUNDLE_IDENTIFIER: &str = "com.ccem.desktop.dev";
+const LEGACY_DEV_PRODUCT_NAME: &str = "CCEM Desktop Dev";
+const LEGACY_DEV_BUNDLE_IDENTIFIER: &str = "com.ccem.desktop.dev";
+const DEV_PRODUCT_NAME_PREFIX: &str = "CCEM Desktop Dev ";
+const DEV_BUNDLE_IDENTIFIER_PREFIX: &str = "com.ccem.desktop.dev.i";
+const DEV_INSTANCE_ENV: &str = "CCEM_DESKTOP_DEV_INSTANCE_ID";
 const INSTALLED_RELEASE_ROOT: &str = "/Applications/CCEM Desktop.app";
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SmokeHostIdentity {
+    product_name: String,
+    bundle_identifier: String,
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -283,8 +292,8 @@ struct RuntimeReceipt<'a> {
     app_version: &'static str,
     main_pid: u32,
     executable_path: String,
-    host_product_name: &'static str,
-    host_bundle_identifier: &'static str,
+    host_product_name: String,
+    host_bundle_identifier: String,
     contract_scope: &'static str,
     smoke_root: String,
     data_root: String,
@@ -502,28 +511,34 @@ pub(crate) fn run(
         Err(error) => {
             return finish_before_event_loop(
                 &config,
+                None,
                 EXIT_GATE_REJECTED,
                 &format!("resolve macOS Mode 2 smoke executable: {error}"),
             )
         }
     };
-    if let Err(error) = validate_smoke_host_identity(
+    let dev_instance_id = std::env::var(DEV_INSTANCE_ENV).ok();
+    let host_identity = match validate_smoke_host_identity(
         context.config().product_name.as_deref(),
         &context.config().identifier,
         &executable,
+        dev_instance_id.as_deref(),
     ) {
-        return finish_before_event_loop(&config, EXIT_GATE_REJECTED, &error);
-    }
+        Ok(identity) => identity,
+        Err(error) => return finish_before_event_loop(&config, None, EXIT_GATE_REJECTED, &error),
+    };
+    let finish = |exit_code, error: &str| {
+        finish_before_event_loop(&config, Some(&host_identity), exit_code, error)
+    };
     if let Err(error) = prepare_isolated_roots(&config) {
-        return finish_before_event_loop(&config, EXIT_SMOKE_FAILED, &error);
+        return finish(EXIT_SMOKE_FAILED, &error);
     }
     let _instance_lock = match acquire_smoke_instance_lock(&config.instance_lock_path) {
         Ok(lock) => lock,
-        Err(error) => return finish_before_event_loop(&config, EXIT_SMOKE_FAILED, &error),
+        Err(error) => return finish(EXIT_SMOKE_FAILED, &error),
     };
     if !config.allow_concurrent_release {
-        return finish_before_event_loop(
-            &config,
+        return finish(
             EXIT_SMOKE_FAILED,
             "macOS Mode 2 smoke requires explicit concurrent-release isolation approval",
         );
@@ -531,19 +546,18 @@ pub(crate) fn run(
     let concurrent_release_instances =
         match inspect_separate_running_release() {
             Ok(instances) if !instances.is_empty() => instances,
-            Ok(_) => return finish_before_event_loop(
-                &config,
+            Ok(_) => return finish(
                 EXIT_GATE_REJECTED,
                 "macOS Mode 2 concurrent smoke requires the installed release app to be running",
             ),
-            Err(error) => return finish_before_event_loop(&config, EXIT_SMOKE_FAILED, &error),
+            Err(error) => return finish(EXIT_SMOKE_FAILED, &error),
         };
     if let Err(error) = require_mock_keychain_preflight(&config) {
-        return finish_before_event_loop(&config, EXIT_SMOKE_FAILED, &error);
+        return finish(EXIT_SMOKE_FAILED, &error);
     }
     let controller = match CefHostController::new(config.cef_cache_root.clone()) {
         Ok(controller) => Arc::new(controller),
-        Err(error) => return finish_before_event_loop(&config, EXIT_SMOKE_FAILED, &error),
+        Err(error) => return finish(EXIT_SMOKE_FAILED, &error),
     };
 
     let mut found_main = false;
@@ -564,8 +578,7 @@ pub(crate) fn run(
         }
     }
     if !found_main {
-        return finish_before_event_loop(
-            &config,
+        return finish(
             EXIT_SMOKE_FAILED,
             "macOS Mode 2 smoke requires the configured main Tauri window",
         );
@@ -574,8 +587,7 @@ pub(crate) fn run(
     let app = match tauri::Builder::default().build(context) {
         Ok(app) => app,
         Err(error) => {
-            return finish_before_event_loop(
-                &config,
+            return finish(
                 EXIT_SMOKE_FAILED,
                 &format!("build isolated macOS Mode 2 smoke host: {error}"),
             )
@@ -719,9 +731,13 @@ pub(crate) fn run(
     }
     let stage_snapshot = stages.lock().map(|guard| guard.clone()).unwrap_or_default();
     let fact_snapshot = facts.lock().map(|guard| guard.clone()).unwrap_or_default();
-    if let Err(error) =
-        write_terminal_receipt(&config, &final_outcome, &stage_snapshot, &fact_snapshot)
-    {
+    if let Err(error) = write_terminal_receipt(
+        &config,
+        Some(&host_identity),
+        &final_outcome,
+        &stage_snapshot,
+        &fact_snapshot,
+    ) {
         final_outcome = SmokeOutcome::failed(
             EXIT_SMOKE_FAILED,
             format!("write macOS Mode 2 smoke receipt: {error}"),
@@ -735,16 +751,68 @@ fn validate_smoke_host_identity(
     product_name: Option<&str>,
     bundle_identifier: &str,
     executable: &Path,
-) -> Result<(), String> {
-    if product_name != Some(DEV_PRODUCT_NAME) || bundle_identifier != DEV_BUNDLE_IDENTIFIER {
-        return Err(format!(
-            "macOS Mode 2 smoke requires {DEV_PRODUCT_NAME} / {DEV_BUNDLE_IDENTIFIER} host identity"
-        ));
-    }
+    dev_instance_id: Option<&str>,
+) -> Result<SmokeHostIdentity, String> {
     if executable.starts_with(Path::new(INSTALLED_RELEASE_ROOT)) {
         return Err("macOS Mode 2 smoke refuses the installed release executable".to_string());
     }
-    Ok(())
+
+    let expected = match dev_instance_id {
+        Some(instance_id) => expected_canonical_smoke_host_identity(instance_id)?,
+        None
+            if product_name == Some(LEGACY_DEV_PRODUCT_NAME)
+                && bundle_identifier == LEGACY_DEV_BUNDLE_IDENTIFIER =>
+        {
+            SmokeHostIdentity {
+                product_name: LEGACY_DEV_PRODUCT_NAME.to_string(),
+                bundle_identifier: LEGACY_DEV_BUNDLE_IDENTIFIER.to_string(),
+            }
+        }
+        None => {
+            return Err(format!(
+                "macOS Mode 2 smoke requires {LEGACY_DEV_PRODUCT_NAME} / {LEGACY_DEV_BUNDLE_IDENTIFIER}, or a canonical per-worktree host bound by {DEV_INSTANCE_ENV}"
+            ))
+        }
+    };
+
+    if product_name != Some(expected.product_name.as_str())
+        || bundle_identifier != expected.bundle_identifier
+    {
+        return Err(format!(
+            "macOS Mode 2 smoke host identity does not match {DEV_INSTANCE_ENV}; expected {} / {}",
+            expected.product_name, expected.bundle_identifier
+        ));
+    }
+    Ok(expected)
+}
+
+fn expected_canonical_smoke_host_identity(instance_id: &str) -> Result<SmokeHostIdentity, String> {
+    let invalid = || {
+        format!(
+            "macOS Mode 2 smoke requires {DEV_INSTANCE_ENV} as <worktree-slug>-<8 lowercase hex>"
+        )
+    };
+    let (slug, hash) = instance_id.rsplit_once('-').ok_or_else(&invalid)?;
+    let slug_bytes = slug.as_bytes();
+    let slug_is_valid = !slug_bytes.is_empty()
+        && slug_bytes.len() <= 32
+        && slug_bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && slug_bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && !slug.contains("--");
+    let hash_is_valid = hash.len() == 8
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    if !slug_is_valid || !hash_is_valid {
+        return Err(invalid());
+    }
+
+    Ok(SmokeHostIdentity {
+        product_name: format!("{DEV_PRODUCT_NAME_PREFIX}{slug}"),
+        bundle_identifier: format!("{DEV_BUNDLE_IDENTIFIER_PREFIX}{hash}"),
+    })
 }
 
 impl SmokeOutcome {
@@ -2490,12 +2558,19 @@ impl Drop for LocalConcurrentProfileServer {
 
 fn finish_before_event_loop(
     config: &MacosDebugMode2SmokeConfig,
+    host_identity: Option<&SmokeHostIdentity>,
     exit_code: i32,
     error: &str,
 ) -> i32 {
     let outcome = SmokeOutcome::failed(exit_code, error.to_string());
     if config.evidence_root.is_dir() {
-        let _ = write_terminal_receipt(config, &outcome, &[], &RuntimeFacts::default());
+        let _ = write_terminal_receipt(
+            config,
+            host_identity,
+            &outcome,
+            &[],
+            &RuntimeFacts::default(),
+        );
     }
     emit_process_result(config, &outcome);
     exit_code
@@ -2503,6 +2578,7 @@ fn finish_before_event_loop(
 
 fn write_terminal_receipt(
     config: &MacosDebugMode2SmokeConfig,
+    host_identity: Option<&SmokeHostIdentity>,
     outcome: &SmokeOutcome,
     stages: &[SmokeStage],
     facts: &RuntimeFacts,
@@ -2519,8 +2595,12 @@ fn write_terminal_receipt(
         executable_path: std::env::current_exe()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "<unavailable>".to_string()),
-        host_product_name: DEV_PRODUCT_NAME,
-        host_bundle_identifier: DEV_BUNDLE_IDENTIFIER,
+        host_product_name: host_identity
+            .map(|identity| identity.product_name.clone())
+            .unwrap_or_else(|| "<unverified>".to_string()),
+        host_bundle_identifier: host_identity
+            .map(|identity| identity.bundle_identifier.clone())
+            .unwrap_or_else(|| "<unverified>".to_string()),
         contract_scope: "cef-surface-profile+retained-session-actor",
         smoke_root: config.smoke_root.to_string_lossy().into_owned(),
         data_root: config.data_root.to_string_lossy().into_owned(),

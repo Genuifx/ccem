@@ -1,6 +1,7 @@
 export type ClaudeToolPermissionOptions = {
   toolUseID: string;
   requestId?: string;
+  agentID?: string;
 };
 
 export function resolveClaudePermissionRequestId(

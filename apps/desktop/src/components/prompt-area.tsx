@@ -60,6 +60,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
   autoFocus = false,
   autoGrow = false,
   'aria-label': ariaLabel,
+  'aria-keyshortcuts': ariaKeyShortcuts,
   'data-test-id': dataTestId,
   images = [],
   imagePosition = 'above',
@@ -120,6 +121,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
 
   const [isFocused, setIsFocused] = useState(false)
   const [editorHeight, setEditorHeight] = useState<number | undefined>(undefined)
+  const heightFrameRef = useRef<number | null>(null)
 
   const syncHeight = useCallback(() => {
     const el = editorRef.current
@@ -131,11 +133,30 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
     setEditorHeight(contentHeight)
   }, [editorRef])
 
+  const scheduleHeightSync = useCallback(() => {
+    if (heightFrameRef.current !== null) {
+      cancelAnimationFrame(heightFrameRef.current)
+    }
+    heightFrameRef.current = requestAnimationFrame(() => {
+      heightFrameRef.current = null
+      if (eventHandlers.isComposing.current) return
+      syncHeight()
+    })
+  }, [eventHandlers.isComposing, syncHeight])
+
+  useEffect(() => {
+    return () => {
+      if (heightFrameRef.current !== null) {
+        cancelAnimationFrame(heightFrameRef.current)
+      }
+    }
+  }, [])
+
   const handleFocus = useCallback(() => {
     if (!autoGrow) return
     setIsFocused(true)
-    syncHeight()
-  }, [autoGrow, syncHeight])
+    scheduleHeightSync()
+  }, [autoGrow, scheduleHeightSync])
 
   const handleBlurWithShrink = useCallback(() => {
     eventHandlers.onBlur()
@@ -153,17 +174,24 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
 
   const handleInputWithGrow = useCallback(() => {
     handleInput()
-    if (autoGrow && isFocused) {
-      syncHeight()
+    if (autoGrow && isFocused && !eventHandlers.isComposing.current) {
+      scheduleHeightSync()
     }
-  }, [handleInput, autoGrow, isFocused, syncHeight])
+  }, [handleInput, autoGrow, isFocused, eventHandlers.isComposing, scheduleHeightSync])
 
   // Re-measure on value changes (chip insertion, undo/redo, programmatic updates)
   useEffect(() => {
-    if (autoGrow && isFocused) {
-      requestAnimationFrame(() => syncHeight())
+    if (autoGrow && isFocused && !eventHandlers.isComposing.current) {
+      scheduleHeightSync()
     }
-  }, [value, autoGrow, isFocused, syncHeight])
+  }, [value, autoGrow, isFocused, eventHandlers.isComposing, scheduleHeightSync])
+
+  const handleCompositionEndWithGrow = useCallback(() => {
+    eventHandlers.onCompositionEnd()
+    if (autoGrow && isFocused) {
+      scheduleHeightSync()
+    }
+  }, [eventHandlers, autoGrow, isFocused, scheduleHeightSync])
 
   // -----------------------------------------------------------------------
   // Overflow indicator: detect when collapsed content is clipped
@@ -301,6 +329,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
           suppressContentEditableWarning
           role="textbox"
           aria-label={ariaLabel ?? 'Text input'}
+          aria-keyshortcuts={ariaKeyShortcuts}
           aria-multiline="true"
           aria-disabled={disabled || undefined}
           data-test-id={dataTestId}
@@ -321,7 +350,7 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
           onDrop={eventHandlers.onDrop}
           onDragOver={eventHandlers.onDragOver}
           onCompositionStart={eventHandlers.onCompositionStart}
-          onCompositionEnd={eventHandlers.onCompositionEnd}
+          onCompositionEnd={handleCompositionEndWithGrow}
           onBlur={autoGrow ? handleBlurWithShrink : eventHandlers.onBlur}
         />
 

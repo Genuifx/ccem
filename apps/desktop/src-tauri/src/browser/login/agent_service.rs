@@ -46,9 +46,9 @@ impl PreparedAgentToolExecution {
 }
 
 impl LoginBrowserSessionManager {
-    /// Route an existing native Agent browser request to the exact Login Browser handed to the
-    /// same opaque conversation lineage. `None` means Preview Browser remains the selected
-    /// backend. Agent arguments never select a profile/session/backend directly.
+    /// Route an existing native Agent browser request to the exact embedded browser handed to the
+    /// same opaque conversation lineage. `None` means there is no eligible Mode 2 handoff.
+    /// Agent arguments never select a profile/session/backend directly.
     pub(crate) fn prepare_agent_tool_if_handed_off(
         &self,
         workspace_dir: &str,
@@ -57,8 +57,8 @@ impl LoginBrowserSessionManager {
         request: &BrowserToolRequest,
     ) -> Result<Option<PreparedAgentToolExecution>, String> {
         if !self.is_available() {
-            // This is an optional routing probe. A degraded Mode 2 registry must behave exactly
-            // like "no handoff" so the existing Preview Browser remains the selected backend.
+            // The native runtime converts this missing route into a fail-closed error. Never
+            // silently fall back to the legacy Preview implementation.
             return Ok(None);
         }
         let workspace = TrustedWorkspacePath::from_trusted_app(PathBuf::from(workspace_dir))
@@ -69,9 +69,8 @@ impl LoginBrowserSessionManager {
         else {
             return Ok(None);
         };
-        // Optional Login Browser routing must resolve the exact native conversation before
-        // interpreting its request. A non-owner (including Preview fallback) cannot turn an
-        // unsupported or malformed tool into a Mode 2 error.
+        // Resolve the exact native conversation before interpreting its request. A non-owner
+        // cannot turn an unsupported or malformed tool into an oracle for Mode 2 capabilities.
         let command = parse_command(request)?;
         Ok(Some(PreparedAgentToolExecution {
             actor_id: agent_actor_id.to_string(),

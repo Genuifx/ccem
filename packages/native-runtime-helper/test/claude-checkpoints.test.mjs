@@ -72,6 +72,10 @@ async function buildHelperWithMockClaudeSdk() {
               }
             }
 
+            export async function forkSession() {
+              throw new Error('forkSession should not be called in this test');
+            }
+
             export function query({ prompt, options }) {
               assertCheckpointOptions(options);
               let closed = false;
@@ -112,7 +116,13 @@ async function buildHelperWithMockClaudeSdk() {
                   if (userMessage?.content === 'hold running') {
                     await new Promise(() => {});
                   }
-                  yield { type: 'result', subtype: 'success', result: 'done', session_id };
+                  yield {
+                    type: 'result',
+                    subtype: 'success',
+                    result: 'done',
+                    user_message_uuid: next.value.uuid,
+                    session_id,
+                  };
                   if (userMessage?.content === 'complete but stay open') {
                     await new Promise(() => {});
                   }

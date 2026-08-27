@@ -55,42 +55,14 @@ async function importBrowserPanelParticipant() {
   return import(pathToFileURL(outputPath).href);
 }
 
-test('BrowserPanel occlusion pauses Preview before hide and never resumes authority', async () => {
+test('BrowserPanel Mode 2 occlusion uses one atomic backend barrier and never resumes authority', async () => {
   const { createBrowserPanelNativeSurfaceParticipant } = await importBrowserPanelParticipant();
   const events = [];
   const participant = createBrowserPanelNativeSurfaceParticipant({
-    backend: 'preview',
-    preparePreviewHide: () => events.push('prepare'),
-    pausePreview: async () => events.push('pause:ack'),
-    hidePreview: async () => events.push('hide:ack'),
-    occludeLogin: async () => events.push('unexpected:login'),
+    occlude: async () => events.push('occlude:pause-then-hide:ack'),
     restore: async () => events.push('restore:visibility-only'),
   });
 
-  participant.prepareHide();
-  await participant.hide();
-  await participant.restore();
-  assert.deepEqual(events, [
-    'prepare',
-    'pause:ack',
-    'hide:ack',
-    'restore:visibility-only',
-  ]);
-});
-
-test('BrowserPanel Login occlusion uses one atomic backend barrier', async () => {
-  const { createBrowserPanelNativeSurfaceParticipant } = await importBrowserPanelParticipant();
-  const events = [];
-  const participant = createBrowserPanelNativeSurfaceParticipant({
-    backend: 'login',
-    preparePreviewHide: () => events.push('unexpected:prepare'),
-    pausePreview: async () => events.push('unexpected:pause'),
-    hidePreview: async () => events.push('unexpected:hide'),
-    occludeLogin: async () => events.push('occlude:pause-then-hide:ack'),
-    restore: async () => events.push('restore:visibility-only'),
-  });
-
-  participant.prepareHide();
   await participant.hide();
   await participant.restore();
   assert.deepEqual(events, [
@@ -103,38 +75,29 @@ test('an inactive BrowserPanel never participates in overlay pause, hide, or res
   const { createBrowserPanelNativeSurfaceParticipant } = await importBrowserPanelParticipant();
   const events = [];
   const participant = createBrowserPanelNativeSurfaceParticipant({
-    backend: 'preview',
     isActive: () => false,
-    preparePreviewHide: () => events.push('prepare'),
-    pausePreview: async () => events.push('pause'),
-    hidePreview: async () => events.push('hide'),
-    occludeLogin: async () => events.push('login'),
+    occlude: async () => events.push('occlude'),
     restore: async () => events.push('restore'),
   });
 
-  participant.prepareHide();
   await participant.hide();
   await participant.restore();
   assert.deepEqual(events, []);
 });
 
-test('a failed Preview pause prevents native hide and overlay readiness', async () => {
+test('a failed Mode 2 occlusion prevents overlay readiness', async () => {
   const { createBrowserPanelNativeSurfaceParticipant } = await importBrowserPanelParticipant();
   const events = [];
   const participant = createBrowserPanelNativeSurfaceParticipant({
-    backend: 'preview',
-    preparePreviewHide() {},
-    pausePreview: async () => {
-      events.push('pause:failed');
-      throw new Error('pause ACK missing');
+    occlude: async () => {
+      events.push('occlude:failed');
+      throw new Error('occlusion ACK missing');
     },
-    hidePreview: async () => events.push('unsafe:hide'),
-    occludeLogin() {},
     restore() {},
   });
 
-  await assert.rejects(participant.hide(), /pause ACK missing/);
-  assert.deepEqual(events, ['pause:failed']);
+  await assert.rejects(participant.hide(), /occlusion ACK missing/);
+  assert.deepEqual(events, ['occlude:failed']);
 });
 
 test('overlay readiness waits for native hide ACK and overlapping leases restore once', async () => {
@@ -327,13 +290,11 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
     browserBackend,
     browserCommands,
     previewWebview,
-    tauriIpc,
     hook,
     dialog,
     allProjects,
     projectPicker,
     reviewPopover,
-    app,
   ] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
     fs.readFile(
@@ -350,7 +311,6 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
       path.join(desktopDir, 'src-tauri', 'src', 'browser', 'webview.rs'),
       'utf8',
     ),
-    fs.readFile(path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'lib', 'nativeSurfaceOcclusion.ts'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'components', 'ui', 'dialog.tsx'), 'utf8'),
     fs.readFile(
@@ -365,7 +325,6 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
       path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewPopover.tsx'),
       'utf8',
     ),
-    fs.readFile(path.join(desktopDir, 'src', 'App.tsx'), 'utf8'),
   ]);
 
   assert.match(workspace, /const nativeSurfaceModalOccluded = useNativeSurfaceOccluded\(\)/);
@@ -380,34 +339,24 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
     browserPanel,
     /useNativeSurfaceOcclusionParticipant\(createBrowserPanelNativeSurfaceParticipant\(\{/,
   );
-  assert.match(browserPanelParticipant, /await options\.pausePreview\(\)/);
-  assert.match(browserPanelParticipant, /await options\.hidePreview\(\)/);
-  assert.match(browserPanelParticipant, /await options\.occludeLogin\(\)/);
+  assert.match(browserPanelParticipant, /await options\.occlude\(\)/);
   assert.match(browserPanelParticipant, /await options\.restore\(\)/);
-  assert.match(browserPanel, /previewDesiredVisibilityRef\.current = false/);
   assert.doesNotMatch(
     browserPanel,
-    /\.then\(\(\) => setNativeSurfaceVisible\(previewDesiredVisibilityRef\.current\)\)/,
+    /pausePreview|hidePreview|occludeLogin|previewDesiredVisibilityRef/,
   );
   assert.match(
     browserPanel,
     /if \(!isSurfaceReady\) return;[\s\S]*setNativeSurfaceVisible\(isActiveSurface && !surfaceOccluded\)/,
   );
-  assert.match(browserPanel, /hidePreview: \(\) => setNativeSurfaceVisible\(false\)/);
+  assert.match(browserPanel, /occlude: occludeSurface/);
   assert.match(browserPanel, /action: 'occlude'/);
-  assert.match(browserPanel, /await syncLoginSurface\(visible, presentationRevision\)/);
+  assert.match(browserPanel, /syncSurface\(requestedVisible, presentationRevision\)/);
   assert.match(
     browserPanel,
-    /await invoke\('browser_set_visible', \{[\s\S]*sessionId,[\s\S]*visible,[\s\S]*presentationRevision/,
+    /browserSurfaceClient\.acquire\(\{ \.\.\.acquireRequest, clientRevision \}\)/,
   );
-  assert.match(
-    browserPanel,
-    /invoke<BrowserOpenResponse>\('browser_open', \{[\s\S]*?sessionId,[\s\S]*?aliasSessionId: requestedAliasSessionId,[\s\S]*?url: url \|\| null,[\s\S]*?visible: false,[\s\S]*?\}\)/,
-  );
-  assert.match(
-    tauriIpc,
-    /browser_open: \[[\s\S]*?sessionId\?: string \| null;[\s\S]*?aliasSessionId\?: string \| null;[\s\S]*?url\?: string \| null;[\s\S]*?visible\?: boolean \| null[\s\S]*?BrowserOpenResponse[\s\S]*?\];/,
-  );
+  assert.doesNotMatch(browserPanel, /browser_open|browser_set_visible|browser_set_active_session/);
   assert.match(browserBackend, /pub fn open_with_visibility\(/);
   assert.match(browserCommands, /visible\.unwrap_or\(true\)/);
   for (const command of [
@@ -486,6 +435,4 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
   assert.match(projectPicker, /if \(!gatedOpen\)/);
   assert.match(reviewPopover, /const gatedOpen = useNativeSurfaceOcclusion\(isOpen\)/);
   assert.match(reviewPopover, /open=\{gatedOpen\}/);
-  assert.match(app, /const gatedOpen = useNativeSurfaceOcclusion\(true\)/);
-  assert.match(app, /if \(!gatedOpen\) return null/);
 });

@@ -63,6 +63,7 @@ import {
   FolderSearchIcon,
   FolderTreeIcon,
   GitCompareIcon,
+  GitForkIcon,
   GitPullRequestIcon,
   Globe02Icon,
   GridViewIcon,
@@ -113,6 +114,8 @@ import {
   Rocket01Icon,
   RotateLeft01Icon,
   RotateRight01Icon,
+  Route01Icon,
+  Router01Icon,
   ScissorIcon,
   ScrollIcon,
   Search01Icon,
@@ -254,6 +257,7 @@ export const FolderSearch = createIcon(FolderSearchIcon, 'FolderSearch');
 export const FolderTree = createIcon(FolderTreeIcon, 'FolderTree');
 export const Gauge = createIcon(DashboardSpeed01Icon, 'Gauge');
 export const Gem = createIcon(DiamondIcon, 'Gem');
+export const GitFork = createIcon(GitForkIcon, 'GitFork');
 export const GitPullRequest = createIcon(GitPullRequestIcon, 'GitPullRequest');
 export const Globe = createIcon(Globe02Icon, 'Globe');
 export const Globe2 = createIcon(Globe02Icon, 'Globe2');
@@ -311,6 +315,8 @@ export const RefreshCw = createIcon(RefreshIcon, 'RefreshCw');
 export const Rocket = createIcon(Rocket01Icon, 'Rocket');
 export const RotateCcw = createIcon(RotateLeft01Icon, 'RotateCcw');
 export const RotateCw = createIcon(RotateRight01Icon, 'RotateCw');
+export const Route = createIcon(Route01Icon, 'Route');
+export const Router = createIcon(Router01Icon, 'Router');
 export const Save = createIcon(FloppyDiskIcon, 'Save');
 export const Scissors = createIcon(ScissorIcon, 'Scissors');
 export const ScrollText = createIcon(ScrollIcon, 'ScrollText');

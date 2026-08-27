@@ -24,9 +24,9 @@ CCEM Desktop so it republishes a fresh endpoint.
 
 ### Development builds and the control descriptor
 
-`pnpm tauri:dev` uses the distinct `CCEM Desktop Dev` product name and
-`com.ccem.desktop.dev` bundle identifier. It does **not** publish the global
-`~/.ccem/control.json` descriptor by default, so `ccem desktop health` from
+`pnpm tauri:dev` derives a distinct product name, bundle identifier, Vite port,
+Rust lock, and 100-port MCP block for each worktree. It does **not** publish the
+global `~/.ccem/control.json` descriptor by default, so `ccem desktop health` from
 another terminal will keep using the last release app's descriptor. Run the
 dev build with the opt-in flag when you need the CLI/skill to talk to it:
 
@@ -34,15 +34,30 @@ dev build with the opt-in flag when you need the CLI/skill to talk to it:
 CCEM_DESKTOP_PUBLISH_CONTROL_DESCRIPTOR=1 pnpm tauri:dev
 ```
 
+Different worktrees may run concurrently. The launcher prints an ignored
+`.artifacts/tauri-dev/` manifest with the exact `launcherPid`, `identifier`, and
+`mcpPort`; target those values when operating or stopping a dev app. A second
+launch in the same worktree is rejected with the live owner PID. Stop only a
+process the current task launched, via its terminal or exact `launcherPid`.
+Never use `pkill`, `killall`, port cleanup, lock deletion, or an installed-app
+quit to resolve a collision.
+
+Named dev instances default automatic shared background services off. Set
+`CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1` only for a targeted single-owner test
+of runtime cleanup/reconciliation, proxy boot, system autostart sync, session
+monitoring, cron, bot watchers, or chat bridge auto-start. The launcher does
+not clone `~/.ccem`; manual settings/config/session writes remain shared, so
+coordinate concurrent tests that mutate the same records.
+
 Release builds always publish the descriptor. Do not edit or read
 `~/.ccem/control.json` directly — let the CLI wrapper negotiate the
 descriptor for you.
 
 A development self-test must not quit, terminate, or kill
 `/Applications/CCEM Desktop.app` to resolve an ambiguous automation target.
-Target `com.ccem.desktop.dev`, the exact development app path, or the Tauri MCP
-port. If those are unavailable, stop and report the targeting failure without
-disturbing the installed release.
+Target the exact generated bundle identifier or Tauri MCP port from the
+manifest. If those are unavailable, stop and report the targeting failure
+without disturbing the installed release.
 
 If it is healthy, create sessions through the desktop CLI wrapper:
 

@@ -52,12 +52,17 @@ test('composer submit clears the live PromptArea DOM after a successful send', a
   assert.ok(clearIndex < attachmentResetIndex, 'editor clear should run before attachment state resets');
 });
 
-test('composer submit refreshes skills before resolving selected skill files', async () => {
+test('composer submit refreshes skills only for potential references before resolving selected skill files', async () => {
   const source = await readComposerSource();
   const submitBlock = sliceBetween(source, 'const handleComposerSubmit = useCallback', 'const hasComposerAttentionPanel');
   const refreshIndex = submitBlock.indexOf('await onRefreshSkills()');
   const resolveIndex = submitBlock.indexOf('selectedSkillFilesFromComposerText(promptValue, provider, latestInstalledSkills, workspaceCommands)');
 
+  assert.match(
+    submitBlock,
+    /if \(onRefreshSkills && composerTextMayContainSkillReference\(promptValue\)\) \{/,
+    'ordinary prompts must submit from cached skills without waiting for a workspace skill scan',
+  );
   assert.notEqual(refreshIndex, -1, 'missing submit-time skill refresh');
   assert.notEqual(resolveIndex, -1, 'missing refreshed skill list in selected skill resolution');
   assert.ok(refreshIndex < resolveIndex, 'skills must refresh before selected skill resolution');

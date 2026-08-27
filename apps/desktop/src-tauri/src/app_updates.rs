@@ -10,6 +10,8 @@ use crate::app_update_engine::{
     check_and_store, download_verified_and_install, PendingAppUpdate, UpdateProgress,
 };
 
+use crate::native_runtime::NativeRuntimeManager;
+
 const RELEASE_URL_PREFIX: &str =
     "https://github.com/Genuifx/claude-code-env-manager/releases/tag/v";
 
@@ -121,15 +123,26 @@ pub async fn install_app_update(
 #[tauri::command]
 pub async fn restart_app(
     app: AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    force: Option<bool>,
     sessions: State<'_, Arc<crate::browser::login::session::LoginBrowserSessionManager>>,
     surfaces: State<'_, Arc<crate::browser::login::surface_commands::LoginBrowserSurfaceManager>>,
     cef_host: State<'_, Arc<crate::browser::login::cef::host::CefHostController>>,
 ) -> Result<(), String> {
-    surfaces.begin_shutdown()?;
+    // Once native runtimes have committed their terminal hand-off we cannot
+    // safely return to a half-running app. Any later CEF teardown failure must
+    // therefore fall back to the process restart, whose exit path owns the
+    // final child cleanup.
+    native_state.prepare_app_termination(force.unwrap_or(false))?;
+    if let Err(error) = surfaces.begin_shutdown() {
+        eprintln!("Login Browser shutdown gate failed during restart: {error}");
+        app.request_restart();
+        return Ok(());
+    }
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     let app_for_shutdown = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let browser_shutdown = tauri::async_runtime::spawn_blocking(move || {
         let report = sessions.shutdown_all().map_err(|error| error.to_string())?;
         if !report.failures.is_empty() {
             return Err(format!(
@@ -140,14 +153,23 @@ pub async fn restart_app(
         cef_host.prepare_shutdown(&app_for_shutdown)
     })
     .await
-    .map_err(|error| format!("join graceful app restart: {error}"))??;
+    .map_err(|error| format!("join graceful app restart: {error}"))
+    .and_then(|result| result);
+    if let Err(error) = browser_shutdown {
+        eprintln!("Login Browser graceful shutdown failed during restart: {error}");
+    }
     app.request_restart();
     Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
 #[tauri::command]
-pub fn restart_app(app: AppHandle) -> Result<(), String> {
+pub fn restart_app(
+    app: AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    force: Option<bool>,
+) -> Result<(), String> {
+    native_state.prepare_app_termination(force.unwrap_or(false))?;
     app.request_restart();
     Ok(())
 }

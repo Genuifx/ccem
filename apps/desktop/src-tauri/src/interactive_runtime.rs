@@ -11,6 +11,7 @@ use crate::runtime::{
 use crate::session::{Session, SessionManager};
 use crate::session_provenance::bind_source_session_id;
 use crate::tmux::{ClaudeTerminalState, TmuxManager, TmuxWindowInfo};
+use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -556,6 +557,16 @@ impl InteractiveRuntimeManager {
         Ok(events.events_since(since_seq))
     }
 
+    /// Read the incrementally maintained attention summary for a session.
+    pub fn attention_summary(&self, session_id: &str) -> Result<AttentionSummary, String> {
+        let handle = self.get_handle(session_id)?;
+        let events = handle
+            .events
+            .lock()
+            .map_err(|_| "Failed to lock interactive event store".to_string())?;
+        Ok(events.attention_summary())
+    }
+
     pub fn summary(&self, session_id: &str) -> Option<InteractiveSessionSummary> {
         let handle = self.get_handle(session_id).ok()?;
         let session = handle.session.lock().ok()?.clone();
@@ -1038,10 +1049,10 @@ fn diff_capture_snapshot(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_client_args, diff_capture_snapshot, normalize_project_dir, project_dirs_match,
-        InteractiveTranscript,
-    };
+    use super::{build_client_args, diff_capture_snapshot, InteractiveTranscript};
+    #[cfg(target_os = "macos")]
+    use super::{normalize_project_dir, project_dirs_match};
+    #[cfg(target_os = "macos")]
     use std::path::PathBuf;
 
     #[test]

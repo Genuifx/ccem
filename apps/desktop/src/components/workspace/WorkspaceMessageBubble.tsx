@@ -1,5 +1,6 @@
 import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 import {
   AlertCircle,
   Brain,
@@ -10,6 +11,8 @@ import {
   Circle,
   ClipboardList,
   Copy,
+  FileImage,
+  GitFork,
   ImageIcon,
   LoaderCircle,
   Scissors,
@@ -18,6 +21,7 @@ import {
   X,
 } from '@/lib/lucide-react';
 import { MarkdownRenderer } from '@/components/history/MarkdownRenderer';
+import { TranscriptImageExportNode, copyTranscriptNodeToClipboard } from './TranscriptImageExport';
 import {
   extractToolSummary,
   getMessageCopyText,
@@ -48,6 +52,16 @@ import { WorkspaceMessageAnnotationsPopover } from './WorkspaceMessageAnnotation
 interface WorkspaceMessageBubbleProps {
   message: ConversationMessageData;
   prevRole?: string | null;
+  /**
+   * Offer "fork session from this turn" on model-output turns. Must be a
+   * stable callback: the bubble memo comparator ignores prop identity.
+   */
+  onForkTurn?: (message: ConversationMessageData) => void;
+}
+
+/** Live turns without a provider uuid use the synthetic `assistant-turn-<seq>` id. */
+function hasProviderMessageUuid(message: ConversationMessageData): boolean {
+  return Boolean(message.uuid) && !message.uuid!.startsWith('assistant-turn-');
 }
 
 export interface WorkspaceThinkingEntry {
@@ -1180,26 +1194,69 @@ const MessageMetaBar = memo(function MessageMetaBar({
   isUser,
   visible,
   t,
+  onForkTurn,
 }: {
   message: ConversationMessageData;
   isUser: boolean;
   visible: boolean;
   t: (key: string) => string;
+  onForkTurn?: (message: ConversationMessageData) => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [exportingImage, setExportingImage] = useState(false);
+  const [imageCopied, setImageCopied] = useState(false);
+  const exportNodeRef = useRef<HTMLDivElement | null>(null);
   const timeLabel = formatMessageTime(message.timestamp);
 
+  const handleForkTurn = useCallback(() => {
+    onForkTurn?.(message);
+  }, [message, onForkTurn]);
+
+  const copyText = useMemo(() => getMessageCopyText(message, t).trim(), [message, t]);
+
   const handleCopy = useCallback(async () => {
-    const text = getMessageCopyText(message, t).trim();
-    if (!text) return;
+    if (!copyText) return;
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(copyText);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
       /* clipboard unavailable */
     }
-  }, [message, t]);
+  }, [copyText]);
+
+  const handleCopyImage = useCallback(() => {
+    if (exportingImage || !copyText) return;
+    setImageCopied(false);
+    setExportingImage(true);
+  }, [exportingImage, copyText]);
+
+  useEffect(() => {
+    if (!exportingImage) return;
+    let cancelled = false;
+    void (async () => {
+      const node = exportNodeRef.current;
+      if (!node) return;
+      try {
+        // No rAF wait: when the window is hidden/occluded WKWebView throttles
+        // animation frames and the export would hang forever.
+        await copyTranscriptNodeToClipboard(node);
+        if (!cancelled) {
+          setImageCopied(true);
+          window.setTimeout(() => setImageCopied(false), 1500);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          toast.error(t('workspace.copyImageFailed').replace('{error}', String(error)));
+        }
+      } finally {
+        if (!cancelled) setExportingImage(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [exportingImage, t]);
 
   return (
     <div
@@ -1233,6 +1290,56 @@ const MessageMetaBar = memo(function MessageMetaBar({
         {copied ? t('workspace.copied') : t('workspace.copyMessage')}
       </TooltipContent>
     </Tooltip>
+      {!isUser ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={t('workspace.copyImage')}
+              onClick={handleCopyImage}
+              disabled={exportingImage}
+              className={cn(
+                'inline-flex h-5 w-5 items-center justify-center rounded transition-colors',
+                'text-muted-foreground/50 hover:bg-muted/50 disabled:opacity-50',
+              )}
+            >
+              {exportingImage ? (
+                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+              ) : imageCopied ? (
+                <Check className="h-3.5 w-3.5 text-success" />
+              ) : (
+                <FileImage className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {t('workspace.copyImage')}
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
+      {!isUser && onForkTurn ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={t('workspace.forkTurnAction')}
+              onClick={handleForkTurn}
+              className={cn(
+                'inline-flex h-5 w-5 items-center justify-center rounded transition-colors',
+                'text-muted-foreground/50 hover:bg-muted/50',
+              )}
+            >
+              <GitFork className="h-3.5 w-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {t('workspace.forkTurnAction')}
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
+      {exportingImage ? (
+        <TranscriptImageExportNode ref={exportNodeRef} content={copyText} />
+      ) : null}
       {timeLabel ? (
         <span className="text-[10px] tabular-nums text-muted-foreground/40">
           {timeLabel}
@@ -1738,7 +1845,7 @@ function renderContentBlocks(
   return { content: result, images: imageBlocks };
 }
 
-function WorkspaceMessageBubbleComponent({ message, prevRole }: WorkspaceMessageBubbleProps) {
+function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: WorkspaceMessageBubbleProps) {
   const { t } = useLocale();
   const [isActionHovering, setIsActionHovering] = useState(false);
   const [isActionFocusWithin, setIsActionFocusWithin] = useState(false);
@@ -1884,7 +1991,13 @@ function WorkspaceMessageBubbleComponent({ message, prevRole }: WorkspaceMessage
             onBlurCapture={handleActionRegionBlur}
           >
             <div className="space-y-3">{renderedContent}</div>
-            <MessageMetaBar message={message} isUser={false} visible={showMessageActions} t={t} />
+            <MessageMetaBar
+              message={message}
+              isUser={false}
+              visible={showMessageActions}
+              t={t}
+              onForkTurn={onForkTurn && hasProviderMessageUuid(message) ? onForkTurn : undefined}
+            />
           </div>
       ) : null}
 

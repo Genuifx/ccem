@@ -25,7 +25,7 @@ test('browser backend avoids Wry webview.url because it can panic on empty WKWeb
   assert.match(registrySource, /apply_navigation_metadata/);
 
   const infoMethod = browserSource.match(
-    /pub fn info\([\s\S]*?\n    }\n\n    pub fn health_check/,
+    /pub fn info\([\s\S]*?\r?\n    }\r?\n\r?\n    pub fn health_check/,
   )?.[0] ?? '';
   assert.match(infoMethod, /session_snapshot/);
   assert.doesNotMatch(infoMethod, /browser_page_metadata|\.URL\(\)/);

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Plus, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Search, LayoutGrid, List } from '@/lib/lucide-react';
 import { ErrorBanner } from '@/components/ui/EmptyState';
 import { EnvList } from '@/components/environments';
+import { EnvironmentsRouterRules } from '@/components/EnvironmentsRouterRules';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { useAppStore } from '@/store';
@@ -264,6 +265,9 @@ export function Environments({ onAddEnv, onEditEnv, onCopyEnv, onDeleteEnv }: En
           })}
         </div>
       </section>
+
+      {/* Default routing rules + profile management (CCEM Router) */}
+      <EnvironmentsRouterRules envNames={environments.map((e) => e.name)} />
     </div>
   );
 }

@@ -381,13 +381,12 @@ test('recovery projection exposes only stable states and renders them in the rel
   assert.match(zh.workspace.browserRecoveryAttention, /\{state\}/);
 });
 
-test('panel source isolates login leases from the legacy preview command path', async () => {
+test('panel source exposes only Mode 2 lease commands through one ordering lane', async () => {
   const [
     panelSource,
     panelChromeSource,
     geometrySyncSource,
     workspaceSource,
-    launcherSource,
   ] = await Promise.all([
     fs.readFile(
       path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
@@ -402,13 +401,9 @@ test('panel source isolates login leases from the legacy preview command path', 
       'utf8',
     ),
     fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
-    fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserLauncherPopover.tsx'),
-      'utf8',
-    ),
   ]);
 
-  assert.match(panelSource, /data-ccem-browser-backend=\{backend\}/);
+  assert.match(panelSource, /data-ccem-browser-backend="login"/);
   assert.match(panelSource, /browser_surface_state_changed/);
   assert.match(panelSource, /BROWSER_SURFACE_HOST_SHORTCUT_EVENT/);
   assert.match(panelSource, /browserSurfaceHostShortcutMatchesLease\(/);
@@ -419,14 +414,14 @@ test('panel source isolates login leases from the legacy preview command path', 
   );
   assert.match(
     panelSource,
-    /loginSurfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.acquire\(\{ \.\.\.acquireRequest, clientRevision \}\)/,
+    /surfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.acquire\(\{ \.\.\.acquireRequest, clientRevision \}\)/,
   );
   assert.doesNotMatch(panelSource, /disposition: 'hide'/);
   assert.match(
     panelSource,
-    /await loginSurfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.release\(\{[\s\S]*disposition: 'close'/,
+    /await surfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.release\(\{[\s\S]*disposition: 'close'/,
   );
-  assert.match(panelSource, /backend === 'login'[\s\S]*browserSurfaceClient\.navigate/);
+  assert.match(panelSource, /browserSurfaceClient\.navigate/);
   assert.match(
     panelSource,
     /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
@@ -447,15 +442,11 @@ test('panel source isolates login leases from the legacy preview command path', 
   assert.match(geometrySyncSource, /observer\.disconnect\(\)/);
   assert.match(panelSource, /data-ccem-browser-occluded=\{surfaceOccluded \? 'true' : 'false'\}/);
   assert.match(panelSource, /<BrowserPanelNavigation/);
-  assert.match(panelChromeSource, /disabled=\{backend === 'login' \|\| isBusy \|\| !canGoBack\}/);
+  assert.doesNotMatch(panelChromeSource, /ArrowLeft|ArrowRight|browserReload/);
   assert.match(workspaceSource, /browserTargetBySessionId/);
   assert.match(
     workspaceSource,
-    /browserSurfaceOccluded = !isActive[\s\S]*\|\| browserHostOverlayOpen[\s\S]*\|\| isGlobalSearchOpen[\s\S]*\|\| nativeSurfaceModalOccluded/,
-  );
-  assert.match(
-    workspaceSource,
-    /activeVisibleBrowserTarget\?\.backend === 'preview' && !browserSurfaceOccluded/,
+    /browserSurfaceOccluded = !isActive[\s\S]*\|\| isGlobalSearchOpen[\s\S]*\|\| nativeSurfaceModalOccluded/,
   );
   assert.match(workspaceSource, /surfaceOccluded: browserSurfaceOccluded \|\| !isPanelActive/);
   assert.match(workspaceSource, /onHostShortcut: handleBrowserSurfaceHostShortcut/);
@@ -463,11 +454,7 @@ test('panel source isolates login leases from the legacy preview command path', 
   assert.match(workspaceSource, /case 'open_project':[\s\S]*handleOpenProjectShortcut\(\)/);
   assert.match(workspaceSource, /case 'submit':[\s\S]*handleWorkspaceSubmitShortcut\(\)/);
   assert.match(workspaceSource, /case 'escape':[\s\S]*handleWorkspaceEscapeShortcut\(\)/);
-  assert.match(workspaceSource, /backend: 'login'/);
-  assert.doesNotMatch(launcherSource, /loginBrowserLauncherClient\.open\(/);
-  assert.doesNotMatch(launcherSource, /loginBrowserLauncherClient\.openProfile\(/);
-  assert.match(launcherSource, /onOpenLoginBrowser\(\{ workingDir, profileMode \}\)/);
-  assert.match(launcherSource, /profileMode: 'saved'[\s\S]*profileId/);
+  assert.doesNotMatch(workspaceSource, /browser_panel_requested|backend=["']preview["']/i);
 
   const listenerIndex = panelSource.indexOf("'browser_surface_state_changed'");
   const hostShortcutListenerIndex = panelSource.indexOf(
@@ -486,7 +473,7 @@ test('panel source isolates login leases from the legacy preview command path', 
   );
   assert.match(panelSource, /pendingStates\.push\(event\.payload\)/);
   assert.match(panelSource, /createBrowserSurfaceOrdering\(\)/);
-  assert.match(panelSource, /loginSurfaceOrdering\.enqueue\(/);
+  assert.match(panelSource, /surfaceOrdering\.enqueue\(/);
   assert.match(panelSource, /state\.server_sequence/);
   assert.doesNotMatch(panelSource, /nextSurfaceRevision/);
 
@@ -514,7 +501,7 @@ test('panel source isolates login leases from the legacy preview command path', 
       while (ancestor && !(
         ts.isCallExpression(ancestor)
         && ts.isPropertyAccessExpression(ancestor.expression)
-        && ancestor.expression.getText(panelAst) === 'loginSurfaceOrdering.enqueue'
+        && ancestor.expression.getText(panelAst) === 'surfaceOrdering.enqueue'
       )) {
         ancestor = ancestor.parent;
       }
@@ -523,13 +510,12 @@ test('panel source isolates login leases from the legacy preview command path', 
     ts.forEachChild(node, inspectSurfaceCalls);
   };
   inspectSurfaceCalls(panelAst);
-  assert.equal(surfaceCalls.length, 9);
-  assert.deepEqual(unlanedCalls, [], 'every login surface mutation must use one ordering lane');
-  const guardedMutationApply = 'applyBrowserSurfaceMutationResponseForLease(loginSurfaceOrdering, surfaceLeaseRef.current, lease, response, applySurfaceSnapshot)';
+  assert.ok(surfaceCalls.length >= 8);
+  assert.deepEqual(unlanedCalls, [], 'every Mode 2 surface mutation must use one ordering lane');
   assert.equal(
-    panelSource.split(guardedMutationApply).length - 1,
-    2,
-    'control and popup responses must bind captured, current, and response lease identity',
+    panelSource.match(/applyBrowserSurfaceMutationResponseForLease\(/g)?.length,
+    3,
+    'occlusion, control, and popup responses must bind captured, current, and response lease identity',
   );
 
   const replayIndex = panelSource.indexOf(

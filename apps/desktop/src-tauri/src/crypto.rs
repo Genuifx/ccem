@@ -69,20 +69,26 @@ fn load_or_create_install_key_at(key_path: &Path) -> Result<[u8; 32], String> {
     let key_dir = key_path
         .parent()
         .ok_or_else(|| "Install key path has no parent directory".to_string())?;
-    std::fs::create_dir_all(key_dir)
+    crate::secure_fs::ensure_private_dir(key_dir)
         .map_err(|e| format!("Failed to create config directory for install key: {}", e))?;
 
     let mut rng = rand::thread_rng();
     let new_key: [u8; 32] = rng.gen();
-    std::fs::write(key_path, hex::encode(new_key))
-        .map_err(|e| format!("Failed to persist install key: {}", e))?;
-
+    let encoded = hex::encode(new_key);
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Failed to restrict install key permissions: {}", e))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options
+        .open(key_path)
+        .map_err(|e| format!("Failed to create install key: {}", e))?;
+    use std::io::Write as _;
+    file.write_all(encoded.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("Failed to persist install key: {}", e))?;
 
     Ok(new_key)
 }
@@ -543,13 +549,9 @@ mod tests {
         assert_eq!(reloaded, created, "reloaded key must match created key");
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_key_unix_permissions_are_restricted() {
-        // Only meaningful on Unix; on other platforms the chmod step is absent.
-        if !cfg!(unix) {
-            return;
-        }
-
         let dir = tempfile::tempdir().expect("create tempdir");
         let key_path = dir.path().join(".install-key");
         load_or_create_install_key_at(&key_path).expect("create key");

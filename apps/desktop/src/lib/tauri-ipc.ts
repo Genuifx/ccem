@@ -18,6 +18,14 @@ import type {
   BrowserSurfaceSyncRequest,
   BrowserSurfaceSnapshotMutationResponse,
 } from '@/lib/browserSurfaceIpc';
+import type { UsageStats as AnalyticsUsageStats } from '@/types/analytics';
+import type {
+  RouterConfig,
+  RouterLaunchDraft,
+  RouterStatus,
+  SessionRouterState,
+  UpdateSessionRouterRequest,
+} from '@ccem/core/browser';
 
 // ============================================
 // Environment Commands
@@ -58,13 +66,16 @@ export interface TauriCommands {
     void
   ];
   delete_environment: [{ name: string }, void];
+  // 权威引用清单：全局 rules/profiles + active/recoverable session 对某环境的引用
+  get_environment_router_references: [{ name: string }, string[]];
 
   // 应用配置
   get_app_config: [void, AppConfig];
   get_app_version: [void, string];
   check_app_update: [void, AppUpdateMetadata | null];
   install_app_update: [void, void];
-  restart_app: [void, void];
+  restart_app: [{ force?: boolean | null } | void, void];
+  quit_app: [{ force?: boolean | null } | void, void];
   add_favorite: [{ path: string; name: string }, void];
   remove_favorite: [{ path: string }, void];
   add_recent: [{ path: string }, void];
@@ -75,6 +86,8 @@ export interface TauriCommands {
   mark_pet_notification_read: [{ notificationId: string }, PetNotificationReadState];
   open_pet_notification: [{ request: PetOpenSessionRequest }, void];
   open_tray_cockpit: [{ x?: number | null; y?: number | null }, void];
+  get_tray_runtime_snapshot: [void, TrayRuntimeSnapshot];
+  get_tray_usage_stats: [void, AnalyticsUsageStats | null];
   get_telegram_settings: [void, TelegramSettings];
   save_telegram_settings: [{ settings: TelegramSettings }, void];
   get_telegram_bridge_status: [void, TelegramBridgeStatus];
@@ -114,6 +127,13 @@ export interface TauriCommands {
   list_proxy_traffic: [{ limit: number; cursor?: string | null }, ProxyTrafficPage];
   get_proxy_traffic_detail: [{ id: string }, ProxyTrafficDetail];
   clear_proxy_traffic: [void, void];
+  // 路由器 (CCEM Router) — 全局配置与每会话路由表
+  get_router_settings: [void, RouterConfig];
+  update_router_settings: [{ settings: RouterConfig }, RouterStatus];
+  router_status: [void, RouterStatus];
+  get_session_router: [{ runtimeId: string }, SessionRouterState];
+  update_session_router: [{ request: UpdateSessionRouterRequest }, SessionRouterState];
+  restart_native_session_direct: [{ runtimeId: string }, SessionRouterState];
   generate_workspace_session_title: [{ titleInput: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
   browser_set_active_session: [{
@@ -355,6 +375,13 @@ export interface TauriCommands {
     },
     void
   ];
+  preflight_codex_model_migration: [
+    {
+      envName: string;
+      workingDir: string;
+    },
+    CodexModelMigrationPreflightResult
+  ];
   create_native_session: [
     {
       provider: 'claude' | 'codex';
@@ -369,6 +396,15 @@ export interface TauriCommands {
       providerSessionId?: string | null;
       effort?: string | null;
       seedBoundaryMessageCount?: number | null;
+      /** Claude only: fork the parent transcript up to and including this message uuid. */
+      forkFromMessageId?: string | null;
+      /**
+       * Per-Composer Dynamic Routing opt-in snapshot (null/omitted = legacy
+       * direct launch). Core-owned wire type shared with the Rust backend.
+       */
+      routerLaunchDraft?: RouterLaunchDraft | null;
+      resumeRouterFromRuntimeId?: string | null;
+      codexMigrationProofToken?: string | null;
     },
     NativeSessionSummary
   ];
@@ -410,6 +446,12 @@ export interface TauriCommands {
     },
     void
   ];
+  query_native_session_usage: [
+    {
+      runtimeId: string;
+    },
+    void
+  ];
   get_native_session_events: [
     {
       runtimeId: string;
@@ -432,12 +474,20 @@ export interface TauriCommands {
     },
     void
   ];
+  stop_native_background_task: [
+    {
+      runtimeId: string;
+      taskId: string;
+    },
+    void
+  ];
   update_native_session_settings: [
     {
       runtimeId: string;
       envName?: string | null;
       permMode?: string | null;
       effort?: string | null;
+      forceRestart?: boolean | null;
     },
     void
   ];
@@ -452,6 +502,7 @@ export interface TauriCommands {
     {
       runtimeId: string;
       terminalType?: NativeTerminalType | null;
+      allowBackgroundTaskTermination?: boolean | null;
     },
     NativeHandoffResult
   ];
@@ -472,7 +523,13 @@ export interface TauriCommands {
   check_arrange_support: [void, boolean];
 
   // 使用统计
-  get_usage_stats: [void, UsageStats];
+  get_usage_stats: [
+    void | {
+      source?: 'claude' | 'codex' | 'opencode' | null;
+      force?: boolean;
+    },
+    AnalyticsUsageStats
+  ];
   get_usage_history: [{ days: number }, UsageHistoryEntry[]];
   get_continuous_usage_days: [void, number];
   check_ccem_installed: [void, boolean];
@@ -958,6 +1015,29 @@ export interface ProxyMetrics {
   activeConnections: number;
 }
 
+/**
+ * Router service error returned by get/update_session_router and
+ * restart_native_session_direct. Re-exported from the pure conflict module so
+ * the CAS handling logic and its contract live together and stay unit-tested.
+ */
+export type { RouterServiceError } from './routerConflict';
+
+/** Payload of the `native-session-router-updated` event. */
+export interface SessionRouterUpdatedEvent {
+  runtimeId: string;
+  router: SessionRouterState;
+  reason: string;
+}
+
+/**
+ * Per-Composer Dynamic Routing opt-in carried by the FIRST
+ * `create_native_session` submit. Null/omitted = legacy single-environment
+ * (direct) launch; an opted-in draft always carries the full snapshot (there
+ * is no partial frontend shape). Owned by @ccem/core (shared wire contract
+ * with the Rust backend); re-exported here for the IPC layer's convenience.
+ */
+export type { RouterLaunchDraft };
+
 export interface ManagedSessionSummary {
   runtime_id: string;
   claude_session_id?: string | null;
@@ -973,6 +1053,23 @@ export interface ManagedSessionSummary {
 }
 
 export type NativeProvider = 'claude' | 'codex';
+
+export type CodexModelMigrationPreflightResult =
+  | {
+      status: 'affected';
+      model: 'gpt-5.4';
+      replacement: 'gpt-5.6-terra';
+      proofToken: string;
+    }
+  | {
+      status: 'affected';
+      model: 'gpt-5.4-mini';
+      replacement: 'gpt-5.6-luna';
+      proofToken: string;
+    }
+  | {
+      status: 'unaffected' | 'unknown';
+    };
 
 export interface PlatformCapabilities {
   os: 'windows' | 'macos' | 'linux' | 'unknown';
@@ -996,6 +1093,44 @@ export type NativeTransport =
 
 export type NativeTerminalType = 'terminalapp' | 'iterm2';
 
+export type NativeBackgroundTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'stopping'
+  | 'settling'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'interrupted';
+
+export interface NativeBackgroundTaskUsage {
+  total_tokens: number;
+  tool_uses: number;
+  duration_ms: number;
+}
+
+export interface NativeBackgroundTask {
+  task_id: string;
+  tool_use_id?: string | null;
+  task_type?: string | null;
+  subagent_type?: string | null;
+  workflow_name?: string | null;
+  description: string;
+  status: NativeBackgroundTaskStatus;
+  started_at: string;
+  updated_at: string;
+  progress_summary?: string | null;
+  last_tool_name?: string | null;
+  usage?: NativeBackgroundTaskUsage | null;
+  terminal_summary?: string | null;
+  output_file?: string | null;
+  error?: string | null;
+  skip_transcript?: boolean | null;
+  stop_request_id?: string | null;
+  stop_failed?: boolean | null;
+}
+
 export interface NativeSessionSummary {
   runtime_id: string;
   provider: NativeProvider;
@@ -1006,6 +1141,8 @@ export interface NativeSessionSummary {
   perm_mode: string;
   runtime_perm_mode?: string | null;
   effort?: string | null;
+  pending_env_name?: string | null;
+  pending_effort?: string | null;
   status: string;
   created_at: string;
   updated_at: string;
@@ -1013,7 +1150,10 @@ export interface NativeSessionSummary {
   last_event_seq?: number | null;
   seed_boundary_message_count?: number | null;
   can_handoff_to_terminal: boolean;
+  background_tasks?: NativeBackgroundTask[];
   last_error?: string | null;
+  /** Public router state when this session is routed (mirrors Rust field). */
+  router?: SessionRouterState | null;
 }
 
 export interface NativeHandoffResult {
@@ -1227,8 +1367,10 @@ export interface WorkspaceMediaPreview {
 }
 
 export interface ReplayBatch {
+  source_available?: boolean;
   gap_detected: boolean;
   truncated?: boolean;
+  unloaded_gap_starts?: number[];
   oldest_available_seq?: number | null;
   newest_available_seq?: number | null;
   events: SessionEventRecord[];
@@ -1327,7 +1469,7 @@ export type SessionEventPayload =
       canonical_hash?: string | null;
     }
   | { type: 'system_message'; message: string }
-  | { type: 'lifecycle'; stage: string; detail: string }
+  | { type: 'lifecycle'; stage: string; detail: string; assistant_message_uuid?: string }
   | { type: 'claude_json'; message_type?: string | null; raw_json: string }
   | { type: 'stderr_line'; line: string }
   | { type: 'assistant_chunk'; text: string }
@@ -1356,6 +1498,7 @@ export type SessionEventPayload =
       tool_use_id?: string | null;
       tool_name: string;
       input_summary?: string | null;
+      background_task_id?: string | null;
     }
   | {
       type: 'permission_responded';
@@ -1401,6 +1544,26 @@ export type SessionEventPayload =
       scope?: string | null;
     }
   | {
+      /** Router request LEDGER entry (one per forwarded /v1/messages request).
+       *  usage is upstream self-reported (observational, not billing) and may
+       *  be absent — never render absent usage as zero. */
+      type: 'routed_request';
+      provider: string;
+      request_id: string;
+      target_env: string;
+      sub_route?: boolean;
+      model?: string | null;
+      logical_key?: string | null;
+      status: number;
+      complete: boolean;
+      usage?: {
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_creation_tokens: number;
+      } | null;
+    }
+  | {
       type: 'context_usage';
       provider: string;
       used_tokens: number;
@@ -1411,7 +1574,41 @@ export type SessionEventPayload =
       is_auto_compact_enabled: boolean;
       model: string;
       categories: Array<{ name: string; tokens: number }>;
-    };
+    }
+  | {
+      type: 'session_usage';
+      provider: string;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_creation_tokens: number;
+      cost_usd?: number | null;
+      model_usage: Array<{
+        model: string;
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_creation_tokens: number;
+        cost_usd?: number | null;
+      }>;
+      subscription_type?: string | null;
+      rate_limits_available?: boolean;
+      rate_limits?: {
+        five_hour?: { utilization: number | null; resets_at: string | null } | null;
+        seven_day?: { utilization: number | null; resets_at: string | null } | null;
+      } | null;
+    }
+  | {
+      type: 'runtime_settings_changed';
+      state: 'deferred' | 'applied';
+      request_id?: string | null;
+      env_name: string;
+      effort?: string | null;
+      pending_env_name?: string | null;
+      pending_effort?: string | null;
+    }
+  | { type: 'background_tasks_changed'; tasks: NativeBackgroundTask[] }
+  | { type: 'background_task_updated'; task: NativeBackgroundTask };
 
 export interface ProxyTrafficPage {
   items: ProxyTrafficItem[];
@@ -1456,14 +1653,7 @@ export interface ReducedStreamLog {
   totalStreamMs?: number;
 }
 
-export interface UsageStats {
-  totalTokens: number;
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-}
+export type UsageStats = AnalyticsUsageStats;
 
 export interface UsageHistoryEntry {
   date: string;
@@ -1580,6 +1770,22 @@ export interface CronWecomNotification {
   botId?: string | null;
   peerId?: string | null;
   enabled?: boolean | null;
+}
+
+export interface TrayRuntimeSnapshot {
+  currentEnv: string;
+  permissionMode: string;
+  theme: string;
+  sessions: Array<{
+    id: string;
+    client: string;
+    env_name: string;
+    perm_mode: string;
+    working_dir: string;
+    status: string;
+    start_time: string;
+  }>;
+  cronTasks: CronTask[];
 }
 
 export interface CronTaskRun {

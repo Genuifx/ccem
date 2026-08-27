@@ -175,3 +175,89 @@ test('browser tool bridge rejects all pending requests when the session closes',
 
   await assert.rejects(pending, /session closed/);
 });
+
+test('browser tool bridge can reject foreground work without cancelling background agents', async () => {
+  const { createBrowserToolBridge } = await importBrowserMcpModule();
+  let owner = 'foreground';
+  const requests = [];
+  const bridge = createBrowserToolBridge(
+    (request) => requests.push(request),
+    1_000,
+    () => owner,
+  );
+
+  const foreground = bridge.sendBrowserToolRequest('snapshot', {});
+  owner = 'background';
+  const background = bridge.sendBrowserToolRequest('get_url', {});
+  bridge.rejectOwned('foreground', 'foreground interrupted');
+
+  await assert.rejects(foreground, /foreground interrupted/);
+  assert.equal(bridge.handleBrowserToolResponse({
+    type: 'browser_tool_response',
+    request_id: requests[1].request_id,
+    ok: true,
+    result: { url: 'https://example.com' },
+  }), true);
+  assert.deepEqual(await background, { url: 'https://example.com' });
+});
+
+test('browser tool ownership follows the matching permission request instead of global ingress order', async () => {
+  const { createBrowserToolBridge } = await importBrowserMcpModule();
+  const requests = [];
+  const bridge = createBrowserToolBridge((request) => requests.push(request), 1_000);
+  bridge.recordOwner('click', { snapshotId: 'one', ref: 1 }, 'foreground');
+  bridge.recordOwner('click', { ref: 2, snapshotId: 'two' }, 'background');
+
+  const background = bridge.sendBrowserToolRequest('click', { snapshotId: 'two', ref: 2 });
+  const foreground = bridge.sendBrowserToolRequest('click', { ref: 1, snapshotId: 'one' });
+  bridge.rejectOwned('foreground', 'foreground interrupted');
+
+  await assert.rejects(foreground, /foreground interrupted/);
+  assert.equal(bridge.handleBrowserToolResponse({
+    type: 'browser_tool_response',
+    request_id: requests[0].request_id,
+    ok: true,
+    result: { kept: true },
+  }), true);
+  assert.deepEqual(await background, { kept: true });
+});
+
+test('browser tool bridge cancels only the selected background task owner', async () => {
+  const { createBrowserToolBridge } = await importBrowserMcpModule();
+  const requests = [];
+  const bridge = createBrowserToolBridge((request) => requests.push(request), 1_000);
+  bridge.recordOwner('snapshot', {}, 'background:task-one');
+  bridge.recordOwner('get_url', {}, 'background:task-two');
+
+  const first = bridge.sendBrowserToolRequest('snapshot', {});
+  const second = bridge.sendBrowserToolRequest('get_url', {});
+  bridge.rejectOwned('background:task-one', 'task one stopped');
+
+  await assert.rejects(first, /task one stopped/);
+  assert.equal(bridge.handleBrowserToolResponse({
+    type: 'browser_tool_response',
+    request_id: requests[1].request_id,
+    ok: true,
+    result: { kept: true },
+  }), true);
+  assert.deepEqual(await second, { kept: true });
+});
+
+test('browser tool bridge discards queued owners when their turn or task is cancelled', async () => {
+  const { createBrowserToolBridge } = await importBrowserMcpModule();
+  const requests = [];
+  const bridge = createBrowserToolBridge((request) => requests.push(request), 1_000);
+
+  bridge.recordOwner('snapshot', {}, 'background:stale-task');
+  bridge.rejectOwned('background:stale-task', 'stale task stopped before dispatch');
+  const foreground = bridge.sendBrowserToolRequest('snapshot', {});
+  bridge.rejectOwned('foreground', 'foreground interrupted');
+  await assert.rejects(foreground, /foreground interrupted/);
+
+  bridge.recordOwner('get_url', {}, 'background:stale-task');
+  bridge.rejectAll('session closed before dispatch');
+  const nextSessionForeground = bridge.sendBrowserToolRequest('get_url', {});
+  bridge.rejectOwned('foreground', 'next foreground interrupted');
+  await assert.rejects(nextSessionForeground, /next foreground interrupted/);
+  assert.equal(requests.length, 2);
+});

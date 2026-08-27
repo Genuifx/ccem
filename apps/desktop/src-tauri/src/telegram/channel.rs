@@ -165,7 +165,7 @@ impl TelegramChannel {
                 SessionEventPayload::StdErrLine { line } if !line.trim().is_empty() => {
                     state.pending_stderr.push(line.clone());
                 }
-                SessionEventPayload::Lifecycle { stage, detail } => {
+                SessionEventPayload::Lifecycle { stage, detail, .. } => {
                     if matches!(
                         stage.as_str(),
                         "stderr_error" | "stdout_error" | "process_failure"

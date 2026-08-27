@@ -2416,14 +2416,24 @@ Some content here.
         assert!(!status.up_to_date);
         assert_eq!(status.targets.len(), 2);
         assert!(status.targets.iter().any(|target| target.agent == "Codex"
-            && target.path.ends_with(".codex/skills/ccem/SKILL.md")
+            && Path::new(&target.path).ends_with(
+                Path::new(".codex")
+                    .join("skills")
+                    .join("ccem")
+                    .join("SKILL.md")
+            )
             && !target.installed
             && !target.up_to_date));
         assert!(status
             .targets
             .iter()
             .any(|target| target.agent == "Claude Code"
-                && target.path.ends_with(".claude/skills/ccem/SKILL.md")
+                && Path::new(&target.path).ends_with(
+                    Path::new(".claude")
+                        .join("skills")
+                        .join("ccem")
+                        .join("SKILL.md")
+                )
                 && !target.installed
                 && !target.up_to_date));
 

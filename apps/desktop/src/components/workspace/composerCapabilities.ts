@@ -17,6 +17,12 @@ export interface WorkspaceComposerCapabilities {
   planCommandPrefix?: string;
   commands: ComposerCommandDefinition[];
   supportsImages: boolean;
+  /**
+   * Whether this provider's requests can be split across environments by the
+   * CCEM Router (per-provider capability, not a global Claude-only assumption;
+   * only Claude's Anthropic-compatible protocol is wired today).
+   */
+  supportsEnvRouting: boolean;
 }
 
 const CCEM_COMMANDS: ComposerCommandDefinition[] = [
@@ -82,6 +88,7 @@ const CAPABILITIES: Record<WorkspaceComposerProvider, WorkspaceComposerCapabilit
     planModeKind: 'session_permission',
     commands: CLAUDE_COMMANDS,
     supportsImages: true,
+    supportsEnvRouting: true,
   },
   codex: {
     provider: 'codex',
@@ -90,6 +97,7 @@ const CAPABILITIES: Record<WorkspaceComposerProvider, WorkspaceComposerCapabilit
     planCommandPrefix: '/plan',
     commands: CODEX_COMMANDS,
     supportsImages: true,
+    supportsEnvRouting: false,
   },
 };
 

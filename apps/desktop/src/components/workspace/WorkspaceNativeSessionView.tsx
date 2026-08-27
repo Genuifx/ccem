@@ -15,7 +15,17 @@ import {
   SquarePen,
   Terminal,
 } from '@/lib/lucide-react';
-import { Suspense, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  Suspense,
+  startTransition,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import {
@@ -75,6 +85,8 @@ import {
   type ComposerSubmitPayload,
 } from './composerAttachments';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
+import { getWorkspaceForkTurnPreview } from './WorkspaceForkDialog';
+import { shouldPreserveRestoredReadingPosition } from './workspaceTranscriptTopWindowing';
 import { WorkspaceSessionComposer } from './WorkspaceSessionComposer';
 import {
   ComposerControls,
@@ -101,22 +113,51 @@ import {
 import {
   appendSessionEvents,
   buildBaseMessages,
-  buildMessagesFromEvents,
   createInitialLocalUserPrompts,
+  deriveTranscriptAppend,
+  deriveTranscriptReset,
+  finalizeTranscriptMessages,
   filterConfirmedLocalUserPrompts,
+  RAW_TAIL_LIMIT,
+  rebaseTranscriptHead,
+  pruneRawEventTail,
   replayBatchCoversAvailableSequenceRange,
+  selectEventAppendRange,
+  selectTranscriptAppendEvents,
   sessionEventsNeedSummaryRefresh,
   shouldTreatNativeSessionAsProcessing,
   splitLocalUserPromptsForReplay,
   stabilizeMessageRefs,
   type LocalUserPrompt,
+  type TranscriptDerivationState,
 } from './workspaceEventTranscript';
+import {
+  createTranscriptBackfillEventUpdate,
+  inspectIncrementalTranscriptReplay,
+  markTranscriptPartialObservation,
+  resolveTranscriptBackfillReplay,
+  resolveTranscriptBackfillPresentation,
+  runTranscriptBackfillWithRetry,
+  type TranscriptPartialObservation,
+} from './workspaceTranscriptBackfill';
+import {
+  WorkspaceTranscriptBackfillStatus,
+  type WorkspaceTranscriptBackfillState,
+} from './WorkspaceTranscriptBackfillStatus';
 import { ContextWindowIndicator } from './ContextWindowIndicator';
-import { computeSessionUsage } from './workspaceUsage';
+import { WorkspaceBackgroundTasksPopover } from './WorkspaceBackgroundTasksPopover';
+import { deriveWorkspaceBackgroundTasks } from './workspaceBackgroundTasks';
+import {
+  buildSessionUsageState,
+  foldSessionUsageEvents,
+  type SessionUsageFold,
+} from './workspaceUsage';
 import { LazyWorkspaceReviewPopover } from './LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
-  buildWorkspaceReviewSummary,
+  buildWorkspaceReviewSummaryFromFold,
+  foldWorkspaceReviewEvents,
+  type WorkspaceReviewEventFold,
 } from './workspaceReview';
 import {
   mergeWorkspaceReplayEvents,
@@ -216,6 +257,11 @@ type QueuedGuidanceMessagesUpdate =
   | QueuedGuidanceMessage[]
   | ((previous: QueuedGuidanceMessage[]) => QueuedGuidanceMessage[]);
 
+type PendingBackgroundTaskRiskAction =
+  | { kind: 'environment'; envName: string }
+  | { kind: 'effort'; effort: EffortLevel }
+  | { kind: 'handoff' };
+
 interface WorkspaceNativeSessionViewProps {
   session: NativeSessionSummary;
   initialPrompt?: string | null;
@@ -231,17 +277,37 @@ interface WorkspaceNativeSessionViewProps {
   codexInstalled?: boolean;
   opencodeInstalled?: boolean;
   onLaunchNewSession?: (client: LaunchClient) => void;
+  /** Opens the fork-from-turn dialog (Claude sessions with a provider session id). */
+  onForkTurnRequest?: (
+    request: {
+      providerSessionId: string;
+      forkFromMessageId: string;
+      seedMessages: ConversationMessageData[];
+      envName?: string;
+      permMode?: string;
+      workingDir?: string | null;
+      effort?: string | null;
+    },
+    target: { turnPreview: string },
+  ) => void;
+  onNavigateEnvironments?: () => void;
 }
 
 const ACTIVE_POLL_INTERVAL_MS = 140;
 const IDLE_POLL_INTERVAL_MS = 700;
 const TERMINAL_POLL_INTERVAL_MS = 1100;
 const SUMMARY_REFRESH_COOLDOWN_MS = 2000;
-const CACHE_FLUSH_INTERVAL_MS = 1500;
+// Streaming flushes of the sessionStorage mirror are trailing-edge and at
+// most one per interval; idle/terminal/switch/unmount flush immediately. The
+// mirror only survives remounts within a session — backend replay refills it.
+const CACHE_FLUSH_MAX_INTERVAL_MS = 10_000;
 const FILE_REWIND_TIMEOUT_MS = 30_000;
 const INITIAL_EVENT_REPLAY_LIMIT = 1200;
 const NATIVE_EVENT_CACHE_KEY_PREFIX = 'ccem-workspace-native-events:';
 const NATIVE_EVENT_CACHE_LIMIT = 8000;
+// Prune hysteresis: only prune once the raw tail exceeds the limit by this
+// margin, so a session hovering at the boundary does not thrash setEvents.
+const RAW_TAIL_PRUNE_MARGIN = 512;
 const GUIDANCE_QUEUE_STORAGE_PREFIX = 'ccem:workspace-native-guidance-queue:v1:';
 
 class PromptAnnotationLimitError extends Error {}
@@ -391,7 +457,10 @@ function resolveGuidanceMessagesUpdate(
 }
 
 function isTerminalStatus(status: string) {
-  return status === 'stopped' || status === 'error' || status === 'handoff';
+  return status === 'stopped'
+    || status === 'error'
+    || status === 'handoff'
+    || status.startsWith('handoff_');
 }
 
 function formatCheckpointRelativeTime(
@@ -455,23 +524,43 @@ function nativeEventCacheKey(runtimeId: string) {
   return `${NATIVE_EVENT_CACHE_KEY_PREFIX}${runtimeId}`;
 }
 
-function readCachedNativeEvents(runtimeId: string): SessionEventRecord[] {
+/**
+ * Cache payload: the retained event window plus the seqs where a seq jump is
+ * a known prune/anchor seam (not a real gap), so a remount derivation does
+ * not paint spurious transcript-gap chips. Legacy entries are bare arrays.
+ */
+interface NativeEventCacheRead {
+  events: SessionEventRecord[];
+  seams: number[];
+}
+
+function readCachedNativeEvents(runtimeId: string): NativeEventCacheRead {
   try {
     if (typeof sessionStorage === 'undefined') {
-      return [];
+      return { events: [], seams: [] };
     }
 
     const raw = sessionStorage.getItem(nativeEventCacheKey(runtimeId));
     if (!raw) {
-      return [];
+      return { events: [], seams: [] };
     }
 
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [];
+    const parsed: unknown = JSON.parse(raw);
+    const candidate = Array.isArray(parsed)
+      ? parsed
+      : (parsed as { events?: unknown } | null)?.events;
+    if (!Array.isArray(candidate)) {
+      return { events: [], seams: [] };
     }
 
-    return parsed.filter((event): event is SessionEventRecord =>
+    const seamsSource = Array.isArray(parsed)
+      ? []
+      : (parsed as { seams?: unknown }).seams;
+    const seams = Array.isArray(seamsSource)
+      ? seamsSource.filter((seq): seq is number => Number.isFinite(seq))
+      : [];
+
+    const events = candidate.filter((event): event is SessionEventRecord =>
       event
       && typeof event === 'object'
       && event.runtime_id === runtimeId
@@ -480,12 +569,17 @@ function readCachedNativeEvents(runtimeId: string): SessionEventRecord[] {
       && event.payload
       && typeof event.payload === 'object',
     );
+    return { events, seams };
   } catch {
-    return [];
+    return { events: [], seams: [] };
   }
 }
 
-function writeCachedNativeEvents(runtimeId: string, events: SessionEventRecord[]) {
+function writeCachedNativeEvents(
+  runtimeId: string,
+  events: SessionEventRecord[],
+  seams: number[] = [],
+) {
   try {
     if (typeof sessionStorage === 'undefined') {
       return;
@@ -494,7 +588,17 @@ function writeCachedNativeEvents(runtimeId: string, events: SessionEventRecord[]
     const key = nativeEventCacheKey(runtimeId);
     for (const limit of [NATIVE_EVENT_CACHE_LIMIT, 3000, 1000]) {
       try {
-        sessionStorage.setItem(key, JSON.stringify(selectCachedWorkspaceEvents(events, limit)));
+        const cached = selectCachedWorkspaceEvents(events, limit);
+        // Seams only matter for seqs present in the retained window. A
+        // length of limit + 1 means selectCachedWorkspaceEvents prepended the
+        // structured-snapshot event outside the tail — that jump is benign
+        // too, everything else in the window keeps its real gap semantics.
+        const cachedSeqs = new Set(cached.map((event) => event.seq));
+        const cacheSeams = seams.filter((seq) => cachedSeqs.has(seq));
+        if (cached.length === limit + 1 && !cacheSeams.includes(cached[1]!.seq)) {
+          cacheSeams.push(cached[1]!.seq);
+        }
+        sessionStorage.setItem(key, JSON.stringify({ events: cached, seams: cacheSeams }));
         return;
       } catch {
         // Try a smaller retained window before giving up.
@@ -661,6 +765,7 @@ function buildAskUserQuestionResponse(
 function WorkspaceAttentionPanel({
   provider,
   attentionState,
+  backgroundTasks,
   respondingRequestId,
   isSubmittingPrompt,
   onPermission,
@@ -668,6 +773,7 @@ function WorkspaceAttentionPanel({
 }: {
   provider: string;
   attentionState: NativeSessionAttentionState;
+  backgroundTasks: ReactNode;
   respondingRequestId: string | null;
   isSubmittingPrompt: boolean;
   onPermission: (requestId: string, approved: boolean) => void;
@@ -677,11 +783,18 @@ function WorkspaceAttentionPanel({
   const [promptStates, setPromptStates] = useState<Record<string, InteractivePromptState>>({});
   const [collapsedPromptIds, setCollapsedPromptIds] = useState<Set<string>>(new Set());
   const attentionPanelRef = useRef<HTMLDivElement | null>(null);
+  const hasBackgroundTasks = Boolean(backgroundTasks);
   const attentionMotionKey = useMemo(() => [
     attentionState.permissions.map((request) => request.requestId).join('|'),
     attentionState.prompts.map((prompt) => prompt.toolUseId).join('|'),
     attentionState.terminalPrompt ? 'terminal' : 'no-terminal',
-  ].join('::'), [attentionState.permissions, attentionState.prompts, attentionState.terminalPrompt]);
+    hasBackgroundTasks ? 'background-tasks' : 'no-background-tasks',
+  ].join('::'), [
+    attentionState.permissions,
+    attentionState.prompts,
+    attentionState.terminalPrompt,
+    hasBackgroundTasks,
+  ]);
 
   useEffect(() => {
     const activePromptIds = new Set(attentionState.prompts.map((prompt) => prompt.toolUseId));
@@ -776,6 +889,7 @@ function WorkspaceAttentionPanel({
     attentionState.permissions.length === 0
     && attentionState.prompts.length === 0
     && !attentionState.terminalPrompt
+    && !hasBackgroundTasks
   ) {
     return null;
   }
@@ -1277,6 +1391,8 @@ function WorkspaceAttentionPanel({
           </p>
         </div>
       ) : null}
+
+      {backgroundTasks}
     </div>
   );
 }
@@ -1296,6 +1412,8 @@ export function WorkspaceNativeSessionView({
   codexInstalled = false,
   opencodeInstalled = false,
   onLaunchNewSession,
+  onForkTurnRequest,
+  onNavigateEnvironments,
 }: WorkspaceNativeSessionViewProps) {
   const { t } = useLocale();
   const environments = useAppStore((state) => state.environments);
@@ -1307,7 +1425,9 @@ export function WorkspaceNativeSessionView({
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
+    queryNativeSessionUsage,
     stopNativeSession,
+    stopNativeBackgroundTask,
     updateNativeSessionSettings,
     setNativeSessionRuntimePermMode,
     handoffNativeSessionToTerminal,
@@ -1315,7 +1435,7 @@ export function WorkspaceNativeSessionView({
     getWorkspaceFileDiff,
     getWorkspaceMediaPreview,
     getSessionSubagents,
-    listNativeSessions,
+    getNativeSessionSummary,
     searchWorkspaceFiles,
   } = useTauriCommands();
   const [sessionEnv, setSessionEnv] = useState(session.env_name);
@@ -1340,14 +1460,22 @@ export function WorkspaceNativeSessionView({
     () => isNativeSessionPlanRuntime(session),
   );
   const [events, setEvents] = useState<SessionEventRecord[]>(() =>
-    readCachedNativeEvents(session.runtime_id),
+    readCachedNativeEvents(session.runtime_id).events,
   );
+  const [transcriptBackfillView, setTranscriptBackfillView] = useState<{
+    runtimeId: string;
+    state: WorkspaceTranscriptBackfillState;
+  }>(() => ({ runtimeId: session.runtime_id, state: 'idle' }));
   const [localUserPrompts, setLocalUserPrompts] = useState<LocalUserPrompt[]>(() =>
     createInitialLocalUserPrompts(initialPrompt, initialImages, initialAnnotations)
   );
   const [isSending, setIsSending] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isHandingOff, setIsHandingOff] = useState(false);
+  const [pendingBackgroundTaskRiskAction, setPendingBackgroundTaskRiskAction] =
+    useState<PendingBackgroundTaskRiskAction | null>(null);
+  const [isApplyingBackgroundTaskRiskAction, setIsApplyingBackgroundTaskRiskAction] =
+    useState(false);
   const [isWecomBindDialogOpen, setIsWecomBindDialogOpen] = useState(false);
   const [isExternalActionsOpen, setIsExternalActionsOpen] = useState(false);
   const [isFileRestoreMenuOpen, setIsFileRestoreMenuOpen] = useState(false);
@@ -1385,6 +1513,32 @@ export function WorkspaceNativeSessionView({
   const lastSeenSeqRef = useRef<number | null>(latestEventSeq(events));
   const latestEventsRef = useRef<SessionEventRecord[]>(events);
   const previousMessagesRef = useRef<ConversationMessageData[]>([]);
+  // Incremental derivation state (plan 022): transcript messages, usage totals
+  // and review evidence fold only appended events; a reset refolds from
+  // scratch when the event list is not a suffix extension of what was folded.
+  const transcriptDerivationRef = useRef<TranscriptDerivationState | null>(null);
+  const sessionUsageDerivationRef = useRef<{
+    runtimeId: string | null;
+    consumedSeq: number | null;
+    consumedCount: number;
+    fold: SessionUsageFold;
+  } | null>(null);
+  const reviewFoldRef = useRef<{
+    runtimeId: string | null;
+    consumedSeq: number | null;
+    consumedCount: number;
+    fold: WorkspaceReviewEventFold;
+  } | null>(null);
+  // Seqs where a jump in the CURRENT events array is a prune/anchor seam, not
+  // a real gap. Set by cache reads and pruning; consumed by reset derivations.
+  const rawTailSeamsRef = useRef<number[]>([]);
+  // Exact seq boundaries omitted by the backend's limited replay. Unlike a
+  // raw seq jump, each entry is proven to have persisted rows behind it.
+  const initialReplayUnloadedGapStartsRef = useRef<number[]>([]);
+  // Raw-tail pruning waits until the initial replay/backfill settled for this
+  // runtime so it never prunes history the backend has not re-delivered yet.
+  const rawTailSettledRef = useRef(false);
+  const activeCacheRuntimeRef = useRef<string | null>(null);
   const cacheFlushTimerRef = useRef<number | null>(null);
   const cacheFlushIdleCancelRef = useRef<(() => void) | null>(null);
   const cacheFlushPendingRef = useRef(false);
@@ -1400,10 +1554,59 @@ export function WorkspaceNativeSessionView({
   const pendingRewindCheckpointIdRef = useRef<string | null>(null);
   const pendingRewindStartSeqRef = useRef(0);
   const prevEventCountRef = useRef(0);
+  const wasVisibleForAutoScrollRef = useRef(isVisible);
   const tickInFlightRef = useRef(false);
   const initialReplayRuntimeRef = useRef<string | null>(null);
-  const initialReplayBackfillRuntimeRef = useRef<string | null>(null);
+  const runtimeRequestScopeRef = useRef({
+    runtimeId: session.runtime_id,
+    generation: 0,
+  });
+  const transcriptBackfillRequestRef = useRef<{
+    runtimeId: string;
+    generation: number;
+    controller: AbortController;
+    startedWithSeq: number | null;
+    partialVersionAtStart: number;
+  } | null>(null);
+  const transcriptPartialObservationRef = useRef<TranscriptPartialObservation>({
+    version: 0,
+    throughSeq: null,
+    unknownRange: false,
+  });
   const gitSnapshotRequestSeqRef = useRef(0);
+
+  useLayoutEffect(() => {
+    const previousScope = runtimeRequestScopeRef.current;
+    if (previousScope.runtimeId === session.runtime_id) {
+      return;
+    }
+
+    runtimeRequestScopeRef.current = {
+      runtimeId: session.runtime_id,
+      generation: previousScope.generation + 1,
+    };
+    transcriptBackfillRequestRef.current?.controller.abort();
+    transcriptBackfillRequestRef.current = null;
+  }, [session.runtime_id]);
+
+  useEffect(() => () => {
+    const previousScope = runtimeRequestScopeRef.current;
+    runtimeRequestScopeRef.current = {
+      runtimeId: previousScope.runtimeId,
+      generation: previousScope.generation + 1,
+    };
+    transcriptBackfillRequestRef.current?.controller.abort();
+    transcriptBackfillRequestRef.current = null;
+  }, []);
+
+  const isRuntimeRequestCurrent = useCallback((scope: {
+    runtimeId: string;
+    generation: number;
+  }) => {
+    const currentScope = runtimeRequestScopeRef.current;
+    return currentScope.runtimeId === scope.runtimeId
+      && currentScope.generation === scope.generation;
+  }, []);
 
   const handleComposerTextChange = useCallback((value: string) => {
     composerTextRef.current = value;
@@ -1419,7 +1622,64 @@ export function WorkspaceNativeSessionView({
     setComposerDraftRevision((revision) => revision + 1);
   }, [handleComposerTextChange]);
 
-  const sessionUsage = useMemo(() => computeSessionUsage(events), [events]);
+  const sessionUsage = useMemo(() => {
+    const previous = sessionUsageDerivationRef.current;
+    if (!previous) {
+      const fold = foldSessionUsageEvents(null, events);
+      sessionUsageDerivationRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+      return buildSessionUsageState(fold);
+    }
+    const selection = selectEventAppendRange(
+      events,
+      previous.consumedSeq,
+      previous.consumedCount,
+      previous.runtimeId,
+    );
+    if (selection.mode === 'reset') {
+      const fold = foldSessionUsageEvents(null, events);
+      sessionUsageDerivationRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+      return buildSessionUsageState(fold);
+    }
+    if (selection.mode === 'append') {
+      const fold = foldSessionUsageEvents(previous.fold, selection.appended);
+      sessionUsageDerivationRef.current = {
+        runtimeId: previous.runtimeId,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: previous.consumedCount + selection.appended.length,
+        fold,
+      };
+      return buildSessionUsageState(fold);
+    }
+    // Idle: events unchanged for this fold (or pruned from the head — the
+    // running totals already account for pruned events).
+    return buildSessionUsageState(previous.fold);
+  }, [events]);
+  const backgroundTaskModel = useMemo(
+    () => deriveWorkspaceBackgroundTasks(session, events),
+    [events, session.background_tasks, session.last_event_seq],
+  );
+  const activeBackgroundTaskCount = backgroundTaskModel.active.length;
+  const [bgTasksDismissed, setBgTasksDismissed] = useState(false);
+  useEffect(() => {
+    if (backgroundTaskModel.active.length > 0) setBgTasksDismissed(false);
+  }, [backgroundTaskModel.active.length]);
+
+  const refreshSessionUsage = useCallback(() => {
+    if (session.provider !== 'claude') return;
+    void queryNativeSessionUsage(session.runtime_id).catch((error) => {
+      console.debug('Failed to query native session usage:', error);
+    });
+  }, [queryNativeSessionUsage, session.provider, session.runtime_id]);
   const fileCheckpoints = useMemo(() => deriveNativeFileCheckpoints(events), [events]);
 
   const clearFileRewindTimeout = useCallback(() => {
@@ -1524,7 +1784,23 @@ export function WorkspaceNativeSessionView({
   }, [getWorkspaceGitSnapshot, session.project_dir]);
 
   useEffect(() => {
-    const cachedEvents = readCachedNativeEvents(session.runtime_id);
+    // Flush the outgoing runtime's mirror immediately on session switch
+    // (under its own runtime id — latestEventsRef still holds its events).
+    if (
+      activeCacheRuntimeRef.current
+      && activeCacheRuntimeRef.current !== session.runtime_id
+      && latestEventsRef.current.length > 0
+    ) {
+      writeCachedNativeEvents(
+        activeCacheRuntimeRef.current,
+        latestEventsRef.current,
+        rawTailSeamsRef.current,
+      );
+    }
+    activeCacheRuntimeRef.current = session.runtime_id;
+
+    const cached = readCachedNativeEvents(session.runtime_id);
+    const cachedEvents = cached.events;
     const initialPrompts = createInitialLocalUserPrompts(
       initialPrompt,
       initialImages,
@@ -1534,10 +1810,22 @@ export function WorkspaceNativeSessionView({
     lastSeenSeqRef.current = latestEventSeq(cachedEvents);
     latestEventsRef.current = cachedEvents;
     previousMessagesRef.current = [];
-    initialReplayBackfillRuntimeRef.current = null;
+    transcriptDerivationRef.current = null;
+    sessionUsageDerivationRef.current = null;
+    reviewFoldRef.current = null;
+    rawTailSeamsRef.current = cached.seams;
+    initialReplayUnloadedGapStartsRef.current = [];
+    rawTailSettledRef.current = false;
+    transcriptPartialObservationRef.current = {
+      version: 0,
+      throughSeq: null,
+      unknownRange: false,
+    };
+    lastSummaryRefreshTimestampRef.current = 0;
     autoScrollDetachedRef.current = false;
     prevEventCountRef.current = 0;
     setEvents(cachedEvents);
+    setTranscriptBackfillView({ runtimeId: session.runtime_id, state: 'idle' });
     clearComposerDraft();
     setComposerPlanModeEnabled(isNativeSessionPlanRuntime(session));
     setQueuedMessages([]);
@@ -1599,28 +1887,158 @@ export function WorkspaceNativeSessionView({
     [unconfirmedLocalUserPrompts],
   );
 
-  const rawMessages = useMemo(
-    () => buildMessagesFromEvents(
-      buildBaseMessages(seedMessages, replayLocalPrompts.initialPrompt),
+  const transcriptTerminalError = session.status === 'error'
+    ? session.last_error ?? null
+    : null;
+
+  const rawMessages = useMemo(() => {
+    const baseMessages = buildBaseMessages(seedMessages, replayLocalPrompts.initialPrompt);
+    const tokens = { seedMessages, prompts: replayLocalPrompts };
+    // Cache/prune seams are proven presentation-only boundaries. While the
+    // initial limited replay is still being recovered, its sparse anchors are
+    // presentation-only too: show one recovery status instead of inserting a
+    // transcript message for every temporary sequence jump.
+    const suppressedGapStarts = (isMount: boolean) => {
+      const knownSeams = rawTailSeamsRef.current.length > 0
+        ? rawTailSeamsRef.current
+        : (isMount ? readCachedNativeEvents(session.runtime_id).seams : []);
+      const suppressed = new Set([
+        ...knownSeams,
+        ...(!rawTailSettledRef.current
+          ? initialReplayUnloadedGapStartsRef.current
+          : []),
+      ]);
+      return suppressed.size > 0 ? suppressed : undefined;
+    };
+    const resetState = (isMount: boolean) => deriveTranscriptReset(
+      baseMessages,
       replayLocalPrompts.remainingPrompts,
       events,
-      session.status === 'error' ? session.last_error : null,
-    ),
-    [events, replayLocalPrompts, seedMessages, session.last_error, session.status],
-  );
+      transcriptTerminalError,
+      { tokens, suppressGapBeforeSeqs: suppressedGapStarts(isMount) },
+    );
+
+    const previousState = transcriptDerivationRef.current;
+    let state: TranscriptDerivationState;
+    if (!previousState) {
+      state = resetState(true);
+    } else if (
+      previousState.seedMessages !== seedMessages
+      || previousState.prompts !== replayLocalPrompts
+    ) {
+      // Seed/prompt inputs changed: rebuild only the head and refresh the
+      // prompt queue; every event-derived message keeps its identity.
+      state = rebaseTranscriptHead(
+        previousState,
+        baseMessages,
+        events,
+        replayLocalPrompts.remainingPrompts,
+        tokens,
+        suppressedGapStarts(false),
+      );
+    } else {
+      const selection = selectTranscriptAppendEvents(events, previousState);
+      if (selection.mode === 'reset') {
+        state = resetState(false);
+      } else if (selection.mode === 'append') {
+        state = deriveTranscriptAppend(
+          previousState,
+          selection.appended,
+          suppressedGapStarts(false),
+        );
+      } else {
+        state = previousState;
+      }
+    }
+    // Terminal error is a finalize-only input; never refold for it.
+    if (state.terminalError !== transcriptTerminalError) {
+      state = { ...state, terminalError: transcriptTerminalError };
+    }
+    transcriptDerivationRef.current = state;
+    return finalizeTranscriptMessages(state);
+  }, [events, replayLocalPrompts, seedMessages, transcriptTerminalError]);
 
   const messages = useMemo(
     () => stabilizeMessageRefs(rawMessages, previousMessagesRef.current),
     [rawMessages],
   );
 
-  const reviewSummary = useMemo(
-    () => buildWorkspaceReviewSummary({
+  // Fork-from-turn anchor: rebuilt every render from the latest session and
+  // transcript, but the callback handed to memoized bubbles stays stable.
+  const forkTurnImplRef = useRef<(message: ConversationMessageData) => void>(() => {});
+  forkTurnImplRef.current = (message: ConversationMessageData) => {
+    if (!onForkTurnRequest) {
+      return;
+    }
+    if (session.provider !== 'claude' || !session.provider_session_id?.trim()) {
+      return;
+    }
+    if (!message.uuid || message.uuid.startsWith('assistant-turn-')) {
+      return;
+    }
+    const index = messages.findIndex((candidate) => candidate.uuid === message.uuid);
+    if (index < 0) {
+      return;
+    }
+    onForkTurnRequest(
+      {
+        providerSessionId: session.provider_session_id,
+        forkFromMessageId: message.uuid,
+        seedMessages: messages.slice(0, index + 1),
+        envName: session.env_name,
+        permMode: session.perm_mode,
+        workingDir: session.project_dir,
+        effort: session.effort ?? null,
+      },
+      {
+        turnPreview: getWorkspaceForkTurnPreview(message),
+      },
+    );
+  };
+  const handleForkTurn = useCallback((message: ConversationMessageData) => {
+    forkTurnImplRef.current(message);
+  }, []);
+
+  const reviewSummary = useMemo(() => {
+    const previous = reviewFoldRef.current;
+    if (!previous) {
+      const fold = foldWorkspaceReviewEvents(null, events);
+      reviewFoldRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot);
+    }
+    const selection = selectEventAppendRange(
       events,
-      gitSnapshot,
-    }),
-    [events, gitSnapshot],
-  );
+      previous.consumedSeq,
+      previous.consumedCount,
+      previous.runtimeId,
+    );
+    let fold = previous.fold;
+    if (selection.mode === 'reset') {
+      fold = foldWorkspaceReviewEvents(null, events);
+      reviewFoldRef.current = {
+        runtimeId: events.length ? events[0]!.runtime_id : null,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: events.length,
+        fold,
+      };
+    } else if (selection.mode === 'append') {
+      fold = foldWorkspaceReviewEvents(previous.fold, selection.appended);
+      reviewFoldRef.current = {
+        runtimeId: previous.runtimeId,
+        consumedSeq: latestEventSeq(events),
+        consumedCount: previous.consumedCount + selection.appended.length,
+        fold,
+      };
+    }
+    // Idle: reuse the fold (pruned head is already accounted for). The git
+    // snapshot only participates in assembly, so git refreshes never refold.
+    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot);
+  }, [events, gitSnapshot]);
   const reviewModel = useMemo(
     () => {
       if (!isReviewPopoverOpen) {
@@ -1669,7 +2087,7 @@ export function WorkspaceNativeSessionView({
     }
 
     const write = () => {
-      writeCachedNativeEvents(session.runtime_id, latestEventsRef.current);
+      writeCachedNativeEvents(session.runtime_id, latestEventsRef.current, rawTailSeamsRef.current);
     };
 
     if (options.immediate) {
@@ -1694,15 +2112,39 @@ export function WorkspaceNativeSessionView({
       if (cacheFlushPendingRef.current) {
         flushCachedEvents();
       }
-    }, CACHE_FLUSH_INTERVAL_MS);
+    }, CACHE_FLUSH_MAX_INTERVAL_MS);
   }, [flushCachedEvents]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     latestEventsRef.current = events;
+  }, [events]);
+
+  useEffect(() => {
     if (events.length > 0) {
       scheduleCacheFlush();
     }
   }, [events, scheduleCacheFlush]);
+
+  // Bound the in-memory raw tail. Only at idle (never mid-send), only after
+  // the initial replay/backfill settled for this runtime, and only past a
+  // hysteresis margin over RAW_TAIL_LIMIT. Derivations fold incrementally, so
+  // pruning never re-derives anything: append selections stay valid because
+  // the newest events (the consumed marker) are always retained.
+  useEffect(() => {
+    if (
+      !rawTailSettledRef.current
+      || isSending
+      || events.length <= RAW_TAIL_LIMIT + RAW_TAIL_PRUNE_MARGIN
+    ) {
+      return;
+    }
+    const pruned = pruneRawEventTail(events, RAW_TAIL_LIMIT);
+    if (!pruned.prunedCount) {
+      return;
+    }
+    rawTailSeamsRef.current = pruned.seams;
+    setEvents(pruned.events);
+  }, [events, isSending]);
 
   useEffect(() => () => {
     if (cacheFlushTimerRef.current !== null) {
@@ -1718,8 +2160,14 @@ export function WorkspaceNativeSessionView({
     }
   }, [flushCachedEvents]);
 
+  // Idle/terminal sessions flush the mirror immediately; only while streaming
+  // (processing/initializing) does the 10s trailing timer govern.
   useEffect(() => {
-    if (isTerminalStatus(session.status) && latestEventsRef.current.length > 0) {
+    if (
+      session.status !== 'processing'
+      && session.status !== 'initializing'
+      && latestEventsRef.current.length > 0
+    ) {
       flushCachedEvents({ immediate: true });
     }
   }, [flushCachedEvents, session.status]);
@@ -1746,50 +2194,124 @@ export function WorkspaceNativeSessionView({
   ]);
 
   const refreshSummary = useCallback(async (options: { force?: boolean } = {}) => {
+    const requestScope = {
+      runtimeId: session.runtime_id,
+      generation: runtimeRequestScopeRef.current.generation,
+    };
     const now = Date.now();
     if (!options.force && now - lastSummaryRefreshTimestampRef.current < SUMMARY_REFRESH_COOLDOWN_MS) {
       return;
     }
     lastSummaryRefreshTimestampRef.current = now;
-    const sessions = await listNativeSessions();
-    const next = sessions.find(
-      (candidate) => candidate.runtime_id === session.runtime_id,
-    );
-    if (next) {
+    const next = await getNativeSessionSummary(session.runtime_id);
+    if (next && isRuntimeRequestCurrent(requestScope)) {
       onSessionUpdate(next);
     }
-  }, [listNativeSessions, onSessionUpdate, session.runtime_id]);
+  }, [getNativeSessionSummary, isRuntimeRequestCurrent, onSessionUpdate, session.runtime_id]);
 
   const backfillInitialReplay = useCallback(async () => {
-    if (initialReplayBackfillRuntimeRef.current === session.runtime_id) {
+    const requestScope = {
+      runtimeId: session.runtime_id,
+      generation: runtimeRequestScopeRef.current.generation,
+    };
+    if (!isRuntimeRequestCurrent(requestScope)) {
       return;
     }
-    initialReplayBackfillRuntimeRef.current = session.runtime_id;
-
-    try {
-      const fullBatch = await getNativeSessionEvents(session.runtime_id, null, null);
-      if (!fullBatch.events.length) {
-        return;
-      }
-
-      const fullBatchLatestSeq = latestEventSeq(fullBatch.events);
-      if (fullBatchLatestSeq != null) {
-        lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? fullBatchLatestSeq, fullBatchLatestSeq);
-      }
-
-      startTransition(() => {
-        setEvents((previous) => appendSessionEvents(fullBatch.events, previous));
-      });
-
-      if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
-        await refreshSummary({ force: true });
-      }
-    } catch (error) {
-      console.error('Failed to backfill native session transcript:', error);
+    const activeRequest = transcriptBackfillRequestRef.current;
+    if (activeRequest?.runtimeId === requestScope.runtimeId) {
+      return;
     }
-  }, [getNativeSessionEvents, refreshSummary, session.runtime_id]);
+    activeRequest?.controller.abort();
+
+    const request = {
+      ...requestScope,
+      controller: new AbortController(),
+      startedWithSeq: latestEventSeq(latestEventsRef.current),
+      partialVersionAtStart: transcriptPartialObservationRef.current.version,
+    };
+    transcriptBackfillRequestRef.current = request;
+    setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'loading' });
+
+    const result = await runTranscriptBackfillWithRetry({
+      load: () => getNativeSessionEvents(requestScope.runtimeId, null, null),
+      isComplete: replayBatchCoversAvailableSequenceRange,
+      physicalRequestKey: requestScope.runtimeId,
+      signal: request.controller.signal,
+    });
+
+    if (
+      !isRuntimeRequestCurrent(requestScope)
+      || transcriptBackfillRequestRef.current !== request
+    ) {
+      return;
+    }
+    transcriptBackfillRequestRef.current = null;
+
+    if (result.status === 'cancelled') {
+      return;
+    }
+    if (result.status === 'error') {
+      console.error('Failed to backfill native session transcript:', result.error);
+      setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'error' });
+      return;
+    }
+
+    const fullBatch = result.value;
+    const resolution = resolveTranscriptBackfillReplay(
+      result.status,
+      fullBatch,
+      [],
+    );
+    const replayCursor = fullBatch.newest_available_seq ?? latestEventSeq(fullBatch.events);
+    if (replayCursor != null) {
+      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? replayCursor, replayCursor);
+    } else if (
+      result.status === 'success'
+      && lastSeenSeqRef.current === request.startedWithSeq
+    ) {
+      lastSeenSeqRef.current = null;
+    }
+
+    if (resolution.clearProvisionalGaps) {
+      rawTailSeamsRef.current = [];
+      initialReplayUnloadedGapStartsRef.current = [];
+    }
+    rawTailSettledRef.current = resolution.rawTailSettled;
+    const presentation = resolveTranscriptBackfillPresentation(
+      result.status,
+      replayCursor,
+      request.partialVersionAtStart,
+      transcriptPartialObservationRef.current,
+    );
+    transcriptPartialObservationRef.current = presentation.partialObservation;
+    const updateEvents = createTranscriptBackfillEventUpdate(
+      result.status,
+      fullBatch,
+      request.startedWithSeq,
+    );
+    setEvents((previous) => (
+      isRuntimeRequestCurrent(requestScope) ? updateEvents(previous) : previous
+    ));
+    setTranscriptBackfillView({
+      runtimeId: requestScope.runtimeId,
+      state: presentation.state,
+    });
+
+    if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
+      void refreshSummary({ force: true });
+    }
+  }, [
+    getNativeSessionEvents,
+    isRuntimeRequestCurrent,
+    refreshSummary,
+    session.runtime_id,
+  ]);
 
   const pollEvents = useCallback(async () => {
+    const requestScope = {
+      runtimeId: session.runtime_id,
+      generation: runtimeRequestScopeRef.current.generation,
+    };
     const isInitialReplay = initialReplayRuntimeRef.current !== session.runtime_id;
     const sinceSeq = isInitialReplay ? null : lastSeenSeqRef.current;
     const batch = await getNativeSessionEvents(
@@ -1797,21 +2319,67 @@ export function WorkspaceNativeSessionView({
       sinceSeq,
       isInitialReplay ? INITIAL_EVENT_REPLAY_LIMIT : null,
     );
+    if (!isRuntimeRequestCurrent(requestScope)) {
+      return false;
+    }
     initialReplayRuntimeRef.current = session.runtime_id;
+    const incrementalReplay = isInitialReplay
+      ? null
+      : inspectIncrementalTranscriptReplay(batch);
     if (!batch.events.length) {
+      if (isInitialReplay) {
+        initialReplayUnloadedGapStartsRef.current = [];
+        if (replayBatchCoversAvailableSequenceRange(batch)) {
+          lastSeenSeqRef.current = null;
+          latestEventsRef.current = [];
+          rawTailSeamsRef.current = [];
+          rawTailSettledRef.current = true;
+          setEvents([]);
+          setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'idle' });
+        } else {
+          void backfillInitialReplay();
+        }
+      } else if (incrementalReplay?.state === 'partial') {
+        if (incrementalReplay.acknowledgedSeq != null) {
+          lastSeenSeqRef.current = Math.max(
+            lastSeenSeqRef.current ?? incrementalReplay.acknowledgedSeq,
+            incrementalReplay.acknowledgedSeq,
+          );
+        }
+        transcriptPartialObservationRef.current = markTranscriptPartialObservation(
+          transcriptPartialObservationRef.current,
+          incrementalReplay.acknowledgedSeq,
+        );
+        setTranscriptBackfillView({
+          runtimeId: requestScope.runtimeId,
+          state: 'partial',
+        });
+      }
       return false;
     }
 
-    const batchLatestSeq = latestEventSeq(batch.events);
+    if (isInitialReplay) {
+      initialReplayUnloadedGapStartsRef.current = batch.unloaded_gap_starts ?? [];
+    }
+
+    const batchLatestSeq = incrementalReplay?.acknowledgedSeq ?? latestEventSeq(batch.events);
     if (batchLatestSeq != null) {
       lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? batchLatestSeq, batchLatestSeq);
     }
+    // A gap-detected replacement batch comes straight from the backend
+    // (contiguous); prune seams from the replaced array no longer apply.
+    if (!isInitialReplay && batch.gap_detected) {
+      rawTailSeamsRef.current = [];
+    }
     const updateEvents = () => {
-      setEvents((previous) => (
-        isInitialReplay
+      setEvents((previous) => {
+        if (!isRuntimeRequestCurrent(requestScope)) {
+          return previous;
+        }
+        return isInitialReplay
           ? mergeWorkspaceReplayEvents(previous, batch.events)
-          : appendSessionEvents(previous, batch.events, batch.gap_detected)
-      ));
+          : appendSessionEvents(previous, batch.events, batch.gap_detected);
+      });
     };
 
     if (hasImmediateAttentionEvent(batch.events)) {
@@ -1820,12 +2388,34 @@ export function WorkspaceNativeSessionView({
       startTransition(updateEvents);
     }
 
-    if (isInitialReplay && !replayBatchCoversAvailableSequenceRange(batch)) {
-      void backfillInitialReplay();
+    if (isInitialReplay) {
+      if (replayBatchCoversAvailableSequenceRange(batch)) {
+        // Replay covered the backend's full range: no backfill needed and the
+        // raw tail may start pruning once the session goes idle.
+        rawTailSettledRef.current = true;
+        initialReplayUnloadedGapStartsRef.current = [];
+        setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'idle' });
+      } else {
+        void backfillInitialReplay();
+      }
+    } else if (incrementalReplay?.state === 'partial') {
+      transcriptPartialObservationRef.current = markTranscriptPartialObservation(
+        transcriptPartialObservationRef.current,
+        incrementalReplay.acknowledgedSeq,
+      );
+      setTranscriptBackfillView({
+        runtimeId: requestScope.runtimeId,
+        state: 'partial',
+      });
     }
 
     return sessionEventsNeedSummaryRefresh(batch.events);
-  }, [backfillInitialReplay, getNativeSessionEvents, session.runtime_id]);
+  }, [
+    backfillInitialReplay,
+    getNativeSessionEvents,
+    isRuntimeRequestCurrent,
+    session.runtime_id,
+  ]);
 
   const rawAttentionState = useMemo(
     () => extractAttentionState(events),
@@ -1899,6 +2489,9 @@ export function WorkspaceNativeSessionView({
       tickInFlightRef.current = true;
       try {
         const forceSummary = await pollEvents();
+        if (cancelled) {
+          return;
+        }
         await refreshSummary({ force: forceSummary });
       } catch (error) {
         if (!cancelled) {
@@ -1940,6 +2533,13 @@ export function WorkspaceNativeSessionView({
     }
 
     const handleScroll = () => {
+      // `display:none` live-session panes can emit a scroll event while their
+      // geometry and scrollTop collapse to zero. That is not a user gesture:
+      // treating it as one can clear the detached reading state, so the
+      // parent auto-scroll races the transcript's switch-back restoration.
+      if (!isVisible || container.clientWidth <= 0 || container.clientHeight <= 0) {
+        return;
+      }
       if (programmaticScrollRef.current) {
         return;
       }
@@ -1958,7 +2558,7 @@ export function WorkspaceNativeSessionView({
       container.removeEventListener('scroll', handleScroll);
       container.removeEventListener('wheel', handleWheel);
     };
-  }, [cancelPendingAutoScroll, session.runtime_id]);
+  }, [cancelPendingAutoScroll, isVisible, session.runtime_id]);
 
   // Clean up any pending scroll animation frame on unmount
   useEffect(() => () => {
@@ -1969,6 +2569,8 @@ export function WorkspaceNativeSessionView({
   // We watch events.length (not messages.length) because streaming deltas grow
   // existing message content without increasing the message count.
   useLayoutEffect(() => {
+    const wasVisible = wasVisibleForAutoScrollRef.current;
+    wasVisibleForAutoScrollRef.current = isVisible;
     if (!isVisible || !containerRef.current) {
       return;
     }
@@ -1976,9 +2578,25 @@ export function WorkspaceNativeSessionView({
     const container = containerRef.current;
     const prevCount = prevEventCountRef.current;
     prevEventCountRef.current = events.length;
+    const becameVisible = !wasVisible;
 
     // Nothing to scroll to
     if (messages.length === 0) {
+      return;
+    }
+
+    // The transcript child restores its saved scrollTop during its layout
+    // effect before this parent effect runs. On a hidden -> visible return,
+    // treat that restored non-bottom position as authoritative even if a
+    // hidden zero-geometry scroll event previously disturbed the detached
+    // flag. This check is transition-only: applying it on every append would
+    // mistake newly grown streaming content for a user scroll-away.
+    if (shouldPreserveRestoredReadingPosition({
+      becameVisible,
+      previousEventCount: prevCount,
+      isNearBottom: isNearBottom(container),
+    })) {
+      autoScrollDetachedRef.current = true;
       return;
     }
 
@@ -2033,25 +2651,35 @@ export function WorkspaceNativeSessionView({
     [attentionState.prompts],
   );
   const hasPlanExitPrompt = planExitPromptIds.length > 0;
-  const hasHardBlockingAttention = attentionState.permissions.length > 0
+  const hasHardBlockingAttention = attentionState.permissions.some(
+    (request) => !request.backgroundTaskId,
+  )
     || Boolean(attentionState.terminalPrompt)
     || hasAskUserQuestionPrompt;
   const hasBlockingAttention = hasHardBlockingAttention || hasQuickReplyPrompt;
-  const hasAttentionPanel = hasBlockingAttention;
+  const hasBackgroundTaskPanel = session.provider === 'claude'
+    && (backgroundTaskModel.active.length > 0 || backgroundTaskModel.recent.length > 0)
+    && !bgTasksDismissed;
+  const hasAttentionPanel = attentionState.permissions.length > 0
+    || hasBlockingAttention
+    || hasBackgroundTaskPanel;
   const canSend = !isSending
     && !isTerminalStatus(session.status)
-    && (composerHasDraft || sessionAnnotations.annotations.length > 0);
+    && (composerHasDraft || sessionAnnotations.pendingAnnotations.length > 0);
   const canShowFileRestorePoints = session.provider === 'claude'
     && fileCheckpoints.length > 0;
   const canUseFileRestorePoints = canShowFileRestorePoints
     && !isTerminalStatus(session.status)
     && !isProcessingTurn
     && !hasBlockingAttention
+    && activeBackgroundTaskCount === 0
     && !isRewindingFiles;
   const fileRestoreDisabledReason = canUseFileRestorePoints
     ? null
     : isRewindingFiles
       ? t('common.loading')
+      : activeBackgroundTaskCount > 0
+        ? t('workspace.nativeRestoreBackgroundBusy')
       : hasBlockingAttention
         ? t('workspace.nativeRestoreBlocked')
         : isProcessingTurn
@@ -2412,21 +3040,24 @@ export function WorkspaceNativeSessionView({
     return true;
   }, []);
 
-  const handleEnvChange = useCallback((envName: string) => {
-    const previousEnv = sessionEnv;
+  const performEnvChange = useCallback((envName: string, forceRestart = false) => {
     const runtimeId = session.runtime_id;
     const requestSeq = environmentUpdateRequestSeqRef.current + 1;
     const previousUpdate = pendingEnvironmentUpdateRef.current;
     environmentUpdateRequestSeqRef.current = requestSeq;
-    setSessionEnv(envName);
-
     let updatePromise: Promise<boolean>;
     updatePromise = (async () => {
       if (previousUpdate) {
         await previousUpdate;
       }
       try {
-        await updateNativeSessionSettings(runtimeId, envName, undefined);
+        await updateNativeSessionSettings(
+          runtimeId,
+          envName,
+          undefined,
+          undefined,
+          forceRestart,
+        );
         if (environmentUpdateRequestSeqRef.current === requestSeq) {
           await refreshSummary({ force: true });
         }
@@ -2434,7 +3065,6 @@ export function WorkspaceNativeSessionView({
       } catch (error) {
         console.error('Failed to update native session environment:', error);
         if (environmentUpdateRequestSeqRef.current === requestSeq) {
-          setSessionEnv(previousEnv);
           toast.error(t('workspace.nativeSettingsFailed'));
         }
         return false;
@@ -2445,7 +3075,16 @@ export function WorkspaceNativeSessionView({
       }
     });
     pendingEnvironmentUpdateRef.current = updatePromise;
-  }, [refreshSummary, session.runtime_id, sessionEnv, t, updateNativeSessionSettings]);
+    return updatePromise;
+  }, [refreshSummary, session.runtime_id, t, updateNativeSessionSettings]);
+
+  const handleEnvChange = useCallback((envName: string) => {
+    if (activeBackgroundTaskCount > 0) {
+      setPendingBackgroundTaskRiskAction({ kind: 'environment', envName });
+      return;
+    }
+    performEnvChange(envName);
+  }, [activeBackgroundTaskCount, performEnvChange]);
 
   const handlePermModeChange = useCallback((mode: PermissionModeName) => {
     const previousRuntimeMode = sessionRuntimePermMode;
@@ -2475,18 +3114,33 @@ export function WorkspaceNativeSessionView({
     void applyRuntimePlanModeChange(enabled);
   }, [applyRuntimePlanModeChange]);
 
-  const handleEffortChange = useCallback((effort: EffortLevel) => {
+  const performEffortChange = useCallback((effort: EffortLevel, forceRestart = false) => {
     const nextEffort = normalizeEffortForProvider(effort, session.provider);
-    const previousEffort = sessionEffort;
-    setSessionEffort(nextEffort);
-    void updateNativeSessionSettings(session.runtime_id, undefined, undefined, nextEffort)
-      .then(() => refreshSummary({ force: true }))
+    return updateNativeSessionSettings(
+      session.runtime_id,
+      undefined,
+      undefined,
+      nextEffort,
+      forceRestart,
+    )
+      .then(async () => {
+        await refreshSummary({ force: true });
+        return true;
+      })
       .catch((error) => {
         console.error('Failed to update native session effort:', error);
-        setSessionEffort(previousEffort);
         toast.error(t('workspace.nativeSettingsFailed'));
+        return false;
       });
-  }, [refreshSummary, session.provider, session.runtime_id, sessionEffort, t, updateNativeSessionSettings]);
+  }, [refreshSummary, session.provider, session.runtime_id, t, updateNativeSessionSettings]);
+
+  const handleEffortChange = useCallback((effort: EffortLevel) => {
+    if (activeBackgroundTaskCount > 0) {
+      setPendingBackgroundTaskRiskAction({ kind: 'effort', effort });
+      return;
+    }
+    performEffortChange(effort);
+  }, [activeBackgroundTaskCount, performEffortChange]);
 
   const handleSend = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isSending) {
@@ -2729,23 +3383,82 @@ export function WorkspaceNativeSessionView({
     }
   }, [refreshSummary, session.runtime_id, stopNativeSession, t]);
 
-  const handleHandoff = useCallback(async () => {
+  const handleStopBackgroundTask = useCallback(async (taskId: string) => {
+    await stopNativeBackgroundTask(session.runtime_id, taskId);
+    await pollEvents();
+    await refreshSummary({ force: true });
+  }, [pollEvents, refreshSummary, session.runtime_id, stopNativeBackgroundTask]);
+
+  const performHandoff = useCallback(async (allowBackgroundTaskTermination = false) => {
     setIsHandingOff(true);
     try {
-      const result = await handoffNativeSessionToTerminal(session.runtime_id);
+      const result = await handoffNativeSessionToTerminal(
+        session.runtime_id,
+        undefined,
+        allowBackgroundTaskTermination,
+      );
       await refreshSummary({ force: true });
       toast.success(
         t(result.status === 'pending'
           ? 'workspace.nativeHandoffPending'
           : 'workspace.nativeHandoffDone'),
       );
+      return true;
     } catch (error) {
       console.error('Failed to handoff native session:', error);
       toast.error(t('workspace.nativeHandoffFailed'));
+      return false;
     } finally {
       setIsHandingOff(false);
     }
   }, [handoffNativeSessionToTerminal, refreshSummary, session.runtime_id, t]);
+
+  const handleHandoff = useCallback(() => {
+    if (activeBackgroundTaskCount > 0) {
+      setPendingBackgroundTaskRiskAction({ kind: 'handoff' });
+      return;
+    }
+    void performHandoff();
+  }, [activeBackgroundTaskCount, performHandoff]);
+
+  const applyPendingBackgroundTaskRiskAction = useCallback(async (force: boolean) => {
+    const action = pendingBackgroundTaskRiskAction;
+    if (!action || isApplyingBackgroundTaskRiskAction) {
+      return;
+    }
+    setIsApplyingBackgroundTaskRiskAction(true);
+    try {
+      if (!force && action.kind !== 'handoff') {
+        const succeeded = action.kind === 'environment'
+          ? await performEnvChange(action.envName, false)
+          : await performEffortChange(action.effort, false);
+        if (!succeeded) return;
+        setPendingBackgroundTaskRiskAction(null);
+        toast.info(t('workspace.backgroundTasksDeferred'));
+        return;
+      }
+      let succeeded = false;
+      if (action.kind === 'environment') {
+        succeeded = await performEnvChange(action.envName, force);
+      } else if (action.kind === 'effort') {
+        succeeded = await performEffortChange(action.effort, force);
+      } else if (force) {
+        succeeded = await performHandoff(true);
+      }
+      if (succeeded) {
+        setPendingBackgroundTaskRiskAction(null);
+      }
+    } finally {
+      setIsApplyingBackgroundTaskRiskAction(false);
+    }
+  }, [
+    isApplyingBackgroundTaskRiskAction,
+    pendingBackgroundTaskRiskAction,
+    performEffortChange,
+    performEnvChange,
+    performHandoff,
+    t,
+  ]);
 
   const handleRestoreFileCheckpoint = useCallback(async () => {
     if (!selectedFileCheckpoint || !canUseFileRestorePoints) {
@@ -2860,10 +3573,13 @@ export function WorkspaceNativeSessionView({
   ]);
 
   const hasComposerDraft = composerHasDraft;
-  const hasComposerInput = hasComposerDraft || sessionAnnotations.annotations.length > 0;
+  const hasComposerInput = hasComposerDraft || sessionAnnotations.pendingAnnotations.length > 0;
   const shouldGuideModel = !isTerminalStatus(session.status)
     && hasComposerInput
     && (isProcessingTurn || hasHardBlockingAttention);
+  const transcriptBackfillState = transcriptBackfillView.runtimeId === session.runtime_id
+    ? transcriptBackfillView.state
+    : 'idle';
 
   return (
     <>
@@ -2906,6 +3622,18 @@ export function WorkspaceNativeSessionView({
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
         <div className="mx-auto max-w-[960px] px-8 py-8">
+          {transcriptBackfillState !== 'idle' ? (
+            <div className="sticky top-2 z-10">
+              <WorkspaceTranscriptBackfillStatus
+                state={transcriptBackfillState}
+                loadingMessage={t('workspace.nativeTranscriptBackfillLoading')}
+                errorMessage={t('workspace.nativeTranscriptBackfillError')}
+                partialMessage={t('workspace.nativeTranscriptBackfillPartial')}
+                retryLabel={t('common.retry')}
+                onRetry={() => void backfillInitialReplay()}
+              />
+            </div>
+          ) : null}
           {messages.length === 0 ? (
             <div className="flex min-h-[280px] flex-col items-center justify-center gap-3 text-center">
               <div className="rounded-2xl border border-border/40 bg-surface/70 p-4">
@@ -2924,6 +3652,9 @@ export function WorkspaceNativeSessionView({
             <WorkspaceTranscriptList
               messages={messages}
               isAwaitingResponse={isAwaitingResponse}
+              enableTopWindowing
+              viewportRef={containerRef}
+              onForkTurn={onForkTurnRequest ? handleForkTurn : undefined}
             />
           )}
         </div>
@@ -2988,6 +3719,8 @@ export function WorkspaceNativeSessionView({
         workspaceCommands={workspaceCommands}
         workingDir={session.project_dir}
         searchWorkspaceFiles={searchWorkspaceFiles}
+        routeRuntimeId={session.provider === 'claude' ? session.runtime_id : null}
+        onNavigateEnvironments={onNavigateEnvironments}
         planModeEnabled={composerPlanModeEnabled}
         onPlanModeEnabledChange={handlePlanModeEnabledChange}
         planModeHint={session.provider === 'claude' && sessionRuntimePermMode === 'plan'
@@ -3002,15 +3735,23 @@ export function WorkspaceNativeSessionView({
           setQueuedMessages((previous) => previous.filter((message) => message.id !== id));
         }}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
-        annotations={sessionAnnotations.annotations}
+        annotations={sessionAnnotations.pendingAnnotations}
         onUpdateAnnotation={sessionAnnotations.updateAnnotation}
         onRemoveAnnotation={sessionAnnotations.removeAnnotation}
-        onClearAnnotations={sessionAnnotations.clearAnnotations}
-        onAnnotationsSent={sessionAnnotations.clearAnnotations}
+        onClearAnnotations={sessionAnnotations.clearPendingAnnotations}
+        onAnnotationsSent={sessionAnnotations.markAllSent}
         aboveComposer={hasAttentionPanel ? (
           <WorkspaceAttentionPanel
             provider={session.provider}
             attentionState={attentionState}
+            backgroundTasks={hasBackgroundTaskPanel ? (
+              <WorkspaceBackgroundTasksPopover
+                activeTasks={backgroundTaskModel.active}
+                recentTasks={backgroundTaskModel.recent}
+                onStopTask={handleStopBackgroundTask}
+                onDismiss={() => setBgTasksDismissed(true)}
+              />
+            ) : null}
             respondingRequestId={respondingRequestId}
             isSubmittingPrompt={isSending}
             onPermission={(requestId, approved) => {
@@ -3036,7 +3777,11 @@ export function WorkspaceNativeSessionView({
         )}
         secondaryActions={(
           <>
-            <ContextWindowIndicator usage={sessionUsage} />
+            <ContextWindowIndicator
+              usage={sessionUsage}
+              provider={session.provider}
+              onRefreshUsage={refreshSessionUsage}
+            />
             {canShowFileRestorePoints ? (
               <DropdownMenu
                 modal={false}
@@ -3191,7 +3936,7 @@ export function WorkspaceNativeSessionView({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="gap-2.5"
-                  disabled={isHandingOff || isHandoffPending}
+                  disabled={isHandingOff || isHandoffPending || isProcessingTurn}
                   onSelect={() => {
                     closeExternalActionsMenu();
                     void handleHandoff();
@@ -3210,6 +3955,66 @@ export function WorkspaceNativeSessionView({
         )}
       />
     </div>
+    <Dialog
+      open={Boolean(pendingBackgroundTaskRiskAction)}
+      onOpenChange={(open) => {
+        if (!open && !isApplyingBackgroundTaskRiskAction) {
+          setPendingBackgroundTaskRiskAction(null);
+        }
+      }}
+    >
+      <DialogContent
+        data-ccem-background-task-risk-dialog
+        className="frosted-panel glass-noise max-w-[440px] border-none p-5"
+      >
+        <DialogHeader>
+          <DialogTitle>{t('workspace.backgroundTasksRestartWarningTitle')}</DialogTitle>
+          <DialogDescription>
+            {t(
+              pendingBackgroundTaskRiskAction?.kind === 'handoff'
+                ? 'workspace.backgroundTasksHandoffWarningBody'
+                : 'workspace.backgroundTasksRestartWarningBody',
+              { count: activeBackgroundTaskCount },
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            className="glass-btn-outline"
+            disabled={isApplyingBackgroundTaskRiskAction}
+            onClick={() => setPendingBackgroundTaskRiskAction(null)}
+          >
+            {t('workspace.backgroundTasksCancel')}
+          </Button>
+          {pendingBackgroundTaskRiskAction?.kind !== 'handoff' ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isApplyingBackgroundTaskRiskAction}
+              onClick={() => void applyPendingBackgroundTaskRiskAction(false)}
+            >
+              {t('workspace.backgroundTasksDefer')}
+            </Button>
+          ) : null}
+          <Button
+            type="button"
+            variant="destructive"
+            className="gap-2"
+            disabled={isApplyingBackgroundTaskRiskAction}
+            onClick={() => void applyPendingBackgroundTaskRiskAction(true)}
+          >
+            {isApplyingBackgroundTaskRiskAction ? (
+              <LoaderCircle className="h-4 w-4 animate-spin" />
+            ) : (
+              <ShieldAlert className="h-4 w-4" />
+            )}
+            {t('workspace.backgroundTasksContinue')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
     <Dialog
       open={isRestoreDialogOpen}
       onOpenChange={(open) => {

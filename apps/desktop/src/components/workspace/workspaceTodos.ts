@@ -831,6 +831,21 @@ export function buildWorkspaceTodos(
   );
 }
 
+/**
+ * The live view's events array is already seq-ascending except transiently
+ * after a gap merge; walking the tail window only (O(tail)) detects that
+ * cheaply so the common path avoids the copy + full sort.
+ */
+function tailWindowIsSeqOrdered(events: SessionEventRecord[], windowSize: number): boolean {
+  const start = Math.max(0, events.length - windowSize);
+  for (let index = Math.max(1, start); index < events.length; index += 1) {
+    if (events[index]!.seq <= events[index - 1]!.seq) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function selectCachedWorkspaceEvents(
   events: SessionEventRecord[],
   tailLimit: number,
@@ -840,7 +855,9 @@ export function selectCachedWorkspaceEvents(
     return [];
   }
 
-  const ordered = [...events].sort((left, right) => left.seq - right.seq);
+  const ordered = tailWindowIsSeqOrdered(events, limit + 1)
+    ? events
+    : [...events].sort((left, right) => left.seq - right.seq);
   const tail = ordered.slice(-limit);
   const snapshotEvent = latestStructuredSnapshot(ordered)?.event;
   if (!snapshotEvent) {

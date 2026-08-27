@@ -17,14 +17,45 @@ fn lock_path() -> PathBuf {
             return root.join("desktop-app-dev.lock");
         }
     }
-    let lock_name = if cfg!(debug_assertions) {
-        "desktop-app-dev.lock"
+    let instance_id = std::env::var("CCEM_DESKTOP_DEV_INSTANCE_ID").ok();
+    lock_path_for_instance(instance_id.as_deref(), cfg!(debug_assertions))
+}
+
+fn lock_path_for_instance(instance_id: Option<&str>, debug_assertions: bool) -> PathBuf {
+    let lock_name = if debug_assertions {
+        instance_id
+            .and_then(sanitize_instance_id)
+            .map(|instance_id| format!("desktop-app-dev-{}.lock", instance_id))
+            .unwrap_or_else(|| "desktop-app-dev.lock".to_string())
     } else {
-        "desktop-app.lock"
+        "desktop-app.lock".to_string()
     };
     dirs::home_dir()
-        .map(|home| home.join(format!(".ccem/{}", lock_name)))
-        .unwrap_or_else(|| PathBuf::from(format!(".ccem/{}", lock_name)))
+        .map(|home| home.join(".ccem").join(&lock_name))
+        .unwrap_or_else(|| PathBuf::from(".ccem").join(&lock_name))
+}
+
+fn sanitize_instance_id(value: &str) -> Option<String> {
+    let mut sanitized = String::with_capacity(value.len().min(64));
+    let mut pending_separator = false;
+
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if pending_separator && !sanitized.is_empty() {
+                sanitized.push('-');
+            }
+            sanitized.push(character.to_ascii_lowercase());
+            pending_separator = false;
+        } else if !sanitized.is_empty() {
+            pending_separator = true;
+        }
+
+        if sanitized.len() >= 64 {
+            break;
+        }
+    }
+
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 pub fn acquire_desktop_instance_lock() -> Result<DesktopInstanceLock, String> {
@@ -89,7 +120,7 @@ fn acquire_desktop_instance_lock_at(path: PathBuf) -> Result<DesktopInstanceLock
 
 #[cfg(test)]
 mod tests {
-    use super::acquire_desktop_instance_lock_at;
+    use super::{acquire_desktop_instance_lock_at, lock_path_for_instance};
 
     #[test]
     fn desktop_instance_lock_rejects_second_holder() {
@@ -105,5 +136,26 @@ mod tests {
         );
 
         drop(first);
+    }
+
+    #[test]
+    fn desktop_instance_lock_path_is_scoped_to_the_dev_instance() {
+        let alpha = lock_path_for_instance(Some("worktree-alpha"), true);
+        let beta = lock_path_for_instance(Some("worktree-beta"), true);
+
+        assert_ne!(alpha, beta, "different worktrees must not share a dev lock");
+        assert!(alpha.ends_with("desktop-app-dev-worktree-alpha.lock"));
+        assert!(beta.ends_with("desktop-app-dev-worktree-beta.lock"));
+    }
+
+    #[test]
+    fn desktop_instance_lock_path_sanitizes_untrusted_instance_ids() {
+        let path = lock_path_for_instance(Some("../../Feature One! 🚀"), true);
+
+        assert!(path.ends_with("desktop-app-dev-feature-one.lock"));
+        assert_eq!(
+            path.parent(),
+            dirs::home_dir().map(|home| home.join(".ccem")).as_deref()
+        );
     }
 }

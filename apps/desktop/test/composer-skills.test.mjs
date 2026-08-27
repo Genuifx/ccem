@@ -61,6 +61,18 @@ function skill(overrides) {
   };
 }
 
+test('skill refresh hint excludes ordinary prompts and detects skill references', async () => {
+  const { composerTextMayContainSkillReference } = await importComposerModel();
+
+  assert.equal(composerTextMayContainSkillReference('Explain the current workspace state'), false);
+  assert.equal(composerTextMayContainSkillReference('Use $frontend-design for this screen'), true);
+  assert.equal(composerTextMayContainSkillReference('Run /lightweight-dev-mode for this fix'), true);
+  assert.equal(
+    composerTextMayContainSkillReference('Use [$frontend-design](/tmp/frontend-design/SKILL.md)'),
+    true,
+  );
+});
+
 test('slash query returns mixed command and skill suggestions without deduping Codex duplicates', async () => {
   const {
     buildComposerSuggestions,
