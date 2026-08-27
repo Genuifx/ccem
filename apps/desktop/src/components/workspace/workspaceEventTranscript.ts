@@ -313,7 +313,11 @@ export function trimSeedMessagesBeforeFirstUserPrompt(
 }
 
 export function replayBatchCoversAvailableSequenceRange(replayBatch: ReplayBatch): boolean {
-  if (replayBatch.truncated || replayBatch.gap_detected) {
+  if (
+    replayBatch.source_available === false
+    || replayBatch.truncated
+    || replayBatch.gap_detected
+  ) {
     return false;
   }
 
@@ -556,6 +560,24 @@ export function dedupeEvents(events: SessionEventRecord[]) {
   }
 
   return deduped;
+}
+
+export function eventSequenceGapStarts(events: SessionEventRecord[]): number[] {
+  const gapStarts: number[] = [];
+  let previousEvent: SessionEventRecord | undefined;
+
+  for (const event of events) {
+    if (
+      previousEvent
+      && event.runtime_id === previousEvent.runtime_id
+      && event.seq > previousEvent.seq + 1
+    ) {
+      gapStarts.push(event.seq);
+    }
+    previousEvent = event;
+  }
+
+  return gapStarts;
 }
 
 export function appendSessionEvents(
@@ -1476,11 +1498,12 @@ export function deriveTranscriptReset(
 export function deriveTranscriptAppend(
   state: TranscriptDerivationState,
   appendedEvents: SessionEventRecord[],
+  suppressGapBeforeSeqs?: ReadonlySet<number>,
 ): TranscriptDerivationState {
   if (!appendedEvents.length) {
     return state;
   }
-  return foldTranscriptEvents({ ...state }, appendedEvents);
+  return foldTranscriptEvents({ ...state }, appendedEvents, suppressGapBeforeSeqs);
 }
 
 /**
@@ -1508,7 +1531,7 @@ export function rebaseTranscriptHead(
   };
   const selection = selectTranscriptAppendEvents(events, rebased);
   if (selection.mode === 'append') {
-    return deriveTranscriptAppend(rebased, selection.appended);
+    return deriveTranscriptAppend(rebased, selection.appended, suppressGapBeforeSeqs);
   }
   if (selection.mode === 'reset') {
     return deriveTranscriptReset(

@@ -427,8 +427,12 @@ pub struct SessionEventRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayBatch {
+    #[serde(default)]
+    pub source_available: bool,
     pub gap_detected: bool,
     pub truncated: bool,
+    #[serde(default)]
+    pub unloaded_gap_starts: Vec<u64>,
     pub oldest_available_seq: Option<u64>,
     pub newest_available_seq: Option<u64>,
     pub events: Vec<SessionEventRecord>,
@@ -452,8 +456,10 @@ pub fn replay_records(records: &[SessionEventRecord], last_seen_seq: Option<u64>
     };
 
     ReplayBatch {
+        source_available: true,
         gap_detected,
         truncated: false,
+        unloaded_gap_starts: Vec::new(),
         oldest_available_seq,
         newest_available_seq,
         events,
@@ -525,7 +531,19 @@ impl SessionStore {
 
     pub fn events_since(&self, last_seen_seq: Option<u64>) -> ReplayBatch {
         let records = self.events.iter().cloned().collect::<Vec<_>>();
-        replay_records(&records, last_seen_seq)
+        let mut batch = replay_records(&records, last_seen_seq);
+        // A full replay from the bounded in-memory store is only complete
+        // when it still starts at the beginning of the runtime sequence.
+        // Reconnected stores may start above 1 and long-running stores evict
+        // their oldest rows once they reach capacity.
+        if last_seen_seq.is_none()
+            && batch
+                .oldest_available_seq
+                .is_some_and(|oldest_seq| oldest_seq > 1)
+        {
+            batch.truncated = true;
+        }
+        batch
     }
 
     pub fn len(&self) -> usize {
@@ -986,5 +1004,8 @@ mod tests {
         assert_eq!(replay.events.len(), 2);
         assert_eq!(replay.events[0].seq, 2);
         assert_eq!(replay.events[1].seq, 3);
+
+        let full_replay = store.events_since(None);
+        assert!(full_replay.truncated);
     }
 }

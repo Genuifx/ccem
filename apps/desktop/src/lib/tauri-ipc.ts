@@ -1279,8 +1279,10 @@ export interface WorkspaceMediaPreview {
 }
 
 export interface ReplayBatch {
+  source_available?: boolean;
   gap_detected: boolean;
   truncated?: boolean;
+  unloaded_gap_starts?: number[];
   oldest_available_seq?: number | null;
   newest_available_seq?: number | null;
   events: SessionEventRecord[];

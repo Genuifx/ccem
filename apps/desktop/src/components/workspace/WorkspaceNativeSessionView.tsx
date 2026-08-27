@@ -131,6 +131,19 @@ import {
   type LocalUserPrompt,
   type TranscriptDerivationState,
 } from './workspaceEventTranscript';
+import {
+  createTranscriptBackfillEventUpdate,
+  inspectIncrementalTranscriptReplay,
+  markTranscriptPartialObservation,
+  resolveTranscriptBackfillReplay,
+  resolveTranscriptBackfillPresentation,
+  runTranscriptBackfillWithRetry,
+  type TranscriptPartialObservation,
+} from './workspaceTranscriptBackfill';
+import {
+  WorkspaceTranscriptBackfillStatus,
+  type WorkspaceTranscriptBackfillState,
+} from './WorkspaceTranscriptBackfillStatus';
 import { ContextWindowIndicator } from './ContextWindowIndicator';
 import { WorkspaceBackgroundTasksPopover } from './WorkspaceBackgroundTasksPopover';
 import { deriveWorkspaceBackgroundTasks } from './workspaceBackgroundTasks';
@@ -1449,6 +1462,10 @@ export function WorkspaceNativeSessionView({
   const [events, setEvents] = useState<SessionEventRecord[]>(() =>
     readCachedNativeEvents(session.runtime_id).events,
   );
+  const [transcriptBackfillView, setTranscriptBackfillView] = useState<{
+    runtimeId: string;
+    state: WorkspaceTranscriptBackfillState;
+  }>(() => ({ runtimeId: session.runtime_id, state: 'idle' }));
   const [localUserPrompts, setLocalUserPrompts] = useState<LocalUserPrompt[]>(() =>
     createInitialLocalUserPrompts(initialPrompt, initialImages, initialAnnotations)
   );
@@ -1515,6 +1532,9 @@ export function WorkspaceNativeSessionView({
   // Seqs where a jump in the CURRENT events array is a prune/anchor seam, not
   // a real gap. Set by cache reads and pruning; consumed by reset derivations.
   const rawTailSeamsRef = useRef<number[]>([]);
+  // Exact seq boundaries omitted by the backend's limited replay. Unlike a
+  // raw seq jump, each entry is proven to have persisted rows behind it.
+  const initialReplayUnloadedGapStartsRef = useRef<number[]>([]);
   // Raw-tail pruning waits until the initial replay/backfill settled for this
   // runtime so it never prunes history the backend has not re-delivered yet.
   const rawTailSettledRef = useRef(false);
@@ -1537,8 +1557,56 @@ export function WorkspaceNativeSessionView({
   const wasVisibleForAutoScrollRef = useRef(isVisible);
   const tickInFlightRef = useRef(false);
   const initialReplayRuntimeRef = useRef<string | null>(null);
-  const initialReplayBackfillRuntimeRef = useRef<string | null>(null);
+  const runtimeRequestScopeRef = useRef({
+    runtimeId: session.runtime_id,
+    generation: 0,
+  });
+  const transcriptBackfillRequestRef = useRef<{
+    runtimeId: string;
+    generation: number;
+    controller: AbortController;
+    startedWithSeq: number | null;
+    partialVersionAtStart: number;
+  } | null>(null);
+  const transcriptPartialObservationRef = useRef<TranscriptPartialObservation>({
+    version: 0,
+    throughSeq: null,
+    unknownRange: false,
+  });
   const gitSnapshotRequestSeqRef = useRef(0);
+
+  useLayoutEffect(() => {
+    const previousScope = runtimeRequestScopeRef.current;
+    if (previousScope.runtimeId === session.runtime_id) {
+      return;
+    }
+
+    runtimeRequestScopeRef.current = {
+      runtimeId: session.runtime_id,
+      generation: previousScope.generation + 1,
+    };
+    transcriptBackfillRequestRef.current?.controller.abort();
+    transcriptBackfillRequestRef.current = null;
+  }, [session.runtime_id]);
+
+  useEffect(() => () => {
+    const previousScope = runtimeRequestScopeRef.current;
+    runtimeRequestScopeRef.current = {
+      runtimeId: previousScope.runtimeId,
+      generation: previousScope.generation + 1,
+    };
+    transcriptBackfillRequestRef.current?.controller.abort();
+    transcriptBackfillRequestRef.current = null;
+  }, []);
+
+  const isRuntimeRequestCurrent = useCallback((scope: {
+    runtimeId: string;
+    generation: number;
+  }) => {
+    const currentScope = runtimeRequestScopeRef.current;
+    return currentScope.runtimeId === scope.runtimeId
+      && currentScope.generation === scope.generation;
+  }, []);
 
   const handleComposerTextChange = useCallback((value: string) => {
     composerTextRef.current = value;
@@ -1746,11 +1814,18 @@ export function WorkspaceNativeSessionView({
     sessionUsageDerivationRef.current = null;
     reviewFoldRef.current = null;
     rawTailSeamsRef.current = cached.seams;
+    initialReplayUnloadedGapStartsRef.current = [];
     rawTailSettledRef.current = false;
-    initialReplayBackfillRuntimeRef.current = null;
+    transcriptPartialObservationRef.current = {
+      version: 0,
+      throughSeq: null,
+      unknownRange: false,
+    };
+    lastSummaryRefreshTimestampRef.current = 0;
     autoScrollDetachedRef.current = false;
     prevEventCountRef.current = 0;
     setEvents(cachedEvents);
+    setTranscriptBackfillView({ runtimeId: session.runtime_id, state: 'idle' });
     clearComposerDraft();
     setComposerPlanModeEnabled(isNativeSessionPlanRuntime(session));
     setQueuedMessages([]);
@@ -1819,22 +1894,28 @@ export function WorkspaceNativeSessionView({
   const rawMessages = useMemo(() => {
     const baseMessages = buildBaseMessages(seedMessages, replayLocalPrompts.initialPrompt);
     const tokens = { seedMessages, prompts: replayLocalPrompts };
-    // Seam suppression only applies to resets folding a seam-carrying array
-    // (cache-restored or pruned); merges/backfills replace it with a complete
-    // array and clear the seams at their call sites. The sessionStorage
-    // fallback only applies at mount, where the ref is not hydrated yet.
-    const resetSeams = (isMount: boolean) => {
-      const seams = rawTailSeamsRef.current.length > 0
+    // Cache/prune seams are proven presentation-only boundaries. While the
+    // initial limited replay is still being recovered, its sparse anchors are
+    // presentation-only too: show one recovery status instead of inserting a
+    // transcript message for every temporary sequence jump.
+    const suppressedGapStarts = (isMount: boolean) => {
+      const knownSeams = rawTailSeamsRef.current.length > 0
         ? rawTailSeamsRef.current
         : (isMount ? readCachedNativeEvents(session.runtime_id).seams : []);
-      return seams.length ? new Set(seams) : undefined;
+      const suppressed = new Set([
+        ...knownSeams,
+        ...(!rawTailSettledRef.current
+          ? initialReplayUnloadedGapStartsRef.current
+          : []),
+      ]);
+      return suppressed.size > 0 ? suppressed : undefined;
     };
     const resetState = (isMount: boolean) => deriveTranscriptReset(
       baseMessages,
       replayLocalPrompts.remainingPrompts,
       events,
       transcriptTerminalError,
-      { tokens, suppressGapBeforeSeqs: resetSeams(isMount) },
+      { tokens, suppressGapBeforeSeqs: suppressedGapStarts(isMount) },
     );
 
     const previousState = transcriptDerivationRef.current;
@@ -1853,14 +1934,18 @@ export function WorkspaceNativeSessionView({
         events,
         replayLocalPrompts.remainingPrompts,
         tokens,
-        resetSeams(false),
+        suppressedGapStarts(false),
       );
     } else {
       const selection = selectTranscriptAppendEvents(events, previousState);
       if (selection.mode === 'reset') {
         state = resetState(false);
       } else if (selection.mode === 'append') {
-        state = deriveTranscriptAppend(previousState, selection.appended);
+        state = deriveTranscriptAppend(
+          previousState,
+          selection.appended,
+          suppressedGapStarts(false),
+        );
       } else {
         state = previousState;
       }
@@ -2030,8 +2115,11 @@ export function WorkspaceNativeSessionView({
     }, CACHE_FLUSH_MAX_INTERVAL_MS);
   }, [flushCachedEvents]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     latestEventsRef.current = events;
+  }, [events]);
+
+  useEffect(() => {
     if (events.length > 0) {
       scheduleCacheFlush();
     }
@@ -2106,52 +2194,124 @@ export function WorkspaceNativeSessionView({
   ]);
 
   const refreshSummary = useCallback(async (options: { force?: boolean } = {}) => {
+    const requestScope = {
+      runtimeId: session.runtime_id,
+      generation: runtimeRequestScopeRef.current.generation,
+    };
     const now = Date.now();
     if (!options.force && now - lastSummaryRefreshTimestampRef.current < SUMMARY_REFRESH_COOLDOWN_MS) {
       return;
     }
     lastSummaryRefreshTimestampRef.current = now;
     const next = await getNativeSessionSummary(session.runtime_id);
-    if (next) {
+    if (next && isRuntimeRequestCurrent(requestScope)) {
       onSessionUpdate(next);
     }
-  }, [getNativeSessionSummary, onSessionUpdate, session.runtime_id]);
+  }, [getNativeSessionSummary, isRuntimeRequestCurrent, onSessionUpdate, session.runtime_id]);
 
   const backfillInitialReplay = useCallback(async () => {
-    if (initialReplayBackfillRuntimeRef.current === session.runtime_id) {
+    const requestScope = {
+      runtimeId: session.runtime_id,
+      generation: runtimeRequestScopeRef.current.generation,
+    };
+    if (!isRuntimeRequestCurrent(requestScope)) {
       return;
     }
-    initialReplayBackfillRuntimeRef.current = session.runtime_id;
-
-    try {
-      const fullBatch = await getNativeSessionEvents(session.runtime_id, null, null);
-      if (!fullBatch.events.length) {
-        rawTailSettledRef.current = true;
-        return;
-      }
-
-      const fullBatchLatestSeq = latestEventSeq(fullBatch.events);
-      if (fullBatchLatestSeq != null) {
-        lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? fullBatchLatestSeq, fullBatchLatestSeq);
-      }
-
-      // The merged array is complete (backend replay is the source of truth),
-      // so prune seams from any earlier array no longer apply.
-      rawTailSeamsRef.current = [];
-      startTransition(() => {
-        setEvents((previous) => appendSessionEvents(fullBatch.events, previous));
-      });
-      rawTailSettledRef.current = true;
-
-      if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
-        await refreshSummary({ force: true });
-      }
-    } catch (error) {
-      console.error('Failed to backfill native session transcript:', error);
+    const activeRequest = transcriptBackfillRequestRef.current;
+    if (activeRequest?.runtimeId === requestScope.runtimeId) {
+      return;
     }
-  }, [getNativeSessionEvents, refreshSummary, session.runtime_id]);
+    activeRequest?.controller.abort();
+
+    const request = {
+      ...requestScope,
+      controller: new AbortController(),
+      startedWithSeq: latestEventSeq(latestEventsRef.current),
+      partialVersionAtStart: transcriptPartialObservationRef.current.version,
+    };
+    transcriptBackfillRequestRef.current = request;
+    setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'loading' });
+
+    const result = await runTranscriptBackfillWithRetry({
+      load: () => getNativeSessionEvents(requestScope.runtimeId, null, null),
+      isComplete: replayBatchCoversAvailableSequenceRange,
+      physicalRequestKey: requestScope.runtimeId,
+      signal: request.controller.signal,
+    });
+
+    if (
+      !isRuntimeRequestCurrent(requestScope)
+      || transcriptBackfillRequestRef.current !== request
+    ) {
+      return;
+    }
+    transcriptBackfillRequestRef.current = null;
+
+    if (result.status === 'cancelled') {
+      return;
+    }
+    if (result.status === 'error') {
+      console.error('Failed to backfill native session transcript:', result.error);
+      setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'error' });
+      return;
+    }
+
+    const fullBatch = result.value;
+    const resolution = resolveTranscriptBackfillReplay(
+      result.status,
+      fullBatch,
+      [],
+    );
+    const replayCursor = fullBatch.newest_available_seq ?? latestEventSeq(fullBatch.events);
+    if (replayCursor != null) {
+      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? replayCursor, replayCursor);
+    } else if (
+      result.status === 'success'
+      && lastSeenSeqRef.current === request.startedWithSeq
+    ) {
+      lastSeenSeqRef.current = null;
+    }
+
+    if (resolution.clearProvisionalGaps) {
+      rawTailSeamsRef.current = [];
+      initialReplayUnloadedGapStartsRef.current = [];
+    }
+    rawTailSettledRef.current = resolution.rawTailSettled;
+    const presentation = resolveTranscriptBackfillPresentation(
+      result.status,
+      replayCursor,
+      request.partialVersionAtStart,
+      transcriptPartialObservationRef.current,
+    );
+    transcriptPartialObservationRef.current = presentation.partialObservation;
+    const updateEvents = createTranscriptBackfillEventUpdate(
+      result.status,
+      fullBatch,
+      request.startedWithSeq,
+    );
+    setEvents((previous) => (
+      isRuntimeRequestCurrent(requestScope) ? updateEvents(previous) : previous
+    ));
+    setTranscriptBackfillView({
+      runtimeId: requestScope.runtimeId,
+      state: presentation.state,
+    });
+
+    if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
+      void refreshSummary({ force: true });
+    }
+  }, [
+    getNativeSessionEvents,
+    isRuntimeRequestCurrent,
+    refreshSummary,
+    session.runtime_id,
+  ]);
 
   const pollEvents = useCallback(async () => {
+    const requestScope = {
+      runtimeId: session.runtime_id,
+      generation: runtimeRequestScopeRef.current.generation,
+    };
     const isInitialReplay = initialReplayRuntimeRef.current !== session.runtime_id;
     const sinceSeq = isInitialReplay ? null : lastSeenSeqRef.current;
     const batch = await getNativeSessionEvents(
@@ -2159,12 +2319,50 @@ export function WorkspaceNativeSessionView({
       sinceSeq,
       isInitialReplay ? INITIAL_EVENT_REPLAY_LIMIT : null,
     );
+    if (!isRuntimeRequestCurrent(requestScope)) {
+      return false;
+    }
     initialReplayRuntimeRef.current = session.runtime_id;
+    const incrementalReplay = isInitialReplay
+      ? null
+      : inspectIncrementalTranscriptReplay(batch);
     if (!batch.events.length) {
+      if (isInitialReplay) {
+        initialReplayUnloadedGapStartsRef.current = [];
+        if (replayBatchCoversAvailableSequenceRange(batch)) {
+          lastSeenSeqRef.current = null;
+          latestEventsRef.current = [];
+          rawTailSeamsRef.current = [];
+          rawTailSettledRef.current = true;
+          setEvents([]);
+          setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'idle' });
+        } else {
+          void backfillInitialReplay();
+        }
+      } else if (incrementalReplay?.state === 'partial') {
+        if (incrementalReplay.acknowledgedSeq != null) {
+          lastSeenSeqRef.current = Math.max(
+            lastSeenSeqRef.current ?? incrementalReplay.acknowledgedSeq,
+            incrementalReplay.acknowledgedSeq,
+          );
+        }
+        transcriptPartialObservationRef.current = markTranscriptPartialObservation(
+          transcriptPartialObservationRef.current,
+          incrementalReplay.acknowledgedSeq,
+        );
+        setTranscriptBackfillView({
+          runtimeId: requestScope.runtimeId,
+          state: 'partial',
+        });
+      }
       return false;
     }
 
-    const batchLatestSeq = latestEventSeq(batch.events);
+    if (isInitialReplay) {
+      initialReplayUnloadedGapStartsRef.current = batch.unloaded_gap_starts ?? [];
+    }
+
+    const batchLatestSeq = incrementalReplay?.acknowledgedSeq ?? latestEventSeq(batch.events);
     if (batchLatestSeq != null) {
       lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? batchLatestSeq, batchLatestSeq);
     }
@@ -2174,11 +2372,14 @@ export function WorkspaceNativeSessionView({
       rawTailSeamsRef.current = [];
     }
     const updateEvents = () => {
-      setEvents((previous) => (
-        isInitialReplay
+      setEvents((previous) => {
+        if (!isRuntimeRequestCurrent(requestScope)) {
+          return previous;
+        }
+        return isInitialReplay
           ? mergeWorkspaceReplayEvents(previous, batch.events)
-          : appendSessionEvents(previous, batch.events, batch.gap_detected)
-      ));
+          : appendSessionEvents(previous, batch.events, batch.gap_detected);
+      });
     };
 
     if (hasImmediateAttentionEvent(batch.events)) {
@@ -2192,13 +2393,29 @@ export function WorkspaceNativeSessionView({
         // Replay covered the backend's full range: no backfill needed and the
         // raw tail may start pruning once the session goes idle.
         rawTailSettledRef.current = true;
+        initialReplayUnloadedGapStartsRef.current = [];
+        setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'idle' });
       } else {
         void backfillInitialReplay();
       }
+    } else if (incrementalReplay?.state === 'partial') {
+      transcriptPartialObservationRef.current = markTranscriptPartialObservation(
+        transcriptPartialObservationRef.current,
+        incrementalReplay.acknowledgedSeq,
+      );
+      setTranscriptBackfillView({
+        runtimeId: requestScope.runtimeId,
+        state: 'partial',
+      });
     }
 
     return sessionEventsNeedSummaryRefresh(batch.events);
-  }, [backfillInitialReplay, getNativeSessionEvents, session.runtime_id]);
+  }, [
+    backfillInitialReplay,
+    getNativeSessionEvents,
+    isRuntimeRequestCurrent,
+    session.runtime_id,
+  ]);
 
   const rawAttentionState = useMemo(
     () => extractAttentionState(events),
@@ -2272,6 +2489,9 @@ export function WorkspaceNativeSessionView({
       tickInFlightRef.current = true;
       try {
         const forceSummary = await pollEvents();
+        if (cancelled) {
+          return;
+        }
         await refreshSummary({ force: forceSummary });
       } catch (error) {
         if (!cancelled) {
@@ -3357,6 +3577,9 @@ export function WorkspaceNativeSessionView({
   const shouldGuideModel = !isTerminalStatus(session.status)
     && hasComposerInput
     && (isProcessingTurn || hasHardBlockingAttention);
+  const transcriptBackfillState = transcriptBackfillView.runtimeId === session.runtime_id
+    ? transcriptBackfillView.state
+    : 'idle';
 
   return (
     <>
@@ -3399,6 +3622,18 @@ export function WorkspaceNativeSessionView({
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
         <div className="mx-auto max-w-[960px] px-8 py-8">
+          {transcriptBackfillState !== 'idle' ? (
+            <div className="sticky top-2 z-10">
+              <WorkspaceTranscriptBackfillStatus
+                state={transcriptBackfillState}
+                loadingMessage={t('workspace.nativeTranscriptBackfillLoading')}
+                errorMessage={t('workspace.nativeTranscriptBackfillError')}
+                partialMessage={t('workspace.nativeTranscriptBackfillPartial')}
+                retryLabel={t('common.retry')}
+                onRetry={() => void backfillInitialReplay()}
+              />
+            </div>
+          ) : null}
           {messages.length === 0 ? (
             <div className="flex min-h-[280px] flex-col items-center justify-center gap-3 text-center">
               <div className="rounded-2xl border border-border/40 bg-surface/70 p-4">

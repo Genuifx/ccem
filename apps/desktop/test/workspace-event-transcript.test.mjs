@@ -1279,6 +1279,14 @@ test('detects whether a replay batch continuously covers its available sequence 
     ...completeReplay,
     truncated: true,
   }), false);
+  assert.equal(replayBatchCoversAvailableSequenceRange({
+    source_available: false,
+    gap_detected: false,
+    truncated: false,
+    oldest_available_seq: null,
+    newest_available_seq: null,
+    events: [],
+  }), false);
 });
 
 test('live transcript trims duplicated hydrated skill prompt before replaying native events', async () => {
