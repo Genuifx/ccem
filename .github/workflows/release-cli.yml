@@ -41,11 +41,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Run tests
-        run: pnpm -r test:run
+      - name: Test CLI and dependencies
+        run: pnpm --filter ccem... test:run
 
-      - name: Build all packages
-        run: pnpm -r build
+      - name: Build CLI and dependencies
+        run: pnpm --filter ccem... build
 
       - name: Determine npm tag
         id: npm-tag
