@@ -64,6 +64,7 @@ const capture = process.env.FAKE_DSH_CAPTURE;
 const signalReceived = [];
 process.on('SIGTERM', () => { signalReceived.push('SIGTERM'); cleanup(); });
 process.on('SIGINT', () => { signalReceived.push('SIGINT'); cleanup(); });
+process.stdout.write('ready\\n');
 function cleanup() {
   if (capture) writeFileSync(capture, JSON.stringify({ signalReceived }));
   process.exit(128 + 15);

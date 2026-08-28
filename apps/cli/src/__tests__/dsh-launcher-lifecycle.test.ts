@@ -186,24 +186,25 @@ describe('dsh launcher with fake dsh binary', () => {
   });
 });
 
-describe('dsh signal forwarding', () => {
-  it('forwards SIGTERM to the child and the child exits 143', async () => {
+describe('dsh child signal handling', () => {
+  it('reports 143 when the child handles SIGTERM and exits', async () => {
     const result = await runDshTask({
       task: 'sleep forever',
       spec: SPEC,
       token: TOKEN,
       invocation: fakeInvocation(fakeSleeperPath),
       env: parentEnv({ FAKE_DSH_CAPTURE: capturePath }),
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'ignore'],
       onSpawned: (child) => {
-        setTimeout(() => {
+        child.stdout!.once('data', () => {
           child.kill('SIGTERM');
-        }, 100);
+        });
       },
     });
 
     expect(result.exitCode).toBe(143);
-    expect(result.signal).toBe('SIGTERM');
+    expect(result.signal).toBeNull();
+    expect(JSON.parse(fs.readFileSync(capturePath, 'utf-8')).signalReceived).toEqual(['SIGTERM']);
   });
 });
 
@@ -452,11 +453,11 @@ describe('dsh signal forwarding via process.emit', () => {
       token: TOKEN,
       invocation: fakeInvocation(fakeSleeperPath),
       env: parentEnv({ FAKE_DSH_CAPTURE: capturePath }),
-      stdio: 'ignore',
-      onSpawned: (_child) => {
-        setTimeout(() => {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      onSpawned: (child) => {
+        child.stdout!.once('data', () => {
           process.emit('SIGTERM', 'SIGTERM');
-        }, 150);
+        });
       },
     });
 
