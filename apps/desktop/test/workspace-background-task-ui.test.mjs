@@ -44,7 +44,7 @@ test('Workspace keeps foreground composition independent and guards task-destruc
   assert.doesNotMatch(canSendBlock, /activeBackgroundTaskCount/);
   assert.match(workspace, /activeBackgroundTaskCount === 0/);
   assert.match(workspace, /data-ccem-background-task-risk-dialog/);
-  assert.match(workspace, /performEnvChange\(action\.envName, force\)/);
+  assert.match(workspace, /performEnvChange\(action\.envName\)/);
   assert.match(workspace, /performEffortChange\(action\.effort, force\)/);
   assert.match(workspace, /performHandoff\(true\)/);
   assert.match(workspace, /disabled=\{isHandingOff \|\| isHandoffPending \|\| isProcessingTurn\}/);
@@ -63,6 +63,42 @@ test('Workspace keeps foreground composition independent and guards task-destruc
   assert.ok(backgroundTaskPanelIndex < composerControlsIndex);
   assert.ok(secondaryActionsIndex > backgroundTaskPanelIndex);
   assert.equal(workspace.match(/<WorkspaceBackgroundTasksPopover/g)?.length, 1);
+});
+
+test('Workspace environment changes are force-only while effort changes may still defer', async () => {
+  const workspace = await readSource(
+    'src',
+    'components',
+    'workspace',
+    'WorkspaceNativeSessionView.tsx',
+  );
+  const envChangeBlock = workspace.match(
+    /const performEnvChange = useCallback[\s\S]*?const handlePermModeChange/,
+  )?.[0] ?? '';
+  const riskActionBlock = workspace.match(
+    /const applyPendingBackgroundTaskRiskAction = useCallback[\s\S]*?const handleRestoreFileCheckpoint/,
+  )?.[0] ?? '';
+  const riskDialogBlock = workspace.match(
+    /data-ccem-background-task-risk-dialog[\s\S]*?<\/Dialog>/,
+  )?.[0] ?? '';
+
+  assert.match(
+    envChangeBlock,
+    /updateNativeSessionSettings\([\s\S]*?envName,[\s\S]*?undefined,[\s\S]*?undefined,[\s\S]*?true,/,
+    'every environment selection must request a forced retained-query restart',
+  );
+  assert.doesNotMatch(
+    envChangeBlock,
+    /performEnvChange = useCallback\(\(envName: string, forceRestart/,
+    'callers must not be able to downgrade an environment switch to deferred mode',
+  );
+  assert.match(riskActionBlock, /if \(!force && action\.kind === 'effort'\)/);
+  assert.match(riskActionBlock, /performEnvChange\(action\.envName\)/);
+  assert.match(
+    riskDialogBlock,
+    /pendingBackgroundTaskRiskAction\?\.kind === 'effort'/,
+    'only effort changes retain the wait-for-background-tasks action',
+  );
 });
 
 test('app quit and restart share the background-task confirmation guard', async () => {
