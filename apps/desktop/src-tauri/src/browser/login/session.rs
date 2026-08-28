@@ -186,15 +186,17 @@ impl LoginBrowserSessionManager {
             .resolve(workspace.as_path())
             .map_err(map_workspace_error)?;
         let descriptor = self.select_profile(&workspace_identity, selection)?;
+        let profile_owner_identity = descriptor.owner_identity().map_err(map_profile_error)?;
         let profile_lease = inner
             .profiles
-            .acquire_launch_lease(descriptor.profile_id(), &workspace_identity)
+            .acquire_launch_lease(descriptor.profile_id(), &profile_owner_identity)
             .map_err(map_profile_error)?;
         // The gate protects only default selection + lease acquisition. Process launch may be
         // slow and must not serialize an unrelated workspace or an explicit new-profile launch.
         drop(open_guard);
         Ok(PreparedLoginBrowserProfile {
-            workspace_identity,
+            session_workspace_identity: workspace_identity,
+            profile_owner_identity,
             profile_id: descriptor.profile_id().clone(),
             profile_lease,
         })
@@ -250,9 +252,14 @@ impl LoginBrowserSessionManager {
                     |identity| EmbeddedProfilePreparationError::for_profile(error, identity),
                 )
             })?;
+        let profile_owner_identity = descriptor
+            .owner_identity()
+            .map_err(map_profile_error)
+            .map_err(EmbeddedProfilePreparationError::before_profile)?;
         drop(open_guard);
         Ok(PreparedLoginBrowserRegistration {
-            workspace_identity,
+            session_workspace_identity: workspace_identity,
+            profile_owner_identity,
             profile_id: descriptor.profile_id().clone(),
         })
     }
@@ -274,11 +281,14 @@ impl LoginBrowserSessionManager {
             .map_err(EmbeddedProfilePreparationError::before_profile)?;
         let recovery_identity = EmbeddedProfileIdentity::new(
             registration.profile_id(),
-            registration.workspace_identity(),
+            registration.profile_owner_identity(),
         );
         let reservation = inner
             .profiles
-            .reserve_embedded_launch(registration.profile_id(), registration.workspace_identity())
+            .reserve_embedded_launch(
+                registration.profile_id(),
+                registration.profile_owner_identity(),
+            )
             .map_err(map_profile_error)
             .map_err(|error| {
                 EmbeddedProfilePreparationError::for_profile(error, recovery_identity.clone())
@@ -325,21 +335,29 @@ impl LoginBrowserSessionManager {
         match selection {
             ProfileSelection::Default => inner
                 .profiles
-                .list_profiles(workspace_identity)
+                .global_default_profile(workspace_identity, true)
                 .map_err(map_profile_error)?
-                .into_iter()
-                .next()
-                .map(Ok)
-                .unwrap_or_else(|| inner.profiles.create_profile(workspace_identity))
-                .map_err(map_profile_error),
+                .ok_or(SessionManagerError::ProfileUnavailable),
             ProfileSelection::ExplicitNew => inner
                 .profiles
                 .create_profile(workspace_identity)
                 .map_err(map_profile_error),
-            ProfileSelection::Existing(profile_id) => inner
-                .profiles
-                .descriptor(&profile_id, workspace_identity)
-                .map_err(map_profile_error),
+            ProfileSelection::Existing(profile_id) => {
+                let global = inner
+                    .profiles
+                    .global_default_profile(workspace_identity, false)
+                    .map_err(map_profile_error)?;
+                if let Some(descriptor) =
+                    global.filter(|descriptor| descriptor.profile_id() == &profile_id)
+                {
+                    Ok(descriptor)
+                } else {
+                    inner
+                        .profiles
+                        .descriptor(&profile_id, workspace_identity)
+                        .map_err(map_profile_error)
+                }
+            }
         }
     }
 
@@ -360,10 +378,11 @@ impl LoginBrowserSessionManager {
         launched: LaunchedSessionRuntime,
     ) -> Result<OpenedLoginBrowserSession, SessionManagerError> {
         let PreparedLoginBrowserRegistration {
-            workspace_identity,
+            session_workspace_identity,
+            profile_owner_identity: _,
             profile_id,
         } = prepared;
-        self.register_launched(workspace_identity, profile_id, launched)
+        self.register_launched(session_workspace_identity, profile_id, launched)
     }
 
     fn register_launched(
@@ -843,6 +862,7 @@ pub(crate) enum SessionManagerError {
     RuntimeUnavailable,
     TransportUnavailable,
     OriginUnavailable,
+    HandoffPreflightRejected,
     PopupActive,
     OperationTimedOut,
     OwnerQuiescenceTimedOut,
@@ -876,6 +896,9 @@ impl fmt::Display for SessionManagerError {
             Self::TransportUnavailable => "The private browser transport is unavailable.",
             Self::OriginUnavailable => {
                 "The current page has no HTTP or HTTPS origin available for Agent handoff."
+            }
+            Self::HandoffPreflightRejected => {
+                "The current page did not pass the browser handoff safety check."
             }
             Self::PopupActive => {
                 "Close the Login Browser popup before handing control to the Agent."

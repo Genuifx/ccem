@@ -2,8 +2,8 @@
 
 Date: 2026-07-12
 
-Status: accepted target architecture; implementation in progress on
-`codex/agent-browser-mode2`
+Status: accepted Mode 2-only target architecture; implementation in progress on
+`codex/agent-browser-mode2-mainline`
 
 Supersedes: [`agent-browser-mode2-implementation-plan.md`](agent-browser-mode2-implementation-plan.md)
 
@@ -17,12 +17,12 @@ experimental renderer.
 Tauri main window
 ├── Wry WebView: CCEM React shell and trusted controls
 └── fixed BrowserPanel viewport
-    ├── Mode 1: system WebView preview surface
     └── Mode 2: windowed CEF child surface
 ```
 
-Only one browser surface is visible in the viewport at a time. Mode 1 remains lightweight and
-ephemeral. Mode 2 uses a CCEM-owned persistent profile and the bundled CEF runtime.
+The browser entry always opens Mode 2. Each CCEM conversation owns one CEF surface, while the
+app-global Default Profile shares login storage across conversations and workspaces. An explicitly
+created Profile remains isolated. Mode 1/Preview is no longer a product or Agent fallback.
 
 ## Non-negotiable decisions
 
@@ -34,7 +34,8 @@ ephemeral. Mode 2 uses a CCEM-owned persistent profile and the bundled CEF runti
   browser rectangle.
 - Before a global confirmation, pause Agent effects, disable or hide the active browser surface,
   show the trusted host modal, then restore visibility and focus deliberately.
-- Preserve CCEM-owned workspace/profile isolation. Never read user Chrome state.
+- Preserve CCEM-owned storage boundaries. The app-global Default Profile is shared deliberately;
+  explicitly created Profiles remain isolated. Never read user Chrome state.
 - Preserve the semantic capability, policy, provenance, redaction, artifact, and audit layers from
   the external-runtime checkpoint.
 - Replace the external process supervisor, private Chrome pipe owner, runtime downloader, separate
@@ -47,8 +48,8 @@ ephemeral. Mode 2 uses a CCEM-owned persistent profile and the bundled CEF runti
 
 ```text
 Trusted Workspace UI
-  ├── BrowserLauncherPopover
-  └── LoginBrowserPanel controls
+  ├── Browser toggle
+  └── LoginBrowserPanel controls and Profile menu
              │
              ▼
 LoginBrowserSessionManager
@@ -85,7 +86,7 @@ The browser viewport is an explicit native-surface slot owned by Workspace:
 - Rust applies only the platform coordinate transform (AppKit origin or Windows monitor DPI) and
   outward rounding; app zoom must not be applied or inverted a second time.
 - Hidden and inactive session surfaces are actually hidden, not merely covered with DOM.
-- Mode switches hide the previous surface before showing the next surface.
+- Conversation switches hide the previous surface before showing the next surface.
 - Surface acquisition creates CEF hidden and unfocused. Only a still-current frontend lease sync
   may reveal it; native clicks, not geometry/visibility/app-activation sync, own content focus.
 - Moving, resizing, zooming, minimizing, restoring, entering fullscreen, and changing display scale
@@ -106,7 +107,8 @@ Renderer, GPU, and utility work always runs in CEF subprocesses.
   must use Rust code or run after initialization.
 - Integrate the external message pump with the existing AppKit/Win32 event loop without polling
   threads or unbounded wakeups.
-- Create one request context per persistent profile and reject cross-workspace reuse.
+- Create one request context per persistent profile. The app-global Default Profile may be reused
+  across workspaces; explicit Profiles remain bound to their owner workspace.
 - Closing a Mode 2 session closes its browser, waits for `OnBeforeClose`, releases its profile
   lease, and removes its surface registry entry.
 - Closing before a BrowserHost exists retires the pending RequestContext immediately and publishes
@@ -187,7 +189,7 @@ Keep and adapt:
 - persistent profile descriptors, locks, reset/delete flows, and workspace identities;
 - screenshot/snapshot, console/network projection, redaction, audit, and artifact retention;
 - download/upload policy and one-shot confirmation capabilities;
-- BrowserLauncher profile inventory and maintenance UI.
+- Profile inventory and maintenance UI inside the Mode 2 browser workbench.
 
 Replace or delete:
 
@@ -211,7 +213,7 @@ Replace or delete:
 
 - A real windowed CEF browser occupies only the BrowserPanel viewport.
 - Resize, zoom, hide/show, focus, Chinese IME, keyboard shortcuts, and display-scale changes work.
-- Mode 1 and Mode 2 switch without overlap or stale native surfaces.
+- Conversation A/B switching never overlaps or leaves stale native surfaces.
 
 ### Gate 3: semantic backend
 
@@ -229,7 +231,8 @@ Replace or delete:
 ### Gate 4: profile and recovery
 
 - Manual login survives CCEM restart in the same opaque profile.
-- Two workspaces and two profiles do not share cookies or local storage.
+- The app-global Default Profile shares cookies and local storage across conversations/workspaces.
+- Two explicitly created Profiles do not share cookies or local storage.
 - Reset/delete works only after the browser is closed and trusted confirmation is current.
 - The signed production-runtime smoke closes and reopens both primary and secondary profiles,
   proving cookie and local-storage persistence within each profile and isolation across them.
@@ -250,7 +253,7 @@ Replace or delete:
 - Windows release verification proves renderer/GPU/utility subprocesses run with the CEF sandbox;
   `--no-sandbox` or `no_sandbox=1` is a hard failure.
 - Updater replacement preserves app integrity and does not leave mixed CEF versions.
-- Preview Browser regression remains green.
+- No UI or Agent path can silently fall back to Mode 1/Preview.
 
 ### Signed readiness and release boundary
 
@@ -293,12 +296,13 @@ for the exact candidate SHA is still required before Gate 5 can be marked comple
 Mode 2 is production ready only when every gate above has current evidence. Required behavioral
 proof is a real installed-app flow:
 
-1. Open a Workspace and select Login Browser.
+1. Open a Workspace and open the browser; it selects embedded Mode 2 directly.
 2. Confirm CEF appears inside BrowserPanel, never as a separate browser/control window.
 3. Log in manually, hand control to the Agent, run a semantic read and write action, then pause.
 4. Show a trusted confirmation while the native browser is hidden or disabled, then restore focus.
 5. Restart CCEM, reopen the same profile, and prove login persistence.
-6. Open another workspace/profile and prove storage isolation.
+6. Open another conversation/workspace with Default and prove shared login state, then create an
+   explicit Profile and prove its storage is isolated.
 7. Close the browser and CCEM, then prove no owned helper remains.
 8. Inspect redacted audit, network, and console artifacts, plus the private snapshot and screenshot
    artifacts. Snapshots and screenshots intentionally retain page content and must stay inside the

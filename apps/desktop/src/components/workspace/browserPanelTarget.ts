@@ -5,6 +5,8 @@ const TERMINAL_BROWSER_AGENT_RUNTIME_STATUSES = new Set([
   'stopped',
   'error',
   'handoff',
+  'handoff_closing',
+  'app_closing',
   'interrupted',
   'closed_idle',
   'permission_quarantined',
@@ -128,6 +130,49 @@ export function resolveActiveBrowserAgentSessionId(
     return null;
   }
   return session.runtime_id.trim() || null;
+}
+
+export interface BrowserPanelHistorySessionIdentity {
+  source: string;
+  id: string;
+  project: string;
+}
+
+function normalizeBrowserAgentProject(project: string): string {
+  return project.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/**
+ * A history view may still have one active native runtime behind it. Bind the
+ * browser only when that authoritative runtime belongs to the exact provider
+ * conversation and working directory currently selected.
+ */
+export function resolveHistoryBrowserAgentSessionId(
+  historySession: BrowserPanelHistorySessionIdentity | null | undefined,
+  nativeSession: Pick<
+    NativeSessionSummary,
+    | 'provider'
+    | 'provider_session_id'
+    | 'project_dir'
+    | 'runtime_id'
+    | 'status'
+    | 'is_active'
+  > | null | undefined,
+): string | null {
+  if (
+    !historySession
+    || !nativeSession
+    || nativeSession.provider !== historySession.source
+    || (
+      nativeSession.provider_session_id !== historySession.id
+      && nativeSession.runtime_id !== historySession.id
+    )
+    || normalizeBrowserAgentProject(nativeSession.project_dir)
+      !== normalizeBrowserAgentProject(historySession.project)
+  ) {
+    return null;
+  }
+  return resolveActiveBrowserAgentSessionId(nativeSession);
 }
 
 export function isBrowserPanelTargetVisible(

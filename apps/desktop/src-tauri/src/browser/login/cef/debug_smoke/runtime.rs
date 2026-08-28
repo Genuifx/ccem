@@ -555,7 +555,7 @@ pub(crate) fn run(
     if let Err(error) = require_mock_keychain_preflight(&config) {
         return finish(EXIT_SMOKE_FAILED, &error);
     }
-    let controller = match CefHostController::new(config.cef_cache_root.clone()) {
+    let controller = match CefHostController::new_ephemeral(config.cef_cache_root.clone()) {
         Ok(controller) => Arc::new(controller),
         Err(error) => return finish(EXIT_SMOKE_FAILED, &error),
     };

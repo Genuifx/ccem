@@ -315,14 +315,21 @@ fn validate_frames(
         let loader_id = bounded_field(frame, "loaderId", 256).ok_or_else(invalid_inventory)?;
         let security_origin =
             bounded_field(frame, "securityOrigin", MAX_URL_CHARS).ok_or_else(invalid_inventory)?;
-        let inherited = !is_root && matches!(url.as_str(), "about:blank" | "about:srcdoc");
-        let allowed = (NormalizedOrigin::parse(&url)
-            .map(|origin| &origin == expected_origin)
-            .unwrap_or(false)
-            || inherited)
-            && NormalizedOrigin::parse(&security_origin)
+        // Clicking handoff explicitly authorizes the stable page tree already visible to the
+        // user, including embedded foreign or opaque frames. Keep the root bound to the granted
+        // origin, and require every child URL/securityOrigin pair to be internally consistent.
+        // Once Agent control begins, SessionNavigationPolicy still fail-closes every new iframe
+        // document, redirect, and popup against the immutable top-level origin grant.
+        let allowed = if is_root {
+            NormalizedOrigin::parse(&url)
                 .map(|origin| &origin == expected_origin)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && NormalizedOrigin::parse(&security_origin)
+                    .map(|origin| &origin == expected_origin)
+                    .unwrap_or(false)
+        } else {
+            existing_child_origin_is_consistent(&url, &security_origin)
+        };
         if !allowed {
             return Err(HandoffPreflightDenial {
                 kind: if is_root {
@@ -358,6 +365,36 @@ fn validate_frames(
     }
     inventory.sort();
     Ok((root_url.ok_or_else(invalid_inventory)?, inventory))
+}
+
+fn blob_url_origin(raw: &str) -> Option<NormalizedOrigin> {
+    let parsed = tauri::Url::parse(raw).ok()?;
+    (parsed.scheme() == "blob")
+        .then(|| NormalizedOrigin::parse(parsed.path()).ok())
+        .flatten()
+}
+
+fn existing_child_origin_is_consistent(url: &str, security_origin: &str) -> bool {
+    let Ok(parsed) = tauri::Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "http" | "https" => {
+            let document_origin = NormalizedOrigin::parse(url).ok();
+            document_origin.is_some()
+                && document_origin == NormalizedOrigin::parse(security_origin).ok()
+        }
+        "blob" => {
+            let document_origin = blob_url_origin(url);
+            document_origin.is_some()
+                && document_origin == NormalizedOrigin::parse(security_origin).ok()
+        }
+        "about" if matches!(url, "about:blank" | "about:srcdoc") => {
+            security_origin == "://" || NormalizedOrigin::parse(security_origin).is_ok()
+        }
+        "data" => security_origin == "://",
+        _ => false,
+    }
 }
 
 fn bounded_field(value: &Value, key: &str, maximum: usize) -> Option<String> {
@@ -492,6 +529,47 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_blob_child_frame_is_allowed_by_browser_security_origin() {
+        let mut tree = frames(vec![child(
+            "same-origin-blob",
+            "blob:https://allowed.example/ccem-frame",
+            vec![],
+        )]);
+        tree["frameTree"]["childFrames"][0]["frame"]["securityOrigin"] =
+            Value::String("https://allowed.example".to_string());
+
+        assert!(
+            validate_handoff_preflight(&targets(None), &tree, "primary-target", &origin()).is_ok(),
+            "Chromium's frame securityOrigin is authoritative for a same-origin blob document"
+        );
+    }
+
+    #[test]
+    fn explicit_handoff_includes_stable_existing_foreign_and_opaque_child_frames() {
+        let mut foreign = child("foreign", "https://embedded.example/widget", vec![]);
+        foreign["frame"]["securityOrigin"] = Value::String("https://embedded.example".to_string());
+        let mut opaque_blank = child("opaque-blank", "about:blank", vec![]);
+        opaque_blank["frame"]["securityOrigin"] = Value::String("://".to_string());
+        let mut opaque_data = child("opaque-data", "data:text/html,embedded", vec![]);
+        opaque_data["frame"]["securityOrigin"] = Value::String("://".to_string());
+        let mut foreign_blob = child(
+            "foreign-blob",
+            "blob:https://embedded.example/frame-id",
+            vec![],
+        );
+        foreign_blob["frame"]["securityOrigin"] =
+            Value::String("https://embedded.example".to_string());
+
+        assert!(validate_handoff_preflight(
+            &targets(None),
+            &frames(vec![foreign, opaque_blank, opaque_data, foreign_blob]),
+            "primary-target",
+            &origin(),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn extra_page_is_denied_even_when_same_origin() {
         let error = validate_handoff_preflight(
             &targets(Some(("popup", "https://allowed.example/popup?private=1"))),
@@ -508,16 +586,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_and_opaque_child_frames_fail_closed() {
-        for url in [
-            "https://denied.example/private?token=raw",
-            "data:text/html,private",
-            "blob:https://allowed.example/private-id",
-            "about:blank#not-exact",
+    fn malformed_or_mismatched_child_origins_fail_closed() {
+        for (url, security_origin) in [
+            (
+                "https://embedded.example/private?token=raw",
+                "https://different.example",
+            ),
+            ("data:text/html,private", "data:text/html,private"),
+            (
+                "blob:https://allowed.example/private-id",
+                "https://different.example",
+            ),
+            ("about:blank#not-exact", "https://allowed.example"),
         ] {
+            let mut denied = child("denied", url, vec![]);
+            denied["frame"]["securityOrigin"] = Value::String(security_origin.to_string());
             let error = validate_handoff_preflight(
                 &targets(None),
-                &frames(vec![child("denied", url, vec![])]),
+                &frames(vec![denied]),
                 "primary-target",
                 &origin(),
             )

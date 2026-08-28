@@ -191,14 +191,16 @@ pub(in crate::browser::login) enum ProfileSelection {
 /// cleanup marker fail-closed.
 #[cfg(test)]
 pub(in crate::browser::login) struct PreparedLoginBrowserProfile {
-    workspace_identity: TrustedWorkspaceIdentity,
+    session_workspace_identity: TrustedWorkspaceIdentity,
+    profile_owner_identity: TrustedWorkspaceIdentity,
     profile_id: ProfileId,
     profile_lease: BrowserProfileLease,
 }
 
 #[derive(Clone)]
 pub(in crate::browser::login) struct PreparedLoginBrowserRegistration {
-    workspace_identity: TrustedWorkspaceIdentity,
+    session_workspace_identity: TrustedWorkspaceIdentity,
+    profile_owner_identity: TrustedWorkspaceIdentity,
     profile_id: ProfileId,
 }
 
@@ -207,8 +209,14 @@ impl PreparedLoginBrowserRegistration {
         &self.profile_id
     }
 
-    pub(in crate::browser::login) fn workspace_identity(&self) -> &TrustedWorkspaceIdentity {
-        &self.workspace_identity
+    pub(in crate::browser::login) fn session_workspace_identity(
+        &self,
+    ) -> &TrustedWorkspaceIdentity {
+        &self.session_workspace_identity
+    }
+
+    pub(in crate::browser::login) fn profile_owner_identity(&self) -> &TrustedWorkspaceIdentity {
+        &self.profile_owner_identity
     }
 }
 
@@ -302,7 +310,7 @@ impl PreparedEmbeddedLoginBrowserProfile {
     pub(in crate::browser::login) fn recovery_identity(&self) -> EmbeddedProfileIdentity {
         EmbeddedProfileIdentity::new(
             &self.registration.profile_id,
-            &self.registration.workspace_identity,
+            &self.registration.profile_owner_identity,
         )
     }
 
@@ -328,7 +336,8 @@ impl PreparedLoginBrowserProfile {
     ) -> (PreparedLoginBrowserRegistration, BrowserProfileLease) {
         (
             PreparedLoginBrowserRegistration {
-                workspace_identity: self.workspace_identity,
+                session_workspace_identity: self.session_workspace_identity,
+                profile_owner_identity: self.profile_owner_identity,
                 profile_id: self.profile_id,
             },
             self.profile_lease,

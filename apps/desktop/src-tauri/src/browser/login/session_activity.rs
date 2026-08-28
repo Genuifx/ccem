@@ -211,10 +211,19 @@ impl LoginBrowserSessionManager {
             .resolve(workspace.as_path())
             .map_err(super::map_workspace_error)?;
         let profile_id = ProfileId::parse(profile_id).map_err(super::map_profile_error)?;
-        inner
+        let global_default = inner
             .profiles
-            .descriptor(&profile_id, &workspace_identity)
+            .global_default_profile(&workspace_identity, false)
             .map_err(super::map_profile_error)?;
+        if !global_default
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.profile_id() == &profile_id)
+        {
+            inner
+                .profiles
+                .descriptor(&profile_id, &workspace_identity)
+                .map_err(super::map_profile_error)?;
+        }
         let session_ids = inner.profile_activity.session_ids(&profile_id)?;
         let mut artifacts = Vec::new();
         if session_ids.is_empty() {

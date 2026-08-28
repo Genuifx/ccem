@@ -170,6 +170,53 @@ fn auto_attached_workers_are_resumed_instead_of_remaining_debugger_paused() {
 }
 
 #[test]
+fn auto_attached_service_worker_allows_bounded_cold_start_latency() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_target = Some("primary-target".to_string());
+    engine.primary_session = Some("primary-session".to_string());
+    let (sender, inbox, state) = super::super::transport::frame_channel();
+    let responder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(450));
+        let value = serde_json::json!({"id":1,"result":{}});
+        let byte_len = serde_json::to_vec(&value).unwrap().len();
+        assert!(state.reserve_bytes(byte_len, usize::MAX));
+        sender
+            .send(super::super::transport::FrameEnvelope { value, byte_len })
+            .unwrap();
+    });
+    let mut output = Vec::new();
+    let mut client = CdpClient::new(&mut output, inbox);
+
+    engine
+        .on_event(
+            &mut client,
+            CdpEvent {
+                kind: CdpEventKind::TargetAttached,
+                params: serde_json::json!({
+                    "sessionId":"service-worker-session",
+                    "targetInfo":{
+                        "targetId":"service-worker-target",
+                        "type":"service_worker",
+                        "url":"https://allowed.example/sw.js"
+                    }
+                }),
+                session_id: None,
+            },
+        )
+        .unwrap();
+    responder.join().unwrap();
+
+    let command = output
+        .split(|byte| *byte == 0)
+        .find(|frame| !frame.is_empty())
+        .map(|frame| serde_json::from_slice::<Value>(frame).unwrap())
+        .unwrap();
+    assert_eq!(command["method"], "Runtime.runIfWaitingForDebugger");
+    assert_eq!(command["sessionId"], "service-worker-session");
+}
+
+#[test]
 fn unknown_auto_attached_target_types_fail_terminal_without_resuming() {
     let temp = tempfile::tempdir().unwrap();
     let mut engine = test_engine(&temp);

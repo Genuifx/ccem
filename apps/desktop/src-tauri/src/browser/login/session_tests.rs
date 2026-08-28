@@ -222,7 +222,7 @@ impl SessionOwnedBackend for FakeBackend {
             let mut state = state.lock().unwrap();
             state.preflight_count += 1;
             if state.fail_close {
-                return Err(SessionManagerError::OriginUnavailable);
+                return Err(SessionManagerError::HandoffPreflightRejected);
             }
             state.preflight_barriers.clone()
         };
@@ -356,13 +356,17 @@ fn manager(
 }
 
 #[test]
-fn two_workspaces_are_isolated_and_explicit_new_profile_does_not_reuse_default() {
+fn two_workspaces_share_the_default_profile_and_explicit_new_profile_stays_isolated() {
     let fixture = Fixture::new();
     assert_eq!(fixture.state.lock().unwrap().reap_count, 1);
     let first = fixture
         .manager
         .open_default_profile(Fixture::trusted(&fixture.workspace_a))
         .expect("workspace a default");
+    // The cfg(test) external-runtime harness takes an exclusive process-style profile lease.
+    // Production Mode 2 shares the lease through EmbeddedProfileGroup while retaining one CEF
+    // Browser per conversation, so serialize this lower-level selection assertion.
+    fixture.manager.close(&first.handle).unwrap();
     let second = fixture
         .manager
         .open_default_profile(Fixture::trusted(&fixture.workspace_b))
@@ -373,13 +377,12 @@ fn two_workspaces_are_isolated_and_explicit_new_profile_does_not_reuse_default()
         .expect("workspace a explicit profile");
 
     assert_ne!(first.snapshot.workspace_id, second.snapshot.workspace_id);
-    assert_ne!(first.snapshot.profile_id, second.snapshot.profile_id);
+    assert_eq!(first.snapshot.profile_id, second.snapshot.profile_id);
     assert_eq!(first.snapshot.workspace_id, explicit.snapshot.workspace_id);
     assert_ne!(first.snapshot.profile_id, explicit.snapshot.profile_id);
 
     fixture.manager.close(&explicit.handle).unwrap();
     fixture.manager.close(&second.handle).unwrap();
-    fixture.manager.close(&first.handle).unwrap();
     let reopened = fixture
         .manager
         .open_default_profile(Fixture::trusted(&fixture.workspace_a))
@@ -491,6 +494,56 @@ fn embedded_prepare_commits_recovery_intent_before_returning_launch_pending() {
             .cleanup_state(),
         ProfileCleanupState::Stopped
     ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cross_workspace_default_keeps_session_identity_separate_from_profile_recovery_owner() {
+    let fixture = Fixture::new();
+    let opened = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("create global default owned by workspace A");
+    fixture.manager.close(&opened.handle).unwrap();
+    let profile_owner =
+        TrustedWorkspaceIdentity::from_trusted_store(opened.snapshot.workspace_id.clone())
+            .expect("profile owner identity");
+    let session_workspace = fixture
+        .manager
+        .available()
+        .unwrap()
+        .workspace_identities
+        .resolve(&fixture.workspace_b)
+        .expect("workspace B session identity");
+
+    let registration = fixture
+        .manager
+        .select_embedded_registration(
+            Fixture::trusted(&fixture.workspace_b),
+            ProfileSelection::Default,
+        )
+        .expect("select shared default from workspace B");
+    assert_eq!(
+        registration.profile_id().as_str(),
+        opened.snapshot.profile_id
+    );
+    assert_eq!(
+        registration.session_workspace_identity(),
+        &session_workspace
+    );
+    assert_eq!(registration.profile_owner_identity(), &profile_owner);
+    assert_ne!(
+        registration.session_workspace_identity(),
+        registration.profile_owner_identity()
+    );
+    assert_eq!(
+        EmbeddedProfileIdentity::new(
+            registration.profile_id(),
+            registration.profile_owner_identity(),
+        ),
+        EmbeddedProfileIdentity::new(registration.profile_id(), &profile_owner),
+        "lease/recovery identity must retain the descriptor's original owner"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -607,7 +660,7 @@ fn shutdown_all_force_closes_every_registered_session() {
         .expect("open first session");
     let second = fixture
         .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_b))
+        .open_new_profile(Fixture::trusted(&fixture.workspace_b))
         .expect("open second session");
 
     let report = fixture.manager.shutdown_all().expect("shutdown sweep");
@@ -637,7 +690,7 @@ fn shutdown_all_continues_after_a_force_shutdown_failure() {
         .expect("open first session");
     let second = fixture
         .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_b))
+        .open_new_profile(Fixture::trusted(&fixture.workspace_b))
         .expect("open second session");
     fixture.state.lock().unwrap().fail_next_force_shutdown = true;
 

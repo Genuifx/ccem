@@ -1,5 +1,6 @@
 use super::*;
 use std::cell::Cell;
+use std::io::Cursor;
 
 struct NoopHandler;
 
@@ -92,4 +93,31 @@ fn abandoned_response_capacity_preserves_primary_cancellation_and_timeout() {
         BackendFailureCode::TimedOut
     );
     assert_eq!(client.ignored.len(), MAX_IGNORED_RESPONSES);
+}
+
+#[test]
+fn bounded_frame_queue_absorbs_a_modern_page_navigation_burst() {
+    const BURST_FRAMES: usize = 1_024;
+    let (sender, inbox, state) = frame_channel();
+    let mut input = Vec::new();
+    for index in 0..BURST_FRAMES {
+        input.extend_from_slice(
+            &serde_json::to_vec(&serde_json::json!({
+                "method":"Network.requestWillBeSent",
+                "params":{"requestId":format!("request-{index}")}
+            }))
+            .unwrap(),
+        );
+        input.push(0);
+    }
+
+    run_frame_reader(&mut Cursor::new(input), sender, Arc::clone(&state));
+
+    for _ in 0..BURST_FRAMES {
+        assert!(inbox
+            .recv_timeout(Duration::from_millis(10))
+            .unwrap()
+            .is_some());
+    }
+    assert_eq!(state.fault(), Some(TransportFaultCode::PipeEof));
 }

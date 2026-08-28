@@ -151,6 +151,7 @@ import {
   rebindBrowserPanelTarget,
   retireBrowserPanelTargetForWorkingDirChange,
   resolveActiveBrowserAgentSessionId,
+  resolveHistoryBrowserAgentSessionId,
   toggleDefaultBrowserPanelTarget,
   WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
 } from '@/components/workspace/browserPanelTarget';
@@ -491,6 +492,7 @@ export function Workspace({
   const liveSessionsByRuntimeIdRef = useRef<WorkspaceLiveSessionsByRuntimeId>(liveSessionsByRuntimeId);
   const nativeSessionRestoreRequestSeqRef = useRef(0);
   const [activeLiveRuntimeId, setActiveLiveRuntimeId] = useState<string | null>(null);
+  const [selectedHistoryNativeRuntimeId, setSelectedHistoryNativeRuntimeId] = useState<string | null>(null);
   const [hasAttemptedNativeSessionRestore, setHasAttemptedNativeSessionRestore] = useState(false);
   const [workspaceGitSnapshot, setWorkspaceGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [isRefreshingWorkspaceGitSnapshot, setIsRefreshingWorkspaceGitSnapshot] = useState(false);
@@ -1321,14 +1323,22 @@ export function Workspace({
       return resolveActiveBrowserAgentSessionId(activeLiveEntry?.session);
     }
     if (workspaceMode === 'history' && selectedSession) {
-      const matchingLiveEntry = Object.values(liveSessionsByRuntimeId).find((entry) => (
-        entry.session.provider === selectedSession.source
-        && entry.session.provider_session_id === selectedSession.id
-      ));
-      return resolveActiveBrowserAgentSessionId(matchingLiveEntry?.session);
+      const selectedHistoryNativeSession = selectedHistoryNativeRuntimeId
+        ? liveSessionsByRuntimeId[selectedHistoryNativeRuntimeId]?.session
+        : null;
+      return resolveHistoryBrowserAgentSessionId(
+        selectedSession,
+        selectedHistoryNativeSession,
+      );
     }
     return null;
-  }, [activeLiveEntry, liveSessionsByRuntimeId, selectedSession, workspaceMode]);
+  }, [
+    activeLiveEntry,
+    liveSessionsByRuntimeId,
+    selectedHistoryNativeRuntimeId,
+    selectedSession,
+    workspaceMode,
+  ]);
 
   const activeBrowserTarget = browserTargetBySessionId[activeBrowserSessionId] ?? null;
   const activeVisibleBrowserTarget = isBrowserPanelTargetVisible(activeBrowserTarget)
@@ -1981,6 +1991,7 @@ export function Workspace({
         && selectedKeyRef.current === key;
       setSelectedKey(key);
       selectedKeyRef.current = key;
+      setSelectedHistoryNativeRuntimeId(null);
 
       // Apply the user's unsubmitted per-history choice synchronously with
       // selection. If none exists, start off until the authoritative native
@@ -2020,6 +2031,15 @@ export function Workspace({
         })
         : options.nativeHistorySession ?? null;
       if (!selectionIsCurrent()) return;
+
+      const historyBrowserAgentSessionId = resolveHistoryBrowserAgentSessionId(
+        session,
+        nativeHistorySession,
+      );
+      if (historyBrowserAgentSessionId && nativeHistorySession) {
+        upsertLiveSessionEntry(nativeHistorySession);
+        setSelectedHistoryNativeRuntimeId(historyBrowserAgentSessionId);
+      }
 
       if (requiresRouteResolution && nativeHistoryLookupFailed) {
         updateHistoryRouteResolutionStatus('failed');
@@ -2063,6 +2083,7 @@ export function Workspace({
       markPetNotificationReadForSession,
       setSelectedWorkingDir,
       t,
+      upsertLiveSessionEntry,
       updateHistoryRouteDraftState,
       updateHistoryRouteResolutionStatus,
     ]

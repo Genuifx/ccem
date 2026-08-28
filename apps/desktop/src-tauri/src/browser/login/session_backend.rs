@@ -148,7 +148,7 @@ impl SessionOwnedBackend for OwnerSessionBackend {
     fn preflight_handoff(&self, expected: &NormalizedOrigin) -> Result<(), SessionManagerError> {
         self.backend
             .preflight_handoff(expected.clone())
-            .map_err(map_backend_failure)
+            .map_err(map_handoff_preflight_failure)
     }
 
     fn begin_diagnostic_segment(&self, handoff_epoch: u64) -> Result<(), SessionManagerError> {
@@ -227,6 +227,15 @@ fn map_backend_failure(error: BackendFailure) -> SessionManagerError {
     }
 }
 
+fn map_handoff_preflight_failure(error: BackendFailure) -> SessionManagerError {
+    match error.code {
+        super::backend::BackendFailureCode::NavigationFailed => {
+            SessionManagerError::HandoffPreflightRejected
+        }
+        _ => map_backend_failure(error),
+    }
+}
+
 #[cfg(test)]
 mod terminal_cleanup_tests {
     use super::*;
@@ -244,6 +253,17 @@ mod terminal_cleanup_tests {
         assert_eq!(
             terminal_cleanup_result(Ok(()), Err(SessionManagerError::OwnerQuiescenceTimedOut),),
             Err(SessionManagerError::OwnerQuiescenceTimedOut)
+        );
+    }
+
+    #[test]
+    fn handoff_inventory_denial_is_not_reported_as_a_missing_origin() {
+        assert_eq!(
+            map_handoff_preflight_failure(BackendFailure::new(
+                super::super::backend::BackendFailureCode::NavigationFailed,
+                "handoff inventory rejected",
+            )),
+            SessionManagerError::HandoffPreflightRejected
         );
     }
 }

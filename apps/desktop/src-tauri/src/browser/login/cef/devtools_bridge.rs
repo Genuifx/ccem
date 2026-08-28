@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::sync::Arc;
 use std::time::Duration;
 
-const INBOUND_QUEUE_CAPACITY: usize = 128;
+const INBOUND_QUEUE_CAPACITY: usize = 4_096;
 const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -282,5 +282,26 @@ mod tests {
             "queue_unavailable"
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn inbound_bridge_absorbs_a_bounded_modern_page_navigation_burst() {
+        const BURST_FRAMES: usize = 1_024;
+        let bridge = CefDevToolsBridge::new(|_| Ok(()));
+        let (mut reader, _writer, observer) = bridge.into_parts();
+        let frame = br#"{"method":"Network.requestWillBeSent","params":{}}"#;
+
+        for _ in 0..BURST_FRAMES {
+            observer.on_message(frame).unwrap();
+        }
+
+        let mut received = Vec::new();
+        let expected_bytes = (frame.len() + 1) * BURST_FRAMES;
+        while received.len() < expected_bytes {
+            let mut chunk = [0_u8; 8 * 1024];
+            let count = reader.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(received.len(), expected_bytes);
     }
 }

@@ -85,6 +85,78 @@ test('a late provider id and live/history round trip retain one browser instance
   assert.equal(reboundTargets[beforeProviderId].surfaceSessionId, 'draft:workspace:7');
 });
 
+test('history handoff uses only the exact active native runtime selected for that history record', async () => {
+  const { resolveHistoryBrowserAgentSessionId } = await importBrowserPanelTarget();
+  const historySession = {
+    source: 'claude',
+    id: 'provider-a',
+    project: '/workspace/project',
+  };
+  const exactActiveRuntime = {
+    provider: 'claude',
+    provider_session_id: 'provider-a',
+    project_dir: '/workspace/project/',
+    runtime_id: 'native-runtime-a',
+    status: 'ready',
+    is_active: true,
+  };
+
+  assert.equal(
+    resolveHistoryBrowserAgentSessionId(historySession, exactActiveRuntime),
+    'native-runtime-a',
+  );
+  assert.equal(
+    resolveHistoryBrowserAgentSessionId(
+      { ...historySession, id: 'native-runtime-a' },
+      { ...exactActiveRuntime, provider_session_id: null },
+    ),
+    'native-runtime-a',
+    'runtime-addressed history links bind the same exact native actor',
+  );
+  assert.equal(
+    resolveHistoryBrowserAgentSessionId(
+      historySession,
+      { ...exactActiveRuntime, provider: 'codex' },
+    ),
+    null,
+    'a runtime from another provider must not become the handoff actor',
+  );
+  assert.equal(
+    resolveHistoryBrowserAgentSessionId(
+      historySession,
+      { ...exactActiveRuntime, provider_session_id: 'provider-b' },
+    ),
+    null,
+    'a runtime from another provider session must not become the handoff actor',
+  );
+  assert.equal(
+    resolveHistoryBrowserAgentSessionId(
+      historySession,
+      { ...exactActiveRuntime, project_dir: '/workspace/other-project' },
+    ),
+    null,
+    'provider ids are not authoritative across working directories',
+  );
+  assert.equal(
+    resolveHistoryBrowserAgentSessionId(
+      historySession,
+      { ...exactActiveRuntime, status: 'stopped', is_active: false },
+    ),
+    null,
+    'terminal runtimes must not remain eligible for handoff',
+  );
+  for (const terminalStatus of ['handoff_closing', 'app_closing']) {
+    assert.equal(
+      resolveHistoryBrowserAgentSessionId(
+        historySession,
+        { ...exactActiveRuntime, status: terminalStatus },
+      ),
+      null,
+      `${terminalStatus} is already terminal for browser actor lookup`,
+    );
+  }
+});
+
 test('closed Browser toggle creates default Mode 2 once, then only hides and shows that lease', async () => {
   const {
     isBrowserPanelTargetVisible,
@@ -191,6 +263,28 @@ test('Workspace retains inactive Mode 2 panels and wires the status button to th
     /rebindBrowserPanelTarget\([\s\S]*WORKSPACE_BROWSER_COMPOSE_SESSION_ID,[\s\S]*liveBrowserSessionId/,
   );
   assert.doesNotMatch(workspaceSource, /browser_panel_requested|backend=["']preview["']/i);
+});
+
+test('Workspace binds an exact active native history selection as the browser handoff actor without leaving history', async () => {
+  const workspaceSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'),
+    'utf8',
+  );
+
+  assert.match(workspaceSource, /const \[selectedHistoryNativeRuntimeId, setSelectedHistoryNativeRuntimeId\] = useState/);
+  assert.match(workspaceSource, /setSelectedHistoryNativeRuntimeId\(null\);[\s\S]*const nativeHistorySession/);
+  assert.match(
+    workspaceSource,
+    /const historyBrowserAgentSessionId = resolveHistoryBrowserAgentSessionId\([\s\S]*session,[\s\S]*nativeHistorySession,[\s\S]*\);/,
+  );
+  assert.match(
+    workspaceSource,
+    /if \(historyBrowserAgentSessionId && nativeHistorySession\) \{[\s\S]*upsertLiveSessionEntry\(nativeHistorySession\);[\s\S]*setSelectedHistoryNativeRuntimeId\(historyBrowserAgentSessionId\);[\s\S]*\}/,
+  );
+  assert.match(
+    workspaceSource,
+    /workspaceMode === 'history'[\s\S]*resolveHistoryBrowserAgentSessionId\([\s\S]*selectedSession,[\s\S]*selectedHistoryNativeSession,[\s\S]*\)/,
+  );
 });
 
 test('inactive panels hide without bounds, and only the active surface observes geometry or overlays', async () => {

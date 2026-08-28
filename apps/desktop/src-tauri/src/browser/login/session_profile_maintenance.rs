@@ -42,19 +42,32 @@ impl LoginBrowserSessionManager {
             .workspace_identities
             .resolve(workspace.as_path())
             .map_err(super::map_workspace_error)?;
-        inner
+        let global_default = inner
+            .profiles
+            .global_default_profile(&workspace_identity, false)
+            .map_err(super::map_profile_error)?;
+        let mut profiles = inner
             .profiles
             .list_profiles(&workspace_identity)
-            .map_err(super::map_profile_error)
-            .map(|profiles| {
-                profiles
-                    .iter()
-                    .enumerate()
-                    .map(|(index, descriptor)| {
-                        LoginBrowserProfileSummary::from_descriptor(descriptor, index == 0)
-                    })
-                    .collect()
+            .map_err(super::map_profile_error)?;
+        let default_profile_id = global_default
+            .as_ref()
+            .map(|descriptor| descriptor.profile_id().clone());
+        if let Some(default) = global_default {
+            profiles.retain(|descriptor| descriptor.profile_id() != default.profile_id());
+            profiles.insert(0, default);
+        }
+        Ok(profiles
+            .iter()
+            .map(|descriptor| {
+                LoginBrowserProfileSummary::from_descriptor(
+                    descriptor,
+                    default_profile_id
+                        .as_ref()
+                        .is_some_and(|profile_id| descriptor.profile_id() == profile_id),
+                )
             })
+            .collect())
     }
 
     pub(crate) fn reset_profile(
@@ -71,12 +84,15 @@ impl LoginBrowserSessionManager {
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
-        let (workspace_identity, descriptor) = self.resolve_profile(workspace, profile_id)?;
-        let is_default = self.is_default_profile(&workspace_identity, descriptor.profile_id())?;
+        let (profile_owner_identity, descriptor) = self.resolve_profile(workspace, profile_id)?;
+        let is_default = inner
+            .profiles
+            .is_global_default(descriptor.profile_id())
+            .map_err(super::map_profile_error)?;
         let authorization = DestructiveProfileAuthorization::from_trusted_ui(
             DestructiveProfileAction::Reset,
             descriptor.profile_id().clone(),
-            workspace_identity,
+            profile_owner_identity,
             DESTRUCTIVE_PROFILE_AUTHORIZATION_TTL,
         )
         .map_err(super::map_profile_error)?;
@@ -101,18 +117,31 @@ impl LoginBrowserSessionManager {
             .open_gate
             .lock()
             .map_err(|_| SessionManagerError::StateUnavailable)?;
-        let (workspace_identity, descriptor) = self.resolve_profile(workspace, profile_id)?;
+        let (profile_owner_identity, descriptor) = self.resolve_profile(workspace, profile_id)?;
+        let is_default = inner
+            .profiles
+            .is_global_default(descriptor.profile_id())
+            .map_err(super::map_profile_error)?;
         let authorization = DestructiveProfileAuthorization::from_trusted_ui(
             DestructiveProfileAction::Delete,
             descriptor.profile_id().clone(),
-            workspace_identity,
+            profile_owner_identity,
             DESTRUCTIVE_PROFILE_AUTHORIZATION_TTL,
         )
         .map_err(super::map_profile_error)?;
         inner
             .profiles
             .delete_profile(authorization)
-            .map_err(super::map_profile_error)
+            .map_err(super::map_profile_error)?;
+        if is_default
+            && !inner
+                .profiles
+                .clear_global_default(descriptor.profile_id())
+                .map_err(super::map_profile_error)?
+        {
+            return Err(SessionManagerError::ProfileChanged);
+        }
+        Ok(())
     }
 
     fn resolve_profile(
@@ -126,27 +155,24 @@ impl LoginBrowserSessionManager {
             .resolve(workspace.as_path())
             .map_err(super::map_workspace_error)?;
         let profile_id = ProfileId::parse(profile_id).map_err(super::map_profile_error)?;
-        let descriptor = inner
+        let global_default = inner
             .profiles
-            .descriptor(&profile_id, &workspace_identity)
+            .global_default_profile(&workspace_identity, false)
             .map_err(super::map_profile_error)?;
-        Ok((workspace_identity, descriptor))
-    }
-
-    fn is_default_profile(
-        &self,
-        workspace_identity: &TrustedWorkspaceIdentity,
-        profile_id: &ProfileId,
-    ) -> Result<bool, SessionManagerError> {
-        self.available()?
-            .profiles
-            .list_profiles(workspace_identity)
-            .map_err(super::map_profile_error)
-            .map(|profiles| {
-                profiles
-                    .first()
-                    .is_some_and(|descriptor| descriptor.profile_id() == profile_id)
-            })
+        let descriptor = if let Some(descriptor) =
+            global_default.filter(|descriptor| descriptor.profile_id() == &profile_id)
+        {
+            descriptor
+        } else {
+            inner
+                .profiles
+                .descriptor(&profile_id, &workspace_identity)
+                .map_err(super::map_profile_error)?
+        };
+        let profile_owner_identity = descriptor
+            .owner_identity()
+            .map_err(super::map_profile_error)?;
+        Ok((profile_owner_identity, descriptor))
     }
 
     #[cfg(test)]
@@ -155,7 +181,7 @@ impl LoginBrowserSessionManager {
         workspace: TrustedWorkspacePath,
     ) -> Result<Option<LoginBrowserProfileSummary>, SessionManagerError> {
         self.profile_summaries(workspace)
-            .map(|profiles| profiles.into_iter().next())
+            .map(|profiles| profiles.into_iter().find(|profile| profile.is_default))
     }
 
     #[cfg(test)]
@@ -194,7 +220,7 @@ fn ensure_expected_default(
     profiles: &[LoginBrowserProfileSummary],
     expected_profile_id: &str,
 ) -> Result<(), SessionManagerError> {
-    match profiles.first() {
+    match profiles.iter().find(|profile| profile.is_default) {
         Some(profile) if profile.profile_id == expected_profile_id => Ok(()),
         _ => Err(SessionManagerError::ProfileChanged),
     }

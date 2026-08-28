@@ -48,15 +48,14 @@ impl LoginBrowserSessionManager {
         // The real browser preflight can take seconds. The candidate nonce keeps this session
         // undiscoverable and prevents a competing handoff without serializing pause/takeover for
         // every other session behind the global registry mutex.
-        if prepared
+        if let Err(preflight_error) = prepared
             .backend
             .preflight_handoff(&prepared.expected_origin)
-            .is_err()
         {
             return Err(self.rollback_preflight_candidate(
                 &authorization.session_id,
                 &prepared,
-                SessionManagerError::OriginUnavailable,
+                preflight_error,
             ));
         }
 

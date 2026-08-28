@@ -123,4 +123,16 @@ test('browser panel exposes only Mode 2 sidebar chrome and native surface IPC', 
   const browserPanelCss = cssSource.match(/\.workspace-browser-panel \{[\s\S]*?\n\}/)?.[0] ?? '';
   assert.match(browserPanelCss, /border-left:/);
   assert.doesNotMatch(browserPanelCss, /border-radius:/);
+
+  // BrowserPanel's DOMRect is used as an AppKit child-view rectangle. Any transformed ancestor
+  // changes that DOMRect without changing the native parent NSView, so the workspace motion
+  // layers must become transform-free as soon as a native browser owner is mounted.
+  assert.match(
+    cssSource,
+    /\[data-motion-page='workspace'\]:has\(\[data-ccem-browser-panel-owner\]\)[\s\S]*?transform:\s*none\s*!important/,
+  );
+  assert.match(
+    cssSource,
+    /\.page-transition-enter:has\(\[data-ccem-browser-panel-owner\]\)[\s\S]*?animation:\s*none\s*!important/,
+  );
 });

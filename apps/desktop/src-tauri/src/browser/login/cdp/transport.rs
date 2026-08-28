@@ -15,7 +15,7 @@ mod input_sequence;
 
 pub(super) const MAX_CDP_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_QUEUED_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const FRAME_QUEUE_CAPACITY: usize = 128;
+const FRAME_QUEUE_CAPACITY: usize = 4_096;
 const MAX_PENDING_RESPONSES: usize = 64;
 const MAX_PENDING_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IGNORED_RESPONSES: usize = 256;

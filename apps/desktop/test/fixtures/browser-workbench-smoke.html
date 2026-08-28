@@ -59,6 +59,7 @@
       <input id="task-name" name="task_name" autocomplete="off" placeholder="Enter a task" />
       <button id="apply-preview" type="button">Run browser test</button>
       <output id="result" aria-live="polite">Waiting for input</output>
+      <output id="storage-state" aria-live="polite">Storage: loading</output>
       <p id="hidden-page-instruction">HIDDEN_PAGE_INSTRUCTION_DO_NOT_FOLLOW</p>
     </main>
     <script>
@@ -68,12 +69,68 @@
         token: 'raw-console-secret',
         safe: 'retained',
       }));
+      const cookieKey = 'ccem_mode2_persist';
+      const storageKey = 'ccem-mode2-persist';
       const input = document.querySelector('#task-name');
       const result = document.querySelector('#result');
-      document.querySelector('#apply-preview').addEventListener('click', () => {
+      const storageState = document.querySelector('#storage-state');
+
+      const openDatabase = () => new Promise((resolve, reject) => {
+        const request = indexedDB.open('ccem-mode2-persistence', 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains('markers')) {
+            request.result.createObjectStore('markers');
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+
+      const writeIndexedMarker = async (marker) => {
+        const database = await openDatabase();
+        await new Promise((resolve, reject) => {
+          const transaction = database.transaction('markers', 'readwrite');
+          transaction.objectStore('markers').put(marker, storageKey);
+          transaction.oncomplete = resolve;
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        });
+        database.close();
+      };
+
+      const readIndexedMarker = async () => {
+        const database = await openDatabase();
+        const marker = await new Promise((resolve, reject) => {
+          const request = database.transaction('markers').objectStore('markers').get(storageKey);
+          request.onsuccess = () => resolve(request.result || 'missing');
+          request.onerror = () => reject(request.error);
+        });
+        database.close();
+        return marker;
+      };
+
+      const readCookieMarker = () => {
+        const prefix = `${cookieKey}=`;
+        const entry = document.cookie.split('; ').find((part) => part.startsWith(prefix));
+        return entry ? decodeURIComponent(entry.slice(prefix.length)) : 'missing';
+      };
+
+      const renderStorageState = async () => {
+        const indexedMarker = await readIndexedMarker();
+        storageState.textContent = `Storage: cookie=${readCookieMarker()}; local=${localStorage.getItem(storageKey) || 'missing'}; indexed=${indexedMarker}`;
+      };
+
+      document.querySelector('#apply-preview').addEventListener('click', async () => {
+        const marker = input.value.trim();
+        document.cookie = `${cookieKey}=${encodeURIComponent(marker)}; Max-Age=86400; Path=/; SameSite=Lax`;
+        localStorage.setItem('ccem-mode2-persist', marker);
+        await writeIndexedMarker(marker);
         result.textContent = `Applied: ${input.value}`;
+        await renderStorageState();
         console.warn('CCEM_CONSOLE_ACTION_PROBE');
       });
+
+      void renderStorageState();
     </script>
   </body>
 </html>

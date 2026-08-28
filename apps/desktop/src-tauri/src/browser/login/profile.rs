@@ -1,3 +1,5 @@
+#[path = "profile_default.rs"]
+mod default_profile;
 #[path = "profile_storage.rs"]
 mod storage;
 
@@ -32,6 +34,7 @@ include!("profile_types.rs");
 pub(crate) struct BrowserProfileManager {
     root: PathBuf,
     profiles_root: PathBuf,
+    default_profile_root: PathBuf,
     cef_cache_root: PathBuf,
     active_leases: Arc<Mutex<HashSet<ProfileId>>>,
 }
@@ -61,9 +64,13 @@ impl BrowserProfileManager {
         ensure_private_child_directory(storage_parent, &cef_cache_root)?;
         let profiles_root = root.join("profiles");
         ensure_private_child_directory(&root, &profiles_root)?;
+        let default_profile_root = root.join("default-profile");
+        ensure_private_child_directory(&root, &default_profile_root)?;
+        ensure_private_lock_file(&default_profile_root.join("default.lock"))?;
         Ok(Self {
             root,
             profiles_root,
+            default_profile_root,
             cef_cache_root,
             active_leases: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -79,6 +86,14 @@ impl BrowserProfileManager {
     }
 
     pub(crate) fn create_profile(
+        &self,
+        workspace_identity: &TrustedWorkspaceIdentity,
+    ) -> Result<BrowserProfileDescriptor, ProfileError> {
+        self.seal_legacy_default_before_explicit_profile(workspace_identity)?;
+        self.create_profile_record(workspace_identity)
+    }
+
+    fn create_profile_record(
         &self,
         workspace_identity: &TrustedWorkspaceIdentity,
     ) -> Result<BrowserProfileDescriptor, ProfileError> {
@@ -133,6 +148,14 @@ impl BrowserProfileManager {
         &self,
         workspace_identity: &TrustedWorkspaceIdentity,
     ) -> Result<Vec<BrowserProfileDescriptor>, ProfileError> {
+        Ok(self
+            .list_all_profiles()?
+            .into_iter()
+            .filter(|descriptor| descriptor.workspace_identity == workspace_identity.as_str())
+            .collect())
+    }
+
+    fn list_all_profiles(&self) -> Result<Vec<BrowserProfileDescriptor>, ProfileError> {
         let entries = fs::read_dir(&self.profiles_root)
             .map_err(|error| io_error("list browser profiles", error))?;
         let mut descriptors = Vec::new();
@@ -147,9 +170,7 @@ impl BrowserProfileManager {
             let profile_dir = entry.path();
             ensure_profile_directory(&self.profiles_root, &profile_dir)?;
             let descriptor = load_current_descriptor(&profile_dir, &profile_id)?;
-            if descriptor.workspace_identity == workspace_identity.as_str() {
-                descriptors.push(descriptor);
-            }
+            descriptors.push(descriptor);
         }
         descriptors.sort_by(|left, right| {
             left.created_at
@@ -157,6 +178,14 @@ impl BrowserProfileManager {
                 .then_with(|| left.profile_id.as_str().cmp(right.profile_id.as_str()))
         });
         Ok(descriptors)
+    }
+
+    fn descriptor_unscoped(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<BrowserProfileDescriptor, ProfileError> {
+        let profile_dir = self.checked_profile_dir(profile_id)?;
+        load_current_descriptor(&profile_dir, profile_id)
     }
 
     pub(crate) fn descriptor(

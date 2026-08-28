@@ -257,7 +257,10 @@ fn trusted_handoff_pause_and_takeover_advance_epoch_and_invalidate_old_grants() 
         )
         .unwrap(),
     );
-    assert_eq!(rejected.err(), Some(SessionManagerError::OriginUnavailable));
+    assert_eq!(
+        rejected.err(),
+        Some(SessionManagerError::HandoffPreflightRejected)
+    );
     assert_eq!(
         fixture.manager.snapshot(&opened.handle).unwrap().control,
         SessionControlOwner::User
@@ -556,7 +559,7 @@ fn blocked_handoff_preflight_does_not_delay_pause_for_an_unrelated_session() {
         .unwrap();
     let candidate = fixture
         .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_b))
+        .open_new_profile(Fixture::trusted(&fixture.workspace_b))
         .unwrap();
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));

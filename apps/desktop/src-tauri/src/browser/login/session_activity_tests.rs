@@ -152,16 +152,14 @@ fn profile_recent_activity_survives_close_and_rejects_a_tampered_app_owned_index
             &opened.snapshot.profile_id,
         )
         .expect("closed profile proof");
-    assert_eq!(
-        fixture
-            .manager
-            .recent_activity_for_profile(
-                Fixture::trusted(&fixture.workspace_b),
-                &opened.snapshot.profile_id,
-            )
-            .unwrap_err(),
-        SessionManagerError::ProfileUnavailable
-    );
+    let activity_from_other_workspace = fixture
+        .manager
+        .recent_activity_for_profile(
+            Fixture::trusted(&fixture.workspace_b),
+            &opened.snapshot.profile_id,
+        )
+        .expect("global default activity is shared across workspaces");
+    assert_eq!(activity_from_other_workspace, activity);
     assert_eq!(activity.artifacts.len(), 2);
     let projection = serde_json::to_string(&activity).unwrap();
     assert!(!projection.contains("POST_CLOSE_SECRET"));

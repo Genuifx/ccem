@@ -1,6 +1,6 @@
 use super::*;
 
-const AUTO_ATTACHED_WORKER_RESUME_TIMEOUT: Duration = Duration::from_millis(300);
+const AUTO_ATTACHED_WORKER_RESUME_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl SemanticEngine {
     pub(super) fn handle_target_event(
@@ -42,17 +42,26 @@ impl SemanticEngine {
                 self.queue_session(session.clone())?;
                 self.track_target_session(session, target)
             }
-            "worker" | "service_worker" | "shared_worker" | "worklet" => client
-                .call(
+            "worker" | "service_worker" | "shared_worker" | "worklet" => {
+                match client.call(
                     CdpMethod::RuntimeRunIfWaitingForDebugger,
                     serde_json::json!({}),
                     Some(&session),
                     Instant::now() + AUTO_ATTACHED_WORKER_RESUME_TIMEOUT,
                     &NeverCancelled,
                     self,
-                )
-                .map(|_| ())
-                .map_err(|_| target_setup_failure()),
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        eprintln!(
+                            "CEF auto-attached {target_type} resume failed: {} ({})",
+                            error,
+                            error.code.as_str(),
+                        );
+                        Err(target_setup_failure())
+                    }
+                }
+            }
             _ => Err(protocol_failure()),
         }
     }

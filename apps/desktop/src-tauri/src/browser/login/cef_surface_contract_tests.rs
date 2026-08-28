@@ -25,7 +25,7 @@ fn persistent_cef_profiles_are_direct_children_of_the_runtime_root() {
 }
 
 #[test]
-fn macos_debug_profiles_share_an_in_memory_request_context_group() {
+fn macos_profiles_share_a_request_context_group_in_both_storage_modes() {
     let source = include_str!("cef/surface/macos.rs");
     let create_surface = source
         .split_once("pub(crate) fn create_surface(")
@@ -35,8 +35,8 @@ fn macos_debug_profiles_share_an_in_memory_request_context_group() {
         .expect("macOS create_surface boundary")
         .0;
 
-    // Debug keeps the profile fully in memory, so it cannot touch the persistent cache or
-    // macOS Safe Storage. Release keeps the same settings branch with persistence enabled.
+    // The explicit debug smoke keeps its profile in memory. Interactive development and release
+    // use the same settings branch with persistent profile storage enabled.
     assert!(create_surface.contains(
         ".persistent_profile_storage\n        .then(|| prepare_profile_path(profile_root, &spec.profile_id))"
     ));
@@ -46,9 +46,9 @@ fn macos_debug_profiles_share_an_in_memory_request_context_group() {
     assert!(create_surface
         .contains("persist_session_cookies: i32::from(spec.persistent_profile_storage)"));
 
-    // Persistence controls only the backing store. Both debug and release must join the
-    // profile-keyed anchor registry so Browser instances in one Profile share storage while
-    // retaining separate RequestContext objects.
+    // Persistence controls only the backing store. Every mode must join the profile-keyed anchor
+    // registry so Browser instances in one Profile share storage while retaining separate
+    // RequestContext objects.
     assert!(!create_surface.contains("let context = if spec.persistent_profile_storage"));
     assert!(create_surface.contains(
         "let context = PROFILE_CONTEXTS.with(|contexts| -> Result<RequestContext, String>"
@@ -58,6 +58,18 @@ fn macos_debug_profiles_share_an_in_memory_request_context_group() {
     assert!(create_surface.contains("contexts.insert("));
     assert!(create_surface.contains("spec.profile_id.clone(),"));
     assert!(!create_surface.contains("isolated RequestContext"));
+}
+
+#[test]
+fn macos_interactive_dev_uses_persistent_profiles_while_debug_smoke_opts_out() {
+    let host = include_str!("cef/host.rs");
+    let smoke = include_str!("cef/debug_smoke/runtime.rs");
+
+    assert!(host.contains("profile_storage: CefProfileStorage::Persistent"));
+    assert!(host.contains("let persistent_profile_storage = self.profile_storage.is_persistent();"));
+    assert!(host.contains("persistent_profile_storage,"));
+    assert!(smoke.contains("CefHostController::new_ephemeral("));
+    assert!(!host.contains("persistent_profile_storage: !cfg!(debug_assertions)"));
 }
 
 #[test]

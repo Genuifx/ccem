@@ -282,7 +282,7 @@ pub(super) fn open_profile_lock(path: &Path) -> Result<File, ProfileError> {
     Ok(file)
 }
 
-fn read_regular_file(path: &Path) -> Result<Vec<u8>, ProfileError> {
+pub(super) fn read_regular_file(path: &Path) -> Result<Vec<u8>, ProfileError> {
     ensure_path_is_not_symlink(path)?;
     let mut options = OpenOptions::new();
     options.read(true);
@@ -304,7 +304,7 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, ProfileError> {
     Ok(bytes)
 }
 
-fn write_private_new_file(path: &Path, bytes: &[u8]) -> Result<(), ProfileError> {
+pub(super) fn write_private_new_file(path: &Path, bytes: &[u8]) -> Result<(), ProfileError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     configure_private_open_options(&mut options);

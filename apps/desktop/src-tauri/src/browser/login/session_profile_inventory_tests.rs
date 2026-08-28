@@ -66,6 +66,24 @@ fn every_persistent_profile_is_discoverable_and_reopenable_by_opaque_id_after_re
         .close(&reopened.handle)
         .expect("close reopened profile");
 
+    let shared_default = restarted
+        .open_existing_profile(
+            Fixture::trusted(&fixture.workspace_b),
+            &default.snapshot.profile_id,
+        )
+        .expect("global default is selectable from another trusted workspace");
+    assert_eq!(
+        shared_default.snapshot.profile_id,
+        default.snapshot.profile_id
+    );
+    assert_ne!(
+        shared_default.snapshot.workspace_id,
+        default.snapshot.workspace_id
+    );
+    restarted
+        .close(&shared_default.handle)
+        .expect("close cross-workspace default");
+
     assert!(matches!(
         restarted.open_existing_profile(
             Fixture::trusted(&fixture.workspace_b),
@@ -73,7 +91,56 @@ fn every_persistent_profile_is_discoverable_and_reopenable_by_opaque_id_after_re
         ),
         Err(SessionManagerError::ProfileUnavailable)
     ));
-    assert_eq!(restarted_state.lock().unwrap().launch_count, 1);
+    assert_eq!(restarted_state.lock().unwrap().launch_count, 2);
+}
+
+#[test]
+fn every_workspace_inventory_shows_the_same_default_and_only_its_own_isolated_profiles() {
+    let fixture = Fixture::new();
+    let default = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("create global default");
+    fixture.manager.close(&default.handle).unwrap();
+    let isolated_a = fixture
+        .manager
+        .open_new_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("workspace A isolated profile");
+    fixture.manager.close(&isolated_a.handle).unwrap();
+    let isolated_b = fixture
+        .manager
+        .open_new_profile(Fixture::trusted(&fixture.workspace_b))
+        .expect("workspace B isolated profile");
+    fixture.manager.close(&isolated_b.handle).unwrap();
+
+    let inventory_a = fixture
+        .manager
+        .profile_summaries(Fixture::trusted(&fixture.workspace_a))
+        .unwrap();
+    let inventory_b = fixture
+        .manager
+        .profile_summaries(Fixture::trusted(&fixture.workspace_b))
+        .unwrap();
+    assert_eq!(
+        inventory_a
+            .iter()
+            .map(|profile| (&profile.profile_id, profile.is_default))
+            .collect::<Vec<_>>(),
+        vec![
+            (&default.snapshot.profile_id, true),
+            (&isolated_a.snapshot.profile_id, false),
+        ]
+    );
+    assert_eq!(
+        inventory_b
+            .iter()
+            .map(|profile| (&profile.profile_id, profile.is_default))
+            .collect::<Vec<_>>(),
+        vec![
+            (&default.snapshot.profile_id, true),
+            (&isolated_b.snapshot.profile_id, false),
+        ]
+    );
 }
 
 #[test]

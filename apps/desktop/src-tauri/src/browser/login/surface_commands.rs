@@ -381,7 +381,7 @@ impl LoginBrowserSurfaceManager {
         let selected_profile_id = selected_registration.profile_id().as_str().to_string();
         let recovery_identity = super::session::EmbeddedProfileIdentity::new(
             selected_registration.profile_id(),
-            selected_registration.workspace_identity(),
+            selected_registration.profile_owner_identity(),
         );
         let recovery_states = self.state()?.recovery.states_for(&recovery_identity);
         let surface_id = format!("login-{}-{}", lease.generation, lease.lease_id);

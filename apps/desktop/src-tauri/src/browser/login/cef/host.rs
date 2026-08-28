@@ -29,8 +29,22 @@ thread_local! {
     static CEF_PROCESS: RefCell<Option<CefProcess>> = const { RefCell::new(None) };
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CefProfileStorage {
+    Persistent,
+    #[cfg(debug_assertions)]
+    Ephemeral,
+}
+
+impl CefProfileStorage {
+    fn is_persistent(self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+}
+
 pub(crate) struct CefHostController {
     cache_root: PathBuf,
+    profile_storage: CefProfileStorage,
     startup_error: Option<String>,
     operation_gate: Mutex<()>,
     lifecycle: Mutex<CefHostStateMachine>,
@@ -39,11 +53,24 @@ pub(crate) struct CefHostController {
 
 impl CefHostController {
     pub(crate) fn new(cache_root: PathBuf) -> Result<Self, String> {
+        Self::with_profile_storage(cache_root, CefProfileStorage::Persistent)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn new_ephemeral(cache_root: PathBuf) -> Result<Self, String> {
+        Self::with_profile_storage(cache_root, CefProfileStorage::Ephemeral)
+    }
+
+    fn with_profile_storage(
+        cache_root: PathBuf,
+        profile_storage: CefProfileStorage,
+    ) -> Result<Self, String> {
         if !cache_root.is_absolute() {
             return Err("CEF cache root must be absolute".to_string());
         }
         Ok(Self {
             cache_root,
+            profile_storage,
             startup_error: None,
             operation_gate: Mutex::new(()),
             lifecycle: Mutex::new(CefHostStateMachine::new()),
@@ -55,6 +82,7 @@ impl CefHostController {
         let error = error.into();
         Self {
             cache_root: PathBuf::new(),
+            profile_storage: CefProfileStorage::Persistent,
             startup_error: Some(error.clone()),
             operation_gate: Mutex::new(()),
             lifecycle: Mutex::new(CefHostStateMachine::new()),
@@ -142,6 +170,7 @@ impl CefHostController {
         let _operation = self.lock_ready_operation()?;
         let app_handle = app.clone();
         let profile_root = self.cache_root.clone();
+        let persistent_profile_storage = self.profile_storage.is_persistent();
         run_on_main(app, move || {
             let main_window = app_handle
                 .get_webview_window("main")
@@ -162,10 +191,10 @@ impl CefHostController {
                     parent_view: parent_view as usize,
                     bounds,
                     visible: request.visible,
-                    // Debug CEF uses Chromium's fixed test key and must never persist cookies or
-                    // OAuth credentials. A release process reaches this branch only after the
-                    // trusted Developer ID requirement has succeeded.
-                    persistent_profile_storage: !cfg!(debug_assertions),
+                    // Interactive development uses an app-owned, worktree-specific profile with
+                    // Chromium's mock keychain. Only an explicitly isolated debug smoke opts out
+                    // of persistence; release reaches this path after its Keychain identity gate.
+                    persistent_profile_storage,
                 },
             )
         })

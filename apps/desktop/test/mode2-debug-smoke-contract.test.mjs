@@ -19,6 +19,10 @@ test('Mode 2 workbench fixture uses current neutral product wording', async () =
   assert.doesNotMatch(fixture, />[^<]*(?:Preview Browser|Apply preview)[^<]*</u);
   assert.match(fixture, /CCEM_WORKBENCH_READY/u);
   assert.match(fixture, /result\.textContent = `Applied: \$\{input\.value\}`/u);
+  assert.match(fixture, /ccem_mode2_persist/u);
+  assert.match(fixture, /localStorage\.setItem\('ccem-mode2-persist'/u);
+  assert.match(fixture, /indexedDB\.open\('ccem-mode2-persistence'/u);
+  assert.match(fixture, /Storage: cookie=/u);
 });
 
 test('debug Mode 2 smoke binds canonical dev identity and cannot select system Keychain', async () => {

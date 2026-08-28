@@ -261,7 +261,7 @@ fn workspace_aliases_resolve_to_the_same_default_profile_before_authorization_is
 }
 
 #[test]
-fn stale_profile_confirmation_cannot_target_a_newly_promoted_default() {
+fn deleting_default_does_not_promote_an_isolated_profile_or_retarget_stale_confirmation() {
     let fixture = Fixture::new();
     let first = fixture
         .manager
@@ -282,19 +282,45 @@ fn stale_profile_confirmation_cannot_target_a_newly_promoted_default() {
             true,
         )
         .expect("delete the profile that was actually confirmed");
-    let promoted = fixture
+    assert_eq!(
+        fixture
+            .manager
+            .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
+            .unwrap(),
+        None,
+        "deleting the global default must not promote an explicitly isolated profile"
+    );
+    let inventory = fixture
         .manager
-        .default_profile_summary(Fixture::trusted(&fixture.workspace_a))
-        .unwrap()
-        .expect("second profile promoted");
-    assert_eq!(promoted.profile_id, second.snapshot.profile_id);
-    let promoted_id = ProfileId::parse(&promoted.profile_id).unwrap();
+        .profile_summaries(Fixture::trusted(&fixture.workspace_a))
+        .expect("isolated profile remains discoverable");
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].profile_id, second.snapshot.profile_id);
+    assert!(!inventory[0].is_default);
+
+    let replacement = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("create a fresh global default after explicit deletion");
+    fixture
+        .manager
+        .close(&replacement.handle)
+        .expect("stop replacement default");
+    assert_ne!(replacement.snapshot.profile_id, second.snapshot.profile_id);
+
+    let isolated_id = ProfileId::parse(&second.snapshot.profile_id).unwrap();
+    let replacement_id = ProfileId::parse(&replacement.snapshot.profile_id).unwrap();
     let workspace = TrustedWorkspaceIdentity::from_trusted_store(second.snapshot.workspace_id)
         .expect("workspace identity");
-    let before = fixture
+    let isolated_before = fixture
         .manager
         .profiles_for_test()
-        .descriptor(&promoted_id, &workspace)
+        .descriptor(&isolated_id, &workspace)
+        .unwrap();
+    let replacement_before = fixture
+        .manager
+        .profiles_for_test()
+        .descriptor(&replacement_id, &workspace)
         .unwrap();
 
     for result in [
@@ -310,7 +336,11 @@ fn stale_profile_confirmation_cannot_target_a_newly_promoted_default() {
                 &first.snapshot.profile_id,
                 true,
             )
-            .map(|_| promoted.clone()),
+            .map(|_| LoginBrowserProfileSummary {
+                profile_id: first.snapshot.profile_id.clone(),
+                last_used_at: None,
+                is_default: true,
+            }),
     ] {
         assert_eq!(result.unwrap_err(), SessionManagerError::ProfileChanged);
     }
@@ -318,9 +348,17 @@ fn stale_profile_confirmation_cannot_target_a_newly_promoted_default() {
         fixture
             .manager
             .profiles_for_test()
-            .descriptor(&promoted_id, &workspace)
+            .descriptor(&isolated_id, &workspace)
             .unwrap(),
-        before
+        isolated_before
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .profiles_for_test()
+            .descriptor(&replacement_id, &workspace)
+            .unwrap(),
+        replacement_before
     );
 }
 

@@ -10,12 +10,12 @@ Mode 2 is a real Chromium browser embedded as a native child inside the Workspac
 
 ```text
 Tauri main window
-├── Wry WebView: CCEM React UI and Mode 1 Preview Browser
-└── native CEF child surface: Mode 2 Login Browser
+├── Wry WebView: CCEM React UI and trusted controls
+└── native CEF child surface: Mode 2 browser
 ```
 
 Mode 2 must never open a separately managed Chrome window or a separate always-on-top control
-window. Mode 1 remains a Wry child webview and must continue to behave independently.
+window. The browser entry always opens Mode 2; Mode 1/Preview is not a product or Agent fallback.
 
 The user owns manual login and can hand control to the Agent, pause it, or take over again. Agent
 actions use the bounded semantic backend; raw JavaScript, raw CDP, cookies, storage, passwords, and
@@ -23,8 +23,9 @@ arbitrary response bodies are not exposed as Agent capabilities.
 
 ## Hard safety constraints
 
-- Development and automated tests must not access the macOS system Keychain. macOS debug CEF always
-  uses `--use-mock-keychain`, an isolated `browser-dev` root, and non-persistent profile storage.
+- Development and automated tests must not access the macOS system Keychain. Interactive macOS dev
+  uses `--use-mock-keychain` plus a private, stable, worktree-specific `browser-dev` root so login
+  state survives restart. Isolated debug smoke explicitly opts into an ephemeral temporary Profile.
   Windows prototype data, when explicitly exercised on Windows, must remain under the isolated
   debug root and never be reused by a release profile.
 - Ordinary tests must not execute `security`, signing, notarization, or Keychain tools. Code-signature
@@ -91,7 +92,7 @@ Deliverables:
   monitor DPI exactly once in the native backend;
 - let real native-child clicks own browser focus; resize, zoom, visibility, and window activation
   synchronization must never steal focus from trusted React controls;
-- keep Mode 1 and Mode 2 mutually exclusive with no stale native surface;
+- keep conversation surfaces mutually exclusive with no stale native surface;
 - hide or disable CEF before any host overlay that must appear above it;
 - preserve Chinese IME, keyboard shortcuts, focus restoration, display scaling, and fullscreen changes;
 - retire a creating surface synchronously when no BrowserHost exists, and make late CEF callbacks
@@ -120,7 +121,8 @@ Deliverables:
 - run `navigate -> AX snapshot -> click -> type -> screenshot` without raw CDP exposure;
 - make User/Agent/Paused transitions atomic with popup admission and the execution fence;
 - cancel active Agent effects within one second on pause/takeover;
-- persist opaque release profiles and isolate them by workspace/profile;
+- persist one app-global Default Profile shared across conversations/workspaces, while keeping each
+  explicitly created Profile isolated to its owner workspace;
 - make profile lock release retryable and never report cleanup success before persistence and unlock
   both succeed;
 - recover explicitly from renderer crash, browser close, app force-exit, and restart;
@@ -209,13 +211,14 @@ Evidence:
 
 Production readiness requires current evidence for this exact installed-app flow:
 
-1. Open a Workspace and select Login Browser.
+1. Open a Workspace and open the browser; it selects embedded Mode 2 directly.
 2. Confirm CEF appears only inside BrowserPanel.
 3. Complete manual login, including a controlled OAuth popup where applicable.
 4. Hand control to the Agent and perform one semantic read and one semantic write.
 5. Pause, show a trusted host confirmation with CEF hidden/disabled, then restore focus.
 6. Restart CCEM and prove login persistence in the same profile.
-7. Open a second workspace/profile and prove cookie and local-storage isolation.
+7. Open a second conversation/workspace with Default and prove the login state is shared; then
+   create an explicit Profile and prove cookie and local-storage isolation.
 8. Exercise renderer crash, browser close, app force-exit, and recovery.
 9. Close Mode 2 and CCEM, then prove no owned CEF helper remains.
 10. Inspect redacted audit, network, and console artifacts, then verify that raw page-content

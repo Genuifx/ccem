@@ -130,6 +130,10 @@ impl BrowserProfileDescriptor {
         &self.workspace_identity
     }
 
+    pub(crate) fn owner_identity(&self) -> Result<TrustedWorkspaceIdentity, ProfileError> {
+        TrustedWorkspaceIdentity::from_trusted_store(self.workspace_identity.clone())
+    }
+
     pub(crate) fn last_used_at(&self) -> Option<&str> {
         self.last_used_at.as_deref()
     }

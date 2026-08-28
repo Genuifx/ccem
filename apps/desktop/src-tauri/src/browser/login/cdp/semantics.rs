@@ -648,16 +648,22 @@ impl SemanticEngine {
                     serde_json::json!({}),
                 ),
             ] {
-                client
-                    .call(
-                        method,
-                        params,
-                        Some(&session),
-                        deadline,
-                        &setup_cancellation,
-                        self,
-                    )
-                    .map_err(|_| target_setup_failure())?;
+                if let Err(error) = client.call(
+                    method,
+                    params,
+                    Some(&session),
+                    deadline,
+                    &setup_cancellation,
+                    self,
+                ) {
+                    eprintln!(
+                        "CEF target security setup failed at {}: {} ({})",
+                        method.as_str(),
+                        error,
+                        error.code.as_str(),
+                    );
+                    return Err(target_setup_failure());
+                }
             }
             // A detach observed while setup commands were in flight invalidates the setup. Never
             // reinsert that session as configured; terminate the owner so no target can escape its

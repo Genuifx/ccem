@@ -34,6 +34,234 @@ fn authorization(
 }
 
 #[test]
+fn global_default_migrates_existing_profile_in_place_and_survives_manager_restart() {
+    let (temp, manager) = manager();
+    let workspace_a = workspace("workspace-global-migration-a");
+    let workspace_b = workspace("workspace-global-migration-b");
+    // Simulate profile directories written by the pre-global-default release, before any binding
+    // generation existed.
+    let legacy_a = manager
+        .create_profile_record(&workspace_a)
+        .expect("legacy workspace A profile");
+    let legacy_b = manager
+        .create_profile_record(&workspace_b)
+        .expect("legacy workspace B profile");
+    let expected = manager
+        .list_profiles(&workspace_b)
+        .expect("requesting workspace legacy profiles")
+        .into_iter()
+        .next()
+        .expect("requesting workspace migration candidate");
+    let expected_profile_dir = manager.profiles_root.join(expected.profile_id().as_str());
+    let user_data_marker = expected_profile_dir.join("user-data/login-cookie-marker");
+    fs::write(&user_data_marker, b"legacy login state").expect("legacy user-data marker");
+    let cef_profile_dir = manager
+        .checked_cef_profile_dir(expected.profile_id())
+        .expect("legacy CEF profile path");
+    fs::create_dir(&cef_profile_dir).expect("legacy CEF profile cache");
+    let cef_marker = cef_profile_dir.join("Cookies");
+    fs::write(&cef_marker, b"legacy CEF login state").expect("legacy CEF marker");
+
+    let migrated = manager
+        .global_default_profile(&workspace_b, false)
+        .expect("migrate legacy default")
+        .expect("existing profile becomes global default");
+    assert_eq!(migrated.profile_id(), expected.profile_id());
+    assert_eq!(
+        migrated.owner_identity().unwrap(),
+        expected.owner_identity().unwrap()
+    );
+    assert!(user_data_marker.exists());
+    assert!(cef_marker.exists());
+    assert!(manager
+        .profiles_root
+        .join(legacy_a.profile_id().as_str())
+        .is_dir());
+    assert!(manager
+        .profiles_root
+        .join(legacy_b.profile_id().as_str())
+        .is_dir());
+
+    let restarted = BrowserProfileManager::new(
+        temp.path().join("login/profile-state"),
+        temp.path().join("login/cef"),
+    )
+    .expect("restart profile manager");
+    let reopened = restarted
+        .global_default_profile(&workspace_a, true)
+        .expect("reload global default")
+        .expect("persisted global default");
+    assert_eq!(reopened.profile_id(), expected.profile_id());
+    let isolated = restarted
+        .create_profile(&workspace_b)
+        .expect("explicit isolated profile");
+    assert_ne!(isolated.profile_id(), expected.profile_id());
+    assert_eq!(
+        restarted
+            .global_default_profile(&workspace_b, true)
+            .unwrap()
+            .unwrap()
+            .profile_id(),
+        expected.profile_id(),
+        "explicit profile creation must not replace the global default"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let generation = fs::read_dir(&restarted.default_profile_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("default-") && name.ends_with(".json"))
+            })
+            .expect("private default binding generation");
+        assert_eq!(
+            generation.metadata().unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+}
+
+#[test]
+fn clearing_global_default_never_promotes_an_explicit_profile() {
+    let (_temp, manager) = manager();
+    let workspace_a = workspace("workspace-global-clear-a");
+    let workspace_b = workspace("workspace-global-clear-b");
+    let default = manager
+        .global_default_profile(&workspace_a, true)
+        .unwrap()
+        .expect("create global default");
+    let isolated = manager
+        .create_profile(&workspace_a)
+        .expect("create explicit isolated profile");
+
+    manager
+        .delete_profile(authorization(
+            DestructiveProfileAction::Delete,
+            &default,
+            &workspace_a,
+        ))
+        .expect("delete global default data");
+    assert!(manager
+        .clear_global_default(default.profile_id())
+        .expect("publish empty global binding"));
+    assert!(manager
+        .global_default_profile(&workspace_b, false)
+        .unwrap()
+        .is_none());
+    assert!(manager
+        .descriptor(isolated.profile_id(), &workspace_a)
+        .is_ok());
+
+    let replacement = manager
+        .global_default_profile(&workspace_b, true)
+        .unwrap()
+        .expect("create fresh global default");
+    assert_ne!(replacement.profile_id(), isolated.profile_id());
+    assert_eq!(replacement.workspace_identity(), workspace_b.as_str());
+    assert!(manager.is_global_default(replacement.profile_id()).unwrap());
+}
+
+#[test]
+fn first_explicit_profile_never_becomes_the_global_default() {
+    let (_temp, manager) = manager();
+    let workspace_a = workspace("workspace-explicit-first-a");
+    let workspace_b = workspace("workspace-explicit-first-b");
+    let isolated = manager
+        .create_profile(&workspace_a)
+        .expect("create first explicit profile");
+
+    assert!(manager
+        .global_default_profile(&workspace_b, false)
+        .expect("inspect uninitialized global default")
+        .is_none());
+    let default = manager
+        .global_default_profile(&workspace_b, true)
+        .expect("create global default")
+        .expect("global default descriptor");
+    assert_ne!(default.profile_id(), isolated.profile_id());
+    assert_eq!(default.workspace_identity(), workspace_b.as_str());
+    assert!(manager
+        .descriptor(isolated.profile_id(), &workspace_a)
+        .is_ok());
+}
+
+#[test]
+fn concurrent_managers_atomically_create_one_global_default() {
+    let temp = tempfile::tempdir().expect("profile root fixture");
+    let root = temp.path().join("login/profile-state");
+    let cef = temp.path().join("login/cef");
+    let first = BrowserProfileManager::new(root.clone(), cef.clone()).unwrap();
+    let second = BrowserProfileManager::new(root.clone(), cef.clone()).unwrap();
+    let workspace_a = workspace("workspace-global-race-a");
+    let workspace_b = workspace("workspace-global-race-b");
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let first_barrier = Arc::clone(&barrier);
+    let first_worker = std::thread::spawn(move || {
+        first_barrier.wait();
+        first
+            .global_default_profile(&workspace_a, true)
+            .unwrap()
+            .unwrap()
+    });
+    let second_barrier = Arc::clone(&barrier);
+    let second_worker = std::thread::spawn(move || {
+        second_barrier.wait();
+        second
+            .global_default_profile(&workspace_b, true)
+            .unwrap()
+            .unwrap()
+    });
+    barrier.wait();
+
+    let first_default = first_worker.join().unwrap();
+    let second_default = second_worker.join().unwrap();
+    assert_eq!(first_default.profile_id(), second_default.profile_id());
+    let restarted = BrowserProfileManager::new(root, cef).unwrap();
+    assert_eq!(restarted.list_all_profiles().unwrap().len(), 1);
+    assert_eq!(
+        restarted
+            .global_default_profile(&workspace("workspace-global-race-reader"), false)
+            .unwrap()
+            .unwrap()
+            .profile_id(),
+        first_default.profile_id()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn global_default_binding_rejects_a_symlink_generation() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, manager) = manager();
+    let outside = temp.path().join("outside-default.json");
+    fs::write(
+        &outside,
+        br#"{"schema_version":1,"revision":1,"profile_id":null}"#,
+    )
+    .unwrap();
+    symlink(
+        &outside,
+        manager
+            .default_profile_root
+            .join("default-00000000000000000001.json"),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        manager.global_default_profile(&workspace("workspace-symlink-reader"), false),
+        Err(ProfileError::UnsafePath(_))
+    ));
+}
+
+#[test]
 fn profile_ids_are_opaque_and_paths_are_private() {
     let (_temp, manager) = manager();
     let workspace = workspace("workspace-alpha-001");
