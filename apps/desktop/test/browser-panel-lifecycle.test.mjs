@@ -181,14 +181,15 @@ async function importBrowserPanelHarness() {
           en: (key) => 'en:' + key,
         };
 
-        export function mountBrowserPanel(container, initialProps) {
+        export function mountBrowserPanel(container, initialProps, options = {}) {
           const root = createRoot(container);
           globalThis.${bridgeKey}.React = React;
           const render = (nextProps) => {
             const { locale, ...panelProps } = nextProps;
             globalThis.${bridgeKey}.translate = translators[locale];
             act(() => {
-              root.render(<BrowserPanel {...panelProps} />);
+              const panel = <BrowserPanel {...panelProps} />;
+              root.render(options.strictMode ? <React.StrictMode>{panel}</React.StrictMode> : panel);
             });
           };
           render(initialProps);
@@ -210,6 +211,10 @@ async function importBrowserPanelHarness() {
 
         export function click(element) {
           act(() => element.click());
+        }
+
+        export function emitBrowserState(bridge, leaseId, generation, snapshot) {
+          act(() => bridge.emitBrowserState(leaseId, generation, snapshot));
         }
       `,
       resolveDir: desktopDir,
@@ -306,17 +311,35 @@ function installDom() {
   return dom;
 }
 
-function createBridge() {
+function createBridge({ acquireSnapshot = {}, syncGate = null } = {}) {
   let loginGeneration = 0;
   let loginServerSequence = 100;
   const calls = [];
+  const listeners = new Map();
   const bridge = {
     calls,
     toasts: [],
     translate: (key) => `zh:${key}`,
     async listen(eventName, handler) {
       calls.push({ command: `listen:${eventName}`, args: { handler } });
-      return () => {};
+      const eventListeners = listeners.get(eventName) ?? new Set();
+      eventListeners.add(handler);
+      listeners.set(eventName, eventListeners);
+      return () => eventListeners.delete(handler);
+    },
+    emitBrowserState(leaseId, generation, snapshot) {
+      const payload = {
+        lease_id: leaseId,
+        generation,
+        client_revision: 0,
+        server_sequence: ++loginServerSequence,
+        backend: 'login',
+        cause: 'test',
+        snapshot,
+      };
+      for (const handler of listeners.get('browser_surface_state_changed') ?? []) {
+        handler({ payload });
+      }
     },
     async openExternal(url) {
       calls.push({ command: 'open_external', args: { url } });
@@ -351,10 +374,13 @@ function createBridge() {
               popup_title: null,
               popup_loading: false,
               popup_error: null,
+              ...acquireSnapshot,
             },
           };
         }
         case 'browser_surface_sync':
+          if (syncGate) await syncGate;
+          return undefined;
         case 'browser_surface_release':
         case 'browser_surface_navigate':
           return undefined;
@@ -448,7 +474,7 @@ test('Login locale changes retain its lease until the panel actually unmounts', 
   assert.equal(releases[0].args.disposition, 'close');
 });
 
-test('Login A and B hand off to their own runtime, retain leases across A-to-B-to-A, and close exactly A', async (t) => {
+test('Login A and B default to their exact Agent once per lease, retain leases across A-to-B-to-A, and close exactly A', async (t) => {
   const dom = installDom();
   const bridge = createBridge();
   const { harness, tempDir } = await importBrowserPanelHarness();
@@ -508,11 +534,15 @@ test('Login A and B hand off to their own runtime, retain leases across A-to-B-t
   ))?.args;
   assert.ok(leaseA);
   assert.ok(leaseB);
-
-  harness.click(containerA.querySelector(
-    'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
-  ));
-  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      leaseId: args.leaseId,
+      action: args.action,
+      agentSessionId: args.agentSessionId,
+    })),
+    [{ leaseId: 'lease-1', action: 'handoff', agentSessionId: 'runtime-a' }],
+    'a new ready lease with an exact runtime must hand off without another user gesture',
+  );
 
   mountedA.render({
     ...propsA,
@@ -527,9 +557,6 @@ test('Login A and B hand off to their own runtime, retain leases across A-to-B-t
     presentationRevision: 2,
   });
   await harness.flushEffects();
-  harness.click(containerB.querySelector(
-    'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
-  ));
   await harness.flushEffects();
 
   mountedA.render({ ...propsA, isActiveSurface: true, presentationRevision: 3 });
@@ -586,11 +613,343 @@ test('Login A and B hand off to their own runtime, retain leases across A-to-B-t
     'Workspace removal after a successful close must not release A twice',
   );
   assert.ok(containerB.querySelector(
-    'button[aria-label="zh:loginBrowserControl.pauseAgent"]',
+    '[data-ccem-browser-navigation="true"] button[aria-label="zh:loginBrowserControl.takeover"]',
   ));
+  assert.equal(
+    containerB.querySelector('[data-ccem-browser-tab-strip="true"] [data-ccem-browser-control-toggle="true"]'),
+    null,
+    'handoff, pause, and takeover controls must not remain in the tab strip',
+  );
 });
 
-test('Login handoff is disabled without an active runtime and close uses close semantics', async (t) => {
+test('Agent control is one address-bar toggle and takeover does not re-handoff the same lease', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:agent-default:browser:1',
+    agentSessionId: 'runtime-a',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff'],
+  );
+  const navigation = container.querySelector('[data-ccem-browser-navigation="true"]');
+  const tabStrip = container.querySelector('[data-ccem-browser-tab-strip="true"]');
+  assert.ok(navigation);
+  assert.ok(tabStrip);
+  const takeover = navigation.querySelector(
+    'button[aria-label="zh:loginBrowserControl.takeover"]',
+  );
+  assert.ok(takeover);
+  assert.equal(
+    navigation.querySelectorAll('[data-ccem-browser-control-toggle="true"]').length,
+    1,
+    'the address bar exposes one control toggle',
+  );
+  assert.equal(tabStrip.querySelector(
+    'button[aria-label="zh:loginBrowserControl.pauseAgent"]',
+  ), null);
+  assert.equal(tabStrip.querySelector(
+    'button[aria-label="zh:loginBrowserControl.takeover"]',
+  ), null);
+
+  harness.click(takeover);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  mounted.render({ ...props, presentationRevision: 2 });
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'takeover'],
+    'taking over must not let a render or control-state update auto-handoff the same lease again',
+  );
+  assert.ok(navigation.querySelector(
+    'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
+  ));
+
+  mounted.render({
+    ...props,
+    sessionId: 'conversation:agent-default:browser:2',
+    presentationRevision: 3,
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      leaseId: args.leaseId,
+      action: args.action,
+    })),
+    [
+      { leaseId: 'lease-1', action: 'handoff' },
+      { leaseId: 'lease-1', action: 'takeover' },
+      { leaseId: 'lease-2', action: 'handoff' },
+    ],
+    'a genuinely new lease must receive its own one-time default handoff',
+  );
+});
+
+test('about:blank waits for the first authoritative HTTP page before the lease defaults to Agent', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:blank-then-ready:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(callsFor(bridge, 'browser_surface_control').length, 0);
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    url: 'https://accounts.example.test/login',
+    lifecycle: 'ready',
+    loading: false,
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      action: args.action,
+      agentSessionId: args.agentSessionId,
+    })),
+    [{ action: 'handoff', agentSessionId: 'runtime-a' }],
+  );
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    url: 'https://accounts.example.test/login?ready=1',
+    lifecycle: 'ready',
+    loading: false,
+  });
+  mounted.render({
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:blank-then-ready:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 2,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  assert.equal(
+    callsFor(bridge, 'browser_surface_control').length,
+    1,
+    'later native events and renders must not consume the same lease twice',
+  );
+});
+
+test('a paused lease stays fail-closed until the single address-bar icon takes over', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({
+    acquireSnapshot: { control: 'paused', paused: true },
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:paused:browser:1',
+    agentSessionId: 'runtime-a',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(callsFor(bridge, 'browser_surface_control').length, 0);
+  const navigation = container.querySelector('[data-ccem-browser-navigation="true"]');
+  assert.ok(navigation);
+  const takeover = navigation.querySelector(
+    '[data-ccem-browser-control-state="paused"][aria-label="zh:loginBrowserControl.takeover"]',
+  );
+  assert.ok(takeover);
+  assert.equal(navigation.querySelectorAll('[data-ccem-browser-control-toggle="true"]').length, 1);
+  assert.equal(container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.pauseAgent"]',
+  ), null);
+
+  harness.click(takeover);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['takeover'],
+  );
+});
+
+test('React StrictMode hands off only the final live lease once', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:strict:browser:1',
+    agentSessionId: 'runtime-a',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  }, { strictMode: true });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  const acquires = callsFor(bridge, 'browser_surface_acquire');
+  const handoffs = callsFor(bridge, 'browser_surface_control')
+    .filter(({ args }) => args.action === 'handoff');
+  assert.ok(acquires.length >= 1);
+  assert.equal(handoffs.length, 1);
+  assert.equal(
+    handoffs[0].args.leaseId,
+    `lease-${acquires.length}`,
+    'a disposed StrictMode lease must never receive Agent control',
+  );
+});
+
+test('a queued handoff revalidates the current exact Agent before IPC', async (t) => {
+  const dom = installDom();
+  let releaseSync;
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  const bridge = createBridge({ syncGate });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    releaseSync?.();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:actor-race:browser:1',
+    agentSessionId: 'runtime-a',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  assert.ok(callsFor(bridge, 'browser_surface_sync').length >= 1);
+  assert.equal(callsFor(bridge, 'browser_surface_control').length, 0);
+
+  mounted.render({ ...props, agentSessionId: 'runtime-b', presentationRevision: 2 });
+  await harness.flushEffects();
+  releaseSync();
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(
+    callsFor(bridge, 'browser_surface_control').length,
+    0,
+    'the queued handoff for runtime A must be cancelled after the exact actor changes',
+  );
+  const retry = container.querySelector(
+    '[data-ccem-browser-control-toggle="true"][aria-label="zh:loginBrowserControl.handoffAgent"]',
+  );
+  assert.ok(retry);
+  harness.click(retry);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      action: args.action,
+      agentSessionId: args.agentSessionId,
+    })),
+    [{ action: 'handoff', agentSessionId: 'runtime-b' }],
+    'the user can explicitly hand the same lease to the newly selected exact Agent',
+  );
+});
+
+test('Login opens in user control when no exact runtime exists and close uses close semantics', async (t) => {
   const dom = installDom();
   const bridge = createBridge();
   const { harness, tempDir } = await importBrowserPanelHarness();
@@ -624,6 +983,7 @@ test('Login handoff is disabled without an active runtime and close uses close s
     'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
   );
   assert.ok(handoff);
+  assert.ok(handoff.closest('[data-ccem-browser-navigation="true"]'));
   assert.equal(handoff.disabled, true);
   harness.click(handoff);
   await harness.flushEffects();

@@ -5,8 +5,6 @@ import {
   Globe,
   LoaderCircle,
   PanelTopClose,
-  Pause,
-  Play,
   UserRound,
   X,
 } from '@/lib/lucide-react';
@@ -19,7 +17,7 @@ import type {
 } from '@/lib/browserSurfaceIpc';
 
 type BrowserPanelLifecycle = NonNullable<BrowserSurfaceSnapshot['lifecycle']>;
-type LoginControlAction = 'handoff' | 'pause' | 'takeover';
+type LoginControlAction = 'handoff' | 'takeover';
 
 const recoveryStateTranslationKeys: Record<BrowserSurfaceRecoveryState, string> = {
   retained_live_host: 'workspace.browserRecoveryRetainedLiveHost',
@@ -73,8 +71,14 @@ interface BrowserPanelNavigationProps {
   urlInputRef: RefObject<HTMLInputElement>;
   urlInput: string;
   displayUrl: string;
+  sessionStatus: 'running' | 'closing' | 'cleanup_required';
+  control: BrowserSurfaceSnapshot['control'];
+  paused: boolean;
+  isLoginControlBusy: boolean;
+  canHandoffAgent: boolean;
   t: (key: string) => string;
   onOpenExternal: () => void;
+  onLoginControl: (action: LoginControlAction) => void;
   onSubmit: FormEventHandler<HTMLFormElement>;
   onUrlInputChange: (value: string) => void;
   onCancelUrlEditing: () => void;
@@ -88,13 +92,33 @@ export function BrowserPanelNavigation({
   urlInputRef,
   urlInput,
   displayUrl,
+  sessionStatus,
+  control,
+  paused,
+  isLoginControlBusy,
+  canHandoffAgent,
   t,
   onOpenExternal,
+  onLoginControl,
   onSubmit,
   onUrlInputChange,
   onCancelUrlEditing,
   onStartUrlEditing,
 }: BrowserPanelNavigationProps) {
+  const effectiveControl = control === 'agent'
+    ? 'agent'
+    : control === 'paused' || paused
+      ? 'paused'
+      : 'user';
+  const agentHasControl = effectiveControl === 'agent';
+  const needsTakeover = effectiveControl !== 'user';
+  const controlLabel = needsTakeover
+    ? t('loginBrowserControl.takeover')
+    : t('loginBrowserControl.handoffAgent');
+  const controlDisabled = sessionStatus !== 'running'
+    || isLoginControlBusy
+    || (!needsTakeover && (popupActive || !canHandoffAgent));
+
   return (
     <div data-ccem-browser-navigation="true" className="flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
       <BrowserToolButton
@@ -136,6 +160,31 @@ export function BrowserPanelNavigation({
           </button>
         )}
       </form>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex">
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              data-ccem-browser-control-toggle="true"
+              data-ccem-browser-control-state={effectiveControl}
+              aria-label={controlLabel}
+              aria-pressed={agentHasControl}
+              disabled={controlDisabled}
+              onClick={() => onLoginControl(needsTakeover ? 'takeover' : 'handoff')}
+              className={agentHasControl
+                ? 'h-8 w-8 rounded-full bg-amber-500/12 text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300'
+                : 'h-8 w-8 rounded-full'}
+            >
+              {needsTakeover
+                ? <UserRound className="h-4 w-4" />
+                : <Bot className="h-4 w-4" />}
+            </Button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{controlLabel}</TooltipContent>
+      </Tooltip>
     </div>
   );
 }
@@ -146,17 +195,11 @@ interface BrowserPanelTabStripProps {
   recoveryStates: BrowserSurfaceRecoveryState[];
   popupActive: boolean;
   lifecycle: BrowserPanelLifecycle;
-  control: BrowserSurfaceSnapshot['control'];
-  paused: boolean;
-  browserAgentControllingLabel: string;
   spinnerActive: boolean;
-  isLoginControlBusy: boolean;
-  canHandoffAgent: boolean;
   isPopupCloseBusy: boolean;
   isClosingSurface: boolean;
   t: (key: string) => string;
   onClosePopup: () => void;
-  onLoginControl: (action: LoginControlAction) => void;
   onClose: () => void;
 }
 
@@ -166,17 +209,11 @@ export function BrowserPanelTabStrip({
   recoveryStates,
   popupActive,
   lifecycle,
-  control,
-  paused,
-  browserAgentControllingLabel,
   spinnerActive,
-  isLoginControlBusy,
-  canHandoffAgent,
   isPopupCloseBusy,
   isClosingSurface,
   t,
   onClosePopup,
-  onLoginControl,
   onClose,
 }: BrowserPanelTabStripProps) {
   const recoveryNeedsAttention = recoveryStates.some((state) => (
@@ -218,14 +255,6 @@ export function BrowserPanelTabStrip({
         <span className="text-[11px] font-medium text-destructive">
           {t('workspace.browserCrashed')}
         </span>
-      ) : control === 'agent' ? (
-        <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-          {browserAgentControllingLabel}
-        </span>
-      ) : paused ? (
-        <span className="text-[11px] font-medium text-muted-foreground">
-          {t('workspace.browserAgentPaused')}
-        </span>
       ) : null}
       {spinnerActive ? (
         <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
@@ -238,47 +267,6 @@ export function BrowserPanelTabStrip({
         >
           <PanelTopClose className="h-4 w-4" />
         </BrowserToolButton>
-      ) : null}
-      {sessionStatus === 'running' ? (
-        control === 'agent' ? (
-          <>
-            <BrowserToolButton
-              label={t('loginBrowserControl.pauseAgent')}
-              onClick={() => onLoginControl('pause')}
-              disabled={isLoginControlBusy}
-            >
-              <Pause className="h-4 w-4" />
-            </BrowserToolButton>
-            <BrowserToolButton
-              label={t('loginBrowserControl.takeover')}
-              onClick={() => onLoginControl('takeover')}
-              disabled={isLoginControlBusy}
-            >
-              <UserRound className="h-4 w-4" />
-            </BrowserToolButton>
-          </>
-        ) : (
-          <>
-            <BrowserToolButton
-              label={paused
-                ? t('loginBrowserControl.resumeAgent')
-                : t('loginBrowserControl.handoffAgent')}
-              onClick={() => onLoginControl('handoff')}
-              disabled={isLoginControlBusy || popupActive || !canHandoffAgent}
-            >
-              {paused ? <Play className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
-            </BrowserToolButton>
-            {paused ? (
-              <BrowserToolButton
-                label={t('loginBrowserControl.takeover')}
-                onClick={() => onLoginControl('takeover')}
-                disabled={isLoginControlBusy}
-              >
-                <UserRound className="h-4 w-4" />
-              </BrowserToolButton>
-            ) : null}
-          </>
-        )
       ) : null}
       <BrowserToolButton
         label={t('loginBrowserControl.closeBrowser')}

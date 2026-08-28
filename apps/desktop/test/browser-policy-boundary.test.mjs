@@ -37,10 +37,11 @@ test('browser tool dispatch uses a current revision-bound native permission auth
 });
 
 test('browser actions require exact visible session control and support cancellation', async () => {
-  const [toolsSource, registrySource, panelSource] = await Promise.all([
+  const [toolsSource, registrySource, panelSource, chromeSource] = await Promise.all([
     fs.readFile(path.join(rustDir, 'browser', 'tools.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'registry.rs'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanelChrome.tsx'), 'utf8'),
   ]);
 
   const dispatch = toolsSource.match(/pub fn run_tool\([\s\S]*?\n    fn run_tool_inner/)?.[0] ?? '';
@@ -49,6 +50,9 @@ test('browser actions require exact visible session control and support cancella
   assert.match(registrySource, /active_session_id == session_id[\s\S]*session\.visible && !session\.paused/);
   assert.match(registrySource, /cancel_epoch = session\.cancel_epoch\.saturating_add\(1\)/);
   assert.match(panelSource, /browserSurfaceClient\.control/);
-  assert.match(panelSource, /action: 'handoff' \| 'pause' \| 'takeover'/);
-  assert.match(panelSource, /browserAgentControlling/);
+  assert.match(panelSource, /action: 'handoff' \| 'takeover'/);
+  assert.match(panelSource, /autoHandoffAttemptedLeaseRef/);
+  assert.match(panelSource, /hasHttpOrHttpsOrigin\(authoritativeUrl\)/);
+  assert.match(chromeSource, /data-ccem-browser-control-toggle="true"/);
+  assert.doesNotMatch(chromeSource, /loginBrowserControl\.pauseAgent/);
 });

@@ -61,6 +61,8 @@ type BrowserPanelProps = BrowserPanelSharedProps & BrowserSurfaceProfileSelectio
 type BrowserPanelLifecycle = NonNullable<BrowserSurfaceSnapshot['lifecycle']>;
 type BrowserPanelControl = NonNullable<BrowserSurfaceSnapshot['control']>;
 
+class BrowserControlSupersededError extends Error {}
+
 const browserSurfaceClient = createBrowserSurfaceClient({
   invoke: (command, args) => invoke(command, args),
 });
@@ -86,6 +88,16 @@ function normalizeBrowserInput(value: string): string {
     return `https://${trimmed}`;
   }
   return `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`;
+}
+
+function hasHttpOrHttpsOrigin(value: string | null): boolean {
+  if (!value) return false;
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 export function BrowserPanel({
@@ -118,6 +130,7 @@ export function BrowserPanel({
   const surfaceOrdering = surfaceOrderingRef.current;
   const surfaceClosingRef = useRef(false);
   const surfaceCloseSucceededRef = useRef(false);
+  const autoHandoffAttemptedLeaseRef = useRef<string | null>(null);
   const onHostShortcutRef = useRef(onHostShortcut);
   onHostShortcutRef.current = onHostShortcut;
   const presentationRevisionRef = useRef(presentationRevision);
@@ -129,8 +142,11 @@ export function BrowserPanel({
   surfaceOccludedRef.current = surfaceOccluded;
 
   const loginAgentSessionId = agentSessionId?.trim() || undefined;
+  const loginAgentSessionIdRef = useRef(loginAgentSessionId);
+  loginAgentSessionIdRef.current = loginAgentSessionId;
   const loginProfileId = profileMode === 'saved' ? profileId : undefined;
   const [currentUrl, setCurrentUrl] = useState<string | null>(defaultUrl ?? null);
+  const [authoritativeUrl, setAuthoritativeUrl] = useState<string | null>(null);
   const [urlInput, setUrlInput] = useState(defaultUrl ?? '');
   const [isUrlEditing, setIsUrlEditing] = useState(false);
   const [title, setTitle] = useState<string | null>(null);
@@ -151,10 +167,15 @@ export function BrowserPanel({
   const [isPopupCloseBusy, setIsPopupCloseBusy] = useState(false);
   const [isClosingSurface, setIsClosingSurface] = useState(false);
   const [isSurfaceReady, setIsSurfaceReady] = useState(false);
+  const sessionStatusRef = useRef(sessionStatus);
+  sessionStatusRef.current = sessionStatus;
+  const popupActiveRef = useRef(popupActive);
+  popupActiveRef.current = popupActive;
 
   const applySurfaceSnapshot = useCallback((snapshot?: BrowserSurfaceSnapshot | null) => {
     if (!snapshot) return;
     if (snapshot.url !== undefined) {
+      setAuthoritativeUrl(snapshot.url ?? null);
       setCurrentUrl(snapshot.url ?? null);
       if (!isUrlEditingRef.current) setUrlInput(snapshot.url ?? '');
     }
@@ -273,6 +294,7 @@ export function BrowserPanel({
     let unlistenHostShortcut: (() => void) | null = null;
     const pendingStates: BrowserSurfaceStateChangedEvent[] = [];
     setLifecycle('creating');
+    setAuthoritativeUrl(null);
     setIsSurfaceReady(false);
     setIsBusy(true);
     setError(null);
@@ -280,6 +302,7 @@ export function BrowserPanel({
     surfaceOrdering.resetServerSequence();
     surfaceClosingRef.current = false;
     surfaceCloseSucceededRef.current = false;
+    autoHandoffAttemptedLeaseRef.current = null;
     setIsClosingSurface(false);
     setSessionStatus('running');
     setRecoveryStates([]);
@@ -567,7 +590,7 @@ export function BrowserPanel({
   }, [currentUrl, popupActive, popupUrl, showBrowserError]);
 
   const handleLoginControl = useCallback(async (
-    action: 'handoff' | 'pause' | 'takeover',
+    action: 'handoff' | 'takeover',
   ) => {
     if (isLoginControlBusy) return;
     const controlIntent = action === 'handoff'
@@ -582,17 +605,33 @@ export function BrowserPanel({
       showBrowserError(t('workspace.browserSurfaceUnavailable'));
       return;
     }
+    autoHandoffAttemptedLeaseRef.current = `${lease.leaseId}:${lease.generation}`;
     setIsLoginControlBusy(true);
     setError(null);
     try {
-      const response = await surfaceOrdering.enqueue((clientRevision) => (
-        browserSurfaceClient.control({
+      const response = await surfaceOrdering.enqueue((clientRevision) => {
+        const currentLease = surfaceLeaseRef.current;
+        const leaseChanged = !currentLease
+          || currentLease.leaseId !== lease.leaseId
+          || currentLease.generation !== lease.generation;
+        const handoffContextChanged = action === 'handoff' && (
+          loginAgentSessionIdRef.current !== loginAgentSessionId
+          || !isActiveSurfaceRef.current
+          || surfaceOccludedRef.current
+          || nativeSurfaceOcclusionStore.isOccluded()
+          || popupActiveRef.current
+          || sessionStatusRef.current !== 'running'
+        );
+        if (leaseChanged || surfaceClosingRef.current || handoffContextChanged) {
+          throw new BrowserControlSupersededError();
+        }
+        return browserSurfaceClient.control({
           leaseId: lease.leaseId,
           generation: lease.generation,
           clientRevision,
           ...controlIntent,
-        })
-      ));
+        });
+      });
       applyBrowserSurfaceMutationResponseForLease(
         surfaceOrdering,
         surfaceLeaseRef.current,
@@ -601,11 +640,54 @@ export function BrowserPanel({
         applySurfaceSnapshot,
       );
     } catch (controlError) {
-      showBrowserError(String(controlError));
+      if (!(controlError instanceof BrowserControlSupersededError)) {
+        showBrowserError(String(controlError));
+      }
     } finally {
       setIsLoginControlBusy(false);
     }
   }, [applySurfaceSnapshot, isLoginControlBusy, loginAgentSessionId, showBrowserError, surfaceOrdering, t]);
+
+  useEffect(() => {
+    if (
+      !isSurfaceReady
+      || lifecycle !== 'ready'
+      || sessionStatus !== 'running'
+      || !isActiveSurface
+      || surfaceOccluded
+      || isLoading
+      || popupActive
+    ) return;
+    const lease = surfaceLeaseRef.current;
+    if (!lease) return;
+    const leaseKey = `${lease.leaseId}:${lease.generation}`;
+    if (control === 'agent' || control === 'paused' || paused) {
+      autoHandoffAttemptedLeaseRef.current = leaseKey;
+      return;
+    }
+    if (
+      autoHandoffAttemptedLeaseRef.current === leaseKey
+      || !loginAgentSessionId
+      || isLoginControlBusy
+      || !hasHttpOrHttpsOrigin(authoritativeUrl)
+    ) return;
+    autoHandoffAttemptedLeaseRef.current = leaseKey;
+    void handleLoginControl('handoff');
+  }, [
+    control,
+    handleLoginControl,
+    authoritativeUrl,
+    isActiveSurface,
+    isLoginControlBusy,
+    isLoading,
+    isSurfaceReady,
+    lifecycle,
+    loginAgentSessionId,
+    paused,
+    popupActive,
+    sessionStatus,
+    surfaceOccluded,
+  ]);
 
   const handleClosePopup = useCallback(async () => {
     if (isPopupCloseBusy) return;
@@ -673,18 +755,12 @@ export function BrowserPanel({
           recoveryStates={recoveryStates}
           popupActive={popupActive}
           lifecycle={lifecycle}
-          control={control}
-          paused={paused}
-          browserAgentControllingLabel={t('workspace.browserAgentControlling')}
           spinnerActive={isBusy || isLoading || popupLoading || isClosingSurface
             || isLoginControlBusy || isPopupCloseBusy}
-          isLoginControlBusy={isLoginControlBusy}
-          canHandoffAgent={Boolean(loginAgentSessionId)}
           isPopupCloseBusy={isPopupCloseBusy}
           isClosingSurface={isClosingSurface}
           t={t}
           onClosePopup={() => void handleClosePopup()}
-          onLoginControl={(action) => void handleLoginControl(action)}
           onClose={() => void handleClose()}
         />
       </div>
@@ -696,8 +772,14 @@ export function BrowserPanel({
         urlInputRef={urlInputRef}
         urlInput={urlInput}
         displayUrl={displayUrl}
+        sessionStatus={sessionStatus}
+        control={control}
+        paused={paused}
+        isLoginControlBusy={isLoginControlBusy}
+        canHandoffAgent={Boolean(loginAgentSessionId)}
         t={t}
         onOpenExternal={handleOpenExternal}
+        onLoginControl={(action) => void handleLoginControl(action)}
         onSubmit={handleSubmit}
         onUrlInputChange={setUrlInput}
         onCancelUrlEditing={cancelUrlEditing}

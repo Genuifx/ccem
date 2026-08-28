@@ -109,7 +109,9 @@ test('browser panel exposes only Mode 2 sidebar chrome and native surface IPC', 
   assert.match(browserPanelSource, /browserSurfaceClient\.navigate/);
   assert.match(browserPanelSource, /browserSurfaceClient\.release/);
   assert.match(browserPanelSource, /occlude: occludeSurface/);
-  assert.match(browserPanelSource, /browserAgentControlling/);
+  assert.match(browserPanelSource, /autoHandoffAttemptedLeaseRef/);
+  assert.match(browserPanelChromeSource, /data-ccem-browser-control-toggle="true"/);
+  assert.doesNotMatch(browserPanelChromeSource, /loginBrowserControl\.pauseAgent/);
   assert.doesNotMatch(
     `${browserPanelSource}\n${browserPanelChromeSource}`,
     /backend:\s*'preview'|backend === 'preview'|browser_open|browser_set_visible|usePreviewSurfaceMutation/i,
