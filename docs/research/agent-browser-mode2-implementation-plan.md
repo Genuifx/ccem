@@ -134,9 +134,11 @@ Evidence:
 - semantic, cancellation, provenance, profile, cleanup, and recovery tests;
 - signed production-runtime smoke on every release target that runs the bounded semantic chain,
   overlaps a real write with Occlude, verifies the canonical app-owned PNG through strict chunk,
-  all-chunk CRC, bounded decode, size, and digest checks, reopens the primary and secondary profiles,
-  and binds every result to the exact producer workflow and release identity;
-- installed-app persistent-login restart, two-profile isolation, focus/IME, OAuth popup, trusted
+  all-chunk CRC, bounded decode, size, and digest checks, proves workspace A/B Default opens share one
+  Profile while retaining distinct browser-session identities, then reopens an isolated Explicit New
+  Profile, and binds every result to the exact producer workflow and release identity;
+- installed-app persistent-login restart, app-global Default sharing plus Explicit New isolation,
+  focus/IME, OAuth popup, trusted
   overlay, renderer-crash, and force-exit recovery observation. Automation is supporting evidence
   for these interaction-sensitive cases, not a substitute for the real installed flow.
 

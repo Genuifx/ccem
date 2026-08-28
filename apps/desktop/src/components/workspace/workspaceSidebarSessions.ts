@@ -7,6 +7,9 @@ export interface WorkspaceSidebarLiveSessionEntry {
     | 'runtime_id'
     | 'provider'
     | 'provider_session_id'
+    | 'display_title'
+    | 'display_title_revision'
+    | 'initial_user_prompt'
     | 'project_dir'
     | 'env_name'
     | 'status'
@@ -198,9 +201,11 @@ export function toLiveHistorySessionItem(
   }
 
   const project = entry.session.project_dir.trim();
-  const display = entry.generatedTitle?.trim()
+  const hasAuthoritativeTitleState = (entry.session.display_title_revision ?? 0) > 0;
+  const display = entry.session.display_title?.trim()
+    || (!hasAuthoritativeTitleState ? entry.generatedTitle?.trim() : '')
     || entry.initialPrompt?.trim()
-    || entry.session.provider_session_id?.trim()
+    || entry.session.initial_user_prompt?.trim()
     || `${entry.session.provider === 'codex' ? 'Codex' : 'Claude'} workspace session`;
 
   return {

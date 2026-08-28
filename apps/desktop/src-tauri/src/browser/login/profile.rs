@@ -24,6 +24,7 @@ const METADATA_FILE_SUFFIX: &str = ".json";
 const METADATA_REVISION_WIDTH: usize = 20;
 const CEF_CACHE_ROOT_NAME: &str = "cef";
 const CEF_PROFILE_DIRECTORY_PREFIX: &str = "Profile-";
+const DEFAULT_PENDING_PROFILE_DIRECTORY_PREFIX: &str = ".default-pending-";
 const MAX_RUNTIME_ID_BYTES: usize = 160;
 const MAX_RUNTIME_VERSION_BYTES: usize = 160;
 const MAX_PROTOCOL_VERSION_BYTES: usize = 80;
@@ -105,26 +106,8 @@ impl BrowserProfileManager {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(io_error("create browser profile directory", error)),
             }
-            let initialized = (|| {
-                secure_directory(&profile_dir)?;
-                ensure_profile_directory(&self.profiles_root, &profile_dir)?;
-                ensure_private_child_directory(&profile_dir, &profile_dir.join("user-data"))?;
-                ensure_private_lock_file(&profile_dir.join("profile.lock"))?;
-
-                let now = Utc::now().to_rfc3339();
-                let descriptor = BrowserProfileDescriptor {
-                    schema_version: PROFILE_SCHEMA_VERSION,
-                    revision: 1,
-                    profile_id,
-                    workspace_identity: workspace_identity.as_str().to_string(),
-                    created_at: now,
-                    last_used_at: None,
-                    runtime_compatibility: ProfileRuntimeCompatibility::default(),
-                    cleanup_state: ProfileCleanupState::Stopped,
-                };
-                write_descriptor_generation(&profile_dir, &descriptor)?;
-                Ok(descriptor)
-            })();
+            let initialized =
+                self.initialize_profile_record(&profile_dir, profile_id, workspace_identity);
             match initialized {
                 Ok(descriptor) => return Ok(descriptor),
                 Err(error) => {
@@ -137,6 +120,80 @@ impl BrowserProfileManager {
         }
         Err(ProfileError::Io(
             "failed to allocate a unique browser profile id".to_string(),
+        ))
+    }
+
+    fn initialize_profile_record(
+        &self,
+        profile_dir: &Path,
+        profile_id: ProfileId,
+        workspace_identity: &TrustedWorkspaceIdentity,
+    ) -> Result<BrowserProfileDescriptor, ProfileError> {
+        secure_directory(profile_dir)?;
+        ensure_profile_directory(&self.profiles_root, profile_dir)?;
+        ensure_private_child_directory(profile_dir, &profile_dir.join("user-data"))?;
+        ensure_private_lock_file(&profile_dir.join("profile.lock"))?;
+
+        let descriptor = BrowserProfileDescriptor {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            revision: 1,
+            profile_id,
+            workspace_identity: workspace_identity.as_str().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            last_used_at: None,
+            runtime_compatibility: ProfileRuntimeCompatibility::default(),
+            cleanup_state: ProfileCleanupState::Stopped,
+        };
+        write_descriptor_generation(profile_dir, &descriptor)?;
+        Ok(descriptor)
+    }
+
+    /// Builds the exact profile named by a durable pending-default intent without ever exposing a
+    /// partially initialized `profiles/<profile-id>` directory to legacy discovery.
+    fn create_profile_record_with_id(
+        &self,
+        profile_id: &ProfileId,
+        workspace_identity: &TrustedWorkspaceIdentity,
+    ) -> Result<BrowserProfileDescriptor, ProfileError> {
+        ProfileId::parse(profile_id.as_str())?;
+        let profile_dir = self.profile_dir(profile_id);
+        match fs::symlink_metadata(&profile_dir) {
+            Ok(_) => {
+                return Err(ProfileError::CorruptMetadata(
+                    "pending global default profile already exists without a valid descriptor"
+                        .to_string(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect pending global default profile", error)),
+        }
+
+        let staging_dir = self.pending_default_profile_staging_dir(profile_id);
+        remove_private_directory_if_present(&self.profiles_root, &staging_dir)?;
+        fs::create_dir(&staging_dir)
+            .map_err(|error| io_error("create pending global default staging directory", error))?;
+        let initialized =
+            self.initialize_profile_record(&staging_dir, profile_id.clone(), workspace_identity);
+        let descriptor = match initialized {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                let _ = remove_private_directory_if_present(&self.profiles_root, &staging_dir);
+                return Err(error);
+            }
+        };
+        if let Err(error) = fs::rename(&staging_dir, &profile_dir) {
+            let _ = remove_private_directory_if_present(&self.profiles_root, &staging_dir);
+            return Err(io_error("publish pending global default profile", error));
+        }
+        sync_directory(&self.profiles_root)?;
+        ensure_profile_directory(&self.profiles_root, &profile_dir)?;
+        Ok(descriptor)
+    }
+
+    fn pending_default_profile_staging_dir(&self, profile_id: &ProfileId) -> PathBuf {
+        self.profiles_root.join(format!(
+            "{DEFAULT_PENDING_PROFILE_DIRECTORY_PREFIX}{}",
+            profile_id.as_str()
         ))
     }
 
@@ -373,13 +430,18 @@ impl BrowserProfileManager {
         reset_private_child_directory(&maintenance.profile_dir, &user_data, &tombstone)?;
         reset_private_child_directory(&self.cef_cache_root, &cef_profile_dir, &cef_tombstone)?;
 
+        // Keep Resetting durable until both staged copies are actually gone. Persisting Stopped
+        // first would make a crash or deletion failure strand the old cookies/tokens in a
+        // tombstone that no future trusted reset could identify and resume.
+        remove_private_directory_if_present(&maintenance.profile_dir, &tombstone)?;
+        remove_private_directory_if_present(&self.cef_cache_root, &cef_tombstone)?;
+        sync_directory(&maintenance.profile_dir)?;
+        sync_directory(&self.cef_cache_root)?;
+
         maintenance.descriptor.last_used_at = None;
         maintenance.descriptor.runtime_compatibility = ProfileRuntimeCompatibility::default();
         maintenance.descriptor.cleanup_state = ProfileCleanupState::Stopped;
-        let descriptor = maintenance.persist_and_release()?;
-        remove_private_directory_if_present(&maintenance.profile_dir, &tombstone)?;
-        remove_private_directory_if_present(&self.cef_cache_root, &cef_tombstone)?;
-        Ok(descriptor)
+        maintenance.persist_and_release()
     }
 
     pub(crate) fn delete_profile(

@@ -14,6 +14,7 @@ const producerWorkflowRef =
 const job = 'build-desktop';
 
 export function windowsSemanticProductionPathProof(smokeRoot, profileId) {
+  const explicitProfileId = `profile-${'6'.repeat(32)}`;
   return {
     semantic: {
       navigatedViaCapability: true,
@@ -38,21 +39,29 @@ export function windowsSemanticProductionPathProof(smokeRoot, profileId) {
       occlusionAckMillis: 87,
       postPauseNoLateWrite: true,
     },
-    reopenedProfileId: profileId,
-    secondaryReopenedProfileId: `profile-${'6'.repeat(32)}`,
-    finalReopenedProfileId: profileId,
-    profileIsolation: {
+    defaultSessionId: `login-session-${'1'.repeat(32)}`,
+    crossWorkspaceDefaultProfileId: profileId,
+    crossWorkspaceDefaultSessionId: `login-session-${'2'.repeat(32)}`,
+    explicitProfileId,
+    explicitSessionId: `login-session-${'3'.repeat(32)}`,
+    reopenedExplicitProfileId: explicitProfileId,
+    reopenedExplicitSessionId: `login-session-${'4'.repeat(32)}`,
+    finalDefaultProfileId: profileId,
+    finalDefaultSessionId: `login-session-${'5'.repeat(32)}`,
+    profileStorage: {
       secondaryWorkspaceRoot: `${smokeRoot}\\workspace-secondary`,
-      secondaryProfileId: `profile-${'6'.repeat(32)}`,
-      distinctWorkspaceProfiles: true,
-      primaryCookiePersisted: true,
-      primaryLocalStoragePersisted: true,
-      secondaryProfileInitiallyEmpty: true,
-      secondaryCookieIsolated: true,
-      secondaryLocalStorageIsolated: true,
-      secondaryCookiePersisted: true,
-      secondaryLocalStoragePersisted: true,
-      primaryUnchangedAfterSecondary: true,
+      defaultProfileSharedAcrossWorkspaces: true,
+      defaultCookieShared: true,
+      defaultLocalStorageShared: true,
+      defaultCookiePersisted: true,
+      defaultLocalStoragePersisted: true,
+      explicitProfileIsolated: true,
+      explicitProfileInitiallyEmpty: true,
+      explicitCookieIsolated: true,
+      explicitLocalStorageIsolated: true,
+      explicitCookiePersisted: true,
+      explicitLocalStoragePersisted: true,
+      defaultUnchangedAfterExplicit: true,
     },
     cleanup: {
       activeSurfaceCount: 0,

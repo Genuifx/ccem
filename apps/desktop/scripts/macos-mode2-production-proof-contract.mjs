@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-export const MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION = 2;
+export const MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION = 3;
 
 const MANAGER = 'LoginBrowserSurfaceManager/SessionManager';
 const MAX_SCREENSHOT_BYTES = 24 * 1024 * 1024;
@@ -48,6 +48,13 @@ function exactProfileId(value, label) {
     || value.length > 128
     || !/^[A-Za-z0-9._-]+$/u.test(value)
   ) {
+    fail(`${label} is invalid`);
+  }
+  return value;
+}
+
+function exactSessionId(value, label) {
+  if (!/^login-session-[a-f0-9]{32}$/u.test(value ?? '')) {
     fail(`${label} is invalid`);
   }
   return value;
@@ -105,17 +112,19 @@ function validateSemantic(proof, scenarioRoot) {
   validateScreenshot(proof.screenshot, scenarioRoot);
 }
 
-function validateIsolation(proof) {
+function validateProfileStorage(proof) {
   exactKeys(proof, [
-    'distinctWorkspaceProfiles', 'primaryCookiePersisted',
-    'primaryLocalStoragePersisted', 'secondaryProfileInitiallyEmpty',
-    'secondaryCookieIsolated', 'secondaryLocalStorageIsolated',
-    'primaryUnchangedAfterSecondary', 'secondaryUnchangedAfterPrimary',
-  ], 'production profile isolation proof');
-  requireTrueFields(proof, Object.keys(proof), 'production profile isolation proof');
+    'defaultProfileSharedAcrossWorkspaces', 'defaultCookieShared',
+    'defaultLocalStorageShared', 'defaultCookiePersisted',
+    'defaultLocalStoragePersisted', 'explicitProfileIsolated',
+    'explicitProfileInitiallyEmpty', 'explicitCookieIsolated',
+    'explicitLocalStorageIsolated', 'explicitCookiePersisted',
+    'explicitLocalStoragePersisted', 'defaultUnchangedAfterExplicit',
+  ], 'production profile storage proof');
+  requireTrueFields(proof, Object.keys(proof), 'production profile storage proof');
 }
 
-function validateCleanup(proof) {
+function validateCleanup(proof, phase) {
   exactKeys(proof, [
     'activeSurfaceCount', 'activeSessionCount', 'ownerRecordCount',
     'persistedProfileCount', 'workspaceCount', 'profileLocksAvailable',
@@ -124,7 +133,7 @@ function validateCleanup(proof) {
     proof.activeSurfaceCount !== 0
     || proof.activeSessionCount !== 0
     || proof.ownerRecordCount !== 0
-    || proof.persistedProfileCount !== 2
+    || proof.persistedProfileCount !== (phase === 'prime' ? 2 : 3)
     || proof.workspaceCount !== 2
     || proof.profileLocksAvailable !== true
   ) {
@@ -147,13 +156,29 @@ export function expectedMacosProductionPaths(scenarioPlan, phase) {
 export function validateMacosMode2ProductionProof(proof, scenarioPlan, phase) {
   exactKeys(proof, [
     'schemaVersion', 'verified', 'manager', 'sessionRoot', 'workspaceRoot',
-    'secondaryWorkspaceRoot', 'primaryProfileId', 'reopenedPrimaryProfileId',
-    'finalPrimaryProfileId', 'secondaryProfileId', 'finalSecondaryProfileId',
-    'semantic', 'profileIsolation', 'cleanup',
+    'secondaryWorkspaceRoot', 'defaultProfileId', 'defaultSessionId',
+    'crossWorkspaceDefaultProfileId', 'crossWorkspaceDefaultSessionId',
+    'explicitProfileId', 'explicitSessionId', 'reopenedExplicitProfileId',
+    'reopenedExplicitSessionId', 'finalDefaultProfileId', 'finalDefaultSessionId',
+    'semantic', 'profileStorage', 'cleanup',
   ], 'production path proof');
   const expected = expectedMacosProductionPaths(scenarioPlan, phase);
-  const primary = exactProfileId(proof.primaryProfileId, 'primary profile id');
-  const secondary = exactProfileId(proof.secondaryProfileId, 'secondary profile id');
+  const defaultProfile = exactProfileId(proof.defaultProfileId, 'Default profile id');
+  const explicitProfile = exactProfileId(proof.explicitProfileId, 'Explicit New profile id');
+  const defaultSession = exactSessionId(proof.defaultSessionId, 'Default workspace A session id');
+  const crossWorkspaceDefaultSession = exactSessionId(
+    proof.crossWorkspaceDefaultSessionId,
+    'Default workspace B session id',
+  );
+  const explicitSession = exactSessionId(proof.explicitSessionId, 'Explicit New session id');
+  const reopenedExplicitSession = exactSessionId(
+    proof.reopenedExplicitSessionId,
+    'reopened Explicit New session id',
+  );
+  const finalDefaultSession = exactSessionId(
+    proof.finalDefaultSessionId,
+    'final Default session id',
+  );
   if (
     proof.schemaVersion !== MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION
     || proof.verified !== true
@@ -161,15 +186,21 @@ export function validateMacosMode2ProductionProof(proof, scenarioPlan, phase) {
     || proof.sessionRoot !== expected.sessionRoot
     || proof.workspaceRoot !== expected.workspaceRoot
     || proof.secondaryWorkspaceRoot !== expected.secondaryWorkspaceRoot
-    || primary === secondary
-    || proof.reopenedPrimaryProfileId !== primary
-    || proof.finalPrimaryProfileId !== primary
-    || proof.finalSecondaryProfileId !== secondary
+    || proof.crossWorkspaceDefaultProfileId !== defaultProfile
+    || proof.finalDefaultProfileId !== defaultProfile
+    || explicitProfile === defaultProfile
+    || proof.reopenedExplicitProfileId !== explicitProfile
   ) {
-    fail('production path proof does not bind this exact phase and two-profile manager run');
+    fail('production path proof does not bind shared Default and isolated Explicit New profiles');
+  }
+  if (new Set([defaultSession, crossWorkspaceDefaultSession, finalDefaultSession]).size !== 3) {
+    fail('shared Default profile did not use distinct browser sessions');
+  }
+  if (explicitSession === reopenedExplicitSession) {
+    fail('Explicit New reopen did not create a distinct browser session');
   }
   validateSemantic(proof.semantic, scenarioPlan.root);
-  validateIsolation(proof.profileIsolation);
-  validateCleanup(proof.cleanup);
+  validateProfileStorage(proof.profileStorage);
+  validateCleanup(proof.cleanup, phase);
   return proof;
 }

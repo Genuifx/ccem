@@ -448,7 +448,11 @@ impl LoginBrowserSessionManager {
             let _ = backend.shutdown(true);
             return Err(SessionManagerError::StateUnavailable);
         }
-        if let Err(error) = inner.profile_activity.register(&profile_id, &session_id) {
+        if let Err(error) =
+            inner
+                .profile_activity
+                .register(&profile_id, &session_id, &workspace_identity)
+        {
             drop(sessions);
             let _ = backend.shutdown(true);
             return Err(error);

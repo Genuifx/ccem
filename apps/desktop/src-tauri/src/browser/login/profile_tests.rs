@@ -34,6 +34,219 @@ fn authorization(
 }
 
 #[test]
+fn profile_transactions_use_the_cfg_aware_directory_sync_contract() {
+    let profile_source = include_str!("profile.rs");
+    let default_source = include_str!("profile_default.rs");
+    let storage_source = include_str!("profile_storage.rs");
+    assert!(!profile_source.contains("File::open(&maintenance.profile_dir)"));
+    assert!(!profile_source.contains("File::open(&self.cef_cache_root)"));
+    assert!(!profile_source.contains("File::open(&self.profiles_root)"));
+    assert!(!default_source.contains("std::fs::File::open(&self.default_profile_root)"));
+    assert!(!default_source.contains("std::fs::File::open(&self.profiles_root)"));
+    assert!(storage_source.contains("#[cfg(unix)]\npub(super) fn sync_directory"));
+    assert!(storage_source.contains("#[cfg(not(unix))]\npub(super) fn sync_directory"));
+}
+
+fn write_pending_default_binding(
+    manager: &BrowserProfileManager,
+    revision: u64,
+    profile_id: &ProfileId,
+    owner: &TrustedWorkspaceIdentity,
+) {
+    let path = manager
+        .default_profile_root
+        .join(format!("default-{revision:020}.json"));
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "revision": revision,
+        "profile_id": profile_id,
+        "pending_owner_identity": owner.as_str(),
+    }))
+    .expect("serialize pending default binding");
+    write_private_new_file(&path, &bytes).expect("persist pending default binding fixture");
+}
+
+fn pending_default_staging_dir(manager: &BrowserProfileManager, profile_id: &ProfileId) -> PathBuf {
+    manager
+        .profiles_root
+        .join(format!(".default-pending-{}", profile_id.as_str()))
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_default_intent_write_never_leaves_an_unbound_legacy_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp, manager) = manager();
+    let owner = workspace("workspace-default-intent-write-failure");
+    fs::set_permissions(
+        &manager.default_profile_root,
+        fs::Permissions::from_mode(0o500),
+    )
+    .expect("make default binding directory read-only");
+
+    let result = manager.global_default_profile(&owner, true);
+    fs::set_permissions(
+        &manager.default_profile_root,
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore default binding directory permissions");
+
+    assert!(matches!(result, Err(ProfileError::Io(_))));
+    assert!(
+        manager.list_all_profiles().unwrap().is_empty(),
+        "a failed pending-intent write must happen before any profile record exists"
+    );
+    assert!(manager
+        .global_default_profile(&owner, false)
+        .expect("inspect default after failed intent")
+        .is_none());
+}
+
+#[test]
+fn pending_default_recovers_the_exact_id_from_every_creation_crash_window() {
+    for stage in 0..3 {
+        let temp = tempfile::tempdir().expect("pending default crash fixture");
+        let profile_state_root = temp.path().join("login/profile-state");
+        let cef_cache_root = temp.path().join("login/cef");
+        let manager =
+            BrowserProfileManager::new(profile_state_root.clone(), cef_cache_root.clone())
+                .expect("create browser profile manager");
+        let owner = workspace(&format!("workspace-pending-default-owner-{stage}"));
+        let sibling_owner = workspace(&format!("workspace-pending-default-sibling-{stage}"));
+        let sibling = manager
+            .create_profile_record(&sibling_owner)
+            .expect("create isolated sibling fixture");
+        let pending_id = if stage >= 2 {
+            manager
+                .create_profile_record(&owner)
+                .expect("finish exact profile before bound generation")
+                .profile_id()
+                .clone()
+        } else {
+            ProfileId::generate()
+        };
+        write_pending_default_binding(&manager, 1, &pending_id, &owner);
+
+        if stage >= 1 {
+            let staging = pending_default_staging_dir(&manager, &pending_id);
+            fs::create_dir(&staging).expect("create partial pending staging directory");
+            fs::write(staging.join("partial-secret"), b"must not survive recovery")
+                .expect("write partial pending staging marker");
+        }
+        drop(manager);
+
+        let restarted = BrowserProfileManager::new(profile_state_root, cef_cache_root)
+            .expect("restart browser profile manager");
+        let recovered = restarted
+            .global_default_profile(&workspace("workspace-pending-default-reader"), false)
+            .expect("recover pending global default")
+            .expect("pending global default descriptor");
+        assert_eq!(recovered.profile_id(), &pending_id);
+        assert_eq!(recovered.workspace_identity(), owner.as_str());
+        assert_ne!(recovered.profile_id(), sibling.profile_id());
+        assert!(matches!(
+            recovered.cleanup_state(),
+            ProfileCleanupState::Stopped
+        ));
+        assert!(!pending_default_staging_dir(&restarted, &pending_id).exists());
+        assert_eq!(restarted.list_all_profiles().unwrap().len(), 2);
+        assert!(restarted.is_global_default(&pending_id).unwrap());
+
+        let mut generations = fs::read_dir(&restarted.default_profile_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("default-") && name.ends_with(".json"))
+            })
+            .collect::<Vec<_>>();
+        generations.sort_by_key(|entry| entry.file_name());
+        assert_eq!(generations.len(), 2, "binding recovery must append");
+        let pending: serde_json::Value =
+            serde_json::from_slice(&fs::read(generations[0].path()).unwrap()).unwrap();
+        let bound: serde_json::Value =
+            serde_json::from_slice(&fs::read(generations[1].path()).unwrap()).unwrap();
+        assert_eq!(
+            pending["pending_owner_identity"],
+            serde_json::Value::String(owner.as_str().to_string())
+        );
+        assert_eq!(
+            bound["profile_id"],
+            serde_json::Value::String(pending_id.as_str().to_string())
+        );
+        assert!(bound.get("pending_owner_identity").is_none());
+    }
+}
+
+#[test]
+fn pending_default_exact_record_must_match_owner_and_be_stopped() {
+    let (_temp, manager) = manager();
+    let intended_owner = workspace("workspace-pending-default-intended-owner");
+    let wrong_owner = workspace("workspace-pending-default-wrong-owner");
+    let wrong_descriptor = manager
+        .create_profile_record(&wrong_owner)
+        .expect("create wrong-owner exact record");
+    write_pending_default_binding(&manager, 1, wrong_descriptor.profile_id(), &intended_owner);
+    assert!(matches!(
+        manager.global_default_profile(&intended_owner, true),
+        Err(ProfileError::CorruptMetadata(_))
+    ));
+    assert!(!manager
+        .is_global_default(wrong_descriptor.profile_id())
+        .unwrap_or(false));
+
+    let temp = tempfile::tempdir().expect("pending non-stopped fixture");
+    let second = BrowserProfileManager::new(
+        temp.path().join("login/profile-state"),
+        temp.path().join("login/cef"),
+    )
+    .expect("create second browser profile manager");
+    let owner = workspace("workspace-pending-default-non-stopped");
+    let descriptor = second
+        .create_profile_record(&owner)
+        .expect("create exact pending profile");
+    let lease = second
+        .acquire_launch_lease(descriptor.profile_id(), &owner)
+        .expect("mark exact pending profile non-stopped");
+    write_pending_default_binding(&second, 1, descriptor.profile_id(), &owner);
+    assert!(matches!(
+        second.global_default_profile(&owner, true),
+        Err(ProfileError::CorruptMetadata(_))
+    ));
+    drop(lease);
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_default_recovery_rejects_a_symlinked_staging_directory() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, manager) = manager();
+    let owner = workspace("workspace-pending-default-staging-symlink");
+    let pending_id = ProfileId::generate();
+    write_pending_default_binding(&manager, 1, &pending_id, &owner);
+    let outside = temp.path().join("outside-pending-default");
+    fs::create_dir(&outside).expect("create outside staging target");
+    let outside_marker = outside.join("must-survive");
+    fs::write(&outside_marker, b"outside").expect("write outside marker");
+    symlink(&outside, pending_default_staging_dir(&manager, &pending_id))
+        .expect("replace pending staging with symlink");
+
+    assert!(matches!(
+        manager.global_default_profile(&owner, true),
+        Err(ProfileError::UnsafePath(_))
+    ));
+    assert!(outside_marker.exists());
+    assert!(matches!(
+        manager.global_default_profile(&owner, false),
+        Err(ProfileError::UnsafePath(_))
+    ));
+}
+
+#[test]
 fn global_default_migrates_existing_profile_in_place_and_survives_manager_restart() {
     let (temp, manager) = manager();
     let workspace_a = workspace("workspace-global-migration-a");
@@ -823,4 +1036,180 @@ fn destructive_cleanup_states_resume_only_with_fresh_trusted_authorization() {
         Err(ProfileError::ProfileNotFound(_))
     ));
     assert!(!cef_profile_dir.exists());
+}
+
+#[test]
+fn reset_restarts_safely_from_every_durable_cleanup_stage() {
+    // Exercise every process-crash boundary after Resetting is durable: before either rename,
+    // after each rename but before its replacement directory exists, after each replacement, and
+    // after each tombstone deletion but before Stopped is committed.
+    for stage in 0..7 {
+        let temp = tempfile::tempdir().expect("profile reset crash-stage fixture");
+        let profile_state_root = temp.path().join("login/profile-state");
+        let cef_cache_root = temp.path().join("login/cef");
+        let manager =
+            BrowserProfileManager::new(profile_state_root.clone(), cef_cache_root.clone())
+                .expect("create browser profile manager");
+        let workspace = workspace(&format!("workspace-reset-crash-stage-{stage}"));
+        let descriptor = manager.create_profile(&workspace).expect("create profile");
+        let profile_dir = manager.profiles_root.join(descriptor.profile_id().as_str());
+        let user_data = profile_dir.join("user-data");
+        let cef_profile_dir = manager
+            .checked_cef_profile_dir(descriptor.profile_id())
+            .expect("CEF profile path");
+        fs::create_dir(&cef_profile_dir).expect("create CEF profile cache");
+        let user_marker = user_data.join("Cookies");
+        let cef_marker = cef_profile_dir.join("Cookies");
+        fs::write(&user_marker, b"stale user-data token").expect("write user-data token");
+        fs::write(&cef_marker, b"stale CEF token").expect("write CEF token");
+
+        let reset_id = format!("destructive-crash-stage-{stage}");
+        let mut interrupted = manager
+            .acquire_maintenance_lock(descriptor.profile_id(), &workspace)
+            .expect("lock interrupted reset fixture");
+        interrupted.descriptor.cleanup_state = ProfileCleanupState::Resetting {
+            authorization_id: reset_id.clone(),
+            since: Utc::now().to_rfc3339(),
+        };
+        interrupted.persist().expect("persist reset intent");
+        drop(interrupted);
+
+        let user_tombstone = profile_dir.join(format!("user-data.reset-{reset_id}"));
+        let cef_tombstone = cef_cache_root.join(format!(
+            "Profile-{}.reset-{reset_id}",
+            descriptor.profile_id().as_str()
+        ));
+        if stage >= 1 {
+            fs::rename(&user_data, &user_tombstone).expect("stage user-data reset");
+        }
+        if stage >= 2 {
+            fs::create_dir(&user_data).expect("create replacement user-data");
+        }
+        if stage >= 3 {
+            fs::rename(&cef_profile_dir, &cef_tombstone).expect("stage CEF reset");
+        }
+        if stage >= 4 {
+            fs::create_dir(&cef_profile_dir).expect("create replacement CEF cache");
+        }
+        if stage >= 5 {
+            fs::remove_dir_all(&user_tombstone).expect("delete user-data tombstone");
+        }
+        if stage >= 6 {
+            fs::remove_dir_all(&cef_tombstone).expect("delete CEF tombstone");
+        }
+        drop(manager);
+
+        let restarted = BrowserProfileManager::new(profile_state_root, cef_cache_root)
+            .expect("restart browser profile manager");
+        assert!(matches!(
+            restarted
+                .descriptor(descriptor.profile_id(), &workspace)
+                .expect("reload interrupted descriptor")
+                .cleanup_state(),
+            ProfileCleanupState::Resetting { authorization_id, .. }
+                if authorization_id == &reset_id
+        ));
+        assert!(matches!(
+            restarted.acquire_launch_lease(descriptor.profile_id(), &workspace),
+            Err(ProfileError::ProfileRequiresCleanup)
+        ));
+
+        let reset = authorization(DestructiveProfileAction::Reset, &descriptor, &workspace);
+        let recovered = restarted
+            .reset_profile(reset)
+            .expect("resume reset after process restart");
+        assert!(matches!(
+            recovered.cleanup_state(),
+            ProfileCleanupState::Stopped
+        ));
+        assert!(user_data.is_dir());
+        assert!(cef_profile_dir.is_dir());
+        assert!(!user_marker.exists());
+        assert!(!cef_marker.exists());
+        assert!(!user_tombstone.exists());
+        assert!(!cef_tombstone.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_cleanup_failure_stays_retryable_until_both_tombstones_are_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temp, manager) = manager();
+    let workspace = workspace("workspace-reset-cleanup-retry-001");
+    let descriptor = manager.create_profile(&workspace).expect("create profile");
+    let profile_dir = manager.profiles_root.join(descriptor.profile_id().as_str());
+    let user_data = profile_dir.join("user-data");
+    fs::write(user_data.join("Cookies"), b"stale user-data token").expect("write user-data token");
+    let cef_profile_dir = manager
+        .checked_cef_profile_dir(descriptor.profile_id())
+        .expect("CEF profile path");
+    fs::create_dir(&cef_profile_dir).expect("create CEF profile cache");
+    let protected = cef_profile_dir.join("protected");
+    fs::create_dir(&protected).expect("create protected CEF child");
+    fs::write(protected.join("token"), b"stale CEF token").expect("write protected CEF token");
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o500))
+        .expect("make tombstone cleanup fail");
+
+    let error = manager
+        .reset_profile(authorization(
+            DestructiveProfileAction::Reset,
+            &descriptor,
+            &workspace,
+        ))
+        .expect_err("protected tombstone must reject reset completion");
+    assert!(matches!(error, ProfileError::Io(_)));
+    assert!(
+        !error
+            .to_string()
+            .contains(&temp.path().display().to_string()),
+        "reset errors must not expose the private profile path"
+    );
+
+    let interrupted = manager
+        .descriptor(descriptor.profile_id(), &workspace)
+        .expect("reload failed reset descriptor");
+    let reset_id = match interrupted.cleanup_state() {
+        ProfileCleanupState::Resetting {
+            authorization_id, ..
+        } => authorization_id.clone(),
+        state => panic!("failed cleanup must remain Resetting, got {state:?}"),
+    };
+    assert!(matches!(
+        manager.acquire_launch_lease(descriptor.profile_id(), &workspace),
+        Err(ProfileError::ProfileRequiresCleanup)
+    ));
+    let cef_tombstone = manager.cef_cache_root.join(format!(
+        "Profile-{}.reset-{reset_id}",
+        descriptor.profile_id().as_str()
+    ));
+    assert!(cef_tombstone.is_dir());
+    fs::set_permissions(
+        cef_tombstone.join("protected"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore tombstone permissions");
+    let profile_state_root = manager.root().to_path_buf();
+    let cef_cache_root = manager.cef_cache_root().to_path_buf();
+    drop(manager);
+
+    let restarted = BrowserProfileManager::new(profile_state_root, cef_cache_root)
+        .expect("restart browser profile manager");
+    let recovered = restarted
+        .reset_profile(authorization(
+            DestructiveProfileAction::Reset,
+            &descriptor,
+            &workspace,
+        ))
+        .expect("retry reset with fresh trusted authorization");
+    assert!(matches!(
+        recovered.cleanup_state(),
+        ProfileCleanupState::Stopped
+    ));
+    assert!(!cef_tombstone.exists());
+    assert!(restarted
+        .cef_cache_root
+        .join(format!("Profile-{}", descriptor.profile_id().as_str()))
+        .is_dir());
 }

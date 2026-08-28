@@ -2,7 +2,7 @@ use super::MacosSafeStorageSmokeConfig;
 use crate::browser::{
     login::{
         cef::host::CefHostController,
-        session::{LoginBrowserSessionManager, TrustedWorkspacePath},
+        session::LoginBrowserSessionManager,
         surface_commands::{
             BrowserSurfaceControlActionArg, LoginBrowserSurfaceManager, ProductionSmokeLease,
             ProductionSmokeScreenshotProof, ProductionSmokeSemanticRun,
@@ -26,9 +26,10 @@ use std::{
 };
 use tauri::AppHandle;
 
-const PROOF_SCHEMA_VERSION: u32 = 2;
+const PROOF_SCHEMA_VERSION: u32 = 3;
 const EFFECT_ENTRY_TIMEOUT: Duration = Duration::from_secs(5);
 const EFFECT_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const SEMANTIC_ORIGIN_PORT_FILE: &str = "production-origin-port";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,15 +49,19 @@ pub(super) struct MacosProductionSemanticProof {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct MacosProductionProfileIsolationProof {
-    distinct_workspace_profiles: bool,
-    primary_cookie_persisted: bool,
-    primary_local_storage_persisted: bool,
-    secondary_profile_initially_empty: bool,
-    secondary_cookie_isolated: bool,
-    secondary_local_storage_isolated: bool,
-    primary_unchanged_after_secondary: bool,
-    secondary_unchanged_after_primary: bool,
+pub(super) struct MacosProductionProfileStorageProof {
+    default_profile_shared_across_workspaces: bool,
+    default_cookie_shared: bool,
+    default_local_storage_shared: bool,
+    default_cookie_persisted: bool,
+    default_local_storage_persisted: bool,
+    explicit_profile_isolated: bool,
+    explicit_profile_initially_empty: bool,
+    explicit_cookie_isolated: bool,
+    explicit_local_storage_isolated: bool,
+    explicit_cookie_persisted: bool,
+    explicit_local_storage_persisted: bool,
+    default_unchanged_after_explicit: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -79,13 +84,18 @@ pub(super) struct MacosProductionPathProof {
     session_root: String,
     workspace_root: String,
     secondary_workspace_root: String,
-    primary_profile_id: String,
-    reopened_primary_profile_id: String,
-    final_primary_profile_id: String,
-    secondary_profile_id: String,
-    final_secondary_profile_id: String,
+    default_profile_id: String,
+    default_session_id: String,
+    cross_workspace_default_profile_id: String,
+    cross_workspace_default_session_id: String,
+    explicit_profile_id: String,
+    explicit_session_id: String,
+    reopened_explicit_profile_id: String,
+    reopened_explicit_session_id: String,
+    final_default_profile_id: String,
+    final_default_session_id: String,
     semantic: MacosProductionSemanticProof,
-    profile_isolation: MacosProductionProfileIsolationProof,
+    profile_storage: MacosProductionProfileStorageProof,
     cleanup: MacosProductionCleanupProof,
 }
 
@@ -162,17 +172,16 @@ pub(super) fn run(
     };
     let preview = Arc::new(BrowserManager::default());
     let mut cleanup = ProductionCleanup::new(app.clone(), runtime, Arc::clone(&preview));
-    let server = LocalSemanticServer::start(&config.nonce)?;
+    let server = LocalSemanticServer::start(&config.nonce, &session_root, &config.phase)?;
     let workspace = workspace_root.to_string_lossy().into_owned();
     let secondary_workspace = secondary_workspace_root.to_string_lossy().into_owned();
 
-    let mut primary = cleanup.runtime.surfaces.production_smoke_acquire(
+    let mut primary = cleanup.runtime.surfaces.production_smoke_acquire_default(
         app,
         &cleanup.runtime.sessions,
         &cleanup.runtime.cef_host,
         &preview,
         workspace.clone(),
-        None,
         server.url().to_string(),
         1,
     )?;
@@ -196,14 +205,24 @@ pub(super) fn run(
     )?;
     cleanup.lease = Some(primary.clone());
 
-    let primary_marker = format!("CCEM_MODE2_MAC_PRIMARY_{}", &config.nonce[..16]);
+    let primary_marker = format!("CCEM_MODE2_MAC_DEFAULT_{}", &config.nonce[..16]);
+    let initial_storage_value = if config.phase == "verify" {
+        primary_marker.as_str()
+    } else {
+        ""
+    };
     let ProductionSmokeSemanticRun {
         proof: semantic,
         active_effect,
     } = cleanup
         .runtime
         .sessions
-        .production_smoke_run_semantic_chain(&workspace, server.url(), &primary_marker)?;
+        .production_smoke_run_semantic_chain_with_initial_storage(
+            &workspace,
+            server.url(),
+            &primary_marker,
+            initial_storage_value,
+        )?;
     server.wait_for_effect_entry(EFFECT_ENTRY_TIMEOUT)?;
     let occlusion_started = Instant::now();
     cleanup.runtime.surfaces.production_smoke_control(
@@ -243,64 +262,75 @@ pub(super) fn run(
         .runtime
         .sessions
         .production_smoke_verify_profile_storage(&workspace, server.url(), &primary_marker, true)?;
-    let primary_profile_id = primary.profile_id.clone();
+    let default_profile_id = primary.profile_id.clone();
+    let default_session_id = primary.session_id.clone();
     release(&mut cleanup, &mut primary, 7)?;
 
-    let mut reopened_primary = acquire_saved(
+    let mut cross_workspace_default = acquire_default(
         &mut cleanup,
         &preview,
-        &workspace,
-        &primary_profile_id,
+        &secondary_workspace,
         server.url(),
         8,
     )?;
+    if cross_workspace_default.profile_id != default_profile_id {
+        return Err(
+            "macOS Mode 2 workspaces did not select the same app-global Default profile".into(),
+        );
+    }
+    if cross_workspace_default.session_id == default_session_id {
+        return Err(
+            "macOS Mode 2 workspaces reused one browser session for the shared Default profile"
+                .into(),
+        );
+    }
     cleanup
         .runtime
         .sessions
         .production_smoke_verify_profile_storage(
-            &workspace,
+            &secondary_workspace,
             server.url(),
             &primary_marker,
             false,
         )?;
-    let reopened_primary_profile_id = reopened_primary.profile_id.clone();
-    release(&mut cleanup, &mut reopened_primary, 11)?;
+    let cross_workspace_default_profile_id = cross_workspace_default.profile_id.clone();
+    let cross_workspace_default_session_id = cross_workspace_default.session_id.clone();
+    release(&mut cleanup, &mut cross_workspace_default, 11)?;
 
-    let mut secondary = cleanup.runtime.surfaces.production_smoke_acquire(
-        app,
-        &cleanup.runtime.sessions,
-        &cleanup.runtime.cef_host,
-        &preview,
-        secondary_workspace.clone(),
-        None,
-        server.url().to_string(),
-        12,
-    )?;
-    if secondary.profile_id == primary_profile_id {
-        return Err("macOS Mode 2 isolated workspaces selected the same profile".into());
+    let mut explicit = cleanup
+        .runtime
+        .surfaces
+        .production_smoke_acquire_explicit_new(
+            app,
+            &cleanup.runtime.sessions,
+            &cleanup.runtime.cef_host,
+            &preview,
+            secondary_workspace.clone(),
+            server.url().to_string(),
+            12,
+        )?;
+    if explicit.profile_id == default_profile_id {
+        return Err("macOS Mode 2 Explicit New selected the app-global Default profile".into());
     }
-    cleanup.lease = Some(secondary.clone());
-    show_and_handoff(&mut cleanup, &preview, &mut secondary, 13, 14)?;
-    let secondary_marker = format!("CCEM_MODE2_MAC_SECONDARY_{}", &config.nonce[..16]);
+    cleanup.lease = Some(explicit.clone());
+    show_and_handoff(&mut cleanup, &preview, &mut explicit, 13, 14)?;
+    let explicit_marker = format!("CCEM_MODE2_MAC_EXPLICIT_{}", &config.nonce[..16]);
     cleanup
         .runtime
         .sessions
         .production_smoke_write_isolated_profile(
             &secondary_workspace,
             server.url(),
-            &secondary_marker,
+            &explicit_marker,
         )?;
-    let secondary_profile_id = secondary.profile_id.clone();
-    release(&mut cleanup, &mut secondary, 15)?;
+    let explicit_profile_id = explicit.profile_id.clone();
+    let explicit_session_id = explicit.session_id.clone();
+    release(&mut cleanup, &mut explicit, 15)?;
 
-    let mut final_primary = acquire_saved(
-        &mut cleanup,
-        &preview,
-        &workspace,
-        &primary_profile_id,
-        server.url(),
-        16,
-    )?;
+    let mut final_default = acquire_default(&mut cleanup, &preview, &workspace, server.url(), 16)?;
+    if final_default.profile_id != default_profile_id {
+        return Err("macOS Mode 2 final Default reopen selected a different profile".into());
+    }
     cleanup
         .runtime
         .sessions
@@ -310,14 +340,15 @@ pub(super) fn run(
             &primary_marker,
             false,
         )?;
-    let final_primary_profile_id = final_primary.profile_id.clone();
-    release(&mut cleanup, &mut final_primary, 19)?;
+    let final_default_profile_id = final_default.profile_id.clone();
+    let final_default_session_id = final_default.session_id.clone();
+    release(&mut cleanup, &mut final_default, 19)?;
 
-    let mut final_secondary = acquire_saved(
+    let mut reopened_explicit = acquire_saved(
         &mut cleanup,
         &preview,
         &secondary_workspace,
-        &secondary_profile_id,
+        &explicit_profile_id,
         server.url(),
         20,
     )?;
@@ -327,20 +358,22 @@ pub(super) fn run(
         .production_smoke_verify_profile_storage(
             &secondary_workspace,
             server.url(),
-            &secondary_marker,
+            &explicit_marker,
             false,
         )?;
-    let final_secondary_profile_id = final_secondary.profile_id.clone();
-    release(&mut cleanup, &mut final_secondary, 23)?;
+    if reopened_explicit.session_id == explicit_session_id {
+        return Err("macOS Mode 2 Explicit New reopen reused the prior browser session".into());
+    }
+    let reopened_explicit_profile_id = reopened_explicit.profile_id.clone();
+    let reopened_explicit_session_id = reopened_explicit.session_id.clone();
+    release(&mut cleanup, &mut reopened_explicit, 23)?;
 
     let cleanup_proof = verify_cleanup(
         &cleanup.runtime,
         &owner_record_root,
         &profile_state_root,
-        [
-            (&workspace_root, primary_profile_id.as_str()),
-            (&secondary_workspace_root, secondary_profile_id.as_str()),
-        ],
+        [default_profile_id.as_str(), explicit_profile_id.as_str()],
+        if config.phase == "prime" { 2 } else { 3 },
     )?;
     drop(server);
 
@@ -351,11 +384,16 @@ pub(super) fn run(
         session_root: session_root.to_string_lossy().into_owned(),
         workspace_root: workspace,
         secondary_workspace_root: secondary_workspace,
-        primary_profile_id,
-        reopened_primary_profile_id,
-        final_primary_profile_id,
-        secondary_profile_id,
-        final_secondary_profile_id,
+        default_profile_id,
+        default_session_id,
+        cross_workspace_default_profile_id,
+        cross_workspace_default_session_id,
+        explicit_profile_id,
+        explicit_session_id,
+        reopened_explicit_profile_id,
+        reopened_explicit_session_id,
+        final_default_profile_id,
+        final_default_session_id,
         semantic: MacosProductionSemanticProof {
             navigated_via_capability: semantic.navigated_via_capability,
             ax_snapshot_via_capability: semantic.ax_snapshot_via_capability,
@@ -369,15 +407,19 @@ pub(super) fn run(
             occlusion_ack_millis,
             post_pause_no_late_write: true,
         },
-        profile_isolation: MacosProductionProfileIsolationProof {
-            distinct_workspace_profiles: true,
-            primary_cookie_persisted: true,
-            primary_local_storage_persisted: true,
-            secondary_profile_initially_empty: true,
-            secondary_cookie_isolated: true,
-            secondary_local_storage_isolated: true,
-            primary_unchanged_after_secondary: true,
-            secondary_unchanged_after_primary: true,
+        profile_storage: MacosProductionProfileStorageProof {
+            default_profile_shared_across_workspaces: true,
+            default_cookie_shared: true,
+            default_local_storage_shared: true,
+            default_cookie_persisted: true,
+            default_local_storage_persisted: true,
+            explicit_profile_isolated: true,
+            explicit_profile_initially_empty: true,
+            explicit_cookie_isolated: true,
+            explicit_local_storage_isolated: true,
+            explicit_cookie_persisted: true,
+            explicit_local_storage_persisted: true,
+            default_unchanged_after_explicit: true,
         },
         cleanup: cleanup_proof,
     })
@@ -391,19 +433,40 @@ fn acquire_saved(
     url: &str,
     revision: u64,
 ) -> Result<ProductionSmokeLease, String> {
-    let mut lease = cleanup.runtime.surfaces.production_smoke_acquire(
+    let mut lease = cleanup.runtime.surfaces.production_smoke_acquire_saved(
         &cleanup.app,
         &cleanup.runtime.sessions,
         &cleanup.runtime.cef_host,
         preview,
         workspace.to_string(),
-        Some(profile_id.to_string()),
+        profile_id.to_string(),
         url.to_string(),
         revision,
     )?;
     if lease.profile_id != profile_id {
         return Err("macOS Mode 2 saved profile reopen selected a different profile".into());
     }
+    cleanup.lease = Some(lease.clone());
+    show_and_handoff(cleanup, preview, &mut lease, revision + 1, revision + 2)?;
+    Ok(lease)
+}
+
+fn acquire_default(
+    cleanup: &mut ProductionCleanup,
+    preview: &Arc<BrowserManager>,
+    workspace: &str,
+    url: &str,
+    revision: u64,
+) -> Result<ProductionSmokeLease, String> {
+    let mut lease = cleanup.runtime.surfaces.production_smoke_acquire_default(
+        &cleanup.app,
+        &cleanup.runtime.sessions,
+        &cleanup.runtime.cef_host,
+        preview,
+        workspace.to_string(),
+        url.to_string(),
+        revision,
+    )?;
     cleanup.lease = Some(lease.clone());
     show_and_handoff(cleanup, preview, &mut lease, revision + 1, revision + 2)?;
     Ok(lease)
@@ -469,7 +532,8 @@ fn verify_cleanup(
     runtime: &ProductionRuntime,
     owner_record_root: &Path,
     profile_state_root: &Path,
-    profiles: [(&Path, &str); 2],
+    profile_ids: [&str; 2],
+    expected_persisted_profile_count: u32,
 ) -> Result<MacosProductionCleanupProof, String> {
     runtime.surfaces.production_smoke_assert_inactive()?;
     let active_session_count = runtime
@@ -488,16 +552,12 @@ fn verify_cleanup(
     if owner_record_count != 0 {
         return Err("macOS Mode 2 smoke retained an embedded owner record".into());
     }
-    for (workspace_root, profile_id) in profiles {
-        let workspace = TrustedWorkspacePath::from_trusted_app(workspace_root.to_path_buf())
-            .map_err(|error| error.to_string())?;
-        let summaries = runtime
-            .sessions
-            .profile_summaries(workspace)
-            .map_err(|error| error.to_string())?;
-        if summaries.len() != 1 || summaries[0].profile_id != profile_id {
-            return Err("macOS Mode 2 workspace profile inventory is inconsistent".into());
-        }
+    if profile_ids[0] == profile_ids[1] {
+        return Err(
+            "macOS Mode 2 cleanup received one profile for Default and Explicit New".into(),
+        );
+    }
+    for profile_id in profile_ids {
         require_profile_lock_available(
             &profile_state_root
                 .join("profiles")
@@ -505,11 +565,29 @@ fn verify_cleanup(
                 .join("profile.lock"),
         )?;
     }
+    let profile_entries = fs::read_dir(profile_state_root.join("profiles"))
+        .map_err(|error| format!("read macOS Mode 2 persisted profiles: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("inspect macOS Mode 2 persisted profiles: {error}"))?;
+    for entry in &profile_entries {
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("inspect macOS Mode 2 persisted profile: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("macOS Mode 2 persisted profile is not a regular directory".into());
+        }
+    }
+    let persisted_profile_count = u32::try_from(profile_entries.len())
+        .map_err(|_| "macOS Mode 2 persisted profile count exceeded u32")?;
+    if persisted_profile_count != expected_persisted_profile_count {
+        return Err(format!(
+            "macOS Mode 2 persisted profile count was {persisted_profile_count}, expected {expected_persisted_profile_count}"
+        ));
+    }
     Ok(MacosProductionCleanupProof {
         active_surface_count: 0,
         active_session_count: 0,
         owner_record_count: 0,
-        persisted_profile_count: 2,
+        persisted_profile_count,
         workspace_count: 2,
         profile_locks_available: true,
     })
@@ -541,9 +619,8 @@ struct LocalSemanticServer {
 }
 
 impl LocalSemanticServer {
-    fn start(nonce: &str) -> Result<Self, String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|error| format!("bind macOS Mode 2 smoke origin: {error}"))?;
+    fn start(nonce: &str, session_root: &Path, phase: &str) -> Result<Self, String> {
+        let listener = bind_persistent_semantic_origin(session_root, phase)?;
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("configure macOS Mode 2 smoke origin: {error}"))?;
@@ -595,6 +672,77 @@ impl LocalSemanticServer {
             }
         }
         Err("macOS Mode 2 active effect never reached the page barrier".into())
+    }
+}
+
+fn bind_persistent_semantic_origin(
+    session_root: &Path,
+    phase: &str,
+) -> Result<TcpListener, String> {
+    let port_path = session_root.join(SEMANTIC_ORIGIN_PORT_FILE);
+    match phase {
+        "prime" => {
+            if fs::symlink_metadata(&port_path).is_ok() {
+                return Err("macOS Mode 2 semantic origin port already exists before prime".into());
+            }
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .map_err(|error| format!("bind macOS Mode 2 prime semantic origin: {error}"))?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| format!("resolve macOS Mode 2 prime semantic origin: {error}"))?
+                .port();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&port_path)
+                .map_err(|error| format!("create macOS Mode 2 semantic origin port: {error}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|error| {
+                        format!("protect macOS Mode 2 semantic origin port: {error}")
+                    })?;
+            }
+            file.write_all(port.to_string().as_bytes())
+                .map_err(|error| format!("write macOS Mode 2 semantic origin port: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("sync macOS Mode 2 semantic origin port: {error}"))?;
+            fs::File::open(session_root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync macOS Mode 2 semantic origin directory: {error}"))?;
+            Ok(listener)
+        }
+        "verify" => {
+            let metadata = fs::symlink_metadata(&port_path)
+                .map_err(|error| format!("inspect macOS Mode 2 semantic origin port: {error}"))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 5 {
+                return Err(
+                    "macOS Mode 2 semantic origin port is not a bounded regular file".into(),
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err(
+                        "macOS Mode 2 semantic origin port is not private to this user".into(),
+                    );
+                }
+            }
+            let raw = fs::read_to_string(&port_path)
+                .map_err(|error| format!("read macOS Mode 2 semantic origin port: {error}"))?;
+            let port = raw
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port >= 1024)
+                .ok_or_else(|| "macOS Mode 2 semantic origin port is invalid".to_string())?;
+            TcpListener::bind(("127.0.0.1", port))
+                .map_err(|error| format!("rebind macOS Mode 2 semantic origin: {error}"))
+        }
+        _ => Err("macOS Mode 2 semantic origin phase is invalid".into()),
     }
 }
 
@@ -672,4 +820,37 @@ race.addEventListener('click',()=>{{late.value='LATE_WRITE_MUST_NOT_APPEAR';}});
 sync();
 </script>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prime_and_verify_bind_the_same_persisted_semantic_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let prime = bind_persistent_semantic_origin(root.path(), "prime").unwrap();
+        let prime_port = prime.local_addr().unwrap().port();
+        drop(prime);
+
+        let verify = bind_persistent_semantic_origin(root.path(), "verify").unwrap();
+        assert_eq!(verify.local_addr().unwrap().port(), prime_port);
+        assert_eq!(
+            fs::read_to_string(root.path().join(SEMANTIC_ORIGIN_PORT_FILE)).unwrap(),
+            prime_port.to_string(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_rejects_a_symlinked_semantic_origin_port() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"41000").unwrap();
+        symlink(&outside, root.path().join(SEMANTIC_ORIGIN_PORT_FILE)).unwrap();
+
+        assert!(bind_persistent_semantic_origin(root.path(), "verify").is_err());
+    }
 }

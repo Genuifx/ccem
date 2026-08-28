@@ -22,8 +22,8 @@ function fixture() {
   };
 }
 
-test('schema binds the full semantic race and two-profile stage order', () => {
-  assert.equal(WINDOWS_MODE2_SMOKE_SCHEMA_VERSION, 9);
+test('schema binds the full semantic race, shared Default, and Explicit New stage order', () => {
+  assert.equal(WINDOWS_MODE2_SMOKE_SCHEMA_VERSION, 10);
   assert.deepEqual(WINDOWS_MODE2_REQUIRED_STAGES.slice(8, 15), [
     'production_semantic_chain_started',
     'production_active_effect_entered',
@@ -33,21 +33,26 @@ test('schema binds the full semantic race and two-profile stage order', () => {
     'production_rehandoff',
     'production_post_pause_no_late_write',
   ]);
-  assert.deepEqual(WINDOWS_MODE2_REQUIRED_STAGES.slice(23), [
-    'production_secondary_acquired',
-    'production_secondary_shown',
-    'production_secondary_handoff',
-    'production_secondary_isolation_verified',
-    'production_secondary_released',
-    'production_secondary_reopened_ready',
-    'production_secondary_reopened_shown',
-    'production_secondary_reopened_handoff',
-    'production_secondary_persistence_verified',
-    'production_secondary_reclosed',
-    'production_primary_final_reopened',
-    'production_primary_final_handoff',
-    'production_primary_unchanged_verified',
-    'production_primary_final_released',
+  assert.deepEqual(WINDOWS_MODE2_REQUIRED_STAGES.slice(18), [
+    'production_cross_workspace_default_ready',
+    'production_cross_workspace_default_shown',
+    'production_cross_workspace_default_handoff',
+    'production_cross_workspace_default_storage_shared_verified',
+    'production_cross_workspace_default_released',
+    'production_explicit_new_acquired',
+    'production_explicit_new_shown',
+    'production_explicit_new_handoff',
+    'production_explicit_new_isolation_verified',
+    'production_explicit_new_released',
+    'production_explicit_reopened_ready',
+    'production_explicit_reopened_shown',
+    'production_explicit_reopened_handoff',
+    'production_explicit_persistence_verified',
+    'production_explicit_reclosed',
+    'production_default_final_reopened',
+    'production_default_final_handoff',
+    'production_default_unchanged_verified',
+    'production_default_final_released',
     'production_cleanup_verified',
   ]);
 });
@@ -91,30 +96,42 @@ test('every semantic proof and the sub-second acknowledgement fail closed', () =
   }
 });
 
-test('profile storage isolation binds two workspaces, distinct profiles, and clean locks', () => {
-  for (const field of Object.keys(fixture().profileIsolation)
-    .filter((name) => !['secondaryWorkspaceRoot', 'secondaryProfileId'].includes(name))) {
+test('profile storage binds cross-workspace Default sharing and Explicit New isolation', () => {
+  for (const field of Object.keys(fixture().profileStorage)
+    .filter((name) => name !== 'secondaryWorkspaceRoot')) {
     const mutated = fixture();
-    mutated.profileIsolation[field] = false;
+    mutated.profileStorage[field] = false;
     assert.throws(
       () => validateWindowsMode2SemanticAndProfileProof(mutated, smokeRoot),
-      /profile isolation proof/u,
+      /profile storage proof/u,
     );
   }
-  const sameProfile = fixture();
-  sameProfile.profileIsolation.secondaryProfileId = primaryProfileId;
+  const splitDefault = fixture();
+  splitDefault.crossWorkspaceDefaultProfileId = `profile-${'4'.repeat(32)}`;
   assert.throws(
-    () => validateWindowsMode2SemanticAndProfileProof(sameProfile, smokeRoot),
-    /not distinct/u,
+    () => validateWindowsMode2SemanticAndProfileProof(splitDefault, smokeRoot),
+    /same app-global Default profile/u,
   );
-  const wrongSecondaryReopen = fixture();
-  wrongSecondaryReopen.secondaryReopenedProfileId = `profile-${'4'.repeat(32)}`;
+  const reusedDefaultSession = fixture();
+  reusedDefaultSession.crossWorkspaceDefaultSessionId = reusedDefaultSession.defaultSessionId;
   assert.throws(
-    () => validateWindowsMode2SemanticAndProfileProof(wrongSecondaryReopen, smokeRoot),
-    /exact secondary profile/u,
+    () => validateWindowsMode2SemanticAndProfileProof(reusedDefaultSession, smokeRoot),
+    /distinct browser sessions/u,
+  );
+  const sameExplicitProfile = fixture();
+  sameExplicitProfile.explicitProfileId = primaryProfileId;
+  assert.throws(
+    () => validateWindowsMode2SemanticAndProfileProof(sameExplicitProfile, smokeRoot),
+    /Explicit New profile is not isolated/u,
+  );
+  const wrongExplicitReopen = fixture();
+  wrongExplicitReopen.reopenedExplicitProfileId = `profile-${'4'.repeat(32)}`;
+  assert.throws(
+    () => validateWindowsMode2SemanticAndProfileProof(wrongExplicitReopen, smokeRoot),
+    /exact Explicit New profile/u,
   );
   const escaped = fixture();
-  escaped.profileIsolation.secondaryWorkspaceRoot = 'D:\\escape';
+  escaped.profileStorage.secondaryWorkspaceRoot = 'D:\\escape';
   assert.throws(
     () => validateWindowsMode2SemanticAndProfileProof(escaped, smokeRoot),
     /escaped/u,
@@ -155,6 +172,15 @@ test('release smoke source retains semantic-only capability and active page-effe
   assert.match(runtime, /request\.open\('GET','\{effect_path\}',false\)/u);
   assert.match(runtime, /document\.cookie=.*localStorage\.setItem/u);
   assert.match(runtime, /secondary_workspace_root/u);
-  assert.match(runtime, /production_secondary_persistence_verified/u);
-  assert.match(runtime, /production_primary_unchanged_verified/u);
+  assert.match(runtime, /production_cross_workspace_default_storage_shared_verified/u);
+  assert.match(runtime, /production_explicit_persistence_verified/u);
+  assert.match(runtime, /production_default_unchanged_verified/u);
+  assert.match(
+    runtime,
+    /primary_profiles\.len\(\) != 1[\s\S]*!primary_profiles\[0\]\.is_default/u,
+  );
+  assert.match(
+    runtime,
+    /secondary_profiles\.len\(\) != 2[\s\S]*secondary_profiles\[0\]\.profile_id != primary_profile_id[\s\S]*secondary_profiles\[1\]\.profile_id != secondary_profile_id/u,
+  );
 });

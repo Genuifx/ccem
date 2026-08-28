@@ -404,14 +404,14 @@ fn secure_file(_path: &Path) -> Result<(), ProfileError> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), ProfileError> {
+pub(super) fn sync_directory(path: &Path) -> Result<(), ProfileError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| io_error("sync browser profile directory", error))
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), ProfileError> {
+pub(super) fn sync_directory(_path: &Path) -> Result<(), ProfileError> {
     Ok(())
 }
 

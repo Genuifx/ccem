@@ -361,6 +361,12 @@ pub struct NativeSessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
+    #[serde(default)]
+    pub display_title_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_user_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_boundary_message_count: Option<u64>,
     pub project_dir: String,
     pub env_name: String,
@@ -1747,6 +1753,9 @@ impl NativeSessionHandle {
             provider: record.provider,
             transport: record.transport,
             provider_session_id: record.provider_session_id,
+            display_title: None,
+            display_title_revision: 0,
+            initial_user_prompt: None,
             seed_boundary_message_count: record.seed_boundary_message_count,
             project_dir: record.project_dir,
             env_name: record.env_name,
@@ -1766,6 +1775,19 @@ impl NativeSessionHandle {
             router: record.router.as_ref().map(SessionRouterState::from),
         }
     }
+}
+
+fn initial_record_provider_session_id(
+    requested_provider_session_id: Option<&str>,
+    is_fork: bool,
+) -> Option<String> {
+    if is_fork {
+        return None;
+    }
+    requested_provider_session_id
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -2117,7 +2139,13 @@ impl NativeRuntimeManager {
             runtime_id: runtime_id.clone(),
             provider: options.provider,
             transport: NativeTransport::NativeSdk,
-            provider_session_id: options.provider_session_id.clone(),
+            // A fork starts with its parent's provider id in the helper init
+            // options. It is not the child session's identity and must never be
+            // persisted or exposed as authoritative before SessionMeta arrives.
+            provider_session_id: initial_record_provider_session_id(
+                options.provider_session_id.as_deref(),
+                options.fork_from_message_id.is_some(),
+            ),
             browser_actor_id: generate_browser_actor_id()?,
             seed_boundary_message_count: options.seed_boundary_message_count,
             project_dir: options.working_dir.clone(),
@@ -2439,6 +2467,9 @@ impl NativeRuntimeManager {
                         provider: record.provider,
                         transport: record.transport,
                         provider_session_id: record.provider_session_id,
+                        display_title: None,
+                        display_title_revision: 0,
+                        initial_user_prompt: None,
                         seed_boundary_message_count: record.seed_boundary_message_count,
                         project_dir: record.project_dir,
                         env_name: record.env_name,
@@ -2463,6 +2494,33 @@ impl NativeRuntimeManager {
 
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         sessions
+    }
+
+    /// Add the persisted first user-visible prompt only at IPC projection
+    /// boundaries. Keeping this out of `list_sessions` avoids event-log I/O in
+    /// runtime/decorations polling paths that do not render sidebar labels.
+    pub fn enrich_initial_user_prompts(&self, summaries: &mut [NativeSessionSummary]) {
+        let runtime_ids = summaries
+            .iter()
+            .filter(|summary| summary.initial_user_prompt.is_none())
+            .map(|summary| summary.runtime_id.clone())
+            .collect::<Vec<_>>();
+        if runtime_ids.is_empty() {
+            return;
+        }
+
+        let prompts = match self.event_log.first_user_prompts(&runtime_ids) {
+            Ok(prompts) => prompts,
+            Err(error) => {
+                eprintln!("Failed to restore native session initial prompts: {error}");
+                return;
+            }
+        };
+        for summary in summaries {
+            if summary.initial_user_prompt.is_none() {
+                summary.initial_user_prompt = prompts.get(&summary.runtime_id).cloned();
+            }
+        }
     }
 
     pub fn replay_events(
@@ -7523,6 +7581,9 @@ impl NativeRuntimeManager {
                 provider: record.provider,
                 transport: record.transport,
                 provider_session_id: record.provider_session_id,
+                display_title: None,
+                display_title_revision: 0,
+                initial_user_prompt: None,
                 seed_boundary_message_count: record.seed_boundary_message_count,
                 project_dir: record.project_dir,
                 env_name: record.env_name,
@@ -8006,12 +8067,13 @@ mod tests {
     use super::unix_descendant_process_ids;
     use super::{
         apply_session_router_patch, authorize_browser_tool_for_record, clear_terminal_launches,
-        drain_helper_output_lines, is_retryable_native_child_write_error,
-        is_unknown_native_child_delivery_error, launch_terminal_for_native_handoff,
-        merge_helper_env_path, merge_path_values_with_separator,
-        native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
-        reactivate_record_for_reconnect, read_native_runtime_state_from,
-        recoverable_record_after_helper_removed, router_launch_decision, runtime_child_is_owned,
+        drain_helper_output_lines, initial_record_provider_session_id,
+        is_retryable_native_child_write_error, is_unknown_native_child_delivery_error,
+        launch_terminal_for_native_handoff, merge_helper_env_path,
+        merge_path_values_with_separator, native_session_allows_dangerously_skip_permissions,
+        native_status_allows_file_rewind, reactivate_record_for_reconnect,
+        read_native_runtime_state_from, recoverable_record_after_helper_removed,
+        router_launch_decision, runtime_child_is_owned,
         session_router_patch_oauth_validation_enabled, stage_runtime_settings_update,
         take_terminal_launches, validate_router_create_selection,
         validate_router_launch_draft_profile, HelperInputCommand, NativeProvider,
@@ -8042,6 +8104,19 @@ mod tests {
 
     fn native_session_handle(record: NativeSessionRecord) -> Arc<NativeSessionHandle> {
         native_session_handle_with_terminal_env(record, HashMap::new())
+    }
+
+    #[test]
+    fn fork_record_never_exposes_the_parent_provider_session_id() {
+        assert_eq!(
+            initial_record_provider_session_id(Some("parent-provider-id"), true),
+            None
+        );
+        assert_eq!(
+            initial_record_provider_session_id(Some("provider-id"), false),
+            Some("provider-id".into())
+        );
+        assert_eq!(initial_record_provider_session_id(Some("   "), false), None);
     }
 
     #[cfg(unix)]

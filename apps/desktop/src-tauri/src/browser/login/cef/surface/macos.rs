@@ -15,6 +15,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -37,8 +38,9 @@ thread_local! {
 
 /// CEF requires an anchor RequestContext for each Profile. Additional Browser instances get
 /// distinct sibling contexts created with `create_context_shared`, so their browser runtimes
-/// remain independent while cookies/local storage/cache are intentionally shared. Debug anchors
-/// stay in memory; release anchors use the Profile's persistent cache path.
+/// remain independent while cookies/local storage/cache are intentionally shared. Interactive
+/// debug and release anchors use the Profile's persistent cache path; isolated debug smoke tests
+/// opt into an ephemeral host before reaching this layer.
 struct ProfileRequestContextGroup {
     anchor: RequestContext,
     members: HashSet<String>,
@@ -929,6 +931,7 @@ fn send_devtools_message_on_main(surface_id: &str, message: &[u8]) -> Result<(),
 fn prepare_profile_path(root: &Path, profile_id: &str) -> Result<PathBuf, String> {
     fs::create_dir_all(root)
         .map_err(|error| format!("create CEF profile root {}: {error}", root.display()))?;
+    secure_profile_directory(root, "CEF profile root")?;
     let root = root
         .canonicalize()
         .map_err(|error| format!("resolve CEF profile root {}: {error}", root.display()))?;
@@ -949,10 +952,39 @@ fn prepare_profile_path(root: &Path, profile_id: &str) -> Result<PathBuf, String
             return Err(format!("inspect CEF profile {}: {error}", path.display()));
         }
     }
+    secure_profile_directory(&path, "CEF profile path")?;
     if path.parent() != Some(root.as_path()) {
         return Err("CEF profile cache is not a direct root child".to_string());
     }
     Ok(path)
+}
+
+fn secure_profile_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{label} is not a real directory: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!("{label} is not owned by the current user"));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure {label} {}: {error}", path.display()))?;
+    let hardened = fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect {label} {}: {error}", path.display()))?;
+    if hardened.file_type().is_symlink()
+        || !hardened.is_dir()
+        || hardened.uid() != unsafe { libc::geteuid() }
+        || hardened.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(format!(
+            "{label} did not remain a private current-user directory"
+        ));
+    }
+    Ok(())
 }
 
 fn all_surfaces_closed() -> bool {
@@ -961,6 +993,37 @@ fn all_surfaces_closed() -> bool {
     let surface_count = SURFACES.with(|surfaces| surfaces.borrow().len());
     let profile_context_count = PROFILE_CONTEXTS.with(|contexts| contexts.borrow().len());
     native_registries_are_drained(surface_count, profile_context_count)
+}
+
+#[cfg(test)]
+mod profile_path_tests {
+    use super::prepare_profile_path;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    const PROFILE_ID: &str = "profile-0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn persistent_profile_leaf_is_hardened_to_current_user_only() {
+        let temp = tempfile::tempdir().expect("CEF profile root fixture");
+        let root = temp.path().join("cef");
+        fs::create_dir(&root).unwrap();
+        let leaf = root.join(format!("Profile-{PROFILE_ID}"));
+        fs::create_dir(&leaf).unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prepared = prepare_profile_path(&root, PROFILE_ID).expect("prepare private profile");
+        assert_eq!(
+            prepared,
+            root.canonicalize()
+                .unwrap()
+                .join(format!("Profile-{PROFILE_ID}"))
+        );
+        assert_eq!(
+            fs::symlink_metadata(prepared).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 }
 
 fn remaining_profile_contexts() -> String {

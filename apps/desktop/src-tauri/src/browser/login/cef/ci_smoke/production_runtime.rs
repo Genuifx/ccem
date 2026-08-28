@@ -1,6 +1,6 @@
 use super::{
     check_cancelled, publish_observation_ready, wait_for_observation_ack, ProductionCleanupProof,
-    ProductionPathCheckpoint, ProductionPathReceipt, ProductionProfileIsolationProof,
+    ProductionPathCheckpoint, ProductionPathReceipt, ProductionProfileStorageProof,
     ProductionSemanticProof, RuntimeReceipt, StageRecorder, WindowsMode2SmokeConfig,
     WindowsMode2SmokeRuntime, ACK_TIMEOUT, CDP_TIMEOUT, CLOSE_TIMEOUT, READY_TIMEOUT,
     SCHEMA_VERSION, SMOKE_URL,
@@ -53,13 +53,12 @@ pub(super) fn execute_smoke(
         ProductionSurfaceCleanup::new(app.clone(), runtime.clone(), Arc::clone(&preview));
 
     let workspace = config.workspace_root.to_string_lossy().into_owned();
-    let mut lease = runtime.surfaces.production_smoke_acquire(
+    let mut lease = runtime.surfaces.production_smoke_acquire_default(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
         &preview,
         workspace.clone(),
-        None,
         server.bootstrap_url().to_string(),
         1,
     )?;
@@ -229,222 +228,235 @@ pub(super) fn execute_smoke(
     stages.record("production_released")?;
     check_cancelled(&cancelled)?;
 
-    let mut reopened = runtime.surfaces.production_smoke_acquire(
+    let secondary_workspace = config
+        .secondary_workspace_root
+        .to_string_lossy()
+        .into_owned();
+    let mut cross_workspace_default = runtime.surfaces.production_smoke_acquire_default(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
         &preview,
-        workspace.clone(),
-        Some(lease.profile_id.clone()),
+        secondary_workspace.clone(),
         server.semantic_url().to_string(),
         12,
     )?;
-    if reopened.profile_id != lease.profile_id {
-        return Err("Windows Mode 2 smoke reopened a different production profile".to_string());
+    if cross_workspace_default.profile_id != lease.profile_id {
+        return Err(
+            "Windows Mode 2 workspaces did not select the same app-global Default profile"
+                .to_string(),
+        );
     }
-    cleanup.lease = Some(reopened.clone());
-    stages.record("production_reopened_ready")?;
+    if cross_workspace_default.session_id == lease.session_id {
+        return Err(
+            "Windows Mode 2 workspaces reused one browser session for the shared Default profile"
+                .to_string(),
+        );
+    }
+    cleanup.lease = Some(cross_workspace_default.clone());
+    stages.record("production_cross_workspace_default_ready")?;
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
         &preview,
-        &mut reopened,
+        &mut cross_workspace_default,
         13,
         true,
     )?;
-    cleanup.lease = Some(reopened.clone());
-    stages.record("production_reopened_shown")?;
+    cleanup.lease = Some(cross_workspace_default.clone());
+    stages.record("production_cross_workspace_default_shown")?;
     check_cancelled(&cancelled)?;
 
     runtime.surfaces.production_smoke_control(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut reopened,
+        &mut cross_workspace_default,
         14,
         BrowserSurfaceControlActionArg::Handoff,
     )?;
-    cleanup.lease = Some(reopened.clone());
-    stages.record("production_reopened_handoff")?;
+    cleanup.lease = Some(cross_workspace_default.clone());
+    stages.record("production_cross_workspace_default_handoff")?;
     runtime.sessions.production_smoke_verify_profile_storage(
-        &workspace,
+        &secondary_workspace,
         server.semantic_url(),
         &semantic_marker,
         false,
     )?;
-    stages.record("production_profile_persistence_verified")?;
+    stages.record("production_cross_workspace_default_storage_shared_verified")?;
 
     runtime.surfaces.production_smoke_release(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut reopened,
+        &mut cross_workspace_default,
         15,
     )?;
     cleanup.lease = None;
-    stages.record("production_reclosed")?;
+    stages.record("production_cross_workspace_default_released")?;
 
-    let secondary_workspace = config
-        .secondary_workspace_root
-        .to_string_lossy()
-        .into_owned();
-    let mut secondary = runtime.surfaces.production_smoke_acquire(
+    let mut explicit = runtime.surfaces.production_smoke_acquire_explicit_new(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
         &preview,
         secondary_workspace.clone(),
-        None,
         server.semantic_url().to_string(),
         16,
     )?;
-    if secondary.profile_id == lease.profile_id {
-        return Err("Windows Mode 2 isolated workspaces selected the same profile".to_string());
+    if explicit.profile_id == lease.profile_id {
+        return Err(
+            "Windows Mode 2 Explicit New selected the app-global Default profile".to_string(),
+        );
     }
-    cleanup.lease = Some(secondary.clone());
-    stages.record("production_secondary_acquired")?;
+    cleanup.lease = Some(explicit.clone());
+    stages.record("production_explicit_new_acquired")?;
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
         &preview,
-        &mut secondary,
+        &mut explicit,
         17,
         true,
     )?;
-    cleanup.lease = Some(secondary.clone());
-    stages.record("production_secondary_shown")?;
+    cleanup.lease = Some(explicit.clone());
+    stages.record("production_explicit_new_shown")?;
     runtime.surfaces.production_smoke_control(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut secondary,
+        &mut explicit,
         18,
         BrowserSurfaceControlActionArg::Handoff,
     )?;
-    cleanup.lease = Some(secondary.clone());
-    stages.record("production_secondary_handoff")?;
-    let secondary_marker = format!("CCEM_MODE2_SECONDARY_{}", &config.nonce[..16]);
+    cleanup.lease = Some(explicit.clone());
+    stages.record("production_explicit_new_handoff")?;
+    let explicit_marker = format!("CCEM_MODE2_EXPLICIT_{}", &config.nonce[..16]);
     runtime.sessions.production_smoke_write_isolated_profile(
         &secondary_workspace,
         server.semantic_url(),
-        &secondary_marker,
+        &explicit_marker,
     )?;
-    stages.record("production_secondary_isolation_verified")?;
+    stages.record("production_explicit_new_isolation_verified")?;
     runtime.surfaces.production_smoke_release(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut secondary,
+        &mut explicit,
         19,
     )?;
     cleanup.lease = None;
-    stages.record("production_secondary_released")?;
+    stages.record("production_explicit_new_released")?;
 
-    let mut reopened_secondary = runtime.surfaces.production_smoke_acquire(
+    let mut reopened_explicit = runtime.surfaces.production_smoke_acquire_saved(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
         &preview,
         secondary_workspace.clone(),
-        Some(secondary.profile_id.clone()),
+        explicit.profile_id.clone(),
         server.semantic_url().to_string(),
         20,
     )?;
-    if reopened_secondary.profile_id != secondary.profile_id {
-        return Err("Windows Mode 2 smoke reopened a different secondary profile".to_string());
+    if reopened_explicit.profile_id != explicit.profile_id {
+        return Err("Windows Mode 2 smoke reopened a different Explicit New profile".to_string());
     }
-    cleanup.lease = Some(reopened_secondary.clone());
-    stages.record("production_secondary_reopened_ready")?;
+    if reopened_explicit.session_id == explicit.session_id {
+        return Err(
+            "Windows Mode 2 Explicit New reopen reused the prior browser session".to_string(),
+        );
+    }
+    cleanup.lease = Some(reopened_explicit.clone());
+    stages.record("production_explicit_reopened_ready")?;
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
         &preview,
-        &mut reopened_secondary,
+        &mut reopened_explicit,
         21,
         true,
     )?;
-    cleanup.lease = Some(reopened_secondary.clone());
-    stages.record("production_secondary_reopened_shown")?;
+    cleanup.lease = Some(reopened_explicit.clone());
+    stages.record("production_explicit_reopened_shown")?;
     runtime.surfaces.production_smoke_control(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut reopened_secondary,
+        &mut reopened_explicit,
         22,
         BrowserSurfaceControlActionArg::Handoff,
     )?;
-    cleanup.lease = Some(reopened_secondary.clone());
-    stages.record("production_secondary_reopened_handoff")?;
+    cleanup.lease = Some(reopened_explicit.clone());
+    stages.record("production_explicit_reopened_handoff")?;
     runtime.sessions.production_smoke_verify_profile_storage(
         &secondary_workspace,
         server.semantic_url(),
-        &secondary_marker,
+        &explicit_marker,
         false,
     )?;
-    stages.record("production_secondary_persistence_verified")?;
+    stages.record("production_explicit_persistence_verified")?;
     runtime.surfaces.production_smoke_release(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut reopened_secondary,
+        &mut reopened_explicit,
         23,
     )?;
     cleanup.lease = None;
-    stages.record("production_secondary_reclosed")?;
+    stages.record("production_explicit_reclosed")?;
 
-    let mut final_primary = runtime.surfaces.production_smoke_acquire(
+    let mut final_default = runtime.surfaces.production_smoke_acquire_default(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
         &preview,
         workspace.clone(),
-        Some(lease.profile_id.clone()),
         server.semantic_url().to_string(),
         24,
     )?;
-    if final_primary.profile_id != lease.profile_id {
-        return Err("Windows Mode 2 final primary reopen selected a different profile".to_string());
+    if final_default.profile_id != lease.profile_id {
+        return Err("Windows Mode 2 final Default reopen selected a different profile".to_string());
     }
-    cleanup.lease = Some(final_primary.clone());
+    cleanup.lease = Some(final_default.clone());
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
         &preview,
-        &mut final_primary,
+        &mut final_default,
         25,
         true,
     )?;
-    cleanup.lease = Some(final_primary.clone());
-    stages.record("production_primary_final_reopened")?;
+    cleanup.lease = Some(final_default.clone());
+    stages.record("production_default_final_reopened")?;
     runtime.surfaces.production_smoke_control(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut final_primary,
+        &mut final_default,
         26,
         BrowserSurfaceControlActionArg::Handoff,
     )?;
-    cleanup.lease = Some(final_primary.clone());
-    stages.record("production_primary_final_handoff")?;
+    cleanup.lease = Some(final_default.clone());
+    stages.record("production_default_final_handoff")?;
     runtime.sessions.production_smoke_verify_profile_storage(
         &workspace,
         server.semantic_url(),
         &semantic_marker,
         false,
     )?;
-    stages.record("production_primary_unchanged_verified")?;
+    stages.record("production_default_unchanged_verified")?;
     runtime.surfaces.production_smoke_release(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &mut final_primary,
+        &mut final_default,
         27,
     )?;
     cleanup.lease = None;
-    stages.record("production_primary_final_released")?;
+    stages.record("production_default_final_released")?;
 
     let cleanup_proof =
-        verify_production_cleanup(&runtime, &config, &lease.profile_id, &secondary.profile_id)?;
+        verify_production_cleanup(&runtime, &config, &lease.profile_id, &explicit.profile_id)?;
     stages.record("production_cleanup_verified")?;
     drop(cleanup);
     drop(server);
@@ -476,21 +488,29 @@ pub(super) fn execute_smoke(
                 occlusion_ack_millis: semantic.occlusion_ack_millis,
                 post_pause_no_late_write: semantic.post_pause_no_late_write,
             },
-            reopened_profile_id: reopened.profile_id,
-            secondary_reopened_profile_id: reopened_secondary.profile_id,
-            final_reopened_profile_id: final_primary.profile_id,
-            profile_isolation: ProductionProfileIsolationProof {
+            default_session_id: lease.session_id,
+            cross_workspace_default_profile_id: cross_workspace_default.profile_id,
+            cross_workspace_default_session_id: cross_workspace_default.session_id,
+            explicit_profile_id: explicit.profile_id,
+            explicit_session_id: explicit.session_id,
+            reopened_explicit_profile_id: reopened_explicit.profile_id,
+            reopened_explicit_session_id: reopened_explicit.session_id,
+            final_default_profile_id: final_default.profile_id,
+            final_default_session_id: final_default.session_id,
+            profile_storage: ProductionProfileStorageProof {
                 secondary_workspace_root: secondary_workspace,
-                secondary_profile_id: secondary.profile_id,
-                distinct_workspace_profiles: true,
-                primary_cookie_persisted: true,
-                primary_local_storage_persisted: true,
-                secondary_profile_initially_empty: true,
-                secondary_cookie_isolated: true,
-                secondary_local_storage_isolated: true,
-                secondary_cookie_persisted: true,
-                secondary_local_storage_persisted: true,
-                primary_unchanged_after_secondary: true,
+                default_profile_shared_across_workspaces: true,
+                default_cookie_shared: true,
+                default_local_storage_shared: true,
+                default_cookie_persisted: true,
+                default_local_storage_persisted: true,
+                explicit_profile_isolated: true,
+                explicit_profile_initially_empty: true,
+                explicit_cookie_isolated: true,
+                explicit_local_storage_isolated: true,
+                explicit_cookie_persisted: true,
+                explicit_local_storage_persisted: true,
+                default_unchanged_after_explicit: true,
             },
             cleanup: cleanup_proof,
         },
@@ -557,21 +577,40 @@ fn verify_production_cleanup(
     if owner_record_count != 0 {
         return Err("Windows Mode 2 smoke retained an embedded owner record".to_string());
     }
-    for (workspace_root, profile_id) in [
-        (&config.workspace_root, primary_profile_id),
-        (&config.secondary_workspace_root, secondary_profile_id),
-    ] {
-        let workspace = TrustedWorkspacePath::from_trusted_app(workspace_root.clone())
+    let primary_workspace = TrustedWorkspacePath::from_trusted_app(config.workspace_root.clone())
+        .map_err(|error| error.to_string())?;
+    let primary_profiles = runtime
+        .sessions
+        .profile_summaries(primary_workspace)
+        .map_err(|error| error.to_string())?;
+    if primary_profiles.len() != 1
+        || primary_profiles[0].profile_id != primary_profile_id
+        || !primary_profiles[0].is_default
+    {
+        return Err(
+            "Windows Mode 2 primary workspace inventory did not contain only the app-global Default profile"
+                .to_string(),
+        );
+    }
+    let secondary_workspace =
+        TrustedWorkspacePath::from_trusted_app(config.secondary_workspace_root.clone())
             .map_err(|error| error.to_string())?;
-        let profiles = runtime
-            .sessions
-            .profile_summaries(workspace)
-            .map_err(|error| error.to_string())?;
-        if profiles.len() != 1 || profiles[0].profile_id != profile_id {
-            return Err(
-                "Windows Mode 2 smoke workspace profile inventory is inconsistent".to_string(),
-            );
-        }
+    let secondary_profiles = runtime
+        .sessions
+        .profile_summaries(secondary_workspace)
+        .map_err(|error| error.to_string())?;
+    if secondary_profiles.len() != 2
+        || secondary_profiles[0].profile_id != primary_profile_id
+        || !secondary_profiles[0].is_default
+        || secondary_profiles[1].profile_id != secondary_profile_id
+        || secondary_profiles[1].is_default
+    {
+        return Err(
+            "Windows Mode 2 secondary workspace inventory did not contain Default plus Explicit New"
+                .to_string(),
+        );
+    }
+    for profile_id in [primary_profile_id, secondary_profile_id] {
         let lock_path = config
             .profile_state_root
             .join("profiles")

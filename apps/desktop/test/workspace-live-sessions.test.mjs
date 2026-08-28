@@ -155,6 +155,352 @@ test('reconciles restored runtime truth without erasing live conversation metada
   assert.deepEqual(reconciled['native-2'].seedMessages, []);
 });
 
+test('reconciles a persisted display title even when no other summary field changes', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const previous = upsertWorkspaceLiveSessionEntry(
+    {},
+    nativeSession({ display_title: '旧标题' }),
+  );
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(previous, [
+    nativeSession({ display_title: '首屏加载请求优化' }),
+  ]);
+
+  assert.notEqual(reconciled, previous);
+  assert.notEqual(reconciled['native-1'], previous['native-1']);
+  assert.equal(reconciled['native-1'].session.display_title, '首屏加载请求优化');
+});
+
+test('reconciles a restored first user prompt even when no other summary field changes', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const previous = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    initial_user_prompt: null,
+  }));
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(previous, [
+    nativeSession({ initial_user_prompt: '冷启动恢复出的首条用户消息' }),
+  ]);
+
+  assert.notEqual(reconciled, previous);
+  assert.notEqual(reconciled['native-1'], previous['native-1']);
+  assert.equal(
+    reconciled['native-1'].session.initial_user_prompt,
+    '冷启动恢复出的首条用户消息',
+  );
+});
+
+test('a temporary empty summary cannot erase a restored first user prompt', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const restored = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    initial_user_prompt: '已经从事件库恢复的首条用户消息',
+  }));
+  const temporarilyEmpty = nativeSession({ initial_user_prompt: null });
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(
+    restored,
+    [temporarilyEmpty],
+    restored,
+  );
+  assert.equal(
+    reconciled['native-1'].session.initial_user_prompt,
+    '已经从事件库恢复的首条用户消息',
+  );
+
+  const refreshedFromGet = upsertWorkspaceLiveSessionEntry(restored, temporarilyEmpty);
+  assert.equal(
+    refreshedFromGet['native-1'].session.initial_user_prompt,
+    '已经从事件库恢复的首条用户消息',
+  );
+});
+
+test('a stale runtime snapshot still contributes a newly restored first user prompt', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const requestBaseline = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    updated_at: '2026-05-05T10:00:01.000Z',
+    initial_user_prompt: null,
+  }));
+  const current = upsertWorkspaceLiveSessionEntry(requestBaseline, nativeSession({
+    status: 'ready',
+    updated_at: '2026-05-05T10:00:03.000Z',
+    initial_user_prompt: null,
+  }));
+  const staleRuntimeWithPrompt = nativeSession({
+    updated_at: '2026-05-05T10:00:02.000Z',
+    initial_user_prompt: '虽然运行状态较旧，但这是新恢复出的首条消息',
+  });
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(
+    current,
+    [staleRuntimeWithPrompt],
+    requestBaseline,
+  );
+  assert.equal(reconciled['native-1'].session.status, 'ready');
+  assert.equal(reconciled['native-1'].session.updated_at, '2026-05-05T10:00:03.000Z');
+  assert.equal(
+    reconciled['native-1'].session.initial_user_prompt,
+    '虽然运行状态较旧，但这是新恢复出的首条消息',
+  );
+});
+
+test('provider binding keeps the runtime first prompt stable', async () => {
+  const { upsertWorkspaceLiveSessionEntry } = await importWorkspaceLiveSessions();
+  const runtimeFallback = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    provider_session_id: null,
+    initial_user_prompt: '本次继续会话时发送的消息',
+  }));
+
+  const bound = upsertWorkspaceLiveSessionEntry(runtimeFallback, nativeSession({
+    provider_session_id: 'provider-1',
+    initial_user_prompt: '不能替换 runtime 首条消息的其他候选',
+  }));
+  assert.equal(
+    bound['native-1'].session.initial_user_prompt,
+    '本次继续会话时发送的消息',
+  );
+
+  const staleUnbound = upsertWorkspaceLiveSessionEntry(bound, nativeSession({
+    provider_session_id: null,
+    initial_user_prompt: '迟到的 runtime 继续消息',
+  }));
+  assert.equal(
+    staleUnbound['native-1'].session.initial_user_prompt,
+    '本次继续会话时发送的消息',
+  );
+});
+
+test('patches a snapshot-excluded live title immediately and clears stale generated text', async () => {
+  const {
+    updateWorkspaceLiveSessionDisplayTitle,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const first = upsertWorkspaceLiveSessionEntry(
+    {},
+    nativeSession({ provider_session_id: 'provider-1' }),
+    { generatedTitle: '旧的自动标题' },
+  );
+  const previous = upsertWorkspaceLiveSessionEntry(
+    first,
+    nativeSession({
+      runtime_id: 'native-2',
+      provider_session_id: 'provider-1',
+    }),
+    { generatedTitle: '另一个旧自动标题' },
+  );
+
+  const renamed = updateWorkspaceLiveSessionDisplayTitle(
+    previous,
+    'claude',
+    'provider-1',
+    '手工改名后的标题',
+    101,
+  );
+
+  assert.equal(renamed['native-1'].session.display_title, '手工改名后的标题');
+  assert.equal(renamed['native-1'].generatedTitle, null);
+  assert.equal(renamed['native-2'].session.display_title, '手工改名后的标题');
+  assert.equal(renamed['native-2'].session.display_title_revision, 101);
+  assert.equal(renamed['native-2'].generatedTitle, null);
+
+  const cleared = updateWorkspaceLiveSessionDisplayTitle(
+    renamed,
+    'claude',
+    'provider-1',
+    '   ',
+    102,
+  );
+  assert.equal(cleared['native-1'].session.display_title, null);
+  assert.equal(cleared['native-1'].generatedTitle, null);
+  assert.equal(cleared['native-2'].session.display_title, null);
+  assert.equal(cleared['native-2'].session.display_title_revision, 102);
+  assert.equal(cleared['native-2'].generatedTitle, null);
+});
+
+test('a stale native summary cannot roll back a newer local rename or clear', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    updateWorkspaceLiveSessionDisplayTitle,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const requestBaseline = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    provider_session_id: 'provider-1',
+    display_title: '旧标题',
+    display_title_revision: 10,
+  }));
+  const current = updateWorkspaceLiveSessionDisplayTitle(
+    requestBaseline,
+    'claude',
+    'provider-1',
+    '',
+    12,
+  );
+  const staleSummary = nativeSession({
+    provider_session_id: 'provider-1',
+    display_title: '旧标题',
+    display_title_revision: 10,
+  });
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(
+    current,
+    [staleSummary],
+    requestBaseline,
+  );
+  assert.equal(reconciled['native-1'].session.display_title, null);
+  assert.equal(reconciled['native-1'].session.display_title_revision, 12);
+
+  const refreshedFromStaleGet = upsertWorkspaceLiveSessionEntry(current, staleSummary);
+  assert.equal(refreshedFromStaleGet['native-1'].session.display_title, null);
+  assert.equal(refreshedFromStaleGet['native-1'].session.display_title_revision, 12);
+});
+
+test('provider binding replaces a runtime-key title with authoritative provider title state', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const runtimeTitle = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    display_title: '绑定前 runtime 标题',
+    display_title_revision: 20,
+  }));
+  const boundProviderSummary = nativeSession({
+    provider_session_id: 'provider-1',
+    display_title: null,
+    display_title_revision: 0,
+  });
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(
+    runtimeTitle,
+    [boundProviderSummary],
+    runtimeTitle,
+  );
+  assert.equal(reconciled['native-1'].session.provider_session_id, 'provider-1');
+  assert.equal(reconciled['native-1'].session.display_title, null);
+  assert.equal(reconciled['native-1'].session.display_title_revision, 0);
+
+  const refreshedFromGet = upsertWorkspaceLiveSessionEntry(runtimeTitle, boundProviderSummary);
+  assert.equal(refreshedFromGet['native-1'].session.display_title, null);
+  assert.equal(refreshedFromGet['native-1'].session.display_title_revision, 0);
+});
+
+test('a stale unbound summary cannot undo provider binding or its title state', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const bound = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    provider_session_id: 'provider-1',
+    display_title: '绑定后的手工标题',
+    display_title_revision: 20,
+  }));
+  const staleUnboundSummary = nativeSession({
+    provider_session_id: null,
+    display_title: '绑定前的 runtime 标题',
+    display_title_revision: 10,
+  });
+
+  const refreshedFromGet = upsertWorkspaceLiveSessionEntry(bound, staleUnboundSummary);
+  assert.equal(refreshedFromGet['native-1'].session.provider_session_id, 'provider-1');
+  assert.equal(refreshedFromGet['native-1'].session.display_title, '绑定后的手工标题');
+  assert.equal(refreshedFromGet['native-1'].session.display_title_revision, 20);
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(
+    bound,
+    [staleUnboundSummary],
+    bound,
+  );
+  assert.equal(reconciled['native-1'].session.provider_session_id, 'provider-1');
+  assert.equal(reconciled['native-1'].session.display_title, '绑定后的手工标题');
+  assert.equal(reconciled['native-1'].session.display_title_revision, 20);
+});
+
+test('a newer authoritative clear drops stale generated title metadata', async () => {
+  const {
+    reconcileWorkspaceLiveSessionsSnapshot,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const previous = upsertWorkspaceLiveSessionEntry(
+    {},
+    nativeSession({
+      provider_session_id: 'provider-1',
+      display_title_revision: 0,
+    }),
+    { generatedTitle: '不应复活的自动标题' },
+  );
+  const clearedSummary = nativeSession({
+    provider_session_id: 'provider-1',
+    display_title: null,
+    display_title_revision: 40,
+  });
+
+  const reconciled = reconcileWorkspaceLiveSessionsSnapshot(
+    previous,
+    [clearedSummary],
+    previous,
+  );
+  assert.equal(reconciled['native-1'].generatedTitle, null);
+  assert.equal(reconciled['native-1'].session.display_title, null);
+
+  const refreshedFromGet = upsertWorkspaceLiveSessionEntry(previous, clearedSummary);
+  assert.equal(refreshedFromGet['native-1'].generatedTitle, null);
+  assert.equal(refreshedFromGet['native-1'].session.display_title_revision, 40);
+});
+
+test('an older rename response cannot roll back a newer optimistic title revision', async () => {
+  const {
+    updateWorkspaceLiveSessionDisplayTitle,
+    upsertWorkspaceLiveSessionEntry,
+  } = await importWorkspaceLiveSessions();
+  const initial = upsertWorkspaceLiveSessionEntry({}, nativeSession({
+    provider_session_id: 'provider-1',
+  }));
+  const newer = updateWorkspaceLiveSessionDisplayTitle(
+    initial,
+    'claude',
+    'provider-1',
+    '较新的手工标题',
+    30,
+  );
+  const stale = updateWorkspaceLiveSessionDisplayTitle(
+    newer,
+    'claude',
+    'provider-1',
+    '较旧的手工标题',
+    29,
+  );
+
+  assert.equal(stale, newer);
+  assert.equal(stale['native-1'].session.display_title, '较新的手工标题');
+  assert.equal(stale['native-1'].session.display_title_revision, 30);
+});
+
+test('manual title edits invalidate an in-flight automatic title generation', async () => {
+  const {
+    beginWorkspaceSessionTitleGeneration,
+    cancelWorkspaceSessionTitleGeneration,
+    isWorkspaceSessionTitleGenerationCurrent,
+  } = await importWorkspaceLiveSessions();
+  const revisions = {};
+  const first = beginWorkspaceSessionTitleGeneration(revisions, 'native-1');
+  assert.equal(isWorkspaceSessionTitleGenerationCurrent(revisions, 'native-1', first), true);
+
+  cancelWorkspaceSessionTitleGeneration(revisions, 'native-1');
+  assert.equal(isWorkspaceSessionTitleGenerationCurrent(revisions, 'native-1', first), false);
+
+  const second = beginWorkspaceSessionTitleGeneration(revisions, 'native-1');
+  assert.equal(isWorkspaceSessionTitleGenerationCurrent(revisions, 'native-1', second), true);
+});
+
 test('reconcile preserves a live session created while native truth was loading', async () => {
   const {
     reconcileWorkspaceLiveSessionsSnapshot,

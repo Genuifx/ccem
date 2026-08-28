@@ -16,14 +16,14 @@ const MAX_DIRECTORY_ENTRIES: usize = 512;
 const MAX_RECENT_ARTIFACTS: usize = 12;
 const MAX_VISIBLE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 const RANDOM_ID_HEX_LENGTH: usize = 32;
-const PROFILE_ACTIVITY_SCHEMA_VERSION: u32 = 1;
+const PROFILE_ACTIVITY_SCHEMA_VERSION: u32 = 2;
+const LEGACY_PROFILE_ACTIVITY_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_PROFILE_ACTIVITY_SESSIONS: usize = 16;
 pub(super) const MAX_PROFILE_ACTIVITY_BYTES: u64 = 4 * 1024;
 const MAX_PROFILE_ACTIVITY_ROOT_ENTRIES: usize = 4_096;
 const PROFILE_ACTIVITY_KEY_BYTES: usize = 32;
 const PROFILE_ACTIVITY_KEY_FILE: &str = "integrity.key";
 const PROFILE_ACTIVITY_LOCK_FILE: &str = "activity.lock";
-const PROFILE_ACTIVITY_INTEGRITY_DOMAIN: &[u8] = b"ccem-login-browser-profile-activity-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct LoginBrowserRecentActivity {
@@ -65,17 +65,52 @@ pub(super) struct ProfileActivityStore {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedProfileActivity {
+struct PersistedProfileActivityV1 {
     schema_version: u32,
     session_ids: Vec<String>,
     integrity_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum PersistedProfileActivity {
+    V1(PersistedProfileActivityV1),
+    V2(PersistedProfileActivityV2),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProfileActivityV2 {
+    schema_version: u32,
+    sessions: Vec<PersistedProfileActivityEntry>,
+    integrity_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProfileActivityEntry {
+    session_id: String,
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileActivityEntry {
+    session_id: SessionId,
+    workspace_id: Option<TrustedWorkspaceIdentity>,
+}
+
 #[derive(Serialize)]
-struct ProfileActivityIntegrityPayload<'a> {
+struct ProfileActivityIntegrityPayloadV1<'a> {
     schema_version: u32,
     profile_id: &'a str,
     session_ids: &'a [String],
+}
+
+#[derive(Serialize)]
+struct ProfileActivityIntegrityPayloadV2<'a> {
+    schema_version: u32,
+    profile_id: &'a str,
+    sessions: &'a [PersistedProfileActivityEntry],
 }
 
 impl ProfileActivityStore {
@@ -101,22 +136,29 @@ impl ProfileActivityStore {
         &self,
         profile_id: &ProfileId,
         session_id: &SessionId,
+        workspace_identity: &TrustedWorkspaceIdentity,
     ) -> Result<(), SessionManagerError> {
         ensure_private_directory(&self.root)?;
         let lock = acquire_profile_activity_lock(&self.lock_path)?;
         self.validate_integrity_key()?;
-        let mut session_ids = self.load(profile_id)?;
-        session_ids.retain(|existing| existing != session_id);
-        session_ids.push(session_id.clone());
-        if session_ids.len() > MAX_PROFILE_ACTIVITY_SESSIONS {
-            session_ids.drain(..session_ids.len() - MAX_PROFILE_ACTIVITY_SESSIONS);
+        let mut entries = self.load(profile_id)?;
+        entries.retain(|existing| &existing.session_id != session_id);
+        entries.push(ProfileActivityEntry {
+            session_id: session_id.clone(),
+            workspace_id: Some(workspace_identity.clone()),
+        });
+        if entries.len() > MAX_PROFILE_ACTIVITY_SESSIONS {
+            entries.drain(..entries.len() - MAX_PROFILE_ACTIVITY_SESSIONS);
         }
-        self.write(profile_id, &session_ids)?;
+        self.write(profile_id, &entries)?;
         drop(lock);
         Ok(())
     }
 
-    fn session_ids(&self, profile_id: &ProfileId) -> Result<Vec<SessionId>, SessionManagerError> {
+    fn entries(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<Vec<ProfileActivityEntry>, SessionManagerError> {
         ensure_private_directory(&self.root)?;
         let lock = acquire_profile_activity_lock(&self.lock_path)?;
         self.validate_integrity_key()?;
@@ -135,7 +177,10 @@ impl ProfileActivityStore {
         Ok(())
     }
 
-    fn load(&self, profile_id: &ProfileId) -> Result<Vec<SessionId>, SessionManagerError> {
+    fn load(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<Vec<ProfileActivityEntry>, SessionManagerError> {
         let path = profile_activity_path(&self.root, profile_id);
         if !regular_file_presence(&path)? {
             return Ok(Vec::new());
@@ -143,25 +188,38 @@ impl ProfileActivityStore {
         let bytes = read_bounded_private_file(&path, MAX_PROFILE_ACTIVITY_BYTES)?;
         let persisted = serde_json::from_slice::<PersistedProfileActivity>(&bytes)
             .map_err(|_| SessionManagerError::StateUnavailable)?;
-        validate_persisted_profile_activity(profile_id, &persisted, &self.integrity_key)
+        match persisted {
+            PersistedProfileActivity::V1(persisted) => {
+                validate_persisted_profile_activity_v1(profile_id, &persisted, &self.integrity_key)
+            }
+            PersistedProfileActivity::V2(persisted) => {
+                validate_persisted_profile_activity_v2(profile_id, &persisted, &self.integrity_key)
+            }
+        }
     }
 
     fn write(
         &self,
         profile_id: &ProfileId,
-        session_ids: &[SessionId],
+        entries: &[ProfileActivityEntry],
     ) -> Result<(), SessionManagerError> {
-        if session_ids.len() > MAX_PROFILE_ACTIVITY_SESSIONS {
+        if entries.len() > MAX_PROFILE_ACTIVITY_SESSIONS {
             return Err(SessionManagerError::StateUnavailable);
         }
-        let session_ids = session_ids
+        let sessions = entries
             .iter()
-            .map(|session_id| session_id.as_str().to_string())
+            .map(|entry| PersistedProfileActivityEntry {
+                session_id: entry.session_id.as_str().to_string(),
+                workspace_id: entry
+                    .workspace_id
+                    .as_ref()
+                    .map(|workspace| workspace.as_str().to_string()),
+            })
             .collect::<Vec<_>>();
-        let payload = serialize_profile_activity_payload(profile_id, &session_ids)?;
-        let persisted = PersistedProfileActivity {
+        let payload = serialize_profile_activity_payload_v2(profile_id, &sessions)?;
+        let persisted = PersistedProfileActivityV2 {
             schema_version: PROFILE_ACTIVITY_SCHEMA_VERSION,
-            session_ids,
+            sessions,
             integrity_sha256: hex::encode(hmac_sha256(&self.integrity_key, &payload)),
         };
         let bytes =
@@ -215,24 +273,38 @@ impl LoginBrowserSessionManager {
             .profiles
             .global_default_profile(&workspace_identity, false)
             .map_err(super::map_profile_error)?;
-        if !global_default
-            .as_ref()
-            .is_some_and(|descriptor| descriptor.profile_id() == &profile_id)
+        let (descriptor, is_global_default) = if let Some(descriptor) =
+            global_default.filter(|descriptor| descriptor.profile_id() == &profile_id)
         {
-            inner
-                .profiles
-                .descriptor(&profile_id, &workspace_identity)
-                .map_err(super::map_profile_error)?;
-        }
-        let session_ids = inner.profile_activity.session_ids(&profile_id)?;
+            (descriptor, true)
+        } else {
+            (
+                inner
+                    .profiles
+                    .descriptor(&profile_id, &workspace_identity)
+                    .map_err(super::map_profile_error)?,
+                false,
+            )
+        };
+        let owner_identity = descriptor
+            .owner_identity()
+            .map_err(super::map_profile_error)?;
+        let entries = inner.profile_activity.entries(&profile_id)?;
         let mut artifacts = Vec::new();
-        if session_ids.is_empty() {
+        if entries.is_empty() {
             return Ok(LoginBrowserRecentActivity { artifacts });
         }
         let sessions_root = inner.root.join("sessions");
         ensure_directory_without_symlink(&sessions_root)?;
-        for session_id in session_ids.into_iter().rev() {
-            let session_root = sessions_root.join(session_id.as_str());
+        for entry in entries.into_iter().rev().filter(|entry| {
+            activity_entry_is_visible(
+                entry,
+                &workspace_identity,
+                &owner_identity,
+                is_global_default,
+            )
+        }) {
+            let session_root = sessions_root.join(entry.session_id.as_str());
             ensure_directory_without_symlink(&session_root)?;
             let activity = collect_recent_activity(&ActivityRoots {
                 artifacts: session_root.join("artifacts"),
@@ -247,16 +319,31 @@ impl LoginBrowserSessionManager {
     }
 }
 
+fn activity_entry_is_visible(
+    entry: &ProfileActivityEntry,
+    requested_workspace: &TrustedWorkspaceIdentity,
+    profile_owner: &TrustedWorkspaceIdentity,
+    is_global_default: bool,
+) -> bool {
+    match entry.workspace_id.as_ref() {
+        Some(entry_workspace) => entry_workspace == requested_workspace,
+        // Schema v1 predates exact workspace attribution. Once a Profile becomes app-global its
+        // legacy index may contain sessions from several workspaces, so no caller may safely claim
+        // those entries. An owner-scoped Explicit profile cannot have crossed that boundary.
+        None => !is_global_default && profile_owner == requested_workspace,
+    }
+}
+
 fn profile_activity_path(root: &Path, profile_id: &ProfileId) -> PathBuf {
     root.join(format!("{}.json", profile_id.as_str()))
 }
 
-fn validate_persisted_profile_activity(
+fn validate_persisted_profile_activity_v1(
     profile_id: &ProfileId,
-    persisted: &PersistedProfileActivity,
+    persisted: &PersistedProfileActivityV1,
     integrity_key: &[u8; PROFILE_ACTIVITY_KEY_BYTES],
-) -> Result<Vec<SessionId>, SessionManagerError> {
-    if persisted.schema_version != PROFILE_ACTIVITY_SCHEMA_VERSION
+) -> Result<Vec<ProfileActivityEntry>, SessionManagerError> {
+    if persisted.schema_version != LEGACY_PROFILE_ACTIVITY_SCHEMA_VERSION
         || persisted.session_ids.len() > MAX_PROFILE_ACTIVITY_SESSIONS
         || !is_lower_hex_sha256(&persisted.integrity_sha256)
     {
@@ -271,26 +358,141 @@ fn validate_persisted_profile_activity(
         }
         session_ids.push(session_id);
     }
-    let payload = serialize_profile_activity_payload(profile_id, &persisted.session_ids)?;
+    let payload = serialize_profile_activity_payload_v1(profile_id, &persisted.session_ids)?;
     let expected = hmac_sha256(integrity_key, &payload);
     let actual = hex::decode(&persisted.integrity_sha256)
         .map_err(|_| SessionManagerError::StateUnavailable)?;
     if !constant_time_equal(&expected, &actual) {
         return Err(SessionManagerError::StateUnavailable);
     }
-    Ok(session_ids)
+    Ok(session_ids
+        .into_iter()
+        .map(|session_id| ProfileActivityEntry {
+            session_id,
+            workspace_id: None,
+        })
+        .collect())
 }
 
-fn serialize_profile_activity_payload(
+fn validate_persisted_profile_activity_v2(
+    profile_id: &ProfileId,
+    persisted: &PersistedProfileActivityV2,
+    integrity_key: &[u8; PROFILE_ACTIVITY_KEY_BYTES],
+) -> Result<Vec<ProfileActivityEntry>, SessionManagerError> {
+    if persisted.schema_version != PROFILE_ACTIVITY_SCHEMA_VERSION
+        || persisted.sessions.len() > MAX_PROFILE_ACTIVITY_SESSIONS
+        || !is_lower_hex_sha256(&persisted.integrity_sha256)
+    {
+        return Err(SessionManagerError::StateUnavailable);
+    }
+    let mut unique = HashSet::new();
+    let mut entries = Vec::with_capacity(persisted.sessions.len());
+    for persisted_entry in &persisted.sessions {
+        let session_id = parse_opaque_session_id(&persisted_entry.session_id)?;
+        if !unique.insert(persisted_entry.session_id.as_str()) {
+            return Err(SessionManagerError::StateUnavailable);
+        }
+        let workspace_id = persisted_entry
+            .workspace_id
+            .as_ref()
+            .map(|workspace_id| {
+                TrustedWorkspaceIdentity::from_trusted_store(workspace_id.clone())
+                    .map_err(super::map_profile_error)
+            })
+            .transpose()?;
+        entries.push(ProfileActivityEntry {
+            session_id,
+            workspace_id,
+        });
+    }
+    let payload = serialize_profile_activity_payload_v2(profile_id, &persisted.sessions)?;
+    let expected = hmac_sha256(integrity_key, &payload);
+    let actual = hex::decode(&persisted.integrity_sha256)
+        .map_err(|_| SessionManagerError::StateUnavailable)?;
+    if !constant_time_equal(&expected, &actual) {
+        return Err(SessionManagerError::StateUnavailable);
+    }
+    Ok(entries)
+}
+
+fn serialize_profile_activity_payload_v1(
     profile_id: &ProfileId,
     session_ids: &[String],
 ) -> Result<Vec<u8>, SessionManagerError> {
-    serde_json::to_vec(&ProfileActivityIntegrityPayload {
-        schema_version: PROFILE_ACTIVITY_SCHEMA_VERSION,
+    serde_json::to_vec(&ProfileActivityIntegrityPayloadV1 {
+        schema_version: LEGACY_PROFILE_ACTIVITY_SCHEMA_VERSION,
         profile_id: profile_id.as_str(),
         session_ids,
     })
     .map_err(|_| SessionManagerError::StateUnavailable)
+}
+
+fn serialize_profile_activity_payload_v2(
+    profile_id: &ProfileId,
+    sessions: &[PersistedProfileActivityEntry],
+) -> Result<Vec<u8>, SessionManagerError> {
+    serde_json::to_vec(&ProfileActivityIntegrityPayloadV2 {
+        schema_version: PROFILE_ACTIVITY_SCHEMA_VERSION,
+        profile_id: profile_id.as_str(),
+        sessions,
+    })
+    .map_err(|_| SessionManagerError::StateUnavailable)
+}
+
+#[cfg(test)]
+mod profile_activity_schema_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_v1_index_remains_readable_without_claiming_a_workspace() {
+        let profile_id = ProfileId::parse("profile-0123456789abcdef0123456789abcdef").unwrap();
+        let session_id = "login-session-11111111111111111111111111111111".to_string();
+        let session_ids = vec![session_id.clone()];
+        let integrity_key = [0x5a_u8; PROFILE_ACTIVITY_KEY_BYTES];
+        let payload = serialize_profile_activity_payload_v1(&profile_id, &session_ids).unwrap();
+        let persisted = PersistedProfileActivityV1 {
+            schema_version: LEGACY_PROFILE_ACTIVITY_SCHEMA_VERSION,
+            session_ids,
+            integrity_sha256: hex::encode(hmac_sha256(&integrity_key, &payload)),
+        };
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let parsed = serde_json::from_slice::<PersistedProfileActivity>(&bytes).unwrap();
+        let PersistedProfileActivity::V1(parsed) = parsed else {
+            panic!("legacy activity must retain its exact schema");
+        };
+        let entries =
+            validate_persisted_profile_activity_v1(&profile_id, &parsed, &integrity_key).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id.as_str(), session_id);
+        assert!(entries[0].workspace_id.is_none());
+
+        let owner = TrustedWorkspaceIdentity::from_trusted_store("workspace-owner").unwrap();
+        let other = TrustedWorkspaceIdentity::from_trusted_store("workspace-other").unwrap();
+        assert!(!activity_entry_is_visible(
+            &entries[0],
+            &owner,
+            &owner,
+            true,
+        ));
+        assert!(!activity_entry_is_visible(
+            &entries[0],
+            &other,
+            &owner,
+            true,
+        ));
+        assert!(activity_entry_is_visible(
+            &entries[0],
+            &owner,
+            &owner,
+            false,
+        ));
+        assert!(!activity_entry_is_visible(
+            &entries[0],
+            &other,
+            &owner,
+            false,
+        ));
+    }
 }
 
 fn parse_opaque_session_id(value: &str) -> Result<SessionId, SessionManagerError> {

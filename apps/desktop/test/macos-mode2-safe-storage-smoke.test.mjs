@@ -27,6 +27,7 @@ import {
   run,
 } from '../scripts/run-macos-mode2-safe-storage-smoke.mjs';
 import { inspectMacosSafeStorageReleaseAttestation } from '../scripts/verify-macos-safe-storage-release.mjs';
+import { MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION } from '../scripts/macos-mode2-production-proof-contract.mjs';
 
 const NONCE = 'b'.repeat(64);
 const SOURCE_COMMIT = 'a'.repeat(40);
@@ -68,8 +69,8 @@ function planFixture() {
 
 function receiptFixture(plan, scenario, phase) {
   const scenarioPlan = plan.scenarios.find((entry) => entry.name === scenario);
-  const primaryProfileId = `primary-${scenario}-${phase}`;
-  const secondaryProfileId = `secondary-${scenario}-${phase}`;
+  const defaultProfileId = `default-${scenario}`;
+  const explicitProfileId = `explicit-${scenario}-${phase}`;
   return {
     schemaVersion: 2,
     smoke: 'macos-mode2-safe-storage-release',
@@ -104,17 +105,24 @@ function receiptFixture(plan, scenario, phase) {
     normalStartupBypassed: true,
     sandboxEnabled: true,
     productionPath: {
-      schemaVersion: 2,
+      schemaVersion: MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION,
       verified: true,
       manager: 'LoginBrowserSurfaceManager/SessionManager',
       sessionRoot: `${scenarioPlan.root}/data/login`,
       workspaceRoot: `${scenarioPlan.root}/workspace-${phase}`,
       secondaryWorkspaceRoot: `${scenarioPlan.root}/workspace-${phase}-secondary`,
-      primaryProfileId,
-      reopenedPrimaryProfileId: primaryProfileId,
-      finalPrimaryProfileId: primaryProfileId,
-      secondaryProfileId,
-      finalSecondaryProfileId: secondaryProfileId,
+      defaultProfileId,
+      defaultSessionId: `login-session-${(phase === 'prime' ? '1' : '6').repeat(32)}`,
+      crossWorkspaceDefaultProfileId: defaultProfileId,
+      crossWorkspaceDefaultSessionId:
+        `login-session-${(phase === 'prime' ? '2' : '7').repeat(32)}`,
+      explicitProfileId,
+      explicitSessionId: `login-session-${(phase === 'prime' ? '3' : '8').repeat(32)}`,
+      reopenedExplicitProfileId: explicitProfileId,
+      reopenedExplicitSessionId:
+        `login-session-${(phase === 'prime' ? '4' : '9').repeat(32)}`,
+      finalDefaultProfileId: defaultProfileId,
+      finalDefaultSessionId: `login-session-${(phase === 'prime' ? '5' : 'a').repeat(32)}`,
       semantic: {
         navigatedViaCapability: true,
         axSnapshotViaCapability: true,
@@ -139,21 +147,25 @@ function receiptFixture(plan, scenario, phase) {
         occlusionAckMillis: 73,
         postPauseNoLateWrite: true,
       },
-      profileIsolation: {
-        distinctWorkspaceProfiles: true,
-        primaryCookiePersisted: true,
-        primaryLocalStoragePersisted: true,
-        secondaryProfileInitiallyEmpty: true,
-        secondaryCookieIsolated: true,
-        secondaryLocalStorageIsolated: true,
-        primaryUnchangedAfterSecondary: true,
-        secondaryUnchangedAfterPrimary: true,
+      profileStorage: {
+        defaultProfileSharedAcrossWorkspaces: true,
+        defaultCookieShared: true,
+        defaultLocalStorageShared: true,
+        defaultCookiePersisted: true,
+        defaultLocalStoragePersisted: true,
+        explicitProfileIsolated: true,
+        explicitProfileInitiallyEmpty: true,
+        explicitCookieIsolated: true,
+        explicitLocalStorageIsolated: true,
+        explicitCookiePersisted: true,
+        explicitLocalStoragePersisted: true,
+        defaultUnchangedAfterExplicit: true,
       },
       cleanup: {
         activeSurfaceCount: 0,
         activeSessionCount: 0,
         ownerRecordCount: 0,
-        persistedProfileCount: 2,
+        persistedProfileCount: phase === 'prime' ? 2 : 3,
         workspaceCount: 2,
         profileLocksAvailable: true,
       },
@@ -403,6 +415,7 @@ test('runner state machine restores Keychain state and removes every owned tempo
 });
 
 test('runtime and final contracts require two successful signed launches per scenario', () => {
+  assert.equal(MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION, 3);
   const plan = planFixture();
   const attestation = attestationFixture(plan);
   for (const scenario of ['clean', 'generic-conflict']) {
@@ -445,8 +458,8 @@ test('runtime and final contracts require two successful signed launches per sce
       value.scenarios[0].receipts.prime.productionPath.semantic.screenshot.sha256Verified = false;
     },
     (value) => {
-      value.scenarios[1].receipts.verify.productionPath.profileIsolation
-        .secondaryUnchangedAfterPrimary = false;
+      value.scenarios[1].receipts.verify.productionPath.profileStorage
+        .defaultProfileSharedAcrossWorkspaces = false;
     },
     (value) => { value.cleanup.originalKeychainStateRestored = false; },
   ]) {
@@ -628,6 +641,8 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
   assert.match(productionRuntime, /production_smoke_run_semantic_chain/u);
   assert.match(productionRuntime, /ProductionSmokeScreenshotProof/u);
   assert.match(productionRuntime, /production_smoke_write_isolated_profile/u);
+  assert.match(productionRuntime, /production-origin-port/u);
+  assert.match(productionRuntime, /bind_persistent_semantic_origin/u);
   assert.match(productionRuntime, /try_lock_exclusive/u);
   assert.match(debugSmoke, /CefCredentialStorePolicy::MockKeychain/);
   assert.match(bootstrap, /use-mock-keychain/);

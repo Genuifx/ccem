@@ -1,5 +1,6 @@
 use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionEventRecord, TodoSnapshotV1};
 use crate::session_provenance::state_db_path;
+use crate::user_prompt_display::normalize_user_visible_prompt;
 use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -16,6 +17,7 @@ pub struct NativeEventLog {
     db_path: PathBuf,
     conn: Mutex<Option<Connection>>,
     pending: Mutex<Vec<SessionEventRecord>>,
+    first_user_prompt_cache: Mutex<HashMap<String, String>>,
 }
 
 impl Default for NativeEventLog {
@@ -36,6 +38,7 @@ impl NativeEventLog {
             db_path,
             conn: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
+            first_user_prompt_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -125,6 +128,101 @@ impl NativeEventLog {
     pub fn has_events(&self, runtime_id: &str) -> Result<bool, String> {
         self.flush_pending()?;
         self.with_conn(|conn| runtime_has_events(conn, runtime_id))
+    }
+
+    /// Read the first user-visible prompt for each requested runtime without
+    /// replaying its transcript. The `(runtime_id, seq)` primary key keeps each
+    /// cursor ordered, while one connection lock and one prepared statement
+    /// keep a cold-start batch inexpensive.
+    pub fn first_user_prompts(
+        &self,
+        runtime_ids: &[String],
+    ) -> Result<HashMap<String, String>, String> {
+        if runtime_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut cache = self
+            .first_user_prompt_cache
+            .lock()
+            .map_err(|_| "Failed to lock native first prompt cache".to_string())?;
+        let mut requested_ids = Vec::new();
+        for runtime_id in runtime_ids {
+            let runtime_id = runtime_id.trim();
+            if !runtime_id.is_empty() && !requested_ids.iter().any(|id| id == runtime_id) {
+                requested_ids.push(runtime_id.to_string());
+            }
+        }
+        let uncached_ids = requested_ids
+            .iter()
+            .filter(|runtime_id| !cache.contains_key(runtime_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !uncached_ids.is_empty() {
+            self.flush_pending()?;
+            let discovered = self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT payload_json
+                         FROM native_session_events
+                         WHERE runtime_id = ?1
+                           AND payload_json LIKE '{\"type\":\"user_prompt\"%'
+                         ORDER BY seq ASC",
+                    )
+                    .map_err(|error| {
+                        format!("Failed to prepare first native user prompt query: {error}")
+                    })?;
+                let mut prompts = HashMap::new();
+
+                for runtime_id in &uncached_ids {
+                    let runtime_id = runtime_id.trim();
+                    if runtime_id.is_empty() || prompts.contains_key(runtime_id) {
+                        continue;
+                    }
+                    let mut rows = stmt.query([runtime_id]).map_err(|error| {
+                        format!("Failed to query native user prompts for {runtime_id}: {error}")
+                    })?;
+                    while let Some(row) = rows.next().map_err(|error| {
+                        format!("Failed to read native user prompt for {runtime_id}: {error}")
+                    })? {
+                        let Ok(payload_json) = row.get::<_, String>(0) else {
+                            continue;
+                        };
+                        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json)
+                        else {
+                            // A corrupt legacy row must not prevent every other
+                            // restored runtime from receiving its prompt.
+                            continue;
+                        };
+                        let Some(prompt) = payload
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(normalize_user_visible_prompt)
+                        else {
+                            continue;
+                        };
+                        prompts.insert(runtime_id.to_string(), prompt);
+                        break;
+                    }
+                }
+
+                Ok(prompts)
+            })?;
+            for (runtime_id, prompt) in discovered {
+                cache.insert(runtime_id, prompt);
+            }
+        }
+
+        Ok(requested_ids
+            .into_iter()
+            .filter_map(|runtime_id| {
+                cache
+                    .get(&runtime_id)
+                    .cloned()
+                    .map(|prompt| (runtime_id, prompt))
+            })
+            .collect())
     }
 
     /// Persisted, incrementally maintained attention summary for a runtime.
@@ -747,6 +845,7 @@ mod attention_tests;
 mod tests {
     use super::NativeEventLog;
     use crate::event_bus::{SessionEventPayload, SessionEventRecord};
+    use crate::user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP;
     use chrono::Utc;
     use rusqlite::Connection;
 
@@ -870,6 +969,148 @@ mod tests {
         assert_eq!(replay.newest_available_seq, Some(2));
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.events[0].seq, 2);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_restores_the_full_first_user_prompt_after_reopen() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-first-prompt-test-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+        let runtime_id = "runtime-first-prompt";
+        log.append(&SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::Lifecycle {
+                stage: "runtime_boot".to_string(),
+                detail: "Starting native runtime".to_string(),
+                assistant_message_uuid: None,
+            },
+        })
+        .expect("append lifecycle");
+        log.append(&SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq: 2,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::UserPrompt {
+                text: "   ".to_string(),
+                image_count: 0,
+                images: None,
+                annotations: None,
+                canonical_hash: None,
+            },
+        })
+        .expect("append blank prompt");
+        log.with_conn(|conn| {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO native_session_events
+                 (runtime_id, seq, occurred_at, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    runtime_id,
+                    3_i64,
+                    now,
+                    "{\"type\":\"user_prompt\",not-valid-json",
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| format!("insert corrupt prompt fixture: {error}"))?;
+            Ok(())
+        })
+        .expect("insert corrupt prompt fixture");
+        log.append(&SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq: 4,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::UserPrompt {
+                text: format!(
+                    "<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n  第一行\n\n第二行 {}  ",
+                    "很长的内容".repeat(80),
+                ),
+                image_count: 0,
+                images: None,
+                annotations: None,
+                canonical_hash: None,
+            },
+        })
+        .expect("append first visible prompt");
+        log.append(&SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq: 5,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::UserPrompt {
+                text: "后续消息不能替代首条消息".to_string(),
+                image_count: 0,
+                images: None,
+                annotations: None,
+                canonical_hash: None,
+            },
+        })
+        .expect("append later prompt");
+        drop(log);
+
+        let reopened = NativeEventLog::new(db_path.clone());
+        let prompts = reopened
+            .first_user_prompts(&[runtime_id.to_string(), "missing".to_string()])
+            .expect("restore first user prompts");
+        let prompt = prompts.get(runtime_id).expect("first user prompt");
+
+        assert_eq!(
+            prompt,
+            &format!("第一行\n\n第二行 {}", "很长的内容".repeat(80)),
+        );
+        assert!(!prompt.contains("后续消息"));
+        assert!(!prompts.contains_key("missing"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_does_not_negative_cache_prompts_written_by_another_log() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-log-first-prompt-cache-test-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let observer = NativeEventLog::new(db_path.clone());
+        let runtime_id = "runtime-first-prompt-cache";
+
+        assert!(observer
+            .first_user_prompts(&[runtime_id.to_string()])
+            .expect("read missing prompt")
+            .is_empty());
+        assert!(!observer
+            .first_user_prompt_cache
+            .lock()
+            .expect("lock first prompt cache")
+            .contains_key(runtime_id));
+
+        let writer = NativeEventLog::new(db_path.clone());
+        writer
+            .append(&SessionEventRecord {
+                runtime_id: runtime_id.to_string(),
+                seq: 1,
+                occurred_at: Utc::now(),
+                payload: SessionEventPayload::UserPrompt {
+                    text: "后来抵达的第一条用户消息".to_string(),
+                    image_count: 0,
+                    images: None,
+                    annotations: None,
+                    canonical_hash: None,
+                },
+            })
+            .expect("append user prompt from another event log");
+        assert_eq!(
+            observer
+                .first_user_prompts(&[runtime_id.to_string()])
+                .expect("observe newly persisted prompt")
+                .get(runtime_id),
+            Some(&"后来抵达的第一条用户消息".to_string()),
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

@@ -158,8 +158,8 @@ fn profile_recent_activity_survives_close_and_rejects_a_tampered_app_owned_index
             Fixture::trusted(&fixture.workspace_b),
             &opened.snapshot.profile_id,
         )
-        .expect("global default activity is shared across workspaces");
-    assert_eq!(activity_from_other_workspace, activity);
+        .expect("global default storage does not share session activity across workspaces");
+    assert!(activity_from_other_workspace.artifacts.is_empty());
     assert_eq!(activity.artifacts.len(), 2);
     let projection = serde_json::to_string(&activity).unwrap();
     assert!(!projection.contains("POST_CLOSE_SECRET"));
@@ -179,7 +179,7 @@ fn profile_recent_activity_survives_close_and_rejects_a_tampered_app_owned_index
     index_keys.sort_unstable();
     assert_eq!(
         index_keys,
-        vec!["integrity_sha256", "schema_version", "session_ids"]
+        vec!["integrity_sha256", "schema_version", "sessions"]
     );
     assert!(index.contains(&opened.snapshot.session_id));
     assert!(!index.contains(fixture._temp.path().to_string_lossy().as_ref()));
@@ -201,9 +201,15 @@ fn profile_recent_activity_survives_close_and_rejects_a_tampered_app_owned_index
     }
 
     let mut tampered = serde_json::from_str::<serde_json::Value>(&index).unwrap();
-    tampered["session_ids"] = serde_json::json!([
-        opened.snapshot.session_id,
-        "login-session-00000000000000000000000000000000"
+    tampered["sessions"] = serde_json::json!([
+        {
+            "session_id": opened.snapshot.session_id,
+            "workspace_id": "workspace-a"
+        },
+        {
+            "session_id": "login-session-00000000000000000000000000000000",
+            "workspace_id": "workspace-a"
+        }
     ]);
     write_private(
         &index_path,
@@ -241,6 +247,93 @@ fn profile_recent_activity_survives_close_and_rejects_a_tampered_app_owned_index
 }
 
 #[test]
+fn global_default_storage_sharing_does_not_merge_workspace_activity_history() {
+    let fixture = Fixture::new();
+    let opened_a = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .unwrap();
+    let artifact_root_a = {
+        let sessions = fixture.manager.lock_sessions().unwrap();
+        fixture
+            .manager
+            .record(&sessions, &opened_a.handle.session_id)
+            .unwrap()
+            .artifact_root
+            .clone()
+    };
+    let logs_a = artifact_root_a.parent().unwrap().join("logs");
+    for directory in [&artifact_root_a, &logs_a] {
+        fs::create_dir_all(directory).unwrap();
+        set_private(directory, 0o700);
+    }
+    let artifact_a = "11111111111111111111111111111111";
+    write_private(
+        &artifact_root_a.join(format!("shot-{artifact_a}.png")),
+        b"workspace a screenshot",
+    );
+    fixture.manager.force_stop(&opened_a.handle).unwrap();
+
+    let opened_b = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_b))
+        .unwrap();
+    assert_eq!(
+        opened_b.snapshot.profile_id, opened_a.snapshot.profile_id,
+        "the app-global Default Profile must still share browser storage"
+    );
+    let artifact_root_b = {
+        let sessions = fixture.manager.lock_sessions().unwrap();
+        fixture
+            .manager
+            .record(&sessions, &opened_b.handle.session_id)
+            .unwrap()
+            .artifact_root
+            .clone()
+    };
+    let logs_b = artifact_root_b.parent().unwrap().join("logs");
+    for directory in [&artifact_root_b, &logs_b] {
+        fs::create_dir_all(directory).unwrap();
+        set_private(directory, 0o700);
+    }
+    let artifact_b = "22222222222222222222222222222222";
+    write_private(
+        &artifact_root_b.join(format!("shot-{artifact_b}.png")),
+        b"workspace b screenshot",
+    );
+    fixture.manager.force_stop(&opened_b.handle).unwrap();
+
+    let activity_a = fixture
+        .manager
+        .recent_activity_for_profile(
+            Fixture::trusted(&fixture.workspace_a),
+            &opened_a.snapshot.profile_id,
+        )
+        .unwrap();
+    let activity_b = fixture
+        .manager
+        .recent_activity_for_profile(
+            Fixture::trusted(&fixture.workspace_b),
+            &opened_b.snapshot.profile_id,
+        )
+        .unwrap();
+    let screenshots_a = activity_a
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == LoginBrowserRecentArtifactKind::Screenshot)
+        .map(|artifact| artifact.artifact_id.clone())
+        .collect::<Vec<_>>();
+    let screenshots_b = activity_b
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == LoginBrowserRecentArtifactKind::Screenshot)
+        .map(|artifact| artifact.artifact_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(screenshots_a, vec![format!("shot-{artifact_a}")]);
+    assert_eq!(screenshots_b, vec![format!("shot-{artifact_b}")]);
+}
+
+#[test]
 fn profile_activity_index_retains_only_the_latest_bounded_opaque_sessions() {
     let fixture = Fixture::new();
     let first = fixture
@@ -249,6 +342,7 @@ fn profile_activity_index_retains_only_the_latest_bounded_opaque_sessions() {
         .unwrap();
     let profile_id = first.snapshot.profile_id.clone();
     let first_session_id = first.snapshot.session_id.clone();
+    let workspace_id = first.snapshot.workspace_id.clone();
     fixture.manager.force_stop(&first.handle).unwrap();
     let mut latest_session_id = first_session_id.clone();
     for _ in 0..20 {
@@ -267,22 +361,25 @@ fn profile_activity_index_retains_only_the_latest_bounded_opaque_sessions() {
     let bytes = fs::read(&index_path).unwrap();
     assert!(bytes.len() <= super::super::activity::MAX_PROFILE_ACTIVITY_BYTES as usize);
     let index = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
-    let session_ids = index["session_ids"].as_array().unwrap();
+    let sessions = index["sessions"].as_array().unwrap();
     assert_eq!(
-        session_ids.len(),
+        sessions.len(),
         super::super::activity::MAX_PROFILE_ACTIVITY_SESSIONS
     );
-    assert!(!session_ids
+    assert!(!sessions
         .iter()
-        .any(|value| value.as_str() == Some(first_session_id.as_str())));
+        .any(|value| value["session_id"].as_str() == Some(first_session_id.as_str())));
     assert_eq!(
-        session_ids.last().and_then(|value| value.as_str()),
+        sessions
+            .last()
+            .and_then(|value| value["session_id"].as_str()),
         Some(latest_session_id.as_str())
     );
-    assert!(session_ids.iter().all(|value| {
-        value
+    assert!(sessions.iter().all(|value| {
+        value["session_id"]
             .as_str()
             .is_some_and(|session_id| session_id.starts_with("login-session-"))
+            && value["workspace_id"].as_str() == Some(workspace_id.as_str())
     }));
 }
 

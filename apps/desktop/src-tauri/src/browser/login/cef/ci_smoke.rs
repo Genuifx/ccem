@@ -34,7 +34,7 @@ pub(crate) const EXIT_SMOKE_FAILED: i32 = 83;
 #[cfg(all(windows, not(debug_assertions)))]
 const EXIT_SMOKE_TIMEOUT: i32 = 84;
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 const NETWORK_SERVICE_SANDBOX_FEATURE: &str = "NetworkServiceSandbox";
 const NETWORK_SERVICE_LPAC_FEATURE: &str = "WinSboxNetworkServiceSandboxIsLPAC";
 const SMOKE_DIRECTORY: &str = "ccem-mode2-production-smoke";
@@ -536,18 +536,20 @@ struct ProductionSemanticProof {
 #[cfg(any(not(debug_assertions), test))]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProductionProfileIsolationProof {
+struct ProductionProfileStorageProof {
     secondary_workspace_root: String,
-    secondary_profile_id: String,
-    distinct_workspace_profiles: bool,
-    primary_cookie_persisted: bool,
-    primary_local_storage_persisted: bool,
-    secondary_profile_initially_empty: bool,
-    secondary_cookie_isolated: bool,
-    secondary_local_storage_isolated: bool,
-    secondary_cookie_persisted: bool,
-    secondary_local_storage_persisted: bool,
-    primary_unchanged_after_secondary: bool,
+    default_profile_shared_across_workspaces: bool,
+    default_cookie_shared: bool,
+    default_local_storage_shared: bool,
+    default_cookie_persisted: bool,
+    default_local_storage_persisted: bool,
+    explicit_profile_isolated: bool,
+    explicit_profile_initially_empty: bool,
+    explicit_cookie_isolated: bool,
+    explicit_local_storage_isolated: bool,
+    explicit_cookie_persisted: bool,
+    explicit_local_storage_persisted: bool,
+    default_unchanged_after_explicit: bool,
 }
 
 #[cfg(any(not(debug_assertions), test))]
@@ -557,10 +559,16 @@ struct ProductionPathReceipt {
     #[serde(flatten)]
     checkpoint: ProductionPathCheckpoint,
     semantic: ProductionSemanticProof,
-    reopened_profile_id: String,
-    secondary_reopened_profile_id: String,
-    final_reopened_profile_id: String,
-    profile_isolation: ProductionProfileIsolationProof,
+    default_session_id: String,
+    cross_workspace_default_profile_id: String,
+    cross_workspace_default_session_id: String,
+    explicit_profile_id: String,
+    explicit_session_id: String,
+    reopened_explicit_profile_id: String,
+    reopened_explicit_session_id: String,
+    final_default_profile_id: String,
+    final_default_session_id: String,
+    profile_storage: ProductionProfileStorageProof,
     cleanup: ProductionCleanupProof,
 }
 
@@ -647,25 +655,25 @@ impl StageRecorder {
             "production_paused",
             "production_takeover",
             "production_released",
-            "production_reopened_ready",
-            "production_reopened_shown",
-            "production_reopened_handoff",
-            "production_profile_persistence_verified",
-            "production_reclosed",
-            "production_secondary_acquired",
-            "production_secondary_shown",
-            "production_secondary_handoff",
-            "production_secondary_isolation_verified",
-            "production_secondary_released",
-            "production_secondary_reopened_ready",
-            "production_secondary_reopened_shown",
-            "production_secondary_reopened_handoff",
-            "production_secondary_persistence_verified",
-            "production_secondary_reclosed",
-            "production_primary_final_reopened",
-            "production_primary_final_handoff",
-            "production_primary_unchanged_verified",
-            "production_primary_final_released",
+            "production_cross_workspace_default_ready",
+            "production_cross_workspace_default_shown",
+            "production_cross_workspace_default_handoff",
+            "production_cross_workspace_default_storage_shared_verified",
+            "production_cross_workspace_default_released",
+            "production_explicit_new_acquired",
+            "production_explicit_new_shown",
+            "production_explicit_new_handoff",
+            "production_explicit_new_isolation_verified",
+            "production_explicit_new_released",
+            "production_explicit_reopened_ready",
+            "production_explicit_reopened_shown",
+            "production_explicit_reopened_handoff",
+            "production_explicit_persistence_verified",
+            "production_explicit_reclosed",
+            "production_default_final_reopened",
+            "production_default_final_handoff",
+            "production_default_unchanged_verified",
+            "production_default_final_released",
             "production_cleanup_verified",
         ];
         let next = ORDER

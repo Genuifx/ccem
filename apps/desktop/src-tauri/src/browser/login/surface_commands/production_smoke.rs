@@ -91,6 +91,23 @@ pub(in crate::browser::login) struct ProductionSmokeLease {
     pub(in crate::browser::login) client_revision: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProductionSmokeProfileSelection {
+    Default,
+    ExplicitNew,
+    Saved(String),
+}
+
+impl ProductionSmokeProfileSelection {
+    fn into_request(self) -> (BrowserSurfaceProfileModeArg, Option<String>) {
+        match self {
+            Self::Default => (BrowserSurfaceProfileModeArg::Default, None),
+            Self::ExplicitNew => (BrowserSurfaceProfileModeArg::New, None),
+            Self::Saved(profile_id) => (BrowserSurfaceProfileModeArg::Saved, Some(profile_id)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::browser::login) struct ProductionSmokeRegistryCounts {
     pub(in crate::browser::login) surface_count: u32,
@@ -99,25 +116,73 @@ pub(in crate::browser::login) struct ProductionSmokeRegistryCounts {
 
 impl LoginBrowserSurfaceManager {
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::browser::login) fn production_smoke_acquire(
+    pub(in crate::browser::login) fn production_smoke_acquire_default(
         self: &Arc<Self>,
         app: &AppHandle,
         sessions: &Arc<LoginBrowserSessionManager>,
         cef_host: &Arc<CefHostController>,
         preview: &Arc<BrowserManager>,
         working_dir: String,
-        saved_profile_id: Option<String>,
         initial_url: String,
         client_revision: u64,
     ) -> Result<ProductionSmokeLease, String> {
-        self.production_smoke_acquire_for_panel(
+        self.production_smoke_acquire_selected(
             app,
             sessions,
             cef_host,
             preview,
             format!("mode2-windows-production-smoke-{client_revision}"),
             working_dir,
-            saved_profile_id,
+            ProductionSmokeProfileSelection::Default,
+            initial_url,
+            client_revision,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::browser::login) fn production_smoke_acquire_explicit_new(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        sessions: &Arc<LoginBrowserSessionManager>,
+        cef_host: &Arc<CefHostController>,
+        preview: &Arc<BrowserManager>,
+        working_dir: String,
+        initial_url: String,
+        client_revision: u64,
+    ) -> Result<ProductionSmokeLease, String> {
+        self.production_smoke_acquire_selected(
+            app,
+            sessions,
+            cef_host,
+            preview,
+            format!("mode2-windows-production-smoke-{client_revision}"),
+            working_dir,
+            ProductionSmokeProfileSelection::ExplicitNew,
+            initial_url,
+            client_revision,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::browser::login) fn production_smoke_acquire_saved(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        sessions: &Arc<LoginBrowserSessionManager>,
+        cef_host: &Arc<CefHostController>,
+        preview: &Arc<BrowserManager>,
+        working_dir: String,
+        profile_id: String,
+        initial_url: String,
+        client_revision: u64,
+    ) -> Result<ProductionSmokeLease, String> {
+        self.production_smoke_acquire_selected(
+            app,
+            sessions,
+            cef_host,
+            preview,
+            format!("mode2-windows-production-smoke-{client_revision}"),
+            working_dir,
+            ProductionSmokeProfileSelection::Saved(profile_id),
             initial_url,
             client_revision,
         )
@@ -136,12 +201,39 @@ impl LoginBrowserSurfaceManager {
         initial_url: String,
         client_revision: u64,
     ) -> Result<ProductionSmokeLease, String> {
+        let selection = match saved_profile_id {
+            Some(profile_id) => ProductionSmokeProfileSelection::Saved(profile_id),
+            None => ProductionSmokeProfileSelection::ExplicitNew,
+        };
+        self.production_smoke_acquire_selected(
+            app,
+            sessions,
+            cef_host,
+            preview,
+            panel_session_id,
+            working_dir,
+            selection,
+            initial_url,
+            client_revision,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn production_smoke_acquire_selected(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        sessions: &Arc<LoginBrowserSessionManager>,
+        cef_host: &Arc<CefHostController>,
+        preview: &Arc<BrowserManager>,
+        panel_session_id: String,
+        working_dir: String,
+        selection: ProductionSmokeProfileSelection,
+        initial_url: String,
+        client_revision: u64,
+    ) -> Result<ProductionSmokeLease, String> {
         let expected_panel_session_id = panel_session_id.clone();
         let expected_initial_url = initial_url.clone();
-        let (profile_mode, profile_id) = match saved_profile_id {
-            Some(profile_id) => (BrowserSurfaceProfileModeArg::Saved, Some(profile_id)),
-            None => (BrowserSurfaceProfileModeArg::New, None),
-        };
+        let (profile_mode, profile_id) = selection.into_request();
         let response = self.acquire_login(
             app,
             sessions,
@@ -453,6 +545,21 @@ impl LoginBrowserSessionManager {
         expected_url: &str,
         written_value: &str,
     ) -> Result<ProductionSmokeSemanticRun, String> {
+        self.production_smoke_run_semantic_chain_with_initial_storage(
+            workspace_dir,
+            expected_url,
+            written_value,
+            "",
+        )
+    }
+
+    pub(in crate::browser::login) fn production_smoke_run_semantic_chain_with_initial_storage(
+        self: &Arc<Self>,
+        workspace_dir: &str,
+        expected_url: &str,
+        written_value: &str,
+        initial_storage_value: &str,
+    ) -> Result<ProductionSmokeSemanticRun, String> {
         if written_value.is_empty() || written_value == SEMANTIC_SMOKE_LATE_WRITE {
             return Err("Windows Mode 2 semantic smoke value is invalid".to_string());
         }
@@ -482,7 +589,14 @@ impl LoginBrowserSessionManager {
             },
         )?;
         let initial = semantic_page_from_snapshot(&initial, expected_url)?;
-        require_storage_state(&initial, "", "", "", "", "")?;
+        require_storage_state(
+            &initial,
+            initial_storage_value,
+            initial_storage_value,
+            initial_storage_value,
+            "",
+            "",
+        )?;
 
         require_action_result(&self.production_smoke_execute_agent_request(
             workspace_dir,
@@ -1062,6 +1176,31 @@ mod artifact_tests;
 #[cfg(test)]
 mod support_api_tests {
     use super::*;
+
+    #[test]
+    fn production_smoke_profile_selection_keeps_default_new_and_saved_distinct() {
+        let (mode, profile_id) = ProductionSmokeProfileSelection::Default.into_request();
+        assert_eq!(
+            parse_profile_selection(Some(mode), profile_id).unwrap(),
+            super::super::super::session::ProfileSelection::Default,
+        );
+
+        let (mode, profile_id) = ProductionSmokeProfileSelection::ExplicitNew.into_request();
+        assert_eq!(
+            parse_profile_selection(Some(mode), profile_id).unwrap(),
+            super::super::super::session::ProfileSelection::ExplicitNew,
+        );
+
+        let saved = "profile-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (mode, profile_id) =
+            ProductionSmokeProfileSelection::Saved(saved.to_string()).into_request();
+        assert_eq!(
+            parse_profile_selection(Some(mode), profile_id).unwrap(),
+            super::super::super::session::ProfileSelection::Existing(
+                super::super::super::profile::ProfileId::parse(saved).unwrap(),
+            ),
+        );
+    }
 
     fn empty_managers() -> (
         tempfile::TempDir,

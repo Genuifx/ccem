@@ -234,8 +234,9 @@ Replace or delete:
 - The app-global Default Profile shares cookies and local storage across conversations/workspaces.
 - Two explicitly created Profiles do not share cookies or local storage.
 - Reset/delete works only after the browser is closed and trusted confirmation is current.
-- The signed production-runtime smoke closes and reopens both primary and secondary profiles,
-  proving cookie and local-storage persistence within each profile and isolation across them.
+- The signed production-runtime smoke opens Default from two workspaces and requires the same Profile
+  ID with different browser-session IDs, proving cookie and local-storage sharing/persistence. It then
+  creates and reopens Explicit New, proving that profile remains isolated from Default.
 - Renderer termination is sticky until an explicit close/reopen, is projected to the workspace only
   after active Agent control is paused, and has a visible retry path. Browser close, forced app exit,
   and restart have equally explicit recovery states.

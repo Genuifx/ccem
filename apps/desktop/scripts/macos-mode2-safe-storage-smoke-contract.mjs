@@ -373,6 +373,18 @@ export function validateMacosSafeStorageSmokeAttestation(attestation, plan) {
     ) {
       fail(`scenario ${scenario} did not reopen the same persistent profile and app build`);
     }
+    if (
+      entry.receipts.prime.productionPath.defaultProfileId
+        !== entry.receipts.verify.productionPath.defaultProfileId
+    ) {
+      fail(`scenario ${scenario} did not preserve the app-global Default profile across launches`);
+    }
+    if (
+      entry.receipts.prime.productionPath.explicitProfileId
+        === entry.receipts.verify.productionPath.explicitProfileId
+    ) {
+      fail(`scenario ${scenario} did not create a fresh Explicit New profile per launch`);
+    }
   }
   exactKeys(attestation.cleanup, [
     'originalKeychainStateRestored', 'temporaryKeychainsDeleted',
