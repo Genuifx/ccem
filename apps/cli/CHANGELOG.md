@@ -1,5 +1,11 @@
 # ccem
 
+## 2.73.3
+
+### Patch Changes
+
+- Stabilize the cross-platform signal handling test used by the CLI release gate.
+
 ## 2.73.2
 
 ### Patch Changes
