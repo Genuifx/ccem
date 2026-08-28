@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 const API_ORIGIN = 'https://api.github.com';
 const UPLOAD_ORIGIN = 'https://uploads.github.com';
 const MAX_RELEASE_PAGES = 100;
+const MAX_TRANSIENT_ATTEMPTS = 4;
+const RETRY_BASE_DELAY_MS = 1_000;
 
 function fail(message) {
   throw new Error(`[github-draft-release-api] ${message}`);
@@ -79,11 +81,49 @@ export function releaseSourceCommit(body) {
 }
 
 function safeErrorDetail(value) {
-  return value.replace(/[\u0000-\u001f\u007f]/gu, ' ').slice(0, 500);
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]/gu, ' ').slice(0, 500);
+}
+
+function defaultSleep(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function requestError(method, status, detail, cause) {
+  const error = new Error(
+    `[github-draft-release-api] ${method} request failed (${status}): ${safeErrorDetail(detail)}`,
+    cause === undefined ? undefined : { cause },
+  );
+  error.status = status === 'network' ? undefined : status;
+  error.transient = status === 'network'
+    || status === 408
+    || status === 429
+    || (Number.isInteger(status) && status >= 500 && status <= 599);
+  return error;
+}
+
+export function isTransientGitHubError(error) {
+  return error?.transient === true
+    || error?.status === 408
+    || error?.status === 429
+    || (Number.isInteger(error?.status) && error.status >= 500 && error.status <= 599);
 }
 
 function exactAssetPath(repository, releaseId) {
   return `/repos/${repository}/releases/${releaseId}/assets`;
+}
+
+function releaseAssetIdentity(assets) {
+  if (!Array.isArray(assets)) fail('release has an invalid asset inventory');
+  return assets.map((asset) => ({
+    id: asset?.id,
+    name: asset?.name,
+    size: asset?.size,
+    digest: asset?.digest,
+    state: asset?.state,
+  })).sort((left, right) => {
+    if (left.id !== right.id) return Number(left.id) - Number(right.id);
+    return String(left.name).localeCompare(String(right.name));
+  });
 }
 
 export class DraftReleaseClient {
@@ -95,6 +135,7 @@ export class DraftReleaseClient {
     expectedOwnerRunId,
     expectedSourceCommit,
     fetchImpl = globalThis.fetch,
+    sleepImpl = defaultSleep,
   }) {
     this.repository = validateRepository(repository);
     this.tag = validateTag(tag);
@@ -103,7 +144,16 @@ export class DraftReleaseClient {
     this.expectedOwnerRunId = validateRunId(expectedOwnerRunId);
     this.expectedSourceCommit = validateOptionalSourceCommit(expectedSourceCommit);
     if (typeof fetchImpl !== 'function') fail('fetch implementation is unavailable');
+    if (typeof sleepImpl !== 'function') fail('sleep implementation is unavailable');
     this.fetchImpl = fetchImpl;
+    this.sleepImpl = sleepImpl;
+  }
+
+  async waitBeforeRetry(attempt) {
+    if (!Number.isInteger(attempt) || attempt < 1 || attempt >= MAX_TRANSIENT_ATTEMPTS) {
+      fail('retry attempt is outside the bounded retry contract');
+    }
+    await this.sleepImpl(RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)));
   }
 
   validateOwner(release) {
@@ -151,17 +201,37 @@ export class DraftReleaseClient {
       options.body = body;
       if (!Buffer.isBuffer(body) && typeof body !== 'string') options.duplex = 'half';
     }
-    const response = await this.fetchImpl(url, options);
-    if (!response?.ok) {
-      const detail = typeof response?.text === 'function'
-        ? safeErrorDetail(await response.text())
-        : '';
-      const error = new Error(
-        `[github-draft-release-api] ${method} request failed (${response?.status ?? 'unknown'}): ${detail}`,
-      );
-      error.status = response?.status;
-      throw error;
+    const safeToRetry = method === 'GET' && body === undefined;
+    let response;
+    for (let attempt = 1; attempt <= MAX_TRANSIENT_ATTEMPTS; attempt += 1) {
+      try {
+        response = await this.fetchImpl(url, options);
+      } catch (cause) {
+        const error = requestError(method, 'network', cause?.message ?? cause, cause);
+        if (!safeToRetry || attempt === MAX_TRANSIENT_ATTEMPTS) throw error;
+        await this.waitBeforeRetry(attempt);
+        continue;
+      }
+      if (!response?.ok) {
+        let detail = '';
+        try {
+          detail = typeof response?.text === 'function' ? await response.text() : '';
+        } catch (cause) {
+          const error = requestError(method, 'network', cause?.message ?? cause, cause);
+          if (!safeToRetry || attempt === MAX_TRANSIENT_ATTEMPTS) throw error;
+          await this.waitBeforeRetry(attempt);
+          continue;
+        }
+        const error = requestError(method, response?.status ?? 'unknown', detail);
+        if (!safeToRetry || !isTransientGitHubError(error) || attempt === MAX_TRANSIENT_ATTEMPTS) {
+          throw error;
+        }
+        await this.waitBeforeRetry(attempt);
+        continue;
+      }
+      break;
     }
+    if (!response?.ok) fail(`${method} request exhausted without a successful response`);
     if (response.status === 204) return null;
     const result = await response.json();
     if (!result || typeof result !== 'object') fail(`${method} request returned invalid JSON`);
@@ -270,7 +340,7 @@ export class DraftReleaseClient {
   async downloadAssetFingerprint(asset) {
     if (!Number.isSafeInteger(asset?.id) || asset.id <= 0) fail('release asset has an invalid id');
     const url = `${API_ORIGIN}/repos/${this.repository}/releases/assets/${asset.id}`;
-    const response = await this.fetchImpl(url, {
+    const options = {
       method: 'GET',
       redirect: 'follow',
       headers: {
@@ -278,11 +348,27 @@ export class DraftReleaseClient {
         Authorization: `Bearer ${this.token}`,
         'X-GitHub-Api-Version': '2022-11-28',
       },
-    });
-    if (!response?.ok) {
-      const detail = typeof response?.text === 'function' ? safeErrorDetail(await response.text()) : '';
-      fail(`asset byte verification failed (${response?.status ?? 'unknown'}): ${detail}`);
+    };
+    let response;
+    for (let attempt = 1; attempt <= MAX_TRANSIENT_ATTEMPTS; attempt += 1) {
+      try {
+        response = await this.fetchImpl(url, options);
+      } catch (cause) {
+        const error = requestError('GET', 'network', cause?.message ?? cause, cause);
+        if (attempt === MAX_TRANSIENT_ATTEMPTS) throw error;
+        await this.waitBeforeRetry(attempt);
+        continue;
+      }
+      if (!response?.ok) {
+        const detail = typeof response?.text === 'function' ? await response.text() : '';
+        const error = requestError('GET', response?.status ?? 'unknown', detail);
+        if (!isTransientGitHubError(error) || attempt === MAX_TRANSIENT_ATTEMPTS) throw error;
+        await this.waitBeforeRetry(attempt);
+        continue;
+      }
+      break;
     }
+    if (!response?.ok) fail('asset byte verification exhausted without a successful response');
     if (typeof response.arrayBuffer !== 'function') fail('asset byte verification returned an invalid body');
     const bytes = Buffer.from(await response.arrayBuffer());
     return { size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
@@ -297,20 +383,51 @@ export class DraftReleaseClient {
     ) {
       fail('cannot publish a release that is not bound to the exact draft id and tag');
     }
-    const published = await this.request(
-      `${API_ORIGIN}/repos/${this.repository}/releases/${release.id}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft: false }),
-      },
-    );
+    const exactUrl = `${API_ORIGIN}/repos/${this.repository}/releases/${release.id}`;
+    let published;
+    for (let attempt = 1; attempt <= MAX_TRANSIENT_ATTEMPTS; attempt += 1) {
+      try {
+        published = await this.request(exactUrl, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ draft: false }),
+        });
+        break;
+      } catch (error) {
+        if (!isTransientGitHubError(error)) throw error;
+        const observed = await this.request(exactUrl);
+        if (observed?.draft === false) {
+          this.validatePublishedIdentity(observed, release.id, 'ambiguous publication recovery');
+          return { published: observed, confirmed: observed };
+        }
+        this.validateDraftRetryIdentity(observed, release);
+        if (attempt === MAX_TRANSIENT_ATTEMPTS) throw error;
+        await this.waitBeforeRetry(attempt);
+      }
+    }
+    if (!published) fail('publication retry exhausted without a response');
     this.validatePublishedIdentity(published, release.id, 'publication response');
-    const confirmed = await this.request(
-      `${API_ORIGIN}/repos/${this.repository}/releases/${release.id}`,
-    );
+    const confirmed = await this.request(exactUrl);
     this.validatePublishedIdentity(confirmed, release.id, 'post-publication exact release');
     return { published, confirmed };
+  }
+
+  validateDraftRetryIdentity(observed, original) {
+    if (
+      observed?.id !== original.id
+      || (this.expectedReleaseId != null && observed.id !== this.expectedReleaseId)
+      || observed.tag_name !== this.tag
+      || observed.draft !== true
+      || observed.immutable === true
+    ) {
+      fail('publication retry did not preserve the exact mutable draft');
+    }
+    this.validateMarkers(observed);
+    const before = releaseAssetIdentity(original.assets);
+    const after = releaseAssetIdentity(observed.assets);
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      fail('draft asset identity changed before publication retry');
+    }
   }
 
   validatePublishedIdentity(release, releaseId, label) {

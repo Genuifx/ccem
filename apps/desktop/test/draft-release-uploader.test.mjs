@@ -168,7 +168,7 @@ function fakeGitHub({
   };
 }
 
-function clientFor(api) {
+function clientFor(api, overrides = {}) {
   return new DraftReleaseClient({
     repository,
     tag,
@@ -177,6 +177,7 @@ function clientFor(api) {
     expectedOwnerRunId: runId,
     expectedSourceCommit: sourceCommit,
     fetchImpl: api.fetchImpl,
+    ...overrides,
   });
 }
 
@@ -583,6 +584,111 @@ test('idempotent upload accepts only an exact digest and never deletes collision
   assert.equal(mismatchApi.requests.some(({ method }) => ['POST', 'DELETE'].includes(method)), false);
 });
 
+test('draft reads retry bounded transient network and server failures', async () => {
+  const api = fakeGitHub();
+  let attempts = 0;
+  const client = clientFor({
+    ...api,
+    fetchImpl: async (rawUrl, options) => {
+      const url = new URL(rawUrl);
+      if ((options?.method ?? 'GET') === 'GET'
+        && url.pathname === `/repos/${repository}/releases`
+        && attempts < 3) {
+        attempts += 1;
+        if (attempts === 1) throw new TypeError('fixture connection reset');
+        return response(attempts === 2 ? 429 : 503, { message: 'fixture unavailable' });
+      }
+      attempts += 1;
+      return api.fetchImpl(rawUrl, options);
+    },
+  }, { sleepImpl: async () => {} });
+
+  assert.equal((await client.requireDraft()).id, 42);
+  assert.equal(attempts, 5);
+
+  let requestTimeoutAttempts = 0;
+  const requestTimeout = clientFor({
+    ...api,
+    fetchImpl: async (rawUrl, options) => {
+      const url = new URL(rawUrl);
+      if ((options?.method ?? 'GET') === 'GET'
+        && url.pathname === `/repos/${repository}/releases`
+        && requestTimeoutAttempts === 0) {
+        requestTimeoutAttempts += 1;
+        return response(408, { message: 'fixture request timeout' });
+      }
+      requestTimeoutAttempts += 1;
+      return api.fetchImpl(rawUrl, options);
+    },
+  }, { sleepImpl: async () => {} });
+  assert.equal((await requestTimeout.requireDraft()).id, 42);
+  assert.equal(requestTimeoutAttempts, 3);
+
+  let exhausted = 0;
+  const unavailable = clientFor({
+    ...api,
+    fetchImpl: async () => {
+      exhausted += 1;
+      return response(502, { message: 'fixture unavailable' });
+    },
+  }, { sleepImpl: async () => {} });
+  await assert.rejects(unavailable.requireDraft(), /GET request failed \(502\)/u);
+  assert.equal(exhausted, 4);
+});
+
+test('upload recovers an exact persisted asset after a client error without overwriting it', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-draft-upload-recovery-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const candidate = await metadata(root, 'recovered.dmg', 'persisted-before-client-error');
+  const api = fakeGitHub();
+  let uploadAttempts = 0;
+  const fetchImpl = async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    if ((options?.method ?? 'GET') === 'POST' && url.origin === 'https://uploads.github.com') {
+      uploadAttempts += 1;
+      const persisted = await api.fetchImpl(rawUrl, options);
+      assert.equal(persisted.status, 201);
+      throw new TypeError('fixture socket closed after upload');
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  const result = await uploadCandidateIdempotently(clientFor({ ...api, fetchImpl }, {
+    sleepImpl: async () => {},
+  }), candidate);
+  assert.equal(result.uploaded, true);
+  assert.equal(result.asset.name, candidate.fileName);
+  assert.equal(result.asset.size, candidate.size);
+  assert.equal(result.asset.digest, `sha256:${candidate.sha256}`);
+  assert.equal(uploadAttempts, 1);
+  assert.equal(api.release().assets.length, 1);
+  assert.equal(api.requests.some(({ method }) => method === 'DELETE'), false);
+});
+
+test('upload retries a transient 5xx only after proving the named asset is still absent', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-draft-upload-retry-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const candidate = await metadata(root, 'retry.dmg', 'retry-after-503');
+  const api = fakeGitHub();
+  let uploadAttempts = 0;
+  const fetchImpl = async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    if ((options?.method ?? 'GET') === 'POST' && url.origin === 'https://uploads.github.com') {
+      uploadAttempts += 1;
+      if (uploadAttempts === 1) return response(503, { message: 'fixture unavailable' });
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  const result = await uploadCandidateIdempotently(clientFor({ ...api, fetchImpl }, {
+    sleepImpl: async () => {},
+  }), candidate);
+  assert.equal(result.uploaded, true);
+  assert.equal(uploadAttempts, 2);
+  assert.equal(api.release().assets.length, 1);
+  assert.equal(api.requests.some(({ method }) => method === 'DELETE'), false);
+});
+
 test('publication contract joins exact eight inventory assets with upload ids and latest.json', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-publication-contract-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -843,6 +949,106 @@ test('publication rechecks exact draft and has no unpublish transition', async (
   assert.equal(replacedReleaseApi.requests.some(({ method }) => method === 'PATCH'), false);
 });
 
+test('publication recovers when GitHub commits the exact immutable release before a client error', async () => {
+  const contract = publicationContract();
+  const api = fakeGitHub({ initialRelease: releaseFixture({ assets: contract.assets }) });
+  let patchAttempts = 0;
+  const fetchImpl = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    if ((options.method ?? 'GET') === 'PATCH' && url.pathname === exactReleasePath) {
+      patchAttempts += 1;
+      const committed = await api.fetchImpl(rawUrl, options);
+      assert.equal(committed.status, 200);
+      throw new TypeError('fixture socket closed after publication');
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  const result = await publishDraftGithubRelease({
+    client: clientFor({ ...api, fetchImpl }, { sleepImpl: async () => {} }),
+    desiredDraft: false,
+    expectedAssets: contract.expectedAssets,
+    requireImmutableReleasePolicy: immutablePolicyFor(api),
+  });
+
+  assert.deepEqual(result, { state: 'published', releaseId: 42 });
+  assert.equal(patchAttempts, 1);
+  assert.equal(api.release().draft, false);
+  assert.equal(api.release().immutable, true);
+  assert.equal(api.requests.some(({ method }) => method === 'DELETE'), false);
+});
+
+test('publication retries only after an exact draft reread and remains bounded', async () => {
+  const contract = publicationContract();
+  const api = fakeGitHub({ initialRelease: releaseFixture({ assets: contract.assets }) });
+  let patchAttempts = 0;
+  const fetchImpl = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    if ((options.method ?? 'GET') === 'PATCH' && url.pathname === exactReleasePath) {
+      patchAttempts += 1;
+      if (patchAttempts < 3) return response(503, { message: 'fixture unavailable' });
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  assert.deepEqual(await publishDraftGithubRelease({
+    client: clientFor({ ...api, fetchImpl }, { sleepImpl: async () => {} }),
+    desiredDraft: false,
+    expectedAssets: contract.expectedAssets,
+    requireImmutableReleasePolicy: immutablePolicyFor(api),
+  }), { state: 'published', releaseId: 42 });
+  assert.equal(patchAttempts, 3);
+
+  const unavailableApi = fakeGitHub({ initialRelease: releaseFixture({ assets: contract.assets }) });
+  let exhaustedAttempts = 0;
+  await assert.rejects(publishDraftGithubRelease({
+    client: clientFor({
+      ...unavailableApi,
+      fetchImpl: async (rawUrl, options = {}) => {
+        const url = new URL(rawUrl);
+        if ((options.method ?? 'GET') === 'PATCH' && url.pathname === exactReleasePath) {
+          exhaustedAttempts += 1;
+          return response(503, { message: 'fixture unavailable' });
+        }
+        return unavailableApi.fetchImpl(rawUrl, options);
+      },
+    }, { sleepImpl: async () => {} }),
+    desiredDraft: false,
+    expectedAssets: contract.expectedAssets,
+    requireImmutableReleasePolicy: immutablePolicyFor(unavailableApi),
+  }), /PATCH request failed \(503\)/u);
+  assert.equal(exhaustedAttempts, 4);
+  assert.equal(unavailableApi.release().draft, true);
+});
+
+test('ambiguous publication fails closed when the recovered immutable release drifts', async () => {
+  const contract = publicationContract();
+  const changedAssets = contract.assets.map((asset, index) => (
+    index === 0 ? { ...asset, digest: `sha256:${'f'.repeat(64)}` } : asset
+  ));
+  const api = fakeGitHub({
+    initialRelease: releaseFixture({ assets: contract.assets }),
+    postPublishExactOverride: { assets: changedAssets },
+  });
+  const fetchImpl = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    if ((options.method ?? 'GET') === 'PATCH' && url.pathname === exactReleasePath) {
+      const committed = await api.fetchImpl(rawUrl, options);
+      assert.equal(committed.status, 200);
+      throw new TypeError('fixture socket closed after publication');
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  await assert.rejects(publishDraftGithubRelease({
+    client: clientFor({ ...api, fetchImpl }, { sleepImpl: async () => {} }),
+    desiredDraft: false,
+    expectedAssets: contract.expectedAssets,
+    requireImmutableReleasePolicy: immutablePolicyFor(api),
+  }), /asset identity changed before publication/u);
+  assert.equal(api.requests.some(({ method }) => method === 'DELETE'), false);
+});
+
 test('dedicated preparation creates once and locks the exact draft id', async () => {
   const api = fakeGitHub({ initialRelease: null });
   const result = await ensureDraftGithubRelease({
@@ -868,6 +1074,95 @@ test('dedicated preparation creates once and locks the exact draft id', async ()
   assert.equal(api.release().draft, true);
   assert.match(api.release().body, new RegExp(releaseOwnerMarker(runId).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
   assert.match(api.release().body, new RegExp(releaseSourceMarker('a'.repeat(40)).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
+});
+
+test('draft creation recovers when the server committed before the client error', async () => {
+  const api = fakeGitHub({ initialRelease: null });
+  let createAttempts = 0;
+  const fetchImpl = async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    if ((options?.method ?? 'GET') === 'POST'
+      && url.pathname === `/repos/${repository}/releases`) {
+      createAttempts += 1;
+      const committed = await api.fetchImpl(rawUrl, options);
+      assert.equal(committed.status, 201);
+      throw new TypeError('fixture socket closed after create');
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  assert.deepEqual(await ensureDraftGithubRelease({
+    repository,
+    tag,
+    token: 'fixture-token',
+    name: 'CCEM v2.53.0',
+    body: 'fixture notes',
+    commitish: sourceCommit,
+    prerelease: false,
+    runId,
+    fetchImpl,
+    sleepImpl: async () => {},
+  }), {
+    state: 'draft', releaseId: 42, releaseOwnerRunId: runId, created: false, recovered: false,
+  });
+  assert.equal(createAttempts, 1);
+  assert.equal(api.release().assets.length, 0);
+  assert.equal(api.requests.some(({ method }) => ['PATCH', 'DELETE'].includes(method)), false);
+});
+
+test('draft creation retries bounded transient 5xx after exact rediscovery stays missing', async () => {
+  const api = fakeGitHub({ initialRelease: null });
+  let createAttempts = 0;
+  const fetchImpl = async (rawUrl, options) => {
+    const url = new URL(rawUrl);
+    if ((options?.method ?? 'GET') === 'POST'
+      && url.pathname === `/repos/${repository}/releases`) {
+      createAttempts += 1;
+      if (createAttempts < 3) return response(503, { message: 'fixture unavailable' });
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  assert.deepEqual(await ensureDraftGithubRelease({
+    repository,
+    tag,
+    token: 'fixture-token',
+    name: 'CCEM v2.53.0',
+    body: 'fixture notes',
+    commitish: sourceCommit,
+    prerelease: false,
+    runId,
+    fetchImpl,
+    sleepImpl: async () => {},
+  }), {
+    state: 'draft', releaseId: 42, releaseOwnerRunId: runId, created: true, recovered: false,
+  });
+  assert.equal(createAttempts, 3);
+  assert.equal(api.requests.some(({ method }) => ['PATCH', 'DELETE'].includes(method)), false);
+
+  let exhaustedAttempts = 0;
+  const unavailableApi = fakeGitHub({ initialRelease: null });
+  await assert.rejects(ensureDraftGithubRelease({
+    repository,
+    tag,
+    token: 'fixture-token',
+    name: 'CCEM v2.53.0',
+    body: 'fixture notes',
+    commitish: sourceCommit,
+    prerelease: false,
+    runId,
+    fetchImpl: async (rawUrl, options) => {
+      const url = new URL(rawUrl);
+      if ((options?.method ?? 'GET') === 'POST'
+        && url.pathname === `/repos/${repository}/releases`) {
+        exhaustedAttempts += 1;
+        return response(500, { message: 'fixture unavailable' });
+      }
+      return unavailableApi.fetchImpl(rawUrl, options);
+    },
+    sleepImpl: async () => {},
+  }), /POST request failed \(500\)/u);
+  assert.equal(exhaustedAttempts, 4);
 });
 
 test('draft ownership is stable across rerun attempts and fails closed across run ids', async () => {

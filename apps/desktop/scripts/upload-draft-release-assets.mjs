@@ -3,7 +3,11 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { DraftReleaseClient, exactAssetsNamed } from './github-draft-release-api.mjs';
+import {
+  DraftReleaseClient,
+  exactAssetsNamed,
+  isTransientGitHubError,
+} from './github-draft-release-api.mjs';
 import {
   discoverTargetAssets,
   isMacReleaseTarget,
@@ -13,6 +17,8 @@ import {
 } from './release-asset-discovery.mjs';
 
 export { discoverTargetAssets };
+
+const MAX_UPLOAD_ATTEMPTS = 4;
 
 function fail(message) {
   throw new Error(`[upload-draft-release-assets] ${message}`);
@@ -72,14 +78,47 @@ async function confirmAssetSetStillOnDraft(client, records) {
 }
 
 async function uploadAbsentAsset(client, candidate) {
-  // This is intentionally the final awaited read before the POST mutation.
-  const release = await client.requireDraft();
-  if (exactAssetsNamed(release, candidate.fileName).length !== 0) {
-    fail(`release asset appeared before upload: ${candidate.fileName}`);
+  let previousUploadError = null;
+  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+    // This is intentionally the final awaited read before each POST mutation.
+    // After an ambiguous prior POST, an exact asset here is recovery, while any
+    // conflicting or duplicate name still fails closed without deletion.
+    const release = await client.requireDraft();
+    const beforeUpload = exactAssetsNamed(release, candidate.fileName);
+    if (beforeUpload.length > 1) {
+      fail(`duplicate release assets exist for ${candidate.fileName}`);
+    }
+    if (beforeUpload.length === 1) {
+      if (previousUploadError == null) {
+        fail(`release asset appeared before upload: ${candidate.fileName}`);
+      }
+      validateUploadedAsset(beforeUpload[0], candidate);
+      return beforeUpload[0];
+    }
+
+    try {
+      const uploaded = await client.uploadAsset(release, candidate);
+      validateUploadedAsset(uploaded, candidate);
+      return uploaded;
+    } catch (error) {
+      // GitHub can commit the asset while the upload client observes a socket,
+      // 408, 429, or 5xx failure. Re-read the exact fenced draft before deciding whether
+      // another POST is safe.
+      const observedRelease = await client.requireDraft();
+      const observed = exactAssetsNamed(observedRelease, candidate.fileName);
+      if (observed.length > 1) {
+        fail(`duplicate release assets exist after upload error: ${candidate.fileName}`);
+      }
+      if (observed.length === 1) {
+        validateUploadedAsset(observed[0], candidate);
+        return observed[0];
+      }
+      if (!isTransientGitHubError(error) || attempt === MAX_UPLOAD_ATTEMPTS) throw error;
+      previousUploadError = error;
+      await client.waitBeforeRetry(attempt);
+    }
   }
-  const uploaded = await client.uploadAsset(release, candidate);
-  validateUploadedAsset(uploaded, candidate);
-  return uploaded;
+  fail(`upload retry bound was exhausted for ${candidate.fileName}`);
 }
 
 export async function uploadCandidateIdempotently(client, candidate) {
