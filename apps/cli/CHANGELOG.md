@@ -1,5 +1,11 @@
 # ccem
 
+## 2.73.1
+
+### Patch Changes
+
+- Harden desktop release publishing to prevent concurrent updater manifest uploads.
+
 ## 2.73.0
 
 ### Minor Changes
