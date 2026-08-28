@@ -137,6 +137,133 @@ test('uses generated live session titles before provider history exists', async 
   assert.equal(sessions[0].display, '排查工作间标题生成');
 });
 
+test('uses a persisted title when an interrupted session is outside the history snapshot', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+  const providerSessionId = '520a3148-0a22-43d7-983f-608e182eae34';
+
+  const sessions = buildWorkspaceSidebarSessions([], [
+    {
+      session: nativeSession({
+        runtime_id: 'native-interrupted',
+        provider_session_id: providerSessionId,
+        display_title: '首屏加载请求优化',
+        status: 'interrupted',
+        is_active: false,
+      }),
+      initialPrompt: null,
+      generatedTitle: null,
+    },
+  ]);
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, providerSessionId);
+  assert.equal(sessions[0].display, '首屏加载请求优化');
+});
+
+test('uses the restored first user prompt when an interrupted session has no title', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+  const providerSessionId = '82f9f901-2831-402e-b380-0ca2e75ec3cb';
+
+  const sessions = buildWorkspaceSidebarSessions([], [
+    {
+      session: nativeSession({
+        runtime_id: 'native-interrupted-untitled',
+        provider_session_id: providerSessionId,
+        display_title: null,
+        display_title_revision: 0,
+        initial_user_prompt: '请严格执行：用 Bash 启动两个后台任务，任务 A 先完成，任务 B 稍后完成。',
+        status: 'interrupted',
+        is_active: false,
+      }),
+      initialPrompt: null,
+      generatedTitle: null,
+    },
+  ]);
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, providerSessionId);
+  assert.equal(
+    sessions[0].display,
+    '请严格执行：用 Bash 启动两个后台任务，任务 A 先完成，任务 B 稍后完成。',
+  );
+  assert.notEqual(sessions[0].display, providerSessionId);
+  assert.notEqual(sessions[0].display, 'Claude workspace session');
+});
+
+test('keeps a persisted rename authoritative over ephemeral live title candidates', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+
+  const sessions = buildWorkspaceSidebarSessions([], [
+    {
+      session: nativeSession({ display_title: '手工改名后的标题' }),
+      generatedTitle: '晚到的自动标题',
+      initialPrompt: '原始输入',
+    },
+  ]);
+
+  assert.equal(sessions[0].display, '手工改名后的标题');
+});
+
+test('an authoritative clear never falls back to a stale generated title', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+
+  const sessions = buildWorkspaceSidebarSessions([], [
+    {
+      session: nativeSession({
+        display_title: null,
+        display_title_revision: 42,
+      }),
+      generatedTitle: '不应复活的自动标题',
+      initialPrompt: null,
+    },
+  ]);
+
+  assert.equal(sessions[0].display, 'Claude workspace session');
+  assert.notEqual(sessions[0].display, '不应复活的自动标题');
+});
+
+test('an authoritative clear falls back to the restored first user prompt', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+
+  const sessions = buildWorkspaceSidebarSessions([], [
+    {
+      session: nativeSession({
+        display_title: null,
+        display_title_revision: 42,
+        initial_user_prompt: '这是用户最开始发送、应当显示在侧栏里的消息',
+      }),
+      generatedTitle: '不应复活的自动标题',
+      initialPrompt: null,
+    },
+  ]);
+
+  assert.equal(sessions[0].display, '这是用户最开始发送、应当显示在侧栏里的消息');
+  assert.notEqual(sessions[0].display, '不应复活的自动标题');
+});
+
+test('never exposes a provider UUID as the title of an untitled restored session', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+  const providerSessionId = '520a3148-0a22-43d7-983f-608e182eae34';
+
+  const sessions = buildWorkspaceSidebarSessions([], [
+    {
+      session: nativeSession({
+        runtime_id: 'native-interrupted',
+        provider_session_id: providerSessionId,
+        status: 'interrupted',
+        is_active: false,
+      }),
+      initialPrompt: null,
+      generatedTitle: null,
+    },
+  ]);
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, providerSessionId);
+  assert.equal(sessions[0].display, 'Claude workspace session');
+  assert.notEqual(sessions[0].display, providerSessionId);
+});
+
 test('deduplicates live native sessions after matching provider history appears', async () => {
   const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
   const history = [

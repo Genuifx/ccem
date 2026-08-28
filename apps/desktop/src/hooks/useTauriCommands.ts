@@ -62,6 +62,22 @@ import type {
 import { extractRouterServiceError, type RouterServiceError } from '@/lib/routerConflict';
 import { coordinateEnvDelete } from '@/lib/envDeleteCoordination';
 
+export const SESSION_TITLE_UPDATED_EVENT = 'ccem:session-title-updated';
+
+export interface SessionTitleUpdateResult {
+  revision: number;
+  applied: boolean;
+}
+
+export interface SessionTitleUpdatedEventDetail extends SessionTitleUpdateResult {
+  source: string;
+  sessionId: string;
+  title: string;
+  aliasSessionIds: string[];
+  overwriteExisting: boolean;
+  nativeRuntimeIds: string[];
+}
+
 function makeLaunchTraceId(): string {
   return `launch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -1657,8 +1673,39 @@ export function useTauriCommands() {
     });
   }, []);
 
-  const setSessionTitle = useCallback(async (source: string, sessionId: string, title: string): Promise<void> => {
-    await invoke('set_session_title', { source, sessionId, title });
+  const setSessionTitle = useCallback(async (
+    source: string,
+    sessionId: string,
+    title: string,
+    aliasSessionIds: string[] = [],
+    overwriteExisting = true,
+    nativeRuntimeIds: string[] = [],
+  ): Promise<SessionTitleUpdateResult> => {
+    const result = await invoke<SessionTitleUpdateResult>('set_session_title', {
+      source,
+      sessionId,
+      title,
+      aliasSessionIds,
+      overwriteExisting,
+      nativeRuntimeIds,
+    });
+    if (result.applied && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent<SessionTitleUpdatedEventDetail>(
+        SESSION_TITLE_UPDATED_EVENT,
+        {
+          detail: {
+            ...result,
+            source,
+            sessionId,
+            title,
+            aliasSessionIds,
+            overwriteExisting,
+            nativeRuntimeIds,
+          },
+        },
+      ));
+    }
+    return result;
   }, []);
 
   const setSessionAnnotation = useCallback(async (

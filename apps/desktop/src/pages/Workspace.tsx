@@ -73,7 +73,11 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useAppStore } from '@/store';
 import type { InstalledSkill, LaunchClient } from '@/store';
-import { useTauriCommands } from '@/hooks/useTauriCommands';
+import {
+  SESSION_TITLE_UPDATED_EVENT,
+  useTauriCommands,
+  type SessionTitleUpdatedEventDetail,
+} from '@/hooks/useTauriCommands';
 import {
   useSessionInterruptedEvent,
   useSessionUpdatedEvent,
@@ -129,8 +133,12 @@ import {
   isInteractiveSessionTerminalOpenError,
 } from '@/lib/interactiveSessionLaunch';
 import {
+  beginWorkspaceSessionTitleGeneration,
+  cancelWorkspaceSessionTitleGeneration,
+  isWorkspaceSessionTitleGenerationCurrent,
   reconcileWorkspaceLiveSessionsSnapshot,
   updateWorkspaceLiveSessionsSnapshot,
+  updateWorkspaceLiveSessionDisplayTitle,
   upsertWorkspaceLiveSessionEntry,
   type WorkspaceLiveSessionEntry,
   type WorkspaceLiveSessionsByRuntimeId,
@@ -509,6 +517,7 @@ export function Workspace({
   const prevIsActiveRef = useRef(isActive);
   const selectedKeyRef = useRef<string | null>(null);
   const persistedGeneratedTitleKeysRef = useRef(new Set<string>());
+  const titleGenerationRevisionsRef = useRef<Record<string, number>>({});
   const reviewOwnerKey = `${workspaceMode}:${selectedKey ?? ''}:${activeLiveRuntimeId ?? ''}:${composeDir ?? ''}`;
   const reviewOwnerKeyRef = useRef(reviewOwnerKey);
 
@@ -767,6 +776,50 @@ export function Workspace({
     );
   }, []);
 
+  useEffect(() => {
+    const handleSessionTitleUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<SessionTitleUpdatedEventDetail>).detail;
+      const sessionIds = Array.from(new Set([
+        detail.sessionId,
+        ...detail.aliasSessionIds,
+      ].filter((id) => id.trim())));
+      const matchingRuntimeIds = Object.values(liveSessionsByRuntimeIdRef.current)
+        .filter((entry) => (
+          entry.session.provider === detail.source
+          && sessionIds.some((id) => (
+            entry.session.runtime_id === id
+            || entry.session.provider_session_id === id
+          ))
+        ))
+        .map((entry) => entry.session.runtime_id);
+
+      if (detail.overwriteExisting) {
+        for (const runtimeId of new Set([
+          ...detail.nativeRuntimeIds,
+          ...matchingRuntimeIds,
+        ])) {
+          cancelWorkspaceSessionTitleGeneration(
+            titleGenerationRevisionsRef.current,
+            runtimeId,
+          );
+        }
+      }
+
+      updateLiveSessionsByRuntimeId((previous) => sessionIds.reduce(
+        (next, sessionId) => updateWorkspaceLiveSessionDisplayTitle(
+          next,
+          detail.source,
+          sessionId,
+          detail.title,
+          detail.revision,
+        ),
+        previous,
+      ));
+    };
+    window.addEventListener(SESSION_TITLE_UPDATED_EVENT, handleSessionTitleUpdated);
+    return () => window.removeEventListener(SESSION_TITLE_UPDATED_EVENT, handleSessionTitleUpdated);
+  }, [updateLiveSessionsByRuntimeId]);
+
   const upsertLiveSessionEntry = useCallback((
     session: NativeSessionSummary,
     options: {
@@ -786,19 +839,6 @@ export function Workspace({
       upsertWorkspaceLiveSessionEntry(previous, session, options)
     );
   }, [setSessionRouter, updateLiveSessionsByRuntimeId]);
-
-  const setLiveSessionGeneratedTitle = useCallback((runtimeId: string, title: string) => {
-    updateLiveSessionsByRuntimeId((previous) => {
-      const existing = previous[runtimeId];
-      if (!existing) {
-        return previous;
-      }
-
-      return upsertWorkspaceLiveSessionEntry(previous, existing.session, {
-        generatedTitle: title,
-      });
-    });
-  }, [updateLiveSessionsByRuntimeId]);
 
   const restoreNativeSessions = useCallback(async ({
     restorePersistedSelection = true,
@@ -1205,7 +1245,14 @@ export function Workspace({
       }
 
       persistedGeneratedTitleKeysRef.current.add(key);
-      void setSessionTitle(entry.session.provider, providerSessionId, generatedTitle)
+      void setSessionTitle(
+        entry.session.provider,
+        entry.session.runtime_id,
+        generatedTitle,
+        [providerSessionId],
+        false,
+        [entry.session.runtime_id],
+      )
         .then(() => {
           invalidateHistoryCache();
           scheduleWorkspaceRefresh(650);
@@ -2394,25 +2441,47 @@ export function Workspace({
     if (!normalizedInput) {
       return;
     }
+    const generationRevision = beginWorkspaceSessionTitleGeneration(
+      titleGenerationRevisionsRef.current,
+      session.runtime_id,
+    );
 
     void generateWorkspaceSessionTitle(normalizedInput)
       .then(async (generatedTitle) => {
         const title = generatedTitle?.trim();
-        if (!title) {
+        if (
+          !title
+          || !isWorkspaceSessionTitleGenerationCurrent(
+            titleGenerationRevisionsRef.current,
+            session.runtime_id,
+            generationRevision,
+          )
+        ) {
           return;
         }
 
-        setLiveSessionGeneratedTitle(session.runtime_id, title);
-        await setSessionTitle(session.provider, session.runtime_id, title).catch((error) => {
-          console.error('Failed to persist generated runtime session title:', error);
-        });
-
         const latestSession = liveSessionsByRuntimeIdRef.current[session.runtime_id]?.session ?? session;
         const providerSessionId = latestSession.provider_session_id?.trim();
-        if (providerSessionId) {
-          await setSessionTitle(session.provider, providerSessionId, title).catch((error) => {
-            console.error('Failed to persist generated provider session title:', error);
-          });
+        const result = await setSessionTitle(
+          session.provider,
+          session.runtime_id,
+          title,
+          providerSessionId ? [providerSessionId] : [],
+          false,
+          [session.runtime_id],
+        ).catch((error) => {
+          console.error('Failed to persist generated native session title:', error);
+          return null;
+        });
+        if (
+          !result?.applied
+          || !isWorkspaceSessionTitleGenerationCurrent(
+            titleGenerationRevisionsRef.current,
+            session.runtime_id,
+            generationRevision,
+          )
+        ) {
+          return;
         }
 
         invalidateHistoryCache();
@@ -2424,7 +2493,6 @@ export function Workspace({
   }, [
     generateWorkspaceSessionTitle,
     scheduleWorkspaceRefresh,
-    setLiveSessionGeneratedTitle,
     setSessionTitle,
   ]);
 
@@ -3249,8 +3317,43 @@ export function Workspace({
     session: HistorySessionItem,
     title: string,
   ) => {
-    await setSessionTitle(session.source, session.id, title);
-  }, [setSessionTitle]);
+    const liveEntries = Object.values(liveSessionsByRuntimeIdRef.current).filter((entry) => (
+      entry.session.provider === session.source
+      && (
+        entry.session.runtime_id === session.id
+        || entry.session.provider_session_id === session.id
+      )
+    ));
+    const aliasSessionIds = Array.from(new Set(
+      liveEntries
+        .flatMap((entry) => [entry.session.runtime_id, entry.session.provider_session_id])
+        .filter((id): id is string => Boolean(id?.trim()) && id !== session.id),
+    ));
+    for (const entry of liveEntries) {
+      cancelWorkspaceSessionTitleGeneration(
+        titleGenerationRevisionsRef.current,
+        entry.session.runtime_id,
+      );
+    }
+
+    const { revision: displayTitleRevision } = await setSessionTitle(
+      session.source,
+      session.id,
+      title,
+      aliasSessionIds,
+      true,
+      liveEntries.map((entry) => entry.session.runtime_id),
+    );
+    updateLiveSessionsByRuntimeId((previous) =>
+      updateWorkspaceLiveSessionDisplayTitle(
+        previous,
+        session.source,
+        session.id,
+        title,
+        displayTitleRevision,
+      )
+    );
+  }, [setSessionTitle, updateLiveSessionsByRuntimeId]);
 
   const handleProjectTreeSaveAnnotation = useCallback(async (
     session: HistorySessionItem,

@@ -55,6 +55,7 @@ mod tmux;
 mod tray;
 mod unified_runtime;
 mod unified_session;
+mod user_prompt_display;
 mod wecom;
 mod weixin;
 mod workspace_decorations;
@@ -1299,14 +1300,15 @@ fn debug_compare_sessions(
     unified_state.debug_compare_sessions()
 }
 
-const WRITE_TOOL_LIMIT_SYSTEM_TIP: &str = "请注意分片写入，不要一次性写入太多内容到文件中，Write/Edit 失败 → 不要重试相同内容 → 改用更小的分块";
-
 fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: bool) -> String {
     if !limit_write_tools {
         return initial_prompt.to_string();
     }
 
-    format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{initial_prompt}")
+    format!(
+        "<system_tip>{}</system_tip>\n\n{initial_prompt}",
+        user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP,
+    )
 }
 
 #[tauri::command]
@@ -1384,6 +1386,8 @@ async fn create_native_session(
         .map(|mode| mode.trim().to_string())
         .filter(|mode| !mode.is_empty() && mode != &effective_perm_mode);
     let initial_images = initial_images.filter(|images| !images.is_empty());
+    let user_visible_initial_prompt =
+        initial_display_prompt.unwrap_or_else(|| initial_prompt.clone());
 
     let options = match provider {
         NativeProvider::Claude => {
@@ -1402,7 +1406,7 @@ async fn create_native_session(
                     &initial_prompt,
                     resolved.limit_write_tools,
                 )),
-                display_prompt: initial_display_prompt.clone(),
+                display_prompt: Some(user_visible_initial_prompt.clone()),
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
@@ -1436,7 +1440,7 @@ async fn create_native_session(
                     &initial_prompt,
                     resolved.limit_write_tools,
                 )),
-                display_prompt: initial_display_prompt.clone(),
+                display_prompt: Some(user_visible_initial_prompt.clone()),
                 initial_images: initial_images.clone(),
                 initial_annotations: initial_annotations.clone(),
                 provider_session_id: provider_session_id.clone(),
@@ -1455,7 +1459,7 @@ async fn create_native_session(
         }
     };
 
-    let summary = native_state.create_session(app, options)?;
+    let mut summary = native_state.create_session(app, options)?;
     drop(mutation_guard);
 
     if let Err(error) = register_launch(SessionProvenanceUpsert {
@@ -1475,6 +1479,8 @@ async fn create_native_session(
         );
     }
 
+    title_overrides::TitleOverrides::enrich_native_session_title(&mut summary);
+    native_state.enrich_initial_user_prompts(std::slice::from_mut(&mut summary));
     Ok(summary)
 }
 
@@ -1482,7 +1488,10 @@ async fn create_native_session(
 fn list_native_sessions(
     native_state: State<'_, Arc<NativeRuntimeManager>>,
 ) -> Vec<NativeSessionSummary> {
-    native_state.list_sessions()
+    let mut sessions = native_state.list_sessions();
+    title_overrides::TitleOverrides::enrich_native_session_titles(&mut sessions);
+    native_state.enrich_initial_user_prompts(&mut sessions);
+    sessions
 }
 
 #[tauri::command]
@@ -1490,7 +1499,12 @@ fn get_native_session_summary(
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     runtime_id: String,
 ) -> Result<Option<NativeSessionSummary>, String> {
-    native_state.get_session_summary(&runtime_id)
+    let mut summary = native_state.get_session_summary(&runtime_id)?;
+    if let Some(summary) = summary.as_mut() {
+        title_overrides::TitleOverrides::enrich_native_session_title(summary);
+        native_state.enrich_initial_user_prompts(std::slice::from_mut(summary));
+    }
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -5741,12 +5755,13 @@ mod tests {
         build_remote_load_args, build_remote_load_stdin_payload,
         collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
         normalize_git_changed_path, parse_git_status_line, prepend_write_tool_limit_system_tip,
-        RemoteEnvConfig, WorkspaceGitChangedFile, WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        RemoteEnvConfig, WorkspaceGitChangedFile,
     };
     use crate::router::{
         rename_router_config_environment, router_config_environment_references, RouterConfig,
         RouterProfile,
     };
+    use crate::user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP;
     use std::collections::HashMap;
 
     #[test]
