@@ -385,6 +385,7 @@ export class DraftReleaseClient {
     }
     const exactUrl = `${API_ORIGIN}/repos/${this.repository}/releases/${release.id}`;
     let published;
+    let ambiguousFailureSeen = false;
     for (let attempt = 1; attempt <= MAX_TRANSIENT_ATTEMPTS; attempt += 1) {
       try {
         published = await this.request(exactUrl, {
@@ -394,14 +395,17 @@ export class DraftReleaseClient {
         });
         break;
       } catch (error) {
-        if (!isTransientGitHubError(error)) throw error;
+        const transient = isTransientGitHubError(error);
+        if (!transient && !ambiguousFailureSeen) throw error;
         const observed = await this.request(exactUrl);
         if (observed?.draft === false) {
           this.validatePublishedIdentity(observed, release.id, 'ambiguous publication recovery');
           return { published: observed, confirmed: observed };
         }
+        if (!transient) throw error;
         this.validateDraftRetryIdentity(observed, release);
         if (attempt === MAX_TRANSIENT_ATTEMPTS) throw error;
+        ambiguousFailureSeen = true;
         await this.waitBeforeRetry(attempt);
       }
     }

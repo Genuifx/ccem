@@ -615,9 +615,11 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   const evidenceJobIndex = producerWorkflow.indexOf('  verify-evidence:');
   const callJobIndex = workflow.indexOf('  signed-producer:');
   const transactionJobIndex = workflow.indexOf('  publish-updater-manifest:');
+  const publishedUpdaterJobIndex = workflow.indexOf('  verify-published-updater:');
   const universalJobIndex = workflow.indexOf('  create-universal:');
   assert.ok(releaseModeIndex > 0 && releaseModeIndex < buildJobIndex && buildJobIndex < evidenceJobIndex);
-  assert.ok(callJobIndex > 0 && callJobIndex < transactionJobIndex && transactionJobIndex < universalJobIndex);
+  assert.ok(callJobIndex > 0 && callJobIndex < transactionJobIndex);
+  assert.ok(transactionJobIndex < publishedUpdaterJobIndex && publishedUpdaterJobIndex < universalJobIndex);
   const prepareJob = workflow.slice(0, callJobIndex);
   assert.match(prepareJob, /git fetch --force --no-tags origin "refs\/tags\/\$\{current_tag\}:refs\/tags\/\$\{current_tag\}"/u);
   assert.match(prepareJob, /Release tag \$\{current_tag\} must exist before desktop release builds start/u);
@@ -641,7 +643,7 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(buildJob, /retention-days: 30/u);
   assert.match(buildJob, /inputs\.export_release_payload == true/u);
 
-  const transactionJob = workflow.slice(transactionJobIndex, universalJobIndex);
+  const transactionJob = workflow.slice(transactionJobIndex, publishedUpdaterJobIndex);
   assert.match(transactionJob, /needs: \[prepare-release, signed-producer, dsh_bundle_smoke\]/u);
   assert.match(transactionJob, /needs\.signed-producer\.result == 'success'/u);
   assert.match(transactionJob, /needs\.dsh_bundle_smoke\.result == 'success'/u);
@@ -662,6 +664,14 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(transactionJob, /publish-draft-github-release\.mjs/u);
   assert.equal(transactionJob.match(/EXPECTED_RELEASE_ID: \$\{\{ steps\.draft-release\.outputs\.release_id \}\}/gu)?.length, 3);
   assert.equal(transactionJob.match(/EXPECTED_RELEASE_OWNER_RUN_ID: \$\{\{ steps\.draft-release\.outputs\.release_owner_run_id \}\}/gu)?.length, 3);
+  const publishedUpdaterJob = workflow.slice(publishedUpdaterJobIndex, universalJobIndex);
+  assert.match(publishedUpdaterJob, /needs: \[prepare-release, publish-updater-manifest\]/u);
+  assert.match(publishedUpdaterJob, /permissions: \{\}/u);
+  assert.match(publishedUpdaterJob, /inputs\.draft == 'false'/u);
+  assert.match(publishedUpdaterJob, /releases\/download\/\$\{encoded_tag\}/u);
+  assert.match(publishedUpdaterJob, /--retry-all-errors/u);
+  assert.match(publishedUpdaterJob, /--range 0-0/u);
+  assert.doesNotMatch(publishedUpdaterJob, /GITHUB_TOKEN|contents: write|secrets\./u);
   assert.doesNotMatch(workflow, /--data '\{"draft":true\}'/);
   assert.doesNotMatch(workflow, /xattr -c|clear quarantine/);
   assert.doesNotMatch(workflow, /\/releases\/tags\//);

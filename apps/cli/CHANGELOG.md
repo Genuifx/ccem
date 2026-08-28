@@ -1,5 +1,24 @@
 # ccem
 
+## 2.73.3
+
+### Patch Changes
+
+- Stabilize the cross-platform signal handling test used by the CLI release gate.
+
+## 2.73.2
+
+### Patch Changes
+
+- 361268f: Scope CLI release validation to the CLI and its workspace dependencies.
+- 61a7f46: Publish updater manifests with stable tag-based download URLs.
+
+## 2.73.1
+
+### Patch Changes
+
+- Harden desktop release publishing to prevent concurrent updater manifest uploads.
+
 ## 2.73.0
 
 ### Minor Changes

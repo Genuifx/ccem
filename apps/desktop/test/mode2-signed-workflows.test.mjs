@@ -254,7 +254,7 @@ test('release caller keeps the only write token behind the shared producer', asy
   const producer = jobBlock(source, 'signed-producer', 'publish-updater-manifest');
   assert.match(producer, /actions: read\n\s+contents: read/u);
   assert.doesNotMatch(producer, /contents: write/u);
-  const publisher = jobBlock(source, 'publish-updater-manifest', 'create-universal');
+  const publisher = jobBlock(source, 'publish-updater-manifest', 'verify-published-updater');
   assert.match(publisher, /needs: \[prepare-release, signed-producer, dsh_bundle_smoke\]/u);
   assert.match(publisher, /needs\.signed-producer\.result == 'success'/u);
   assert.match(publisher, /needs\.dsh_bundle_smoke\.result == 'success'/u);
@@ -263,6 +263,11 @@ test('release caller keeps the only write token behind the shared producer', asy
   assert.match(publisher, /ensure-draft-github-release\.mjs/u);
   assert.match(publisher, /upload-draft-release-assets\.mjs --mode payload/u);
   assert.match(publisher, /publish-draft-github-release\.mjs/u);
+  const publishedUpdaterVerifier = jobBlock(source, 'verify-published-updater', 'create-universal');
+  assert.match(publishedUpdaterVerifier, /needs: \[prepare-release, publish-updater-manifest\]/u);
+  assert.match(publishedUpdaterVerifier, /permissions: \{\}/u);
+  assert.match(publishedUpdaterVerifier, /inputs\.draft == 'false'/u);
+  assert.doesNotMatch(publishedUpdaterVerifier, /GITHUB_TOKEN|contents: write|secrets\./u);
   assertExternalActionsPinned(source);
 });
 

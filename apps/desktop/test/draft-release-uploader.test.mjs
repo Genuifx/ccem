@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { detectActionsReleasePayload } from '../scripts/detect-actions-release-payload.mjs';
+import { createLatestFromReleasePayload } from '../scripts/create-latest-from-release-payload.mjs';
 import {
   DraftReleaseClient,
   releaseOwnerMarker,
@@ -285,6 +286,36 @@ function stepBlock(workflow, name) {
   const next = workflow.indexOf('\n      - name:', start + marker.length);
   return workflow.slice(start, next < 0 ? workflow.length : next);
 }
+
+test('latest.json uses unique stable tag download URLs for every updater payload', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-stable-updater-urls-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const fixture = await verifiedPayloadFixture(root);
+  const outputPath = path.join(root, 'latest.json');
+  const latest = await createLatestFromReleasePayload({
+    contractPath: fixture.contractPath,
+    outputPath,
+    repository,
+    tag,
+    version: appVersion,
+    pubDate: '2026-08-28T00:00:00Z',
+    runId,
+  });
+
+  const targetByPlatform = {
+    'darwin-aarch64': 'aarch64-apple-darwin',
+    'darwin-x86_64': 'x86_64-apple-darwin',
+    'windows-x86_64': 'x86_64-pc-windows-msvc',
+  };
+  const expectedUrls = Object.entries(targetByPlatform).map(([platform, target]) => {
+    const targetContract = fixture.contract.targets.find((candidate) => candidate.target === target);
+    const expected = `https://github.com/${repository}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(targetContract.assets.updater.fileName)}`;
+    assert.equal(latest.platforms[platform].url, expected);
+    return expected;
+  });
+  assert.equal(new Set(expectedUrls).size, 3);
+  assert.deepEqual(JSON.parse(await fs.readFile(outputPath, 'utf8')), latest);
+});
 
 test('immutable release preflight is read-only and fails closed unless enabled is true', async () => {
   const requests = [];
@@ -1019,6 +1050,32 @@ test('publication retries only after an exact draft reread and remains bounded',
   }), /PATCH request failed \(503\)/u);
   assert.equal(exhaustedAttempts, 4);
   assert.equal(unavailableApi.release().draft, true);
+});
+
+test('publication reconciles a non-transient retry response after an earlier ambiguous failure', async () => {
+  const contract = publicationContract();
+  const api = fakeGitHub({ initialRelease: releaseFixture({ assets: contract.assets }) });
+  let patchAttempts = 0;
+  const fetchImpl = async (rawUrl, options = {}) => {
+    const url = new URL(rawUrl);
+    if ((options.method ?? 'GET') === 'PATCH' && url.pathname === exactReleasePath) {
+      patchAttempts += 1;
+      if (patchAttempts === 1) return response(503, { message: 'fixture unavailable' });
+      const committed = await api.fetchImpl(rawUrl, options);
+      assert.equal(committed.status, 200);
+      return response(422, { message: 'already published' });
+    }
+    return api.fetchImpl(rawUrl, options);
+  };
+
+  assert.deepEqual(await publishDraftGithubRelease({
+    client: clientFor({ ...api, fetchImpl }, { sleepImpl: async () => {} }),
+    desiredDraft: false,
+    expectedAssets: contract.expectedAssets,
+    requireImmutableReleasePolicy: immutablePolicyFor(api),
+  }), { state: 'published', releaseId: 42 });
+  assert.equal(patchAttempts, 2);
+  assert.equal(api.release().immutable, true);
 });
 
 test('ambiguous publication fails closed when the recovered immutable release drifts', async () => {
