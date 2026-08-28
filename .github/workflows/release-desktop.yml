@@ -546,8 +546,13 @@ jobs:
           echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
           upload_url="$(jq -r '.upload_url' "$release_json" | sed 's/{.*//')"
 
+          encoded_tag="$(jq -rn --arg value "$TAG_NAME" '$value | @uri')"
+          download_base="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/releases/download/${encoded_tag}"
+
           asset_url() {
-            jq -r --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n1
+            local encoded_name
+            encoded_name="$(jq -rn --arg value "$1" '$value | @uri')"
+            printf '%s/%s\n' "$download_base" "$encoded_name"
           }
 
           asset_id() {
@@ -589,6 +594,13 @@ jobs:
             if [[ -z "$value" || "$value" == "null" ]]; then
               echo "Missing updater bundle or signature asset for ${TAG_NAME}" >&2
               jq -r '.assets[].name' "$release_json" >&2
+              exit 1
+            fi
+          done
+
+          for bundle_url in "$aarch64_bundle_url" "$x64_bundle_url" "$windows_bundle_url"; do
+            if [[ "$bundle_url" != "${download_base}/"* ]]; then
+              echo "Updater bundle URL is not stable for ${TAG_NAME}: ${bundle_url}" >&2
               exit 1
             fi
           done
@@ -731,6 +743,61 @@ jobs:
             -H "Content-Type: application/json" \
             --data '{"draft":false}' \
             "${api}/releases/${RELEASE_ID}"
+
+  verify-published-updater:
+    name: Verify Published Updater
+    needs: [prepare-release, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ !cancelled() && needs.publish-release.result == 'success' }}
+
+    steps:
+      - name: Verify published updater downloads
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          encoded_tag="$(jq -rn --arg value "$TAG_NAME" '$value | @uri')"
+          download_base="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/releases/download/${encoded_tag}"
+          manifest_url="${download_base}/latest.json"
+          manifest_file="$(mktemp)"
+          retry_args=(
+            --retry 5
+            --retry-all-errors
+            --retry-delay 5
+            --retry-max-time 60
+            --connect-timeout 15
+            --max-time 60
+          )
+
+          if ! curl "${retry_args[@]}" -fsSL -o "$manifest_file" "$manifest_url"; then
+            echo "Published updater manifest is not downloadable: ${manifest_url}" >&2
+            exit 1
+          fi
+
+          if ! jq -e --arg version "$VERSION" --arg base "${download_base}/" '
+            .version == $version
+            and (.platforms | keys | sort == ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"])
+            and ([.platforms[].signature] | all(type == "string" and length > 0))
+            and ([.platforms[].url] | length == 3)
+            and ([.platforms[].url] | unique | length == 3)
+            and ([.platforms[].url] | all(startswith($base)))
+          ' "$manifest_file" >/dev/null; then
+            echo "Published updater manifest does not contain stable ${TAG_NAME} download URLs" >&2
+            cat "$manifest_file" >&2
+            exit 1
+          fi
+
+          while IFS= read -r asset_url; do
+            if ! curl "${retry_args[@]}" -fsSL --range 0-0 -o /dev/null "$asset_url"; then
+              echo "Published updater asset is not reachable: ${asset_url}" >&2
+              exit 1
+            fi
+          done < <(jq -r '.platforms[].url' "$manifest_file")
 
   # Universal binary (optional — combines both architectures)
   create-universal:
