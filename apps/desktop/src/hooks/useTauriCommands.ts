@@ -28,6 +28,7 @@ import type {
   InteractivePromptAnnotation,
   InteractiveReplayBatch,
   ManagedSessionSummary,
+  NativeEventReplayPage,
   NativeHandoffResult,
   NativePromptImageInput,
   SessionPromptAnnotation,
@@ -1085,6 +1086,20 @@ export function useTauriCommands() {
     });
   }, []);
 
+  const getNativeSessionEventPage = useCallback(async (
+    runtimeId: string,
+    afterSeq: number | null,
+    snapshotNewestSeq: number | null,
+    limit: number,
+  ): Promise<NativeEventReplayPage> => {
+    return invoke<NativeEventReplayPage>('get_native_session_event_page', {
+      runtimeId,
+      afterSeq,
+      snapshotNewestSeq,
+      limit,
+    });
+  }, []);
+
   const stopNativeSession = useCallback(async (
     runtimeId: string,
     source?: string | null,
@@ -1790,6 +1805,7 @@ export function useTauriCommands() {
     rewindNativeSessionFiles,
     queryNativeSessionUsage,
     getNativeSessionEvents,
+    getNativeSessionEventPage,
     stopNativeSession,
     stopNativeBackgroundTask,
     updateNativeSessionSettings,

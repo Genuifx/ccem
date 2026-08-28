@@ -43,6 +43,503 @@ function missingRunner() {
   return Promise.resolve({ status: 'missing', attempts: 0 });
 }
 
+function event(seq, message = `event-${seq}`) {
+  return {
+    runtime_id: 'runtime-paged',
+    seq,
+    occurred_at: `2026-08-29T00:00:${String(seq).padStart(2, '0')}Z`,
+    payload: { type: 'system_message', message },
+  };
+}
+
+function isCompleteReplay(batch) {
+  if (
+    batch.source_available === false
+    || batch.gap_detected
+    || batch.truncated
+  ) {
+    return false;
+  }
+  if (batch.oldest_available_seq == null || batch.newest_available_seq == null) {
+    return batch.events.length === 0;
+  }
+  return batch.events.length === batch.newest_available_seq - batch.oldest_available_seq + 1
+    && batch.events[0]?.seq === batch.oldest_available_seq
+    && batch.events[batch.events.length - 1]?.seq === batch.newest_available_seq;
+}
+
+test('paged transcript backfill treats has_more as normal progress and freezes the snapshot', async () => {
+  const mod = await importBackfillModule();
+  const run = mod.runTranscriptPagedBackfill ?? missingRunner;
+  const requests = [];
+  let yields = 0;
+
+  const result = await run({
+    loadPage: async (afterSeq, snapshotNewestSeq) => {
+      requests.push([afterSeq, snapshotNewestSeq]);
+      if (afterSeq == null) {
+        return {
+          source_available: true,
+          gap_detected: false,
+          decode_failure_count: 0,
+          oldest_available_seq: 1,
+          snapshot_newest_seq: 5,
+          next_cursor: 2,
+          has_more: true,
+          events: [event(1), event(2)],
+        };
+      }
+      if (afterSeq === 2) {
+        return {
+          source_available: true,
+          gap_detected: false,
+          decode_failure_count: 0,
+          oldest_available_seq: 1,
+          snapshot_newest_seq: 5,
+          next_cursor: 4,
+          has_more: true,
+          events: [event(3), event(4)],
+        };
+      }
+      return {
+        source_available: true,
+        gap_detected: false,
+        decode_failure_count: 0,
+        oldest_available_seq: 1,
+        snapshot_newest_seq: 5,
+        next_cursor: 5,
+        has_more: false,
+        events: [event(5)],
+      };
+    },
+    isComplete: isCompleteReplay,
+    retryDelaysMs: [],
+    timeoutMs: 100,
+    yieldBetweenPages: async () => { yields += 1; },
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.attempts, 3);
+  assert.deepEqual(result.value.events.map((entry) => entry.seq), [1, 2, 3, 4, 5]);
+  assert.deepEqual(requests, [[null, null], [2, 5], [4, 5]]);
+  assert.equal(yields, 2);
+});
+
+test('paged incremental replay starts after the committed cursor and freezes the live tail', async () => {
+  const mod = await importBackfillModule();
+  const run = mod.runTranscriptPagedBackfill ?? missingRunner;
+  const coversAfter = mod.replayBatchCoversSequenceAfter;
+  const requests = [];
+
+  const result = await run({
+    initialAfterSeq: 100,
+    loadPage: async (afterSeq, snapshotNewestSeq) => {
+      requests.push([afterSeq, snapshotNewestSeq]);
+      if (snapshotNewestSeq == null) {
+        return {
+          source_available: true,
+          gap_detected: false,
+          decode_failure_count: 0,
+          oversized_event_count: 0,
+          oldest_available_seq: 1,
+          snapshot_newest_seq: 104,
+          next_cursor: 102,
+          has_more: true,
+          events: [event(101), event(102)],
+        };
+      }
+      return {
+        source_available: true,
+        gap_detected: false,
+        decode_failure_count: 0,
+        oversized_event_count: 0,
+        oldest_available_seq: 1,
+        snapshot_newest_seq: 104,
+        next_cursor: 104,
+        has_more: false,
+        // Event 105 arrived while paging and belongs to the next poll.
+        events: [event(103), event(104)],
+      };
+    },
+    isComplete: (batch) => coversAfter(batch, 100),
+    retryDelaysMs: [],
+    timeoutMs: 100,
+    yieldBetweenPages: async () => {},
+  });
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.value.events.map((entry) => entry.seq), [101, 102, 103, 104]);
+  assert.deepEqual(requests, [[100, null], [102, 104]]);
+});
+
+test('incremental range completeness treats an unchanged snapshot as an empty success', async () => {
+  const mod = await importBackfillModule();
+  const coversAfter = mod.replayBatchCoversSequenceAfter;
+
+  assert.equal(coversAfter({
+    source_available: true,
+    gap_detected: false,
+    truncated: false,
+    oldest_available_seq: 1,
+    newest_available_seq: 100,
+    events: [],
+  }, 100), true);
+  assert.equal(coversAfter({
+    source_available: true,
+    gap_detected: true,
+    truncated: true,
+    oldest_available_seq: 1,
+    newest_available_seq: 104,
+    events: [event(103), event(104)],
+  }, 100), false);
+});
+
+test('paged transcript backfill advances past unreadable rows and reports partial integrity', async () => {
+  const mod = await importBackfillModule();
+  const run = mod.runTranscriptPagedBackfill ?? missingRunner;
+  const requests = [];
+
+  const result = await run({
+    loadPage: async (afterSeq, snapshotNewestSeq) => {
+      requests.push([afterSeq, snapshotNewestSeq]);
+      if (afterSeq == null) {
+        return {
+          source_available: true,
+          gap_detected: false,
+          decode_failure_count: 2,
+          oldest_available_seq: 1,
+          snapshot_newest_seq: 3,
+          next_cursor: 2,
+          has_more: true,
+          events: [],
+        };
+      }
+      return {
+        source_available: true,
+        gap_detected: false,
+        decode_failure_count: 0,
+        oldest_available_seq: 1,
+        snapshot_newest_seq: 3,
+        next_cursor: 3,
+        has_more: false,
+        events: [event(3)],
+      };
+    },
+    isComplete: isCompleteReplay,
+    retryDelaysMs: [],
+    timeoutMs: 100,
+    yieldBetweenPages: async () => {},
+  });
+
+  assert.equal(result.status, 'partial');
+  assert.deepEqual(result.value.events.map((entry) => entry.seq), [3]);
+  assert.equal(result.value.truncated, true);
+  assert.deepEqual(requests, [[null, null], [2, 3]]);
+});
+
+test('paged transcript backfill reports an oversized skipped event as partial', async () => {
+  const mod = await importBackfillModule();
+  const run = mod.runTranscriptPagedBackfill ?? missingRunner;
+
+  const result = await run({
+    loadPage: async () => ({
+      source_available: true,
+      gap_detected: false,
+      decode_failure_count: 0,
+      oversized_event_count: 1,
+      oldest_available_seq: 1,
+      snapshot_newest_seq: 1,
+      next_cursor: 1,
+      has_more: false,
+      events: [],
+    }),
+    // Integrity flags must remain authoritative even if a caller's structural
+    // completeness predicate does not know about a newly added skip reason.
+    isComplete: (batch) => batch.truncated !== true,
+    retryDelaysMs: [],
+    timeoutMs: 100,
+    yieldBetweenPages: async () => {},
+  });
+
+  assert.equal(result.status, 'partial');
+  assert.equal(result.value.truncated, true);
+});
+
+test('hide disposition preserves a settled transcript but restarts interrupted work', async () => {
+  const mod = await importBackfillModule();
+  const derive = mod.deriveTranscriptBackfillHideDisposition;
+  assert.equal(typeof derive, 'function');
+
+  const runtimeId = 'runtime-paged';
+  const pending = { runtimeId, generation: 7, commitId: 3 };
+
+  assert.deepEqual(derive({
+    runtimeId,
+    activeRequestRuntimeId: null,
+    pendingCommit: null,
+    committedMarker: pending,
+    rawTailSettled: true,
+  }), {
+    pendingCommitLanded: false,
+    mustRestartInitialReplay: false,
+  });
+
+  assert.deepEqual(derive({
+    runtimeId,
+    activeRequestRuntimeId: runtimeId,
+    pendingCommit: null,
+    committedMarker: null,
+    rawTailSettled: false,
+  }), {
+    pendingCommitLanded: false,
+    mustRestartInitialReplay: true,
+  });
+
+  // The page request resolved and advanced the raw cursor, but React has not
+  // committed the corresponding event update yet. Hiding here must force a
+  // new bounded snapshot or the older rows would be lost permanently.
+  assert.deepEqual(derive({
+    runtimeId,
+    activeRequestRuntimeId: null,
+    pendingCommit: pending,
+    committedMarker: { ...pending, commitId: 2 },
+    rawTailSettled: true,
+  }), {
+    pendingCommitLanded: false,
+    mustRestartInitialReplay: true,
+  });
+
+  assert.deepEqual(derive({
+    runtimeId,
+    activeRequestRuntimeId: null,
+    pendingCommit: pending,
+    committedMarker: pending,
+    rawTailSettled: true,
+  }), {
+    pendingCommitLanded: true,
+    mustRestartInitialReplay: false,
+  });
+
+});
+
+test('scroll anchors are released only by their exact backfill commit', async () => {
+  const mod = await importBackfillModule();
+  const matches = mod.transcriptBackfillCommitMatches;
+  assert.equal(typeof matches, 'function');
+
+  const expected = { runtimeId: 'runtime-paged', generation: 4, commitId: 9 };
+  assert.equal(matches(expected, null), false);
+  assert.equal(matches(expected, { ...expected, commitId: 8 }), false);
+  assert.equal(matches(expected, { ...expected, generation: 5 }), false);
+  assert.equal(matches(expected, expected), true);
+});
+
+test('poll cursors advance only from a committed replay marker', async () => {
+  const mod = await importBackfillModule();
+  const commitCursor = mod.resolveCommittedReplayCursor;
+  assert.equal(typeof commitCursor, 'function');
+
+  assert.equal(commitCursor(1200, 21_238, false), 21_238);
+  assert.equal(commitCursor(21_238, 21_000, false), 21_238);
+  assert.equal(commitCursor(21_238, null, true), null);
+});
+
+test('paged transcript backfill retries only the failed cursor page', async () => {
+  const mod = await importBackfillModule();
+  const run = mod.runTranscriptPagedBackfill ?? missingRunner;
+  let firstPageCalls = 0;
+  let secondPageCalls = 0;
+
+  const result = await run({
+    loadPage: async (afterSeq) => {
+      if (afterSeq == null) {
+        firstPageCalls += 1;
+        return {
+          source_available: true,
+          gap_detected: false,
+          decode_failure_count: 0,
+          oldest_available_seq: 1,
+          snapshot_newest_seq: 2,
+          next_cursor: 1,
+          has_more: true,
+          events: [event(1)],
+        };
+      }
+      secondPageCalls += 1;
+      if (secondPageCalls === 1) {
+        throw new Error('temporary page read failure');
+      }
+      return {
+        source_available: true,
+        gap_detected: false,
+        decode_failure_count: 0,
+        oldest_available_seq: 1,
+        snapshot_newest_seq: 2,
+        next_cursor: 2,
+        has_more: false,
+        events: [event(2)],
+      };
+    },
+    isComplete: isCompleteReplay,
+    retryDelaysMs: [0],
+    timeoutMs: 100,
+    yieldBetweenPages: async () => {},
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(firstPageCalls, 1);
+  assert.equal(secondPageCalls, 2);
+  assert.equal(result.attempts, 3);
+});
+
+test('paged transcript backfill recovers the 21k-event regression shape without an unbounded read', async () => {
+  const mod = await importBackfillModule();
+  const run = mod.runTranscriptPagedBackfill ?? missingRunner;
+  const eventCount = 21_238;
+  const pageLimit = 512;
+  let pageCalls = 0;
+  let largestPage = 0;
+
+  const result = await run({
+    loadPage: async (afterSeq, snapshotNewestSeq) => {
+      pageCalls += 1;
+      const snapshot = snapshotNewestSeq ?? eventCount;
+      const start = (afterSeq ?? 0) + 1;
+      const end = Math.min(snapshot, start + pageLimit - 1);
+      const events = end >= start
+        ? Array.from({ length: end - start + 1 }, (_, index) => event(start + index))
+        : [];
+      largestPage = Math.max(largestPage, events.length);
+      return {
+        source_available: true,
+        gap_detected: false,
+        decode_failure_count: 0,
+        oldest_available_seq: 1,
+        snapshot_newest_seq: snapshot,
+        next_cursor: events[events.length - 1]?.seq ?? afterSeq,
+        has_more: end < snapshot,
+        events,
+      };
+    },
+    isComplete: isCompleteReplay,
+    retryDelaysMs: [],
+    timeoutMs: 100,
+    yieldBetweenPages: async () => {},
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.value.events.length, eventCount);
+  assert.equal(result.value.events[0].seq, 1);
+  assert.equal(result.value.events[eventCount - 1].seq, eventCount);
+  assert.equal(pageCalls, Math.ceil(eventCount / pageLimit));
+  assert.equal(largestPage, pageLimit);
+});
+
+test('native workspace live and history recovery both use the bounded page command', async () => {
+  const nativeViewSource = await fs.readFile(path.join(
+    desktopDir,
+    'src',
+    'components',
+    'workspace',
+    'WorkspaceNativeSessionView.tsx',
+  ), 'utf8');
+  const workspaceSource = await fs.readFile(path.join(
+    desktopDir,
+    'src',
+    'pages',
+    'Workspace.tsx',
+  ), 'utf8');
+
+  assert.match(nativeViewSource, /runTranscriptPagedBackfill\(\{/);
+  assert.match(nativeViewSource, /getNativeSessionEventPage\(/);
+  assert.match(nativeViewSource, /deriveTranscriptBackfillHideDisposition\(\{/);
+  assert.match(nativeViewSource, /initialAfterSeq: sinceSeq/);
+  assert.match(nativeViewSource, /const pollEvents = useCallback\(\(\): Promise<boolean>/);
+  assert.match(nativeViewSource, /setPollReplayCommitMarker/);
+  assert.match(nativeViewSource, /lastSeenSeqRef\.current = resolveCommittedReplayCursor\(/);
+  assert.match(
+    nativeViewSource,
+    /transcriptPartialObservationRef\.current\s*=\s*pendingTranscriptPartialObservationRef\.current\.observation/,
+  );
+  assert.match(
+    nativeViewSource,
+    /incrementalReplay\?\.state === 'partial'\s*&& !transcriptBackfillCommitMatches\(\s*pendingTranscriptPartialObservationRef\.current,\s*commitMarker,/,
+  );
+  const pollMarkerEffect = nativeViewSource.slice(
+    nativeViewSource.indexOf('const marker = pollReplayCommitMarker'),
+    nativeViewSource.indexOf('const isRuntimeRequestCurrent = useCallback'),
+  );
+  assert.doesNotMatch(
+    pollMarkerEffect,
+    /markTranscriptPartialObservation\(/,
+    'a stale poll marker must not revive an integrity warning cleared by a covering full replay',
+  );
+  const pollImplementation = nativeViewSource.slice(
+    nativeViewSource.indexOf('const runPollEvents = useCallback'),
+    nativeViewSource.indexOf('const pollEvents = useCallback'),
+  );
+  assert.doesNotMatch(
+    pollImplementation,
+    /lastSeenSeqRef\.current\s*=/,
+    'poll responses must not advance the cursor before their React commit lands',
+  );
+  assert.doesNotMatch(
+    nativeViewSource,
+    /getNativeSessionEvents\(\s*session\.runtime_id,\s*sinceSeq,\s*null/,
+  );
+  assert.match(nativeViewSource, /transcriptBackfillCommitPendingRef/);
+  assert.match(nativeViewSource, /setTranscriptBackfillCommitMarker/);
+  assert.match(
+    nativeViewSource,
+    /\[isVisible, transcriptBackfillCommitMarker\]/,
+  );
+  assert.doesNotMatch(
+    nativeViewSource,
+    /getNativeSessionEvents\(requestScope\.runtimeId,\s*null,\s*null\)/,
+  );
+  assert.match(workspaceSource, /runTranscriptPagedBackfill\(\{/);
+  assert.match(workspaceSource, /getNativeSessionEventPage\(/);
+  assert.doesNotMatch(
+    workspaceSource,
+    /getNativeSessionEvents\(nativeSession\.runtime_id,\s*null,\s*null\)/,
+  );
+  assert.match(
+    workspaceSource,
+    /integrity: result\.status === 'partial' \? 'partial' : 'complete'/,
+  );
+  assert.match(
+    workspaceSource,
+    /if \(providerHasTranscript\) \{\s*setHistoryTranscriptBackfillState\('idle'\);\s*return;/,
+  );
+  assert.match(workspaceSource, /preserveActiveRequest: true/);
+  assert.match(
+    workspaceSource,
+    /preserveActiveRequest\s*&& \(conversationLoadAbortRef\.current \|\| isLoadingMessagesRef\.current\)/,
+  );
+  const providerFirstPaint = workspaceSource.indexOf(
+    'providerHistory = await fetchConversationDetail(session)',
+  );
+  const nativeHistorySettle = workspaceSource.indexOf(
+    'const nativeHistoryResult = await nativeHistoryPromise',
+  );
+  assert.ok(providerFirstPaint >= 0 && providerFirstPaint < nativeHistorySettle);
+});
+
+test('historical prepend does not animate every recovered transcript item', async () => {
+  const source = await fs.readFile(path.join(
+    desktopDir,
+    'src',
+    'components',
+    'workspace',
+    'WorkspaceTranscriptList.tsx',
+  ), 'utf8');
+
+  assert.match(source, /const isTailAppend =/);
+  assert.match(source, /slice\(-12\)/);
+  assert.match(source, /const newKeySet = new Set\(newKeys\)/);
+  assert.doesNotMatch(source, /newKeys\.includes\(/);
+});
+
 test('transcript backfill retries one rejected read and returns the complete replay', async () => {
   const mod = await importBackfillModule();
   const run = mod.runTranscriptBackfillWithRetry ?? missingRunner;
@@ -498,4 +995,94 @@ test('older successful snapshot cannot clear a newer incremental partial observa
   );
   assert.equal(successWithLargerCursor.state, 'partial');
   assert.equal(successWithLargerCursor.partialObservation.unknownRange, true);
+});
+
+test('full replay preserves a partial poll response whose React marker has not committed yet', async () => {
+  const mod = await importBackfillModule();
+  const includePending = mod.includePendingTranscriptPartialObservation
+    ?? ((committed) => committed);
+  const markPartial = mod.markTranscriptPartialObservation ?? (() => ({ version: -1 }));
+  const resolvePresentation = mod.resolveTranscriptBackfillPresentation
+    ?? (() => ({ state: 'missing' }));
+  const requestScope = { runtimeId: 'runtime-interleaved', generation: 4 };
+  const beforeFullRequest = {
+    version: 0,
+    throughSeq: null,
+    unknownRange: false,
+  };
+  const pendingPartial = {
+    ...requestScope,
+    commitId: 7,
+    observation: markPartial(beforeFullRequest, 11),
+  };
+
+  // The incremental response has resolved, but its low-priority React marker
+  // has not committed yet. A full snapshot through seq 10 must still see it.
+  const observationAtFullResolution = includePending(
+    beforeFullRequest,
+    pendingPartial,
+    requestScope,
+  );
+  const staleFullSuccess = resolvePresentation(
+    'success',
+    10,
+    beforeFullRequest.version,
+    observationAtFullResolution,
+  );
+  assert.equal(staleFullSuccess.state, 'partial');
+  assert.deepEqual(staleFullSuccess.partialObservation, pendingPartial.observation);
+
+  assert.deepEqual(
+    includePending(beforeFullRequest, pendingPartial, {
+      runtimeId: requestScope.runtimeId,
+      generation: requestScope.generation + 1,
+    }),
+    beforeFullRequest,
+    'a hidden or switched runtime generation must not inherit an uncommitted partial',
+  );
+});
+
+test('covering full replay is not reverted by its queued stale partial marker', async () => {
+  const mod = await importBackfillModule();
+  const includePending = mod.includePendingTranscriptPartialObservation
+    ?? ((committed) => committed);
+  const markPartial = mod.markTranscriptPartialObservation ?? (() => ({ version: -1 }));
+  const resolvePresentation = mod.resolveTranscriptBackfillPresentation
+    ?? (() => ({ state: 'missing' }));
+  const markerMatches = mod.transcriptBackfillCommitMatches ?? (() => true);
+  const requestScope = { runtimeId: 'runtime-covered', generation: 9 };
+  const beforeFullRequest = {
+    version: 0,
+    throughSeq: null,
+    unknownRange: false,
+  };
+  const acceptedPartial = markPartial(beforeFullRequest, 11);
+  const queuedPartialMarker = {
+    ...requestScope,
+    commitId: 12,
+    observation: acceptedPartial,
+  };
+
+  const coveringFullSuccess = resolvePresentation(
+    'success',
+    11,
+    beforeFullRequest.version,
+    includePending(acceptedPartial, queuedPartialMarker, requestScope),
+  );
+  assert.equal(coveringFullSuccess.state, 'idle');
+  assert.equal(coveringFullSuccess.partialObservation.throughSeq, null);
+
+  // A covering success clears this pending slot. Both the queued view update
+  // and marker effect are then observation-neutral for the stale marker.
+  const pendingAfterCoveringFull = null;
+  assert.equal(markerMatches(pendingAfterCoveringFull, queuedPartialMarker), false);
+  const finalViewState = markerMatches(pendingAfterCoveringFull, queuedPartialMarker)
+    ? 'partial'
+    : coveringFullSuccess.state;
+  assert.equal(finalViewState, 'idle');
+  assert.deepEqual(coveringFullSuccess.partialObservation, {
+    version: acceptedPartial.version,
+    throughSeq: null,
+    unknownRange: false,
+  });
 });

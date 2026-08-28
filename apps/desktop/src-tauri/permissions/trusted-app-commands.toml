@@ -91,6 +91,7 @@ commands.allow = [
   "rewind_native_session_files",
   "query_native_session_usage",
   "get_native_session_events",
+  "get_native_session_event_page",
   "read_prompt_image_attachment",
   "update_native_session_settings",
   "get_router_settings",

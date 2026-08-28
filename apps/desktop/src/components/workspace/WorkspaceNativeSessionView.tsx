@@ -50,6 +50,7 @@ import type {
   InteractiveToolPrompt,
   NativePromptImageInput,
   NativeSessionSummary,
+  ReplayBatch,
   SessionEventRecord,
   SessionPromptAnnotation,
   SessionPromptImage,
@@ -133,11 +134,19 @@ import {
 } from './workspaceEventTranscript';
 import {
   createTranscriptBackfillEventUpdate,
+  deriveTranscriptBackfillHideDisposition,
+  includePendingTranscriptPartialObservation,
   inspectIncrementalTranscriptReplay,
   markTranscriptPartialObservation,
   resolveTranscriptBackfillReplay,
   resolveTranscriptBackfillPresentation,
-  runTranscriptBackfillWithRetry,
+  resolveCommittedReplayCursor,
+  replayBatchCoversSequenceAfter,
+  runTranscriptPagedBackfill,
+  transcriptBackfillCommitMatches,
+  NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT,
+  type PendingTranscriptPartialObservation,
+  type TranscriptBackfillCommitIdentity,
   type TranscriptPartialObservation,
 } from './workspaceTranscriptBackfill';
 import {
@@ -1421,6 +1430,7 @@ export function WorkspaceNativeSessionView({
   const defaultPermissionMode = useAppStore((state) => state.permissionMode);
   const {
     getNativeSessionEvents,
+    getNativeSessionEventPage,
     sendNativeSessionInput,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
@@ -1466,6 +1476,22 @@ export function WorkspaceNativeSessionView({
     runtimeId: string;
     state: WorkspaceTranscriptBackfillState;
   }>(() => ({ runtimeId: session.runtime_id, state: 'idle' }));
+  const [transcriptBackfillCommitMarker, setTranscriptBackfillCommitMarker] = useState<{
+    runtimeId: string;
+    generation: number;
+    commitId: number;
+  } | null>(null);
+  const [pollReplayCommitMarker, setPollReplayCommitMarker] = useState<(
+    TranscriptBackfillCommitIdentity & {
+      isInitialReplay: boolean;
+      acknowledgedSeq: number | null;
+      resetLastSeen: boolean;
+      rawTailSettled: boolean;
+      clearRawTailSeams: boolean;
+      initialUnloadedGapStarts: number[];
+      partial: boolean;
+    }
+  ) | null>(null);
   const [localUserPrompts, setLocalUserPrompts] = useState<LocalUserPrompt[]>(() =>
     createInitialLocalUserPrompts(initialPrompt, initialImages, initialAnnotations)
   );
@@ -1546,6 +1572,13 @@ export function WorkspaceNativeSessionView({
   const containerRef = useRef<HTMLDivElement>(null);
   const programmaticScrollRef = useRef(false);
   const autoScrollDetachedRef = useRef(false);
+  const pendingBackfillScrollAnchorRef = useRef<{
+    commit: TranscriptBackfillCommitIdentity;
+    key: string | null;
+    viewportTopOffset: number;
+    scrollTop: number;
+    scrollHeight: number;
+  } | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
   const scrollSettleTimeoutRef = useRef<number | null>(null);
   const externalActionsCloseTimerRef = useRef<number | null>(null);
@@ -1568,6 +1601,15 @@ export function WorkspaceNativeSessionView({
     startedWithSeq: number | null;
     partialVersionAtStart: number;
   } | null>(null);
+  const incrementalReplayAbortRef = useRef<AbortController | null>(null);
+  const pollEventsInFlightRef = useRef<{
+    runtimeId: string;
+    promise: Promise<boolean>;
+  } | null>(null);
+  const transcriptBackfillCommitSequenceRef = useRef(0);
+  const transcriptBackfillCommitPendingRef = useRef<TranscriptBackfillCommitIdentity | null>(null);
+  const pendingTranscriptPartialObservationRef =
+    useRef<PendingTranscriptPartialObservation | null>(null);
   const transcriptPartialObservationRef = useRef<TranscriptPartialObservation>({
     version: 0,
     throughSeq: null,
@@ -1587,6 +1629,10 @@ export function WorkspaceNativeSessionView({
     };
     transcriptBackfillRequestRef.current?.controller.abort();
     transcriptBackfillRequestRef.current = null;
+    incrementalReplayAbortRef.current?.abort();
+    incrementalReplayAbortRef.current = null;
+    transcriptBackfillCommitPendingRef.current = null;
+    pendingTranscriptPartialObservationRef.current = null;
   }, [session.runtime_id]);
 
   useEffect(() => () => {
@@ -1597,7 +1643,120 @@ export function WorkspaceNativeSessionView({
     };
     transcriptBackfillRequestRef.current?.controller.abort();
     transcriptBackfillRequestRef.current = null;
+    incrementalReplayAbortRef.current?.abort();
+    incrementalReplayAbortRef.current = null;
+    transcriptBackfillCommitPendingRef.current = null;
+    pendingTranscriptPartialObservationRef.current = null;
   }, []);
+
+  // Workspace keeps inactive live views mounted. Stop historical pagination
+  // as soon as this view is hidden so opening several long sessions cannot
+  // leave several background readers competing for SQLite and the WebView.
+  // An interrupted view restarts from a fresh bounded snapshot when shown;
+  // an already committed view keeps its cursor and only resumes the live tail.
+  useLayoutEffect(() => {
+    if (isVisible) {
+      return;
+    }
+    const previousScope = runtimeRequestScopeRef.current;
+    if (previousScope.runtimeId === session.runtime_id) {
+      runtimeRequestScopeRef.current = {
+        runtimeId: previousScope.runtimeId,
+        generation: previousScope.generation + 1,
+      };
+    }
+    const activeRequest = transcriptBackfillRequestRef.current;
+    if (activeRequest?.runtimeId === session.runtime_id) {
+      activeRequest.controller.abort();
+      transcriptBackfillRequestRef.current = null;
+    }
+    incrementalReplayAbortRef.current?.abort();
+    incrementalReplayAbortRef.current = null;
+    pendingTranscriptPartialObservationRef.current = null;
+    const pendingCommit = transcriptBackfillCommitPendingRef.current;
+    const { pendingCommitLanded, mustRestartInitialReplay } =
+      deriveTranscriptBackfillHideDisposition({
+        runtimeId: session.runtime_id,
+        activeRequestRuntimeId: activeRequest?.runtimeId ?? null,
+        pendingCommit,
+        committedMarker: transcriptBackfillCommitMarker,
+        rawTailSettled: rawTailSettledRef.current,
+      });
+    if (pendingCommitLanded) {
+      transcriptBackfillCommitPendingRef.current = null;
+    }
+    if (mustRestartInitialReplay) {
+      initialReplayRuntimeRef.current = null;
+      rawTailSettledRef.current = false;
+    }
+    if (pendingCommit && !pendingCommitLanded) {
+      transcriptBackfillCommitPendingRef.current = null;
+    }
+    pendingBackfillScrollAnchorRef.current = null;
+    setTranscriptBackfillView((current) => (
+      current.runtimeId === session.runtime_id && current.state === 'loading'
+        ? { runtimeId: session.runtime_id, state: 'idle' }
+        : current
+    ));
+  }, [
+    isVisible,
+    session.runtime_id,
+    transcriptBackfillCommitMarker,
+  ]);
+
+  useLayoutEffect(() => {
+    const pendingCommit = transcriptBackfillCommitPendingRef.current;
+    if (transcriptBackfillCommitMatches(pendingCommit, transcriptBackfillCommitMarker)) {
+      transcriptBackfillCommitPendingRef.current = null;
+      initialReplayRuntimeRef.current = session.runtime_id;
+    }
+  }, [session.runtime_id, transcriptBackfillCommitMarker]);
+
+  useLayoutEffect(() => {
+    const marker = pollReplayCommitMarker;
+    const currentScope = runtimeRequestScopeRef.current;
+    if (
+      !marker
+      || marker.runtimeId !== currentScope.runtimeId
+      || marker.generation !== currentScope.generation
+    ) {
+      return;
+    }
+
+    if (marker.isInitialReplay) {
+      initialReplayRuntimeRef.current = marker.runtimeId;
+      if (!rawTailSettledRef.current) {
+        initialReplayUnloadedGapStartsRef.current = marker.initialUnloadedGapStarts;
+      }
+      if (marker.resetLastSeen) {
+        lastSeenSeqRef.current = resolveCommittedReplayCursor(
+          lastSeenSeqRef.current,
+          marker.acknowledgedSeq,
+          true,
+        );
+      }
+      if (marker.clearRawTailSeams) {
+        rawTailSeamsRef.current = [];
+      }
+      if (marker.rawTailSettled) {
+        rawTailSettledRef.current = true;
+        initialReplayUnloadedGapStartsRef.current = [];
+      }
+    }
+    if (!marker.resetLastSeen && marker.acknowledgedSeq != null) {
+      lastSeenSeqRef.current = resolveCommittedReplayCursor(
+        lastSeenSeqRef.current,
+        marker.acknowledgedSeq,
+        false,
+      );
+    }
+    if (marker.partial) {
+      const pendingPartial = pendingTranscriptPartialObservationRef.current;
+      if (transcriptBackfillCommitMatches(pendingPartial, marker)) {
+        pendingTranscriptPartialObservationRef.current = null;
+      }
+    }
+  }, [pollReplayCommitMarker]);
 
   const isRuntimeRequestCurrent = useCallback((scope: {
     runtimeId: string;
@@ -1606,6 +1765,31 @@ export function WorkspaceNativeSessionView({
     const currentScope = runtimeRequestScopeRef.current;
     return currentScope.runtimeId === scope.runtimeId
       && currentScope.generation === scope.generation;
+  }, []);
+
+  const captureBackfillReadingAnchor = useCallback((
+    commit: TranscriptBackfillCommitIdentity,
+  ) => {
+    const container = containerRef.current;
+    if (!container || !autoScrollDetachedRef.current) {
+      pendingBackfillScrollAnchorRef.current = null;
+      return;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const items = container.querySelectorAll<HTMLElement>('[data-transcript-item-key]');
+    const firstVisible = Array.from(items).find((item) => {
+      const rect = item.getBoundingClientRect();
+      return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
+    });
+    pendingBackfillScrollAnchorRef.current = {
+      commit,
+      key: firstVisible?.dataset.transcriptItemKey ?? null,
+      viewportTopOffset: firstVisible
+        ? firstVisible.getBoundingClientRect().top - containerRect.top
+        : 0,
+      scrollTop: container.scrollTop,
+      scrollHeight: container.scrollHeight,
+    };
   }, []);
 
   const handleComposerTextChange = useCallback((value: string) => {
@@ -2214,7 +2398,7 @@ export function WorkspaceNativeSessionView({
       runtimeId: session.runtime_id,
       generation: runtimeRequestScopeRef.current.generation,
     };
-    if (!isRuntimeRequestCurrent(requestScope)) {
+    if (!isVisible || !isRuntimeRequestCurrent(requestScope)) {
       return;
     }
     const activeRequest = transcriptBackfillRequestRef.current;
@@ -2230,10 +2414,16 @@ export function WorkspaceNativeSessionView({
       partialVersionAtStart: transcriptPartialObservationRef.current.version,
     };
     transcriptBackfillRequestRef.current = request;
+    rawTailSettledRef.current = false;
     setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'loading' });
 
-    const result = await runTranscriptBackfillWithRetry({
-      load: () => getNativeSessionEvents(requestScope.runtimeId, null, null),
+    const result = await runTranscriptPagedBackfill({
+      loadPage: (afterSeq, snapshotNewestSeq) => getNativeSessionEventPage(
+        requestScope.runtimeId,
+        afterSeq,
+        snapshotNewestSeq,
+        NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT,
+      ),
       isComplete: replayBatchCoversAvailableSequenceRange,
       physicalRequestKey: requestScope.runtimeId,
       signal: request.controller.signal,
@@ -2277,145 +2467,242 @@ export function WorkspaceNativeSessionView({
       initialReplayUnloadedGapStartsRef.current = [];
     }
     rawTailSettledRef.current = resolution.rawTailSettled;
+    const partialObservationAtResolution = includePendingTranscriptPartialObservation(
+      transcriptPartialObservationRef.current,
+      pendingTranscriptPartialObservationRef.current,
+      requestScope,
+    );
     const presentation = resolveTranscriptBackfillPresentation(
       result.status,
       replayCursor,
       request.partialVersionAtStart,
-      transcriptPartialObservationRef.current,
+      partialObservationAtResolution,
     );
     transcriptPartialObservationRef.current = presentation.partialObservation;
+    const pendingPartial = pendingTranscriptPartialObservationRef.current;
+    if (
+      result.status === 'success'
+      && presentation.state === 'idle'
+      && pendingPartial?.runtimeId === requestScope.runtimeId
+      && pendingPartial.generation === requestScope.generation
+    ) {
+      // This authoritative snapshot covered every known partial range. Drop
+      // its queued marker too, so that marker cannot revive a cleared warning.
+      pendingTranscriptPartialObservationRef.current = null;
+    }
     const updateEvents = createTranscriptBackfillEventUpdate(
       result.status,
       fullBatch,
       request.startedWithSeq,
     );
-    setEvents((previous) => (
-      isRuntimeRequestCurrent(requestScope) ? updateEvents(previous) : previous
-    ));
-    setTranscriptBackfillView({
-      runtimeId: requestScope.runtimeId,
-      state: presentation.state,
+    const commitMarker = {
+      ...requestScope,
+      commitId: transcriptBackfillCommitSequenceRef.current + 1,
+    };
+    transcriptBackfillCommitSequenceRef.current = commitMarker.commitId;
+    transcriptBackfillCommitPendingRef.current = commitMarker;
+    captureBackfillReadingAnchor(commitMarker);
+    startTransition(() => {
+      setEvents((previous) => (
+        isRuntimeRequestCurrent(requestScope) ? updateEvents(previous) : previous
+      ));
+      setTranscriptBackfillView((current) => (
+        isRuntimeRequestCurrent(requestScope)
+          ? { runtimeId: requestScope.runtimeId, state: presentation.state }
+          : current
+      ));
+      setTranscriptBackfillCommitMarker((current) => (
+        isRuntimeRequestCurrent(requestScope) ? commitMarker : current
+      ));
     });
 
     if (sessionEventsNeedSummaryRefresh(fullBatch.events)) {
       void refreshSummary({ force: true });
     }
   }, [
-    getNativeSessionEvents,
+    getNativeSessionEventPage,
+    captureBackfillReadingAnchor,
     isRuntimeRequestCurrent,
+    isVisible,
     refreshSummary,
     session.runtime_id,
   ]);
 
-  const pollEvents = useCallback(async () => {
+  const runPollEvents = useCallback(async () => {
     const requestScope = {
       runtimeId: session.runtime_id,
       generation: runtimeRequestScopeRef.current.generation,
     };
     const isInitialReplay = initialReplayRuntimeRef.current !== session.runtime_id;
     const sinceSeq = isInitialReplay ? null : lastSeenSeqRef.current;
-    const batch = await getNativeSessionEvents(
-      session.runtime_id,
-      sinceSeq,
-      isInitialReplay ? INITIAL_EVENT_REPLAY_LIMIT : null,
-    );
+    if (!isVisible || !isRuntimeRequestCurrent(requestScope)) {
+      return false;
+    }
+    let batch: ReplayBatch;
+    if (isInitialReplay) {
+      batch = await getNativeSessionEvents(
+        session.runtime_id,
+        null,
+        INITIAL_EVENT_REPLAY_LIMIT,
+      );
+    } else {
+      const controller = new AbortController();
+      incrementalReplayAbortRef.current?.abort();
+      incrementalReplayAbortRef.current = controller;
+      try {
+        const result = await runTranscriptPagedBackfill({
+          initialAfterSeq: sinceSeq,
+          loadPage: (afterSeq, snapshotNewestSeq) => getNativeSessionEventPage(
+            session.runtime_id,
+            afterSeq,
+            snapshotNewestSeq,
+            NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT,
+          ),
+          isComplete: (replay) => replayBatchCoversSequenceAfter(replay, sinceSeq),
+          physicalRequestKey: `${session.runtime_id}:incremental`,
+          signal: controller.signal,
+        });
+        if (result.status === 'cancelled') {
+          return false;
+        }
+        if (result.status === 'error') {
+          throw result.error;
+        }
+        batch = result.value;
+      } finally {
+        if (incrementalReplayAbortRef.current === controller) {
+          incrementalReplayAbortRef.current = null;
+        }
+      }
+    }
     if (!isRuntimeRequestCurrent(requestScope)) {
       return false;
     }
-    initialReplayRuntimeRef.current = session.runtime_id;
     const incrementalReplay = isInitialReplay
       ? null
       : inspectIncrementalTranscriptReplay(batch);
-    if (!batch.events.length) {
-      if (isInitialReplay) {
-        initialReplayUnloadedGapStartsRef.current = [];
-        if (replayBatchCoversAvailableSequenceRange(batch)) {
-          lastSeenSeqRef.current = null;
-          latestEventsRef.current = [];
-          rawTailSeamsRef.current = [];
-          rawTailSettledRef.current = true;
-          setEvents([]);
-          setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'idle' });
-        } else {
-          void backfillInitialReplay();
-        }
-      } else if (incrementalReplay?.state === 'partial') {
-        if (incrementalReplay.acknowledgedSeq != null) {
-          lastSeenSeqRef.current = Math.max(
-            lastSeenSeqRef.current ?? incrementalReplay.acknowledgedSeq,
-            incrementalReplay.acknowledgedSeq,
-          );
-        }
-        transcriptPartialObservationRef.current = markTranscriptPartialObservation(
+    const initialReplayComplete = isInitialReplay
+      && replayBatchCoversAvailableSequenceRange(batch);
+    const acknowledgedSeq = incrementalReplay?.acknowledgedSeq ?? latestEventSeq(batch.events);
+    const shouldCommit = isInitialReplay
+      || batch.events.length > 0
+      || incrementalReplay?.state === 'partial';
+
+    if (shouldCommit) {
+      const commitMarker = {
+        ...requestScope,
+        commitId: transcriptBackfillCommitSequenceRef.current + 1,
+        isInitialReplay,
+        acknowledgedSeq,
+        resetLastSeen: Boolean(initialReplayComplete && batch.events.length === 0),
+        rawTailSettled: Boolean(initialReplayComplete),
+        clearRawTailSeams: Boolean(initialReplayComplete && batch.events.length === 0),
+        initialUnloadedGapStarts: isInitialReplay && !initialReplayComplete
+          ? batch.unloaded_gap_starts ?? []
+          : [],
+        partial: incrementalReplay?.state === 'partial',
+      };
+      transcriptBackfillCommitSequenceRef.current = commitMarker.commitId;
+      if (commitMarker.partial) {
+        const partialObservation = includePendingTranscriptPartialObservation(
           transcriptPartialObservationRef.current,
-          incrementalReplay.acknowledgedSeq,
+          pendingTranscriptPartialObservationRef.current,
+          requestScope,
         );
-        setTranscriptBackfillView({
-          runtimeId: requestScope.runtimeId,
-          state: 'partial',
-        });
+        pendingTranscriptPartialObservationRef.current = {
+          ...commitMarker,
+          observation: markTranscriptPartialObservation(
+            partialObservation,
+            commitMarker.acknowledgedSeq,
+          ),
+        };
+        // Integrity is accepted synchronously once this response is proven to
+        // belong to the current runtime generation. The React marker still
+        // gates cursor advancement, but must never be able to re-add a partial
+        // warning after a newer authoritative full snapshot has covered it.
+        transcriptPartialObservationRef.current =
+          pendingTranscriptPartialObservationRef.current.observation;
       }
-      return false;
-    }
 
-    if (isInitialReplay) {
-      initialReplayUnloadedGapStartsRef.current = batch.unloaded_gap_starts ?? [];
-    }
-
-    const batchLatestSeq = incrementalReplay?.acknowledgedSeq ?? latestEventSeq(batch.events);
-    if (batchLatestSeq != null) {
-      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? batchLatestSeq, batchLatestSeq);
-    }
-    // A gap-detected replacement batch comes straight from the backend
-    // (contiguous); prune seams from the replaced array no longer apply.
-    if (!isInitialReplay && batch.gap_detected) {
-      rawTailSeamsRef.current = [];
-    }
-    const updateEvents = () => {
-      setEvents((previous) => {
-        if (!isRuntimeRequestCurrent(requestScope)) {
-          return previous;
+      const commitPollReplay = () => {
+        if (batch.events.length > 0 || (isInitialReplay && initialReplayComplete)) {
+          setEvents((previous) => {
+            if (!isRuntimeRequestCurrent(requestScope)) {
+              return previous;
+            }
+            if (isInitialReplay && batch.events.length === 0) {
+              return [];
+            }
+            return isInitialReplay
+              ? mergeWorkspaceReplayEvents(previous, batch.events)
+              : appendSessionEvents(previous, batch.events);
+          });
         }
-        return isInitialReplay
-          ? mergeWorkspaceReplayEvents(previous, batch.events)
-          : appendSessionEvents(previous, batch.events, batch.gap_detected);
-      });
-    };
+        if (initialReplayComplete || incrementalReplay?.state === 'partial') {
+          setTranscriptBackfillView((current) => {
+            if (!isRuntimeRequestCurrent(requestScope)) {
+              return current;
+            }
+            if (
+              incrementalReplay?.state === 'partial'
+              && !transcriptBackfillCommitMatches(
+                pendingTranscriptPartialObservationRef.current,
+                commitMarker,
+              )
+            ) {
+              return current;
+            }
+            return {
+              runtimeId: requestScope.runtimeId,
+              state: incrementalReplay?.state === 'partial' ? 'partial' : 'idle',
+            };
+          });
+        }
+        setPollReplayCommitMarker((current) => (
+          isRuntimeRequestCurrent(requestScope) ? commitMarker : current
+        ));
+      };
 
-    if (hasImmediateAttentionEvent(batch.events)) {
-      updateEvents();
-    } else {
-      startTransition(updateEvents);
+      if (hasImmediateAttentionEvent(batch.events)) {
+        commitPollReplay();
+      } else {
+        startTransition(commitPollReplay);
+      }
     }
 
-    if (isInitialReplay) {
-      if (replayBatchCoversAvailableSequenceRange(batch)) {
-        // Replay covered the backend's full range: no backfill needed and the
-        // raw tail may start pruning once the session goes idle.
-        rawTailSettledRef.current = true;
-        initialReplayUnloadedGapStartsRef.current = [];
-        setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'idle' });
-      } else {
-        void backfillInitialReplay();
-      }
-    } else if (incrementalReplay?.state === 'partial') {
-      transcriptPartialObservationRef.current = markTranscriptPartialObservation(
-        transcriptPartialObservationRef.current,
-        incrementalReplay.acknowledgedSeq,
-      );
-      setTranscriptBackfillView({
-        runtimeId: requestScope.runtimeId,
-        state: 'partial',
-      });
+    if (isInitialReplay && !initialReplayComplete) {
+      void backfillInitialReplay();
     }
 
     return sessionEventsNeedSummaryRefresh(batch.events);
   }, [
     backfillInitialReplay,
+    getNativeSessionEventPage,
     getNativeSessionEvents,
     isRuntimeRequestCurrent,
+    isVisible,
     session.runtime_id,
   ]);
+
+  // Timer ticks and direct post-action refreshes share one whole-drain lease.
+  // Page-level request de-duplication alone cannot stop two callers from
+  // committing different snapshots out of order.
+  const pollEvents = useCallback((): Promise<boolean> => {
+    const inFlight = pollEventsInFlightRef.current;
+    if (inFlight?.runtimeId === session.runtime_id) {
+      return inFlight.promise;
+    }
+
+    const promise = runPollEvents();
+    const lease = { runtimeId: session.runtime_id, promise };
+    pollEventsInFlightRef.current = lease;
+    void promise.finally(() => {
+      if (pollEventsInFlightRef.current === lease) {
+        pollEventsInFlightRef.current = null;
+      }
+    }).catch(() => {});
+    return promise;
+  }, [runPollEvents, session.runtime_id]);
 
   const rawAttentionState = useMemo(
     () => extractAttentionState(events),
@@ -2564,6 +2851,45 @@ export function WorkspaceNativeSessionView({
   useEffect(() => () => {
     cancelPendingAutoScroll();
   }, [cancelPendingAutoScroll]);
+
+  // A full backfill prepends history. Restore the detached reader only when
+  // that exact transition commits; an intervening live append must not consume
+  // the saved anchor early.
+  useLayoutEffect(() => {
+    const anchor = pendingBackfillScrollAnchorRef.current;
+    if (
+      !anchor
+      || !isVisible
+      || !transcriptBackfillCommitMatches(anchor.commit, transcriptBackfillCommitMarker)
+    ) {
+      return;
+    }
+    pendingBackfillScrollAnchorRef.current = null;
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    if (anchor.key) {
+      const item = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-transcript-item-key]'),
+      ).find((candidate) => candidate.dataset.transcriptItemKey === anchor.key);
+      if (item) {
+        const delta = item.getBoundingClientRect().top
+          - container.getBoundingClientRect().top
+          - anchor.viewportTopOffset;
+        if (Math.abs(delta) >= 1) {
+          container.scrollTop += delta;
+        }
+        return;
+      }
+    }
+
+    const heightDelta = container.scrollHeight - anchor.scrollHeight;
+    if (Math.abs(heightDelta) >= 1) {
+      container.scrollTop = anchor.scrollTop + heightDelta;
+    }
+  }, [isVisible, transcriptBackfillCommitMarker]);
 
   // Auto-scroll to bottom when new events arrive, unless the user has scrolled up.
   // We watch events.length (not messages.length) because streaming deltas grow

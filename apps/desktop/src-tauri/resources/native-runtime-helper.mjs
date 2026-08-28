@@ -43299,6 +43299,93 @@ var ClaudeBackgroundTaskTracker = class {
   }
 };
 
+// src/streamEventCoalescer.ts
+var STREAM_EVENT_FLUSH_DELAY_MS = 40;
+var STREAM_EVENT_MAX_BUFFERED_BYTES = 4096;
+function exactStreamFragment(payload) {
+  if (Object.keys(payload).length !== 2) {
+    return null;
+  }
+  if (payload.type === "assistant_chunk" && typeof payload.text === "string" && payload.text) {
+    return { kind: "assistant_chunk", content: payload.text };
+  }
+  if (payload.type === "system_message" && typeof payload.message === "string" && payload.message) {
+    return { kind: "system_message", content: payload.message };
+  }
+  return null;
+}
+function payloadFromPending(pending) {
+  return pending.kind === "assistant_chunk" ? { type: pending.kind, text: pending.content } : { type: pending.kind, message: pending.content };
+}
+function createStreamEventCoalescer(writePayload, options = {}) {
+  const flushDelayMs = options.flushDelayMs ?? STREAM_EVENT_FLUSH_DELAY_MS;
+  const maxBufferedBytes = options.maxBufferedBytes ?? STREAM_EVENT_MAX_BUFFERED_BYTES;
+  const setTimer = options.setTimer ?? setTimeout;
+  const clearTimer = options.clearTimer ?? clearTimeout;
+  let pending = null;
+  let flushTimer = null;
+  const clearFlushTimer = () => {
+    if (flushTimer === null) {
+      return;
+    }
+    clearTimer(flushTimer);
+    flushTimer = null;
+  };
+  const flush = () => {
+    clearFlushTimer();
+    if (!pending) {
+      return;
+    }
+    const next = pending;
+    pending = null;
+    writePayload(payloadFromPending(next));
+  };
+  const startPending = (fragment, byteLength) => {
+    pending = {
+      kind: fragment.kind,
+      content: fragment.content,
+      byteLength
+    };
+    flushTimer = setTimer(() => {
+      flushTimer = null;
+      flush();
+    }, flushDelayMs);
+  };
+  const emit2 = (payload) => {
+    const fragment = exactStreamFragment(payload);
+    if (!fragment) {
+      flush();
+      writePayload(payload);
+      return;
+    }
+    const fragmentBytes = Buffer.byteLength(fragment.content, "utf8");
+    if (pending?.kind !== fragment.kind) {
+      flush();
+    }
+    if (fragmentBytes >= maxBufferedBytes) {
+      flush();
+      writePayload(payload);
+      return;
+    }
+    if (!pending) {
+      startPending(fragment, fragmentBytes);
+      return;
+    }
+    const combinedBytes = pending.byteLength + fragmentBytes;
+    if (combinedBytes > maxBufferedBytes) {
+      flush();
+      startPending(fragment, fragmentBytes);
+      return;
+    }
+    pending.content += fragment.content;
+    pending.byteLength = combinedBytes;
+    if (combinedBytes === maxBufferedBytes) {
+      flush();
+    }
+  };
+  return { emit: emit2, flush };
+}
+
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
 var CLAUDE_INCOMPLETE_RESPONSE_REASON = "Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.";
@@ -43306,6 +43393,7 @@ var initCommand = null;
 var stopped = false;
 var activeTurn = false;
 var currentProviderSessionId = null;
+var lastEmittedProviderSessionId = null;
 var currentAbortController = null;
 var currentClaudeQuery = null;
 var claudeInputQueue = null;
@@ -43393,21 +43481,32 @@ var AsyncMessageQueue = class {
     }
   }
 };
-function emit(output) {
+function writeOutput(output) {
   process5.stdout.write(`${JSON.stringify(output)}
 `);
+}
+var streamEventCoalescer = createStreamEventCoalescer((payload) => {
+  writeOutput({ type: "event", payload });
+});
+function emit(output) {
+  streamEventCoalescer.flush();
+  writeOutput(output);
 }
 function emitStatus(status, detail) {
   emit({ type: "status", status, detail });
 }
 function emitEvent(payload) {
-  emit({ type: "event", payload });
+  streamEventCoalescer.emit(payload);
 }
 function emitSessionMeta(providerSessionId) {
   if (!providerSessionId) {
     return;
   }
   currentProviderSessionId = providerSessionId;
+  if (lastEmittedProviderSessionId === providerSessionId) {
+    return;
+  }
+  lastEmittedProviderSessionId = providerSessionId;
   emit({ type: "session_meta", provider_session_id: providerSessionId });
 }
 function emitClaudeBackgroundTasksChanged(tasks = claudeBackgroundTasks.activeTasks(), force = false) {
@@ -45880,6 +45979,7 @@ async function handleCommand(command) {
   }
   if (command.type === "init") {
     initCommand = command;
+    lastEmittedProviderSessionId = null;
     const forkRequested = command.provider === "claude" && Boolean(command.fork_session) && Boolean(command.provider_session_id?.trim());
     const resumedClaudeWithoutTodoSeed = command.provider === "claude" && Boolean(command.provider_session_id?.trim()) && !command.todo_snapshot_seed;
     todoSnapshotTracker.reset(
@@ -46375,6 +46475,7 @@ rl2.on("line", (line) => {
   });
 });
 rl2.on("close", () => {
+  streamEventCoalescer.flush();
   if (terminateOwnedProcessGroupOnParentClose()) {
     return;
   }

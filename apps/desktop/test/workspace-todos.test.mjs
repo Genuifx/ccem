@@ -800,7 +800,7 @@ test('live native view always issues one limited initial replay before increment
   );
   assert.match(
     source,
-    /const sinceSeq = isInitialReplay \? null : lastSeenSeqRef\.current;[\s\S]*sinceSeq,[\s\S]*isInitialReplay \? INITIAL_EVENT_REPLAY_LIMIT : null/,
+    /if \(isInitialReplay\) \{[\s\S]*getNativeSessionEvents\([\s\S]*null,[\s\S]*INITIAL_EVENT_REPLAY_LIMIT,[\s\S]*\}[\s\S]*initialAfterSeq: sinceSeq/,
   );
   assert.match(
     source,

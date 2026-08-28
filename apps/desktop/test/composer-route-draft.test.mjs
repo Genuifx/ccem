@@ -278,11 +278,11 @@ test('source regression: every fresh-Composer entry point resets the routing dra
   );
   assert.match(
     handleSelectBlock,
-    /setMessages\(\[\]\);[\s\S]*setSegments\(\[\]\);[\s\S]*setHistoryEvents\(\[\]\);[\s\S]*setIsLoadingMessages\(true\);/,
+    /setMessages\(\[\]\);[\s\S]*setSegments\(\[\]\);[\s\S]*setHistoryEvents\(\[\]\);[\s\S]*updateIsLoadingMessages\(true\);/,
     'B selection must synchronously remove A transcript while B resolves',
   );
   assert.ok(
-    handleSelectBlock.includes('setIsLoadingMessages(false);'),
+    handleSelectBlock.includes('updateIsLoadingMessages(false);'),
     'a selection resolved to a live session must close the history loading state',
   );
   assert.ok(
