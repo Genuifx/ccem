@@ -116,6 +116,12 @@ function previewText(value: string, limit = PET_MESSAGE_PREVIEW_LIMIT): string {
 }
 
 function sessionTitle(session: PetNotificationSourceSession): string {
+  if (isNativeSession(session)) {
+    return nonEmptyText(session.display_title)
+      ?? nonEmptyText(session.displayTitle)
+      ?? nonEmptyText(session.title)
+      ?? basename(sessionProjectDir(session));
+  }
   return nonEmptyText(session.title)
     ?? nonEmptyText(session.displayTitle)
     ?? nonEmptyText(session.display_title)

@@ -1048,6 +1048,9 @@ export interface NativeSessionSummary {
   provider: NativeProvider;
   transport: NativeTransport;
   provider_session_id?: string | null;
+  display_title?: string | null;
+  display_title_revision?: number;
+  initial_user_prompt?: string | null;
   project_dir: string;
   env_name: string;
   perm_mode: string;

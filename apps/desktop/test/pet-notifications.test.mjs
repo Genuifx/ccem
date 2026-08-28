@@ -158,6 +158,22 @@ test('uses the session title and latest model output preview when available', as
   assert.equal(notifications[0].message, '已经定位到 macOS Spaces 的窗口行为，需要把桌面宠物作为跨 Space 浮窗处理。');
 });
 
+test('uses the persisted native display title before an event-derived prompt title', async () => {
+  const { buildPetNotifications } = await importPetNotifications();
+  const notifications = buildPetNotifications(
+    [
+      session({
+        display_title: '首屏加载请求优化',
+        title: '帮我排查为什么标题没了',
+      }),
+    ],
+    new Set(),
+  );
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, '首屏加载请求优化');
+});
+
 test('falls back to thinking text when no model output is available', async () => {
   const { buildPetNotifications } = await importPetNotifications();
   const notifications = buildPetNotifications(
