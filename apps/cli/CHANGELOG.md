@@ -1,5 +1,12 @@
 # ccem
 
+## 2.73.2
+
+### Patch Changes
+
+- 361268f: Scope CLI release validation to the CLI and its workspace dependencies.
+- 61a7f46: Publish updater manifests with stable tag-based download URLs.
+
 ## 2.73.1
 
 ### Patch Changes
