@@ -785,6 +785,11 @@ function isClaudeForegroundAndSdkIdle() {
   return !claudeTurnAwaitingResult && claudeLastSessionState === 'idle';
 }
 
+function canRestartClaudeRuntimeForSettings(forceRestart: boolean) {
+  return !claudeTurnAwaitingResult
+    && (forceRestart || claudeLastSessionState === 'idle');
+}
+
 function isClaudeRuntimeSafeToClose() {
   return isClaudeForegroundAndSdkIdle() && !hasUnsettledClaudeBackgroundTasks();
 }
@@ -2140,7 +2145,7 @@ function applyPendingClaudeSettingsAfterTurn() {
   }
 
   const forceRestart = pendingSettings.forceRestart === true;
-  if (!isClaudeForegroundAndSdkIdle()
+  if (!canRestartClaudeRuntimeForSettings(forceRestart)
     || (hasUnsettledClaudeBackgroundTasks() && !forceRestart)) {
     return false;
   }
@@ -2148,23 +2153,26 @@ function applyPendingClaudeSettingsAfterTurn() {
   applyPendingSettingsToInitCommand();
   closeClaudeQueryForRecovery(captureCurrentClaudeQuerySnapshot(), {
     interruptBackgroundTasks: forceRestart,
+    allowUnsafeClose: forceRestart,
     reason: 'Claude settings changed before the background task settled.',
   });
   return true;
 }
 
 function applyClaudeSettingsByRestartingIdleRuntime(command: UpdateSettingsCommand) {
-  if (!isClaudeForegroundAndSdkIdle()) {
+  const forceRestart = command.force_restart === true;
+  if (!canRestartClaudeRuntimeForSettings(forceRestart)) {
     return false;
   }
 
-  if (hasUnsettledClaudeBackgroundTasks() && command.force_restart !== true) {
+  if (hasUnsettledClaudeBackgroundTasks() && !forceRestart) {
     return false;
   }
 
   applySettingsCommand(command);
   closeClaudeQueryForRecovery(captureCurrentClaudeQuerySnapshot(), {
-    interruptBackgroundTasks: command.force_restart === true,
+    interruptBackgroundTasks: forceRestart,
+    allowUnsafeClose: forceRestart,
     reason: 'Claude settings changed before the background task settled.',
   });
   return true;

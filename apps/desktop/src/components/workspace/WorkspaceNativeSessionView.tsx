@@ -3040,7 +3040,7 @@ export function WorkspaceNativeSessionView({
     return true;
   }, []);
 
-  const performEnvChange = useCallback((envName: string, forceRestart = false) => {
+  const performEnvChange = useCallback((envName: string) => {
     const runtimeId = session.runtime_id;
     const requestSeq = environmentUpdateRequestSeqRef.current + 1;
     const previousUpdate = pendingEnvironmentUpdateRef.current;
@@ -3056,7 +3056,7 @@ export function WorkspaceNativeSessionView({
           envName,
           undefined,
           undefined,
-          forceRestart,
+          true,
         );
         if (environmentUpdateRequestSeqRef.current === requestSeq) {
           await refreshSummary({ force: true });
@@ -3428,10 +3428,8 @@ export function WorkspaceNativeSessionView({
     }
     setIsApplyingBackgroundTaskRiskAction(true);
     try {
-      if (!force && action.kind !== 'handoff') {
-        const succeeded = action.kind === 'environment'
-          ? await performEnvChange(action.envName, false)
-          : await performEffortChange(action.effort, false);
+      if (!force && action.kind === 'effort') {
+        const succeeded = await performEffortChange(action.effort, false);
         if (!succeeded) return;
         setPendingBackgroundTaskRiskAction(null);
         toast.info(t('workspace.backgroundTasksDeferred'));
@@ -3439,7 +3437,7 @@ export function WorkspaceNativeSessionView({
       }
       let succeeded = false;
       if (action.kind === 'environment') {
-        succeeded = await performEnvChange(action.envName, force);
+        succeeded = await performEnvChange(action.envName);
       } else if (action.kind === 'effort') {
         succeeded = await performEffortChange(action.effort, force);
       } else if (force) {
@@ -3988,7 +3986,7 @@ export function WorkspaceNativeSessionView({
           >
             {t('workspace.backgroundTasksCancel')}
           </Button>
-          {pendingBackgroundTaskRiskAction?.kind !== 'handoff' ? (
+          {pendingBackgroundTaskRiskAction?.kind === 'effort' ? (
             <Button
               type="button"
               variant="outline"

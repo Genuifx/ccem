@@ -1208,6 +1208,38 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function spawnTrackedHelper(t, helperPath) {
+  const helper = spawn(process.execPath, [helperPath], {
+    env: {
+      ...process.env,
+      CCEM_NATIVE_CLAUDE_IDLE_TTL_MS: '60000',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(() => helper.kill('SIGTERM'));
+
+  const outputs = [];
+  const stderrRef = { value: '' };
+  let stdoutBuffer = '';
+  helper.stdout.setEncoding('utf8');
+  helper.stdout.on('data', (chunk) => {
+    stdoutBuffer += chunk;
+    let newlineIndex = stdoutBuffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = stdoutBuffer.slice(0, newlineIndex).trim();
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line) outputs.push(JSON.parse(line));
+      newlineIndex = stdoutBuffer.indexOf('\n');
+    }
+  });
+  helper.stderr.setEncoding('utf8');
+  helper.stderr.on('data', (chunk) => {
+    stderrRef.value += chunk;
+  });
+
+  return { helper, outputs, stderrRef };
+}
+
 test('task notification cannot hide or duplicate an active foreground plan question', async (t) => {
   const helperPath = await buildHelperWithBackgroundRaceMock({
     foregroundPlanAfterTaskNotification: true,
@@ -2681,6 +2713,182 @@ test('defers retained-query settings until the SDK reports real idle after Resul
     stderrRef,
     /__MOCK_CLAUDE_CLOSE__/,
     'retained query close after real SDK idle',
+  );
+});
+
+test('force-restarts a completed retained Claude query without waiting for SDK idle', async (t) => {
+  const helperPath = await buildHelperWithMockClaudeSdk({
+    keepAliveAfterResult: true,
+    yieldIdleAfterResult: false,
+    logClose: true,
+    reportModelState: true,
+  });
+  const { helper, outputs, stderrRef } = spawnTrackedHelper(t, helperPath);
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    env_vars: { ANTHROPIC_MODEL: 'old-model' },
+    perm_mode: 'dev',
+    working_dir: os.tmpdir(),
+    initial_prompt: 'first',
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_completed',
+    stderrRef,
+    'completed foreground Result without SDK idle',
+  );
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'update_settings',
+    request_id: 'force-settings-after-result',
+    env_name: 'updated',
+    env_vars: { ANTHROPIC_MODEL: 'new-model' },
+    force_restart: true,
+  })}\n`);
+  helper.stdin.write(`${JSON.stringify({ type: 'prompt', text: 'second' })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'runtime_settings_changed'
+      && output.payload.state === 'applied'
+      && output.payload.request_id === 'force-settings-after-result'
+      && output.payload.env_name === 'updated',
+    stderrRef,
+    'forced settings acknowledgement without SDK idle',
+  );
+  await waitForStderr(
+    stderrRef,
+    /__MOCK_CLAUDE_CLOSE__/,
+    'forced retained query close without SDK idle',
+  );
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'assistant_chunk'
+      && output.payload.text === 'model=new-model;setModel=false',
+    stderrRef,
+    'next Claude response with the forced environment',
+  );
+});
+
+test('forced settings preserve the active foreground turn then interrupt background tasks', async (t) => {
+  const helperPath = await buildHelperWithMockClaudeSdk({
+    delayMsBeforeResult: 180,
+    keepAliveAfterResult: true,
+    yieldIdleAfterResult: false,
+    launchBackgroundTaskBeforeInterrupt: true,
+    logClose: true,
+    reportModelState: true,
+  });
+  const { helper, outputs, stderrRef } = spawnTrackedHelper(t, helperPath);
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    env_vars: { ANTHROPIC_MODEL: 'old-model' },
+    perm_mode: 'dev',
+    working_dir: os.tmpdir(),
+    initial_prompt: 'first',
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'background_tasks_changed'
+      && output.payload.tasks.some((task) => task.task_id === 'task-background-during-interrupt'),
+    stderrRef,
+    'active background task before forced environment switch',
+  );
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'assistant_chunk'
+      && output.payload.text === 'model=old-model;setModel=false',
+    stderrRef,
+    'foreground response before its Result boundary',
+  );
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'update_settings',
+    request_id: 'force-settings-after-active-turn',
+    env_name: 'updated',
+    env_vars: { ANTHROPIC_MODEL: 'new-model' },
+    force_restart: true,
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'runtime_settings_changed'
+      && output.payload.state === 'deferred'
+      && output.payload.request_id === 'force-settings-after-active-turn',
+    stderrRef,
+    'forced settings deferred until the foreground Result',
+  );
+  await delay(40);
+  assert.doesNotMatch(
+    stderrRef.value,
+    /__MOCK_CLAUDE_CLOSE__/,
+    'forced environment switch must preserve the active foreground turn',
+  );
+  assert.equal(
+    outputs.some((output) => output.type === 'event'
+      && output.payload?.type === 'background_task_updated'
+      && output.payload.task.task_id === 'task-background-during-interrupt'
+      && output.payload.task.status === 'interrupted'),
+    false,
+    'background work must remain attached until the foreground Result',
+  );
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_completed',
+    stderrRef,
+    'preserved foreground Result boundary',
+  );
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'runtime_settings_changed'
+      && output.payload.state === 'applied'
+      && output.payload.request_id === 'force-settings-after-active-turn'
+      && output.payload.env_name === 'updated',
+    stderrRef,
+    'forced settings applied at the foreground Result boundary',
+  );
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'background_task_updated'
+      && output.payload.task.task_id === 'task-background-during-interrupt'
+      && output.payload.task.status === 'interrupted',
+    stderrRef,
+    'background task interrupted by forced environment switch',
+  );
+  await waitForStderr(
+    stderrRef,
+    /__MOCK_CLAUDE_CLOSE__/,
+    'retained query close after preserved foreground Result',
+  );
+
+  helper.stdin.write(`${JSON.stringify({ type: 'prompt', text: 'second' })}\n`);
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'assistant_chunk'
+      && output.payload.text === 'model=new-model;setModel=false',
+    stderrRef,
+    'next Claude response after background-task teardown',
   );
 });
 
