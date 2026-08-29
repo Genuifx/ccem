@@ -3,6 +3,72 @@ use crate::browser::login::capability::BrowserPermissionAuthority;
 use crate::browser::BrowserToolRequest;
 
 #[test]
+fn exact_about_blank_can_handoff() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().current_url = "about:blank".to_string();
+    let opened = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("open blank browser");
+
+    let grant = fixture
+        .manager
+        .handoff_to_agent_for_actor(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::HandoffToAgent,
+                Duration::from_secs(30),
+            )
+            .expect("trusted handoff authorization"),
+            "blank-browser-agent",
+        )
+        .expect("blank browser handoff");
+
+    let snapshot = fixture.manager.snapshot(&opened.handle).unwrap();
+    assert_eq!(snapshot.control, SessionControlOwner::Agent);
+    assert_eq!(snapshot.current_origin, None);
+    assert!(snapshot.auto_handoff);
+    assert!(grant.control().validate_grant(grant.binding()).is_ok());
+
+    fixture.manager.force_stop(&opened.handle).unwrap();
+}
+
+#[test]
+fn current_page_scheme_does_not_block_instance_handoff() {
+    for current_url in [
+        "about:blank#fragment",
+        "data:text/html,hello",
+        "file:///tmp/private",
+    ] {
+        let fixture = Fixture::new();
+        fixture.state.lock().unwrap().current_url = current_url.to_string();
+        let opened = fixture
+            .manager
+            .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+            .expect("open browser");
+
+        fixture
+            .manager
+            .handoff_to_agent_for_actor(
+                TrustedUiControlAuthorization::from_trusted_ui(
+                    &opened.handle,
+                    TrustedUiControlAction::HandoffToAgent,
+                    Duration::from_secs(30),
+                )
+                .expect("trusted handoff authorization"),
+                "instance-bound-agent",
+            )
+            .expect("the physical browser instance is the handoff boundary");
+
+        assert_eq!(
+            fixture.manager.snapshot(&opened.handle).unwrap().control,
+            SessionControlOwner::Agent
+        );
+        fixture.manager.force_stop(&opened.handle).unwrap();
+    }
+}
+
+#[test]
 fn terminated_exact_actor_route_retires_the_dead_handoff() {
     let fixture = Fixture::new();
     let opened = fixture
@@ -174,8 +240,124 @@ fn wrong_actor_falls_back_before_mode2_parses_an_unsupported_request() {
         Err(error) => error,
         Ok(_) => panic!("exact actor still rejects unsupported Mode 2 tools"),
     };
-    assert!(exact_error.contains("does not expose arbitrary JavaScript"));
+    assert!(exact_error.contains("does not expose raw CDP"));
 
+    fixture.manager.close(&opened.handle).unwrap();
+}
+
+#[test]
+fn first_browser_tool_waits_for_the_compose_surface_handoff() {
+    let fixture = Fixture::new();
+    let opened = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("open compose browser");
+    let actor = "browser-actor-33333333333333333333333333333333";
+    let manager = Arc::clone(&fixture.manager);
+    let session = opened.handle.clone();
+    let handoff = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(40));
+        manager
+            .handoff_to_agent_for_actor(
+                TrustedUiControlAuthorization::from_trusted_ui(
+                    &session,
+                    TrustedUiControlAction::HandoffToAgent,
+                    Duration::from_secs(30),
+                )
+                .expect("trusted handoff authorization"),
+                actor,
+            )
+            .expect("delayed compose handoff");
+    });
+    let request = BrowserToolRequest {
+        request_id: "first-tool-after-handoff".to_string(),
+        tool: "get_url".to_string(),
+        args: serde_json::json!({}),
+    };
+
+    let result = fixture
+        .manager
+        .run_agent_tool_if_handed_off(
+            &fixture.workspace_a.to_string_lossy(),
+            actor,
+            "yolo",
+            &request,
+        )
+        .expect("first browser tool route");
+
+    handoff.join().expect("handoff worker");
+    assert!(result.is_some(), "the first tool must not outrun handoff");
+    fixture.manager.close(&opened.handle).unwrap();
+}
+
+#[test]
+fn browser_tool_without_a_surface_returns_immediately() {
+    let fixture = Fixture::new();
+    let request = BrowserToolRequest {
+        request_id: "no-browser".to_string(),
+        tool: "get_url".to_string(),
+        args: serde_json::json!({}),
+    };
+    let started = Instant::now();
+
+    let result = fixture
+        .manager
+        .run_agent_tool_if_handed_off(
+            &fixture.workspace_a.to_string_lossy(),
+            "browser-actor-44444444444444444444444444444444",
+            "yolo",
+            &request,
+        )
+        .expect("missing browser is an optional route miss");
+
+    assert!(result.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a missing browser must not consume the handoff grace period"
+    );
+}
+
+#[test]
+fn browser_tool_for_a_different_actor_returns_immediately() {
+    let fixture = Fixture::new();
+    let opened = fixture
+        .manager
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("open browser");
+    fixture
+        .manager
+        .handoff_to_agent_for_actor(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::HandoffToAgent,
+                Duration::from_secs(30),
+            )
+            .expect("trusted handoff authorization"),
+            "browser-actor-55555555555555555555555555555555",
+        )
+        .expect("handoff browser to another actor");
+    let request = BrowserToolRequest {
+        request_id: "wrong-actor".to_string(),
+        tool: "get_url".to_string(),
+        args: serde_json::json!({}),
+    };
+    let started = Instant::now();
+
+    let result = fixture
+        .manager
+        .run_agent_tool_if_handed_off(
+            &fixture.workspace_a.to_string_lossy(),
+            "browser-actor-66666666666666666666666666666666",
+            "yolo",
+            &request,
+        )
+        .expect("wrong actor is an optional route miss");
+
+    assert!(result.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an actor mismatch must not consume the handoff grace period"
+    );
     fixture.manager.close(&opened.handle).unwrap();
 }
 
@@ -200,6 +382,7 @@ fn trusted_occlusion_pause_is_idempotent_and_cancels_only_agent_control() {
         .expect("user-owned session is already safe");
     assert_eq!(user.control, SessionControlOwner::User);
     assert_eq!(user.handoff_epoch, 0);
+    assert!(user.auto_handoff);
 
     fixture
         .manager
@@ -225,6 +408,7 @@ fn trusted_occlusion_pause_is_idempotent_and_cancels_only_agent_control() {
         .expect("occlusion pause");
     assert_eq!(paused.control, SessionControlOwner::Paused);
     assert_eq!(paused.handoff_epoch, 2);
+    assert!(paused.auto_handoff);
 
     let still_paused = fixture
         .manager
@@ -239,6 +423,7 @@ fn trusted_occlusion_pause_is_idempotent_and_cancels_only_agent_control() {
         .expect("already-paused session stays safe");
     assert_eq!(still_paused.control, SessionControlOwner::Paused);
     assert_eq!(still_paused.handoff_epoch, paused.handoff_epoch);
+    assert!(still_paused.auto_handoff);
 }
 
 #[test]
@@ -248,24 +433,6 @@ fn trusted_handoff_pause_and_takeover_advance_epoch_and_invalidate_old_grants() 
         .manager
         .open_default_profile(Fixture::trusted(&fixture.workspace_a))
         .expect("open");
-    fixture.state.lock().unwrap().fail_close = true;
-    let rejected = fixture.manager.handoff_to_agent(
-        TrustedUiControlAuthorization::from_trusted_ui(
-            &opened.handle,
-            TrustedUiControlAction::HandoffToAgent,
-            Duration::from_secs(30),
-        )
-        .unwrap(),
-    );
-    assert_eq!(
-        rejected.err(),
-        Some(SessionManagerError::HandoffPreflightRejected)
-    );
-    assert_eq!(
-        fixture.manager.snapshot(&opened.handle).unwrap().control,
-        SessionControlOwner::User
-    );
-    fixture.state.lock().unwrap().fail_close = false;
     let grant_one = fixture
         .manager
         .handoff_to_agent(
@@ -303,6 +470,7 @@ fn trusted_handoff_pause_and_takeover_advance_epoch_and_invalidate_old_grants() 
         .expect("pause");
     assert_eq!(paused.control, SessionControlOwner::Paused);
     assert_eq!(paused.handoff_epoch, 2);
+    assert!(paused.auto_handoff);
     assert_eq!(
         grant_one
             .control()
@@ -337,6 +505,7 @@ fn trusted_handoff_pause_and_takeover_advance_epoch_and_invalidate_old_grants() 
         .expect("takeover");
     assert_eq!(user.control, SessionControlOwner::User);
     assert_eq!(user.handoff_epoch, 4);
+    assert!(!user.auto_handoff);
     assert!(grant_two
         .control()
         .validate_grant(grant_two.binding())
@@ -540,79 +709,7 @@ fn diagnostic_start_failure_rolls_back_before_discovery_and_consumes_the_authori
 }
 
 #[test]
-fn blocked_handoff_preflight_does_not_delay_pause_for_an_unrelated_session() {
-    let fixture = Fixture::new();
-    let active = fixture
-        .manager
-        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
-        .unwrap();
-    fixture
-        .manager
-        .handoff_to_agent(
-            TrustedUiControlAuthorization::from_trusted_ui(
-                &active.handle,
-                TrustedUiControlAction::HandoffToAgent,
-                Duration::from_secs(30),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let candidate = fixture
-        .manager
-        .open_new_profile(Fixture::trusted(&fixture.workspace_b))
-        .unwrap();
-    let entered = Arc::new(Barrier::new(2));
-    let release = Arc::new(Barrier::new(2));
-    fixture.state.lock().unwrap().preflight_barriers =
-        Some((Arc::clone(&entered), Arc::clone(&release)));
-
-    let manager = Arc::clone(&fixture.manager);
-    let candidate_handle = candidate.handle.clone();
-    let handoff = thread::spawn(move || {
-        manager.handoff_to_agent(
-            TrustedUiControlAuthorization::from_trusted_ui(
-                &candidate_handle,
-                TrustedUiControlAction::HandoffToAgent,
-                Duration::from_secs(30),
-            )
-            .unwrap(),
-        )
-    });
-    entered.wait();
-    let delayed_release = Arc::clone(&release);
-    let releaser = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(1_200));
-        delayed_release.wait();
-    });
-
-    let started = Instant::now();
-    let paused = fixture
-        .manager
-        .pause_agent(
-            TrustedUiControlAuthorization::from_trusted_ui(
-                &active.handle,
-                TrustedUiControlAction::PauseAgent,
-                Duration::from_secs(30),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "unrelated pause waited behind candidate preflight: {:?}",
-        started.elapsed()
-    );
-    assert_eq!(paused.control, SessionControlOwner::Paused);
-
-    releaser.join().unwrap();
-    handoff.join().unwrap().unwrap();
-    fixture.state.lock().unwrap().preflight_barriers = None;
-    fixture.manager.force_stop(&candidate.handle).unwrap();
-    fixture.manager.force_stop(&active.handle).unwrap();
-}
-
-#[test]
-fn duplicate_handoff_from_agent_has_no_preflight_or_state_effect() {
+fn duplicate_handoff_from_agent_has_no_state_effect() {
     let fixture = Fixture::new();
     let opened = fixture
         .manager
@@ -630,7 +727,6 @@ fn duplicate_handoff_from_agent_has_no_preflight_or_state_effect() {
         )
         .unwrap();
     let before_snapshot = fixture.manager.snapshot(&opened.handle).unwrap();
-    let before_preflights = fixture.state.lock().unwrap().preflight_count;
 
     let error = fixture
         .manager
@@ -646,10 +742,6 @@ fn duplicate_handoff_from_agent_has_no_preflight_or_state_effect() {
         .expect("duplicate Agent handoff must be rejected");
 
     assert_eq!(error, SessionManagerError::InvalidControlTransition);
-    assert_eq!(
-        fixture.state.lock().unwrap().preflight_count,
-        before_preflights
-    );
     assert_eq!(
         fixture.manager.snapshot(&opened.handle).unwrap(),
         before_snapshot

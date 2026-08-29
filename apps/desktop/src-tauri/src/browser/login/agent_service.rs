@@ -1,6 +1,6 @@
 use super::backend::{
-    DiagnosticLogResult, SemanticBrowserCommand, SemanticBrowserResult, SemanticOperation,
-    SemanticWaitCondition,
+    DiagnosticLogResult, SemanticBrowserCommand, SemanticBrowserResult, SemanticKey,
+    SemanticOperation, SemanticWaitCondition,
 };
 #[cfg(test)]
 use super::capability::BrowserPermissionAuthority;
@@ -10,8 +10,8 @@ use super::capability::{
 };
 use super::console_log::{ConsoleLogArtifact, ConsoleLogStore};
 use super::network_log::{NetworkLogArtifact, NetworkLogStore};
-use super::policy::{BrowserDataProvenance, NormalizedOrigin};
-use super::provenance::{ProvenanceKey, ProvenanceOperation, ProvenanceWriteState};
+use super::policy::NormalizedOrigin;
+use super::provenance::ProvenanceKey;
 use super::session::{LoginBrowserSessionManager, TrustedWorkspacePath};
 use super::session_backend::SessionOwnedBackend;
 use crate::browser::BrowserToolRequest;
@@ -19,8 +19,27 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::thread;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 mod artifacts;
+
+const SEMANTIC_BROWSER_TOOL_NAMES: &[&str] = &[
+    "navigate",
+    "get_url",
+    "snapshot",
+    "click",
+    "type",
+    "press_key",
+    "scroll",
+    "screenshot",
+    "read_console_log",
+    "read_network_log",
+    "evaluate",
+    "wait_for",
+];
 
 #[cfg(any(
     not(debug_assertions),
@@ -99,38 +118,31 @@ impl LoginBrowserSessionManager {
             Arc::clone(&lease.backend),
             Arc::clone(&lease.operation_ids),
         );
-        let key = ProvenanceKey::new_trusted(&lease.workspace_identity, &actor_id)
-            .map_err(|_| provenance_unavailable())?;
-        let result = lease
-            .provenance
-            .with_serialized_operation(&key, |provenance| {
-                let data_provenance =
-                    command_data_provenance(&command, &lease.current_url, provenance)?;
-                let operation = command.operation();
-                let context =
-                    SemanticExecutionContext::new_trusted(&lease.binding, &lease.current_url)
-                        .with_data_provenance(data_provenance)
-                        .with_request_id(&request.request_id)
-                        .with_actor_id(&actor_id)
-                        .with_permission_epoch(permission.epoch());
-                let result = service.execute(&context, command).map_err(|error| {
-                    format!(
-                        "Login Browser capability denied ({}:{}).",
-                        error.code.as_str(),
-                        error.cause_code
-                    )
-                })?;
-                if let Some(origin) =
-                    successful_page_read_origin(operation, &result, lease.backend.as_ref())?
-                {
-                    provenance
-                        .record_successful_page_read(&origin)
-                        .map_err(|_| provenance_unavailable())?;
-                }
-                serialize_agent_result(result, &lease.artifact_root)
-            })
-            .map_err(|_| provenance_unavailable())??;
-        Ok(result)
+        let operation = command.operation();
+        let context = SemanticExecutionContext::new_trusted(&lease.binding, &lease.current_url)
+            .with_request_id(&request.request_id)
+            .with_actor_id(&actor_id)
+            .with_permission_epoch(permission.epoch());
+        let result = service.execute(&context, command).map_err(|error| {
+            format!(
+                "Login Browser capability denied ({}:{}).",
+                error.code.as_str(),
+                error.cause_code
+            )
+        })?;
+
+        // Provenance is useful diagnostics, not an availability dependency. A stale or corrupt
+        // ledger must never withhold a browser result after its effect already happened.
+        if let (Some(provenance), Ok(key), Some(origin)) = (
+            Arc::as_ref(&lease.provenance).as_ref(),
+            ProvenanceKey::new_trusted(&lease.workspace_identity, &actor_id),
+            successful_page_read_origin(operation, &result, lease.backend.as_ref()),
+        ) {
+            let _ = provenance.with_serialized_operation(&key, |provenance| {
+                let _ = provenance.record_successful_page_read(&origin);
+            });
+        }
+        serialize_agent_result(result, &lease.artifact_root)
     }
 
     #[cfg(test)]
@@ -142,51 +154,40 @@ impl LoginBrowserSessionManager {
         request: &BrowserToolRequest,
     ) -> Result<Option<Value>, String> {
         let authority = BrowserPermissionAuthority::new(permission_mode);
-        let prepared = self.prepare_agent_tool_if_handed_off(
-            workspace_dir,
-            actor_id,
-            authority
-                .current_ticket()
-                .map_err(|_| "Native browser permission authority is unavailable".to_string())?,
-            request,
-        )?;
-        prepared
-            .map(|prepared| self.execute_prepared_agent_tool(request, prepared))
-            .transpose()
-    }
-}
-
-fn command_data_provenance(
-    command: &SemanticBrowserCommand,
-    current_url: &str,
-    provenance: &ProvenanceOperation<'_>,
-) -> Result<BrowserDataProvenance, String> {
-    if !command.is_write_capability() {
-        return Ok(BrowserDataProvenance::UntrackedOrSameOrigin);
-    }
-    let target_url = command.navigation_url().unwrap_or(current_url);
-    let Ok(target) = NormalizedOrigin::parse(target_url) else {
-        // Invalid or ungranted targets must reach the capability policy so their denial is
-        // durably audited. There is no backend effect before that decision.
-        return Ok(BrowserDataProvenance::UntrackedOrSameOrigin);
-    };
-    provenance
-        .write_state(&target)
-        .map(|state| match state {
-            ProvenanceWriteState::Untainted | ProvenanceWriteState::SingleOriginSame => {
-                BrowserDataProvenance::UntrackedOrSameOrigin
+        let workspace = TrustedWorkspacePath::from_trusted_app(PathBuf::from(workspace_dir))
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let prepared = self.prepare_agent_tool_if_handed_off(
+                workspace_dir,
+                actor_id,
+                authority.current_ticket().map_err(|_| {
+                    "Native browser permission authority is unavailable".to_string()
+                })?,
+                request,
+            )?;
+            if let Some(prepared) = prepared {
+                return self
+                    .execute_prepared_agent_tool(request, prepared)
+                    .map(Some);
             }
-            ProvenanceWriteState::SingleOriginDifferent => BrowserDataProvenance::CrossOrigin,
-            ProvenanceWriteState::Mixed => BrowserDataProvenance::Mixed,
-        })
-        .map_err(|_| provenance_unavailable())
+            if !self
+                .agent_handoff_expected_for_actor(&workspace, actor_id)
+                .map_err(|error| error.to_string())?
+                || Instant::now() >= deadline
+            {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 fn successful_page_read_origin(
     operation: SemanticOperation,
     result: &SemanticBrowserResult,
     backend: &dyn SessionOwnedBackend,
-) -> Result<Option<NormalizedOrigin>, String> {
+) -> Option<NormalizedOrigin> {
     let url = match (operation, result) {
         (
             SemanticOperation::Navigate | SemanticOperation::GetUrl,
@@ -199,23 +200,20 @@ fn successful_page_read_origin(
             SemanticOperation::Screenshot
             | SemanticOperation::ReadConsoleLog
             | SemanticOperation::ReadNetworkLog
+            | SemanticOperation::Evaluate
             | SemanticOperation::WaitFor,
             _,
-        ) => Some(
-            backend
-                .projection()
-                .map_err(|_| provenance_unavailable())?
-                .current_url,
-        ),
-        (SemanticOperation::Click | SemanticOperation::Type, _) => None,
-        _ => return Err(provenance_unavailable()),
+        ) => Some(backend.projection().ok()?.current_url),
+        (
+            SemanticOperation::Click
+            | SemanticOperation::Type
+            | SemanticOperation::PressKey
+            | SemanticOperation::Scroll,
+            _,
+        ) => None,
+        _ => return None,
     };
-    url.map(|url| NormalizedOrigin::parse(&url).map_err(|_| provenance_unavailable()))
-        .transpose()
-}
-
-fn provenance_unavailable() -> String {
-    "Login Browser provenance state is unavailable.".to_string()
+    url.and_then(|url| NormalizedOrigin::parse(&url).ok())
 }
 
 fn serialize_agent_result(
@@ -401,6 +399,15 @@ fn serialize_diagnostic_log(result: SemanticBrowserResult, path: PathBuf) -> Res
 }
 
 fn parse_command(request: &BrowserToolRequest) -> Result<SemanticBrowserCommand, String> {
+    if request.tool == "raw_cdp" {
+        return Err("Login Browser does not expose raw CDP.".to_string());
+    }
+    if !SEMANTIC_BROWSER_TOOL_NAMES.contains(&request.tool.as_str()) {
+        return Err(format!(
+            "Login Browser semantic backend does not support tool {}.",
+            request.tool
+        ));
+    }
     let command = match request.tool.as_str() {
         "navigate" => SemanticBrowserCommand::Navigate {
             url: required_string(&request.args, "url")?,
@@ -419,9 +426,19 @@ fn parse_command(request: &BrowserToolRequest) -> Result<SemanticBrowserCommand,
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
         },
+        "press_key" => SemanticBrowserCommand::PressKey {
+            key: SemanticKey::from_mcp_name(&required_string(&request.args, "key")?)
+                .ok_or_else(|| "Unsupported Login Browser key.".to_string())?,
+        },
+        "scroll" => SemanticBrowserCommand::Scroll {
+            delta_y: optional_i64(&request.args, "deltaY")?.unwrap_or(600),
+        },
         "screenshot" => SemanticBrowserCommand::Screenshot,
         "read_console_log" => SemanticBrowserCommand::ReadConsoleLog,
         "read_network_log" => SemanticBrowserCommand::ReadNetworkLog,
+        "evaluate" => SemanticBrowserCommand::Evaluate {
+            script: required_string(&request.args, "script")?,
+        },
         "wait_for" => {
             let timeout_millis = request
                 .args
@@ -446,16 +463,7 @@ fn parse_command(request: &BrowserToolRequest) -> Result<SemanticBrowserCommand,
                 timeout_millis,
             }
         }
-        "evaluate" | "raw_cdp" => {
-            return Err(
-                "Login Browser does not expose arbitrary JavaScript or raw CDP.".to_string(),
-            )
-        }
-        other => {
-            return Err(format!(
-                "Login Browser semantic backend does not support tool {other}."
-            ))
-        }
+        _ => unreachable!("tool vocabulary and parser match must stay exhaustive"),
     };
     command
         .validate()
@@ -479,6 +487,16 @@ fn required_string_allow_empty(value: &Value, name: &str) -> Result<String, Stri
         .ok_or_else(|| format!("Missing Login Browser argument: {name}."))
 }
 
+fn optional_i64(value: &Value, name: &str) -> Result<Option<i64>, String> {
+    match value.get(name) {
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("Invalid Login Browser argument: {name}.")),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,8 +507,6 @@ mod tests {
         project_network_event, NetworkEventInput, NetworkRedactionConfig, SafeNetworkEventKind,
     };
     use crate::browser::login::network_log::NetworkLogStore;
-    use crate::browser::login::profile::TrustedWorkspaceIdentity;
-    use crate::browser::login::provenance::ProvenanceLedger;
     use sha2::{Digest, Sha256};
 
     fn request(tool: &str, args: Value) -> BrowserToolRequest {
@@ -499,64 +515,6 @@ mod tests {
             tool: tool.to_string(),
             args,
         }
-    }
-
-    #[test]
-    fn persisted_ledger_state_is_projected_into_capability_policy_context() {
-        let temp = tempfile::tempdir().unwrap();
-        let ledger = ProvenanceLedger::new(temp.path().join("provenance")).unwrap();
-        let workspace =
-            TrustedWorkspaceIdentity::from_trusted_store("workspace-provenance").unwrap();
-        let key = ProvenanceKey::new_trusted(&workspace, "actor-provenance").unwrap();
-        let current = "https://a.example/form";
-        ledger
-            .with_serialized_operation(&key, |operation| {
-                assert_eq!(
-                    command_data_provenance(&SemanticBrowserCommand::GetUrl, current, operation)?,
-                    BrowserDataProvenance::UntrackedOrSameOrigin
-                );
-                assert_eq!(
-                    command_data_provenance(
-                        &SemanticBrowserCommand::Click {
-                            element_ref: "el-submit".to_string(),
-                        },
-                        current,
-                        operation,
-                    )?,
-                    BrowserDataProvenance::UntrackedOrSameOrigin
-                );
-                operation
-                    .record_successful_page_read(&NormalizedOrigin::parse(current).unwrap())
-                    .map_err(|_| provenance_unavailable())?;
-                assert_eq!(
-                    command_data_provenance(
-                        &SemanticBrowserCommand::Navigate {
-                            url: "https://b.example/next".to_string(),
-                        },
-                        current,
-                        operation,
-                    )?,
-                    BrowserDataProvenance::CrossOrigin
-                );
-                operation
-                    .record_successful_page_read(
-                        &NormalizedOrigin::parse("https://b.example/next").unwrap(),
-                    )
-                    .map_err(|_| provenance_unavailable())?;
-                assert_eq!(
-                    command_data_provenance(
-                        &SemanticBrowserCommand::Click {
-                            element_ref: "el-submit".to_string(),
-                        },
-                        current,
-                        operation,
-                    )?,
-                    BrowserDataProvenance::Mixed
-                );
-                Ok::<(), String>(())
-            })
-            .unwrap()
-            .unwrap();
     }
 
     #[test]
@@ -571,11 +529,36 @@ mod tests {
                 element_ref: "el-2-opaque".to_string(),
             }
         );
+        assert_eq!(
+            parse_command(&request("press_key", serde_json::json!({"key":"Enter"}),)).unwrap(),
+            SemanticBrowserCommand::PressKey {
+                key: SemanticKey::Enter,
+            }
+        );
+        assert_eq!(
+            parse_command(&request("scroll", serde_json::json!({"deltaY":-600}),)).unwrap(),
+            SemanticBrowserCommand::Scroll { delta_y: -600 }
+        );
+        assert_eq!(
+            parse_command(&request(
+                "evaluate",
+                serde_json::json!({"script":"document.title"}),
+            ))
+            .unwrap(),
+            SemanticBrowserCommand::Evaluate {
+                script: "document.title".to_string(),
+            }
+        );
+        assert!(
+            parse_command(&request("press_key", serde_json::json!({"key":"Meta+L"}),)).is_err()
+        );
+        assert!(parse_command(&request("scroll", serde_json::json!({"deltaY":0}),)).is_err());
         assert!(parse_command(&request(
             "evaluate",
-            serde_json::json!({"script":"document.cookie"}),
+            serde_json::json!({"script":"x".repeat(32_769)}),
         ))
         .is_err());
+        assert!(parse_command(&request("evaluate", serde_json::json!({}),)).is_err());
         assert!(parse_command(&request(
             "raw_cdp",
             serde_json::json!({"method":"Runtime.evaluate"}),
@@ -589,6 +572,40 @@ mod tests {
             parse_command(&request("read_network_log", serde_json::json!({}))).unwrap(),
             SemanticBrowserCommand::ReadNetworkLog
         );
+    }
+
+    #[test]
+    fn parser_vocabulary_matches_the_mcp_contract() {
+        let vocabulary: Vec<String> = serde_json::from_str(include_str!(
+            "../../../../../../packages/native-runtime-helper/src/browser-tool-vocabulary.json"
+        ))
+        .unwrap();
+        let mut parsed = vocabulary
+            .iter()
+            .map(|tool| {
+                let args = match tool.as_str() {
+                    "navigate" => serde_json::json!({"url":"https://example.test"}),
+                    "click" => serde_json::json!({"elementRef":"el-1"}),
+                    "type" => serde_json::json!({"elementRef":"el-1","text":"hello"}),
+                    "press_key" => serde_json::json!({"key":"Enter"}),
+                    "scroll" => serde_json::json!({"deltaY":600}),
+                    "evaluate" => serde_json::json!({"script":"document.title"}),
+                    "wait_for" => serde_json::json!({"loadComplete":true}),
+                    _ => serde_json::json!({}),
+                };
+                parse_command(&request(tool, args))
+                    .map(|_| tool.clone())
+                    .unwrap_or_else(|error| panic!("MCP tool {tool} is missing in Rust: {error}"))
+            })
+            .collect::<Vec<_>>();
+        parsed.sort();
+        let mut vocabulary = vocabulary;
+        vocabulary.sort();
+        assert_eq!(parsed, vocabulary);
+        let mut parser_vocabulary = SEMANTIC_BROWSER_TOOL_NAMES.to_vec();
+        parser_vocabulary.sort();
+        assert_eq!(parser_vocabulary, vocabulary);
+        assert!(parse_command(&request("raw_cdp", serde_json::json!({}))).is_err());
     }
 
     #[test]

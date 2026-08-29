@@ -342,9 +342,9 @@ impl SessionLaunchRuntime for EmbeddedCefSessionRuntime {
     }
 }
 
-/// Adds the user-popup admission boundary to the existing semantic owner.
-/// Popup state never crosses into Agent capabilities; it only gates the exact
-/// handoff/owner transitions around the shared CEF surface.
+/// Adds the gesture-gated popup admission boundary to the existing semantic owner.
+/// Popup state never crosses into Agent capabilities; an active popup still blocks the exact
+/// transition that begins Agent-owned diagnostics on the shared CEF surface.
 struct EmbeddedCefSessionBackend {
     inner: OwnerSessionBackend,
     surface: CefSurfaceStateHandle,
@@ -367,29 +367,12 @@ impl SessionOwnedBackend for EmbeddedCefSessionBackend {
         self.inner.projection()
     }
 
-    fn validate_current_origin(
-        &self,
-        expected: &super::super::policy::NormalizedOrigin,
-    ) -> Result<super::super::session_backend::SessionBackendProjection, SessionManagerError> {
-        self.inner.validate_current_origin(expected)
-    }
-
-    fn preflight_handoff(
-        &self,
-        expected: &super::super::policy::NormalizedOrigin,
-    ) -> Result<(), SessionManagerError> {
-        if self.surface.popup_active() {
-            return Err(SessionManagerError::PopupActive);
-        }
-        self.inner.preflight_handoff(expected)
-    }
-
     fn begin_diagnostic_segment(&self, handoff_epoch: u64) -> Result<(), SessionManagerError> {
         self.surface
-            .lock_popups_for_agent()
+            .allow_agent_popups()
             .map_err(map_popup_gate_error)?;
-        // Keep admission denied on failure. The handoff rollback restores User
-        // admission only inside the acknowledged owner-quiescence barrier.
+        // A real CEF user gesture remains mandatory in the native popup client. Agent ownership
+        // only keeps that fixed admission path available for semantic clicks that open OAuth.
         self.inner.begin_diagnostic_segment(handoff_epoch)
     }
 

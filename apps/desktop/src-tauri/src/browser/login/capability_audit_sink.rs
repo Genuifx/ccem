@@ -1,5 +1,4 @@
 use super::{safe_policy_code, AuditFailure, AuditPreRecord, AuditResultRecord, SemanticAuditSink};
-use crate::browser::login::cdp::guard::TrustedSecurityEvent;
 use crate::browser::login::policy::BrowserGrantBinding;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -142,26 +141,6 @@ impl JsonlSemanticAuditSink {
         )
     }
 
-    pub(in crate::browser::login) fn write_transfer_denied(
-        &self,
-        binding: &BrowserGrantBinding,
-        event: TrustedSecurityEvent,
-    ) -> Result<(), AuditFailure> {
-        self.append(
-            "transfer_decision",
-            &TransferDenyAuditRecord {
-                decided_at: chrono::Utc::now().to_rfc3339(),
-                workspace_identity: binding.workspace_identity().to_string(),
-                profile_id: binding.profile_id().to_string(),
-                session_id: binding.session_id().to_string(),
-                handoff_epoch: binding.handoff_epoch(),
-                event: event.as_str(),
-                decision: "denied",
-                cause_code: event.as_str(),
-            },
-        )
-    }
-
     pub(in crate::browser::login) fn path(&self) -> &Path {
         &self.path
     }
@@ -214,18 +193,6 @@ fn fingerprint_denied_origin(value: &str) -> Option<DeniedOriginFingerprint> {
         scheme,
         port,
     })
-}
-
-#[derive(Serialize)]
-struct TransferDenyAuditRecord {
-    decided_at: String,
-    workspace_identity: String,
-    profile_id: String,
-    session_id: String,
-    handoff_epoch: u64,
-    event: &'static str,
-    decision: &'static str,
-    cause_code: &'static str,
 }
 
 fn rotated_audit_path(path: &Path, index: usize) -> PathBuf {

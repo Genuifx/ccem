@@ -421,10 +421,18 @@ impl EmbeddedOwnerRecordStore {
             if !record_id.starts_with(RECORD_PREFIX) {
                 continue;
             }
-            records.push(
-                self.load(record_id)?
-                    .ok_or(EmbeddedOwnerRecoveryError::RecordConflict)?,
-            );
+            match self.load(record_id) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(_) => {
+                    // `load` also revalidates the shared root. Preserve that root-level boundary
+                    // even though failures attributable to this individual entry are isolated.
+                    ensure_private_directory(&self.root)?;
+                    // Once the root itself is known safe and enumerable, one corrupt, untrusted,
+                    // or unreadable crash record must not make every browser profile
+                    // unavailable. Leave it untouched for diagnosis and recover valid peers.
+                }
+            }
         }
         Ok(records)
     }

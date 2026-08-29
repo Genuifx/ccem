@@ -32,8 +32,6 @@ struct FakeSupervisorState {
     fail_close: bool,
     fail_next_force_shutdown: bool,
     fail_diagnostic_begin: bool,
-    preflight_count: usize,
-    preflight_barriers: Option<(Arc<Barrier>, Arc<Barrier>)>,
     current_url: String,
     terminated: bool,
     semantic_effect_count: usize,
@@ -51,8 +49,6 @@ impl Default for FakeSupervisorState {
             fail_close: false,
             fail_next_force_shutdown: false,
             fail_diagnostic_begin: false,
-            preflight_count: 0,
-            preflight_barriers: None,
             current_url: "https://example.com/account?token=secret".to_string(),
             terminated: false,
             semantic_effect_count: 0,
@@ -202,35 +198,6 @@ impl SessionOwnedBackend for FakeBackend {
             ready: !state.terminated,
             terminated: state.terminated,
         })
-    }
-
-    fn validate_current_origin(
-        &self,
-        expected: &NormalizedOrigin,
-    ) -> Result<SessionBackendProjection, SessionManagerError> {
-        let projection = self.projection()?;
-        let actual = NormalizedOrigin::parse(&projection.current_url)
-            .map_err(|_| SessionManagerError::OriginUnavailable)?;
-        if &actual != expected {
-            return Err(SessionManagerError::OriginUnavailable);
-        }
-        Ok(projection)
-    }
-    fn preflight_handoff(&self, expected: &NormalizedOrigin) -> Result<(), SessionManagerError> {
-        let state = Arc::clone(&self.runtime.lock().unwrap().as_ref().unwrap().state);
-        let barriers = {
-            let mut state = state.lock().unwrap();
-            state.preflight_count += 1;
-            if state.fail_close {
-                return Err(SessionManagerError::HandoffPreflightRejected);
-            }
-            state.preflight_barriers.clone()
-        };
-        if let Some((entered, release)) = barriers {
-            entered.wait();
-            release.wait();
-        }
-        self.validate_current_origin(expected).map(|_| ())
     }
 
     fn begin_diagnostic_segment(&self, _handoff_epoch: u64) -> Result<(), SessionManagerError> {
@@ -753,6 +720,7 @@ fn snapshot_is_an_exact_opaque_projection_without_paths_pids_or_handles() {
     assert_eq!(
         keys,
         vec![
+            "auto_handoff",
             "control",
             "current_origin",
             "handoff_epoch",

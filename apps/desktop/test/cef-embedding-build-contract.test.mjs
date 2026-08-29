@@ -99,13 +99,15 @@ test('CEF startup never calls utility APIs before cef_initialize', async () => {
 });
 
 test('legacy external Login Browser launch and control surfaces are absent', async () => {
-  const [main, permission, launcher, roots, capabilities] = await Promise.all([
+  const [main, permission, roots, capabilities] = await Promise.all([
     fs.readFile(path.join(tauriDir, 'src', 'lib.rs'), 'utf8'),
     fs.readFile(path.join(tauriDir, 'permissions', 'trusted-app-commands.toml'), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src', 'lib', 'loginBrowserLauncherIpc.ts'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'lib', 'windowRootRouting.ts'), 'utf8'),
     fs.readdir(path.join(tauriDir, 'capabilities')),
   ]);
+  await assert.rejects(
+    fs.access(path.join(desktopDir, 'src', 'lib', 'loginBrowserLauncherIpc.ts')),
+  );
   const legacyCommands = [
     'browser_login_open',
     'browser_login_open_profile',
@@ -116,12 +118,15 @@ test('legacy external Login Browser launch and control surfaces are absent', asy
     'browser_login_takeover',
     'browser_login_close',
     'browser_login_force_stop',
+    'browser_login_profiles',
+    'browser_login_profile_recent_activity',
+    'browser_login_reset_profile',
+    'browser_login_delete_profile',
   ];
 
   for (const command of legacyCommands) {
     assert.doesNotMatch(main, new RegExp(`login_commands::${command}\\b`));
     assert.doesNotMatch(permission, new RegExp(`"${command}"`));
-    assert.doesNotMatch(launcher, new RegExp(`['"]${command}['"]`));
   }
   assert.doesNotMatch(roots, /login-browser-control/);
   assert.ok(!capabilities.includes('login-browser-control.json'));

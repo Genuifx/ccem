@@ -76,7 +76,7 @@ mod tests {
         SemanticBrowserResult,
     };
     use crate::browser::login::control::{HandoffControl, HandoffGrant, OperationCancellation};
-    use crate::browser::login::policy::{BrowserGrantBinding, NormalizedOrigin};
+    use crate::browser::login::policy::BrowserGrantBinding;
     use crate::browser::login::session_backend::SessionBackendProjection;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -101,13 +101,6 @@ mod tests {
 
     impl SessionOwnedBackend for StuckBackend {
         fn projection(&self) -> Result<SessionBackendProjection, SessionManagerError> {
-            Err(SessionManagerError::RuntimeUnavailable)
-        }
-
-        fn validate_current_origin(
-            &self,
-            _expected: &NormalizedOrigin,
-        ) -> Result<SessionBackendProjection, SessionManagerError> {
             Err(SessionManagerError::RuntimeUnavailable)
         }
 

@@ -1,10 +1,6 @@
 use super::super::backend::{BackendFailure, BackendFailureCode};
 use super::super::supervisor::VerifiedRuntimeTerminationHandle;
-use super::owner::{
-    runtime_failure, ChromiumOwnerProjection, OwnerRequest, STARTUP_TIMEOUT,
-    TRUSTED_BARRIER_TIMEOUT,
-};
-use super::owner_handoff::run_handoff_preflight;
+use super::owner::{runtime_failure, ChromiumOwnerProjection, OwnerRequest, STARTUP_TIMEOUT};
 use super::owner_transition::OwnerTransitionInbox;
 use super::semantics::{SemanticEngine, SemanticEngineProjection};
 use super::transport::{frame_channel, run_frame_reader, CdpClient};
@@ -212,45 +208,16 @@ fn run_protocol_owner_with_shutdown(
                         break;
                     }
                 }
-                Ok(OwnerRequest::ValidateCurrentOrigin { expected, response }) => {
-                    let deadline = Instant::now() + TRUSTED_BARRIER_TIMEOUT;
-                    let result = engine
-                        .validate_current_origin(&mut client, &expected, deadline)
-                        .map(|engine_projection| {
-                            let projected = ChromiumOwnerProjection {
-                                current_url: engine_projection.current_url.clone(),
-                                current_title: engine_projection.current_title.clone(),
-                                generation: engine_projection.generation,
-                                blocked_download_count: engine_projection.blocked_download_count,
-                                canceled_download_count: engine_projection.canceled_download_count,
-                                ready: true,
-                                terminated: false,
-                            };
-                            let _ = publish_projection(projection, engine_projection, true);
-                            projected
-                        });
-                    let terminal = terminal_failure(&result);
-                    let _ = response.send(result);
-                    if let Some(error) = terminal {
-                        terminal_error = Some(error);
-                        break;
-                    }
-                }
-                Ok(OwnerRequest::PreflightHandoff { expected, response }) => {
-                    let result = run_handoff_preflight(&mut engine, &mut client, &expected);
-                    let terminal = terminal_failure(&result);
-                    let _ = response.send(result);
-                    if let Some(error) = terminal {
-                        terminal_error = Some(error);
-                        break;
-                    }
-                }
                 Ok(OwnerRequest::BeginDiagnosticSegment {
                     handoff_epoch,
+                    deadline,
                     response,
                 }) => {
-                    let result =
-                        engine.begin_diagnostic_segment_after_barrier(&mut client, handoff_epoch);
+                    let result = engine.begin_diagnostic_segment_after_barrier(
+                        &mut client,
+                        handoff_epoch,
+                        deadline,
+                    );
                     let terminal = terminal_failure(&result);
                     let _ = response.send(result);
                     if let Some(error) = terminal {
@@ -309,8 +276,6 @@ fn publish_projection(
     projection.current_url = source.current_url;
     projection.current_title = source.current_title;
     projection.generation = source.generation;
-    projection.blocked_download_count = source.blocked_download_count;
-    projection.canceled_download_count = source.canceled_download_count;
     projection.ready = ready;
     Ok(())
 }

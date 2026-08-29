@@ -5,7 +5,6 @@ mod bootstrap;
 mod chromium_spike;
 pub(crate) mod commands;
 pub(crate) mod login;
-pub(crate) mod login_commands;
 mod logs;
 mod policy;
 mod registry;

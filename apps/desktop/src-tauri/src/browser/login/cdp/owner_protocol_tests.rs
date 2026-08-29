@@ -478,6 +478,7 @@ fn terminal_diagnostic_protocol_failure_stops_owner_before_returning_to_user_con
     request_tx
         .send(OwnerRequest::BeginDiagnosticSegment {
             handoff_epoch: 1,
+            deadline: Instant::now() + Duration::from_secs(1),
             response: response_tx,
         })
         .unwrap();

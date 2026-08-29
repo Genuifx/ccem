@@ -14,9 +14,9 @@ pub(super) enum CdpMethod {
     TargetAttachToTarget,
     TargetCloseTarget,
     PageEnable,
-    PageSetInterceptFileChooserDialog,
     PageSetLifecycleEventsEnabled,
     PageGetFrameTree,
+    PageGetLayoutMetrics,
     PageGetNavigationHistory,
     PageNavigate,
     PageCaptureScreenshot,
@@ -30,11 +30,11 @@ pub(super) enum CdpMethod {
     InputInsertText,
     NetworkEnable,
     RuntimeEnable,
+    RuntimeEvaluate,
     FetchEnable,
     FetchContinueRequest,
     FetchFailRequest,
     RuntimeRunIfWaitingForDebugger,
-    BrowserSetDownloadBehavior,
     BrowserClose,
 }
 
@@ -49,9 +49,9 @@ impl CdpMethod {
             Self::TargetAttachToTarget => "Target.attachToTarget",
             Self::TargetCloseTarget => "Target.closeTarget",
             Self::PageEnable => "Page.enable",
-            Self::PageSetInterceptFileChooserDialog => "Page.setInterceptFileChooserDialog",
             Self::PageSetLifecycleEventsEnabled => "Page.setLifecycleEventsEnabled",
             Self::PageGetFrameTree => "Page.getFrameTree",
+            Self::PageGetLayoutMetrics => "Page.getLayoutMetrics",
             Self::PageGetNavigationHistory => "Page.getNavigationHistory",
             Self::PageNavigate => "Page.navigate",
             Self::PageCaptureScreenshot => "Page.captureScreenshot",
@@ -65,11 +65,11 @@ impl CdpMethod {
             Self::InputInsertText => "Input.insertText",
             Self::NetworkEnable => "Network.enable",
             Self::RuntimeEnable => "Runtime.enable",
+            Self::RuntimeEvaluate => "Runtime.evaluate",
             Self::FetchEnable => "Fetch.enable",
             Self::FetchContinueRequest => "Fetch.continueRequest",
             Self::FetchFailRequest => "Fetch.failRequest",
             Self::RuntimeRunIfWaitingForDebugger => "Runtime.runIfWaitingForDebugger",
-            Self::BrowserSetDownloadBehavior => "Browser.setDownloadBehavior",
             Self::BrowserClose => "Browser.close",
         }
     }
@@ -84,10 +84,7 @@ pub(super) enum CdpEventKind {
     TargetDetached,
     TargetCrashed,
     FrameNavigated,
-    FileChooserOpened,
     ConsoleApiCalled,
-    DownloadWillBegin,
-    DownloadProgress,
     LoadEventFired,
     LifecycleEvent,
     RequestWillBeSent,
@@ -163,10 +160,7 @@ fn classify_event(method: &str) -> CdpEventKind {
         "Target.detachedFromTarget" => CdpEventKind::TargetDetached,
         "Target.targetCrashed" | "Inspector.targetCrashed" => CdpEventKind::TargetCrashed,
         "Page.frameNavigated" => CdpEventKind::FrameNavigated,
-        "Page.fileChooserOpened" => CdpEventKind::FileChooserOpened,
         "Runtime.consoleAPICalled" => CdpEventKind::ConsoleApiCalled,
-        "Browser.downloadWillBegin" => CdpEventKind::DownloadWillBegin,
-        "Browser.downloadProgress" => CdpEventKind::DownloadProgress,
         "Page.loadEventFired" => CdpEventKind::LoadEventFired,
         "Page.lifecycleEvent" => CdpEventKind::LifecycleEvent,
         "Network.requestWillBeSent" => CdpEventKind::RequestWillBeSent,
@@ -190,7 +184,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_method_allowlist_has_only_the_fixed_runtime_resume_and_download_deny_surfaces() {
+    fn production_method_allowlist_has_only_fixed_runtime_methods() {
         let methods = [
             CdpMethod::TargetSetDiscoverTargets,
             CdpMethod::TargetSetAutoAttach,
@@ -199,9 +193,9 @@ mod tests {
             CdpMethod::TargetAttachToTarget,
             CdpMethod::TargetCloseTarget,
             CdpMethod::PageEnable,
-            CdpMethod::PageSetInterceptFileChooserDialog,
             CdpMethod::PageSetLifecycleEventsEnabled,
             CdpMethod::PageGetFrameTree,
+            CdpMethod::PageGetLayoutMetrics,
             CdpMethod::PageGetNavigationHistory,
             CdpMethod::PageNavigate,
             CdpMethod::PageCaptureScreenshot,
@@ -215,26 +209,29 @@ mod tests {
             CdpMethod::InputInsertText,
             CdpMethod::NetworkEnable,
             CdpMethod::RuntimeEnable,
+            CdpMethod::RuntimeEvaluate,
             CdpMethod::FetchEnable,
             CdpMethod::FetchContinueRequest,
             CdpMethod::FetchFailRequest,
             CdpMethod::RuntimeRunIfWaitingForDebugger,
-            CdpMethod::BrowserSetDownloadBehavior,
             CdpMethod::BrowserClose,
         ]
         .map(CdpMethod::as_str);
-        assert!(methods.contains(&"Browser.setDownloadBehavior"));
+        assert!(!methods.contains(&"Browser.setDownloadBehavior"));
+        assert!(!methods.contains(&"Page.setInterceptFileChooserDialog"));
         assert_eq!(
             methods
                 .iter()
                 .copied()
                 .filter(|method| method.starts_with("Runtime."))
                 .collect::<Vec<_>>(),
-            vec!["Runtime.enable", "Runtime.runIfWaitingForDebugger"]
+            vec![
+                "Runtime.enable",
+                "Runtime.evaluate",
+                "Runtime.runIfWaitingForDebugger"
+            ]
         );
-        assert!(!methods
-            .iter()
-            .any(|method| method.contains("evaluate") || method.contains("callFunction")));
+        assert!(!methods.iter().any(|method| method.contains("callFunction")));
     }
 
     #[test]
@@ -326,30 +323,12 @@ mod tests {
     }
 
     #[test]
-    fn file_chooser_events_are_classified_with_the_flat_target_session() {
-        let frame = classify_frame(serde_json::json!({
-            "method": "Page.fileChooserOpened",
-            "sessionId": "primary-session",
-            "params": {
-                "frameId": "main-frame",
-                "mode": "selectSingle",
-                "backendNodeId": 42
-            }
-        }))
-        .unwrap();
-        let IncomingFrame::Event(event) = frame else {
-            panic!("file chooser notification must be an event");
-        };
-        assert_eq!(event.kind, CdpEventKind::FileChooserOpened);
-        assert_eq!(event.session_id.as_deref(), Some("primary-session"));
-    }
-
-    #[test]
-    fn console_and_download_events_are_classified_without_promoting_raw_payloads() {
+    fn only_console_events_are_promoted_to_the_diagnostic_stream() {
         for (method, expected) in [
             ("Runtime.consoleAPICalled", CdpEventKind::ConsoleApiCalled),
-            ("Browser.downloadWillBegin", CdpEventKind::DownloadWillBegin),
-            ("Browser.downloadProgress", CdpEventKind::DownloadProgress),
+            ("Browser.downloadWillBegin", CdpEventKind::Other),
+            ("Browser.downloadProgress", CdpEventKind::Other),
+            ("Page.fileChooserOpened", CdpEventKind::Other),
         ] {
             let frame = classify_frame(serde_json::json!({
                 "method": method,

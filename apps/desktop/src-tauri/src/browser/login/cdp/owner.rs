@@ -3,7 +3,6 @@ use super::super::backend::{
     SemanticBrowserResult,
 };
 use super::super::control::OperationCancellation;
-use super::super::policy::NormalizedOrigin;
 use super::super::supervisor::ManagedLoginRuntime;
 use super::artifacts::CdpArtifactStore;
 use super::console_events::ConsoleEventRecorder;
@@ -38,16 +37,9 @@ pub(super) enum OwnerRequest {
         deadline: Instant,
         response: SyncSender<Result<SemanticBrowserResult, BackendFailure>>,
     },
-    ValidateCurrentOrigin {
-        expected: NormalizedOrigin,
-        response: SyncSender<Result<ChromiumOwnerProjection, BackendFailure>>,
-    },
-    PreflightHandoff {
-        expected: NormalizedOrigin,
-        response: SyncSender<Result<(), BackendFailure>>,
-    },
     BeginDiagnosticSegment {
         handoff_epoch: u64,
+        deadline: Instant,
         response: SyncSender<Result<(), BackendFailure>>,
     },
     StopDiagnosticSegment {
@@ -74,8 +66,6 @@ pub(in crate::browser::login) struct ChromiumOwnerProjection {
     pub(in crate::browser::login) current_url: String,
     pub(in crate::browser::login) current_title: Option<String>,
     pub(in crate::browser::login) generation: u64,
-    pub(in crate::browser::login) blocked_download_count: u64,
-    pub(in crate::browser::login) canceled_download_count: u64,
     pub(in crate::browser::login) ready: bool,
     pub(in crate::browser::login) terminated: bool,
 }
@@ -86,8 +76,6 @@ impl Default for ChromiumOwnerProjection {
             current_url: "about:blank".to_string(),
             current_title: None,
             generation: 0,
-            blocked_download_count: 0,
-            canceled_download_count: 0,
             ready: false,
             terminated: false,
         }
@@ -241,28 +229,6 @@ impl ChromiumLoginBackend {
             .read()
             .map(|projection| projection.clone())
             .map_err(|_| runtime_failure())
-    }
-
-    pub(in crate::browser::login) fn validate_current_origin(
-        &self,
-        expected: NormalizedOrigin,
-    ) -> Result<ChromiumOwnerProjection, BackendFailure> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(runtime_failure());
-        }
-        let (response, result) = mpsc::sync_channel(1);
-        self.requests
-            .try_send(OwnerRequest::ValidateCurrentOrigin { expected, response })
-            .map_err(|_| runtime_failure())?;
-        result
-            .recv_timeout(TRUSTED_BARRIER_TIMEOUT)
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => BackendFailure::new(
-                    BackendFailureCode::TimedOut,
-                    "Browser trusted origin barrier reached its fixed deadline.",
-                ),
-                RecvTimeoutError::Disconnected => runtime_failure(),
-            })?
     }
 
     pub(in crate::browser::login) fn with_owner_quiesced(

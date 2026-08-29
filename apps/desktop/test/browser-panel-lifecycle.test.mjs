@@ -118,6 +118,7 @@ const browserPanelTestStubs = {
             export const RefreshCw = icon('RefreshCw');
             export const ScrollText = icon('ScrollText');
             export const ShieldCheck = icon('ShieldCheck');
+            export const Square = icon('Square');
             export const UserRound = icon('UserRound');
             export const X = icon('X');
           `,
@@ -178,6 +179,7 @@ async function importBrowserPanelHarness() {
         import React, { act } from 'react';
         import { createRoot } from 'react-dom/client';
         import { BrowserPanel } from '@/components/workspace/BrowserPanel';
+        import { nativeSurfaceOcclusionStore } from '@/lib/nativeSurfaceOcclusionStore';
 
         const translators = {
           zh: (key) => 'zh:' + key,
@@ -237,6 +239,19 @@ async function importBrowserPanelHarness() {
         export function emitBrowserState(bridge, leaseId, generation, snapshot) {
           act(() => bridge.emitBrowserState(leaseId, generation, snapshot));
         }
+
+        export async function acquireNativeSurfaceOcclusion() {
+          let lease;
+          await act(async () => {
+            lease = nativeSurfaceOcclusionStore.acquire();
+            await lease.ready;
+          });
+          return {
+            async release() {
+              await act(async () => lease.release());
+            },
+          };
+        }
       `,
       resolveDir: desktopDir,
       sourcefile: 'browser-panel-lifecycle-harness.tsx',
@@ -274,7 +289,6 @@ function installDom() {
   };
   const requestAnimationFrame = (callback) => {
     const handle = setTimeout(() => callback(Date.now()), 0);
-    handle.unref?.();
     return handle;
   };
   const cancelAnimationFrame = (handle) => clearTimeout(handle);
@@ -334,11 +348,14 @@ function installDom() {
 
 function createBridge({
   acquireSnapshot = {},
+  acquireSnapshots = null,
+  acquireSurfaceIds = null,
   navigationActionSnapshots = {},
   syncGate = null,
 } = {}) {
   let loginGeneration = 0;
   let loginServerSequence = 100;
+  const loginControls = new Map();
   const calls = [];
   const listeners = new Map();
   const bridge = {
@@ -353,6 +370,7 @@ function createBridge({
       return () => eventListeners.delete(handler);
     },
     emitBrowserState(leaseId, generation, snapshot) {
+      if (snapshot.control !== undefined) loginControls.set(leaseId, snapshot.control);
       const payload = {
         lease_id: leaseId,
         generation,
@@ -374,33 +392,39 @@ function createBridge({
       switch (command) {
         case 'browser_surface_acquire': {
           loginGeneration += 1;
+          const indexedAcquireSnapshot = acquireSnapshots?.[loginGeneration - 1]
+            ?? acquireSnapshot;
+          const snapshot = {
+            url: args.initialUrl ?? null,
+            title: 'Login',
+            visible: false,
+            loading: false,
+            error: null,
+            lifecycle: 'ready',
+            control: 'user',
+            auto_handoff: true,
+            paused: false,
+            profile_id: 'shared-profile',
+            session_status: 'running',
+            recovery_states: [],
+            popup_active: false,
+            popup_url: null,
+            popup_title: null,
+            popup_loading: false,
+            popup_error: null,
+            ...indexedAcquireSnapshot,
+          };
+          loginControls.set(`lease-${loginGeneration}`, snapshot.control);
           return {
             lease_id: `lease-${loginGeneration}`,
             generation: loginGeneration,
-            surface_id: `surface-${loginGeneration}`,
+            surface_id: acquireSurfaceIds?.[loginGeneration - 1]
+              ?? `surface-${loginGeneration}`,
             client_revision: args.clientRevision,
             server_sequence: loginGeneration,
             backend: 'login',
             profile_id: 'shared-profile',
-            snapshot: {
-              url: args.initialUrl ?? null,
-              title: 'Login',
-              visible: false,
-              loading: false,
-              error: null,
-              lifecycle: 'ready',
-              control: 'user',
-              paused: false,
-              profile_id: 'shared-profile',
-              session_status: 'running',
-              recovery_states: [],
-              popup_active: false,
-              popup_url: null,
-              popup_title: null,
-              popup_loading: false,
-              popup_error: null,
-              ...acquireSnapshot,
-            },
+            snapshot,
           };
         }
         case 'browser_surface_sync':
@@ -422,20 +446,36 @@ function createBridge({
               ...(navigationActionSnapshots[args.action] ?? {}),
             },
           };
-        case 'browser_surface_control':
+        case 'browser_surface_control': {
+          const previousControl = loginControls.get(args.leaseId) ?? 'user';
+          const nextControl = args.action === 'handoff'
+            ? 'agent'
+            : args.action === 'takeover'
+              ? 'user'
+              : args.action === 'occlude' && previousControl === 'agent'
+                ? 'paused'
+                : previousControl;
+          loginControls.set(args.leaseId, nextControl);
+          const responseSequence = ++loginServerSequence;
           return {
             lease_id: args.leaseId,
             generation: args.generation,
-            server_sequence: ++loginServerSequence,
+            server_sequence: responseSequence,
             snapshot: {
               lifecycle: 'ready',
-              control: args.action === 'handoff' ? 'agent' : 'user',
-              paused: false,
+              control: nextControl,
+              auto_handoff: args.action === 'handoff'
+                ? true
+                : args.action === 'takeover'
+                  ? false
+                  : undefined,
+              paused: nextControl === 'paused',
               session_status: 'running',
               recovery_states: [],
               popup_active: false,
             },
           };
+        }
         default:
           throw new Error(`Unexpected BrowserPanel command: ${command}`);
       }
@@ -520,6 +560,128 @@ test('Login locale changes retain its lease until the panel actually unmounts', 
   const releases = callsFor(bridge, 'browser_surface_release');
   assert.equal(releases.length, 1, 'real unmount must close the exact Login lease');
   assert.equal(releases[0].args.disposition, 'close');
+});
+
+test('browser action failures toast without replacing the page with an inline error', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const invoke = bridge.invoke.bind(bridge);
+  bridge.invoke = async (command, args) => {
+    if (command === 'browser_surface_navigation_action') {
+      throw new Error('reload failed');
+    }
+    return invoke(command, args);
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:action-error:browser:1',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  const reload = container.querySelector('button[aria-label="zh:workspace.browserReload"]');
+  assert.ok(reload);
+  harness.click(reload);
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(bridge.toasts, [{ kind: 'error', message: 'Error: reload failed' }]);
+  assert.doesNotMatch(container.textContent, /reload failed/);
+});
+
+test('acquire failures stay inline and do not duplicate as a toast', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:acquire-error:browser:1',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+
+  assert.match(container.textContent, /zh:workspace\.browserSurfaceUnavailable/);
+  assert.deepEqual(bridge.toasts, []);
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 0);
+});
+
+test('a fresh snapshot clears omitted recovery state and its derived inline error', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({
+    acquireSnapshot: { recovery_states: ['renderer_process_terminated'] },
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:recovery-cleared:browser:1',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  const panel = container.querySelector('[data-ccem-browser-panel="true"]');
+  assert.ok(panel);
+  assert.equal(panel.getAttribute('data-ccem-browser-recovery'), 'renderer_process_terminated');
+  assert.match(container.textContent, /zh:workspace\.browserRecoveryRendererStopped/);
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, { lifecycle: 'ready' });
+  await harness.flushEffects();
+
+  assert.equal(panel.getAttribute('data-ccem-browser-recovery'), 'none');
+  assert.doesNotMatch(container.textContent, /zh:workspace\.browserRecoveryRendererStopped/);
 });
 
 test('address bar navigation actions use exact lease state and authoritative capabilities', async (t) => {
@@ -661,31 +823,57 @@ test('address bar navigation actions use exact lease state and authoritative cap
     index === 0 || args.clientRevision > actionCalls[index - 1].args.clientRevision
   )), 'navigation actions must retain monotonically increasing client revisions');
 
-  const assertNavigationDisabled = () => {
+  const assertHistoryDisabled = () => {
     assert.equal(button('browserBack')?.disabled, true);
     assert.equal(button('browserForward')?.disabled, true);
-    assert.equal(button('browserReload')?.disabled, true);
   };
-  harness.emitBrowserState(bridge, 'lease-1', 1, { loading: true });
+  harness.emitBrowserState(bridge, 'lease-1', 1, { lifecycle: 'ready', loading: true });
   await harness.flushEffects();
-  assertNavigationDisabled();
+  assertHistoryDisabled();
+  assert.equal(button('browserReload'), null);
+  assert.equal(
+    button('browserStopLoading')?.disabled,
+    true,
+    'Stop stays disabled until native lifecycle and loading state both agree',
+  );
+  harness.emitBrowserState(bridge, 'lease-1', 1, { lifecycle: 'loading', loading: true });
+  await harness.flushEffects();
+  const stop = button('browserStopLoading');
+  assert.ok(stop);
+  assert.equal(stop.disabled, false);
+  assert.ok([...navigation.querySelectorAll('[data-tooltip-content="true"]')]
+    .some((tooltip) => tooltip.textContent === 'zh:workspace.browserStopLoading'));
+  harness.click(stop);
+  assert.equal(stop.disabled, true, 'busy state disables Stop immediately');
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(button('browserStopLoading'), null);
+  assert.equal(button('browserReload')?.disabled, false);
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_navigation_action').map(({ args }) => args.action),
+    ['back', 'forward', 'reload', 'stop'],
+  );
+
   harness.emitBrowserState(bridge, 'lease-1', 1, { loading: false, lifecycle: 'loading' });
   await harness.flushEffects();
-  assertNavigationDisabled();
+  assertHistoryDisabled();
+  assert.equal(button('browserReload')?.disabled, true);
   harness.emitBrowserState(bridge, 'lease-1', 1, {
     lifecycle: 'ready',
     popup_active: true,
   });
   await harness.flushEffects();
-  assertNavigationDisabled();
+  assertHistoryDisabled();
+  assert.equal(button('browserReload')?.disabled, true);
   harness.emitBrowserState(bridge, 'lease-1', 1, {
     popup_active: false,
     session_status: 'closing',
   });
   await harness.flushEffects();
-  assertNavigationDisabled();
+  assertHistoryDisabled();
+  assert.equal(button('browserReload')?.disabled, true);
   harness.click(button('browserReload'));
-  assert.equal(callsFor(bridge, 'browser_surface_navigation_action').length, 3);
+  assert.equal(callsFor(bridge, 'browser_surface_navigation_action').length, 4);
 });
 
 test('a queued navigation action silently supersedes after its surface becomes inactive', async (t) => {
@@ -806,6 +994,66 @@ test('a queued navigation action silently supersedes when the page starts loadin
     'a queued action must revalidate authoritative loading state before invoking IPC',
   );
   assert.deepEqual(bridge.toasts, [], 'loading-state supersede must remain silent');
+});
+
+test('a queued Stop silently supersedes after loading has already finished', async (t) => {
+  const dom = installDom();
+  let releaseSync;
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  const bridge = createBridge({
+    acquireSnapshot: { lifecycle: 'loading', loading: true },
+    syncGate,
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    releaseSync?.();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:stop-loading-race:browser:1',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+
+  const stop = container.querySelector(
+    'button[aria-label="zh:workspace.browserStopLoading"]',
+  );
+  assert.ok(stop);
+  assert.equal(stop.disabled, false);
+  harness.click(stop);
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'ready',
+    loading: false,
+  });
+  await harness.flushEffects();
+  releaseSync();
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(
+    callsFor(bridge, 'browser_surface_navigation_action').length,
+    0,
+    'queued Stop must revalidate that this exact lease is still loading',
+  );
+  assert.deepEqual(bridge.toasts, []);
 });
 
 test('a superseded queued URL keeps the newer authoritative browser URL', async (t) => {
@@ -1086,14 +1334,41 @@ test('Agent control is one address-bar toggle and takeover does not re-handoff t
     ['handoff', 'takeover'],
     'taking over must not let a render or control-state update auto-handoff the same lease again',
   );
-  assert.ok(navigation.querySelector(
+  const handoff = navigation.querySelector(
     'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
-  ));
+  );
+  assert.ok(handoff);
+  assert.equal(handoff.disabled, false);
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'loading',
+    loading: true,
+  });
+  await harness.flushEffects();
+  assert.equal(handoff.disabled, true, 'handoff waits for authoritative Ready state');
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'ready',
+    loading: false,
+  });
+  await harness.flushEffects();
+  assert.equal(handoff.disabled, false);
+
+  mounted.render({
+    ...props,
+    presentationRevision: 3,
+    isActiveSurface: false,
+    surfaceOccluded: true,
+  });
+  await harness.flushEffects();
+  assert.equal(handoff.disabled, true, 'an inactive hidden surface exposes no control action');
+  mounted.render({ ...props, presentationRevision: 4 });
+  await harness.flushEffects();
+  assert.equal(handoff.disabled, false);
 
   mounted.render({
     ...props,
     sessionId: 'conversation:agent-default:browser:2',
-    presentationRevision: 3,
+    presentationRevision: 5,
   });
   await harness.flushEffects();
   await harness.flushEffects();
@@ -1111,7 +1386,7 @@ test('Agent control is one address-bar toggle and takeover does not re-handoff t
   );
 });
 
-test('about:blank waits for the first authoritative HTTP page before the lease defaults to Agent', async (t) => {
+test('about:blank defaults to the exact Agent as soon as its lease is ready', async (t) => {
   const dom = installDom();
   const bridge = createBridge();
   const { harness, tempDir } = await importBrowserPanelHarness();
@@ -1141,14 +1416,6 @@ test('about:blank waits for the first authoritative HTTP page before the lease d
   await harness.flushEffects();
   await harness.flushEffects();
 
-  assert.equal(callsFor(bridge, 'browser_surface_control').length, 0);
-  harness.emitBrowserState(bridge, 'lease-1', 1, {
-    url: 'https://accounts.example.test/login',
-    lifecycle: 'ready',
-    loading: false,
-  });
-  await harness.flushEffects();
-  await harness.flushEffects();
   assert.deepEqual(
     callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
       action: args.action,
@@ -1182,10 +1449,474 @@ test('about:blank waits for the first authoritative HTTP page before the lease d
   );
 });
 
+test('a temporary overlay resumes the exact Agent on the same lease after restore', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+  let overlay;
+
+  t.after(async () => {
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:overlay-resume:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  overlay = await harness.acquireNativeSurfaceOcclusion();
+  await harness.flushEffects();
+  assert.equal(
+    container.querySelector('[data-ccem-browser-panel="true"]')
+      ?.getAttribute('data-ccem-browser-control'),
+    'paused',
+  );
+
+  await overlay.release();
+  overlay = null;
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      leaseId: args.leaseId,
+      generation: args.generation,
+      action: args.action,
+      agentSessionId: args.agentSessionId,
+    })),
+    [
+      { leaseId: 'lease-1', generation: 1, action: 'handoff', agentSessionId: 'runtime-a' },
+      { leaseId: 'lease-1', generation: 1, action: 'occlude', agentSessionId: undefined },
+      { leaseId: 'lease-1', generation: 1, action: 'handoff', agentSessionId: 'runtime-a' },
+    ],
+    'overlay restore must resume only the exact actor that owned this exact lease before occlusion',
+  );
+});
+
+test('a queued User takeover silently supersedes when an overlay starts before the queue drains', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const invoke = bridge.invoke.bind(bridge);
+  let blockNextSync = false;
+  let releaseSync;
+  let notifySyncStarted;
+  const syncStarted = new Promise((resolve) => {
+    notifySyncStarted = resolve;
+  });
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  bridge.invoke = async (command, args) => {
+    if (command === 'browser_surface_sync' && blockNextSync) {
+      blockNextSync = false;
+      notifySyncStarted();
+      await syncGate;
+    }
+    return invoke(command, args);
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+  let overlay;
+
+  t.after(async () => {
+    releaseSync?.();
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:takeover-overlay-race:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff'],
+  );
+
+  blockNextSync = true;
+  mounted.render({ ...props, presentationRevision: 2 });
+  await syncStarted;
+
+  const takeover = container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.takeover"]',
+  );
+  assert.ok(takeover);
+  harness.click(takeover);
+  const overlayPromise = harness.acquireNativeSurfaceOcclusion();
+  await harness.flushEffects();
+  releaseSync();
+  overlay = await overlayPromise;
+  await harness.flushEffects();
+
+  await overlay.release();
+  overlay = null;
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'occlude', 'handoff'],
+    'the hidden-surface fence must cancel takeover before IPC and restore the prior Agent owner',
+  );
+  const panel = container.querySelector('[data-ccem-browser-panel="true"]');
+  assert.equal(panel?.getAttribute('data-ccem-browser-control'), 'agent');
+  assert.equal(panel?.getAttribute('data-ccem-browser-auto-handoff'), 'true');
+  assert.deepEqual(bridge.toasts, []);
+});
+
+test('an in-flight authoritative User takeover is not undone by a later overlay restore', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const invoke = bridge.invoke.bind(bridge);
+  let holdTakeover = false;
+  let releaseTakeover;
+  let notifyTakeoverStarted;
+  const takeoverStarted = new Promise((resolve) => {
+    notifyTakeoverStarted = resolve;
+  });
+  const takeoverGate = new Promise((resolve) => {
+    releaseTakeover = resolve;
+  });
+  bridge.invoke = async (command, args) => {
+    const response = await invoke(command, args);
+    if (command === 'browser_surface_control' && args.action === 'takeover' && holdTakeover) {
+      holdTakeover = false;
+      notifyTakeoverStarted();
+      await takeoverGate;
+    }
+    return response;
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+  let overlay;
+
+  t.after(async () => {
+    releaseTakeover?.();
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:inflight-takeover-overlay:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  holdTakeover = true;
+  const takeover = container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.takeover"]',
+  );
+  assert.ok(takeover);
+  harness.click(takeover);
+  await takeoverStarted;
+
+  const overlayPromise = harness.acquireNativeSurfaceOcclusion();
+  await harness.flushEffects();
+  releaseTakeover();
+  overlay = await overlayPromise;
+  await harness.flushEffects();
+  await overlay.release();
+  overlay = null;
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'takeover', 'occlude'],
+    'the authoritative User/auto_handoff=false snapshot must erase stale overlay resume intent',
+  );
+  const panel = container.querySelector('[data-ccem-browser-panel="true"]');
+  assert.equal(panel?.getAttribute('data-ccem-browser-control'), 'user');
+  assert.equal(panel?.getAttribute('data-ccem-browser-auto-handoff'), 'false');
+});
+
+test('an overlay during page loading waits for Ready before restoring automatic Agent control', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const invoke = bridge.invoke.bind(bridge);
+  bridge.invoke = async (command, args) => {
+    const response = await invoke(command, args);
+    if (command === 'browser_surface_control' && args.action === 'occlude') {
+      response.snapshot.lifecycle = 'loading';
+      response.snapshot.loading = true;
+    }
+    return response;
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+  let overlay;
+
+  t.after(async () => {
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:loading-overlay:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'loading',
+    loading: true,
+  });
+  overlay = await harness.acquireNativeSurfaceOcclusion();
+  await harness.flushEffects();
+  await overlay.release();
+  overlay = null;
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'occlude'],
+    'overlay restore must not hand off a browser whose authoritative page is still loading',
+  );
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'ready',
+    loading: false,
+    control: 'paused',
+    paused: true,
+    auto_handoff: true,
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'occlude', 'handoff'],
+    'the normal one-shot policy should restore Agent only after the exact lease becomes Ready',
+  );
+});
+
+test('explicit User takeover stays durable across hide/show and later overlay restore', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+  let overlay;
+
+  t.after(async () => {
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:durable-takeover:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  const takeover = container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.takeover"]',
+  );
+  assert.ok(takeover);
+  harness.click(takeover);
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  mounted.render({
+    ...props,
+    presentationRevision: 2,
+    isActiveSurface: false,
+    surfaceOccluded: true,
+  });
+  await harness.flushEffects();
+  mounted.render({ ...props, presentationRevision: 3 });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'takeover'],
+    'hiding and showing the retained lease must not undo User takeover',
+  );
+
+  overlay = await harness.acquireNativeSurfaceOcclusion();
+  await overlay.release();
+  overlay = null;
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff', 'takeover', 'occlude'],
+    'an overlay must not undo an explicit User takeover',
+  );
+  assert.ok(container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
+  ));
+});
+
+test('authoritative User takeover survives a new component and rotated lease for one retained surface', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({
+    acquireSnapshots: [
+      { auto_handoff: true },
+      { control: 'user', auto_handoff: false },
+    ],
+    acquireSurfaceIds: ['retained-surface-a', 'retained-surface-a'],
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, {
+    ...props,
+    sessionId: 'conversation:retained-a:browser:lease-1',
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  const takeover = container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.takeover"]',
+  );
+  assert.ok(takeover);
+  harness.click(takeover);
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  mounted.unmount();
+  mounted = null;
+  await harness.flushEffects();
+  mounted = harness.mountBrowserPanel(container, {
+    ...props,
+    sessionId: 'conversation:retained-a:browser:lease-2',
+    presentationRevision: 2,
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      leaseId: args.leaseId,
+      action: args.action,
+    })),
+    [
+      { leaseId: 'lease-1', action: 'handoff' },
+      { leaseId: 'lease-1', action: 'takeover' },
+    ],
+    'the retained surface snapshot must suppress a new component default handoff',
+  );
+  const manualHandoff = container.querySelector(
+    'button[aria-label="zh:loginBrowserControl.handoffAgent"]',
+  );
+  assert.ok(manualHandoff);
+  harness.click(manualHandoff);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      leaseId: args.leaseId,
+      action: args.action,
+    })),
+    [
+      { leaseId: 'lease-1', action: 'handoff' },
+      { leaseId: 'lease-1', action: 'takeover' },
+      { leaseId: 'lease-2', action: 'handoff' },
+    ],
+    'manual handoff remains available after durable takeover suppresses only the automatic path',
+  );
+});
+
 test('a paused lease stays fail-closed until the single address-bar icon takes over', async (t) => {
   const dom = installDom();
   const bridge = createBridge({
-    acquireSnapshot: { control: 'paused', paused: true },
+    acquireSnapshot: { control: 'paused', paused: true, auto_handoff: false },
   });
   const { harness, tempDir } = await importBrowserPanelHarness();
   const container = document.querySelector('#root');
@@ -1236,6 +1967,65 @@ test('a paused lease stays fail-closed until the single address-bar icon takes o
   );
 });
 
+test('the same runtime returning converges an auto-handoff paused lease back to Agent', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:runtime-return:browser:1',
+    agentSessionId: 'runtime-a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action),
+    ['handoff'],
+  );
+
+  mounted.render({ ...props, agentSessionId: undefined, presentationRevision: 2 });
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    control: 'paused',
+    paused: true,
+    auto_handoff: true,
+  });
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_control').length, 1);
+
+  mounted.render({ ...props, presentationRevision: 3 });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      action: args.action,
+      agentSessionId: args.agentSessionId,
+    })),
+    [
+      { action: 'handoff', agentSessionId: 'runtime-a' },
+      { action: 'handoff', agentSessionId: 'runtime-a' },
+    ],
+  );
+});
+
 test('React StrictMode hands off only the final live lease once', async (t) => {
   const dom = installDom();
   const bridge = createBridge();
@@ -1256,7 +2046,6 @@ test('React StrictMode hands off only the final live lease once', async (t) => {
     backend: 'login',
     sessionId: 'conversation:strict:browser:1',
     agentSessionId: 'runtime-a',
-    defaultUrl: 'https://accounts.example.test',
     presentationRevision: 1,
     isActiveSurface: true,
     surfaceOccluded: false,
@@ -1324,26 +2113,145 @@ test('a queued handoff revalidates the current exact Agent before IPC', async (t
   await harness.flushEffects();
   await harness.flushEffects();
 
-  assert.equal(
-    callsFor(bridge, 'browser_surface_control').length,
-    0,
-    'the queued handoff for runtime A must be cancelled after the exact actor changes',
-  );
-  const retry = container.querySelector(
-    '[data-ccem-browser-control-toggle="true"][aria-label="zh:loginBrowserControl.handoffAgent"]',
-  );
-  assert.ok(retry);
-  harness.click(retry);
-  await harness.flushEffects();
-  await harness.flushEffects();
   assert.deepEqual(
     callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
       action: args.action,
       agentSessionId: args.agentSessionId,
     })),
     [{ action: 'handoff', agentSessionId: 'runtime-b' }],
-    'the user can explicitly hand the same lease to the newly selected exact Agent',
+    'runtime A must be cancelled and the current exact Agent gets its own one-time default handoff',
   );
+});
+
+test('a same-actor auto-handoff superseded by loading retries once the lease is Ready', async (t) => {
+  const dom = installDom();
+  let releaseSync;
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  const bridge = createBridge({ syncGate });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    releaseSync?.();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:same-actor-loading-race:browser:1',
+    agentSessionId: 'runtime-a',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  assert.ok(callsFor(bridge, 'browser_surface_sync').length >= 1);
+  assert.equal(callsFor(bridge, 'browser_surface_control').length, 0);
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'loading',
+    loading: true,
+  });
+  await harness.flushEffects();
+  releaseSync();
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(
+    callsFor(bridge, 'browser_surface_control').length,
+    0,
+    'the stale queued handoff must not cross the loading fence',
+  );
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'ready',
+    loading: false,
+    control: 'user',
+    paused: false,
+    auto_handoff: true,
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.deepEqual(
+    callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
+      action: args.action,
+      agentSessionId: args.agentSessionId,
+    })),
+    [{ action: 'handoff', agentSessionId: 'runtime-a' }],
+    'the same exact auto-handoff attempt must retry after lifecycle convergence',
+  );
+  assert.deepEqual(bridge.toasts, []);
+});
+
+test('a real auto-handoff backend failure remains one-shot for the same lease and actor', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const invoke = bridge.invoke.bind(bridge);
+  bridge.invoke = async (command, args) => {
+    if (command === 'browser_surface_control' && args.action === 'handoff') {
+      bridge.calls.push({ command, args });
+      throw new Error('handoff backend unavailable');
+    }
+    return invoke(command, args);
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:handoff-backend-error:browser:1',
+    agentSessionId: 'runtime-a',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  mounted.render({ ...props, presentationRevision: 2 });
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'ready',
+    loading: false,
+    control: 'user',
+    auto_handoff: true,
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(
+    callsFor(bridge, 'browser_surface_control').length,
+    1,
+    'a backend failure must not create a render-driven retry loop',
+  );
+  assert.deepEqual(bridge.toasts, [
+    { kind: 'error', message: 'Error: handoff backend unavailable' },
+  ]);
 });
 
 test('Login opens in user control when no exact runtime exists and close uses close semantics', async (t) => {

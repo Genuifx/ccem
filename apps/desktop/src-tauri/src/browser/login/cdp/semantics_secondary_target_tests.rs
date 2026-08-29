@@ -18,10 +18,51 @@ impl TrustedNavigationGuard for AuditUnavailable {
 }
 
 #[test]
+fn denied_or_invalid_secondary_pages_are_still_closed() {
+    for url in [
+        "https://denied.example/popup",
+        "javascript:globalThis.compromised=true",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut engine = test_engine(&temp);
+        engine.primary_target = Some("primary".to_string());
+        engine.guard = Arc::new(DenyNavigation);
+        let inbox = inbox_with_frames([serde_json::json!({"id":1,"result":{"success":true}})]);
+        let mut output = Vec::new();
+        let mut client = CdpClient::new(&mut output, inbox);
+
+        engine
+            .on_event(
+                &mut client,
+                CdpEvent {
+                    kind: CdpEventKind::TargetCreated,
+                    params: serde_json::json!({"targetInfo":{
+                        "targetId":"popup",
+                        "type":"page",
+                        "url":url
+                    }}),
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        let commands = output
+            .split(|byte| *byte == 0)
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice::<Value>(frame).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["method"], "Target.closeTarget");
+        assert_eq!(commands[0]["params"]["targetId"], "popup");
+    }
+}
+
+#[test]
 fn unacknowledged_secondary_page_close_is_a_terminal_protocol_failure() {
     let temp = tempfile::tempdir().unwrap();
     let mut engine = test_engine(&temp);
     engine.primary_target = Some("primary".to_string());
+    engine.guard = Arc::new(DenyNavigation);
     let inbox = inbox_with_frames([serde_json::json!({"id":1,"result":{"success":false}})]);
     let mut output = Vec::new();
     let mut client = CdpClient::new(&mut output, inbox);
@@ -287,12 +328,11 @@ fn primary_crash_during_attach_stops_initialization_before_target_setup() {
         let mut engine = test_engine(&temp);
         let mut frames = vec![
             serde_json::json!({"id":1,"result":{}}),
-            serde_json::json!({"id":2,"result":{}}),
-            serde_json::json!({"id":3,"result":{"targetId":"primary-target"}}),
+            serde_json::json!({"id":2,"result":{"targetId":"primary-target"}}),
         ];
         frames.extend(crash_frames);
         frames.push(serde_json::json!({
-            "id":4,
+            "id":3,
             "result":{"sessionId":"primary-session"}
         }));
         let inbox = inbox_with_frames(frames);
@@ -312,8 +352,8 @@ fn primary_crash_during_attach_stops_initialization_before_target_setup() {
             .filter(|frame| !frame.is_empty())
             .map(|frame| serde_json::from_slice::<Value>(frame).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(commands.len(), 4);
-        assert_eq!(commands[3]["method"], "Target.attachToTarget");
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[2]["method"], "Target.attachToTarget");
     }
 }
 

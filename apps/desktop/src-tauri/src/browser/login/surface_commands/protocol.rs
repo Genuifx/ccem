@@ -50,6 +50,7 @@ pub(crate) struct BrowserSurfaceSnapshotResponse {
     pub(super) error: Option<String>,
     pub(super) lifecycle: &'static str,
     control: &'static str,
+    auto_handoff: bool,
     paused: bool,
     profile_id: Option<String>,
     session_status: &'static str,
@@ -150,6 +151,7 @@ pub(super) fn snapshot_response(
             SessionControlOwner::Agent => "agent",
             SessionControlOwner::Paused => "paused",
         },
+        auto_handoff: session.auto_handoff,
         paused: session.control == SessionControlOwner::Paused,
         profile_id: Some(native.profile_id.clone()),
         session_status: match session.status {
@@ -268,6 +270,7 @@ mod tests {
                 error: None,
                 lifecycle: "ready",
                 control: "user",
+                auto_handoff: false,
                 paused: false,
                 profile_id: Some("profile-a".to_string()),
                 session_status: "running",
@@ -285,6 +288,7 @@ mod tests {
         assert_eq!(json["server_sequence"], 17);
         assert_eq!(json["snapshot"]["can_go_back"], true);
         assert_eq!(json["snapshot"]["can_go_forward"], false);
+        assert_eq!(json["snapshot"]["auto_handoff"], false);
         assert_eq!(
             json["snapshot"]["recovery_states"][0],
             "recovered_runtime_owned"

@@ -4,7 +4,6 @@ use super::cdp::owner::{
     ChromiumLoginBackend, ChromiumLoginBackendConfig, ChromiumOwnerProjection,
 };
 use super::network::NetworkRedactionConfig;
-use super::policy::NormalizedOrigin;
 use super::session::SessionManagerError;
 use super::supervisor::ManagedLoginRuntime;
 use std::path::PathBuf;
@@ -24,15 +23,6 @@ pub(super) trait SessionOwnedBackend: SemanticBrowserBackend {
     /// This must be a bounded in-memory projection read. Session registry locks may be held by the
     /// caller; implementations must never perform browser I/O here.
     fn projection(&self) -> Result<SessionBackendProjection, SessionManagerError>;
-
-    fn validate_current_origin(
-        &self,
-        expected: &NormalizedOrigin,
-    ) -> Result<SessionBackendProjection, SessionManagerError>;
-
-    fn preflight_handoff(&self, expected: &NormalizedOrigin) -> Result<(), SessionManagerError> {
-        self.validate_current_origin(expected).map(|_| ())
-    }
 
     fn begin_diagnostic_segment(&self, _handoff_epoch: u64) -> Result<(), SessionManagerError> {
         Ok(())
@@ -135,22 +125,6 @@ impl SessionOwnedBackend for OwnerSessionBackend {
             .map_err(map_backend_failure)
     }
 
-    fn validate_current_origin(
-        &self,
-        expected: &NormalizedOrigin,
-    ) -> Result<SessionBackendProjection, SessionManagerError> {
-        self.backend
-            .validate_current_origin(expected.clone())
-            .map(SessionBackendProjection::from)
-            .map_err(map_backend_failure)
-    }
-
-    fn preflight_handoff(&self, expected: &NormalizedOrigin) -> Result<(), SessionManagerError> {
-        self.backend
-            .preflight_handoff(expected.clone())
-            .map_err(map_handoff_preflight_failure)
-    }
-
     fn begin_diagnostic_segment(&self, handoff_epoch: u64) -> Result<(), SessionManagerError> {
         self.backend
             .begin_diagnostic_segment(handoff_epoch)
@@ -227,15 +201,6 @@ fn map_backend_failure(error: BackendFailure) -> SessionManagerError {
     }
 }
 
-fn map_handoff_preflight_failure(error: BackendFailure) -> SessionManagerError {
-    match error.code {
-        super::backend::BackendFailureCode::NavigationFailed => {
-            SessionManagerError::HandoffPreflightRejected
-        }
-        _ => map_backend_failure(error),
-    }
-}
-
 #[cfg(test)]
 mod terminal_cleanup_tests {
     use super::*;
@@ -253,17 +218,6 @@ mod terminal_cleanup_tests {
         assert_eq!(
             terminal_cleanup_result(Ok(()), Err(SessionManagerError::OwnerQuiescenceTimedOut),),
             Err(SessionManagerError::OwnerQuiescenceTimedOut)
-        );
-    }
-
-    #[test]
-    fn handoff_inventory_denial_is_not_reported_as_a_missing_origin() {
-        assert_eq!(
-            map_handoff_preflight_failure(BackendFailure::new(
-                super::super::backend::BackendFailureCode::NavigationFailed,
-                "handoff inventory rejected",
-            )),
-            SessionManagerError::HandoffPreflightRejected
         );
     }
 }

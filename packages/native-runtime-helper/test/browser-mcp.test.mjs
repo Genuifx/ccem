@@ -94,8 +94,15 @@ test('browser MCP exposes interactive tools for development modes', async () => 
     'readonly',
   );
   assert.ok(readonlyAllowed?.includes('mcp__ccem-browser__get_url'));
-  assert.ok(readonlyAllowed?.includes('mcp__ccem-browser__evaluate'));
-  assert.ok(ensureBrowserMcpToolsAllowed(['Read'], 'dev')?.includes('mcp__ccem-browser__evaluate'));
+  assert.equal(readonlyAllowed?.includes('mcp__ccem-browser__evaluate'), false);
+  assert.equal(
+    ensureBrowserMcpToolsAllowed(['Read'], 'dev')?.includes('mcp__ccem-browser__evaluate'),
+    false,
+  );
+  assert.ok(ensureBrowserMcpToolsAllowed(
+    ['Read', 'mcp__ccem-browser__evaluate'],
+    'dev',
+  )?.includes('mcp__ccem-browser__evaluate'));
   assert.equal(ensureBrowserMcpToolsAllowed(undefined, 'dev'), undefined);
 
   const server = createCcemBrowserMcpServer('dev', async (toolName, args) => ({ toolName, args }));
@@ -122,6 +129,50 @@ test('browser MCP exposes interactive tools for development modes', async () => 
     toolName: 'read_network_log',
     args: {},
   });
+
+  const pressKeyTool = server.instance._registeredTools.press_key;
+  const pressKey = pressKeyTool.handler;
+  const pressKeyResult = await pressKey({ key: 'Enter' });
+  assert.deepEqual(JSON.parse(pressKeyResult.content[0].text), {
+    toolName: 'press_key',
+    args: { key: 'Enter' },
+  });
+
+  const scrollTool = server.instance._registeredTools.scroll;
+  const scroll = scrollTool.handler;
+  const scrollResult = await scroll({ deltaY: -600 });
+  assert.deepEqual(JSON.parse(scrollResult.content[0].text), {
+    toolName: 'scroll',
+    args: { deltaY: -600 },
+  });
+
+  const evaluateTool = server.instance._registeredTools.evaluate;
+  const evaluate = evaluateTool.handler;
+  const evaluateResult = await evaluate({ script: 'document.title' });
+  assert.deepEqual(JSON.parse(evaluateResult.content[0].text), {
+    toolName: 'evaluate',
+    args: { script: 'document.title' },
+  });
+
+  assert.equal(pressKeyTool.inputSchema.safeParse({ key: 'Meta+L' }).success, false);
+  assert.equal(scrollTool.inputSchema.safeParse({ deltaY: 0 }).success, false);
+  assert.equal(scrollTool.inputSchema.safeParse({ deltaY: 2_001 }).success, false);
+  assert.equal(scrollTool.inputSchema.safeParse({ deltaY: 1.5 }).success, false);
+  assert.equal(evaluateTool.inputSchema.safeParse({ script: 'x'.repeat(32_769) }).success, false);
+  assert.equal(evaluateTool.inputSchema.safeParse({ script: '你'.repeat(11_000) }).success, false);
+});
+
+test('registered MCP tools exactly match the shared Rust parser vocabulary', async () => {
+  const vocabulary = JSON.parse(await fs.readFile(
+    path.join(packageDir, 'src', 'browser-tool-vocabulary.json'),
+    'utf8',
+  ));
+  const { createCcemBrowserMcpServer } = await importBrowserMcpModule();
+
+  assert.deepEqual(
+    registeredToolNames(createCcemBrowserMcpServer('dev', async () => ({}))),
+    [...vocabulary].sort(),
+  );
 });
 
 test('browser tool bridge resolves successful responses and rejects failures', async () => {

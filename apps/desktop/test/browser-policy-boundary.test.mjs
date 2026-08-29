@@ -52,7 +52,9 @@ test('browser actions require exact visible session control and support cancella
   assert.match(panelSource, /browserSurfaceClient\.control/);
   assert.match(panelSource, /action: 'handoff' \| 'takeover'/);
   assert.match(panelSource, /autoHandoffAttemptedLeaseRef/);
-  assert.match(panelSource, /hasHttpOrHttpsOrigin\(authoritativeUrl\)/);
+  assert.doesNotMatch(panelSource, /hasHttpOrHttpsOrigin/);
+  assert.match(panelSource, /occludedAgentResumeRef/);
+  assert.match(panelSource, /loginAgentSessionIdRef\.current !== resumeIntent\.agentSessionId/);
   assert.match(chromeSource, /data-ccem-browser-control-toggle="true"/);
   assert.doesNotMatch(chromeSource, /loginBrowserControl\.pauseAgent/);
 });

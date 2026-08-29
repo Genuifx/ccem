@@ -8,6 +8,7 @@ import {
   LoaderCircle,
   PanelTopClose,
   RefreshCw,
+  Square,
   UserRound,
   X,
 } from '@/lib/lucide-react';
@@ -82,7 +83,9 @@ interface BrowserPanelNavigationProps {
   canHandoffAgent: boolean;
   canGoBack: boolean;
   canGoForward: boolean;
+  isLoading: boolean;
   navigationDisabled: boolean;
+  stopLoadingDisabled: boolean;
   t: (key: string) => string;
   onNavigationAction: (action: BrowserSurfaceNavigationAction) => void;
   onOpenExternal: () => void;
@@ -107,7 +110,9 @@ export function BrowserPanelNavigation({
   canHandoffAgent,
   canGoBack,
   canGoForward,
+  isLoading,
   navigationDisabled,
+  stopLoadingDisabled,
   t,
   onNavigationAction,
   onOpenExternal,
@@ -130,6 +135,9 @@ export function BrowserPanelNavigation({
   const controlDisabled = sessionStatus !== 'running'
     || isLoginControlBusy
     || (!needsTakeover && (popupActive || !canHandoffAgent));
+  const reloadOrStopLabel = t(isLoading
+    ? 'workspace.browserStopLoading'
+    : 'workspace.browserReload');
 
   return (
     <div data-ccem-browser-navigation="true" className="flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
@@ -148,11 +156,13 @@ export function BrowserPanelNavigation({
         <ArrowRight className="h-4 w-4" />
       </BrowserToolButton>
       <BrowserToolButton
-        label={t('workspace.browserReload')}
-        onClick={() => onNavigationAction('reload')}
-        disabled={navigationDisabled}
+        label={reloadOrStopLabel}
+        onClick={() => onNavigationAction(isLoading ? 'stop' : 'reload')}
+        disabled={isLoading ? stopLoadingDisabled : navigationDisabled}
       >
-        <RefreshCw className="h-4 w-4" />
+        {isLoading
+          ? <Square className="h-3.5 w-3.5 fill-current" />
+          : <RefreshCw className="h-4 w-4" />}
       </BrowserToolButton>
       <BrowserToolButton
         label={t('workspace.browserOpenExternal')}

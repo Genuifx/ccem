@@ -1,16 +1,14 @@
 use super::super::backend::{
-    ActionResult, BackendFailure, BackendFailureCode, DiagnosticLogResult, NavigationResult,
-    SemanticBrowserCommand, SemanticBrowserResult, SemanticWaitCondition, StructuredPageResult,
-    WaitResult,
+    ActionResult, BackendFailure, BackendFailureCode, DiagnosticLogResult, EvaluationResult,
+    NavigationResult, SemanticBrowserCommand, SemanticBrowserResult, SemanticKey,
+    SemanticWaitCondition, StructuredPageResult, WaitResult,
 };
 use super::super::control::OperationCancellation;
-use super::super::policy::NormalizedOrigin;
 use super::artifacts::CdpArtifactStore;
 use super::console_events::ConsoleEventRecorder;
 use super::guard::{
-    TrustedHandoffPreflightDenial, TrustedHandoffPreflightDenialKind, TrustedNavigationDecision,
-    TrustedNavigationGuard, TrustedNavigationRequest, TrustedNavigationSurface,
-    TrustedSecurityEvent,
+    TrustedNavigationDecision, TrustedNavigationGuard, TrustedNavigationRequest,
+    TrustedNavigationSurface,
 };
 use super::network_events::NetworkEventRecorder;
 use super::protocol::{CdpEvent, CdpEventKind, CdpMethod};
@@ -41,6 +39,9 @@ const MAX_SESSIONS: usize = 64;
 const IDLE_EVENT_BURST: usize = 64;
 const SECONDARY_TARGET_CLOSE_TIMEOUT: Duration = Duration::from_millis(300);
 const FETCH_DISPOSITION_TIMEOUT: Duration = Duration::from_millis(300);
+const EVALUATE_RENDERER_TIMEOUT_MAX: Duration = Duration::from_secs(10);
+const EVALUATE_HOST_DEADLINE_MARGIN: Duration = Duration::from_millis(250);
+const MAX_CSS_VIEWPORT_DIMENSION: f64 = 1_000_000.0;
 
 pub(super) struct SemanticEngine {
     pub(super) guard: Arc<dyn TrustedNavigationGuard>,
@@ -60,9 +61,6 @@ pub(super) struct SemanticEngine {
     loaded_navigation: Option<NavigationIdentity>,
     load_generation: u64,
     document_generation: u64,
-    blocked_file_chooser_count: u64,
-    blocked_download_count: u64,
-    canceled_download_count: u64,
     primary_target_bootstrap: PrimaryTargetBootstrap,
 }
 
@@ -71,9 +69,6 @@ pub(super) struct SemanticEngineProjection {
     pub(super) current_url: String,
     pub(super) current_title: Option<String>,
     pub(super) generation: u64,
-    pub(super) blocked_file_chooser_count: u64,
-    pub(super) blocked_download_count: u64,
-    pub(super) canceled_download_count: u64,
 }
 
 impl SemanticEngine {
@@ -132,9 +127,6 @@ impl SemanticEngine {
             loaded_navigation: None,
             load_generation: 0,
             document_generation: 1,
-            blocked_file_chooser_count: 0,
-            blocked_download_count: 0,
-            canceled_download_count: 0,
             primary_target_bootstrap,
         }
     }
@@ -148,25 +140,7 @@ impl SemanticEngine {
             current_url: self.current_url.clone(),
             current_title: self.current_title.clone(),
             generation: self.document_generation,
-            blocked_file_chooser_count: self.blocked_file_chooser_count,
-            blocked_download_count: self.blocked_download_count,
-            canceled_download_count: self.canceled_download_count,
         }
-    }
-
-    pub(super) fn validate_current_origin(
-        &mut self,
-        client: &mut CdpClient<'_>,
-        expected: &NormalizedOrigin,
-        deadline: Instant,
-    ) -> Result<SemanticEngineProjection, BackendFailure> {
-        self.guarded_document_barrier(client, &NeverCancelled, deadline)?;
-        let actual =
-            NormalizedOrigin::parse(&self.current_url).map_err(|_| navigation_failure())?;
-        if &actual != expected {
-            return Err(navigation_failure());
-        }
-        Ok(self.projection())
     }
 
     pub(super) fn initialize(
@@ -175,16 +149,6 @@ impl SemanticEngine {
         deadline: Instant,
     ) -> Result<(), BackendFailure> {
         let token = NeverCancelled;
-        // Download behavior is browser-global and must fail closed before any target can navigate
-        // or receive Agent input. M2 intentionally has no temporary `allow` window yet.
-        client.call(
-            CdpMethod::BrowserSetDownloadBehavior,
-            serde_json::json!({"behavior": "deny", "eventsEnabled": true}),
-            None,
-            deadline,
-            &token,
-            self,
-        )?;
         if self.primary_target_bootstrap == PrimaryTargetBootstrap::CreateOwnedPage {
             client.call(
                 CdpMethod::TargetSetDiscoverTargets,
@@ -284,6 +248,12 @@ impl SemanticEngine {
                 text,
                 replace,
             } => self.type_text(client, element_ref, text, *replace, cancellation, deadline),
+            SemanticBrowserCommand::PressKey { key } => {
+                self.press_key(client, *key, cancellation, deadline)
+            }
+            SemanticBrowserCommand::Scroll { delta_y } => {
+                self.scroll(client, *delta_y, cancellation, deadline)
+            }
             SemanticBrowserCommand::ReadPage => self.read_page(client, cancellation, deadline),
             SemanticBrowserCommand::Screenshot => self.screenshot(client, cancellation, deadline),
             SemanticBrowserCommand::ReadConsoleLog => {
@@ -309,6 +279,9 @@ impl SemanticEngine {
                     recent: artifact.recent,
                     untrusted: artifact.untrusted,
                 }))
+            }
+            SemanticBrowserCommand::Evaluate { script } => {
+                self.evaluate(client, script, cancellation, deadline)
             }
             SemanticBrowserCommand::WaitFor {
                 condition,
@@ -484,6 +457,154 @@ impl SemanticEngine {
         Ok(())
     }
 
+    fn press_key(
+        &mut self,
+        client: &mut CdpClient<'_>,
+        key: SemanticKey,
+        cancellation: &OperationCancellation,
+        deadline: Instant,
+    ) -> Result<SemanticBrowserResult, BackendFailure> {
+        let expected_generation = self.guarded_document_barrier(client, cancellation, deadline)?;
+        let session = self.primary_session()?;
+        ensure_not_cancelled(cancellation)?;
+        self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
+        let (_, sequence) = client.begin_input_sequence(
+            CdpMethod::InputDispatchKeyEvent,
+            key_down_params(key),
+            &session,
+            deadline,
+            cancellation,
+            self,
+        )?;
+        // Enter may submit and navigate on keyDown. That committed effect is success, not a stale
+        // reference to report and retry. Cancellation still uses the sequence's fixed safety
+        // release; only document-generation revalidation is intentionally omitted here.
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            return Err(client.abort_input_sequence_preserving_error(sequence, self, error));
+        }
+        client.finish_input_sequence(sequence, deadline, cancellation, self)?;
+        ensure_not_cancelled(cancellation)?;
+        Ok(SemanticBrowserResult::Action(ActionResult {
+            completed: true,
+        }))
+    }
+
+    fn scroll(
+        &mut self,
+        client: &mut CdpClient<'_>,
+        delta_y: i64,
+        cancellation: &OperationCancellation,
+        deadline: Instant,
+    ) -> Result<SemanticBrowserResult, BackendFailure> {
+        let expected_generation = self.guarded_document_barrier(client, cancellation, deadline)?;
+        let session = self.primary_session()?;
+        ensure_not_cancelled(cancellation)?;
+        let metrics = client.call(
+            CdpMethod::PageGetLayoutMetrics,
+            serde_json::json!({}),
+            Some(&session),
+            deadline,
+            cancellation,
+            self,
+        )?;
+        let (x, y) = css_visual_viewport_center(&metrics)?;
+        ensure_not_cancelled(cancellation)?;
+        self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
+        client.call(
+            CdpMethod::InputDispatchMouseEvent,
+            serde_json::json!({
+                "type": "mouseWheel",
+                "x": x,
+                "y": y,
+                "deltaX": 0,
+                "deltaY": delta_y,
+                "buttons": 0,
+                "pointerType": "mouse"
+            }),
+            Some(&session),
+            deadline,
+            cancellation,
+            self,
+        )?;
+        ensure_not_cancelled(cancellation)?;
+        // A wheel handler may navigate after the input is committed. Report that committed effect
+        // as success instead of converting it into a stale-document failure that invites a retry.
+        Ok(SemanticBrowserResult::Action(ActionResult {
+            completed: true,
+        }))
+    }
+
+    fn evaluate(
+        &mut self,
+        client: &mut CdpClient<'_>,
+        script: &str,
+        cancellation: &OperationCancellation,
+        deadline: Instant,
+    ) -> Result<SemanticBrowserResult, BackendFailure> {
+        let expected_generation = self.guarded_document_barrier(client, cancellation, deadline)?;
+        let session = self.primary_session()?;
+        ensure_not_cancelled(cancellation)?;
+        self.revalidate_guarded_document(client, cancellation, deadline, expected_generation)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(renderer_budget) = remaining.checked_sub(EVALUATE_HOST_DEADLINE_MARGIN) else {
+            return Err(BackendFailure::new(
+                BackendFailureCode::TimedOut,
+                "Browser JavaScript evaluation has no bounded renderer budget remaining.",
+            ));
+        };
+        let renderer_timeout = renderer_budget.min(EVALUATE_RENDERER_TIMEOUT_MAX);
+        let renderer_timeout_millis = u64::try_from(renderer_timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let response = client.call(
+            CdpMethod::RuntimeEvaluate,
+            serde_json::json!({
+                "expression": script,
+                "returnByValue": true,
+                "awaitPromise": true,
+                "generatePreview": false,
+                "replMode": false,
+                "timeout": renderer_timeout_millis
+            }),
+            Some(&session),
+            deadline,
+            cancellation,
+            self,
+        )?;
+        ensure_not_cancelled(cancellation)?;
+        // The script may intentionally navigate. Once Runtime.evaluate returned, do not turn its
+        // committed effect into a stale-document failure that invites a duplicate evaluation.
+        if response.get("exceptionDetails").is_some() {
+            return Err(BackendFailure::new(
+                BackendFailureCode::EvaluationFailed,
+                "Browser JavaScript evaluation failed.",
+            ));
+        }
+        let remote = response
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(protocol_failure)?;
+        if remote.contains_key("objectId") {
+            return Err(protocol_failure());
+        }
+        let value = if let Some(value) = remote.get("value") {
+            value.clone()
+        } else if remote.get("type").and_then(Value::as_str) == Some("undefined") {
+            Value::Null
+        } else if let Some(value) = remote.get("unserializableValue").and_then(Value::as_str) {
+            if value.len() > 128 || value.contains('\0') {
+                return Err(protocol_failure());
+            }
+            Value::String(value.to_string())
+        } else {
+            return Err(protocol_failure());
+        };
+        Ok(SemanticBrowserResult::Evaluation(EvaluationResult {
+            value,
+            untrusted: true,
+        }))
+    }
+
     fn read_page(
         &mut self,
         client: &mut CdpClient<'_>,
@@ -630,10 +751,6 @@ impl SemanticEngine {
                         "filter": managed_auto_attach_filter()
                     }),
                 ),
-                (
-                    CdpMethod::PageSetInterceptFileChooserDialog,
-                    serde_json::json!({"enabled": true, "cancel": true}),
-                ),
                 (CdpMethod::PageEnable, serde_json::json!({})),
                 (
                     CdpMethod::PageSetLifecycleEventsEnabled,
@@ -717,7 +834,7 @@ impl SemanticEngine {
                 .authorize(TrustedNavigationRequest::new(&url, surface))
         });
         if decision.is_some_and(TrustedNavigationDecision::terminal) {
-            return Err(security_audit_failure());
+            return Err(navigation_policy_failure());
         }
         let allowed = decision.is_some_and(TrustedNavigationDecision::allowed);
         let (method, params) = if allowed {
@@ -763,23 +880,24 @@ impl SemanticEngine {
             "page" => TrustedNavigationSurface::Popup,
             _ => return Ok(()),
         };
+        // CEF only creates this target after its native user-gesture gate admitted the popup.
+        // Chromium commonly reports a provisional blank URL first; defer that decision until
+        // Target.targetInfoChanged supplies the real destination, which is guarded below.
+        if surface == TrustedNavigationSurface::Popup
+            && (url.is_empty() || url == "about:blank" || url.starts_with("about:blank#"))
+        {
+            return Ok(());
+        }
         let decision = self
             .guard
             .authorize(TrustedNavigationRequest::new(&url, surface));
         if decision.terminal() {
-            return Err(security_audit_failure());
+            return Err(navigation_policy_failure());
         }
-        let user_control = decision.allowed() && decision.code() == "user_control";
-        let close = !decision.allowed() || (target_type == "page" && !user_control);
-        if close {
-            if decision.allowed() {
-                self.guard
-                    .record_handoff_preflight_denial(TrustedHandoffPreflightDenial {
-                        kind: TrustedHandoffPreflightDenialKind::ExtraPage,
-                        target_url: Some(&url),
-                    })
-                    .map_err(|_| security_audit_failure())?;
-            }
+        // Native CEF popup admission already requires a real user gesture. Once that fixed gate
+        // admitted an HTTP(S) popup, keep it within this browser instance; OAuth must not be
+        // destroyed merely because the same session is currently under Agent control.
+        if !decision.allowed() {
             let result = client
                 .call(
                     CdpMethod::TargetCloseTarget,
@@ -796,32 +914,73 @@ impl SemanticEngine {
         }
         Ok(())
     }
+}
 
-    fn observe_blocked_file_chooser(&mut self, event: &CdpEvent) -> Result<(), BackendFailure> {
-        let session = event.session_id.as_deref().ok_or_else(protocol_failure)?;
-        if Some(session) != self.primary_session.as_deref()
-            && !self.configured_sessions.contains(session)
-            && !self
-                .pending_sessions
-                .iter()
-                .any(|pending| pending == session)
-        {
-            return Err(protocol_failure());
-        }
-        let params = event.params.as_object().ok_or_else(protocol_failure)?;
-        let mode = string_from_map(params, "mode").ok_or_else(protocol_failure)?;
-        if !matches!(mode.as_str(), "selectSingle" | "selectMultiple") {
-            return Err(protocol_failure());
-        }
-        // `cancel: true` already denied the browser effect. Retain only a monotonic signal that
-        // the gate fired; never retain a DOM node, a renderer payload, or any local path-shaped
-        // data in the owner projection.
-        self.guard
-            .record_security_event(TrustedSecurityEvent::UploadBlocked)
-            .map_err(|_| security_audit_failure())?;
-        self.blocked_file_chooser_count = self.blocked_file_chooser_count.saturating_add(1);
-        Ok(())
+fn css_visual_viewport_center(metrics: &Value) -> Result<(f64, f64), BackendFailure> {
+    let viewport = metrics
+        .get("cssVisualViewport")
+        .and_then(Value::as_object)
+        .ok_or_else(viewport_metrics_failure)?;
+    let width = viewport
+        .get("clientWidth")
+        .and_then(Value::as_f64)
+        .ok_or_else(viewport_metrics_failure)?;
+    let height = viewport
+        .get("clientHeight")
+        .and_then(Value::as_f64)
+        .ok_or_else(viewport_metrics_failure)?;
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || width > MAX_CSS_VIEWPORT_DIMENSION
+        || height > MAX_CSS_VIEWPORT_DIMENSION
+    {
+        return Err(viewport_metrics_failure());
     }
+    let center = (width / 2.0, height / 2.0);
+    if !center.0.is_finite() || !center.1.is_finite() || center.0 <= 0.0 || center.1 <= 0.0 {
+        return Err(viewport_metrics_failure());
+    }
+    Ok(center)
+}
+
+fn viewport_metrics_failure() -> BackendFailure {
+    BackendFailure::new(
+        BackendFailureCode::ProtocolViolation,
+        "Browser viewport metrics were unavailable for scrolling.",
+    )
+}
+
+fn key_down_params(key: SemanticKey) -> Value {
+    let text = matches!(key, SemanticKey::Enter).then_some("\r");
+    let (key, code, virtual_key_code) = match key {
+        SemanticKey::Enter => ("Enter", "Enter", 13),
+        SemanticKey::Tab => ("Tab", "Tab", 9),
+        SemanticKey::Escape => ("Escape", "Escape", 27),
+        SemanticKey::Backspace => ("Backspace", "Backspace", 8),
+        SemanticKey::Delete => ("Delete", "Delete", 46),
+        SemanticKey::ArrowUp => ("ArrowUp", "ArrowUp", 38),
+        SemanticKey::ArrowDown => ("ArrowDown", "ArrowDown", 40),
+        SemanticKey::ArrowLeft => ("ArrowLeft", "ArrowLeft", 37),
+        SemanticKey::ArrowRight => ("ArrowRight", "ArrowRight", 39),
+        SemanticKey::Home => ("Home", "Home", 36),
+        SemanticKey::End => ("End", "End", 35),
+        SemanticKey::PageUp => ("PageUp", "PageUp", 33),
+        SemanticKey::PageDown => ("PageDown", "PageDown", 34),
+        SemanticKey::Space => (" ", "Space", 32),
+    };
+    let mut params = serde_json::json!({
+        "type": "keyDown",
+        "key": key,
+        "code": code,
+        "windowsVirtualKeyCode": virtual_key_code
+    });
+    if let Some(text) = text {
+        params["text"] = Value::from(text);
+        params["unmodifiedText"] = Value::from(text);
+    }
+    params
 }
 
 impl ProtocolEventHandler for SemanticEngine {
@@ -838,21 +997,6 @@ impl ProtocolEventHandler for SemanticEngine {
             | CdpEventKind::TargetDetached
             | CdpEventKind::TargetCrashed => self.handle_target_event(client, &event)?,
             CdpEventKind::FrameNavigated => self.observe_frame_navigated(&event)?,
-            CdpEventKind::FileChooserOpened => self.observe_blocked_file_chooser(&event)?,
-            CdpEventKind::DownloadWillBegin => {
-                self.guard
-                    .record_security_event(TrustedSecurityEvent::DownloadBlocked)
-                    .map_err(|_| security_audit_failure())?;
-                self.blocked_download_count = self.blocked_download_count.saturating_add(1);
-            }
-            CdpEventKind::DownloadProgress => {
-                if event.params.get("state").and_then(Value::as_str) == Some("canceled") {
-                    self.guard
-                        .record_security_event(TrustedSecurityEvent::DownloadCanceled)
-                        .map_err(|_| security_audit_failure())?;
-                    self.canceled_download_count = self.canceled_download_count.saturating_add(1);
-                }
-            }
             CdpEventKind::LifecycleEvent => self.observe_lifecycle_event(&event)?,
             // This event has no frame or loader identity, so it cannot complete an Agent wait.
             CdpEventKind::LoadEventFired => {}
@@ -868,10 +1012,10 @@ impl ProtocolEventHandler for SemanticEngine {
     }
 }
 
-fn security_audit_failure() -> BackendFailure {
+fn navigation_policy_failure() -> BackendFailure {
     BackendFailure::new(
         BackendFailureCode::RuntimeUnavailable,
-        "Browser transfer-denial audit is unavailable.",
+        "Browser navigation policy is unavailable.",
     )
 }
 
@@ -882,10 +1026,6 @@ pub(super) mod tests;
 #[cfg(test)]
 #[path = "input_sequence_race_tests.rs"]
 mod input_sequence_race_tests;
-
-#[cfg(test)]
-#[path = "semantics_security_audit_tests.rs"]
-mod security_audit_tests;
 
 #[cfg(test)]
 #[path = "semantics_secondary_target_tests.rs"]

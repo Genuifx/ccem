@@ -21,7 +21,6 @@ struct PreparedHandoff {
     agent_actor_id: String,
     binding: BrowserGrantBinding,
     origin_grant: TrustedOriginGrant,
-    expected_origin: NormalizedOrigin,
     backend: Arc<dyn SessionOwnedBackend>,
     control: Arc<LoginBrowserControl>,
     navigation_policy: Arc<SessionNavigationPolicy>,
@@ -44,20 +43,6 @@ impl LoginBrowserSessionManager {
             return Err(SessionManagerError::ControlUnavailable);
         }
         let prepared = self.prepare_handoff_candidate(&authorization, agent_actor_id)?;
-
-        // The real browser preflight can take seconds. The candidate nonce keeps this session
-        // undiscoverable and prevents a competing handoff without serializing pause/takeover for
-        // every other session behind the global registry mutex.
-        if let Err(preflight_error) = prepared
-            .backend
-            .preflight_handoff(&prepared.expected_origin)
-        {
-            return Err(self.rollback_preflight_candidate(
-                &authorization.session_id,
-                &prepared,
-                preflight_error,
-            ));
-        }
 
         let mut sessions = match self.lock_sessions() {
             Ok(sessions) => sessions,
@@ -114,10 +99,11 @@ impl LoginBrowserSessionManager {
             return Err(error);
         }
 
-        // These fields are the single Agent-discoverability point. The preflight and diagnostic
-        // barrier both completed while the record still projected its prior trusted UI owner.
+        // These fields are the single Agent-discoverability point. The diagnostic barrier
+        // completed while the record still projected its prior trusted UI owner.
         record.snapshot.handoff_epoch = prepared.epoch;
         record.snapshot.control = SessionControlOwner::Agent;
+        record.snapshot.auto_handoff = true;
         record.agent_actor_id = Some(prepared.agent_actor_id);
         record.active_binding = Some(prepared.binding.clone());
         record.origin_gate = Some(Arc::new(TrustedOriginPolicyGate::new(
@@ -161,14 +147,6 @@ impl LoginBrowserSessionManager {
         }
 
         let record = self.record_mut(&mut sessions, &authorization.session_id)?;
-        refresh_record_projection(record)?;
-        let origin = record
-            .snapshot
-            .current_origin
-            .clone()
-            .ok_or(SessionManagerError::OriginUnavailable)?;
-        let expected_origin =
-            NormalizedOrigin::parse(&origin).map_err(|_| SessionManagerError::OriginUnavailable)?;
         let epoch = next_epoch(record.snapshot.handoff_epoch)?;
         let binding = BrowserGrantBinding::new_trusted(
             record.snapshot.workspace_id.clone(),
@@ -180,8 +158,8 @@ impl LoginBrowserSessionManager {
         let candidate_id = HandoffCandidateId::generate()?;
         let origin_grant = record
             .navigation_policy
-            .activate(binding.clone(), [&origin])
-            .map_err(|_| SessionManagerError::OriginUnavailable)?;
+            .activate(binding.clone())
+            .map_err(|_| SessionManagerError::StateUnavailable)?;
         record.handoff_candidate = Some(candidate_id);
 
         Ok(PreparedHandoff {
@@ -191,35 +169,10 @@ impl LoginBrowserSessionManager {
             agent_actor_id: agent_actor_id.to_string(),
             binding,
             origin_grant,
-            expected_origin,
             backend: Arc::clone(&record.backend),
             control: Arc::clone(&record.control),
             navigation_policy: Arc::clone(&record.navigation_policy),
         })
-    }
-
-    fn rollback_preflight_candidate(
-        &self,
-        session_id: &SessionId,
-        prepared: &PreparedHandoff,
-        reported_error: SessionManagerError,
-    ) -> SessionManagerError {
-        let mut sessions = match self.lock_sessions() {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                fail_closed_detached_candidate(prepared);
-                return error;
-            }
-        };
-        let Some(record) = sessions.get_mut(session_id) else {
-            return SessionManagerError::SessionNotFound;
-        };
-        if record.handoff_candidate != Some(prepared.candidate_id) {
-            return SessionManagerError::InvalidControlTransition;
-        }
-        let error = rollback_candidate(record, prepared.epoch, false, reported_error);
-        record.handoff_candidate = None;
-        error
     }
 
     #[cfg(test)]

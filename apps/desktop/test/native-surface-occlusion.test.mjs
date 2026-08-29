@@ -55,19 +55,19 @@ async function importBrowserPanelParticipant() {
   return import(pathToFileURL(outputPath).href);
 }
 
-test('BrowserPanel Mode 2 occlusion uses one atomic backend barrier and never resumes authority', async () => {
+test('BrowserPanel Mode 2 occlusion delegates one atomic hide and restore transaction', async () => {
   const { createBrowserPanelNativeSurfaceParticipant } = await importBrowserPanelParticipant();
   const events = [];
   const participant = createBrowserPanelNativeSurfaceParticipant({
     occlude: async () => events.push('occlude:pause-then-hide:ack'),
-    restore: async () => events.push('restore:visibility-only'),
+    restore: async () => events.push('restore:visibility-and-owner-policy'),
   });
 
   await participant.hide();
   await participant.restore();
   assert.deepEqual(events, [
     'occlude:pause-then-hide:ack',
-    'restore:visibility-only',
+    'restore:visibility-and-owner-policy',
   ]);
 });
 

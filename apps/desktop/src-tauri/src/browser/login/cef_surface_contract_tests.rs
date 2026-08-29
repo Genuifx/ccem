@@ -107,6 +107,54 @@ fn shared_request_context_contract_uses_storage_sharing_not_wrapper_identity() {
 }
 
 #[test]
+fn embedded_cef_clients_use_native_upload_dialogs_and_user_chosen_download_paths() {
+    let shared_surface = include_str!("cef/surface.rs");
+    assert!(shared_surface.contains("struct SurfaceDownloadHandler"));
+    assert!(shared_surface.contains("fn can_download("));
+    assert!(shared_surface.contains("callback.cont(None, 1);"));
+
+    for (platform, source) in [
+        ("macOS", include_str!("cef/surface/macos.rs")),
+        ("Windows", include_str!("cef/surface/windows.rs")),
+    ] {
+        let client = source
+            .split_once("struct SurfaceClient {")
+            .unwrap_or_else(|| panic!("{platform} SurfaceClient"))
+            .1
+            .split_once("wrap_request_context_handler!")
+            .unwrap_or_else(|| panic!("{platform} SurfaceClient boundary"))
+            .0;
+        assert!(
+            client.contains("fn download_handler(&self) -> Option<DownloadHandler>"),
+            "{platform} must opt into CEF download handling"
+        );
+        assert!(
+            client.contains("Some(SurfaceDownloadHandler::new())"),
+            "{platform} downloads must reach the system save dialog"
+        );
+        assert!(
+            !client.contains("fn dialog_handler("),
+            "{platform} uploads must retain CEF's default system file chooser"
+        );
+    }
+
+    for (platform, source) in [
+        ("macOS popup", include_str!("cef/surface/macos/popup.rs")),
+        (
+            "Windows popup",
+            include_str!("cef/surface/windows/popup.rs"),
+        ),
+    ] {
+        let client = source
+            .split_once("struct PopupSurfaceClient {")
+            .unwrap_or_else(|| panic!("{platform} SurfaceClient"))
+            .1;
+        assert!(client.contains("Some(SurfaceDownloadHandler::new())"));
+        assert!(!client.contains("fn dialog_handler("));
+    }
+}
+
+#[test]
 fn browser_panel_top_left_coordinates_convert_to_outward_rounded_nsview_bounds() {
     let bounds = macos_child_bounds(
         LogicalViewport {
@@ -423,6 +471,7 @@ fn mode2_navigation_actions_use_authoritative_cef_history_on_both_platforms() {
         assert!(surface.contains("browser.can_go_forward()"));
         assert!(surface.contains("CefSurfaceNavigationAction::Forward => browser.go_forward()"));
         assert!(surface.contains("CefSurfaceNavigationAction::Reload => browser.reload()"));
+        assert!(surface.contains("CefSurfaceNavigationAction::Stop => browser.stop_load()"));
         assert!(!surface.contains("reload_ignore_cache"));
         assert!(surface.contains("lifecycle != CefSurfaceLifecycle::Ready"));
         assert!(host.contains("navigation_action_surface"));

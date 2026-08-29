@@ -8,6 +8,37 @@ pub(super) struct PermissionSyncFailure {
 }
 
 impl LoginBrowserSessionManager {
+    pub(crate) fn agent_handoff_expected_for_actor(
+        &self,
+        workspace: &TrustedWorkspacePath,
+        agent_actor_id: &str,
+    ) -> Result<bool, SessionManagerError> {
+        if !self.is_available() {
+            return Ok(false);
+        }
+        let workspace_identity = self
+            .available()?
+            .workspace_identities
+            .resolve(workspace.as_path())
+            .map_err(map_workspace_error)?;
+        let sessions = self.lock_sessions()?;
+        Ok(sessions.values().any(|record| {
+            if record.snapshot.workspace_id != workspace_identity.as_str()
+                || record.snapshot.status != LoginBrowserSessionStatus::Running
+            {
+                return false;
+            }
+            match record.snapshot.control {
+                SessionControlOwner::Agent => {
+                    record.agent_actor_id.as_deref() == Some(agent_actor_id)
+                }
+                SessionControlOwner::User | SessionControlOwner::Paused => {
+                    record.snapshot.auto_handoff && record.agent_actor_id.is_none()
+                }
+            }
+        }))
+    }
+
     /// Retires the Login Browser handoff owned by one native conversation lineage.
     ///
     /// Native runtime stop/quarantine is a trusted host transition, so it cannot rely on a

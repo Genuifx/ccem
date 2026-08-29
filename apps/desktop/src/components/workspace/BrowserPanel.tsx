@@ -92,16 +92,6 @@ function normalizeBrowserInput(value: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`;
 }
 
-function hasHttpOrHttpsOrigin(value: string | null): boolean {
-  if (!value) return false;
-  try {
-    const protocol = new URL(value).protocol;
-    return protocol === 'http:' || protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
 export function BrowserPanel({
   sessionId,
   workingDir,
@@ -149,7 +139,6 @@ export function BrowserPanel({
   loginAgentSessionIdRef.current = loginAgentSessionId;
   const loginProfileId = profileMode === 'saved' ? profileId : undefined;
   const [currentUrl, setCurrentUrl] = useState<string | null>(defaultUrl ?? null);
-  const [authoritativeUrl, setAuthoritativeUrl] = useState<string | null>(null);
   const authoritativeUrlRef = useRef<string | null>(null);
   const [urlInput, setUrlInput] = useState(defaultUrl ?? '');
   const [isUrlEditing, setIsUrlEditing] = useState(false);
@@ -158,6 +147,7 @@ export function BrowserPanel({
   const [error, setError] = useState<string | null>(null);
   const [lifecycle, setLifecycle] = useState<BrowserPanelLifecycle>('creating');
   const [control, setControl] = useState<BrowserPanelControl>('user');
+  const [autoHandoff, setAutoHandoff] = useState(true);
   const [paused, setPaused] = useState(false);
   const [sessionStatus, setSessionStatus] = useState<'running' | 'closing' | 'cleanup_required'>('running');
   const [recoveryStates, setRecoveryStates] = useState<BrowserSurfaceRecoveryState[]>([]);
@@ -175,6 +165,8 @@ export function BrowserPanel({
   const [isSurfaceReady, setIsSurfaceReady] = useState(false);
   const controlRef = useRef(control);
   controlRef.current = control;
+  const autoHandoffRef = useRef(autoHandoff);
+  autoHandoffRef.current = autoHandoff;
   const lifecycleRef = useRef(lifecycle);
   lifecycleRef.current = lifecycle;
   const isLoadingRef = useRef(isLoading);
@@ -185,30 +177,67 @@ export function BrowserPanel({
   sessionStatusRef.current = sessionStatus;
   const popupActiveRef = useRef(popupActive);
   popupActiveRef.current = popupActive;
+  const rendererRecoveryErrorRef = useRef(false);
+  const occludedAgentResumeRef = useRef<({
+    leaseId: string;
+    generation: number;
+    agentSessionId: string;
+  }) | null>(null);
+  const resumeAgentAfterOcclusionRef = useRef<() => Promise<void>>(async () => {});
 
   const applySurfaceSnapshot = useCallback((snapshot?: BrowserSurfaceSnapshot | null) => {
     if (!snapshot) return;
     if (snapshot.url !== undefined) {
       authoritativeUrlRef.current = snapshot.url ?? null;
-      setAuthoritativeUrl(snapshot.url ?? null);
       setCurrentUrl(snapshot.url ?? null);
       if (!isUrlEditingRef.current) setUrlInput(snapshot.url ?? '');
     }
     if (snapshot.title !== undefined) setTitle(snapshot.title ?? null);
-    if (snapshot.lifecycle !== undefined) setLifecycle(snapshot.lifecycle);
-    if (snapshot.control !== undefined) setControl(snapshot.control);
+    if (snapshot.lifecycle !== undefined) {
+      lifecycleRef.current = snapshot.lifecycle;
+      setLifecycle(snapshot.lifecycle);
+    }
+    if (snapshot.control !== undefined) {
+      controlRef.current = snapshot.control;
+      setControl(snapshot.control);
+      if (snapshot.control === 'user') {
+        occludedAgentResumeRef.current = null;
+      }
+    }
+    if (snapshot.auto_handoff !== undefined) {
+      autoHandoffRef.current = snapshot.auto_handoff;
+      setAutoHandoff(snapshot.auto_handoff);
+      if (!snapshot.auto_handoff) {
+        occludedAgentResumeRef.current = null;
+      }
+    }
     if (snapshot.paused !== undefined) setPaused(snapshot.paused);
-    if (snapshot.loading !== undefined) setIsLoading(snapshot.loading);
+    if (snapshot.loading !== undefined) {
+      isLoadingRef.current = snapshot.loading;
+      setIsLoading(snapshot.loading);
+    }
     if (snapshot.can_go_back !== undefined) setCanGoBack(snapshot.can_go_back);
     if (snapshot.can_go_forward !== undefined) setCanGoForward(snapshot.can_go_forward);
-    if (snapshot.recovery_states?.includes('renderer_process_terminated')) {
+    const nextRecoveryStates = snapshot.recovery_states ?? [];
+    setRecoveryStates([...nextRecoveryStates]);
+    if (nextRecoveryStates.includes('renderer_process_terminated')) {
+      rendererRecoveryErrorRef.current = true;
       setError(t('workspace.browserRecoveryRendererStopped'));
     } else if (snapshot.error !== undefined) {
+      rendererRecoveryErrorRef.current = false;
       setError(snapshot.error ?? null);
+    } else if (rendererRecoveryErrorRef.current) {
+      rendererRecoveryErrorRef.current = false;
+      setError(null);
     }
-    if (snapshot.session_status !== undefined) setSessionStatus(snapshot.session_status);
-    if (snapshot.recovery_states !== undefined) setRecoveryStates([...snapshot.recovery_states]);
-    if (snapshot.popup_active !== undefined) setPopupActive(snapshot.popup_active);
+    if (snapshot.session_status !== undefined) {
+      sessionStatusRef.current = snapshot.session_status;
+      setSessionStatus(snapshot.session_status);
+    }
+    if (snapshot.popup_active !== undefined) {
+      popupActiveRef.current = snapshot.popup_active;
+      setPopupActive(snapshot.popup_active);
+    }
     if (snapshot.popup_url !== undefined) setPopupUrl(snapshot.popup_url ?? null);
     if (snapshot.popup_title !== undefined) setPopupTitle(snapshot.popup_title ?? null);
     if (snapshot.popup_loading !== undefined) setPopupLoading(snapshot.popup_loading);
@@ -251,27 +280,53 @@ export function BrowserPanel({
     if (!isActiveSurfaceRef.current || surfaceClosingRef.current) return;
     const lease = surfaceLeaseRef.current;
     if (!lease) return;
-    const response = await surfaceOrdering.enqueue((clientRevision) => (
-      browserSurfaceClient.control({
-        leaseId: lease.leaseId,
-        generation: lease.generation,
-        clientRevision,
-        action: 'occlude',
-      })
-    ));
-    applyBrowserSurfaceMutationResponseForLease(
-      surfaceOrdering,
-      surfaceLeaseRef.current,
-      lease,
-      response,
-      applySurfaceSnapshot,
-    );
+    const agentSessionId = loginAgentSessionIdRef.current;
+    const existingResume = occludedAgentResumeRef.current;
+    if (controlRef.current === 'agent' && agentSessionId) {
+      occludedAgentResumeRef.current = { ...lease, agentSessionId };
+    } else if (!(
+      controlRef.current === 'paused'
+      && existingResume?.leaseId === lease.leaseId
+      && existingResume.generation === lease.generation
+      && existingResume.agentSessionId === agentSessionId
+    )) {
+      occludedAgentResumeRef.current = null;
+    }
+    try {
+      const response = await surfaceOrdering.enqueue((clientRevision) => (
+        browserSurfaceClient.control({
+          leaseId: lease.leaseId,
+          generation: lease.generation,
+          clientRevision,
+          action: 'occlude',
+        })
+      ));
+      applyBrowserSurfaceMutationResponseForLease(
+        surfaceOrdering,
+        surfaceLeaseRef.current,
+        lease,
+        response,
+        applySurfaceSnapshot,
+      );
+    } catch (occlusionError) {
+      const pendingResume = occludedAgentResumeRef.current;
+      if (
+        pendingResume?.leaseId === lease.leaseId
+        && pendingResume.generation === lease.generation
+      ) {
+        occludedAgentResumeRef.current = null;
+      }
+      throw occlusionError;
+    }
   }, [applySurfaceSnapshot, surfaceOrdering]);
 
   useNativeSurfaceOcclusionParticipant(createBrowserPanelNativeSurfaceParticipant({
     isActive: () => isActiveSurfaceRef.current,
     occlude: occludeSurface,
-    restore: () => setNativeSurfaceVisible(!surfaceOccludedRef.current),
+    restore: async () => {
+      await setNativeSurfaceVisible(!surfaceOccludedRef.current);
+      await resumeAgentAfterOcclusionRef.current();
+    },
   }), isActiveSurface);
 
   const syncBounds = useCallback(() => {
@@ -286,22 +341,26 @@ export function BrowserPanel({
     });
   }, [presentationRevision, readViewport, syncSurface]);
 
-  const showBrowserError = useCallback((message: string) => {
+  const showLifecycleError = useCallback((message: string) => {
     setIsLoading(false);
+    rendererRecoveryErrorRef.current = false;
     setError(message);
+  }, []);
+
+  const showActionError = useCallback((message: string) => {
     toast.error(message);
   }, []);
 
   const lifecycleActionsRef = useRef({
     applySurfaceSnapshot,
     readViewport,
-    showBrowserError,
+    showLifecycleError,
     syncSurface,
   });
   lifecycleActionsRef.current = {
     applySurfaceSnapshot,
     readViewport,
-    showBrowserError,
+    showLifecycleError,
     syncSurface,
   };
 
@@ -312,7 +371,6 @@ export function BrowserPanel({
     const pendingStates: BrowserSurfaceStateChangedEvent[] = [];
     setLifecycle('creating');
     authoritativeUrlRef.current = null;
-    setAuthoritativeUrl(null);
     setIsSurfaceReady(false);
     setIsBusy(true);
     setError(null);
@@ -321,6 +379,10 @@ export function BrowserPanel({
     surfaceClosingRef.current = false;
     surfaceCloseSucceededRef.current = false;
     autoHandoffAttemptedLeaseRef.current = null;
+    autoHandoffRef.current = true;
+    setAutoHandoff(true);
+    occludedAgentResumeRef.current = null;
+    rendererRecoveryErrorRef.current = false;
     setIsClosingSurface(false);
     setSessionStatus('running');
     setRecoveryStates([]);
@@ -333,7 +395,7 @@ export function BrowserPanel({
     setCanGoForward(false);
 
     if (!workingDir.trim() || (profileMode === 'saved' && !loginProfileId?.trim())) {
-      lifecycleActionsRef.current.showBrowserError(
+      lifecycleActionsRef.current.showLifecycleError(
         tRef.current('workspace.browserSurfaceUnavailable'),
       );
       setLifecycle('failed');
@@ -343,7 +405,7 @@ export function BrowserPanel({
 
     const viewport = lifecycleActionsRef.current.readViewport();
     if (!viewport) {
-      lifecycleActionsRef.current.showBrowserError(
+      lifecycleActionsRef.current.showLifecycleError(
         tRef.current('workspace.browserSurfaceUnavailable'),
       );
       setLifecycle('failed');
@@ -460,7 +522,7 @@ export function BrowserPanel({
           unlistenHostShortcut?.();
           unlistenHostShortcut = null;
           setLifecycle('failed');
-          showBrowserError(String(acquireError));
+          showLifecycleError(String(acquireError));
         } else {
           console.error('Failed to close a disposed browser surface:', acquireError);
         }
@@ -491,7 +553,7 @@ export function BrowserPanel({
         });
       }
     };
-  }, [loginProfileId, profileMode, sessionId, showBrowserError, surfaceOrdering, workingDir]);
+  }, [loginProfileId, profileMode, sessionId, showLifecycleError, surfaceOrdering, workingDir]);
 
   useEffect(() => {
     if (!isSurfaceReady) return;
@@ -517,7 +579,7 @@ export function BrowserPanel({
   const navigate = useCallback(async (rawValue: string) => {
     if (manualNavigationBusyRef.current) return;
     if (popupActive) {
-      showBrowserError(t('workspace.browserPopupCloseBeforeNavigate'));
+      showActionError(t('workspace.browserPopupCloseBeforeNavigate'));
       return;
     }
     if (controlRef.current !== 'user') return;
@@ -528,13 +590,12 @@ export function BrowserPanel({
     }
     const lease = surfaceLeaseRef.current;
     if (!lease) {
-      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      showActionError(t('workspace.browserSurfaceUnavailable'));
       return;
     }
     const previousUrl = currentUrl;
     manualNavigationBusyRef.current = true;
     setIsBusy(true);
-    setError(null);
     setUrlInput(nextUrl);
     try {
       await surfaceOrdering.enqueue((clientRevision) => {
@@ -574,7 +635,7 @@ export function BrowserPanel({
         }
       }
       if (!(navigateError instanceof BrowserNavigationSupersededError)) {
-        showBrowserError(String(navigateError));
+        showActionError(String(navigateError));
       }
     } finally {
       manualNavigationBusyRef.current = false;
@@ -587,7 +648,7 @@ export function BrowserPanel({
         setIsBusy(false);
       }
     }
-  }, [currentUrl, popupActive, showBrowserError, surfaceOrdering, t]);
+  }, [currentUrl, popupActive, showActionError, surfaceOrdering, t]);
 
   const handleNavigationAction = useCallback(async (
     action: BrowserSurfaceNavigationAction,
@@ -595,21 +656,22 @@ export function BrowserPanel({
     if (manualNavigationBusyRef.current) return;
     const lease = surfaceLeaseRef.current;
     if (!lease) {
-      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      showActionError(t('workspace.browserSurfaceUnavailable'));
       return;
     }
     manualNavigationBusyRef.current = true;
     setIsBusy(true);
-    setError(null);
     try {
       const response = await surfaceOrdering.enqueue((clientRevision) => {
         const currentLease = surfaceLeaseRef.current;
         const leaseChanged = !currentLease
           || currentLease.leaseId !== lease.leaseId
           || currentLease.generation !== lease.generation;
+        const navigationStateChanged = action === 'stop'
+          ? lifecycleRef.current !== 'loading' || !isLoadingRef.current
+          : lifecycleRef.current !== 'ready' || isLoadingRef.current;
         const navigationContextChanged = controlRef.current !== 'user'
-          || lifecycleRef.current !== 'ready'
-          || isLoadingRef.current
+          || navigationStateChanged
           || isLoginControlBusyRef.current
           || !isActiveSurfaceRef.current
           || surfaceOccludedRef.current
@@ -635,7 +697,7 @@ export function BrowserPanel({
       );
     } catch (navigationError) {
       if (!(navigationError instanceof BrowserNavigationSupersededError)) {
-        showBrowserError(String(navigationError));
+        showActionError(String(navigationError));
       }
     } finally {
       manualNavigationBusyRef.current = false;
@@ -648,7 +710,7 @@ export function BrowserPanel({
         setIsBusy(false);
       }
     }
-  }, [applySurfaceSnapshot, showBrowserError, surfaceOrdering, t]);
+  }, [applySurfaceSnapshot, showActionError, surfaceOrdering, t]);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -660,7 +722,7 @@ export function BrowserPanel({
     const lease = surfaceLeaseRef.current;
     if (!lease) {
       if (lifecycle === 'failed' || lifecycle === 'closed') onClose();
-      else showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      else showActionError(t('workspace.browserSurfaceUnavailable'));
       return;
     }
 
@@ -670,7 +732,6 @@ export function BrowserPanel({
       syncFrameRef.current = null;
     }
     setIsClosingSurface(true);
-    setError(null);
     try {
       await surfaceOrdering.enqueue((clientRevision) => (
         browserSurfaceClient.release({
@@ -685,10 +746,10 @@ export function BrowserPanel({
       onClose();
     } catch (closeError) {
       surfaceClosingRef.current = false;
-      showBrowserError(String(closeError));
+      showActionError(String(closeError));
       setIsClosingSurface(false);
     }
-  }, [lifecycle, onClose, showBrowserError, surfaceOrdering, t]);
+  }, [lifecycle, onClose, showActionError, surfaceOrdering, t]);
 
   const cancelUrlEditing = useCallback(() => {
     setUrlInput(currentUrl ?? '');
@@ -705,44 +766,55 @@ export function BrowserPanel({
     const targetUrl = popupActive ? popupUrl : currentUrl;
     if (!targetUrl) return;
     void openExternalUrl(targetUrl).catch((openError) => {
-      showBrowserError(String(openError));
+      showActionError(String(openError));
     });
-  }, [currentUrl, popupActive, popupUrl, showBrowserError]);
+  }, [currentUrl, popupActive, popupUrl, showActionError]);
 
   const handleLoginControl = useCallback(async (
     action: 'handoff' | 'takeover',
   ) => {
-    if (isLoginControlBusy) return;
+    if (action === 'takeover') occludedAgentResumeRef.current = null;
+    if (isLoginControlBusyRef.current) return;
     const controlIntent = action === 'handoff'
       ? (loginAgentSessionId ? { action, agentSessionId: loginAgentSessionId } as const : null)
       : { action };
     if (!controlIntent) {
-      showBrowserError(t('loginBrowserControl.unavailable'));
+      showActionError(t('loginBrowserControl.unavailable'));
       return;
     }
     const lease = surfaceLeaseRef.current;
     if (!lease) {
-      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      showActionError(t('workspace.browserSurfaceUnavailable'));
       return;
     }
-    autoHandoffAttemptedLeaseRef.current = `${lease.leaseId}:${lease.generation}`;
+    const handoffAttemptKey = action === 'handoff'
+      ? `${lease.leaseId}:${lease.generation}:${controlRef.current}:${loginAgentSessionId}`
+      : null;
+    if (handoffAttemptKey) autoHandoffAttemptedLeaseRef.current = handoffAttemptKey;
+    isLoginControlBusyRef.current = true;
     setIsLoginControlBusy(true);
-    setError(null);
     try {
       const response = await surfaceOrdering.enqueue((clientRevision) => {
         const currentLease = surfaceLeaseRef.current;
         const leaseChanged = !currentLease
           || currentLease.leaseId !== lease.leaseId
           || currentLease.generation !== lease.generation;
-        const handoffContextChanged = action === 'handoff' && (
-          loginAgentSessionIdRef.current !== loginAgentSessionId
-          || !isActiveSurfaceRef.current
+        const controlContextChanged = !isActiveSurfaceRef.current
           || surfaceOccludedRef.current
           || nativeSurfaceOcclusionStore.isOccluded()
+          || sessionStatusRef.current !== 'running';
+        const handoffContextChanged = action === 'handoff' && (
+          loginAgentSessionIdRef.current !== loginAgentSessionId
+          || lifecycleRef.current !== 'ready'
+          || isLoadingRef.current
           || popupActiveRef.current
-          || sessionStatusRef.current !== 'running'
         );
-        if (leaseChanged || surfaceClosingRef.current || handoffContextChanged) {
+        if (
+          leaseChanged
+          || surfaceClosingRef.current
+          || controlContextChanged
+          || handoffContextChanged
+        ) {
           throw new BrowserControlSupersededError();
         }
         return browserSurfaceClient.control({
@@ -760,13 +832,55 @@ export function BrowserPanel({
         applySurfaceSnapshot,
       );
     } catch (controlError) {
-      if (!(controlError instanceof BrowserControlSupersededError)) {
-        showBrowserError(String(controlError));
+      if (controlError instanceof BrowserControlSupersededError) {
+        if (autoHandoffAttemptedLeaseRef.current === handoffAttemptKey) {
+          autoHandoffAttemptedLeaseRef.current = null;
+        }
+      } else {
+        showActionError(String(controlError));
       }
     } finally {
+      isLoginControlBusyRef.current = false;
       setIsLoginControlBusy(false);
     }
-  }, [applySurfaceSnapshot, isLoginControlBusy, loginAgentSessionId, showBrowserError, surfaceOrdering, t]);
+  }, [applySurfaceSnapshot, loginAgentSessionId, showActionError, surfaceOrdering, t]);
+
+  resumeAgentAfterOcclusionRef.current = async () => {
+    const resumeIntent = occludedAgentResumeRef.current;
+    if (!resumeIntent) return;
+    if (controlRef.current === 'agent') {
+      occludedAgentResumeRef.current = null;
+      return;
+    }
+    const currentLease = surfaceLeaseRef.current;
+    if (
+      !currentLease
+      || currentLease.leaseId !== resumeIntent.leaseId
+      || currentLease.generation !== resumeIntent.generation
+      || loginAgentSessionIdRef.current !== resumeIntent.agentSessionId
+      || !isActiveSurfaceRef.current
+      || popupActiveRef.current
+      || sessionStatusRef.current !== 'running'
+      || surfaceClosingRef.current
+    ) {
+      occludedAgentResumeRef.current = null;
+      return;
+    }
+    if (surfaceOccludedRef.current || nativeSurfaceOcclusionStore.isOccluded()) return;
+    if (
+      controlRef.current !== 'paused'
+      || !autoHandoffRef.current
+      || lifecycleRef.current !== 'ready'
+      || isLoadingRef.current
+    ) {
+      // The normal auto-handoff effect retries a still-desired Paused lease after
+      // its authoritative native lifecycle converges back to Ready.
+      occludedAgentResumeRef.current = null;
+      return;
+    }
+    occludedAgentResumeRef.current = null;
+    await handleLoginControl('handoff');
+  };
 
   useEffect(() => {
     if (
@@ -775,28 +889,30 @@ export function BrowserPanel({
       || sessionStatus !== 'running'
       || !isActiveSurface
       || surfaceOccluded
+      || nativeSurfaceOcclusionStore.isOccluded()
       || isLoading
       || popupActive
     ) return;
     const lease = surfaceLeaseRef.current;
     if (!lease) return;
-    const leaseKey = `${lease.leaseId}:${lease.generation}`;
-    if (control === 'agent' || control === 'paused' || paused) {
-      autoHandoffAttemptedLeaseRef.current = leaseKey;
+    if (control === 'agent') {
+      autoHandoffAttemptedLeaseRef.current = `${lease.leaseId}:${lease.generation}:agent:${loginAgentSessionId ?? ''}`;
       return;
     }
+    const desiredControl = control === 'paused' || paused ? 'paused' : 'user';
+    const attemptKey = `${lease.leaseId}:${lease.generation}:${desiredControl}:${loginAgentSessionId ?? ''}`;
     if (
-      autoHandoffAttemptedLeaseRef.current === leaseKey
+      autoHandoffAttemptedLeaseRef.current === attemptKey
+      || !autoHandoff
       || !loginAgentSessionId
       || isLoginControlBusy
-      || !hasHttpOrHttpsOrigin(authoritativeUrl)
     ) return;
-    autoHandoffAttemptedLeaseRef.current = leaseKey;
+    autoHandoffAttemptedLeaseRef.current = attemptKey;
     void handleLoginControl('handoff');
   }, [
+    autoHandoff,
     control,
     handleLoginControl,
-    authoritativeUrl,
     isActiveSurface,
     isLoginControlBusy,
     isLoading,
@@ -813,7 +929,7 @@ export function BrowserPanel({
     if (isPopupCloseBusy) return;
     const lease = surfaceLeaseRef.current;
     if (!lease) {
-      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      showActionError(t('workspace.browserSurfaceUnavailable'));
       return;
     }
     setIsPopupCloseBusy(true);
@@ -834,26 +950,42 @@ export function BrowserPanel({
         applySurfaceSnapshot,
       );
     } catch (popupCloseError) {
-      showBrowserError(String(popupCloseError));
+      showActionError(String(popupCloseError));
     } finally {
       setIsPopupCloseBusy(false);
     }
-  }, [applySurfaceSnapshot, isPopupCloseBusy, showBrowserError, surfaceOrdering, t]);
+  }, [applySurfaceSnapshot, isPopupCloseBusy, showActionError, surfaceOrdering, t]);
 
   const panelTitle = t('workspace.browserTitle');
   const effectiveUrl = popupActive ? popupUrl : currentUrl;
   const displayUrl = effectiveUrl || (popupActive ? popupTitle : title) || panelTitle;
-  const navigationDisabled = !isSurfaceReady
-    || lifecycle !== 'ready'
+  const navigationCommonDisabled = !isSurfaceReady
     || sessionStatus !== 'running'
     || control !== 'user'
     || !isActiveSurface
     || surfaceOccluded
+    || nativeSurfaceOcclusionStore.isOccluded()
     || popupActive
     || isBusy
-    || isLoading
     || isLoginControlBusy
     || isClosingSurface;
+  const navigationDisabled = navigationCommonDisabled
+    || lifecycle !== 'ready'
+    || isLoading;
+  const stopLoadingDisabled = navigationCommonDisabled
+    || lifecycle !== 'loading'
+    || !isLoading;
+  const controlToggleUnavailable = !isSurfaceReady
+    || sessionStatus !== 'running'
+    || !isActiveSurface
+    || surfaceOccluded
+    || nativeSurfaceOcclusionStore.isOccluded()
+    || isClosingSurface;
+  const canHandoffAgent = Boolean(loginAgentSessionId)
+    && !controlToggleUnavailable
+    && lifecycle === 'ready'
+    && !isLoading
+    && !isBusy;
 
   return (
     <aside
@@ -861,6 +993,7 @@ export function BrowserPanel({
       data-ccem-browser-backend="login"
       data-ccem-browser-lifecycle={lifecycle}
       data-ccem-browser-control={control}
+      data-ccem-browser-auto-handoff={autoHandoff ? 'true' : 'false'}
       data-ccem-browser-paused={paused ? 'true' : 'false'}
       data-ccem-browser-session-status={sessionStatus}
       data-ccem-browser-recovery={recoveryStates.join(',') || 'none'}
@@ -906,11 +1039,13 @@ export function BrowserPanel({
         sessionStatus={sessionStatus}
         control={control}
         paused={paused}
-        isLoginControlBusy={isLoginControlBusy}
-        canHandoffAgent={Boolean(loginAgentSessionId)}
+        isLoginControlBusy={isLoginControlBusy || controlToggleUnavailable}
+        canHandoffAgent={canHandoffAgent}
         canGoBack={canGoBack}
         canGoForward={canGoForward}
+        isLoading={isLoading}
         navigationDisabled={navigationDisabled}
+        stopLoadingDisabled={stopLoadingDisabled}
         t={t}
         onNavigationAction={(action) => void handleNavigationAction(action)}
         onOpenExternal={handleOpenExternal}

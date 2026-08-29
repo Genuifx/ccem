@@ -1,6 +1,7 @@
 use super::{finalize_surface_if_terminal, record_error, require_main_thread, SURFACES};
 use crate::browser::login::cef::surface::{
     diagnostic_url, CefSurfaceLifecycle, HostShortcutKeyboardHandler, SharedSurfaceState,
+    SurfaceDownloadHandler,
 };
 use cef::*;
 use cef_objc2_app_kit::NSView;
@@ -547,6 +548,10 @@ wrap_client! {
     impl Client {
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(PopupDisplayHandler::new(self.popup_id, Arc::clone(&self.shared)))
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(SurfaceDownloadHandler::new())
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {

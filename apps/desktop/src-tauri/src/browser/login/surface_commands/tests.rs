@@ -508,6 +508,42 @@ fn acquire_keeps_cef_hidden_until_the_current_frontend_lease_syncs_visibility() 
 }
 
 #[test]
+fn mode2_surface_commands_do_not_depend_on_the_legacy_preview_manager() {
+    let surface = include_str!("../surface_commands.rs");
+    let ipc = include_str!("ipc.rs");
+    let production_smoke = include_str!("production_smoke.rs");
+
+    assert!(
+        !surface.contains("use crate::browser::BrowserManager;"),
+        "the Mode 2 surface manager must not import the legacy Preview Browser manager"
+    );
+    assert!(
+        !ipc.contains("BrowserManager"),
+        "Mode 2 acquire/sync IPC must not require legacy Preview Browser state"
+    );
+    assert!(
+        !production_smoke.contains("BrowserManager"),
+        "Mode 2 smoke callers must exercise acquire/sync without legacy Preview Browser state"
+    );
+
+    let acquire_start = surface.find("fn acquire_login(").expect("acquire source");
+    let acquire_end = surface[acquire_start..]
+        .find("fn start_state_watcher(")
+        .map(|offset| acquire_start + offset)
+        .expect("acquire source end");
+    assert!(!surface[acquire_start..acquire_end].contains("BrowserManager"));
+
+    let sync_start = surface.find("fn sync(").expect("sync source");
+    let sync_end = surface[sync_start..]
+        .find("fn release(")
+        .map(|offset| sync_start + offset)
+        .expect("sync source end");
+    let sync = &surface[sync_start..sync_end];
+    assert!(!sync.contains("BrowserManager"));
+    assert!(!sync.contains("preview.hide_all"));
+}
+
+#[test]
 fn trusted_overlay_occlusion_pauses_effects_before_capturing_native_focus_and_hiding() {
     let source = include_str!("../surface_commands.rs");
     let control_start = source
@@ -695,6 +731,7 @@ fn cleanup_required_user_session_is_not_eligible_for_manual_navigation() {
         workspace_id: "workspace-test".to_string(),
         runtime_version: "test".to_string(),
         control: SessionControlOwner::User,
+        auto_handoff: true,
         handoff_epoch: 0,
         current_origin: None,
         status: LoginBrowserSessionStatus::Running,

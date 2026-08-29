@@ -69,6 +69,9 @@ pub(crate) struct LoginBrowserSessionSnapshot {
     pub workspace_id: String,
     pub runtime_version: String,
     pub control: SessionControlOwner,
+    /// Durable preference for this physical browser session. Temporary pauses preserve it;
+    /// only an explicit user takeover clears it and a successful handoff restores it.
+    pub auto_handoff: bool,
     pub handoff_epoch: u64,
     pub current_origin: Option<String>,
     pub status: LoginBrowserSessionStatus,
@@ -174,7 +177,7 @@ pub(super) struct AgentExecutionLease {
     pub(super) permission: Arc<CcemPermissionGate>,
     pub(super) operation_ids: Arc<AtomicU64>,
     pub(super) artifact_root: PathBuf,
-    pub(super) provenance: Arc<ProvenanceLedger>,
+    pub(super) provenance: Arc<Option<ProvenanceLedger>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,7 +393,7 @@ struct LoginBrowserSessionManagerInner {
     profiles: BrowserProfileManager,
     #[cfg(test)]
     supervisor: Option<Arc<dyn SessionSupervisor>>,
-    provenance: Arc<ProvenanceLedger>,
+    provenance: Arc<Option<ProvenanceLedger>>,
     profile_activity: activity::ProfileActivityStore,
     sessions: Mutex<HashMap<SessionId, SessionRecord>>,
     open_gate: Mutex<()>,

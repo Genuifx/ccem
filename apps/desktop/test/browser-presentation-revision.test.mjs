@@ -97,7 +97,7 @@ test('Mode 2 acquire lifetime stays stable across active, occlusion, and present
   );
   assert.match(
     dependencyList,
-    /\[loginProfileId, profileMode, sessionId, showBrowserError, surfaceOrdering, workingDir\]/,
+    /\[loginProfileId, profileMode, sessionId, showLifecycleError, surfaceOrdering, workingDir\]/,
   );
   assert.match(
     acquireEffect,

@@ -6,7 +6,6 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BrowserSurfaceBackendArg {
-    Preview,
     Login,
 }
 
@@ -40,11 +39,21 @@ pub(crate) enum BrowserSurfaceNavigationActionArg {
     Back,
     Forward,
     Reload,
+    Stop,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BrowserSurfaceNavigationActionArg;
+    use super::{BrowserSurfaceBackendArg, BrowserSurfaceNavigationActionArg};
+
+    #[test]
+    fn mode2_is_the_only_surface_backend() {
+        assert!(matches!(
+            serde_json::from_str::<BrowserSurfaceBackendArg>("\"login\"").expect("Mode 2 backend"),
+            BrowserSurfaceBackendArg::Login
+        ));
+        assert!(serde_json::from_str::<BrowserSurfaceBackendArg>("\"preview\"").is_err());
+    }
 
     #[test]
     fn navigation_action_is_a_closed_snake_case_protocol() {
@@ -52,6 +61,7 @@ mod tests {
             ("\"back\"", BrowserSurfaceNavigationActionArg::Back),
             ("\"forward\"", BrowserSurfaceNavigationActionArg::Forward),
             ("\"reload\"", BrowserSurfaceNavigationActionArg::Reload),
+            ("\"stop\"", BrowserSurfaceNavigationActionArg::Stop),
         ] {
             assert_eq!(
                 serde_json::from_str::<BrowserSurfaceNavigationActionArg>(raw)
@@ -59,7 +69,7 @@ mod tests {
                 expected
             );
         }
-        assert!(serde_json::from_str::<BrowserSurfaceNavigationActionArg>("\"stop\"").is_err());
+        assert!(serde_json::from_str::<BrowserSurfaceNavigationActionArg>("\"raw_cdp\"").is_err());
     }
 }
 

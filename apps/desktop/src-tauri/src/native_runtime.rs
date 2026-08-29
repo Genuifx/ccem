@@ -64,6 +64,8 @@ const NATIVE_SETTINGS_UPDATE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_HELPER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_HELPER_WRITE_QUEUE_CAPACITY: usize = 16;
 const NATIVE_HELPER_RETIRING_ERROR: &str = "Native runtime helper is retiring";
+const NATIVE_BROWSER_HANDOFF_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const NATIVE_BROWSER_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ACTIVE_BACKGROUND_TASK_SHUTDOWN_ERROR: &str = "Cannot close this native runtime while Claude background tasks remain active. Retry with force after confirming their results may be lost.";
 const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
@@ -6275,48 +6277,87 @@ impl NativeRuntimeManager {
                 .try_state::<Arc<crate::browser::login::session::LoginBrowserSessionManager>>()
                 .map(|state| Arc::clone(&state))
                 .ok_or_else(|| "Mode 2 browser manager is not registered.".to_string())?;
-            let prepared = {
-                let _sync = handle.browser_permission_sync.lock().map_err(|_| {
-                    "Failed to lock native browser permission authority".to_string()
-                })?;
-                if handle.permission_quarantined.load(Ordering::SeqCst) {
+            let (workspace_dir, browser_actor_id) = {
+                let record = handle
+                    .record
+                    .lock()
+                    .map_err(|_| "Failed to lock native session record".to_string())?;
+                if !is_valid_browser_actor_id(&record.browser_actor_id) {
+                    return Err("Native browser actor lineage is unavailable.".to_string());
+                }
+                (record.project_dir.clone(), record.browser_actor_id.clone())
+            };
+            let workspace = crate::browser::login::session::TrustedWorkspacePath::from_trusted_app(
+                PathBuf::from(&workspace_dir),
+            )
+            .map_err(|error| error.to_string())?;
+            let handoff_deadline = Instant::now() + NATIVE_BROWSER_HANDOFF_GRACE_PERIOD;
+            let prepared = loop {
+                if !handle.alive.load(Ordering::SeqCst)
+                    || handle.permission_quarantined.load(Ordering::SeqCst)
+                    || !self.is_current_handle(runtime_id, &handle)?
+                {
                     return Err(
-                        "Native runtime helper is quarantined after an incomplete permission update."
+                        "Mode 2 browser handoff wait was cancelled with the native session."
                             .to_string(),
                     );
                 }
-                let authority = handle.browser_permission.current_ticket().map_err(|_| {
-                    "Native browser permission authority is unavailable".to_string()
-                })?;
-                let (workspace_dir, browser_actor_id) = {
-                    let record = handle
-                        .record
-                        .lock()
-                        .map_err(|_| "Failed to lock native session record".to_string())?;
-                    let recorded_mode = effective_native_perm_mode(
-                        record.perm_mode.as_str(),
-                        record.runtime_perm_mode.as_deref(),
-                    );
-                    if recorded_mode != authority.mode() {
+                let prepared = {
+                    // Permission updates may cancel this wait between attempts. Never hold this
+                    // lock, the native record lock, or the Login Browser registry while sleeping.
+                    let _sync = handle.browser_permission_sync.lock().map_err(|_| {
+                        "Failed to lock native browser permission authority".to_string()
+                    })?;
+                    if handle.permission_quarantined.load(Ordering::SeqCst) {
                         return Err(
-                            "Native browser permission authority is out of sync.".to_string()
+                            "Native runtime helper is quarantined after an incomplete permission update."
+                                .to_string(),
                         );
                     }
-                    if !is_valid_browser_actor_id(&record.browser_actor_id) {
-                        return Err("Native browser actor lineage is unavailable.".to_string());
+                    let authority = handle.browser_permission.current_ticket().map_err(|_| {
+                        "Native browser permission authority is unavailable".to_string()
+                    })?;
+                    {
+                        let record = handle
+                            .record
+                            .lock()
+                            .map_err(|_| "Failed to lock native session record".to_string())?;
+                        let recorded_mode = effective_native_perm_mode(
+                            record.perm_mode.as_str(),
+                            record.runtime_perm_mode.as_deref(),
+                        );
+                        if recorded_mode != authority.mode() {
+                            return Err(
+                                "Native browser permission authority is out of sync.".to_string()
+                            );
+                        }
                     }
-                    (record.project_dir.clone(), record.browser_actor_id.clone())
-                };
-                login
-                    .prepare_agent_tool_if_handed_off(
+                    login.prepare_agent_tool_if_handed_off(
                         &workspace_dir,
                         &browser_actor_id,
                         authority,
                         &request,
                     )?
-                    .ok_or_else(|| {
-                        "Mode 2 browser is not handed off to this exact session actor.".to_string()
-                    })?
+                };
+                if let Some(prepared) = prepared {
+                    break prepared;
+                }
+                if !login
+                    .agent_handoff_expected_for_actor(&workspace, &browser_actor_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(
+                        "Mode 2 browser is not handed off to this exact session actor.".to_string(),
+                    );
+                }
+                let now = Instant::now();
+                if now >= handoff_deadline {
+                    return Err(
+                        "Mode 2 browser handoff did not become ready for this exact session actor."
+                            .to_string(),
+                    );
+                }
+                thread::sleep(NATIVE_BROWSER_HANDOFF_POLL_INTERVAL.min(handoff_deadline - now));
             };
             login.execute_prepared_agent_tool(&request, prepared)
         })();

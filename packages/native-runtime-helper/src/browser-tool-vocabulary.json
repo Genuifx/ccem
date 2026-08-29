@@ -1,0 +1,14 @@
+[
+  "navigate",
+  "get_url",
+  "snapshot",
+  "click",
+  "type",
+  "press_key",
+  "scroll",
+  "screenshot",
+  "read_console_log",
+  "read_network_log",
+  "evaluate",
+  "wait_for"
+]

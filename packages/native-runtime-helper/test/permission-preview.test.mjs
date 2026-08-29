@@ -90,7 +90,7 @@ test('exposes additional invisible formats and bounds work for hostile long inpu
   assert.ok(hostile.length > 0);
 });
 
-async function buildHelperWithPermissionMock() {
+async function buildHelperWithPermissionMock(scenario = 'preview') {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-helper-permission-preview-test-'));
   const outfile = path.join(tempDir, 'native-runtime-helper.mjs');
 
@@ -112,6 +112,7 @@ async function buildHelperWithPermissionMock() {
         pluginBuild.onLoad({ filter: /^claude-agent-sdk$/, namespace: 'mock-sdk' }, () => ({
           loader: 'js',
           contents: `
+            const scenario = ${JSON.stringify(scenario)};
             export function tool(name, description, inputSchema, handler) {
               return { name, description, inputSchema, handler };
             }
@@ -158,6 +159,25 @@ async function buildHelperWithPermissionMock() {
                   const next = await iterator.next();
                   if (next.done) return;
 
+                  if (scenario === 'evaluate') {
+                    const first = await options.canUseTool(
+                      'mcp__ccem-browser__evaluate',
+                      { script: 'document.title' },
+                      { toolUseID: 'evaluate-1', requestId: 'evaluate-request-1' },
+                    );
+                    const second = await options.canUseTool(
+                      'mcp__ccem-browser__evaluate',
+                      { script: 'location.href' },
+                      { toolUseID: 'evaluate-2', requestId: 'evaluate-request-2' },
+                    );
+                    console.error('EVALUATE_APPROVAL_PROOF ' + JSON.stringify({
+                      first: first.behavior,
+                      second: second.behavior,
+                    }));
+                    yield { type: 'result', subtype: 'success', result: 'done', session_id: 'mock-session' };
+                    return;
+                  }
+
                   const rawInput = deepFreeze({
                     command: 'printf ' + String.fromCodePoint(0x201c) + 'safe' + String.fromCodePoint(0x201d)
                       + String.fromCodePoint(0x202e) + ' ; rm' + String.fromCodePoint(0x200b)
@@ -203,6 +223,46 @@ async function buildHelperWithPermissionMock() {
   });
 
   return outfile;
+}
+
+async function runEvaluateApprovalScenario(permissionMode, t) {
+  const helperPath = await buildHelperWithPermissionMock('evaluate');
+  const helper = spawn(process.execPath, [helperPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  t.after(() => helper.kill('SIGTERM'));
+  const { outputs, stderrRef } = collectHelperOutput(helper);
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    perm_mode: permissionMode,
+    working_dir: os.tmpdir(),
+    initial_prompt: 'evaluate twice',
+  })}\n`);
+
+  if (permissionMode !== 'yolo') {
+    const permission = await waitFor(
+      () => outputs.find((output) => output.type === 'event'
+        && output.payload?.type === 'permission_required'),
+      'evaluate permission request',
+      () => `stdout=${JSON.stringify(outputs)}\nstderr=${stderrRef.value}`,
+    );
+    helper.stdin.write(`${JSON.stringify({
+      type: 'permission_response',
+      request_id: permission.payload.request_id,
+      approved: true,
+    })}\n`);
+  }
+
+  const proofLine = await waitFor(
+    () => stderrRef.value.split('\n').find((line) => line.startsWith('EVALUATE_APPROVAL_PROOF ')),
+    'evaluate approval proof marker',
+    () => `stdout=${JSON.stringify(outputs)}\nstderr=${stderrRef.value}`,
+  );
+  return {
+    outputs,
+    proof: JSON.parse(proofLine.slice('EVALUATE_APPROVAL_PROOF '.length)),
+  };
 }
 
 function collectHelperOutput(helper) {
@@ -307,3 +367,23 @@ for (const approved of [true, false]) {
     assert.equal(proof.before, proof.after);
   });
 }
+
+test('evaluate approval is requested once and then retained for the native session', async (t) => {
+  const { outputs, proof } = await runEvaluateApprovalScenario('dev', t);
+  const permissions = outputs.filter((output) => output.type === 'event'
+    && output.payload?.type === 'permission_required');
+
+  assert.equal(permissions.length, 1);
+  assert.equal(permissions[0].payload.tool_name, 'Browser evaluate');
+  assert.equal(permissions[0].payload.tool_use_id, 'evaluate-1');
+  assert.deepEqual(proof, { first: 'allow', second: 'allow' });
+});
+
+test('yolo mode evaluates without prompting', async (t) => {
+  const { outputs, proof } = await runEvaluateApprovalScenario('yolo', t);
+  const permissions = outputs.filter((output) => output.type === 'event'
+    && output.payload?.type === 'permission_required');
+
+  assert.equal(permissions.length, 0);
+  assert.deepEqual(proof, { first: 'allow', second: 'allow' });
+});

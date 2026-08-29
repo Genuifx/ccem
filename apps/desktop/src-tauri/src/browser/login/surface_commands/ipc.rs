@@ -25,19 +25,16 @@ pub(crate) async fn browser_surface_acquire(
     manager: tauri::State<'_, Arc<LoginBrowserSurfaceManager>>,
     sessions: tauri::State<'_, Arc<LoginBrowserSessionManager>>,
     cef_host: tauri::State<'_, Arc<CefHostController>>,
-    preview: tauri::State<'_, Arc<BrowserManager>>,
 ) -> Result<BrowserSurfaceLeaseResponse, String> {
     ensure_trusted_main_window(&window)?;
     let manager = Arc::clone(manager.inner());
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
-    let preview = Arc::clone(preview.inner());
     tauri::async_runtime::spawn_blocking(move || {
         manager.acquire_login(
             &app,
             &sessions,
             &cef_host,
-            &preview,
             panel_session_id,
             backend,
             working_dir,
@@ -83,17 +80,14 @@ pub(crate) async fn browser_surface_sync(
     presentation_revision: Option<u64>,
     manager: tauri::State<'_, Arc<LoginBrowserSurfaceManager>>,
     cef_host: tauri::State<'_, Arc<CefHostController>>,
-    preview: tauri::State<'_, Arc<BrowserManager>>,
 ) -> Result<(), String> {
     ensure_trusted_main_window(&window)?;
     let manager = Arc::clone(manager.inner());
     let cef_host = Arc::clone(cef_host.inner());
-    let preview = Arc::clone(preview.inner());
     tauri::async_runtime::spawn_blocking(move || {
         manager.sync(
             &app,
             &cef_host,
-            &preview,
             lease_id,
             generation,
             client_revision,

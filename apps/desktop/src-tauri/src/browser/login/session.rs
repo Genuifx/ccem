@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 #[path = "session_profile_maintenance.rs"]
 mod profile_maintenance;
+#[cfg(test)]
 pub(crate) use profile_maintenance::LoginBrowserProfileSummary;
 #[path = "session_activity.rs"]
 mod activity;
@@ -34,7 +35,6 @@ mod activity;
 mod handoff;
 #[path = "session_permission.rs"]
 mod permission_update;
-pub(crate) use activity::LoginBrowserRecentActivity;
 
 #[cfg(test)]
 const LOGIN_PROTOCOL_VERSION: &str = "1";
@@ -81,10 +81,9 @@ impl LoginBrowserSessionManager {
         workspace_identities: WorkspaceIdentityStore,
         profiles: BrowserProfileManager,
     ) -> Result<Self, SessionManagerError> {
-        let provenance = Arc::new(
-            ProvenanceLedger::new(root.join("provenance"))
-                .map_err(|_| SessionManagerError::StateUnavailable)?,
-        );
+        // Provenance is diagnostic-only. A damaged ledger must not make the browser manager,
+        // physical browser sessions, or Agent tools unavailable after restart.
+        let provenance = Arc::new(ProvenanceLedger::new(root.join("provenance")).ok());
         let profile_activity = activity::ProfileActivityStore::new(root.join("profile-activity"))?;
         Ok(Self {
             inner: Some(LoginBrowserSessionManagerInner {
@@ -417,6 +416,7 @@ impl LoginBrowserSessionManager {
             workspace_id: workspace_identity.as_str().to_string(),
             runtime_version: launched.runtime_version,
             control: SessionControlOwner::User,
+            auto_handoff: true,
             handoff_epoch: 0,
             current_origin: None,
             status: LoginBrowserSessionStatus::Running,
@@ -593,9 +593,8 @@ impl LoginBrowserSessionManager {
                 SessionControlOwner::Agent => unreachable!(),
             });
         if let Err(error) = transition {
-            // Keep an in-flight handoff reservation until its preflight returns. This prevents a
-            // second candidate from reusing the shared policy/control objects while the first
-            // owner call is still outstanding.
+            // Revocation already retired the previous grant. Keep the session paused and require
+            // verified cleanup rather than publishing a partially completed control transition.
             record.active_binding = None;
             record.origin_gate = None;
             record.agent_actor_id = None;
@@ -609,6 +608,9 @@ impl LoginBrowserSessionManager {
         record.agent_actor_id = None;
         record.snapshot.handoff_epoch = epoch;
         record.snapshot.control = target;
+        if target == SessionControlOwner::User {
+            record.snapshot.auto_handoff = false;
+        }
         Ok(record.snapshot.clone())
     }
 
@@ -866,7 +868,6 @@ pub(crate) enum SessionManagerError {
     RuntimeUnavailable,
     TransportUnavailable,
     OriginUnavailable,
-    HandoffPreflightRejected,
     PopupActive,
     OperationTimedOut,
     OwnerQuiescenceTimedOut,
@@ -900,9 +901,6 @@ impl fmt::Display for SessionManagerError {
             Self::TransportUnavailable => "The private browser transport is unavailable.",
             Self::OriginUnavailable => {
                 "The current page has no HTTP or HTTPS origin available for Agent handoff."
-            }
-            Self::HandoffPreflightRejected => {
-                "The current page did not pass the browser handoff safety check."
             }
             Self::PopupActive => {
                 "Close the Login Browser popup before handing control to the Agent."

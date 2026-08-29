@@ -68,7 +68,7 @@ test('overlay occlusion round-trips native focus intent without ordinary-show fo
     browserPanel,
     /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
   );
-  assert.match(browserPanel, /recovery_states\?\.includes\('renderer_process_terminated'\)/);
+  assert.match(browserPanel, /nextRecoveryStates\.includes\('renderer_process_terminated'\)/);
   assert.match(browserPanel, /setError\(t\('workspace\.browserRecoveryRendererStopped'\)\)/);
 });
 
@@ -286,10 +286,19 @@ test('surface client preserves lease generation and monotonic revision payloads'
 });
 
 test('central Tauri IPC types include the Mode 2 navigation action contract', async () => {
+  const browserIpcSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'lib', 'browserSurfaceIpc.ts'),
+    'utf8',
+  );
   const source = await fs.readFile(
     path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'),
     'utf8',
   );
+  assert.match(
+    browserIpcSource,
+    /BrowserSurfaceNavigationAction = 'back' \| 'forward' \| 'reload' \| 'stop'/,
+  );
+  assert.match(browserIpcSource, /auto_handoff\?: boolean/);
   assert.match(source, /BrowserSurfaceNavigationActionRequest/);
   assert.match(
     source,
@@ -394,6 +403,7 @@ test('recovery projection exposes only stable states and renders them in the rel
     'browserRecoveryRuntimeRecovered',
     'browserRecoveryRecordCleared',
     'browserRecoveryRendererStopped',
+    'browserStopLoading',
   ];
   for (const key of translationKeys) {
     assert.equal(typeof en.workspace[key], 'string');
@@ -582,7 +592,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
   assert.ok(closeCallbackIndex > closeSucceededIndex, 'panel closes only after native close succeeds');
   assert.match(
     panelSource,
-    /catch \(closeError\) \{[\s\S]*showBrowserError\(String\(closeError\)\);[\s\S]*setIsClosingSurface\(false\);/,
+    /catch \(closeError\) \{[\s\S]*showActionError\(String\(closeError\)\);[\s\S]*setIsClosingSurface\(false\);/,
   );
   assert.match(
     panelSource,

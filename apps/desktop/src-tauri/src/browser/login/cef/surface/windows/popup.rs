@@ -4,6 +4,7 @@ use super::{
 };
 use crate::browser::login::cef::surface::{
     diagnostic_url, CefSurfaceLifecycle, HostShortcutKeyboardHandler, SharedSurfaceState,
+    SurfaceDownloadHandler,
 };
 use cef::*;
 use std::{net::IpAddr, sync::Arc};
@@ -574,6 +575,10 @@ wrap_client! {
     impl Client {
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(PopupDisplayHandler::new(self.popup_id, Arc::clone(&self.shared)))
+        }
+
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(SurfaceDownloadHandler::new())
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {

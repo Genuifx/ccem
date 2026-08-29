@@ -3,14 +3,13 @@ use super::protocol::CdpMethod;
 use super::semantics::SemanticEngine;
 use super::transport::{CdpClient, NeverCancelled};
 use rand::{rngs::OsRng, RngCore};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const SEGMENT_PREFIX: &str = "diag-";
 const SEGMENT_RANDOM_BYTES: usize = 16;
 const MAX_CDP_SESSION_ID_BYTES: usize = 256;
 const DRAIN_BURST: usize = 64;
 const MAX_DISABLED_BARRIER_FRAMES: usize = 4_096;
-const TARGET_SETUP_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DiagnosticSegmentError;
@@ -101,13 +100,14 @@ impl SemanticEngine {
         &mut self,
         client: &mut CdpClient<'_>,
         handoff_epoch: u64,
+        deadline: Instant,
     ) -> Result<(), BackendFailure> {
         let primary_session = self.primary_session()?;
         let barrier = client.call(
             CdpMethod::PageGetFrameTree,
             serde_json::json!({}),
             Some(&primary_session),
-            Instant::now() + TARGET_SETUP_TIMEOUT,
+            deadline,
             &NeverCancelled,
             self,
         )?;
@@ -129,11 +129,7 @@ impl SemanticEngine {
             let handled = client.poll_available(self, remaining.min(DRAIN_BURST))?;
             drained = drained.saturating_add(handled);
             if !self.pending_sessions.is_empty() {
-                self.flush_pending_sessions(
-                    client,
-                    Instant::now() + TARGET_SETUP_TIMEOUT,
-                    &NeverCancelled,
-                )?;
+                self.flush_pending_sessions(client, deadline, &NeverCancelled)?;
             }
             if handled == 0 {
                 break;
@@ -278,7 +274,11 @@ mod tests {
         let mut client = CdpClient::new(&mut output, inbox);
 
         engine
-            .begin_diagnostic_segment_after_barrier(&mut client, 1)
+            .begin_diagnostic_segment_after_barrier(
+                &mut client,
+                1,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
             .unwrap();
         assert_eq!(engine.console.read().unwrap().event_count, 0);
 

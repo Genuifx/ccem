@@ -7,7 +7,7 @@ use crate::browser::login::control::{
 };
 use crate::browser::login::policy::BrowserPolicyCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{mpsc, Barrier};
+use std::sync::{mpsc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 type Order = Arc<Mutex<Vec<&'static str>>>;
@@ -819,91 +819,45 @@ fn permission_change_cancels_active_wait_and_result_audits_in_under_one_second()
 }
 
 #[test]
-fn production_origin_gate_rejects_ungranted_navigation() {
+fn production_browser_gate_allows_first_http_navigation_from_about_blank() {
     let current = binding("session-a", 1);
-    let grant = TrustedOriginGrant::new_trusted(current.clone(), ["https://allowed.example"])
-        .expect("origin grant");
+    let grant = TrustedOriginGrant::new_trusted(current.clone());
     let gate = TrustedOriginPolicyGate::new(grant);
-    let context = SemanticExecutionContext::new_trusted(&current, "https://allowed.example/");
-    let error = gate
+    let context = SemanticExecutionContext::new_trusted(&current, "about:blank");
+    let authorization = gate
         .authorize(
             &context,
             &SemanticBrowserCommand::Navigate {
-                url: "https://evil.example/".to_string(),
+                url: "https://identity.example/oauth/authorize".to_string(),
             },
         )
-        .expect_err("ungranted origin");
-    assert_eq!(error.code, BrowserPolicyCode::OriginNotGranted.as_str());
+        .expect("cross-site navigation belongs to the same browser grant");
+    assert_eq!(
+        authorization.policy_code,
+        BrowserPolicyCode::Allowed.as_str()
+    );
 }
 
 #[test]
-fn persisted_provenance_denials_are_durably_audited_before_any_effect() {
-    let current = binding("session-provenance", 1);
-    let order = Arc::new(Mutex::new(Vec::new()));
-    let control = Arc::new(RecordingControl::active(
-        current.clone(),
-        Arc::clone(&order),
-    ));
-    let permission = Arc::new(FakePermission {
-        order: Arc::clone(&order),
-        deny: AtomicBool::new(false),
-        epoch: AtomicU64::new(1),
-    });
-    let origin = Arc::new(TrustedOriginPolicyGate::new(
-        TrustedOriginGrant::new_trusted(current.clone(), ["https://allowed.example"])
-            .expect("origin grant"),
-    ));
-    let audit = Arc::new(FakeAudit {
-        order: Arc::clone(&order),
-        fail_pre: AtomicBool::new(false),
-        fail_result: AtomicBool::new(false),
-        pre_records: Mutex::new(Vec::new()),
-    });
-    let backend = Arc::new(FakeBackend {
-        order: Arc::clone(&order),
-        effects: AtomicUsize::new(0),
-    });
-    let service = SemanticCapabilityService::new(
-        control,
-        permission,
-        origin,
-        Arc::clone(&audit),
-        Arc::clone(&backend),
+fn blank_browser_allows_inspection_but_not_non_http_navigation() {
+    let current = binding("session-blank", 1);
+    let gate = TrustedOriginPolicyGate::new(TrustedOriginGrant::new_trusted(current.clone()));
+    let context = SemanticExecutionContext::new_trusted(&current, "about:blank");
+
+    gate.authorize(&context, &SemanticBrowserCommand::GetUrl)
+        .expect("owned blank browser remains inspectable");
+    let denied = gate
+        .authorize(
+            &context,
+            &SemanticBrowserCommand::Navigate {
+                url: "file:///tmp/private".to_string(),
+            },
+        )
+        .expect_err("explicit non-HTTP navigation remains blocked");
+    assert_eq!(
+        denied.code,
+        BrowserPolicyCode::UnsupportedOriginScheme.as_str()
     );
-
-    for (provenance, expected) in [
-        (
-            BrowserDataProvenance::CrossOrigin,
-            "cross_origin_write_blocked",
-        ),
-        (
-            BrowserDataProvenance::Mixed,
-            "mixed_provenance_write_blocked",
-        ),
-    ] {
-        let context =
-            SemanticExecutionContext::new_trusted(&current, "https://allowed.example/form")
-                .with_data_provenance(provenance)
-                .with_request_id("request-provenance")
-                .with_actor_id("actor-provenance");
-        let error = service
-            .execute(&context, write_command())
-            .expect_err("tainted write must fail closed");
-        assert_eq!(error.code, CapabilityErrorCode::OriginDenied);
-        assert_eq!(error.cause_code, expected);
-    }
-
-    assert_eq!(backend.effects.load(Ordering::Acquire), 0);
-    let records = audit.pre_records.lock().expect("audit records");
-    assert_eq!(records.len(), 2);
-    for (record, expected) in records.iter().zip([
-        "cross_origin_write_blocked",
-        "mixed_provenance_write_blocked",
-    ]) {
-        let value = serde_json::to_value(record).expect("audit value");
-        assert_eq!(value["decision"], "denied");
-        assert_eq!(value["cause_code"], expected);
-    }
 }
 
 #[path = "capability_audit_tests.rs"]

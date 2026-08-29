@@ -156,6 +156,7 @@ import type { BrowserPanelTarget } from '@/components/workspace/browserPanelTarg
 import {
   createBrowserPanelSessionKeyRegistry,
   isBrowserPanelTargetVisible,
+  matchesBrowserPanelHistorySession,
   rebindBrowserPanelTarget,
   retireBrowserPanelTargetForWorkingDirChange,
   resolveActiveBrowserAgentSessionId,
@@ -526,6 +527,8 @@ export function Workspace({
   const [browserTargetBySessionId, setBrowserTargetBySessionId] = useState<
     Record<string, BrowserPanelTarget | undefined>
   >({});
+  const browserTargetBySessionIdRef = useRef(browserTargetBySessionId);
+  browserTargetBySessionIdRef.current = browserTargetBySessionId;
   const browserPanelInstanceSeqRef = useRef(0);
   const browserPanelSessionKeyRegistryRef = useRef(createBrowserPanelSessionKeyRegistry());
   const browserPresentationRevisionAllocatorRef = useRef(
@@ -1469,8 +1472,7 @@ export function Workspace({
     }
     if (workspaceMode === 'history' && selectedSession) {
       const matchingLiveEntry = Object.values(liveSessionsByRuntimeId).find((entry) => (
-        entry.session.provider === selectedSession.source
-        && entry.session.provider_session_id === selectedSession.id
+        matchesBrowserPanelHistorySession(selectedSession, entry.session)
       ));
       return browserPanelSessionKeyRegistryRef.current.resolveHistory({
         provider: selectedSession.source,
@@ -1530,6 +1532,7 @@ export function Workspace({
       if (!previous[sessionId]) return previous;
       const next = { ...previous };
       delete next[sessionId];
+      browserTargetBySessionIdRef.current = next;
       return next;
     });
   }, []);
@@ -2711,7 +2714,6 @@ export function Workspace({
       return false;
     }
     const previewPrompt = buildComposerPromptPreview(displayPrompt, attachments);
-
     // Per-Composer Dynamic Routing opt-in: resolve the launch seed from the
     // CURRENT store config at submit time. Blocking codes keep the draft so the
     // user can fix the selection and retry; opted-out drafts omit the param.
@@ -2779,11 +2781,13 @@ export function Workspace({
         runtimeId: summary.runtime_id,
       });
       setBrowserTargetBySessionId((previous) => {
-        return rebindBrowserPanelTarget(
+        const next = rebindBrowserPanelTarget(
           previous,
           WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
           liveBrowserSessionId,
         );
+        browserTargetBySessionIdRef.current = next;
+        return next;
       });
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
@@ -3804,6 +3808,9 @@ export function Workspace({
           if (!target) return null;
           const isPanelActive = sessionId === activeBrowserSessionId
             && isBrowserPanelTargetVisible(target);
+          const panelAgentSessionId = sessionId === activeBrowserSessionId
+            ? activeBrowserAgentSessionId ?? undefined
+            : undefined;
           const panelKey = String(target.instanceId);
           const panelProps = {
             sessionId: target.surfaceSessionId,
@@ -3836,11 +3843,7 @@ export function Workspace({
                 key={panelKey}
                 {...target}
                 {...panelProps}
-                agentSessionId={
-                  sessionId === activeBrowserSessionId
-                    ? activeBrowserAgentSessionId ?? undefined
-                    : undefined
-                }
+                agentSessionId={panelAgentSessionId}
               />
             </div>
           );

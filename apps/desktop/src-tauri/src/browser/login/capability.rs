@@ -4,14 +4,13 @@ use super::backend::{
 };
 use super::control::{ControlErrorCode, HandoffControl};
 use super::policy::{
-    authorize_browser_request, BrowserDataProvenance, BrowserGrantBinding, BrowserPolicyEffect,
-    BrowserPolicyRequest, BrowserPolicySurface, NormalizedOrigin, TrustedCrossOriginConfirmation,
+    authorize_browser_request, BrowserGrantBinding, BrowserPolicyRequest, BrowserPolicySurface,
     TrustedOriginGrant,
 };
 use serde::Serialize;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 #[path = "capability_audit_sink.rs"]
 mod audit_sink;
@@ -21,35 +20,19 @@ pub(super) use audit_sink::JsonlSemanticAuditSink;
 /// This type deliberately does not implement `Deserialize`.
 pub(super) struct SemanticExecutionContext<'a> {
     binding: &'a BrowserGrantBinding,
-    current_url: &'a str,
-    source_data_origin: Option<&'a NormalizedOrigin>,
-    data_provenance: BrowserDataProvenance,
     request_id: Option<&'a str>,
     actor_id: Option<&'a str>,
     permission_epoch: Option<u64>,
 }
 
 impl<'a> SemanticExecutionContext<'a> {
-    pub(super) fn new_trusted(binding: &'a BrowserGrantBinding, current_url: &'a str) -> Self {
+    pub(super) fn new_trusted(binding: &'a BrowserGrantBinding, _current_url: &'a str) -> Self {
         Self {
             binding,
-            current_url,
-            source_data_origin: None,
-            data_provenance: BrowserDataProvenance::UntrackedOrSameOrigin,
             request_id: None,
             actor_id: None,
             permission_epoch: None,
         }
-    }
-
-    pub(super) fn with_source_data_origin(mut self, origin: &'a NormalizedOrigin) -> Self {
-        self.source_data_origin = Some(origin);
-        self
-    }
-
-    pub(super) fn with_data_provenance(mut self, provenance: BrowserDataProvenance) -> Self {
-        self.data_provenance = provenance;
-        self
     }
 
     pub(super) fn with_request_id(mut self, request_id: &'a str) -> Self {
@@ -464,27 +447,11 @@ pub(super) trait SemanticOriginGate: Send + Sync {
 /// Production origin-policy adapter around the single Login Browser origin decision function.
 pub(super) struct TrustedOriginPolicyGate {
     grant: TrustedOriginGrant,
-    confirmation: Mutex<Option<TrustedCrossOriginConfirmation>>,
 }
 
 impl TrustedOriginPolicyGate {
     pub(super) fn new(grant: TrustedOriginGrant) -> Self {
-        Self {
-            grant,
-            confirmation: Mutex::new(None),
-        }
-    }
-
-    pub(super) fn install_confirmation(
-        &self,
-        confirmation: TrustedCrossOriginConfirmation,
-    ) -> Result<(), OriginFailure> {
-        let mut slot = self
-            .confirmation
-            .lock()
-            .map_err(|_| OriginFailure::new("origin_policy_unavailable"))?;
-        *slot = Some(confirmation);
-        Ok(())
+        Self { grant }
     }
 }
 
@@ -494,7 +461,6 @@ impl SemanticOriginGate for TrustedOriginPolicyGate {
         context: &SemanticExecutionContext<'_>,
         command: &SemanticBrowserCommand,
     ) -> Result<OriginAuthorization, OriginFailure> {
-        let target_url = command.navigation_url().unwrap_or(context.current_url);
         let request = BrowserPolicyRequest {
             binding: context.binding,
             surface: if command.navigation_url().is_some() {
@@ -502,22 +468,11 @@ impl SemanticOriginGate for TrustedOriginPolicyGate {
             } else {
                 BrowserPolicySurface::Mutation
             },
-            effect: if command.is_write_capability() {
-                BrowserPolicyEffect::Mutate
-            } else {
-                BrowserPolicyEffect::Navigate
-            },
-            target_url,
-            source_data_origin: context.source_data_origin,
-            data_provenance: context.data_provenance,
+            target_url: command.navigation_url(),
             // Pause/cancel authority was already checked immediately before this policy step.
             paused: false,
         };
-        let mut confirmation = self
-            .confirmation
-            .lock()
-            .map_err(|_| OriginFailure::new("origin_policy_unavailable"))?;
-        let decision = authorize_browser_request(&self.grant, request, confirmation.as_mut());
+        let decision = authorize_browser_request(&self.grant, request);
         if !decision.allowed {
             return Err(OriginFailure::new(decision.code.as_str()));
         }

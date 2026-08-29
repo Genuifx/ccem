@@ -2,7 +2,7 @@ use super::{
     diagnostic_url, run_cancellable_on_main, should_retire_surface_without_browser,
     validate_surface_id, CefSurfaceConnection, CefSurfaceLifecycle, CefSurfaceNavigationAction,
     CefSurfaceOpenSpec, HostShortcutKeyboardHandler, NativeChildBounds, SharedSurfaceState,
-    SurfaceRequestHandler,
+    SurfaceDownloadHandler, SurfaceRequestHandler,
 };
 use crate::browser::login::cef::{
     devtools_bridge::{CefDevToolsBridge, CefDevToolsObserver},
@@ -496,6 +496,10 @@ wrap_client! {
             Some(SurfaceDisplayHandler::new(Arc::clone(&self.shared)))
         }
 
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(SurfaceDownloadHandler::new())
+        }
+
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(SurfaceLifeSpanHandler::new(
                 self.surface_id.clone(),
@@ -833,7 +837,11 @@ pub(crate) fn navigation_action(
             return Err("Close the Login Browser popup before navigating the opener.".to_string());
         }
         let lifecycle = surface.shared.snapshot().lifecycle;
-        if lifecycle != CefSurfaceLifecycle::Ready {
+        let expected_lifecycle = match action {
+            CefSurfaceNavigationAction::Stop => CefSurfaceLifecycle::Loading,
+            _ => CefSurfaceLifecycle::Ready,
+        };
+        if lifecycle != expected_lifecycle {
             return Err("CEF surface is not ready for navigation".to_string());
         }
         let browser = surface
@@ -845,11 +853,14 @@ pub(crate) fn navigation_action(
             CefSurfaceNavigationAction::Forward if browser.can_go_forward() == 0 => return Ok(()),
             _ => {}
         }
-        surface.shared.begin_navigation()?;
+        if action != CefSurfaceNavigationAction::Stop {
+            surface.shared.begin_navigation()?;
+        }
         match action {
             CefSurfaceNavigationAction::Back => browser.go_back(),
             CefSurfaceNavigationAction::Forward => browser.go_forward(),
             CefSurfaceNavigationAction::Reload => browser.reload(),
+            CefSurfaceNavigationAction::Stop => browser.stop_load(),
         }
         Ok(())
     })

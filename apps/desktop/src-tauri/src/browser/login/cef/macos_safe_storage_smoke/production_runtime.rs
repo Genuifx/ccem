@@ -180,7 +180,6 @@ pub(super) fn run(
         app,
         &cleanup.runtime.sessions,
         &cleanup.runtime.cef_host,
-        &preview,
         workspace.clone(),
         server.url().to_string(),
         1,
@@ -189,7 +188,6 @@ pub(super) fn run(
     cleanup.runtime.surfaces.production_smoke_sync(
         app,
         &cleanup.runtime.cef_host,
-        &preview,
         &mut primary,
         2,
         true,
@@ -243,7 +241,6 @@ pub(super) fn run(
     cleanup.runtime.surfaces.production_smoke_sync(
         app,
         &cleanup.runtime.cef_host,
-        &preview,
         &mut primary,
         5,
         true,
@@ -266,13 +263,8 @@ pub(super) fn run(
     let default_session_id = primary.session_id.clone();
     release(&mut cleanup, &mut primary, 7)?;
 
-    let mut cross_workspace_default = acquire_default(
-        &mut cleanup,
-        &preview,
-        &secondary_workspace,
-        server.url(),
-        8,
-    )?;
+    let mut cross_workspace_default =
+        acquire_default(&mut cleanup, &secondary_workspace, server.url(), 8)?;
     if cross_workspace_default.profile_id != default_profile_id {
         return Err(
             "macOS Mode 2 workspaces did not select the same app-global Default profile".into(),
@@ -304,7 +296,6 @@ pub(super) fn run(
             app,
             &cleanup.runtime.sessions,
             &cleanup.runtime.cef_host,
-            &preview,
             secondary_workspace.clone(),
             server.url().to_string(),
             12,
@@ -313,7 +304,7 @@ pub(super) fn run(
         return Err("macOS Mode 2 Explicit New selected the app-global Default profile".into());
     }
     cleanup.lease = Some(explicit.clone());
-    show_and_handoff(&mut cleanup, &preview, &mut explicit, 13, 14)?;
+    show_and_handoff(&mut cleanup, &mut explicit, 13, 14)?;
     let explicit_marker = format!("CCEM_MODE2_MAC_EXPLICIT_{}", &config.nonce[..16]);
     cleanup
         .runtime
@@ -327,7 +318,7 @@ pub(super) fn run(
     let explicit_session_id = explicit.session_id.clone();
     release(&mut cleanup, &mut explicit, 15)?;
 
-    let mut final_default = acquire_default(&mut cleanup, &preview, &workspace, server.url(), 16)?;
+    let mut final_default = acquire_default(&mut cleanup, &workspace, server.url(), 16)?;
     if final_default.profile_id != default_profile_id {
         return Err("macOS Mode 2 final Default reopen selected a different profile".into());
     }
@@ -346,7 +337,6 @@ pub(super) fn run(
 
     let mut reopened_explicit = acquire_saved(
         &mut cleanup,
-        &preview,
         &secondary_workspace,
         &explicit_profile_id,
         server.url(),
@@ -427,7 +417,6 @@ pub(super) fn run(
 
 fn acquire_saved(
     cleanup: &mut ProductionCleanup,
-    preview: &Arc<BrowserManager>,
     workspace: &str,
     profile_id: &str,
     url: &str,
@@ -437,7 +426,6 @@ fn acquire_saved(
         &cleanup.app,
         &cleanup.runtime.sessions,
         &cleanup.runtime.cef_host,
-        preview,
         workspace.to_string(),
         profile_id.to_string(),
         url.to_string(),
@@ -447,13 +435,12 @@ fn acquire_saved(
         return Err("macOS Mode 2 saved profile reopen selected a different profile".into());
     }
     cleanup.lease = Some(lease.clone());
-    show_and_handoff(cleanup, preview, &mut lease, revision + 1, revision + 2)?;
+    show_and_handoff(cleanup, &mut lease, revision + 1, revision + 2)?;
     Ok(lease)
 }
 
 fn acquire_default(
     cleanup: &mut ProductionCleanup,
-    preview: &Arc<BrowserManager>,
     workspace: &str,
     url: &str,
     revision: u64,
@@ -462,19 +449,17 @@ fn acquire_default(
         &cleanup.app,
         &cleanup.runtime.sessions,
         &cleanup.runtime.cef_host,
-        preview,
         workspace.to_string(),
         url.to_string(),
         revision,
     )?;
     cleanup.lease = Some(lease.clone());
-    show_and_handoff(cleanup, preview, &mut lease, revision + 1, revision + 2)?;
+    show_and_handoff(cleanup, &mut lease, revision + 1, revision + 2)?;
     Ok(lease)
 }
 
 fn show_and_handoff(
     cleanup: &mut ProductionCleanup,
-    preview: &Arc<BrowserManager>,
     lease: &mut ProductionSmokeLease,
     show_revision: u64,
     handoff_revision: u64,
@@ -482,7 +467,6 @@ fn show_and_handoff(
     cleanup.runtime.surfaces.production_smoke_sync(
         &cleanup.app,
         &cleanup.runtime.cef_host,
-        preview,
         lease,
         show_revision,
         true,

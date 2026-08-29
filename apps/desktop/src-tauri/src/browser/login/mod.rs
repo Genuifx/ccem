@@ -33,5 +33,4 @@ mod session_policy;
 mod session_quiescence;
 pub(crate) mod supervisor;
 pub(crate) mod surface_commands;
-pub(crate) mod transfer;
 pub(crate) mod workspace;

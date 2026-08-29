@@ -4,7 +4,7 @@ use crate::browser::BrowserToolRequest;
 use crate::native_runtime::{resolve_browser_actor_id, BrowserActorLineageRef, NativeProvider};
 
 #[test]
-fn resumed_provider_conversation_reuses_provisional_actor_taint_across_native_runtimes() {
+fn resumed_provider_conversation_keeps_actor_identity_without_cross_site_blocking() {
     let fixture = Fixture::new();
     let opened = fixture
         .manager
@@ -68,7 +68,7 @@ fn resumed_provider_conversation_reuses_provisional_actor_taint_across_native_ru
         .handoff_to_agent_for_actor(authorize(TrustedUiControlAction::HandoffToAgent), &actor_b)
         .expect("origin B exact-actor handoff");
 
-    let error = fixture
+    fixture
         .manager
         .run_agent_tool_if_handed_off(
             &workspace,
@@ -80,8 +80,8 @@ fn resumed_provider_conversation_reuses_provisional_actor_taint_across_native_ru
                 args: serde_json::json!({"elementRef":"el-submit"}),
             },
         )
-        .expect_err("runtime B must retain runtime A's origin-A taint");
-    assert!(error.contains("cross_origin_write_blocked"));
+        .expect("runtime B can use the same browser across sites")
+        .expect("mode 2 selected");
 
     let audit = fs::read_to_string(
         fixture
@@ -97,7 +97,7 @@ fn resumed_provider_conversation_reuses_provisional_actor_taint_across_native_ru
 }
 
 #[test]
-fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denials() {
+fn recorded_provenance_never_blocks_normal_browser_use_across_handoffs() {
     let fixture = Fixture::new();
     let opened = fixture
         .manager
@@ -118,6 +118,8 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
         .handoff_to_agent_for_actor(authorize(TrustedUiControlAction::HandoffToAgent), actor_a)
         .expect("first exact-actor handoff");
     let workspace = fixture.workspace_a.to_string_lossy();
+    let provenance_path = fixture.session_root.join("provenance/provenance.json");
+    let empty_provenance = fs::read(&provenance_path).expect("initialized provenance ledger");
     let request = |request_id: &str, tool: &str, args: serde_json::Value| BrowserToolRequest {
         request_id: request_id.to_string(),
         tool: tool.to_string(),
@@ -135,10 +137,11 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
         .expect("read origin a")
         .expect("mode 2 selected");
     assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 1);
-    assert!(fixture
-        .session_root
-        .join("provenance/provenance.json")
-        .is_file());
+    assert_ne!(
+        fs::read(&provenance_path).expect("best-effort provenance record"),
+        empty_provenance,
+        "a healthy diagnostic ledger still records successful page reads"
+    );
 
     fixture
         .manager
@@ -150,7 +153,7 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
         .handoff_to_agent_for_actor(authorize(TrustedUiControlAction::HandoffToAgent), actor_a)
         .expect("second-origin exact-actor handoff");
 
-    let cross = fixture
+    fixture
         .manager
         .run_agent_tool_if_handed_off(
             &workspace,
@@ -162,9 +165,9 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
                 serde_json::json!({"elementRef":"el-submit"}),
             ),
         )
-        .expect_err("cross-origin taint must deny");
-    assert!(cross.contains("cross_origin_write_blocked"));
-    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 1);
+        .expect("cross-site click")
+        .expect("mode 2 selected");
+    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 2);
 
     fixture
         .manager
@@ -176,7 +179,7 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
         )
         .expect("read origin b")
         .expect("mode 2 selected");
-    let mixed = fixture
+    fixture
         .manager
         .run_agent_tool_if_handed_off(
             &workspace,
@@ -188,9 +191,9 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
                 serde_json::json!({"elementRef":"el-submit"}),
             ),
         )
-        .expect_err("mixed provenance must deny");
-    assert!(mixed.contains("mixed_provenance_write_blocked"));
-    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 2);
+        .expect("mixed prior reads do not block click")
+        .expect("mode 2 selected");
+    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 4);
 
     fixture
         .manager
@@ -214,7 +217,7 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
         )
         .expect("actor isolation")
         .expect("mode 2 selected");
-    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 3);
+    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 5);
 
     let audit_path = fixture
         .session_root
@@ -222,8 +225,8 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
         .join(&opened.snapshot.session_id)
         .join("audit/actions.jsonl");
     let audit = fs::read_to_string(audit_path).expect("durable decision audit");
-    assert!(audit.contains("cross_origin_write_blocked"));
-    assert!(audit.contains("mixed_provenance_write_blocked"));
+    assert!(!audit.contains("cross_origin_write_blocked"));
+    assert!(!audit.contains("mixed_provenance_write_blocked"));
     fixture.manager.close(&opened.handle).unwrap();
 
     let reopened = fixture
@@ -242,7 +245,7 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
             actor_a,
         )
         .expect("second-session exact-actor handoff");
-    let persisted = fixture
+    fixture
         .manager
         .run_agent_tool_if_handed_off(
             &workspace,
@@ -254,9 +257,9 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
                 serde_json::json!({"elementRef":"el-submit"}),
             ),
         )
-        .expect_err("mixed provenance must survive session close");
-    assert!(persisted.contains("mixed_provenance_write_blocked"));
-    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 3);
+        .expect("recorded provenance does not block a later session")
+        .expect("mode 2 selected");
+    assert_eq!(fixture.state.lock().unwrap().semantic_effect_count, 6);
     let second_audit = fs::read_to_string(
         fixture
             .session_root
@@ -265,7 +268,7 @@ fn agent_provenance_is_monotonic_across_sessions_and_handoffs_with_audited_denia
             .join("audit/actions.jsonl"),
     )
     .expect("second-session durable audit");
-    assert!(second_audit.contains("mixed_provenance_write_blocked"));
+    assert!(!second_audit.contains("mixed_provenance_write_blocked"));
     fixture.manager.close(&reopened.handle).unwrap();
 }
 
@@ -376,7 +379,50 @@ fn prepared_execution_keeps_the_actor_that_owned_the_exact_handoff() {
 }
 
 #[test]
-fn successful_page_data_is_not_returned_when_provenance_persistence_fails() {
+fn corrupt_provenance_at_restart_does_not_disable_browser_or_agent_tools() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.session_root.join("provenance/provenance.json"),
+        b"{}",
+    )
+    .expect("corrupt persisted provenance before restart");
+
+    let restarted = manager(&fixture.session_root, Arc::clone(&fixture.state));
+    let opened = restarted
+        .open_default_profile(Fixture::trusted(&fixture.workspace_a))
+        .expect("corrupt diagnostic ledger must not disable browser startup");
+    let actor = "browser-actor-11111111111111111111111111111111";
+    restarted
+        .handoff_to_agent_for_actor(
+            TrustedUiControlAuthorization::from_trusted_ui(
+                &opened.handle,
+                TrustedUiControlAction::HandoffToAgent,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            actor,
+        )
+        .expect("exact-actor handoff");
+    let result = restarted
+        .run_agent_tool_if_handed_off(
+            &fixture.workspace_a.to_string_lossy(),
+            actor,
+            "yolo",
+            &BrowserToolRequest {
+                request_id: "read-after-corrupt-ledger-restart".to_string(),
+                tool: "get_url".to_string(),
+                args: serde_json::json!({}),
+            },
+        )
+        .expect("diagnostic startup failure must not block browser tools")
+        .expect("mode 2 selected");
+
+    assert_eq!(result["url"], "https://example.com/account?token=secret");
+    restarted.close(&opened.handle).unwrap();
+}
+
+#[test]
+fn corrupt_provenance_diagnostics_do_not_block_normal_browser_use() {
     let fixture = Fixture::new();
     let opened = fixture
         .manager
@@ -400,7 +446,7 @@ fn successful_page_data_is_not_returned_when_provenance_persistence_fails() {
         b"{}",
     )
     .expect("corrupt provenance fixture");
-    let error = fixture
+    let result = fixture
         .manager
         .run_agent_tool_if_handed_off(
             &fixture.workspace_a.to_string_lossy(),
@@ -412,12 +458,13 @@ fn successful_page_data_is_not_returned_when_provenance_persistence_fails() {
                 args: serde_json::json!({}),
             },
         )
-        .expect_err("page data must not escape without durable provenance");
-    assert_eq!(error, "Login Browser provenance state is unavailable.");
+        .expect("diagnostic ledger failure must not block the browser")
+        .expect("mode 2 selected");
+    assert_eq!(result["url"], "https://example.com/account?token=secret");
     assert_eq!(
         fixture.state.lock().unwrap().semantic_effect_count,
         1,
-        "the backend completed, but its page-derived result was withheld"
+        "the browser action still executes exactly once"
     );
     fixture.manager.close(&opened.handle).unwrap();
 }

@@ -41898,7 +41898,41 @@ function date4(params) {
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/classic/external.js
 config(en_default());
 
+// src/browser-tool-vocabulary.json
+var browser_tool_vocabulary_default = [
+  "navigate",
+  "get_url",
+  "snapshot",
+  "click",
+  "type",
+  "press_key",
+  "scroll",
+  "screenshot",
+  "read_console_log",
+  "read_network_log",
+  "evaluate",
+  "wait_for"
+];
+
 // src/browserMcp.ts
+var BROWSER_KEY_NAMES = [
+  "Enter",
+  "Tab",
+  "Escape",
+  "Backspace",
+  "Delete",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+  "Space"
+];
+var MAX_BROWSER_SCROLL_DELTA = 2e3;
+var MAX_BROWSER_EVALUATE_SCRIPT_BYTES = 32768;
 function stableRequestValue(value) {
   if (Array.isArray(value)) {
     return value.map(stableRequestValue);
@@ -41920,20 +41954,8 @@ var READ_TOOLS = /* @__PURE__ */ new Set([
   "read_console_log",
   "read_network_log"
 ]);
-var NORMAL_TOOLS = /* @__PURE__ */ new Set([
-  "navigate",
-  "get_url",
-  "snapshot",
-  "click",
-  "type",
-  "press_key",
-  "scroll",
-  "screenshot",
-  "read_console_log",
-  "read_network_log",
-  "wait_for"
-]);
-var ALL_TOOLS = /* @__PURE__ */ new Set([...NORMAL_TOOLS, "evaluate"]);
+var ALL_TOOLS = new Set(browser_tool_vocabulary_default);
+var AUTO_APPROVED_TOOLS = [...ALL_TOOLS].filter((name) => name !== "evaluate");
 var BROWSER_TOOL_BRIDGE_TIMEOUT_MS = 45e3;
 function browserToolNamesForPermissionMode(permMode) {
   if (permMode === "readonly" || permMode === "audit" || permMode === "plan" || permMode === "safe" || permMode === "ci") {
@@ -41952,7 +41974,7 @@ function ensureBrowserMcpToolsAllowed(allowedTools, _permMode) {
     return allowedTools;
   }
   const existing = new Set(allowedTools);
-  const missing = [...ALL_TOOLS].map((name) => `mcp__ccem-browser__${name}`).filter((toolName) => !existing.has(toolName));
+  const missing = AUTO_APPROVED_TOOLS.map((name) => `mcp__ccem-browser__${name}`).filter((toolName) => !existing.has(toolName));
   return missing.length ? [...allowedTools, ...missing] : allowedTools;
 }
 function toToolResult(value) {
@@ -42104,14 +42126,16 @@ function createCcemBrowserMcpServer(permissionMode, sendBrowserToolRequest) {
       )),
       ...maybe("press_key", d0e(
         "press_key",
-        "Dispatch a key press to the active element in the embedded browser.",
-        { key: external_exports.string().min(1) },
+        "Press a common navigation or editing key in the embedded browser.",
+        { key: external_exports.enum(BROWSER_KEY_NAMES) },
         async (args) => toToolResult(await sendAuthorizedBrowserToolRequest("press_key", args))
       )),
       ...maybe("scroll", d0e(
         "scroll",
-        "Scroll the embedded browser viewport.",
-        { deltaY: external_exports.number().optional() },
+        "Scroll the embedded browser viewport; positive deltaY scrolls down, negative scrolls up, and the default is 600.",
+        {
+          deltaY: external_exports.number().int().min(-MAX_BROWSER_SCROLL_DELTA).max(MAX_BROWSER_SCROLL_DELTA).refine((value) => value !== 0, "Scroll delta must not be zero.").optional()
+        },
         async (args) => toToolResult(await sendAuthorizedBrowserToolRequest("scroll", args))
       )),
       ...maybe("screenshot", d0e(
@@ -42135,7 +42159,12 @@ function createCcemBrowserMcpServer(permissionMode, sendBrowserToolRequest) {
       ...maybe("evaluate", d0e(
         "evaluate",
         "Evaluate JavaScript in the embedded browser. This is powerful and may require user approval.",
-        { script: external_exports.string().min(1) },
+        {
+          script: external_exports.string().min(1).refine(
+            (value) => Buffer.byteLength(value, "utf8") <= MAX_BROWSER_EVALUATE_SCRIPT_BYTES,
+            "JavaScript must not exceed 32768 UTF-8 bytes."
+          )
+        },
         async (args) => toToolResult(await sendAuthorizedBrowserToolRequest("evaluate", args))
       )),
       ...maybe("wait_for", d0e(

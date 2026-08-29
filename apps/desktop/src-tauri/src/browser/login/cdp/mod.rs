@@ -2,7 +2,6 @@ pub(super) mod artifacts;
 mod console_events;
 mod diagnostic_segment;
 pub(super) mod guard;
-mod handoff_preflight;
 mod network_events;
 pub(super) mod owner;
 mod owner_config;

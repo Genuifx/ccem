@@ -95,7 +95,10 @@ export function createBrowserPanelSessionKeyRegistry() {
       if (
         matchingLiveSession
         && matchingLiveSession.provider === provider
-        && matchingLiveSession.providerSessionId?.trim() === providerSessionId
+        && (
+          matchingLiveSession.providerSessionId?.trim() === providerSessionId
+          || matchingLiveSession.runtimeId === providerSessionId
+        )
       ) {
         return resolveLive(matchingLiveSession);
       }
@@ -121,10 +124,14 @@ export type BrowserPanelTarget = BrowserPanelTargetBase & {
 } & BrowserSurfaceProfileSelection;
 
 export function resolveActiveBrowserAgentSessionId(
-  session: Pick<NativeSessionSummary, 'runtime_id' | 'status' | 'is_active'> | null | undefined,
+  session: Pick<
+    NativeSessionSummary,
+    'provider' | 'runtime_id' | 'status' | 'is_active'
+  > | null | undefined,
 ): string | null {
   if (
-    !session?.is_active
+    session?.provider !== 'claude'
+    || !session.is_active
     || TERMINAL_BROWSER_AGENT_RUNTIME_STATUSES.has(session.status)
   ) {
     return null;
@@ -140,6 +147,26 @@ export interface BrowserPanelHistorySessionIdentity {
 
 function normalizeBrowserAgentProject(project: string): string {
   return project.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+export function matchesBrowserPanelHistorySession(
+  historySession: BrowserPanelHistorySessionIdentity | null | undefined,
+  nativeSession: Pick<
+    NativeSessionSummary,
+    'provider' | 'provider_session_id' | 'project_dir' | 'runtime_id'
+  > | null | undefined,
+): boolean {
+  return Boolean(
+    historySession
+    && nativeSession
+    && nativeSession.provider === historySession.source
+    && (
+      nativeSession.provider_session_id === historySession.id
+      || nativeSession.runtime_id === historySession.id
+    )
+    && normalizeBrowserAgentProject(nativeSession.project_dir)
+      === normalizeBrowserAgentProject(historySession.project),
+  );
 }
 
 /**
@@ -159,17 +186,7 @@ export function resolveHistoryBrowserAgentSessionId(
     | 'is_active'
   > | null | undefined,
 ): string | null {
-  if (
-    !historySession
-    || !nativeSession
-    || nativeSession.provider !== historySession.source
-    || (
-      nativeSession.provider_session_id !== historySession.id
-      && nativeSession.runtime_id !== historySession.id
-    )
-    || normalizeBrowserAgentProject(nativeSession.project_dir)
-      !== normalizeBrowserAgentProject(historySession.project)
-  ) {
+  if (!nativeSession || !matchesBrowserPanelHistorySession(historySession, nativeSession)) {
     return null;
   }
   return resolveActiveBrowserAgentSessionId(nativeSession);
@@ -178,7 +195,7 @@ export function resolveHistoryBrowserAgentSessionId(
 export function isBrowserPanelTargetVisible(
   target: BrowserPanelTarget | null | undefined,
 ): boolean {
-  return target?.visible !== false;
+  return Boolean(target && target.visible !== false);
 }
 
 export function setBrowserPanelTargetVisible(

@@ -57,7 +57,6 @@ pub(super) fn execute_smoke(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &preview,
         workspace.clone(),
         server.bootstrap_url().to_string(),
         1,
@@ -66,34 +65,19 @@ pub(super) fn execute_smoke(
     stages.record("production_acquired_hidden_ready")?;
     check_cancelled(&cancelled)?;
 
-    runtime.surfaces.production_smoke_sync(
-        &app,
-        &runtime.cef_host,
-        &preview,
-        &mut lease,
-        2,
-        true,
-    )?;
+    runtime
+        .surfaces
+        .production_smoke_sync(&app, &runtime.cef_host, &mut lease, 2, true)?;
     cleanup.lease = Some(lease.clone());
     stages.record("production_shown")?;
-    runtime.surfaces.production_smoke_sync(
-        &app,
-        &runtime.cef_host,
-        &preview,
-        &mut lease,
-        3,
-        false,
-    )?;
+    runtime
+        .surfaces
+        .production_smoke_sync(&app, &runtime.cef_host, &mut lease, 3, false)?;
     cleanup.lease = Some(lease.clone());
     stages.record("production_hidden")?;
-    runtime.surfaces.production_smoke_sync(
-        &app,
-        &runtime.cef_host,
-        &preview,
-        &mut lease,
-        4,
-        true,
-    )?;
+    runtime
+        .surfaces
+        .production_smoke_sync(&app, &runtime.cef_host, &mut lease, 4, true)?;
     cleanup.lease = Some(lease.clone());
     stages.record("production_reshown")?;
     let native_window =
@@ -159,14 +143,9 @@ pub(super) fn execute_smoke(
     stages.record("production_active_effect_cancelled")?;
     check_cancelled(&cancelled)?;
 
-    runtime.surfaces.production_smoke_sync(
-        &app,
-        &runtime.cef_host,
-        &preview,
-        &mut lease,
-        7,
-        true,
-    )?;
+    runtime
+        .surfaces
+        .production_smoke_sync(&app, &runtime.cef_host, &mut lease, 7, true)?;
     cleanup.lease = Some(lease.clone());
     stages.record("production_restored")?;
     check_cancelled(&cancelled)?;
@@ -236,7 +215,6 @@ pub(super) fn execute_smoke(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &preview,
         secondary_workspace.clone(),
         server.semantic_url().to_string(),
         12,
@@ -258,7 +236,6 @@ pub(super) fn execute_smoke(
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
-        &preview,
         &mut cross_workspace_default,
         13,
         true,
@@ -299,7 +276,6 @@ pub(super) fn execute_smoke(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &preview,
         secondary_workspace.clone(),
         server.semantic_url().to_string(),
         16,
@@ -311,14 +287,9 @@ pub(super) fn execute_smoke(
     }
     cleanup.lease = Some(explicit.clone());
     stages.record("production_explicit_new_acquired")?;
-    runtime.surfaces.production_smoke_sync(
-        &app,
-        &runtime.cef_host,
-        &preview,
-        &mut explicit,
-        17,
-        true,
-    )?;
+    runtime
+        .surfaces
+        .production_smoke_sync(&app, &runtime.cef_host, &mut explicit, 17, true)?;
     cleanup.lease = Some(explicit.clone());
     stages.record("production_explicit_new_shown")?;
     runtime.surfaces.production_smoke_control(
@@ -352,7 +323,6 @@ pub(super) fn execute_smoke(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &preview,
         secondary_workspace.clone(),
         explicit.profile_id.clone(),
         server.semantic_url().to_string(),
@@ -371,7 +341,6 @@ pub(super) fn execute_smoke(
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
-        &preview,
         &mut reopened_explicit,
         21,
         true,
@@ -409,7 +378,6 @@ pub(super) fn execute_smoke(
         &app,
         &runtime.sessions,
         &runtime.cef_host,
-        &preview,
         workspace.clone(),
         server.semantic_url().to_string(),
         24,
@@ -421,7 +389,6 @@ pub(super) fn execute_smoke(
     runtime.surfaces.production_smoke_sync(
         &app,
         &runtime.cef_host,
-        &preview,
         &mut final_default,
         25,
         true,

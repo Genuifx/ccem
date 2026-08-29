@@ -32,11 +32,6 @@ fn durable_jsonl_sink_writes_pre_and_result_records() {
         outcome_code: "completed".to_string(),
     })
     .expect("write result");
-    sink.write_transfer_denied(
-        &binding("session-a", 1),
-        crate::browser::login::cdp::guard::TrustedSecurityEvent::UploadBlocked,
-    )
-    .expect("write transfer denial");
     let contents = std::fs::read_to_string(sink.path()).expect("read audit");
     let phases = contents
         .lines()
@@ -49,7 +44,7 @@ fn durable_jsonl_sink_writes_pre_and_result_records() {
                 .to_string()
         })
         .collect::<Vec<_>>();
-    assert_eq!(phases, vec!["decision", "result", "transfer_decision"]);
+    assert_eq!(phases, vec!["decision", "result"]);
     assert!(!contents.contains("url"));
     assert!(!contents.contains("guid"));
     assert!(!contents.contains("filename"));

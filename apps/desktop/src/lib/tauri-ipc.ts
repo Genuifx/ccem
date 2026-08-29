@@ -150,22 +150,6 @@ export interface TauriCommands {
     BrowserSurfaceClosePopupRequest,
     BrowserSurfaceSnapshotMutationResponse
   ];
-  browser_login_profiles: [
-    { workingDir: string },
-    LoginBrowserProfileSummary[]
-  ];
-  browser_login_profile_recent_activity: [
-    { workingDir: string; profileId: string },
-    LoginBrowserRecentActivity
-  ];
-  browser_login_reset_profile: [
-    { workingDir: string; profileId: string; confirmed: boolean },
-    LoginBrowserProfileSummary
-  ];
-  browser_login_delete_profile: [
-    { workingDir: string; profileId: string; confirmed: boolean },
-    void
-  ];
   search_workspace_files: [
     {
       workingDir: string;
@@ -607,34 +591,6 @@ export interface TauriCommands {
 // ============================================
 // 类型定义
 // ============================================
-
-export type LoginBrowserRecentArtifactKind =
-  | 'screenshot'
-  | 'interaction_snapshot'
-  | 'console_log'
-  | 'network_log'
-  | 'audit_log';
-
-/** Bounded artifact metadata; trusted control windows never receive paths or raw page data. */
-export interface LoginBrowserRecentArtifact {
-  kind: LoginBrowserRecentArtifactKind;
-  artifact_id: string;
-  byte_size: number;
-  modified_at: string;
-  immutable: boolean;
-  untrusted: boolean;
-}
-
-export interface LoginBrowserRecentActivity {
-  artifacts: LoginBrowserRecentArtifact[];
-}
-
-/** Trusted-main-window projection; profile paths and runtime ownership stay in Rust. */
-export interface LoginBrowserProfileSummary {
-  profile_id: string;
-  last_used_at?: string | null;
-  is_default: boolean;
-}
 
 export interface AppConfig {
   favorites: FavoriteProject[];

@@ -349,6 +349,78 @@ fn startup_removes_reserved_intent_when_crash_precedes_launch_pending() {
 }
 
 #[test]
+fn one_malformed_owner_record_does_not_disable_recovery_for_other_profiles() {
+    let (_temp, manager, store) = fixture();
+    let malformed = store
+        .root
+        .join("embedded-owner-malformed000000000000000000000000.json");
+    fs::write(&malformed, b"{not-json").expect("write malformed sibling record");
+
+    let descriptor = manager.create_profile(&workspace()).expect("profile");
+    let reservation = manager
+        .reserve_embedded_launch(descriptor.profile_id(), &workspace())
+        .expect("reservation");
+    let owner = store
+        .begin_profile_reservation(&reservation, "login-malformed-sibling")
+        .expect("valid owner record");
+    drop(reservation);
+
+    let recovered = store
+        .reap_stale_with(&manager, &FakeInspector(Inspection::Identity(None)))
+        .expect("a malformed sibling must not disable recovery");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].disposition,
+        EmbeddedOwnerRecoveryDisposition::RemovedFinishedRecord
+    );
+    assert!(
+        malformed.exists(),
+        "untrusted data is ignored, not rewritten"
+    );
+    drop(owner);
+}
+
+#[cfg(unix)]
+#[test]
+fn one_unreadable_owner_record_does_not_disable_recovery_for_other_profiles() {
+    let (_temp, manager, store) = fixture();
+    let unreadable = store
+        .root
+        .join("embedded-owner-00000000000000000000000000000000.json");
+    fs::write(&unreadable, b"{}").expect("write unreadable sibling record");
+    let mut permissions = fs::metadata(&unreadable)
+        .expect("unreadable sibling metadata")
+        .permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&unreadable, permissions).expect("remove sibling read permission");
+
+    let descriptor = manager.create_profile(&workspace()).expect("profile");
+    let reservation = manager
+        .reserve_embedded_launch(descriptor.profile_id(), &workspace())
+        .expect("reservation");
+    let owner = store
+        .begin_profile_reservation(&reservation, "login-unreadable-sibling")
+        .expect("valid owner record");
+    drop(reservation);
+
+    let recovered = store.reap_stale_with(&manager, &FakeInspector(Inspection::Identity(None)));
+    let mut permissions = fs::metadata(&unreadable)
+        .expect("retained unreadable sibling metadata")
+        .permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&unreadable, permissions).expect("restore sibling read permission");
+
+    let recovered = recovered.expect("an unreadable sibling must not disable recovery");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].disposition,
+        EmbeddedOwnerRecoveryDisposition::RemovedFinishedRecord
+    );
+    assert!(unreadable.exists(), "unreadable data is left untouched");
+    drop(owner);
+}
+
+#[test]
 fn startup_recovers_launch_pending_before_record_phase_update_only_after_host_is_gone() {
     let (_temp, manager, store) = fixture();
     let descriptor = manager.create_profile(&workspace()).expect("profile");

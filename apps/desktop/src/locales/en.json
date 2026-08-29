@@ -356,6 +356,7 @@
     "browserBack": "Back",
     "browserForward": "Forward",
     "browserReload": "Reload",
+    "browserStopLoading": "Stop loading",
     "browserOpenExternal": "Open externally",
     "browserAgentControlling": "Agent controlling",
     "browserAgentPaused": "You have control",

@@ -356,6 +356,7 @@
     "browserBack": "后退",
     "browserForward": "前进",
     "browserReload": "刷新",
+    "browserStopLoading": "停止加载",
     "browserOpenExternal": "用外部浏览器打开",
     "browserAgentControlling": "Agent 正在控制",
     "browserAgentPaused": "已交给你操作",

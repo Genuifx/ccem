@@ -15,23 +15,6 @@ impl TrustedNavigationGuard for AllowNavigation {
     ) -> super::super::guard::TrustedNavigationDecision {
         super::super::guard::TrustedNavigationDecision::allow("allowed")
     }
-
-    fn record_security_event(
-        &self,
-        _event: super::super::guard::TrustedSecurityEvent,
-    ) -> Result<
-        super::super::guard::TrustedSecurityAuditDisposition,
-        super::super::guard::TrustedSecurityAuditFailure,
-    > {
-        Ok(super::super::guard::TrustedSecurityAuditDisposition::UserControl)
-    }
-
-    fn record_handoff_preflight_denial(
-        &self,
-        _denial: super::super::guard::TrustedHandoffPreflightDenial<'_>,
-    ) -> Result<(), super::super::guard::TrustedSecurityAuditFailure> {
-        Ok(())
-    }
 }
 
 pub(in crate::browser::login::cdp) fn test_engine(temp: &tempfile::TempDir) -> SemanticEngine {
@@ -129,11 +112,11 @@ fn cancellable_operation() -> (Arc<LoginBrowserControl>, OperationCancellation) 
 }
 
 #[test]
-fn agent_inventory_closes_an_authorized_secondary_page_before_semantic_work() {
+fn cef_admitted_allowed_oauth_popup_remains_open_during_agent_control() {
     let temp = tempfile::tempdir().unwrap();
     let mut engine = test_engine(&temp);
     engine.primary_target = Some("primary".to_string());
-    let inbox = inbox_with_frames([serde_json::json!({"id":1,"result":{"success":true}})]);
+    let (_sender, inbox, _state) = super::super::transport::frame_channel();
     let mut output = Vec::new();
     let mut client = CdpClient::new(&mut output, inbox);
 
@@ -145,7 +128,7 @@ fn agent_inventory_closes_an_authorized_secondary_page_before_semantic_work() {
                 params: serde_json::json!({"targetInfo":{
                     "targetId":"popup",
                     "type":"page",
-                    "url":"https://allowed.example/popup"
+                    "url":"https://accounts.example.test/oauth/authorize"
                 }}),
                 session_id: None,
             },
@@ -153,10 +136,76 @@ fn agent_inventory_closes_an_authorized_secondary_page_before_semantic_work() {
         .unwrap();
     drop(client);
 
-    let commands = parse_commands(&output);
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0]["method"], "Target.closeTarget");
-    assert_eq!(commands[0]["params"]["targetId"], "popup");
+    assert!(output.is_empty());
+}
+
+#[test]
+fn admitted_oauth_popup_blank_bootstrap_waits_for_its_guarded_https_destination() {
+    use crate::browser::login::policy::BrowserGrantBinding;
+    use crate::browser::login::session_policy::SessionNavigationPolicy;
+
+    for bootstrap_url in ["", "about:blank", "about:blank#oauth"] {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = Arc::new(SessionNavigationPolicy::new());
+        policy
+            .activate(BrowserGrantBinding::new_trusted("w", "p", "s", 1).expect("browser binding"))
+            .expect("active Agent browser policy");
+        let mut engine = SemanticEngine::new(
+            policy,
+            CdpArtifactStore::new(temp.path().join("artifacts")).unwrap(),
+            NetworkEventRecorder::new(
+                temp.path().join("network"),
+                "session-test".to_string(),
+                NetworkRedactionConfig::default(),
+            )
+            .unwrap(),
+            ConsoleEventRecorder::new(
+                temp.path().join("network"),
+                "session-test".to_string(),
+                NetworkRedactionConfig::default(),
+            )
+            .unwrap(),
+        );
+        engine.primary_target = Some("primary".to_string());
+        let inbox = inbox_with_responses(|_| serde_json::json!({"success":true}));
+        let mut output = Vec::new();
+        let mut client = CdpClient::new(&mut output, inbox);
+
+        engine
+            .on_event(
+                &mut client,
+                CdpEvent {
+                    kind: CdpEventKind::TargetCreated,
+                    params: serde_json::json!({"targetInfo":{
+                        "targetId":"popup",
+                        "type":"page",
+                        "url": bootstrap_url
+                    }}),
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        engine
+            .on_event(
+                &mut client,
+                CdpEvent {
+                    kind: CdpEventKind::TargetInfoChanged,
+                    params: serde_json::json!({"targetInfo":{
+                        "targetId":"popup",
+                        "type":"page",
+                        "url":"https://accounts.example.test/oauth/authorize"
+                    }}),
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        drop(client);
+
+        assert!(
+            output.is_empty(),
+            "blank popup bootstrap must not be closed before its guarded HTTPS destination: {bootstrap_url:?}"
+        );
+    }
 }
 
 struct CancelOnMousePress {
@@ -340,6 +389,479 @@ fn cancelled_replace_type_releases_a_dispatched_key_down_before_returning_origin
 }
 
 #[test]
+fn press_key_dispatches_one_fixed_down_up_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/".to_string();
+    let inbox = inbox_with_responses(|_| serde_json::json!({}));
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let result = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine.press_key(
+            &mut client,
+            SemanticKey::Enter,
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    .unwrap();
+
+    assert_eq!(
+        result,
+        SemanticBrowserResult::Action(ActionResult { completed: true })
+    );
+    let inputs = parse_commands(&output)
+        .into_iter()
+        .filter(|command| command["method"] == "Input.dispatchKeyEvent")
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["params"]["type"], "keyDown");
+    assert_eq!(inputs[0]["params"]["key"], "Enter");
+    assert_eq!(inputs[0]["params"]["code"], "Enter");
+    assert_eq!(inputs[0]["params"]["windowsVirtualKeyCode"], 13);
+    assert_eq!(inputs[0]["params"]["text"], "\r");
+    assert_eq!(inputs[0]["params"]["unmodifiedText"], "\r");
+    assert_eq!(inputs[1]["params"]["type"], "keyUp");
+    assert!(inputs[1]["params"].get("text").is_none());
+    assert!(inputs[1]["params"].get("unmodifiedText").is_none());
+}
+
+#[test]
+fn enter_navigation_after_key_down_finishes_once_without_reporting_a_retryable_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/form".to_string();
+    let history = serde_json::json!({
+        "currentIndex": 0,
+        "entries": [{"url":"https://allowed.example/form","title":"Form"}]
+    });
+    let inbox = inbox_with_frames([
+        serde_json::json!({"id":1,"result":history.clone()}),
+        serde_json::json!({"id":2,"result":history}),
+        serde_json::json!({"id":3,"result":{}}),
+        serde_json::json!({
+            "method":"Page.frameNavigated",
+            "sessionId":"primary",
+            "params":{"frame":{
+                "id":"main-frame",
+                "loaderId":"submitted-loader",
+                "url":"https://allowed.example/submitted"
+            }}
+        }),
+        serde_json::json!({"id":4,"result":{}}),
+        serde_json::json!({"id":5,"result":{}}),
+    ]);
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let result = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine.press_key(
+            &mut client,
+            SemanticKey::Enter,
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    .expect("an Enter submission that already navigated is completed, not retryable");
+
+    assert_eq!(
+        result,
+        SemanticBrowserResult::Action(ActionResult { completed: true })
+    );
+    let commands = parse_commands(&output);
+    let key_types = commands
+        .iter()
+        .filter(|command| command["method"] == "Input.dispatchKeyEvent")
+        .map(|command| command["params"]["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(key_types, ["keyDown", "keyUp"]);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["method"] == "Page.getNavigationHistory")
+            .count(),
+        2,
+        "do not insert a stale-document barrier between the committed Enter down/up pair"
+    );
+}
+
+#[test]
+fn scroll_queries_css_viewport_and_dispatches_one_wheel_event_at_its_center() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/".to_string();
+    let inbox = inbox_with_responses(|id| {
+        if id == 2 {
+            serde_json::json!({
+                "cssVisualViewport": {
+                    "clientWidth": 1200.0,
+                    "clientHeight": 800.0
+                }
+            })
+        } else {
+            serde_json::json!({})
+        }
+    });
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let result = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine.scroll(
+            &mut client,
+            -600,
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    .unwrap();
+
+    assert_eq!(
+        result,
+        SemanticBrowserResult::Action(ActionResult { completed: true })
+    );
+    let commands = parse_commands(&output);
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "Page.getNavigationHistory",
+            "Page.getLayoutMetrics",
+            "Page.getNavigationHistory",
+            "Input.dispatchMouseEvent",
+        ],
+        "the exact document must be revalidated after reading metrics and before the wheel event"
+    );
+    let inputs = commands
+        .into_iter()
+        .filter(|command| command["method"] == "Input.dispatchMouseEvent")
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["params"]["type"], "mouseWheel");
+    assert_eq!(inputs[0]["params"]["x"], 600.0);
+    assert_eq!(inputs[0]["params"]["y"], 400.0);
+    assert_eq!(inputs[0]["params"]["deltaY"], -600);
+    assert_eq!(inputs[0]["params"]["deltaX"], 0);
+}
+
+#[test]
+fn scroll_rejects_navigation_observed_while_waiting_for_metrics_before_wheel() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/feed".to_string();
+    let history_and_metrics = serde_json::json!({
+        "currentIndex": 0,
+        "entries": [{"url":"https://allowed.example/feed","title":"Feed"}],
+        "cssVisualViewport": {
+            "clientWidth": 1200.0,
+            "clientHeight": 800.0
+        }
+    });
+    let inbox = inbox_with_frames([
+        serde_json::json!({"id":1,"result":history_and_metrics.clone()}),
+        serde_json::json!({
+            "method":"Page.frameNavigated",
+            "sessionId":"primary",
+            "params":{"frame":{
+                "id":"main-frame",
+                "loaderId":"metrics-race-navigation",
+                "url":"https://allowed.example/next"
+            }}
+        }),
+        serde_json::json!({"id":2,"result":history_and_metrics.clone()}),
+        serde_json::json!({"id":3,"result":history_and_metrics}),
+        serde_json::json!({"id":4,"result":{}}),
+    ]);
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let error = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine
+            .scroll(
+                &mut client,
+                600,
+                &cancellation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("navigation observed before the wheel write must supersede the scroll")
+    };
+
+    assert_eq!(error.code, BackendFailureCode::InvalidSemanticReference);
+    let commands = parse_commands(&output);
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "Page.getNavigationHistory",
+            "Page.getLayoutMetrics",
+            "Page.getNavigationHistory",
+        ],
+        "the navigation must be observed during metrics before the pre-effect revalidation",
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["method"] == "Input.dispatchMouseEvent")
+            .count(),
+        0,
+        "a stale document must not receive the wheel effect",
+    );
+}
+
+#[test]
+fn scroll_navigation_after_wheel_effect_completes_once_without_retryable_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/feed".to_string();
+    let history = serde_json::json!({
+        "currentIndex": 0,
+        "entries": [{"url":"https://allowed.example/feed","title":"Feed"}]
+    });
+    let inbox = inbox_with_frames([
+        serde_json::json!({"id":1,"result":history.clone()}),
+        serde_json::json!({
+            "id":2,
+            "result":{
+                "cssVisualViewport": {
+                    "clientWidth": 1200.0,
+                    "clientHeight": 800.0
+                }
+            }
+        }),
+        serde_json::json!({"id":3,"result":history}),
+        serde_json::json!({
+            "method":"Page.frameNavigated",
+            "sessionId":"primary",
+            "params":{"frame":{
+                "id":"main-frame",
+                "loaderId":"wheel-navigation",
+                "url":"https://allowed.example/next"
+            }}
+        }),
+        serde_json::json!({"id":4,"result":{}}),
+        serde_json::json!({"id":5,"result":{}}),
+    ]);
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let result = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine.scroll(
+            &mut client,
+            600,
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    .expect("a wheel effect that already navigated is completed, not retryable");
+
+    assert_eq!(
+        result,
+        SemanticBrowserResult::Action(ActionResult { completed: true })
+    );
+    let commands = parse_commands(&output);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["method"] == "Input.dispatchMouseEvent")
+            .count(),
+        1,
+        "the committed wheel effect must not be retried"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["method"] == "Page.getNavigationHistory")
+            .count(),
+        2,
+        "navigation after the wheel effect must not trigger a stale-document barrier"
+    );
+}
+
+#[test]
+fn scroll_fails_before_input_when_css_viewport_metrics_are_unavailable_or_unsafe() {
+    let malformed_metrics = [
+        serde_json::json!({}),
+        serde_json::json!({"cssVisualViewport": {}}),
+        serde_json::json!({
+            "cssVisualViewport": {"clientWidth": 0.0, "clientHeight": 800.0}
+        }),
+        serde_json::json!({
+            "cssVisualViewport": {"clientWidth": 1200.0, "clientHeight": -1.0}
+        }),
+        serde_json::json!({
+            "cssVisualViewport": {"clientWidth": 1.0e20, "clientHeight": 800.0}
+        }),
+        serde_json::json!({
+            "cssVisualViewport": {"clientWidth": "1200", "clientHeight": 800.0}
+        }),
+    ];
+
+    for metrics in malformed_metrics {
+        let temp = tempfile::tempdir().unwrap();
+        let mut engine = test_engine(&temp);
+        engine.primary_session = Some("primary".to_string());
+        engine.current_url = "https://allowed.example/".to_string();
+        let inbox = inbox_with_responses(|id| {
+            if id == 2 {
+                metrics.clone()
+            } else {
+                serde_json::json!({})
+            }
+        });
+        let (_, cancellation) = cancellable_operation();
+        let mut output = Vec::new();
+        let error = {
+            let mut client = CdpClient::new(&mut output, inbox);
+            engine
+                .scroll(
+                    &mut client,
+                    600,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap_err()
+        };
+
+        assert_eq!(error.code, BackendFailureCode::ProtocolViolation);
+        assert!(error.to_string().contains("viewport metrics"));
+        let commands = parse_commands(&output);
+        assert_eq!(commands.last().unwrap()["method"], "Page.getLayoutMetrics");
+        assert!(
+            commands
+                .iter()
+                .all(|command| command["method"] != "Input.dispatchMouseEvent"),
+            "malformed viewport metrics must fail before any wheel effect"
+        );
+    }
+}
+
+#[test]
+fn evaluate_uses_only_fixed_return_by_value_await_promise_runtime_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/".to_string();
+    let inbox = inbox_with_responses(|id| {
+        if id == 3 {
+            serde_json::json!({"result":{"type":"object","value":{"ok":true}}})
+        } else {
+            serde_json::json!({})
+        }
+    });
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let result = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine.evaluate(
+            &mut client,
+            "Promise.resolve({ ok: true })",
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    .unwrap();
+
+    assert_eq!(
+        result,
+        SemanticBrowserResult::Evaluation(EvaluationResult {
+            value: serde_json::json!({"ok":true}),
+            untrusted: true,
+        })
+    );
+    let commands = parse_commands(&output);
+    let evaluate = commands
+        .iter()
+        .find(|command| command["method"] == "Runtime.evaluate")
+        .unwrap();
+    assert_eq!(
+        evaluate["params"]["expression"],
+        "Promise.resolve({ ok: true })"
+    );
+    assert_eq!(evaluate["params"]["returnByValue"], true);
+    assert_eq!(evaluate["params"]["awaitPromise"], true);
+    assert!(evaluate["params"]["timeout"]
+        .as_u64()
+        .is_some_and(|timeout| timeout > 0 && timeout < 1_000));
+    assert!(evaluate["params"].get("objectGroup").is_none());
+}
+
+#[test]
+fn evaluate_navigation_after_script_effect_returns_once_without_retryable_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut engine = test_engine(&temp);
+    engine.primary_session = Some("primary".to_string());
+    engine.current_url = "https://allowed.example/start".to_string();
+    let history = serde_json::json!({
+        "currentIndex": 0,
+        "entries": [{"url":"https://allowed.example/start","title":"Start"}]
+    });
+    let inbox = inbox_with_frames([
+        serde_json::json!({"id":1,"result":history.clone()}),
+        serde_json::json!({"id":2,"result":history}),
+        serde_json::json!({
+            "method":"Page.frameNavigated",
+            "sessionId":"primary",
+            "params":{"frame":{
+                "id":"main-frame",
+                "loaderId":"script-navigation",
+                "url":"https://allowed.example/next"
+            }}
+        }),
+        serde_json::json!({
+            "id":3,
+            "result":{"result":{"type":"string","value":"navigation-started"}}
+        }),
+        serde_json::json!({"id":4,"result":{}}),
+    ]);
+    let (_, cancellation) = cancellable_operation();
+    let mut output = Vec::new();
+    let result = {
+        let mut client = CdpClient::new(&mut output, inbox);
+        engine.evaluate(
+            &mut client,
+            "location.href = 'https://allowed.example/next'; 'navigation-started'",
+            &cancellation,
+            Instant::now() + Duration::from_secs(1),
+        )
+    }
+    .expect("a script effect that already navigated returns its result, not a retryable failure");
+
+    assert_eq!(
+        result,
+        SemanticBrowserResult::Evaluation(EvaluationResult {
+            value: Value::String("navigation-started".to_string()),
+            untrusted: true,
+        })
+    );
+    let commands = parse_commands(&output);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["method"] == "Runtime.evaluate")
+            .count(),
+        1,
+        "the committed script effect must not be retried"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["method"] == "Page.getNavigationHistory")
+            .count(),
+        2,
+        "navigation after the script effect must not trigger a stale-document barrier"
+    );
+}
+
+#[test]
 fn timed_out_click_uses_an_independent_deadline_to_release_mouse_input() {
     let temp = tempfile::tempdir().unwrap();
     let mut engine = test_engine(&temp);
@@ -499,15 +1021,15 @@ fn initialization_owns_the_explicitly_created_page_when_the_profile_has_multiple
     let temp = tempfile::tempdir().unwrap();
     let mut engine = test_engine(&temp);
     let inbox = inbox_with_responses(|id| match id {
-        3 => serde_json::json!({
+        2 => serde_json::json!({
             "targetId": "managed-target",
             "targetInfos": [
                 {"targetId":"restored-a","type":"page","url":"https://a.example/"},
                 {"targetId":"restored-b","type":"page","url":"https://b.example/"}
             ]
         }),
-        4 => serde_json::json!({"sessionId":"session-1"}),
-        16 => serde_json::json!({
+        3 => serde_json::json!({"sessionId":"session-1"}),
+        14 => serde_json::json!({
             "targetInfos": [
                 {"targetId":"restored-a","type":"page","url":"https://a.example/"},
                 {"targetId":"managed-target","type":"page","url":"about:blank"},
@@ -515,8 +1037,8 @@ fn initialization_owns_the_explicitly_created_page_when_the_profile_has_multiple
                 {"targetId":"service-worker","type":"service_worker","url":"https://b.example/sw.js"}
             ]
         }),
-        17 | 18 => serde_json::json!({"success": true}),
-        19 => serde_json::json!({
+        15 | 16 => serde_json::json!({"success": true}),
+        17 => serde_json::json!({
             "currentIndex":0,
             "entries":[{"url":"about:blank","title":""}]
         }),
@@ -529,11 +1051,9 @@ fn initialization_owns_the_explicitly_created_page_when_the_profile_has_multiple
         .initialize(&mut client, Instant::now() + Duration::from_secs(1))
         .unwrap();
     let commands = parse_commands(&output);
-    assert_eq!(commands[0]["method"], "Browser.setDownloadBehavior");
-    assert_eq!(
-        commands[0]["params"],
-        serde_json::json!({"behavior":"deny","eventsEnabled":true})
-    );
+    assert!(!commands
+        .iter()
+        .any(|command| command["method"] == "Browser.setDownloadBehavior"));
     assert!(commands
         .iter()
         .filter(|command| command["method"] == "Target.setAutoAttach")
@@ -551,8 +1071,8 @@ fn initialization_owns_the_explicitly_created_page_when_the_profile_has_multiple
         .iter()
         .filter(|command| command["method"] == "Target.setAutoAttach")
         .all(|command| command["params"]["filter"] == expected_target_filter));
-    assert_eq!(commands[2]["method"], "Target.createTarget");
-    assert_eq!(commands[2]["params"]["url"], "about:blank");
+    assert_eq!(commands[1]["method"], "Target.createTarget");
+    assert_eq!(commands[1]["params"]["url"], "about:blank");
     let attach = commands
         .iter()
         .find(|command| command["method"] == "Target.attachToTarget")
@@ -565,11 +1085,10 @@ fn initialization_owns_the_explicitly_created_page_when_the_profile_has_multiple
         .map(|command| command["method"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
-        &session_methods[..10],
+        &session_methods[..9],
         [
             "Fetch.enable",
             "Target.setAutoAttach",
-            "Page.setInterceptFileChooserDialog",
             "Page.enable",
             "Page.setLifecycleEventsEnabled",
             "Accessibility.enable",
@@ -583,19 +1102,9 @@ fn initialization_owns_the_explicitly_created_page_when_the_profile_has_multiple
         .iter()
         .position(|command| command["method"] == "Runtime.runIfWaitingForDebugger")
         .unwrap();
-    let chooser_intercept_index = commands
+    assert!(!commands
         .iter()
-        .position(|command| command["method"] == "Page.setInterceptFileChooserDialog")
-        .expect("file chooser interception is installed for the target");
-    assert!(chooser_intercept_index < resume_index);
-    assert_eq!(
-        commands[chooser_intercept_index]["params"],
-        serde_json::json!({"enabled": true, "cancel": true})
-    );
-    assert!(!commands.iter().any(|command| {
-        command["method"] == "Page.setInterceptFileChooserDialog"
-            && command["params"]["enabled"] == false
-    }));
+        .any(|command| { command["method"] == "Page.setInterceptFileChooserDialog" }));
     let enumerate_index = commands
         .iter()
         .position(|command| command["method"] == "Target.getTargets")
@@ -630,7 +1139,7 @@ fn embedded_initialization_attaches_the_current_cef_page_without_creating_or_clo
         .unwrap(),
     );
     let inbox = inbox_with_responses(|id| match id {
-        2 => serde_json::json!({
+        1 => serde_json::json!({
             "targetInfo": {
                 "targetId": "cef-current-page",
                 "type": "page",
@@ -639,8 +1148,8 @@ fn embedded_initialization_attaches_the_current_cef_page_without_creating_or_clo
                 "attached": true
             }
         }),
-        3 => serde_json::json!({"sessionId":"cef-session"}),
-        14 => serde_json::json!({
+        2 => serde_json::json!({"sessionId":"cef-session"}),
+        12 => serde_json::json!({
             "currentIndex": 0,
             "entries": [{"url":"https://login.example/","title":"Login"}]
         }),
@@ -654,7 +1163,7 @@ fn embedded_initialization_attaches_the_current_cef_page_without_creating_or_clo
         .unwrap();
 
     let commands = parse_commands(&output);
-    assert_eq!(commands[1]["method"], "Target.getTargetInfo");
+    assert_eq!(commands[0]["method"], "Target.getTargetInfo");
     assert!(
         !commands
             .iter()
@@ -685,51 +1194,6 @@ fn embedded_initialization_attaches_the_current_cef_page_without_creating_or_clo
             Some("Target.createTarget" | "Target.closeTarget" | "Target.getTargets")
         )
     }));
-}
-
-#[test]
-fn download_deny_enables_events_and_projects_only_terminal_counters() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut engine = test_engine(&temp);
-    let (_sender, inbox, _state) = super::super::transport::frame_channel();
-    let mut output = Vec::new();
-    let mut client = CdpClient::new(&mut output, inbox);
-
-    for event in [
-        CdpEvent {
-            kind: CdpEventKind::DownloadWillBegin,
-            params: serde_json::json!({
-                "guid": "raw-download-guid",
-                "url": "https://example.test/private?token=secret",
-                "suggestedFilename": "secret.txt"
-            }),
-            session_id: None,
-        },
-        CdpEvent {
-            kind: CdpEventKind::DownloadProgress,
-            params: serde_json::json!({
-                "guid": "raw-download-guid",
-                "state": "canceled",
-                "filePath": "/Users/alice/Downloads/secret.txt"
-            }),
-            session_id: None,
-        },
-    ] {
-        engine.on_event(&mut client, event).unwrap();
-    }
-
-    let projection = engine.projection();
-    assert_eq!(projection.blocked_download_count, 1);
-    assert_eq!(projection.canceled_download_count, 1);
-    let debug = format!("{projection:?}");
-    for raw in [
-        "raw-download-guid",
-        "token=secret",
-        "secret.txt",
-        "/Users/alice",
-    ] {
-        assert!(!debug.contains(raw));
-    }
 }
 
 fn navigation_url(result: SemanticBrowserResult) -> String {
@@ -847,53 +1311,17 @@ fn agent_cancellation_cannot_interrupt_security_setup_for_a_paused_target() {
         .map(|command| command["method"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(methods.first().map(String::as_str), Some("Fetch.enable"));
-    let chooser_intercept_index = methods
-        .iter()
-        .position(|method| method == "Page.setInterceptFileChooserDialog")
-        .expect("cancelled Agent setup still installs file chooser interception");
     let resume_index = methods
         .iter()
         .position(|method| method == "Runtime.runIfWaitingForDebugger")
         .unwrap();
-    assert!(chooser_intercept_index < resume_index);
+    assert!(!methods
+        .iter()
+        .any(|method| method == "Page.setInterceptFileChooserDialog"));
+    assert!(resume_index > 0);
     assert_eq!(
         methods.last().map(String::as_str),
         Some("Runtime.runIfWaitingForDebugger")
-    );
-}
-
-#[test]
-fn intercepted_file_chooser_is_projected_as_blocked_without_exposing_a_path_capability() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut engine = test_engine(&temp);
-    engine.primary_session = Some("primary".to_string());
-    engine.configured_sessions.insert("primary".to_string());
-    let (_sender, inbox, _state) = super::super::transport::frame_channel();
-    let mut output = Vec::new();
-    let mut client = CdpClient::new(&mut output, inbox);
-
-    engine
-        .on_event(
-            &mut client,
-            CdpEvent {
-                kind: CdpEventKind::FileChooserOpened,
-                params: serde_json::json!({
-                    "frameId": "main-frame",
-                    "mode": "selectSingle",
-                    "backendNodeId": 42,
-                    "untrustedExtra": "/Users/alice/secret.txt"
-                }),
-                session_id: Some("primary".to_string()),
-            },
-        )
-        .unwrap();
-
-    let projection = engine.projection();
-    assert_eq!(projection.blocked_file_chooser_count, 1);
-    assert!(!format!("{projection:?}").contains("secret.txt"));
-    assert!(
-        output.is_empty(),
-        "blocked chooser must not gain a file-path command"
     );
 }
 

@@ -85,6 +85,62 @@ test('a late provider id and live/history round trip retain one browser instance
   assert.equal(reboundTargets[beforeProviderId].surfaceSessionId, 'draft:workspace:7');
 });
 
+test('runtime-addressed history reuses the live browser only for the same provider and working directory', async () => {
+  const {
+    createBrowserPanelSessionKeyRegistry,
+    matchesBrowserPanelHistorySession,
+  } = await importBrowserPanelTarget();
+  const registry = createBrowserPanelSessionKeyRegistry();
+  const historySession = {
+    source: 'claude',
+    id: 'native-runtime-a',
+    project: '/workspace/project',
+  };
+  const matchingRuntime = {
+    provider: 'claude',
+    provider_session_id: null,
+    project_dir: '/workspace/project/',
+    runtime_id: 'native-runtime-a',
+  };
+
+  const liveKey = registry.resolveLive({
+    provider: matchingRuntime.provider,
+    providerSessionId: matchingRuntime.provider_session_id,
+    runtimeId: matchingRuntime.runtime_id,
+  });
+  assert.equal(liveKey, 'runtime:native-runtime-a');
+  assert.equal(matchesBrowserPanelHistorySession(historySession, matchingRuntime), true);
+  assert.equal(
+    registry.resolveHistory({
+      provider: historySession.source,
+      providerSessionId: historySession.id,
+      matchingLiveSession: {
+        provider: matchingRuntime.provider,
+        providerSessionId: matchingRuntime.provider_session_id,
+        runtimeId: matchingRuntime.runtime_id,
+      },
+    }),
+    liveKey,
+    'live to runtime-addressed history and back must retain one BrowserPanel key',
+  );
+  assert.equal(
+    matchesBrowserPanelHistorySession(
+      historySession,
+      { ...matchingRuntime, project_dir: '/workspace/other-project' },
+    ),
+    false,
+    'the same runtime id in another working directory must not capture this browser',
+  );
+  assert.equal(
+    matchesBrowserPanelHistorySession(
+      historySession,
+      { ...matchingRuntime, provider: 'codex' },
+    ),
+    false,
+    'the same runtime id from another provider must not capture this browser',
+  );
+});
+
 test('history handoff uses only the exact active native runtime selected for that history record', async () => {
   const { resolveHistoryBrowserAgentSessionId } = await importBrowserPanelTarget();
   const historySession = {
@@ -153,6 +209,43 @@ test('history handoff uses only the exact active native runtime selected for tha
       ),
       null,
       `${terminalStatus} is already terminal for browser actor lookup`,
+    );
+  }
+});
+
+test('only a runtime with the embedded browser MCP can become the browser Agent', async () => {
+  const {
+    resolveActiveBrowserAgentSessionId,
+    resolveHistoryBrowserAgentSessionId,
+  } = await importBrowserPanelTarget();
+  const activeRuntime = {
+    provider: 'claude',
+    provider_session_id: 'provider-a',
+    project_dir: '/workspace/project',
+    runtime_id: 'native-runtime-a',
+    status: 'ready',
+    is_active: true,
+  };
+
+  assert.equal(resolveActiveBrowserAgentSessionId(activeRuntime), 'native-runtime-a');
+  for (const provider of ['codex', 'opencode']) {
+    const unsupportedRuntime = { ...activeRuntime, provider };
+    assert.equal(
+      resolveActiveBrowserAgentSessionId(unsupportedRuntime),
+      null,
+      `${provider} must stay in User control without ccem-browser tools`,
+    );
+    assert.equal(
+      resolveHistoryBrowserAgentSessionId(
+        {
+          source: provider,
+          id: unsupportedRuntime.provider_session_id,
+          project: unsupportedRuntime.project_dir,
+        },
+        unsupportedRuntime,
+      ),
+      null,
+      `${provider} history must not present a fake Agent handoff`,
     );
   }
 });
@@ -238,6 +331,14 @@ test('Workspace retains inactive Mode 2 panels and wires the status button to th
     path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'),
     'utf8',
   );
+  const commandHookSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'hooks', 'useTauriCommands.ts'),
+    'utf8',
+  );
+  const tauriIpcSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'),
+    'utf8',
+  );
 
   assert.match(workspaceSource, /Object\.entries\(browserTargetBySessionId\)\.map/);
   assert.match(workspaceSource, /const panelKey = String\(target\.instanceId\);/);
@@ -262,6 +363,9 @@ test('Workspace retains inactive Mode 2 panels and wires the status button to th
     workspaceSource,
     /rebindBrowserPanelTarget\([\s\S]*WORKSPACE_BROWSER_COMPOSE_SESSION_ID,[\s\S]*liveBrowserSessionId/,
   );
+  assert.doesNotMatch(workspaceSource, /deferInitialTurn|onAgentHandoff/);
+  assert.doesNotMatch(commandHookSource, /deferInitialTurn|start_native_session_initial_turn/);
+  assert.doesNotMatch(tauriIpcSource, /start_native_session_initial_turn/);
   assert.doesNotMatch(workspaceSource, /browser_panel_requested|backend=["']preview["']/i);
 });
 

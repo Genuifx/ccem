@@ -37,6 +37,7 @@ export interface BrowserSurfaceSnapshot {
   error?: string | null;
   lifecycle?: 'creating' | 'loading' | 'ready' | 'closing' | 'failed' | 'closed';
   control?: 'user' | 'agent' | 'paused';
+  auto_handoff?: boolean;
   paused?: boolean;
   profile_id?: string | null;
   session_status?: 'running' | 'closing' | 'cleanup_required';
@@ -240,7 +241,7 @@ export interface BrowserSurfaceNavigateRequest {
   url: string;
 }
 
-export type BrowserSurfaceNavigationAction = 'back' | 'forward' | 'reload';
+export type BrowserSurfaceNavigationAction = 'back' | 'forward' | 'reload' | 'stop';
 
 export interface BrowserSurfaceNavigationActionRequest {
   leaseId: string;

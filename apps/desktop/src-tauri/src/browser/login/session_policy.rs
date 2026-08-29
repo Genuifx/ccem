@@ -1,27 +1,24 @@
 use super::capability::JsonlSemanticAuditSink;
 use super::cdp::guard::{
-    TrustedHandoffPreflightDenial, TrustedNavigationDecision, TrustedNavigationGuard,
-    TrustedNavigationRequest, TrustedNavigationSurface, TrustedSecurityAuditDisposition,
-    TrustedSecurityAuditFailure, TrustedSecurityEvent,
+    TrustedNavigationDecision, TrustedNavigationGuard, TrustedNavigationRequest,
+    TrustedNavigationSurface,
 };
 use super::policy::{
-    authorize_browser_request, BrowserDataProvenance, BrowserGrantBinding, BrowserPolicyEffect,
-    BrowserPolicyError, BrowserPolicyRequest, BrowserPolicySurface, NormalizedOrigin,
+    authorize_browser_request, BrowserGrantBinding, BrowserPolicyRequest, BrowserPolicySurface,
     TrustedOriginGrant,
 };
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(super) enum SessionNavigationPolicyError {
-    InvalidGrant(BrowserPolicyError),
     Unavailable,
 }
 
 /// Owner-thread navigation guard shared with trusted session state.
 ///
-/// Manual user control intentionally has no Agent origin grant installed. Once the trusted UI
+/// Manual user control intentionally has no Agent browser grant installed. Once the trusted UI
 /// hands control to an Agent, every top-level request, redirect, popup, and iframe document passes
-/// through the immutable handoff-bound origin grant. A transition retains that binding in a
+/// through the immutable handoff-bound browser grant. A transition retains that binding in a
 /// paused fail-closed state until the owner acknowledges the user-control boundary.
 pub(super) struct SessionNavigationPolicy {
     authority: Mutex<NavigationAuthority>,
@@ -50,17 +47,11 @@ impl SessionNavigationPolicy {
         }
     }
 
-    pub(super) fn activate<I, S>(
+    pub(super) fn activate(
         &self,
         binding: BrowserGrantBinding,
-        origins: I,
-    ) -> Result<TrustedOriginGrant, SessionNavigationPolicyError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let grant = TrustedOriginGrant::new_trusted(binding, origins)
-            .map_err(SessionNavigationPolicyError::InvalidGrant)?;
+    ) -> Result<TrustedOriginGrant, SessionNavigationPolicyError> {
+        let grant = TrustedOriginGrant::new_trusted(binding);
         let mut authority = self
             .authority
             .lock()
@@ -112,6 +103,12 @@ impl TrustedNavigationGuard for SessionNavigationPolicy {
                 };
             }
         };
+        if !paused
+            && request.surface() == TrustedNavigationSurface::AgentEffect
+            && request.target_url() == "about:blank"
+        {
+            return TrustedNavigationDecision::allow("agent_blank_effect");
+        }
         let trusted_surface = request.surface();
         let surface = match trusted_surface {
             TrustedNavigationSurface::AgentNavigation => BrowserPolicySurface::InitialNavigation,
@@ -125,13 +122,9 @@ impl TrustedNavigationGuard for SessionNavigationPolicy {
             BrowserPolicyRequest {
                 binding: grant.binding(),
                 surface,
-                effect: BrowserPolicyEffect::Navigate,
-                target_url: request.target_url(),
-                source_data_origin: None,
-                data_provenance: BrowserDataProvenance::UntrackedOrSameOrigin,
+                target_url: Some(request.target_url()),
                 paused,
             },
-            None,
         );
         if decision.allowed {
             TrustedNavigationDecision::allow(decision.code.as_str())
@@ -154,63 +147,6 @@ impl TrustedNavigationGuard for SessionNavigationPolicy {
             TrustedNavigationDecision::deny(decision.code.as_str())
         }
     }
-
-    fn record_security_event(
-        &self,
-        event: TrustedSecurityEvent,
-    ) -> Result<TrustedSecurityAuditDisposition, TrustedSecurityAuditFailure> {
-        let binding = {
-            let authority = self
-                .authority
-                .lock()
-                .map_err(|_| TrustedSecurityAuditFailure)?;
-            match &*authority {
-                NavigationAuthority::Agent(grant) | NavigationAuthority::Paused(grant) => {
-                    grant.binding().clone()
-                }
-                NavigationAuthority::User => {
-                    return Ok(TrustedSecurityAuditDisposition::UserControl)
-                }
-            }
-        };
-        let audit = self.audit.as_ref().ok_or(TrustedSecurityAuditFailure)?;
-        audit
-            .write_transfer_denied(&binding, event)
-            .map_err(|_| TrustedSecurityAuditFailure)?;
-        Ok(TrustedSecurityAuditDisposition::Recorded)
-    }
-
-    fn record_handoff_preflight_denial(
-        &self,
-        denial: TrustedHandoffPreflightDenial<'_>,
-    ) -> Result<(), TrustedSecurityAuditFailure> {
-        let binding = {
-            let authority = self
-                .authority
-                .lock()
-                .map_err(|_| TrustedSecurityAuditFailure)?;
-            match &*authority {
-                NavigationAuthority::Agent(grant) => grant.binding().clone(),
-                NavigationAuthority::User | NavigationAuthority::Paused(_) => {
-                    return Err(TrustedSecurityAuditFailure)
-                }
-            }
-        };
-        let target_origin = denial
-            .target_url
-            .and_then(|url| NormalizedOrigin::parse(url).ok())
-            .map(|origin| origin.as_serialized_origin());
-        self.audit
-            .as_ref()
-            .ok_or(TrustedSecurityAuditFailure)?
-            .write_navigation_denied(
-                &binding,
-                denial.kind.surface(),
-                denial.kind.cause_code(),
-                target_origin.as_deref(),
-            )
-            .map_err(|_| TrustedSecurityAuditFailure)
-    }
 }
 
 fn navigation_surface_name(surface: TrustedNavigationSurface) -> &'static str {
@@ -226,14 +162,13 @@ fn navigation_surface_name(surface: TrustedNavigationSurface) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::login::control::{HandoffControl, LoginBrowserControl};
 
     fn binding(epoch: u64) -> BrowserGrantBinding {
         BrowserGrantBinding::new_trusted("w", "p", "s", epoch).unwrap()
     }
 
     #[test]
-    fn manual_control_is_open_but_agent_handoff_closes_every_navigation_surface() {
+    fn manual_control_is_open_and_agent_handoff_is_browser_instance_scoped() {
         let policy = SessionNavigationPolicy::new();
         assert!(!policy
             .authorize(TrustedNavigationRequest::new(
@@ -248,9 +183,7 @@ mod tests {
             ))
             .allowed());
 
-        policy
-            .activate(binding(1), ["https://allowed.example"])
-            .unwrap();
+        policy.activate(binding(1)).unwrap();
         for surface in [
             TrustedNavigationSurface::AgentNavigation,
             TrustedNavigationSurface::AgentEffect,
@@ -264,7 +197,7 @@ mod tests {
                     surface,
                 ))
                 .allowed());
-            assert!(!policy
+            assert!(policy
                 .authorize(TrustedNavigationRequest::new(
                     "https://denied.example/path",
                     surface,
@@ -295,14 +228,88 @@ mod tests {
     }
 
     #[test]
-    fn denied_redirect_popup_and_iframe_are_durably_audited_for_the_active_handoff() {
+    fn active_agent_browser_can_cross_sites_for_search_and_oauth() {
+        let policy = SessionNavigationPolicy::new();
+        policy.activate(binding(2)).unwrap();
+
+        for (surface, target) in [
+            (
+                TrustedNavigationSurface::AgentNavigation,
+                "https://search.example/results?q=ccem",
+            ),
+            (
+                TrustedNavigationSurface::Redirect,
+                "https://identity.example/oauth/authorize",
+            ),
+            (
+                TrustedNavigationSurface::Popup,
+                "https://accounts.example/sign-in",
+            ),
+            (
+                TrustedNavigationSurface::Iframe,
+                "https://identity.example/session-check",
+            ),
+        ] {
+            let decision = policy.authorize(TrustedNavigationRequest::new(target, surface));
+            assert!(
+                decision.allowed(),
+                "active browser ownership should allow {surface:?}: {}",
+                decision.code()
+            );
+        }
+    }
+
+    #[test]
+    fn active_agent_can_inspect_exact_blank_page_without_relaxing_navigation() {
+        let policy = SessionNavigationPolicy::new();
+        policy.activate(binding(3)).unwrap();
+
+        let blank_effect = policy.authorize(TrustedNavigationRequest::new(
+            "about:blank",
+            TrustedNavigationSurface::AgentEffect,
+        ));
+        assert!(blank_effect.allowed());
+        assert_eq!(blank_effect.code(), "agent_blank_effect");
+
+        for (surface, target) in [
+            (
+                TrustedNavigationSurface::AgentEffect,
+                "about:blank#fragment",
+            ),
+            (TrustedNavigationSurface::AgentNavigation, "about:blank"),
+            (TrustedNavigationSurface::Redirect, "about:blank"),
+            (TrustedNavigationSurface::Popup, "about:blank"),
+            (TrustedNavigationSurface::Iframe, "about:blank"),
+        ] {
+            assert!(!policy
+                .authorize(TrustedNavigationRequest::new(target, surface))
+                .allowed());
+        }
+
+        policy.pause_agent().unwrap();
+        assert!(!policy
+            .authorize(TrustedNavigationRequest::new(
+                "about:blank",
+                TrustedNavigationSurface::AgentEffect,
+            ))
+            .allowed());
+
+        policy.resume_user_control();
+        assert!(!policy
+            .authorize(TrustedNavigationRequest::new(
+                "about:blank",
+                TrustedNavigationSurface::AgentEffect,
+            ))
+            .allowed());
+    }
+
+    #[test]
+    fn invalid_scheme_redirect_popup_and_iframe_are_durably_audited() {
         let temp = tempfile::tempdir().unwrap();
         let audit_path = temp.path().join("audit").join("actions.jsonl");
         let audit = Arc::new(JsonlSemanticAuditSink::new(audit_path.clone()));
         let policy = SessionNavigationPolicy::with_audit(audit);
-        policy
-            .activate(binding(7), ["https://allowed.example"])
-            .unwrap();
+        policy.activate(binding(7)).unwrap();
 
         for surface in [
             TrustedNavigationSurface::Redirect,
@@ -310,7 +317,7 @@ mod tests {
             TrustedNavigationSurface::Iframe,
         ] {
             let decision = policy.authorize(TrustedNavigationRequest::new(
-                "https://denied.example/private?token=DO_NOT_LOG_FULL_URL",
+                "file:///private/DO_NOT_LOG_FULL_URL",
                 surface,
             ));
             assert!(!decision.allowed());
@@ -326,7 +333,7 @@ mod tests {
             assert_eq!(record["record"]["session_id"], "s");
             assert_eq!(record["record"]["handoff_epoch"], 7);
             assert_eq!(record["record"]["decision"], "denied");
-            assert_eq!(record["record"]["cause_code"], "origin_not_granted");
+            assert_eq!(record["record"]["cause_code"], "unsupported_origin_scheme");
             assert!(!record.to_string().contains("DO_NOT_LOG_FULL_URL"));
             assert!(!record.to_string().contains("/private"));
         }
@@ -338,9 +345,7 @@ mod tests {
         let audit_path = temp.path().join("audit").join("actions.jsonl");
         let audit = Arc::new(JsonlSemanticAuditSink::new(audit_path.clone()));
         let policy = SessionNavigationPolicy::with_audit(audit);
-        policy
-            .activate(binding(11), ["https://allowed.example"])
-            .unwrap();
+        policy.activate(binding(11)).unwrap();
         policy.pause_agent().unwrap();
 
         let decision = policy.authorize(TrustedNavigationRequest::new(
@@ -361,94 +366,6 @@ mod tests {
         assert_eq!(record["record"]["cause_code"], "agent_control_paused");
     }
 
-    #[test]
-    fn transfer_denials_are_audited_only_for_an_active_agent_grant() {
-        let temp = tempfile::tempdir().unwrap();
-        let audit_path = temp.path().join("audit").join("actions.jsonl");
-        let audit = Arc::new(JsonlSemanticAuditSink::new(audit_path.clone()));
-        let policy = SessionNavigationPolicy::with_audit(audit);
-
-        assert_eq!(
-            policy
-                .record_security_event(TrustedSecurityEvent::UploadBlocked)
-                .unwrap(),
-            TrustedSecurityAuditDisposition::UserControl
-        );
-        assert!(!audit_path.exists());
-
-        policy
-            .activate(binding(9), ["https://allowed.example"])
-            .unwrap();
-        for event in [
-            TrustedSecurityEvent::UploadBlocked,
-            TrustedSecurityEvent::DownloadBlocked,
-            TrustedSecurityEvent::DownloadCanceled,
-        ] {
-            assert_eq!(
-                policy.record_security_event(event).unwrap(),
-                TrustedSecurityAuditDisposition::Recorded
-            );
-        }
-
-        let records = std::fs::read_to_string(audit_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0]["phase"], "transfer_decision");
-        assert_eq!(records[0]["record"]["session_id"], "s");
-        assert_eq!(records[0]["record"]["handoff_epoch"], 9);
-        assert_eq!(records[0]["record"]["decision"], "denied");
-        assert_eq!(records[0]["record"]["event"], "upload_blocked");
-        assert_eq!(records[1]["record"]["event"], "download_blocked");
-        assert_eq!(records[2]["record"]["event"], "download_canceled");
-    }
-
-    #[test]
-    fn preflight_denial_audit_contains_only_origin_fingerprint_scheme_and_port() {
-        let temp = tempfile::tempdir().unwrap();
-        let audit_path = temp.path().join("audit").join("actions.jsonl");
-        let policy = SessionNavigationPolicy::with_audit(Arc::new(JsonlSemanticAuditSink::new(
-            audit_path.clone(),
-        )));
-        policy
-            .activate(binding(13), ["https://allowed.example"])
-            .unwrap();
-        policy
-            .record_handoff_preflight_denial(TrustedHandoffPreflightDenial {
-                kind: super::super::cdp::guard::TrustedHandoffPreflightDenialKind::ChildFrameOrigin,
-                target_url: Some("https://raw-secret-host.example/private/path?token=raw-secret"),
-            })
-            .unwrap();
-
-        let contents = std::fs::read_to_string(audit_path).unwrap();
-        assert!(!contents.contains("raw-secret-host"));
-        assert!(!contents.contains("private/path"));
-        assert!(!contents.contains("raw-secret"));
-        let record: serde_json::Value =
-            serde_json::from_str(contents.lines().next().unwrap()).unwrap();
-        assert_eq!(record["record"]["target_scheme"], "https");
-        assert_eq!(record["record"]["target_port"], 443);
-        assert_eq!(
-            record["record"]["target_origin_sha256"]
-                .as_str()
-                .unwrap()
-                .len(),
-            64
-        );
-
-        policy.resume_user_control();
-        let control = LoginBrowserControl::new();
-        assert!(control.begin_operation(&binding(13), true).is_err());
-        let decision = policy.authorize(TrustedNavigationRequest::new(
-            "https://allowed.example/click",
-            TrustedNavigationSurface::AgentEffect,
-        ));
-        assert!(!decision.allowed());
-        assert_eq!(decision.code(), "no_active_handoff");
-    }
-
     #[cfg(unix)]
     #[test]
     fn navigation_audit_storage_failure_is_a_terminal_policy_decision() {
@@ -463,12 +380,10 @@ mod tests {
         symlink(&outside, &audit_path).unwrap();
         let policy =
             SessionNavigationPolicy::with_audit(Arc::new(JsonlSemanticAuditSink::new(audit_path)));
-        policy
-            .activate(binding(19), ["https://allowed.example"])
-            .unwrap();
+        policy.activate(binding(19)).unwrap();
 
         let decision = policy.authorize(TrustedNavigationRequest::new(
-            "https://denied.example/redirect",
+            "file:///private/redirect",
             TrustedNavigationSurface::Redirect,
         ));
 

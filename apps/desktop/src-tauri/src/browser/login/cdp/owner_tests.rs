@@ -15,8 +15,21 @@ struct DenyRedirectGuard;
 
 struct NoopTermination;
 
+struct ReleaseTermination {
+    release: Mutex<Option<mpsc::SyncSender<()>>>,
+}
+
 impl OwnerTerminalTermination for NoopTermination {
     fn request_terminal_shutdown(&self) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+}
+
+impl OwnerTerminalTermination for ReleaseTermination {
+    fn request_terminal_shutdown(&self) -> Result<(), BackendFailure> {
+        if let Some(release) = self.release.lock().unwrap().take() {
+            let _ = release.send(());
+        }
         Ok(())
     }
 }
@@ -74,6 +87,84 @@ fn read_frame(reader: &mut BufReader<UnixStream>) -> Value {
     reader.read_until(0, &mut bytes).unwrap();
     assert_eq!(bytes.pop(), Some(0));
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn diagnostic_start_allows_a_slow_but_healthy_cef_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let (owner_stream, peer_stream) = UnixStream::pair().unwrap();
+    let owner_reader = Box::new(owner_stream.try_clone().unwrap());
+    let owner_writer = Box::new(owner_stream);
+    let mut peer_reader = BufReader::new(peer_stream.try_clone().unwrap());
+    let mut peer_writer = peer_stream;
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let termination: Arc<dyn OwnerTerminalTermination> = Arc::new(ReleaseTermination {
+        release: Mutex::new(Some(release_tx)),
+    });
+    let peer = thread::spawn(move || loop {
+        let command = read_frame(&mut peer_reader);
+        let id = command["id"].as_u64().unwrap();
+        let method = command["method"].as_str().unwrap();
+        let result = match method {
+            "Target.getTargetInfo" => serde_json::json!({
+                "targetInfo": {
+                    "targetId":"cef-target",
+                    "type":"page",
+                    "url":"https://example.test/",
+                    "title":"Example",
+                    "attached":true
+                }
+            }),
+            "Target.attachToTarget" => serde_json::json!({"sessionId":"cef-session"}),
+            "Page.getNavigationHistory" => serde_json::json!({
+                "currentIndex":0,
+                "entries":[{"url":"https://example.test/","title":"Example"}]
+            }),
+            "Page.getFrameTree" => {
+                thread::sleep(Duration::from_millis(500));
+                serde_json::json!({"frameTree":{"frame":{
+                    "id":"root",
+                    "loaderId":"loader",
+                    "url":"https://example.test/",
+                    "securityOrigin":"https://example.test"
+                }}})
+            }
+            _ => serde_json::json!({}),
+        };
+        write_frame(
+            &mut peer_writer,
+            serde_json::json!({"id":id,"result":result}),
+        );
+        if method == "Page.getFrameTree" {
+            let _ = release_rx.recv();
+            break;
+        }
+    });
+    let config = ChromiumLoginBackendConfig::new_trusted(
+        temp.path().join("artifacts"),
+        temp.path().join("network"),
+        "slow-diagnostic-start".to_string(),
+        NetworkRedactionConfig::default(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let backend = ChromiumLoginBackend::spawn_embedded(
+        owner_reader,
+        owner_writer,
+        config,
+        Arc::new(DenyRedirectGuard),
+        termination,
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    backend
+        .begin_diagnostic_segment(1)
+        .expect("a healthy CEF round-trip must not lose the first handoff");
+    assert!(started.elapsed() >= Duration::from_millis(450));
+    backend.stop_diagnostic_segment().unwrap();
+    backend.shutdown(false).unwrap();
+    peer.join().unwrap();
 }
 
 #[test]

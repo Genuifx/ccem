@@ -7,8 +7,8 @@ export interface BrowserPanelNativeSurfaceParticipantOptions {
 /**
  * Builds the acknowledgement-bearing BrowserPanel participant used by trusted
  * host overlays. Occlusion is one Mode 2 transaction so Agent cancellation is
- * acknowledged before CEF becomes hidden. Restore intentionally never resumes
- * Agent authority.
+ * acknowledged before CEF becomes hidden. BrowserPanel owns the exact-lease
+ * decision to resume Agent control after this participant restores the surface.
  */
 export function createBrowserPanelNativeSurfaceParticipant(
   options: BrowserPanelNativeSurfaceParticipantOptions,

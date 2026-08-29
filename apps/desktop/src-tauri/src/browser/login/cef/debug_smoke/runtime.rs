@@ -1299,7 +1299,6 @@ fn execute_manager_e2e(
         app,
         &sessions,
         &cef_host,
-        &preview,
         panel_session_id_a.clone(),
         workspace.clone(),
         None,
@@ -1307,7 +1306,7 @@ fn execute_manager_e2e(
         1,
     )?;
     cleanup.remember(&lease_a);
-    surfaces.production_smoke_sync(app, &cef_host, &preview, &mut lease_a, 2, true)?;
+    surfaces.production_smoke_sync(app, &cef_host, &mut lease_a, 2, true)?;
     cleanup.remember(&lease_a);
     surfaces.production_smoke_control_for_actor(
         app,
@@ -1415,7 +1414,6 @@ fn execute_manager_e2e(
         app,
         &sessions,
         &cef_host,
-        &preview,
         panel_session_id_b.clone(),
         workspace.clone(),
         Some(lease_a.profile_id.clone()),
@@ -1423,7 +1421,7 @@ fn execute_manager_e2e(
         4,
     )?;
     cleanup.remember(&lease_b);
-    surfaces.production_smoke_sync(app, &cef_host, &preview, &mut lease_b, 5, true)?;
+    surfaces.production_smoke_sync(app, &cef_host, &mut lease_b, 5, true)?;
     cleanup.remember(&lease_b);
     require_manager_pair_visibility(
         app,
@@ -1576,7 +1574,7 @@ fn execute_manager_e2e(
     recorder.record("manager_exact_actor_routes")?;
     check_cancelled(cancelled)?;
 
-    surfaces.production_smoke_sync(app, &cef_host, &preview, &mut lease_a, 7, true)?;
+    surfaces.production_smoke_sync(app, &cef_host, &mut lease_a, 7, true)?;
     cleanup.remember(&lease_a);
     require_manager_pair_visibility(
         app,
@@ -1586,7 +1584,7 @@ fn execute_manager_e2e(
         &lease_b.surface_id,
         false,
     )?;
-    surfaces.production_smoke_sync(app, &cef_host, &preview, &mut lease_b, 8, true)?;
+    surfaces.production_smoke_sync(app, &cef_host, &mut lease_b, 8, true)?;
     cleanup.remember(&lease_b);
     require_manager_pair_visibility(
         app,
@@ -1596,7 +1594,7 @@ fn execute_manager_e2e(
         &lease_b.surface_id,
         true,
     )?;
-    surfaces.production_smoke_sync(app, &cef_host, &preview, &mut lease_a, 9, true)?;
+    surfaces.production_smoke_sync(app, &cef_host, &mut lease_a, 9, true)?;
     cleanup.remember(&lease_a);
     require_manager_pair_visibility(
         app,
@@ -1671,7 +1669,7 @@ fn execute_manager_e2e(
             "macOS Mode 2 manager smoke retained Browser A actor after exact close".to_string(),
         );
     }
-    surfaces.production_smoke_sync(app, &cef_host, &preview, &mut lease_b, 11, true)?;
+    surfaces.production_smoke_sync(app, &cef_host, &mut lease_b, 11, true)?;
     cleanup.remember(&lease_b);
     let peer_b = manager_snapshot(
         &sessions,

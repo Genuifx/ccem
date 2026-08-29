@@ -6,7 +6,6 @@ use super::session::{
 use crate::browser::surface_coordinator::{
     BrowserSurfaceApplyOutcome, BrowserSurfaceBackend, BrowserSurfaceCoordinator,
 };
-use crate::browser::BrowserManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", windows))]
@@ -305,9 +304,8 @@ impl LoginBrowserSurfaceManager {
         app: &AppHandle,
         sessions: &Arc<LoginBrowserSessionManager>,
         cef_host: &Arc<CefHostController>,
-        _preview: &Arc<BrowserManager>,
         panel_session_id: String,
-        backend: BrowserSurfaceBackendArg,
+        _backend: BrowserSurfaceBackendArg,
         working_dir: Option<String>,
         profile_mode: Option<BrowserSurfaceProfileModeArg>,
         profile_id: Option<String>,
@@ -319,9 +317,6 @@ impl LoginBrowserSurfaceManager {
         validate_panel_session_id(&panel_session_id)?;
         if client_revision == 0 {
             return Err("Browser surface revision must be positive.".to_string());
-        }
-        if !matches!(backend, BrowserSurfaceBackendArg::Login) {
-            return Err("Preview Browser keeps its existing browser_* command path.".to_string());
         }
         let viewport = viewport.validate()?;
         let initial_url = crate::browser::url::parse_browser_url(
@@ -897,7 +892,6 @@ impl LoginBrowserSurfaceManager {
         &self,
         app: &AppHandle,
         cef_host: &Arc<CefHostController>,
-        preview: &Arc<BrowserManager>,
         lease_id: String,
         generation: u64,
         client_revision: u64,
@@ -935,7 +929,6 @@ impl LoginBrowserSurfaceManager {
         }
         if visible == Some(true) {
             self.hide_active_before_activation(app, cef_host, &active.panel_session_id)?;
-            preview.hide_all(app)?;
             if let Err(error) = cef_host.set_surface_visible(app, active.surface_id.clone(), true) {
                 let _ = cef_host.set_surface_visible(app, active.surface_id.clone(), false);
                 return Err(error);
@@ -1091,6 +1084,7 @@ impl LoginBrowserSurfaceManager {
             BrowserSurfaceNavigationActionArg::Back => CefSurfaceNavigationAction::Back,
             BrowserSurfaceNavigationActionArg::Forward => CefSurfaceNavigationAction::Forward,
             BrowserSurfaceNavigationActionArg::Reload => CefSurfaceNavigationAction::Reload,
+            BrowserSurfaceNavigationActionArg::Stop => CefSurfaceNavigationAction::Stop,
         };
         cef_host.navigation_action_surface(app, active.surface_id.clone(), native_action)?;
         let native = cef_host.surface_snapshot(app, active.surface_id)?;

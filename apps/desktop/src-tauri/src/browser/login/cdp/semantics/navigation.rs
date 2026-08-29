@@ -95,7 +95,7 @@ impl SemanticEngine {
             TrustedNavigationSurface::AgentNavigation,
         ));
         if decision.terminal() {
-            return Err(security_audit_failure());
+            return Err(navigation_policy_failure());
         }
         if !decision.allowed() {
             return Err(navigation_failure());
@@ -264,7 +264,7 @@ impl SemanticEngine {
             TrustedNavigationSurface::AgentEffect,
         ));
         if decision.terminal() {
-            return Err(security_audit_failure());
+            return Err(navigation_policy_failure());
         }
         if !decision.allowed() {
             return Err(BackendFailure::new(

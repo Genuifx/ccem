@@ -17,6 +17,8 @@ mod host_shortcut;
 mod recovery_state;
 #[cfg(any(target_os = "macos", windows))]
 mod renderer_recovery;
+#[cfg(any(target_os = "macos", windows))]
+use cef::*;
 use dispatch::run_cancellable_on_main;
 pub(crate) use geometry::{
     macos_child_bounds, profile_cache_path, LogicalViewport, NativeChildBounds,
@@ -28,6 +30,36 @@ pub(crate) use geometry::{validate_windows_native_window_observation, windows_ch
 use host_shortcut::HostShortcutKeyboardHandler;
 #[cfg(any(target_os = "macos", windows))]
 use renderer_recovery::SurfaceRequestHandler;
+
+#[cfg(any(target_os = "macos", windows))]
+wrap_download_handler! {
+    pub(super) struct SurfaceDownloadHandler;
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _download_item: Option<&mut DownloadItem>,
+            _suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            callback.cont(None, 1);
+            1
+        }
+    }
+}
 
 fn should_retire_surface_without_browser(browser_ready: bool, popup_active: bool) -> bool {
     !browser_ready && !popup_active
@@ -72,6 +104,7 @@ pub(crate) enum CefSurfaceNavigationAction {
     Back,
     Forward,
     Reload,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,8 +248,8 @@ impl CefSurfaceStateHandle {
         self.shared.snapshot().popup.is_some()
     }
 
-    pub(crate) fn lock_popups_for_agent(&self) -> Result<(), CefPopupAgentLockError> {
-        self.shared.lock_popups_for_agent()
+    pub(crate) fn allow_agent_popups(&self) -> Result<(), CefPopupAgentLockError> {
+        self.shared.allow_agent_popups()
     }
 
     pub(crate) fn deny_popups(&self) {
@@ -490,7 +523,7 @@ impl SharedSurfaceState {
         finished
     }
 
-    fn lock_popups_for_agent(&self) -> Result<(), CefPopupAgentLockError> {
+    fn allow_agent_popups(&self) -> Result<(), CefPopupAgentLockError> {
         let mut state = self
             .state
             .lock()
@@ -506,8 +539,8 @@ impl SharedSurfaceState {
         ) {
             return Err(CefPopupAgentLockError::SurfaceUnavailable);
         }
-        if state.user_popups_allowed {
-            state.user_popups_allowed = false;
+        if !state.user_popups_allowed {
+            state.user_popups_allowed = true;
             state.revision = state
                 .revision
                 .checked_add(1)
@@ -1002,7 +1035,7 @@ mod state_tests {
     }
 
     #[test]
-    fn popup_admission_is_atomic_across_user_agent_and_paused_control() {
+    fn popup_admission_follows_active_user_agent_and_paused_control() {
         let state = state();
         let handle = CefSurfaceStateHandle {
             shared: Arc::clone(&state),
@@ -1019,24 +1052,28 @@ mod state_tests {
             .expect("manual user popup");
         assert!(handle.popup_active());
         assert_eq!(
-            handle.lock_popups_for_agent(),
+            handle.allow_agent_popups(),
             Err(CefPopupAgentLockError::PopupActive)
         );
 
         assert!(state.finish_popup(17));
         handle
-            .lock_popups_for_agent()
-            .expect("handoff closes popup admission atomically");
-        assert!(state
+            .allow_agent_popups()
+            .expect("handoff keeps gesture-gated popup admission available to Agent clicks");
+        state
             .reserve_user_popup(18, "https://id.example/again".to_string())
-            .is_err());
+            .expect("Agent-owned browser may open one admitted popup");
+        assert!(state.finish_popup(18));
 
         handle.deny_popups();
+        assert!(state
+            .reserve_user_popup(19, "https://id.example/paused".to_string())
+            .is_err());
         handle
             .allow_user_popups()
             .expect("trusted user takeover restores popup admission");
         state
-            .reserve_user_popup(19, "about:blank".to_string())
+            .reserve_user_popup(20, "about:blank".to_string())
             .expect("manual popup after takeover");
     }
 

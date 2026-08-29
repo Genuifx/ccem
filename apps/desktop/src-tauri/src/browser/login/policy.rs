@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::collections::BTreeSet;
 use std::fmt;
 
 const MAX_BINDING_COMPONENT_CHARS: usize = 256;
@@ -185,65 +184,23 @@ fn bounded_binding_component(
     Ok(value.to_string())
 }
 
-/// An origin allowlist minted by trusted CCEM UI/service code for one handoff epoch.
+/// Browser-instance authority minted by trusted CCEM UI/service code for one handoff epoch.
+///
+/// The legacy type name is retained locally to keep the handoff/capability seam small. Authority
+/// is intentionally bound to the exact browser instance identity, not to the origin visible when
+/// the user handed it off.
 #[derive(Debug, Clone)]
 pub(super) struct TrustedOriginGrant {
     binding: BrowserGrantBinding,
-    origins: BTreeSet<NormalizedOrigin>,
 }
 
 impl TrustedOriginGrant {
-    pub(super) fn new_trusted<I, S>(
-        binding: BrowserGrantBinding,
-        origins: I,
-    ) -> Result<Self, BrowserPolicyError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let origins = origins
-            .into_iter()
-            .map(|origin| NormalizedOrigin::parse(origin.as_ref()))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        Ok(Self { binding, origins })
+    pub(super) fn new_trusted(binding: BrowserGrantBinding) -> Self {
+        Self { binding }
     }
 
     pub(super) fn binding(&self) -> &BrowserGrantBinding {
         &self.binding
-    }
-
-    pub(super) fn origins(&self) -> impl Iterator<Item = &NormalizedOrigin> {
-        self.origins.iter()
-    }
-}
-
-/// A one-use trusted confirmation for carrying data read at one origin into a mutating action at
-/// another. It is intentionally separate from the ordinary origin allowlist: granting both sites
-/// does not silently grant a cross-site data flow.
-#[derive(Debug)]
-pub(super) struct TrustedCrossOriginConfirmation {
-    binding: BrowserGrantBinding,
-    source: NormalizedOrigin,
-    destination: NormalizedOrigin,
-    consumed: bool,
-}
-
-impl TrustedCrossOriginConfirmation {
-    pub(super) fn new_trusted(
-        binding: BrowserGrantBinding,
-        source: NormalizedOrigin,
-        destination: NormalizedOrigin,
-    ) -> Self {
-        Self {
-            binding,
-            source,
-            destination,
-            consumed: false,
-        }
-    }
-
-    pub(super) fn is_consumed(&self) -> bool {
-        self.consumed
     }
 }
 
@@ -257,33 +214,12 @@ pub(super) enum BrowserPolicySurface {
     Mutation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BrowserPolicyEffect {
-    Navigate,
-    Mutate,
-}
-
-/// App-owned persisted provenance projected into the common origin-policy decision path.
-///
-/// The ledger stores only origin fingerprints, so a different prior origin cannot be recreated as
-/// a raw `NormalizedOrigin`. This closed enum lets policy reject that case without weakening the
-/// existing durable capability-decision audit boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BrowserDataProvenance {
-    UntrackedOrSameOrigin,
-    CrossOrigin,
-    Mixed,
-}
-
 /// Untrusted action attributes plus trusted service state. `paused` and `binding` must come from
 /// the Rust session registry, never from the Agent request or page content.
 pub(super) struct BrowserPolicyRequest<'a> {
     pub(super) binding: &'a BrowserGrantBinding,
     pub(super) surface: BrowserPolicySurface,
-    pub(super) effect: BrowserPolicyEffect,
-    pub(super) target_url: &'a str,
-    pub(super) source_data_origin: Option<&'a NormalizedOrigin>,
-    pub(super) data_provenance: BrowserDataProvenance,
+    pub(super) target_url: Option<&'a str>,
     pub(super) paused: bool,
 }
 
@@ -291,40 +227,26 @@ pub(super) struct BrowserPolicyRequest<'a> {
 #[serde(rename_all = "snake_case")]
 pub(super) enum BrowserPolicyCode {
     Allowed,
-    AllowedWithCrossOriginConfirmation,
     InvalidGrantBinding,
     InvalidOrigin,
     OriginCredentialsForbidden,
     UnsupportedOriginScheme,
-    OriginNotGranted,
-    SourceOriginNotGranted,
     GrantBindingMismatch,
     HandoffEpochMismatch,
     AgentControlPaused,
-    CrossOriginWriteBlocked,
-    MixedProvenanceWriteBlocked,
-    CrossOriginConfirmationMismatch,
-    CrossOriginConfirmationConsumed,
 }
 
 impl BrowserPolicyCode {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Allowed => "allowed",
-            Self::AllowedWithCrossOriginConfirmation => "allowed_with_cross_origin_confirmation",
             Self::InvalidGrantBinding => "invalid_grant_binding",
             Self::InvalidOrigin => "invalid_origin",
             Self::OriginCredentialsForbidden => "origin_credentials_forbidden",
             Self::UnsupportedOriginScheme => "unsupported_origin_scheme",
-            Self::OriginNotGranted => "origin_not_granted",
-            Self::SourceOriginNotGranted => "source_origin_not_granted",
             Self::GrantBindingMismatch => "grant_binding_mismatch",
             Self::HandoffEpochMismatch => "handoff_epoch_mismatch",
             Self::AgentControlPaused => "agent_control_paused",
-            Self::CrossOriginWriteBlocked => "cross_origin_write_blocked",
-            Self::MixedProvenanceWriteBlocked => "mixed_provenance_write_blocked",
-            Self::CrossOriginConfirmationMismatch => "cross_origin_confirmation_mismatch",
-            Self::CrossOriginConfirmationConsumed => "cross_origin_confirmation_consumed",
         }
     }
 }
@@ -335,24 +257,20 @@ pub(super) struct BrowserPolicyDecision {
     pub(super) code: BrowserPolicyCode,
     pub(super) surface: BrowserPolicySurface,
     pub(super) target_origin: Option<String>,
-    pub(super) source_data_origin: Option<String>,
     pub(super) handoff_epoch: u64,
 }
 
 impl BrowserPolicyDecision {
     fn allow(
         request: &BrowserPolicyRequest<'_>,
-        target: &NormalizedOrigin,
+        target: Option<&NormalizedOrigin>,
         code: BrowserPolicyCode,
     ) -> Self {
         Self {
             allowed: true,
             code,
             surface: request.surface,
-            target_origin: Some(target.as_serialized_origin()),
-            source_data_origin: request
-                .source_data_origin
-                .map(NormalizedOrigin::as_serialized_origin),
+            target_origin: target.map(NormalizedOrigin::as_serialized_origin),
             handoff_epoch: request.binding.handoff_epoch,
         }
     }
@@ -367,9 +285,6 @@ impl BrowserPolicyDecision {
             code,
             surface: request.surface,
             target_origin: target.map(NormalizedOrigin::as_serialized_origin),
-            source_data_origin: request
-                .source_data_origin
-                .map(NormalizedOrigin::as_serialized_origin),
             handoff_epoch: request.binding.handoff_epoch,
         }
     }
@@ -399,11 +314,10 @@ impl fmt::Display for BrowserPolicyError {
 
 impl std::error::Error for BrowserPolicyError {}
 
-/// The single fail-closed decision path for all origin-sensitive browser surfaces.
+/// The single decision path for browser-instance-owned HTTP(S) surfaces.
 pub(super) fn authorize_browser_request(
     grant: &TrustedOriginGrant,
     request: BrowserPolicyRequest<'_>,
-    confirmation: Option<&mut TrustedCrossOriginConfirmation>,
 ) -> BrowserPolicyDecision {
     if request.paused {
         return BrowserPolicyDecision::deny(&request, None, BrowserPolicyCode::AgentControlPaused);
@@ -423,86 +337,14 @@ pub(super) fn authorize_browser_request(
         );
     }
 
-    let target = match NormalizedOrigin::parse(request.target_url) {
-        Ok(target) => target,
-        Err(error) => return BrowserPolicyDecision::deny(&request, None, error.code),
+    let target = match request.target_url {
+        Some(target_url) => match NormalizedOrigin::parse(target_url) {
+            Ok(target) => Some(target),
+            Err(error) => return BrowserPolicyDecision::deny(&request, None, error.code),
+        },
+        None => None,
     };
-    if !grant.origins.contains(&target) {
-        return BrowserPolicyDecision::deny(
-            &request,
-            Some(&target),
-            BrowserPolicyCode::OriginNotGranted,
-        );
-    }
-
-    if let Some(source) = request.source_data_origin {
-        if !grant.origins.contains(source) {
-            return BrowserPolicyDecision::deny(
-                &request,
-                Some(&target),
-                BrowserPolicyCode::SourceOriginNotGranted,
-            );
-        }
-    }
-
-    if request.effect == BrowserPolicyEffect::Mutate {
-        match request.data_provenance {
-            BrowserDataProvenance::UntrackedOrSameOrigin => {}
-            BrowserDataProvenance::CrossOrigin => {
-                return BrowserPolicyDecision::deny(
-                    &request,
-                    Some(&target),
-                    BrowserPolicyCode::CrossOriginWriteBlocked,
-                );
-            }
-            BrowserDataProvenance::Mixed => {
-                return BrowserPolicyDecision::deny(
-                    &request,
-                    Some(&target),
-                    BrowserPolicyCode::MixedProvenanceWriteBlocked,
-                );
-            }
-        }
-    }
-
-    let cross_origin_source = request
-        .source_data_origin
-        .filter(|source| request.effect == BrowserPolicyEffect::Mutate && *source != &target);
-    let Some(source) = cross_origin_source else {
-        return BrowserPolicyDecision::allow(&request, &target, BrowserPolicyCode::Allowed);
-    };
-    let Some(confirmation) = confirmation else {
-        return BrowserPolicyDecision::deny(
-            &request,
-            Some(&target),
-            BrowserPolicyCode::CrossOriginWriteBlocked,
-        );
-    };
-    if confirmation.consumed {
-        return BrowserPolicyDecision::deny(
-            &request,
-            Some(&target),
-            BrowserPolicyCode::CrossOriginConfirmationConsumed,
-        );
-    }
-    if !confirmation.binding.same_identity(request.binding)
-        || confirmation.binding.handoff_epoch != request.binding.handoff_epoch
-        || confirmation.source != *source
-        || confirmation.destination != target
-    {
-        return BrowserPolicyDecision::deny(
-            &request,
-            Some(&target),
-            BrowserPolicyCode::CrossOriginConfirmationMismatch,
-        );
-    }
-
-    confirmation.consumed = true;
-    BrowserPolicyDecision::allow(
-        &request,
-        &target,
-        BrowserPolicyCode::AllowedWithCrossOriginConfirmation,
-    )
+    BrowserPolicyDecision::allow(&request, target.as_ref(), BrowserPolicyCode::Allowed)
 }
 
 #[cfg(test)]
@@ -515,27 +357,18 @@ mod tests {
     }
 
     fn grant(epoch: u64) -> TrustedOriginGrant {
-        TrustedOriginGrant::new_trusted(
-            binding(epoch),
-            ["https://allowed.example", "https://write.example:443"],
-        )
-        .expect("trusted origin grant")
+        TrustedOriginGrant::new_trusted(binding(epoch))
     }
 
     fn request<'a>(
         binding: &'a BrowserGrantBinding,
         surface: BrowserPolicySurface,
-        effect: BrowserPolicyEffect,
         target_url: &'a str,
-        source_data_origin: Option<&'a NormalizedOrigin>,
     ) -> BrowserPolicyRequest<'a> {
         BrowserPolicyRequest {
             binding,
             surface,
-            effect,
-            target_url,
-            source_data_origin,
-            data_provenance: BrowserDataProvenance::UntrackedOrSameOrigin,
+            target_url: Some(target_url),
             paused: false,
         }
     }
@@ -595,51 +428,60 @@ mod tests {
     }
 
     #[test]
-    fn every_surface_uses_the_same_fail_closed_origin_gate() {
+    fn active_browser_grant_allows_normal_cross_site_http_workflows() {
         let grant = grant(7);
         let binding = binding(7);
-        for (surface, effect) in [
+        for (surface, target) in [
             (
                 BrowserPolicySurface::InitialNavigation,
-                BrowserPolicyEffect::Navigate,
+                "https://search.example/results?q=ccem",
             ),
             (
                 BrowserPolicySurface::Redirect,
-                BrowserPolicyEffect::Navigate,
+                "https://identity.example/oauth/authorize",
             ),
-            (BrowserPolicySurface::Popup, BrowserPolicyEffect::Navigate),
+            (
+                BrowserPolicySurface::Popup,
+                "https://accounts.example/sign-in",
+            ),
             (
                 BrowserPolicySurface::IframeAction,
-                BrowserPolicyEffect::Mutate,
+                "https://payments.example/confirm",
             ),
-            (BrowserPolicySurface::Mutation, BrowserPolicyEffect::Mutate),
+            (
+                BrowserPolicySurface::Mutation,
+                "https://destination.example/form",
+            ),
         ] {
-            let allowed = authorize_browser_request(
-                &grant,
-                request(
-                    &binding,
-                    surface,
-                    effect,
-                    "https://allowed.example/page",
-                    None,
-                ),
-                None,
+            let decision = authorize_browser_request(&grant, request(&binding, surface, target));
+            assert!(
+                decision.allowed,
+                "active browser ownership should allow {surface:?}: {}",
+                decision.code.as_str()
             );
-            assert!(allowed.allowed, "{surface:?} should allow a granted origin");
+        }
+    }
 
-            let denied = authorize_browser_request(
+    #[test]
+    fn browser_instance_grant_still_rejects_non_http_schemes() {
+        let grant = grant(10);
+        let binding = binding(10);
+
+        for target in [
+            "about:blank",
+            "data:text/html,hello",
+            "file:///tmp/private",
+            "javascript:alert(1)",
+        ] {
+            let decision = authorize_browser_request(
                 &grant,
-                request(
-                    &binding,
-                    surface,
-                    effect,
-                    "https://denied.example/page",
-                    None,
-                ),
-                None,
+                request(&binding, BrowserPolicySurface::InitialNavigation, target),
             );
-            assert_eq!(denied.code, BrowserPolicyCode::OriginNotGranted);
-            assert!(!denied.allowed);
+            assert!(!decision.allowed, "must reject {target}");
+            assert!(matches!(
+                decision.code,
+                BrowserPolicyCode::InvalidOrigin | BrowserPolicyCode::UnsupportedOriginScheme
+            ));
         }
     }
 
@@ -659,11 +501,8 @@ mod tests {
                 request(
                     &mismatch,
                     BrowserPolicySurface::Mutation,
-                    BrowserPolicyEffect::Mutate,
                     "https://allowed.example",
-                    None,
                 ),
-                None,
             );
             assert_eq!(denied.code, BrowserPolicyCode::GrantBindingMismatch);
         }
@@ -674,11 +513,8 @@ mod tests {
             request(
                 &stale_epoch,
                 BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
                 "https://allowed.example",
-                None,
             ),
-            None,
         );
         assert_eq!(denied.code, BrowserPolicyCode::HandoffEpochMismatch);
     }
@@ -690,170 +526,24 @@ mod tests {
         let mut paused_request = request(
             &binding,
             BrowserPolicySurface::Mutation,
-            BrowserPolicyEffect::Mutate,
             "https://allowed.example/?resume=true",
-            None,
         );
         paused_request.paused = true;
-        let denied = authorize_browser_request(&grant, paused_request, None);
+        let denied = authorize_browser_request(&grant, paused_request);
         assert_eq!(denied.code, BrowserPolicyCode::AgentControlPaused);
-    }
-
-    #[test]
-    fn cross_origin_read_to_write_requires_matching_one_use_confirmation() {
-        let grant = grant(11);
-        let binding = binding(11);
-        let source = NormalizedOrigin::parse("https://allowed.example").expect("source");
-        let destination = NormalizedOrigin::parse("https://write.example").expect("destination");
-
-        let denied = authorize_browser_request(
-            &grant,
-            request(
-                &binding,
-                BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
-                "https://write.example/form",
-                Some(&source),
-            ),
-            None,
-        );
-        assert_eq!(denied.code, BrowserPolicyCode::CrossOriginWriteBlocked);
-
-        let mut confirmation = TrustedCrossOriginConfirmation::new_trusted(
-            binding.clone(),
-            source.clone(),
-            destination,
-        );
-        let allowed = authorize_browser_request(
-            &grant,
-            request(
-                &binding,
-                BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
-                "https://write.example/form",
-                Some(&source),
-            ),
-            Some(&mut confirmation),
-        );
-        assert_eq!(
-            allowed.code,
-            BrowserPolicyCode::AllowedWithCrossOriginConfirmation
-        );
-        assert!(confirmation.is_consumed());
-
-        let denied_reuse = authorize_browser_request(
-            &grant,
-            request(
-                &binding,
-                BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
-                "https://write.example/again",
-                Some(&source),
-            ),
-            Some(&mut confirmation),
-        );
-        assert_eq!(
-            denied_reuse.code,
-            BrowserPolicyCode::CrossOriginConfirmationConsumed
-        );
-    }
-
-    #[test]
-    fn persisted_cross_origin_and_mixed_provenance_fail_closed_in_policy() {
-        let grant = grant(15);
-        let binding = binding(15);
-        for (provenance, expected) in [
-            (
-                BrowserDataProvenance::CrossOrigin,
-                BrowserPolicyCode::CrossOriginWriteBlocked,
-            ),
-            (
-                BrowserDataProvenance::Mixed,
-                BrowserPolicyCode::MixedProvenanceWriteBlocked,
-            ),
-        ] {
-            let mut write = request(
-                &binding,
-                BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
-                "https://allowed.example/form",
-                None,
-            );
-            write.data_provenance = provenance;
-            let denied = authorize_browser_request(&grant, write, None);
-            assert!(!denied.allowed);
-            assert_eq!(denied.code, expected);
-        }
-    }
-
-    #[test]
-    fn mismatched_cross_origin_confirmation_fails_without_consuming_the_grant() {
-        let grant = grant(13);
-        let binding = binding(13);
-        let source = NormalizedOrigin::parse("https://allowed.example").expect("source");
-        let wrong_destination =
-            NormalizedOrigin::parse("https://allowed.example").expect("wrong destination");
-        let mut confirmation = TrustedCrossOriginConfirmation::new_trusted(
-            binding.clone(),
-            source.clone(),
-            wrong_destination,
-        );
-        let denied = authorize_browser_request(
-            &grant,
-            request(
-                &binding,
-                BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
-                "https://write.example/form",
-                Some(&source),
-            ),
-            Some(&mut confirmation),
-        );
-        assert_eq!(
-            denied.code,
-            BrowserPolicyCode::CrossOriginConfirmationMismatch
-        );
-        assert!(!confirmation.is_consumed());
-    }
-
-    #[test]
-    fn data_from_an_ungranted_source_cannot_enter_even_a_granted_destination() {
-        let grant = grant(12);
-        let binding = binding(12);
-        let ungranted_source =
-            NormalizedOrigin::parse("https://source-not-granted.example").expect("source");
-        let denied = authorize_browser_request(
-            &grant,
-            request(
-                &binding,
-                BrowserPolicySurface::Mutation,
-                BrowserPolicyEffect::Mutate,
-                "https://write.example/form",
-                Some(&ungranted_source),
-            ),
-            None,
-        );
-        assert_eq!(denied.code, BrowserPolicyCode::SourceOriginNotGranted);
     }
 
     #[test]
     fn policy_codes_are_stable_and_bounded() {
         for code in [
             BrowserPolicyCode::Allowed,
-            BrowserPolicyCode::AllowedWithCrossOriginConfirmation,
             BrowserPolicyCode::InvalidGrantBinding,
             BrowserPolicyCode::InvalidOrigin,
             BrowserPolicyCode::OriginCredentialsForbidden,
             BrowserPolicyCode::UnsupportedOriginScheme,
-            BrowserPolicyCode::OriginNotGranted,
-            BrowserPolicyCode::SourceOriginNotGranted,
             BrowserPolicyCode::GrantBindingMismatch,
             BrowserPolicyCode::HandoffEpochMismatch,
             BrowserPolicyCode::AgentControlPaused,
-            BrowserPolicyCode::CrossOriginWriteBlocked,
-            BrowserPolicyCode::MixedProvenanceWriteBlocked,
-            BrowserPolicyCode::CrossOriginConfirmationMismatch,
-            BrowserPolicyCode::CrossOriginConfirmationConsumed,
         ] {
             let value = code.as_str();
             assert!(value.len() <= 64);
