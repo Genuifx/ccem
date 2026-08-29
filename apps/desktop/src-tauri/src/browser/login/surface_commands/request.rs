@@ -34,6 +34,35 @@ pub(crate) enum BrowserSurfaceControlActionArg {
     Occlude,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserSurfaceNavigationActionArg {
+    Back,
+    Forward,
+    Reload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BrowserSurfaceNavigationActionArg;
+
+    #[test]
+    fn navigation_action_is_a_closed_snake_case_protocol() {
+        for (raw, expected) in [
+            ("\"back\"", BrowserSurfaceNavigationActionArg::Back),
+            ("\"forward\"", BrowserSurfaceNavigationActionArg::Forward),
+            ("\"reload\"", BrowserSurfaceNavigationActionArg::Reload),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<BrowserSurfaceNavigationActionArg>(raw)
+                    .expect("known action"),
+                expected
+            );
+        }
+        assert!(serde_json::from_str::<BrowserSurfaceNavigationActionArg>("\"stop\"").is_err());
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub(crate) struct BrowserSurfaceViewportArg {
     pub(super) x: f64,

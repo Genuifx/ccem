@@ -45,6 +45,8 @@ pub(crate) struct BrowserSurfaceSnapshotResponse {
     title: Option<String>,
     pub(super) visible: bool,
     loading: bool,
+    can_go_back: bool,
+    can_go_forward: bool,
     pub(super) error: Option<String>,
     pub(super) lifecycle: &'static str,
     control: &'static str,
@@ -132,6 +134,8 @@ pub(super) fn snapshot_response(
             native.lifecycle,
             CefSurfaceLifecycle::Creating | CefSurfaceLifecycle::Loading
         ),
+        can_go_back: native.can_go_back,
+        can_go_forward: native.can_go_forward,
         error: native.error.clone(),
         lifecycle: match native.lifecycle {
             CefSurfaceLifecycle::Creating => "creating",
@@ -259,6 +263,8 @@ mod tests {
                 title: Some("current".to_string()),
                 visible: true,
                 loading: false,
+                can_go_back: true,
+                can_go_forward: false,
                 error: None,
                 lifecycle: "ready",
                 control: "user",
@@ -277,6 +283,8 @@ mod tests {
         assert_eq!(json["lease_id"], "lease-a");
         assert_eq!(json["generation"], 8);
         assert_eq!(json["server_sequence"], 17);
+        assert_eq!(json["snapshot"]["can_go_back"], true);
+        assert_eq!(json["snapshot"]["can_go_forward"], false);
         assert_eq!(
             json["snapshot"]["recovery_states"][0],
             "recovered_runtime_owned"

@@ -1,5 +1,8 @@
 use super::devtools_bridge::{CefDevToolsReader, CefDevToolsWriter};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -64,6 +67,13 @@ pub(crate) enum CefSurfaceRecoveryState {
     RendererProcessTerminated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CefSurfaceNavigationAction {
+    Back,
+    Forward,
+    Reload,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CefPopupSnapshot {
     pub(crate) popup_id: i32,
@@ -89,6 +99,8 @@ pub(crate) struct CefSurfaceSnapshot {
     pub(crate) lifecycle: CefSurfaceLifecycle,
     pub(crate) devtools_attached: bool,
     pub(crate) current_url: String,
+    pub(crate) can_go_back: bool,
+    pub(crate) can_go_forward: bool,
     pub(crate) title: Option<String>,
     pub(crate) visible: bool,
     pub(crate) error: Option<String>,
@@ -219,6 +231,8 @@ impl CefSurfaceStateHandle {
 pub(super) struct SharedSurfaceState {
     state: Mutex<CefSurfaceSnapshot>,
     focus_restore: Mutex<focus_restore::FocusRestoreIntent>,
+    initial_url: String,
+    initial_document_started: AtomicBool,
     changed: Condvar,
 }
 
@@ -234,6 +248,8 @@ impl SharedSurfaceState {
                 // Do not report the requested URL as current until CEF confirms a
                 // main-frame load. Consumers use this snapshot as runtime evidence.
                 current_url: String::new(),
+                can_go_back: false,
+                can_go_forward: false,
                 title: None,
                 visible: spec.visible,
                 error: None,
@@ -244,8 +260,16 @@ impl SharedSurfaceState {
                 user_popups_allowed: false,
             }),
             focus_restore: Mutex::new(focus_restore::FocusRestoreIntent::default()),
+            initial_url: spec.initial_url.clone(),
+            initial_document_started: AtomicBool::new(spec.initial_url == "about:blank"),
             changed: Condvar::new(),
         })
+    }
+
+    pub(super) fn mark_main_document_started(&self, current_url: &str) {
+        if current_url != "about:blank" || self.initial_url == "about:blank" {
+            self.initial_document_started.store(true, Ordering::Release);
+        }
     }
 
     pub(super) fn snapshot(&self) -> CefSurfaceSnapshot {
@@ -262,6 +286,15 @@ impl SharedSurfaceState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = state.clone();
         update(&mut state);
+        if matches!(
+            state.lifecycle,
+            CefSurfaceLifecycle::Closing
+                | CefSurfaceLifecycle::Closed
+                | CefSurfaceLifecycle::Failed
+        ) {
+            state.can_go_back = false;
+            state.can_go_forward = false;
+        }
         // Revisions are owned by SharedSurfaceState, never by individual CEF
         // callbacks. Reset an accidental callback mutation before comparison.
         state.revision = before.revision;
@@ -280,6 +313,41 @@ impl SharedSurfaceState {
         let error = error.into();
         self.update(|state| {
             state.error = Some(error);
+        });
+    }
+
+    pub(super) fn update_loading_state(
+        &self,
+        is_loading: bool,
+        can_go_back: bool,
+        can_go_forward: bool,
+        current_url: Option<String>,
+    ) {
+        if !is_loading
+            && self.initial_url != "about:blank"
+            && !self.initial_document_started.load(Ordering::Acquire)
+        {
+            return;
+        }
+        self.update(|state| {
+            if matches!(
+                state.lifecycle,
+                CefSurfaceLifecycle::Closing
+                    | CefSurfaceLifecycle::Closed
+                    | CefSurfaceLifecycle::Failed
+            ) {
+                return;
+            }
+            state.can_go_back = can_go_back;
+            state.can_go_forward = can_go_forward;
+            if let Some(current_url) = current_url.filter(|url| !url.is_empty()) {
+                state.current_url = current_url;
+            }
+            state.lifecycle = if is_loading {
+                CefSurfaceLifecycle::Loading
+            } else {
+                CefSurfaceLifecycle::Ready
+            };
         });
     }
 
@@ -656,10 +724,14 @@ mod state_tests {
     use super::*;
 
     fn state() -> Arc<SharedSurfaceState> {
+        state_with_initial_url("about:blank")
+    }
+
+    fn state_with_initial_url(initial_url: &str) -> Arc<SharedSurfaceState> {
         SharedSurfaceState::new(&CefSurfaceOpenSpec {
             surface_id: "surface-state-test".to_string(),
             profile_id: "profile-state-test".to_string(),
-            initial_url: "about:blank".to_string(),
+            initial_url: initial_url.to_string(),
             parent_view: 1,
             bounds: NativeChildBounds {
                 x: 0,
@@ -670,6 +742,28 @@ mod state_tests {
             visible: false,
             persistent_profile_storage: false,
         })
+    }
+
+    #[test]
+    fn bootstrap_about_blank_cannot_publish_ready_before_the_requested_document_starts() {
+        let state = state_with_initial_url("https://example.test/target");
+
+        state.begin_main_frame_load("about:blank".to_string());
+        state.update_loading_state(false, false, false, Some("about:blank".to_string()));
+        let bootstrap = state.snapshot();
+        assert_eq!(bootstrap.lifecycle, CefSurfaceLifecycle::Loading);
+        assert_eq!(bootstrap.current_url, "about:blank");
+
+        state.begin_main_frame_load("https://example.test/target".to_string());
+        state.update_loading_state(
+            false,
+            false,
+            false,
+            Some("https://example.test/target".to_string()),
+        );
+        let requested = state.snapshot();
+        assert_eq!(requested.lifecycle, CefSurfaceLifecycle::Ready);
+        assert_eq!(requested.current_url, "https://example.test/target");
     }
 
     #[test]
@@ -727,6 +821,46 @@ mod state_tests {
         });
         assert_eq!(state.snapshot().lifecycle, CefSurfaceLifecycle::Loading);
         assert!(state.snapshot().error.is_none());
+    }
+
+    #[test]
+    fn loading_state_closes_same_document_navigation_and_fails_closed_when_terminal() {
+        let state = state();
+        let initial = state.snapshot();
+        assert!(!initial.can_go_back);
+        assert!(!initial.can_go_forward);
+
+        state
+            .begin_navigation()
+            .expect("begin same-document navigation");
+        state.update_loading_state(
+            false,
+            true,
+            false,
+            Some("https://example.test/page#next".to_string()),
+        );
+        let navigated = state.snapshot();
+        assert_eq!(navigated.lifecycle, CefSurfaceLifecycle::Ready);
+        assert_eq!(navigated.current_url, "https://example.test/page#next");
+        assert!(navigated.can_go_back);
+        assert!(!navigated.can_go_forward);
+
+        state.update(|snapshot| snapshot.lifecycle = CefSurfaceLifecycle::Closing);
+        let closing = state.snapshot();
+        assert!(!closing.can_go_back);
+        assert!(!closing.can_go_forward);
+
+        state.update_loading_state(
+            false,
+            true,
+            true,
+            Some("https://example.test/late".to_string()),
+        );
+        let late_callback = state.snapshot();
+        assert_eq!(late_callback.lifecycle, CefSurfaceLifecycle::Closing);
+        assert_eq!(late_callback.current_url, "https://example.test/page#next");
+        assert!(!late_callback.can_go_back);
+        assert!(!late_callback.can_go_forward);
     }
 
     #[test]

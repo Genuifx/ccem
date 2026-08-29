@@ -657,6 +657,57 @@ fn retained_panel_registry_switches_a_to_b_to_a_without_removing_a() {
 }
 
 #[test]
+fn retained_hidden_surface_loses_manual_navigation_ownership_after_visible_switch() {
+    let mut epoch = PresentationEpoch::default();
+    let mut instances = BrowserSurfaceInstanceRegistry::default();
+    instances.insert("panel-a".to_string(), "surface-a");
+    instances.insert("panel-b".to_string(), "surface-b");
+
+    assert!(epoch.accepts_login_visibility(1, "panel-a", true));
+    instances.activate("panel-a");
+    assert!(is_active_login_presentation_owner(
+        &instances, &epoch, "panel-a", true
+    ));
+
+    // Trusted overlay occlusion intentionally keeps the semantic owner and retained runtime,
+    // but the hidden native surface must no longer accept delayed manual navigation IPC.
+    assert!(!is_active_login_presentation_owner(
+        &instances, &epoch, "panel-a", false
+    ));
+
+    // The physical A runtime remains retained, but B now owns the one visible browser slot.
+    assert!(epoch.accepts_login_visibility(2, "panel-b", true));
+    instances.activate("panel-b");
+    assert_eq!(instances.get("panel-a"), Some(&"surface-a"));
+    assert!(!is_active_login_presentation_owner(
+        &instances, &epoch, "panel-a", true
+    ));
+    assert!(is_active_login_presentation_owner(
+        &instances, &epoch, "panel-b", true
+    ));
+}
+
+#[test]
+fn cleanup_required_user_session_is_not_eligible_for_manual_navigation() {
+    let mut session = LoginBrowserSessionSnapshot {
+        session_id: "login-session-test".to_string(),
+        profile_id: "profile-test".to_string(),
+        workspace_id: "workspace-test".to_string(),
+        runtime_version: "test".to_string(),
+        control: SessionControlOwner::User,
+        handoff_epoch: 0,
+        current_origin: None,
+        status: LoginBrowserSessionStatus::Running,
+    };
+    assert!(ensure_manual_navigation_session(&session).is_ok());
+
+    session.status = LoginBrowserSessionStatus::CleanupRequired;
+    let error = ensure_manual_navigation_session(&session)
+        .expect_err("cleanup-required session must reject native navigation");
+    assert!(error.contains("running"));
+}
+
+#[test]
 fn retained_reacquire_preflight_happens_before_lease_rotation() {
     let source = include_str!("../surface_commands.rs");
     let acquire_start = source.find("fn acquire_login(").expect("acquire source");
@@ -880,4 +931,80 @@ fn watcher_reloads_authoritative_state_inside_the_command_operation_lane() {
     assert!(recovery_fence < fresh_response);
     assert!(fresh_response < publish);
     assert!(!watcher[operation..publish].contains("force_stop"));
+}
+
+#[test]
+fn navigation_action_is_fenced_before_native_dispatch_and_returns_authoritative_snapshot() {
+    let source = include_str!("../surface_commands.rs");
+    let start = source
+        .find("fn navigation_action(")
+        .expect("navigation action source");
+    let end = source[start..]
+        .find("fn transition_control(")
+        .map(|offset| start + offset)
+        .expect("navigation action boundary");
+    let action = &source[start..end];
+    let operation = action
+        .find("self.mutation_operation()")
+        .expect("mutation lane");
+    let exact_lease = action
+        .find("self.apply_instance_revision")
+        .expect("exact lease and revision fence");
+    let running_user_session = action
+        .find("ensure_manual_navigation_session")
+        .expect("running user session fence");
+    let native_visible = action
+        .find("active.native_state.snapshot().visible")
+        .expect("native visibility fence");
+    let visible_owner = action
+        .find("owns_visible_presentation")
+        .expect("active visible presentation owner fence");
+    let native = action
+        .find("cef_host.navigation_action_surface")
+        .expect("native navigation action");
+    let snapshot = action
+        .find("cef_host.surface_snapshot")
+        .expect("authoritative native snapshot");
+    let response = action
+        .find("snapshot_mutation_response")
+        .expect("lease-bound response");
+
+    assert!(operation < exact_lease);
+    assert!(exact_lease < running_user_session);
+    assert!(running_user_session < native_visible);
+    assert!(native_visible < visible_owner);
+    assert!(visible_owner < native);
+    assert!(native < snapshot);
+    assert!(snapshot < response);
+}
+
+#[test]
+fn url_navigation_requires_running_user_and_visible_owner_before_native_dispatch() {
+    let source = include_str!("../surface_commands.rs");
+    let start = source.find("fn navigate(").expect("navigate source");
+    let end = source[start..]
+        .find("fn navigation_action(")
+        .map(|offset| start + offset)
+        .expect("navigate boundary");
+    let navigate = &source[start..end];
+    let exact_lease = navigate
+        .find("self.apply_instance_revision")
+        .expect("exact lease and revision fence");
+    let running_user_session = navigate
+        .find("ensure_manual_navigation_session")
+        .expect("running user session fence");
+    let native_visible = navigate
+        .find("active.native_state.snapshot().visible")
+        .expect("native visibility fence");
+    let visible_owner = navigate
+        .find("owns_visible_presentation")
+        .expect("active visible presentation owner fence");
+    let native = navigate
+        .find("cef_host.navigate_surface")
+        .expect("native URL navigation");
+
+    assert!(exact_lease < running_user_session);
+    assert!(running_user_session < native_visible);
+    assert!(native_visible < visible_owner);
+    assert!(visible_owner < native);
 }

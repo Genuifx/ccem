@@ -24,6 +24,7 @@ import {
   type BrowserSurfaceHostShortcutAction,
   type BrowserSurfaceHostShortcutEvent,
   type BrowserSurfaceLeaseIdentity,
+  type BrowserSurfaceNavigationAction,
   type BrowserSurfaceOrdering,
   type BrowserSurfaceProfileSelection,
   type BrowserSurfaceRecoveryState,
@@ -62,6 +63,7 @@ type BrowserPanelLifecycle = NonNullable<BrowserSurfaceSnapshot['lifecycle']>;
 type BrowserPanelControl = NonNullable<BrowserSurfaceSnapshot['control']>;
 
 class BrowserControlSupersededError extends Error {}
+class BrowserNavigationSupersededError extends Error {}
 
 const browserSurfaceClient = createBrowserSurfaceClient({
   invoke: (command, args) => invoke(command, args),
@@ -130,6 +132,7 @@ export function BrowserPanel({
   const surfaceOrdering = surfaceOrderingRef.current;
   const surfaceClosingRef = useRef(false);
   const surfaceCloseSucceededRef = useRef(false);
+  const manualNavigationBusyRef = useRef(false);
   const autoHandoffAttemptedLeaseRef = useRef<string | null>(null);
   const onHostShortcutRef = useRef(onHostShortcut);
   onHostShortcutRef.current = onHostShortcut;
@@ -147,6 +150,7 @@ export function BrowserPanel({
   const loginProfileId = profileMode === 'saved' ? profileId : undefined;
   const [currentUrl, setCurrentUrl] = useState<string | null>(defaultUrl ?? null);
   const [authoritativeUrl, setAuthoritativeUrl] = useState<string | null>(null);
+  const authoritativeUrlRef = useRef<string | null>(null);
   const [urlInput, setUrlInput] = useState(defaultUrl ?? '');
   const [isUrlEditing, setIsUrlEditing] = useState(false);
   const [title, setTitle] = useState<string | null>(null);
@@ -163,10 +167,20 @@ export function BrowserPanel({
   const [popupLoading, setPopupLoading] = useState(false);
   const [popupError, setPopupError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
   const [isLoginControlBusy, setIsLoginControlBusy] = useState(false);
   const [isPopupCloseBusy, setIsPopupCloseBusy] = useState(false);
   const [isClosingSurface, setIsClosingSurface] = useState(false);
   const [isSurfaceReady, setIsSurfaceReady] = useState(false);
+  const controlRef = useRef(control);
+  controlRef.current = control;
+  const lifecycleRef = useRef(lifecycle);
+  lifecycleRef.current = lifecycle;
+  const isLoadingRef = useRef(isLoading);
+  isLoadingRef.current = isLoading;
+  const isLoginControlBusyRef = useRef(isLoginControlBusy);
+  isLoginControlBusyRef.current = isLoginControlBusy;
   const sessionStatusRef = useRef(sessionStatus);
   sessionStatusRef.current = sessionStatus;
   const popupActiveRef = useRef(popupActive);
@@ -175,6 +189,7 @@ export function BrowserPanel({
   const applySurfaceSnapshot = useCallback((snapshot?: BrowserSurfaceSnapshot | null) => {
     if (!snapshot) return;
     if (snapshot.url !== undefined) {
+      authoritativeUrlRef.current = snapshot.url ?? null;
       setAuthoritativeUrl(snapshot.url ?? null);
       setCurrentUrl(snapshot.url ?? null);
       if (!isUrlEditingRef.current) setUrlInput(snapshot.url ?? '');
@@ -184,6 +199,8 @@ export function BrowserPanel({
     if (snapshot.control !== undefined) setControl(snapshot.control);
     if (snapshot.paused !== undefined) setPaused(snapshot.paused);
     if (snapshot.loading !== undefined) setIsLoading(snapshot.loading);
+    if (snapshot.can_go_back !== undefined) setCanGoBack(snapshot.can_go_back);
+    if (snapshot.can_go_forward !== undefined) setCanGoForward(snapshot.can_go_forward);
     if (snapshot.recovery_states?.includes('renderer_process_terminated')) {
       setError(t('workspace.browserRecoveryRendererStopped'));
     } else if (snapshot.error !== undefined) {
@@ -294,6 +311,7 @@ export function BrowserPanel({
     let unlistenHostShortcut: (() => void) | null = null;
     const pendingStates: BrowserSurfaceStateChangedEvent[] = [];
     setLifecycle('creating');
+    authoritativeUrlRef.current = null;
     setAuthoritativeUrl(null);
     setIsSurfaceReady(false);
     setIsBusy(true);
@@ -311,6 +329,8 @@ export function BrowserPanel({
     setPopupTitle(null);
     setPopupLoading(false);
     setPopupError(null);
+    setCanGoBack(false);
+    setCanGoForward(false);
 
     if (!workingDir.trim() || (profileMode === 'saved' && !loginProfileId?.trim())) {
       lifecycleActionsRef.current.showBrowserError(
@@ -495,40 +515,140 @@ export function BrowserPanel({
   useNativeBrowserSurfaceGeometrySync(frameRef, syncBounds, isActiveSurface);
 
   const navigate = useCallback(async (rawValue: string) => {
+    if (manualNavigationBusyRef.current) return;
     if (popupActive) {
       showBrowserError(t('workspace.browserPopupCloseBeforeNavigate'));
       return;
     }
+    if (controlRef.current !== 'user') return;
     const nextUrl = normalizeBrowserInput(rawValue);
     if (!nextUrl) {
       setUrlInput(currentUrl ?? '');
       return;
     }
+    const lease = surfaceLeaseRef.current;
+    if (!lease) {
+      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      return;
+    }
     const previousUrl = currentUrl;
+    manualNavigationBusyRef.current = true;
     setIsBusy(true);
     setError(null);
     setUrlInput(nextUrl);
-    setCurrentUrl(nextUrl);
     try {
-      const lease = surfaceLeaseRef.current;
-      if (!lease) throw new Error(t('workspace.browserSurfaceUnavailable'));
-      await surfaceOrdering.enqueue((clientRevision) => (
-        browserSurfaceClient.navigate({
+      await surfaceOrdering.enqueue((clientRevision) => {
+        const currentLease = surfaceLeaseRef.current;
+        const leaseChanged = !currentLease
+          || currentLease.leaseId !== lease.leaseId
+          || currentLease.generation !== lease.generation;
+        const navigationContextChanged = controlRef.current !== 'user'
+          || lifecycleRef.current !== 'ready'
+          || isLoadingRef.current
+          || isLoginControlBusyRef.current
+          || !isActiveSurfaceRef.current
+          || surfaceOccludedRef.current
+          || nativeSurfaceOcclusionStore.isOccluded()
+          || popupActiveRef.current
+          || sessionStatusRef.current !== 'running';
+        if (leaseChanged || surfaceClosingRef.current || navigationContextChanged) {
+          throw new BrowserNavigationSupersededError();
+        }
+        return browserSurfaceClient.navigate({
           leaseId: lease.leaseId,
           generation: lease.generation,
           clientRevision,
           url: nextUrl,
-        })
-      ));
+        });
+      });
       setIsUrlEditing(false);
     } catch (navigateError) {
-      setCurrentUrl(previousUrl);
-      setUrlInput(previousUrl ?? '');
-      showBrowserError(String(navigateError));
+      const currentLease = surfaceLeaseRef.current;
+      const leaseStillCurrent = currentLease?.leaseId === lease.leaseId
+        && currentLease.generation === lease.generation
+        && !surfaceClosingRef.current;
+      if (leaseStillCurrent) {
+        setUrlInput(authoritativeUrlRef.current ?? previousUrl ?? '');
+        if (navigateError instanceof BrowserNavigationSupersededError) {
+          setIsUrlEditing(false);
+        }
+      }
+      if (!(navigateError instanceof BrowserNavigationSupersededError)) {
+        showBrowserError(String(navigateError));
+      }
     } finally {
-      setIsBusy(false);
+      manualNavigationBusyRef.current = false;
+      const currentLease = surfaceLeaseRef.current;
+      if (
+        currentLease?.leaseId === lease.leaseId
+        && currentLease.generation === lease.generation
+        && !surfaceClosingRef.current
+      ) {
+        setIsBusy(false);
+      }
     }
   }, [currentUrl, popupActive, showBrowserError, surfaceOrdering, t]);
+
+  const handleNavigationAction = useCallback(async (
+    action: BrowserSurfaceNavigationAction,
+  ) => {
+    if (manualNavigationBusyRef.current) return;
+    const lease = surfaceLeaseRef.current;
+    if (!lease) {
+      showBrowserError(t('workspace.browserSurfaceUnavailable'));
+      return;
+    }
+    manualNavigationBusyRef.current = true;
+    setIsBusy(true);
+    setError(null);
+    try {
+      const response = await surfaceOrdering.enqueue((clientRevision) => {
+        const currentLease = surfaceLeaseRef.current;
+        const leaseChanged = !currentLease
+          || currentLease.leaseId !== lease.leaseId
+          || currentLease.generation !== lease.generation;
+        const navigationContextChanged = controlRef.current !== 'user'
+          || lifecycleRef.current !== 'ready'
+          || isLoadingRef.current
+          || isLoginControlBusyRef.current
+          || !isActiveSurfaceRef.current
+          || surfaceOccludedRef.current
+          || nativeSurfaceOcclusionStore.isOccluded()
+          || popupActiveRef.current
+          || sessionStatusRef.current !== 'running';
+        if (leaseChanged || surfaceClosingRef.current || navigationContextChanged) {
+          throw new BrowserNavigationSupersededError();
+        }
+        return browserSurfaceClient.navigationAction({
+          leaseId: lease.leaseId,
+          generation: lease.generation,
+          clientRevision,
+          action,
+        });
+      });
+      applyBrowserSurfaceMutationResponseForLease(
+        surfaceOrdering,
+        surfaceLeaseRef.current,
+        lease,
+        response,
+        applySurfaceSnapshot,
+      );
+    } catch (navigationError) {
+      if (!(navigationError instanceof BrowserNavigationSupersededError)) {
+        showBrowserError(String(navigationError));
+      }
+    } finally {
+      manualNavigationBusyRef.current = false;
+      const currentLease = surfaceLeaseRef.current;
+      if (
+        currentLease?.leaseId === lease.leaseId
+        && currentLease.generation === lease.generation
+        && !surfaceClosingRef.current
+      ) {
+        setIsBusy(false);
+      }
+    }
+  }, [applySurfaceSnapshot, showBrowserError, surfaceOrdering, t]);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -576,10 +696,10 @@ export function BrowserPanel({
   }, [currentUrl]);
 
   const handleStartUrlEditing = useCallback(() => {
-    if (popupActive) return;
+    if (popupActive || control !== 'user') return;
     setUrlInput(currentUrl ?? '');
     setIsUrlEditing(true);
-  }, [currentUrl, popupActive]);
+  }, [control, currentUrl, popupActive]);
 
   const handleOpenExternal = useCallback(() => {
     const targetUrl = popupActive ? popupUrl : currentUrl;
@@ -723,6 +843,17 @@ export function BrowserPanel({
   const panelTitle = t('workspace.browserTitle');
   const effectiveUrl = popupActive ? popupUrl : currentUrl;
   const displayUrl = effectiveUrl || (popupActive ? popupTitle : title) || panelTitle;
+  const navigationDisabled = !isSurfaceReady
+    || lifecycle !== 'ready'
+    || sessionStatus !== 'running'
+    || control !== 'user'
+    || !isActiveSurface
+    || surfaceOccluded
+    || popupActive
+    || isBusy
+    || isLoading
+    || isLoginControlBusy
+    || isClosingSurface;
 
   return (
     <aside
@@ -777,7 +908,11 @@ export function BrowserPanel({
         paused={paused}
         isLoginControlBusy={isLoginControlBusy}
         canHandoffAgent={Boolean(loginAgentSessionId)}
+        canGoBack={canGoBack}
+        canGoForward={canGoForward}
+        navigationDisabled={navigationDisabled}
         t={t}
+        onNavigationAction={(action) => void handleNavigationAction(action)}
         onOpenExternal={handleOpenExternal}
         onLoginControl={(action) => void handleLoginControl(action)}
         onSubmit={handleSubmit}

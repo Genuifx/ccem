@@ -1,8 +1,8 @@
 use super::{
     diagnostic_url, profile_cache_path, run_cancellable_on_main,
     should_retire_surface_without_browser, validate_surface_id, CefSurfaceConnection,
-    CefSurfaceLifecycle, CefSurfaceOpenSpec, HostShortcutKeyboardHandler, NativeChildBounds,
-    SharedSurfaceState, SurfaceRequestHandler,
+    CefSurfaceLifecycle, CefSurfaceNavigationAction, CefSurfaceOpenSpec,
+    HostShortcutKeyboardHandler, NativeChildBounds, SharedSurfaceState, SurfaceRequestHandler,
 };
 use crate::browser::login::cef::{
     devtools_bridge::{CefDevToolsBridge, CefDevToolsObserver},
@@ -193,6 +193,24 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
+        fn on_loading_state_change(
+            &self,
+            browser: Option<&mut Browser>,
+            is_loading: i32,
+            can_go_back: i32,
+            can_go_forward: i32,
+        ) {
+            let current_url = browser
+                .and_then(|browser| browser.main_frame())
+                .map(|frame| CefString::from(&frame.url()).to_string());
+            self.shared.update_loading_state(
+                is_loading != 0,
+                can_go_back != 0,
+                can_go_forward != 0,
+                current_url,
+            );
+        }
+
         fn on_load_start(
             &self,
             _browser: Option<&mut Browser>,
@@ -770,6 +788,9 @@ pub(crate) fn navigate(surface_id: &str, url: &str) -> Result<(), String> {
         if surface.popup.is_some() {
             return Err("Close the Login Browser popup before navigating the opener.".to_string());
         }
+        if surface.shared.snapshot().lifecycle != CefSurfaceLifecycle::Ready {
+            return Err("CEF surface is not ready for navigation".to_string());
+        }
         let browser = surface
             .browser
             .as_ref()
@@ -780,6 +801,38 @@ pub(crate) fn navigate(surface_id: &str, url: &str) -> Result<(), String> {
         surface.shared.begin_navigation()?;
         let url = CefString::from(url);
         frame.load_url(Some(&url));
+        Ok(())
+    })
+}
+
+pub(crate) fn navigation_action(
+    surface_id: &str,
+    action: CefSurfaceNavigationAction,
+) -> Result<(), String> {
+    require_main_thread()?;
+    with_surface(surface_id, |surface| {
+        if surface.popup.is_some() {
+            return Err("Close the Login Browser popup before navigating the opener.".to_string());
+        }
+        let lifecycle = surface.shared.snapshot().lifecycle;
+        if lifecycle != CefSurfaceLifecycle::Ready {
+            return Err("CEF surface is not ready for navigation".to_string());
+        }
+        let browser = surface
+            .browser
+            .as_ref()
+            .ok_or_else(|| "CEF surface is not ready".to_string())?;
+        match action {
+            CefSurfaceNavigationAction::Back if browser.can_go_back() == 0 => return Ok(()),
+            CefSurfaceNavigationAction::Forward if browser.can_go_forward() == 0 => return Ok(()),
+            _ => {}
+        }
+        surface.shared.begin_navigation()?;
+        match action {
+            CefSurfaceNavigationAction::Back => browser.go_back(),
+            CefSurfaceNavigationAction::Forward => browser.go_forward(),
+            CefSurfaceNavigationAction::Reload => browser.reload(),
+        }
         Ok(())
     })
 }

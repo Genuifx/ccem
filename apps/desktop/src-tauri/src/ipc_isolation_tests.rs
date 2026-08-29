@@ -44,6 +44,9 @@ fn trusted_app_acl_manifest_includes_environment_router_references() {
     assert!(allowed
         .iter()
         .any(|command| { command.as_str() == Some("get_environment_router_references") }));
+    assert!(allowed
+        .iter()
+        .any(|command| { command.as_str() == Some("browser_surface_navigation_action") }));
 }
 
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {

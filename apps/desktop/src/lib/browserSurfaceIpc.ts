@@ -32,6 +32,8 @@ export interface BrowserSurfaceSnapshot {
   title?: string | null;
   visible?: boolean;
   loading?: boolean;
+  can_go_back?: boolean;
+  can_go_forward?: boolean;
   error?: string | null;
   lifecycle?: 'creating' | 'loading' | 'ready' | 'closing' | 'failed' | 'closed';
   control?: 'user' | 'agent' | 'paused';
@@ -238,6 +240,15 @@ export interface BrowserSurfaceNavigateRequest {
   url: string;
 }
 
+export type BrowserSurfaceNavigationAction = 'back' | 'forward' | 'reload';
+
+export interface BrowserSurfaceNavigationActionRequest {
+  leaseId: string;
+  generation: number;
+  clientRevision: number;
+  action: BrowserSurfaceNavigationAction;
+}
+
 interface BrowserSurfaceControlRequestBase {
   leaseId: string;
   generation: number;
@@ -276,6 +287,11 @@ export function createBrowserSurfaceClient(dependencies: BrowserSurfaceIpcDepend
       dependencies.invoke<void>('browser_surface_release', { ...request }),
     navigate: (request: BrowserSurfaceNavigateRequest) =>
       dependencies.invoke<void>('browser_surface_navigate', { ...request }),
+    navigationAction: (request: BrowserSurfaceNavigationActionRequest) =>
+      dependencies.invoke<BrowserSurfaceSnapshotMutationResponse>(
+        'browser_surface_navigation_action',
+        { ...request },
+      ),
     control: (request: BrowserSurfaceControlRequest) =>
       dependencies.invoke<BrowserSurfaceSnapshotMutationResponse>('browser_surface_control', {
         ...request,

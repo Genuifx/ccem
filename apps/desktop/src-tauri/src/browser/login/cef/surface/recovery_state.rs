@@ -2,6 +2,7 @@ use super::{CefSurfaceLifecycle, CefSurfaceRecoveryState, SharedSurfaceState};
 
 impl SharedSurfaceState {
     pub(super) fn begin_main_frame_load(&self, current_url: String) {
+        self.mark_main_document_started(&current_url);
         self.update(|state| {
             if surface_is_terminal(state.lifecycle) {
                 return;

@@ -141,7 +141,10 @@ const browserPanelTestStubs = {
           tooltip: `
             export function Tooltip({ children }) { return children; }
             export function TooltipTrigger({ children }) { return children; }
-            export function TooltipContent() { return null; }
+            export function TooltipContent({ children }) {
+              const React = globalThis.${bridgeKey}.React;
+              return React.createElement('span', { 'data-tooltip-content': 'true' }, children);
+            }
           `,
         };
         return {
@@ -211,6 +214,24 @@ async function importBrowserPanelHarness() {
 
         export function click(element) {
           act(() => element.click());
+        }
+
+        export function changeInput(element, value) {
+          act(() => {
+            const setter = Object.getOwnPropertyDescriptor(
+              element.ownerDocument.defaultView.HTMLInputElement.prototype,
+              'value',
+            ).set;
+            setter.call(element, value);
+            element.dispatchEvent(new element.ownerDocument.defaultView.Event('input', { bubbles: true }));
+          });
+        }
+
+        export function submit(form) {
+          act(() => form.dispatchEvent(new form.ownerDocument.defaultView.Event('submit', {
+            bubbles: true,
+            cancelable: true,
+          })));
         }
 
         export function emitBrowserState(bridge, leaseId, generation, snapshot) {
@@ -311,7 +332,11 @@ function installDom() {
   return dom;
 }
 
-function createBridge({ acquireSnapshot = {}, syncGate = null } = {}) {
+function createBridge({
+  acquireSnapshot = {},
+  navigationActionSnapshots = {},
+  syncGate = null,
+} = {}) {
   let loginGeneration = 0;
   let loginServerSequence = 100;
   const calls = [];
@@ -384,6 +409,19 @@ function createBridge({ acquireSnapshot = {}, syncGate = null } = {}) {
         case 'browser_surface_release':
         case 'browser_surface_navigate':
           return undefined;
+        case 'browser_surface_navigation_action':
+          return {
+            lease_id: args.leaseId,
+            generation: args.generation,
+            server_sequence: ++loginServerSequence,
+            snapshot: {
+              lifecycle: 'ready',
+              loading: false,
+              session_status: 'running',
+              popup_active: false,
+              ...(navigationActionSnapshots[args.action] ?? {}),
+            },
+          };
         case 'browser_surface_control':
           return {
             lease_id: args.leaseId,
@@ -447,6 +485,11 @@ test('Login locale changes retain its lease until the panel actually unmounts', 
   await harness.flushEffects();
   assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 1);
   assert.equal(callsFor(bridge, 'browser_surface_release').length, 0);
+  for (const key of ['browserBack', 'browserForward', 'browserReload']) {
+    assert.ok(container.querySelector(`button[aria-label="zh:workspace.${key}"]`));
+    assert.ok([...container.querySelectorAll('[data-tooltip-content="true"]')]
+      .some((tooltip) => tooltip.textContent === `zh:workspace.${key}`));
+  }
 
   mounted.render({
     ...initialProps,
@@ -465,6 +508,11 @@ test('Login locale changes retain its lease until the panel actually unmounts', 
     0,
     'changing the translator identity must not close Login',
   );
+  for (const key of ['browserBack', 'browserForward', 'browserReload']) {
+    assert.ok(container.querySelector(`button[aria-label="en:workspace.${key}"]`));
+    assert.ok([...container.querySelectorAll('[data-tooltip-content="true"]')]
+      .some((tooltip) => tooltip.textContent === `en:workspace.${key}`));
+  }
 
   mounted.unmount();
   mounted = null;
@@ -472,6 +520,355 @@ test('Login locale changes retain its lease until the panel actually unmounts', 
   const releases = callsFor(bridge, 'browser_surface_release');
   assert.equal(releases.length, 1, 'real unmount must close the exact Login lease');
   assert.equal(releases[0].args.disposition, 'close');
+});
+
+test('address bar navigation actions use exact lease state and authoritative capabilities', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({
+    acquireSnapshot: {
+      url: null,
+      can_go_back: false,
+      can_go_forward: false,
+    },
+    navigationActionSnapshots: {
+      back: {
+        url: 'https://accounts.example.test/start',
+        can_go_back: false,
+        can_go_forward: true,
+      },
+      forward: {
+        url: 'https://accounts.example.test/next',
+        can_go_back: true,
+        can_go_forward: false,
+      },
+      reload: {
+        url: 'https://accounts.example.test/next',
+        can_go_back: true,
+        can_go_forward: false,
+      },
+    },
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:navigation:browser:1',
+    defaultUrl: 'https://accounts.example.test/next',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  const navigation = container.querySelector('[data-ccem-browser-navigation="true"]');
+  assert.ok(navigation);
+  assert.deepEqual(
+    [...navigation.querySelectorAll('button')].map((button) => button.getAttribute('aria-label')),
+    [
+      'zh:workspace.browserBack',
+      'zh:workspace.browserForward',
+      'zh:workspace.browserReload',
+      'zh:workspace.browserOpenExternal',
+      'zh:workspace.browserUrl',
+      'zh:loginBrowserControl.handoffAgent',
+    ],
+    'browser navigation controls must precede External, URL, and the single Agent toggle',
+  );
+
+  const button = (key) => navigation.querySelector(`button[aria-label="zh:workspace.${key}"]`);
+  assert.equal(button('browserBack')?.disabled, true);
+  assert.equal(button('browserForward')?.disabled, true);
+  assert.equal(button('browserReload')?.disabled, false);
+  harness.click(button('browserBack'));
+  harness.click(button('browserForward'));
+  assert.equal(callsFor(bridge, 'browser_surface_navigation_action').length, 0);
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    control: 'agent',
+    can_go_back: true,
+    can_go_forward: true,
+  });
+  await harness.flushEffects();
+  assert.equal(button('browserBack')?.disabled, true);
+  assert.equal(button('browserForward')?.disabled, true);
+  assert.equal(button('browserReload')?.disabled, true);
+  const urlDisplay = navigation.querySelector('[data-ccem-browser-url-display="true"]');
+  assert.ok(urlDisplay);
+  assert.equal(urlDisplay.disabled, true, 'manual URL navigation requires User control');
+  harness.click(button('browserReload'));
+  harness.click(urlDisplay);
+  assert.equal(callsFor(bridge, 'browser_surface_navigation_action').length, 0);
+  assert.equal(navigation.querySelector('[data-ccem-browser-url-input="true"]'), null);
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    control: 'user',
+    can_go_back: true,
+    can_go_forward: true,
+  });
+  await harness.flushEffects();
+  assert.equal(button('browserBack')?.disabled, false);
+  assert.equal(button('browserForward')?.disabled, false);
+
+  harness.click(button('browserBack'));
+  harness.click(button('browserBack'));
+  assert.equal(button('browserBack')?.disabled, true, 'busy state disables Back immediately');
+  assert.equal(button('browserForward')?.disabled, true, 'busy state disables Forward immediately');
+  assert.equal(button('browserReload')?.disabled, true, 'busy state disables Reload immediately');
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(button('browserBack')?.disabled, true);
+  assert.equal(button('browserForward')?.disabled, false);
+
+  harness.click(button('browserForward'));
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(button('browserBack')?.disabled, false);
+  assert.equal(button('browserForward')?.disabled, true);
+
+  harness.click(button('browserReload'));
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  const actionCalls = callsFor(bridge, 'browser_surface_navigation_action');
+  assert.deepEqual(
+    actionCalls.map(({ args }) => ({
+      leaseId: args.leaseId,
+      generation: args.generation,
+      action: args.action,
+    })),
+    [
+      { leaseId: 'lease-1', generation: 1, action: 'back' },
+      { leaseId: 'lease-1', generation: 1, action: 'forward' },
+      { leaseId: 'lease-1', generation: 1, action: 'reload' },
+    ],
+  );
+  assert.ok(actionCalls.every(({ args }, index) => (
+    index === 0 || args.clientRevision > actionCalls[index - 1].args.clientRevision
+  )), 'navigation actions must retain monotonically increasing client revisions');
+
+  const assertNavigationDisabled = () => {
+    assert.equal(button('browserBack')?.disabled, true);
+    assert.equal(button('browserForward')?.disabled, true);
+    assert.equal(button('browserReload')?.disabled, true);
+  };
+  harness.emitBrowserState(bridge, 'lease-1', 1, { loading: true });
+  await harness.flushEffects();
+  assertNavigationDisabled();
+  harness.emitBrowserState(bridge, 'lease-1', 1, { loading: false, lifecycle: 'loading' });
+  await harness.flushEffects();
+  assertNavigationDisabled();
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'ready',
+    popup_active: true,
+  });
+  await harness.flushEffects();
+  assertNavigationDisabled();
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    popup_active: false,
+    session_status: 'closing',
+  });
+  await harness.flushEffects();
+  assertNavigationDisabled();
+  harness.click(button('browserReload'));
+  assert.equal(callsFor(bridge, 'browser_surface_navigation_action').length, 3);
+});
+
+test('a queued navigation action silently supersedes after its surface becomes inactive', async (t) => {
+  const dom = installDom();
+  let releaseSync;
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  const bridge = createBridge({
+    acquireSnapshot: { can_go_back: true, can_go_forward: true },
+    syncGate,
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    releaseSync?.();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const props = {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:navigation-race:browser:1',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  assert.ok(callsFor(bridge, 'browser_surface_sync').length >= 1);
+
+  const back = container.querySelector('button[aria-label="zh:workspace.browserBack"]');
+  assert.ok(back);
+  assert.equal(back.disabled, false);
+  harness.click(back);
+  mounted.render({
+    ...props,
+    isActiveSurface: false,
+    surfaceOccluded: true,
+    presentationRevision: 2,
+  });
+  await harness.flushEffects();
+  releaseSync();
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(
+    callsFor(bridge, 'browser_surface_navigation_action').length,
+    0,
+    'the queued action must revalidate current active and occlusion state before invoking IPC',
+  );
+  assert.deepEqual(bridge.toasts, [], 'superseded navigation must remain silent');
+});
+
+test('a queued navigation action silently supersedes when the page starts loading', async (t) => {
+  const dom = installDom();
+  let releaseSync;
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  const bridge = createBridge({
+    acquireSnapshot: { can_go_back: true, can_go_forward: true },
+    syncGate,
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    releaseSync?.();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:navigation-loading-race:browser:1',
+    defaultUrl: 'https://accounts.example.test',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+
+  const back = container.querySelector('button[aria-label="zh:workspace.browserBack"]');
+  assert.ok(back);
+  assert.equal(back.disabled, false);
+  harness.click(back);
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    lifecycle: 'loading',
+    loading: true,
+  });
+  await harness.flushEffects();
+  releaseSync();
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(
+    callsFor(bridge, 'browser_surface_navigation_action').length,
+    0,
+    'a queued action must revalidate authoritative loading state before invoking IPC',
+  );
+  assert.deepEqual(bridge.toasts, [], 'loading-state supersede must remain silent');
+});
+
+test('a superseded queued URL keeps the newer authoritative browser URL', async (t) => {
+  const dom = installDom();
+  let releaseSync;
+  const syncGate = new Promise((resolve) => {
+    releaseSync = resolve;
+  });
+  const bridge = createBridge({
+    acquireSnapshot: { url: 'https://accounts.example.test/a' },
+    syncGate,
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+  let mounted;
+
+  t.after(async () => {
+    releaseSync?.();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh',
+    backend: 'login',
+    sessionId: 'conversation:url-race:browser:1',
+    defaultUrl: 'https://accounts.example.test/a',
+    presentationRevision: 1,
+    isActiveSurface: true,
+    surfaceOccluded: false,
+    workingDir: '/workspace',
+    profileMode: 'default',
+    onClose() {},
+  });
+  await harness.flushEffects();
+
+  const display = container.querySelector('[data-ccem-browser-url-display="true"]');
+  assert.ok(display);
+  harness.click(display);
+  const input = container.querySelector('[data-ccem-browser-url-input="true"]');
+  assert.ok(input);
+  harness.changeInput(input, 'https://accounts.example.test/c');
+  harness.submit(input.closest('form'));
+
+  harness.emitBrowserState(bridge, 'lease-1', 1, {
+    url: 'https://accounts.example.test/b',
+    lifecycle: 'loading',
+    loading: true,
+  });
+  await harness.flushEffects();
+  releaseSync();
+  await harness.flushEffects();
+  await harness.flushEffects();
+
+  assert.equal(callsFor(bridge, 'browser_surface_navigate').length, 0);
+  assert.equal(
+    container.querySelector('[data-ccem-browser-url-display="true"]')?.textContent,
+    'https://accounts.example.test/b',
+  );
+  assert.deepEqual(bridge.toasts, []);
 });
 
 test('Login A and B default to their exact Agent once per lease, retain leases across A-to-B-to-A, and close exactly A', async (t) => {

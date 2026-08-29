@@ -1,10 +1,13 @@
 import type { FormEventHandler, ReactNode, RefObject } from 'react';
 import {
+  ArrowLeft,
+  ArrowRight,
   Bot,
   ExternalLink,
   Globe,
   LoaderCircle,
   PanelTopClose,
+  RefreshCw,
   UserRound,
   X,
 } from '@/lib/lucide-react';
@@ -12,6 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type {
+  BrowserSurfaceNavigationAction,
   BrowserSurfaceRecoveryState,
   BrowserSurfaceSnapshot,
 } from '@/lib/browserSurfaceIpc';
@@ -76,7 +80,11 @@ interface BrowserPanelNavigationProps {
   paused: boolean;
   isLoginControlBusy: boolean;
   canHandoffAgent: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  navigationDisabled: boolean;
   t: (key: string) => string;
+  onNavigationAction: (action: BrowserSurfaceNavigationAction) => void;
   onOpenExternal: () => void;
   onLoginControl: (action: LoginControlAction) => void;
   onSubmit: FormEventHandler<HTMLFormElement>;
@@ -97,7 +105,11 @@ export function BrowserPanelNavigation({
   paused,
   isLoginControlBusy,
   canHandoffAgent,
+  canGoBack,
+  canGoForward,
+  navigationDisabled,
   t,
+  onNavigationAction,
   onOpenExternal,
   onLoginControl,
   onSubmit,
@@ -122,6 +134,27 @@ export function BrowserPanelNavigation({
   return (
     <div data-ccem-browser-navigation="true" className="flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
       <BrowserToolButton
+        label={t('workspace.browserBack')}
+        onClick={() => onNavigationAction('back')}
+        disabled={navigationDisabled || !canGoBack}
+      >
+        <ArrowLeft className="h-4 w-4" />
+      </BrowserToolButton>
+      <BrowserToolButton
+        label={t('workspace.browserForward')}
+        onClick={() => onNavigationAction('forward')}
+        disabled={navigationDisabled || !canGoForward}
+      >
+        <ArrowRight className="h-4 w-4" />
+      </BrowserToolButton>
+      <BrowserToolButton
+        label={t('workspace.browserReload')}
+        onClick={() => onNavigationAction('reload')}
+        disabled={navigationDisabled}
+      >
+        <RefreshCw className="h-4 w-4" />
+      </BrowserToolButton>
+      <BrowserToolButton
         label={t('workspace.browserOpenExternal')}
         onClick={onOpenExternal}
         disabled={!effectiveUrl}
@@ -144,7 +177,7 @@ export function BrowserPanelNavigation({
               }
             }}
             className="h-8 min-w-0 rounded-md border-border/60 bg-muted/20 px-2 text-xs shadow-none focus-visible:ring-1 focus-visible:ring-ring"
-            disabled={popupActive}
+            disabled={navigationDisabled}
           />
         ) : (
           <button
@@ -154,7 +187,7 @@ export function BrowserPanelNavigation({
             title={displayUrl}
             className="flex h-8 w-full min-w-0 items-center rounded-md px-2 text-left text-xs text-muted-foreground transition hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             onClick={onStartUrlEditing}
-            disabled={popupActive}
+            disabled={navigationDisabled}
           >
             <span className="truncate">{displayUrl}</span>
           </button>

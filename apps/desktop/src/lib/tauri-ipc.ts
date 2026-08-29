@@ -13,6 +13,7 @@ import type {
   BrowserSurfaceClosePopupRequest,
   BrowserSurfaceControlRequest,
   BrowserSurfaceLease,
+  BrowserSurfaceNavigationActionRequest,
   BrowserSurfaceNavigateRequest,
   BrowserSurfaceReleaseRequest,
   BrowserSurfaceSyncRequest,
@@ -140,6 +141,10 @@ export interface TauriCommands {
   browser_surface_sync: [BrowserSurfaceSyncRequest, void];
   browser_surface_release: [BrowserSurfaceReleaseRequest, void];
   browser_surface_navigate: [BrowserSurfaceNavigateRequest, void];
+  browser_surface_navigation_action: [
+    BrowserSurfaceNavigationActionRequest,
+    BrowserSurfaceSnapshotMutationResponse,
+  ];
   browser_surface_control: [BrowserSurfaceControlRequest, BrowserSurfaceSnapshotMutationResponse];
   browser_surface_close_popup: [
     BrowserSurfaceClosePopupRequest,

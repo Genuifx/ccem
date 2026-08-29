@@ -2,8 +2,8 @@ use super::{
     bootstrap::{CefProcess, CefRuntimeLayout},
     lifecycle::{CefHostStateMachine, CefHostStatus},
     surface::{
-        windows_child_bounds, CefSurfaceConnection, CefSurfaceOpenSpec, CefSurfaceRequest,
-        CefSurfaceSnapshot, LogicalViewport,
+        windows_child_bounds, CefSurfaceConnection, CefSurfaceNavigationAction, CefSurfaceOpenSpec,
+        CefSurfaceRequest, CefSurfaceSnapshot, LogicalViewport,
     },
 };
 use std::{
@@ -220,6 +220,18 @@ impl CefHostController {
         let _operation = self.lock_ready_operation()?;
         run_on_main(app, move || {
             super::surface::windows::navigate(&surface_id, &url)
+        })
+    }
+
+    pub(crate) fn navigation_action_surface(
+        &self,
+        app: &AppHandle,
+        surface_id: String,
+        action: CefSurfaceNavigationAction,
+    ) -> Result<(), String> {
+        let _operation = self.lock_ready_operation()?;
+        run_on_main(app, move || {
+            super::surface::windows::navigation_action(&surface_id, action)
         })
     }
 

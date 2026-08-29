@@ -162,15 +162,18 @@ pub(crate) async fn browser_surface_navigate(
     client_revision: u64,
     url: String,
     manager: tauri::State<'_, Arc<LoginBrowserSurfaceManager>>,
+    sessions: tauri::State<'_, Arc<LoginBrowserSessionManager>>,
     cef_host: tauri::State<'_, Arc<CefHostController>>,
 ) -> Result<(), String> {
     ensure_trusted_main_window(&window)?;
     let parsed = crate::browser::url::parse_browser_url(&url)?;
     let manager = Arc::clone(manager.inner());
+    let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
         manager.navigate(
             &app,
+            &sessions,
             &cef_host,
             lease_id,
             generation,
@@ -185,6 +188,47 @@ pub(crate) async fn browser_surface_navigate(
 #[cfg(not(any(target_os = "macos", windows)))]
 #[tauri::command]
 pub(crate) async fn browser_surface_navigate(window: WebviewWindow) -> Result<(), String> {
+    ensure_trusted_main_window(&window)?;
+    Err("Embedded Login Browser is not available on this platform.".to_string())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[tauri::command]
+pub(crate) async fn browser_surface_navigation_action(
+    app: AppHandle,
+    window: WebviewWindow,
+    lease_id: String,
+    generation: u64,
+    client_revision: u64,
+    action: BrowserSurfaceNavigationActionArg,
+    manager: tauri::State<'_, Arc<LoginBrowserSurfaceManager>>,
+    sessions: tauri::State<'_, Arc<LoginBrowserSessionManager>>,
+    cef_host: tauri::State<'_, Arc<CefHostController>>,
+) -> Result<BrowserSurfaceSnapshotMutationResponse, String> {
+    ensure_trusted_main_window(&window)?;
+    let manager = Arc::clone(manager.inner());
+    let sessions = Arc::clone(sessions.inner());
+    let cef_host = Arc::clone(cef_host.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.navigation_action(
+            &app,
+            &sessions,
+            &cef_host,
+            lease_id,
+            generation,
+            client_revision,
+            action,
+        )
+    })
+    .await
+    .map_err(|error| format!("join browser surface navigation action: {error}"))?
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[tauri::command]
+pub(crate) async fn browser_surface_navigation_action(
+    window: WebviewWindow,
+) -> Result<BrowserSurfaceSnapshotMutationResponse, String> {
     ensure_trusted_main_window(&window)?;
     Err("Embedded Login Browser is not available on this platform.".to_string())
 }

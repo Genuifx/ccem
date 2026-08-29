@@ -121,22 +121,28 @@ test('surface client preserves lease generation and monotonic revision payloads'
     clientRevision: 3,
     url: 'https://example.com/next',
   });
-  await client.control({
+  await client.navigationAction({
     leaseId: 'lease-a',
     generation: 8,
     clientRevision: 4,
+    action: 'back',
+  });
+  await client.control({
+    leaseId: 'lease-a',
+    generation: 8,
+    clientRevision: 5,
     action: 'handoff',
     agentSessionId: 'runtime-a',
   });
   await client.closePopup({
     leaseId: 'lease-a',
     generation: 8,
-    clientRevision: 5,
+    clientRevision: 6,
   });
   await client.release({
     leaseId: 'lease-a',
     generation: 8,
-    clientRevision: 6,
+    clientRevision: 7,
     disposition: 'close',
   });
 
@@ -165,22 +171,28 @@ test('surface client preserves lease generation and monotonic revision payloads'
       clientRevision: 3,
       url: 'https://example.com/next',
     }],
-    ['browser_surface_control', {
+    ['browser_surface_navigation_action', {
       leaseId: 'lease-a',
       generation: 8,
       clientRevision: 4,
+      action: 'back',
+    }],
+    ['browser_surface_control', {
+      leaseId: 'lease-a',
+      generation: 8,
+      clientRevision: 5,
       action: 'handoff',
       agentSessionId: 'runtime-a',
     }],
     ['browser_surface_close_popup', {
       leaseId: 'lease-a',
       generation: 8,
-      clientRevision: 5,
+      clientRevision: 6,
     }],
     ['browser_surface_release', {
       leaseId: 'lease-a',
       generation: 8,
-      clientRevision: 6,
+      clientRevision: 7,
       disposition: 'close',
     }],
   ]);
@@ -271,6 +283,18 @@ test('surface client preserves lease generation and monotonic revision payloads'
   assert.deepEqual(appliedSnapshots, [{ title: 'new' }]);
   ordering.resetServerSequence();
   assert.equal(ordering.applySequencedSnapshot(1, null, () => {}), true);
+});
+
+test('central Tauri IPC types include the Mode 2 navigation action contract', async () => {
+  const source = await fs.readFile(
+    path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'),
+    'utf8',
+  );
+  assert.match(source, /BrowserSurfaceNavigationActionRequest/);
+  assert.match(
+    source,
+    /browser_surface_navigation_action:\s*\[\s*BrowserSurfaceNavigationActionRequest,\s*BrowserSurfaceSnapshotMutationResponse,?\s*\]/,
+  );
 });
 
 test('a delayed mutation response cannot cross a lease replacement after sequence reset', async () => {
@@ -422,6 +446,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
     /await surfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.release\(\{[\s\S]*disposition: 'close'/,
   );
   assert.match(panelSource, /browserSurfaceClient\.navigate/);
+  assert.match(panelSource, /browserSurfaceClient\.navigationAction/);
   assert.match(
     panelSource,
     /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
@@ -442,7 +467,14 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
   assert.match(geometrySyncSource, /observer\.disconnect\(\)/);
   assert.match(panelSource, /data-ccem-browser-occluded=\{surfaceOccluded \? 'true' : 'false'\}/);
   assert.match(panelSource, /<BrowserPanelNavigation/);
-  assert.doesNotMatch(panelChromeSource, /ArrowLeft|ArrowRight|browserReload/);
+  assert.match(panelChromeSource, /ArrowLeft/);
+  assert.match(panelChromeSource, /ArrowRight/);
+  assert.match(panelChromeSource, /RefreshCw/);
+  assert.match(panelChromeSource, /workspace\.browserBack/);
+  assert.match(panelChromeSource, /workspace\.browserForward/);
+  assert.match(panelChromeSource, /workspace\.browserReload/);
+  assert.match(panelSource, /control !== 'user'/);
+  assert.match(panelChromeSource, /disabled=\{navigationDisabled\}/);
   assert.match(workspaceSource, /browserTargetBySessionId/);
   assert.match(
     workspaceSource,
@@ -485,7 +517,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
     ts.ScriptKind.TSX,
   );
   const orderedMethods = new Set([
-    'acquire', 'sync', 'release', 'navigate', 'control', 'closePopup',
+    'acquire', 'sync', 'release', 'navigate', 'navigationAction', 'control', 'closePopup',
   ]);
   const surfaceCalls = [];
   const unlanedCalls = [];
@@ -510,13 +542,28 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
     ts.forEachChild(node, inspectSurfaceCalls);
   };
   inspectSurfaceCalls(panelAst);
-  assert.ok(surfaceCalls.length >= 8);
+  assert.ok(surfaceCalls.length >= 9);
   assert.deepEqual(unlanedCalls, [], 'every Mode 2 surface mutation must use one ordering lane');
   assert.equal(
     panelSource.match(/applyBrowserSurfaceMutationResponseForLease\(/g)?.length,
-    3,
-    'occlusion, control, and popup responses must bind captured, current, and response lease identity',
+    4,
+    'occlusion, navigation action, control, and popup responses must bind exact lease identity',
   );
+
+  const navigationActionStart = panelSource.indexOf('const handleNavigationAction');
+  const navigationActionEnd = panelSource.indexOf('const handleSubmit', navigationActionStart);
+  const navigationAction = panelSource.slice(navigationActionStart, navigationActionEnd);
+  assert.ok(navigationActionStart > 0 && navigationActionEnd > navigationActionStart);
+  assert.match(navigationAction, /surfaceOrdering\.enqueue\(/);
+  assert.match(navigationAction, /surfaceLeaseRef\.current/);
+  assert.match(navigationAction, /isActiveSurfaceRef\.current/);
+  assert.match(navigationAction, /surfaceOccludedRef\.current/);
+  assert.match(navigationAction, /nativeSurfaceOcclusionStore\.isOccluded\(\)/);
+  assert.match(navigationAction, /popupActiveRef\.current/);
+  assert.match(navigationAction, /sessionStatusRef\.current !== 'running'/);
+  assert.match(navigationAction, /lifecycleRef\.current !== 'ready'/);
+  assert.match(navigationAction, /isLoadingRef\.current/);
+  assert.match(navigationAction, /surfaceClosingRef\.current/);
 
   const replayIndex = panelSource.indexOf(
     'highestSequencedSurfaceEventForLease(',

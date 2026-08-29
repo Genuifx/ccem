@@ -396,3 +396,36 @@ fn windows_mode2_uses_real_cef_modules_and_production_ipc_not_unsupported_stubs(
     assert!(ipc.contains("#[cfg(any(target_os = \"macos\", windows))]"));
     assert!(ipc.contains("#[cfg(not(any(target_os = \"macos\", windows)))]"));
 }
+
+#[test]
+fn mode2_navigation_actions_use_authoritative_cef_history_on_both_platforms() {
+    for (platform, surface, host) in [
+        (
+            "macOS",
+            include_str!("cef/surface/macos.rs"),
+            include_str!("cef/host.rs"),
+        ),
+        (
+            "Windows",
+            include_str!("cef/surface/windows.rs"),
+            include_str!("cef/host/windows.rs"),
+        ),
+    ] {
+        assert!(
+            surface.contains("fn on_loading_state_change("),
+            "{platform} must project CEF history capabilities"
+        );
+        assert!(surface.contains("browser.main_frame()"));
+        assert!(surface.contains("is_loading != 0"));
+        assert!(surface.contains("update_loading_state("));
+        assert!(surface.contains("browser.can_go_back()"));
+        assert!(surface.contains("CefSurfaceNavigationAction::Back => browser.go_back()"));
+        assert!(surface.contains("browser.can_go_forward()"));
+        assert!(surface.contains("CefSurfaceNavigationAction::Forward => browser.go_forward()"));
+        assert!(surface.contains("CefSurfaceNavigationAction::Reload => browser.reload()"));
+        assert!(!surface.contains("reload_ignore_cache"));
+        assert!(surface.contains("lifecycle != CefSurfaceLifecycle::Ready"));
+        assert!(host.contains("navigation_action_surface"));
+        assert!(host.contains("run_on_main(app"));
+    }
+}

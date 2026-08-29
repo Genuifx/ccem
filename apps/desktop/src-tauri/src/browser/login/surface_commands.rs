@@ -1,6 +1,6 @@
 use super::session::{
     LoginBrowserSessionHandle, LoginBrowserSessionManager, LoginBrowserSessionSnapshot,
-    SessionControlOwner, SessionManagerError, TrustedUiControlAction,
+    LoginBrowserSessionStatus, SessionControlOwner, SessionManagerError, TrustedUiControlAction,
     TrustedUiControlAuthorization, TrustedWorkspacePath,
 };
 use crate::browser::surface_coordinator::{
@@ -22,7 +22,8 @@ use super::cef::{
     recovery::EmbeddedOwnerRecordStore,
     session_runtime::{prepare_launched_runtime_with_profile_group, EmbeddedProfileGroup},
     surface::{
-        CefSurfaceRequest, CefSurfaceSnapshot, CefSurfaceStateChange, CefSurfaceStateHandle,
+        CefSurfaceNavigationAction, CefSurfaceRequest, CefSurfaceSnapshot, CefSurfaceStateChange,
+        CefSurfaceStateHandle,
     },
 };
 
@@ -65,7 +66,8 @@ use recovery_projection::{
 pub(in crate::browser::login) use request::BrowserSurfaceControlActionArg;
 use request::{
     parse_profile_selection, validate_panel_session_id, BrowserSurfaceBackendArg,
-    BrowserSurfaceProfileModeArg, BrowserSurfaceReleaseArg, BrowserSurfaceViewportArg,
+    BrowserSurfaceNavigationActionArg, BrowserSurfaceProfileModeArg, BrowserSurfaceReleaseArg,
+    BrowserSurfaceViewportArg,
 };
 
 #[derive(Default)]
@@ -232,6 +234,30 @@ impl<T> BrowserSurfaceInstanceRegistry<T> {
             .get(panel_session_id)
             .map(|instance| (panel_session_id, instance))
     }
+}
+
+fn is_active_login_presentation_owner<T>(
+    instances: &BrowserSurfaceInstanceRegistry<T>,
+    presentation_epoch: &PresentationEpoch,
+    panel_session_id: &str,
+    native_visible: bool,
+) -> bool {
+    native_visible
+        && instances.active_panel_session_id() == Some(panel_session_id)
+        && matches!(
+            presentation_epoch.owner.as_ref(),
+            Some(PresentationOwner::Login(owner)) if owner == panel_session_id
+        )
+}
+
+fn ensure_manual_navigation_session(session: &LoginBrowserSessionSnapshot) -> Result<(), String> {
+    if session.status != LoginBrowserSessionStatus::Running {
+        return Err("Login Browser must be running before navigating.".to_string());
+    }
+    if session.control != SessionControlOwner::User {
+        return Err("Take over the Login Browser before navigating.".to_string());
+    }
+    Ok(())
 }
 
 pub(crate) mod ipc;
@@ -989,6 +1015,7 @@ impl LoginBrowserSurfaceManager {
     fn navigate(
         &self,
         app: &AppHandle,
+        sessions: &Arc<LoginBrowserSessionManager>,
         cef_host: &Arc<CefHostController>,
         lease_id: String,
         generation: u64,
@@ -1001,9 +1028,83 @@ impl LoginBrowserSurfaceManager {
         else {
             return Ok(());
         };
+        let session = sessions
+            .snapshot(&active.session)
+            .map_err(|error| error.to_string())?;
+        ensure_manual_navigation_session(&session)?;
+        let native_visible = active.native_state.snapshot().visible;
+        let owns_visible_presentation = {
+            let state = self.state()?;
+            is_active_login_presentation_owner(
+                &state.instances,
+                &state.presentation_epoch,
+                &active.panel_session_id,
+                native_visible,
+            )
+        };
+        if !owns_visible_presentation {
+            return Err(
+                "Login Browser navigation requires the active visible surface.".to_string(),
+            );
+        }
         cef_host.navigate_surface(app, active.surface_id, url)?;
         self.emit_surface_state(app, &current, "navigate", None);
         Ok(())
+    }
+
+    fn navigation_action(
+        &self,
+        app: &AppHandle,
+        sessions: &Arc<LoginBrowserSessionManager>,
+        cef_host: &Arc<CefHostController>,
+        lease_id: String,
+        generation: u64,
+        client_revision: u64,
+        action: BrowserSurfaceNavigationActionArg,
+    ) -> Result<BrowserSurfaceSnapshotMutationResponse, String> {
+        let _operation = self.mutation_operation()?;
+        let Some((active, current)) =
+            self.apply_instance_revision(&lease_id, generation, client_revision)?
+        else {
+            return Err("Login Browser navigation lease is stale.".to_string());
+        };
+        let session = sessions
+            .snapshot(&active.session)
+            .map_err(|error| error.to_string())?;
+        ensure_manual_navigation_session(&session)?;
+        let native_visible = active.native_state.snapshot().visible;
+        let owns_visible_presentation = {
+            let state = self.state()?;
+            is_active_login_presentation_owner(
+                &state.instances,
+                &state.presentation_epoch,
+                &active.panel_session_id,
+                native_visible,
+            )
+        };
+        if !owns_visible_presentation {
+            return Err(
+                "Login Browser navigation requires the active visible surface.".to_string(),
+            );
+        }
+        let native_action = match action {
+            BrowserSurfaceNavigationActionArg::Back => CefSurfaceNavigationAction::Back,
+            BrowserSurfaceNavigationActionArg::Forward => CefSurfaceNavigationAction::Forward,
+            BrowserSurfaceNavigationActionArg::Reload => CefSurfaceNavigationAction::Reload,
+        };
+        cef_host.navigation_action_surface(app, active.surface_id.clone(), native_action)?;
+        let native = cef_host.surface_snapshot(app, active.surface_id)?;
+        let session = sessions
+            .snapshot(&active.session)
+            .map_err(|error| error.to_string())?;
+        let response = snapshot_response(&native, &session);
+        let server_sequence =
+            self.emit_surface_state(app, &current, "navigation_action", Some(response.clone()));
+        Ok(snapshot_mutation_response(
+            &current,
+            server_sequence,
+            response,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

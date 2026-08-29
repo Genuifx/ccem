@@ -5676,6 +5676,7 @@ pub fn run_desktop_app() -> i32 {
             browser::login::surface_commands::ipc::browser_surface_sync,
             browser::login::surface_commands::ipc::browser_surface_release,
             browser::login::surface_commands::ipc::browser_surface_navigate,
+            browser::login::surface_commands::ipc::browser_surface_navigation_action,
             browser::login::surface_commands::ipc::browser_surface_control,
             browser::login::surface_commands::ipc::browser_surface_close_popup,
             browser::login_commands::browser_login_profiles,
