@@ -49,6 +49,7 @@ import {
   isBackgroundLaunchResult,
   type ClaudeBackgroundTask,
 } from './claudeBackgroundTasks';
+import { createStreamEventCoalescer } from './streamEventCoalescer';
 
 type NativeProvider = 'claude' | 'codex';
 
@@ -254,6 +255,7 @@ let initCommand: InitCommand | null = null;
 let stopped = false;
 let activeTurn = false;
 let currentProviderSessionId: string | null = null;
+let lastEmittedProviderSessionId: string | null = null;
 let currentAbortController: AbortController | null = null;
 let currentClaudeQuery: ReturnType<typeof query> | null = null;
 let claudeInputQueue: AsyncMessageQueue<SDKUserMessage> | null = null;
@@ -361,8 +363,17 @@ class AsyncMessageQueue<T> implements AsyncIterable<T> {
   }
 }
 
-function emit(output: HelperOutput) {
+function writeOutput(output: HelperOutput) {
   process.stdout.write(`${JSON.stringify(output)}\n`);
+}
+
+const streamEventCoalescer = createStreamEventCoalescer((payload) => {
+  writeOutput({ type: 'event', payload });
+});
+
+function emit(output: HelperOutput) {
+  streamEventCoalescer.flush();
+  writeOutput(output);
 }
 
 function emitStatus(status: string, detail?: string) {
@@ -388,7 +399,7 @@ function emitSettingsUpdateResult(
 }
 
 function emitEvent(payload: Record<string, unknown>) {
-  emit({ type: 'event', payload });
+  streamEventCoalescer.emit(payload);
 }
 
 function emitSessionMeta(providerSessionId: string) {
@@ -396,6 +407,10 @@ function emitSessionMeta(providerSessionId: string) {
     return;
   }
   currentProviderSessionId = providerSessionId;
+  if (lastEmittedProviderSessionId === providerSessionId) {
+    return;
+  }
+  lastEmittedProviderSessionId = providerSessionId;
   emit({ type: 'session_meta', provider_session_id: providerSessionId });
 }
 
@@ -3562,6 +3577,10 @@ async function handleCommand(command: InputCommand) {
 
   if (command.type === 'init') {
     initCommand = command;
+    // `init` is a protocol boundary and historically always published its
+    // session metadata. Deduplication only applies to repeated SDK frames
+    // within that initialized runtime.
+    lastEmittedProviderSessionId = null;
     const forkRequested = command.provider === 'claude'
       && Boolean(command.fork_session)
       && Boolean(command.provider_session_id?.trim());
@@ -4145,6 +4164,7 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => {
+  streamEventCoalescer.flush();
   // Desktop launches the helper as a dedicated Unix process-group leader. Once parent stdin is
   // gone, kill that owned group first: telemetry and SDK cleanup can throw or block on broken I/O.
   if (terminateOwnedProcessGroupOnParentClose()) {

@@ -4,10 +4,13 @@ use crate::browser::login::capability::{
 use crate::browser::{authorize_browser_tool, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
-    NativeBackgroundTask, NativeBackgroundTaskStatus, ReplayBatch, SessionEventPayload,
-    SessionPromptAnnotation, SessionPromptImage, SessionStore, TodoSnapshotV1,
+    NativeBackgroundTask, NativeBackgroundTaskStatus, NativeEventReplayPage, ReplayBatch,
+    SessionEventPayload, SessionPromptAnnotation, SessionPromptImage, SessionStore, TodoSnapshotV1,
 };
-use crate::native_event_log::NativeEventLog;
+use crate::native_event_log::{
+    bound_decoded_event_page, ensure_event_replay_page_size, validate_event_replay_page_request,
+    NativeEventLog,
+};
 use crate::native_helper_resource::native_helper_script_path;
 use crate::prompt_image_store::PromptImageStore;
 use crate::router::{
@@ -2624,6 +2627,107 @@ impl NativeRuntimeManager {
                     }
                 }
                 batch
+            })
+    }
+
+    pub fn replay_event_page(
+        &self,
+        runtime_id: &str,
+        after_seq: Option<u64>,
+        snapshot_newest_seq: Option<u64>,
+        limit: u64,
+    ) -> Result<NativeEventReplayPage, String> {
+        validate_event_replay_page_request(after_seq, snapshot_newest_seq)?;
+        let sqlite_empty_page =
+            match self
+                .event_log
+                .replay_page(runtime_id, after_seq, snapshot_newest_seq, limit)
+            {
+                Ok(page) if page.snapshot_newest_seq.is_some() => return Ok(page),
+                Ok(page) => Some(page),
+                Err(error) => {
+                    eprintln!(
+                        "Failed to replay native event page from sqlite for {}: {}",
+                        runtime_id, error
+                    );
+                    None
+                }
+            };
+        let persisted_source_available = sqlite_empty_page.is_some();
+
+        let handles = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
+        let Some(handle) = handles.get(runtime_id) else {
+            if self.has_record(runtime_id)? {
+                if let Some(page) = sqlite_empty_page {
+                    return Ok(page);
+                }
+                let page = NativeEventReplayPage {
+                    source_available: false,
+                    gap_detected: false,
+                    decode_failure_count: 0,
+                    oversized_event_count: 0,
+                    oldest_available_seq: None,
+                    snapshot_newest_seq: None,
+                    next_cursor: None,
+                    has_more: false,
+                    events: Vec::new(),
+                };
+                ensure_event_replay_page_size(&page)?;
+                return Ok(page);
+            }
+            return Err(format!("Native runtime {} not found", runtime_id));
+        };
+
+        handle
+            .events
+            .lock()
+            .map_err(|_| "Failed to lock native session events".to_string())
+            .and_then(|store| {
+                let batch = store.events_since(after_seq);
+                if persisted_source_available && store.is_empty() {
+                    return Ok(sqlite_empty_page.expect("successful sqlite page is retained"));
+                }
+
+                // Preserve a caller-supplied snapshot even if the readable
+                // fallback ends earlier. The short tail is an integrity gap,
+                // not permission to move the snapshot boundary.
+                let snapshot_newest_seq = snapshot_newest_seq.or(batch.newest_available_seq);
+                validate_event_replay_page_request(after_seq, snapshot_newest_seq)?;
+                let mut events = batch.events;
+                if let Some(snapshot) = snapshot_newest_seq {
+                    events.retain(|event| event.seq <= snapshot);
+                } else {
+                    events.clear();
+                }
+                let bounded = bound_decoded_event_page(events, limit)?;
+                let mut gap_detected = batch.gap_detected;
+                if !bounded.has_more {
+                    let scanned_through = bounded.next_cursor.or(after_seq);
+                    if snapshot_newest_seq
+                        .is_some_and(|snapshot| scanned_through.unwrap_or(0) < snapshot)
+                    {
+                        gap_detected = true;
+                    }
+                }
+
+                let page = NativeEventReplayPage {
+                    // The in-memory store is readable evidence, but never an
+                    // authoritative replacement for persisted history.
+                    source_available: false,
+                    gap_detected,
+                    decode_failure_count: 0,
+                    oversized_event_count: bounded.oversized_event_count,
+                    oldest_available_seq: batch.oldest_available_seq,
+                    snapshot_newest_seq,
+                    next_cursor: bounded.next_cursor,
+                    has_more: bounded.has_more,
+                    events: bounded.events,
+                };
+                ensure_event_replay_page_size(&page)?;
+                Ok(page)
             })
     }
 
@@ -8085,7 +8189,7 @@ mod tests {
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
         TodoSnapshotV1,
     };
-    use crate::native_event_log::NativeEventLog;
+    use crate::native_event_log::{NativeEventLog, MAX_EVENT_REPLAY_PAGE_BYTES};
     use crate::prompt_image_store::PromptImageStore;
     use crate::router::{
         LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterConfig, RouterManager,
@@ -9559,6 +9663,98 @@ mod tests {
         assert_eq!(replay.events.len(), 500);
         assert_eq!(replay.oldest_available_seq, Some(2));
         assert_eq!(replay.newest_available_seq, Some(501));
+    }
+
+    #[test]
+    fn replay_event_page_applies_hard_byte_budget_to_live_memory_fallback() {
+        let runtime_id = "native-page-live-memory-budget";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.event_log = NativeEventLog::new(std::env::temp_dir());
+        let handle = manager
+            .handles
+            .lock()
+            .expect("lock handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live handle");
+        let mut events = handle.events.lock().expect("lock in-memory events");
+        events.append(SessionEventPayload::AssistantChunk {
+            text: "x".repeat(MAX_EVENT_REPLAY_PAGE_BYTES + 1024),
+        });
+        events.append(SessionEventPayload::AssistantChunk {
+            text: "readable fallback tail".to_string(),
+        });
+        drop(events);
+
+        let page = manager
+            .replay_event_page(runtime_id, None, None, 2000)
+            .expect("bounded live-memory page");
+
+        assert!(!page.source_available);
+        assert_eq!(page.oversized_event_count, 1);
+        assert_eq!(page.next_cursor, Some(2));
+        assert!(!page.has_more);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].seq, 2);
+        assert!(
+            serde_json::to_vec(&page)
+                .expect("serialize fallback page")
+                .len()
+                <= MAX_EVENT_REPLAY_PAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn replay_event_page_memory_start_after_binds_a_fixed_snapshot() {
+        let runtime_id = "native-page-start-after-snapshot";
+        let mut manager = manager_with_handle(runtime_id);
+        manager.event_log = NativeEventLog::new(std::env::temp_dir());
+        let handle = manager
+            .handles
+            .lock()
+            .expect("lock handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live handle");
+        {
+            let mut events = handle.events.lock().expect("lock in-memory events");
+            for seq in 1..=3 {
+                events.append(SessionEventPayload::AssistantChunk {
+                    text: format!("chunk-{seq}"),
+                });
+            }
+        }
+
+        let first = manager
+            .replay_event_page(runtime_id, Some(1), None, 1)
+            .expect("start-after memory page");
+        assert!(!first.source_available);
+        assert_eq!(first.snapshot_newest_seq, Some(3));
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].seq, 2);
+        assert_eq!(first.next_cursor, Some(2));
+        assert!(first.has_more);
+
+        handle.events.lock().expect("lock in-memory events").append(
+            SessionEventPayload::AssistantChunk {
+                text: "after snapshot".to_string(),
+            },
+        );
+        let second = manager
+            .replay_event_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 10)
+            .expect("memory snapshot continuation");
+        assert_eq!(second.snapshot_newest_seq, Some(3));
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].seq, 3);
+        assert_eq!(second.next_cursor, Some(3));
+        assert!(!second.has_more);
+
+        assert!(manager
+            .replay_event_page(runtime_id, Some(2), Some(1), 10)
+            .is_err());
+        assert!(manager
+            .replay_event_page(runtime_id, Some(5), None, 10)
+            .is_err());
     }
 
     #[test]

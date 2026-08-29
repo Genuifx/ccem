@@ -194,9 +194,15 @@ import {
 } from '@/components/workspace/workspaceCronCommand';
 import {
   buildMessagesFromEvents,
+  replayBatchCoversAvailableSequenceRange,
   selectSeedMessagesForNativeReplay,
   shouldSkipProviderSeedHydration,
 } from '@/components/workspace/workspaceEventTranscript';
+import {
+  NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT,
+  runTranscriptPagedBackfill,
+} from '@/components/workspace/workspaceTranscriptBackfill';
+import type { WorkspaceTranscriptBackfillState } from '@/components/workspace/WorkspaceTranscriptBackfillStatus';
 import {
   nativeSessionMatchesCcemSessionLink,
   parseCcemSessionLink,
@@ -435,6 +441,7 @@ export function Workspace({
     setSessionAnnotation,
     preflightCodexModelMigration,
     createNativeSession,
+    getNativeSessionEventPage,
     getNativeSessionEvents,
     listNativeSessions,
     loadRouterStatus,
@@ -460,8 +467,11 @@ export function Workspace({
   const [messages, setMessages] = useState<ConversationMessageData[]>([]);
   const [segments, setSegments] = useState<HistorySegment[]>([]);
   const [historyEvents, setHistoryEvents] = useState<SessionEventRecord[]>([]);
+  const [historyTranscriptBackfillState, setHistoryTranscriptBackfillState] =
+    useState<WorkspaceTranscriptBackfillState>('idle');
   const [activeSegment, setActiveSegment] = useState<number | null>(null);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const isLoadingMessagesRef = useRef(false);
   const [codexInstalled, setCodexInstalled] = useState(false);
   const [opencodeInstalled, setOpenCodeInstalled] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceViewMode>('compose');
@@ -531,6 +541,7 @@ export function Workspace({
   const refreshRequestSeqRef = useRef(0);
   const skillsBootstrapAttemptedRef = useRef(false);
   const conversationRequestSeqRef = useRef(0);
+  const conversationLoadAbortRef = useRef<AbortController | null>(null);
   const hydratingLiveRuntimeIdsRef = useRef(new Set<string>());
   const hydratedLiveRuntimeIdsRef = useRef(new Set<string>());
   const pendingRefreshRef = useRef(false);
@@ -557,6 +568,11 @@ export function Workspace({
     setHistoryRouteResolutionStatus(next);
   }, []);
 
+  const updateIsLoadingMessages = useCallback((next: boolean) => {
+    isLoadingMessagesRef.current = next;
+    setIsLoadingMessages(next);
+  }, []);
+
   const requestCodexModelMigrationDecision = useCallback((
     warning: CodexModelMigrationWarning,
   ): Promise<boolean> => new Promise((resolve) => {
@@ -575,6 +591,7 @@ export function Workspace({
   useEffect(() => () => {
     codexModelMigrationDecisionRef.current?.(false);
     codexModelMigrationDecisionRef.current = null;
+    conversationLoadAbortRef.current?.abort();
   }, []);
 
   useLayoutEffect(() => {
@@ -960,13 +977,13 @@ export function Workspace({
       setSegments([]);
       setHistoryEvents([]);
       setActiveSegment(null);
-      setIsLoadingMessages(false);
+      updateIsLoadingMessages(false);
       if (Object.keys(liveSessionsSnapshot).length === 0) {
         setWorkspaceMode('compose');
       }
     }
     return retainedSessions;
-  }, [replaceSessions]);
+  }, [replaceSessions, updateIsLoadingMessages]);
 
   useEffect(() => {
     if (!hasAttemptedNativeSessionRestore) {
@@ -1034,13 +1051,32 @@ export function Workspace({
 
   const loadNativeHistoryConversation = useCallback(async (
     nativeSession: NativeSessionSummary,
+    signal?: AbortSignal,
   ): Promise<{
     messages: ConversationMessageData[];
     segments: HistorySegment[];
     events: SessionEventRecord[];
+    integrity: 'complete' | 'partial';
   } | null> => {
-    const replayBatch = await getNativeSessionEvents(nativeSession.runtime_id, null, null);
-    if (replayBatch.events.length === 0) {
+    const result = await runTranscriptPagedBackfill({
+      loadPage: (afterSeq, snapshotNewestSeq) => getNativeSessionEventPage(
+        nativeSession.runtime_id,
+        afterSeq,
+        snapshotNewestSeq,
+        NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT,
+      ),
+      isComplete: replayBatchCoversAvailableSequenceRange,
+      physicalRequestKey: nativeSession.runtime_id,
+      signal,
+    });
+    if (result.status === 'cancelled') {
+      throw new DOMException('Native history replay was cancelled', 'AbortError');
+    }
+    if (result.status === 'error') {
+      throw result.error;
+    }
+    const replayBatch = result.value;
+    if (result.status === 'success' && replayBatch.events.length === 0) {
       return null;
     }
 
@@ -1054,8 +1090,9 @@ export function Workspace({
       messages: nativeMessages,
       segments: [],
       events: replayBatch.events,
+      integrity: result.status === 'partial' ? 'partial' : 'complete',
     };
-  }, [getNativeSessionEvents]);
+  }, [getNativeSessionEventPage]);
 
   const loadConversation = useCallback(
     async (
@@ -1064,18 +1101,33 @@ export function Workspace({
         resetBeforeLoad?: boolean;
         showLoading?: boolean;
         nativeHistorySession?: NativeSessionSummary | null;
+        preserveActiveRequest?: boolean;
       } = {}
     ) => {
-      const { resetBeforeLoad = true, showLoading = true } = options;
+      const {
+        resetBeforeLoad = true,
+        showLoading = true,
+        preserveActiveRequest = false,
+      } = options;
+      if (
+        preserveActiveRequest
+        && (conversationLoadAbortRef.current || isLoadingMessagesRef.current)
+      ) {
+        return;
+      }
       const hasNativeHistorySessionOption = Object.prototype.hasOwnProperty.call(
         options,
         'nativeHistorySession',
       );
       const requestSeq = ++conversationRequestSeqRef.current;
+      conversationLoadAbortRef.current?.abort();
+      const requestController = new AbortController();
+      conversationLoadAbortRef.current = requestController;
 
       if (resetBeforeLoad) {
         setMessages([]);
         setSegments([]);
+        setHistoryTranscriptBackfillState('idle');
         if (hasNativeHistorySessionOption) {
           setHistoryEvents([]);
         }
@@ -1083,28 +1135,90 @@ export function Workspace({
       }
 
       if (showLoading) {
-        setIsLoadingMessages(true);
+        updateIsLoadingMessages(true);
       }
 
       try {
-        const nativeHistory = options.nativeHistorySession
-          ? await loadNativeHistoryConversation(options.nativeHistorySession).catch((error) => {
-            console.error('Failed to load native history transcript:', error);
-            return null;
-          })
+        const nativeHistoryPromise = options.nativeHistorySession
+          ? loadNativeHistoryConversation(
+            options.nativeHistorySession,
+            requestController.signal,
+          ).then(
+            (value) => ({ value, error: null as unknown }),
+            (error: unknown) => ({ value: null, error }),
+          )
           : null;
-        if (requestSeq !== conversationRequestSeqRef.current) {
-          return;
-        }
-        if (nativeHistory && hasNativeHistoryTranscriptMessages(nativeHistory.messages)) {
-          setMessages(nativeHistory.messages);
-          setSegments(nativeHistory.segments);
-          setHistoryEvents(nativeHistory.events);
+
+        // Provider history is already a semantic transcript and is normally
+        // much smaller than the raw native event log. Paint it first while a
+        // routed native session is paged in parallel for review/usage data.
+        // This keeps time-to-first-content independent of raw event count.
+        if (nativeHistoryPromise) {
+          let providerHistory: Awaited<ReturnType<typeof fetchConversationDetail>> | null = null;
+          let providerHistoryError: unknown = null;
+          try {
+            providerHistory = await fetchConversationDetail(session);
+          } catch (error) {
+            providerHistoryError = error;
+          }
+          if (requestSeq !== conversationRequestSeqRef.current) {
+            return;
+          }
+
+          const providerHasTranscript = providerHistory
+            ? hasNativeHistoryTranscriptMessages(providerHistory.messages)
+            : false;
+          if (providerHistory) {
+            setMessages(providerHistory.messages);
+            setSegments(providerHistory.segments);
+            if (providerHasTranscript && showLoading) {
+              updateIsLoadingMessages(false);
+            }
+          }
+
+          const nativeHistoryResult = await nativeHistoryPromise;
+          if (requestSeq !== conversationRequestSeqRef.current) {
+            return;
+          }
+          if (nativeHistoryResult.error && requestController.signal.aborted) {
+            throw nativeHistoryResult.error;
+          }
+          if (nativeHistoryResult.error) {
+            console.error('Failed to load native history transcript:', nativeHistoryResult.error);
+            if (!providerHasTranscript) {
+              setHistoryTranscriptBackfillState('error');
+            }
+          }
+          const nativeHistory = nativeHistoryResult.value;
+          setHistoryEvents(nativeHistory?.events ?? []);
+          if (providerHasTranscript) {
+            setHistoryTranscriptBackfillState('idle');
+            return;
+          }
+          if (nativeHistory) {
+            setHistoryTranscriptBackfillState(
+              nativeHistory.integrity === 'partial' ? 'partial' : 'idle',
+            );
+          }
+          if (
+            nativeHistory
+            && hasNativeHistoryTranscriptMessages(nativeHistory.messages)
+          ) {
+            setMessages(nativeHistory.messages);
+            setSegments(nativeHistory.segments);
+            return;
+          }
+          if (providerHistory) {
+            return;
+          }
+          if (providerHistoryError) {
+            throw providerHistoryError;
+          }
           return;
         }
 
         if (hasNativeHistorySessionOption) {
-          setHistoryEvents(nativeHistory?.events ?? []);
+          setHistoryEvents([]);
         }
         const { messages: msgs, segments: segs } = await fetchConversationDetail(session);
 
@@ -1114,18 +1228,24 @@ export function Workspace({
 
         setMessages(msgs);
         setSegments(segs);
+        if (hasNativeHistoryTranscriptMessages(msgs)) {
+          setHistoryTranscriptBackfillState('idle');
+        }
       } catch (error) {
         if (requestSeq !== conversationRequestSeqRef.current) {
           return;
         }
         console.error('Failed to load conversation:', error);
       } finally {
+        if (conversationLoadAbortRef.current === requestController) {
+          conversationLoadAbortRef.current = null;
+        }
         if (showLoading && requestSeq === conversationRequestSeqRef.current) {
-          setIsLoadingMessages(false);
+          updateIsLoadingMessages(false);
         }
       }
     },
-    [loadNativeHistoryConversation]
+    [loadNativeHistoryConversation, updateIsLoadingMessages]
   );
 
   const refreshWorkspaceData = useCallback(
@@ -1168,6 +1288,7 @@ export function Workspace({
               await loadConversation(selectedSession, {
                 resetBeforeLoad: false,
                 showLoading: false,
+                preserveActiveRequest: true,
               });
             }
           }
@@ -2025,14 +2146,16 @@ export function Workspace({
       // session before awaiting native/history lookups for this one. Without
       // this, a slow A request can still overwrite B after B becomes live.
       conversationRequestSeqRef.current += 1;
+      conversationLoadAbortRef.current?.abort();
       // Clear A synchronously as soon as B is selected. Merely invalidating
       // A's request is not enough: its already-rendered transcript would sit
       // under B's title while B's native lookup is pending (or if it fails).
       setMessages([]);
       setSegments([]);
       setHistoryEvents([]);
+      setHistoryTranscriptBackfillState('idle');
       setActiveSegment(null);
-      setIsLoadingMessages(true);
+      updateIsLoadingMessages(true);
       const selectionIsCurrent = () =>
         historySelectionRequestSeqRef.current === selectionRequestSeq
         && selectedKeyRef.current === key;
@@ -2060,7 +2183,7 @@ export function Workspace({
       if (!selectionIsCurrent()) return;
       if (liveEntry && canRestoreWorkspaceLiveSession(liveEntry.session)) {
         updateHistoryRouteResolutionStatus('ready');
-        setIsLoadingMessages(false);
+        updateIsLoadingMessages(false);
         setActiveLiveRuntimeId(liveEntry.session.runtime_id);
         setComposeDir(liveEntry.session.project_dir);
         setSelectedWorkingDir(liveEntry.session.project_dir);
@@ -2133,6 +2256,7 @@ export function Workspace({
       upsertLiveSessionEntry,
       updateHistoryRouteDraftState,
       updateHistoryRouteResolutionStatus,
+      updateIsLoadingMessages,
     ]
   );
 
@@ -3324,6 +3448,10 @@ export function Workspace({
               activeSegment={activeSegment}
               onActiveSegmentChange={setActiveSegment}
               isLoadingMessages={isLoadingMessages}
+              transcriptBackfillState={historyTranscriptBackfillState}
+              onTranscriptRetry={() => {
+                void handleSelect(selectedSession, { forceHistory: true });
+              }}
               canAddAnnotation={selectedHistorySupportsInline && historyAnnotations.canAddAnnotation}
               annotations={historyAnnotations.annotations}
               onAddAnnotation={selectedHistorySupportsInline ? historyAnnotations.addAnnotation : undefined}

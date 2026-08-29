@@ -272,7 +272,7 @@ export function WorkspaceTranscriptList({
   onForkTurn,
 }: WorkspaceTranscriptListProps) {
   const listRef = useRef<HTMLDivElement | null>(null);
-  const seenItemKeysRef = useRef<Set<string>>(new Set());
+  const previousMotionKeysRef = useRef<string[]>([]);
   const hasHydratedMotionRef = useRef(false);
   /** Per-item-key measured heights; stable estimates immune to one giant row. */
   const heightCacheRef = useRef<TranscriptItemHeightCache>(createTranscriptItemHeightCache());
@@ -356,14 +356,21 @@ export function WorkspaceTranscriptList({
     const list = listRef.current;
     const currentKeys = displayItems.map((item) => item.key);
     if (!list) {
-      seenItemKeysRef.current = new Set(currentKeys);
+      previousMotionKeysRef.current = currentKeys;
       hasHydratedMotionRef.current = true;
       return;
     }
 
-    const previousKeys = seenItemKeysRef.current;
-    const newKeys = currentKeys.filter((key) => !previousKeys.has(key));
-    seenItemKeysRef.current = new Set(currentKeys);
+    const previousKeys = previousMotionKeysRef.current;
+    const isTailAppend = previousKeys.length < currentKeys.length
+      && previousKeys.every((key, index) => currentKeys[index] === key);
+    // Historical recovery prepends older messages. Animating every recovered
+    // row both misrepresents it as new and can enqueue hundreds of GSAP
+    // targets. Only animate a verified tail append, with a small hard cap.
+    const newKeys = isTailAppend
+      ? currentKeys.slice(previousKeys.length).slice(-12)
+      : [];
+    previousMotionKeysRef.current = currentKeys;
 
     if (!hasHydratedMotionRef.current) {
       hasHydratedMotionRef.current = true;
@@ -374,10 +381,11 @@ export function WorkspaceTranscriptList({
       return;
     }
 
+    const newKeySet = new Set(newKeys);
     const targets = gsap.utils.toArray<HTMLElement>('[data-transcript-item-key]', list)
       .filter((element) => {
         const key = element.dataset.transcriptItemKey;
-        return key ? newKeys.includes(key) : false;
+        return key ? newKeySet.has(key) : false;
       });
 
     if (targets.length === 0) {

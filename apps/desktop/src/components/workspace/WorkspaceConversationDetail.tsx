@@ -6,6 +6,10 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
 import { getPerformanceMode } from '@/lib/performance';
 import { WorkspaceTranscriptSelection } from './WorkspaceAnnotations';
+import {
+  WorkspaceTranscriptBackfillStatus,
+  type WorkspaceTranscriptBackfillState,
+} from './WorkspaceTranscriptBackfillStatus';
 import { mergeToolResults } from '@/features/conversations/messageState';
 import type {
   ConversationMessageData,
@@ -28,6 +32,8 @@ interface WorkspaceConversationDetailProps {
   activeSegment: number | null;
   onActiveSegmentChange: (segment: number | null) => void;
   isLoadingMessages: boolean;
+  transcriptBackfillState?: WorkspaceTranscriptBackfillState;
+  onTranscriptRetry?: () => void;
   canAddAnnotation?: boolean;
   annotations?: WorkspaceAnnotation[];
   onAddAnnotation?: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
@@ -50,6 +56,8 @@ export function WorkspaceConversationDetail({
   messages,
   activeSegment,
   isLoadingMessages,
+  transcriptBackfillState = 'idle',
+  onTranscriptRetry,
   canAddAnnotation = false,
   annotations = [],
   onAddAnnotation,
@@ -281,6 +289,16 @@ export function WorkspaceConversationDetail({
       ) : null}
       <ScrollArea viewportRef={messagesContainerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
         <div className="mx-auto max-w-[860px] px-8 py-8">
+          <div className="sticky top-2 z-10">
+            <WorkspaceTranscriptBackfillStatus
+              state={transcriptBackfillState}
+              loadingMessage={t('workspace.nativeTranscriptBackfillLoading')}
+              errorMessage={t('workspace.nativeTranscriptBackfillError')}
+              partialMessage={t('workspace.nativeTranscriptBackfillPartial')}
+              retryLabel={t('common.retry')}
+              onRetry={onTranscriptRetry ?? (() => {})}
+            />
+          </div>
           {isLoadingMessages ? (
             <div className="space-y-5">
               {Array.from({ length: 5 }).map((_, index) => (

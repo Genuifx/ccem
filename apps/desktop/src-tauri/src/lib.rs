@@ -1601,6 +1601,22 @@ fn get_native_session_events(
 }
 
 #[tauri::command]
+async fn get_native_session_event_page(
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    after_seq: Option<u64>,
+    snapshot_newest_seq: Option<u64>,
+    limit: u64,
+) -> Result<event_bus::NativeEventReplayPage, String> {
+    let native_state = native_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        native_state.replay_event_page(&runtime_id, after_seq, snapshot_newest_seq, limit)
+    })
+    .await
+    .map_err(|error| format!("Native event page task failed: {}", error))?
+}
+
+#[tauri::command]
 fn read_prompt_image_attachment(
     storage_path: String,
     media_type: String,
@@ -5750,6 +5766,7 @@ pub fn run_desktop_app() -> i32 {
             rewind_native_session_files,
             query_native_session_usage,
             get_native_session_events,
+            get_native_session_event_page,
             read_prompt_image_attachment,
             update_native_session_settings,
             restart_native_session_direct,

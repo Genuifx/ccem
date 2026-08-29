@@ -1,4 +1,6 @@
-use crate::event_bus::{ReplayBatch, SessionEventPayload, SessionEventRecord, TodoSnapshotV1};
+use crate::event_bus::{
+    NativeEventReplayPage, ReplayBatch, SessionEventPayload, SessionEventRecord, TodoSnapshotV1,
+};
 use crate::session_provenance::state_db_path;
 use crate::user_prompt_display::normalize_user_visible_prompt;
 use crate::workspace_decorations::AttentionSummary;
@@ -12,6 +14,102 @@ use std::time::Duration;
 
 const EVENT_LOG_FLUSH_BATCH_SIZE: usize = 64;
 const ATTENTION_SUMMARY_TAIL_FALLBACK_LIMIT: u64 = 2000;
+pub(crate) const MAX_EVENT_REPLAY_PAGE_SIZE: u64 = 2000;
+pub(crate) const MAX_EVENT_REPLAY_PAGE_BYTES: usize = 512 * 1024;
+// Leave ample room for the page fields, JSON keys, array delimiters, and
+// numeric values. Event records are measured with serde_json before inclusion,
+// and the completed page is checked again before it leaves Rust.
+const EVENT_REPLAY_PAGE_ENVELOPE_BYTES: usize = 4 * 1024;
+
+pub(crate) struct BoundedDecodedEventPage {
+    pub events: Vec<SessionEventRecord>,
+    pub next_cursor: Option<u64>,
+    pub has_more: bool,
+    pub oversized_event_count: u64,
+}
+
+pub(crate) fn validate_event_replay_page_request(
+    after_seq: Option<u64>,
+    snapshot_newest_seq: Option<u64>,
+) -> Result<(), String> {
+    if let (Some(after), Some(snapshot)) = (after_seq, snapshot_newest_seq) {
+        if after > snapshot {
+            return Err("after_seq cannot be greater than snapshot_newest_seq".to_string());
+        }
+    }
+    if let Some(after) = after_seq {
+        sqlite_i64_from_u64(after, "after_seq")?;
+    }
+    if let Some(snapshot) = snapshot_newest_seq {
+        sqlite_i64_from_u64(snapshot, "snapshot_newest_seq")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn bound_decoded_event_page(
+    records: Vec<SessionEventRecord>,
+    limit: u64,
+) -> Result<BoundedDecodedEventPage, String> {
+    let page_size = limit.clamp(1, MAX_EVENT_REPLAY_PAGE_SIZE) as usize;
+    let event_budget = MAX_EVENT_REPLAY_PAGE_BYTES.saturating_sub(EVENT_REPLAY_PAGE_ENVELOPE_BYTES);
+    let mut events = Vec::with_capacity(records.len().min(page_size));
+    let mut serialized_event_bytes = 0_usize;
+    let mut next_cursor = None;
+    let mut oversized_event_count = 0_u64;
+    let mut scanned_rows = 0_usize;
+    let mut has_more = false;
+
+    for record in records {
+        if scanned_rows >= page_size {
+            has_more = true;
+            break;
+        }
+
+        let record_bytes = serialized_event_size(&record)?;
+        let record_with_delimiter = record_bytes.saturating_add(1);
+        if record_with_delimiter > event_budget {
+            scanned_rows += 1;
+            next_cursor = Some(record.seq);
+            oversized_event_count = oversized_event_count.saturating_add(1);
+            continue;
+        }
+        if serialized_event_bytes.saturating_add(record_with_delimiter) > event_budget {
+            has_more = true;
+            break;
+        }
+
+        scanned_rows += 1;
+        serialized_event_bytes = serialized_event_bytes.saturating_add(record_with_delimiter);
+        next_cursor = Some(record.seq);
+        events.push(record);
+    }
+
+    Ok(BoundedDecodedEventPage {
+        events,
+        next_cursor,
+        has_more,
+        oversized_event_count,
+    })
+}
+
+pub(crate) fn ensure_event_replay_page_size(page: &NativeEventReplayPage) -> Result<(), String> {
+    let serialized_bytes = serde_json::to_vec(page)
+        .map_err(|error| format!("Failed to measure native event page: {}", error))?
+        .len();
+    if serialized_bytes > MAX_EVENT_REPLAY_PAGE_BYTES {
+        return Err(format!(
+            "Native event page exceeded serialized byte budget: {} > {}",
+            serialized_bytes, MAX_EVENT_REPLAY_PAGE_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn serialized_event_size(record: &SessionEventRecord) -> Result<usize, String> {
+    serde_json::to_vec(record)
+        .map(|json| json.len())
+        .map_err(|error| format!("Failed to measure native event record: {}", error))
+}
 
 pub struct NativeEventLog {
     db_path: PathBuf,
@@ -122,6 +220,82 @@ impl NativeEventLog {
                 newest_available_seq,
                 events,
             })
+        })
+    }
+
+    /// Read a bounded forward page from a fixed event-sequence snapshot.
+    ///
+    /// A request that omits `snapshot_newest_seq` starts a new snapshot and may
+    /// still carry `after_seq` for incremental replay. The returned bound must
+    /// be echoed by every later request. This makes backfill finite even while
+    /// a live runtime continues appending events. The cursor advances by raw
+    /// SQLite rows rather than decoded events, so an unreadable row cannot
+    /// trap the caller in an infinite retry loop.
+    pub fn replay_page(
+        &self,
+        runtime_id: &str,
+        after_seq: Option<u64>,
+        snapshot_newest_seq: Option<u64>,
+        limit: u64,
+    ) -> Result<NativeEventReplayPage, String> {
+        validate_event_replay_page_request(after_seq, snapshot_newest_seq)?;
+        self.flush_pending()?;
+        self.with_conn(|conn| {
+            let (oldest_available_seq, current_newest_seq) = event_seq_bounds(conn, runtime_id)?;
+            // A supplied snapshot is immutable. If persisted rows disappear
+            // between calls, retain the original bound and report the missing
+            // tail as a real gap instead of silently shrinking the snapshot.
+            let snapshot_newest_seq = snapshot_newest_seq.or(current_newest_seq);
+            let Some(snapshot_newest_seq) = snapshot_newest_seq else {
+                let page = NativeEventReplayPage {
+                    source_available: true,
+                    gap_detected: false,
+                    decode_failure_count: 0,
+                    oversized_event_count: 0,
+                    oldest_available_seq,
+                    snapshot_newest_seq: None,
+                    next_cursor: None,
+                    has_more: false,
+                    events: Vec::new(),
+                };
+                ensure_event_replay_page_size(&page)?;
+                return Ok(page);
+            };
+            // The initial request can supply a cursor before the snapshot is
+            // known. Once bound, it must obey the same cursor ordering as a
+            // continuation request.
+            validate_event_replay_page_request(after_seq, Some(snapshot_newest_seq))?;
+
+            let page_size = limit.clamp(1, MAX_EVENT_REPLAY_PAGE_SIZE);
+            let after_seq_i64 = sqlite_i64_from_u64(after_seq.unwrap_or(0), "after_seq")?;
+            let snapshot_newest_seq_i64 =
+                sqlite_i64_from_u64(snapshot_newest_seq, "snapshot_newest_seq")?;
+            let row_limit_i64 =
+                sqlite_i64_from_u64(page_size.saturating_add(1), "native event page row limit")?;
+            let scan = scan_event_page_rows(
+                conn,
+                runtime_id,
+                after_seq_i64,
+                snapshot_newest_seq_i64,
+                after_seq.map(|seq| seq.saturating_add(1)).or(Some(1)),
+                snapshot_newest_seq,
+                page_size as usize,
+                row_limit_i64,
+            )?;
+
+            let page = NativeEventReplayPage {
+                source_available: true,
+                gap_detected: scan.gap_detected,
+                decode_failure_count: scan.decode_failure_count,
+                oversized_event_count: scan.oversized_event_count,
+                oldest_available_seq,
+                snapshot_newest_seq: Some(snapshot_newest_seq),
+                next_cursor: scan.next_cursor,
+                has_more: scan.has_more,
+                events: scan.events,
+            };
+            ensure_event_replay_page_size(&page)?;
+            Ok(page)
         })
     }
 
@@ -260,7 +434,9 @@ impl NativeEventLog {
     ) -> Result<(u64, Option<u64>, Option<u64>), String> {
         self.flush_pending()?;
         self.with_conn(|conn| {
-            let since = since_seq.map(|seq| seq as i64);
+            let since = since_seq
+                .map(|seq| sqlite_i64_from_u64(seq, "since_seq"))
+                .transpose()?;
             let (pending_count, oldest, newest) = conn
                 .query_row(
                     "SELECT COALESCE(SUM(CASE WHEN ?2 IS NULL OR seq > ?2 THEN 1 ELSE 0 END), 0),
@@ -363,9 +539,10 @@ impl NativeEventLog {
                     let payload_json = serde_json::to_string(&record.payload).map_err(|error| {
                         format!("Failed to serialize native event payload: {}", error)
                     })?;
+                    let seq = sqlite_i64_from_u64(record.seq, "native event sequence")?;
                     stmt.execute(params![
                         record.runtime_id,
-                        record.seq as i64,
+                        seq,
                         record.occurred_at.to_rfc3339(),
                         payload_json,
                         created_at,
@@ -553,35 +730,73 @@ fn query_events_since(
     let mut records = Vec::new();
 
     if let Some(last_seen) = since_seq {
-        let mut stmt = conn
-            .prepare(
-                "SELECT seq, occurred_at, payload_json
-                 FROM native_session_events
-                 WHERE runtime_id = ?1 AND seq > ?2
-                 ORDER BY seq ASC",
-            )
-            .map_err(|error| format!("Failed to prepare native event replay: {}", error))?;
-        let rows = stmt
-            .query_map(params![runtime_id, last_seen as i64], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| format!("Failed to query native session events: {}", error))?;
+        let last_seen_i64 = sqlite_i64_from_u64(last_seen, "since_seq")?;
+        if let Some(limit) = limit.filter(|value| *value > 0) {
+            let limit_i64 = sqlite_i64_from_u64(limit, "event replay limit")?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, occurred_at, payload_json
+                     FROM native_session_events
+                     WHERE runtime_id = ?1 AND seq > ?2
+                     ORDER BY seq ASC
+                     LIMIT ?3",
+                )
+                .map_err(|error| {
+                    format!("Failed to prepare limited native event replay: {}", error)
+                })?;
+            let rows = stmt
+                .query_map(params![runtime_id, last_seen_i64, limit_i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| {
+                    format!("Failed to query limited native session events: {}", error)
+                })?;
 
-        for row in rows {
-            let row =
-                row.map_err(|error| format!("Failed to read native session event row: {}", error))?;
-            if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
-                records.push(record);
+            for row in rows {
+                let row = row.map_err(|error| {
+                    format!("Failed to read limited native session event row: {}", error)
+                })?;
+                if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
+                    records.push(record);
+                }
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, occurred_at, payload_json
+                     FROM native_session_events
+                     WHERE runtime_id = ?1 AND seq > ?2
+                     ORDER BY seq ASC",
+                )
+                .map_err(|error| format!("Failed to prepare native event replay: {}", error))?;
+            let rows = stmt
+                .query_map(params![runtime_id, last_seen_i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("Failed to query native session events: {}", error))?;
+
+            for row in rows {
+                let row = row.map_err(|error| {
+                    format!("Failed to read native session event row: {}", error)
+                })?;
+                if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
+                    records.push(record);
+                }
             }
         }
         return Ok(records);
     }
 
     if let Some(limit) = limit.filter(|value| *value > 0) {
+        let limit_i64 = sqlite_i64_from_u64(limit, "event replay limit")?;
         let mut stmt = conn
             .prepare(
                 "WITH oldest AS (
@@ -619,7 +834,7 @@ fn query_events_since(
             )
             .map_err(|error| format!("Failed to prepare native event tail replay: {}", error))?;
         let rows = stmt
-            .query_map(params![runtime_id, limit as i64], |row| {
+            .query_map(params![runtime_id, limit_i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -666,6 +881,159 @@ fn query_events_since(
     Ok(records)
 }
 
+struct PersistedEventPageScan {
+    gap_detected: bool,
+    decode_failure_count: u64,
+    oversized_event_count: u64,
+    next_cursor: Option<u64>,
+    has_more: bool,
+    events: Vec<SessionEventRecord>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_event_page_rows(
+    conn: &Connection,
+    runtime_id: &str,
+    after_seq: i64,
+    snapshot_newest_seq_i64: i64,
+    expected_first_seq: Option<u64>,
+    snapshot_newest_seq: u64,
+    page_size: usize,
+    row_limit: i64,
+) -> Result<PersistedEventPageScan, String> {
+    let event_budget = MAX_EVENT_REPLAY_PAGE_BYTES.saturating_sub(EVENT_REPLAY_PAGE_ENVELOPE_BYTES);
+    let event_budget_i64 = i64::try_from(event_budget)
+        .map_err(|_| "Native event page byte budget exceeds SQLite range".to_string())?;
+    let mut metadata_stmt = conn
+        .prepare(
+            "SELECT seq,
+                    occurred_at,
+                    length(CAST(payload_json AS BLOB)),
+                    CASE
+                      WHEN length(CAST(payload_json AS BLOB)) <= ?5 THEN payload_json
+                      ELSE NULL
+                    END
+             FROM native_session_events
+             WHERE runtime_id = ?1 AND seq > ?2 AND seq <= ?3
+             ORDER BY seq ASC
+             LIMIT ?4",
+        )
+        .map_err(|error| format!("Failed to prepare native event page: {}", error))?;
+    let mut rows = metadata_stmt
+        .query(params![
+            runtime_id,
+            after_seq,
+            snapshot_newest_seq_i64,
+            row_limit,
+            event_budget_i64
+        ])
+        .map_err(|error| format!("Failed to query native event page: {}", error))?;
+
+    let mut serialized_event_bytes = 0_usize;
+    let mut scanned_rows = 0_usize;
+    let mut previous_raw_seq = None;
+    let mut next_cursor = None;
+    let mut has_more = false;
+    let mut gap_detected = false;
+    let mut decode_failure_count = 0_u64;
+    let mut oversized_event_count = 0_u64;
+    let mut events = Vec::with_capacity(page_size);
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Failed to read native event page metadata: {}", error))?
+    {
+        if scanned_rows >= page_size {
+            has_more = true;
+            break;
+        }
+
+        let seq_i64 = row
+            .get::<_, i64>(0)
+            .map_err(|error| format!("Failed to read native event page sequence: {}", error))?;
+        let seq = non_negative_i64_to_u64(seq_i64)
+            .ok_or_else(|| format!("Invalid native event sequence number: {}", seq_i64))?;
+        let occurred_at = row
+            .get::<_, String>(1)
+            .map_err(|error| format!("Failed to read native event page timestamp: {}", error))?;
+        let payload_bytes = row
+            .get::<_, i64>(2)
+            .map_err(|error| format!("Failed to read native event payload length: {}", error))?;
+        let payload_bytes = usize::try_from(payload_bytes).unwrap_or(usize::MAX);
+
+        let row_has_gap = previous_raw_seq
+            .map(|previous: u64| seq != previous.saturating_add(1))
+            .or_else(|| expected_first_seq.map(|expected| seq != expected))
+            .unwrap_or(false);
+
+        // A payload that cannot possibly fit is counted and skipped without
+        // copying its body from SQLite into Rust. The raw cursor still moves.
+        if payload_bytes > event_budget {
+            scanned_rows += 1;
+            gap_detected |= row_has_gap;
+            previous_raw_seq = Some(seq);
+            next_cursor = Some(seq);
+            oversized_event_count = oversized_event_count.saturating_add(1);
+            continue;
+        }
+
+        let payload_json = row
+            .get::<_, Option<String>>(3)
+            .map_err(|error| format!("Failed to read native event payload: {}", error))?
+            .ok_or_else(|| "Native event payload was unexpectedly omitted".to_string())?;
+        let record = event_row_to_record_lossy(runtime_id, (seq_i64, occurred_at, payload_json));
+        let Some(record) = record else {
+            scanned_rows += 1;
+            gap_detected |= row_has_gap;
+            previous_raw_seq = Some(seq);
+            next_cursor = Some(seq);
+            decode_failure_count = decode_failure_count.saturating_add(1);
+            continue;
+        };
+
+        let record_with_delimiter = serialized_event_size(&record)?.saturating_add(1);
+        if record_with_delimiter > event_budget {
+            scanned_rows += 1;
+            gap_detected |= row_has_gap;
+            previous_raw_seq = Some(seq);
+            next_cursor = Some(seq);
+            oversized_event_count = oversized_event_count.saturating_add(1);
+            continue;
+        }
+        if serialized_event_bytes.saturating_add(record_with_delimiter) > event_budget {
+            has_more = true;
+            break;
+        }
+
+        scanned_rows += 1;
+        serialized_event_bytes = serialized_event_bytes.saturating_add(record_with_delimiter);
+        gap_detected |= row_has_gap;
+        previous_raw_seq = Some(seq);
+        next_cursor = Some(seq);
+        events.push(record);
+    }
+
+    // Exhausting the query below the immutable snapshot means persisted rows
+    // are missing at the tail. Byte/count pagination is normal and reports
+    // has_more instead, so it must not be mistaken for corruption.
+    if !has_more {
+        let scanned_through =
+            next_cursor.or_else(|| expected_first_seq.map(|seq| seq.saturating_sub(1)));
+        if scanned_through.is_some_and(|seq| seq < snapshot_newest_seq) {
+            gap_detected = true;
+        }
+    }
+
+    Ok(PersistedEventPageScan {
+        gap_detected,
+        decode_failure_count,
+        oversized_event_count,
+        next_cursor,
+        has_more,
+        events,
+    })
+}
+
 fn event_row_to_record(
     runtime_id: &str,
     row: (i64, String, String),
@@ -710,6 +1078,15 @@ fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
     } else {
         Some(value as u64)
     }
+}
+
+fn sqlite_i64_from_u64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| {
+        format!(
+            "{} exceeds SQLite's signed 64-bit integer range: {}",
+            field, value
+        )
+    })
 }
 
 fn replay_batch_is_truncated(
@@ -785,6 +1162,8 @@ fn limited_replay_unloaded_gap_starts(
         if next.seq <= previous.seq.saturating_add(1) {
             continue;
         }
+        let previous_seq = sqlite_i64_from_u64(previous.seq, "native event sequence")?;
+        let next_seq = sqlite_i64_from_u64(next.seq, "native event sequence")?;
 
         let contains_omitted_event = conn
             .query_row(
@@ -794,7 +1173,7 @@ fn limited_replay_unloaded_gap_starts(
                     WHERE runtime_id = ?1 AND seq > ?2 AND seq < ?3
                     LIMIT 1
                  )",
-                params![runtime_id, previous.seq as i64, next.seq as i64],
+                params![runtime_id, previous_seq, next_seq],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| format!("Failed to classify native event replay gap: {}", error))?
@@ -843,11 +1222,578 @@ mod attention_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::NativeEventLog;
+    use super::{NativeEventLog, MAX_EVENT_REPLAY_PAGE_BYTES};
     use crate::event_bus::{SessionEventPayload, SessionEventRecord};
     use crate::user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP;
     use chrono::Utc;
     use rusqlite::Connection;
+
+    fn replay_page_test_record(runtime_id: &str, seq: u64) -> SessionEventRecord {
+        SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::AssistantChunk {
+                text: format!("chunk-{seq}"),
+            },
+        }
+    }
+
+    #[test]
+    fn native_event_log_page_skips_one_oversized_row_and_keeps_a_hard_response_limit() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-oversized-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-oversized";
+        let log = NativeEventLog::new(db_path.clone());
+        log.append(&SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq: 1,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::AssistantChunk {
+                text: "x".repeat(MAX_EVENT_REPLAY_PAGE_BYTES + 1024),
+            },
+        })
+        .expect("append oversized event");
+        log.append(&replay_page_test_record(runtime_id, 2))
+            .expect("append readable event");
+
+        let page = log
+            .replay_page(runtime_id, None, None, 10)
+            .expect("oversized page");
+        assert_eq!(page.oversized_event_count, 1);
+        assert_eq!(page.decode_failure_count, 0);
+        assert_eq!(page.next_cursor, Some(2));
+        assert!(!page.has_more);
+        assert!(!page.gap_detected);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+        );
+        assert!(
+            serde_json::to_vec(&page).expect("serialize page").len() <= MAX_EVENT_REPLAY_PAGE_BYTES
+        );
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_stops_lazy_scan_at_the_byte_budget() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-many-large-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-many-large";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=2001 {
+            log.append(&SessionEventRecord {
+                runtime_id: runtime_id.to_string(),
+                seq,
+                occurred_at: Utc::now(),
+                payload: SessionEventPayload::AssistantChunk {
+                    text: "x".repeat(4 * 1024),
+                },
+            })
+            .expect("append large event");
+        }
+
+        let page = log
+            .replay_page(runtime_id, None, None, 2000)
+            .expect("byte-bounded page");
+        assert!(page.has_more);
+        assert_eq!(page.oversized_event_count, 0);
+        assert!(!page.events.is_empty());
+        assert!(page.events.len() < 2000);
+        assert_eq!(page.next_cursor, page.events.last().map(|event| event.seq));
+        assert!(
+            serde_json::to_vec(&page).expect("serialize page").len() <= MAX_EVENT_REPLAY_PAGE_BYTES
+        );
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_reports_a_missing_runtime_head() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-head-gap-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-head-gap";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 2..=3 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append event after missing head");
+        }
+
+        let page = log
+            .replay_page(runtime_id, None, None, 10)
+            .expect("head-gapped page");
+        assert_eq!(page.oldest_available_seq, Some(2));
+        assert!(page.gap_detected);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_pages_a_fixed_snapshot_while_new_events_arrive() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-snapshot-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-snapshot";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=5 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append snapshot event");
+        }
+
+        let first = log
+            .replay_page(runtime_id, None, None, 2)
+            .expect("first page");
+        assert_eq!(first.snapshot_newest_seq, Some(5));
+        assert_eq!(first.next_cursor, Some(2));
+        assert!(first.has_more);
+        assert!(!first.gap_detected);
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+        );
+
+        // This row is visible to live polling, but must not move the frozen
+        // history snapshot or make pagination chase a moving tail.
+        log.append(&replay_page_test_record(runtime_id, 6))
+            .expect("append live event");
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("second page");
+        assert_eq!(second.snapshot_newest_seq, Some(5));
+        assert_eq!(second.next_cursor, Some(4));
+        assert!(second.has_more);
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+        );
+        let third = log
+            .replay_page(
+                runtime_id,
+                second.next_cursor,
+                second.snapshot_newest_seq,
+                2,
+            )
+            .expect("third page");
+        assert_eq!(third.snapshot_newest_seq, Some(5));
+        assert_eq!(third.next_cursor, Some(5));
+        assert!(!third.has_more);
+        assert_eq!(
+            third
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![5],
+        );
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_has_more_is_false_on_an_exact_final_page() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-exact-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-exact";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=4 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append exact-page event");
+        }
+
+        let first = log
+            .replay_page(runtime_id, None, None, 2)
+            .expect("first exact page");
+        assert!(first.has_more);
+        assert_eq!(first.next_cursor, Some(2));
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("second exact page");
+        assert!(!second.has_more);
+        assert_eq!(second.next_cursor, Some(4));
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+        );
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_detects_a_gap_at_the_page_boundary() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-boundary-gap-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-boundary-gap";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=5 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append boundary-gap event");
+        }
+        log.flush_pending().expect("flush boundary-gap events");
+        log.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM native_session_events WHERE runtime_id = ?1 AND seq = 3",
+                [runtime_id],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .expect("delete boundary row");
+
+        let first = log
+            .replay_page(runtime_id, None, None, 2)
+            .expect("first boundary page");
+        assert!(!first.gap_detected);
+        assert!(first.has_more);
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("second boundary page");
+        assert!(second.gap_detected);
+        assert_eq!(second.events.first().map(|event| event.seq), Some(4));
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_keeps_snapshot_and_reports_a_deleted_tail() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-tail-gap-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-tail-gap";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=4 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append tail-gap event");
+        }
+        let first = log
+            .replay_page(runtime_id, None, None, 2)
+            .expect("first tail page");
+        log.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM native_session_events WHERE runtime_id = ?1 AND seq = 4",
+                [runtime_id],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .expect("delete snapshot tail");
+
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("tail-gapped page");
+        assert_eq!(second.snapshot_newest_seq, Some(4));
+        assert_eq!(second.next_cursor, Some(3));
+        assert!(!second.has_more);
+        assert!(second.gap_detected);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_start_after_binds_a_fixed_snapshot() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-start-after-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-start-after";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=5 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append initial event");
+        }
+
+        let first = log
+            .replay_page(runtime_id, Some(2), None, 2)
+            .expect("start-after page");
+        assert_eq!(first.snapshot_newest_seq, Some(5));
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(first.next_cursor, Some(4));
+        assert!(first.has_more);
+
+        log.append(&replay_page_test_record(runtime_id, 6))
+            .expect("append after snapshot");
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("snapshot continuation");
+        assert_eq!(second.snapshot_newest_seq, Some(5));
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(second.next_cursor, Some(5));
+        assert!(!second.has_more);
+        assert!(log.replay_page(runtime_id, Some(7), None, 2).is_err());
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_rejects_invalid_continuation_and_integer_parameters() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-params-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-params";
+        let log = NativeEventLog::new(db_path.clone());
+        log.append(&replay_page_test_record(runtime_id, 1))
+            .expect("append parameter-test event");
+
+        assert!(log.replay_page(runtime_id, Some(2), Some(1), 10).is_err());
+        assert!(log
+            .replay_page(runtime_id, Some(u64::MAX), Some(u64::MAX), 10)
+            .is_err());
+        assert!(log.replay(runtime_id, Some(u64::MAX), Some(1)).is_err());
+        assert!(log.replay(runtime_id, None, Some(u64::MAX)).is_err());
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_cursor_advances_past_an_unreadable_row() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-decode-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-decode";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=3 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append event");
+        }
+        log.flush_pending().expect("flush events");
+        log.with_conn(|conn| {
+            conn.execute(
+                "UPDATE native_session_events SET payload_json = ?1
+                 WHERE runtime_id = ?2 AND seq = 2",
+                ["{\"type\":\"unknown-future-payload\"}", runtime_id],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .expect("inject unreadable row");
+
+        let first = log
+            .replay_page(runtime_id, None, None, 2)
+            .expect("first lossy page");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].seq, 1);
+        assert_eq!(first.decode_failure_count, 1);
+        assert_eq!(first.next_cursor, Some(2));
+        assert!(first.has_more);
+
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("page after unreadable row");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].seq, 3);
+        assert_eq!(second.next_cursor, Some(3));
+        assert!(!second.has_more);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_cursor_advances_when_every_row_in_a_page_is_unreadable() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-all-decode-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-all-decode";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=3 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append event");
+        }
+        log.flush_pending().expect("flush events");
+        log.with_conn(|conn| {
+            conn.execute(
+                "UPDATE native_session_events SET payload_json = ?1
+                 WHERE runtime_id = ?2 AND seq <= 2",
+                ["{\"type\":\"unknown-future-payload\"}", runtime_id],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .expect("inject unreadable page");
+
+        let first = log
+            .replay_page(runtime_id, None, None, 2)
+            .expect("all-unreadable page");
+        assert!(first.events.is_empty());
+        assert_eq!(first.decode_failure_count, 2);
+        assert_eq!(first.next_cursor, Some(2));
+        assert!(first.has_more);
+
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
+            .expect("page after all unreadable rows");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].seq, 3);
+        assert_eq!(second.next_cursor, Some(3));
+        assert!(!second.has_more);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_reports_a_real_sequence_gap() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-gap-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-gap";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=3 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append event");
+        }
+        log.flush_pending().expect("flush events");
+        log.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM native_session_events WHERE runtime_id = ?1 AND seq = 2",
+                [runtime_id],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .expect("delete middle row");
+
+        let page = log
+            .replay_page(runtime_id, None, None, 10)
+            .expect("gapped page");
+        assert!(page.gap_detected);
+        assert_eq!(page.next_cursor, Some(3));
+        assert!(!page.has_more);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_page_applies_a_serialized_byte_budget() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-page-bytes-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-page-bytes";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=3 {
+            log.append(&SessionEventRecord {
+                runtime_id: runtime_id.to_string(),
+                seq,
+                occurred_at: Utc::now(),
+                payload: SessionEventPayload::AssistantChunk {
+                    text: "x".repeat(300 * 1024),
+                },
+            })
+            .expect("append large event");
+        }
+
+        let first = log
+            .replay_page(runtime_id, None, None, 10)
+            .expect("byte-bounded first page");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.next_cursor, Some(1));
+        assert!(first.has_more);
+
+        let second = log
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 10)
+            .expect("byte-bounded second page");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.next_cursor, Some(2));
+        assert!(second.has_more);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn native_event_log_applies_limit_to_incremental_replay() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-native-event-incremental-limit-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let runtime_id = "runtime-incremental-limit";
+        let log = NativeEventLog::new(db_path.clone());
+        for seq in 1..=5 {
+            log.append(&replay_page_test_record(runtime_id, seq))
+                .expect("append event");
+        }
+
+        let replay = log
+            .replay(runtime_id, Some(1), Some(2))
+            .expect("limited incremental replay");
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+        );
+        assert!(replay.truncated);
+
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
 
     #[test]
     fn native_event_log_replay_skips_unknown_payload_types() {

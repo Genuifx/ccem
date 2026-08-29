@@ -524,11 +524,15 @@ test('native history carries replay events into review and provider-only history
   );
   assert.match(
     source,
-    /if \(nativeHistory && hasNativeHistoryTranscriptMessages\(nativeHistory\.messages\)\) \{[\s\S]*setHistoryEvents\(nativeHistory\.events\)/,
+    /integrity: result\.status === 'partial' \? 'partial' : 'complete'/,
   );
   assert.match(
     source,
-    /if \(hasNativeHistorySessionOption\) \{[\s\S]*setHistoryEvents\(nativeHistory\?\.events \?\? \[\]\);[\s\S]*\}/,
+    /setHistoryEvents\(nativeHistory\?\.events \?\? \[\]\);[\s\S]*if \(providerHasTranscript\)[\s\S]*return;[\s\S]*hasNativeHistoryTranscriptMessages\(nativeHistory\.messages\)/,
+  );
+  assert.match(
+    source,
+    /if \(hasNativeHistorySessionOption\) \{[\s\S]*setHistoryEvents\(\[\]\);[\s\S]*\}/,
   );
   assert.equal(
     source.match(/events: workspaceReviewEvents/g)?.length,

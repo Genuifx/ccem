@@ -423,6 +423,15 @@ export interface TauriCommands {
     },
     ReplayBatch
   ];
+  get_native_session_event_page: [
+    {
+      runtimeId: string;
+      afterSeq?: number | null;
+      snapshotNewestSeq?: number | null;
+      limit: number;
+    },
+    NativeEventReplayPage
+  ];
   read_prompt_image_attachment: [
     {
       storagePath: string;
@@ -1235,6 +1244,18 @@ export interface ReplayBatch {
   unloaded_gap_starts?: number[];
   oldest_available_seq?: number | null;
   newest_available_seq?: number | null;
+  events: SessionEventRecord[];
+}
+
+export interface NativeEventReplayPage {
+  source_available: boolean;
+  gap_detected: boolean;
+  decode_failure_count: number;
+  oversized_event_count: number;
+  oldest_available_seq?: number | null;
+  snapshot_newest_seq?: number | null;
+  next_cursor?: number | null;
+  has_more: boolean;
   events: SessionEventRecord[];
 }
 

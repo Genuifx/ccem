@@ -35,6 +35,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
   const yieldLateResultAfterClose = options.yieldLateResultAfterClose ?? false;
   const peerStartsAfterIdleMs = options.peerStartsAfterIdleMs ?? 0;
   const launchBackgroundTaskBeforeInterrupt = options.launchBackgroundTaskBeforeInterrupt ?? false;
+  const streamFragments = options.streamFragments ?? null;
 
   await build({
     entryPoints: [path.join(packageDir, 'src', 'index.ts')],
@@ -90,6 +91,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const yieldLateResultAfterClose = ${JSON.stringify(yieldLateResultAfterClose)};
             const peerStartsAfterIdleMs = ${JSON.stringify(peerStartsAfterIdleMs)};
             const launchBackgroundTaskBeforeInterrupt = ${JSON.stringify(launchBackgroundTaskBeforeInterrupt)};
+            const streamFragments = ${JSON.stringify(streamFragments)};
             let queryCount = 0;
             let setModelCalled = false;
             export async function forkSession() {
@@ -371,10 +373,32 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                       };
                       continue;
                     }
+                    if (streamFragments?.length) {
+                      yield {
+                        type: 'stream_event',
+                        session_id,
+                        event: { type: 'message_start' },
+                      };
+                      for (const fragment of streamFragments) {
+                        yield {
+                          type: 'stream_event',
+                          session_id,
+                          event: {
+                            type: 'content_block_delta',
+                            delta: { type: 'text_delta', text: fragment },
+                          },
+                        };
+                      }
+                    }
                     yield {
                       type: 'assistant',
                       session_id,
-                      message: { content: [{ type: 'text', text }] },
+                      message: {
+                        content: [{
+                          type: 'text',
+                          text: streamFragments?.join('') || text,
+                        }],
+                      },
                     };
                     if (permissionOwnershipScenario && localTurn === 2) {
                       yield {
@@ -1464,7 +1488,14 @@ test('background task result cannot complete a queued human turn', async (t) => 
     stderrRef,
     'background task notification',
   );
-  await delay(40);
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'assistant_chunk'
+      && output.payload.text.includes('Human stream after attachment survives'),
+    stderrRef,
+    'foreground stream after the hidden task attachment',
+  );
 
   assert.equal(
     outputs.filter((output) => output.type === 'event'
@@ -1478,10 +1509,12 @@ test('background task result cannot complete a queued human turn', async (t) => 
     readyCountBeforeSecond,
     'task-notification result must not make the second human turn ready',
   );
+  const visibleAssistantText = outputs
+    .filter((output) => output.type === 'event' && output.payload?.type === 'assistant_chunk')
+    .map((output) => output.payload.text)
+    .join('');
   assert.equal(
-    outputs.some((output) => output.type === 'event'
-      && output.payload?.type === 'assistant_chunk'
-      && output.payload.text === 'Must stay in the task panel'),
+    visibleAssistantText.includes('Must stay in the task panel'),
     false,
     'task-notification assistant content must not enter the top-level transcript',
   );
@@ -1493,16 +1526,12 @@ test('background task result cannot complete a queued human turn', async (t) => 
     'background child tool summaries must not create top-level orphan completions',
   );
   assert.equal(
-    outputs.some((output) => output.type === 'event'
-      && output.payload?.type === 'assistant_chunk'
-      && output.payload.text === 'Human stream survives'),
+    visibleAssistantText.includes('Human stream survives'),
     true,
     'a human stream frame interleaved after task notification must remain visible',
   );
   assert.equal(
-    outputs.some((output) => output.type === 'event'
-      && output.payload?.type === 'assistant_chunk'
-      && output.payload.text === 'Human stream after attachment survives'),
+    visibleAssistantText.includes('Human stream after attachment survives'),
     true,
     'a shouldQuery=false task attachment must not take ownership from the active human stream',
   );
@@ -1646,15 +1675,13 @@ test('peer turn frames stay isolated without hiding the active human stream', as
     'human completion after peer turn',
   );
 
-  assert.equal(outputs.some((output) => output.type === 'event'
-    && output.payload?.type === 'assistant_chunk'
-    && output.payload.text.includes('Peer')), false);
-  assert.equal(outputs.some((output) => output.type === 'event'
-    && output.payload?.type === 'assistant_chunk'
-    && output.payload.text === 'Human assistant remains visible'), true);
-  assert.equal(outputs.some((output) => output.type === 'event'
-    && output.payload?.type === 'assistant_chunk'
-    && output.payload.text === 'Human stream remains visible'), true);
+  const visibleAssistantText = outputs
+    .filter((output) => output.type === 'event' && output.payload?.type === 'assistant_chunk')
+    .map((output) => output.payload.text)
+    .join('');
+  assert.equal(visibleAssistantText.includes('Peer'), false);
+  assert.equal(visibleAssistantText.includes('Human assistant remains visible'), true);
+  assert.equal(visibleAssistantText.includes('Human stream remains visible'), true);
   assert.equal(outputs.some((output) => output.type === 'event'
     && output.payload?.type === 'token_usage'
     && output.payload.input_tokens === 91), false, 'peer usage must not count toward the foreground turn');
@@ -1807,6 +1834,78 @@ test('restarts Claude query and marks each desktop prompt as human-originated', 
     .map((output) => output.payload.text);
 
   assert.deepEqual(chunks, ['mock response 1', 'mock response 2']);
+});
+
+test('coalesces adjacent Claude stream fragments and emits stable session metadata once', async (t) => {
+  const helperPath = await buildHelperWithMockClaudeSdk({
+    streamFragments: ['hello', ' ', 'world'],
+  });
+  const helper = spawn(process.execPath, [helperPath], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(() => helper.kill('SIGTERM'));
+
+  const outputs = [];
+  const stderrRef = { value: '' };
+  let stdoutBuffer = '';
+  helper.stdout.setEncoding('utf8');
+  helper.stdout.on('data', (chunk) => {
+    stdoutBuffer += chunk;
+    let newlineIndex = stdoutBuffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = stdoutBuffer.slice(0, newlineIndex).trim();
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line) outputs.push(JSON.parse(line));
+      newlineIndex = stdoutBuffer.indexOf('\n');
+    }
+  });
+  helper.stderr.setEncoding('utf8');
+  helper.stderr.on('data', (chunk) => {
+    stderrRef.value += chunk;
+  });
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    perm_mode: 'dev',
+    working_dir: os.tmpdir(),
+    provider_session_id: 'resume-session',
+    initial_prompt: 'stream this response',
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_completed',
+    stderrRef,
+    'coalesced Claude stream completion',
+  );
+
+  const chunks = outputs
+    .filter((output) => output.type === 'event' && output.payload?.type === 'assistant_chunk')
+    .map((output) => output.payload.text);
+  assert.deepEqual(chunks, ['hello world']);
+
+  const sessionMetas = outputs.filter((output) => output.type === 'session_meta');
+  assert.deepEqual(sessionMetas, [
+    {
+      type: 'session_meta',
+      provider_session_id: 'resume-session',
+    },
+    {
+      type: 'session_meta',
+      provider_session_id: 'mock-session',
+    },
+  ]);
+
+  const chunkIndex = outputs.findIndex((output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk');
+  const completionIndex = outputs.findIndex((output) => output.type === 'event'
+    && output.payload?.type === 'lifecycle'
+    && output.payload.stage === 'turn_completed');
+  assert.ok(chunkIndex >= 0 && chunkIndex < completionIndex, 'stream text must flush before completion');
 });
 
 test('keeps an idle Claude query open for the next prompt instead of closing background work', async (t) => {

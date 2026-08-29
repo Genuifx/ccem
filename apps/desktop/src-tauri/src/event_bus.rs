@@ -438,6 +438,32 @@ pub struct ReplayBatch {
     pub events: Vec<SessionEventRecord>,
 }
 
+/// A bounded, cursor-addressed slice of persisted native events.
+///
+/// Pagination state is deliberately separate from integrity state: `has_more`
+/// only means the caller has not reached the fixed snapshot boundary yet. It
+/// must never be presented as missing transcript data. `gap_detected`,
+/// `decode_failure_count`, `oversized_event_count`, and `source_available` are
+/// the authoritative integrity signals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NativeEventReplayPage {
+    #[serde(default)]
+    pub source_available: bool,
+    pub gap_detected: bool,
+    #[serde(default)]
+    pub decode_failure_count: u64,
+    /// Replay rows that were deliberately omitted because one event could not
+    /// fit inside the hard serialized page budget. The raw cursor still
+    /// advances across these rows so callers cannot retry forever.
+    #[serde(default)]
+    pub oversized_event_count: u64,
+    pub oldest_available_seq: Option<u64>,
+    pub snapshot_newest_seq: Option<u64>,
+    pub next_cursor: Option<u64>,
+    pub has_more: bool,
+    pub events: Vec<SessionEventRecord>,
+}
+
 pub fn replay_records(records: &[SessionEventRecord], last_seen_seq: Option<u64>) -> ReplayBatch {
     let oldest_available_seq = records.first().map(|event| event.seq);
     let newest_available_seq = records.last().map(|event| event.seq);
