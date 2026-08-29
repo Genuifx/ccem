@@ -35,6 +35,8 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
   const peerStartsAfterIdleMs = options.peerStartsAfterIdleMs ?? 0;
   const launchBackgroundTaskBeforeInterrupt = options.launchBackgroundTaskBeforeInterrupt ?? false;
   const streamFragments = options.streamFragments ?? null;
+  const manualCompactFirstTurn = options.manualCompactFirstTurn ?? false;
+  const manualCompactStatusOnly = options.manualCompactStatusOnly ?? false;
 
   await build({
     entryPoints: [path.join(packageDir, 'src', 'index.ts')],
@@ -90,6 +92,8 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const peerStartsAfterIdleMs = ${JSON.stringify(peerStartsAfterIdleMs)};
             const launchBackgroundTaskBeforeInterrupt = ${JSON.stringify(launchBackgroundTaskBeforeInterrupt)};
             const streamFragments = ${JSON.stringify(streamFragments)};
+            const manualCompactFirstTurn = ${JSON.stringify(manualCompactFirstTurn)};
+            const manualCompactStatusOnly = ${JSON.stringify(manualCompactStatusOnly)};
             let queryCount = 0;
             let setModelCalled = false;
             export async function forkSession() {
@@ -159,6 +163,35 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                       ? 'model=' + (options.model ?? '<none>') + ';setModel=' + setModelCalled
                       : 'mock response ' + responseNumber;
                     yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
+                    if (manualCompactFirstTurn && localTurn === 1) {
+                      yield {
+                        type: 'system',
+                        subtype: 'status',
+                        status: 'compacting',
+                        session_id,
+                      };
+                      if (!manualCompactStatusOnly) {
+                        yield {
+                          type: 'system',
+                          subtype: 'compact_boundary',
+                          compact_metadata: {
+                            trigger: 'manual',
+                            pre_tokens: 120000,
+                            post_tokens: 18000,
+                          },
+                          session_id,
+                        };
+                      }
+                      yield {
+                        type: 'system',
+                        subtype: 'status',
+                        status: null,
+                        compact_result: 'success',
+                        session_id,
+                      };
+                      yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
+                      continue;
+                    }
                     if (launchBackgroundTaskBeforeInterrupt && localTurn === 1) {
                       yield {
                         type: 'assistant',
@@ -508,6 +541,7 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
   const peerIngressOnly = options.peerIngressOnly ?? false;
   const notificationStreamWaitsForQueuedHumanPrompt = options.notificationStreamWaitsForQueuedHumanPrompt ?? false;
   const foregroundPlanAfterTaskNotification = options.foregroundPlanAfterTaskNotification ?? false;
+  const omitForegroundPlanResultProvenance = options.omitForegroundPlanResultProvenance ?? false;
 
   await build({
     entryPoints: [path.join(packageDir, 'src', 'index.ts')],
@@ -531,6 +565,7 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
             const peerIngressOnly = ${JSON.stringify(peerIngressOnly)};
             const notificationStreamWaitsForQueuedHumanPrompt = ${JSON.stringify(notificationStreamWaitsForQueuedHumanPrompt)};
             const foregroundPlanAfterTaskNotification = ${JSON.stringify(foregroundPlanAfterTaskNotification)};
+            const omitForegroundPlanResultProvenance = ${JSON.stringify(omitForegroundPlanResultProvenance)};
             export function tool(name, description, inputSchema, handler) {
               return { name, description, inputSchema, handler };
             }
@@ -693,8 +728,12 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
                         type: 'result',
                         subtype: 'success',
                         result: 'plan question answered',
-                        origin: { kind: 'human' },
-                        user_message_uuid: promptUuid,
+                        ...(omitForegroundPlanResultProvenance
+                          ? {}
+                          : {
+                            origin: { kind: 'human' },
+                            user_message_uuid: promptUuid,
+                          }),
                         session_id,
                       };
                       yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
@@ -1264,9 +1303,76 @@ function spawnTrackedHelper(t, helperPath) {
   return { helper, outputs, stderrRef };
 }
 
+test('manual compact closes its control turn and accepts the next prompt', async (t) => {
+  for (const scenario of [
+    { name: 'compact boundary', manualCompactStatusOnly: false },
+    { name: 'status fallback', manualCompactStatusOnly: true },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const helperPath = await buildHelperWithMockClaudeSdk({
+        manualCompactFirstTurn: true,
+        manualCompactStatusOnly: scenario.manualCompactStatusOnly,
+      });
+      const { helper, outputs, stderrRef } = spawnTrackedHelper(t, helperPath);
+
+      helper.stdin.write(`${JSON.stringify({
+        type: 'init',
+        provider: 'claude',
+        env_name: 'default',
+        perm_mode: 'dev',
+        working_dir: os.tmpdir(),
+        initial_prompt: '/compact retain the active implementation decisions',
+      })}\n`);
+
+      await waitForOutput(
+        outputs,
+        (output) => output.type === 'event'
+          && output.payload?.type === 'lifecycle'
+          && output.payload.stage === 'compact_completed',
+        stderrRef,
+        `${scenario.name} completion`,
+      );
+      await waitForOutput(
+        outputs,
+        (output) => output.type === 'status'
+          && output.status === 'ready'
+          && output.detail === 'Ready for the next prompt.',
+        stderrRef,
+        `${scenario.name} ready boundary`,
+      );
+      assert.equal(outputs.some((output) => output.type === 'event'
+        && output.payload?.type === 'lifecycle'
+        && output.payload.stage === 'turn_completed'), true);
+
+      helper.stdin.write(`${JSON.stringify({
+        type: 'prompt',
+        text: 'continue after compact',
+      })}\n`);
+      await waitForOutput(
+        outputs,
+        (output) => output.type === 'event'
+          && output.payload?.type === 'assistant_chunk'
+          && output.payload.text === 'mock response 1',
+        stderrRef,
+        `${scenario.name} follow-up response`,
+      );
+      await waitForOutput(
+        outputs,
+        (output) => output.type === 'event'
+          && output.payload?.type === 'lifecycle'
+          && output.payload.stage === 'turn_completed'
+          && output.payload.detail === 'done 1',
+        stderrRef,
+        `${scenario.name} follow-up completion`,
+      );
+    });
+  }
+});
+
 test('task notification cannot hide or duplicate an active foreground plan question', async (t) => {
   const helperPath = await buildHelperWithBackgroundRaceMock({
     foregroundPlanAfterTaskNotification: true,
+    omitForegroundPlanResultProvenance: true,
   });
   const helper = spawn(process.execPath, [helperPath], {
     env: {

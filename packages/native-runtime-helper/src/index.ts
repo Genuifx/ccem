@@ -269,8 +269,10 @@ let claudeLastAssistantMessageUuid: string | null = null;
 let claudeTurnAwaitingResult = false;
 let claudeForegroundPromptUuid: string | null = null;
 let claudeForegroundPromptAccepted = false;
+let claudeForegroundCommand: 'compact' | null = null;
 let claudeIngressOriginKind: string | null = null;
 let claudePendingNonHumanResultCount = 0;
+let claudeDeferredForegroundResult: { detail: string; failed: boolean } | null = null;
 const claudeSeenNonHumanResultKeys = new Set<string>();
 let pendingClaudePromptReplay: {
   text: string;
@@ -770,6 +772,8 @@ function closeClaudeQueryForRecovery(
     claudeTurnAwaitingResult = false;
     claudeForegroundPromptUuid = null;
     claudeForegroundPromptAccepted = false;
+    claudeForegroundCommand = null;
+    claudeDeferredForegroundResult = null;
   }
 
   const queueToClose = snapshot.inputQueue;
@@ -1067,6 +1071,7 @@ function resetClaudeTurnTracking() {
   resetClaudeContentTracking();
   claudeTurnCompletionEmitted = false;
   claudeLastAssistantMessageUuid = null;
+  claudeDeferredForegroundResult = null;
 }
 
 function emitClaudeTurnCompleted(detail: string) {
@@ -1077,6 +1082,8 @@ function emitClaudeTurnCompleted(detail: string) {
   claudeTurnCompletionEmitted = true;
   claudeForegroundPromptAccepted = false;
   claudeForegroundPromptUuid = null;
+  claudeForegroundCommand = null;
+  claudeDeferredForegroundResult = null;
   emitEvent({
     type: 'lifecycle',
     stage: 'turn_completed',
@@ -1098,6 +1105,8 @@ function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop 
   claudeTurnAwaitingResult = false;
   claudeForegroundPromptAccepted = false;
   claudeForegroundPromptUuid = null;
+  claudeForegroundCommand = null;
+  claudeDeferredForegroundResult = null;
   claudeLastSessionState = 'idle';
   claudeInterruptRequested = false;
   resetClaudeTurnTracking();
@@ -1129,6 +1138,8 @@ function emitClaudeIncompleteResponse() {
   claudeTurnAwaitingResult = false;
   claudeForegroundPromptUuid = null;
   claudeForegroundPromptAccepted = false;
+  claudeForegroundCommand = null;
+  claudeDeferredForegroundResult = null;
   claudeLastSessionState = 'idle';
   claudeTurnCompletionEmitted = true;
   emitEvent({
@@ -1682,6 +1693,22 @@ function handleClaudePartialEvent(
   }
 }
 
+function completeClaudeManualCompactTurn() {
+  if (
+    !claudeTurnAwaitingResult
+    || claudeForegroundCommand !== 'compact'
+    || claudeTurnCompletionEmitted
+  ) {
+    return false;
+  }
+
+  claudeTurnAwaitingResult = false;
+  pendingClaudePromptReplay = null;
+  claudeIngressOriginKind = null;
+  claudePendingNonHumanResultCount = 0;
+  return emitClaudeTurnCompleted('');
+}
+
 function handleClaudeCompactBoundary(message: Record<string, unknown>) {
   const metadata = message.compact_metadata && typeof message.compact_metadata === 'object'
     ? message.compact_metadata as Record<string, unknown>
@@ -1705,6 +1732,10 @@ function handleClaudeCompactBoundary(message: Record<string, unknown>) {
     stage: 'compact_completed',
     detail: parts.join(' '),
   });
+
+  if (trigger === 'manual') {
+    completeClaudeManualCompactTurn();
+  }
 
   // Emit fresh context snapshot after compaction
   void emitClaudeContextUsage();
@@ -2024,11 +2055,13 @@ async function emitCodexContextUsageFromSessionFile(
 function handleClaudeStatusMessage(message: Record<string, unknown>) {
   const compactResult = message.compact_result;
   if (compactResult === 'success') {
+    const detail = 'Claude compacted the context.';
     emitEvent({
       type: 'lifecycle',
       stage: 'compact_completed',
-      detail: 'Claude compacted the context.',
+      detail,
     });
+    completeClaudeManualCompactTurn();
     return true;
   }
 
@@ -2041,6 +2074,7 @@ function handleClaudeStatusMessage(message: Record<string, unknown>) {
       stage: 'compact_failed',
       detail: compactError,
     });
+    completeClaudeManualCompactTurn();
     return true;
   }
 
@@ -2765,6 +2799,35 @@ async function consumeClaudeMessages() {
         }
 
         claudeLastSessionState = message.state;
+        // Older or partially-provenanced emitters can omit both Result origin
+        // and user_message_uuid. Wait for SDK idle before accepting that Result
+        // as the foreground boundary, so a task Result cannot finish a live turn
+        // and the real foreground turn cannot remain stuck forever.
+        if (
+          message.state === 'idle'
+          && claudeTurnAwaitingResult
+          && claudeForegroundPromptAccepted
+          && claudeDeferredForegroundResult
+          && claudePendingNonHumanResultCount === 0
+          && !nonHumanStateIngress
+        ) {
+          const deferredResult = claudeDeferredForegroundResult;
+          claudeTurnAwaitingResult = false;
+          pendingClaudePromptReplay = null;
+          claudeIngressOriginKind = null;
+          claudePendingNonHumanResultCount = 0;
+          emitClaudeTurnCompleted(deferredResult.detail);
+          if (deferredResult.failed) {
+            emitEvent({
+              type: 'session_completed',
+              reason: deferredResult.detail,
+            });
+          } else {
+            await new Promise(resolve => setImmediate(resolve));
+            await emitClaudeContextUsage();
+            await emitClaudeSessionUsage();
+          }
+        }
         if (message.state === 'idle' && !claudeTurnAwaitingResult) {
           if (applyPendingClaudeSettingsAfterTurn()) {
             emitStatus('ready', 'Settings applied.');
@@ -2806,6 +2869,20 @@ async function consumeClaudeMessages() {
               claudePendingNonHumanResultCount - 1,
             );
             claudeIngressOriginKind = null;
+            if (
+              claudeTurnAwaitingResult
+              && claudeForegroundPromptAccepted
+              && !resultOriginKind
+              && typeof resultPromptUuid !== 'string'
+            ) {
+              const failed = message.subtype !== 'success';
+              claudeDeferredForegroundResult = {
+                detail: failed
+                  ? message.errors?.join('\n') || message.subtype
+                  : message.result?.trim() ?? '',
+                failed,
+              };
+            }
           }
           continue;
         }
@@ -2983,6 +3060,9 @@ function enqueueClaudePrompt(
   claudeInterruptCompletionEmitted = false;
   claudeForegroundPromptUuid = messageUuid;
   claudeForegroundPromptAccepted = false;
+  claudeForegroundCommand = /^\/compact(?:\s|$)/iu.test(text.trim())
+    ? 'compact'
+    : null;
   const parts = buildPromptContentParts(text, images);
   const hasImages = parts.some((part) => part.type === 'image');
   const content = hasImages
