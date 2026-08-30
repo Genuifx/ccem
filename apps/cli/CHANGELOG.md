@@ -1,5 +1,11 @@
 # ccem
 
+## 2.74.0
+
+### Minor Changes
+
+- Desktop workspace stability: stabilize native transcript replay, force active session environment switches, and preserve restored session display titles.
+
 ## 2.73.3
 
 ### Patch Changes
