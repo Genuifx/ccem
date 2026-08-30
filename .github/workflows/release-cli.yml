@@ -41,6 +41,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - name: Build core
+        run: pnpm --filter @ccem/core build
+
       - name: Test CLI and dependencies
         run: pnpm --filter ccem... test:run
 
