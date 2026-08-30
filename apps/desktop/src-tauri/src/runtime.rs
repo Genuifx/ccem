@@ -764,6 +764,9 @@ impl RuntimeManager {
                 stage: stage.into(),
                 detail: detail.into(),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         );
     }
@@ -1831,7 +1834,10 @@ const NATIVE_HELPER_SCRIPT_MARKER: &str = "native-runtime-helper.mjs";
 fn native_sidecar_exe_anchor() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(NATIVE_SIDECAR_EXECUTABLE_NAME)))
+        .and_then(|exe| {
+            exe.parent()
+                .map(|dir| dir.join(NATIVE_SIDECAR_EXECUTABLE_NAME))
+        })
         .unwrap_or_default()
 }
 
@@ -1852,7 +1858,9 @@ fn native_sidecar_command_matches(command_line: &str, expected_exe: &Path) -> bo
     // ("/Applications/CCEM Desktop.app/…") are not split mid-path.
     if let Some(rest) = trimmed.strip_prefix(expected_exe_str) {
         if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-            return rest.split_whitespace().any(is_native_helper_marker_argument);
+            return rest
+                .split_whitespace()
+                .any(is_native_helper_marker_argument);
         }
     }
 
@@ -1939,12 +1947,11 @@ mod tests {
         clear_runtime_recovery_candidates_by_claude_session_id_from,
         dismiss_runtime_recovery_candidate_from, extract_protocol_events,
         list_runtime_recovery_candidates_from, native_sidecar_command_matches,
-        permission_bridge_root_dir, read_runtime_state_from,
-        recover_pending_permission_from_disk, replace_runtime_entries_for_kind,
-        runtime_command_matches, select_orphaned_native_sidecar_pids, status_name,
-        write_runtime_state_to, ManagedSessionOptions, ManagedSessionRecord, ManagedSessionSource,
-        ManagedSessionStatus, RuntimeKind, RuntimeManager, RuntimeRecoveryCandidate,
-        RuntimeStateEntry, RuntimeStateFile,
+        permission_bridge_root_dir, read_runtime_state_from, recover_pending_permission_from_disk,
+        replace_runtime_entries_for_kind, runtime_command_matches,
+        select_orphaned_native_sidecar_pids, status_name, write_runtime_state_to,
+        ManagedSessionOptions, ManagedSessionRecord, ManagedSessionSource, ManagedSessionStatus,
+        RuntimeKind, RuntimeManager, RuntimeRecoveryCandidate, RuntimeStateEntry, RuntimeStateFile,
     };
     use crate::remote::RemotePlatform;
     use chrono::Utc;

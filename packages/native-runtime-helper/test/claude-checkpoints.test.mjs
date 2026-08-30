@@ -96,6 +96,7 @@ async function buildHelperWithMockClaudeSdk() {
                 },
                 async *[Symbol.asyncIterator]() {
                   const session_id = 'mock-session';
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id };
                   if (typeof prompt === 'string') {
                     yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                     return;
@@ -123,6 +124,7 @@ async function buildHelperWithMockClaudeSdk() {
                     user_message_uuid: next.value.uuid,
                     session_id,
                   };
+                  yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                   if (userMessage?.content === 'complete but stay open') {
                     await new Promise(() => {});
                   }

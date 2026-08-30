@@ -125,6 +125,8 @@ pub struct BotBindingOutboxFrame {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotBindingInboundRequest {
     pub binding_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quoted_task_id: Option<String>,
@@ -443,6 +445,7 @@ impl BotBindingManager {
             Some(&routed_text),
             None,
             None,
+            request.client_message_id.as_deref(),
         )
     }
 

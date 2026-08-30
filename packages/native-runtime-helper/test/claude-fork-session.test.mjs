@@ -66,6 +66,7 @@ async function buildHelperWithMockClaudeSdk() {
                 close() {},
                 async *[Symbol.asyncIterator]() {
                   const session_id = options.resume;
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id };
                   const iterator = prompt[Symbol.asyncIterator]();
                   const next = await iterator.next();
                   if (next.done) return;
@@ -94,6 +95,7 @@ async function buildHelperWithMockClaudeSdk() {
                     user_message_uuid: next.value.uuid,
                     session_id,
                   };
+                  yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                   await new Promise(() => {});
                 },
               };

@@ -355,12 +355,14 @@ export interface TauriCommands {
     {
       runtimeId: string;
       text: string;
+      clientMessageId?: string | null;
       displayText?: string | null;
       images?: NativePromptImageInput[] | null;
       annotations?: SessionPromptAnnotation[] | null;
     },
     void
   ];
+  flush_native_session_input_queue: [{ runtimeId: string }, void];
   respond_native_session_permission: [
     {
       runtimeId: string;
@@ -373,6 +375,7 @@ export interface TauriCommands {
     {
       runtimeId: string;
       toolUseId: string;
+      expectedAttentionSeq: number;
       promptType: 'ask_user_question' | 'plan_exit';
       displayText?: string | null;
       answers: Record<string, string>;
@@ -422,6 +425,7 @@ export interface TauriCommands {
     {
       runtimeId: string;
       source?: string | null;
+      expectedCommandId?: string | null;
     },
     void
   ];
@@ -446,6 +450,8 @@ export interface TauriCommands {
     {
       runtimeId: string;
       runtimePermMode?: string | null;
+      attentionId?: string | null;
+      expectedAttentionSeq?: number | null;
     },
     void
   ];
@@ -1052,6 +1058,35 @@ export interface NativeBackgroundTask {
   stop_failed?: boolean | null;
 }
 
+/**
+ * Foreground lifecycle projection from the Rust coordinator: ids, states and
+ * counts only — never prompt bodies, image paths, env vars or secrets.
+ */
+export interface NativeLifecycleProjection {
+  state_revision: number;
+  adapter: 'full_lifecycle' | 'legacy_serial' | string;
+  /** Optional fields let newer coordinator snapshots remain additive. */
+  helper_incarnation?: number | null;
+  protocol_error?: string | null;
+  queue_count?: number;
+  active_command_id?: string | null;
+  active_helper_incarnation?: number | null;
+  active_phase?:
+    | 'dispatching'
+    | 'uncertain'
+    | 'helper_admitted'
+    | 'sdk_queued'
+    | 'sdk_started'
+    | string
+    | null;
+  settings_pending: boolean;
+  settings_state?: 'pending' | 'applied' | 'deferred' | 'failed' | string | null;
+  delivery_uncertain_count: number;
+  query_generation: number;
+  conversation_epoch: number;
+  capabilities: string[];
+}
+
 export interface NativeSessionSummary {
   runtime_id: string;
   provider: NativeProvider;
@@ -1078,6 +1113,8 @@ export interface NativeSessionSummary {
   last_error?: string | null;
   /** Public router state when this session is routed (mirrors Rust field). */
   router?: SessionRouterState | null;
+  /** Coordinator-backed foreground lifecycle projection, when available. */
+  lifecycle?: NativeLifecycleProjection | null;
 }
 
 export interface NativeHandoffResult {
@@ -1405,7 +1442,14 @@ export type SessionEventPayload =
       canonical_hash?: string | null;
     }
   | { type: 'system_message'; message: string }
-  | { type: 'lifecycle'; stage: string; detail: string; assistant_message_uuid?: string }
+  | {
+      type: 'lifecycle';
+      stage: string;
+      detail: string;
+      assistant_message_uuid?: string | null;
+      command_id?: string | null;
+      query_generation?: number | null;
+    }
   | { type: 'claude_json'; message_type?: string | null; raw_json: string }
   | { type: 'stderr_line'; line: string }
   | { type: 'assistant_chunk'; text: string }
@@ -1467,7 +1511,15 @@ export type SessionEventPayload =
     }
   | { type: 'terminal_prompt_required'; prompt_kind: TerminalPromptKind; prompt_text: string }
   | { type: 'terminal_prompt_resolved'; prompt_kind: TerminalPromptKind; approved: boolean }
-  | { type: 'session_completed'; reason: string }
+  | { type: 'session_completed'; reason: string; command_id?: string | null }
+  | {
+      type: 'interactive_response_result';
+      tool_use_id: string;
+      prompt_type?: 'ask_user_question' | 'plan_exit' | string | null;
+      state: 'applied' | 'rejected' | 'stale_no_resolver' | string;
+      control_request_id?: string | null;
+      query_generation?: number | null;
+    }
   | { type: 'gap_notification'; last_seen_seq: number; oldest_available_seq: number }
   | {
       type: 'token_usage';
@@ -1536,8 +1588,9 @@ export type SessionEventPayload =
     }
   | {
       type: 'runtime_settings_changed';
-      state: 'deferred' | 'applied';
+      state: 'deferred' | 'applied' | 'failed' | string;
       request_id?: string | null;
+      query_generation?: number | null;
       env_name: string;
       effort?: string | null;
       pending_env_name?: string | null;

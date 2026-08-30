@@ -72,10 +72,8 @@ fn native_event_log_persists_and_restores_attention_summary() {
     let summary = log
         .attention_summary(runtime_id)
         .expect("read persisted attention summary");
-    assert_eq!(
-        summary.attention_kind().as_deref(),
-        Some("input_required")
-    );
+    assert_eq!(summary.attention_kind().as_deref(), Some("input_required"));
+    assert_eq!(summary.pending_response_seqs.get("toolu-input"), Some(&5));
 
     drop(log);
     let reopened = NativeEventLog::new(db_path.clone());
@@ -84,6 +82,28 @@ fn native_event_log_persists_and_restores_attention_summary() {
         .expect("read restored attention summary");
     assert_eq!(restored.attention_kind().as_deref(), Some("input_required"));
     assert_eq!(restored, summary);
+
+    reopened
+        .append(&SessionEventRecord {
+            runtime_id: runtime_id.to_string(),
+            seq: 6,
+            occurred_at: Utc::now(),
+            payload: SessionEventPayload::InteractiveResponseResult {
+                tool_use_id: "toolu-input".to_string(),
+                control_request_id: None,
+                prompt_type: Some("ask_user_question".to_string()),
+                state: "resolver_expired".to_string(),
+                query_generation: Some(1),
+            },
+        })
+        .expect("append resolver expiration receipt");
+    assert_eq!(
+        reopened
+            .attention_summary(runtime_id)
+            .expect("read cleared attention summary")
+            .attention_kind(),
+        None
+    );
 
     drop(reopened);
     let _ = std::fs::remove_file(db_path);

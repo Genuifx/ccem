@@ -66,6 +66,7 @@ async function buildHelperWithRouterProbe() {
                   };
                 },
                 async *[Symbol.asyncIterator]() {
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id: 'mock-session' };
                   const iterator = prompt[Symbol.asyncIterator]();
                   const next = await iterator.next();
                   if (next.done) return;

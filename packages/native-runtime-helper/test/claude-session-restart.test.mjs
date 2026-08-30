@@ -27,7 +27,8 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
   const expectedQueryModel = options.expectedQueryModel ?? null;
   const reportModelState = options.reportModelState ?? false;
   const keepAliveAfterResult = options.keepAliveAfterResult ?? false;
-  const yieldIdleAfterResult = options.yieldIdleAfterResult ?? keepAliveAfterResult;
+  const yieldIdleAfterResult = options.yieldIdleAfterResult ?? true;
+  const advertiseLifecycle = options.advertiseLifecycle ?? false;
   const endFirstTurnWithoutResult = options.endFirstTurnWithoutResult ?? false;
   const assertHumanPromptOrigin = options.assertHumanPromptOrigin ?? false;
   const permissionOwnershipScenario = options.permissionOwnershipScenario ?? false;
@@ -85,6 +86,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const reportModelState = ${JSON.stringify(reportModelState)};
             const keepAliveAfterResult = ${JSON.stringify(keepAliveAfterResult)};
             const yieldIdleAfterResult = ${JSON.stringify(yieldIdleAfterResult)};
+            const advertiseLifecycle = ${JSON.stringify(advertiseLifecycle)};
             const endFirstTurnWithoutResult = ${JSON.stringify(endFirstTurnWithoutResult)};
             const assertHumanPromptOrigin = ${JSON.stringify(assertHumanPromptOrigin)};
             const permissionOwnershipScenario = ${JSON.stringify(permissionOwnershipScenario)};
@@ -147,11 +149,21 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                   const iterator = prompt[Symbol.asyncIterator]();
                   const session_id = 'mock-session';
                   let localTurn = 0;
+                  yield {
+                    type: 'system',
+                    subtype: 'init',
+                    capabilities: advertiseLifecycle ? ['msg_lifecycle_v1'] : [],
+                    session_id,
+                  };
                   while (!closed) {
                     const next = await iterator.next();
                     if (closed || next.done) return;
                     if (assertHumanPromptOrigin && next.value?.origin?.kind !== 'human') {
                       throw new Error('expected SDK prompt origin.kind to be human');
+                    }
+                    if (advertiseLifecycle) {
+                      yield { type: 'command_lifecycle', command_uuid: next.value.uuid, state: 'queued', session_id };
+                      yield { type: 'command_lifecycle', command_uuid: next.value.uuid, state: 'started', session_id };
                     }
                     yield {
                       ...next.value,
@@ -189,6 +201,9 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                         compact_result: 'success',
                         session_id,
                       };
+                      if (advertiseLifecycle) {
+                        yield { type: 'command_lifecycle', command_uuid: next.value.uuid, state: 'completed', session_id };
+                      }
                       yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                       continue;
                     }
@@ -494,6 +509,9 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                     if (settleDelayMsAfterResult > 0) {
                       await new Promise((resolve) => setTimeout(resolve, settleDelayMsAfterResult));
                     }
+                    if (advertiseLifecycle) {
+                      yield { type: 'command_lifecycle', command_uuid: next.value.uuid, state: 'completed', session_id };
+                    }
                     if (yieldIdleAfterResult && !yieldIdleBeforeResult && !interruptible) {
                       yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                     }
@@ -591,6 +609,7 @@ async function buildHelperWithBackgroundRaceMock(options = {}) {
                 async *[Symbol.asyncIterator]() {
                   const iterator = prompt[Symbol.asyncIterator]();
                   const session_id = 'background-race-session';
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id };
                   let turn = 0;
                   while (!closed) {
                     const next = await iterator.next();
@@ -1992,10 +2011,18 @@ test('coalesces adjacent Claude stream fragments and emits stable session metada
     {
       type: 'session_meta',
       provider_session_id: 'resume-session',
+      query_generation: 0,
+    },
+    {
+      type: 'session_meta',
+      provider_session_id: 'resume-session',
+      query_generation: 1,
     },
     {
       type: 'session_meta',
       provider_session_id: 'mock-session',
+      capabilities: [],
+      query_generation: 1,
     },
   ]);
 
@@ -2303,7 +2330,7 @@ test('app teardown reports the post-Result SDK settling window instead of preten
     outputs,
     (output) => output.type === 'event'
       && output.payload?.type === 'lifecycle'
-      && output.payload.stage === 'turn_completed',
+      && output.payload.stage === 'turn_result_observed',
     stderrRef,
     'foreground completion before SDK idle',
   );
@@ -2875,7 +2902,7 @@ test('defers retained-query settings until the SDK reports real idle after Resul
     outputs,
     (output) => output.type === 'event'
       && output.payload?.type === 'lifecycle'
-      && output.payload.stage === 'turn_completed',
+      && output.payload.stage === 'turn_result_observed',
     stderrRef,
     'foreground Result boundary',
   );
@@ -2923,6 +2950,7 @@ test('defers retained-query settings until the SDK reports real idle after Resul
 
 test('force-restarts a completed retained Claude query without waiting for SDK idle', async (t) => {
   const helperPath = await buildHelperWithMockClaudeSdk({
+    advertiseLifecycle: true,
     keepAliveAfterResult: true,
     yieldIdleAfterResult: false,
     logClose: true,
@@ -2944,7 +2972,8 @@ test('force-restarts a completed retained Claude query without waiting for SDK i
     outputs,
     (output) => output.type === 'event'
       && output.payload?.type === 'lifecycle'
-      && output.payload.stage === 'turn_completed',
+      && output.payload.stage === 'sdk_command_state'
+      && output.payload.detail === 'completed',
     stderrRef,
     'completed foreground Result without SDK idle',
   );
@@ -2985,6 +3014,7 @@ test('force-restarts a completed retained Claude query without waiting for SDK i
 
 test('forced settings preserve the active foreground turn then interrupt background tasks', async (t) => {
   const helperPath = await buildHelperWithMockClaudeSdk({
+    advertiseLifecycle: true,
     delayMsBeforeResult: 180,
     keepAliveAfterResult: true,
     yieldIdleAfterResult: false,
@@ -3057,7 +3087,8 @@ test('forced settings preserve the active foreground turn then interrupt backgro
     outputs,
     (output) => output.type === 'event'
       && output.payload?.type === 'lifecycle'
-      && output.payload.stage === 'turn_completed',
+      && output.payload.stage === 'sdk_command_state'
+      && output.payload.detail === 'completed',
     stderrRef,
     'preserved foreground Result boundary',
   );
@@ -3228,6 +3259,7 @@ test('applies environment settings after the active Claude turn before accepting
 
 test('restarts Claude query when a prompt arrives after idle but before the old query settles', async (t) => {
   const helperPath = await buildHelperWithMockClaudeSdk({
+    advertiseLifecycle: true,
     yieldIdleBeforeResult: true,
     settleDelayMsAfterResult: 80,
   });
@@ -3434,7 +3466,6 @@ test('marks Claude helper ready after a non-success result so the workspace can 
 test('preserves partial output, reports one incomplete response, and recovers the next Claude prompt', async (t) => {
   const helperPath = await buildHelperWithMockClaudeSdk({
     endFirstTurnWithoutResult: true,
-    yieldIdleBeforeResult: true,
   });
   const helper = spawn(process.execPath, [helperPath], {
     stdio: ['pipe', 'pipe', 'pipe'],

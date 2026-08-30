@@ -1475,6 +1475,7 @@ fn try_route_bot_binding_message(
         native_state.inner().clone(),
         crate::bot_binding::BotBindingInboundRequest {
             binding_id: binding.binding_id.clone(),
+            client_message_id: Some(frame.headers.req_id.clone()),
             text: prompt,
             quoted_task_id: markers
                 .quoted_task_id

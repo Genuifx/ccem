@@ -28,7 +28,9 @@ mod ipc_isolation_tests;
 mod jsonl_watcher;
 mod native_event_log;
 mod native_helper_resource;
+mod native_input_queue;
 mod native_runtime;
+mod native_session_coordinator;
 mod notifications;
 mod opencode;
 mod permission;
@@ -1342,7 +1344,12 @@ async fn create_native_session(
                     .to_string(),
             );
         }
-        if provider_session_id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             return Err(
                 "FORK_MISSING_PARENT: forking requires provider_session_id of the parent session"
                     .to_string(),
@@ -1504,7 +1511,7 @@ fn get_native_session_summary(
 }
 
 #[tauri::command]
-fn send_native_session_input(
+async fn send_native_session_input(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
@@ -1513,16 +1520,42 @@ fn send_native_session_input(
     display_text: Option<String>,
     images: Option<Vec<PromptImage>>,
     annotations: Option<Vec<SessionPromptAnnotation>>,
+    client_message_id: Option<String>,
 ) -> Result<(), String> {
-    let _mutation_guard = environment_mutations.lock()?;
-    native_state.send_user_message(
-        &app,
-        &runtime_id,
-        &text,
-        display_text.as_deref(),
-        images.as_ref(),
-        annotations.as_ref(),
-    )
+    // Admission may wait on the settings-ACK condvar: run off the main thread.
+    let native_state = Arc::clone(native_state.inner());
+    let environment_mutations = Arc::clone(environment_mutations.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
+        native_state.send_user_message(
+            &app,
+            &runtime_id,
+            &text,
+            display_text.as_deref(),
+            images.as_ref(),
+            annotations.as_ref(),
+            client_message_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("Native send task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn flush_native_session_input_queue(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    runtime_id: String,
+) -> Result<(), String> {
+    let native_state = Arc::clone(native_state.inner());
+    let environment_mutations = Arc::clone(environment_mutations.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
+        native_state.flush_visible_queued_input(&app, &runtime_id)
+    })
+    .await
+    .map_err(|error| format!("Native queue flush task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1538,27 +1571,37 @@ fn respond_native_session_permission(
 }
 
 #[tauri::command]
-fn respond_native_session_prompt(
+async fn respond_native_session_prompt(
+    app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     tool_use_id: String,
+    expected_attention_seq: u64,
     prompt_type: String,
     display_text: Option<String>,
     answers: HashMap<String, String>,
     annotations: Option<HashMap<String, InteractivePromptAnnotation>>,
     prompt_annotations: Option<Vec<SessionPromptAnnotation>>,
 ) -> Result<(), String> {
-    let _mutation_guard = environment_mutations.lock()?;
-    native_state.respond_to_prompt(
-        &runtime_id,
-        &tool_use_id,
-        &prompt_type,
-        display_text.as_deref(),
-        &answers,
-        annotations.as_ref(),
-        prompt_annotations.as_ref(),
-    )
+    let native_state = Arc::clone(native_state.inner());
+    let environment_mutations = Arc::clone(environment_mutations.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
+        native_state.respond_to_prompt(
+            Some(&app),
+            &runtime_id,
+            &tool_use_id,
+            expected_attention_seq,
+            &prompt_type,
+            display_text.as_deref(),
+            &answers,
+            annotations.as_ref(),
+            prompt_annotations.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("Native interactive response task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1616,11 +1659,53 @@ fn read_prompt_image_attachment(
     PromptImageStore::default().read_data_url(&storage_path, &media_type)
 }
 
-#[tauri::command]
-fn update_native_session_settings(
+#[allow(clippy::too_many_arguments)]
+fn apply_native_session_settings_ordered(
+    app: &tauri::AppHandle,
+    native_state: &Arc<NativeRuntimeManager>,
+    claude_managed: bool,
+    runtime_id: &str,
+    env_name: Option<&str>,
+    perm_mode: Option<&str>,
+    env_vars: Option<&HashMap<String, String>>,
+    effort: Option<&str>,
+    force_restart: bool,
+) -> Result<(), String> {
+    if claude_managed
+        && perm_mode.is_some()
+        && (env_name.is_some() || env_vars.is_some() || effort.is_some())
+    {
+        // Claude applies permission-only changes to the live query, while
+        // environment/effort may defer until turn end. Keep their ACK lanes
+        // ordered so an older mixed patch cannot later undo the permission.
+        native_state
+            .update_session_settings(app, runtime_id, None, perm_mode, None, None, false)?;
+        return native_state.update_session_settings(
+            app,
+            runtime_id,
+            env_name,
+            None,
+            env_vars,
+            effort,
+            force_restart,
+        );
+    }
+    native_state.update_session_settings(
+        app,
+        runtime_id,
+        env_name,
+        perm_mode,
+        env_vars,
+        effort,
+        force_restart,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_native_session_settings_blocking(
     app: tauri::AppHandle,
-    native_state: State<'_, Arc<NativeRuntimeManager>>,
-    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    native_state: Arc<NativeRuntimeManager>,
+    environment_mutations: Arc<config::EnvironmentMutationCoordinator>,
     runtime_id: String,
     env_name: Option<String>,
     perm_mode: Option<String>,
@@ -1660,8 +1745,10 @@ fn update_native_session_settings(
             if perm_mode.is_none() && effort.is_none() {
                 return Ok(());
             }
-            return native_state.update_session_settings(
+            return apply_native_session_settings_ordered(
                 &app,
+                &native_state,
+                current.provider == NativeProvider::Claude,
                 &runtime_id,
                 None,
                 perm_mode.as_deref(),
@@ -1692,8 +1779,10 @@ fn update_native_session_settings(
         },
         _ => (None, None),
     };
-    native_state.update_session_settings(
+    apply_native_session_settings_ordered(
         &app,
+        &native_state,
+        current.provider == NativeProvider::Claude,
         &runtime_id,
         resolved_env_name.as_deref(),
         perm_mode.as_deref(),
@@ -1704,24 +1793,80 @@ fn update_native_session_settings(
 }
 
 #[tauri::command]
-fn set_native_session_runtime_perm_mode(
+async fn update_native_session_settings(
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
+    runtime_id: String,
+    env_name: Option<String>,
+    perm_mode: Option<String>,
+    effort: Option<String>,
+    force_restart: Option<bool>,
+) -> Result<(), String> {
+    let native_state = native_state.inner().clone();
+    let environment_mutations = environment_mutations.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        update_native_session_settings_blocking(
+            app,
+            native_state,
+            environment_mutations,
+            runtime_id,
+            env_name,
+            perm_mode,
+            effort,
+            force_restart,
+        )
+    })
+    .await
+    .map_err(|error| format!("Native settings task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn set_native_session_runtime_perm_mode(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     runtime_perm_mode: Option<String>,
+    attention_id: Option<String>,
+    expected_attention_seq: Option<u64>,
 ) -> Result<(), String> {
-    let _mutation_guard = environment_mutations.lock()?;
-    native_state.update_session_runtime_perm_mode(&app, &runtime_id, runtime_perm_mode.as_deref())
+    let native_state = native_state.inner().clone();
+    let environment_mutations = environment_mutations.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
+        native_state.update_session_runtime_perm_mode(
+            &app,
+            &runtime_id,
+            runtime_perm_mode.as_deref(),
+            attention_id.as_deref(),
+            expected_attention_seq,
+        )
+    })
+    .await
+    .map_err(|error| format!("Native permission settings task failed: {error}"))?
 }
 
 #[tauri::command]
 fn stop_native_session(
+    app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     runtime_id: String,
     source: Option<String>,
+    expected_command_id: Option<String>,
 ) -> Result<(), String> {
-    native_state.stop_session_from(&runtime_id, source.as_deref())
+    native_state.stop_session_from_expected(
+        &runtime_id,
+        source.as_deref(),
+        expected_command_id.as_deref(),
+    )?;
+    // An explicit stop may safely abandon an uncertain command after its old
+    // helper generation retired. Resume any later FIFO item once the stop
+    // locks are gone; a still-active normal interrupt simply returns Busy and
+    // keeps the queue in place until its real terminal.
+    let _mutation_guard = environment_mutations.lock()?;
+    native_state.flush_visible_queued_input(&app, &runtime_id)
 }
 
 #[tauri::command]
@@ -3960,16 +4105,27 @@ fn get_session_router(
 }
 
 #[tauri::command]
-fn update_session_router(
+async fn update_session_router(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
     request: UpdateSessionRouterRequest,
 ) -> Result<SessionRouterState, RouterServiceError> {
-    let _mutation_guard = environment_mutations
-        .lock()
-        .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
-    native_state.update_session_router(&app, request, "ipc")
+    let native_state = native_state.inner().clone();
+    let environment_mutations = environment_mutations.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations
+            .lock()
+            .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
+        native_state.update_session_router(&app, request, "ipc")
+    })
+    .await
+    .map_err(|error| {
+        RouterServiceError::new(
+            "ROUTER_STATE_UNAVAILABLE",
+            format!("Native router settings task failed: {error}"),
+        )
+    })?
 }
 
 #[tauri::command]
@@ -5352,6 +5508,7 @@ fn main() {
             list_native_sessions,
             get_native_session_summary,
             send_native_session_input,
+            flush_native_session_input_queue,
             respond_native_session_permission,
             respond_native_session_prompt,
             rewind_native_session_files,

@@ -34,6 +34,21 @@ function event(seq, payload) {
   };
 }
 
+function interactivePromptStarted(seq = 1, toolUseId = 'interactive-1') {
+  return event(seq, {
+    type: 'tool_use_started',
+    tool_use_id: toolUseId,
+    raw_name: 'AskUserQuestion',
+    input_summary: 'Choose an option',
+    needs_response: true,
+    prompt: {
+      prompt_type: 'ask_user_question',
+      questions: [],
+    },
+    category: { category: 'user_input', kind: 'ask_user_question', raw_name: 'AskUserQuestion' },
+  });
+}
+
 test('plan review card prefers the detailed ExitPlanMode plan over a synthetic blocked-tool prompt', async () => {
   const { extractAttentionState } = await importWorkspaceNativeAttention();
 
@@ -75,6 +90,7 @@ test('plan review card prefers the detailed ExitPlanMode plan over a synthetic b
 
   assert.equal(attention.prompts.length, 1);
   assert.equal(attention.prompts[0].toolUseId, 'real-plan-exit');
+  assert.equal(attention.prompts[0].eventSeq, 2);
   assert.match(attention.prompts[0].prompt.plan_summary, /# Plan: Add copy button/);
 });
 
@@ -120,10 +136,10 @@ test('plan exit prompts always expose a primary approval reply', async () => {
   );
 });
 
-test('user continuation clears persisted plan review prompts', async () => {
+test('persisted user replies and tool completion cannot dismiss a prompt before its applied receipt', async () => {
   const { extractAttentionState } = await importWorkspaceNativeAttention();
 
-  const attention = extractAttentionState([
+  const beforeReceipt = extractAttentionState([
     event(1, {
       type: 'tool_use_started',
       tool_use_id: 'real-plan-exit',
@@ -147,7 +163,39 @@ test('user continuation clears persisted plan review prompts', async () => {
     event(3, { type: 'user_prompt', text: '继续执行', image_count: 0 }),
   ]);
 
-  assert.equal(attention.prompts.length, 0);
+  assert.equal(beforeReceipt.prompts.length, 1);
+
+  const afterReceipt = extractAttentionState([
+    event(1, {
+      type: 'tool_use_started',
+      tool_use_id: 'real-plan-exit',
+      raw_name: 'ExitPlanMode',
+      input_summary: '# Plan: Add copy button',
+      needs_response: true,
+      prompt: {
+        prompt_type: 'plan_exit',
+        allowed_prompts: [],
+        plan_summary: '# Plan: Add copy button',
+      },
+      category: { category: 'user_input', kind: 'plan_exit', raw_name: 'ExitPlanMode' },
+    }),
+    event(2, { type: 'user_prompt', text: '继续执行', image_count: 0 }),
+    event(3, {
+      type: 'tool_use_completed',
+      tool_use_id: 'real-plan-exit',
+      raw_name: 'ExitPlanMode',
+      result_summary: 'Plan accepted.',
+      success: true,
+    }),
+    event(4, {
+      type: 'interactive_response_result',
+      tool_use_id: 'real-plan-exit',
+      prompt_type: 'plan_exit',
+      state: 'applied',
+    }),
+  ]);
+
+  assert.equal(afterReceipt.prompts.length, 0);
 });
 
 test('permission requests preserve request and tool-use correlation ids', async () => {
@@ -194,4 +242,63 @@ test('background task permissions remain visible without being cleared by a new 
     inputSummary: 'pnpm test',
     backgroundTaskId: 'task-background-1',
   }]);
+});
+
+test('interactive prompts remain pending until an authoritative helper receipt is observed', async () => {
+  const { extractAttentionState } = await importWorkspaceNativeAttention();
+
+  const beforeReceipt = extractAttentionState([interactivePromptStarted()]);
+  assert.equal(
+    beforeReceipt.prompts.length,
+    1,
+    'a successful pipe write alone has no event that can permanently hide the card',
+  );
+
+  const afterAppliedReceipt = extractAttentionState([
+    interactivePromptStarted(),
+    event(2, {
+      type: 'interactive_response_result',
+      tool_use_id: 'interactive-1',
+      prompt_type: 'ask_user_question',
+      state: 'applied',
+      control_request_id: 'control-1',
+      query_generation: 4,
+    }),
+  ]);
+  assert.equal(afterAppliedReceipt.prompts.length, 0);
+});
+
+test('terminal interactive receipts cannot leave ghost attention cards', async () => {
+  const { extractAttentionState } = await importWorkspaceNativeAttention();
+
+  for (const state of ['rejected', 'stale', 'stale_no_resolver', 'resolver_expired']) {
+    const attention = extractAttentionState([
+      interactivePromptStarted(),
+      event(2, {
+        type: 'interactive_response_result',
+        tool_use_id: 'interactive-1',
+        prompt_type: 'ask_user_question',
+        state,
+      }),
+    ]);
+    assert.equal(attention.prompts.length, 0, `${state} must invalidate the pending resolver`);
+  }
+});
+
+test('nonterminal mismatch receipts preserve the live resolver occurrence', async () => {
+  const { extractAttentionState } = await importWorkspaceNativeAttention();
+
+  for (const state of ['generation_mismatch', 'prompt_type_mismatch']) {
+    const attention = extractAttentionState([
+      interactivePromptStarted(7, 'interactive-reused'),
+      event(8, {
+        type: 'interactive_response_result',
+        tool_use_id: 'interactive-reused',
+        prompt_type: 'ask_user_question',
+        state,
+      }),
+    ]);
+    assert.equal(attention.prompts.length, 1, `${state} must preserve the resolver`);
+    assert.equal(attention.prompts[0].eventSeq, 7);
+  }
 });

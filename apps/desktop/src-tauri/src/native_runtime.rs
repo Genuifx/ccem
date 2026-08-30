@@ -2,13 +2,22 @@ use crate::browser::{authorize_browser_tool, BrowserManager, BrowserToolRequest}
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
     NativeBackgroundTask, NativeBackgroundTaskStatus, NativeEventReplayPage, ReplayBatch,
-    SessionEventPayload, SessionPromptAnnotation, SessionPromptImage, SessionStore, TodoSnapshotV1,
+    SessionEventPayload, SessionEventRecord, SessionPromptAnnotation, SessionPromptImage,
+    SessionStore, TodoSnapshotV1,
 };
 use crate::native_event_log::{
     bound_decoded_event_page, ensure_event_replay_page_size, validate_event_replay_page_request,
     NativeEventLog,
 };
 use crate::native_helper_resource::native_helper_script_path;
+use crate::native_input_queue::{
+    FrozenNativeInputBatch, FrozenNativeInputParts, NativeInputClaimOutcome, NativeInputQueue,
+    NativeInputQueueError, QueuedInputDeliveryState,
+};
+use crate::native_session_coordinator::{
+    AdapterKind, InteractiveWaitOutcome, LifecycleDecision, NativeLifecycleProjection,
+    SettingsWaitOutcome, COMMAND_ADMISSION_ACK_WAIT,
+};
 use crate::prompt_image_store::PromptImageStore;
 use crate::router::{
     apply_session_router_patch, describe_router_environment, is_valid_router_environment_alias,
@@ -61,6 +70,13 @@ const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
 const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
 const MAX_PROMPT_ANNOTATION_TOTAL_CHARS: usize = 60_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDispatchTrigger {
+    VisibleUserAction,
+    AuthoritativeLifecycle,
+    InitializationSettled,
+}
 
 fn is_background_task_shutdown_safety_error(message: &str) -> bool {
     message.starts_with("Cannot close this native runtime while ")
@@ -214,6 +230,9 @@ pub struct NativeSessionSummary {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router: Option<SessionRouterState>,
+    /// Foreground lifecycle projection (ids, states and counts only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<NativeLifecycleProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,6 +444,8 @@ enum HelperInputCommand<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         initial_prompt: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        initial_command_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         initial_images: Option<&'a [PromptImage]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_session_id: Option<&'a str>,
@@ -450,6 +471,8 @@ enum HelperInputCommand<'a> {
     Prompt {
         text: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
+        command_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<&'a [PromptImage]>,
     },
     PermissionResponse {
@@ -457,8 +480,11 @@ enum HelperInputCommand<'a> {
         approved: bool,
     },
     InteractivePromptResponse {
+        control_request_id: &'a str,
         tool_use_id: &'a str,
         prompt_type: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_query_generation: Option<u64>,
         answers: &'a HashMap<String, String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<&'a HashMap<String, InteractivePromptAnnotation>>,
@@ -469,6 +495,8 @@ enum HelperInputCommand<'a> {
         env_name: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         perm_mode: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_scope: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         env_vars: Option<&'a HashMap<String, String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -487,7 +515,10 @@ enum HelperInputCommand<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<&'a str>,
     },
-    InterruptTurn,
+    InterruptTurn {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_command_id: Option<&'a str>,
+    },
     PrepareStop {
         request_id: &'a str,
         require_idle: bool,
@@ -597,6 +628,67 @@ fn stage_runtime_settings_update(
         }
     }
     record.updated_at = Utc::now();
+}
+
+fn validate_claude_settings_patch(
+    env_name: Option<&str>,
+    perm_mode: Option<&str>,
+    env_vars_present: bool,
+    effort: Option<&str>,
+) -> Result<(), String> {
+    if perm_mode.is_some() && (env_name.is_some() || env_vars_present || effort.is_some()) {
+        return Err(
+            "MIXED_CLAUDE_SETTINGS_UNSUPPORTED: apply permission and environment/effort as separate ordered updates"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_plan_approval_permission(
+    prompt_type: &str,
+    answers: &HashMap<String, String>,
+    effective_perm_mode: &str,
+) -> Result<(), String> {
+    if prompt_type == "plan_exit"
+        && answers
+            .get("decision")
+            .is_some_and(|value| value.trim() == "approve")
+        && effective_perm_mode == "plan"
+    {
+        return Err(
+            "PLAN_PERMISSION_NOT_APPLIED: exit Plan permission must receive an exact applied ACK before approval"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_interactive_attention_occurrence(
+    summary: &AttentionSummary,
+    tool_use_id: &str,
+    expected_attention_seq: u64,
+    prompt_type: &str,
+) -> Result<(), String> {
+    let expected_kind = match prompt_type {
+        "ask_user_question" => "input_required",
+        "plan_exit" => "plan_review",
+        _ => {
+            return Err(format!(
+                "INTERACTIVE_PROMPT_TYPE_UNSUPPORTED: {prompt_type}"
+            ))
+        }
+    };
+    let actual_kind = summary.pending_responses.get(tool_use_id);
+    let actual_seq = summary.pending_response_seqs.get(tool_use_id).copied();
+    if actual_kind.map(String::as_str) != Some(expected_kind)
+        || actual_seq != Some(expected_attention_seq)
+    {
+        return Err(format!(
+            "INTERACTIVE_ATTENTION_STALE: {tool_use_id} occurrence {expected_attention_seq} is no longer the live {expected_kind} resolver"
+        ));
+    }
+    Ok(())
 }
 
 fn apply_background_task_event(
@@ -819,7 +911,7 @@ fn helper_command_kind(command: &HelperInputCommand<'_>) -> &'static str {
         HelperInputCommand::RewindFiles { .. } => "rewind_files",
         HelperInputCommand::UsageQuery => "usage_query",
         HelperInputCommand::BrowserToolResponse { .. } => "browser_tool_response",
-        HelperInputCommand::InterruptTurn => "interrupt_turn",
+        HelperInputCommand::InterruptTurn { .. } => "interrupt_turn",
         HelperInputCommand::PrepareStop { .. } => "prepare_stop",
         HelperInputCommand::CancelPrepareStop { .. } => "cancel_prepare_stop",
         HelperInputCommand::StopTask { .. } => "stop_task",
@@ -852,6 +944,12 @@ fn normalize_stop_source(source: Option<&str>) -> String {
 enum HelperOutputEvent {
     SessionMeta {
         provider_session_id: String,
+        /// Omitted while this query generation is still negotiating; an
+        /// explicit empty array selects the legacy serial adapter.
+        #[serde(default)]
+        capabilities: Option<Vec<String>>,
+        #[serde(default)]
+        query_generation: Option<u64>,
     },
     Status {
         status: String,
@@ -878,6 +976,83 @@ enum HelperOutputEvent {
         stop_request_id: String,
         error: String,
     },
+}
+
+fn helper_output_defers_queue_autodrain(line: &str) -> bool {
+    line.lines().map(str::trim).any(|entry| {
+        let Ok(value) = serde_json::from_str::<Value>(entry) else {
+            return false;
+        };
+        value.get("type").and_then(Value::as_str) == Some("event")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("lifecycle")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("stage"))
+                .and_then(Value::as_str)
+                == Some("command_rejected")
+    })
+}
+
+fn helper_output_requests_queue_autodrain(line: &str) -> bool {
+    line.lines().map(str::trim).any(|entry| {
+        let Ok(value) = serde_json::from_str::<Value>(entry) else {
+            return false;
+        };
+        value.get("type").and_then(Value::as_str) == Some("event")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("lifecycle")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("stage"))
+                .and_then(Value::as_str)
+                == Some("initialization_settled")
+    })
+}
+
+fn helper_output_reports_initialization_failure(line: &str) -> bool {
+    line.lines().map(str::trim).any(|entry| {
+        let Ok(value) = serde_json::from_str::<Value>(entry) else {
+            return false;
+        };
+        value.get("type").and_then(Value::as_str) == Some("event")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("lifecycle")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("stage"))
+                .and_then(Value::as_str)
+                == Some("initialization_failed")
+    })
+}
+
+fn lifecycle_transition_unblocked_queue(
+    before: Option<&NativeLifecycleProjection>,
+    after: Option<&NativeLifecycleProjection>,
+) -> bool {
+    let Some(after) = after else {
+        return false;
+    };
+    let Some(before) = before else {
+        return after.adapter == AdapterKind::FullLifecycle.as_str()
+            && after.active_command_id.is_none()
+            && !after.settings_pending;
+    };
+    (before.active_command_id.is_some() && after.active_command_id.is_none())
+        || (before.settings_pending && !after.settings_pending)
+        || (before.adapter != AdapterKind::FullLifecycle.as_str()
+            && after.adapter == AdapterKind::FullLifecycle.as_str()
+            && after.active_command_id.is_none()
+            && !after.settings_pending)
 }
 
 #[derive(Debug)]
@@ -1348,6 +1523,7 @@ impl NativeSessionHandle {
             background_tasks,
             last_error: record.last_error,
             router: record.router.as_ref().map(SessionRouterState::from),
+            lifecycle: None,
         }
     }
 }
@@ -1456,10 +1632,36 @@ pub struct NativeRuntimeManager {
     prompt_image_store: PromptImageStore,
     router_manager: OnceLock<Arc<RouterManager>>,
     reconnect_lock: Mutex<()>,
+    /// Serializes the canonical record mutation, live-handle mirror, and
+    /// persistence snapshot as one projection transaction. Without this, a
+    /// slower older clone can overwrite a newer status in the live handle.
+    record_update_lock: Mutex<()>,
     settings_update_lock: Mutex<()>,
     app_termination_lock: Mutex<()>,
     app_termination_in_progress: AtomicBool,
     terminal_handoff_preparations: Mutex<HashMap<String, String>>,
+    /// Foreground lifecycle coordinator: the single owner of active command,
+    /// settings ACK state, adapter kind and the incarnation/query/epoch fences.
+    lifecycle: crate::native_session_coordinator::NativeSessionCoordinator,
+    /// Process-local FIFO. It intentionally has no disk sidecar and therefore
+    /// preserves the product's existing app-restart semantics.
+    input_queue: NativeInputQueue,
+    /// A freshly spawned Claude helper cannot accept queued prompts until its
+    /// resume/fork identity and query bootstrap are settled. This fence is
+    /// independent of presentation status, so an early abandonment cannot
+    /// drain into a half-initialized helper.
+    initializing_runtimes: Mutex<HashSet<String>>,
+}
+
+#[derive(Debug)]
+enum LiveWriteOutcome {
+    Written,
+    /// Encoding, locking, liveness, or child lookup failed before calling the
+    /// child write primitive. The exact admission may be safely abandoned.
+    NotStarted(String),
+    /// The child write primitive returned an error after it may have accepted
+    /// a prefix. Replaying could duplicate a user action.
+    StartedUnknown(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1581,11 +1783,15 @@ impl NativeRuntimeManager {
             records: Mutex::new(records),
             handles: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(1),
+            lifecycle: Default::default(),
+            input_queue: Default::default(),
+            initializing_runtimes: Mutex::new(HashSet::new()),
             state_path,
             event_log: NativeEventLog::default(),
             prompt_image_store: PromptImageStore::default(),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            record_update_lock: Mutex::new(()),
             settings_update_lock: Mutex::new(()),
             app_termination_lock: Mutex::new(()),
             app_termination_in_progress: AtomicBool::new(false),
@@ -1775,6 +1981,9 @@ impl NativeRuntimeManager {
                     stage: "runtime_boot".to_string(),
                     detail: format!("Starting {} native runtime.", options.provider.as_str()),
                     assistant_message_uuid: None,
+                    command_id: None,
+                    query_generation: None,
+                    user_message_uuid: None,
                 },
             )?;
             self.append_user_prompt_event(
@@ -1994,6 +2203,17 @@ impl NativeRuntimeManager {
         )
     }
 
+    fn lifecycle_projection(&self, runtime_id: &str) -> Option<NativeLifecycleProjection> {
+        let mut projection = self.lifecycle.projection(runtime_id)?;
+        projection.queue_count = self.input_queue.count(runtime_id);
+        // A post-write failure is represented by both the active coordinator
+        // command and its retained queue head. Count that one user action once.
+        projection.delivery_uncertain_count = projection
+            .delivery_uncertain_count
+            .max(self.input_queue.delivery_uncertain_count(runtime_id));
+        Some(projection)
+    }
+
     pub fn list_sessions(&self) -> Vec<NativeSessionSummary> {
         let handles = self
             .handles
@@ -2039,11 +2259,15 @@ impl NativeRuntimeManager {
                         background_tasks: Vec::new(),
                         last_error: record.last_error,
                         router: record.router.as_ref().map(SessionRouterState::from),
+                        lifecycle: None,
                     }
                 }
             })
             .collect::<Vec<_>>();
 
+        for session in &mut sessions {
+            session.lifecycle = self.lifecycle_projection(&session.runtime_id);
+        }
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         sessions
     }
@@ -2288,12 +2512,8 @@ impl NativeRuntimeManager {
         display_text: Option<&str>,
         images: Option<&Vec<PromptImage>>,
         annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
     ) -> Result<(), String> {
-        let _termination_guard = self
-            .app_termination_lock
-            .lock()
-            .map_err(|_| "Failed to lock native runtime termination".to_string())?;
-        self.reject_query_mutation_during_transition(runtime_id, "send a prompt")?;
         let text = text.trim();
         let has_images = images.as_ref().is_some_and(|imgs| !imgs.is_empty());
         let annotations = validate_prompt_annotations(annotations)?;
@@ -2301,6 +2521,129 @@ impl NativeRuntimeManager {
             return Ok(());
         }
 
+        let claude_managed = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .is_some_and(|record| record.provider == NativeProvider::Claude);
+        if claude_managed {
+            let status = self
+                .records
+                .lock()
+                .map_err(|_| "Failed to lock native runtime records".to_string())?
+                .get(runtime_id)
+                .map(|record| record.status.clone())
+                .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+            if is_query_mutation_terminal_status(&status) || status.starts_with("handoff_") {
+                return Err(format!(
+                    "Cannot send a prompt while native session {runtime_id} is {status}."
+                ));
+            }
+            let client_message_id = client_message_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "native-input-{}-{}",
+                        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                        random_router_secret(8)
+                    )
+                });
+            let image_values = images
+                .filter(|items| !items.is_empty())
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .map_err(|error| format!("Failed to freeze queued prompt images: {error}"))?;
+            let annotation_values = annotations
+                .as_ref()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .map_err(|error| format!("Failed to freeze queued prompt annotations: {error}"))?;
+            self.lifecycle.ensure_session(runtime_id);
+            match self.input_queue.enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new(
+                    &client_message_id,
+                    text,
+                    display_text.map(str::to_string),
+                    image_values,
+                    annotation_values,
+                ),
+            ) {
+                Ok(queue_count) => {
+                    self.lifecycle.note_queue_changed(runtime_id);
+                    let _ = self.append_lifecycle_event(
+                        runtime_id,
+                        "prompt_queued",
+                        format!("client_message_id={client_message_id} queue_count={queue_count}"),
+                    );
+                }
+                Err(NativeInputQueueError::DuplicateClientMessageId) => return Ok(()),
+                Err(error) => return Err(format!("Failed to queue native input: {error}")),
+            }
+
+            // Queue acceptance is the renderer contract. Dispatch is attempted
+            // immediately, but a busy foreground or pending settings ACK keeps
+            // the immutable batch in backend memory for the next authoritative
+            // lifecycle transition.
+            if let Err(error) =
+                self.maybe_dispatch_queued(app, runtime_id, QueueDispatchTrigger::VisibleUserAction)
+            {
+                let _ = self.set_last_error(runtime_id, error.clone());
+                let _ = self.append_lifecycle_event(
+                    runtime_id,
+                    "queued_prompt_dispatch_deferred",
+                    error,
+                );
+            }
+            return Ok(());
+        }
+
+        self.send_user_message_admitted(
+            app,
+            runtime_id,
+            text,
+            display_text,
+            images,
+            annotations.as_ref(),
+            claude_managed,
+            None,
+            None,
+        )
+    }
+
+    /// Post-admission body of `send_user_message`. `command_id` is set only
+    /// for coordinator-managed (Claude) sessions.
+    #[allow(clippy::too_many_arguments)]
+    fn send_user_message_admitted(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        text: &str,
+        display_text: Option<&str>,
+        images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
+        claude_managed: bool,
+        command_id_override: Option<&str>,
+        admission_attempt: Option<u64>,
+    ) -> Result<(), String> {
+        let _termination_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime termination".to_string())?;
+        self.reject_query_mutation_during_transition(runtime_id, "send a prompt")?;
         let mut handle = self.ensure_handle(app.clone(), runtime_id)?;
         let image_count = images.as_ref().map(|imgs| imgs.len()).unwrap_or(0);
         if !self.is_current_live_handle(runtime_id, &handle)? {
@@ -2309,51 +2652,418 @@ impl NativeRuntimeManager {
                 return Err("Native runtime helper was replaced while sending prompt".to_string());
             }
         }
+        // Admission is deliberately after ensure_handle: reconnect establishes
+        // the helper incarnation first, so it cannot erase the new command.
+        let command_id = if claude_managed {
+            Some(
+                match (command_id_override, admission_attempt) {
+                    (Some(command_id), Some(admission_attempt)) => {
+                        self.lifecycle.admit_queued_prompt(
+                            runtime_id,
+                            handle.generation,
+                            command_id,
+                            admission_attempt,
+                        )
+                    }
+                    (Some(command_id), None) => self.lifecycle.admit_prompt_with_id(
+                        runtime_id,
+                        handle.generation,
+                        command_id,
+                    ),
+                    (None, None) => self.lifecycle.admit_prompt(runtime_id, handle.generation),
+                    (None, Some(_)) => unreachable!("queue attempt requires a command id"),
+                }
+                .map_err(|error| error.to_message())?,
+            )
+        } else {
+            None
+        };
         let record = handle
             .record
             .lock()
             .map_err(|_| "Failed to lock native session record".to_string())?
             .clone();
-        self.append_lifecycle_event(
+        if let Err(error) = self.append_lifecycle_event(
             runtime_id,
             "prompt_send_requested",
             format!(
-                "runtime_id={} provider={} status={} handle_generation={} chars={} images={}",
+                "runtime_id={} provider={} status={} handle_generation={} command_id={} chars={} images={}",
                 runtime_id,
                 record.provider.as_str(),
                 record.status,
                 handle.generation,
+                command_id.as_deref().unwrap_or("-"),
                 text.chars().count(),
                 image_count
             ),
-        )?;
+        ) {
+            if let Some(command_id) = command_id.as_deref() {
+                self.lifecycle
+                    .abandon_admission(runtime_id, handle.generation, command_id);
+            }
+            return Err(error);
+        }
         let images_ref = images
             .filter(|imgs| !imgs.is_empty())
             .map(|imgs| imgs.as_slice());
-        self.write_to_child_with_reconnect(
-            app,
-            runtime_id,
-            handle,
-            &HelperInputCommand::Prompt {
-                text,
-                images: images_ref,
-            },
-        )?;
-        self.append_lifecycle_event(
+        let prompt_command = HelperInputCommand::Prompt {
+            text,
+            command_id: command_id.as_deref(),
+            images: images_ref,
+        };
+        if let Some(command_id) = command_id.as_deref() {
+            match self.write_to_live_child_outcome(&handle, &prompt_command) {
+                LiveWriteOutcome::Written => {}
+                LiveWriteOutcome::NotStarted(error) => {
+                    let abandoned =
+                        self.lifecycle
+                            .abandon_admission(runtime_id, handle.generation, command_id);
+                    if !abandoned
+                        && self.lifecycle.abandon_not_started_after_retirement(
+                            runtime_id,
+                            handle.generation,
+                            command_id,
+                        )
+                    {
+                        // The old helper retired before the write primitive
+                        // started, which is exact non-delivery evidence. While
+                        // still holding the transition lock, reconnect once
+                        // and reuse the same wire id/queue attempt. A racing
+                        // exact Stop waits on this lock and can therefore
+                        // interrupt that same id after the retry, never a
+                        // replacement id or an orphaned cloned batch.
+                        let retry_handle = match self.ensure_handle(app.clone(), runtime_id) {
+                            Ok(handle) => handle,
+                            Err(reconnect_error) => {
+                                return Err(format!(
+                                    "PROMPT_NOT_STARTED_AFTER_HELPER_RETIREMENT: {error}; reconnect failed: {reconnect_error}"
+                                ));
+                            }
+                        };
+                        let retry_admission = match admission_attempt {
+                            Some(admission_attempt) => self.lifecycle.admit_queued_prompt(
+                                runtime_id,
+                                retry_handle.generation,
+                                command_id,
+                                admission_attempt,
+                            ),
+                            None => self.lifecycle.admit_prompt_with_id(
+                                runtime_id,
+                                retry_handle.generation,
+                                command_id,
+                            ),
+                        };
+                        if let Err(admission_error) = retry_admission {
+                            return Err(format!(
+                                "PROMPT_NOT_STARTED_AFTER_HELPER_RETIREMENT: {error}; reconnect admission failed: {}",
+                                admission_error.to_message()
+                            ));
+                        }
+                        match self.write_to_live_child_outcome(&retry_handle, &prompt_command) {
+                            LiveWriteOutcome::Written => {}
+                            LiveWriteOutcome::NotStarted(retry_error) => {
+                                let retry_abandoned = self.lifecycle.abandon_admission(
+                                    runtime_id,
+                                    retry_handle.generation,
+                                    command_id,
+                                );
+                                if !retry_abandoned {
+                                    self.lifecycle.abandon_not_started_after_retirement(
+                                        runtime_id,
+                                        retry_handle.generation,
+                                        command_id,
+                                    );
+                                }
+                                return Err(format!(
+                                    "PROMPT_NOT_STARTED_AFTER_HELPER_RETIREMENT: {retry_error}"
+                                ));
+                            }
+                            LiveWriteOutcome::StartedUnknown(retry_error) => {
+                                self.lifecycle.mark_delivery_uncertain(
+                                    runtime_id,
+                                    retry_handle.generation,
+                                    command_id,
+                                    retry_error.clone(),
+                                );
+                                let _ = self.append_lifecycle_event(
+                                    runtime_id,
+                                    "prompt_delivery_uncertain",
+                                    format!("command_id={command_id} error={retry_error}"),
+                                );
+                                return Err(format!(
+                                    "DELIVERY_UNCERTAIN: prompt may have reached the helper ({retry_error})"
+                                ));
+                            }
+                        }
+                    } else {
+                        return Err(error);
+                    }
+                }
+                LiveWriteOutcome::StartedUnknown(error) => {
+                    self.lifecycle.mark_delivery_uncertain(
+                        runtime_id,
+                        handle.generation,
+                        command_id,
+                        error.clone(),
+                    );
+                    let _ = self.append_lifecycle_event(
+                        runtime_id,
+                        "prompt_delivery_uncertain",
+                        format!("command_id={command_id} error={error}"),
+                    );
+                    return Err(format!(
+                        "DELIVERY_UNCERTAIN: prompt may have reached the helper ({error})"
+                    ));
+                }
+            }
+        } else {
+            self.write_to_child_with_reconnect(app, runtime_id, handle, &prompt_command)?;
+        }
+
+        // From this point the prompt was written. Observation/log failures are
+        // reported, but must not cause the renderer to requeue and replay it.
+        if let Err(error) = self.append_lifecycle_event(
             runtime_id,
             "prompt_send_written",
             format!(
-                "helper accepted prompt command: chars={} images={}",
+                "helper accepted prompt command: command_id={} chars={} images={}",
+                command_id.as_deref().unwrap_or("-"),
                 text.chars().count(),
                 image_count
             ),
-        )?;
-        self.append_user_prompt_event(
+        ) {
+            eprintln!("Failed to append prompt write observation for {runtime_id}: {error}");
+        }
+        if let Err(error) = self.append_user_prompt_event(
             runtime_id,
             display_text.unwrap_or(text),
             images,
-            annotations.as_ref(),
-        )
+            annotations,
+        ) {
+            eprintln!("Failed to append written user prompt for {runtime_id}: {error}");
+        }
+        Ok(())
+    }
+
+    pub fn flush_visible_queued_input(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+    ) -> Result<(), String> {
+        self.maybe_dispatch_queued(app, runtime_id, QueueDispatchTrigger::VisibleUserAction)
+    }
+
+    fn schedule_command_admission_deadline(
+        self: &Arc<Self>,
+        runtime_id: &str,
+        helper_incarnation: u64,
+        command_id: &str,
+        admission_attempt: u64,
+    ) {
+        let manager = Arc::clone(self);
+        let runtime_id = runtime_id.to_string();
+        let command_id = command_id.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            thread::sleep(COMMAND_ADMISSION_ACK_WAIT);
+            let detail = format!(
+                "helper admission ACK timed out for command {command_id}; automatic replay is disabled"
+            );
+            if !manager.lifecycle.expire_dispatching_admission(
+                &runtime_id,
+                helper_incarnation,
+                &command_id,
+                admission_attempt,
+                COMMAND_ADMISSION_ACK_WAIT,
+                detail.clone(),
+            ) {
+                return;
+            }
+            manager.input_queue.mark_dispatch_delivery_uncertain(
+                &runtime_id,
+                &command_id,
+                admission_attempt,
+            );
+            manager.lifecycle.note_queue_changed(&runtime_id);
+            let _ = manager.set_last_error(&runtime_id, detail.clone());
+            let _ = manager.append_lifecycle_event(&runtime_id, "prompt_admission_timeout", detail);
+        });
+    }
+
+    fn maybe_dispatch_queued(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        trigger: QueueDispatchTrigger,
+    ) -> Result<(), String> {
+        if trigger != QueueDispatchTrigger::InitializationSettled
+            && self
+                .initializing_runtimes
+                .lock()
+                .map_err(|_| "Failed to lock native initialization fences".to_string())?
+                .contains(runtime_id)
+        {
+            return Ok(());
+        }
+        if self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .is_some_and(|record| record.status == "initializing")
+        {
+            return Ok(());
+        }
+        if trigger == QueueDispatchTrigger::AuthoritativeLifecycle
+            && self.lifecycle.adapter_kind(runtime_id) != Some(AdapterKind::FullLifecycle)
+        {
+            return Ok(());
+        }
+        loop {
+            let (batch, dispatch_attempt, dispatch_command_id) =
+                match self.input_queue.claim_next(runtime_id) {
+                    NativeInputClaimOutcome::Claimed {
+                        batch,
+                        dispatch_attempt,
+                        dispatch_command_id,
+                    } => (batch, dispatch_attempt, dispatch_command_id),
+                    NativeInputClaimOutcome::AlreadyDispatching { .. }
+                    | NativeInputClaimOutcome::BlockedByDeliveryUncertain { .. }
+                    | NativeInputClaimOutcome::Empty => return Ok(()),
+                };
+            let FrozenNativeInputParts {
+                client_message_id,
+                text,
+                display_text,
+                images,
+                annotations,
+            } = batch.into_parts();
+            let decoded_images: Result<Option<Vec<PromptImage>>, String> = images
+                .map(|values| serde_json::from_value(Value::Array(values)))
+                .transpose()
+                .map_err(|error| {
+                    format!(
+                        "Failed to decode queued prompt images for {client_message_id}: {error}"
+                    )
+                });
+            let decoded_annotations: Result<Option<Vec<SessionPromptAnnotation>>, String> =
+                annotations
+                .map(|values| serde_json::from_value(Value::Array(values)))
+                .transpose()
+                .map_err(|error| {
+                    format!(
+                        "Failed to decode queued prompt annotations for {client_message_id}: {error}"
+                    )
+                });
+            let (images, annotations) = match (decoded_images, decoded_annotations) {
+                (Ok(images), Ok(annotations)) => (images, annotations),
+                (Err(error), _) | (_, Err(error)) => {
+                    self.input_queue.release_dispatch(
+                        runtime_id,
+                        &client_message_id,
+                        dispatch_attempt,
+                    );
+                    self.lifecycle.note_queue_changed(runtime_id);
+                    return Err(error);
+                }
+            };
+
+            let dispatch = self.send_user_message_admitted(
+                app,
+                runtime_id,
+                &text,
+                display_text.as_deref(),
+                images.as_ref(),
+                annotations.as_ref(),
+                true,
+                Some(&dispatch_command_id),
+                Some(dispatch_attempt),
+            );
+            match dispatch {
+                Ok(()) => {
+                    // A successful pipe write is not helper admission. Keep the
+                    // exact head claimed until command_admitted (or another
+                    // fenced positive lifecycle fact) proves receipt.
+                    self.schedule_command_admission_deadline(
+                        runtime_id,
+                        self.lifecycle
+                            .projection(runtime_id)
+                            .and_then(|projection| projection.active_helper_incarnation)
+                            .unwrap_or_default(),
+                        &dispatch_command_id,
+                        dispatch_attempt,
+                    );
+
+                    // A synchronous helper rejection can race the pipe-write
+                    // return and put this same claim back to Pending. Never
+                    // turn that authoritative rejection into a hot retry loop;
+                    // a later visible user action may retry it deliberately.
+                    if self.input_queue.peek(runtime_id).is_some_and(|head| {
+                        head.batch().client_message_id() == client_message_id
+                            && head.dispatch_attempt() == dispatch_attempt
+                            && head.delivery_state() == QueuedInputDeliveryState::Pending
+                    }) {
+                        return Ok(());
+                    }
+
+                    // A terminal can race the pipe-write return. If ownership
+                    // already released, continue here so the next FIFO item is
+                    // not stranded waiting for an event that already happened.
+                    if self
+                        .lifecycle
+                        .projection(runtime_id)
+                        .and_then(|projection| projection.active_command_id)
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    if error.starts_with("PROMPT_NOT_STARTED_AFTER_HELPER_RETIREMENT:") {
+                        self.input_queue.release_not_started(
+                            runtime_id,
+                            &client_message_id,
+                            &dispatch_command_id,
+                            dispatch_attempt,
+                        );
+                        self.lifecycle.note_queue_changed(runtime_id);
+                        let _ = self.set_last_error(runtime_id, error);
+                        return Ok(());
+                    }
+                    let current_batch_is_uncertain = error.starts_with("DELIVERY_UNCERTAIN:")
+                        && self
+                            .lifecycle
+                            .projection(runtime_id)
+                            .and_then(|projection| projection.active_command_id)
+                            .as_deref()
+                            == Some(dispatch_command_id.as_str());
+                    if current_batch_is_uncertain {
+                        self.input_queue.mark_claim_delivery_uncertain(
+                            runtime_id,
+                            &client_message_id,
+                            dispatch_attempt,
+                        );
+                        self.lifecycle.note_queue_changed(runtime_id);
+                        let _ = self.set_last_error(runtime_id, error);
+                        return Ok(());
+                    }
+
+                    self.input_queue.release_dispatch(
+                        runtime_id,
+                        &client_message_id,
+                        dispatch_attempt,
+                    );
+                    self.lifecycle.note_queue_changed(runtime_id);
+                    if error.starts_with("NATIVE_SESSION_BUSY:")
+                        || error.starts_with("DELIVERY_UNCERTAIN:")
+                        || error.starts_with("SETTINGS_STALE:")
+                        || error.starts_with("STALE_HELPER_INCARNATION:")
+                    {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 
     pub fn respond_to_permission(
@@ -2388,23 +3098,60 @@ impl NativeRuntimeManager {
 
     pub fn respond_to_prompt(
         self: &Arc<Self>,
+        app: Option<&AppHandle>,
         runtime_id: &str,
         tool_use_id: &str,
+        expected_attention_seq: u64,
         prompt_type: &str,
         display_text: Option<&str>,
         answers: &HashMap<String, String>,
         annotations: Option<&HashMap<String, InteractivePromptAnnotation>>,
         prompt_annotations: Option<&Vec<SessionPromptAnnotation>>,
     ) -> Result<(), String> {
-        let _transition_guard = self
+        // A Plan approval is one backend transaction: validate the exact card,
+        // leave Plan with a correlated settings ACK, then resolve that same
+        // helper occurrence. The lock remains held through the interactive ACK
+        // so no restart or concurrent mode mutation can split the operation.
+        let transition_guard = self
             .app_termination_lock
             .lock()
             .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        validate_interactive_attention_occurrence(
+            &self.event_log.attention_summary(runtime_id)?,
+            tool_use_id,
+            expected_attention_seq,
+            prompt_type,
+        )?;
         self.reject_query_mutation_during_transition(runtime_id, "respond to a prompt")?;
         if answers.is_empty() {
             return Err("Interactive prompt response requires at least one answer.".to_string());
         }
         let prompt_annotations = validate_prompt_annotations(prompt_annotations)?;
+        let plan_approval = prompt_type == "plan_exit"
+            && answers
+                .get("decision")
+                .is_some_and(|value| value.trim() == "approve");
+        let plan_app = if plan_approval {
+            Some(app.ok_or_else(|| {
+                "PLAN_APP_CONTEXT_REQUIRED: Plan approval requires the desktop app context"
+                    .to_string()
+            })?)
+        } else {
+            None
+        };
+
+        match self.lifecycle.wait_for_settings_convergence(
+            runtime_id,
+            crate::native_session_coordinator::SETTINGS_ACK_WAIT,
+        ) {
+            SettingsWaitOutcome::Converged | SettingsWaitOutcome::Deferred => {}
+            SettingsWaitOutcome::Failed => {
+                return Err("PLAN_SETTINGS_NOT_APPLIED: interactive reply was not sent".to_string())
+            }
+            SettingsWaitOutcome::Timeout => {
+                return Err("PLAN_SETTINGS_ACK_TIMEOUT: interactive reply was not sent".to_string())
+            }
+        }
 
         let handle = self
             .handles
@@ -2416,23 +3163,213 @@ impl NativeRuntimeManager {
             .ok_or_else(|| {
                 format!("Native runtime {runtime_id} no longer has a live interactive prompt.")
             })?;
-        self.deliver_and_append_interactive_prompt_response(
+        // Settings ACK waits and renderer refreshes can outlive the original
+        // card. Fence again immediately before claiming the helper resolver.
+        validate_interactive_attention_occurrence(
+            &self.event_log.attention_summary(runtime_id)?,
+            tool_use_id,
+            expected_attention_seq,
+            prompt_type,
+        )?;
+        let original_plan_runtime_perm_mode = if plan_approval {
+            Some(
+                handle
+                    .record
+                    .lock()
+                    .map_err(|_| "Failed to lock native session record".to_string())?
+                    .runtime_perm_mode
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        if let (Some(app), Some(original_runtime_perm_mode)) =
+            (plan_app, original_plan_runtime_perm_mode.as_ref())
+        {
+            self.update_session_runtime_perm_mode_under_transition(
+                app,
+                runtime_id,
+                None,
+                Some(tool_use_id),
+                Some(expected_attention_seq),
+                Some(handle.generation),
+            )?;
+
+            let post_settings_validation = (|| {
+                validate_interactive_attention_occurrence(
+                    &self.event_log.attention_summary(runtime_id)?,
+                    tool_use_id,
+                    expected_attention_seq,
+                    prompt_type,
+                )?;
+                let current_generation = self
+                    .handles
+                    .lock()
+                    .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                    .get(runtime_id)
+                    .filter(|current| current.alive.load(Ordering::SeqCst))
+                    .map(|current| current.generation);
+                if current_generation != Some(handle.generation) {
+                    return Err(format!(
+                        "INTERACTIVE_ATTENTION_STALE: Plan helper generation changed from {} to {:?}",
+                        handle.generation, current_generation
+                    ));
+                }
+                let effective_perm_mode = self
+                    .records
+                    .lock()
+                    .map_err(|_| "Failed to lock native runtime records".to_string())?
+                    .get(runtime_id)
+                    .map(|record| {
+                        effective_native_perm_mode(
+                            record.perm_mode.as_str(),
+                            record.runtime_perm_mode.as_deref(),
+                        )
+                        .to_string()
+                    })
+                    .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+                validate_plan_approval_permission(prompt_type, answers, &effective_perm_mode)
+            })();
+            if let Err(error) = post_settings_validation {
+                return Err(self.plan_failure_with_permission_rollback(
+                    app,
+                    runtime_id,
+                    handle.generation,
+                    original_runtime_perm_mode.as_deref(),
+                    error,
+                ));
+            }
+        } else if prompt_type == "plan_exit" {
+            let effective_perm_mode = self
+                .records
+                .lock()
+                .map_err(|_| "Failed to lock native runtime records".to_string())?
+                .get(runtime_id)
+                .map(|record| {
+                    effective_native_perm_mode(
+                        record.perm_mode.as_str(),
+                        record.runtime_perm_mode.as_deref(),
+                    )
+                    .to_string()
+                })
+                .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+            validate_plan_approval_permission(prompt_type, answers, &effective_perm_mode)?;
+        }
+
+        let control_request_id = format!(
+            "interactive-{}-{}",
             runtime_id,
-            display_text,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let expected_query_generation = match self.lifecycle.begin_interactive_op(
+            runtime_id,
+            handle.generation,
+            &control_request_id,
+            tool_use_id,
+        ) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let error = error.to_message();
+                if let (Some(app), Some(original_runtime_perm_mode)) =
+                    (plan_app, original_plan_runtime_perm_mode.as_ref())
+                {
+                    return Err(self.plan_failure_with_permission_rollback(
+                        app,
+                        runtime_id,
+                        handle.generation,
+                        original_runtime_perm_mode.as_deref(),
+                        error,
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let response_command = HelperInputCommand::InteractivePromptResponse {
+            control_request_id: &control_request_id,
+            tool_use_id,
+            prompt_type,
+            expected_query_generation,
             answers,
-            prompt_annotations.as_ref(),
-            || {
-                self.write_to_child(
-                    &handle,
-                    &HelperInputCommand::InteractivePromptResponse {
-                        tool_use_id,
-                        prompt_type,
-                        answers,
-                        annotations,
-                    },
-                )
-            },
-        )
+            annotations,
+        };
+        match self.write_to_live_child_outcome(&handle, &response_command) {
+            LiveWriteOutcome::Written => {}
+            LiveWriteOutcome::NotStarted(error) => {
+                self.lifecycle.note_interactive_failed(
+                    runtime_id,
+                    handle.generation,
+                    &control_request_id,
+                );
+                if let (Some(app), Some(original_runtime_perm_mode)) =
+                    (plan_app, original_plan_runtime_perm_mode.as_ref())
+                {
+                    return Err(self.plan_failure_with_permission_rollback(
+                        app,
+                        runtime_id,
+                        handle.generation,
+                        original_runtime_perm_mode.as_deref(),
+                        error,
+                    ));
+                }
+                return Err(error);
+            }
+            LiveWriteOutcome::StartedUnknown(error) => {
+                // The helper resolver is keyed by tool_use_id and consumes at
+                // most one reply. End this control attempt so a visible retry
+                // can reconcile via applied/stale_no_resolver instead of being
+                // blocked forever by an orphaned Pending operation.
+                self.lifecycle.note_interactive_failed(
+                    runtime_id,
+                    handle.generation,
+                    &control_request_id,
+                );
+                return Err(format!(
+                    "INTERACTIVE_DELIVERY_UNCERTAIN: response may have reached the helper; permission was not rolled back ({error})"
+                ));
+            }
+        }
+
+        let result = match self.lifecycle.wait_for_interactive_ack(
+            runtime_id,
+            &control_request_id,
+            crate::native_session_coordinator::SETTINGS_ACK_WAIT,
+        ) {
+            InteractiveWaitOutcome::Applied => self.append_interactive_prompt_response_event(
+                runtime_id,
+                display_text,
+                answers,
+                prompt_annotations.as_ref(),
+            ),
+            InteractiveWaitOutcome::Rejected => {
+                let error =
+                    "INTERACTIVE_RESPONSE_REJECTED: the helper resolver did not apply this response"
+                        .to_string();
+                if let (Some(app), Some(original_runtime_perm_mode)) =
+                    (plan_app, original_plan_runtime_perm_mode.as_ref())
+                {
+                    Err(self.plan_failure_with_permission_rollback(
+                        app,
+                        runtime_id,
+                        handle.generation,
+                        original_runtime_perm_mode.as_deref(),
+                        error,
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+            InteractiveWaitOutcome::Failed => Err(
+                "INTERACTIVE_RESPONSE_UNCERTAIN: helper retirement or local failure interrupted acknowledgement; permission was not rolled back"
+                    .to_string(),
+            ),
+            InteractiveWaitOutcome::Timeout => Err(
+                "INTERACTIVE_RESPONSE_ACK_TIMEOUT: delivery is uncertain; automatic retry is disabled"
+                    .to_string(),
+            ),
+        };
+        drop(transition_guard);
+        result
     }
 
     fn active_background_tasks(
@@ -2931,49 +3868,151 @@ impl NativeRuntimeManager {
             runtime_id,
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        if let Some(mode) = perm_mode {
-            self.update_record(runtime_id, |record| {
-                record.perm_mode = mode.to_string();
-                record.runtime_perm_mode = None;
-                record.updated_at = Utc::now();
-            })?;
-            notify_browser_policy_changed(app, runtime_id);
-        }
         let original_settings = handle
             .record
             .lock()
             .map_err(|_| "Failed to lock native session record".to_string())?
             .clone();
-        if env_name.is_some() || effort.is_some() {
-            self.update_record(runtime_id, |record| {
-                stage_runtime_settings_update(record, env_name, effort, &request_id);
-            })?;
-        }
-        if let Err(error) = self.write_to_child_with_reconnect(
-            app,
-            runtime_id,
-            handle,
-            &HelperInputCommand::UpdateSettings {
-                request_id: &request_id,
-                env_name,
-                perm_mode,
-                env_vars,
-                effort,
-                force_restart,
-            },
-        ) {
-            if env_name.is_some() || effort.is_some() {
-                self.update_record(runtime_id, |record| {
-                    record.env_name = original_settings.env_name;
-                    record.effort = original_settings.effort;
-                    record.pending_env_name = original_settings.pending_env_name;
-                    record.pending_effort = original_settings.pending_effort;
-                    record.pending_settings_request_id =
-                        original_settings.pending_settings_request_id;
-                    record.updated_at = Utc::now();
-                })?;
+        // Correlated settings operation: the matching runtime_settings_changed
+        // ACK resolves it; prompt dispatch waits for convergence while pending.
+        let lifecycle_managed = original_settings.provider == NativeProvider::Claude;
+        let permission_only =
+            perm_mode.is_some() && env_name.is_none() && env_vars.is_none() && effort.is_none();
+        if lifecycle_managed {
+            validate_claude_settings_patch(env_name, perm_mode, env_vars.is_some(), effort)?;
+            if permission_only {
+                self.lifecycle
+                    .begin_permission_settings_op(runtime_id, handle.generation, &request_id)
+                    .map_err(|error| error.to_message())?;
+            } else {
+                self.lifecycle
+                    .begin_settings_op(runtime_id, handle.generation, &request_id)
+                    .map_err(|error| error.to_message())?;
             }
-            return Err(error);
+        }
+        let stage_result = self.update_record(runtime_id, |record| {
+            if !lifecycle_managed {
+                if let Some(mode) = perm_mode {
+                    record.perm_mode = mode.to_string();
+                    record.runtime_perm_mode = None;
+                }
+            }
+            if lifecycle_managed && !permission_only {
+                // Claude permission and environment projection is committed
+                // only after the exact helper ACK. Until then browser policy
+                // and the visible current environment remain authoritative.
+                record.pending_settings_request_id = Some(request_id.clone());
+            }
+            if env_name.is_some() || effort.is_some() {
+                stage_runtime_settings_update(record, env_name, effort, &request_id);
+            }
+            record.updated_at = Utc::now();
+        });
+        if let Err(error) = stage_result {
+            if lifecycle_managed {
+                self.lifecycle
+                    .note_settings_failed(runtime_id, handle.generation, &request_id);
+            }
+            let rollback_error = self
+                .update_record(runtime_id, |record| {
+                    *record = original_settings.clone();
+                })
+                .err();
+            if perm_mode.is_some() {
+                notify_browser_policy_changed(app, runtime_id);
+            }
+            return Err(match rollback_error {
+                Some(rollback_error) => {
+                    format!("{error}; settings staging rollback also failed: {rollback_error}")
+                }
+                None => error,
+            });
+        }
+        if perm_mode.is_some() && !lifecycle_managed {
+            notify_browser_policy_changed(app, runtime_id);
+        }
+        let handle_generation = handle.generation;
+        let settings_command = HelperInputCommand::UpdateSettings {
+            request_id: &request_id,
+            env_name,
+            perm_mode,
+            permission_scope: perm_mode.map(|_| "display"),
+            env_vars,
+            effort,
+            force_restart,
+        };
+        let write_result: Result<(), (String, bool)> = if lifecycle_managed {
+            match self.write_to_live_child_outcome(&handle, &settings_command) {
+                LiveWriteOutcome::Written => Ok(()),
+                LiveWriteOutcome::NotStarted(error) => Err((error, false)),
+                LiveWriteOutcome::StartedUnknown(error) => Err((error, true)),
+            }
+        } else {
+            self.write_to_child_with_reconnect(app, runtime_id, handle, &settings_command)
+                .map_err(|error| (error, false))
+        };
+        if let Err((error, uncertain)) = write_result {
+            if lifecycle_managed {
+                if uncertain {
+                    self.lifecycle.note_settings_uncertain(
+                        runtime_id,
+                        handle_generation,
+                        &request_id,
+                    );
+                } else {
+                    self.lifecycle
+                        .note_settings_failed(runtime_id, handle_generation, &request_id);
+                }
+            }
+            if !uncertain {
+                self.update_record(runtime_id, |record| *record = original_settings.clone())?;
+                if perm_mode.is_some() {
+                    notify_browser_policy_changed(app, runtime_id);
+                }
+            }
+            return Err(if uncertain {
+                format!("SETTINGS_DELIVERY_UNCERTAIN: {error}")
+            } else {
+                error
+            });
+        }
+        if lifecycle_managed {
+            let wait_outcome = self.lifecycle.wait_for_settings_ack(
+                runtime_id,
+                &request_id,
+                crate::native_session_coordinator::SETTINGS_ACK_WAIT,
+            );
+            match wait_outcome {
+                SettingsWaitOutcome::Converged => {
+                    // The stdout event committed the exact env/effort and
+                    // permission scope before waking this waiter.
+                }
+                SettingsWaitOutcome::Deferred => {
+                    // Receipt is definite, but the live turn still owns the
+                    // old settings. The exact later Applied event commits the
+                    // staged projection and unlocks the FIFO.
+                }
+                SettingsWaitOutcome::Failed | SettingsWaitOutcome::Timeout => {
+                    let detail = if wait_outcome == SettingsWaitOutcome::Timeout {
+                        "SETTINGS_ACK_TIMEOUT: helper settings delivery is uncertain; choose the setting again to reconcile"
+                    } else {
+                        "SETTINGS_NOT_APPLIED: helper rejected the settings update"
+                    }
+                    .to_string();
+                    self.update_record(runtime_id, |record| {
+                        if record.pending_settings_request_id.as_deref()
+                            == Some(request_id.as_str())
+                        {
+                            record.pending_env_name = None;
+                            record.pending_effort = None;
+                            record.pending_settings_request_id = None;
+                        }
+                        record.last_error = Some(detail.clone());
+                        record.updated_at = Utc::now();
+                    })?;
+                    return Err(detail);
+                }
+            }
         }
         Ok(())
     }
@@ -3170,6 +4209,12 @@ impl NativeRuntimeManager {
         request: UpdateSessionRouterRequest,
         reason: &str,
     ) -> Result<SessionRouterState, RouterServiceError> {
+        let _settings_guard = self.settings_update_lock.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native settings coordinator is poisoned.",
+            )
+        })?;
         let _coordinator = self.reconnect_lock.lock().map_err(|_| {
             RouterServiceError::new(
                 "ROUTER_STATE_UNAVAILABLE",
@@ -3272,6 +4317,7 @@ impl NativeRuntimeManager {
         // router state. Recovery and route updates share reconnect_lock; the
         // handle lock also prevents an exit callback from unregistering/replacing
         // this generation between the check and registration.
+        let mut direct_settings_written = false;
         let apply_result = if let Some(handle) = active_handle.as_ref() {
             if updated_router.launch_transport == LaunchTransport::Routed {
                 router_manager
@@ -3283,23 +4329,54 @@ impl NativeRuntimeManager {
                     )
                     .map_err(|error| RouterServiceError::new(error.code, error.message))
             } else if let Some(resolved) = direct_env.as_ref() {
-                self.write_to_child(
-                    handle,
-                    &HelperInputCommand::UpdateSettings {
+                if let Err(error) = self.lifecycle.begin_settings_op(
+                    &request.runtime_id,
+                    handle.generation,
+                    &settings_request_id,
+                ) {
+                    Err(RouterServiceError::new(
+                        "ROUTER_DIRECT_UPDATE_STALE",
+                        error.to_message(),
+                    ))
+                } else {
+                    let command = HelperInputCommand::UpdateSettings {
                         request_id: &settings_request_id,
                         env_name: Some(&updated_router.default_env),
                         perm_mode: None,
+                        permission_scope: None,
                         env_vars: Some(&resolved.env_vars),
                         effort: None,
                         force_restart: false,
-                    },
-                )
-                .map_err(|error| {
-                    RouterServiceError::new(
-                        "ROUTER_DIRECT_UPDATE_FAILED",
-                        format!("Failed to switch the direct helper environment: {error}"),
-                    )
-                })
+                    };
+                    match self.write_to_live_child_outcome(handle, &command) {
+                        LiveWriteOutcome::Written => {
+                            direct_settings_written = true;
+                            Ok(())
+                        }
+                        LiveWriteOutcome::NotStarted(error) => {
+                            self.lifecycle.note_settings_failed(
+                                &request.runtime_id,
+                                handle.generation,
+                                &settings_request_id,
+                            );
+                            Err(RouterServiceError::new(
+                                "ROUTER_DIRECT_UPDATE_FAILED",
+                                format!("Failed to switch the direct helper environment: {error}"),
+                            ))
+                        }
+                        LiveWriteOutcome::StartedUnknown(error) => {
+                            self.lifecycle.note_settings_uncertain(
+                                &request.runtime_id,
+                                handle.generation,
+                                &settings_request_id,
+                            );
+                            Err(RouterServiceError::new(
+                                "ROUTER_DIRECT_UPDATE_UNCERTAIN",
+                                format!("Direct helper environment delivery is uncertain: {error}"),
+                            ))
+                        }
+                    }
+                }
             } else {
                 Ok(())
             }
@@ -3343,6 +4420,70 @@ impl NativeRuntimeManager {
         }
         drop(handles);
         drop(records);
+        // Helper stdout ingestion takes reconnect_lock. Release it before an
+        // exact direct-environment ACK wait or the event that resolves this
+        // operation could never be observed.
+        drop(_coordinator);
+
+        if direct_settings_written {
+            let settings_outcome = self.lifecycle.wait_for_settings_ack(
+                &request.runtime_id,
+                &settings_request_id,
+                crate::native_session_coordinator::SETTINGS_ACK_WAIT,
+            );
+            if matches!(
+                settings_outcome,
+                SettingsWaitOutcome::Failed | SettingsWaitOutcome::Timeout
+            ) {
+                let detail = if settings_outcome == SettingsWaitOutcome::Timeout {
+                    "Direct helper environment ACK timed out; choose the environment again to reconcile."
+                } else {
+                    "The helper rejected the direct environment update."
+                };
+                self.update_record(&request.runtime_id, |record| {
+                    record.env_name = previous_record.env_name.clone();
+                    record.router = previous_record.router.clone();
+                    if record.pending_settings_request_id.as_deref()
+                        == Some(settings_request_id.as_str())
+                    {
+                        record.pending_env_name = None;
+                        record.pending_effort = None;
+                        record.pending_settings_request_id = None;
+                    }
+                    record.last_error = Some(detail.to_string());
+                    record.updated_at = Utc::now();
+                })
+                .map_err(|error| {
+                    RouterServiceError::new(
+                        "ROUTER_ROLLBACK_FAILED",
+                        format!("{detail} State rollback also failed: {error}"),
+                    )
+                })?;
+                if let (Some(manager), Some(handle), Some(previous_router)) = (
+                    router_manager,
+                    active_handle.as_ref(),
+                    previous_record.router.clone(),
+                ) {
+                    if previous_router.launch_transport == LaunchTransport::Routed {
+                        let _ = manager.register(
+                            &request.runtime_id,
+                            handle.generation,
+                            previous_router,
+                        );
+                    }
+                }
+                return Err(RouterServiceError::new(
+                    if settings_outcome == SettingsWaitOutcome::Timeout {
+                        "ROUTER_DIRECT_UPDATE_ACK_TIMEOUT"
+                    } else {
+                        "ROUTER_DIRECT_UPDATE_REJECTED"
+                    },
+                    detail,
+                ));
+            }
+            // Converged projection was committed by the exact stdout event
+            // before its coordinator notification. Deferred remains staged.
+        }
         let state = SessionRouterState::from(&updated_router);
         let event = SessionRouterUpdatedEvent {
             runtime_id: request.runtime_id,
@@ -3363,6 +4504,12 @@ impl NativeRuntimeManager {
         app: &AppHandle,
         runtime_id: &str,
     ) -> Result<SessionRouterState, RouterServiceError> {
+        let _transition_guard = self.app_termination_lock.lock().map_err(|_| {
+            RouterServiceError::new(
+                "ROUTER_STATE_UNAVAILABLE",
+                "Native runtime transition coordinator is poisoned.",
+            )
+        })?;
         let _coordinator = self.reconnect_lock.lock().map_err(|_| {
             RouterServiceError::new(
                 "ROUTER_STATE_UNAVAILABLE",
@@ -3453,6 +4600,8 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         previous_revision: u64,
     ) -> Result<NativeSessionRecord, RouterServiceError> {
+        self.expire_interactive_attention(runtime_id)
+            .map_err(|error| RouterServiceError::new("ROUTER_STATE_UNAVAILABLE", error))?;
         let mut records = self.records.lock().map_err(|_| {
             RouterServiceError::new(
                 "ROUTER_STATE_UNAVAILABLE",
@@ -3517,8 +4666,12 @@ impl NativeRuntimeManager {
         drop(child);
         drop(handles);
         drop(records);
-        if let (Some(manager), Some(generation)) = (self.router_manager.get(), removed_generation) {
-            manager.unregister_generation(runtime_id, generation);
+        if let Some(generation) = removed_generation {
+            self.lifecycle
+                .note_generation_retired(runtime_id, generation);
+            if let Some(manager) = self.router_manager.get() {
+                manager.unregister_generation(runtime_id, generation);
+            }
         }
         Ok(recovery_record)
     }
@@ -3589,23 +4742,104 @@ impl NativeRuntimeManager {
         app: &AppHandle,
         runtime_id: &str,
         runtime_perm_mode: Option<&str>,
+        attention_id: Option<&str>,
+        expected_attention_seq: Option<u64>,
     ) -> Result<(), String> {
         let _transition_guard = self
             .app_termination_lock
             .lock()
             .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        self.update_session_runtime_perm_mode_under_transition(
+            app,
+            runtime_id,
+            runtime_perm_mode,
+            attention_id,
+            expected_attention_seq,
+            None,
+        )
+    }
+
+    fn update_session_runtime_perm_mode_under_transition(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        runtime_perm_mode: Option<&str>,
+        attention_id: Option<&str>,
+        expected_attention_seq: Option<u64>,
+        required_handle_generation: Option<u64>,
+    ) -> Result<(), String> {
+        let attention_fence = match (attention_id, expected_attention_seq) {
+            (Some(tool_use_id), Some(expected_attention_seq)) => {
+                validate_interactive_attention_occurrence(
+                    &self.event_log.attention_summary(runtime_id)?,
+                    tool_use_id,
+                    expected_attention_seq,
+                    "plan_exit",
+                )?;
+                Some((tool_use_id, expected_attention_seq))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "INTERACTIVE_ATTENTION_FENCE_INVALID: attention id and sequence must be supplied together"
+                        .to_string(),
+                )
+            }
+        };
         self.reject_query_mutation_during_transition(runtime_id, "update permissions")?;
-        let handle = self.ensure_handle(app.clone(), runtime_id)?;
-        let display_perm_mode = {
+        let _settings_guard = self
+            .settings_update_lock
+            .lock()
+            .map_err(|_| "Failed to lock native settings updates".to_string())?;
+        let handle = if attention_fence.is_some() || required_handle_generation.is_some() {
+            self.handles
+                .lock()
+                .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                .get(runtime_id)
+                .cloned()
+                .filter(|handle| {
+                    handle.alive.load(Ordering::SeqCst)
+                        && required_handle_generation
+                            .is_none_or(|generation| handle.generation == generation)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "INTERACTIVE_ATTENTION_STALE: native runtime {runtime_id} no longer has the required live Plan helper"
+                    )
+                })?
+        } else {
+            self.ensure_handle(app.clone(), runtime_id)?
+        };
+        if let Some((tool_use_id, expected_attention_seq)) = attention_fence {
+            validate_interactive_attention_occurrence(
+                &self.event_log.attention_summary(runtime_id)?,
+                tool_use_id,
+                expected_attention_seq,
+                "plan_exit",
+            )?;
+        }
+        let (display_perm_mode, original_runtime_perm_mode, lifecycle_managed) = {
             let record = handle
                 .record
                 .lock()
                 .map_err(|_| "Failed to lock native session record".to_string())?;
-            record.perm_mode.clone()
+            (
+                record.perm_mode.clone(),
+                record.runtime_perm_mode.clone(),
+                record.provider == NativeProvider::Claude,
+            )
         };
         let normalized_runtime_perm_mode = runtime_perm_mode
             .map(|mode| mode.trim().to_string())
             .filter(|mode| !mode.is_empty() && mode != &display_perm_mode);
+        if normalized_runtime_perm_mode == original_runtime_perm_mode
+            && !self
+                .lifecycle
+                .projection(runtime_id)
+                .is_some_and(|projection| projection.settings_pending)
+        {
+            return Ok(());
+        }
         let helper_perm_mode = effective_native_perm_mode(
             display_perm_mode.as_str(),
             normalized_runtime_perm_mode.as_deref(),
@@ -3617,26 +4851,184 @@ impl NativeRuntimeManager {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
 
-        self.update_record(runtime_id, |record| {
-            record.runtime_perm_mode = normalized_runtime_perm_mode.clone();
+        // Correlated settings operation for the live permission/Plan switch:
+        // prompt dispatch waits until the matching applied ACK (or failure).
+        if lifecycle_managed {
+            self.lifecycle
+                .begin_permission_settings_op(runtime_id, handle.generation, &request_id)
+                .map_err(|error| error.to_message())?;
+        }
+        let stage_result = self.update_record(runtime_id, |record| {
+            if !lifecycle_managed {
+                record.runtime_perm_mode = normalized_runtime_perm_mode.clone();
+            }
             record.updated_at = Utc::now();
-        })?;
-        notify_browser_policy_changed(app, runtime_id);
+        });
+        if let Err(error) = stage_result {
+            if lifecycle_managed {
+                self.lifecycle
+                    .note_settings_failed(runtime_id, handle.generation, &request_id);
+            }
+            let rollback_error = self
+                .update_record(runtime_id, |record| {
+                    record.runtime_perm_mode = original_runtime_perm_mode.clone();
+                    record.updated_at = Utc::now();
+                })
+                .err();
+            notify_browser_policy_changed(app, runtime_id);
+            return Err(match rollback_error {
+                Some(rollback_error) => format!(
+                    "{error}; runtime permission staging rollback also failed: {rollback_error}"
+                ),
+                None => error,
+            });
+        }
+        if !lifecycle_managed {
+            notify_browser_policy_changed(app, runtime_id);
+        }
+        let handle_generation = handle.generation;
+        let settings_command = HelperInputCommand::UpdateSettings {
+            request_id: &request_id,
+            env_name: None,
+            perm_mode: Some(&helper_perm_mode),
+            permission_scope: Some("runtime"),
+            env_vars: None,
+            effort: None,
+            force_restart: false,
+        };
+        let write_result: Result<(), (String, bool)> = if lifecycle_managed {
+            match self.write_to_live_child_outcome(&handle, &settings_command) {
+                LiveWriteOutcome::Written => Ok(()),
+                LiveWriteOutcome::NotStarted(error) => Err((error, false)),
+                LiveWriteOutcome::StartedUnknown(error) => Err((error, true)),
+            }
+        } else {
+            self.write_to_child_with_reconnect(app, runtime_id, handle, &settings_command)
+                .map_err(|error| (error, false))
+        };
+        if let Err((error, uncertain)) = write_result {
+            if lifecycle_managed {
+                if uncertain {
+                    self.lifecycle.note_settings_uncertain(
+                        runtime_id,
+                        handle_generation,
+                        &request_id,
+                    );
+                } else {
+                    self.lifecycle
+                        .note_settings_failed(runtime_id, handle_generation, &request_id);
+                }
+            }
+            if !uncertain {
+                self.update_record(runtime_id, |record| {
+                    record.runtime_perm_mode = original_runtime_perm_mode;
+                    record.updated_at = Utc::now();
+                })?;
+                notify_browser_policy_changed(app, runtime_id);
+            }
+            return Err(if uncertain {
+                format!("SETTINGS_DELIVERY_UNCERTAIN: {error}")
+            } else {
+                error
+            });
+        }
+        if lifecycle_managed {
+            let wait_outcome = self.lifecycle.wait_for_settings_ack(
+                runtime_id,
+                &request_id,
+                crate::native_session_coordinator::SETTINGS_ACK_WAIT,
+            );
+            match wait_outcome {
+                SettingsWaitOutcome::Converged => {
+                    // The exact stdout event committed runtime permission and
+                    // invalidated browser policy before waking this waiter.
+                }
+                SettingsWaitOutcome::Deferred => {
+                    return Err(
+                        "PERMISSION_SETTINGS_DEFERRED: live Plan permission was not applied; interactive reply was not sent"
+                            .to_string(),
+                    );
+                }
+                SettingsWaitOutcome::Failed | SettingsWaitOutcome::Timeout => {
+                    let detail = if wait_outcome == SettingsWaitOutcome::Timeout {
+                        "SETTINGS_ACK_TIMEOUT: helper permission delivery is uncertain; choose the mode again to reconcile"
+                    } else {
+                        "SETTINGS_NOT_APPLIED: helper rejected the permission update"
+                    }
+                    .to_string();
+                    self.update_record(runtime_id, |record| {
+                        if record.pending_settings_request_id.as_deref()
+                            == Some(request_id.as_str())
+                        {
+                            record.pending_settings_request_id = None;
+                        }
+                        record.last_error = Some(detail.clone());
+                        record.updated_at = Utc::now();
+                    })?;
+                    return Err(detail);
+                }
+            }
+        }
+        Ok(())
+    }
 
-        self.write_to_child_with_reconnect(
+    fn rollback_plan_permission_under_transition(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        helper_generation: u64,
+        original_runtime_perm_mode: Option<&str>,
+    ) -> Result<(), String> {
+        let current_generation = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .filter(|handle| handle.alive.load(Ordering::SeqCst))
+            .map(|handle| handle.generation);
+        match current_generation {
+            Some(current) if current == helper_generation => {
+                self.update_session_runtime_perm_mode_under_transition(
+                    app,
+                    runtime_id,
+                    original_runtime_perm_mode,
+                    None,
+                    None,
+                    Some(helper_generation),
+                )
+            }
+            None => {
+                let original_runtime_perm_mode = original_runtime_perm_mode.map(str::to_string);
+                self.update_record(runtime_id, |record| {
+                    record.runtime_perm_mode = original_runtime_perm_mode;
+                    record.updated_at = Utc::now();
+                })?;
+                notify_browser_policy_changed(app, runtime_id);
+                Ok(())
+            }
+            Some(current) => Err(format!(
+                "PLAN_PERMISSION_ROLLBACK_UNCERTAIN: helper generation changed from {helper_generation} to {current}"
+            )),
+        }
+    }
+
+    fn plan_failure_with_permission_rollback(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        helper_generation: u64,
+        original_runtime_perm_mode: Option<&str>,
+        cause: String,
+    ) -> String {
+        match self.rollback_plan_permission_under_transition(
             app,
             runtime_id,
-            handle,
-            &HelperInputCommand::UpdateSettings {
-                request_id: &request_id,
-                env_name: None,
-                perm_mode: Some(&helper_perm_mode),
-                env_vars: None,
-                effort: None,
-                force_restart: false,
-            },
-        )?;
-        Ok(())
+            helper_generation,
+            original_runtime_perm_mode,
+        ) {
+            Ok(()) => cause,
+            Err(rollback_error) => format!("{cause}; {rollback_error}"),
+        }
     }
 
     pub fn stop_session(self: &Arc<Self>, runtime_id: &str) -> Result<(), String> {
@@ -3648,16 +5040,35 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         source: Option<&str>,
     ) -> Result<(), String> {
-        self.stop_session_from_with_grace(runtime_id, source, NATIVE_STOP_GRACE_PERIOD)
+        self.stop_session_from_with_grace(runtime_id, source, None, NATIVE_STOP_GRACE_PERIOD)
+    }
+
+    pub fn stop_session_from_expected(
+        self: &Arc<Self>,
+        runtime_id: &str,
+        source: Option<&str>,
+        expected_command_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.stop_session_from_with_grace(
+            runtime_id,
+            source,
+            expected_command_id,
+            NATIVE_STOP_GRACE_PERIOD,
+        )
     }
 
     fn stop_session_from_with_grace(
         self: &Arc<Self>,
         runtime_id: &str,
         source: Option<&str>,
+        expected_command_id: Option<&str>,
         force_kill_grace: Duration,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
         let _reconnect_guard = match self.reconnect_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -3702,19 +5113,120 @@ impl NativeRuntimeManager {
         }
 
         if provider == NativeProvider::Claude {
-            if let Some(handle) = stop_handle {
-                if let Err(error) = self.write_to_child(&handle, &HelperInputCommand::InterruptTurn)
-                {
-                    errors.push(error);
-                } else if let Err(error) = self.append_lifecycle_event(
-                    runtime_id,
-                    "interrupt_written",
-                    format!(
-                        "Native helper generation {} accepted foreground interrupt command.",
-                        handle.generation
-                    ),
+            let expected_command_id = expected_command_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(expected_command_id) = expected_command_id {
+                let projection = self.lifecycle.projection(runtime_id);
+                let active_command_id = projection
+                    .as_ref()
+                    .and_then(|projection| projection.active_command_id.as_deref());
+                if active_command_id != Some(expected_command_id) {
+                    if active_command_id.is_none()
+                        && self
+                            .input_queue
+                            .remove_dispatch(runtime_id, expected_command_id)
+                            .is_some()
+                    {
+                        self.lifecycle.note_queue_changed(runtime_id);
+                        if let Err(error) = self.append_lifecycle_event(
+                            runtime_id,
+                            "not_started_prompt_cancelled",
+                            format!(
+                                "User stopped prompt {expected_command_id} after its helper retired before the write started."
+                            ),
+                        ) {
+                            errors.push(error);
+                        }
+                        return if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(errors.join("; "))
+                        };
+                    }
+                    return Err(format!(
+                        "STALE_INTERRUPT_TARGET: expected active command {expected_command_id}, found {}",
+                        active_command_id.unwrap_or("none")
+                    ));
+                }
+
+                // An ambiguous pipe write may have left a partial JSON frame,
+                // so this helper cannot be trusted to parse the interrupt that
+                // would reconcile the command. Exact user Stop authorizes
+                // retiring this owned generation, provided doing so cannot
+                // terminate known background work, then abandoning only the
+                // matching uncertain command.
+                if matches!(
+                    projection
+                        .as_ref()
+                        .and_then(|projection| projection.active_phase.as_deref()),
+                    Some("uncertain" | "protocol_error")
                 ) {
-                    errors.push(error);
+                    self.reject_background_task_termination(
+                        runtime_id,
+                        "abandon this delivery-uncertain foreground command",
+                        false,
+                    )?;
+                    if let Some(handle) = stop_handle.as_ref() {
+                        self.retire_handle_if_current(runtime_id, handle)?;
+                    }
+                }
+
+                let abandon_decision = self
+                    .lifecycle
+                    .abandon_retired_command(runtime_id, expected_command_id);
+                if matches!(abandon_decision, LifecycleDecision::Released { .. }) {
+                    if self
+                        .input_queue
+                        .remove_dispatch(runtime_id, expected_command_id)
+                        .is_some()
+                    {
+                        self.lifecycle.note_queue_changed(runtime_id);
+                    }
+                    if let Err(error) = self.apply_lifecycle_decision(runtime_id, &abandon_decision)
+                    {
+                        errors.push(error);
+                    }
+                    if let Err(error) = self.append_lifecycle_event(
+                        runtime_id,
+                        "uncertain_command_abandoned",
+                        format!(
+                            "User stopped unresolved command {expected_command_id} after its helper generation retired."
+                        ),
+                    ) {
+                        errors.push(error);
+                    }
+                    return if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(errors.join("; "))
+                    };
+                }
+            }
+            if let Some(handle) = stop_handle {
+                match self.write_to_live_child_outcome(
+                    &handle,
+                    &HelperInputCommand::InterruptTurn {
+                        expected_command_id,
+                    },
+                ) {
+                    LiveWriteOutcome::Written => {
+                        if let Err(error) = self.append_lifecycle_event(
+                            runtime_id,
+                            "interrupt_written",
+                            format!(
+                                "Native helper generation {} accepted foreground interrupt command. expected_command_id={}",
+                                handle.generation,
+                                expected_command_id.unwrap_or("-")
+                            ),
+                        ) {
+                            errors.push(error);
+                        }
+                    }
+                    LiveWriteOutcome::NotStarted(error) => errors.push(error),
+                    LiveWriteOutcome::StartedUnknown(error) => errors.push(format!(
+                        "INTERRUPT_DELIVERY_UNCERTAIN: interrupt may have reached the helper ({error})"
+                    )),
                 }
             } else {
                 errors.push(format!(
@@ -3830,6 +5342,8 @@ impl NativeRuntimeManager {
         if changed > 0 {
             persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())?;
         }
+        drop(records);
+        self.expire_orphaned_interactive_attention()?;
 
         Ok(changed)
     }
@@ -3967,6 +5481,9 @@ impl NativeRuntimeManager {
                     terminal.display_name()
                 ),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         )?;
         Ok(NativeHandoffResult {
@@ -4231,6 +5748,9 @@ impl NativeRuntimeManager {
                     terminal.display_name()
                 ),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         )?;
         self.remove_handle(runtime_id)?;
@@ -4429,6 +5949,9 @@ impl NativeRuntimeManager {
                     terminal.display_name()
                 ),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         ) {
             errors.push(error);
@@ -4558,6 +6081,9 @@ impl NativeRuntimeManager {
                         handle.generation
                     ),
                     assistant_message_uuid: None,
+                    command_id: None,
+                    query_generation: None,
+                    user_message_uuid: None,
                 },
             )
             .and_then(|_| self.spawn_helper(app, runtime_id, &options, handle.clone()));
@@ -4764,33 +6290,114 @@ impl NativeRuntimeManager {
             *child_slot = Some(child);
         }
 
-        self.write_to_child(
-            &handle,
-            &HelperInputCommand::Init {
-                provider: options.provider.as_str(),
-                env_name: &options.env_name,
-                perm_mode: effective_native_perm_mode(
-                    options.perm_mode.as_str(),
-                    options.runtime_perm_mode.as_deref(),
+        // The initial prompt becomes a formal foreground command BEFORE the
+        // Init frame is written — it never rides a bare Init unowned. (The
+        // handle is already inserted, so the new incarnation is established.)
+        let has_initial_text = options
+            .initial_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty());
+        let has_initial_images = options
+            .initial_images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty());
+        let initial_command_id = if options.provider == NativeProvider::Claude
+            && (has_initial_text || has_initial_images)
+        {
+            Some(
+                self.lifecycle
+                    .register_initial_prompt(runtime_id, handle.generation)
+                    .map_err(|error| error.to_message())?,
+            )
+        } else {
+            None
+        };
+
+        let init_command = HelperInputCommand::Init {
+            provider: options.provider.as_str(),
+            env_name: &options.env_name,
+            perm_mode: effective_native_perm_mode(
+                options.perm_mode.as_str(),
+                options.runtime_perm_mode.as_deref(),
+            ),
+            allow_dangerously_skip_permissions: native_session_allows_dangerously_skip_permissions(
+                options,
+            ),
+            working_dir: &options.working_dir,
+            env_vars: &handle.helper_env_vars,
+            initial_prompt: options.initial_prompt.as_deref(),
+            initial_command_id: initial_command_id.as_deref(),
+            initial_images: options.initial_images.as_deref(),
+            provider_session_id: options.provider_session_id.as_deref(),
+            fork_session: options.fork_from_message_id.as_ref().map(|_| true),
+            fork_at_message_id: options.fork_from_message_id.as_deref(),
+            claude_path: handle.claude_path.as_deref(),
+            codex_path: handle.codex_path.as_deref(),
+            codex_base_url: handle.codex_base_url.as_deref(),
+            codex_api_key: handle.codex_api_key.as_deref(),
+            effort: options.effort.as_deref(),
+            todo_snapshot_seed: todo_snapshot_seed.as_ref(),
+            router: helper_router_init.as_ref(),
+        };
+        if options.provider == NativeProvider::Claude {
+            self.initializing_runtimes
+                .lock()
+                .map_err(|_| "Failed to lock native initialization fences".to_string())?
+                .insert(runtime_id.to_string());
+        }
+        if let Some(command_id) = initial_command_id.as_deref() {
+            match self.write_to_live_child_outcome(&handle, &init_command) {
+                LiveWriteOutcome::Written => self.schedule_command_admission_deadline(
+                    runtime_id,
+                    handle.generation,
+                    command_id,
+                    0,
                 ),
-                allow_dangerously_skip_permissions:
-                    native_session_allows_dangerously_skip_permissions(options),
-                working_dir: &options.working_dir,
-                env_vars: &handle.helper_env_vars,
-                initial_prompt: options.initial_prompt.as_deref(),
-                initial_images: options.initial_images.as_deref(),
-                provider_session_id: options.provider_session_id.as_deref(),
-                fork_session: options.fork_from_message_id.as_ref().map(|_| true),
-                fork_at_message_id: options.fork_from_message_id.as_deref(),
-                claude_path: handle.claude_path.as_deref(),
-                codex_path: handle.codex_path.as_deref(),
-                codex_base_url: handle.codex_base_url.as_deref(),
-                codex_api_key: handle.codex_api_key.as_deref(),
-                effort: options.effort.as_deref(),
-                todo_snapshot_seed: todo_snapshot_seed.as_ref(),
-                router: helper_router_init.as_ref(),
-            },
-        )?;
+                LiveWriteOutcome::NotStarted(error) => {
+                    self.initializing_runtimes
+                        .lock()
+                        .map_err(|_| "Failed to lock native initialization fences".to_string())?
+                        .remove(runtime_id);
+                    self.lifecycle
+                        .abandon_admission(runtime_id, handle.generation, command_id);
+                    return Err(error);
+                }
+                LiveWriteOutcome::StartedUnknown(error) => {
+                    self.lifecycle.mark_delivery_uncertain(
+                        runtime_id,
+                        handle.generation,
+                        command_id,
+                        error.clone(),
+                    );
+                    let detail = format!(
+                        "Initial prompt delivery is uncertain; automatic retry is disabled ({error})"
+                    );
+                    if let Err(record_error) = self.update_record(runtime_id, |record| {
+                        record.status = "interrupted".to_string();
+                        record.is_active = true;
+                        record.last_error = Some(detail.clone());
+                        record.updated_at = Utc::now();
+                    }) {
+                        eprintln!(
+                            "Failed to persist retained initial delivery uncertainty for {runtime_id}: {record_error}"
+                        );
+                    }
+                    let _ = self.append_lifecycle_event(
+                        runtime_id,
+                        "initial_prompt_delivery_uncertain",
+                        detail,
+                    );
+                }
+            }
+        } else {
+            if let Err(error) = self.write_to_child(&handle, &init_command) {
+                self.initializing_runtimes
+                    .lock()
+                    .map_err(|_| "Failed to lock native initialization fences".to_string())?
+                    .remove(runtime_id);
+                return Err(error);
+            }
+        }
 
         let manager = self.clone();
         let runtime = runtime_id.to_string();
@@ -4889,11 +6496,314 @@ impl NativeRuntimeManager {
     }
 
     fn process_helper_stdout(&self, runtime_id: &str, line: &str) -> Result<(), String> {
-        self.process_helper_stdout_with_app(None, runtime_id, line)
+        let helper_incarnation = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .map(|handle| handle.generation)
+            .unwrap_or_default();
+        if helper_incarnation > 0 {
+            self.lifecycle
+                .note_incarnation(runtime_id, helper_incarnation);
+        }
+        self.process_helper_stdout_with_app(None, runtime_id, line, helper_incarnation)
+    }
+
+    /// Feeds coordinator-relevant helper events into the lifecycle
+    /// coordinator. Correlated facts mutate state; stale generations and
+    /// foreign command ids are dropped by the coordinator itself.
+    fn ingest_lifecycle_for_coordination(
+        &self,
+        runtime_id: &str,
+        helper_incarnation: u64,
+        payload: &SessionEventPayload,
+    ) -> LifecycleDecision {
+        let decision = match payload {
+            SessionEventPayload::Lifecycle {
+                stage,
+                detail,
+                command_id,
+                query_generation,
+                ..
+            } => {
+                let generation = || {
+                    query_generation
+                        .ok_or_else(|| format!("lifecycle stage {stage} omitted query_generation"))
+                };
+                let command = || {
+                    command_id
+                        .as_deref()
+                        .ok_or_else(|| format!("lifecycle stage {stage} omitted command_id"))
+                };
+                match stage.as_str() {
+                    "command_admitted" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => self.lifecycle.note_command_admitted(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id,
+                            generation,
+                        ),
+                        (Err(detail), _) | (_, Err(detail)) => self.lifecycle.note_protocol_error(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id.as_deref(),
+                            detail,
+                        ),
+                    },
+                    "command_rejected" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => self.lifecycle.note_command_rejected(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id,
+                            generation,
+                        ),
+                        (Err(message), _) | (_, Err(message)) => {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id.as_deref(),
+                                message,
+                            )
+                        }
+                    },
+                    "command_abandoned" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => self.lifecycle.note_command_abandoned(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id,
+                            generation,
+                        ),
+                        (Err(message), _) | (_, Err(message)) => {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id.as_deref(),
+                                message,
+                            )
+                        }
+                    },
+                    "sdk_command_state" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => self.lifecycle.note_sdk_command_state(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id,
+                            detail,
+                            generation,
+                        ),
+                        (Err(message), _) | (_, Err(message)) => {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id.as_deref(),
+                                message,
+                            )
+                        }
+                    },
+                    "turn_result_observed" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => self.lifecycle.note_result_observed(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id,
+                            generation,
+                        ),
+                        (Err(message), _) | (_, Err(message)) => {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id.as_deref(),
+                                message,
+                            )
+                        }
+                    },
+                    "legacy_turn_terminal" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => self.lifecycle.note_legacy_terminal(
+                            runtime_id,
+                            helper_incarnation,
+                            command_id,
+                            generation,
+                        ),
+                        (Err(message), _) | (_, Err(message)) => {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id.as_deref(),
+                                message,
+                            )
+                        }
+                    },
+                    "conversation_reset" => match (command_id.as_deref(), *query_generation) {
+                        (Some(command_id), Some(generation)) => {
+                            self.lifecycle.note_sdk_command_state(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id,
+                                "conversation_reset",
+                                generation,
+                            )
+                        }
+                        // Full-lifecycle terminal ownership is released before a
+                        // late SDK conversation_reset can arrive. With no exact
+                        // command fence it is only an observation: it must never
+                        // release or poison a newer foreground command.
+                        (None, _) => LifecycleDecision::Ignored,
+                        (Some(command_id), None) => self.lifecycle.note_protocol_error(
+                            runtime_id,
+                            helper_incarnation,
+                            Some(command_id),
+                            format!("lifecycle stage {stage} omitted query_generation"),
+                        ),
+                    },
+                    "lifecycle_protocol_error" => self.lifecycle.note_protocol_error(
+                        runtime_id,
+                        helper_incarnation,
+                        command_id.as_deref(),
+                        detail,
+                    ),
+                    "interrupt_target_mismatch" => match (command(), generation()) {
+                        (Ok(command_id), Ok(generation)) => {
+                            self.lifecycle.note_interrupt_target_mismatch(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id,
+                                generation,
+                                detail,
+                            )
+                        }
+                        (Err(message), _) | (_, Err(message)) => {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id.as_deref(),
+                                message,
+                            )
+                        }
+                    },
+                    "delivery_uncertain" => {
+                        if let Some(command_id) = command_id.as_deref() {
+                            self.lifecycle.mark_delivery_uncertain(
+                                runtime_id,
+                                helper_incarnation,
+                                command_id,
+                                detail,
+                            );
+                            LifecycleDecision::Updated
+                        } else {
+                            self.lifecycle.note_protocol_error(
+                                runtime_id,
+                                helper_incarnation,
+                                None,
+                                "delivery_uncertain omitted command_id",
+                            )
+                        }
+                    }
+                    _ => LifecycleDecision::Ignored,
+                }
+            }
+            SessionEventPayload::RuntimeSettingsChanged {
+                state,
+                request_id,
+                query_generation,
+                ..
+            } => self.lifecycle.note_settings_ack(
+                runtime_id,
+                helper_incarnation,
+                request_id.as_deref(),
+                state,
+                *query_generation,
+            ),
+            SessionEventPayload::InteractiveResponseResult {
+                control_request_id,
+                tool_use_id,
+                state,
+                query_generation,
+                ..
+            } => self.lifecycle.note_interactive_ack(
+                runtime_id,
+                helper_incarnation,
+                control_request_id.as_deref(),
+                tool_use_id,
+                state,
+                *query_generation,
+            ),
+            // SessionCompleted is transcript/error information, never an
+            // ownership terminal because it has no command/generation fence.
+            _ => LifecycleDecision::Ignored,
+        };
+
+        if let SessionEventPayload::Lifecycle {
+            stage, command_id, ..
+        } = payload
+        {
+            if let Some(command_id) = command_id.as_deref() {
+                let queue_changed = match stage.as_str() {
+                    "command_rejected"
+                        if matches!(&decision, LifecycleDecision::Released { .. }) =>
+                    {
+                        self.input_queue.confirm_rejected(runtime_id, command_id)
+                    }
+                    "command_admitted"
+                    | "command_abandoned"
+                    | "sdk_command_state"
+                    | "turn_result_observed"
+                    | "legacy_turn_terminal"
+                    | "conversation_reset"
+                        if !matches!(
+                            &decision,
+                            LifecycleDecision::Ignored | LifecycleDecision::ProtocolError { .. }
+                        ) =>
+                    {
+                        self.input_queue.confirm_admitted(runtime_id, command_id)
+                    }
+                    "delivery_uncertain" => self
+                        .input_queue
+                        .mark_command_delivery_uncertain(runtime_id, command_id),
+                    _ => false,
+                };
+                if queue_changed {
+                    self.lifecycle.note_queue_changed(runtime_id);
+                }
+            }
+        }
+
+        decision
+    }
+
+    fn apply_lifecycle_decision(
+        &self,
+        runtime_id: &str,
+        decision: &LifecycleDecision,
+    ) -> Result<(), String> {
+        match decision {
+            LifecycleDecision::Released { command_id } => {
+                self.update_record(runtime_id, |record| {
+                    if !is_native_terminal_status(&record.status)
+                        && !record.status.starts_with("handoff_")
+                    {
+                        record.status = "ready".to_string();
+                        record.is_active = true;
+                        record.last_error = None;
+                        record.updated_at = Utc::now();
+                    }
+                })?;
+                self.append_lifecycle_event(
+                    runtime_id,
+                    "ready",
+                    format!("Coordinator released terminal command {command_id}."),
+                )
+            }
+            LifecycleDecision::ProtocolError { detail } => {
+                self.update_record(runtime_id, |record| {
+                    record.last_error = Some(format!("Lifecycle protocol error: {detail}"));
+                    record.updated_at = Utc::now();
+                })
+            }
+            LifecycleDecision::Ignored | LifecycleDecision::Updated => Ok(()),
+        }
     }
 
     fn process_helper_stdout_if_current(
-        &self,
+        self: &Arc<Self>,
         app: Option<&AppHandle>,
         runtime_id: &str,
         line: &str,
@@ -4906,7 +6816,53 @@ impl NativeRuntimeManager {
         if !self.is_current_handle(runtime_id, handle)? {
             return Ok(());
         }
-        self.process_helper_stdout_with_app(app, runtime_id, line)
+        let defer_queue_autodrain = helper_output_defers_queue_autodrain(line);
+        let request_queue_autodrain = helper_output_requests_queue_autodrain(line);
+        let initialization_failed = helper_output_reports_initialization_failure(line);
+        let before = self.lifecycle.projection(runtime_id);
+        let result = self.process_helper_stdout_with_app(app, runtime_id, line, handle.generation);
+        let after = self.lifecycle.projection(runtime_id);
+        if initialization_failed {
+            let dropped = self.input_queue.clear(runtime_id);
+            if dropped > 0 {
+                self.lifecycle.note_queue_changed(runtime_id);
+                let _ = self.set_last_error(
+                    runtime_id,
+                    format!(
+                        "Claude initialization failed before {dropped} queued prompt(s) could be sent; resend them in a new task."
+                    ),
+                );
+            }
+        }
+        if request_queue_autodrain {
+            self.initializing_runtimes
+                .lock()
+                .map_err(|_| "Failed to lock native initialization fences".to_string())?
+                .remove(runtime_id);
+        }
+        drop(_reconnect_guard);
+        let queue_result = if let Some(app) = app.filter(|_| {
+            request_queue_autodrain
+                || (!defer_queue_autodrain
+                    && lifecycle_transition_unblocked_queue(before.as_ref(), after.as_ref()))
+        }) {
+            self.maybe_dispatch_queued(
+                app,
+                runtime_id,
+                if request_queue_autodrain {
+                    QueueDispatchTrigger::InitializationSettled
+                } else {
+                    QueueDispatchTrigger::AuthoritativeLifecycle
+                },
+            )
+        } else {
+            Ok(())
+        };
+        // Ownership/queue mutation occurs before event persistence. Even if
+        // the presentation write fails, always perform the derived drain so a
+        // following FIFO command is not stranded behind a terminal already
+        // consumed by the coordinator. Preserve the observation error after.
+        result.and(queue_result)
     }
 
     fn process_helper_stdout_with_app(
@@ -4914,6 +6870,7 @@ impl NativeRuntimeManager {
         app: Option<&AppHandle>,
         runtime_id: &str,
         line: &str,
+        helper_incarnation: u64,
     ) -> Result<(), String> {
         let mut processed = false;
         for entry in line
@@ -4922,7 +6879,7 @@ impl NativeRuntimeManager {
             .filter(|entry| !entry.is_empty())
         {
             processed = true;
-            self.process_helper_stdout_line(app, runtime_id, entry)?;
+            self.process_helper_stdout_line(app, runtime_id, entry, helper_incarnation)?;
         }
         if !processed {
             return Ok(());
@@ -4935,6 +6892,7 @@ impl NativeRuntimeManager {
         app: Option<&AppHandle>,
         runtime_id: &str,
         line: &str,
+        helper_incarnation: u64,
     ) -> Result<(), String> {
         let output: HelperOutputEvent = serde_json::from_str(line)
             .map_err(|error| format!("Failed to parse helper event JSON: {}", error))?;
@@ -4942,7 +6900,20 @@ impl NativeRuntimeManager {
         match output {
             HelperOutputEvent::SessionMeta {
                 provider_session_id,
+                capabilities,
+                query_generation,
             } => {
+                // Coordinator fences: capabilities fix the adapter kind; a new
+                // provider conversation id bumps the conversation epoch. A
+                // reset alone never releases the active command.
+                let lifecycle_decision = self.lifecycle.note_session_meta(
+                    runtime_id,
+                    helper_incarnation,
+                    Some(&provider_session_id),
+                    capabilities.as_deref(),
+                    query_generation,
+                );
+                self.apply_lifecycle_decision(runtime_id, &lifecycle_decision)?;
                 let mut pending_handoff_terminal = None;
                 let mut pending_handoff_allow_background_task_termination = false;
                 let provider = self
@@ -5036,6 +7007,11 @@ impl NativeRuntimeManager {
                     .as_ref()
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
+                // Coordinator gate first: a generic `ready` from a settings or
+                // interrupt side lane must not flip the session record while a
+                // foreground command owns the session. Uncorrelated status
+                // lines update presentation only and never release ownership.
+                let status_decision = self.lifecycle.note_status_line(runtime_id, &status);
                 let mut applied = false;
                 let mut next_status = status.clone();
                 let handoff_in_progress = self
@@ -5043,10 +7019,33 @@ impl NativeRuntimeManager {
                     .lock()
                     .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
                     .contains_key(runtime_id);
-                self.update_record(runtime_id, |record| {
-                    if handoff_in_progress && status != "error" {
-                        return;
+                if handoff_in_progress && status != "error" {
+                    // Terminal handoff owns the record; keep the original
+                    // silent suppression of helper status lines here.
+                    return Ok(());
+                }
+                if matches!(
+                    status_decision,
+                    crate::native_session_coordinator::StatusDecision::Suppress
+                ) {
+                    // Record the suppressed line for the transcript, but the
+                    // session record keeps its coordinator-backed state.
+                    if let Some(detail) = normalized_detail {
+                        self.append_event(
+                            runtime_id,
+                            SessionEventPayload::Lifecycle {
+                                stage: format!("suppressed_{status}"),
+                                detail,
+                                assistant_message_uuid: None,
+                                command_id: None,
+                                query_generation: None,
+                                user_message_uuid: None,
+                            },
+                        )?;
                     }
+                    return Ok(());
+                }
+                self.update_record(runtime_id, |record| {
                     if status == "error"
                         && is_recoverable_native_helper_error(record, normalized_detail.as_deref())
                     {
@@ -5080,6 +7079,9 @@ impl NativeRuntimeManager {
                             stage: next_status,
                             detail,
                             assistant_message_uuid: None,
+                            command_id: None,
+                            query_generation: None,
+                            user_message_uuid: None,
                         },
                     )?;
                 }
@@ -5098,7 +7100,41 @@ impl NativeRuntimeManager {
                         return Ok(());
                     }
                 };
-                self.append_event(runtime_id, payload)
+                let settings_policy_changed = matches!(
+                    &payload,
+                    SessionEventPayload::RuntimeSettingsChanged {
+                        state,
+                        permission_scope: Some(_),
+                        ..
+                    } if state == "applied"
+                );
+                let lifecycle_decision =
+                    if matches!(&payload, SessionEventPayload::RuntimeSettingsChanged { .. }) {
+                        // Commit the exact settings projection before notifying
+                        // coordinator waiters. This prevents an older stdout-side
+                        // record clone from overwriting the waiter's newer
+                        // permission projection in the live handle.
+                        self.append_event(runtime_id, payload.clone())?;
+                        self.ingest_lifecycle_for_coordination(
+                            runtime_id,
+                            helper_incarnation,
+                            &payload,
+                        )
+                    } else {
+                        let decision = self.ingest_lifecycle_for_coordination(
+                            runtime_id,
+                            helper_incarnation,
+                            &payload,
+                        );
+                        self.append_event(runtime_id, payload)?;
+                        decision
+                    };
+                if settings_policy_changed {
+                    if let Some(app) = app {
+                        notify_browser_policy_changed(app, runtime_id);
+                    }
+                }
+                self.apply_lifecycle_decision(runtime_id, &lifecycle_decision)
             }
             HelperOutputEvent::BrowserToolRequest {
                 request_id,
@@ -5466,6 +7502,43 @@ impl NativeRuntimeManager {
         self.write_to_child_checked(handle, command, true)
     }
 
+    fn write_to_live_child_outcome(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        command: &HelperInputCommand<'_>,
+    ) -> LiveWriteOutcome {
+        let line = match serde_json::to_string(command) {
+            Ok(line) => line,
+            Err(error) => {
+                return LiveWriteOutcome::NotStarted(format!(
+                    "Failed to encode helper command: {error}"
+                ))
+            }
+        };
+        let mut child_guard = match handle.child.lock() {
+            Ok(child) => child,
+            Err(_) => {
+                return LiveWriteOutcome::NotStarted(
+                    "Failed to lock native sidecar child".to_string(),
+                )
+            }
+        };
+        if !handle.alive.load(Ordering::SeqCst) {
+            return LiveWriteOutcome::NotStarted(NATIVE_HELPER_RETIRING_ERROR.to_string());
+        }
+        let Some(child) = child_guard.as_mut() else {
+            return LiveWriteOutcome::NotStarted(
+                "Native sidecar child is not available".to_string(),
+            );
+        };
+        match child.write(format!("{line}\n").as_bytes()) {
+            Ok(()) => LiveWriteOutcome::Written,
+            Err(error) => LiveWriteOutcome::StartedUnknown(format!(
+                "Failed to write to native sidecar stdin: {error}"
+            )),
+        }
+    }
+
     fn write_to_child_checked(
         &self,
         handle: &Arc<NativeSessionHandle>,
@@ -5519,7 +7592,10 @@ impl NativeRuntimeManager {
                             error
                         ),
                         assistant_message_uuid: None,
-                    },
+                        command_id: None,
+                        query_generation: None,
+                        user_message_uuid: None,
+                    }
                 );
                 let _reconnect_guard = self.reconnect_lock.lock().map_err(|_| {
                     "Failed to lock native runtime reconnect coordinator".to_string()
@@ -5771,6 +7847,9 @@ impl NativeRuntimeManager {
         };
 
         if is_current {
+            if let Err(error) = self.expire_interactive_attention(runtime_id) {
+                errors.push(error);
+            }
             if let Err(error) = self.append_lifecycle_event(
                 runtime_id,
                 "stop_force_killed",
@@ -5913,6 +7992,106 @@ impl NativeRuntimeManager {
         self.append_event(runtime_id, payload)
     }
 
+    /// Make every resolver occurrence from the retiring helper terminal in
+    /// the replayable event stream. Helper receipts cover graceful teardown;
+    /// this Rust-side fence covers force-kill, crash, and app-restart gaps.
+    fn expire_interactive_attention(&self, runtime_id: &str) -> Result<usize, String> {
+        let summary = self.event_log.attention_summary(runtime_id)?;
+        let mut pending_responses = summary.pending_responses.into_iter().collect::<Vec<_>>();
+        pending_responses.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut pending_permissions = summary
+            .pending_permissions
+            .into_iter()
+            .chain(summary.pending_background_permissions)
+            .collect::<Vec<_>>();
+        pending_permissions.sort_unstable();
+        pending_permissions.dedup();
+
+        let mut expiry_payloads = Vec::with_capacity(
+            pending_responses
+                .len()
+                .saturating_add(pending_permissions.len()),
+        );
+        for (tool_use_id, kind) in pending_responses {
+            expiry_payloads.push(SessionEventPayload::InteractiveResponseResult {
+                tool_use_id,
+                control_request_id: None,
+                prompt_type: match kind.as_str() {
+                    "plan_review" => Some("plan_exit".to_string()),
+                    "input_required" => Some("ask_user_question".to_string()),
+                    _ => None,
+                },
+                state: "resolver_expired".to_string(),
+                query_generation: None,
+            });
+        }
+        for request_id in pending_permissions {
+            expiry_payloads.push(SessionEventPayload::PermissionResponded {
+                request_id,
+                tool_use_id: None,
+                approved: false,
+                responder: "resolver_expired".to_string(),
+            });
+        }
+        let expired_count = expiry_payloads.len();
+        let has_handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .contains_key(runtime_id);
+        let mut offline_seq = if has_handle {
+            None
+        } else {
+            Some(
+                self.event_log
+                    .newest_seq(runtime_id)?
+                    .unwrap_or_default()
+                    .checked_add(1)
+                    .ok_or_else(|| "Native event sequence overflow".to_string())?,
+            )
+        };
+        for payload in expiry_payloads {
+            if let Some(seq) = offline_seq.as_mut() {
+                self.event_log.append(&SessionEventRecord {
+                    runtime_id: runtime_id.to_string(),
+                    seq: *seq,
+                    occurred_at: Utc::now(),
+                    payload,
+                })?;
+                *seq = seq
+                    .checked_add(1)
+                    .ok_or_else(|| "Native event sequence overflow".to_string())?;
+            } else {
+                self.append_event(runtime_id, payload)?;
+            }
+        }
+        Ok(expired_count)
+    }
+
+    fn expire_orphaned_interactive_attention(&self) -> Result<usize, String> {
+        let live_runtime_ids = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let runtime_ids = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .keys()
+            .filter(|runtime_id| !live_runtime_ids.contains(*runtime_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        runtime_ids
+            .into_iter()
+            .try_fold(0usize, |expired, runtime_id| {
+                self.expire_interactive_attention(&runtime_id)
+                    .map(|count| expired.saturating_add(count))
+            })
+    }
+
     fn append_event(&self, runtime_id: &str, payload: SessionEventPayload) -> Result<(), String> {
         let last_error = payload_last_error(&payload);
         let settings_change = match &payload {
@@ -5921,13 +8100,18 @@ impl NativeRuntimeManager {
                 request_id,
                 env_name,
                 effort,
+                perm_mode,
+                permission_scope,
                 pending_env_name,
                 pending_effort,
+                ..
             } => Some((
                 state.clone(),
                 request_id.clone(),
                 env_name.clone(),
                 effort.clone(),
+                perm_mode.clone(),
+                permission_scope.clone(),
                 pending_env_name.clone(),
                 pending_effort.clone(),
             )),
@@ -5957,23 +8141,56 @@ impl NativeRuntimeManager {
             }
         }
         drop(handles);
-        if let Some((state, request_id, env_name, effort, pending_env_name, pending_effort)) =
-            settings_change
+        if let Some((
+            state,
+            request_id,
+            env_name,
+            effort,
+            perm_mode,
+            permission_scope,
+            pending_env_name,
+            pending_effort,
+        )) = settings_change
         {
+            let lifecycle_request_matches = request_id.as_deref().is_some_and(|request_id| {
+                self.lifecycle
+                    .settings_request_is_current(runtime_id, request_id)
+            });
             self.update_record(runtime_id, |record| {
-                let request_matches =
+                let record_request_matches =
                     request_id.is_some() && request_id == record.pending_settings_request_id;
-                if state == "applied" {
-                    record.env_name = env_name;
-                    record.effort = effort;
-                    if request_matches || record.pending_settings_request_id.is_none() {
-                        record.pending_env_name = None;
-                        record.pending_effort = None;
-                        record.pending_settings_request_id = None;
+                let authoritative = lifecycle_request_matches
+                    || record_request_matches
+                    || (request_id.is_none() && record.pending_settings_request_id.is_none());
+                if state == "applied" && authoritative {
+                    if permission_scope.as_deref() == Some("runtime") {
+                        if let Some(mode) = perm_mode.as_deref() {
+                            record.runtime_perm_mode =
+                                (mode != record.perm_mode).then(|| mode.to_string());
+                        }
+                    } else {
+                        record.env_name = env_name;
+                        record.effort = effort;
+                        if let (Some("display"), Some(mode)) =
+                            (permission_scope.as_deref(), perm_mode.as_deref())
+                        {
+                            record.perm_mode = mode.to_string();
+                            record.runtime_perm_mode = None;
+                        }
+                        if record_request_matches
+                            || (request_id.is_none()
+                                && record.pending_settings_request_id.is_none())
+                        {
+                            record.pending_env_name = None;
+                            record.pending_effort = None;
+                            record.pending_settings_request_id = None;
+                        }
                     }
-                } else if state == "deferred" && request_matches {
-                    record.pending_env_name = pending_env_name;
-                    record.pending_effort = pending_effort;
+                } else if state == "deferred" && authoritative {
+                    if permission_scope.as_deref() != Some("runtime") {
+                        record.pending_env_name = pending_env_name;
+                        record.pending_effort = pending_effort;
+                    }
                 }
                 record.updated_at = Utc::now();
             })?;
@@ -6012,6 +8229,9 @@ impl NativeRuntimeManager {
                 stage: stage.to_string(),
                 detail: detail.into(),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         )
     }
@@ -6041,7 +8261,13 @@ impl NativeRuntimeManager {
             .lock()
             .map_err(|_| "Failed to lock native runtime records".to_string())?;
         records.remove(runtime_id);
-        persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
+        let result =
+            persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect());
+        if result.is_ok() {
+            self.lifecycle.clear_session(runtime_id);
+            self.input_queue.clear(runtime_id);
+        }
+        result
     }
 
     fn insert_handle(
@@ -6049,20 +8275,42 @@ impl NativeRuntimeManager {
         runtime_id: String,
         handle: Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
-        match handles.entry(runtime_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(handle);
-                Ok(())
+        let generation = {
+            let mut handles = self
+                .handles
+                .lock()
+                .map_err(|_| "Failed to lock native runtime handles".to_string())?;
+            let owned_runtime_id = runtime_id.clone();
+            match handles.entry(owned_runtime_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let inserted = entry.insert(handle);
+                    inserted.generation
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => Err(format!(
+                    "Native runtime handle {} already exists",
+                    entry.key()
+                ))?,
             }
-            std::collections::hash_map::Entry::Occupied(entry) => Err(format!(
-                "Native runtime handle {} already exists",
-                entry.key()
-            )),
+        };
+        // A previous app/helper incarnation may have died before emitting its
+        // resolver receipts. Persist terminal attention events before the new
+        // incarnation becomes observable or can receive commands.
+        if let Err(error) = self.expire_interactive_attention(&runtime_id) {
+            if let Ok(mut handles) = self.handles.lock() {
+                let is_inserted = handles
+                    .get(&runtime_id)
+                    .is_some_and(|current| current.generation == generation);
+                if is_inserted {
+                    handles.remove(&runtime_id);
+                }
+            }
+            return Err(error);
         }
+        // A new helper incarnation fences the old process. Uncertain
+        // foreground ownership is retained until an exact receipt or an
+        // explicit user abandon resolves it.
+        self.lifecycle.note_incarnation(&runtime_id, generation);
+        Ok(())
     }
 
     fn allocate_handle_generation(&self) -> u64 {
@@ -6098,6 +8346,11 @@ impl NativeRuntimeManager {
     }
 
     fn remove_handle(&self, runtime_id: &str) -> Result<(), String> {
+        let expiry_error = self.expire_interactive_attention(runtime_id).err();
+        self.initializing_runtimes
+            .lock()
+            .map_err(|_| "Failed to lock native initialization fences".to_string())?
+            .remove(runtime_id);
         let removed_generation = self
             .handles
             .lock()
@@ -6107,7 +8360,14 @@ impl NativeRuntimeManager {
         if let (Some(manager), Some(generation)) = (self.router_manager.get(), removed_generation) {
             manager.unregister_generation(runtime_id, generation);
         }
-        Ok(())
+        if let Some(generation) = removed_generation {
+            self.lifecycle
+                .note_generation_retired(runtime_id, generation);
+        }
+        match expiry_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn retire_handle_if_current(
@@ -6116,6 +8376,32 @@ impl NativeRuntimeManager {
         handle: &Arc<NativeSessionHandle>,
     ) -> Result<bool, String> {
         let mut errors = Vec::new();
+        let is_current = {
+            let handles = match self.handles.lock() {
+                Ok(handles) => handles,
+                Err(poisoned) => {
+                    errors.push(
+                        "Native runtime handles were poisoned while checking helper retirement"
+                            .to_string(),
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            handles
+                .get(runtime_id)
+                .map(|current| Self::same_handle(current, handle))
+                .unwrap_or(false)
+        };
+        if !is_current {
+            return if errors.is_empty() {
+                Ok(false)
+            } else {
+                Err(errors.join("; "))
+            };
+        }
+        if let Err(error) = self.expire_interactive_attention(runtime_id) {
+            errors.push(error);
+        }
         let removed = {
             let mut handles = match self.handles.lock() {
                 Ok(handles) => handles,
@@ -6133,10 +8419,23 @@ impl NativeRuntimeManager {
             is_current.then(|| handles.remove(runtime_id)).flatten()
         };
         let Some(removed) = removed else {
-            return Ok(false);
+            return if errors.is_empty() {
+                Ok(false)
+            } else {
+                Err(errors.join("; "))
+            };
         };
 
+        self.initializing_runtimes
+            .lock()
+            .map_err(|_| "Failed to lock native initialization fences".to_string())?
+            .remove(runtime_id);
+
         removed.alive.store(false, Ordering::SeqCst);
+        // The retired generation's active command/uncertain receipts/settings
+        // op cannot survive its process — drop them from the coordinator.
+        self.lifecycle
+            .note_generation_retired(runtime_id, removed.generation);
         if let Some(manager) = self.router_manager.get() {
             manager.unregister_generation(runtime_id, removed.generation);
         }
@@ -6252,6 +8551,10 @@ impl NativeRuntimeManager {
     where
         F: FnOnce(&mut NativeSessionRecord),
     {
+        let _projection_guard = self
+            .record_update_lock
+            .lock()
+            .map_err(|_| "Failed to lock native record projection".to_string())?;
         let updated_record = {
             let mut records = self
                 .records
@@ -6315,9 +8618,12 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
         {
-            return Ok(Some(handle.summary()));
+            let mut summary = handle.summary();
+            summary.lifecycle = self.lifecycle_projection(runtime_id);
+            return Ok(Some(summary));
         }
 
+        let lifecycle = self.lifecycle_projection(runtime_id);
         Ok(self
             .records
             .lock()
@@ -6349,6 +8655,7 @@ impl NativeRuntimeManager {
                 background_tasks: Vec::new(),
                 last_error: record.last_error,
                 router: record.router.as_ref().map(SessionRouterState::from),
+                lifecycle,
             }))
     }
 
@@ -6369,7 +8676,9 @@ impl NativeRuntimeManager {
             return;
         }
         if let Some(text) = take_remaining_helper_output_line(stdout_buffer) {
-            if let Err(error) = self.process_helper_stdout_with_app(app, runtime_id, &text) {
+            if let Err(error) =
+                self.process_helper_stdout_with_app(app, runtime_id, &text, handle.generation)
+            {
                 let _ = self.append_event(
                     runtime_id,
                     SessionEventPayload::StdErrLine {
@@ -6810,22 +9119,25 @@ mod tests {
         reactivate_record_for_reconnect, read_native_runtime_state_from,
         recoverable_record_after_helper_removed, router_launch_decision, runtime_child_is_owned,
         session_router_patch_oauth_validation_enabled, stage_runtime_settings_update,
-        take_terminal_launches, validate_router_create_selection,
-        validate_router_launch_draft_profile, HelperInputCommand, NativeProvider,
-        NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions, NativeSessionRecord,
-        NativeTransport, PromptImage, RouterLaunchDecision, RouterLaunchDraft,
+        take_terminal_launches, validate_claude_settings_patch,
+        validate_interactive_attention_occurrence, validate_plan_approval_permission,
+        validate_router_create_selection, validate_router_launch_draft_profile, HelperInputCommand,
+        NativeProvider, NativeRuntimeManager, NativeSessionHandle, NativeSessionOptions,
+        NativeSessionRecord, NativeTransport, PromptImage, RouterLaunchDecision, RouterLaunchDraft,
     };
     use crate::event_bus::{
         NativeBackgroundTask, NativeBackgroundTaskStatus, NativeBackgroundTaskUsage,
         SessionEventPayload, SessionPromptAnnotation, SessionStore, TodoSnapshotItemV1,
-        TodoSnapshotV1,
+        TodoSnapshotV1, ToolCategory, UserInputKind,
     };
     use crate::native_event_log::{NativeEventLog, MAX_EVENT_REPLAY_PAGE_BYTES};
+    use crate::native_input_queue::{FrozenNativeInputBatch, NativeInputClaimOutcome};
     use crate::prompt_image_store::PromptImageStore;
     use crate::router::{
         LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterConfig, RouterManager,
         RouterModelPins, RouterProfile, SessionRouterPatch, SessionRouterRecord,
     };
+    use crate::workspace_decorations::AttentionSummary;
     use chrono::Utc;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -6955,10 +9267,14 @@ mod tests {
             ),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            record_update_lock: Mutex::new(()),
             settings_update_lock: Mutex::new(()),
             app_termination_lock: Mutex::new(()),
             app_termination_in_progress: AtomicBool::new(false),
             terminal_handoff_preparations: Mutex::new(HashMap::new()),
+            lifecycle: Default::default(),
+            input_queue: Default::default(),
+            initializing_runtimes: Mutex::new(HashSet::new()),
         };
         manager
     }
@@ -6976,6 +9292,9 @@ mod tests {
             ),
             handles: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(1),
+            lifecycle: Default::default(),
+            input_queue: Default::default(),
+            initializing_runtimes: Mutex::new(HashSet::new()),
             state_path: std::env::temp_dir().join(format!(
                 "ccem-native-runtime-reconcile-test-{runtime_id}.json"
             )),
@@ -6987,6 +9306,7 @@ mod tests {
             ))),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            record_update_lock: Mutex::new(()),
             settings_update_lock: Mutex::new(()),
             app_termination_lock: Mutex::new(()),
             app_termination_in_progress: AtomicBool::new(false),
@@ -6997,7 +9317,11 @@ mod tests {
     #[test]
     fn runtime_child_is_owned_covers_handoff_matrix() {
         // Owned: an active runtime belongs to this app.
-        assert!(runtime_child_is_owned(&native_record("owned", "processing", true)));
+        assert!(runtime_child_is_owned(&native_record(
+            "owned",
+            "processing",
+            true
+        )));
 
         // Handoff requested but not completed still owns the child.
         let mut pending = native_record("pending", "processing", true);
@@ -7018,6 +9342,50 @@ mod tests {
             "handoff",
             true
         )));
+    }
+
+    #[test]
+    fn session_projection_composes_process_local_queue_state() {
+        let runtime_id = "native-queue-projection";
+        let manager = manager_with_handle(runtime_id);
+        manager.lifecycle.ensure_session(runtime_id);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new(
+                    "client-message-1",
+                    "queued text",
+                    Some("queued preview".to_string()),
+                    None,
+                    None,
+                ),
+            )
+            .expect("enqueue");
+        manager.lifecycle.note_queue_changed(runtime_id);
+
+        let projection = manager
+            .lifecycle_projection(runtime_id)
+            .expect("projection");
+        assert_eq!(projection.queue_count, 1);
+        assert_eq!(projection.delivery_uncertain_count, 0);
+
+        let dispatch_attempt = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt, ..
+            } => dispatch_attempt,
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        assert!(manager.input_queue.mark_claim_delivery_uncertain(
+            runtime_id,
+            "client-message-1",
+            dispatch_attempt,
+        ));
+        let projection = manager
+            .lifecycle_projection(runtime_id)
+            .expect("projection");
+        assert_eq!(projection.queue_count, 1);
+        assert_eq!(projection.delivery_uncertain_count, 1);
     }
 
     #[test]
@@ -7049,7 +9417,10 @@ mod tests {
         let record = manager.current_record(runtime_id).expect("record");
         assert_eq!(record.status, "handoff");
         assert!(!record.is_active);
-        assert_eq!(manager.active_background_tasks(runtime_id).unwrap().len(), 1);
+        assert_eq!(
+            manager.active_background_tasks(runtime_id).unwrap().len(),
+            1
+        );
     }
 
     fn native_record(runtime_id: &str, status: &str, is_active: bool) -> NativeSessionRecord {
@@ -7798,13 +10169,11 @@ mod tests {
             .get(runtime_id)
             .cloned()
             .expect("live handle");
-        handle
-            .events
-            .lock()
-            .expect("lock in-memory events")
-            .append(SessionEventPayload::AssistantChunk {
+        handle.events.lock().expect("lock in-memory events").append(
+            SessionEventPayload::AssistantChunk {
                 text: "readable in-memory tail".to_string(),
-            });
+            },
+        );
 
         let replay = manager
             .replay_events_limited(runtime_id, None, None)
@@ -7828,13 +10197,11 @@ mod tests {
             .get(runtime_id)
             .cloned()
             .expect("live handle");
-        handle
-            .events
-            .lock()
-            .expect("lock in-memory events")
-            .append(SessionEventPayload::AssistantChunk {
+        handle.events.lock().expect("lock in-memory events").append(
+            SessionEventPayload::AssistantChunk {
                 text: "memory-only row".to_string(),
-            });
+            },
+        );
 
         let replay = manager
             .replay_events_limited(runtime_id, None, None)
@@ -7948,20 +10315,13 @@ mod tests {
         assert_eq!(first.next_cursor, Some(2));
         assert!(first.has_more);
 
-        handle
-            .events
-            .lock()
-            .expect("lock in-memory events")
-            .append(SessionEventPayload::AssistantChunk {
+        handle.events.lock().expect("lock in-memory events").append(
+            SessionEventPayload::AssistantChunk {
                 text: "after snapshot".to_string(),
-            });
+            },
+        );
         let second = manager
-            .replay_event_page(
-                runtime_id,
-                first.next_cursor,
-                first.snapshot_newest_seq,
-                10,
-            )
+            .replay_event_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 10)
             .expect("memory snapshot continuation");
         assert_eq!(second.snapshot_newest_seq, Some(3));
         assert_eq!(second.events.len(), 1);
@@ -8183,6 +10543,7 @@ mod tests {
             effort: None,
             todo_snapshot_seed: None,
             router: None,
+            initial_command_id: None,
         };
 
         let serialized = serde_json::to_value(&command).expect("serialize fork init command");
@@ -8209,6 +10570,7 @@ mod tests {
             effort: None,
             todo_snapshot_seed: None,
             router: None,
+            initial_command_id: None,
         };
 
         let plain_serialized = serde_json::to_value(&plain).expect("serialize plain init command");
@@ -8250,6 +10612,7 @@ mod tests {
             router: None,
             fork_at_message_id: None,
             fork_session: None,
+            initial_command_id: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -8296,6 +10659,7 @@ mod tests {
             router: None,
             fork_at_message_id: None,
             fork_session: None,
+            initial_command_id: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -8328,6 +10692,7 @@ mod tests {
             router: None,
             fork_at_message_id: None,
             fork_session: None,
+            initial_command_id: None,
         };
 
         let serialized = serde_json::to_value(command).expect("serialize init command");
@@ -8369,6 +10734,9 @@ mod tests {
             records: Mutex::new(HashMap::from([(runtime_id.to_string(), record)])),
             handles: Mutex::new(HashMap::from([(runtime_id.to_string(), handle)])),
             next_handle_generation: AtomicU64::new(2),
+            lifecycle: Default::default(),
+            input_queue: Default::default(),
+            initializing_runtimes: Mutex::new(HashSet::new()),
             state_path: std::env::temp_dir().join(format!(
                 "ccem-native-runtime-terminal-env-test-{runtime_id}.json"
             )),
@@ -8380,6 +10748,7 @@ mod tests {
             ))),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
+            record_update_lock: Mutex::new(()),
             settings_update_lock: Mutex::new(()),
             app_termination_lock: Mutex::new(()),
             app_termination_in_progress: AtomicBool::new(false),
@@ -8688,8 +11057,10 @@ mod tests {
 
     #[test]
     fn helper_foreground_interrupt_and_single_task_stop_are_distinct_commands() {
-        let interrupt = serde_json::to_value(HelperInputCommand::InterruptTurn)
-            .expect("serialize foreground interrupt");
+        let interrupt = serde_json::to_value(HelperInputCommand::InterruptTurn {
+            expected_command_id: Some("command-1"),
+        })
+        .expect("serialize foreground interrupt");
         let stop_task = serde_json::to_value(HelperInputCommand::StopTask {
             task_id: "task-1",
             stop_request_id: "stop-task-1",
@@ -8697,6 +11068,7 @@ mod tests {
         .expect("serialize task stop");
 
         assert_eq!(interrupt["type"], "interrupt_turn");
+        assert_eq!(interrupt["expected_command_id"], "command-1");
         assert_eq!(stop_task["type"], "stop_task");
         assert_eq!(stop_task["task_id"], "task-1");
         assert_eq!(stop_task["stop_request_id"], "stop-task-1");
@@ -9475,6 +11847,352 @@ mod tests {
     }
 
     #[test]
+    fn claude_mixed_permission_and_runtime_patch_requires_ordered_operations() {
+        assert!(validate_claude_settings_patch(None, Some("dev"), false, None).is_ok());
+        assert!(validate_claude_settings_patch(Some("DeepSeek"), None, true, Some("high")).is_ok());
+        for result in [
+            validate_claude_settings_patch(Some("DeepSeek"), Some("dev"), false, None),
+            validate_claude_settings_patch(None, Some("dev"), true, None),
+            validate_claude_settings_patch(None, Some("dev"), false, Some("high")),
+        ] {
+            assert!(result
+                .expect_err("mixed patches must be split")
+                .starts_with("MIXED_CLAUDE_SETTINGS_UNSUPPORTED:"));
+        }
+    }
+
+    #[test]
+    fn plan_approval_requires_authoritative_non_plan_permission() {
+        let approve = HashMap::from([("decision".to_string(), "approve".to_string())]);
+        let revise = HashMap::from([("decision".to_string(), "revise".to_string())]);
+        assert!(
+            validate_plan_approval_permission("plan_exit", &approve, "plan")
+                .expect_err("approval cannot resolve while authoritative permission is Plan")
+                .starts_with("PLAN_PERMISSION_NOT_APPLIED:")
+        );
+        assert!(validate_plan_approval_permission("plan_exit", &approve, "dev").is_ok());
+        assert!(validate_plan_approval_permission("plan_exit", &revise, "plan").is_ok());
+        assert!(validate_plan_approval_permission("ask_user_question", &approve, "plan").is_ok());
+    }
+
+    #[test]
+    fn interactive_attention_fence_requires_exact_occurrence_and_kind() {
+        let mut summary = AttentionSummary::default();
+        summary
+            .pending_responses
+            .insert("tool-plan".to_string(), "plan_review".to_string());
+        summary
+            .pending_response_seqs
+            .insert("tool-plan".to_string(), 42);
+
+        assert!(
+            validate_interactive_attention_occurrence(&summary, "tool-plan", 42, "plan_exit")
+                .is_ok()
+        );
+        assert!(
+            validate_interactive_attention_occurrence(&summary, "tool-plan", 41, "plan_exit")
+                .expect_err("an older card cannot target the current resolver")
+                .starts_with("INTERACTIVE_ATTENTION_STALE:")
+        );
+        assert!(validate_interactive_attention_occurrence(
+            &summary,
+            "tool-plan",
+            42,
+            "ask_user_question"
+        )
+        .expect_err("a Plan occurrence cannot be submitted as AskUserQuestion")
+        .starts_with("INTERACTIVE_ATTENTION_STALE:"));
+
+        summary.pending_response_seqs.clear();
+        assert!(
+            validate_interactive_attention_occurrence(&summary, "tool-plan", 42, "plan_exit")
+                .expect_err("legacy summaries without an occurrence fence fail closed")
+                .starts_with("INTERACTIVE_ATTENTION_STALE:")
+        );
+    }
+
+    fn append_test_interactive_prompt(manager: &NativeRuntimeManager, runtime_id: &str) {
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::ToolUseStarted {
+                    tool_use_id: "tool-attention".to_string(),
+                    category: ToolCategory::UserInput {
+                        kind: UserInputKind::Question,
+                        raw_name: "AskUserQuestion".to_string(),
+                    },
+                    raw_name: "AskUserQuestion".to_string(),
+                    input_summary: "Choose".to_string(),
+                    needs_response: true,
+                    prompt: None,
+                    todo_snapshot: None,
+                },
+            )
+            .expect("append interactive prompt");
+    }
+
+    #[test]
+    fn hard_helper_retirement_persists_resolver_expiration() {
+        let runtime_id = "native-hard-retire-attention";
+        let manager = manager_with_handle(runtime_id);
+        append_test_interactive_prompt(&manager, runtime_id);
+        assert_eq!(
+            manager
+                .event_log
+                .attention_summary(runtime_id)
+                .expect("pending attention")
+                .pending_response_seqs
+                .get("tool-attention"),
+            Some(&1)
+        );
+
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("live handle");
+        assert!(manager
+            .retire_handle_if_current(runtime_id, &handle)
+            .expect("retire helper"));
+
+        let summary = manager
+            .event_log
+            .attention_summary(runtime_id)
+            .expect("expired attention");
+        assert!(summary.pending_responses.is_empty());
+        assert!(summary.pending_response_seqs.is_empty());
+        assert!(manager
+            .event_log
+            .replay(runtime_id, Some(1), None)
+            .expect("replay expiration")
+            .events
+            .iter()
+            .any(|event| matches!(
+                &event.payload,
+                SessionEventPayload::InteractiveResponseResult { state, .. }
+                    if state == "resolver_expired"
+            )));
+    }
+
+    #[test]
+    fn startup_reconcile_expires_persisted_attention_without_a_handle() {
+        let runtime_id = "native-startup-attention";
+        let manager = manager_with_handle(runtime_id);
+        append_test_interactive_prompt(&manager, runtime_id);
+
+        // Simulate a desktop process disappearing before normal Rust
+        // retirement. Only the persisted attention summary survives.
+        manager.handles.lock().expect("handles").remove(runtime_id);
+        manager
+            .reconcile_stale_records()
+            .expect("startup reconcile");
+
+        let summary = manager
+            .event_log
+            .attention_summary(runtime_id)
+            .expect("reconciled attention");
+        assert!(summary.pending_responses.is_empty());
+        assert!(summary.pending_response_seqs.is_empty());
+        assert!(manager
+            .event_log
+            .replay(runtime_id, Some(1), None)
+            .expect("replay startup expiration")
+            .events
+            .iter()
+            .any(|event| matches!(
+                &event.payload,
+                SessionEventPayload::InteractiveResponseResult { state, .. }
+                    if state == "resolver_expired"
+            )));
+    }
+
+    #[test]
+    fn startup_reconcile_expires_foreground_and_background_permissions() {
+        let runtime_id = "native-startup-permissions";
+        let manager = manager_with_handle(runtime_id);
+        for (request_id, background_task_id) in [
+            ("permission-foreground", None),
+            ("permission-background", Some("task-background")),
+        ] {
+            manager
+                .append_event(
+                    runtime_id,
+                    SessionEventPayload::PermissionRequired {
+                        request_id: request_id.to_string(),
+                        tool_use_id: Some(format!("tool-{request_id}")),
+                        tool_name: "Bash".to_string(),
+                        input_summary: None,
+                        background_task_id: background_task_id.map(str::to_string),
+                    },
+                )
+                .expect("append permission request");
+        }
+
+        let pending = manager
+            .event_log
+            .attention_summary(runtime_id)
+            .expect("pending permissions");
+        assert!(pending
+            .pending_permissions
+            .contains("permission-foreground"));
+        assert!(pending
+            .pending_background_permissions
+            .contains("permission-background"));
+
+        // Simulate a Desktop process disappearing before its helper can emit
+        // normal permission_responded receipts.
+        manager.handles.lock().expect("handles").remove(runtime_id);
+        manager
+            .reconcile_stale_records()
+            .expect("startup reconcile");
+
+        let reconciled = manager
+            .event_log
+            .attention_summary(runtime_id)
+            .expect("reconciled permissions");
+        assert!(reconciled.pending_permissions.is_empty());
+        assert!(reconciled.pending_background_permissions.is_empty());
+        let expired_request_ids = manager
+            .event_log
+            .replay(runtime_id, Some(2), None)
+            .expect("replay permission expirations")
+            .events
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                SessionEventPayload::PermissionResponded {
+                    request_id,
+                    approved: false,
+                    responder,
+                    ..
+                } if responder == "resolver_expired" => Some(request_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            expired_request_ids,
+            HashSet::from([
+                "permission-background".to_string(),
+                "permission-foreground".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn stale_settings_ack_cannot_revert_the_authoritative_record() {
+        let runtime_id = "native-stale-settings-ack";
+        let manager = manager_with_handle(runtime_id);
+        let incarnation = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .generation;
+        manager.lifecycle.note_incarnation(runtime_id, incarnation);
+        manager
+            .lifecycle
+            .begin_settings_op(runtime_id, incarnation, "settings-current")
+            .expect("settings op");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"runtime_settings_changed","state":"applied","request_id":"settings-stale","query_generation":1,"env_name":"stale-env","effort":"low","pending_env_name":null,"pending_effort":null}}"#,
+            )
+            .expect("stale ACK is retained as history only");
+        let after_stale = manager.summary_for(runtime_id).expect("summary");
+        assert_eq!(after_stale.env_name, "DeepSeek");
+        assert_eq!(after_stale.effort, None);
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"runtime_settings_changed","state":"applied","request_id":"settings-current","query_generation":1,"env_name":"current-env","effort":"high","pending_env_name":null,"pending_effort":null}}"#,
+            )
+            .expect("current ACK applies");
+        let current = manager.summary_for(runtime_id).expect("summary");
+        assert_eq!(current.env_name, "current-env");
+        assert_eq!(current.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn runtime_permission_ack_preserves_a_deferred_environment_projection() {
+        let runtime_id = "native-settings-two-lanes";
+        let manager = manager_with_handle(runtime_id);
+        let incarnation = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .generation;
+        manager.lifecycle.note_incarnation(runtime_id, incarnation);
+        manager
+            .lifecycle
+            .begin_settings_op(runtime_id, incarnation, "settings-env")
+            .expect("general settings op");
+        manager
+            .update_record(runtime_id, |record| {
+                stage_runtime_settings_update(
+                    record,
+                    Some("next-environment"),
+                    Some("high"),
+                    "settings-env",
+                );
+            })
+            .expect("stage environment");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"runtime_settings_changed","state":"deferred","request_id":"settings-env","query_generation":1,"env_name":"DeepSeek","effort":null,"perm_mode":"dev","permission_scope":null,"pending_env_name":"next-environment","pending_effort":"high"}}"#,
+            )
+            .expect("defer environment");
+
+        manager
+            .lifecycle
+            .begin_permission_settings_op(runtime_id, incarnation, "settings-plan")
+            .expect("permission lane");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"runtime_settings_changed","state":"applied","request_id":"settings-plan","query_generation":1,"env_name":"DeepSeek","effort":null,"perm_mode":"plan","permission_scope":"runtime","pending_env_name":null,"pending_effort":null}}"#,
+            )
+            .expect("apply runtime permission");
+
+        let after_permission = manager.summary_for(runtime_id).expect("summary");
+        assert_eq!(after_permission.env_name, "DeepSeek");
+        assert_eq!(
+            after_permission.pending_env_name.as_deref(),
+            Some("next-environment")
+        );
+        assert_eq!(after_permission.pending_effort.as_deref(), Some("high"));
+        assert_eq!(after_permission.runtime_perm_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            manager
+                .records
+                .lock()
+                .expect("records")
+                .get(runtime_id)
+                .and_then(|record| record.pending_settings_request_id.as_deref()),
+            Some("settings-env")
+        );
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"runtime_settings_changed","state":"applied","request_id":"settings-env","query_generation":1,"env_name":"next-environment","effort":"high","perm_mode":"plan","permission_scope":null,"pending_env_name":null,"pending_effort":null}}"#,
+            )
+            .expect("apply deferred environment");
+        let settled = manager.summary_for(runtime_id).expect("summary");
+        assert_eq!(settled.env_name, "next-environment");
+        assert_eq!(settled.pending_env_name, None);
+        assert_eq!(settled.pending_effort, None);
+        assert_eq!(settled.runtime_perm_mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
     fn helper_stop_rejection_restores_only_the_matching_local_stopping_request() {
         let runtime_id = "native-stop-rejection";
         let manager = manager_with_handle(runtime_id);
@@ -9566,8 +12284,10 @@ mod tests {
         assert!(permission_error.contains("no longer has a live permission request"));
         let prompt_error = manager
             .respond_to_prompt(
+                None,
                 runtime_id,
                 "tool-stale",
+                1,
                 "ask_user_question",
                 Some("answer"),
                 &HashMap::from([("question".to_string(), "answer".to_string())]),
@@ -9575,7 +12295,7 @@ mod tests {
                 None,
             )
             .expect_err("a stale interactive prompt cannot recreate its helper");
-        assert!(prompt_error.contains("no longer has a live interactive prompt"));
+        assert!(prompt_error.contains("INTERACTIVE_ATTENTION_STALE"));
         assert!(manager.handles.lock().expect("handles").is_empty());
     }
 
@@ -9627,8 +12347,10 @@ mod tests {
             assert!(permission_error.contains("no longer has a live permission request"));
             let prompt_error = manager
                 .respond_to_prompt(
+                    None,
                     &runtime_id,
                     "tool-from-old-helper",
+                    1,
                     "ask_user_question",
                     Some("answer"),
                     &HashMap::from([("question".to_string(), "answer".to_string())]),
@@ -9636,7 +12358,7 @@ mod tests {
                     None,
                 )
                 .expect_err("a response cannot reconnect an old interactive prompt");
-            assert!(prompt_error.contains("no longer has a live interactive prompt"));
+            assert!(prompt_error.contains("INTERACTIVE_ATTENTION_STALE"));
             assert!(manager.handles.lock().expect("handles").is_empty());
         }
 
@@ -10788,6 +13510,7 @@ wait"#,
             .stop_session_from_with_grace(
                 runtime_id,
                 Some("regression_test"),
+                None,
                 Duration::from_millis(50),
             )
             .expect_err("state persistence must still be reported");
@@ -11647,6 +14370,512 @@ wait"#,
                 ';'
             ),
             r"D:\Users\test\AppData\Roaming\npm;C:\Program Files\nodejs;C:\custom\bin"
+        );
+    }
+
+    #[test]
+    fn coordinator_suppresses_helper_ready_while_command_active_then_releases_on_terminal() {
+        let runtime_id = "coord-suppress-ready";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"conv-a","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#,
+            )
+            .expect("meta processes");
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        let command_id = manager
+            .lifecycle
+            .admit_prompt(runtime_id, incarnation)
+            .expect("first command admits");
+
+        // A generic ready from a settings/interrupt side lane must not flip
+        // the record while the command owns the foreground.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"status","status":"ready","detail":"Settings applied."}"#,
+            )
+            .expect("status line processes");
+        let summary = manager
+            .get_session_summary(runtime_id)
+            .expect("summary")
+            .expect("session");
+        assert_eq!(
+            summary.status, "processing",
+            "suppressed ready must not flip the record"
+        );
+        let lifecycle = summary.lifecycle.as_ref().expect("projection");
+        assert_eq!(
+            lifecycle.active_command_id.as_deref(),
+            Some(command_id.as_str())
+        );
+
+        // The correlated terminal releases exactly the matching command.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"foreign-command","query_generation":1}}"#,
+            )
+            .expect("foreign terminal processes");
+        assert!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .active_command_id
+                .is_some(),
+            "foreign terminal must not release the active command"
+        );
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("matching terminal processes");
+
+        // After release, a plain ready applies again.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"status","status":"ready","detail":"Ready for the next prompt."}"#,
+            )
+            .expect("post-terminal ready processes");
+        let summary = manager
+            .get_session_summary(runtime_id)
+            .expect("summary")
+            .expect("session");
+        assert_eq!(summary.status, "ready");
+        assert!(summary
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.active_command_id.clone())
+            .is_none(),);
+        let _ = command_id;
+    }
+
+    #[test]
+    fn late_unattributed_conversation_reset_does_not_poison_the_next_prompt() {
+        let runtime_id = "coord-late-reset";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"conv-before-reset","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#,
+            )
+            .expect("meta processes");
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        let first = manager
+            .lifecycle
+            .admit_prompt(runtime_id, incarnation)
+            .expect("first prompt admits");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"{first}","command_id":"{first}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("admission processes");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"{first}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("terminal processes");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"event","payload":{"type":"lifecycle","stage":"conversation_reset","detail":"conv-after-reset","query_generation":1}}"#,
+            )
+            .expect("late reset without a command fence is observational");
+
+        let projection = manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection");
+        assert_eq!(projection.adapter, "full_lifecycle");
+        assert!(projection.protocol_error.is_none());
+        assert!(projection.active_command_id.is_none());
+        manager
+            .lifecycle
+            .admit_prompt(runtime_id, incarnation)
+            .expect("next prompt admits without Esc or reconnect");
+    }
+
+    #[test]
+    fn helper_admitted_receipt_advances_phase_and_resolves_uncertainty() {
+        let runtime_id = "coord-admitted";
+        let manager = manager_with_handle(runtime_id);
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("admitted-client", "queued", None, None, None),
+            )
+            .expect("queue item");
+        let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command_id, dispatch_attempt)
+            .expect("admits");
+        manager.lifecycle.mark_delivery_uncertain(
+            runtime_id,
+            incarnation,
+            &command_id,
+            "test ambiguous write",
+        );
+        manager.input_queue.mark_dispatch_delivery_uncertain(
+            runtime_id,
+            &command_id,
+            dispatch_attempt,
+        );
+        assert_eq!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .delivery_uncertain_count,
+            1
+        );
+
+        // The write actually landed: helper receipt resolves uncertainty.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"{command_id}","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("admitted event processes");
+        let projection = manager.lifecycle.projection(runtime_id).unwrap();
+        assert_eq!(projection.delivery_uncertain_count, 0);
+        assert_eq!(projection.active_phase.as_deref(), Some("helper_admitted"));
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        let _ = command_id;
+    }
+
+    #[test]
+    fn helper_rejection_restores_the_exact_claimed_queue_head() {
+        let runtime_id = "coord-rejected";
+        let manager = manager_with_handle(runtime_id);
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("queued-rejected-client", "queued", None, None, None),
+            )
+            .expect("queue item");
+        let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command_id, dispatch_attempt)
+            .expect("coordinator admission");
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_rejected","detail":"foreground_busy","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("rejection processes");
+
+        assert!(manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection")
+            .active_command_id
+            .is_none());
+        assert_eq!(
+            manager
+                .input_queue
+                .peek(runtime_id)
+                .expect("retained head")
+                .delivery_state(),
+            crate::native_input_queue::QueuedInputDeliveryState::Pending
+        );
+
+        let (retry_attempt, retry_command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected retry claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &retry_command_id, retry_attempt)
+            .expect("retry admission");
+
+        // A duplicate receipt from attempt 1 cannot release or reset attempt 2.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_rejected","detail":"late duplicate","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("late rejection is ignored");
+        let projection = manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection");
+        assert_eq!(
+            projection.active_command_id.as_deref(),
+            Some(retry_command_id.as_str())
+        );
+        let retried = manager.input_queue.peek(runtime_id).expect("retry remains");
+        assert_eq!(
+            retried.delivery_state(),
+            crate::native_input_queue::QueuedInputDeliveryState::Dispatching
+        );
+        assert_eq!(
+            retried.dispatch_command_id(),
+            Some(retry_command_id.as_str())
+        );
+    }
+
+    #[test]
+    fn exact_stop_retires_and_abandons_a_live_delivery_uncertain_generation() {
+        let runtime_id = "coord-uncertain-stop";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let incarnation = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .generation;
+        manager.lifecycle.note_incarnation(runtime_id, incarnation);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("uncertain-client", "queued", None, None, None),
+            )
+            .expect("queue item");
+        let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command_id, dispatch_attempt)
+            .expect("coordinator admission");
+        manager.lifecycle.mark_delivery_uncertain(
+            runtime_id,
+            incarnation,
+            &command_id,
+            "partial pipe write",
+        );
+        manager.input_queue.mark_dispatch_delivery_uncertain(
+            runtime_id,
+            &command_id,
+            dispatch_attempt,
+        );
+
+        manager
+            .stop_session_from_expected(runtime_id, Some("test_exact_stop"), Some(&command_id))
+            .expect("exact stop abandons uncertainty");
+
+        assert!(manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection")
+            .active_command_id
+            .is_none());
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn exact_stop_retires_and_abandons_a_protocol_poisoned_generation() {
+        let runtime_id = "coord-protocol-error-stop";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let incarnation = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .generation;
+        manager.lifecycle.note_incarnation(runtime_id, incarnation);
+        let command_id = manager
+            .lifecycle
+            .admit_prompt(runtime_id, incarnation)
+            .expect("command admission");
+        manager.lifecycle.note_protocol_error(
+            runtime_id,
+            incarnation,
+            Some(&command_id),
+            "malformed lifecycle wire",
+        );
+        let poisoned = manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection");
+        assert_eq!(poisoned.active_phase.as_deref(), Some("protocol_error"));
+        assert_eq!(poisoned.adapter, "poisoned");
+
+        manager
+            .stop_session_from_expected(
+                runtime_id,
+                Some("test_protocol_error_stop"),
+                Some(&command_id),
+            )
+            .expect("exact Stop retires the poisoned helper generation");
+
+        let recovered = manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection");
+        assert!(recovered.active_command_id.is_none());
+        assert_eq!(recovered.adapter, "negotiating");
+        assert!(recovered.protocol_error.is_none());
+        assert!(!manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn exact_stop_discards_a_not_started_pending_claim_without_interrupting_live_helper() {
+        let runtime_id = "coord-not-started-stop";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("not-started-client", "queued", None, None, None),
+            )
+            .expect("queue item");
+        let (batch, dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id)
+        {
+            NativeInputClaimOutcome::Claimed {
+                batch,
+                dispatch_attempt,
+                dispatch_command_id,
+            } => (batch, dispatch_attempt, dispatch_command_id),
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        assert!(manager.input_queue.release_not_started(
+            runtime_id,
+            batch.client_message_id(),
+            &command_id,
+            dispatch_attempt,
+        ));
+
+        manager
+            .stop_session_from_expected(
+                runtime_id,
+                Some("test_not_started_stop"),
+                Some(&command_id),
+            )
+            .expect("exact Stop cancels the retained pre-write attempt");
+
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        assert!(manager
+            .handles
+            .lock()
+            .expect("handles")
+            .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn conversation_epoch_bumps_without_releasing_active_command() {
+        let runtime_id = "coord-epoch";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"conv-a","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#,
+            )
+            .expect("first meta processes");
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        let command_id = manager
+            .lifecycle
+            .admit_prompt(runtime_id, incarnation)
+            .expect("admits");
+
+        // Conversation reset while the command is in flight.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"conv-b","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#,
+            )
+            .expect("second meta processes");
+        let projection = manager.lifecycle.projection(runtime_id).unwrap();
+        assert_eq!(
+            projection.conversation_epoch, 2,
+            "provider id change bumps the epoch"
+        );
+        assert_eq!(projection.adapter, "full_lifecycle");
+        assert_eq!(
+            projection.active_command_id.as_deref(),
+            Some(command_id.as_str()),
+            "reset alone must not release the command"
         );
     }
 }

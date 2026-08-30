@@ -300,24 +300,45 @@ fn build_runtime_match_map(
 /// replaying history.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttentionSummary {
+    /// Foreground permission requests that should raise session attention.
     pub pending_permissions: std::collections::HashSet<String>,
+    /// Background permissions remain answerable after a foreground turn ends,
+    /// but still need resolver-expiry cleanup when their helper retires.
+    #[serde(default)]
+    pub pending_background_permissions: std::collections::HashSet<String>,
     pub pending_responses: std::collections::HashMap<String, String>, // tool_use_id -> kind
+    /// Exact event occurrence for each live resolver. This stays separate
+    /// from `pending_responses` so persisted summaries from older builds keep
+    /// deserializing with the existing string-valued map.
+    #[serde(default)]
+    pub pending_response_seqs: std::collections::HashMap<String, u64>,
     pub terminal_prompt_pending: bool,
 }
 
 impl AttentionSummary {
+    fn remove_pending_response(&mut self, tool_use_id: &str) {
+        self.pending_responses.remove(tool_use_id);
+        self.pending_response_seqs.remove(tool_use_id);
+    }
+
     /// Fold one event into the summary. Mirrors resolve_attention_kind's match arms.
     pub fn apply(&mut self, event: &SessionEventRecord) {
         match &event.payload {
             SessionEventPayload::PermissionRequired {
                 request_id,
-                background_task_id: None,
+                background_task_id,
                 ..
             } => {
-                self.pending_permissions.insert(request_id.clone());
+                if background_task_id.is_some() {
+                    self.pending_background_permissions
+                        .insert(request_id.clone());
+                } else {
+                    self.pending_permissions.insert(request_id.clone());
+                }
             }
             SessionEventPayload::PermissionResponded { request_id, .. } => {
                 self.pending_permissions.remove(request_id);
+                self.pending_background_permissions.remove(request_id);
             }
             SessionEventPayload::TerminalPromptRequired { .. } => {
                 self.terminal_prompt_pending = true;
@@ -337,6 +358,8 @@ impl AttentionSummary {
                 };
                 self.pending_responses
                     .insert(tool_use_id.clone(), attention_kind.to_string());
+                self.pending_response_seqs
+                    .insert(tool_use_id.clone(), event.seq);
             }
             SessionEventPayload::ToolUseCompleted {
                 tool_use_id,
@@ -345,15 +368,30 @@ impl AttentionSummary {
             } => {
                 let pending_kind = self.pending_responses.get(tool_use_id).map(String::as_str);
                 if pending_kind != Some("plan_review") || *success {
-                    self.pending_responses.remove(tool_use_id);
+                    self.remove_pending_response(tool_use_id);
                 }
+            }
+            SessionEventPayload::InteractiveResponseResult {
+                tool_use_id, state, ..
+            } if state == "applied"
+                || state == "rejected"
+                || state == "stale"
+                || state.starts_with("stale_")
+                || state == "resolver_expired" =>
+            {
+                self.remove_pending_response(tool_use_id);
             }
             SessionEventPayload::UserPrompt { .. } => {
                 self.pending_responses.clear();
+                self.pending_response_seqs.clear();
             }
             SessionEventPayload::SessionCompleted { .. } => {
+                // Foreground permission resolvers terminate with the turn.
+                // Background tasks may remain live and keep their own
+                // permission resolver until the task or helper terminates.
                 self.pending_permissions.clear();
                 self.pending_responses.clear();
+                self.pending_response_seqs.clear();
                 self.terminal_prompt_pending = false;
             }
             _ => {}
@@ -746,7 +784,10 @@ mod tests {
         for record in &pending_permission {
             permission_summary.apply(record);
         }
-        assert_eq!(permission_summary.attention_kind().as_deref(), Some("permission_required"));
+        assert_eq!(
+            permission_summary.attention_kind().as_deref(),
+            Some("permission_required")
+        );
 
         let mut plan_review_summary = super::AttentionSummary::default();
         for record in event_records(&[
@@ -755,7 +796,35 @@ mod tests {
         ]) {
             plan_review_summary.apply(&record);
         }
-        assert_eq!(plan_review_summary.attention_kind().as_deref(), Some("plan_review"));
+        assert_eq!(
+            plan_review_summary.attention_kind().as_deref(),
+            Some("plan_review")
+        );
+
+        let mut background_permission_summary = super::AttentionSummary::default();
+        for record in event_records(&[
+            SessionEventPayload::PermissionRequired {
+                request_id: "req-background".to_string(),
+                tool_use_id: Some("toolu-background".to_string()),
+                tool_name: "Bash".to_string(),
+                input_summary: None,
+                background_task_id: Some("task-background".to_string()),
+            },
+            SessionEventPayload::SessionCompleted {
+                reason: "foreground done".to_string(),
+            },
+        ]) {
+            background_permission_summary.apply(&record);
+        }
+        assert_eq!(background_permission_summary.attention_kind(), None);
+        assert!(background_permission_summary
+            .pending_background_permissions
+            .contains("req-background"));
+        background_permission_summary
+            .apply(&event_records(&[permission_responded_payload("req-background")])[0]);
+        assert!(background_permission_summary
+            .pending_background_permissions
+            .is_empty());
     }
 
     fn event_records(payloads: &[SessionEventPayload]) -> Vec<SessionEventRecord> {
@@ -791,10 +860,13 @@ mod tests {
     }
 
     fn plan_review_started_payload(tool_use_id: &str) -> SessionEventPayload {
-        tool_use_started_payload(tool_use_id, Some(InteractiveToolPrompt::PlanExit {
-            allowed_prompts: vec![],
-            plan_summary: None,
-        }))
+        tool_use_started_payload(
+            tool_use_id,
+            Some(InteractiveToolPrompt::PlanExit {
+                allowed_prompts: vec![],
+                plan_summary: None,
+            }),
+        )
     }
 
     fn input_required_started_payload(tool_use_id: &str) -> SessionEventPayload {

@@ -20,7 +20,7 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test('live session guidance queues during active or blocked turns without interrupting them', async () => {
+test('live session guidance delegates active or blocked turns to the backend queue', async () => {
   const source = await readSource('components', 'workspace', 'WorkspaceNativeSessionView.tsx');
   const queueBranch = sliceBetween(
     source,
@@ -28,11 +28,11 @@ test('live session guidance queues during active or blocked turns without interr
     'if (queuedMessages.length > 0 && !hasBlockingAttention) {',
   );
 
-  assert.match(queueBranch, /setQueuedMessages\(\(previous\) => \[\.\.\.previous, nextPrompt\]\);/);
-  assert.doesNotMatch(queueBranch, /stopNativeSession|handleStop|interrupt|sendNativeSessionInput/);
+  assert.match(queueBranch, /await sendPromptBatch\(\[nextPrompt\]\);/);
+  assert.doesNotMatch(queueBranch, /setQueuedMessages|stopNativeSession|handleStop|interrupt/);
 });
 
-test('live session guidance flush waits for current turn completion and terminal safety', async () => {
+test('legacy renderer queue migrates to backend during a live turn but stays terminal-safe', async () => {
   const source = await readSource('components', 'workspace', 'WorkspaceNativeSessionView.tsx');
   const flushBlock = sliceBetween(
     source,
@@ -40,9 +40,10 @@ test('live session guidance flush waits for current turn completion and terminal
     'const handlePermission = useCallback',
   );
 
-  assert.match(flushBlock, /isProcessingTurn/);
-  assert.match(flushBlock, /hasBlockingAttention/);
+  assert.doesNotMatch(flushBlock, /isProcessingTurn/);
+  assert.doesNotMatch(flushBlock, /hasBlockingAttention/);
   assert.match(flushBlock, /isTerminalStatus\(session\.status\)/);
+  assert.match(flushBlock, /await waitForPendingEnvironmentUpdate\(\)/);
   assert.match(flushBlock, /await sendPromptBatch\(pendingBatch\);/);
 });
 
@@ -60,7 +61,7 @@ test('queued guidance keeps priority over later direct input', async () => {
   assert.match(priorityBlock, /setQueuedMessages\(pendingBatch\);/);
 });
 
-test('queued guidance persists per runtime and strips object urls from stored images', async () => {
+test('legacy renderer queue remains readable for one-time backend migration', async () => {
   const source = await readSource('components', 'workspace', 'WorkspaceNativeSessionView.tsx');
 
   assert.match(source, /GUIDANCE_QUEUE_STORAGE_PREFIX = 'ccem:workspace-native-guidance-queue:v1:'/);

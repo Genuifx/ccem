@@ -197,8 +197,7 @@ impl NativeEventLog {
             };
 
             let events = query_events_since(conn, runtime_id, since_seq, limit)?;
-            let unloaded_gap_starts = if since_seq.is_none()
-                && limit.is_some_and(|value| value > 0)
+            let unloaded_gap_starts = if since_seq.is_none() && limit.is_some_and(|value| value > 0)
             {
                 limited_replay_unloaded_gap_starts(conn, runtime_id, &events)?
             } else {
@@ -464,10 +463,7 @@ impl NativeEventLog {
         })
     }
 
-    pub fn latest_todo_snapshot(
-        &self,
-        runtime_id: &str,
-    ) -> Result<Option<TodoSnapshotV1>, String> {
+    pub fn latest_todo_snapshot(&self, runtime_id: &str) -> Result<Option<TodoSnapshotV1>, String> {
         self.flush_pending()?;
         self.with_conn(|conn| {
             let mut stmt = conn
@@ -479,7 +475,10 @@ impl NativeEventLog {
                      ORDER BY seq DESC",
                 )
                 .map_err(|error| {
-                    format!("Failed to prepare latest native todo snapshot query: {}", error)
+                    format!(
+                        "Failed to prepare latest native todo snapshot query: {}",
+                        error
+                    )
                 })?;
             let rows = stmt
                 .query_map([runtime_id], |row| row.get::<_, String>(0))
@@ -491,9 +490,13 @@ impl NativeEventLog {
                 let payload_json = row.map_err(|error| {
                     format!("Failed to read latest native todo snapshot row: {}", error)
                 })?;
-                let payload: SessionEventPayload = serde_json::from_str(&payload_json).map_err(
-                    |error| format!("Failed to deserialize native todo snapshot event: {}", error),
-                )?;
+                let payload: SessionEventPayload =
+                    serde_json::from_str(&payload_json).map_err(|error| {
+                        format!(
+                            "Failed to deserialize native todo snapshot event: {}",
+                            error
+                        )
+                    })?;
                 if let Some(snapshot) = todo_snapshot_from_payload(&payload) {
                     return Ok(Some(snapshot.clone()));
                 }
@@ -872,8 +875,8 @@ fn query_events_since(
         let row =
             row.map_err(|error| format!("Failed to read native session event row: {}", error))?;
         if let Some(record) = event_row_to_record_lossy(runtime_id, row) {
-                records.push(record);
-            }
+            records.push(record);
+        }
     }
     Ok(records)
 }
@@ -1063,9 +1066,7 @@ fn event_row_to_record_lossy(
     match event_row_to_record(runtime_id, row) {
         Ok(record) => Some(record),
         Err(error) => {
-            eprintln!(
-                "Skipping unparsable native event for {runtime_id} during replay: {error}"
-            );
+            eprintln!("Skipping unparsable native event for {runtime_id} during replay: {error}");
             None
         }
     }
@@ -1175,9 +1176,7 @@ fn limited_replay_unloaded_gap_starts(
                 params![runtime_id, previous_seq, next_seq],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|error| {
-                format!("Failed to classify native event replay gap: {}", error)
-            })?
+            .map_err(|error| format!("Failed to classify native event replay gap: {}", error))?
             != 0;
         if contains_omitted_event {
             unloaded_gap_starts.push(next.seq);
@@ -1197,6 +1196,7 @@ fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
         | SessionEventPayload::PermissionResponded { .. }
         | SessionEventPayload::TerminalPromptRequired { .. }
         | SessionEventPayload::TerminalPromptResolved { .. }
+        | SessionEventPayload::InteractiveResponseResult { .. }
         | SessionEventPayload::CheckpointCreated { .. }
         | SessionEventPayload::FilesRewound { .. }
         | SessionEventPayload::FileRewindFailed { .. }
@@ -1549,7 +1549,11 @@ mod tests {
             .expect("start-after page");
         assert_eq!(first.snapshot_newest_seq, Some(5));
         assert_eq!(
-            first.events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            first
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
             vec![3, 4]
         );
         assert_eq!(first.next_cursor, Some(4));
@@ -1558,12 +1562,7 @@ mod tests {
         log.append(&replay_page_test_record(runtime_id, 6))
             .expect("append after snapshot");
         let second = log
-            .replay_page(
-                runtime_id,
-                first.next_cursor,
-                first.snapshot_newest_seq,
-                2,
-            )
+            .replay_page(runtime_id, first.next_cursor, first.snapshot_newest_seq, 2)
             .expect("snapshot continuation");
         assert_eq!(second.snapshot_newest_seq, Some(5));
         assert_eq!(
@@ -1860,7 +1859,10 @@ mod tests {
         let conn = Connection::open(&db_path).expect("open db");
         conn.execute(
             "UPDATE native_session_events SET payload_json = ?1 WHERE runtime_id = ?2",
-            ["{\"type\":\"unknown-future-payload\"}", "runtime-all-invalid"],
+            [
+                "{\"type\":\"unknown-future-payload\"}",
+                "runtime-all-invalid",
+            ],
         )
         .expect("corrupt stored payload");
         drop(conn);
@@ -1934,6 +1936,9 @@ mod tests {
                 stage: "runtime_boot".to_string(),
                 detail: "Starting native runtime".to_string(),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         })
         .expect("append lifecycle");
@@ -2240,7 +2245,11 @@ mod tests {
 
         assert!(replay.truncated);
         assert_eq!(
-            replay.events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            replay
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
             vec![1, 4, 5],
         );
         assert!(replay.unloaded_gap_starts.is_empty());
@@ -2352,6 +2361,9 @@ mod tests {
                 stage: "runtime_boot".to_string(),
                 detail: "Starting claude native runtime.".to_string(),
                 assistant_message_uuid: None,
+                command_id: None,
+                query_generation: None,
+                user_message_uuid: None,
             },
         })
         .expect("append runtime anchor");

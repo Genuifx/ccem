@@ -73,6 +73,7 @@ async function buildHelperWithTodoSdkEvents() {
               return {
                 close() {},
                 async *[Symbol.asyncIterator]() {
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id: 'claude-session' };
                   const iterator = prompt[Symbol.asyncIterator]();
                   const next = await iterator.next();
                   if (next.done) return;
@@ -106,6 +107,7 @@ async function buildHelperWithTodoSdkEvents() {
                       },
                     };
                     yield { type: 'result', subtype: 'success', result: 'done', user_message_uuid: next.value.uuid, session_id: 'claude-session' };
+                    yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: 'claude-session' };
                     await new Promise(() => {});
                     return;
                   }
@@ -165,6 +167,7 @@ async function buildHelperWithTodoSdkEvents() {
                       },
                     };
                     yield { type: 'result', subtype: 'success', result: 'done', user_message_uuid: next.value.uuid, session_id: 'claude-session' };
+                    yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: 'claude-session' };
                     await new Promise(() => {});
                     return;
                   }
@@ -215,6 +218,7 @@ async function buildHelperWithTodoSdkEvents() {
                     },
                   };
                   yield { type: 'result', subtype: 'success', result: 'done', user_message_uuid: next.value.uuid, session_id: 'claude-session' };
+                  yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: 'claude-session' };
                   await new Promise(() => {});
                 },
               };

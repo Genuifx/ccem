@@ -235,6 +235,16 @@ pub enum SessionEventPayload {
         detail: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assistant_message_uuid: Option<String>,
+        /// Canonical foreground command id (== SDK user-message uuid) when the
+        /// helper stamped this lifecycle edge with command ownership.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<String>,
+        /// Helper-side query generation that produced this event (fence).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_generation: Option<u64>,
+        /// SDK-echoed user message uuid on turn terminals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_message_uuid: Option<String>,
     },
     ClaudeJson {
         message_type: Option<String>,
@@ -401,13 +411,32 @@ pub enum SessionEventPayload {
         state: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_generation: Option<u64>,
         env_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        perm_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_env_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_effort: Option<String>,
+    },
+    /// Explicit receipt for an interactive (Ask/Plan) reply: applied to a live
+    /// resolver, rejected, or stale because no resolver exists in this helper
+    /// generation. Missing resolvers are never silent successes.
+    InteractiveResponseResult {
+        tool_use_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control_request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_type: Option<String>,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_generation: Option<u64>,
     },
     BackgroundTasksChanged {
         tasks: Vec<NativeBackgroundTask>,
@@ -919,6 +948,34 @@ mod tests {
             store.attention_summary().attention_kind().as_deref(),
             Some("plan_review")
         );
+        assert_eq!(
+            store
+                .attention_summary()
+                .pending_response_seqs
+                .get("toolu-plan"),
+            Some(&3)
+        );
+
+        store.append(SessionEventPayload::InteractiveResponseResult {
+            tool_use_id: "toolu-plan".to_string(),
+            control_request_id: None,
+            prompt_type: Some("plan_exit".to_string()),
+            state: "generation_mismatch".to_string(),
+            query_generation: Some(1),
+        });
+        assert_eq!(
+            store.attention_summary().attention_kind().as_deref(),
+            Some("plan_review")
+        );
+
+        store.append(SessionEventPayload::InteractiveResponseResult {
+            tool_use_id: "toolu-plan".to_string(),
+            control_request_id: None,
+            prompt_type: Some("plan_exit".to_string()),
+            state: "resolver_expired".to_string(),
+            query_generation: Some(1),
+        });
+        assert_eq!(store.attention_summary().attention_kind(), None);
     }
 
     #[test]
@@ -960,9 +1017,7 @@ mod tests {
 
         assert_eq!(store.attention_summary().attention_kind(), None);
         assert_eq!(
-            crate::workspace_decorations::resolve_attention_kind(
-                &store.events_since(None).events
-            ),
+            crate::workspace_decorations::resolve_attention_kind(&store.events_since(None).events),
             None
         );
     }

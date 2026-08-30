@@ -75,6 +75,19 @@ struct JsonRpcRequest {
     params: Value,
 }
 
+fn rpc_client_message_id(id: Option<&Value>) -> Option<String> {
+    let raw = match id? {
+        Value::String(value) => value.trim().to_string(),
+        Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
+    if raw.is_empty() {
+        None
+    } else {
+        Some(format!("external-control:{raw}"))
+    }
+}
+
 #[derive(Debug)]
 struct ControlRpcError {
     message: String,
@@ -344,6 +357,7 @@ struct EventsParams {
 #[serde(rename_all = "camelCase")]
 struct SendInputParams {
     runtime_id: String,
+    client_message_id: Option<String>,
     text: String,
     display_text: Option<String>,
 }
@@ -621,6 +635,10 @@ impl ExternalControlManager {
             }
             "ccem.workspace.sendInput" => {
                 let params = deserialize_params::<SendInputParams>(rpc.params)?;
+                let client_message_id = params
+                    .client_message_id
+                    .clone()
+                    .or_else(|| rpc_client_message_id(rpc.id.as_ref()));
                 let _mutation_guard = self.environment_mutations.lock()?;
                 self.native_runtime.send_user_message(
                     app,
@@ -629,6 +647,7 @@ impl ExternalControlManager {
                     params.display_text.as_deref(),
                     None,
                     None,
+                    client_message_id.as_deref(),
                 )?;
                 Ok(json!({ "ok": true }))
             }
@@ -2685,6 +2704,19 @@ mod tests {
             &test_descriptor("http://127.0.0.1:1234/rpc", "token-a", 222),
             &expected
         ));
+    }
+
+    #[test]
+    fn rpc_id_is_a_namespaced_send_idempotency_fallback() {
+        assert_eq!(
+            rpc_client_message_id(Some(&json!("request-1"))).as_deref(),
+            Some("external-control:request-1")
+        );
+        assert_eq!(
+            rpc_client_message_id(Some(&json!(42))).as_deref(),
+            Some("external-control:42")
+        );
+        assert_eq!(rpc_client_message_id(Some(&Value::Null)), None);
     }
 
     #[test]

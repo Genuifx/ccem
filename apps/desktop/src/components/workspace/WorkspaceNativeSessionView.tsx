@@ -101,6 +101,7 @@ import {
   isPlanExitApprovalText,
   type NativeSessionAttentionState,
 } from './workspaceNativeAttention';
+import { selectNativeSessionProcessing } from './workspaceNativeSessionProjection';
 import { normalizeEffortForProvider } from './workspaceSessionPreferences';
 import { resolveWorkspaceRuntimePlanMode } from './workspaceRuntimePlanMode';
 import {
@@ -235,6 +236,7 @@ type InteractivePromptReplyPayload =
   | {
       kind: 'ask_user_question';
       toolUseId: string;
+      attentionSeq: number;
       text: string;
       answers: Record<string, string>;
       annotations?: Record<string, InteractivePromptAnnotation>;
@@ -242,6 +244,7 @@ type InteractivePromptReplyPayload =
   | {
       kind: 'plan_exit';
       toolUseId: string;
+      attentionSeq: number;
       text: string;
       requestText?: string;
       approved: boolean;
@@ -795,7 +798,7 @@ function WorkspaceAttentionPanel({
   const hasBackgroundTasks = Boolean(backgroundTasks);
   const attentionMotionKey = useMemo(() => [
     attentionState.permissions.map((request) => request.requestId).join('|'),
-    attentionState.prompts.map((prompt) => prompt.toolUseId).join('|'),
+    attentionState.prompts.map((prompt) => `${prompt.toolUseId}:${prompt.eventSeq}`).join('|'),
     attentionState.terminalPrompt ? 'terminal' : 'no-terminal',
     hasBackgroundTasks ? 'background-tasks' : 'no-background-tasks',
   ].join('::'), [
@@ -806,7 +809,9 @@ function WorkspaceAttentionPanel({
   ]);
 
   useEffect(() => {
-    const activePromptIds = new Set(attentionState.prompts.map((prompt) => prompt.toolUseId));
+    const activePromptIds = new Set(
+      attentionState.prompts.map((prompt) => `${prompt.toolUseId}:${prompt.eventSeq}`),
+    );
     setPromptStates((previous) => {
       const nextEntries = Object.entries(previous)
         .filter(([toolUseId]) => activePromptIds.has(toolUseId));
@@ -952,6 +957,7 @@ function WorkspaceAttentionPanel({
       ))}
 
       {attentionState.prompts.map((entry) => {
+        const promptOccurrenceId = `${entry.toolUseId}:${entry.eventSeq}`;
         const bodyLines = promptPanelBody(entry.prompt);
         const quickReplies = promptQuickReplies(entry.prompt);
         const questionPrompt = entry.prompt.prompt_type === 'ask_user_question'
@@ -964,7 +970,7 @@ function WorkspaceAttentionPanel({
           const providerName = providerDisplayName(provider);
           const customOptionLabel = t('workspace.nativePromptAdjust')
             .replace('{provider}', providerName);
-          const promptState = promptStates[entry.toolUseId] ?? {
+          const promptState = promptStates[promptOccurrenceId] ?? {
             currentQuestionIndex: 0,
             answers: {},
           };
@@ -1005,14 +1011,14 @@ function WorkspaceAttentionPanel({
             .replace('{current}', String(questionIndex + 1))
             .replace('{total}', String(questionPrompt.questions.length));
 
-          const isCollapsed = collapsedPromptIds.has(entry.toolUseId);
+          const isCollapsed = collapsedPromptIds.has(promptOccurrenceId);
           const collapseToggleLabel = isCollapsed
             ? t('workspace.nativePromptExpand')
             : t('workspace.nativePromptCollapse');
 
           return (
             <div
-              key={entry.toolUseId}
+              key={promptOccurrenceId}
               data-native-attention-card
               data-collapsed={isCollapsed ? 'true' : 'false'}
               className={cn(
@@ -1025,8 +1031,8 @@ function WorkspaceAttentionPanel({
                   type="button"
                   className="min-w-0 flex-1 rounded-md text-left outline-none transition-colors hover:bg-muted/25 focus-visible:ring-2 focus-visible:ring-ring/30"
                   aria-expanded={!isCollapsed}
-                  aria-controls={`ask-user-body-${entry.toolUseId}`}
-                  onClick={() => togglePromptCollapsed(entry.toolUseId)}
+                  aria-controls={`ask-user-body-${promptOccurrenceId}`}
+                  onClick={() => togglePromptCollapsed(promptOccurrenceId)}
                 >
                   <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground/80">
                     <span>{progressLabel}</span>
@@ -1076,8 +1082,8 @@ function WorkspaceAttentionPanel({
                     aria-label={collapseToggleLabel}
                     title={collapseToggleLabel}
                     aria-expanded={!isCollapsed}
-                    aria-controls={`ask-user-body-${entry.toolUseId}`}
-                    onClick={() => togglePromptCollapsed(entry.toolUseId)}
+                    aria-controls={`ask-user-body-${promptOccurrenceId}`}
+                    onClick={() => togglePromptCollapsed(promptOccurrenceId)}
                   >
                     {isCollapsed ? (
                       <ChevronDown className="h-3.5 w-3.5" />
@@ -1089,7 +1095,7 @@ function WorkspaceAttentionPanel({
               </div>
 
               {!isCollapsed ? (
-                <div id={`ask-user-body-${entry.toolUseId}`}>
+                <div id={`ask-user-body-${promptOccurrenceId}`}>
                   {selectedSummary || selectedPreview ? (
                     <div className="mt-2.5 rounded-md bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] text-muted-foreground">
                       {selectedSummary ? (
@@ -1115,7 +1121,7 @@ function WorkspaceAttentionPanel({
                         : currentAnswerState.selectedLabels.includes(option.label);
                       return (
                         <button
-                          key={`${entry.toolUseId}-${option.label}`}
+                          key={`${promptOccurrenceId}-${option.label}`}
                           type="button"
                           className={cn(
                             'group relative w-full rounded-lg px-3 py-2 text-left transition-all',
@@ -1125,7 +1131,7 @@ function WorkspaceAttentionPanel({
                           )}
                           onClick={() => {
                             const emptyAnswer = createEmptyPromptAnswer();
-                            updatePromptState(entry.toolUseId, (current) => ({
+                            updatePromptState(promptOccurrenceId, (current) => ({
                               ...current,
                               answers: {
                                 ...current.answers,
@@ -1193,17 +1199,17 @@ function WorkspaceAttentionPanel({
                   {currentAnswerState.customSelected ? (
                     <div className="mt-2.5 space-y-1">
                       <label
-                        htmlFor={`ask-user-custom-${entry.toolUseId}-${questionIndex}`}
+                        htmlFor={`ask-user-custom-${promptOccurrenceId}-${questionIndex}`}
                         className="text-[11px] font-medium text-muted-foreground/80"
                       >
                         {t('workspace.nativePromptCustomLabel')}
                       </label>
                       <textarea
-                        id={`ask-user-custom-${entry.toolUseId}-${questionIndex}`}
+                        id={`ask-user-custom-${promptOccurrenceId}-${questionIndex}`}
                         value={currentAnswerState.customText}
                         onChange={(event) => {
                           const value = event.target.value;
-                          updatePromptState(entry.toolUseId, (current) => ({
+                          updatePromptState(promptOccurrenceId, (current) => ({
                             ...current,
                             answers: {
                               ...current.answers,
@@ -1230,7 +1236,7 @@ function WorkspaceAttentionPanel({
                         className="h-7 px-3 text-[12px]"
                         disabled={isSubmittingPrompt}
                         onClick={() => {
-                          updatePromptState(entry.toolUseId, (current) => ({
+                          updatePromptState(promptOccurrenceId, (current) => ({
                             ...current,
                             currentQuestionIndex: Math.max(0, current.currentQuestionIndex - 1),
                           }));
@@ -1249,7 +1255,7 @@ function WorkspaceAttentionPanel({
                         }
 
                         if (!isLastQuestion) {
-                          updatePromptState(entry.toolUseId, (current) => ({
+                          updatePromptState(promptOccurrenceId, (current) => ({
                             ...current,
                             currentQuestionIndex: Math.min(
                               questionPrompt.questions.length - 1,
@@ -1270,6 +1276,7 @@ function WorkspaceAttentionPanel({
                         await onSubmitPromptReply({
                           kind: 'ask_user_question',
                           toolUseId: entry.toolUseId,
+                          attentionSeq: entry.eventSeq,
                           text: reply.text,
                           answers: reply.answers,
                           annotations: reply.annotations,
@@ -1289,7 +1296,7 @@ function WorkspaceAttentionPanel({
 
         return (
           <div
-            key={entry.toolUseId}
+            key={promptOccurrenceId}
             data-native-attention-card
             className="rounded-xl bg-surface-raised/60 px-3 py-2.5 backdrop-blur-sm"
           >
@@ -1310,6 +1317,7 @@ function WorkspaceAttentionPanel({
                     void onSubmitPromptReply({
                       kind: 'plan_exit',
                       toolUseId: entry.toolUseId,
+                      attentionSeq: entry.eventSeq,
                       text: primaryPlanExitReply,
                       approved: true,
                     });
@@ -1331,7 +1339,7 @@ function WorkspaceAttentionPanel({
               ) : (
                 <div className="mt-1.5 space-y-1 text-[12px] leading-relaxed text-foreground/90">
                   {bodyLines.map((line, index) => (
-                    <p key={`${entry.toolUseId}-line-${index}`}>{line}</p>
+                    <p key={`${promptOccurrenceId}-line-${index}`}>{line}</p>
                   ))}
                 </div>
               )
@@ -1347,7 +1355,7 @@ function WorkspaceAttentionPanel({
               )}>
                 {quickReplies.map((reply) => (
                   <Button
-                    key={`${entry.toolUseId}-${reply}`}
+                    key={`${promptOccurrenceId}-${reply}`}
                     type="button"
                     size="sm"
                     variant={isPlanExitPrompt ? 'default' : 'outline'}
@@ -1363,6 +1371,7 @@ function WorkspaceAttentionPanel({
                         void onSubmitPromptReply({
                           kind: 'plan_exit',
                           toolUseId: entry.toolUseId,
+                          attentionSeq: entry.eventSeq,
                           text: reply,
                           approved: true,
                         });
@@ -1432,6 +1441,7 @@ export function WorkspaceNativeSessionView({
     getNativeSessionEvents,
     getNativeSessionEventPage,
     sendNativeSessionInput,
+    flushNativeSessionInputQueue,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
@@ -1515,9 +1525,6 @@ export function WorkspaceNativeSessionView({
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [isRefreshingGitSnapshot, setIsRefreshingGitSnapshot] = useState(false);
   const [respondingRequestId, setRespondingRequestId] = useState<string | null>(null);
-  const [locallyDismissedPromptIds, setLocallyDismissedPromptIds] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [queuedState, setQueuedState] = useState<QueuedGuidanceState>(() => ({
     runtimeId: session.runtime_id,
     messages: readStoredGuidanceQueue(session.runtime_id),
@@ -2014,7 +2021,6 @@ export function WorkspaceNativeSessionView({
     setComposerPlanModeEnabled(isNativeSessionPlanRuntime(session));
     setQueuedMessages([]);
     setLocalUserPrompts(initialPrompts);
-    setLocallyDismissedPromptIds(new Set());
     setSelectedFileCheckpoint(null);
     setIsRestoreDialogOpen(false);
     setIsRewindingFiles(false);
@@ -2704,38 +2710,10 @@ export function WorkspaceNativeSessionView({
     return promise;
   }, [runPollEvents, session.runtime_id]);
 
-  const rawAttentionState = useMemo(
+  const attentionState = useMemo(
     () => extractAttentionState(events),
     [events],
   );
-  const attentionState = useMemo(() => {
-    if (locallyDismissedPromptIds.size === 0) {
-      return rawAttentionState;
-    }
-
-    const prompts = rawAttentionState.prompts.filter(
-      (entry) => !locallyDismissedPromptIds.has(entry.toolUseId),
-    );
-
-    return {
-      ...rawAttentionState,
-      prompts,
-    };
-  }, [locallyDismissedPromptIds, rawAttentionState]);
-
-  useEffect(() => {
-    if (locallyDismissedPromptIds.size === 0) {
-      return;
-    }
-
-    const activePromptIds = new Set(rawAttentionState.prompts.map((entry) => entry.toolUseId));
-    setLocallyDismissedPromptIds((previous) => {
-      const next = new Set(
-        Array.from(previous).filter((toolUseId) => activePromptIds.has(toolUseId)),
-      );
-      return next.size === previous.size ? previous : next;
-    });
-  }, [locallyDismissedPromptIds.size, rawAttentionState.prompts]);
 
   const pollIntervalMs = isSending
     || session.status === 'initializing'
@@ -2956,7 +2934,37 @@ export function WorkspaceNativeSessionView({
     });
   }, [events.length, isVisible, messages.length]);
 
-  const isProcessingTurn = shouldTreatNativeSessionAsProcessing(session.status, events);
+  // A present coordinator projection fully replaces the legacy status/event
+  // heuristic. Only older runtimes that omit the projection use the fallback.
+  const isProcessingTurn = selectNativeSessionProcessing(
+    session.lifecycle,
+    () => shouldTreatNativeSessionAsProcessing(session.status, events),
+  );
+  const legacyFlushRevisionRef = useRef<string | null>(null);
+  useEffect(() => {
+    const lifecycle = session.lifecycle;
+    if (
+      !isVisible
+      || lifecycle?.adapter !== 'legacy_serial'
+      || lifecycle.active_command_id != null
+      || (lifecycle.queue_count ?? 0) === 0
+    ) {
+      return;
+    }
+    const flushKey = `${session.runtime_id}:${lifecycle.state_revision}`;
+    if (legacyFlushRevisionRef.current === flushKey) {
+      return;
+    }
+    legacyFlushRevisionRef.current = flushKey;
+    void flushNativeSessionInputQueue(session.runtime_id).catch((error) => {
+      console.error('Failed to flush visible legacy native queue:', error);
+    });
+  }, [
+    flushNativeSessionInputQueue,
+    isVisible,
+    session.lifecycle,
+    session.runtime_id,
+  ]);
   const isAwaitingResponse = isSending || isProcessingTurn;
   const hasAskUserQuestionPrompt = attentionState.prompts.some(
     (entry) => entry.prompt.prompt_type === 'ask_user_question',
@@ -2964,19 +2972,15 @@ export function WorkspaceNativeSessionView({
   const hasQuickReplyPrompt = attentionState.prompts.some(
     (entry) => entry.prompt.prompt_type !== 'ask_user_question',
   );
-  const planExitPromptIds = useMemo(
-    () => attentionState.prompts
-      .filter((entry) => entry.prompt.prompt_type === 'plan_exit')
-      .map((entry) => entry.toolUseId),
-    [attentionState.prompts],
-  );
   const planExitApprovalPrompt = useMemo(
     () => attentionState.prompts.find((entry) =>
       entry.prompt.prompt_type === 'plan_exit' && !isSyntheticPlanExitPrompt(entry.prompt)
     ) ?? null,
     [attentionState.prompts],
   );
-  const hasPlanExitPrompt = planExitPromptIds.length > 0;
+  const hasPlanExitPrompt = attentionState.prompts.some(
+    (entry) => entry.prompt.prompt_type === 'plan_exit',
+  );
   const hasHardBlockingAttention = attentionState.permissions.some(
     (request) => !request.backgroundTaskId,
   )
@@ -3111,10 +3115,11 @@ export function WorkspaceNativeSessionView({
           ),
         ].join('\n');
 
+    const clientMessageId = prompts.length === 1
+      ? prompts[0]!.id
+      : `queue-batch-${prompts.map((prompt) => prompt.id).join('-')}`;
     const promptEntry: LocalUserPrompt = {
-      id: prompts.length === 1
-        ? prompts[0]!.id
-        : `queue-batch-${Date.now()}`,
+      id: clientMessageId,
       text: previewText,
       images: images.length > 0 ? images : undefined,
       annotations: annotations.length > 0 ? annotations : undefined,
@@ -3132,6 +3137,7 @@ export function WorkspaceNativeSessionView({
         images.length > 0 ? images : undefined,
         promptEntry.text,
         annotations.length > 0 ? annotations : undefined,
+        clientMessageId,
       );
       await pollEvents();
       await refreshSummary({ force: true });
@@ -3148,7 +3154,13 @@ export function WorkspaceNativeSessionView({
 
   const applyRuntimePlanModeChange = useCallback(async (
     enabled: boolean,
-    options?: { refreshSummaryAfterChange?: boolean },
+    options?: {
+      refreshSummaryAfterChange?: boolean;
+      attention?: {
+        toolUseId: string;
+        expectedAttentionSeq: number;
+      };
+    },
   ) => {
     if (session.provider !== 'claude') {
       setComposerPlanModeEnabled(enabled);
@@ -3164,7 +3176,11 @@ export function WorkspaceNativeSessionView({
     setSessionRuntimePermMode(nextSessionRuntimeMode);
 
     try {
-      await setNativeSessionRuntimePermMode(session.runtime_id, nextRuntimePermMode);
+      await setNativeSessionRuntimePermMode(
+        session.runtime_id,
+        nextRuntimePermMode,
+        options?.attention,
+      );
       if (options?.refreshSummaryAfterChange ?? true) {
         await refreshSummary({ force: true });
       }
@@ -3216,26 +3232,12 @@ export function WorkspaceNativeSessionView({
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
     };
 
-    let exitedPlanModeForPrompt = false;
-    let dismissedPlanExitPromptIds: string[] = [];
-    if (payload.kind === 'plan_exit' && hasPlanExitPrompt) {
-      dismissedPlanExitPromptIds = planExitPromptIds;
-    }
-    if (
+    const exitsPlanModeForPrompt = (
       payload.kind === 'plan_exit'
       && payload.approved
       && hasPlanExitPrompt
       && session.provider === 'claude'
-      && sessionRuntimePermMode === 'plan'
-    ) {
-      const exitedPlanMode = await applyRuntimePlanModeChange(false, {
-        refreshSummaryAfterChange: false,
-      });
-      if (!exitedPlanMode) {
-        return false;
-      }
-      exitedPlanModeForPrompt = true;
-    }
+    );
 
     setIsSending(true);
     setLocalUserPrompts((previous) => [...previous, promptEntry]);
@@ -3244,29 +3246,14 @@ export function WorkspaceNativeSessionView({
       setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
     } else if (payload.kind === 'plan_exit') {
       clearComposerDraft();
-      setComposerPlanModeEnabled(exitedPlanModeForPrompt ? false : sessionRuntimePermMode === 'plan');
-      if (dismissedPlanExitPromptIds.length > 0) {
-        setLocallyDismissedPromptIds((previous) => {
-          const next = new Set(previous);
-          dismissedPlanExitPromptIds.forEach((toolUseId) => next.add(toolUseId));
-          return next;
-        });
-      }
-    } else if (payload.kind === 'ask_user_question') {
-      setLocallyDismissedPromptIds((previous) => {
-        if (previous.has(payload.toolUseId)) {
-          return previous;
-        }
-        const next = new Set(previous);
-        next.add(payload.toolUseId);
-        return next;
-      });
+      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
     }
 
     try {
       if (payload.kind === 'ask_user_question') {
         await respondNativeSessionPrompt(session.runtime_id, {
           toolUseId: payload.toolUseId,
+          expectedAttentionSeq: payload.attentionSeq,
           promptType: 'ask_user_question',
           displayText: payload.text,
           answers: payload.answers,
@@ -3275,6 +3262,7 @@ export function WorkspaceNativeSessionView({
       } else if (payload.kind === 'plan_exit') {
         await respondNativeSessionPrompt(session.runtime_id, {
           toolUseId: payload.toolUseId,
+          expectedAttentionSeq: payload.attentionSeq,
           promptType: 'plan_exit',
           displayText: payload.text,
           answers: payload.approved
@@ -3295,7 +3283,12 @@ export function WorkspaceNativeSessionView({
           requestImages,
           promptEntry.text,
           payload.annotations,
+          promptEntry.id,
         );
+      }
+      if (exitsPlanModeForPrompt) {
+        setComposerPlanModeEnabled(false);
+        setSessionRuntimePermMode(sessionDisplayPermMode);
       }
       await pollEvents();
       await refreshSummary({ force: true });
@@ -3305,32 +3298,11 @@ export function WorkspaceNativeSessionView({
       setLocalUserPrompts((previous) =>
         previous.filter((prompt) => prompt.id !== promptEntry.id),
       );
-      if (dismissedPlanExitPromptIds.length > 0) {
-        setLocallyDismissedPromptIds((previous) => {
-          const next = new Set(previous);
-          dismissedPlanExitPromptIds.forEach((toolUseId) => next.delete(toolUseId));
-          return next;
-        });
-      }
-      if (payload.kind === 'ask_user_question') {
-        setLocallyDismissedPromptIds((previous) => {
-          if (!previous.has(payload.toolUseId)) {
-            return previous;
-          }
-          const next = new Set(previous);
-          next.delete(payload.toolUseId);
-          return next;
-        });
-      }
-      if (payload.kind === 'plan_exit') {
-        setLocallyDismissedPromptIds((previous) => {
-          if (!previous.has(payload.toolUseId)) {
-            return previous;
-          }
-          const next = new Set(previous);
-          next.delete(payload.toolUseId);
-          return next;
-        });
+      try {
+        await pollEvents();
+        await refreshSummary({ force: true });
+      } catch (refreshError) {
+        console.error('Failed to refresh native session after interactive reply error:', refreshError);
       }
       toast.error(t('workspace.nativeSendFailed'));
       return false;
@@ -3339,14 +3311,13 @@ export function WorkspaceNativeSessionView({
     }
   }, [
     pollEvents,
-    applyRuntimePlanModeChange,
     clearComposerDraft,
     refreshSummary,
     respondNativeSessionPrompt,
     sendNativeSessionInput,
     hasPlanExitPrompt,
-    planExitPromptIds,
     session.provider,
+    sessionDisplayPermMode,
     sessionRuntimePermMode,
     session.runtime_id,
     t,
@@ -3527,6 +3498,7 @@ export function WorkspaceNativeSessionView({
         return sendInteractivePromptReply({
           kind: 'plan_exit',
           toolUseId: planExitApprovalPrompt.toolUseId,
+          attentionSeq: planExitApprovalPrompt.eventSeq,
           text: displayText,
           requestText: text,
           approved: true,
@@ -3537,6 +3509,7 @@ export function WorkspaceNativeSessionView({
         return sendInteractivePromptReply({
           kind: 'plan_exit',
           toolUseId: planExitApprovalPrompt.toolUseId,
+          attentionSeq: planExitApprovalPrompt.eventSeq,
           text: displayText,
           requestText: text,
           approved: false,
@@ -3554,14 +3527,23 @@ export function WorkspaceNativeSessionView({
     }
 
     if (isProcessingTurn || hasHardBlockingAttention) {
-      if (collectQueuedPromptAnnotations([...queuedMessages, nextPrompt]) == null) {
+      if (collectQueuedPromptAnnotations([nextPrompt]) == null) {
         toast.error(t('workspace.messageAnnotationsBatchLimit'));
         return false;
       }
       clearComposerDraft();
       setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
-      setQueuedMessages((previous) => [...previous, nextPrompt]);
-      return true;
+      try {
+        await sendPromptBatch([nextPrompt]);
+        return true;
+      } catch (error) {
+        toast.error(t(
+          error instanceof PromptAnnotationLimitError
+            ? 'workspace.messageAnnotationsBatchLimit'
+            : 'workspace.nativeSendFailed',
+        ));
+        return false;
+      }
     }
 
     if (queuedMessages.length > 0 && !hasBlockingAttention) {
@@ -3622,8 +3604,6 @@ export function WorkspaceNativeSessionView({
     if (
       queuedMessages.length === 0
       || isSending
-      || isProcessingTurn
-      || hasBlockingAttention
       || isTerminalStatus(session.status)
     ) {
       return;
@@ -3651,8 +3631,6 @@ export function WorkspaceNativeSessionView({
       ));
     }
   }, [
-    hasBlockingAttention,
-    isProcessingTurn,
     isSending,
     queuedMessages,
     sendPromptBatch,
@@ -3699,7 +3677,11 @@ export function WorkspaceNativeSessionView({
   const handleStop = useCallback(async () => {
     setIsStopping(true);
     try {
-      await stopNativeSession(session.runtime_id, 'native_session_stop_button');
+      await stopNativeSession(
+        session.runtime_id,
+        'native_session_stop_button',
+        session.lifecycle?.active_command_id ?? null,
+      );
       await refreshSummary({ force: true });
     } catch (error) {
       console.error('Failed to stop native session:', error);
@@ -3707,7 +3689,7 @@ export function WorkspaceNativeSessionView({
     } finally {
       setIsStopping(false);
     }
-  }, [refreshSummary, session.runtime_id, stopNativeSession, t]);
+  }, [refreshSummary, session.lifecycle?.active_command_id, session.runtime_id, stopNativeSession, t]);
 
   const handleStopBackgroundTask = useCallback(async (taskId: string) => {
     await stopNativeBackgroundTask(session.runtime_id, taskId);
@@ -3873,8 +3855,6 @@ export function WorkspaceNativeSessionView({
     if (
       queuedMessages.length === 0
       || isSending
-      || isProcessingTurn
-      || hasBlockingAttention
       || isTerminalStatus(session.status)
     ) {
       return;
@@ -3889,8 +3869,6 @@ export function WorkspaceNativeSessionView({
     };
   }, [
     flushQueuedMessages,
-    hasBlockingAttention,
-    isProcessingTurn,
     isSending,
     queuedMessages.length,
     session.status,
@@ -3990,50 +3968,50 @@ export function WorkspaceNativeSessionView({
         onValueChange={handleComposerTextChange}
         onSubmit={handleSend}
         placeholder={t('workspace.composePlaceholder')}
-        disabled={isTerminalStatus(session.status)}
+        disabled={isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null}
         canSubmit={canSend}
         isSubmitting={false}
         submitLabel={t('workspace.composeSend')}
         loadingLabel={t('common.loading')}
         primaryActionLabel={
-          isTerminalStatus(session.status)
-            ? t('workspace.newSession')
-            : !hasComposerInput && isProcessingTurn
+          !hasComposerInput && session.lifecycle?.active_command_id != null
               ? t('workspace.nativeStop')
+            : isTerminalStatus(session.status)
+              ? t('workspace.newSession')
               : shouldGuideModel
                 ? t('workspace.composerGuideModel')
                 : t('workspace.composeSend')
         }
         primaryActionIcon={
-          isTerminalStatus(session.status)
-            ? <SquarePen className="h-4 w-4" />
-            : !hasComposerInput && isProcessingTurn
+          !hasComposerInput && session.lifecycle?.active_command_id != null
               ? <ProcessingActionIcon stopping={isStopping} />
+            : isTerminalStatus(session.status)
+              ? <SquarePen className="h-4 w-4" />
               : shouldGuideModel
                 ? <MessageSquareQuote className="h-4 w-4" />
                 : <ArrowUp className="h-4 w-4" />
         }
         primaryActionDisabled={
-          isTerminalStatus(session.status)
-            ? false
-            : !hasComposerInput && isProcessingTurn
+          !hasComposerInput && session.lifecycle?.active_command_id != null
               ? isStopping
+            : isTerminalStatus(session.status)
+              ? false
               : undefined
         }
         onPrimaryAction={
-          isTerminalStatus(session.status)
-            ? onStartNew
-            : !hasComposerInput && isProcessingTurn
+          !hasComposerInput && session.lifecycle?.active_command_id != null
               ? () => void handleStop()
+            : isTerminalStatus(session.status)
+              ? onStartNew
               : undefined
         }
         primaryActionVariant={
-          isTerminalStatus(session.status)
+          isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
             ? 'outline'
             : 'default'
         }
         primaryActionClassName={
-          isTerminalStatus(session.status)
+          isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
             ? 'shadow-none w-auto rounded-full px-3 gap-1.5'
             : undefined
         }

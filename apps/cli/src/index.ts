@@ -8,6 +8,7 @@ import * as readline from 'readline';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'node:crypto';
 
 // ESM 兼容：获取 __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -1643,11 +1644,13 @@ desktopCmd
   .description('Send input to a CCEM Desktop workspace session')
   .requiredOption('--text <text>', 'Text to send')
   .option('--display-text <text>', 'Text to show in Desktop')
+  .option('--message-id <id>', 'Stable idempotency key to reuse when retrying an uncertain send')
   .option('--json', 'Output JSON')
   .action(async function(this: any, runtimeId: string) {
     const opts = this.opts();
     const result = await requestDesktopControl('ccem.workspace.sendInput', {
       runtimeId,
+      clientMessageId: opts.messageId?.trim() || `ccem-cli-${randomUUID()}`,
       text: opts.text,
       displayText: opts.displayText ?? null,
     });

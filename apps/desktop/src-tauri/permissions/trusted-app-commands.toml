@@ -86,6 +86,7 @@ commands.allow = [
   "list_native_sessions",
   "get_native_session_summary",
   "send_native_session_input",
+  "flush_native_session_input_queue",
   "respond_native_session_permission",
   "respond_native_session_prompt",
   "rewind_native_session_files",

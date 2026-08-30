@@ -94,11 +94,11 @@ async function buildHelperWithWarningMock() {
                   };
                 },
                 async *[Symbol.asyncIterator]() {
+                  const session_id = 'mock-session';
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id };
                   const iterator = prompt[Symbol.asyncIterator]();
                   const next = await iterator.next();
                   if (next.done) return;
-
-                  const session_id = 'mock-session';
                   const input = {
                     questions: [{
                       question: 'Continue?',
@@ -132,6 +132,7 @@ async function buildHelperWithWarningMock() {
                     user_message_uuid: next.value.uuid,
                     session_id,
                   };
+                  yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                 },
               };
             }

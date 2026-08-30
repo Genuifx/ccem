@@ -274,7 +274,7 @@ test('selected skill prompt augmentation stays out of user-visible display text'
   assert.match(nativeViewSource, /buildComposerPromptPreview\(payload\.displayText \?\? payload\.text, payload\.attachments \?\? \[\]\)/);
   assert.match(
     nativeViewSource,
-    /sendNativeSessionInput\(\s*session\.runtime_id,\s*requestText,\s*requestImages,\s*promptEntry\.text,\s*payload\.annotations,\s*\)/,
+    /sendNativeSessionInput\(\s*session\.runtime_id,\s*requestText,\s*requestImages,\s*promptEntry\.text,\s*payload\.annotations,\s*promptEntry\.id,\s*\)/,
   );
 });
 

@@ -212,9 +212,11 @@ pub(super) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
             None
         }
         // Session usage snapshots duplicate the token_usage frames already
-        // forwarded per turn — don't spam bot outboxes with them.
+        // forwarded per turn — don't spam bot outboxes with them. Interactive
+        // receipts are consumed by the desktop attention layer (Slice C).
         SessionEventPayload::SessionUsage { .. }
         | SessionEventPayload::RuntimeSettingsChanged { .. }
+        | SessionEventPayload::InteractiveResponseResult { .. }
         | SessionEventPayload::BackgroundTasksChanged { .. }
         | SessionEventPayload::BackgroundTaskUpdated { .. }
         | SessionEventPayload::StdErrLine { .. }

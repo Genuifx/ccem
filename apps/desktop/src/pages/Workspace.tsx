@@ -49,6 +49,11 @@ import {
   readHistoryRouteDraft,
   writeHistoryRouteDraft,
 } from '@/components/workspace/historyRouteDraftStore';
+import {
+  decideWorkspaceEscape,
+  hasOpenWorkspaceEscapeLayer,
+  type WorkspaceEscapeCommandIdentity,
+} from '@/pages/workspaceEscape';
 import type { RouterLaunchDraft } from '@ccem/core/browser';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
@@ -3153,29 +3158,55 @@ export function Workspace({
   );
   useKeyboardShortcuts(isActive ? shortcuts : {});
 
-  // Escape key: abort running session, prevent fullscreen exit
-  const activeLiveStatus = activeLiveEntry?.session.status;
-  const activeLiveStoppingId = activeLiveEntry?.session.runtime_id;
+  // Escape is owned by the currently visible coordinator command only. Keep
+  // the last identity outside the effect so key repeat and rerenders cannot
+  // send duplicate interrupt requests for the same command.
+  const lastWorkspaceEscapeCommandRef = useRef<WorkspaceEscapeCommandIdentity | null>(null);
+  const activeLiveStoppingId = activeLiveEntry?.session.runtime_id ?? null;
+  const activeLiveCommandId = activeLiveEntry?.session.lifecycle?.active_command_id ?? null;
+  const activeLiveSessionIsActive = (activeLiveEntry?.session.is_active ?? false)
+    || activeLiveCommandId != null;
+  const isActiveLiveSessionVisible = workspaceMode === 'live' && activeLiveEntry != null;
 
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || !isActiveLiveSessionVisible) return;
 
     const handler = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-
-      e.preventDefault();
-
-      if (
-        activeLiveStatus === 'initializing' ||
-        activeLiveStatus === 'processing'
-      ) {
-        void stopNativeSession(activeLiveStoppingId!, 'workspace_escape');
+      const decision = decideWorkspaceEscape({
+        key: e.key,
+        isComposing: e.isComposing,
+        keyCode: e.keyCode,
+        defaultPrevented: e.defaultPrevented,
+        target: e.target,
+        isWorkspaceActive: isActive,
+        isLiveSessionVisible: isActiveLiveSessionVisible,
+        isSessionActive: activeLiveSessionIsActive,
+        runtimeId: activeLiveStoppingId,
+        activeCommandId: activeLiveCommandId,
+        lastRequestedCommand: lastWorkspaceEscapeCommandRef.current,
+        hasOpenInteractionLayer: hasOpenWorkspaceEscapeLayer(document),
+      });
+      if (decision.kind === 'stop') {
+        lastWorkspaceEscapeCommandRef.current = decision;
+        e.preventDefault();
+        void stopNativeSession(
+          decision.runtimeId,
+          'workspace_escape',
+          decision.commandId,
+        );
       }
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [isActive, activeLiveStatus, activeLiveStoppingId, stopNativeSession]);
+  }, [
+    activeLiveCommandId,
+    activeLiveSessionIsActive,
+    activeLiveStoppingId,
+    isActive,
+    isActiveLiveSessionVisible,
+    stopNativeSession,
+  ]);
 
   const renderComposeView = () => (
     <div className="flex h-full min-h-0 flex-col items-center px-4 sm:px-6 lg:px-8">

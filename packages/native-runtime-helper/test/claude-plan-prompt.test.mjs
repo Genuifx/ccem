@@ -67,10 +67,11 @@ async function buildHelperWithMockPlanTool(toolName) {
                   };
                 },
                 async *[Symbol.asyncIterator]() {
+                  const session_id = 'mock-session';
+                  yield { type: 'system', subtype: 'init', capabilities: [], session_id };
                   const iterator = prompt[Symbol.asyncIterator]();
                   const next = await iterator.next();
                   if (next.done) return;
-                  const session_id = 'mock-session';
                   yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
                   await options.hooks.PreToolUse[0].hooks[0]({
                     hook_event_name: 'PreToolUse',

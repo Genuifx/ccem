@@ -48,7 +48,7 @@ test('ask-user-question panel supports collapse/expand toggle above composer', a
   );
   assert.match(
     nativeView,
-    /\{!isCollapsed \? \([\s\S]*?id=\{`ask-user-body-\$\{entry\.toolUseId\}`\}/,
+    /\{!isCollapsed \? \([\s\S]*?id=\{`ask-user-body-\$\{promptOccurrenceId\}`\}/,
     'Question options and actions should hide while collapsed',
   );
   assert.match(

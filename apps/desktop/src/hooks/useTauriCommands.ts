@@ -1010,6 +1010,7 @@ export function useTauriCommands() {
     images?: NativePromptImageInput[],
     displayText?: string | null,
     annotations?: SessionPromptAnnotation[],
+    clientMessageId?: string | null,
   ): Promise<void> => {
     await invoke('send_native_session_input', {
       runtimeId,
@@ -1017,7 +1018,12 @@ export function useTauriCommands() {
       displayText: displayText ?? null,
       images: images?.length ? images : null,
       annotations: annotations?.length ? annotations : null,
+      clientMessageId: clientMessageId ?? null,
     });
+  }, []);
+
+  const flushNativeSessionInputQueue = useCallback(async (runtimeId: string): Promise<void> => {
+    await invoke('flush_native_session_input_queue', { runtimeId });
   }, []);
 
   const respondNativeSessionPermission = useCallback(async (
@@ -1036,6 +1042,7 @@ export function useTauriCommands() {
     runtimeId: string,
     payload: {
       toolUseId: string;
+      expectedAttentionSeq: number;
       promptType: 'ask_user_question' | 'plan_exit';
       displayText?: string | null;
       answers: Record<string, string>;
@@ -1046,6 +1053,7 @@ export function useTauriCommands() {
     await invoke('respond_native_session_prompt', {
       runtimeId,
       toolUseId: payload.toolUseId,
+      expectedAttentionSeq: payload.expectedAttentionSeq,
       promptType: payload.promptType,
       displayText: payload.displayText ?? null,
       answers: payload.answers,
@@ -1103,10 +1111,12 @@ export function useTauriCommands() {
   const stopNativeSession = useCallback(async (
     runtimeId: string,
     source?: string | null,
+    expectedCommandId?: string | null,
   ): Promise<void> => {
     await invoke('stop_native_session', {
       runtimeId,
       source: source ?? null,
+      expectedCommandId: expectedCommandId ?? null,
     });
   }, []);
 
@@ -1136,10 +1146,16 @@ export function useTauriCommands() {
   const setNativeSessionRuntimePermMode = useCallback(async (
     runtimeId: string,
     runtimePermMode?: string | null,
+    attention?: {
+      toolUseId: string;
+      expectedAttentionSeq: number;
+    },
   ): Promise<void> => {
     await invoke('set_native_session_runtime_perm_mode', {
       runtimeId,
       runtimePermMode: runtimePermMode ?? null,
+      attentionId: attention?.toolUseId ?? null,
+      expectedAttentionSeq: attention?.expectedAttentionSeq ?? null,
     });
   }, []);
 
@@ -1800,6 +1816,7 @@ export function useTauriCommands() {
     listNativeSessions,
     getNativeSessionSummary,
     sendNativeSessionInput,
+    flushNativeSessionInputQueue,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,

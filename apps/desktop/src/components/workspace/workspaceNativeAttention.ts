@@ -13,6 +13,7 @@ export interface PendingPermissionRequest {
 
 export interface PendingInteractivePrompt {
   toolUseId: string;
+  eventSeq: number;
   rawName: string;
   prompt: InteractiveToolPrompt;
 }
@@ -127,11 +128,12 @@ function addInteractivePrompt(
   prompts.set(prompt.toolUseId, prompt);
 }
 
-export function shouldClearPromptOnToolCompletion(
-  prompt: PendingInteractivePrompt | undefined,
-  success: boolean,
-) {
-  return !(isPlanExitPrompt(prompt?.prompt) && !success);
+export function isTerminalInteractiveResponseState(state: string) {
+  return state === 'applied'
+    || state === 'rejected'
+    || state === 'stale'
+    || state.startsWith('stale_')
+    || state === 'resolver_expired';
 }
 
 export function extractAttentionState(events: SessionEventRecord[]): NativeSessionAttentionState {
@@ -147,7 +149,6 @@ export function extractAttentionState(events: SessionEventRecord[]): NativeSessi
             permissions.delete(requestId);
           }
         }
-        prompts.clear();
         break;
       case 'permission_required':
         permissions.set(event.payload.request_id, {
@@ -167,18 +168,20 @@ export function extractAttentionState(events: SessionEventRecord[]): NativeSessi
         if (event.payload.needs_response && event.payload.prompt) {
           addInteractivePrompt(prompts, {
             toolUseId: event.payload.tool_use_id,
+            eventSeq: event.seq,
             rawName: event.payload.raw_name,
             prompt: event.payload.prompt,
           });
         }
         break;
-      case 'tool_use_completed': {
-        const prompt = prompts.get(event.payload.tool_use_id);
-        if (shouldClearPromptOnToolCompletion(prompt, event.payload.success)) {
+      case 'interactive_response_result':
+        if (isTerminalInteractiveResponseState(event.payload.state)) {
+          // The helper receipt is the authority. `applied` resolves the prompt;
+          // rejected/stale receipts invalidate a resolver that can no longer be
+          // answered and must not leave a ghost attention card behind.
           prompts.delete(event.payload.tool_use_id);
         }
         break;
-      }
       case 'terminal_prompt_required':
         terminalPrompt = {
           promptKind: event.payload.prompt_kind,
