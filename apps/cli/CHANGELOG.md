@@ -1,5 +1,11 @@
 # ccem
 
+## 2.75.0
+
+### Minor Changes
+
+- Release v2.75.0: restore desktop Claude turn readiness; build @ccem/core before CLI release tests in CI.
+
 ## 2.74.0
 
 ### Minor Changes
