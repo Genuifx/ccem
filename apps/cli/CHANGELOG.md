@@ -1,5 +1,11 @@
 # ccem
 
+## 2.76.0
+
+### Minor Changes
+
+- Coordinate native session lifecycle and queue handling.
+
 ## 2.75.0
 
 ### Minor Changes
