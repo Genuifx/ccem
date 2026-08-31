@@ -759,8 +759,7 @@ impl TmuxManager {
             .iter()
             .find(|pane| launch_pane_matches_target(pane, launch_target))
         {
-            let retention_target =
-                format!("{}:{}", session_name, retention_window.window_index);
+            let retention_target = format!("{}:{}", session_name, retention_window.window_index);
             if self.target_exists(&retention_target)? {
                 if let Err(error) = self.clear_launch_retention(&retention_target) {
                     if self.target_exists(&retention_target)? {
@@ -811,7 +810,10 @@ impl TmuxManager {
         env_vars: &HashMap<String, String>,
     ) -> Result<TmuxWindowInfo, String> {
         thread::sleep(LAUNCH_TARGET_HEALTHCHECK_DELAY);
-        let session_name = target.split_once(':').map(|(session, _)| session).unwrap_or(target);
+        let session_name = target
+            .split_once(':')
+            .map(|(session, _)| session)
+            .unwrap_or(target);
         let pane_states = match self.launch_pane_states(session_name) {
             Ok(states) if !states.is_empty() => states,
             Ok(_) => {
@@ -888,10 +890,7 @@ impl TmuxManager {
                     )
                 })?;
 
-            return self.inspect_target(&format!(
-                "{}:{}",
-                session_name, live_pane.window_index
-            ));
+            return self.inspect_target(&format!("{}:{}", session_name, live_pane.window_index));
         }
 
         let failed_pane = pane_states
@@ -1413,10 +1412,7 @@ fn read_bounded_pane_capture(
     })
 }
 
-fn redact_sensitive_launch_output(
-    output: &str,
-    env_vars: &HashMap<String, String>,
-) -> String {
+fn redact_sensitive_launch_output(output: &str, env_vars: &HashMap<String, String>) -> String {
     let mut sensitive_values = Vec::new();
     for (key, value) in env_vars {
         if value.is_empty() {
@@ -1457,10 +1453,7 @@ fn is_sensitive_config_content_key(key: &str) -> bool {
     key.to_ascii_uppercase().ends_with("CONFIG_CONTENT")
 }
 
-fn collect_sensitive_json_strings(
-    value: &serde_json::Value,
-    sensitive_values: &mut Vec<String>,
-) {
+fn collect_sensitive_json_strings(value: &serde_json::Value, sensitive_values: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(entries) => {
             for (key, nested) in entries {
@@ -2303,11 +2296,8 @@ mod tests {
 
     #[test]
     fn launch_pane_parser_preserves_text_signal_names() {
-        let pane = parse_launch_pane_line(
-            "ccem-session222",
-            "3|main|0|1||term|1",
-        )
-        .expect("launch pane metadata should parse");
+        let pane = parse_launch_pane_line("ccem-session222", "3|main|0|1||term|1")
+            .expect("launch pane metadata should parse");
 
         assert_eq!(pane.pane_dead_signal.as_deref(), Some("term"));
         assert_eq!(pane.pane_dead_status, None);
@@ -2637,29 +2627,25 @@ mod tests {
             session_name,
             String::from_utf8_lossy(&replacement.stdout).trim()
         );
-        assert!(
-            tmux_command()
-                .expect("tmux command should be available")
-                .args([
-                    "set-option",
-                    "-w",
-                    "-t",
-                    &replacement_target,
-                    "remain-on-exit",
-                    "on",
-                ])
-                .status()
-                .expect("replacement lifecycle setting should apply")
-                .success()
-        );
-        assert!(
-            tmux_command()
-                .expect("tmux command should be available")
-                .args(["kill-window", "-t", &initial_target])
-                .status()
-                .expect("initial launch window should be removed")
-                .success()
-        );
+        assert!(tmux_command()
+            .expect("tmux command should be available")
+            .args([
+                "set-option",
+                "-w",
+                "-t",
+                &replacement_target,
+                "remain-on-exit",
+                "on",
+            ])
+            .status()
+            .expect("replacement lifecycle setting should apply")
+            .success());
+        assert!(tmux_command()
+            .expect("tmux command should be available")
+            .args(["kill-window", "-t", &initial_target])
+            .status()
+            .expect("initial launch window should be removed")
+            .success());
 
         let manager = TmuxManager { session_prefix };
         let live_window = manager
@@ -2758,10 +2744,8 @@ mod tests {
 
     #[test]
     fn launch_diagnostics_keep_only_the_bounded_output_tail() {
-        let path = std::env::temp_dir().join(format!(
-            "ccem-bounded-pane-test-{}.log",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ccem-bounded-pane-test-{}.log", std::process::id()));
         let mut payload = vec![b'x'; 70_000];
         payload.extend_from_slice(b"diagnostic-tail");
         std::fs::write(&path, payload).expect("write oversized pane fixture");

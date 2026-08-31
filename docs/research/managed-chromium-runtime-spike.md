@@ -115,7 +115,8 @@ The future preparation manager must keep these proof states separate:
 Build Mode 2 behind a backend interface rather than widening Preview Browser internals:
 
 - Runtime manager: prepare, inspect readiness, launch, stop, reap, update, reset.
-- Profile manager: one app-owned profile per workspace/profile id; never point at a user Chrome profile.
+- Profile manager: one app-global Default profile shared across workspaces plus app-owned Explicit New
+  profiles isolated to their owner workspace; never point at a user Chrome profile.
 - CDP adapter: private pipe only; CDP objects remain internal.
 - Semantic capabilities: open, navigate, snapshot, screenshot, click, type, wait, console, network log.
 - Policy gate: origin authorization and permission checks before every capability.
@@ -123,4 +124,6 @@ Build Mode 2 behind a backend interface rather than widening Preview Browser int
 - Audit: record policy decision before action and bounded result after action.
 - Control: exact visible session, pause within one second, hot permission changes, and cancellation tokens.
 
-Before calling Mode 2 ready, re-run the full spike against the exact pinned CfT archive on mac-arm64, mac-x64, Windows, and Linux, then add persistent-profile isolation and restart tests.
+Before calling Mode 2 ready, re-run the full spike against the exact pinned CfT archive on mac-arm64,
+mac-x64, Windows, and Linux, then add app-global Default sharing, Explicit New isolation, and restart
+tests.

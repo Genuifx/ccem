@@ -287,7 +287,9 @@ impl UnifiedSessionManager {
             .summary(runtime_id)
             .is_some()
         {
-            return self.interactive_runtime_manager.attention_summary(runtime_id);
+            return self
+                .interactive_runtime_manager
+                .attention_summary(runtime_id);
         }
 
         Err(format!("Unified session not found: {}", runtime_id))
@@ -342,9 +344,7 @@ impl UnifiedSessionManager {
             // Native runtimes stream through their own event log and never
             // attach a desktop output channel.
             RuntimeKind::Native => {
-                return Err(
-                    "Native runtimes do not attach desktop output channels".to_string(),
-                );
+                return Err("Native runtimes do not attach desktop output channels".to_string());
             }
         };
 

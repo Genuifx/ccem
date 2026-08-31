@@ -1,24 +1,38 @@
+mod alias;
 mod artifacts;
-#[cfg(all(unix, any(test, feature = "chromium-spike")))]
+mod bootstrap;
+#[cfg(all(unix, feature = "chromium-spike"))]
 mod chromium_spike;
+pub(crate) mod commands;
+pub(crate) mod login;
 mod logs;
 mod policy;
 mod registry;
-mod runtime_readiness;
+mod runtime;
+#[cfg(test)]
+pub(crate) mod runtime_commands;
+mod surface_coordinator;
+#[cfg(test)]
+mod tests;
 mod tools;
 mod url;
 mod webview;
 
+use alias::{BrowserSessionAliasRegistry, BrowserSessionAliasRoute};
 use artifacts::BrowserArtifactStore;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) use bootstrap::create_cef_host_controller;
+pub(crate) use bootstrap::{
+    create_login_browser_session_manager, create_login_browser_surface_manager,
+};
 use logs::BrowserLogStore;
 pub use logs::BrowserRecentActivity;
 pub(crate) use policy::authorize_browser_tool;
-pub use runtime_readiness::BrowserRuntimeReadiness;
 use registry::{BrowserSessionRegistry, BrowserSessionState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(target_os = "macos")]
@@ -28,6 +42,8 @@ use webview::{
     apply_browser_bounds, ensure_browser_webview, eval_webview_js, navigate_browser_history,
     probe_webview_health, require_browser_webview, snapshot_webview_png,
 };
+
+pub use alias::BrowserSessionAliasLease;
 
 pub const BROWSER_LABEL: &str = "ccem-browser";
 
@@ -135,6 +151,8 @@ struct BrowserPageMetadata {
 
 pub struct BrowserManager {
     registry: Arc<BrowserSessionRegistry>,
+    aliases: BrowserSessionAliasRegistry,
+    alias_operation_gate: Mutex<()>,
     artifacts: Arc<BrowserArtifactStore>,
     logs: Arc<BrowserLogStore>,
 }
@@ -143,6 +161,8 @@ impl Default for BrowserManager {
     fn default() -> Self {
         Self {
             registry: Arc::new(BrowserSessionRegistry::new(DEFAULT_BROWSER_SESSION_ID)),
+            aliases: BrowserSessionAliasRegistry::default(),
+            alias_operation_gate: Mutex::new(()),
             artifacts: Arc::new(BrowserArtifactStore::default()),
             logs: Arc::new(BrowserLogStore::default()),
         }
@@ -150,19 +170,276 @@ impl Default for BrowserManager {
 }
 
 impl BrowserManager {
+    pub fn bind_preview_alias(
+        &self,
+        alias_session_id: &str,
+        session_id: &str,
+    ) -> Result<BrowserSessionAliasLease, String> {
+        let _routing = self.alias_operation()?;
+        self.bind_preview_alias_locked(alias_session_id, session_id)
+    }
+
+    fn bind_preview_alias_locked(
+        &self,
+        alias_session_id: &str,
+        session_id: &str,
+    ) -> Result<BrowserSessionAliasLease, String> {
+        let session = self
+            .registry
+            .snapshot(session_id)?
+            .ok_or_else(|| format!("Preview Browser session {session_id} is not registered"))?;
+        let (lease, replaced) =
+            self.aliases
+                .bind(alias_session_id, &session.session_id, session.generation)?;
+        if let Some(replaced) = replaced {
+            self.registry
+                .invalidate_alias_route(&replaced.session_id, replaced.generation)?;
+        }
+        Ok(lease)
+    }
+
+    pub fn unbind_preview_alias(
+        &self,
+        alias_session_id: &str,
+        binding_id: u64,
+    ) -> Result<(), String> {
+        let _routing = self.alias_operation()?;
+        if let Some(removed) = self.aliases.unbind(alias_session_id, binding_id)? {
+            self.registry
+                .invalidate_alias_route(&removed.session_id, removed.generation)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve_preview_session_id(&self, requested: &str) -> Result<String, String> {
+        let _routing = self.alias_operation()?;
+        self.resolve_preview_session_id_locked(requested)
+    }
+
+    fn resolve_preview_session_id_locked(&self, requested: &str) -> Result<String, String> {
+        self.aliases
+            .resolve(requested, |session_id| {
+                self.registry
+                    .snapshot(session_id)
+                    .map(|session| session.map(|session| session.generation))
+            })
+            .map(|resolved| resolved.unwrap_or_else(|| requested.to_string()))
+    }
+
+    fn capture_preview_route_locked(
+        &self,
+        requested: &str,
+    ) -> Result<BrowserSessionAliasRoute, String> {
+        let snapshot = self.aliases.current(requested, |session_id| {
+            self.registry
+                .snapshot(session_id)
+                .map(|session| session.map(|session| session.generation))
+        })?;
+        Ok(BrowserSessionAliasRoute::new(requested, snapshot))
+    }
+
+    fn resolve_preview_route_locked(
+        &self,
+        route: &mut BrowserSessionAliasRoute,
+    ) -> Result<String, String> {
+        if route.adopted.is_none() {
+            if let Some((session_id, generation)) = route.provisional.as_ref() {
+                let current_generation = self
+                    .registry
+                    .snapshot(session_id)?
+                    .map(|session| session.generation);
+                if current_generation != Some(*generation) {
+                    return Err(stale_preview_route_error());
+                }
+            }
+        }
+
+        let current = self
+            .aliases
+            .current(&route.requested_session_id, |session_id| {
+                self.registry
+                    .snapshot(session_id)
+                    .map(|session| session.map(|session| session.generation))
+            })?;
+        if let Some(adopted) = route.adopted.as_ref() {
+            if current.lease.as_ref() != Some(adopted)
+                || route.adopted_revision != Some(current.revision)
+            {
+                return Err(stale_preview_route_error());
+            }
+            return Ok(adopted.session_id.clone());
+        }
+
+        if current.revision == route.captured_revision {
+            if current.lease.is_some() {
+                return Err(stale_preview_route_error());
+            }
+        } else if Some(current.revision) == route.captured_revision.checked_add(1) {
+            let Some(current_lease) = current.lease else {
+                return Err(stale_preview_route_error());
+            };
+            let session_id = current_lease.session_id.clone();
+            route.adopted = Some(current_lease);
+            route.adopted_revision = Some(current.revision);
+            return Ok(session_id);
+        } else {
+            return Err(stale_preview_route_error());
+        }
+
+        route
+            .provisional
+            .as_ref()
+            .map(|(session_id, _)| session_id.clone())
+            .ok_or_else(stale_preview_route_error)
+    }
+
+    fn preview_route_session_locked(
+        &self,
+        route: &mut BrowserSessionAliasRoute,
+    ) -> Result<BrowserSessionState, String> {
+        let session_id = self.resolve_preview_route_locked(route)?;
+        let expected_generation = route
+            .adopted
+            .as_ref()
+            .map(|lease| lease.generation)
+            .or_else(|| {
+                route
+                    .provisional
+                    .as_ref()
+                    .filter(|(provisional_session_id, _)| provisional_session_id == &session_id)
+                    .map(|(_, generation)| *generation)
+            })
+            .ok_or_else(stale_preview_route_error)?;
+        self.registry
+            .snapshot(&session_id)?
+            .filter(|session| session.generation == expected_generation)
+            .ok_or_else(stale_preview_route_error)
+    }
+
+    fn alias_operation(&self) -> Result<MutexGuard<'_, ()>, String> {
+        self.alias_operation_gate
+            .lock()
+            .map_err(|_| "Preview Browser alias operation gate is unavailable.".to_string())
+    }
+
+    pub fn open_with_visibility_and_alias(
+        &self,
+        app: &AppHandle,
+        session_id: Option<&str>,
+        url: Option<&str>,
+        visible: bool,
+        alias_session_id: Option<&str>,
+    ) -> Result<(BrowserInfo, Option<BrowserSessionAliasLease>), String> {
+        let _routing = self.alias_operation()?;
+        let info = self.open_with_visibility(app, session_id, url, visible)?;
+        let alias_lease = if let Some(alias_session_id) = alias_session_id
+            .map(str::trim)
+            .filter(|alias_session_id| !alias_session_id.is_empty())
+        {
+            Some(self.bind_preview_alias_locked(alias_session_id, &info.session_id)?)
+        } else {
+            None
+        };
+        Ok((info, alias_lease))
+    }
+
+    fn with_preview_surface_slot<T>(
+        &self,
+        app: &AppHandle,
+        preview_session_id: &str,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let surface =
+                app.try_state::<Arc<login::surface_commands::LoginBrowserSurfaceManager>>();
+            let sessions = app.try_state::<Arc<login::session::LoginBrowserSessionManager>>();
+            let cef_host = app.try_state::<Arc<login::cef::host::CefHostController>>();
+            if let (Some(surface), Some(sessions), Some(cef_host)) = (surface, sessions, cef_host) {
+                return surface.with_preview_surface_slot(
+                    app,
+                    sessions.inner().as_ref(),
+                    cef_host.inner().as_ref(),
+                    preview_session_id,
+                    operation,
+                );
+            }
+        }
+
+        operation()
+    }
+
+    /// Workspace visibility is globally ordered with Login CEF presentation. The value is
+    /// supplied by the Workspace owner change and applies to both Preview hide/show mutations.
+    /// A stale call intentionally performs no Preview registry or webview mutation.
+    fn with_preview_presentation_epoch<T>(
+        &self,
+        app: &AppHandle,
+        presentation_revision: Option<u64>,
+        preview_session_id: &str,
+        preview_will_be_visible: bool,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let presentation_revision = presentation_revision
+                .filter(|revision| *revision > 0)
+                .ok_or_else(|| {
+                    "Preview visibility requires a positive presentation revision.".to_string()
+                })?;
+            let surface =
+                app.try_state::<Arc<login::surface_commands::LoginBrowserSurfaceManager>>();
+            let sessions = app.try_state::<Arc<login::session::LoginBrowserSessionManager>>();
+            let cef_host = app.try_state::<Arc<login::cef::host::CefHostController>>();
+            if let (Some(surface), Some(sessions), Some(cef_host)) = (surface, sessions, cef_host) {
+                return surface.with_preview_presentation_epoch(
+                    app,
+                    sessions.inner().as_ref(),
+                    cef_host.inner().as_ref(),
+                    presentation_revision,
+                    preview_session_id,
+                    preview_will_be_visible,
+                    operation,
+                );
+            }
+        }
+
+        operation().map(Some)
+    }
+
+    pub(crate) fn hide_all(&self, app: &AppHandle) -> Result<(), String> {
+        let sessions = self.registry.snapshots()?;
+        for session in sessions {
+            let state = self.registry.set_visible(&session.session_id, false)?;
+            emit_browser_state(app, &state, "native_surface_superseded");
+        }
+        self.sync_webview_visibility(app)
+    }
+
     pub fn set_active_session(
         &self,
         app: &AppHandle,
         session_id: Option<&str>,
         visible: bool,
+        presentation_revision: Option<u64>,
     ) -> Result<(), String> {
         let session_id = normalize_browser_session_id(session_id);
         self.session_snapshot(&session_id)?;
-        self.registry.set_active_session(&session_id)?;
-        let state = self.registry.set_visible(&session_id, visible)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_state(app, &state, "active_session");
-        Ok(())
+        let apply = || {
+            self.registry.set_active_session(&session_id)?;
+            let state = self.registry.set_visible(&session_id, visible)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_state(app, &state, "active_session");
+            Ok(())
+        };
+        self.with_preview_presentation_epoch(
+            app,
+            presentation_revision,
+            &session_id,
+            visible,
+            apply,
+        )
+        .map(|_| ())
     }
 
     pub fn open(
@@ -171,14 +448,24 @@ impl BrowserManager {
         session_id: Option<&str>,
         url: Option<&str>,
     ) -> Result<BrowserInfo, String> {
+        self.open_with_visibility(app, session_id, url, true)
+    }
+
+    pub fn open_with_visibility(
+        &self,
+        app: &AppHandle,
+        session_id: Option<&str>,
+        url: Option<&str>,
+        visible: bool,
+    ) -> Result<BrowserInfo, String> {
         let session_id = normalize_browser_session_id(session_id);
         let requested = url.map(str::trim).filter(|value| !value.is_empty());
         let parsed_requested = requested.map(parse_browser_url).transpose()?;
-        let target = parsed_requested
+        let target_url = parsed_requested
             .as_ref()
             .map(|value| value.as_str())
-            .unwrap_or(DEFAULT_BROWSER_URL);
-        let target_url = target.to_string();
+            .unwrap_or(DEFAULT_BROWSER_URL)
+            .to_string();
         let mut session = self.session_snapshot(&session_id)?;
         let mut existed = app.get_webview(&session.label).is_some();
         if session.lifecycle == BrowserLifecycleState::Crashed {
@@ -192,43 +479,77 @@ impl BrowserManager {
             existed = false;
         }
         if !existed || parsed_requested.is_some() {
-            let (state, _) = self.registry.mark_navigation(&session_id, target_url)?;
+            let (state, _) = self
+                .registry
+                .mark_navigation(&session_id, target_url.clone())?;
             emit_browser_state(app, &state, "navigation_requested");
         }
-        let webview = ensure_browser_webview(
-            app,
-            Arc::clone(&self.registry),
-            &session.session_id,
-            &session.label,
-            session.generation,
-            target,
-        )
-        .map_err(|error| self.record_browser_error(app, &session_id, error))?;
-        if existed {
-            if let Some(parsed) = parsed_requested {
-                webview.navigate(parsed).map_err(|error| {
+        if !visible {
+            let state = self.registry.set_visible(&session_id, false)?;
+            self.sync_webview_visibility(app)?;
+            if let Some(webview) = app.get_webview(&session.label) {
+                webview.hide().map_err(|error| {
                     self.record_browser_error(
                         app,
                         &session_id,
-                        format!("navigate browser webview: {error}"),
+                        format!("hide browser webview before hidden open: {error}"),
                     )
                 })?;
+                if let Some(parsed) = parsed_requested.as_ref() {
+                    webview.navigate(parsed.clone()).map_err(|error| {
+                        self.record_browser_error(
+                            app,
+                            &session_id,
+                            format!("navigate hidden browser webview: {error}"),
+                        )
+                    })?;
+                }
+                apply_browser_bounds(&webview, session.bounds)?;
             }
+            // Hidden open is an absolute no-create path. If the child is absent
+            // or disappears at any point, only a later explicit reveal may
+            // attach its replacement.
+            emit_browser_state(app, &state, "opened_hidden");
+            return self.info(app, Some(&session_id));
         }
-        apply_browser_bounds(&webview, session.bounds)?;
-        let state = self.registry.set_visible(&session_id, true)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_opened(
-            app,
-            &session_id,
-            &session.label,
-            if session.control == BrowserControlState::Agent {
-                "agent_reveal"
-            } else {
-                "ui_open"
-            },
-        );
-        emit_browser_state(app, &state, "opened");
+        self.with_preview_surface_slot(app, &session_id, || {
+            let webview = ensure_browser_webview(
+                app,
+                Arc::clone(&self.registry),
+                &session.session_id,
+                &session.label,
+                session.generation,
+                &target_url,
+                true,
+            )
+            .map_err(|error| self.record_browser_error(app, &session_id, error))?;
+            if existed {
+                if let Some(parsed) = parsed_requested {
+                    webview.navigate(parsed).map_err(|error| {
+                        self.record_browser_error(
+                            app,
+                            &session_id,
+                            format!("navigate browser webview: {error}"),
+                        )
+                    })?;
+                }
+            }
+            apply_browser_bounds(&webview, session.bounds)?;
+            let state = self.registry.set_visible(&session_id, true)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_opened(
+                app,
+                &session_id,
+                &session.label,
+                if session.control == BrowserControlState::Agent {
+                    "agent_reveal"
+                } else {
+                    "ui_open"
+                },
+            );
+            emit_browser_state(app, &state, "opened");
+            Ok(())
+        })?;
         self.info(app, Some(&session_id))
     }
 
@@ -253,34 +574,88 @@ impl BrowserManager {
         app: &AppHandle,
         session_id: Option<&str>,
         visible: bool,
+        presentation_revision: Option<u64>,
     ) -> Result<(), String> {
         let session_id = normalize_browser_session_id(session_id);
-        self.session_snapshot(&session_id)?;
-        let state = self.registry.set_visible(&session_id, visible)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_state(app, &state, if visible { "shown" } else { "hidden" });
-        Ok(())
+        let session = self.session_snapshot(&session_id)?;
+        let apply = || {
+            if visible && app.get_webview(&session.label).is_none() {
+                let target = session
+                    .current_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_BROWSER_URL);
+                let webview = ensure_browser_webview(
+                    app,
+                    Arc::clone(&self.registry),
+                    &session.session_id,
+                    &session.label,
+                    session.generation,
+                    target,
+                    true,
+                )
+                .map_err(|error| self.record_browser_error(app, &session_id, error))?;
+                apply_browser_bounds(&webview, session.bounds)?;
+            }
+            let state = self.registry.set_visible(&session_id, visible)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_state(app, &state, if visible { "shown" } else { "hidden" });
+            Ok(())
+        };
+        self.with_preview_presentation_epoch(
+            app,
+            presentation_revision,
+            &session_id,
+            visible,
+            apply,
+        )
+        .map(|_| ())
     }
 
     pub fn close(&self, app: &AppHandle, session_id: Option<&str>) -> Result<(), String> {
-        let session_id = normalize_browser_session_id(session_id);
-        let Some(session) = self.registry.snapshot(&session_id)? else {
-            return Ok(());
+        let requested_session_id = normalize_browser_session_id(session_id);
+        let (session, actor) = {
+            let _routing = self.alias_operation()?;
+            let session_id = self.resolve_preview_session_id_locked(&requested_session_id)?;
+            let Some(session) = self.registry.snapshot(&session_id)? else {
+                return Ok(());
+            };
+            let actor = self.registry.actor(&session.session_id)?;
+            (session, actor)
         };
-        if let Some(workspace_dir) = session.workspace_dir.as_deref() {
-            let _ = self.drain_console_log(app, &session_id, workspace_dir);
+        // Do not hold the alias gate while waiting for an already-entered Agent effect. Once the
+        // physical actor is ours, revalidate the exact route/generation and keep only the short
+        // webview-close/remove critical section under the gate.
+        let _permit = actor.lock().map_err(|_| {
+            format!(
+                "Browser session {} actor is unavailable",
+                session.session_id
+            )
+        })?;
+        let _routing = self.alias_operation()?;
+        let current_session_id = self.resolve_preview_session_id_locked(&requested_session_id)?;
+        let current_generation = self
+            .registry
+            .snapshot(&current_session_id)?
+            .map(|current| current.generation);
+        if current_session_id != session.session_id
+            || current_generation != Some(session.generation)
+        {
+            return Err(stale_preview_route_error());
         }
-        let close_result = if let Some(webview) = app.get_webview(&session.label) {
+        if let Some(workspace_dir) = session.workspace_dir.as_deref() {
+            let _ = self.drain_console_log(app, &session.session_id, workspace_dir);
+        }
+        if let Some(webview) = app.get_webview(&session.label) {
             webview
                 .close()
-                .map_err(|error| format!("close browser webview: {error}"))
-        } else {
-            Ok(())
-        };
-        if let Some(destroyed) = self.registry.remove(&session_id)? {
+                .map_err(|error| format!("close browser webview: {error}"))?;
+        }
+        if let Some(destroyed) = self.registry.remove(&session.session_id)? {
             emit_browser_state(app, &destroyed, "destroyed");
         }
-        close_result
+        self.aliases
+            .remove_session(&session.session_id, session.generation)?;
+        Ok(())
     }
 
     pub fn navigate(
@@ -295,39 +670,43 @@ impl BrowserManager {
         let session = self.session_snapshot(&session_id)?;
         let (state, _) = self.registry.mark_navigation(&session_id, next_url)?;
         emit_browser_state(app, &state, "navigation_requested");
-        let webview = match app.get_webview(&session.label) {
-            Some(webview) => Ok(webview),
-            None => ensure_browser_webview(
-                app,
-                Arc::clone(&self.registry),
-                &session.session_id,
-                &session.label,
-                session.generation,
-                parsed.as_str(),
-            ),
-        }
-        .map_err(|error| self.record_browser_error(app, &session_id, error))?;
-        webview.navigate(parsed).map_err(|error| {
-            self.record_browser_error(
+        self.with_preview_surface_slot(app, &session_id, || {
+            let webview = match app.get_webview(&session.label) {
+                Some(webview) => Ok(webview),
+                None => ensure_browser_webview(
+                    app,
+                    Arc::clone(&self.registry),
+                    &session.session_id,
+                    &session.label,
+                    session.generation,
+                    parsed.as_str(),
+                    true,
+                ),
+            }
+            .map_err(|error| self.record_browser_error(app, &session_id, error))?;
+            webview.navigate(parsed).map_err(|error| {
+                self.record_browser_error(
+                    app,
+                    &session_id,
+                    format!("navigate browser webview: {error}"),
+                )
+            })?;
+            apply_browser_bounds(&webview, session.bounds)?;
+            let state = self.registry.set_visible(&session_id, true)?;
+            self.sync_webview_visibility(app)?;
+            emit_browser_opened(
                 app,
                 &session_id,
-                format!("navigate browser webview: {error}"),
-            )
+                &session.label,
+                if session.control == BrowserControlState::Agent {
+                    "agent_reveal"
+                } else {
+                    "navigation"
+                },
+            );
+            emit_browser_state(app, &state, "shown");
+            Ok(())
         })?;
-        apply_browser_bounds(&webview, session.bounds)?;
-        let state = self.registry.set_visible(&session_id, true)?;
-        self.sync_webview_visibility(app)?;
-        emit_browser_opened(
-            app,
-            &session_id,
-            &session.label,
-            if session.control == BrowserControlState::Agent {
-                "agent_reveal"
-            } else {
-                "navigation"
-            },
-        );
-        emit_browser_state(app, &state, "shown");
         self.info(app, Some(&session_id))
     }
 
@@ -478,11 +857,40 @@ impl BrowserManager {
         self.info_from_state(state, webview_exists)
     }
 
-    pub fn policy_changed(&self, app: &AppHandle, session_id: &str) -> Result<(), String> {
-        let Some(_) = self.registry.snapshot(session_id)? else {
+    fn retire_agent_control_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<BrowserSessionState>, String> {
+        let _routing = self.alias_operation()?;
+        let session_id = self.resolve_preview_session_id_locked(session_id)?;
+        if self.registry.snapshot(&session_id)?.is_none() {
+            return Ok(None);
+        }
+        self.registry.set_paused(&session_id, true).map(Some)
+    }
+
+    pub fn retire_agent_control(&self, app: &AppHandle, session_id: &str) -> Result<bool, String> {
+        let Some(state) = self.retire_agent_control_state(session_id)? else {
+            return Ok(false);
+        };
+        emit_browser_state(app, &state, "runtime_agent_control_retired");
+        Ok(true)
+    }
+
+    pub fn policy_changed(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        permission_revision: u64,
+    ) -> Result<(), String> {
+        let _routing = self.alias_operation()?;
+        let session_id = self.resolve_preview_session_id_locked(session_id)?;
+        let Some(_) = self.registry.snapshot(&session_id)? else {
             return Ok(());
         };
-        let state = self.registry.bump_policy_epoch(session_id)?;
+        let state = self
+            .registry
+            .bump_permission_epoch(&session_id, permission_revision)?;
         emit_browser_state(app, &state, "permission_mode_changed");
         Ok(())
     }
@@ -594,192 +1002,6 @@ impl BrowserManager {
     }
 }
 
-#[tauri::command]
-pub fn browser_set_active_session(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    visible: Option<bool>,
-) -> Result<(), String> {
-    state.set_active_session(&app, session_id.as_deref(), visible.unwrap_or(false))
-}
-
-#[tauri::command]
-pub fn browser_open(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    url: Option<String>,
-) -> Result<BrowserInfo, String> {
-    state.open(&app, session_id.as_deref(), url.as_deref())
-}
-
-#[tauri::command]
-pub fn browser_set_bounds(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    state.set_bounds(
-        &app,
-        session_id.as_deref(),
-        BrowserBounds {
-            x,
-            y,
-            width,
-            height,
-        },
-    )
-}
-
-#[tauri::command]
-pub fn browser_set_visible(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    visible: bool,
-) -> Result<(), String> {
-    state.set_visible(&app, session_id.as_deref(), visible)
-}
-
-#[tauri::command]
-pub fn browser_close(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<(), String> {
-    state.close(&app, session_id.as_deref())
-}
-
-#[tauri::command]
-pub fn browser_navigate(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    url: String,
-) -> Result<BrowserInfo, String> {
-    state.navigate(&app, session_id.as_deref(), &url)
-}
-
-#[tauri::command]
-pub fn browser_reload(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    state.reload(&app, session_id.as_deref())
-}
-
-async fn run_blocking_browser_command<T, F>(
-    app: AppHandle,
-    state: std::sync::Arc<BrowserManager>,
-    command: F,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce(std::sync::Arc<BrowserManager>, AppHandle) -> Result<T, String> + Send + 'static,
-{
-    tauri::async_runtime::spawn_blocking(move || command(state, app))
-        .await
-        .map_err(|error| format!("join browser command: {error}"))?
-}
-
-#[tauri::command]
-pub async fn browser_back(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.back(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn browser_forward(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.forward(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_info(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    state.info(&app, session_id.as_deref())
-}
-
-#[tauri::command]
-pub async fn browser_health_check(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserInfo, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.health_check(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn browser_set_paused(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-    paused: bool,
-) -> Result<BrowserInfo, String> {
-    state.set_paused(&app, session_id.as_deref(), paused)
-}
-
-#[tauri::command]
-pub fn browser_recent_activity(
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<BrowserRecentActivity, String> {
-    state.recent_activity(&normalize_browser_session_id(session_id.as_deref()))
-}
-
-#[tauri::command]
-pub fn browser_runtime_readiness() -> BrowserRuntimeReadiness {
-    runtime_readiness::runtime_readiness()
-}
-
-#[tauri::command]
-pub async fn browser_snapshot(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<Value, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.snapshot(&app, session_id.as_deref())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn browser_screenshot(
-    app: AppHandle,
-    state: tauri::State<'_, std::sync::Arc<BrowserManager>>,
-    session_id: Option<String>,
-) -> Result<String, String> {
-    run_blocking_browser_command(app, state.inner().clone(), move |state, app| {
-        state.screenshot_base64(&app, session_id.as_deref())
-    })
-    .await
-}
-
 fn sanitize_bounds(bounds: BrowserBounds) -> BrowserBounds {
     BrowserBounds {
         x: bounds.x.max(0.0),
@@ -794,6 +1016,10 @@ fn normalize_browser_session_id(raw: Option<&str>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_BROWSER_SESSION_ID)
         .to_string()
+}
+
+fn stale_preview_route_error() -> String {
+    "Browser action was cancelled because its Preview Browser instance changed.".to_string()
 }
 
 fn stable_hash64(seed: u64, value: &str) -> u64 {
@@ -815,52 +1041,6 @@ fn browser_label_for_session_id(session_id: &str, generation: u64) -> String {
     )
 }
 
-fn required_string_arg(args: &Value, key: &str) -> Result<String, String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("Missing browser tool string arg: {key}"))
-}
-
-fn required_u32_arg(args: &Value, key: &str) -> Result<u32, String> {
-    let value = args
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("Missing browser tool numeric arg: {key}"))?;
-    u32::try_from(value).map_err(|_| format!("Browser tool arg out of range: {key}"))
-}
-
-fn decode_eval_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
-}
-
-fn decode_eval_json_string(raw: &str) -> Result<String, String> {
-    match serde_json::from_str::<Value>(raw)
-        .map_err(|error| format!("decode browser eval: {error}"))?
-    {
-        Value::String(value) => Ok(value),
-        other => Ok(other.to_string()),
-    }
-}
-
-fn build_eval_json_script(expression: &str) -> Result<String, String> {
-    Ok(format!(
-        r#"
-(() => {{
-  try {{
-    const value = (
-{expression}
-    );
-    return JSON.stringify(value === undefined ? null : value);
-  }} catch (error) {{
-    return JSON.stringify({{ ok: false, error: String(error && error.message || error) }});
-  }}
-}})()
-"#
-    ))
-}
-
 fn emit_browser_opened(app: &AppHandle, session_id: &str, label: &str, cause: &str) {
     let _ = app.emit(
         "browser_panel_requested",
@@ -868,6 +1048,23 @@ fn emit_browser_opened(app: &AppHandle, session_id: &str, label: &str, cause: &s
             "label": label,
             "sessionId": session_id,
             "cause": cause,
+        }),
+    );
+}
+
+fn emit_browser_opened_for_agent(
+    app: &AppHandle,
+    session_id: &str,
+    agent_session_id: &str,
+    label: &str,
+) {
+    let _ = app.emit(
+        "browser_panel_requested",
+        json!({
+            "label": label,
+            "sessionId": session_id,
+            "agentSessionId": agent_session_id,
+            "cause": "agent_reveal",
         }),
     );
 }
@@ -895,69 +1092,4 @@ fn emit_browser_state(app: &AppHandle, state: &BrowserSessionState, cause: &str)
             "cause": cause,
         }),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        browser_label_for_session_id, build_eval_json_script, normalize_browser_session_id,
-        sanitize_bounds, BrowserBounds, BROWSER_LABEL, DEFAULT_BROWSER_SESSION_ID,
-    };
-
-    #[test]
-    fn sanitize_bounds_keeps_browser_renderable() {
-        let bounds = sanitize_bounds(BrowserBounds {
-            x: -10.0,
-            y: -4.0,
-            width: 0.0,
-            height: -1.0,
-        });
-        assert_eq!(bounds.x, 0.0);
-        assert_eq!(bounds.y, 0.0);
-        assert_eq!(bounds.width, 1.0);
-        assert_eq!(bounds.height, 1.0);
-    }
-
-    #[test]
-    fn build_eval_json_script_runs_without_page_eval() {
-        let script = build_eval_json_script(
-            r#"
-            (() => {
-              window.scrollBy(0, 100);
-              return { ok: true };
-            })()
-            "#,
-        )
-        .expect("script");
-        assert!(!script.contains("eval("));
-        assert!(script.contains("window.scrollBy"));
-        assert!(script.contains("JSON.stringify"));
-    }
-
-    #[test]
-    fn browser_session_ids_default_to_workspace() {
-        assert_eq!(
-            normalize_browser_session_id(None),
-            DEFAULT_BROWSER_SESSION_ID.to_string()
-        );
-        assert_eq!(
-            normalize_browser_session_id(Some("  ")),
-            DEFAULT_BROWSER_SESSION_ID.to_string()
-        );
-        assert_eq!(normalize_browser_session_id(Some("native-a")), "native-a");
-    }
-
-    #[test]
-    fn browser_labels_are_scoped_per_session() {
-        assert_eq!(
-            browser_label_for_session_id(DEFAULT_BROWSER_SESSION_ID, 7),
-            format!("{BROWSER_LABEL}-g7")
-        );
-        let first = browser_label_for_session_id("native-a", 1);
-        let second = browser_label_for_session_id("native-b", 1);
-        assert!(first.starts_with(&format!("{BROWSER_LABEL}-")));
-        assert!(second.starts_with(&format!("{BROWSER_LABEL}-")));
-        assert_ne!(first, second);
-        assert_ne!(first, browser_label_for_session_id("native-a", 2));
-    }
 }

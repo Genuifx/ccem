@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
-test('workspace browser renders as a sidebar sibling of the workspace column', async () => {
+test('workspace browser renders as a retained sidebar sibling of the workspace column', async () => {
   const workspaceSource = await fs.readFile(
     path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'),
     'utf8',
@@ -20,80 +20,61 @@ test('workspace browser renders as a sidebar sibling of the workspace column', a
   assert.match(workspaceSource, /ref=\{browserLayoutRef\}/);
   assert.match(workspaceSource, /data-ccem-workspace-column="true"/);
   assert.match(workspaceSource, /data-ccem-workspace-shell="true"/);
-  assert.match(workspaceSource, /browserOpenBySessionId/);
+  assert.match(workspaceSource, /browserTargetBySessionId/);
   assert.match(workspaceSource, /const activeBrowserSessionId = useMemo/);
-  assert.match(workspaceSource, /workspaceMode === 'live' && activeLiveEntry[\s\S]*activeLiveEntry\.session\.runtime_id/);
-  assert.match(workspaceSource, /const browserPanelOpen = browserOpenBySessionId\[activeBrowserSessionId\] \?\? false/);
-  assert.match(workspaceSource, /browser_set_active_session/);
+  assert.match(workspaceSource, /const activeBrowserTarget = browserTargetBySessionId\[activeBrowserSessionId\] \?\? null/);
+  assert.match(workspaceSource, /const activeVisibleBrowserTarget = isBrowserPanelTargetVisible\(activeBrowserTarget\)/);
+  assert.match(workspaceSource, /const browserPanelOpen = activeVisibleBrowserTarget !== null/);
   assert.match(
     workspaceSource,
-    /browser_panel_requested[\s\S]*cause !== 'agent_reveal'[\s\S]*return/,
+    /<WorkspaceStatusStrip[\s\S]*browserOpen=\{browserPanelOpen\}[\s\S]*onToggleBrowser=\{\(\) => toggleActiveBrowser\(skillsContext\.workingDir\)\}/,
   );
-  assert.match(workspaceSource, /<WorkspaceStatusStrip[\s\S]*browserOpen=\{browserPanelOpen\}[\s\S]*onToggleBrowser=\{\(\) => setActiveBrowserPanelOpen\(\(open\) => !open\)\}/);
   assert.match(
     workspaceSource,
     /className="workspace-main-container flex min-h-0 min-w-0 flex-1 overflow-hidden"/,
   );
-  assert.doesNotMatch(workspaceSource, /data-ccem-workspace-browser-left/);
-  assert.doesNotMatch(
-    workspaceSource,
-    /className="workspace-main-container mx-3 mb-3 flex min-h-0 flex-1 overflow-hidden"/,
-  );
-  assert.doesNotMatch(
-    workspaceSource,
-    /data-ccem-workspace-browser-layout=[\s\S]{0,180}className="mx-3 mb-3 flex/,
-  );
-  assert.doesNotMatch(workspaceSource, /renderBrowserAction/);
-  assert.doesNotMatch(workspaceSource, /browserAction=\{/);
+  assert.doesNotMatch(workspaceSource, /browser_panel_requested|browser_set_active_session/);
 
   const layoutIndex = workspaceSource.indexOf('data-ccem-workspace-browser-layout');
   const columnIndex = workspaceSource.indexOf('data-ccem-workspace-column="true"', layoutIndex);
   const statusStripIndex = workspaceSource.indexOf('<WorkspaceStatusStrip', columnIndex);
   const shellIndex = workspaceSource.indexOf('data-ccem-workspace-shell="true"', columnIndex);
-  const siblingBrowserConditionalIndex = workspaceSource.indexOf(
-    '\n        {browserPanelOpen ? (',
+  const siblingBrowserTargetMapIndex = workspaceSource.indexOf(
+    '\n        {Object.entries(browserTargetBySessionId).map',
     columnIndex,
   );
-  const browserPanelIndex = workspaceSource.indexOf('<BrowserPanel', siblingBrowserConditionalIndex);
+  const browserPanelIndex = workspaceSource.indexOf('<BrowserPanel', siblingBrowserTargetMapIndex);
 
   assert.ok(columnIndex > layoutIndex);
   assert.ok(statusStripIndex > columnIndex);
   assert.ok(shellIndex > statusStripIndex);
-  assert.ok(siblingBrowserConditionalIndex > shellIndex);
-  assert.ok(browserPanelIndex > siblingBrowserConditionalIndex);
+  assert.ok(siblingBrowserTargetMapIndex > shellIndex);
+  assert.ok(browserPanelIndex > siblingBrowserTargetMapIndex);
   assert.match(
-    workspaceSource.slice(siblingBrowserConditionalIndex, browserPanelIndex + 520),
-    /<BrowserPanel\s+key=\{activeBrowserSessionId\}[\s\S]*sessionId=\{activeBrowserSessionId\}[\s\S]*className="shrink-0"[\s\S]*maxWidth: `\$\{BROWSER_PANEL_MAX_WIDTH_PERCENT\}%`[\s\S]*onResizeStart=\{handleBrowserPanelResizeStart\}/,
+    workspaceSource.slice(siblingBrowserTargetMapIndex, browserPanelIndex + 900),
+    /const panelKey = String\(target\.instanceId\);[\s\S]*sessionId: target\.surfaceSessionId,[\s\S]*isActiveSurface: isPanelActive,[\s\S]*surfaceOccluded: browserSurfaceOccluded \|\| !isPanelActive,[\s\S]*key=\{panelKey\}[\s\S]*isPanelActive \? 'flex' : 'hidden'/,
   );
 });
 
-test('workspace browser entry lives beside the review action in the status strip', async () => {
+test('status-strip browser entry is one direct open-hide toggle and preserves the Route chip', async () => {
   const statusStripSource = await fs.readFile(
     path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceStatusStrip.tsx'),
     'utf8',
   );
 
-  assert.match(statusStripSource, /PanelRightOpen/);
-  assert.match(statusStripSource, /PanelRightClose/);
+  assert.match(statusStripSource, /import \{ WorkspaceRouteChip \} from '\.\/WorkspaceRouter'/);
+  assert.match(statusStripSource, /<WorkspaceRouteChip/);
   assert.match(statusStripSource, /browserOpen\?: boolean/);
   assert.match(statusStripSource, /onToggleBrowser\?: \(\) => void/);
-  assert.match(
-    statusStripSource,
-    /data-ccem-workspace-status-compact=\{browserOpen \? 'browser' : 'default'\}/,
-  );
-  assert.match(statusStripSource, /compact=\{browserOpen\}/);
-  assert.match(statusStripSource, /whitespace-nowrap/);
-  assert.match(statusStripSource, /continuousUsageDays > 0 && usageStats/);
-  assert.match(statusStripSource, /browserOpen \? 'inline-flex' : 'hidden md:inline-flex'/);
-  assert.match(statusStripSource, /!browserOpen && activeCronTasks\.length > 0/);
-  assert.match(statusStripSource, /data-ccem-workspace-search-trigger="true"/);
   assert.match(statusStripSource, /data-ccem-workspace-browser-toggle="true"/);
-  assert.match(statusStripSource, /title=\{browserOpen \? t\('workspace.browserClose'\) : t\('workspace.browserOpen'\)\}/);
-  assert.match(statusStripSource, /aria-label=\{browserOpen \? t\('workspace.browserClose'\) : t\('workspace.browserOpen'\)\}/);
   assert.match(statusStripSource, /onClick=\{onToggleBrowser\}/);
-  assert.match(statusStripSource, /browserOpen[\s\S]*\? 'h-8 w-8 min-h-\[2rem\] min-w-\[2rem\] flex-none justify-center px-0'/);
-  assert.match(statusStripSource, /h-8 w-8 min-h-\[2rem\] min-w-\[2rem\] flex-none/);
-  assert.match(statusStripSource, /browserOpen \? 'sr-only' : 'sm:text-\[13px\]'/);
+  assert.match(statusStripSource, /browserOpen \? 'workspace\.browserClose' : 'workspace\.browserOpen'/);
+  assert.match(statusStripSource, /PanelRightOpen/);
+  assert.match(statusStripSource, /PanelRightClose/);
+  assert.doesNotMatch(
+    statusStripSource,
+    /BrowserLauncherPopover|browserBackend|onTogglePreviewBrowser|onOpenLoginBrowser/,
+  );
 
   const reviewIndex = statusStripSource.indexOf("title={t('workspace.reviewEntry')}");
   const browserIndex = statusStripSource.indexOf('data-ccem-workspace-browser-toggle="true"');
@@ -101,49 +82,59 @@ test('workspace browser entry lives beside the review action in the status strip
   assert.ok(browserIndex > reviewIndex);
 });
 
-test('browser panel uses standalone sidebar chrome with tab and lower navigation', async () => {
-  const browserPanelSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
-    'utf8',
-  );
-  const cssSource = await fs.readFile(
-    path.join(desktopDir, 'src', 'index.css'),
-    'utf8',
-  );
+test('browser panel exposes only Mode 2 sidebar chrome and native surface IPC', async () => {
+  const [browserPanelSource, browserPanelChromeSource, cssSource] = await Promise.all([
+    fs.readFile(
+      path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
+      'utf8',
+    ),
+    fs.readFile(
+      path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanelChrome.tsx'),
+      'utf8',
+    ),
+    fs.readFile(path.join(desktopDir, 'src', 'index.css'), 'utf8'),
+  ]);
 
   assert.match(browserPanelSource, /data-ccem-browser-panel="true"/);
-  assert.match(browserPanelSource, /sessionId: string/);
+  assert.match(browserPanelSource, /data-ccem-browser-backend="login"/);
+  assert.match(browserPanelSource, /backend: 'login'/);
   assert.match(browserPanelSource, /data-ccem-browser-resize-handle="true"/);
   assert.match(browserPanelSource, /data-ccem-browser-tab-strip="true"/);
-  assert.match(browserPanelSource, /data-ccem-browser-navigation="true"/);
-  assert.match(browserPanelSource, /workspace-browser-panel relative flex h-full/);
-  assert.match(browserPanelSource, /data-ccem-browser-url-display="true"/);
-  assert.match(browserPanelSource, /data-ccem-browser-url-input="true"/);
-  assert.match(browserPanelSource, /onSubmit=\{handleSubmit\}/);
-  assert.match(browserPanelSource, /browser_navigate[\s\S]*\{ sessionId, url: nextUrl \}/);
-  assert.match(browserPanelSource, /invoke<BrowserInfo>\(command, \{ sessionId \}\)/);
-  assert.match(browserPanelSource, /disabled=\{isBusy \|\| !canGoBack\}/);
-  assert.match(browserPanelSource, /disabled=\{isBusy \|\| !canGoForward\}/);
-  assert.match(browserPanelSource, /browser_set_bounds[\s\S]*\{ sessionId, \.\.\.bounds \}/);
-  assert.match(browserPanelSource, /browser_set_visible[\s\S]*\{ sessionId, visible: false \}/);
-  assert.match(browserPanelSource, /listen<BrowserSessionStateEvent>\('browser_session_state_changed'/);
-  assert.match(browserPanelSource, /browser_health_check/);
-  assert.match(browserPanelSource, /browser_set_paused/);
-  assert.match(browserPanelSource, /browserAgentControlling/);
-  assert.match(
-    browserPanelSource,
-    /localhost\|127[\s\S]*return `http:\/\/\$\{trimmed\}`/,
+  assert.match(browserPanelSource, /<BrowserPanelNavigation/);
+  assert.match(browserPanelChromeSource, /data-ccem-browser-navigation="true"/);
+  assert.match(browserPanelChromeSource, /data-ccem-browser-url-display="true"/);
+  assert.match(browserPanelChromeSource, /data-ccem-browser-url-input="true"/);
+  assert.match(browserPanelSource, /browserSurfaceClient\.acquire/);
+  assert.match(browserPanelSource, /browser_surface_state_changed/);
+  assert.match(browserPanelSource, /browserSurfaceClient\.navigate/);
+  assert.match(browserPanelSource, /browserSurfaceClient\.release/);
+  assert.match(browserPanelSource, /occlude: occludeSurface/);
+  assert.match(browserPanelSource, /autoHandoffAttemptedLeaseRef/);
+  assert.match(browserPanelChromeSource, /data-ccem-browser-control-toggle="true"/);
+  assert.doesNotMatch(browserPanelChromeSource, /loginBrowserControl\.pauseAgent/);
+  assert.doesNotMatch(
+    `${browserPanelSource}\n${browserPanelChromeSource}`,
+    /backend:\s*'preview'|backend === 'preview'|browser_open|browser_set_visible|usePreviewSurfaceMutation/i,
   );
-  assert.doesNotMatch(browserPanelSource, /border-l border-border/);
 
-  const tabStripIndex = browserPanelSource.indexOf('data-ccem-browser-tab-strip="true"');
-  const navigationIndex = browserPanelSource.indexOf('data-ccem-browser-navigation="true"');
+  const tabStripIndex = browserPanelSource.indexOf('<BrowserPanelTabStrip');
+  const navigationIndex = browserPanelSource.indexOf('<BrowserPanelNavigation');
   assert.ok(tabStripIndex > 0);
   assert.ok(navigationIndex > tabStripIndex);
-  assert.doesNotMatch(browserPanelSource.slice(tabStripIndex, navigationIndex), /<Input/);
-  assert.match(browserPanelSource.slice(navigationIndex), /<Input/);
 
   const browserPanelCss = cssSource.match(/\.workspace-browser-panel \{[\s\S]*?\n\}/)?.[0] ?? '';
   assert.match(browserPanelCss, /border-left:/);
   assert.doesNotMatch(browserPanelCss, /border-radius:/);
+
+  // BrowserPanel's DOMRect is used as an AppKit child-view rectangle. Any transformed ancestor
+  // changes that DOMRect without changing the native parent NSView, so the workspace motion
+  // layers must become transform-free as soon as a native browser owner is mounted.
+  assert.match(
+    cssSource,
+    /\[data-motion-page='workspace'\]:has\(\[data-ccem-browser-panel-owner\]\)[\s\S]*?transform:\s*none\s*!important/,
+  );
+  assert.match(
+    cssSource,
+    /\.page-transition-enter:has\(\[data-ccem-browser-panel-owner\]\)[\s\S]*?animation:\s*none\s*!important/,
+  );
 });

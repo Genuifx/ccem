@@ -8,6 +8,17 @@
  */
 
 import type { Environment, Session } from '@/store';
+import type {
+  BrowserSurfaceAcquireRequest,
+  BrowserSurfaceClosePopupRequest,
+  BrowserSurfaceControlRequest,
+  BrowserSurfaceLease,
+  BrowserSurfaceNavigationActionRequest,
+  BrowserSurfaceNavigateRequest,
+  BrowserSurfaceReleaseRequest,
+  BrowserSurfaceSyncRequest,
+  BrowserSurfaceSnapshotMutationResponse,
+} from '@/lib/browserSurfaceIpc';
 import type { UsageStats as AnalyticsUsageStats } from '@/types/analytics';
 import type {
   RouterConfig,
@@ -126,25 +137,19 @@ export interface TauriCommands {
   restart_native_session_direct: [{ runtimeId: string }, SessionRouterState];
   generate_workspace_session_title: [{ titleInput: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
-  browser_set_active_session: [{ sessionId?: string | null; visible?: boolean | null }, void];
-  browser_open: [{ sessionId?: string | null; url?: string | null }, BrowserInfo];
-  browser_set_bounds: [
-    { sessionId?: string | null; x: number; y: number; width: number; height: number },
-    void
+  browser_surface_acquire: [BrowserSurfaceAcquireRequest, BrowserSurfaceLease];
+  browser_surface_sync: [BrowserSurfaceSyncRequest, void];
+  browser_surface_release: [BrowserSurfaceReleaseRequest, void];
+  browser_surface_navigate: [BrowserSurfaceNavigateRequest, void];
+  browser_surface_navigation_action: [
+    BrowserSurfaceNavigationActionRequest,
+    BrowserSurfaceSnapshotMutationResponse,
   ];
-  browser_set_visible: [{ sessionId?: string | null; visible: boolean }, void];
-  browser_close: [{ sessionId?: string | null } | void, void];
-  browser_navigate: [{ sessionId?: string | null; url: string }, BrowserInfo];
-  browser_reload: [{ sessionId?: string | null } | void, BrowserInfo];
-  browser_back: [{ sessionId?: string | null } | void, BrowserInfo];
-  browser_forward: [{ sessionId?: string | null } | void, BrowserInfo];
-  browser_info: [{ sessionId?: string | null } | void, BrowserInfo];
-  browser_health_check: [{ sessionId?: string | null } | void, BrowserInfo];
-  browser_set_paused: [{ sessionId?: string | null; paused: boolean }, BrowserInfo];
-  browser_recent_activity: [{ sessionId?: string | null } | void, BrowserRecentActivity];
-  browser_runtime_readiness: [void, BrowserRuntimeReadiness];
-  browser_snapshot: [{ sessionId?: string | null } | void, BrowserSnapshot];
-  browser_screenshot: [{ sessionId?: string | null } | void, string];
+  browser_surface_control: [BrowserSurfaceControlRequest, BrowserSurfaceSnapshotMutationResponse];
+  browser_surface_close_popup: [
+    BrowserSurfaceClosePopupRequest,
+    BrowserSurfaceSnapshotMutationResponse
+  ];
   search_workspace_files: [
     {
       workingDir: string;
@@ -592,108 +597,6 @@ export interface TauriCommands {
 // ============================================
 // 类型定义
 // ============================================
-
-export interface BrowserInfo {
-  label: string;
-  session_id?: string | null;
-  url?: string | null;
-  title?: string | null;
-  visible: boolean;
-  can_go_back?: boolean;
-  can_go_forward?: boolean;
-  lifecycle?: 'creating' | 'ready' | 'navigating' | 'interactive' | 'crashed' | 'destroyed';
-  loading?: boolean;
-  error?: string | null;
-  control?: 'user' | 'agent' | 'paused';
-  paused?: boolean;
-  generation?: number;
-  last_agent_action?: string | null;
-  created_at?: string;
-  updated_at?: string;
-}
-
-export interface BrowserSessionStateEvent {
-  sessionId: string;
-  label: string;
-  url?: string | null;
-  title?: string | null;
-  visible: boolean;
-  canGoBack: boolean;
-  canGoForward: boolean;
-  lifecycle: NonNullable<BrowserInfo['lifecycle']>;
-  loading: boolean;
-  error?: string | null;
-  control: NonNullable<BrowserInfo['control']>;
-  paused: boolean;
-  generation: number;
-  lastAgentAction?: string | null;
-  createdAt: string;
-  updatedAt: string;
-  cause: string;
-}
-
-export interface BrowserSnapshotElement {
-  ref: number;
-  element_id?: string;
-  tag: string;
-  role?: string | null;
-  type?: string | null;
-  name?: string | null;
-  label?: string | null;
-  href?: string | null;
-  disabled?: boolean;
-  hidden?: boolean;
-  focusable?: boolean;
-  editable?: boolean;
-  readonly?: boolean;
-  checked?: boolean | null;
-  value?: string | null;
-  value_redacted?: boolean;
-  rect?: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
-}
-
-export interface BrowserSnapshot {
-  ok?: boolean;
-  url?: string;
-  title?: string;
-  text?: string;
-  text_blocks?: Array<{ tag: string; text: string }>;
-  hidden_text_count?: number;
-  hidden_text_scan_truncated?: boolean;
-  snapshot_id?: string;
-  generation?: number;
-  navigation_seq?: number;
-  frame_id?: string;
-  elements?: BrowserSnapshotElement[];
-}
-
-export interface BrowserRecentArtifact {
-  kind: 'screenshot' | 'interaction_snapshot' | string;
-  path: string;
-  file_name: string;
-  byte_size: number;
-  modified_at: string;
-}
-
-export interface BrowserRecentActivity {
-  artifacts: BrowserRecentArtifact[];
-  console_log_path?: string | null;
-  audit_log_path?: string | null;
-}
-
-export type BrowserRuntimeReadinessStatus = 'unavailable' | 'preparing' | 'ready' | 'failed';
-
-export interface BrowserRuntimeReadiness {
-  status: BrowserRuntimeReadinessStatus;
-  version?: string | null;
-  error?: string | null;
-  checked_at: string;
-}
 
 export interface AppConfig {
   favorites: FavoriteProject[];

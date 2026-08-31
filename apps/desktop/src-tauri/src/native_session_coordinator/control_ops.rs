@@ -191,6 +191,10 @@ impl NativeSessionCoordinator {
         if coordination.incarnation != Some(helper_incarnation) {
             return LifecycleDecision::Ignored;
         }
+        let is_permission_op = coordination
+            .pending_permission_settings
+            .as_ref()
+            .is_some_and(|op| op.control_request_id == control_request_id);
         let op = coordination
             .pending_settings
             .as_mut()
@@ -219,6 +223,14 @@ impl NativeSessionCoordinator {
             (None, Some(generation)) => op.query_generation = Some(generation),
             (None, None) => {}
         }
+        let parsed = if is_permission_op && parsed == SettingsOpState::Failed {
+            // Permission delivery is a cross-authority transaction. A helper-side failure is
+            // not dispatch-safe until the host finishes fail-closed quarantine, so retain a
+            // blocking state instead of releasing queued prompts from the stdout thread.
+            SettingsOpState::ReconcileRequired
+        } else {
+            parsed
+        };
         if op.state == SettingsOpState::ReconcileRequired {
             // A definite late failure proves that no settings side effect was
             // committed, so the old local projection is authoritative and

@@ -10,7 +10,7 @@ function extractRegisteredAppCommands(source) {
   const block = source.match(
     /\.invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\n\s*\]\)/,
   )?.[1];
-  assert.ok(block, 'main.rs must contain the Tauri generate_handler command list');
+  assert.ok(block, 'lib.rs must contain the Tauri generate_handler command list');
 
   return block
     .split(',')
@@ -66,22 +66,51 @@ test('Tauri capabilities grant desktop privileges only to trusted app webviews',
   }
 });
 
-test('trusted app-command ACL stays in lockstep with generate_handler', async () => {
-  const [mainSource, permissionSource] = await Promise.all([
-    fs.readFile(path.join(tauriDir, 'src', 'main.rs'), 'utf8'),
-    fs.readFile(
-      path.join(tauriDir, 'permissions', 'trusted-app-commands.toml'),
-      'utf8',
-    ),
+test('trusted command ACLs stay in lockstep with generate_handler', async () => {
+  const [mainSource, permissionFiles] = await Promise.all([
+    fs.readFile(path.join(tauriDir, 'src', 'lib.rs'), 'utf8'),
+    fs.readdir(path.join(tauriDir, 'permissions')),
   ]);
   const registered = extractRegisteredAppCommands(mainSource);
-  const allowed = extractAllowedManifestCommands(permissionSource);
+  const allowed = (
+    await Promise.all(
+      permissionFiles
+        .filter((name) => name.endsWith('.toml'))
+        .map(async (name) => extractAllowedManifestCommands(
+          await fs.readFile(path.join(tauriDir, 'permissions', name), 'utf8'),
+        )),
+    )
+  ).flat();
 
   assertUnique(registered, 'generate_handler command list');
-  assertUnique(allowed, 'trusted app-command ACL');
+  assertUnique(allowed, 'trusted command ACL union');
   assert.deepEqual(
     [...allowed].sort(),
     [...registered].sort(),
-    'every registered app command must be explicitly covered by the trusted webview ACL',
+    'every registered app command must be explicitly covered by one trusted webview ACL',
   );
+});
+
+test('legacy Login Browser control capability and launch commands stay removed', async () => {
+  const [capabilities, permissions, trustedPermissionSource] = await Promise.all([
+    fs.readdir(path.join(tauriDir, 'capabilities')),
+    fs.readdir(path.join(tauriDir, 'permissions')),
+    fs.readFile(path.join(tauriDir, 'permissions', 'trusted-app-commands.toml'), 'utf8'),
+  ]);
+
+  assert.ok(!capabilities.includes('login-browser-control.json'));
+  assert.ok(!permissions.includes('login-browser-control-commands.toml'));
+  for (const command of [
+    'browser_login_open',
+    'browser_login_open_profile',
+    'browser_login_control_snapshot',
+    'browser_login_recent_activity',
+    'browser_login_handoff',
+    'browser_login_pause',
+    'browser_login_takeover',
+    'browser_login_close',
+    'browser_login_force_stop',
+  ]) {
+    assert.doesNotMatch(trustedPermissionSource, new RegExp(`"${command}"`));
+  }
 });

@@ -1,4 +1,7 @@
-use crate::browser::{authorize_browser_tool, BrowserManager, BrowserToolRequest};
+use crate::browser::login::capability::{
+    BrowserPermissionAuthority, BrowserPermissionAuthorityTicket,
+};
+use crate::browser::{authorize_browser_tool, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
     NativeBackgroundTask, NativeBackgroundTaskStatus, NativeEventReplayPage, ReplayBatch,
@@ -32,7 +35,7 @@ use crate::system_proxy::resolve_codex_proxy_env;
 use crate::terminal::{self, resolve_claude_path, resolve_codex_path, TerminalType};
 use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
-use rand::RngCore;
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -46,9 +49,10 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::RwLock;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::{os::unix::process::CommandExt, os::unix::process::ExitStatusExt};
 #[cfg(windows)]
@@ -64,12 +68,22 @@ use tauri_plugin_shell::{
 };
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const NATIVE_PERMISSION_QUARANTINE_KILL_TIMEOUT: Duration = Duration::from_secs(3);
+const NATIVE_SETTINGS_UPDATE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const NATIVE_HELPER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const NATIVE_HELPER_WRITE_QUEUE_CAPACITY: usize = 16;
 const NATIVE_HELPER_RETIRING_ERROR: &str = "Native runtime helper is retiring";
+const NATIVE_BROWSER_HANDOFF_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const NATIVE_BROWSER_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ACTIVE_BACKGROUND_TASK_SHUTDOWN_ERROR: &str = "Cannot close this native runtime while Claude background tasks remain active. Retry with force after confirming their results may be lost.";
 const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
 const MAX_PROMPT_ANNOTATION_NOTE_CHARS: usize = 4_000;
 const MAX_PROMPT_ANNOTATION_TOTAL_CHARS: usize = 60_000;
+static NATIVE_RUNTIME_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const BROWSER_ACTOR_ID_PREFIX: &str = "browser-actor-";
+const BROWSER_ACTOR_ID_RANDOM_BYTES: usize = 16;
+const MAX_PROVIDER_SESSION_ID_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueDispatchTrigger {
@@ -130,6 +144,171 @@ impl NativeProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BrowserActorLineageRef<'a> {
+    pub(crate) provider: NativeProvider,
+    pub(crate) provider_session_id: Option<&'a str>,
+    pub(crate) actor_id: &'a str,
+}
+
+pub(crate) fn resolve_browser_actor_id(
+    provider: NativeProvider,
+    provider_session_id: Option<&str>,
+    provisional_actor_id: &str,
+    known_lineages: &[BrowserActorLineageRef<'_>],
+) -> Result<String, String> {
+    if !is_valid_browser_actor_id(provisional_actor_id) {
+        return Err("Native browser actor lineage is invalid.".to_string());
+    }
+
+    let Some(provider_session_id) = normalize_provider_session_id(provider_session_id)? else {
+        return Ok(provisional_actor_id.to_string());
+    };
+
+    let mut matched_actor_id: Option<&str> = None;
+    for lineage in known_lineages {
+        if lineage.provider != provider {
+            continue;
+        }
+        let Ok(Some(known_provider_session_id)) =
+            normalize_provider_session_id(lineage.provider_session_id)
+        else {
+            continue;
+        };
+        if known_provider_session_id != provider_session_id {
+            continue;
+        }
+        if !is_valid_browser_actor_id(lineage.actor_id) {
+            return Err("Native browser actor lineage is invalid.".to_string());
+        }
+        match matched_actor_id {
+            Some(existing) if existing != lineage.actor_id => {
+                return Err("Native browser actor lineage is conflicting.".to_string());
+            }
+            Some(_) => {}
+            None => matched_actor_id = Some(lineage.actor_id),
+        }
+    }
+
+    Ok(matched_actor_id.unwrap_or(provisional_actor_id).to_string())
+}
+
+fn normalize_provider_session_id(value: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_PROVIDER_SESSION_ID_BYTES || trimmed.chars().any(char::is_control) {
+        return Err("Native provider session identity is invalid.".to_string());
+    }
+    Ok(Some(trimmed))
+}
+
+fn is_valid_browser_actor_id(actor_id: &str) -> bool {
+    actor_id
+        .strip_prefix(BROWSER_ACTOR_ID_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == BROWSER_ACTOR_ID_RANDOM_BYTES * 2
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn generate_browser_actor_id() -> Result<String, String> {
+    let mut random = [0_u8; BROWSER_ACTOR_ID_RANDOM_BYTES];
+    OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|_| "Failed to generate native browser actor lineage.".to_string())?;
+    Ok(format!(
+        "{}{}",
+        BROWSER_ACTOR_ID_PREFIX,
+        hex::encode(random)
+    ))
+}
+
+fn legacy_browser_actor_id(provider: NativeProvider, runtime_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ccem-browser-actor-lineage-v1\0");
+    hasher.update(provider.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(runtime_id.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "{}{}",
+        BROWSER_ACTOR_ID_PREFIX,
+        hex::encode(&digest[..BROWSER_ACTOR_ID_RANDOM_BYTES])
+    )
+}
+
+fn backfill_browser_actor_lineages(records: &mut [NativeSessionRecord]) {
+    let actor_ids = records
+        .iter()
+        .map(|record| {
+            let provider_session_id =
+                match normalize_provider_session_id(record.provider_session_id.as_deref()) {
+                    Ok(Some(provider_session_id)) => provider_session_id,
+                    Ok(None) => {
+                        return if is_valid_browser_actor_id(&record.browser_actor_id) {
+                            record.browser_actor_id.clone()
+                        } else {
+                            legacy_browser_actor_id(record.provider, &record.runtime_id)
+                        };
+                    }
+                    Err(_) => {
+                        // A malformed persisted provider identity cannot safely participate in
+                        // lineage resolution. Quarantine it with an invalid actor so browser routing
+                        // fails closed without echoing the raw provider value.
+                        return String::new();
+                    }
+                };
+
+            let matching_records = records.iter().filter(|candidate| {
+                candidate.provider == record.provider
+                    && normalize_provider_session_id(candidate.provider_session_id.as_deref())
+                        .ok()
+                        .flatten()
+                        == Some(provider_session_id)
+            });
+            let mut canonical_runtime_id: Option<&str> = None;
+            let mut known_actor_id: Option<&str> = None;
+            for candidate in matching_records {
+                canonical_runtime_id = Some(match canonical_runtime_id {
+                    Some(current) if current <= candidate.runtime_id.as_str() => current,
+                    _ => candidate.runtime_id.as_str(),
+                });
+                if !is_valid_browser_actor_id(&candidate.browser_actor_id) {
+                    continue;
+                }
+                match known_actor_id {
+                    Some(existing) if existing != candidate.browser_actor_id => {
+                        // Conflicting persisted lineages cannot be merged without access to both
+                        // provenance ledgers. Quarantine the whole conversation instead of
+                        // selecting an actor that could discard existing taint.
+                        return String::new();
+                    }
+                    Some(_) => {}
+                    None => known_actor_id = Some(&candidate.browser_actor_id),
+                }
+            }
+
+            known_actor_id.map(str::to_string).unwrap_or_else(|| {
+                legacy_browser_actor_id(
+                    record.provider,
+                    canonical_runtime_id.unwrap_or(record.runtime_id.as_str()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (record, actor_id) in records.iter_mut().zip(actor_ids) {
+        record.browser_actor_id = actor_id;
+    }
+}
+
 fn app_termination_requires_idle_freeze(provider: NativeProvider) -> bool {
     provider == NativeProvider::Claude
 }
@@ -150,6 +329,8 @@ pub struct NativeSessionRecord {
     pub transport: NativeTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) browser_actor_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_boundary_message_count: Option<u64>,
     pub project_dir: String,
@@ -170,6 +351,8 @@ pub struct NativeSessionRecord {
     pub updated_at: DateTime<Utc>,
     pub is_active: bool,
     pub can_handoff_to_terminal: bool,
+    #[serde(default)]
+    pub(crate) permission_quarantined: bool,
     #[serde(default, skip_serializing)]
     pub pending_handoff_terminal: Option<TerminalType>,
     #[serde(default, skip_serializing)]
@@ -546,6 +729,212 @@ struct HelperRouterInit {
     menu: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SettingsUpdateOutcome {
+    Applied,
+    Failed,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsUpdateAck {
+    outcome: SettingsUpdateOutcome,
+    detail: Option<String>,
+}
+
+#[derive(Default)]
+struct SettingsUpdateAckRegistry {
+    pending: Mutex<HashMap<String, mpsc::SyncSender<SettingsUpdateAck>>>,
+}
+
+impl SettingsUpdateAckRegistry {
+    fn register(&self, request_id: &str) -> Result<mpsc::Receiver<SettingsUpdateAck>, String> {
+        if !is_valid_settings_update_request_id(request_id) {
+            return Err("Invalid native settings update request id.".to_string());
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "Failed to lock native settings acknowledgements".to_string())?;
+        if pending.contains_key(request_id) {
+            return Err("Duplicate native settings update request id.".to_string());
+        }
+        pending.insert(request_id.to_string(), sender);
+        Ok(receiver)
+    }
+
+    fn resolve(&self, request_id: &str, ack: SettingsUpdateAck) -> Result<bool, String> {
+        let sender = self
+            .pending
+            .lock()
+            .map_err(|_| "Failed to lock native settings acknowledgements".to_string())?
+            .remove(request_id);
+        Ok(sender.is_some_and(|sender| sender.send(ack).is_ok()))
+    }
+
+    fn cancel(&self, request_id: &str) -> Result<(), String> {
+        self.pending
+            .lock()
+            .map_err(|_| "Failed to lock native settings acknowledgements".to_string())?
+            .remove(request_id);
+        Ok(())
+    }
+}
+
+trait NativeHelperCommandSink: Send {
+    fn write_command(&mut self, bytes: &[u8]) -> Result<(), String>;
+}
+
+impl NativeHelperCommandSink for ChildStdin {
+    fn write_command(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.write_all(bytes)
+            .map_err(|error| format!("Failed to write to native sidecar stdin: {error}"))
+    }
+}
+
+struct NativeHelperWriteRequest {
+    bytes: Vec<u8>,
+    completed: mpsc::SyncSender<Result<(), String>>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeHelperWriter {
+    requests: mpsc::SyncSender<NativeHelperWriteRequest>,
+}
+
+impl NativeHelperWriter {
+    fn spawn(stdin: ChildStdin) -> Result<Self, String> {
+        Self::spawn_sink(Box::new(stdin))
+    }
+
+    fn spawn_sink(mut sink: Box<dyn NativeHelperCommandSink>) -> Result<Self, String> {
+        let (requests, receiver) =
+            mpsc::sync_channel::<NativeHelperWriteRequest>(NATIVE_HELPER_WRITE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("ccem-native-helper-writer".to_string())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let result = sink.write_command(&request.bytes);
+                    let failed = result.is_err();
+                    let _ = request.completed.send(result);
+                    if failed {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| format!("Failed to start native helper writer: {error}"))?;
+        Ok(Self { requests })
+    }
+
+    fn write_until(&self, bytes: Vec<u8>, deadline: Instant) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("Native helper stdin write timed out.".to_string());
+        }
+        let (completed, receiver) = mpsc::sync_channel(1);
+        self.requests
+            .try_send(NativeHelperWriteRequest { bytes, completed })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => {
+                    "Native helper writer queue is full; command was not delivered.".to_string()
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    "Native helper writer is unavailable.".to_string()
+                }
+            })?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Native helper stdin write timed out.".to_string());
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("Native helper stdin write timed out.".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("Native helper writer completion channel closed.".to_string())
+            }
+        }
+    }
+}
+
+fn is_valid_settings_update_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn new_settings_update_request_id() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("settings-{}", hex::encode(bytes))
+}
+
+fn wait_for_required_settings_ack(
+    request_id: &str,
+    receiver: mpsc::Receiver<SettingsUpdateAck>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(SettingsUpdateAck {
+            outcome: SettingsUpdateOutcome::Applied,
+            ..
+        }) => Ok(()),
+        Ok(SettingsUpdateAck {
+            outcome: SettingsUpdateOutcome::Failed,
+            detail,
+        }) => Err(format!(
+            "Native settings update {request_id} failed{}.",
+            settings_ack_detail_suffix(detail.as_deref())
+        )),
+        Ok(SettingsUpdateAck {
+            outcome: SettingsUpdateOutcome::Deferred,
+            detail,
+        }) => Err(format!(
+            "Native settings update {request_id} was deferred{}.",
+            settings_ack_detail_suffix(detail.as_deref())
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "Native settings update {request_id} acknowledgement timed out."
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "Native settings update {request_id} acknowledgement channel closed."
+        )),
+    }
+}
+
+fn settings_ack_detail_suffix(detail: Option<&str>) -> String {
+    let detail = detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty() && detail.len() <= 160)
+        .filter(|detail| !detail.chars().any(char::is_control));
+    detail
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default()
+}
+
+fn lock_until<'a, T>(
+    mutex: &'a Mutex<T>,
+    deadline: Instant,
+    timeout_message: &str,
+) -> Result<MutexGuard<'a, T>, String> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("Native helper lifecycle lock is poisoned.".to_string())
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => return Err(timeout_message.to_string()),
+        }
+    }
+}
+
 fn is_bypass_permission_mode(mode: &str) -> bool {
     matches!(mode, "yolo" | "bypassPermissions")
 }
@@ -577,6 +966,34 @@ fn authorize_browser_tool_for_record(
         ),
         tool,
     )
+}
+
+fn deliver_browser_permission_change<Deliver, Commit, Quarantine>(
+    expands_browser_authority: bool,
+    deliver: Deliver,
+    commit: Commit,
+    quarantine: Quarantine,
+) -> Result<(), String>
+where
+    Deliver: FnOnce() -> Result<(), String>,
+    Commit: FnOnce() -> Result<(), String>,
+    Quarantine: FnOnce() -> Result<(), String>,
+{
+    let transition = if expands_browser_authority {
+        deliver().and_then(|_| commit())
+    } else {
+        commit().and_then(|_| deliver())
+    };
+
+    match transition {
+        Ok(()) => Ok(()),
+        Err(transition_error) => match quarantine() {
+            Ok(()) => Err(transition_error),
+            Err(quarantine_error) => Err(format!(
+                "{transition_error}; failed to quarantine split permission authority: {quarantine_error}"
+            )),
+        },
+    }
 }
 
 fn native_status_allows_file_rewind(status: &str) -> bool {
@@ -627,6 +1044,18 @@ fn stage_runtime_settings_update(
             record.pending_settings_request_id = None;
         }
     }
+    record.updated_at = Utc::now();
+}
+
+fn rollback_runtime_settings_projection(
+    record: &mut NativeSessionRecord,
+    original: &NativeSessionRecord,
+) {
+    record.env_name = original.env_name.clone();
+    record.effort = original.effort.clone();
+    record.pending_env_name = original.pending_env_name.clone();
+    record.pending_effort = original.pending_effort.clone();
+    record.pending_settings_request_id = original.pending_settings_request_id.clone();
     record.updated_at = Utc::now();
 }
 
@@ -874,31 +1303,24 @@ fn apply_background_task_event(
     }
 }
 
-fn destroy_browser_session(app: Option<&AppHandle>, runtime_id: &str) {
-    let Some(app) = app else {
-        return;
+fn retire_login_browser_agent_control(
+    app: &AppHandle,
+    workspace_dir: &str,
+    browser_actor_id: &str,
+) -> Result<(), String> {
+    let Some(login) =
+        app.try_state::<Arc<crate::browser::login::session::LoginBrowserSessionManager>>()
+    else {
+        return Ok(());
     };
-    let Some(browser) = app.try_state::<Arc<BrowserManager>>() else {
-        return;
-    };
-    if let Err(error) = browser.close(app, Some(runtime_id)) {
-        eprintln!(
-            "Failed to destroy preview browser session {}: {}",
-            runtime_id, error
-        );
-    }
-}
-
-fn notify_browser_policy_changed(app: &AppHandle, runtime_id: &str) {
-    let Some(browser) = app.try_state::<Arc<BrowserManager>>() else {
-        return;
-    };
-    if let Err(error) = browser.policy_changed(app, runtime_id) {
-        eprintln!(
-            "Failed to invalidate preview browser policy for {}: {}",
-            runtime_id, error
-        );
-    }
+    let workspace = crate::browser::login::session::TrustedWorkspacePath::from_trusted_app(
+        PathBuf::from(workspace_dir),
+    )
+    .map_err(|error| error.to_string())?;
+    login
+        .retire_agent_for_actor(workspace, browser_actor_id)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn helper_command_kind(command: &HelperInputCommand<'_>) -> &'static str {
@@ -964,6 +1386,12 @@ enum HelperOutputEvent {
         tool: String,
         #[serde(default)]
         args: Value,
+    },
+    SettingsUpdateResult {
+        request_id: String,
+        outcome: SettingsUpdateOutcome,
+        #[serde(default)]
+        detail: Option<String>,
     },
     TeardownPrepared {
         request_id: String,
@@ -1048,17 +1476,21 @@ fn lifecycle_transition_unblocked_queue(
             && !after.settings_pending;
     };
     (before.active_command_id.is_some() && after.active_command_id.is_none())
-        || (before.settings_pending && !after.settings_pending)
+        || (before.settings_pending && !after.settings_pending && after.active_command_id.is_none())
         || (before.adapter != AdapterKind::FullLifecycle.as_str()
             && after.adapter == AdapterKind::FullLifecycle.as_str()
             && after.active_command_id.is_none()
             && !after.settings_pending)
 }
 
+fn spawn_queue_autodrain(dispatch: impl FnOnce() + Send + 'static) {
+    let _task = tauri::async_runtime::spawn_blocking(dispatch);
+}
+
 #[derive(Debug)]
 struct NativeHelperChild {
     inner: Arc<SharedChild>,
-    stdin: Option<ChildStdin>,
+    writer: Option<NativeHelperWriter>,
     process_tree: Arc<NativeProcessTree>,
 }
 
@@ -1068,15 +1500,18 @@ impl NativeHelperChild {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.stdin
-            .as_mut()
-            .ok_or_else(|| "Native sidecar stdin is closed".to_string())?
-            .write_all(bytes)
-            .map_err(|error| error.to_string())
+        self.write_until(bytes.to_vec(), Instant::now() + NATIVE_HELPER_WRITE_TIMEOUT)
+    }
+
+    fn write_until(&mut self, bytes: Vec<u8>, deadline: Instant) -> Result<(), String> {
+        self.writer
+            .as_ref()
+            .ok_or_else(|| "Native helper writer is unavailable.".to_string())?
+            .write_until(bytes, deadline)
     }
 
     fn kill(mut self) -> Result<(), String> {
-        self.stdin.take();
+        self.writer.take();
         let tree_result = self.process_tree.kill();
         let _ = self.inner.kill();
         tree_result
@@ -1085,7 +1520,7 @@ impl NativeHelperChild {
 
 impl Drop for NativeHelperChild {
     fn drop(&mut self) {
-        self.stdin.take();
+        self.writer.take();
         let _ = self.process_tree.kill();
         let _ = self.inner.kill();
     }
@@ -1305,6 +1740,13 @@ fn spawn_native_helper_process(
             return Err("Native sidecar stdin pipe is unavailable".to_string());
         }
     };
+    let writer = match NativeHelperWriter::spawn(stdin) {
+        Ok(writer) => writer,
+        Err(error) => {
+            abort_managed_native_helper(&child, &process_tree);
+            return Err(error);
+        }
+    };
     let stdout = match child.take_stdout() {
         Some(stdout) => stdout,
         None => {
@@ -1372,7 +1814,7 @@ fn spawn_native_helper_process(
         receiver,
         NativeHelperChild {
             inner: child,
-            stdin: Some(stdin),
+            writer: Some(writer),
             process_tree,
         },
     ))
@@ -1467,6 +1909,9 @@ fn native_process_exists(pid: u32) -> bool {
 struct NativeSessionHandle {
     generation: u64,
     record: Mutex<NativeSessionRecord>,
+    browser_permission: BrowserPermissionAuthority,
+    browser_permission_sync: Mutex<()>,
+    settings_update_acks: SettingsUpdateAckRegistry,
     child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
     background_tasks: Mutex<HashMap<String, NativeBackgroundTask>>,
@@ -1481,6 +1926,7 @@ struct NativeSessionHandle {
     codex_path: Option<String>,
     codex_base_url: Option<String>,
     codex_api_key: Option<String>,
+    permission_quarantined: AtomicBool,
     alive: AtomicBool,
 }
 
@@ -1626,6 +2072,9 @@ struct NativeRuntimeState {
 pub struct NativeRuntimeManager {
     records: Mutex<HashMap<String, NativeSessionRecord>>,
     handles: Mutex<HashMap<String, Arc<NativeSessionHandle>>>,
+    permission_quarantine_fences: Mutex<HashSet<String>>,
+    permission_transactions: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    lifecycle_transactions: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     next_handle_generation: AtomicU64,
     state_path: PathBuf,
     event_log: NativeEventLog,
@@ -1773,15 +2222,24 @@ impl Default for NativeRuntimeManager {
 impl NativeRuntimeManager {
     pub fn try_new() -> Result<Self, String> {
         let state_path = native_runtime_state_file_path();
-        let records = read_native_runtime_state_from(&state_path)
-            .map_err(|error| format!("Failed to load native runtime state: {error}"))?
-            .sessions
-            .into_iter()
-            .map(|record| (record.runtime_id.clone(), record))
+        let records: HashMap<String, NativeSessionRecord> =
+            read_native_runtime_state_from(&state_path)
+                .map_err(|error| format!("Failed to load native runtime state: {error}"))?
+                .sessions
+                .into_iter()
+                .map(|record| (record.runtime_id.clone(), record))
+                .collect();
+        let permission_quarantine_fences = records
+            .values()
+            .filter(|record| record.permission_quarantined)
+            .map(|record| record.runtime_id.clone())
             .collect();
         Ok(Self {
             records: Mutex::new(records),
             handles: Mutex::new(HashMap::new()),
+            permission_quarantine_fences: Mutex::new(permission_quarantine_fences),
+            permission_transactions: Mutex::new(HashMap::new()),
+            lifecycle_transactions: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(1),
             lifecycle: Default::default(),
             input_queue: Default::default(),
@@ -1915,6 +2373,7 @@ impl NativeRuntimeManager {
                 options.provider_session_id.as_deref(),
                 options.fork_from_message_id.is_some(),
             ),
+            browser_actor_id: generate_browser_actor_id()?,
             seed_boundary_message_count: options.seed_boundary_message_count,
             project_dir: options.working_dir.clone(),
             env_name: options.env_name.clone(),
@@ -1929,15 +2388,42 @@ impl NativeRuntimeManager {
             updated_at: now,
             is_active: true,
             can_handoff_to_terminal: terminal::external_terminal_launch_supported(),
+            permission_quarantined: false,
             pending_handoff_terminal: None,
             pending_handoff_allow_background_task_termination: false,
             last_error: None,
             router: options.router_record.clone(),
         };
-
+        let generation = self.allocate_handle_generation();
+        if let (Some(manager), Some(router)) = (
+            self.router_manager.get(),
+            record
+                .router
+                .as_ref()
+                .filter(|router| router.launch_transport == LaunchTransport::Routed),
+        ) {
+            manager
+                .register(&runtime_id, generation, router.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        let record = match self.insert_record(record) {
+            Ok(record) => record,
+            Err(error) => {
+                if let Some(manager) = self.router_manager.get() {
+                    manager.unregister_generation(&runtime_id, generation);
+                }
+                return Err(error);
+            }
+        };
         let handle = Arc::new(NativeSessionHandle {
-            generation: self.allocate_handle_generation(),
+            generation,
             record: Mutex::new(record.clone()),
+            browser_permission: BrowserPermissionAuthority::new(effective_native_perm_mode(
+                record.perm_mode.as_str(),
+                record.runtime_perm_mode.as_deref(),
+            )),
+            browser_permission_sync: Mutex::new(()),
+            settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(runtime_id.clone())),
             background_tasks: Mutex::new(HashMap::new()),
@@ -1952,27 +2438,10 @@ impl NativeRuntimeManager {
             codex_path: options.codex_path.clone(),
             codex_base_url: options.codex_base_url.clone(),
             codex_api_key: options.codex_api_key.clone(),
+            permission_quarantined: AtomicBool::new(false),
             alive: AtomicBool::new(true),
         });
 
-        if let (Some(manager), Some(router)) = (
-            self.router_manager.get(),
-            record
-                .router
-                .as_ref()
-                .filter(|router| router.launch_transport == LaunchTransport::Routed),
-        ) {
-            manager
-                .register(&runtime_id, handle.generation, router.clone())
-                .map_err(|error| error.to_string())?;
-        }
-
-        if let Err(error) = self.insert_record(record) {
-            if let Some(manager) = self.router_manager.get() {
-                manager.unregister_generation(&runtime_id, handle.generation);
-            }
-            return Err(error);
-        }
         let launch_result = (|| {
             self.insert_handle(runtime_id.clone(), handle.clone())?;
             self.append_event(
@@ -3066,6 +3535,30 @@ impl NativeRuntimeManager {
         }
     }
 
+    fn schedule_queued_dispatch(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        trigger: QueueDispatchTrigger,
+    ) {
+        let manager = Arc::clone(self);
+        let app = app.clone();
+        let runtime_id = runtime_id.to_string();
+        spawn_queue_autodrain(move || {
+            if let Err(error) = manager.maybe_dispatch_queued(&app, &runtime_id, trigger) {
+                let detail =
+                    format!("Failed to dispatch queued native prompt after {trigger:?}: {error}");
+                let _ = manager.set_last_error(&runtime_id, detail.clone());
+                let _ = manager.append_lifecycle_event(
+                    &runtime_id,
+                    "queued_prompt_dispatch_failed",
+                    detail.clone(),
+                );
+                eprintln!("{detail}");
+            }
+        });
+    }
+
     pub fn respond_to_permission(
         self: &Arc<Self>,
         runtime_id: &str,
@@ -3862,6 +4355,17 @@ impl NativeRuntimeManager {
             .settings_update_lock
             .lock()
             .map_err(|_| "Failed to lock native settings updates".to_string())?;
+        let permission_transaction = perm_mode
+            .map(|_| self.permission_transaction_lock(runtime_id))
+            .transpose()?;
+        let _permission_guard = permission_transaction
+            .as_ref()
+            .map(|transaction| {
+                transaction
+                    .lock()
+                    .map_err(|_| "Failed to lock native permission transaction".to_string())
+            })
+            .transpose()?;
         let handle = self.ensure_handle(app.clone(), runtime_id)?;
         let request_id = format!(
             "settings-{}-{}",
@@ -3891,12 +4395,6 @@ impl NativeRuntimeManager {
             }
         }
         let stage_result = self.update_record(runtime_id, |record| {
-            if !lifecycle_managed {
-                if let Some(mode) = perm_mode {
-                    record.perm_mode = mode.to_string();
-                    record.runtime_perm_mode = None;
-                }
-            }
             if lifecycle_managed && !permission_only {
                 // Claude permission and environment projection is committed
                 // only after the exact helper ACK. Until then browser policy
@@ -3918,18 +4416,12 @@ impl NativeRuntimeManager {
                     *record = original_settings.clone();
                 })
                 .err();
-            if perm_mode.is_some() {
-                notify_browser_policy_changed(app, runtime_id);
-            }
             return Err(match rollback_error {
                 Some(rollback_error) => {
                     format!("{error}; settings staging rollback also failed: {rollback_error}")
                 }
                 None => error,
             });
-        }
-        if perm_mode.is_some() && !lifecycle_managed {
-            notify_browser_policy_changed(app, runtime_id);
         }
         let handle_generation = handle.generation;
         let settings_command = HelperInputCommand::UpdateSettings {
@@ -3941,6 +4433,38 @@ impl NativeRuntimeManager {
             effort,
             force_restart,
         };
+        if let Some(next_perm_mode) = perm_mode {
+            let delivery = if lifecycle_managed {
+                self.deliver_claude_permission_settings_transaction(
+                    app,
+                    runtime_id,
+                    Arc::clone(&handle),
+                    &request_id,
+                    &settings_command,
+                    next_perm_mode.to_string(),
+                    None,
+                )
+            } else {
+                self.deliver_non_claude_permission_settings_transaction(
+                    app,
+                    runtime_id,
+                    Arc::clone(&handle),
+                    &request_id,
+                    &settings_command,
+                    next_perm_mode.to_string(),
+                    None,
+                )
+            };
+            if let Err(error) = delivery {
+                if env_name.is_some() || effort.is_some() {
+                    self.update_record(runtime_id, |record| {
+                        rollback_runtime_settings_projection(record, &original_settings);
+                    })?;
+                }
+                return Err(error);
+            }
+            return Ok(());
+        }
         let write_result: Result<(), (String, bool)> = if lifecycle_managed {
             match self.write_to_live_child_outcome(&handle, &settings_command) {
                 LiveWriteOutcome::Written => Ok(()),
@@ -3948,8 +4472,13 @@ impl NativeRuntimeManager {
                 LiveWriteOutcome::StartedUnknown(error) => Err((error, true)),
             }
         } else {
-            self.write_to_child_with_reconnect(app, runtime_id, handle, &settings_command)
-                .map_err(|error| (error, false))
+            self.write_to_child_with_reconnect(
+                app,
+                runtime_id,
+                Arc::clone(&handle),
+                &settings_command,
+            )
+            .map_err(|error| (error, false))
         };
         if let Err((error, uncertain)) = write_result {
             if lifecycle_managed {
@@ -3966,9 +4495,6 @@ impl NativeRuntimeManager {
             }
             if !uncertain {
                 self.update_record(runtime_id, |record| *record = original_settings.clone())?;
-                if perm_mode.is_some() {
-                    notify_browser_policy_changed(app, runtime_id);
-                }
             }
             return Err(if uncertain {
                 format!("SETTINGS_DELIVERY_UNCERTAIN: {error}")
@@ -4791,6 +5317,10 @@ impl NativeRuntimeManager {
             .settings_update_lock
             .lock()
             .map_err(|_| "Failed to lock native settings updates".to_string())?;
+        let permission_transaction = self.permission_transaction_lock(runtime_id)?;
+        let _permission_guard = permission_transaction
+            .lock()
+            .map_err(|_| "Failed to lock native permission transaction".to_string())?;
         let handle = if attention_fence.is_some() || required_handle_generation.is_some() {
             self.handles
                 .lock()
@@ -4858,35 +5388,6 @@ impl NativeRuntimeManager {
                 .begin_permission_settings_op(runtime_id, handle.generation, &request_id)
                 .map_err(|error| error.to_message())?;
         }
-        let stage_result = self.update_record(runtime_id, |record| {
-            if !lifecycle_managed {
-                record.runtime_perm_mode = normalized_runtime_perm_mode.clone();
-            }
-            record.updated_at = Utc::now();
-        });
-        if let Err(error) = stage_result {
-            if lifecycle_managed {
-                self.lifecycle
-                    .note_settings_failed(runtime_id, handle.generation, &request_id);
-            }
-            let rollback_error = self
-                .update_record(runtime_id, |record| {
-                    record.runtime_perm_mode = original_runtime_perm_mode.clone();
-                    record.updated_at = Utc::now();
-                })
-                .err();
-            notify_browser_policy_changed(app, runtime_id);
-            return Err(match rollback_error {
-                Some(rollback_error) => format!(
-                    "{error}; runtime permission staging rollback also failed: {rollback_error}"
-                ),
-                None => error,
-            });
-        }
-        if !lifecycle_managed {
-            notify_browser_policy_changed(app, runtime_id);
-        }
-        let handle_generation = handle.generation;
         let settings_command = HelperInputCommand::UpdateSettings {
             request_id: &request_id,
             env_name: None,
@@ -4896,80 +5397,27 @@ impl NativeRuntimeManager {
             effort: None,
             force_restart: false,
         };
-        let write_result: Result<(), (String, bool)> = if lifecycle_managed {
-            match self.write_to_live_child_outcome(&handle, &settings_command) {
-                LiveWriteOutcome::Written => Ok(()),
-                LiveWriteOutcome::NotStarted(error) => Err((error, false)),
-                LiveWriteOutcome::StartedUnknown(error) => Err((error, true)),
-            }
-        } else {
-            self.write_to_child_with_reconnect(app, runtime_id, handle, &settings_command)
-                .map_err(|error| (error, false))
-        };
-        if let Err((error, uncertain)) = write_result {
-            if lifecycle_managed {
-                if uncertain {
-                    self.lifecycle.note_settings_uncertain(
-                        runtime_id,
-                        handle_generation,
-                        &request_id,
-                    );
-                } else {
-                    self.lifecycle
-                        .note_settings_failed(runtime_id, handle_generation, &request_id);
-                }
-            }
-            if !uncertain {
-                self.update_record(runtime_id, |record| {
-                    record.runtime_perm_mode = original_runtime_perm_mode;
-                    record.updated_at = Utc::now();
-                })?;
-                notify_browser_policy_changed(app, runtime_id);
-            }
-            return Err(if uncertain {
-                format!("SETTINGS_DELIVERY_UNCERTAIN: {error}")
-            } else {
-                error
-            });
-        }
         if lifecycle_managed {
-            let wait_outcome = self.lifecycle.wait_for_settings_ack(
+            self.deliver_claude_permission_settings_transaction(
+                app,
                 runtime_id,
+                Arc::clone(&handle),
                 &request_id,
-                crate::native_session_coordinator::SETTINGS_ACK_WAIT,
-            );
-            match wait_outcome {
-                SettingsWaitOutcome::Converged => {
-                    // The exact stdout event committed runtime permission and
-                    // invalidated browser policy before waking this waiter.
-                }
-                SettingsWaitOutcome::Deferred => {
-                    return Err(
-                        "PERMISSION_SETTINGS_DEFERRED: live Plan permission was not applied; interactive reply was not sent"
-                            .to_string(),
-                    );
-                }
-                SettingsWaitOutcome::Failed | SettingsWaitOutcome::Timeout => {
-                    let detail = if wait_outcome == SettingsWaitOutcome::Timeout {
-                        "SETTINGS_ACK_TIMEOUT: helper permission delivery is uncertain; choose the mode again to reconcile"
-                    } else {
-                        "SETTINGS_NOT_APPLIED: helper rejected the permission update"
-                    }
-                    .to_string();
-                    self.update_record(runtime_id, |record| {
-                        if record.pending_settings_request_id.as_deref()
-                            == Some(request_id.as_str())
-                        {
-                            record.pending_settings_request_id = None;
-                        }
-                        record.last_error = Some(detail.clone());
-                        record.updated_at = Utc::now();
-                    })?;
-                    return Err(detail);
-                }
-            }
+                &settings_command,
+                display_perm_mode,
+                normalized_runtime_perm_mode,
+            )
+        } else {
+            self.deliver_non_claude_permission_settings_transaction(
+                app,
+                runtime_id,
+                Arc::clone(&handle),
+                &request_id,
+                &settings_command,
+                display_perm_mode,
+                normalized_runtime_perm_mode,
+            )
         }
-        Ok(())
     }
 
     fn rollback_plan_permission_under_transition(
@@ -5003,7 +5451,6 @@ impl NativeRuntimeManager {
                     record.runtime_perm_mode = original_runtime_perm_mode;
                     record.updated_at = Utc::now();
                 })?;
-                notify_browser_policy_changed(app, runtime_id);
                 Ok(())
             }
             Some(current) => Err(format!(
@@ -5031,16 +5478,598 @@ impl NativeRuntimeManager {
         }
     }
 
-    pub fn stop_session(self: &Arc<Self>, runtime_id: &str) -> Result<(), String> {
-        self.stop_session_from(runtime_id, None)
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_claude_permission_settings_transaction(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        handle: Arc<NativeSessionHandle>,
+        request_id: &str,
+        command: &HelperInputCommand<'_>,
+        next_perm_mode: String,
+        next_runtime_perm_mode: Option<String>,
+    ) -> Result<(), String> {
+        let fail_closed = |error: String| {
+            self.lifecycle
+                .note_settings_uncertain(runtime_id, handle.generation, request_id);
+            let quarantine = self.quarantine_permission_transition(app, runtime_id, &handle);
+            Err(match quarantine {
+                Ok(()) => error,
+                Err(quarantine_error) => format!(
+                    "{error}; failed to quarantine split permission authority: {quarantine_error}"
+                ),
+            })
+        };
+        let expands = match self.browser_permission_change_expands(
+            &handle,
+            &next_perm_mode,
+            next_runtime_perm_mode.as_deref(),
+        ) {
+            Ok(expands) => expands,
+            Err(error) => return fail_closed(error),
+        };
+        let deadline = Instant::now() + crate::native_session_coordinator::SETTINGS_ACK_WAIT;
+        let lifecycle = match self.lifecycle_transaction_lock(runtime_id) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => return fail_closed(error),
+        };
+        let _lifecycle = match lock_until(
+            lifecycle.as_ref(),
+            deadline,
+            "Native settings update timed out waiting for helper lifecycle ownership.",
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return fail_closed(error),
+        };
+
+        let result = deliver_browser_permission_change(
+            expands,
+            || {
+                match self.write_to_live_child_outcome(&handle, command) {
+                    LiveWriteOutcome::Written => {}
+                    LiveWriteOutcome::NotStarted(error) => return Err(error),
+                    LiveWriteOutcome::StartedUnknown(error) => {
+                        return Err(format!("SETTINGS_DELIVERY_UNCERTAIN: {error}"));
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .lifecycle
+                    .wait_for_settings_ack(runtime_id, request_id, remaining)
+                {
+                    SettingsWaitOutcome::Converged => Ok(()),
+                    SettingsWaitOutcome::Deferred => {
+                        Err("PERMISSION_SETTINGS_DEFERRED: permission was not applied".to_string())
+                    }
+                    SettingsWaitOutcome::Failed => {
+                        Err("SETTINGS_NOT_APPLIED: helper rejected permission update".to_string())
+                    }
+                    SettingsWaitOutcome::Timeout => Err(
+                        "SETTINGS_ACK_TIMEOUT: helper permission delivery is uncertain".to_string(),
+                    ),
+                }
+            },
+            || {
+                if expands {
+                    self.verify_current_browser_permission_authority(
+                        runtime_id,
+                        &handle,
+                        &next_perm_mode,
+                        next_runtime_perm_mode.as_deref(),
+                    )
+                } else {
+                    self.commit_browser_permission_fields(
+                        app,
+                        runtime_id,
+                        &handle,
+                        next_perm_mode,
+                        next_runtime_perm_mode,
+                    )
+                }
+            },
+            || self.quarantine_permission_transition(app, runtime_id, &handle),
+        );
+        if result.is_err() {
+            self.lifecycle
+                .note_settings_uncertain(runtime_id, handle.generation, request_id);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_non_claude_permission_settings_transaction(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        handle: Arc<NativeSessionHandle>,
+        request_id: &str,
+        command: &HelperInputCommand<'_>,
+        next_perm_mode: String,
+        next_runtime_perm_mode: Option<String>,
+    ) -> Result<(), String> {
+        let fail_closed = |error: String| {
+            let quarantine = self.quarantine_permission_transition(app, runtime_id, &handle);
+            Err(match quarantine {
+                Ok(()) => error,
+                Err(quarantine_error) => format!(
+                    "{error}; failed to quarantine split permission authority: {quarantine_error}"
+                ),
+            })
+        };
+        let expands = match self.browser_permission_change_expands(
+            &handle,
+            &next_perm_mode,
+            next_runtime_perm_mode.as_deref(),
+        ) {
+            Ok(expands) => expands,
+            Err(error) => return fail_closed(error),
+        };
+        let deadline = Instant::now() + NATIVE_SETTINGS_UPDATE_ACK_TIMEOUT;
+        let lifecycle = match self.lifecycle_transaction_lock(runtime_id) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => return fail_closed(error),
+        };
+        let _lifecycle = match lock_until(
+            lifecycle.as_ref(),
+            deadline,
+            "Native settings update timed out waiting for helper lifecycle ownership.",
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return fail_closed(error),
+        };
+
+        deliver_browser_permission_change(
+            expands,
+            || {
+                self.write_settings_with_required_ack(
+                    runtime_id,
+                    Arc::clone(&handle),
+                    command,
+                    request_id,
+                    deadline,
+                )
+            },
+            || {
+                self.commit_browser_permission_fields(
+                    app,
+                    runtime_id,
+                    &handle,
+                    next_perm_mode,
+                    next_runtime_perm_mode,
+                )
+            },
+            || self.quarantine_permission_transition(app, runtime_id, &handle),
+        )
+    }
+
+    fn write_settings_with_required_ack(
+        &self,
+        runtime_id: &str,
+        handle: Arc<NativeSessionHandle>,
+        command: &HelperInputCommand<'_>,
+        request_id: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let result = (|| {
+            if !self.is_current_handle(runtime_id, &handle)? {
+                return Err("Native runtime helper changed before settings delivery.".to_string());
+            }
+            let receiver = handle.settings_update_acks.register(request_id)?;
+            if let Err(error) = self.write_to_child_until(&handle, command, deadline) {
+                let _ = handle.settings_update_acks.cancel(request_id);
+                return Err(error);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = wait_for_required_settings_ack(request_id, receiver, remaining);
+            let _ = handle.settings_update_acks.cancel(request_id);
+            result?;
+            if !self.is_current_handle(runtime_id, &handle)?
+                || handle.permission_quarantined.load(Ordering::SeqCst)
+            {
+                return Err(
+                    "Native runtime helper changed before settings were committed.".to_string(),
+                );
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.fence_permission_quarantine_handle(runtime_id, &handle);
+        }
+        result
+    }
+
+    fn permission_transaction_lock(&self, runtime_id: &str) -> Result<Arc<Mutex<()>>, String> {
+        let mut transactions = self
+            .permission_transactions
+            .lock()
+            .map_err(|_| "Failed to lock native permission transactions".to_string())?;
+        Ok(Arc::clone(
+            transactions
+                .entry(runtime_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
+    fn fence_permission_quarantine(&self, runtime_id: &str) {
+        let mut fences = match self.permission_quarantine_fences.lock() {
+            Ok(fences) => fences,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        fences.insert(runtime_id.to_string());
+    }
+
+    fn clear_permission_quarantine_fence(&self, runtime_id: &str) {
+        let mut fences = match self.permission_quarantine_fences.lock() {
+            Ok(fences) => fences,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        fences.remove(runtime_id);
+    }
+
+    fn fence_permission_quarantine_handle(
+        &self,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+    ) {
+        self.fence_permission_quarantine(runtime_id);
+        handle.permission_quarantined.store(true, Ordering::SeqCst);
+        handle.alive.store(false, Ordering::SeqCst);
+    }
+
+    fn is_permission_quarantine_fenced(&self, runtime_id: &str) -> bool {
+        let fences = match self.permission_quarantine_fences.lock() {
+            Ok(fences) => fences,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        fences.contains(runtime_id)
+    }
+
+    fn lifecycle_transaction_lock(&self, runtime_id: &str) -> Result<Arc<Mutex<()>>, String> {
+        let mut transactions = self
+            .lifecycle_transactions
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycles".to_string())?;
+        Ok(Arc::clone(
+            transactions
+                .entry(runtime_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
+    fn browser_permission_change_expands(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        next_perm_mode: &str,
+        next_runtime_perm_mode: Option<&str>,
+    ) -> Result<bool, String> {
+        let record = handle
+            .record
+            .lock()
+            .map_err(|_| "Failed to lock native session record".to_string())?;
+        let current = effective_native_perm_mode(
+            record.perm_mode.as_str(),
+            record.runtime_perm_mode.as_deref(),
+        );
+        let next = effective_native_perm_mode(next_perm_mode, next_runtime_perm_mode);
+        Ok(authorize_browser_tool(current, "click").is_err()
+            && authorize_browser_tool(next, "click").is_ok())
+    }
+
+    fn commit_browser_permission_fields(
+        &self,
+        app: &AppHandle,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        next_perm_mode: String,
+        next_runtime_perm_mode: Option<String>,
+    ) -> Result<(), String> {
+        if !self.is_current_handle(runtime_id, handle)?
+            || handle.permission_quarantined.load(Ordering::SeqCst)
+        {
+            return Err("Native runtime helper changed before permission commit.".to_string());
+        }
+        let _sync = handle
+            .browser_permission_sync
+            .lock()
+            .map_err(|_| "Failed to lock native browser permission authority".to_string())?;
+        let (previous_perm_mode, previous_runtime_perm_mode, workspace_dir, browser_actor_id) = {
+            let record = handle
+                .record
+                .lock()
+                .map_err(|_| "Failed to lock native session record".to_string())?;
+            (
+                record.perm_mode.clone(),
+                record.runtime_perm_mode.clone(),
+                record.project_dir.clone(),
+                record.browser_actor_id.clone(),
+            )
+        };
+        let previous_effective = effective_native_perm_mode(
+            previous_perm_mode.as_str(),
+            previous_runtime_perm_mode.as_deref(),
+        )
+        .to_string();
+        let next_effective =
+            effective_native_perm_mode(next_perm_mode.as_str(), next_runtime_perm_mode.as_deref())
+                .to_string();
+        let expands_browser_authority = authorize_browser_tool(&previous_effective, "click")
+            .is_err()
+            && authorize_browser_tool(&next_effective, "click").is_ok();
+        let next_ticket = handle
+            .browser_permission
+            .update_with_invalidation(&next_effective, |_| true)
+            .map_err(|_| "Native browser permission authority is unavailable".to_string())?;
+        let sync_result = self.sync_login_browser_permission(
+            app,
+            &workspace_dir,
+            &browser_actor_id,
+            next_ticket.clone(),
+        );
+
+        if let Err(error) = &sync_result {
+            if expands_browser_authority {
+                self.rollback_browser_permission_authority(
+                    app,
+                    runtime_id,
+                    handle,
+                    &workspace_dir,
+                    &browser_actor_id,
+                    &previous_effective,
+                );
+                return Err(error.clone());
+            }
+        }
+
+        let update_result = self.update_record(runtime_id, |record| {
+            record.perm_mode = next_perm_mode;
+            record.runtime_perm_mode = next_runtime_perm_mode;
+            record.updated_at = Utc::now();
+        });
+        if let Err(error) = update_result {
+            if expands_browser_authority {
+                self.rollback_browser_permission_authority(
+                    app,
+                    runtime_id,
+                    handle,
+                    &workspace_dir,
+                    &browser_actor_id,
+                    &previous_effective,
+                );
+                let _ = self.update_record(runtime_id, |record| {
+                    record.perm_mode = previous_perm_mode;
+                    record.runtime_perm_mode = previous_runtime_perm_mode;
+                    record.updated_at = Utc::now();
+                });
+            }
+            return Err(error);
+        }
+        sync_result
+    }
+
+    fn verify_current_browser_permission_authority(
+        &self,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        next_perm_mode: &str,
+        next_runtime_perm_mode: Option<&str>,
+    ) -> Result<(), String> {
+        if !self.is_current_handle(runtime_id, handle)?
+            || handle.permission_quarantined.load(Ordering::SeqCst)
+        {
+            return Err("Native runtime helper changed before permission commit.".to_string());
+        }
+        let _sync = handle
+            .browser_permission_sync
+            .lock()
+            .map_err(|_| "Failed to lock native browser permission authority".to_string())?;
+        let expected = effective_native_perm_mode(next_perm_mode, next_runtime_perm_mode);
+        let record = handle
+            .record
+            .lock()
+            .map_err(|_| "Failed to lock native session record".to_string())?;
+        let recorded = effective_native_perm_mode(
+            record.perm_mode.as_str(),
+            record.runtime_perm_mode.as_deref(),
+        );
+        let authority = handle
+            .browser_permission
+            .current_ticket()
+            .map_err(|_| "Native browser permission authority is unavailable".to_string())?;
+        if recorded != expected || authority.mode() != expected {
+            return Err("Native browser permission authority is out of sync.".to_string());
+        }
+        Ok(())
+    }
+
+    fn rollback_browser_permission_authority(
+        &self,
+        app: &AppHandle,
+        _runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        workspace_dir: &str,
+        browser_actor_id: &str,
+        permission_mode: &str,
+    ) {
+        if let Ok(ticket) = handle
+            .browser_permission
+            .update_with_invalidation(permission_mode, |_| true)
+        {
+            let _ =
+                self.sync_login_browser_permission(app, workspace_dir, browser_actor_id, ticket);
+        }
+    }
+
+    fn sync_login_browser_permission(
+        &self,
+        app: &AppHandle,
+        workspace_dir: &str,
+        browser_actor_id: &str,
+        authority: BrowserPermissionAuthorityTicket,
+    ) -> Result<(), String> {
+        let Some(login) =
+            app.try_state::<Arc<crate::browser::login::session::LoginBrowserSessionManager>>()
+        else {
+            return Ok(());
+        };
+        let workspace = crate::browser::login::session::TrustedWorkspacePath::from_trusted_app(
+            PathBuf::from(workspace_dir),
+        )
+        .map_err(|error| error.to_string())?;
+        login
+            .update_permission_for_actor(workspace, browser_actor_id, authority)
+            .map_err(|error| error.to_string())
+    }
+
+    fn synchronize_current_browser_permission(
+        &self,
+        app: &AppHandle,
+        runtime_id: &str,
+    ) -> Result<(), String> {
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned()
+            .ok_or_else(|| format!("Native runtime {runtime_id} helper is not connected"))?;
+        let _sync = handle
+            .browser_permission_sync
+            .lock()
+            .map_err(|_| "Failed to lock native browser permission authority".to_string())?;
+        if !self.is_current_handle(runtime_id, &handle)?
+            || handle.permission_quarantined.load(Ordering::SeqCst)
+        {
+            return Err("Native runtime helper changed before permission sync.".to_string());
+        }
+        let (effective_mode, workspace_dir, browser_actor_id) = {
+            let record = handle
+                .record
+                .lock()
+                .map_err(|_| "Failed to lock native session record".to_string())?;
+            (
+                effective_native_perm_mode(
+                    record.perm_mode.as_str(),
+                    record.runtime_perm_mode.as_deref(),
+                )
+                .to_string(),
+                record.project_dir.clone(),
+                record.browser_actor_id.clone(),
+            )
+        };
+        let authority = handle
+            .browser_permission
+            .update_with_invalidation(&effective_mode, |_| true)
+            .map_err(|_| "Native browser permission authority is unavailable".to_string())?;
+        self.sync_login_browser_permission(app, &workspace_dir, &browser_actor_id, authority)
+    }
+
+    fn quarantine_permission_transition(
+        &self,
+        app: &AppHandle,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+    ) -> Result<(), String> {
+        // This is the emergency path for a split authority transaction. It deliberately does not
+        // wait on the lifecycle mutex: a stalled writer may be the reason quarantine is running.
+        // The current handle is atomically fenced and its verified domain is terminated before
+        // any browser-side lock is attempted. The runtime-level fence survives generation
+        // removal until durable readonly quarantine is written.
+        let mut quarantine_errors = Vec::new();
+        let browser_identity = self.browser_identity_for_runtime(runtime_id);
+        self.fence_permission_quarantine(runtime_id);
+        handle.permission_quarantined.store(true, Ordering::SeqCst);
+        handle.alive.store(false, Ordering::SeqCst);
+
+        if let Err(error) = self.retire_handle_if_current(runtime_id, handle) {
+            quarantine_errors.push(format!(
+                "failed to terminate the quarantined helper process tree: {error}"
+            ));
+        }
+
+        if let Err(error) = self.update_record(runtime_id, |record| {
+            record.perm_mode = "readonly".to_string();
+            record.runtime_perm_mode = None;
+            record.permission_quarantined = true;
+            record.status = "permission_quarantined".to_string();
+            record.is_active = false;
+            record.last_error = Some(
+                "Permission update could not be completed safely; the runtime was quarantined."
+                    .to_string(),
+            );
+            record.updated_at = Utc::now();
+        }) {
+            quarantine_errors.push(format!("failed to persist runtime quarantine: {error}"));
+        }
+
+        match handle.browser_permission_sync.try_lock() {
+            Ok(_permission_sync) => match handle.browser_permission.try_update("readonly") {
+                Ok(ticket) => match browser_identity.as_ref() {
+                    Ok((workspace_dir, browser_actor_id)) => {
+                        if let Err(error) = self.sync_login_browser_permission(
+                            app,
+                            workspace_dir,
+                            browser_actor_id,
+                            ticket,
+                        ) {
+                            quarantine_errors.push(format!(
+                                "failed to retire Login Browser permission: {error}"
+                            ));
+                        }
+                    }
+                    Err(error) => quarantine_errors.push(error.clone()),
+                },
+                Err(_) => quarantine_errors
+                    .push("failed to retire native browser permission authority".to_string()),
+            },
+            Err(_) => quarantine_errors.push(
+                "native browser permission retirement was busy; cleanup deferred".to_string(),
+            ),
+        }
+        match browser_identity.as_ref() {
+            Ok((workspace_dir, browser_actor_id)) => {
+                if let Err(error) =
+                    retire_login_browser_agent_control(app, workspace_dir, browser_actor_id)
+                {
+                    quarantine_errors.push(format!(
+                        "failed to retire Login Browser Agent control: {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                if !quarantine_errors.iter().any(|existing| existing == error) {
+                    quarantine_errors.push(error.clone());
+                }
+            }
+        }
+        let _ = self.append_lifecycle_event(
+            runtime_id,
+            "permission_transition_quarantined",
+            "Permission authorities diverged during an update; browser authority was retired and the native helper is being terminated.".to_string(),
+        );
+        if quarantine_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(quarantine_errors.join("; "))
+        }
+    }
+
+    pub fn stop_session(self: &Arc<Self>, app: &AppHandle, runtime_id: &str) -> Result<(), String> {
+        self.stop_session_from(app, runtime_id, None)
     }
 
     pub fn stop_session_from(
         self: &Arc<Self>,
+        app: &AppHandle,
         runtime_id: &str,
         source: Option<&str>,
     ) -> Result<(), String> {
-        self.stop_session_from_with_grace(runtime_id, source, None, NATIVE_STOP_GRACE_PERIOD)
+        self.stop_session_from_with_grace(
+            Some(app),
+            runtime_id,
+            source,
+            None,
+            NATIVE_STOP_GRACE_PERIOD,
+        )
     }
 
     pub fn stop_session_from_expected(
@@ -5050,6 +6079,7 @@ impl NativeRuntimeManager {
         expected_command_id: Option<&str>,
     ) -> Result<(), String> {
         self.stop_session_from_with_grace(
+            None,
             runtime_id,
             source,
             expected_command_id,
@@ -5059,6 +6089,7 @@ impl NativeRuntimeManager {
 
     fn stop_session_from_with_grace(
         self: &Arc<Self>,
+        app: Option<&AppHandle>,
         runtime_id: &str,
         source: Option<&str>,
         expected_command_id: Option<&str>,
@@ -5102,6 +6133,20 @@ impl NativeRuntimeManager {
             .as_ref()
             .map(|handle| handle.generation.to_string())
             .unwrap_or_else(|| "none".to_string());
+        let browser_identity = self.browser_identity_for_runtime(runtime_id);
+        match (app, browser_identity) {
+            (Some(app), Ok((workspace_dir, browser_actor_id))) => {
+                if let Err(error) =
+                    retire_login_browser_agent_control(app, &workspace_dir, &browser_actor_id)
+                {
+                    errors.push(format!(
+                        "failed to retire Login Browser Agent control: {error}"
+                    ));
+                }
+            }
+            (Some(_), Err(error)) => errors.push(error),
+            (None, _) => {}
+        }
         if let Err(error) = self.append_lifecycle_event(
             runtime_id,
             "stop_requested",
@@ -5258,6 +6303,7 @@ impl NativeRuntimeManager {
         if let Some(handle) = stop_handle {
             if let Err(error) = self.update_record(runtime_id, |record| {
                 record.status = "interrupted".to_string();
+                record.is_active = false;
                 record.updated_at = Utc::now();
             }) {
                 errors.push(error);
@@ -6017,6 +7063,23 @@ impl NativeRuntimeManager {
         app: AppHandle,
         runtime_id: &str,
     ) -> Result<Arc<NativeSessionHandle>, String> {
+        let transaction = self.lifecycle_transaction_lock(runtime_id)?;
+        let _transaction = transaction
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycle".to_string())?;
+        self.ensure_handle_locked(app, runtime_id)
+    }
+
+    fn ensure_handle_locked(
+        self: &Arc<Self>,
+        app: AppHandle,
+        runtime_id: &str,
+    ) -> Result<Arc<NativeSessionHandle>, String> {
+        if self.is_permission_quarantine_fenced(runtime_id) {
+            return Err(format!(
+                "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+            ));
+        }
         if let Some(handle) = self
             .handles
             .lock()
@@ -6024,6 +7087,16 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
         {
+            let durable_quarantine = handle
+                .record
+                .lock()
+                .map_err(|_| "Failed to lock native session record".to_string())?
+                .permission_quarantined;
+            if durable_quarantine || handle.permission_quarantined.load(Ordering::SeqCst) {
+                return Err(format!(
+                    "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+                ));
+            }
             if handle.alive.load(Ordering::SeqCst) {
                 return Ok(handle);
             }
@@ -6088,8 +7161,7 @@ impl NativeRuntimeManager {
             )
             .and_then(|_| self.spawn_helper(app, runtime_id, &options, handle.clone()));
         if let Err(error) = launch_result {
-            let _ = self.kill_child(runtime_id);
-            let _ = self.remove_handle(runtime_id);
+            let _ = self.retire_handle_if_current(runtime_id, &handle);
             if let Some(rollback_record) = rollback_record.as_ref() {
                 let _ = self.rollback_reconnect_failure(runtime_id, rollback_record, error.clone());
             } else {
@@ -6119,6 +7191,17 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
             .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
+        if record.permission_quarantined {
+            return Err(format!(
+                "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+            ));
+        }
+        if matches!(record.status.as_str(), "stopped" | "handoff") {
+            return Err(format!(
+                "Native runtime {runtime_id} cannot reconnect from terminal status {}.",
+                record.status
+            ));
+        }
         let rollback_record = rollback_record
             .map(recoverable_record_after_helper_removed)
             .unwrap_or_else(|| record.clone());
@@ -6154,6 +7237,12 @@ impl NativeRuntimeManager {
         let handle = Arc::new(NativeSessionHandle {
             generation: self.allocate_handle_generation(),
             record: Mutex::new(record.clone()),
+            browser_permission: BrowserPermissionAuthority::new(effective_native_perm_mode(
+                record.perm_mode.as_str(),
+                record.runtime_perm_mode.as_deref(),
+            )),
+            browser_permission_sync: Mutex::new(()),
+            settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::with_start_seq(
                 runtime_id.to_string(),
@@ -6171,6 +7260,7 @@ impl NativeRuntimeManager {
             codex_path: options.codex_path.clone(),
             codex_base_url: options.codex_base_url.clone(),
             codex_api_key: options.codex_api_key.clone(),
+            permission_quarantined: AtomicBool::new(record.permission_quarantined),
             alive: AtomicBool::new(true),
         });
 
@@ -6266,6 +7356,12 @@ impl NativeRuntimeManager {
         options: &NativeSessionOptions,
         handle: Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
+        if self.is_permission_quarantine_fenced(runtime_id) {
+            self.fence_permission_quarantine_handle(runtime_id, &handle);
+            return Err(format!(
+                "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+            ));
+        }
         let todo_snapshot_seed = self.event_log.latest_todo_snapshot(runtime_id)?;
         let helper_router_init = options
             .router_record
@@ -6276,18 +7372,45 @@ impl NativeRuntimeManager {
         let command = app
             .shell()
             .sidecar("ccem-node")
-            .map_err(|error| format!("Failed to resolve Node sidecar: {}", error))?
+            .map_err(|error| format!("Failed to resolve Node sidecar: {error}"))?
             .arg(helper_path.to_string_lossy().to_string())
             .current_dir(&options.working_dir);
 
         let (mut rx, child) = spawn_native_helper_process(command.into())?;
-
+        if self.is_permission_quarantine_fenced(runtime_id) {
+            self.fence_permission_quarantine_handle(runtime_id, &handle);
+            drop(child);
+            return Err(format!(
+                "Native runtime {runtime_id} was quarantined during helper launch."
+            ));
+        }
+        if !self.is_current_handle(runtime_id, &handle)? {
+            drop(child);
+            return Err("Native runtime helper owner changed during launch.".to_string());
+        }
         {
             let mut child_slot = handle
                 .child
                 .lock()
                 .map_err(|_| "Failed to lock native sidecar child".to_string())?;
+            if child_slot.is_some() {
+                drop(child);
+                return Err("Native runtime helper already has an owned child.".to_string());
+            }
             *child_slot = Some(child);
+        }
+
+        if self.is_permission_quarantine_fenced(runtime_id) {
+            self.fence_permission_quarantine_handle(runtime_id, &handle);
+            let cleanup = self.retire_handle_if_current(runtime_id, &handle);
+            return Err(match cleanup {
+                Ok(_) => format!(
+                    "Native runtime {runtime_id} was quarantined before helper initialization."
+                ),
+                Err(cleanup_error) => format!(
+                    "Native runtime {runtime_id} was quarantined before helper initialization; helper cleanup failed: {cleanup_error}"
+                ),
+            });
         }
 
         // The initial prompt becomes a formal foreground command BEFORE the
@@ -6841,12 +7964,12 @@ impl NativeRuntimeManager {
                 .remove(runtime_id);
         }
         drop(_reconnect_guard);
-        let queue_result = if let Some(app) = app.filter(|_| {
+        if let Some(app) = app.filter(|_| {
             request_queue_autodrain
                 || (!defer_queue_autodrain
                     && lifecycle_transition_unblocked_queue(before.as_ref(), after.as_ref()))
         }) {
-            self.maybe_dispatch_queued(
+            self.schedule_queued_dispatch(
                 app,
                 runtime_id,
                 if request_queue_autodrain {
@@ -6854,15 +7977,12 @@ impl NativeRuntimeManager {
                 } else {
                     QueueDispatchTrigger::AuthoritativeLifecycle
                 },
-            )
-        } else {
-            Ok(())
-        };
-        // Ownership/queue mutation occurs before event persistence. Even if
-        // the presentation write fails, always perform the derived drain so a
-        // following FIFO command is not stranded behind a terminal already
-        // consumed by the coordinator. Preserve the observation error after.
-        result.and(queue_result)
+            );
+        }
+        // Queue dispatch may wait on the foreground transition lock. Keep it
+        // detached so the single stdout pump can continue consuming the ACKs
+        // that release that lock; claim_next still serializes FIFO ownership.
+        result
     }
 
     fn process_helper_stdout_with_app(
@@ -6914,24 +8034,11 @@ impl NativeRuntimeManager {
                     query_generation,
                 );
                 self.apply_lifecycle_decision(runtime_id, &lifecycle_decision)?;
-                let mut pending_handoff_terminal = None;
-                let mut pending_handoff_allow_background_task_termination = false;
-                let provider = self
-                    .records
-                    .lock()
-                    .map_err(|_| "Failed to lock native runtime records".to_string())?
-                    .get(runtime_id)
-                    .map(|record| record.provider)
-                    .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
-
-                self.update_record(runtime_id, |record| {
-                    record.provider_session_id = Some(provider_session_id.clone());
-                    record.can_handoff_to_terminal = terminal::external_terminal_launch_supported();
-                    pending_handoff_terminal = record.pending_handoff_terminal;
-                    pending_handoff_allow_background_task_termination =
-                        record.pending_handoff_allow_background_task_termination;
-                    record.updated_at = Utc::now();
-                })?;
+                let (provider, pending_handoff_terminal, provider_session_id) =
+                    self.bind_provider_session_lineage(app, runtime_id, &provider_session_id)?;
+                let pending_handoff_allow_background_task_termination = self
+                    .current_record(runtime_id)?
+                    .pending_handoff_allow_background_task_termination;
 
                 if let Err(error) =
                     bind_source_session_id(provider.as_str(), runtime_id, &provider_session_id)
@@ -6974,6 +8081,8 @@ impl NativeRuntimeManager {
                         }
                         Ok(None) => {
                             let record = self.current_record(runtime_id)?;
+                            let browser_identity =
+                                (record.project_dir.clone(), record.browser_actor_id.clone());
                             let result = self.complete_terminal_handoff(
                                 record,
                                 terminal,
@@ -6986,7 +8095,15 @@ impl NativeRuntimeManager {
                                 })?
                                 .remove(runtime_id);
                             match result {
-                                Ok(()) => destroy_browser_session(app, runtime_id),
+                                Ok(()) => {
+                                    if let Some(app) = app {
+                                        retire_login_browser_agent_control(
+                                            app,
+                                            &browser_identity.0,
+                                            &browser_identity.1,
+                                        )?;
+                                    }
+                                }
                                 Err(error) => self.fail_pending_terminal_handoff(
                                     runtime_id,
                                     &preparation_id,
@@ -7100,40 +8217,64 @@ impl NativeRuntimeManager {
                         return Ok(());
                     }
                 };
-                let settings_policy_changed = matches!(
-                    &payload,
+                let permission_change_request = match &payload {
                     SessionEventPayload::RuntimeSettingsChanged {
                         state,
+                        request_id,
                         permission_scope: Some(_),
                         ..
-                    } if state == "applied"
-                );
-                let lifecycle_decision =
-                    if matches!(&payload, SessionEventPayload::RuntimeSettingsChanged { .. }) {
-                        // Commit the exact settings projection before notifying
-                        // coordinator waiters. This prevents an older stdout-side
-                        // record clone from overwriting the waiter's newer
-                        // permission projection in the live handle.
-                        self.append_event(runtime_id, payload.clone())?;
-                        self.ingest_lifecycle_for_coordination(
-                            runtime_id,
-                            helper_incarnation,
-                            &payload,
-                        )
-                    } else {
-                        let decision = self.ingest_lifecycle_for_coordination(
-                            runtime_id,
-                            helper_incarnation,
-                            &payload,
-                        );
-                        self.append_event(runtime_id, payload)?;
-                        decision
-                    };
-                if settings_policy_changed {
-                    if let Some(app) = app {
-                        notify_browser_policy_changed(app, runtime_id);
+                    } if state == "applied" => Some(request_id.clone()),
+                    _ => None,
+                };
+                let lifecycle_decision = if matches!(
+                    &payload,
+                    SessionEventPayload::RuntimeSettingsChanged { .. }
+                ) {
+                    // Commit the exact projection and Mode 2 authority before
+                    // notifying coordinator waiters or auto-draining FIFO.
+                    self.append_event(runtime_id, payload.clone())?;
+                    if let (Some(request_id), Some(app)) = (permission_change_request.as_ref(), app)
+                    {
+                        if let Err(sync_error) =
+                            self.synchronize_current_browser_permission(app, runtime_id)
+                        {
+                            let handle = self
+                                .handles
+                                .lock()
+                                .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                                .get(runtime_id)
+                                .filter(|handle| handle.generation == helper_incarnation)
+                                .cloned();
+                            if let Some(handle) = handle {
+                                if let Some(request_id) = request_id.as_deref() {
+                                    self.lifecycle.note_settings_uncertain(
+                                        runtime_id,
+                                        helper_incarnation,
+                                        request_id,
+                                    );
+                                }
+                                let quarantine =
+                                    self.quarantine_permission_transition(app, runtime_id, &handle);
+                                return Err(match quarantine {
+                                        Ok(()) => sync_error,
+                                        Err(quarantine_error) => format!(
+                                            "{sync_error}; failed to quarantine split permission authority: {quarantine_error}"
+                                        ),
+                                    });
+                            }
+                            return Err(sync_error);
+                        }
                     }
-                }
+                    self.ingest_lifecycle_for_coordination(runtime_id, helper_incarnation, &payload)
+                } else {
+                    let decision = self.ingest_lifecycle_for_coordination(
+                        runtime_id,
+                        helper_incarnation,
+                        &payload,
+                    );
+                    self.append_event(runtime_id, payload)?;
+                    decision
+                };
                 self.apply_lifecycle_decision(runtime_id, &lifecycle_decision)
             }
             HelperOutputEvent::BrowserToolRequest {
@@ -7149,6 +8290,30 @@ impl NativeRuntimeManager {
                     args,
                 },
             ),
+            HelperOutputEvent::SettingsUpdateResult {
+                request_id,
+                outcome,
+                detail,
+            } => {
+                if !is_valid_settings_update_request_id(&request_id) {
+                    return Err(
+                        "Helper returned an invalid settings update request id.".to_string()
+                    );
+                }
+                let handle = self
+                    .handles
+                    .lock()
+                    .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                    .get(runtime_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("Native runtime {runtime_id} helper is not connected")
+                    })?;
+                let _ = handle
+                    .settings_update_acks
+                    .resolve(&request_id, SettingsUpdateAck { outcome, detail })?;
+                Ok(())
+            }
             HelperOutputEvent::TeardownPrepared {
                 request_id,
                 ready,
@@ -7184,6 +8349,8 @@ impl NativeRuntimeManager {
                         return self.fail_pending_terminal_handoff(runtime_id, &request_id, &error);
                     }
                     let record = self.current_record(runtime_id)?;
+                    let browser_identity =
+                        (record.project_dir.clone(), record.browser_actor_id.clone());
                     let result = self.complete_terminal_handoff(
                         record,
                         terminal,
@@ -7195,7 +8362,13 @@ impl NativeRuntimeManager {
                         .remove(runtime_id);
                     match result {
                         Ok(()) => {
-                            destroy_browser_session(app, runtime_id);
+                            if let Some(app) = app {
+                                retire_login_browser_agent_control(
+                                    app,
+                                    &browser_identity.0,
+                                    &browser_identity.1,
+                                )?;
+                            }
                             return Ok(());
                         }
                         Err(error) => {
@@ -7311,53 +8484,104 @@ impl NativeRuntimeManager {
             .get(runtime_id)
             .cloned()
             .ok_or_else(|| format!("Native runtime {} helper is not connected", runtime_id))?;
+        if handle.permission_quarantined.load(Ordering::SeqCst) {
+            return Err(
+                "Native runtime helper is quarantined after an incomplete permission update."
+                    .to_string(),
+            );
+        }
 
-        let (workspace_dir, permission_mode, authorization) = {
-            let record = handle
-                .record
-                .lock()
-                .map_err(|_| "Failed to lock native session record".to_string())?;
-            let permission_mode = effective_native_perm_mode(
-                record.perm_mode.as_str(),
-                record.runtime_perm_mode.as_deref(),
+        let response = (|| {
+            let app =
+                app.ok_or_else(|| "Browser tool request requires an app handle.".to_string())?;
+            let login = app
+                .try_state::<Arc<crate::browser::login::session::LoginBrowserSessionManager>>()
+                .map(|state| Arc::clone(&state))
+                .ok_or_else(|| "Mode 2 browser manager is not registered.".to_string())?;
+            let (workspace_dir, browser_actor_id) = {
+                let record = handle
+                    .record
+                    .lock()
+                    .map_err(|_| "Failed to lock native session record".to_string())?;
+                if !is_valid_browser_actor_id(&record.browser_actor_id) {
+                    return Err("Native browser actor lineage is unavailable.".to_string());
+                }
+                (record.project_dir.clone(), record.browser_actor_id.clone())
+            };
+            let workspace = crate::browser::login::session::TrustedWorkspacePath::from_trusted_app(
+                PathBuf::from(&workspace_dir),
             )
-            .to_string();
-            (
-                record.project_dir.clone(),
-                permission_mode,
-                authorize_browser_tool_for_record(&record, &request.tool),
-            )
-        };
-
-        let response = match app {
-            Some(app) => match app.try_state::<Arc<BrowserManager>>() {
-                Some(browser) => {
-                    let audit = browser.audit_policy_decision(
-                        &workspace_dir,
-                        runtime_id,
-                        &permission_mode,
-                        &request,
-                        authorization.is_ok(),
-                        authorization.as_ref().err().map(String::as_str),
+            .map_err(|error| error.to_string())?;
+            let handoff_deadline = Instant::now() + NATIVE_BROWSER_HANDOFF_GRACE_PERIOD;
+            let prepared = loop {
+                if !handle.alive.load(Ordering::SeqCst)
+                    || handle.permission_quarantined.load(Ordering::SeqCst)
+                    || !self.is_current_handle(runtime_id, &handle)?
+                {
+                    return Err(
+                        "Mode 2 browser handoff wait was cancelled with the native session."
+                            .to_string(),
                     );
-                    match authorization {
-                        Ok(()) => audit.and_then(|_| {
-                            browser.run_tool(app, runtime_id, &workspace_dir, &request)
-                        }),
-                        Err(policy_error) => {
-                            if let Err(audit_error) = audit {
-                                eprintln!(
-                                    "Failed to append denied preview browser audit: {audit_error}"
-                                );
-                            }
-                            Err(policy_error)
+                }
+                let prepared = {
+                    // Permission updates may cancel this wait between attempts. Never hold this
+                    // lock, the native record lock, or the Login Browser registry while sleeping.
+                    let _sync = handle.browser_permission_sync.lock().map_err(|_| {
+                        "Failed to lock native browser permission authority".to_string()
+                    })?;
+                    if handle.permission_quarantined.load(Ordering::SeqCst) {
+                        return Err(
+                            "Native runtime helper is quarantined after an incomplete permission update."
+                                .to_string(),
+                        );
+                    }
+                    let authority = handle.browser_permission.current_ticket().map_err(|_| {
+                        "Native browser permission authority is unavailable".to_string()
+                    })?;
+                    {
+                        let record = handle
+                            .record
+                            .lock()
+                            .map_err(|_| "Failed to lock native session record".to_string())?;
+                        let recorded_mode = effective_native_perm_mode(
+                            record.perm_mode.as_str(),
+                            record.runtime_perm_mode.as_deref(),
+                        );
+                        if recorded_mode != authority.mode() {
+                            return Err(
+                                "Native browser permission authority is out of sync.".to_string()
+                            );
                         }
                     }
+                    login.prepare_agent_tool_if_handed_off(
+                        &workspace_dir,
+                        &browser_actor_id,
+                        authority,
+                        &request,
+                    )?
+                };
+                if let Some(prepared) = prepared {
+                    break prepared;
                 }
-                None => Err("Browser manager is not registered.".to_string()),
-            },
-            None => Err("Browser tool request requires an app handle.".to_string()),
-        };
+                if !login
+                    .agent_handoff_expected_for_actor(&workspace, &browser_actor_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(
+                        "Mode 2 browser is not handed off to this exact session actor.".to_string(),
+                    );
+                }
+                let now = Instant::now();
+                if now >= handoff_deadline {
+                    return Err(
+                        "Mode 2 browser handoff did not become ready for this exact session actor."
+                            .to_string(),
+                    );
+                }
+                thread::sleep(NATIVE_BROWSER_HANDOFF_POLL_INTERVAL.min(handoff_deadline - now));
+            };
+            login.execute_prepared_agent_tool(&request, prepared)
+        })();
 
         match response {
             Ok(result) => self.write_to_child(
@@ -7387,6 +8611,10 @@ impl NativeRuntimeManager {
         exit_code: Option<i32>,
         handle: &Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
+        let lifecycle = self.lifecycle_transaction_lock(runtime_id)?;
+        let _lifecycle = lifecycle
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycle".to_string())?;
         let mut errors = Vec::new();
         let _reconnect_guard = match self.reconnect_lock.lock() {
             Ok(guard) => guard,
@@ -7491,7 +8719,12 @@ impl NativeRuntimeManager {
         handle: &Arc<NativeSessionHandle>,
         command: &HelperInputCommand<'_>,
     ) -> Result<(), String> {
-        self.write_to_child_checked(handle, command, false)
+        self.write_to_child_checked_until(
+            handle,
+            command,
+            false,
+            Instant::now() + NATIVE_HELPER_WRITE_TIMEOUT,
+        )
     }
 
     fn write_to_live_child(
@@ -7499,7 +8732,12 @@ impl NativeRuntimeManager {
         handle: &Arc<NativeSessionHandle>,
         command: &HelperInputCommand<'_>,
     ) -> Result<(), String> {
-        self.write_to_child_checked(handle, command, true)
+        self.write_to_child_checked_until(
+            handle,
+            command,
+            true,
+            Instant::now() + NATIVE_HELPER_WRITE_TIMEOUT,
+        )
     }
 
     fn write_to_live_child_outcome(
@@ -7539,27 +8777,60 @@ impl NativeRuntimeManager {
         }
     }
 
-    fn write_to_child_checked(
+    fn write_to_child_until(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        command: &HelperInputCommand<'_>,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_to_child_checked_until(handle, command, false, deadline)
+    }
+
+    fn write_to_child_checked_until(
         &self,
         handle: &Arc<NativeSessionHandle>,
         command: &HelperInputCommand<'_>,
         require_live: bool,
+        deadline: Instant,
     ) -> Result<(), String> {
-        let line = serde_json::to_string(command)
-            .map_err(|error| format!("Failed to encode helper command: {}", error))?;
-        let mut child_guard = handle
-            .child
-            .lock()
-            .map_err(|_| "Failed to lock native sidecar child".to_string())?;
+        if handle.permission_quarantined.load(Ordering::SeqCst) {
+            return Err(
+                "Native runtime helper is quarantined after an incomplete permission update."
+                    .to_string(),
+            );
+        }
+        let mut line = serde_json::to_vec(command)
+            .map_err(|error| format!("Failed to encode helper command: {error}"))?;
+        line.push(b'\n');
+        let child_guard = lock_until(
+            &handle.child,
+            deadline,
+            "Native settings update timed out waiting for helper process ownership.",
+        )?;
         if require_live && !handle.alive.load(Ordering::SeqCst) {
             return Err(NATIVE_HELPER_RETIRING_ERROR.to_string());
         }
-        let child = child_guard
-            .as_mut()
-            .ok_or_else(|| "Native sidecar child is not available".to_string())?;
-        child
-            .write(format!("{}\n", line).as_bytes())
-            .map_err(|error| format!("Failed to write to native sidecar stdin: {}", error))
+        if handle.permission_quarantined.load(Ordering::SeqCst) {
+            return Err(
+                "Native runtime helper is quarantined after an incomplete permission update."
+                    .to_string(),
+            );
+        }
+        let writer = child_guard
+            .as_ref()
+            .ok_or_else(|| "Native sidecar child is not available".to_string())?
+            .writer
+            .as_ref()
+            .ok_or_else(|| "Native helper writer is unavailable.".to_string())?
+            .clone();
+        drop(child_guard);
+        if handle.permission_quarantined.load(Ordering::SeqCst) {
+            return Err(
+                "Native runtime helper is quarantined after an incomplete permission update."
+                    .to_string(),
+            );
+        }
+        writer.write_until(line, deadline)
     }
 
     fn write_to_child_with_reconnect(
@@ -7569,6 +8840,13 @@ impl NativeRuntimeManager {
         handle: Arc<NativeSessionHandle>,
         command: &HelperInputCommand<'_>,
     ) -> Result<(), String> {
+        let transaction = self.lifecycle_transaction_lock(runtime_id)?;
+        let _transaction = transaction
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycle".to_string())?;
+        if !self.is_current_handle(runtime_id, &handle)? {
+            return Err("Native runtime helper changed before command delivery.".to_string());
+        }
         let requires_live_handle = matches!(command, HelperInputCommand::Prompt { .. });
         let write_result = if requires_live_handle {
             self.write_to_live_child(&handle, command)
@@ -7631,6 +8909,62 @@ impl NativeRuntimeManager {
                 } else {
                     self.write_to_child(&next_handle, command)
                 }
+            }
+            Err(error) if is_unknown_native_child_delivery_error(&error) => {
+                let command_kind = helper_command_kind(command);
+                self.fence_permission_quarantine_handle(runtime_id, &handle);
+                let _ = self.append_event(
+                    runtime_id,
+                    SessionEventPayload::Lifecycle {
+                        stage: "helper_delivery_unknown".to_string(),
+                        detail: format!(
+                            "Stopping native runtime helper generation {} after indeterminate {} delivery; the command will not be replayed automatically.",
+                            handle.generation, command_kind
+                        ),
+                        assistant_message_uuid: None,
+                        command_id: None,
+                        query_generation: None,
+                        user_message_uuid: None,
+                    },
+                );
+                if let Err(kill_error) = self.retire_handle_if_current(runtime_id, &handle) {
+                    let persistence = self.update_record(runtime_id, |record| {
+                        record.perm_mode = "readonly".to_string();
+                        record.runtime_perm_mode = None;
+                        record.permission_quarantined = true;
+                        record.status = "permission_quarantined".to_string();
+                        record.is_active = false;
+                        record.last_error = Some(format!(
+                            "Native {command_kind} delivery was indeterminate and the helper could not be safely terminated."
+                        ));
+                        record.updated_at = Utc::now();
+                    });
+                    return Err(match persistence {
+                        Ok(()) => format!(
+                            "{error}; native {command_kind} delivery is indeterminate; failed to terminate helper: {kill_error}; durable quarantine persisted"
+                        ),
+                        Err(persist_error) => format!(
+                            "{error}; native {command_kind} delivery is indeterminate; failed to terminate helper: {kill_error}; failed to persist durable quarantine: {persist_error}"
+                        ),
+                    });
+                }
+                self.update_record(runtime_id, |record| {
+                    record.status = if record.provider_session_id.is_some() {
+                        "interrupted"
+                    } else {
+                        "error"
+                    }
+                    .to_string();
+                    record.is_active = false;
+                    record.last_error = Some(format!(
+                        "Native {command_kind} delivery was indeterminate; it was not replayed automatically."
+                    ));
+                    record.updated_at = Utc::now();
+                })?;
+                self.clear_permission_quarantine_fence(runtime_id);
+                Err(format!(
+                    "{error}; native {command_kind} delivery is indeterminate and was not replayed"
+                ))
             }
             Err(error) => Err(error),
         }
@@ -7806,9 +9140,16 @@ impl NativeRuntimeManager {
         tauri::async_runtime::spawn_blocking(move || {
             std::thread::sleep(grace);
             if let Err(error) = manager.force_kill_stopped_handle(&runtime_id, &handle) {
-                eprintln!(
+                let detail = format!(
                     "Failed to finalize native helper force cleanup for {runtime_id}: {error}"
                 );
+                let _ = manager.append_lifecycle_event(
+                    &runtime_id,
+                    "stop_force_kill_failed",
+                    detail.clone(),
+                );
+                let _ = manager.set_last_error(&runtime_id, detail.clone());
+                eprintln!("{detail}");
             }
         });
     }
@@ -7818,6 +9159,10 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         handle: &Arc<NativeSessionHandle>,
     ) -> Result<bool, String> {
+        let lifecycle = self.lifecycle_transaction_lock(runtime_id)?;
+        let _lifecycle = lifecycle
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycle".to_string())?;
         let mut errors = Vec::new();
         let _reconnect_guard = match self.reconnect_lock.lock() {
             Ok(guard) => guard,
@@ -7900,6 +9245,9 @@ impl NativeRuntimeManager {
 
         if let Some(manager) = self.router_manager.get() {
             manager.unregister_generation(runtime_id, handle.generation);
+        }
+        if let Err(error) = Self::retire_browser_authority(handle) {
+            errors.push(error);
         }
         let child_to_kill = match handle.child.lock() {
             Ok(mut child) => child.take(),
@@ -8236,7 +9584,10 @@ impl NativeRuntimeManager {
         )
     }
 
-    fn insert_record(&self, record: NativeSessionRecord) -> Result<(), String> {
+    fn insert_record(
+        &self,
+        mut record: NativeSessionRecord,
+    ) -> Result<NativeSessionRecord, String> {
         let mut records = self
             .records
             .lock()
@@ -8245,14 +9596,165 @@ impl NativeRuntimeManager {
         if records.contains_key(&runtime_id) {
             return Err(format!("Native runtime {runtime_id} already exists"));
         }
-        records.insert(runtime_id.clone(), record);
+        {
+            let known_lineages = records
+                .values()
+                .map(|known| BrowserActorLineageRef {
+                    provider: known.provider,
+                    provider_session_id: known.provider_session_id.as_deref(),
+                    actor_id: &known.browser_actor_id,
+                })
+                .collect::<Vec<_>>();
+            record.browser_actor_id = resolve_browser_actor_id(
+                record.provider,
+                record.provider_session_id.as_deref(),
+                &record.browser_actor_id,
+                &known_lineages,
+            )?;
+        }
+        records.insert(runtime_id.clone(), record.clone());
         if let Err(error) =
             persist_native_runtime_state_to(&self.state_path, records.values().cloned().collect())
         {
             records.remove(&runtime_id);
-            return Err(error.to_string());
+            return Err(error);
         }
-        Ok(())
+        Ok(record)
+    }
+
+    fn bind_provider_session_lineage(
+        &self,
+        app: Option<&AppHandle>,
+        runtime_id: &str,
+        provider_session_id: &str,
+    ) -> Result<(NativeProvider, Option<TerminalType>, String), String> {
+        self.bind_provider_session_lineage_with_retirement(
+            runtime_id,
+            provider_session_id,
+            |workspace_dir, invalidated_actor_id| match app {
+                Some(app) => {
+                    retire_login_browser_agent_control(app, workspace_dir, invalidated_actor_id)
+                }
+                None => Ok(()),
+            },
+        )
+    }
+
+    fn bind_provider_session_lineage_with_retirement<Retire>(
+        &self,
+        runtime_id: &str,
+        provider_session_id: &str,
+        mut retire_invalidated_actor: Retire,
+    ) -> Result<(NativeProvider, Option<TerminalType>, String), String>
+    where
+        Retire: FnMut(&str, &str) -> Result<(), String>,
+    {
+        let provider_session_id = normalize_provider_session_id(Some(provider_session_id))?
+            .ok_or_else(|| "Native provider session identity is invalid.".to_string())?
+            .to_string();
+        let (updated, invalidated_actor, persistence) = {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| "Failed to lock native runtime records".to_string())?;
+            let current = records
+                .get(runtime_id)
+                .cloned()
+                .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
+            let known = records
+                .iter()
+                .filter(|(known_runtime_id, _)| known_runtime_id.as_str() != runtime_id)
+                .map(|(_, record)| {
+                    (
+                        record.provider,
+                        record.provider_session_id.clone(),
+                        record.browser_actor_id.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let known_refs = known
+                .iter()
+                .map(
+                    |(provider, provider_session_id, actor_id)| BrowserActorLineageRef {
+                        provider: *provider,
+                        provider_session_id: provider_session_id.as_deref(),
+                        actor_id,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let resolved = resolve_browser_actor_id(
+                current.provider,
+                Some(&provider_session_id),
+                &current.browser_actor_id,
+                &known_refs,
+            );
+            let browser_actor_id = match resolved {
+                Ok(actor_id) if actor_id == current.browser_actor_id => actor_id,
+                // Rebinding to another actor after either runtime may already have read page data
+                // could discard taint. Quarantine this late binder instead; future requests fail
+                // closed and subsequent resumes also see the conflicting persisted lineage.
+                Ok(_) | Err(_) => String::new(),
+            };
+            let invalidated_actor = (browser_actor_id.is_empty()
+                && is_valid_browser_actor_id(&current.browser_actor_id))
+            .then(|| {
+                (
+                    current.project_dir.clone(),
+                    current.browser_actor_id.clone(),
+                )
+            });
+            let record = records
+                .get_mut(runtime_id)
+                .ok_or_else(|| format!("Native runtime {} not found", runtime_id))?;
+            record.provider_session_id = Some(provider_session_id.clone());
+            record.browser_actor_id = browser_actor_id;
+            record.can_handoff_to_terminal = terminal::external_terminal_launch_supported();
+            record.updated_at = Utc::now();
+            let updated = record.clone();
+            let persistence = persist_native_runtime_state_to(
+                &self.state_path,
+                records.values().cloned().collect(),
+            );
+            (updated, invalidated_actor, persistence)
+        };
+
+        let handle = match self.handles.lock() {
+            Ok(handles) => Ok(handles.get(runtime_id).cloned()),
+            Err(_) => Err("Failed to lock native runtime handles".to_string()),
+        };
+        let handle_update = match handle {
+            Ok(Some(handle)) => handle
+                .record
+                .lock()
+                .map_err(|_| "Failed to lock native session record".to_string())
+                .map(|mut record| *record = updated.clone()),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let retirement = invalidated_actor
+            .as_ref()
+            .map(|(workspace_dir, actor_id)| {
+                retire_invalidated_actor(workspace_dir, actor_id).map_err(|error| {
+                    format!(
+                        "Native browser lineage was invalidated but its exact handoff retirement failed: {error}"
+                    )
+                })
+            })
+            .unwrap_or(Ok(()));
+        let mut errors = Vec::new();
+        for result in [persistence, handle_update, retirement] {
+            if let Err(error) = result {
+                errors.push(error);
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        Ok((
+            updated.provider,
+            updated.pending_handoff_terminal,
+            provider_session_id,
+        ))
     }
 
     fn remove_record(&self, runtime_id: &str) -> Result<(), String> {
@@ -8275,6 +9777,11 @@ impl NativeRuntimeManager {
         runtime_id: String,
         handle: Arc<NativeSessionHandle>,
     ) -> Result<(), String> {
+        if self.is_permission_quarantine_fenced(&runtime_id) {
+            return Err(format!(
+                "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+            ));
+        }
         let generation = {
             let mut handles = self
                 .handles
@@ -8333,6 +9840,16 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         handle: &Arc<NativeSessionHandle>,
     ) -> Result<bool, String> {
+        // A stopped handle may be claimed either by prompt delivery or by the delayed force-kill
+        // path. Serialize the check-and-mark with that lifecycle transaction so force-kill cannot
+        // validate `alive == false` and then remove the same handle after this method returns true.
+        let lifecycle = self.lifecycle_transaction_lock(runtime_id)?;
+        let _lifecycle = lifecycle
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycle".to_string())?;
+        if self.is_permission_quarantine_fenced(runtime_id) {
+            return Ok(false);
+        }
         let handles = self
             .handles
             .lock()
@@ -8340,34 +9857,42 @@ impl NativeRuntimeManager {
         Ok(handles
             .get(runtime_id)
             .map(|current| {
-                Self::same_handle(current, handle) && handle.alive.load(Ordering::SeqCst)
+                Self::same_handle(current, handle)
+                    && handle.alive.load(Ordering::SeqCst)
+                    && !handle.permission_quarantined.load(Ordering::SeqCst)
             })
             .unwrap_or(false))
     }
 
     fn remove_handle(&self, runtime_id: &str) -> Result<(), String> {
-        let expiry_error = self.expire_interactive_attention(runtime_id).err();
         self.initializing_runtimes
             .lock()
             .map_err(|_| "Failed to lock native initialization fences".to_string())?
             .remove(runtime_id);
-        let removed_generation = self
+        let handle = self
             .handles
             .lock()
             .map_err(|_| "Failed to lock native runtime handles".to_string())?
-            .remove(runtime_id)
-            .map(|handle| handle.generation);
-        if let (Some(manager), Some(generation)) = (self.router_manager.get(), removed_generation) {
-            manager.unregister_generation(runtime_id, generation);
+            .get(runtime_id)
+            .cloned();
+        if let Some(handle) = handle {
+            self.retire_handle_if_current(runtime_id, &handle)?;
+        } else {
+            self.expire_interactive_attention(runtime_id)?;
         }
-        if let Some(generation) = removed_generation {
-            self.lifecycle
-                .note_generation_retired(runtime_id, generation);
-        }
-        match expiry_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
+    }
+
+    fn retire_browser_authority(handle: &Arc<NativeSessionHandle>) -> Result<(), String> {
+        let _sync = handle
+            .browser_permission_sync
+            .lock()
+            .map_err(|_| "Failed to lock native browser permission authority".to_string())?;
+        handle
+            .browser_permission
+            .update("readonly")
+            .map(|_| ())
+            .map_err(|_| "Failed to retire native browser permission authority".to_string())
     }
 
     fn retire_handle_if_current(
@@ -8436,6 +9961,9 @@ impl NativeRuntimeManager {
         // op cannot survive its process — drop them from the coordinator.
         self.lifecycle
             .note_generation_retired(runtime_id, removed.generation);
+        if let Err(error) = Self::retire_browser_authority(&removed) {
+            errors.push(error);
+        }
         if let Some(manager) = self.router_manager.get() {
             manager.unregister_generation(runtime_id, removed.generation);
         }
@@ -8486,24 +10014,23 @@ impl NativeRuntimeManager {
     }
 
     fn kill_child(&self, runtime_id: &str) -> Result<(), String> {
+        let lifecycle = self.lifecycle_transaction_lock(runtime_id)?;
+        let _lifecycle = lifecycle
+            .lock()
+            .map_err(|_| "Failed to lock native helper lifecycle".to_string())?;
         self.interrupt_background_tasks(
             runtime_id,
             "Claude runtime closed before the background task settled.",
         )?;
-        let handles = self
+        let handle = self
             .handles
             .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?;
-        if let Some(handle) = handles.get(runtime_id) {
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .cloned();
+        if let Some(handle) = handle {
             handle.alive.store(false, Ordering::SeqCst);
-            if let Some(child) = handle
-                .child
-                .lock()
-                .map_err(|_| "Failed to lock native sidecar child".to_string())?
-                .take()
-            {
-                child.kill()?;
-            }
+            self.retire_handle_if_current(runtime_id, &handle)?;
         }
         Ok(())
     }
@@ -8598,6 +10125,58 @@ impl NativeRuntimeManager {
             .lock()
             .map_err(|_| "Failed to lock native runtime records".to_string())
             .map(|records| records.contains_key(runtime_id))
+    }
+
+    fn browser_identity_for_runtime(&self, runtime_id: &str) -> Result<(String, String), String> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?;
+        let record = records
+            .get(runtime_id)
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if !is_valid_browser_actor_id(&record.browser_actor_id) {
+            return Err("Native browser actor lineage is unavailable.".to_string());
+        }
+        Ok((record.project_dir.clone(), record.browser_actor_id.clone()))
+    }
+
+    pub(crate) fn browser_actor_id_for_runtime(&self, runtime_id: &str) -> Result<String, String> {
+        let quarantine_fences = self
+            .permission_quarantine_fences
+            .lock()
+            .map_err(|_| "Failed to lock native runtime quarantine fences".to_string())?;
+        if quarantine_fences.contains(runtime_id) {
+            return Err(format!(
+                "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+            ));
+        }
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?;
+        let record = records
+            .get(runtime_id)
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if record.permission_quarantined {
+            return Err(format!(
+                "Native runtime {runtime_id} is quarantined after an incomplete permission update."
+            ));
+        }
+        if !record.is_active {
+            return Err(format!("Native runtime {runtime_id} is not active."));
+        }
+        if is_native_terminal_status(&record.status) {
+            return Err(format!(
+                "Native runtime {runtime_id} has terminal status {}.",
+                record.status
+            ));
+        }
+        let actor_id = record.browser_actor_id.clone();
+        if !is_valid_browser_actor_id(&actor_id) {
+            return Err("Native browser actor lineage is unavailable.".to_string());
+        }
+        Ok(actor_id)
     }
 
     fn summary_for(&self, runtime_id: &str) -> Result<NativeSessionSummary, String> {
@@ -8800,6 +10379,7 @@ fn is_native_terminal_status(status: &str) -> bool {
             | "app_closing"
             | "interrupted"
             | "closed_idle"
+            | "permission_quarantined"
     )
 }
 
@@ -8830,6 +10410,9 @@ fn is_recoverable_native_process_error(message: &str) -> bool {
 }
 
 fn reactivate_record_for_reconnect(record: &mut NativeSessionRecord) -> bool {
+    if record.permission_quarantined {
+        return false;
+    }
     if !matches!(
         record.status.as_str(),
         "error" | "interrupted" | "closed_idle"
@@ -8861,6 +10444,13 @@ fn session_router_patch_oauth_validation_enabled(current: &SessionRouterRecord) 
 
 fn is_retryable_native_child_write_error(message: &str) -> bool {
     message == "Native sidecar child is not available"
+        || message == "Native helper writer is unavailable."
+        || message.starts_with("Native helper writer queue is full;")
+}
+
+fn is_unknown_native_child_delivery_error(message: &str) -> bool {
+    message == "Native helper stdin write timed out."
+        || message == "Native helper writer completion channel closed."
         || message.starts_with("Failed to write to native sidecar stdin:")
 }
 
@@ -8935,6 +10525,7 @@ fn read_native_runtime_state_from(path: &Path) -> io::Result<NativeRuntimeState>
     let mut state = serde_json::from_str::<NativeRuntimeState>(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
+    backfill_browser_actor_lineages(&mut state.sessions);
     for record in &mut state.sessions {
         if record
             .last_error
@@ -9113,11 +10704,12 @@ mod tests {
     use super::{
         apply_session_router_patch, authorize_browser_tool_for_record, clear_terminal_launches,
         drain_helper_output_lines, initial_record_provider_session_id,
-        is_retryable_native_child_write_error, launch_terminal_for_native_handoff,
-        merge_helper_env_path, merge_path_values_with_separator,
-        native_session_allows_dangerously_skip_permissions, native_status_allows_file_rewind,
-        reactivate_record_for_reconnect, read_native_runtime_state_from,
-        recoverable_record_after_helper_removed, router_launch_decision, runtime_child_is_owned,
+        is_retryable_native_child_write_error, is_unknown_native_child_delivery_error,
+        launch_terminal_for_native_handoff, merge_helper_env_path,
+        merge_path_values_with_separator, native_session_allows_dangerously_skip_permissions,
+        native_status_allows_file_rewind, reactivate_record_for_reconnect,
+        read_native_runtime_state_from, recoverable_record_after_helper_removed,
+        rollback_runtime_settings_projection, router_launch_decision, runtime_child_is_owned,
         session_router_patch_oauth_validation_enabled, stage_runtime_settings_update,
         take_terminal_launches, validate_claude_settings_patch,
         validate_interactive_attention_occurrence, validate_plan_approval_permission,
@@ -9132,6 +10724,7 @@ mod tests {
     };
     use crate::native_event_log::{NativeEventLog, MAX_EVENT_REPLAY_PAGE_BYTES};
     use crate::native_input_queue::{FrozenNativeInputBatch, NativeInputClaimOutcome};
+    use crate::native_session_coordinator::NativeLifecycleProjection;
     use crate::prompt_image_store::PromptImageStore;
     use crate::router::{
         LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterConfig, RouterManager,
@@ -9146,8 +10739,7 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, OnceLock};
-    #[cfg(unix)]
+    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     fn native_session_handle(record: NativeSessionRecord) -> Arc<NativeSessionHandle> {
@@ -9207,7 +10799,15 @@ mod tests {
         let runtime_id = record.runtime_id.clone();
         Arc::new(NativeSessionHandle {
             generation,
+            browser_permission: super::BrowserPermissionAuthority::new(
+                super::effective_native_perm_mode(
+                    record.perm_mode.as_str(),
+                    record.runtime_perm_mode.as_deref(),
+                ),
+            ),
+            browser_permission_sync: Mutex::new(()),
             record: Mutex::new(record),
+            settings_update_acks: super::SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(&runtime_id)),
             background_tasks: Mutex::new(HashMap::new()),
@@ -9222,6 +10822,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            permission_quarantined: AtomicBool::new(false),
             alive: AtomicBool::new(true),
         })
     }
@@ -9232,6 +10833,7 @@ mod tests {
             provider: NativeProvider::Claude,
             transport: NativeTransport::NativeSdk,
             provider_session_id: None,
+            browser_actor_id: super::legacy_browser_actor_id(NativeProvider::Claude, runtime_id),
             seed_boundary_message_count: None,
             project_dir: "/tmp/project".to_string(),
             env_name: "DeepSeek".to_string(),
@@ -9246,6 +10848,7 @@ mod tests {
             updated_at: Utc::now(),
             is_active: true,
             can_handoff_to_terminal: false,
+            permission_quarantined: false,
             pending_handoff_terminal: None,
             pending_handoff_allow_background_task_termination: false,
             last_error: None,
@@ -9255,6 +10858,9 @@ mod tests {
         let manager = NativeRuntimeManager {
             records: Mutex::new(HashMap::from([(runtime_id.to_string(), record)])),
             handles: Mutex::new(HashMap::from([(runtime_id.to_string(), handle)])),
+            permission_quarantine_fences: Mutex::new(HashSet::new()),
+            permission_transactions: Mutex::new(HashMap::new()),
+            lifecycle_transactions: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(2),
             state_path: std::env::temp_dir()
                 .join(format!("ccem-native-runtime-test-{runtime_id}.json")),
@@ -9291,6 +10897,9 @@ mod tests {
                     .collect(),
             ),
             handles: Mutex::new(HashMap::new()),
+            permission_quarantine_fences: Mutex::new(HashSet::new()),
+            permission_transactions: Mutex::new(HashMap::new()),
+            lifecycle_transactions: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(1),
             lifecycle: Default::default(),
             input_queue: Default::default(),
@@ -9429,6 +11038,7 @@ mod tests {
             provider: NativeProvider::Claude,
             transport: NativeTransport::NativeSdk,
             provider_session_id: None,
+            browser_actor_id: super::legacy_browser_actor_id(NativeProvider::Claude, runtime_id),
             seed_boundary_message_count: None,
             project_dir: "/tmp/project".to_string(),
             env_name: "DeepSeek".to_string(),
@@ -9443,10 +11053,26 @@ mod tests {
             updated_at: Utc::now(),
             is_active,
             can_handoff_to_terminal: false,
+            permission_quarantined: false,
             pending_handoff_terminal: None,
             pending_handoff_allow_background_task_termination: false,
             last_error: None,
             router: None,
+        }
+    }
+
+    struct BlockingCommandSink {
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl super::NativeHelperCommandSink for BlockingCommandSink {
+        fn write_command(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            let (lock, changed) = self.released.as_ref();
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            Ok(())
         }
     }
 
@@ -10063,6 +11689,517 @@ mod tests {
         assert!(authorize_browser_tool_for_record(&record, "click").is_ok());
     }
 
+    #[test]
+    fn failed_permission_upgrade_delivery_never_commits_browser_authority() {
+        let steps = Mutex::new(Vec::new());
+        let error = super::deliver_browser_permission_change(
+            true,
+            || {
+                steps.lock().unwrap().push("deliver");
+                Err("helper unavailable".to_string())
+            },
+            || {
+                steps.lock().unwrap().push("commit");
+                Ok(())
+            },
+            || {
+                steps.lock().unwrap().push("quarantine");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "helper unavailable");
+        assert_eq!(*steps.lock().unwrap(), vec!["deliver", "quarantine"]);
+    }
+
+    #[test]
+    fn permission_upgrade_waits_for_coordinator_ack_before_caller_finalize() {
+        let steps = Mutex::new(Vec::new());
+
+        super::deliver_browser_permission_change(
+            true,
+            || {
+                steps.lock().unwrap().push("helper_write");
+                steps.lock().unwrap().push("coordinator_ack");
+                Ok(())
+            },
+            || {
+                steps.lock().unwrap().push("caller_finalize");
+                Ok(())
+            },
+            || {
+                steps.lock().unwrap().push("quarantine");
+                Ok(())
+            },
+        )
+        .expect("coordinated permission upgrade");
+
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec!["helper_write", "coordinator_ack", "caller_finalize"]
+        );
+    }
+
+    #[test]
+    fn permission_upgrade_quarantines_when_coordinator_gate_fails() {
+        let steps = Mutex::new(Vec::new());
+
+        let error = super::deliver_browser_permission_change(
+            true,
+            || {
+                steps.lock().unwrap().push("helper_write");
+                steps.lock().unwrap().push("coordinator_ack");
+                Err("coordinator rejected exact request".to_string())
+            },
+            || {
+                steps.lock().unwrap().push("browser_commit");
+                Ok(())
+            },
+            || {
+                steps.lock().unwrap().push("quarantine");
+                Ok(())
+            },
+        )
+        .expect_err("failed coordinator gate must quarantine");
+
+        assert_eq!(error, "coordinator rejected exact request");
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec!["helper_write", "coordinator_ack", "quarantine"]
+        );
+    }
+
+    #[test]
+    fn settings_ack_does_not_autodrain_fifo_while_a_command_is_active() {
+        let projection = |active: bool, settings_pending: bool| NativeLifecycleProjection {
+            state_revision: 1,
+            adapter: "full_lifecycle".to_string(),
+            helper_incarnation: 1,
+            active_command_id: active.then(|| "command-active".to_string()),
+            active_phase: active.then(|| "helper_admitted".to_string()),
+            active_helper_incarnation: active.then_some(1),
+            settings_pending,
+            settings_state: settings_pending.then(|| "pending".to_string()),
+            queue_count: 1,
+            delivery_uncertain_count: 0,
+            query_generation: 1,
+            conversation_epoch: 1,
+            capabilities: Vec::new(),
+            protocol_error: None,
+        };
+        let before_settings_ack = projection(true, true);
+        let after_settings_ack = projection(true, false);
+        assert!(!super::lifecycle_transition_unblocked_queue(
+            Some(&before_settings_ack),
+            Some(&after_settings_ack),
+        ));
+
+        let after_command_terminal = projection(false, false);
+        assert!(super::lifecycle_transition_unblocked_queue(
+            Some(&after_settings_ack),
+            Some(&after_command_terminal),
+        ));
+    }
+
+    #[test]
+    fn detached_queue_autodrain_cannot_block_following_stdout_ack() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let dispatch_gate = Arc::clone(&gate);
+
+        let caller = std::thread::spawn(move || {
+            super::spawn_queue_autodrain(move || {
+                started_tx.send(()).expect("announce blocked dispatch");
+                let (lock, wake) = &*dispatch_gate;
+                let mut released = lock.lock().expect("dispatch gate");
+                while !*released {
+                    released = wake.wait(released).expect("wait for transition release");
+                }
+                finished_tx.send(()).expect("finish detached dispatch");
+            });
+            returned_tx.send(()).expect("stdout pump remains available");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dispatch job started");
+        let returned_while_blocked = returned_rx.recv_timeout(Duration::from_millis(500));
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().expect("release gate") = true;
+            wake.notify_all();
+        }
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached dispatch finishes after transition release");
+        caller.join().expect("scheduler caller");
+        assert!(
+            returned_while_blocked.is_ok(),
+            "scheduling must return while dispatch waits on the transition lock"
+        );
+    }
+
+    #[test]
+    fn permission_downgrade_retires_browser_authority_before_helper_delivery() {
+        let steps = Mutex::new(Vec::new());
+        let error = super::deliver_browser_permission_change(
+            false,
+            || {
+                steps.lock().unwrap().push("deliver");
+                Err("helper unavailable".to_string())
+            },
+            || {
+                steps.lock().unwrap().push("commit");
+                Ok(())
+            },
+            || {
+                steps.lock().unwrap().push("quarantine");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "helper unavailable");
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec!["commit", "deliver", "quarantine"]
+        );
+    }
+
+    #[test]
+    fn failed_permission_upgrade_commit_quarantines_the_expanded_helper() {
+        let steps = Mutex::new(Vec::new());
+        let error = super::deliver_browser_permission_change(
+            true,
+            || {
+                steps.lock().unwrap().push("deliver");
+                Ok(())
+            },
+            || {
+                steps.lock().unwrap().push("commit");
+                Err("browser commit failed".to_string())
+            },
+            || {
+                steps.lock().unwrap().push("quarantine");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "browser commit failed");
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec!["deliver", "commit", "quarantine"]
+        );
+    }
+
+    #[test]
+    fn correlated_settings_ack_accepts_only_applied_for_the_exact_request() {
+        let acks = super::SettingsUpdateAckRegistry::default();
+        let receiver = acks.register("settings-request-a").expect("register ack");
+
+        assert!(!acks
+            .resolve(
+                "settings-request-b",
+                super::SettingsUpdateAck {
+                    outcome: super::SettingsUpdateOutcome::Applied,
+                    detail: None,
+                },
+            )
+            .expect("ignore wrong request"));
+        assert!(acks
+            .resolve(
+                "settings-request-a",
+                super::SettingsUpdateAck {
+                    outcome: super::SettingsUpdateOutcome::Applied,
+                    detail: None,
+                },
+            )
+            .expect("resolve exact request"));
+
+        super::wait_for_required_settings_ack(
+            "settings-request-a",
+            receiver,
+            Duration::from_millis(10),
+        )
+        .expect("applied ack");
+    }
+
+    #[test]
+    fn helper_settings_ack_cannot_cross_runtime_or_request_boundaries() {
+        let runtime_a = "native-settings-runtime-a";
+        let runtime_b = "native-settings-runtime-b";
+        let manager = manager_with_handle(runtime_a);
+        let handle_a = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_a)
+            .cloned()
+            .unwrap();
+        let record_b = native_record(runtime_b, "ready", true);
+        let handle_b = native_session_handle(record_b.clone());
+        manager
+            .records
+            .lock()
+            .unwrap()
+            .insert(runtime_b.to_string(), record_b);
+        manager
+            .handles
+            .lock()
+            .unwrap()
+            .insert(runtime_b.to_string(), handle_b);
+
+        let receiver = handle_a
+            .settings_update_acks
+            .register("settings-exact-request")
+            .unwrap();
+        manager
+            .process_helper_stdout(
+                runtime_b,
+                r#"{"type":"settings_update_result","request_id":"settings-exact-request","outcome":"applied"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        manager
+            .process_helper_stdout(
+                runtime_a,
+                r#"{"type":"settings_update_result","request_id":"settings-wrong-request","outcome":"applied"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        manager
+            .process_helper_stdout(
+                runtime_a,
+                r#"{"type":"settings_update_result","request_id":"settings-exact-request","outcome":"applied"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(10)).unwrap(),
+            super::SettingsUpdateAck {
+                outcome: super::SettingsUpdateOutcome::Applied,
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn correlated_settings_ack_rejects_failed_delivery() {
+        let acks = super::SettingsUpdateAckRegistry::default();
+        let receiver = acks.register("settings-request-failed").unwrap();
+        acks.resolve(
+            "settings-request-failed",
+            super::SettingsUpdateAck {
+                outcome: super::SettingsUpdateOutcome::Failed,
+                detail: Some("provider rejected mode".to_string()),
+            },
+        )
+        .unwrap();
+
+        let error = super::wait_for_required_settings_ack(
+            "settings-request-failed",
+            receiver,
+            Duration::from_millis(10),
+        )
+        .expect_err("failed ack must fail closed");
+        assert!(error.contains("failed"));
+        assert!(error.contains("provider rejected mode"));
+    }
+
+    #[test]
+    fn correlated_settings_ack_rejects_deferred_delivery() {
+        let acks = super::SettingsUpdateAckRegistry::default();
+        let receiver = acks.register("settings-request-deferred").unwrap();
+        acks.resolve(
+            "settings-request-deferred",
+            super::SettingsUpdateAck {
+                outcome: super::SettingsUpdateOutcome::Deferred,
+                detail: Some("next turn".to_string()),
+            },
+        )
+        .unwrap();
+
+        let error = super::wait_for_required_settings_ack(
+            "settings-request-deferred",
+            receiver,
+            Duration::from_millis(10),
+        )
+        .expect_err("deferred ack is not applied");
+        assert!(error.contains("deferred"));
+    }
+
+    #[test]
+    fn correlated_settings_ack_times_out_without_exact_response() {
+        let acks = super::SettingsUpdateAckRegistry::default();
+        let receiver = acks.register("settings-request-timeout").unwrap();
+
+        let error = super::wait_for_required_settings_ack(
+            "settings-request-timeout",
+            receiver,
+            Duration::from_millis(5),
+        )
+        .expect_err("missing ack must time out");
+        assert!(error.contains("timed out"));
+        acks.cancel("settings-request-timeout").unwrap();
+    }
+
+    #[test]
+    fn blocked_helper_stdin_write_obeys_the_absolute_permission_deadline() {
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let writer = super::NativeHelperWriter::spawn_sink(Box::new(BlockingCommandSink {
+            released: Arc::clone(&released),
+        }))
+        .expect("spawn bounded writer");
+        let started = Instant::now();
+
+        let error = writer
+            .write_until(
+                b"{\"type\":\"update_settings\"}\n".to_vec(),
+                started + Duration::from_millis(40),
+            )
+            .expect_err("blocked helper stdin must time out");
+
+        assert!(error.contains("stdin write timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let (lock, changed) = released.as_ref();
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+    }
+
+    #[test]
+    fn helper_write_and_applied_ack_share_one_total_deadline() {
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let writer = super::NativeHelperWriter::spawn_sink(Box::new(BlockingCommandSink {
+            released: Arc::clone(&released),
+        }))
+        .expect("spawn bounded writer");
+        let acks = super::SettingsUpdateAckRegistry::default();
+        let receiver = acks.register("settings-shared-deadline").unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let (lock, changed) = released.as_ref();
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+        });
+
+        writer
+            .write_until(b"settings\n".to_vec(), deadline)
+            .expect("write completes inside total deadline");
+        let error = super::wait_for_required_settings_ack(
+            "settings-shared-deadline",
+            receiver,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .expect_err("missing applied ack uses only the remaining time");
+
+        assert!(error.contains("acknowledgement timed out"));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        release.join().unwrap();
+        acks.cancel("settings-shared-deadline").unwrap();
+    }
+
+    #[test]
+    fn permission_quarantine_blocks_all_future_helper_commands() {
+        let runtime_id = "native-permission-quarantine";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .cloned()
+            .expect("native handle");
+        handle.permission_quarantined.store(true, Ordering::SeqCst);
+
+        let error = manager
+            .write_to_child(
+                &handle,
+                &HelperInputCommand::Stop {
+                    force_background_tasks: false,
+                },
+            )
+            .expect_err("quarantined helper must reject every command");
+
+        assert!(error.contains("quarantined"));
+        assert!(!manager
+            .is_current_live_handle(runtime_id, &handle)
+            .expect("inspect handle"));
+    }
+
+    #[test]
+    fn durable_permission_quarantine_never_reactivates_as_a_normal_error() {
+        let mut record = native_record("native-durable-quarantine", "error", false);
+        record.permission_quarantined = true;
+        record.perm_mode = "readonly".to_string();
+
+        assert!(!reactivate_record_for_reconnect(&mut record));
+        assert!(record.permission_quarantined);
+        assert_eq!(record.perm_mode, "readonly");
+        assert_eq!(record.status, "error");
+
+        let encoded = serde_json::to_vec(&record).expect("serialize quarantine");
+        let decoded: NativeSessionRecord =
+            serde_json::from_slice(&encoded).expect("restore quarantine");
+        assert!(decoded.permission_quarantined);
+    }
+
+    #[test]
+    fn browser_actor_lookup_rejects_quarantined_inactive_and_terminal_runtimes() {
+        let mut active = native_record("native-actor-active", "processing", true);
+        let expected_actor = active.browser_actor_id.clone();
+        let mut quarantined =
+            native_record("native-actor-quarantined", "permission_quarantined", false);
+        quarantined.permission_quarantined = true;
+        let inactive = native_record("native-actor-inactive", "ready", false);
+        let terminal = native_record("native-actor-terminal", "stopped", true);
+        let manager = manager_with_records(
+            "browser-actor-eligibility",
+            vec![active.clone(), quarantined, inactive, terminal],
+        );
+
+        assert_eq!(
+            manager
+                .browser_actor_id_for_runtime(&active.runtime_id)
+                .expect("active runtime actor"),
+            expected_actor
+        );
+        assert!(manager
+            .browser_actor_id_for_runtime("native-actor-quarantined")
+            .unwrap_err()
+            .contains("quarantined"));
+        assert!(manager
+            .browser_actor_id_for_runtime("native-actor-inactive")
+            .unwrap_err()
+            .contains("not active"));
+        assert!(manager
+            .browser_actor_id_for_runtime("native-actor-terminal")
+            .unwrap_err()
+            .contains("terminal"));
+        manager.fence_permission_quarantine("native-actor-active");
+        assert!(manager
+            .browser_actor_id_for_runtime("native-actor-active")
+            .unwrap_err()
+            .contains("quarantined"));
+
+        active.browser_actor_id.clear();
+        let invalid = manager_with_records("browser-actor-invalid", vec![active]);
+        assert!(invalid
+            .browser_actor_id_for_runtime("native-actor-active")
+            .unwrap_err()
+            .contains("lineage"));
+    }
+
     fn native_session_options(
         perm_mode: &str,
         runtime_perm_mode: Option<&str>,
@@ -10500,6 +12637,448 @@ mod tests {
     }
 
     #[test]
+    fn provider_session_binding_keeps_the_provisional_browser_actor_lineage() {
+        let runtime_id = "native-browser-actor-bind";
+        let manager = manager_with_handle(runtime_id);
+        let before = manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_id)
+            .expect("record")
+            .browser_actor_id
+            .clone();
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"raw-provider-session-id"}"#,
+            )
+            .expect("bind provider session");
+
+        let records = manager.records.lock().expect("records");
+        let record = records.get(runtime_id).expect("record");
+        assert_eq!(
+            record.provider_session_id.as_deref(),
+            Some("raw-provider-session-id")
+        );
+        assert_eq!(record.browser_actor_id, before);
+        assert!(!record.browser_actor_id.contains("raw-provider-session-id"));
+
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn two_late_bound_runtimes_cannot_split_one_provider_conversation_lineage() {
+        let runtime_a = "native-late-lineage-a";
+        let runtime_b = "native-late-lineage-b";
+        let actor_a = "browser-actor-11111111111111111111111111111111";
+        let actor_b = "browser-actor-22222222222222222222222222222222";
+        let mut record_a = native_record(runtime_a, "ready", true);
+        record_a.browser_actor_id = actor_a.to_string();
+        let mut record_b = native_record(runtime_b, "ready", true);
+        record_b.browser_actor_id = actor_b.to_string();
+        let manager = manager_with_records(runtime_a, vec![record_a, record_b]);
+
+        manager
+            .process_helper_stdout(
+                runtime_a,
+                r#"{"type":"session_meta","provider_session_id":"shared-provider-session"}"#,
+            )
+            .expect("bind first runtime");
+        manager
+            .process_helper_stdout(
+                runtime_b,
+                r#"{"type":"session_meta","provider_session_id":"shared-provider-session"}"#,
+            )
+            .expect("bind second runtime without exposing the raw identity");
+
+        let records = manager.records.lock().expect("records");
+        assert_eq!(records[runtime_a].browser_actor_id, actor_a);
+        assert!(
+            records[runtime_b].browser_actor_id.is_empty(),
+            "the conflicting late lineage must be quarantined, never rebound as untainted"
+        );
+        drop(records);
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn conflicting_late_lineage_retires_the_previous_exact_browser_actor() {
+        let runtime_a = "native-late-retire-a";
+        let runtime_b = "native-late-retire-b";
+        let actor_a = "browser-actor-11111111111111111111111111111111";
+        let actor_b = "browser-actor-22222222222222222222222222222222";
+        let manager = manager_with_handle(runtime_b);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_b)
+            .cloned()
+            .expect("runtime B handle");
+        {
+            let mut records = manager.records.lock().expect("records");
+            let runtime_b_record = records.get_mut(runtime_b).expect("runtime B record");
+            runtime_b_record.browser_actor_id = actor_b.to_string();
+            let mut runtime_a_record = native_record(runtime_a, "ready", true);
+            runtime_a_record.provider_session_id = Some("shared-provider-session".to_string());
+            runtime_a_record.browser_actor_id = actor_a.to_string();
+            records.insert(runtime_a.to_string(), runtime_a_record);
+        }
+        handle
+            .record
+            .lock()
+            .expect("handle record")
+            .browser_actor_id = actor_b.to_string();
+
+        let mut retired = Vec::new();
+        manager
+            .bind_provider_session_lineage_with_retirement(
+                runtime_b,
+                "shared-provider-session",
+                |workspace, actor_id| {
+                    assert!(
+                        manager.browser_actor_id_for_runtime(runtime_b).is_err(),
+                        "UI handoff routing must be fenced before exact retirement begins"
+                    );
+                    assert!(
+                        handle
+                            .record
+                            .lock()
+                            .expect("handle record during retirement")
+                            .browser_actor_id
+                            .is_empty(),
+                        "new browser requests must be fenced before retiring the old handoff"
+                    );
+                    retired.push((workspace.to_string(), actor_id.to_string()));
+                    Ok(())
+                },
+            )
+            .expect("conflicting lineage retirement");
+
+        assert_eq!(
+            retired,
+            vec![("/tmp/project".to_string(), actor_b.to_string())]
+        );
+        assert!(manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_b)
+            .expect("runtime B record")
+            .browser_actor_id
+            .is_empty());
+
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn conflicting_late_lineage_remains_fenced_when_exact_retirement_reports_failure() {
+        let runtime_a = "native-late-retire-failure-a";
+        let runtime_b = "native-late-retire-failure-b";
+        let actor_a = "browser-actor-11111111111111111111111111111111";
+        let actor_b = "browser-actor-22222222222222222222222222222222";
+        let manager = manager_with_handle(runtime_b);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_b)
+            .cloned()
+            .expect("runtime B handle");
+        {
+            let mut records = manager.records.lock().expect("records");
+            let runtime_b_record = records.get_mut(runtime_b).expect("runtime B record");
+            runtime_b_record.browser_actor_id = actor_b.to_string();
+            let mut runtime_a_record = native_record(runtime_a, "ready", true);
+            runtime_a_record.provider_session_id = Some("shared-provider-session".to_string());
+            runtime_a_record.browser_actor_id = actor_a.to_string();
+            records.insert(runtime_a.to_string(), runtime_a_record);
+        }
+        handle
+            .record
+            .lock()
+            .expect("handle record")
+            .browser_actor_id = actor_b.to_string();
+
+        let error = manager
+            .bind_provider_session_lineage_with_retirement(
+                runtime_b,
+                "shared-provider-session",
+                |workspace, actor_id| {
+                    assert_eq!(workspace, "/tmp/project");
+                    assert_eq!(actor_id, actor_b);
+                    Err("backend owner acknowledgement failed".to_string())
+                },
+            )
+            .expect_err("retirement failure must remain observable");
+
+        assert!(error.contains("exact handoff retirement failed"));
+        assert!(manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_b)
+            .expect("runtime B record")
+            .browser_actor_id
+            .is_empty());
+        assert!(
+            handle
+                .record
+                .lock()
+                .expect("handle record after failed retirement")
+                .browser_actor_id
+                .is_empty(),
+            "the live helper route must remain fenced after retirement failure"
+        );
+
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn conflicting_late_lineage_still_fences_and_retires_when_persistence_fails() {
+        let runtime_a = "native-late-retire-persist-a";
+        let runtime_b = "native-late-retire-persist-b";
+        let actor_a = "browser-actor-11111111111111111111111111111111";
+        let actor_b = "browser-actor-22222222222222222222222222222222";
+        let mut manager = manager_with_handle(runtime_b);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_b)
+            .cloned()
+            .expect("runtime B handle");
+        {
+            let mut records = manager.records.lock().expect("records");
+            let runtime_b_record = records.get_mut(runtime_b).expect("runtime B record");
+            runtime_b_record.browser_actor_id = actor_b.to_string();
+            let mut runtime_a_record = native_record(runtime_a, "ready", true);
+            runtime_a_record.provider_session_id = Some("shared-provider-session".to_string());
+            runtime_a_record.browser_actor_id = actor_a.to_string();
+            records.insert(runtime_a.to_string(), runtime_a_record);
+        }
+        handle
+            .record
+            .lock()
+            .expect("handle record")
+            .browser_actor_id = actor_b.to_string();
+
+        let blocked_parent = std::env::temp_dir().join(format!(
+            "ccem-native-runtime-state-parent-blocked-{}",
+            std::process::id()
+        ));
+        fs::write(&blocked_parent, b"not a directory").expect("create blocked state parent");
+        manager.state_path = blocked_parent.join("state.json");
+
+        let mut retired = Vec::new();
+        let error = manager
+            .bind_provider_session_lineage_with_retirement(
+                runtime_b,
+                "shared-provider-session",
+                |workspace, actor_id| {
+                    retired.push((workspace.to_string(), actor_id.to_string()));
+                    Ok(())
+                },
+            )
+            .expect_err("persistence failure must remain observable");
+
+        assert!(
+            error.contains("Failed to persist private native runtime state"),
+            "{error}"
+        );
+        assert_eq!(
+            retired,
+            vec![("/tmp/project".to_string(), actor_b.to_string())]
+        );
+        assert!(
+            handle
+                .record
+                .lock()
+                .expect("handle record after failed persistence")
+                .browser_actor_id
+                .is_empty(),
+            "the live helper route must fail closed even when persistence fails"
+        );
+        assert!(manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_b)
+            .expect("runtime B record")
+            .browser_actor_id
+            .is_empty());
+
+        let _ = fs::remove_file(blocked_parent);
+    }
+
+    #[test]
+    fn conflicting_late_lineage_still_retires_when_handle_registry_is_poisoned() {
+        let runtime_a = "native-late-retire-poison-a";
+        let runtime_b = "native-late-retire-poison-b";
+        let actor_a = "browser-actor-11111111111111111111111111111111";
+        let actor_b = "browser-actor-22222222222222222222222222222222";
+        let mut record_a = native_record(runtime_a, "ready", true);
+        record_a.provider_session_id = Some("shared-provider-session".to_string());
+        record_a.browser_actor_id = actor_a.to_string();
+        let mut record_b = native_record(runtime_b, "ready", true);
+        record_b.browser_actor_id = actor_b.to_string();
+        let manager = manager_with_records(runtime_b, vec![record_a, record_b]);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _handles = manager.handles.lock().expect("handles before poison");
+            panic!("poison native handle registry");
+        }));
+        assert!(poisoned.is_err());
+
+        let mut retired = Vec::new();
+        let error = manager
+            .bind_provider_session_lineage_with_retirement(
+                runtime_b,
+                "shared-provider-session",
+                |workspace, actor_id| {
+                    retired.push((workspace.to_string(), actor_id.to_string()));
+                    Ok(())
+                },
+            )
+            .expect_err("poisoned handle registry must remain observable");
+
+        assert!(error.contains("Failed to lock native runtime handles"));
+        assert_eq!(
+            retired,
+            vec![("/tmp/project".to_string(), actor_b.to_string())]
+        );
+        assert!(manager
+            .records
+            .lock()
+            .expect("records")
+            .get(runtime_b)
+            .expect("runtime B record")
+            .browser_actor_id
+            .is_empty());
+
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn insert_record_reuses_one_opaque_actor_for_the_same_provider_conversation() {
+        let runtime_a = "native-browser-actor-a";
+        let runtime_b = "native-browser-actor-b";
+        let raw_provider_session_id = "raw-provider-session-id";
+        let mut first = native_record(runtime_a, "ready", true);
+        first.provider_session_id = Some(raw_provider_session_id.to_string());
+        first.browser_actor_id = "browser-actor-11111111111111111111111111111111".to_string();
+        let manager = manager_with_records(runtime_b, vec![first.clone()]);
+        let mut resumed = native_record(runtime_b, "initializing", true);
+        resumed.provider_session_id = Some(raw_provider_session_id.to_string());
+        resumed.browser_actor_id = "browser-actor-22222222222222222222222222222222".to_string();
+
+        let inserted = manager
+            .insert_record(resumed)
+            .expect("insert resumed record");
+
+        assert_eq!(inserted.browser_actor_id, first.browser_actor_id);
+        assert!(!inserted.browser_actor_id.contains(raw_provider_session_id));
+        let persisted = read_native_runtime_state_from(&manager.state_path).expect("read state");
+        assert!(persisted
+            .sessions
+            .iter()
+            .all(|record| record.browser_actor_id == first.browser_actor_id));
+
+        let _ = fs::remove_file(&manager.state_path);
+    }
+
+    #[test]
+    fn conflicting_actor_lineages_for_one_provider_conversation_fail_closed() {
+        let raw_provider_session_id = "raw-provider-session-id";
+        let error = super::resolve_browser_actor_id(
+            NativeProvider::Claude,
+            Some(raw_provider_session_id),
+            "browser-actor-33333333333333333333333333333333",
+            &[
+                super::BrowserActorLineageRef {
+                    provider: NativeProvider::Claude,
+                    provider_session_id: Some(raw_provider_session_id),
+                    actor_id: "browser-actor-11111111111111111111111111111111",
+                },
+                super::BrowserActorLineageRef {
+                    provider: NativeProvider::Claude,
+                    provider_session_id: Some(raw_provider_session_id),
+                    actor_id: "browser-actor-22222222222222222222222222222222",
+                },
+            ],
+        )
+        .expect_err("conflicting lineage must fail closed");
+
+        assert_eq!(error, "Native browser actor lineage is conflicting.");
+        assert!(!error.contains(raw_provider_session_id));
+    }
+
+    #[test]
+    fn read_state_backfills_a_stable_opaque_actor_for_pre_lineage_records() {
+        let runtime_a = "native-legacy-runtime-a";
+        let runtime_b = "native-legacy-runtime-b";
+        let raw_provider_session_id = "raw-provider-session-id";
+        let mut record_a = native_record(runtime_a, "ready", false);
+        record_a.provider_session_id = Some(raw_provider_session_id.to_string());
+        let mut record_b = native_record(runtime_b, "ready", true);
+        record_b.provider_session_id = Some(raw_provider_session_id.to_string());
+        let state_path = std::env::temp_dir().join(format!(
+            "ccem-native-runtime-browser-actor-state-{}.json",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let mut serialized = serde_json::to_value(serde_json::json!({
+            "sessions": [record_a, record_b],
+        }))
+        .expect("serialize state");
+        for session in serialized["sessions"]
+            .as_array_mut()
+            .expect("sessions array")
+        {
+            session
+                .as_object_mut()
+                .expect("session object")
+                .remove("browser_actor_id");
+        }
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&serialized).expect("encode state"),
+        )
+        .expect("write state");
+
+        let first = read_native_runtime_state_from(&state_path).expect("first read");
+        let second = read_native_runtime_state_from(&state_path).expect("second read");
+        let actor_id = &first.sessions[0].browser_actor_id;
+
+        assert_eq!(actor_id, &second.sessions[0].browser_actor_id);
+        assert_eq!(actor_id, &first.sessions[1].browser_actor_id);
+        assert_eq!(actor_id, &second.sessions[1].browser_actor_id);
+        assert!(super::is_valid_browser_actor_id(actor_id));
+        assert!(!actor_id.contains(runtime_a));
+        assert!(!actor_id.contains(runtime_b));
+        assert!(!actor_id.contains(raw_provider_session_id));
+
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn malformed_persisted_provider_identity_quarantines_browser_authority() {
+        let raw_invalid = format!(
+            "provider-{}",
+            "x".repeat(super::MAX_PROVIDER_SESSION_ID_BYTES + 1)
+        );
+        let mut record = native_record("native-invalid-lineage", "ready", true);
+        record.provider_session_id = Some(raw_invalid.clone());
+        record.browser_actor_id = "browser-actor-11111111111111111111111111111111".to_string();
+
+        super::backfill_browser_actor_lineages(std::slice::from_mut(&mut record));
+
+        assert!(record.browser_actor_id.is_empty());
+        assert!(!record.browser_actor_id.contains(&raw_invalid));
+    }
+
+    #[test]
     fn helper_output_buffers_partial_json_until_newline() {
         let mut buffer = Vec::new();
         let first = drain_helper_output_lines(&mut buffer, br#"{"type":"status","status":"ready""#);
@@ -10733,6 +13312,9 @@ mod tests {
         let manager = NativeRuntimeManager {
             records: Mutex::new(HashMap::from([(runtime_id.to_string(), record)])),
             handles: Mutex::new(HashMap::from([(runtime_id.to_string(), handle)])),
+            permission_quarantine_fences: Mutex::new(HashSet::new()),
+            permission_transactions: Mutex::new(HashMap::new()),
+            lifecycle_transactions: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(2),
             lifecycle: Default::default(),
             input_queue: Default::default(),
@@ -11083,6 +13665,25 @@ mod tests {
 
         assert_eq!(serialized["type"], "rewind_files");
         assert_eq!(serialized["checkpoint_id"], "checkpoint-1");
+    }
+
+    #[test]
+    fn helper_update_settings_serializes_correlated_request_id() {
+        let serialized = serde_json::to_value(HelperInputCommand::UpdateSettings {
+            request_id: "settings-request-serialization",
+            env_name: None,
+            perm_mode: Some("readonly"),
+            permission_scope: Some("display"),
+            env_vars: None,
+            effort: None,
+            force_restart: false,
+        })
+        .expect("serialize settings update");
+
+        assert_eq!(serialized["type"], "update_settings");
+        assert_eq!(serialized["request_id"], "settings-request-serialization");
+        assert_eq!(serialized["perm_mode"], "readonly");
+        assert_eq!(serialized["permission_scope"], "display");
     }
 
     #[test]
@@ -11847,6 +14448,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_combined_settings_rollback_preserves_permission_quarantine() {
+        let mut original = native_record("native-codex-settings-rollback", "ready", true);
+        original.provider = NativeProvider::Codex;
+        original.env_name = "old-codex".to_string();
+        original.effort = Some("medium".to_string());
+        original.perm_mode = "dev".to_string();
+
+        let mut record = original.clone();
+        stage_runtime_settings_update(
+            &mut record,
+            Some("new-codex"),
+            Some("high"),
+            "settings-codex-failed",
+        );
+        assert_eq!(record.perm_mode, "dev");
+        record.perm_mode = "readonly".to_string();
+        record.runtime_perm_mode = None;
+        record.permission_quarantined = true;
+        record.status = "permission_quarantined".to_string();
+
+        rollback_runtime_settings_projection(&mut record, &original);
+
+        assert_eq!(record.env_name, "old-codex");
+        assert_eq!(record.effort.as_deref(), Some("medium"));
+        assert_eq!(record.perm_mode, "readonly");
+        assert!(record.permission_quarantined);
+        assert_eq!(record.status, "permission_quarantined");
+    }
+
+    #[test]
     fn claude_mixed_permission_and_runtime_patch_requires_ordered_operations() {
         assert!(validate_claude_settings_patch(None, Some("dev"), false, None).is_ok());
         assert!(validate_claude_settings_patch(Some("DeepSeek"), None, true, Some("high")).is_ok());
@@ -12476,15 +15107,30 @@ mod tests {
     }
 
     #[test]
-    fn retryable_child_write_errors_match_dead_helper_states() {
+    fn child_write_failures_replay_only_when_non_delivery_is_proven() {
         assert!(is_retryable_native_child_write_error(
             "Native sidecar child is not available"
         ));
-        assert!(is_retryable_native_child_write_error(
+        assert!(!is_retryable_native_child_write_error(
             "Failed to write to native sidecar stdin: Broken pipe"
         ));
         assert!(!is_retryable_native_child_write_error(
+            "Native helper stdin write timed out."
+        ));
+        assert!(is_retryable_native_child_write_error(
+            "Native helper writer queue is full; command was not delivered."
+        ));
+        assert!(!is_retryable_native_child_write_error(
             "Failed to encode helper command: invalid payload"
+        ));
+        assert!(is_unknown_native_child_delivery_error(
+            "Failed to write to native sidecar stdin: Broken pipe"
+        ));
+        assert!(is_unknown_native_child_delivery_error(
+            "Native helper stdin write timed out."
+        ));
+        assert!(!is_unknown_native_child_delivery_error(
+            "Native helper writer queue is full; command was not delivered."
         ));
     }
 
@@ -13128,6 +15774,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn runtime_quarantine_fence_survives_owner_retirement_and_rejects_replacement() {
+        let runtime_id = "native-quarantine-generation-fence";
+        let manager = manager_with_handle(runtime_id);
+        let original = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("original handle");
+        manager.fence_permission_quarantine_handle(runtime_id, &original);
+        manager
+            .retire_handle_if_current(runtime_id, &original)
+            .expect("retire quarantined generation");
+        let replacement = native_session_handle_with_generation(
+            native_record(runtime_id, "initializing", true),
+            original.generation + 1,
+        );
+
+        let error = manager
+            .insert_handle(runtime_id.to_string(), replacement)
+            .expect_err("runtime-level fence must reject every later generation");
+
+        assert!(error.contains("quarantined"));
+        assert!(manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .is_none());
+        assert!(manager.is_permission_quarantine_fenced(runtime_id));
+    }
+
+    #[test]
+    fn lifecycle_guard_keeps_generation_stable_across_permission_commit_window() {
+        let runtime_id = "native-permission-generation-stability";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .cloned()
+            .expect("handle");
+        let lifecycle = manager
+            .lifecycle_transaction_lock(runtime_id)
+            .expect("lifecycle");
+        let guard = lifecycle.lock().expect("lifecycle guard");
+        let worker_manager = Arc::clone(&manager);
+        let worker_handle = Arc::clone(&handle);
+        let (started, started_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started.send(()).expect("start exit worker");
+            worker_manager.mark_process_exit(runtime_id, Some(1), &worker_handle)
+        });
+        started_rx.recv().expect("exit worker started");
+        std::thread::sleep(Duration::from_millis(30));
+
+        assert!(manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("current handle"));
+
+        drop(guard);
+        worker
+            .join()
+            .expect("join exit worker")
+            .expect("retire generation");
+        assert!(!manager
+            .is_current_handle(runtime_id, &handle)
+            .expect("retired handle"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_helper_kill_reaps_shell_wrapper_and_grandchild_without_touching_sibling() {
@@ -13508,6 +16227,7 @@ wait"#,
         let manager = Arc::new(manager);
         let error = manager
             .stop_session_from_with_grace(
+                None,
                 runtime_id,
                 Some("regression_test"),
                 None,

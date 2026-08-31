@@ -16,7 +16,7 @@ const tauriDir = path.join(desktopDir, 'src-tauri');
 // ---------------------------------------------------------------------------
 
 test('desktop registers the external control server on startup', async () => {
-  const mainSource = await fs.readFile(path.join(tauriDir, 'src', 'main.rs'), 'utf8');
+  const mainSource = await fs.readFile(path.join(tauriDir, 'src', 'lib.rs'), 'utf8');
   const controlSource = await fs.readFile(path.join(tauriDir, 'src', 'external_control.rs'), 'utf8');
   const appSource = await fs.readFile(path.join(desktopDir, 'src', 'App.tsx'), 'utf8');
   const cargoSource = await fs.readFile(path.join(tauriDir, 'Cargo.toml'), 'utf8');

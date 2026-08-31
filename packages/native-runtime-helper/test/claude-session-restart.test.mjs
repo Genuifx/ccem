@@ -30,6 +30,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
   const yieldIdleAfterResult = options.yieldIdleAfterResult ?? true;
   const advertiseLifecycle = options.advertiseLifecycle ?? false;
   const endFirstTurnWithoutResult = options.endFirstTurnWithoutResult ?? false;
+  const rejectPermissionChange = options.rejectPermissionChange ?? false;
   const assertHumanPromptOrigin = options.assertHumanPromptOrigin ?? false;
   const permissionOwnershipScenario = options.permissionOwnershipScenario ?? false;
   const yieldLateResultAfterClose = options.yieldLateResultAfterClose ?? false;
@@ -88,6 +89,7 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
             const yieldIdleAfterResult = ${JSON.stringify(yieldIdleAfterResult)};
             const advertiseLifecycle = ${JSON.stringify(advertiseLifecycle)};
             const endFirstTurnWithoutResult = ${JSON.stringify(endFirstTurnWithoutResult)};
+            const rejectPermissionChange = ${JSON.stringify(rejectPermissionChange)};
             const assertHumanPromptOrigin = ${JSON.stringify(assertHumanPromptOrigin)};
             const permissionOwnershipScenario = ${JSON.stringify(permissionOwnershipScenario)};
             const yieldLateResultAfterClose = ${JSON.stringify(yieldLateResultAfterClose)};
@@ -144,6 +146,11 @@ async function buildHelperWithMockClaudeSdk(options = {}) {
                 },
                 async setModel() {
                   setModelCalled = true;
+                },
+                async setPermissionMode() {
+                  if (rejectPermissionChange) {
+                    throw new Error('mock permission mode rejection');
+                  }
                 },
                 async *[Symbol.asyncIterator]() {
                   const iterator = prompt[Symbol.asyncIterator]();
@@ -2748,6 +2755,176 @@ test('closes an idle Claude query after the retention timeout', async (t) => {
     /__MOCK_CLAUDE_CLOSE__/,
     'idle Claude query close after retention timeout',
   );
+});
+
+test('acknowledges an idle retained Claude restart with a correlated applied result', async (t) => {
+  const helperPath = await buildHelperWithMockClaudeSdk({
+    keepAliveAfterResult: true,
+    logClose: true,
+  });
+  const helper = spawn(process.execPath, [helperPath], {
+    env: {
+      ...process.env,
+      CCEM_NATIVE_CLAUDE_IDLE_TTL_MS: '500',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  t.after(() => {
+    helper.kill('SIGTERM');
+  });
+
+  const outputs = [];
+  const stderrRef = { value: '' };
+  let stdoutBuffer = '';
+
+  helper.stdout.setEncoding('utf8');
+  helper.stdout.on('data', (chunk) => {
+    stdoutBuffer += chunk;
+    let newlineIndex = stdoutBuffer.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = stdoutBuffer.slice(0, newlineIndex).trim();
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line) {
+        outputs.push(JSON.parse(line));
+      }
+      newlineIndex = stdoutBuffer.indexOf('\n');
+    }
+  });
+
+  helper.stderr.setEncoding('utf8');
+  helper.stderr.on('data', (chunk) => {
+    stderrRef.value += chunk;
+  });
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    perm_mode: 'dev',
+    working_dir: os.tmpdir(),
+    initial_prompt: 'first',
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'status'
+      && output.status === 'ready'
+      && output.detail === 'Ready for the next prompt.',
+    stderrRef,
+    'ready status before settings update',
+  );
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'update_settings',
+    request_id: 'settings-retained-runtime',
+    env_name: 'updated',
+    env_vars: { ANTHROPIC_MODEL: 'new-model' },
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'status'
+      && output.status === 'ready'
+      && output.detail === 'Settings applied.',
+    stderrRef,
+    'applied settings status',
+  );
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'settings_update_result'
+      && output.request_id === 'settings-retained-runtime'
+      && output.outcome === 'applied',
+    stderrRef,
+    'correlated applied settings acknowledgement',
+  );
+
+  await delay(80);
+  assert.match(stderrRef.value, /__MOCK_CLAUDE_CLOSE__/);
+
+  helper.stdin.write(`${JSON.stringify({
+    type: 'prompt',
+    text: 'second',
+  })}\n`);
+
+  await waitForOutput(
+    outputs,
+    (output) => output.type === 'event'
+      && output.payload?.type === 'assistant_chunk'
+      && output.payload.text === 'mock response 1',
+    stderrRef,
+    'second Claude response on restarted query after settings update',
+  );
+
+  assert.match(stderrRef.value, /__MOCK_CLAUDE_CLOSE__/);
+});
+
+test('correlates applied and failed permission settings acknowledgements', async (t) => {
+  for (const scenario of [
+    { outcome: 'applied', rejectPermissionChange: false },
+    { outcome: 'failed', rejectPermissionChange: true },
+  ]) {
+    const helperPath = await buildHelperWithMockClaudeSdk({
+      keepAliveAfterResult: true,
+      rejectPermissionChange: scenario.rejectPermissionChange,
+    });
+    const helper = spawn(process.execPath, [helperPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    t.after(() => helper.kill('SIGTERM'));
+
+    const outputs = [];
+    const stderrRef = { value: '' };
+    let stdoutBuffer = '';
+    helper.stdout.setEncoding('utf8');
+    helper.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk;
+      let newlineIndex = stdoutBuffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        if (line) outputs.push(JSON.parse(line));
+        newlineIndex = stdoutBuffer.indexOf('\n');
+      }
+    });
+    helper.stderr.setEncoding('utf8');
+    helper.stderr.on('data', (chunk) => {
+      stderrRef.value += chunk;
+    });
+
+    helper.stdin.write(`${JSON.stringify({
+      type: 'init',
+      provider: 'claude',
+      env_name: 'default',
+      perm_mode: 'dev',
+      working_dir: os.tmpdir(),
+      initial_prompt: 'first',
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'status'
+        && output.status === 'ready'
+        && output.detail === 'Ready for the next prompt.',
+      stderrRef,
+      `ready before ${scenario.outcome} permission update`,
+    );
+
+    const requestId = `settings-permission-${scenario.outcome}`;
+    helper.stdin.write(`${JSON.stringify({
+      type: 'update_settings',
+      request_id: requestId,
+      perm_mode: 'readonly',
+    })}\n`);
+    const acknowledgement = await waitForOutput(
+      outputs,
+      (output) => output.type === 'settings_update_result'
+        && output.request_id === requestId,
+      stderrRef,
+      `${scenario.outcome} permission settings acknowledgement`,
+    );
+    assert.equal(acknowledgement.outcome, scenario.outcome);
+    helper.kill('SIGTERM');
+  }
 });
 
 test('restarts an idle retained Claude query before sending with updated environment settings', async (t) => {

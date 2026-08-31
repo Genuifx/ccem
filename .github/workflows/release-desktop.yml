@@ -14,33 +14,90 @@ on:
         options:
           - 'true'
           - 'false'
+      recover_stale_draft:
+        description: 'Resume an unpublished CCEM-owned draft for the same tag and source commit'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 concurrency:
-  group: release-desktop-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-desktop
+  cancel-in-progress: false
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare-release:
-    name: Prepare Release Notes
+    name: Prepare Exact Tagged Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       release_body: ${{ steps.release-notes.outputs.release_body }}
       current_tag: ${{ steps.release-notes.outputs.current_tag }}
       version: ${{ steps.release-notes.outputs.version }}
-      release_id: ${{ steps.draft-release.outputs.release_id }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require protected release ref and main ancestry
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Manual desktop release may run only from protected main." >&2
+              exit 1
+            }
+          else
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] || {
+              echo "Automatic desktop release requires a formal v* tag push." >&2
+              exit 1
+            }
+          fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Desktop release requires the selected main ref or v* tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not verify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Desktop release requires the main branch to be protected." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Desktop release source ${source_commit} is not reachable from origin/main." >&2
+            exit 1
+          }
 
       - name: Generate release body
         id: release-notes
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             current_tag="${GITHUB_REF_NAME}"
           else
@@ -51,15 +108,28 @@ jobs:
             fi
             current_tag="v${version}"
           fi
+          [[ "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Desktop release requires a formal semantic-version tag." >&2
+            exit 1
+          }
 
-          previous_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          git fetch --force --no-tags origin "refs/tags/${current_tag}:refs/tags/${current_tag}" || {
+            echo "Release tag ${current_tag} must exist before desktop release builds start" >&2
+            exit 1
+          }
+          tag_commit="$(git rev-parse "refs/tags/${current_tag}^{commit}")"
+          source_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          [[ "$tag_commit" == "$source_commit" ]] || {
+            echo "Release tag ${current_tag} does not resolve to current source ${source_commit}" >&2
+            exit 1
+          }
+
+          previous_tag="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
           version="${current_tag#v}"
-
           echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
           delimiter="CCEM_RELEASE_BODY_$(date +%s)"
-
           {
             echo "release_body<<${delimiter}"
             echo "## CCEM Desktop v${version}"
@@ -74,12 +144,8 @@ jobs:
             echo "npm install -g ccem@${version}"
             echo '```'
             echo
-            echo "### macOS Gatekeeper"
-            echo "If you use an unsigned macOS build, clear quarantine after installing:"
-            echo
-            echo '```bash'
-            echo 'xattr -c /Applications/CCEM\ Desktop.app'
-            echo '```'
+            echo "### macOS trust"
+            echo "Production artifacts are Developer ID-signed, notarized, and stapled before publication."
             echo
             echo "### Commits"
             if [[ -n "$previous_tag" ]]; then
@@ -96,660 +162,308 @@ jobs:
           EXPECTED_VERSION: ${{ steps.release-notes.outputs.version }}
         run: node scripts/ci/check-release-version.mjs "$EXPECTED_VERSION"
 
-      - name: Create or reuse single draft release
-        id: draft-release
-        shell: bash
+      - name: Verify pinned browser runtime manifests
+        run: node scripts/ci/check-browser-runtime-manifests.mjs
+
+      - name: Require immutable GitHub Releases before signed build
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG_NAME: ${{ steps.release-notes.outputs.current_tag }}
-          VERSION: ${{ steps.release-notes.outputs.version }}
-          RELEASE_BODY: ${{ steps.release-notes.outputs.release_body }}
-          TARGET_COMMITISH: ${{ github.sha }}
-          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-        run: |
-          set -euo pipefail
+          CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
+        run: node apps/desktop/scripts/verify-immutable-releases-enabled.mjs
 
-          api="https://api.github.com/repos/${REPO}"
-          auth_headers=(
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
-            -H "Accept: application/vnd.github+json"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-          curl_retry_args=(
-            --retry 3
-            --retry-delay 2
-            --retry-max-time 60
-          )
-          matching_releases="$(mktemp)"
-          create_response="$(mktemp)"
-
-          for attempt in 1 2 3 4; do
-            curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
-              "${api}/releases?per_page=100" \
-              | jq --arg tag "$TAG_NAME" '[.[] | select(.tag_name == $tag)]' \
-              > "$matching_releases"
-
-            release_count="$(jq 'length' "$matching_releases")"
-            if (( release_count > 1 )); then
-              echo "Multiple releases already exist for ${TAG_NAME}; refusing to split matrix uploads" >&2
-              jq -r '.[] | [.id, .draft, .html_url] | @tsv' "$matching_releases" >&2
-              exit 1
-            fi
-
-            if (( release_count == 1 )); then
-              if [[ "$(jq -r '.[0].draft' "$matching_releases")" != "true" ]]; then
-                echo "Release ${TAG_NAME} is already published; refusing to overwrite it" >&2
-                exit 1
-              fi
-              release_id="$(jq -r '.[0].id' "$matching_releases")"
-              if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-                echo "Draft release ${TAG_NAME} has an invalid id" >&2
-                exit 1
-              fi
-              echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            payload="$(jq -n \
-              --arg tag_name "$TAG_NAME" \
-              --arg target_commitish "$TARGET_COMMITISH" \
-              --arg name "CCEM v${VERSION}" \
-              --arg body "$RELEASE_BODY" \
-              --argjson prerelease "$PRERELEASE" \
-              '{
-                tag_name: $tag_name,
-                target_commitish: $target_commitish,
-                name: $name,
-                body: $body,
-                draft: true,
-                prerelease: $prerelease
-              }')"
-
-            create_status="000"
-            if create_status="$(curl -sS -o "$create_response" -w '%{http_code}' -X POST \
-              "${auth_headers[@]}" \
-              -H "Content-Type: application/json" \
-              --data-binary "$payload" \
-              "${api}/releases")"; then
-              :
-            fi
-            if [[ "$create_status" == "201" ]]; then
-              release_id="$(jq -r '.id' "$create_response")"
-              if [[ "$release_id" =~ ^[0-9]+$ ]]; then
-                echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            fi
-
-            echo "Draft release creation attempt ${attempt} failed (HTTP ${create_status})" >&2
-            head -c 1000 "$create_response" >&2 || true
-            echo >&2
-            if (( attempt < 4 )); then
-              sleep "$((1 << (attempt - 1)))"
-            fi
-          done
-
-          echo "Failed to create or recover draft release ${TAG_NAME}" >&2
-          exit 1
-
-  build-desktop:
-    name: Build Desktop (${{ matrix.target }})
+  signed-producer:
+    name: Produce Exact Signed Desktop Evidence and Payloads
     needs: prepare-release
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/mode2-signed-producer.yml
+    with:
+      version: ${{ needs.prepare-release.outputs.version }}
+      source_commit: ${{ github.sha }}
+      caller_workflow_ref: ${{ github.workflow_ref }}
+      export_release_payload: true
+      release_tag: ${{ needs.prepare-release.outputs.current_tag }}
+
+  dsh_bundle_smoke:
+    name: Verify DSH in Exact Signed Payload (${{ matrix.target }})
+    needs: signed-producer
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
+          - runner: macos-latest
             target: aarch64-apple-darwin
-            args: '--target aarch64-apple-darwin'
-            appleSigning: true
-          - platform: macos-15-intel
+            platform: macos
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
-            args: '--target x86_64-apple-darwin'
-            appleSigning: true
-          - platform: windows-latest
+            platform: macos
+          - runner: windows-latest
             target: x86_64-pc-windows-msvc
-            args: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.windows.conf.json --bundles nsis,updater'
-            appleSigning: false
-
-    runs-on: ${{ matrix.platform }}
+            platform: windows
 
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
-          cache: 'pnpm'
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download this attempt's exact signed target payload
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          targets: ${{ matrix.target }}
+          name: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: release-payload
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: 'apps/desktop/src-tauri -> target'
-          key: ${{ matrix.target }}
-
-      - name: Install dependencies
-        run: pnpm install
-
-      - name: Build core package
-        run: pnpm --filter @ccem/core build
-
-      - name: Detect Apple signing config
-        if: ${{ matrix.appleSigning }}
-        id: apple-signing
+      - name: Smoke DSH helper from exact macOS updater app
+        if: ${{ matrix.platform == 'macos' }}
         shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          if [[ -n "$APPLE_CERTIFICATE" && -n "$APPLE_CERTIFICATE_PASSWORD" && -n "$APPLE_SIGNING_IDENTITY" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Using Apple code signing"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Apple code signing not configured; building unsigned artifacts"
-          fi
-
-      - name: Validate updater signing config
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY is required because updater artifacts are enabled." >&2
-            echo "Generate it with: cd apps/desktop && pnpm tauri signer generate -w ~/.tauri/ccem-updater.key" >&2
-            exit 1
-          fi
-
-      - name: Build and release (signed)
-        id: build-release-signed
-        if: ${{ matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
-        continue-on-error: true
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          releaseId: ${{ needs.prepare-release.outputs.release_id }}
-          tagName: v__VERSION__
-          releaseName: 'CCEM v__VERSION__'
-          releaseBody: ${{ needs.prepare-release.outputs.release_body }}
-          releaseDraft: true
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          includeUpdaterJson: false
-          retryAttempts: 2
-          args: ${{ matrix.args }}
-
-      - name: Build and release (unsigned)
-        id: build-release-unsigned
-        if: ${{ !matrix.appleSigning || steps.apple-signing.outputs.enabled != 'true' }}
-        continue-on-error: true
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          releaseId: ${{ needs.prepare-release.outputs.release_id }}
-          tagName: v__VERSION__
-          releaseName: 'CCEM v__VERSION__'
-          releaseBody: ${{ needs.prepare-release.outputs.release_body }}
-          releaseDraft: true
-          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          includeUpdaterJson: false
-          retryAttempts: 2
-          args: ${{ matrix.args }}
-
-      # GitHub can persist an asset while the upload client still reports an error.
-      # Recover only when every remote asset exactly matches this run's local SHA-256.
-      - name: Verify uploaded assets after action failure
-        if: ${{ steps.build-release-signed.outcome == 'failure' || steps.build-release-unsigned.outcome == 'failure' }}
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          RELEASE_ID: ${{ needs.prepare-release.outputs.release_id }}
-          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-
-          api="https://api.github.com/repos/${REPO}"
-          auth_headers=(
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
-            -H "Accept: application/vnd.github+json"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
-            echo "Prepared draft release has an invalid id" >&2
+          updater_relative="$(
+            node -e '
+              const fs = require("node:fs");
+              const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              const value = manifest?.assets?.updater?.relativePath;
+              if (typeof value !== "string" || !new RegExp("^assets/[^/]+$", "u").test(value)) {
+                throw new Error("payload manifest has no exact updater asset");
+              }
+              process.stdout.write(value);
+            ' release-payload/payload-manifest.json
+          )"
+          updater_path="release-payload/${updater_relative}"
+          [[ -f "$updater_path" ]] || {
+            echo "Signed macOS updater payload is missing: $updater_path" >&2
             exit 1
-          fi
-
+          }
+          extract_root="$RUNNER_TEMP/dsh-payload-${{ matrix.target }}"
+          rm -rf "$extract_root"
+          mkdir -p "$extract_root"
+          tar -xzf "$updater_path" -C "$extract_root"
           shopt -s nullglob
-          bundle_root="apps/desktop/src-tauri/target/${TARGET}/release/bundle"
-          artifact_files=()
-          contract_valid=true
-          case "$TARGET" in
-            aarch64-apple-darwin)
-              dmg_files=("$bundle_root"/dmg/*.dmg)
-              updater_files=("$bundle_root"/macos/*.app.tar.gz)
-              signature_files=("$bundle_root"/macos/*.app.tar.gz.sig)
-              if (( ${#dmg_files[@]} != 1 || ${#updater_files[@]} != 1 || ${#signature_files[@]} != 1 )); then
-                contract_valid=false
-              else
-                artifact_files=("${dmg_files[@]}" "${updater_files[@]}" "${signature_files[@]}")
-              fi
-              ;;
-            x86_64-apple-darwin)
-              dmg_files=("$bundle_root"/dmg/*.dmg)
-              updater_files=("$bundle_root"/macos/*.app.tar.gz)
-              signature_files=("$bundle_root"/macos/*.app.tar.gz.sig)
-              if (( ${#dmg_files[@]} != 1 || ${#updater_files[@]} != 1 || ${#signature_files[@]} != 1 )); then
-                contract_valid=false
-              else
-                artifact_files=("${dmg_files[@]}" "${updater_files[@]}" "${signature_files[@]}")
-              fi
-              ;;
-            x86_64-pc-windows-msvc)
-              installer_files=("$bundle_root"/nsis/*-setup.exe)
-              signature_files=("$bundle_root"/nsis/*-setup.exe.sig)
-              if (( ${#installer_files[@]} != 1 || ${#signature_files[@]} != 1 )); then
-                contract_valid=false
-              else
-                artifact_files=("${installer_files[@]}" "${signature_files[@]}")
-              fi
-              ;;
-            *)
-              echo "No release asset contract is defined for ${TARGET}" >&2
-              exit 1
-              ;;
-          esac
-
-          if [[ "$contract_valid" != "true" ]]; then
-            echo "tauri-action failed and ${TARGET} did not produce exactly one artifact of every required type" >&2
-            find "$bundle_root" -maxdepth 3 -type f -print >&2 || true
-            exit 1
-          fi
-
-          remote_assets_json="$(mktemp)"
-          verified=false
-          for verification_attempt in 1 2 3 4; do
-            curl --retry 3 --retry-delay 2 --retry-max-time 60 -fsSL \
-              "${auth_headers[@]}" "${api}/releases/${RELEASE_ID}/assets?per_page=100" \
-              > "$remote_assets_json"
-
-            verified=true
-            for artifact_file in "${artifact_files[@]}"; do
-              if [[ ! -s "$artifact_file" ]]; then
-                echo "Required local release asset is empty: ${artifact_file}" >&2
-                verified=false
-                break
-              fi
-
-              read -r asset_name asset_size asset_digest < <(
-                node -e '
-                  const { createHash } = require("node:crypto");
-                  const { readFileSync, statSync } = require("node:fs");
-                  const { basename } = require("node:path");
-                  const file = process.argv[1];
-                  const target = process.argv[2];
-                  const updaterExt = [".app.tar.gz.sig", ".app.tar.gz"].find((ext) => file.endsWith(ext));
-                  const arch = target.startsWith("aarch64-") ? "aarch64" : "x64";
-                  const uploadName = updaterExt
-                    ? `${basename(file, updaterExt)}_${arch}${updaterExt}`
-                    : basename(file);
-                  const name = uploadName
-                    .trim()
-                    .replace(/[ ()[\]{}]/g, ".")
-                    .replace(/\.\./g, ".")
-                    .normalize("NFD")
-                    .replace(/[\u0300-\u036f]/g, "");
-                  const size = statSync(file).size;
-                  const digest = `sha256:${createHash("sha256").update(readFileSync(file)).digest("hex")}`;
-                  console.log(`${name}\t${size}\t${digest}`);
-                ' "$artifact_file" "$TARGET"
-              )
-
-              if ! jq -e \
-                --arg name "$asset_name" \
-                --arg digest "$asset_digest" \
-                --argjson size "$asset_size" \
-                'map(select(.name == $name and .state == "uploaded" and .size == $size and .digest == $digest)) | length == 1' \
-                "$remote_assets_json" >/dev/null; then
-                echo "Remote asset does not match this run: ${asset_name} (${asset_digest})" >&2
-                verified=false
-                break
-              fi
-            done
-
-            if [[ "$verified" == "true" ]]; then
-              break
-            fi
-            if (( verification_attempt < 4 )); then
-              sleep "$((1 << (verification_attempt - 1)))"
-            fi
-          done
-
-          if [[ "$verified" != "true" ]]; then
-            echo "tauri-action failed and remote assets do not match this run's ${TARGET} artifacts" >&2
-            jq -r '.[] | [.name, .state, .size, (.digest // "no-digest")] | @tsv' "$remote_assets_json" >&2
-            exit 1
-          fi
-
-          echo "tauri-action reported a client error, but every ${TARGET} asset matches this run byte-for-byte."
-
-      - name: Smoke DSH helper from final macOS app bundle
-        if: ${{ runner.os == 'macOS' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          bundle_root="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos"
-          app_bundle="$(find "$bundle_root" -maxdepth 1 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app_bundle" ]]; then
-            echo "macOS app bundle was not produced under $bundle_root" >&2
+          app_matches=("$extract_root"/*.app)
+          if [[ "${#app_matches[@]}" -ne 1 ]]; then
+            echo "Expected exactly one app in signed updater payload; found ${#app_matches[@]}" >&2
+            printf '%s\n' "${app_matches[@]}" >&2
             exit 1
           fi
           node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs \
-            --app-bundle "$app_bundle" \
+            --app-bundle "${app_matches[0]}" \
             --evidence "$RUNNER_TEMP/dsh-bundle-smoke-${{ matrix.target }}.json"
 
-      - name: Smoke DSH helper from final Windows installer
-        if: ${{ runner.os == 'Windows' }}
+      - name: Smoke DSH helper from exact Windows installer
+        if: ${{ matrix.platform == 'windows' }}
         shell: pwsh
         run: |
-          $bundleRoot = "apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
-          $installer = Get-ChildItem -Path $bundleRoot -Filter "*.exe" -File | Select-Object -First 1
-          if (-not $installer) {
-            throw "Windows NSIS installer was not produced under $bundleRoot"
+          $ErrorActionPreference = 'Stop'
+          $payloadRoot = (Resolve-Path 'release-payload').Path
+          $manifest = Get-Content -LiteralPath (Join-Path $payloadRoot 'payload-manifest.json') -Raw | ConvertFrom-Json
+          $relative = [string]$manifest.assets.updater.relativePath
+          if ($relative -notmatch '^assets/[^/]+$') {
+            throw 'Payload manifest has no exact updater asset'
+          }
+          $installer = Join-Path $payloadRoot ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "Signed Windows updater payload is missing: $installer"
           }
           $evidence = Join-Path $env:RUNNER_TEMP "dsh-bundle-smoke-${{ matrix.target }}.json"
-          node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs --nsis-installer $installer.FullName --evidence $evidence
+          node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs --nsis-installer $installer --evidence $evidence
 
-      - name: Upload DSH bundle smoke evidence
-        uses: actions/upload-artifact@v4
+      - name: Retain DSH signed-payload smoke evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: dsh-bundle-smoke-${{ matrix.target }}
+          name: dsh-bundle-smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
           path: ${{ runner.temp }}/dsh-bundle-smoke-${{ matrix.target }}.json
           if-no-files-found: error
+          retention-days: 90
 
   publish-updater-manifest:
-    name: Publish Updater Manifest
-    needs: [prepare-release, build-desktop]
+    name: Mutate and Publish Exact Release
+    needs: [prepare-release, signed-producer, dsh_bundle_smoke]
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
-    outputs:
-      release_id: ${{ steps.publish-updater.outputs.release_id }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' && needs.dsh_bundle_smoke.result == 'success' }}
+    permissions:
+      actions: read
+      contents: write
 
     steps:
-      - name: Publish combined latest.json
-        id: publish-updater
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - name: Download immutable current-attempt release payloads
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: release-payloads
+          merge-multiple: false
+
+      - name: Revalidate protected release source and exact tag
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+              echo "Manual desktop release may run only from protected main." >&2
+              exit 1
+            }
+          else
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] || {
+              echo "Automatic desktop release requires a formal v* tag push." >&2
+              exit 1
+            }
+          fi
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "Desktop release requires the selected main ref or v* tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not reverify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "Desktop release requires the main branch to remain protected." >&2
+            exit 1
+          }
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Desktop release requires a formal semantic-version tag." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main"
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          tag_commit="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "Desktop release source ${source_commit} is no longer reachable from origin/main." >&2
+            exit 1
+          }
+          [[ "$tag_commit" == "$source_commit" ]] || {
+            echo "Release tag ${TAG_NAME} resolves to ${tag_commit}, not current source ${source_commit}" >&2
+            exit 1
+          }
+
+      - name: Verify exact three immutable payloads and eight assets
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+        run: >-
+          node apps/desktop/scripts/verify-release-payloads.mjs
+          --payload-root release-payloads
+          --version "${VERSION}"
+          --source-commit "${GITHUB_SHA}"
+          --tag "${TAG_NAME}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --inventory-output release-payloads/verified-release-inventory.json
+          --contract-output release-payloads/verified-payload-contract.json
+
+      - name: Create or resume the exact current-run draft release
+        id: draft-release
+        env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          RELEASE_NAME: CCEM v${{ needs.prepare-release.outputs.version }}
+          RELEASE_BODY: ${{ needs.prepare-release.outputs.release_body }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          ALLOW_STALE_DRAFT_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.recover_stale_draft || 'false' }}
+        run: node apps/desktop/scripts/ensure-draft-github-release.mjs
+
+      - name: Upload the exact eight verified target assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+          EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
+          EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          CCEM_RELEASE_PAYLOAD_CONTRACT: ${{ github.workspace }}/release-payloads/verified-payload-contract.json
+          CCEM_RELEASE_PAYLOAD_ROOT: ${{ github.workspace }}/release-payloads
+          CCEM_RELEASE_RECEIPTS_DIR: ${{ github.workspace }}/release-receipts
+          CCEM_RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        working-directory: apps/desktop
+        run: node scripts/upload-draft-release-assets.mjs --mode payload
+
+      - name: Generate latest.json from verified current-run payload
+        shell: bash
+        env:
           TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
           VERSION: ${{ needs.prepare-release.outputs.version }}
-          RELEASE_ID: ${{ needs.prepare-release.outputs.release_id }}
+          CCEM_RELEASE_PAYLOAD_CONTRACT: ${{ github.workspace }}/release-payloads/verified-payload-contract.json
+          CCEM_RELEASE_LATEST_PATH: ${{ github.workspace }}/latest.json
         run: |
           set -euo pipefail
+          export PUB_DATE
+          PUB_DATE="$(git show -s --format=%cI "${TAG_NAME}^{commit}")"
+          node apps/desktop/scripts/create-latest-from-release-payload.mjs
 
-          api="https://api.github.com/repos/${REPO}"
-          auth_headers=(
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
-            -H "Accept: application/vnd.github+json"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-          asset_download_headers=(
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
-            -H "Accept: application/octet-stream"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-          curl_retry_args=(
-            --retry 3
-            --retry-delay 2
-            --retry-max-time 60
-          )
-
-          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
-            echo "Prepared draft release id is invalid" >&2
-            exit 1
-          fi
-
-          release_id="$RELEASE_ID"
-          release_json="$(mktemp)"
-          curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
-            "${api}/releases/${release_id}" > "$release_json"
-          if ! jq -e --arg tag "$TAG_NAME" --argjson id "$release_id" \
-            '.id == $id and .tag_name == $tag and .draft == true' "$release_json" >/dev/null; then
-            echo "Prepared release ${release_id} is not the expected draft for ${TAG_NAME}" >&2
-            exit 1
-          fi
-          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
-          upload_url="$(jq -r '.upload_url' "$release_json" | sed 's/{.*//')"
-
-          encoded_tag="$(jq -rn --arg value "$TAG_NAME" '$value | @uri')"
-          download_base="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/releases/download/${encoded_tag}"
-
-          asset_url() {
-            local encoded_name
-            encoded_name="$(jq -rn --arg value "$1" '$value | @uri')"
-            printf '%s/%s\n' "$download_base" "$encoded_name"
-          }
-
-          asset_id() {
-            jq -r --arg name "$1" '.assets[] | select(.name == $name) | .id' "$release_json" | head -n1
-          }
-
-          asset_name_any() {
-            local candidate
-            for candidate in "$@"; do
-              local id
-              id="$(asset_id "$candidate")"
-              if [[ -n "$id" && "$id" != "null" ]]; then
-                echo "$candidate"
-                return 0
-              fi
-            done
-          }
-
-          asset_name_regex() {
-            jq -r --arg pattern "$1" \
-              '.assets[] | select(.name | test($pattern)) | .name' \
-              "$release_json" | head -n1
-          }
-
-          aarch64_bundle_name="$(asset_name_any 'CCEM.Desktop_aarch64.app.tar.gz' 'CCEM Desktop_aarch64.app.tar.gz')"
-          aarch64_bundle_url="$(asset_url "$aarch64_bundle_name")"
-          aarch64_sig_id="$(asset_id "${aarch64_bundle_name}.sig")"
-          x64_bundle_name="$(asset_name_any 'CCEM.Desktop_x64.app.tar.gz' 'CCEM Desktop_x64.app.tar.gz')"
-          x64_bundle_url="$(asset_url "$x64_bundle_name")"
-          x64_sig_id="$(asset_id "${x64_bundle_name}.sig")"
-          windows_bundle_name="$(asset_name_regex '(x64|x86_64).*setup\.exe$')"
-          if [[ -z "$windows_bundle_name" || "$windows_bundle_name" == "null" ]]; then
-            windows_bundle_name="$(asset_name_regex '(x64|x86_64).*(nsis|msi)\.zip$')"
-          fi
-          windows_bundle_url="$(asset_url "$windows_bundle_name")"
-          windows_sig_id="$(asset_id "${windows_bundle_name}.sig")"
-
-          for value in "$aarch64_bundle_url" "$aarch64_sig_id" "$x64_bundle_url" "$x64_sig_id" "$windows_bundle_url" "$windows_sig_id"; do
-            if [[ -z "$value" || "$value" == "null" ]]; then
-              echo "Missing updater bundle or signature asset for ${TAG_NAME}" >&2
-              jq -r '.assets[].name' "$release_json" >&2
-              exit 1
-            fi
-          done
-
-          for bundle_url in "$aarch64_bundle_url" "$x64_bundle_url" "$windows_bundle_url"; do
-            if [[ "$bundle_url" != "${download_base}/"* ]]; then
-              echo "Updater bundle URL is not stable for ${TAG_NAME}: ${bundle_url}" >&2
-              exit 1
-            fi
-          done
-
-          aarch64_sig="$(curl "${curl_retry_args[@]}" -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${aarch64_sig_id}" | tr -d '\r\n')"
-          x64_sig="$(curl "${curl_retry_args[@]}" -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${x64_sig_id}" | tr -d '\r\n')"
-          windows_sig="$(curl "${curl_retry_args[@]}" -fsSL "${asset_download_headers[@]}" "${api}/releases/assets/${windows_sig_id}" | tr -d '\r\n')"
-          pub_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          notes="See https://github.com/${REPO}/releases/tag/${TAG_NAME}"
-
-          jq -n \
-            --arg version "$VERSION" \
-            --arg notes "$notes" \
-            --arg pub_date "$pub_date" \
-            --arg aarch64_url "$aarch64_bundle_url" \
-            --arg aarch64_sig "$aarch64_sig" \
-            --arg x64_url "$x64_bundle_url" \
-            --arg x64_sig "$x64_sig" \
-            --arg windows_url "$windows_bundle_url" \
-            --arg windows_sig "$windows_sig" \
-            '{
-              version: $version,
-              notes: $notes,
-              pub_date: $pub_date,
-              platforms: {
-                "darwin-aarch64": {
-                  signature: $aarch64_sig,
-                  url: $aarch64_url
-                },
-                "darwin-x86_64": {
-                  signature: $x64_sig,
-                  url: $x64_url
-                },
-                "windows-x86_64": {
-                  signature: $windows_sig,
-                  url: $windows_url
-                }
-              }
-            }' > latest.json
-
-          latest_assets_json="$(mktemp)"
-          delete_response="$(mktemp)"
-          upload_response="$(mktemp)"
-          latest_size="$(wc -c < latest.json | tr -d ' ')"
-          latest_digest="sha256:$(node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write(createHash("sha256").update(readFileSync("latest.json")).digest("hex"));')"
-          uploaded=false
-
-          for attempt in 1 2 3 4; do
-            curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
-              "${api}/releases/${release_id}/assets?per_page=100" > "$latest_assets_json"
-            existing_latest_id="$(jq -r 'map(select(.name == "latest.json")) | first | .id // empty' "$latest_assets_json")"
-
-            if [[ -n "$existing_latest_id" ]]; then
-              delete_status="000"
-              if delete_status="$(curl "${curl_retry_args[@]}" -sS -o "$delete_response" -w '%{http_code}' \
-                -X DELETE "${auth_headers[@]}" "${api}/releases/assets/${existing_latest_id}")"; then
-                :
-              fi
-              if [[ "$delete_status" != "204" && "$delete_status" != "404" ]]; then
-                echo "Failed to delete existing latest.json (HTTP ${delete_status})" >&2
-                head -c 1000 "$delete_response" >&2 || true
-                echo >&2
-                if (( attempt == 4 )); then
-                  exit 1
-                fi
-                sleep "$((1 << (attempt - 1)))"
-                continue
-              fi
-            fi
-
-            upload_status="000"
-            if upload_status="$(curl -sS -o "$upload_response" -w '%{http_code}' -X POST \
-              "${auth_headers[@]}" \
-              -H "Content-Type: application/json" \
-              --data-binary @latest.json \
-              "${upload_url}?name=latest.json")"; then
-              :
-            fi
-            if [[ "$upload_status" == "201" ]]; then
-              uploaded=true
-              break
-            fi
-
-            echo "latest.json upload attempt ${attempt} failed (HTTP ${upload_status})" >&2
-            head -c 1000 "$upload_response" >&2 || true
-            echo >&2
-
-            if curl "${curl_retry_args[@]}" -fsSL "${auth_headers[@]}" \
-              "${api}/releases/${release_id}/assets?per_page=100" > "$latest_assets_json" \
-              && jq -e --argjson size "$latest_size" --arg digest "$latest_digest" \
-                'map(select(.name == "latest.json" and .state == "uploaded" and .size == $size and .digest == $digest)) | length == 1' \
-                "$latest_assets_json" >/dev/null; then
-              echo "latest.json is uploaded and complete despite the client-side error."
-              uploaded=true
-              break
-            fi
-
-            if (( attempt == 4 )); then
-              break
-            fi
-            sleep "$((1 << (attempt - 1)))"
-          done
-
-          if [[ "$uploaded" != "true" ]]; then
-            echo "Failed to upload latest.json after 4 attempts" >&2
-            exit 1
-          fi
-
-  publish-release:
-    name: Publish Verified Release
-    needs: [prepare-release, build-desktop, publish-updater-manifest]
-    runs-on: ubuntu-latest
-    if: >-
-      ${{ !cancelled()
-          && needs.build-desktop.result == 'success'
-          && needs.publish-updater-manifest.result == 'success'
-          && (github.event_name != 'workflow_dispatch' || inputs.draft == 'false') }}
-
-    steps:
-      - name: Publish verified draft release
-        shell: bash
+      - name: Upload exact latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          RELEASE_ID: ${{ needs.publish-updater-manifest.outputs.release_id }}
-        run: |
-          set -euo pipefail
-          api="https://api.github.com/repos/${REPO}"
-          auth_headers=(
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
-            -H "Accept: application/vnd.github+json"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
-            echo "Verified draft release id is invalid" >&2
-            exit 1
-          fi
-          curl --retry 3 --retry-delay 2 --retry-max-time 60 -fsSL -X PATCH \
-            "${auth_headers[@]}" \
-            -H "Content-Type: application/json" \
-            --data '{"draft":false}' \
-            "${api}/releases/${RELEASE_ID}"
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+          EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
+          EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          CCEM_RELEASE_ASSET_PATH: ${{ github.workspace }}/latest.json
+          CCEM_RELEASE_RECEIPT_PATH: ${{ github.workspace }}/latest-upload-receipt.json
+        working-directory: apps/desktop
+        run: node scripts/upload-draft-release-assets.mjs --mode latest
+
+      - name: Verify exact nine assets and publish the locked draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
+          EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}
+          EXPECTED_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          CCEM_RELEASE_INVENTORY_PATH: ${{ github.workspace }}/release-payloads/verified-release-inventory.json
+          CCEM_RELEASE_RECEIPTS_DIR: ${{ github.workspace }}/release-receipts
+          CCEM_RELEASE_LATEST_RECEIPT_PATH: ${{ github.workspace }}/latest-upload-receipt.json
+          CCEM_RELEASE_LATEST_PATH: ${{ github.workspace }}/latest.json
+          DESIRED_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
+        working-directory: apps/desktop
+        run: node scripts/publish-draft-github-release.mjs
 
   verify-published-updater:
     name: Verify Published Updater
-    needs: [prepare-release, publish-release]
+    needs: [prepare-release, publish-updater-manifest]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ !cancelled() && needs.publish-release.result == 'success' }}
+    permissions: {}
+    if: >-
+      ${{ !cancelled()
+          && needs.publish-updater-manifest.result == 'success'
+          && (github.event_name != 'workflow_dispatch' || inputs.draft == 'false') }}
 
     steps:
       - name: Verify published updater downloads
@@ -799,12 +513,12 @@ jobs:
             fi
           done < <(jq -r '.platforms[].url' "$manifest_file")
 
-  # Universal binary (optional — combines both architectures)
   create-universal:
     name: Create Universal Binary
-    needs: build-desktop
+    needs: signed-producer
     runs-on: macos-latest
-    if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
+    if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
+    permissions: {}
 
     steps:
       - name: Note

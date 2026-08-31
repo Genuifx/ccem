@@ -151,8 +151,10 @@ impl RoutedUsageScanner {
                         self.model = Some(model.to_string());
                     }
                     if let Some(usage) = message.get("usage") {
-                        self.input_tokens =
-                            usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        self.input_tokens = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         self.cache_creation_tokens = usage
                             .get("cache_creation_input_tokens")
                             .and_then(|v| v.as_u64())
@@ -169,9 +171,12 @@ impl RoutedUsageScanner {
                     // DeepSeek fills message_start and reports only output here,
                     // GLM reports zeros in message_start and the full truth here.
                     // max() is safe for both (monotonic cumulative counters).
-                    self.input_tokens = self
-                        .input_tokens
-                        .max(usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0));
+                    self.input_tokens = self.input_tokens.max(
+                        usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
                     self.cache_read_tokens = self.cache_read_tokens.max(
                         usage
                             .get("cache_read_input_tokens")
@@ -184,9 +189,12 @@ impl RoutedUsageScanner {
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0),
                     );
-                    self.output_tokens = self
-                        .output_tokens
-                        .max(usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0));
+                    self.output_tokens = self.output_tokens.max(
+                        usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
                 }
             }
         }
@@ -417,8 +425,7 @@ enum ForwardReadError {
     ClientCancelled,
 }
 
-type RoutedUsageSink =
-    Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>;
+type RoutedUsageSink = Arc<dyn Fn(&str, crate::event_bus::SessionEventPayload) + Send + Sync>;
 
 pub struct ProxyDebugManager {
     session_manager: Arc<SessionManager>,
@@ -3247,12 +3254,12 @@ mod tests {
     use super::{
         append_record, bodies_dir, build_sse_reduced, compose_upstream_url, dir_size,
         enforce_log_retention, ensure_proxy_debug_dirs, extract_prompt_preview,
-        list_traffic_records, parse_proxy_path, traffic_jsonl_path,
-        parse_router_path, proxy_debug_dir, read_chunked_body, read_http_request,
-        read_record_by_id, recompute_reduced_detail, redact_body_bytes, redact_body_text,
-        redact_headers, redact_json_value, traffic_idx_path, validate_upstream_url, ForwardMeta,
-        ForwardReadError, ParsedRequest, ProxyDebugManager, ReducedStreamLog, RegisterRouteRequest,
-        RouteBinding, RoutedUsageScanner, TrafficRecord, REDACTED_MARKER,
+        list_traffic_records, parse_proxy_path, parse_router_path, proxy_debug_dir,
+        read_chunked_body, read_http_request, read_record_by_id, recompute_reduced_detail,
+        redact_body_bytes, redact_body_text, redact_headers, redact_json_value, traffic_idx_path,
+        traffic_jsonl_path, validate_upstream_url, ForwardMeta, ForwardReadError, ParsedRequest,
+        ProxyDebugManager, ReducedStreamLog, RegisterRouteRequest, RouteBinding,
+        RoutedUsageScanner, TrafficRecord, REDACTED_MARKER,
     };
     use std::collections::{HashMap, VecDeque};
     use std::fs;
@@ -3676,7 +3683,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn router_socket_emits_routed_request_ledger_entry_with_usage() {
         with_temp_proxy_dir(|| {
@@ -3723,11 +3729,7 @@ mod tests {
                 }]
             }))
             .expect("encode ledger request");
-            let mut client = open_http_client(
-                running.port,
-                "/s/session-ledger/v1/messages",
-                &body,
-            );
+            let mut client = open_http_client(running.port, "/s/session-ledger/v1/messages", &body);
 
             first_chunk_sent
                 .recv_timeout(Duration::from_secs(2))
@@ -3759,7 +3761,10 @@ mod tests {
             };
             assert!(!request_id.is_empty(), "request identity must be stable");
             assert_eq!(target_env, env_name);
-            assert!(sub_route, "subagent-marker requests are sub-route BY IDENTITY");
+            assert!(
+                sub_route,
+                "subagent-marker requests are sub-route BY IDENTITY"
+            );
             assert_eq!(model.as_deref(), Some("target-glm"));
             assert_eq!(logical_key.as_deref(), Some("subagent:Explore"));
             assert_eq!(status, 200);
@@ -3840,14 +3845,20 @@ mod tests {
                 .expect("usage-less request must still be ledgered");
             assert_eq!(runtime_id, "runtime-nousage");
             let crate::event_bus::SessionEventPayload::RoutedRequest {
-                usage, status, complete, ..
+                usage,
+                status,
+                complete,
+                ..
             } = &payload
             else {
                 panic!("expected RoutedRequest ledger entry");
             };
             assert_eq!(*status, 200);
             assert!(*complete);
-            assert!(usage.is_none(), "missing usage must stay None, never zero-filled");
+            assert!(
+                usage.is_none(),
+                "missing usage must stay None, never zero-filled"
+            );
         });
     }
 
@@ -5592,7 +5603,10 @@ mod tests {
         assert_eq!(scanner.input_tokens, 728);
         assert_eq!(scanner.cache_creation_tokens, 12);
         assert_eq!(scanner.cache_read_tokens, 4000);
-        assert_eq!(scanner.output_tokens, 150, "message_delta usage is cumulative");
+        assert_eq!(
+            scanner.output_tokens, 150,
+            "message_delta usage is cumulative"
+        );
         assert!(scanner.has_usage());
     }
 

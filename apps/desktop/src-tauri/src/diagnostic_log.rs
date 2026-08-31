@@ -95,11 +95,7 @@ fn append_line_at(path: &Path, line: &str, max_bytes: u64) -> Result<(), String>
     }
 }
 
-fn rotate_if_needed(
-    path: &Path,
-    incoming_bytes: u64,
-    max_bytes: u64,
-) -> Result<(), String> {
+fn rotate_if_needed(path: &Path, incoming_bytes: u64, max_bytes: u64) -> Result<(), String> {
     let current_bytes = match std::fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -117,11 +113,8 @@ fn rotate_if_needed(
     std::fs::rename(path, &rotated_path)
         .map_err(|error| format!("failed to rotate diagnostic log: {}", error))?;
     #[cfg(unix)]
-    std::fs::set_permissions(
-        &rotated_path,
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .map_err(|error| format!("failed to secure rotated log: {}", error))?;
+    std::fs::set_permissions(&rotated_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("failed to secure rotated log: {}", error))?;
     Ok(())
 }
 

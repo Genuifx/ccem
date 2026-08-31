@@ -2,8 +2,33 @@ import * as React from "react"
 import * as DialogPrimitive from "@radix-ui/react-dialog"
 
 import { cn } from "@/lib/utils"
+import { useNativeSurfaceOcclusion } from "@/lib/nativeSurfaceOcclusion"
 
-const Dialog = DialogPrimitive.Root
+const Dialog = ({
+  open,
+  defaultOpen = false,
+  modal = true,
+  onOpenChange,
+  ...props
+}: React.ComponentProps<typeof DialogPrimitive.Root>) => {
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(defaultOpen)
+  const resolvedOpen = open ?? uncontrolledOpen
+  const gatedOpen = useNativeSurfaceOcclusion(modal && resolvedOpen)
+  const primitiveOpen = modal ? gatedOpen : resolvedOpen
+
+  return (
+    <DialogPrimitive.Root
+      {...props}
+      open={primitiveOpen}
+      modal={modal}
+      onOpenChange={(nextOpen) => {
+        if (open === undefined) setUncontrolledOpen(nextOpen)
+        onOpenChange?.(nextOpen)
+      }}
+    />
+  )
+}
+Dialog.displayName = DialogPrimitive.Root.displayName
 
 const DialogTrigger = DialogPrimitive.Trigger
 

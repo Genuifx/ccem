@@ -10,7 +10,6 @@ import {
   useState,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import {
   Check,
   ChevronDown,
@@ -92,8 +91,10 @@ import {
   useSessionRouterUpdatedEvent,
 } from '@/hooks/useTauriEvents';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { dispatchAppZoomCommand } from '@/hooks/useZoom';
 import { useLocale } from '@/locales';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
+import { useNativeSurfaceOccluded } from '@/lib/nativeSurfaceOcclusion';
 import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { cn, getProjectName, truncatePath } from '@/lib/utils';
 import {
@@ -156,6 +157,20 @@ import {
   calculateBrowserPanelWidthPercent,
   clampBrowserPanelWidthPercent,
 } from '@/components/workspace/browserPanelLayout';
+import type { BrowserPanelTarget } from '@/components/workspace/browserPanelTarget';
+import {
+  createBrowserPanelSessionKeyRegistry,
+  isBrowserPanelTargetVisible,
+  matchesBrowserPanelHistorySession,
+  rebindBrowserPanelTarget,
+  retireBrowserPanelTargetForWorkingDirChange,
+  resolveActiveBrowserAgentSessionId,
+  resolveHistoryBrowserAgentSessionId,
+  toggleDefaultBrowserPanelTarget,
+  WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
+} from '@/components/workspace/browserPanelTarget';
+import { createBrowserPresentationRevisionAllocator } from '@/components/workspace/browserPresentationRevision';
+import type { BrowserSurfaceHostShortcutAction } from '@/lib/browserSurfaceIpc';
 import {
   WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX,
   WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY,
@@ -226,7 +241,6 @@ interface WorkspaceForkTurnRequest {
 
 const ACTIVE_LIVE_RUNTIME_STORAGE_KEY = 'ccem-workspace-live-runtime';
 const LIVE_RUNTIME_SET_STORAGE_KEY = 'ccem-workspace-live-runtimes';
-const WORKSPACE_BROWSER_COMPOSE_SESSION_ID = 'workspace';
 const WORKSPACE_HISTORY_SESSION_LIMIT = 240;
 const NATIVE_ACTIVITY_CONFLICT_RETRY_MS = 3000;
 const NATIVE_ACTIVITY_CONFLICT_MAX_RETRIES = 10;
@@ -502,6 +516,7 @@ export function Workspace({
   const liveSessionsByRuntimeIdRef = useRef<WorkspaceLiveSessionsByRuntimeId>(liveSessionsByRuntimeId);
   const nativeSessionRestoreRequestSeqRef = useRef(0);
   const [activeLiveRuntimeId, setActiveLiveRuntimeId] = useState<string | null>(null);
+  const [selectedHistoryNativeRuntimeId, setSelectedHistoryNativeRuntimeId] = useState<string | null>(null);
   const [hasAttemptedNativeSessionRestore, setHasAttemptedNativeSessionRestore] = useState(false);
   const [workspaceGitSnapshot, setWorkspaceGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [isRefreshingWorkspaceGitSnapshot, setIsRefreshingWorkspaceGitSnapshot] = useState(false);
@@ -514,7 +529,16 @@ export function Workspace({
   const codexModelMigrationDecisionRef = useRef<((shouldContinue: boolean) => void) | null>(null);
   const acknowledgedCodexModelWarningsRef = useRef(new Set<string>());
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
-  const [browserOpenBySessionId, setBrowserOpenBySessionId] = useState<Record<string, boolean>>({});
+  const [browserTargetBySessionId, setBrowserTargetBySessionId] = useState<
+    Record<string, BrowserPanelTarget | undefined>
+  >({});
+  const browserTargetBySessionIdRef = useRef(browserTargetBySessionId);
+  browserTargetBySessionIdRef.current = browserTargetBySessionId;
+  const browserPanelInstanceSeqRef = useRef(0);
+  const browserPanelSessionKeyRegistryRef = useRef(createBrowserPanelSessionKeyRegistry());
+  const browserPresentationRevisionAllocatorRef = useRef(
+    createBrowserPresentationRevisionAllocator(),
+  );
   const [browserPanelWidthPercent, setBrowserPanelWidthPercent] = useState(
     readStoredBrowserPanelWidthPercent,
   );
@@ -720,42 +744,6 @@ export function Workspace({
     window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', stopResize);
     window.addEventListener('pointercancel', stopResize);
-  }, []);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-
-    void listen<{ sessionId?: string; session_id?: string; cause?: string }>('browser_panel_requested', (event) => {
-      if (event.payload?.cause && event.payload.cause !== 'agent_reveal') {
-        return;
-      }
-      const requestedSessionId = event.payload?.sessionId
-        ?? event.payload?.session_id
-        ?? WORKSPACE_BROWSER_COMPOSE_SESSION_ID;
-      setBrowserOpenBySessionId((previous) => {
-        if (previous[requestedSessionId]) {
-          return previous;
-        }
-        return {
-          ...previous,
-          [requestedSessionId]: true,
-        };
-      });
-    }).then((nextUnlisten) => {
-      if (disposed) {
-        nextUnlisten();
-        return;
-      }
-      unlisten = nextUnlisten;
-    }).catch((error) => {
-      console.error('Failed to listen for browser panel requests:', error);
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
   }, []);
 
   useEffect(() => {
@@ -1481,38 +1469,93 @@ export function Workspace({
 
   const activeBrowserSessionId = useMemo(() => {
     if (workspaceMode === 'live' && activeLiveEntry) {
-      return activeLiveEntry.session.runtime_id;
+      return browserPanelSessionKeyRegistryRef.current.resolveLive({
+        provider: activeLiveEntry.session.provider,
+        providerSessionId: activeLiveEntry.session.provider_session_id,
+        runtimeId: activeLiveEntry.session.runtime_id,
+      });
     }
     if (workspaceMode === 'history' && selectedSession) {
-      return `history:${selectedSession.source}:${selectedSession.id}`;
+      const matchingLiveEntry = Object.values(liveSessionsByRuntimeId).find((entry) => (
+        matchesBrowserPanelHistorySession(selectedSession, entry.session)
+      ));
+      return browserPanelSessionKeyRegistryRef.current.resolveHistory({
+        provider: selectedSession.source,
+        providerSessionId: selectedSession.id,
+        matchingLiveSession: matchingLiveEntry
+          ? {
+            provider: matchingLiveEntry.session.provider,
+            providerSessionId: matchingLiveEntry.session.provider_session_id,
+            runtimeId: matchingLiveEntry.session.runtime_id,
+          }
+          : null,
+      });
     }
     return WORKSPACE_BROWSER_COMPOSE_SESSION_ID;
-  }, [activeLiveEntry, selectedSession, workspaceMode]);
+  }, [activeLiveEntry, liveSessionsByRuntimeId, selectedSession, workspaceMode]);
+  const activeBrowserAgentSessionId = useMemo(() => {
+    if (workspaceMode === 'live') {
+      return resolveActiveBrowserAgentSessionId(activeLiveEntry?.session);
+    }
+    if (workspaceMode === 'history' && selectedSession) {
+      const selectedHistoryNativeSession = selectedHistoryNativeRuntimeId
+        ? liveSessionsByRuntimeId[selectedHistoryNativeRuntimeId]?.session
+        : null;
+      return resolveHistoryBrowserAgentSessionId(
+        selectedSession,
+        selectedHistoryNativeSession,
+      );
+    }
+    return null;
+  }, [
+    activeLiveEntry,
+    liveSessionsByRuntimeId,
+    selectedHistoryNativeRuntimeId,
+    selectedSession,
+    workspaceMode,
+  ]);
 
-  const browserPanelOpen = browserOpenBySessionId[activeBrowserSessionId] ?? false;
+  const activeBrowserTarget = browserTargetBySessionId[activeBrowserSessionId] ?? null;
+  const activeVisibleBrowserTarget = isBrowserPanelTargetVisible(activeBrowserTarget)
+    ? activeBrowserTarget
+    : null;
+  const browserPanelOpen = activeVisibleBrowserTarget !== null;
+  const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
+  const browserSurfaceOccluded = !isActive
+    || isGlobalSearchOpen
+    || nativeSurfaceModalOccluded;
+  const presentationSurfaceSessionId = activeBrowserTarget?.surfaceSessionId
+    ?? activeBrowserSessionId;
+  const browserPresentationRevision = browserPresentationRevisionAllocatorRef.current.observe({
+    ownerSessionId: activeBrowserSessionId,
+    surfaceSessionId: presentationSurfaceSessionId,
+    occluded: activeVisibleBrowserTarget ? browserSurfaceOccluded : false,
+  });
 
-  const setActiveBrowserPanelOpen = useCallback((next: boolean | ((previous: boolean) => boolean)) => {
-    setBrowserOpenBySessionId((previous) => {
-      const previousOpen = previous[activeBrowserSessionId] ?? false;
-      const nextOpen = typeof next === 'function' ? next(previousOpen) : next;
-      if (previousOpen === nextOpen) {
-        return previous;
-      }
-      return {
-        ...previous,
-        [activeBrowserSessionId]: nextOpen,
-      };
+  const closeBrowserPanel = useCallback((sessionId: string) => {
+    setBrowserTargetBySessionId((previous) => {
+      if (!previous[sessionId]) return previous;
+      const next = { ...previous };
+      delete next[sessionId];
+      browserTargetBySessionIdRef.current = next;
+      return next;
     });
-  }, [activeBrowserSessionId]);
+  }, []);
 
-  useEffect(() => {
-    void invoke('browser_set_active_session', {
-      sessionId: activeBrowserSessionId,
-      visible: browserPanelOpen,
-    }).catch((error) => {
-      console.error('Failed to sync active browser session:', error);
+  const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
+    if (!workingDir?.trim()) {
+      toast.error(t('workspace.loginBrowserNeedsWorkspace'));
+      return;
+    }
+    setBrowserTargetBySessionId((previous) => {
+      return toggleDefaultBrowserPanelTarget(
+        previous,
+        activeBrowserSessionId,
+        workingDir,
+        () => browserPanelInstanceSeqRef.current += 1,
+      );
     });
-  }, [activeBrowserSessionId, browserPanelOpen]);
+  }, [activeBrowserSessionId, t]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
@@ -2026,6 +2069,17 @@ export function Workspace({
   ]);
 
   useEffect(() => {
+    if (workspaceMode !== 'compose') return;
+    setBrowserTargetBySessionId((previous) => (
+      retireBrowserPanelTargetForWorkingDirChange(
+        previous,
+        WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
+        skillsContext.workingDir,
+      )
+    ));
+  }, [skillsContext.workingDir, workspaceMode]);
+
+  useEffect(() => {
     let cancelled = false;
     void loadWorkspaceSkills({
       workingDir: skillsContext.workingDir,
@@ -2115,6 +2169,7 @@ export function Workspace({
         && selectedKeyRef.current === key;
       setSelectedKey(key);
       selectedKeyRef.current = key;
+      setSelectedHistoryNativeRuntimeId(null);
 
       // Apply the user's unsubmitted per-history choice synchronously with
       // selection. If none exists, start off until the authoritative native
@@ -2154,6 +2209,15 @@ export function Workspace({
         })
         : options.nativeHistorySession ?? null;
       if (!selectionIsCurrent()) return;
+
+      const historyBrowserAgentSessionId = resolveHistoryBrowserAgentSessionId(
+        session,
+        nativeHistorySession,
+      );
+      if (historyBrowserAgentSessionId && nativeHistorySession) {
+        upsertLiveSessionEntry(nativeHistorySession);
+        setSelectedHistoryNativeRuntimeId(historyBrowserAgentSessionId);
+      }
 
       if (requiresRouteResolution && nativeHistoryLookupFailed) {
         updateHistoryRouteResolutionStatus('failed');
@@ -2197,6 +2261,7 @@ export function Workspace({
       markPetNotificationReadForSession,
       setSelectedWorkingDir,
       t,
+      upsertLiveSessionEntry,
       updateHistoryRouteDraftState,
       updateHistoryRouteResolutionStatus,
       updateIsLoadingMessages,
@@ -2654,7 +2719,6 @@ export function Workspace({
       return false;
     }
     const previewPrompt = buildComposerPromptPreview(displayPrompt, attachments);
-
     // Per-Composer Dynamic Routing opt-in: resolve the launch seed from the
     // CURRENT store config at submit time. Blocking codes keep the draft so the
     // user can fix the selection and retry; opted-out drafts omit the param.
@@ -2716,6 +2780,20 @@ export function Workspace({
       }
       const summary = launch.value;
 
+      const liveBrowserSessionId = browserPanelSessionKeyRegistryRef.current.resolveLive({
+        provider: summary.provider,
+        providerSessionId: summary.provider_session_id,
+        runtimeId: summary.runtime_id,
+      });
+      setBrowserTargetBySessionId((previous) => {
+        const next = rebindBrowserPanelTarget(
+          previous,
+          WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
+          liveBrowserSessionId,
+        );
+        browserTargetBySessionIdRef.current = next;
+        return next;
+      });
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
@@ -2760,6 +2838,7 @@ export function Workspace({
   }, [
     buildComposerPromptPreview,
     buildComposerPromptText,
+    browserPanelSessionKeyRegistryRef,
     extractComposerImagePayloads,
     composeEffort,
     composeProvider,
@@ -3137,24 +3216,29 @@ export function Workspace({
     setSelectedKey(nextKey);
   }, [activeLiveEntry, workspaceMode]);
 
+  const handleOpenSearchShortcut = useCallback(() => {
+    setIsGlobalSearchOpen(true);
+  }, []);
+
+  const handleOpenProjectShortcut = useCallback(() => {
+    void handlePickComposeDir();
+  }, [handlePickComposeDir]);
+
+  const handleWorkspaceSubmitShortcut = useCallback(() => {
+    if (workspaceMode === 'history') {
+      void handleContinueHistorySession();
+      return;
+    }
+    void handleCreateNativeConversation();
+  }, [handleContinueHistorySession, handleCreateNativeConversation, workspaceMode]);
+
   const shortcuts = useMemo(
     () => ({
-      'meta+k': () => setIsGlobalSearchOpen(true),
-      'meta+o': () => void handlePickComposeDir(),
-      'meta+enter': () => {
-        if (workspaceMode === 'history') {
-          void handleContinueHistorySession();
-          return;
-        }
-        void handleCreateNativeConversation();
-      },
+      'meta+k': handleOpenSearchShortcut,
+      'meta+o': handleOpenProjectShortcut,
+      'meta+enter': handleWorkspaceSubmitShortcut,
     }),
-    [
-      handleContinueHistorySession,
-      handleCreateNativeConversation,
-      handlePickComposeDir,
-      workspaceMode,
-    ]
+    [handleOpenProjectShortcut, handleOpenSearchShortcut, handleWorkspaceSubmitShortcut],
   );
   useKeyboardShortcuts(isActive ? shortcuts : {});
 
@@ -3168,37 +3252,30 @@ export function Workspace({
     || activeLiveCommandId != null;
   const isActiveLiveSessionVisible = workspaceMode === 'live' && activeLiveEntry != null;
 
-  useEffect(() => {
-    if (!isActive || !isActiveLiveSessionVisible) return;
+  const handleWorkspaceEscapeShortcut = useCallback((event?: KeyboardEvent) => {
+    const decision = decideWorkspaceEscape({
+      key: event?.key ?? 'Escape',
+      isComposing: event?.isComposing,
+      keyCode: event?.keyCode,
+      defaultPrevented: event?.defaultPrevented,
+      target: event?.target ?? null,
+      isWorkspaceActive: isActive,
+      isLiveSessionVisible: isActiveLiveSessionVisible,
+      isSessionActive: activeLiveSessionIsActive,
+      runtimeId: activeLiveStoppingId,
+      activeCommandId: activeLiveCommandId,
+      lastRequestedCommand: lastWorkspaceEscapeCommandRef.current,
+      hasOpenInteractionLayer: hasOpenWorkspaceEscapeLayer(document),
+    });
+    if (decision.kind !== 'stop') return;
 
-    const handler = (e: KeyboardEvent) => {
-      const decision = decideWorkspaceEscape({
-        key: e.key,
-        isComposing: e.isComposing,
-        keyCode: e.keyCode,
-        defaultPrevented: e.defaultPrevented,
-        target: e.target,
-        isWorkspaceActive: isActive,
-        isLiveSessionVisible: isActiveLiveSessionVisible,
-        isSessionActive: activeLiveSessionIsActive,
-        runtimeId: activeLiveStoppingId,
-        activeCommandId: activeLiveCommandId,
-        lastRequestedCommand: lastWorkspaceEscapeCommandRef.current,
-        hasOpenInteractionLayer: hasOpenWorkspaceEscapeLayer(document),
-      });
-      if (decision.kind === 'stop') {
-        lastWorkspaceEscapeCommandRef.current = decision;
-        e.preventDefault();
-        void stopNativeSession(
-          decision.runtimeId,
-          'workspace_escape',
-          decision.commandId,
-        );
-      }
-    };
-
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    lastWorkspaceEscapeCommandRef.current = decision;
+    event?.preventDefault();
+    void stopNativeSession(
+      decision.runtimeId,
+      'workspace_escape',
+      decision.commandId,
+    );
   }, [
     activeLiveCommandId,
     activeLiveSessionIsActive,
@@ -3207,6 +3284,48 @@ export function Workspace({
     isActiveLiveSessionVisible,
     stopNativeSession,
   ]);
+
+  const handleBrowserSurfaceHostShortcut = useCallback((
+    action: BrowserSurfaceHostShortcutAction,
+  ) => {
+    if (!isActive) return;
+    switch (action) {
+      case 'open_search':
+        handleOpenSearchShortcut();
+        break;
+      case 'open_project':
+        handleOpenProjectShortcut();
+        break;
+      case 'submit':
+        handleWorkspaceSubmitShortcut();
+        break;
+      case 'escape':
+        handleWorkspaceEscapeShortcut();
+        break;
+      case 'zoom_in':
+      case 'zoom_out':
+      case 'zoom_reset':
+        dispatchAppZoomCommand(action);
+        break;
+    }
+  }, [
+    handleOpenProjectShortcut,
+    handleOpenSearchShortcut,
+    handleWorkspaceEscapeShortcut,
+    handleWorkspaceSubmitShortcut,
+    isActive,
+  ]);
+
+  useEffect(() => {
+    if (!isActive || !isActiveLiveSessionVisible) return;
+
+    const handler = (e: KeyboardEvent) => {
+      handleWorkspaceEscapeShortcut(e);
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [handleWorkspaceEscapeShortcut, isActive, isActiveLiveSessionVisible]);
 
   const renderComposeView = () => (
     <div className="flex h-full min-h-0 flex-col items-center px-4 sm:px-6 lg:px-8">
@@ -3594,7 +3713,7 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={browserPanelOpen}
-            onToggleBrowser={() => setActiveBrowserPanelOpen((open) => !open)}
+            onToggleBrowser={() => toggleActiveBrowser(skillsContext.workingDir)}
             envContext={statusStripEnvContext}
             activeRuntimeId={
               workspaceMode === 'live' && activeLiveEntry?.session.provider === 'claude'
@@ -3716,20 +3835,50 @@ export function Workspace({
           </div>
         </div>
 
-        {browserPanelOpen ? (
-          <BrowserPanel
-            key={activeBrowserSessionId}
-            sessionId={activeBrowserSessionId}
-            className="shrink-0"
-            style={{
-              flex: `0 0 ${browserPanelWidthPercent}%`,
-              maxWidth: `${BROWSER_PANEL_MAX_WIDTH_PERCENT}%`,
-              minWidth: BROWSER_PANEL_MIN_WIDTH_PX,
-            }}
-            onResizeStart={handleBrowserPanelResizeStart}
-            onClose={() => setActiveBrowserPanelOpen(false)}
-          />
-        ) : null}
+        {Object.entries(browserTargetBySessionId).map(([sessionId, target]) => {
+          if (!target) return null;
+          const isPanelActive = sessionId === activeBrowserSessionId
+            && isBrowserPanelTargetVisible(target);
+          const panelAgentSessionId = sessionId === activeBrowserSessionId
+            ? activeBrowserAgentSessionId ?? undefined
+            : undefined;
+          const panelKey = String(target.instanceId);
+          const panelProps = {
+            sessionId: target.surfaceSessionId,
+            defaultUrl: target.initialUrl,
+            presentationRevision: browserPresentationRevision,
+            isActiveSurface: isPanelActive,
+            surfaceOccluded: browserSurfaceOccluded || !isPanelActive,
+            className: 'h-full w-full',
+            onResizeStart: handleBrowserPanelResizeStart,
+            onHostShortcut: handleBrowserSurfaceHostShortcut,
+            onClose: () => closeBrowserPanel(sessionId),
+          };
+
+          return (
+            <div
+              key={panelKey}
+              data-ccem-browser-panel-owner={sessionId}
+              data-ccem-browser-panel-instance={target.instanceId}
+              className={cn(
+                'h-full shrink-0',
+                isPanelActive ? 'flex' : 'hidden',
+              )}
+              style={isPanelActive ? {
+                flex: `0 0 ${browserPanelWidthPercent}%`,
+                maxWidth: `${BROWSER_PANEL_MAX_WIDTH_PERCENT}%`,
+                minWidth: BROWSER_PANEL_MIN_WIDTH_PX,
+              } : undefined}
+            >
+              <BrowserPanel
+                key={panelKey}
+                {...target}
+                {...panelProps}
+                agentSessionId={panelAgentSessionId}
+              />
+            </div>
+          );
+        })}
       </div>
 
       <WorkspaceForkDialog

@@ -5,17 +5,30 @@ import { createHash, randomUUID } from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { requiredMacCefFrameworkFiles } from './macos-cef-bundle-contract.mjs';
 
-const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const launcherPath = fileURLToPath(import.meta.url);
+const desktopDir = path.resolve(path.dirname(launcherPath), '..');
 const artifactDirName = '.artifacts/tauri-dev';
 const vitePortStart = 14000;
 const vitePortRange = 10000;
 const mcpPortStart = 30000;
 const mcpBlockSize = 100;
 const mcpBlockCount = 300;
+const cefFrameworkExecutableName = 'Chromium Embedded Framework';
+const cefFrameworkBundleName = `${cefFrameworkExecutableName}.framework`;
+const cefHelperName = 'ccem-cef-helper';
+const cefCargoOutputLimit = 64 * 1024 * 1024;
+const cefSideBySideRuntimeNames = Object.freeze([
+  'libEGL.dylib',
+  'libGLESv2.dylib',
+  'libvk_swiftshader.dylib',
+  'vk_swiftshader_icd.json',
+]);
 
 function parseArguments(argv) {
   let describe = false;
@@ -80,6 +93,16 @@ function deriveInstance(worktreeRoot, environment = process.env) {
   const productName = `CCEM Desktop Dev ${slug}`;
   const identifier = `com.ccem.desktop.dev.i${hash.slice(0, 8)}`;
   const devUrl = `http://127.0.0.1:${vitePort}`;
+  const explicitBrowserDataRoot = environment.CCEM_BROWSER_DATA_ROOT?.trim();
+  const browserDataRoot = explicitBrowserDataRoot || path.join(
+    os.homedir(),
+    '.ccem',
+    'browser-dev',
+    instanceId,
+  );
+  const browserDataRootSource = explicitBrowserDataRoot
+    ? 'explicit override'
+    : 'worktree default';
   const backgroundServices = environmentFlagEnabled(
     environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES,
   )
@@ -93,6 +116,8 @@ function deriveInstance(worktreeRoot, environment = process.env) {
     mcpPort,
     productName,
     identifier,
+    browserDataRoot,
+    browserDataRootSource,
     tauriConfig: {
       productName,
       identifier,
@@ -105,6 +130,7 @@ function deriveInstance(worktreeRoot, environment = process.env) {
       CCEM_DESKTOP_DEV_INSTANCE_ID: instanceId,
       CCEM_TAURI_MCP_PORT: String(mcpPort),
       CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: backgroundServices,
+      CCEM_BROWSER_DATA_ROOT: browserDataRoot,
     },
   };
 }
@@ -273,6 +299,237 @@ function pnpmCommand() {
   return { command: 'pnpm', prefix: [] };
 }
 
+function isCefDllSysPackageId(packageId) {
+  if (typeof packageId !== 'string') return false;
+  const fragmentIndex = packageId.lastIndexOf('#');
+  const packageFragment = fragmentIndex >= 0 ? packageId.slice(fragmentIndex + 1) : packageId;
+  return packageFragment.startsWith('cef-dll-sys@') || packageFragment.startsWith('cef-dll-sys ');
+}
+
+export function parseCefOutDirFromCargoJson(output) {
+  const outDirs = new Set();
+  for (const [index, line] of String(output).split(/\r?\n/u).entries()) {
+    if (!line.trim()) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch (error) {
+      throw new Error(`Cargo emitted invalid JSON on stdout line ${index + 1}: ${error.message}`);
+    }
+    if (
+      message.reason !== 'build-script-executed' ||
+      !isCefDllSysPackageId(message.package_id)
+    ) {
+      continue;
+    }
+    if (typeof message.out_dir !== 'string' || !path.isAbsolute(message.out_dir)) {
+      throw new Error('Cargo reported an invalid cef-dll-sys OUT_DIR');
+    }
+    outDirs.add(path.resolve(message.out_dir));
+  }
+
+  if (outDirs.size !== 1) {
+    throw new Error(
+      `Expected exactly one cef-dll-sys OUT_DIR from the current Cargo build; found ${outDirs.size}`,
+    );
+  }
+  return [...outDirs][0];
+}
+
+async function requireDirectory(candidate, label) {
+  let stats;
+  try {
+    stats = await fs.stat(candidate);
+  } catch (error) {
+    throw new Error(`${label} is unavailable at ${candidate}: ${error.message}`);
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`${label} is not a directory: ${candidate}`);
+  }
+  return fs.realpath(candidate);
+}
+
+async function requireRegularFile(
+  candidate,
+  label,
+  { executable = false, platform = process.platform } = {},
+) {
+  let stats;
+  try {
+    stats = await fs.stat(candidate);
+  } catch (error) {
+    throw new Error(`${label} is unavailable at ${candidate}: ${error.message}`);
+  }
+  if (!stats.isFile()) {
+    throw new Error(`${label} is not a regular file: ${candidate}`);
+  }
+  if (executable && platform !== 'win32' && (stats.mode & 0o111) === 0) {
+    throw new Error(`${label} is not executable: ${candidate}`);
+  }
+  return fs.realpath(candidate);
+}
+
+function cefRuntimeArchitecture(architecture) {
+  if (architecture === 'arm64') return 'aarch64';
+  if (architecture === 'x64') return 'x86_64';
+  throw new Error(`Unsupported macOS CEF development architecture: ${architecture}`);
+}
+
+async function requireMacCefFrameworkMember(candidate, relative) {
+  let stats;
+  try {
+    stats = await fs.lstat(candidate);
+  } catch (error) {
+    throw new Error(`CEF framework member ${relative} is unavailable at ${candidate}: ${error.message}`);
+  }
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(`CEF framework member ${relative} must be a regular non-symlink file`);
+  }
+  return stats;
+}
+
+async function stageMacosCefRuntimeFile(source, destination) {
+  const sourceStats = await fs.lstat(source);
+  if (sourceStats.isSymbolicLink() || !sourceStats.isFile()) {
+    throw new Error(`CEF side-by-side runtime source must be a regular file: ${source}`);
+  }
+  const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.copyFile(source, temporary, fsSync.constants.COPYFILE_EXCL);
+    await fs.chmod(temporary, sourceStats.mode & 0o777);
+    await fs.rename(temporary, destination);
+  } finally {
+    await fs.unlink(temporary).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
+  const destinationStats = await fs.lstat(destination);
+  if (
+    destinationStats.isSymbolicLink()
+    || !destinationStats.isFile()
+    || destinationStats.size !== sourceStats.size
+    || (destinationStats.mode & 0o777) !== (sourceStats.mode & 0o777)
+  ) {
+    throw new Error(`CEF side-by-side runtime copy is inconsistent: ${destination}`);
+  }
+  return destination;
+}
+
+function defaultCefCargoRunner({ args, environment, cwd }) {
+  return spawnSync('cargo', args, {
+    cwd,
+    env: environment,
+    encoding: 'utf8',
+    maxBuffer: cefCargoOutputLimit,
+    stdio: ['inherit', 'pipe', 'inherit'],
+  });
+}
+
+export async function prepareBrowserDataRoot(
+  browserDataRoot,
+  { platform = process.platform } = {},
+) {
+  const resolvedRoot = path.resolve(browserDataRoot);
+  await fs.mkdir(resolvedRoot, { recursive: true, mode: 0o700 });
+  const metadata = await fs.lstat(resolvedRoot);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error('Tauri dev browser data root must be a real directory, not a symlink');
+  }
+  if (platform !== 'win32') {
+    await fs.chmod(resolvedRoot, 0o700);
+    const hardened = await fs.lstat(resolvedRoot);
+    if ((hardened.mode & 0o077) !== 0) {
+      throw new Error('Tauri dev browser data root must be private (mode 0700)');
+    }
+  }
+  return resolvedRoot;
+}
+
+export async function prepareMacosCefDevelopmentRuntime({
+  environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
+  cargoRunner = defaultCefCargoRunner,
+} = {}) {
+  if (platform !== 'darwin') {
+    return { environment: {}, frameworkPath: null, source: null, stagedRuntimeFiles: [] };
+  }
+
+  const cargoArgs = [
+    'build',
+    '--locked',
+    '--manifest-path',
+    'src-tauri/Cargo.toml',
+    '--bin',
+    cefHelperName,
+    '--message-format=json',
+  ];
+  const build = cargoRunner({ args: cargoArgs, environment, cwd: desktopDir });
+  if (build?.error) {
+    throw new Error(`Unable to build the CEF development helper: ${build.error.message}`);
+  }
+  if (build?.status !== 0) {
+    throw new Error(`CEF development helper build failed with status ${build?.status ?? 'unknown'}`);
+  }
+
+  const outDir = await requireDirectory(
+    parseCefOutDirFromCargoJson(build.stdout),
+    'cef-dll-sys OUT_DIR',
+  );
+  const buildDirectory = path.dirname(path.dirname(outDir));
+  if (path.basename(buildDirectory) !== 'build') {
+    throw new Error(`cef-dll-sys OUT_DIR is outside the expected Cargo profile layout: ${outDir}`);
+  }
+  const profileDirectory = path.dirname(buildDirectory);
+  await requireRegularFile(
+    path.join(profileDirectory, cefHelperName),
+    'CEF development helper',
+    { executable: true, platform },
+  );
+
+  const explicitOverride = environment.CCEM_CEF_FRAMEWORK_PATH?.trim();
+  const frameworkCandidate = explicitOverride || path.join(
+    outDir,
+    `cef_macos_${cefRuntimeArchitecture(architecture)}`,
+    cefFrameworkBundleName,
+    cefFrameworkExecutableName,
+  );
+  if (
+    path.basename(frameworkCandidate) !== cefFrameworkExecutableName ||
+    path.basename(path.dirname(frameworkCandidate)) !== cefFrameworkBundleName
+  ) {
+    throw new Error(
+      `CEF framework override must name ${cefFrameworkBundleName}/${cefFrameworkExecutableName}`,
+    );
+  }
+  const frameworkPath = await requireRegularFile(
+    path.resolve(frameworkCandidate),
+    explicitOverride ? 'explicit CEF framework override' : 'Cargo CEF framework',
+  );
+  const frameworkRoot = path.dirname(frameworkPath);
+  const target = `${cefRuntimeArchitecture(architecture)}-apple-darwin`;
+  for (const relative of requiredMacCefFrameworkFiles(target)) {
+    await requireMacCefFrameworkMember(
+      path.join(frameworkRoot, ...relative.split('/')),
+      relative,
+    );
+  }
+  const stagedRuntimeFiles = [];
+  for (const name of cefSideBySideRuntimeNames) {
+    stagedRuntimeFiles.push(await stageMacosCefRuntimeFile(
+      path.join(frameworkRoot, 'Libraries', name),
+      path.join(profileDirectory, name),
+    ));
+  }
+
+  return {
+    environment: { CCEM_CEF_FRAMEWORK_PATH: frameworkPath },
+    frameworkPath,
+    source: explicitOverride ? 'explicit override' : 'Cargo OUT_DIR',
+    stagedRuntimeFiles,
+  };
+}
+
 async function run() {
   const options = parseArguments(process.argv.slice(2));
   const worktreeRoot = options.worktreeRoot
@@ -297,7 +554,31 @@ async function run() {
   const launcherLock = await acquireLauncherLock(lockPath, derivedInstance);
 
   try {
-    const instance = await resolveAvailablePorts(derivedInstance);
+    let instance = await resolveAvailablePorts(derivedInstance);
+    const browserDataRoot = await prepareBrowserDataRoot(instance.browserDataRoot);
+    instance = {
+      ...instance,
+      browserDataRoot,
+      environment: {
+        ...instance.environment,
+        CCEM_BROWSER_DATA_ROOT: browserDataRoot,
+      },
+    };
+    const cefRuntime = await prepareMacosCefDevelopmentRuntime();
+    instance = {
+      ...instance,
+      cefRuntime: cefRuntime.frameworkPath
+        ? {
+            frameworkPath: cefRuntime.frameworkPath,
+            source: cefRuntime.source,
+            stagedRuntimeFiles: cefRuntime.stagedRuntimeFiles,
+          }
+        : null,
+      environment: {
+        ...instance.environment,
+        ...cefRuntime.environment,
+      },
+    };
     if (
       instance.vitePort !== derivedInstance.vitePort ||
       instance.mcpPort !== derivedInstance.mcpPort
@@ -331,6 +612,14 @@ async function run() {
     console.log(`[tauri:dev] Vite: ${instance.tauriConfig.build.devUrl}`);
     console.log(`[tauri:dev] MCP base port: ${instance.mcpPort}`);
     console.log(`[tauri:dev] bundle id: ${instance.identifier}`);
+    console.log(
+      `[tauri:dev] browser data (${instance.browserDataRootSource}): ${instance.browserDataRoot}`,
+    );
+    if (cefRuntime.frameworkPath) {
+      console.log(
+        `[tauri:dev] CEF framework (${cefRuntime.source}): ${cefRuntime.frameworkPath}`,
+      );
+    }
     console.log(
       `[tauri:dev] automatic shared background services: ${
         instance.environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES === '1' ? 'enabled' : 'disabled'
@@ -448,7 +737,9 @@ async function run() {
   }
 }
 
-run().catch((error) => {
-  console.error(`[tauri:dev] ${error.message}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === launcherPath) {
+  run().catch((error) => {
+    console.error(`[tauri:dev] ${error.message}`);
+    process.exitCode = 1;
+  });
+}

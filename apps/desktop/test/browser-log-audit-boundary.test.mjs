@@ -27,36 +27,39 @@ test('preview browser console logs are untrusted, bounded, redacted JSONL', asyn
   assert.match(helperSource, /recent redacted events/);
 });
 
-test('Rust audit precedes allowed actions and never stores typed text or scripts', async () => {
-  const [nativeRuntimeSource, logsSource] = await Promise.all([
+test('Mode 2 durable audit precedes browser effects and never stores typed text or scripts', async () => {
+  const [nativeRuntimeSource, capabilitySource, logsSource] = await Promise.all([
     fs.readFile(path.join(rustDir, 'native_runtime.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'browser', 'login', 'capability.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'logs.rs'), 'utf8'),
   ]);
 
   const dispatch = nativeRuntimeSource.match(
     /fn handle_browser_tool_request\([\s\S]*?\n    fn mark_process_exit/,
   )?.[0] ?? '';
-  assert.ok(dispatch.indexOf('audit_policy_decision') < dispatch.indexOf('browser.run_tool'));
-  assert.match(dispatch, /Ok\(\(\)\) => audit\.and_then/);
+  assert.match(dispatch, /login\.execute_prepared_agent_tool\(&request, prepared\)/);
+  assert.doesNotMatch(dispatch, /browser\.run_tool/);
+  assert.ok(
+    capabilitySource.indexOf('self.audit.write_pre(&pre_record)')
+      < capabilitySource.indexOf('self.backend.execute(&command, &cancellation)'),
+  );
+  assert.ok(
+    capabilitySource.indexOf('self.backend.execute(&command, &cancellation)')
+      < capabilitySource.indexOf('self.audit.write_result(&result_record)'),
+  );
   assert.match(logsSource, /"text_chars"/);
   assert.match(logsSource, /"script_sha256"/);
   assert.doesNotMatch(logsSource, /"text": request\.args/);
   assert.doesNotMatch(logsSource, /"script": request\.args/);
 });
 
-test('Preview Browser exposes recent artifacts and log paths through trusted app UI only', async () => {
-  const [panelSource, ipcSource, mainSource, permissionSource] = await Promise.all([
-    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src', 'lib', 'tauri-ipc.ts'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'main.rs'), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src-tauri', 'permissions', 'trusted-app-commands.toml'), 'utf8'),
-  ]);
+test('Mode 2 Browser does not expose the legacy Preview artifact UI', async () => {
+  const panelSource = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
+    'utf8',
+  );
 
-  assert.match(panelSource, /browser_recent_activity/);
-  assert.match(panelSource, /browserRecentArtifacts/);
-  assert.match(panelSource, /console_log_path/);
-  assert.match(panelSource, /audit_log_path/);
-  assert.match(ipcSource, /browser_recent_activity/);
-  assert.match(mainSource, /browser::browser_recent_activity/);
-  assert.match(permissionSource, /"browser_recent_activity"/);
+  assert.doesNotMatch(panelSource, /browser_recent_activity/);
+  assert.doesNotMatch(panelSource, /browserRecentArtifacts/);
+  assert.doesNotMatch(panelSource, /console_log_path|audit_log_path/);
 });

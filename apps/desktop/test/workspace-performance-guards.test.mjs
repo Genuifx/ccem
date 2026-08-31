@@ -197,7 +197,7 @@ test('conversation detail uses single Rust preprocessing command', async () => {
   const historyData = await readSource('src', 'features', 'conversations', 'historyData.ts');
   const messageState = await readSource('src', 'features', 'conversations', 'messageState.ts');
   const backendHistory = await readSource('src-tauri', 'src', 'history.rs');
-  const backendMain = await readSource('src-tauri', 'src', 'main.rs');
+  const backendMain = await readSource('src-tauri', 'src', 'lib.rs');
 
   assert.match(
     historyData,
@@ -235,7 +235,7 @@ test('history search is routed through Rust for non-empty queries', async () => 
   const historyList = await readSource('src', 'components', 'history', 'HistoryList.tsx');
   const historyData = await readSource('src', 'features', 'conversations', 'historyData.ts');
   const backendHistory = await readSource('src-tauri', 'src', 'history.rs');
-  const backendMain = await readSource('src-tauri', 'src', 'main.rs');
+  const backendMain = await readSource('src-tauri', 'src', 'lib.rs');
 
   assert.match(
     historyList,
@@ -267,7 +267,7 @@ test('history search is routed through Rust for non-empty queries', async () => 
 test('workspace runtime decorations use a Rust snapshot command', async () => {
   const hook = await readSource('src', 'components', 'workspace', 'useWorkspaceSessionDecorations.ts');
   const backendDecorations = await readSource('src-tauri', 'src', 'workspace_decorations.rs');
-  const backendMain = await readSource('src-tauri', 'src', 'main.rs');
+  const backendMain = await readSource('src-tauri', 'src', 'lib.rs');
 
   assert.match(
     hook,

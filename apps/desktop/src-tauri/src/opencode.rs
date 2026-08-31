@@ -710,8 +710,8 @@ fn current_timestamp_millis() -> u64 {
 mod tests {
     use super::{
         extract_text_from_parts_json, list_local_sessions, load_local_messages,
-        read_session_metadata, storage_project_from_db_path, track_launched_session,
-        scan_local_sessions, OPENCODE_NATIVE_ENV_NAME,
+        read_session_metadata, scan_local_sessions, storage_project_from_db_path,
+        track_launched_session, OPENCODE_NATIVE_ENV_NAME,
     };
     use rusqlite::Connection;
     use std::collections::{HashMap, HashSet};
@@ -850,8 +850,7 @@ mod tests {
         let db_path = root.join("opencode.db");
         fs::write(&db_path, b"not a sqlite database").expect("write corrupt db fixture");
 
-        let (sessions, complete) =
-            scan_local_sessions(vec![db_path], &HashMap::new());
+        let (sessions, complete) = scan_local_sessions(vec![db_path], &HashMap::new());
 
         assert!(sessions.is_empty());
         assert!(

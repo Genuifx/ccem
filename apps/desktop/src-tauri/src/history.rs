@@ -312,8 +312,11 @@ pub async fn get_conversation_history(
     source: Option<String>,
     limit: Option<usize>,
 ) -> Result<HistoryListResult, HistoryCommandError> {
-    let source_filter = normalize_history_source(source.as_deref())
-        .map_err(|e| HistoryCommandError { code: "invalid_source".to_string(), message: e })?;
+    let source_filter =
+        normalize_history_source(source.as_deref()).map_err(|e| HistoryCommandError {
+            code: "invalid_source".to_string(),
+            message: e,
+        })?;
     let lim = normalize_history_limit(limit);
 
     // Legacy sources (sync)
@@ -321,8 +324,12 @@ pub async fn get_conversation_history(
         let source_filter = source_filter;
         let lim = lim;
         move || load_legacy_history_sessions_filtered(source_filter, lim)
-    }).await
-    .map_err(|e| HistoryCommandError { code: "legacy_error".to_string(), message: e })?;
+    })
+    .await
+    .map_err(|e| HistoryCommandError {
+        code: "legacy_error".to_string(),
+        message: e,
+    })?;
 
     // DSH (async via helper)
     let dsh_result = if source_filter == Some(SOURCE_DSH) || source_filter.is_none() {
@@ -338,10 +345,7 @@ pub async fn get_conversation_history(
 pub async fn get_workspace_overview_snapshot(
     limit: Option<usize>,
 ) -> Result<WorkspaceOverviewSnapshot, String> {
-    run_blocking(move || {
-        orchestrate_workspace_overview(limit, load_legacy_history_sessions)
-    })
-    .await
+    run_blocking(move || orchestrate_workspace_overview(limit, load_legacy_history_sessions)).await
 }
 
 /// Production orchestration seam for workspace overview.
@@ -367,16 +371,23 @@ pub async fn search_conversation_history(
     source: Option<String>,
     limit: Option<usize>,
 ) -> Result<HistoryListResult, HistoryCommandError> {
-    let source_filter = normalize_history_source(source.as_deref())
-        .map_err(|e| HistoryCommandError { code: "invalid_source".to_string(), message: e })?;
+    let source_filter =
+        normalize_history_source(source.as_deref()).map_err(|e| HistoryCommandError {
+            code: "invalid_source".to_string(),
+            message: e,
+        })?;
     let result_limit = normalize_history_limit(limit).unwrap_or(120);
 
     // Load legacy sessions (sync)
     let legacy_sessions = run_blocking({
         let source_filter = source_filter;
         move || load_legacy_history_sessions_filtered(source_filter, Some(HISTORY_LIMIT_MAX))
-    }).await
-    .map_err(|e| HistoryCommandError { code: "legacy_error".to_string(), message: e })?;
+    })
+    .await
+    .map_err(|e| HistoryCommandError {
+        code: "legacy_error".to_string(),
+        message: e,
+    })?;
 
     // DSH (async)
     let dsh_result = if source_filter == Some(SOURCE_DSH) || source_filter.is_none() {
@@ -385,7 +396,8 @@ pub async fn search_conversation_history(
         None
     };
 
-    let mut list_result = orchestrate_history_list(source_filter, None, legacy_sessions, dsh_result)?;
+    let mut list_result =
+        orchestrate_history_list(source_filter, None, legacy_sessions, dsh_result)?;
 
     // Apply search
     let normalized_query = normalize_history_search_text(&query);
@@ -399,7 +411,8 @@ pub async fn search_conversation_history(
         .filter(|term| !term.is_empty())
         .map(|term| term.to_string())
         .collect::<Vec<_>>();
-    let mut scored = list_result.sessions
+    let mut scored = list_result
+        .sessions
         .into_iter()
         .filter_map(|session| {
             score_history_search_match(&session, &normalized_query, &terms)
@@ -417,7 +430,10 @@ pub async fn search_conversation_history(
     scored.truncate(result_limit);
 
     let sessions = scored.into_iter().map(|(_, session)| session).collect();
-    Ok(HistoryListResult { sessions, diagnostics: list_result.diagnostics })
+    Ok(HistoryListResult {
+        sessions,
+        diagnostics: list_result.diagnostics,
+    })
 }
 
 /// Load legacy (non-DSH) sessions with optional source filter. Called from sync run_blocking.
@@ -447,9 +463,7 @@ fn load_legacy_history_sessions_filtered(
 }
 
 /// Legacy-only loader — used by Workspace to ensure DSH never leaks into session tree.
-fn load_legacy_history_sessions(
-    limit: Option<usize>,
-) -> Result<Vec<HistorySession>, String> {
+fn load_legacy_history_sessions(limit: Option<usize>) -> Result<Vec<HistorySession>, String> {
     let limit = normalize_history_limit(limit);
     let scan_limit = limit.map(history_scan_limit);
     let mut sessions = Vec::new();
@@ -637,7 +651,8 @@ pub async fn get_conversation_messages(
 
     // DSH: async helper
     if source_hint == Some(SOURCE_DSH) {
-        let (messages, _segments, _warnings) = load_dsh_conversation_detail_async(&app, &session_id).await?;
+        let (messages, _segments, _warnings) =
+            load_dsh_conversation_detail_async(&app, &session_id).await?;
         return Ok(messages);
     }
 
@@ -654,8 +669,11 @@ pub async fn get_conversation_detail(
     session_id: String,
     source: Option<String>,
 ) -> Result<ConversationDetailPayload, HistoryCommandError> {
-    let source_hint = normalize_history_source(source.as_deref())
-        .map_err(|e| HistoryCommandError { code: "invalid_source".to_string(), message: e })?;
+    let source_hint =
+        normalize_history_source(source.as_deref()).map_err(|e| HistoryCommandError {
+            code: "invalid_source".to_string(),
+            message: e,
+        })?;
 
     // Gather inputs for the single orchestration seam
     let dsh_result = if source_hint == Some(SOURCE_DSH) {
@@ -1422,7 +1440,8 @@ pub async fn get_conversation_segments(
 
     // DSH segments are always empty
     if source_hint == Some(SOURCE_DSH) {
-        let (_messages, segments, _warnings) = load_dsh_conversation_detail_async(&app, &session_id).await?;
+        let (_messages, segments, _warnings) =
+            load_dsh_conversation_detail_async(&app, &session_id).await?;
         return Ok(segments);
     }
 
@@ -4235,7 +4254,10 @@ fn parse_dsh_composite_id(composite: &str) -> Result<(&str, &str), String> {
     }
 
     if session_id.is_empty() {
-        return Err(format!("Invalid DSH composite ID (empty sessionId): {}", composite));
+        return Err(format!(
+            "Invalid DSH composite ID (empty sessionId): {}",
+            composite
+        ));
     }
 
     Ok((fingerprint, session_id))
@@ -4264,7 +4286,11 @@ pub fn map_dsh_list_item(item: &dsh_history::DshSessionListItem) -> HistorySessi
     HistorySession {
         id: composite_id,
         source: SOURCE_DSH.to_string(),
-        display: if title.is_empty() { project_name.clone() } else { title },
+        display: if title.is_empty() {
+            project_name.clone()
+        } else {
+            title
+        },
         timestamp: timestamp_ms,
         project,
         project_name,
@@ -4283,9 +4309,16 @@ pub fn map_dsh_event_to_message(
     source_instance_id: &str,
     session_id: &str,
 ) -> (Option<ConversationMessage>, Vec<String>) {
-    let timestamp_ms = event.time.map(|t| {
-        if t > 1_000_000_000_000 { t as u64 } else { (t as u64).saturating_mul(1000) }
-    }).unwrap_or(0);
+    let timestamp_ms = event
+        .time
+        .map(|t| {
+            if t > 1_000_000_000_000 {
+                t as u64
+            } else {
+                (t as u64).saturating_mul(1000)
+            }
+        })
+        .unwrap_or(0);
 
     // Map role: user → human, assistant → assistant
     let base_msg_type = match event.role {
@@ -4318,7 +4351,10 @@ pub fn map_dsh_event_to_message(
             "tool-call" => {
                 let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let arguments_str = block.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                let arguments_str = block
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
                 let input = match serde_json::from_str::<serde_json::Value>(arguments_str) {
                     Ok(val) => val,
                     Err(_) => {
@@ -4338,9 +4374,15 @@ pub fn map_dsh_event_to_message(
                 }));
             }
             "tool-result" => {
-                let tool_call_id = block.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+                let tool_call_id = block
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let content = block.get("content").cloned().unwrap_or(json!(""));
-                let is_error = block.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_error = block
+                    .get("isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 mapped_blocks.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
@@ -4350,7 +4392,8 @@ pub fn map_dsh_event_to_message(
             }
             _ => {
                 warnings.push(format!(
-                    "Unknown block type '{}' in event seq={}", block_type, event.seq
+                    "Unknown block type '{}' in event seq={}",
+                    block_type, event.seq
                 ));
             }
         }
@@ -4363,21 +4406,24 @@ pub fn map_dsh_event_to_message(
     let msg_type = base_msg_type;
     let uuid = format!("dsh:{}:{}:{}", source_instance_id, session_id, event.seq);
 
-    (Some(ConversationMessage {
-        msg_type: msg_type.to_string(),
-        uuid: Some(uuid),
-        content: json!(mapped_blocks),
-        model: event.model.clone(),
-        summary: None,
-        plan_content: None,
-        timestamp: timestamp_ms,
-        input_tokens: None,
-        output_tokens: None,
-        cache_creation_tokens: None,
-        cache_read_tokens: None,
-        segment_index: 0,
-        is_compact_boundary: false,
-    }), warnings)
+    (
+        Some(ConversationMessage {
+            msg_type: msg_type.to_string(),
+            uuid: Some(uuid),
+            content: json!(mapped_blocks),
+            model: event.model.clone(),
+            summary: None,
+            plan_content: None,
+            timestamp: timestamp_ms,
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            segment_index: 0,
+            is_compact_boundary: false,
+        }),
+        warnings,
+    )
 }
 
 /// Map a DshSessionDetail into (messages, segments, warnings).
@@ -4389,7 +4435,8 @@ pub fn map_dsh_detail(
     let mut warnings = detail.warnings.clone();
 
     for event in &detail.events {
-        let (msg_opt, block_warnings) = map_dsh_event_to_message(event, &detail.source_instance_id, &detail.session_id);
+        let (msg_opt, block_warnings) =
+            map_dsh_event_to_message(event, &detail.source_instance_id, &detail.session_id);
         warnings.extend(block_warnings);
         match msg_opt {
             Some(msg) => messages.push(msg),
@@ -4413,16 +4460,27 @@ async fn load_dsh_history_sessions_async(
     let dsh_source = match dsh_history::resolve_dsh_source() {
         Ok(source) => source,
         Err(dsh_history::DshHistoryError::Absent) => return Ok((vec![], vec![])),
-        Err(e) => return Err(DshListError { code: error_code(&e), message: e.to_string() }),
+        Err(e) => {
+            return Err(DshListError {
+                code: error_code(&e),
+                message: e.to_string(),
+            })
+        }
     };
 
     let roots = vec![dsh_source.sessions_root.to_string_lossy().to_string()];
-    let request = dsh_history::DshHistoryRequest::List { roots: roots.clone(), limit: Some(500) };
+    let request = dsh_history::DshHistoryRequest::List {
+        roots: roots.clone(),
+        limit: Some(500),
+    };
 
     let (items, warnings): (Vec<dsh_history::DshSessionListItem>, Vec<String>) =
         dsh_history::invoke_dsh_helper(app, &request, &roots)
             .await
-            .map_err(|e| DshListError { code: error_code(&e), message: e.to_string() })?;
+            .map_err(|e| DshListError {
+                code: error_code(&e),
+                message: e.to_string(),
+            })?;
 
     Ok((items.iter().map(map_dsh_list_item).collect(), warnings))
 }
@@ -4434,8 +4492,7 @@ async fn load_dsh_conversation_detail_async(
 ) -> Result<(Vec<ConversationMessage>, Vec<CompactSegment>, Vec<String>), String> {
     let (source_instance_id, session_id) = parse_dsh_composite_id(composite_id)?;
 
-    let dsh_source = dsh_history::resolve_dsh_source()
-        .map_err(|e| format!("DSH: {}", e))?;
+    let dsh_source = dsh_history::resolve_dsh_source().map_err(|e| format!("DSH: {}", e))?;
 
     let roots = vec![dsh_source.sessions_root.to_string_lossy().to_string()];
     let request = dsh_history::DshHistoryRequest::Detail {
@@ -6773,7 +6830,10 @@ pub fn orchestrate_history_list(
         sessions.truncate(lim);
     }
 
-    Ok(HistoryListResult { sessions, diagnostics })
+    Ok(HistoryListResult {
+        sessions,
+        diagnostics,
+    })
 }
 
 /// Production orchestration seam for history detail.
@@ -6782,7 +6842,9 @@ pub fn orchestrate_history_list(
 pub fn orchestrate_history_detail(
     _session_id: &str,
     source_hint: Option<&'static str>,
-    dsh_result: Option<Result<(Vec<ConversationMessage>, Vec<CompactSegment>, Vec<String>), String>>,
+    dsh_result: Option<
+        Result<(Vec<ConversationMessage>, Vec<CompactSegment>, Vec<String>), String>,
+    >,
     legacy_result: Option<Result<(Vec<ConversationMessage>, Vec<CompactSegment>), String>>,
 ) -> Result<ConversationDetailPayload, HistoryCommandError> {
     if source_hint == Some(SOURCE_DSH) {
@@ -6898,7 +6960,9 @@ mod dsh_integration_tests {
                     event_type: "assistant/message".to_string(),
                     time: Some(1700000001000),
                     role: dsh_history::DshEventRole::Assistant,
-                    content: Some(vec![json!({"type": "reasoning", "text": "Let me analyze..."})]),
+                    content: Some(vec![
+                        json!({"type": "reasoning", "text": "Let me analyze..."}),
+                    ]),
                     model: Some("deepseek-chat".to_string()),
                     provider: Some("deepseek".to_string()),
                 },
@@ -6948,9 +7012,18 @@ mod dsh_integration_tests {
 
     #[test]
     fn normalize_history_source_accepts_dsh() {
-        assert_eq!(normalize_history_source(Some("dsh")).unwrap(), Some(SOURCE_DSH));
-        assert_eq!(normalize_history_source(Some("DSH")).unwrap(), Some(SOURCE_DSH));
-        assert_eq!(normalize_history_source(Some("Dsh")).unwrap(), Some(SOURCE_DSH));
+        assert_eq!(
+            normalize_history_source(Some("dsh")).unwrap(),
+            Some(SOURCE_DSH)
+        );
+        assert_eq!(
+            normalize_history_source(Some("DSH")).unwrap(),
+            Some(SOURCE_DSH)
+        );
+        assert_eq!(
+            normalize_history_source(Some("Dsh")).unwrap(),
+            Some(SOURCE_DSH)
+        );
     }
 
     #[test]
@@ -6962,10 +7035,22 @@ mod dsh_integration_tests {
 
     #[test]
     fn normalize_history_source_accepts_all_known() {
-        assert_eq!(normalize_history_source(Some("claude")).unwrap(), Some(SOURCE_CLAUDE));
-        assert_eq!(normalize_history_source(Some("codex")).unwrap(), Some(SOURCE_CODEX));
-        assert_eq!(normalize_history_source(Some("opencode")).unwrap(), Some(SOURCE_OPENCODE));
-        assert_eq!(normalize_history_source(Some("dsh")).unwrap(), Some(SOURCE_DSH));
+        assert_eq!(
+            normalize_history_source(Some("claude")).unwrap(),
+            Some(SOURCE_CLAUDE)
+        );
+        assert_eq!(
+            normalize_history_source(Some("codex")).unwrap(),
+            Some(SOURCE_CODEX)
+        );
+        assert_eq!(
+            normalize_history_source(Some("opencode")).unwrap(),
+            Some(SOURCE_OPENCODE)
+        );
+        assert_eq!(
+            normalize_history_source(Some("dsh")).unwrap(),
+            Some(SOURCE_DSH)
+        );
         assert_eq!(normalize_history_source(None).unwrap(), None);
         assert_eq!(normalize_history_source(Some("all")).unwrap(), None);
         assert_eq!(normalize_history_source(Some("")).unwrap(), None);
@@ -7027,7 +7112,7 @@ mod dsh_integration_tests {
         assert_eq!(session.id, "1234567890abcdef:sess-002");
         assert_eq!(session.project_name, "myapp"); // derived from /tmp/myapp
         assert_eq!(session.display, "myapp"); // title missing → project_name
-        // created_at in seconds → converted to ms
+                                              // created_at in seconds → converted to ms
         assert_eq!(session.timestamp, 1700000500000);
     }
 
@@ -7384,7 +7469,8 @@ mod dsh_integration_tests {
                     task_label: None,
                 },
             ])
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(snapshot.total_sessions, 2);
         assert!(snapshot.sessions.iter().all(|s| s.source != SOURCE_DSH));
@@ -7430,11 +7516,14 @@ mod dsh_integration_tests {
                     task_label: None,
                 },
             ])
-        }).unwrap();
+        })
+        .unwrap();
 
         // An all-source loader WOULD allow DSH to appear
-        assert!(snapshot.sessions.iter().any(|s| s.source == SOURCE_DSH),
-            "All-source loader should include DSH — proving the boundary matters");
+        assert!(
+            snapshot.sessions.iter().any(|s| s.source == SOURCE_DSH),
+            "All-source loader should include DSH — proving the boundary matters"
+        );
         assert_eq!(snapshot.total_sessions, 2);
     }
 
@@ -7442,7 +7531,10 @@ mod dsh_integration_tests {
     fn workspace_overview_production_loader_structurally_excludes_dsh() {
         // Verify load_legacy_history_sessions_filtered returns empty for DSH filter
         let dsh_only = load_legacy_history_sessions_filtered(Some(SOURCE_DSH), None).unwrap();
-        assert!(dsh_only.is_empty(), "Production legacy loader never returns DSH sessions");
+        assert!(
+            dsh_only.is_empty(),
+            "Production legacy loader never returns DSH sessions"
+        );
     }
 
     // --- DSH finalization (title overrides apply to DSH too) ---
@@ -7561,7 +7653,8 @@ mod dsh_integration_tests {
             None,
             legacy,
             Some(Ok((dsh, vec!["truncated".to_string()]))),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.sessions.len(), 2);
         // DSH is newer → first after sort
@@ -7592,8 +7685,12 @@ mod dsh_integration_tests {
             None, // source=all
             None,
             legacy,
-            Some(Err(DshListError { code: "timeout".to_string(), message: "timed out".to_string() })),
-        ).unwrap();
+            Some(Err(DshListError {
+                code: "timeout".to_string(),
+                message: "timed out".to_string(),
+            })),
+        )
+        .unwrap();
 
         // Still succeeds with legacy sessions
         assert_eq!(result.sessions.len(), 1);
@@ -7607,7 +7704,10 @@ mod dsh_integration_tests {
             Some(SOURCE_DSH),
             None,
             vec![],
-            Some(Err(DshListError { code: "timeout".to_string(), message: "timed out".to_string() })),
+            Some(Err(DshListError {
+                code: "timeout".to_string(),
+                message: "timed out".to_string(),
+            })),
         );
 
         let err = result.unwrap_err();
@@ -7638,7 +7738,8 @@ mod dsh_integration_tests {
             Some(SOURCE_DSH),
             Some(Ok((messages, vec![], vec!["some warning".to_string()]))),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.messages.len(), 1);
         assert!(result.tool_results_merged);
@@ -7683,7 +7784,8 @@ mod dsh_integration_tests {
             Some(SOURCE_CLAUDE),
             None,
             Some(Ok((messages, vec![]))),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.messages.len(), 1);
         assert!(result.warnings.is_empty());
@@ -7696,7 +7798,10 @@ mod dsh_integration_tests {
         assert_eq!(validate_launch_client(Some("claude")).unwrap(), "claude");
         assert_eq!(validate_launch_client(Some("Claude")).unwrap(), "claude");
         assert_eq!(validate_launch_client(Some("CODEX")).unwrap(), "codex");
-        assert_eq!(validate_launch_client(Some("opencode")).unwrap(), "opencode");
+        assert_eq!(
+            validate_launch_client(Some("opencode")).unwrap(),
+            "opencode"
+        );
         assert_eq!(validate_launch_client(None).unwrap(), "claude"); // default
     }
 
@@ -7727,7 +7832,10 @@ mod dsh_integration_tests {
         // Valid clients succeed through both paths
         assert_eq!(validate_launch_client(Some("claude")).unwrap(), "claude");
         assert_eq!(validate_launch_client(Some("codex")).unwrap(), "codex");
-        assert_eq!(validate_launch_client(Some("opencode")).unwrap(), "opencode");
+        assert_eq!(
+            validate_launch_client(Some("opencode")).unwrap(),
+            "opencode"
+        );
         assert_eq!(validate_launch_client(None).unwrap(), "claude"); // default
     }
 }

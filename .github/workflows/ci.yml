@@ -40,6 +40,9 @@ jobs:
       - name: Audit production dependencies
         run: pnpm audit:prod:high
 
+      - name: Verify pinned browser runtime manifests
+        run: pnpm check:browser-runtime-manifests
+
       - name: Run tests
         run: pnpm -r test:run
 

@@ -49,7 +49,10 @@ pub(crate) const DSH_EXPECTED_VERSION: &str = "0.1.1-rc.2";
 #[serde(tag = "op")]
 pub enum DshHistoryRequest {
     #[serde(rename = "list")]
-    List { roots: Vec<String>, limit: Option<u32> },
+    List {
+        roots: Vec<String>,
+        limit: Option<u32>,
+    },
     #[serde(rename = "detail")]
     Detail {
         #[serde(rename = "sourceInstanceId")]
@@ -389,20 +392,27 @@ fn resolve_ccem_node_path(_app: &AppHandle) -> Result<PathBuf, DshHistoryError> 
 fn resolve_ccem_node_path_from_exe(exe: Option<PathBuf>) -> Result<PathBuf, DshHistoryError> {
     let exe_dir = exe
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .ok_or_else(|| DshHistoryError::HelperUnavailable(
-            "cannot determine app executable directory".to_string(),
-        ))?;
+        .ok_or_else(|| {
+            DshHistoryError::HelperUnavailable(
+                "cannot determine app executable directory".to_string(),
+            )
+        })?;
 
     // Primary: bare name (release macOS: Contents/MacOS/ccem-node, dev: target/debug/ccem-node)
     let bare = exe_dir.join(CCEM_NODE_SIDECAR_NAME);
-    let primary = if cfg!(windows) { bare.with_extension("exe") } else { bare };
+    let primary = if cfg!(windows) {
+        bare.with_extension("exe")
+    } else {
+        bare
+    };
     if primary.exists() {
         return Ok(primary);
     }
 
-    Err(DshHistoryError::HelperUnavailable(
-        format!("ccem-node sidecar not found at {}", primary.display()),
-    ))
+    Err(DshHistoryError::HelperUnavailable(format!(
+        "ccem-node sidecar not found at {}",
+        primary.display()
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +466,13 @@ fn invoke_dsh_helper_blocking<T: for<'de> Deserialize<'de>>(
     request_json: String,
     roots_json: String,
 ) -> Result<(T, Vec<String>), DshHistoryError> {
-    invoke_helper_core(helper_path, ccem_node, request_json, roots_json, &InvocationLimits::production())
+    invoke_helper_core(
+        helper_path,
+        ccem_node,
+        request_json,
+        roots_json,
+        &InvocationLimits::production(),
+    )
 }
 
 /// Execute the DSH history helper asynchronously via spawn_blocking.

@@ -25,7 +25,7 @@ test('tray cockpit owns left-click while preserving the native context menu', as
   ] =
     await Promise.all([
       fs.readFile(path.join(tauriSrcDir, 'tray.rs'), 'utf8'),
-      fs.readFile(path.join(tauriSrcDir, 'main.rs'), 'utf8'),
+      fs.readFile(path.join(tauriSrcDir, 'lib.rs'), 'utf8'),
       fs.readFile(path.join(sourceDir, 'main.tsx'), 'utf8'),
       fs.readFile(path.join(sourceDir, 'App.tsx'), 'utf8'),
       fs.readFile(path.join(desktopDir, 'src-tauri', 'capabilities', 'default.json'), 'utf8'),
@@ -78,8 +78,8 @@ test('tray cockpit owns left-click while preserving the native context menu', as
   assert.match(trayUsageCommand, /read_tray_usage_stats/);
   assert.doesNotMatch(trayUsageCommand, /refresh_usage_cache/);
   assert.match(mainSource, /window\.label\(\) == TRAY_COCKPIT_LABEL[\s\S]*api\.prevent_close\(\)[\s\S]*hide_tray_cockpit/);
-  assert.match(entrySource, /label === 'tray-cockpit'[\s\S]*return TrayCockpit/);
-  assert.match(entrySource, /requestedWindow === 'tray-cockpit'[\s\S]*return TrayCockpit/);
+  assert.match(entrySource, /resolveDesktopWindowRoot\(requestedWindow, nativeWindowLabel\)/);
+  assert.match(entrySource, /case 'tray-cockpit':[\s\S]*return TrayCockpit/);
   assert.match(appSource, /listen<TrayOpenTabRequest>\('tray-open-tab'[\s\S]*navigateToTab\(event\.payload\.tab\)/);
   assert.deepEqual(capabilities.webviews, ['main', 'desktop-pet', 'tray-cockpit']);
   for (const permission of [

@@ -1,6 +1,6 @@
 use super::{
-    listening_tcp_entries, process_group_exists, reap_stale_runtime, write_private_json,
-    ChromiumPageSmoke, ManagedChromiumSpike, StaleReapOutcome,
+    listening_tcp_entries, process_group_exists, reap_stale_runtime, take_next_cdp_frame,
+    write_private_json, ChromiumPageSmoke, ManagedChromiumSpike, StaleReapOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -16,6 +16,22 @@ const OUTPUT_ENV: &str = "CCEM_CHROMIUM_SPIKE_OUTPUT_DIR";
 const ORPHAN_CHILD_ENV: &str = "CCEM_CHROMIUM_ORPHAN_PROBE_CHILD";
 const ORPHAN_PID_FILE_ENV: &str = "CCEM_CHROMIUM_ORPHAN_PID_FILE";
 const ORPHAN_RUNTIME_ROOT_ENV: &str = "CCEM_CHROMIUM_ORPHAN_RUNTIME_ROOT";
+
+#[test]
+fn cdp_frame_limit_applies_before_decoding_complete_frames() {
+    let mut at_limit = vec![b'x'; 8];
+    at_limit.push(0);
+    assert_eq!(
+        take_next_cdp_frame(&mut at_limit, 8).expect("accept exact frame limit"),
+        Some(vec![b'x'; 8])
+    );
+
+    let mut oversized = vec![b'x'; 9];
+    oversized.push(0);
+    let error = take_next_cdp_frame(&mut oversized, 8)
+        .expect_err("reject a complete oversized frame before JSON decoding");
+    assert!(error.contains("exceeded 8 bytes"));
+}
 
 #[derive(Debug, Serialize)]
 struct LifecycleProof {

@@ -19,6 +19,7 @@ import {
   type ClaudeRouterInit,
 } from './claudeRouteHook';
 import {
+  BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
   createBrowserToolBridge,
   createCcemBrowserMcpServer,
   ensureBrowserMcpToolsAllowed,
@@ -219,6 +220,12 @@ type HelperOutput =
       title: string | null;
     }
   | {
+      type: 'settings_update_result';
+      request_id: string;
+      outcome: 'applied' | 'failed' | 'deferred';
+      detail?: string;
+    }
+  | {
       type: 'teardown_prepared';
       request_id: string;
       ready: boolean;
@@ -349,7 +356,7 @@ let claudeBackgroundSnapshotKey = '';
 const todoSnapshotTracker = new TodoSnapshotTracker();
 const browserToolBridge = createBrowserToolBridge(
   (request) => emit(request),
-  30_000,
+  BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
   () => 'foreground',
 );
 let browserEvaluateApprovedForSession = false;
@@ -421,6 +428,24 @@ function emit(output: HelperOutput) {
 
 function emitStatus(status: string, detail?: string) {
   emit({ type: 'status', status, detail });
+}
+
+function emitSettingsUpdateResult(
+  requestId: string | undefined,
+  outcome: 'applied' | 'failed' | 'deferred',
+  detail?: string,
+) {
+  // New desktop runtimes always provide a correlation id. Keep accepting
+  // legacy commands without one, but do not emit an uncorrelatable ack.
+  if (requestId === undefined) {
+    return;
+  }
+  emit({
+    type: 'settings_update_result',
+    request_id: requestId,
+    outcome,
+    ...(detail ? { detail } : {}),
+  });
 }
 
 function emitEvent(payload: Record<string, unknown>) {
@@ -2799,6 +2824,13 @@ function isClaudePermissionOnlySettingsCommand(command: UpdateSettingsCommand) {
     && command.effort === undefined;
 }
 
+function isValidSettingsUpdateRequestId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 96
+    && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
 async function applyClaudePermissionSettingsCommand(command: UpdateSettingsCommand) {
   if (!initCommand || initCommand.provider !== 'claude' || !isClaudePermissionOnlySettingsCommand(command)) {
     return false;
@@ -4834,8 +4866,24 @@ async function handleCommand(command: InputCommand) {
   }
 
   if (command.type === 'update_settings') {
+    if (command.request_id !== undefined
+      && !isValidSettingsUpdateRequestId(command.request_id)) {
+      emitEvent({
+        type: 'stderr_line',
+        line: 'Rejected update_settings command with an invalid request id.',
+      });
+      return;
+    }
+
     await serializeRuntimeSettingsCommand(async () => {
-      if (!initCommand) return;
+      if (!initCommand) {
+        emitSettingsUpdateResult(
+          command.request_id,
+          'failed',
+          'Native runtime helper is not initialized.',
+        );
+        return;
+      }
 
       if (command.perm_mode !== undefined) {
         browserEvaluateApprovedForSession = false;
@@ -4850,6 +4898,7 @@ async function handleCommand(command: InputCommand) {
             if (!claudeTurnAwaitingResult) {
               emitStatus('ready', 'Settings applied.');
             }
+            emitSettingsUpdateResult(command.request_id, 'applied');
             return;
           }
         } catch (error) {
@@ -4861,6 +4910,11 @@ async function handleCommand(command: InputCommand) {
             type: 'stderr_line',
             line: `Claude permission update failed: ${error instanceof Error ? error.message : String(error)}`,
           });
+          emitSettingsUpdateResult(
+            command.request_id,
+            'failed',
+            'Provider rejected the settings update.',
+          );
           return;
         }
       }
@@ -4870,12 +4924,19 @@ async function handleCommand(command: InputCommand) {
           if (canApplySettingsImmediately()) {
             applySettingsCommand(command);
             emitStatus('ready', 'Settings applied.');
+            emitSettingsUpdateResult(command.request_id, 'applied');
           } else if (applyClaudeSettingsByRestartingIdleRuntime(command)) {
             emitStatus('ready', 'Settings applied.');
+            emitSettingsUpdateResult(command.request_id, 'applied');
           } else {
             queuePendingSettings(command);
             const status = claudeTurnAwaitingResult ? 'processing' : 'ready';
             emitStatus(status, 'Settings will apply to the next Claude runtime.');
+            emitSettingsUpdateResult(
+              command.request_id,
+              'deferred',
+              'Settings require a later Claude runtime.',
+            );
           }
         } catch (error) {
           emitClaudeRuntimeSettingsChanged('failed', command.request_id, {
@@ -4886,6 +4947,11 @@ async function handleCommand(command: InputCommand) {
             type: 'stderr_line',
             line: `Claude settings update failed: ${error instanceof Error ? error.message : String(error)}`,
           });
+          emitSettingsUpdateResult(
+            command.request_id,
+            'failed',
+            'Provider rejected the settings update.',
+          );
           return;
         }
         return;
@@ -4897,9 +4963,15 @@ async function handleCommand(command: InputCommand) {
           teardownCodexSession(command.env_vars !== undefined || command.effort !== undefined);
         }
         emitStatus('ready', 'Settings applied.');
+        emitSettingsUpdateResult(command.request_id, 'applied');
       } else {
         queuePendingSettings(command);
         emitStatus('processing', 'Settings will apply after the current turn.');
+        emitSettingsUpdateResult(
+          command.request_id,
+          'deferred',
+          'Settings require the current Codex turn to finish.',
+        );
       }
     });
     return;

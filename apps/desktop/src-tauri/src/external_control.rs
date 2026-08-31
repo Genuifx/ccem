@@ -741,10 +741,6 @@ impl ExternalControlManager {
                     })?;
                 Ok(serde_json::to_value(state).map_err(|error| error.to_string())?)
             }
-            "ccem.browser.smokeProbe" if cfg!(debug_assertions) => {
-                let params = deserialize_params::<BrowserSmokeProbeParams>(rpc.params)?;
-                self.browser_smoke_probe(app, params).map_err(Into::into)
-            }
             method => Err(format!("Unknown method: {}", method).into()),
         }
     }
@@ -1046,7 +1042,9 @@ fn run_browser_smoke_probe(
         "url": info.url,
         "visible": info.visible,
     }));
-    browser.set_active_session(app, Some(BROWSER_SMOKE_SESSION_ID), true)?;
+    // External smoke is never allowed to supersede a Workspace presentation that already owns
+    // the native browser slot. Epoch one works only before the Workspace has selected an owner.
+    browser.set_active_session(app, Some(BROWSER_SMOKE_SESSION_ID), true, Some(1))?;
     steps.push(json!({ "step": "activate", "sessionId": BROWSER_SMOKE_SESSION_ID }));
 
     browser.set_bounds(app, Some(BROWSER_SMOKE_SESSION_ID), bounds)?;
@@ -2187,7 +2185,7 @@ pub fn is_allowed_method(method: &str) -> bool {
     is_allowed_method_for_build(method, cfg!(debug_assertions))
 }
 
-fn is_allowed_method_for_build(method: &str, debug_assertions: bool) -> bool {
+fn is_allowed_method_for_build(method: &str, _debug_assertions: bool) -> bool {
     matches!(
         method,
         "ccem.health"
@@ -2206,7 +2204,7 @@ fn is_allowed_method_for_build(method: &str, debug_assertions: bool) -> bool {
             | "ccem.workspace.getRouter"
             | "ccem.workspace.updateRouter"
             | "ccem.workspace.restartDirect"
-    ) || (debug_assertions && method == "ccem.browser.smokeProbe")
+    )
 }
 
 fn is_loopback_host_name(host: &str) -> bool {
@@ -2483,23 +2481,17 @@ mod tests {
             "ccem.workspace.getRouter",
             "ccem.workspace.updateRouter",
             "ccem.workspace.restartDirect",
-            "ccem.browser.smokeProbe",
         ] {
             assert!(is_allowed_method(method), "{} should be allowed", method);
         }
     }
 
     #[test]
-    fn test_browser_smoke_probe_is_debug_only() {
-        assert!(is_allowed_method_for_build("ccem.browser.smokeProbe", true));
+    fn test_disallowed_methods() {
         assert!(!is_allowed_method_for_build(
             "ccem.browser.smokeProbe",
-            false
+            true
         ));
-    }
-
-    #[test]
-    fn test_disallowed_methods() {
         assert!(!is_allowed_method("ccem.evil"));
         assert!(!is_allowed_method("session/list"));
         assert!(!is_allowed_method(""));

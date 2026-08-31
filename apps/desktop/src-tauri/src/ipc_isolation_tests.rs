@@ -44,14 +44,27 @@ fn trusted_app_acl_manifest_includes_environment_router_references() {
     assert!(allowed
         .iter()
         .any(|command| { command.as_str() == Some("get_environment_router_references") }));
+    assert!(allowed
+        .iter()
+        .any(|command| { command.as_str() == Some("browser_surface_navigation_action") }));
+}
+
+fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+    // Keep a single generate_context! expansion in the macOS test binary. Each expansion embeds
+    // the same exported Info.plist symbol, so expanding it independently in every test prevents
+    // the test harness from linking.
+    tauri::test::mock_builder()
+        .invoke_handler(tauri::generate_handler![
+            super::greet,
+            super::get_environment_router_references
+        ])
+        .build(tauri::generate_context!())
+        .expect("build mock CCEM app")
 }
 
 #[test]
 fn trusted_app_webviews_can_invoke_app_and_core_commands() {
-    let app = tauri::test::mock_builder()
-        .invoke_handler(tauri::generate_handler![super::greet])
-        .build(tauri::generate_context!())
-        .expect("build mock CCEM app");
+    let app = mock_app();
 
     for label in ["main", "desktop-pet", "tray-cockpit"] {
         let webview = tauri::WebviewWindowBuilder::new(
@@ -81,13 +94,7 @@ fn trusted_app_webviews_can_invoke_app_and_core_commands() {
 
 #[test]
 fn remote_browser_child_webview_cannot_invoke_app_or_plugin_commands() {
-    let app = tauri::test::mock_builder()
-        .invoke_handler(tauri::generate_handler![
-            super::greet,
-            super::get_environment_router_references
-        ])
-        .build(tauri::generate_context!())
-        .expect("build mock CCEM app");
+    let app = mock_app();
     let _main =
         tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::App("index.html".into()))
             .build()

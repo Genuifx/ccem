@@ -586,6 +586,64 @@ fn definite_settings_failure_is_resolved_for_future_prompt_admission() {
 }
 
 #[test]
+fn permission_failure_keeps_fifo_blocked_for_host_quarantine() {
+    let coordinator = coordinator_with_incarnation();
+    negotiate_full(&coordinator);
+    coordinator
+        .begin_permission_settings_op(RT, INC, "settings-permission-failed")
+        .expect("permission settings begin");
+
+    assert_eq!(
+        coordinator.note_settings_ack(
+            RT,
+            INC,
+            Some("settings-permission-failed"),
+            "failed",
+            Some(GEN - 1),
+        ),
+        LifecycleDecision::Ignored,
+        "a stale generation cannot finalize the permission lane"
+    );
+    assert_eq!(
+        coordinator
+            .projection(RT)
+            .expect("pending projection")
+            .settings_state
+            .as_deref(),
+        Some("pending")
+    );
+
+    assert_eq!(
+        coordinator.note_settings_ack(
+            RT,
+            INC,
+            Some("settings-permission-failed"),
+            "failed",
+            Some(GEN),
+        ),
+        LifecycleDecision::Updated
+    );
+    let projection = coordinator.projection(RT).expect("failed projection");
+    assert!(projection.settings_pending);
+    assert_eq!(
+        projection.settings_state.as_deref(),
+        Some("reconcile_required")
+    );
+    assert_eq!(
+        coordinator.wait_for_settings_ack(
+            RT,
+            "settings-permission-failed",
+            Duration::from_millis(1),
+        ),
+        SettingsWaitOutcome::Failed
+    );
+    assert!(matches!(
+        coordinator.admit_prompt(RT, INC),
+        Err(AdmissionError::SettingsPending { .. })
+    ));
+}
+
+#[test]
 fn exact_late_settings_failure_resolves_reconcile_required() {
     let coordinator = coordinator_with_incarnation();
     negotiate_full(&coordinator);

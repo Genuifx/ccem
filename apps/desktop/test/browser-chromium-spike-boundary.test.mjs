@@ -14,11 +14,19 @@ const browserSource = await readFile(
   new URL('../src-tauri/src/browser.rs', import.meta.url),
   'utf8',
 );
-const readinessSource = await readFile(
-  new URL('../src-tauri/src/browser/runtime_readiness.rs', import.meta.url),
+const bootstrapSource = await readFile(
+  new URL('../src-tauri/src/browser/bootstrap.rs', import.meta.url),
   'utf8',
 );
-const mainSource = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+const sessionSource = await readFile(
+  new URL('../src-tauri/src/browser/login/session.rs', import.meta.url),
+  'utf8',
+);
+const sessionTypesSource = await readFile(
+  new URL('../src-tauri/src/browser/login/session_types.rs', import.meta.url),
+  'utf8',
+);
+const mainSource = await readFile(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
 const permissionsSource = await readFile(
   new URL('../src-tauri/permissions/trusted-app-commands.toml', import.meta.url),
   'utf8',
@@ -36,8 +44,9 @@ test('managed Chromium spike uses private FD 3/4 CDP instead of a debug TCP port
   assert.match(spikeSource, /read_message\(deadline\)/);
 });
 
-test('spike runtime path is explicit and test-only, never a product cache dependency', () => {
-  assert.match(browserSource, /cfg\(all\(unix, any\(test, feature = "chromium-spike"\)\)\)/);
+test('spike runtime path requires explicit feature opt-in and never uses a product cache dependency', () => {
+  assert.match(browserSource, /cfg\(all\(unix, feature = "chromium-spike"\)\)/);
+  assert.doesNotMatch(browserSource, /any\(test, feature = "chromium-spike"\)/);
   assert.match(spikeTests, /CCEM_CHROMIUM_SPIKE_BINARY/);
   assert.doesNotMatch(spikeSource, /ms-playwright|Google Chrome\.app|\/Users\//);
   assert.match(spikeSource, /--ccem-managed-runtime-id=/);
@@ -46,10 +55,28 @@ test('spike runtime path is explicit and test-only, never a product cache depend
   assert.match(spikeSource, /Never discard the only safe process identity on a signal alone/);
 });
 
-test('Mode 2 readiness is queryable but cannot claim ready before preparation exists', () => {
-  assert.match(readinessSource, /BrowserRuntimeReadinessStatus::Unavailable/);
-  assert.match(readinessSource, /there is no code path that can claim `ready`|only component allowed to return Ready/i);
-  assert.match(mainSource, /browser::browser_runtime_readiness/);
-  assert.match(permissionsSource, /"browser_runtime_readiness"/);
-  assert.match(ipcSource, /browser_runtime_readiness: \[void, BrowserRuntimeReadiness\]/);
+test('production Mode 2 bootstrap cannot construct the retired external Chromium chain', () => {
+  const bootstrapStart = bootstrapSource.indexOf('create_login_browser_session_manager');
+  const bootstrapEnd = bootstrapSource.indexOf('create_login_browser_surface_manager');
+  const sessionStart = sessionSource.indexOf('pub(crate) fn production(root: PathBuf)');
+  const sessionEnd = sessionSource.indexOf('#[cfg(test)]\n    fn from_parts', sessionStart);
+  assert.notEqual(bootstrapStart, -1);
+  assert.notEqual(bootstrapEnd, -1);
+  assert.notEqual(sessionStart, -1);
+  assert.notEqual(sessionEnd, -1);
+
+  const bootstrapConstructor = bootstrapSource.slice(bootstrapStart, bootstrapEnd);
+  const productionConstructor = sessionSource.slice(sessionStart, sessionEnd);
+  assert.doesNotMatch(bootstrapConstructor, /RuntimePaths|ActivationStore|BrowserRuntimeManager/);
+  assert.doesNotMatch(productionConstructor, /ActivationStore|LoginSupervisor|supervisor/);
+  assert.match(sessionSource, /include!\("session_types\.rs"\)/);
+  assert.match(sessionTypesSource, /#\[cfg\(test\)\]\s+trait SessionSupervisor/);
+  assert.match(sessionSource, /#\[cfg\(test\)\]\s+pub\(crate\) fn open_default_profile/);
+  assert.match(sessionSource, /#\[cfg\(test\)\]\s+pub\(in crate::browser::login\) fn prepare_profile/);
+});
+
+test('legacy downloadable Chromium runtime has no production IPC surface', () => {
+  assert.doesNotMatch(mainSource, /browser::runtime_commands::browser_runtime_/);
+  assert.doesNotMatch(permissionsSource, /"browser_runtime_/);
+  assert.doesNotMatch(ipcSource, /browser_runtime_[a-z_]+:/);
 });

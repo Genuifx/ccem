@@ -11,6 +11,12 @@ pub struct DesktopInstanceLock {
 }
 
 fn lock_path() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(root) = std::env::var_os("CCEM_BROWSER_DATA_ROOT").map(PathBuf::from) {
+        if root.is_absolute() {
+            return root.join("desktop-app-dev.lock");
+        }
+    }
     let instance_id = std::env::var("CCEM_DESKTOP_DEV_INSTANCE_ID").ok();
     lock_path_for_instance(instance_id.as_deref(), cfg!(debug_assertions))
 }

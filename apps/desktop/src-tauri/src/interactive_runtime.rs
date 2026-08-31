@@ -1049,9 +1049,7 @@ fn diff_capture_snapshot(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_client_args, diff_capture_snapshot, InteractiveTranscript,
-    };
+    use super::{build_client_args, diff_capture_snapshot, InteractiveTranscript};
     #[cfg(target_os = "macos")]
     use super::{normalize_project_dir, project_dirs_match};
     #[cfg(target_os = "macos")]

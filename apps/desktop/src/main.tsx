@@ -6,6 +6,7 @@ import { PetOverlay } from './pages/PetOverlay';
 import { TrayCockpit } from './pages/TrayCockpit';
 import { initPerformanceMode } from './lib/performance';
 import { initPerfLog } from './lib/perf-log';
+import { resolveDesktopWindowRoot } from './lib/windowRootRouting';
 import './index.css';
 
 initPerformanceMode();
@@ -13,27 +14,23 @@ initPerfLog();
 
 function resolveRoot() {
   const requestedWindow = new URLSearchParams(window.location.search).get('window');
-  if (requestedWindow === 'desktop-pet') {
-    document.documentElement.dataset.window = 'desktop-pet';
-    return PetOverlay;
-  }
-  if (requestedWindow === 'tray-cockpit') {
-    document.documentElement.dataset.window = 'tray-cockpit';
-    return TrayCockpit;
-  }
-
+  let nativeWindowLabel: string | null = null;
   try {
-    if (getCurrentWindow().label === 'desktop-pet') {
-      document.documentElement.dataset.window = 'desktop-pet';
-      return PetOverlay;
-    }
-    if (getCurrentWindow().label === 'tray-cockpit') {
-      document.documentElement.dataset.window = 'tray-cockpit';
-      return TrayCockpit;
-    }
-    return App;
+    nativeWindowLabel = getCurrentWindow().label;
   } catch {
-    return App;
+    // Browser-only preview has no native Tauri window label.
+  }
+  const root = resolveDesktopWindowRoot(requestedWindow, nativeWindowLabel);
+  document.documentElement.dataset.window = root;
+
+  switch (root) {
+    case 'desktop-pet':
+      return PetOverlay;
+    case 'tray-cockpit':
+      return TrayCockpit;
+    case 'main':
+    default:
+      return App;
   }
 }
 

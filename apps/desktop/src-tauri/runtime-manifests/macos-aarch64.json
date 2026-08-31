@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "signing_key_id": "ccem-browser-runtime-2026-01",
+  "sequence": 1,
+  "minimum_protocol_version": 1,
+  "artifact": {
+    "platform": "macos",
+    "architecture": "aarch64",
+    "version": "150.0.7871.115",
+    "minimum_os_version": "12.0",
+    "source_url": "https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.115/mac-arm64/chrome-mac-arm64.zip",
+    "archive": {
+      "format": "zip",
+      "byte_size": 180511523,
+      "sha256": "c418e4a29046bb62e340dfd9479b329bdf53ddd14a127b1362444a1e1b734a48",
+      "max_entries": 1000,
+      "max_unpacked_bytes": 600000000,
+      "max_file_bytes": 300000000
+    },
+    "layout": {
+      "root_directory": "chrome-mac-arm64",
+      "executable": {
+        "relative_path": "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "byte_size": 52112,
+        "sha256": "1b65983b24a1cc6ac9eae6eec7cb38190652607e62122c712a200cfc7e113850"
+      },
+      "symlinks": [
+        {
+          "path": "Google Chrome for Testing.app/Contents/Frameworks/Google Chrome for Testing Framework.framework/Versions/Current",
+          "target": "150.0.7871.115"
+        },
+        {
+          "path": "Google Chrome for Testing.app/Contents/Frameworks/Google Chrome for Testing Framework.framework/Resources",
+          "target": "Versions/Current/Resources"
+        },
+        {
+          "path": "Google Chrome for Testing.app/Contents/Frameworks/Google Chrome for Testing Framework.framework/Libraries",
+          "target": "Versions/Current/Libraries"
+        },
+        {
+          "path": "Google Chrome for Testing.app/Contents/Frameworks/Google Chrome for Testing Framework.framework/Google Chrome for Testing Framework",
+          "target": "Versions/Current/Google Chrome for Testing Framework"
+        },
+        {
+          "path": "Google Chrome for Testing.app/Contents/Frameworks/Google Chrome for Testing Framework.framework/Helpers",
+          "target": "Versions/Current/Helpers"
+        }
+      ]
+    },
+    "product_identity": {
+      "product_name": "Google Chrome for Testing",
+      "product_version": "150.0.7871.115",
+      "bundle_identifier": "com.google.chrome.for.testing",
+      "publisher": null
+    }
+  }
+}

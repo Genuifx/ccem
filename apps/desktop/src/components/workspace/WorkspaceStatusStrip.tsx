@@ -1,6 +1,17 @@
 import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Radio, Flame, Clock, Check, Settings2, ClipboardCheck, Search, Command, PanelRightClose, PanelRightOpen } from '@/lib/lucide-react';
+import {
+  Radio,
+  Flame,
+  Clock,
+  Check,
+  Settings2,
+  ClipboardCheck,
+  Search,
+  Command,
+  PanelRightClose,
+  PanelRightOpen,
+} from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
 import { getEnvColorVar, cn } from '@/lib/utils';
@@ -474,28 +485,19 @@ export function WorkspaceStatusStrip({
         <button
           type="button"
           data-ccem-workspace-browser-toggle="true"
-          aria-pressed={browserOpen}
-          aria-label={browserOpen ? t('workspace.browserClose') : t('workspace.browserOpen')}
-          title={browserOpen ? t('workspace.browserClose') : t('workspace.browserOpen')}
+          aria-label={t(browserOpen ? 'workspace.browserClose' : 'workspace.browserOpen')}
+          title={t(browserOpen ? 'workspace.browserClose' : 'workspace.browserOpen')}
           onClick={onToggleBrowser}
           className={cn(
-            'group relative inline-flex h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none items-center justify-center rounded-full p-0 cursor-pointer',
-            'status-chip-glass',
-            'hover:scale-[1.02] active:scale-[0.98]',
-            browserOpen && 'ring-1 ring-inset ring-primary/40'
+            'group relative inline-flex h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none items-center justify-center rounded-full p-0',
+            'status-chip-glass cursor-pointer hover:scale-[1.02] active:scale-[0.98]',
+            browserOpen && 'ring-1 ring-inset ring-primary/40',
           )}
         >
           {browserOpen ? (
-            <PanelRightClose
-              className="h-3.5 w-3.5 shrink-0 text-primary transition-transform duration-200 group-hover:scale-110"
-            />
+            <PanelRightClose className="h-3.5 w-3.5 text-primary transition-transform group-hover:scale-110" />
           ) : (
-            <PanelRightOpen
-              className={cn(
-                'h-3.5 w-3.5 shrink-0 transition-transform duration-200 group-hover:scale-110',
-                'text-muted-foreground'
-              )}
-            />
+            <PanelRightOpen className="h-3.5 w-3.5 text-muted-foreground transition-transform group-hover:scale-110" />
           )}
         </button>
       ) : null}

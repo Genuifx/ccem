@@ -870,6 +870,18 @@
   animation: page-enter var(--duration-base) var(--ease-decelerate) both;
 }
 
+/* BrowserPanel reserves an AppKit/Win32 child-view rectangle from its DOMRect. The workspace's
+   entry transforms otherwise move and scale that rectangle without changing the native parent
+   view, so opening Mode 2 during the animation can place CEF outside the host window. */
+[data-motion-page='workspace']:has([data-ccem-browser-panel-owner]) {
+  transform: none !important;
+}
+
+.page-transition-enter:has([data-ccem-browser-panel-owner]) {
+  animation: none !important;
+  transform: none !important;
+}
+
 /* === Startup Splash === */
 .startup-splash {
   position: relative;

@@ -1,291 +1,245 @@
-# CCEM Secure Login Browser implementation plan (Mode 2)
+# CCEM Mode 2 embedded CEF delivery plan
 
-Date: 2026-07-10
+This plan implements the accepted architecture in
+[`agent-browser-mode2-cef-architecture.md`](./agent-browser-mode2-cef-architecture.md). It replaces
+the earlier external Chrome for Testing plan.
 
-Status: implementation-ready plan; Mode 2 code has not started
+## Product contract
 
-Depends on: Preview Browser final native-flow gate and a verified full Chrome for Testing runtime
-
-## Outcome
-
-Build a visible Secure Login Browser that runs a CCEM-owned Chromium process and profile. A user
-can log in manually, hand control to an Agent, pause it immediately, restart CCEM without losing
-that profile's login state, and inspect redacted artifacts and audit records afterward.
-
-The first release uses a separate, CCEM-launched Chromium window. It does not embed Chromium into
-the Tauri view hierarchy. Tauri remains the application shell and control surface; managed
-Chromium is the logged-in work engine.
-
-## Decisions carried forward
-
-- Keep Preview Browser and Secure Login Browser as two backends behind shared semantic capability,
-  policy, artifact, audit, and session contracts.
-- Do not reuse the user's Chrome executable as a product dependency or point at a user Chrome
-  profile. The successful system-Chrome spike is architecture evidence only.
-- Do not expose raw CDP, cookies, storage databases, browser handles, or arbitrary JavaScript to an
-  Agent.
-- Use `remote-debugging-pipe`; do not open a debug TCP port.
-- Treat every page-derived string and structure as untrusted data.
-- Prepare the runtime before the user's first login-browser workflow. Standard builds prewarm in
-  the background with visible progress and pause/retry controls; full and enterprise builds may
-  include the same pinned artifact.
-- Keep runtime readiness, browser-session readiness, user login, Agent authorization, and artifact
-  delivery as separate proof states.
-
-## Changes from the Fable draft
-
-The Fable plan had the right sequence but mixed feasibility proof with production delivery. This
-plan separates them:
-
-1. Mode 1.5 proves private-pipe CDP and lifecycle assumptions. It does not download, install, or
-   trust a production runtime.
-2. Runtime preparation is the first Mode 2 production slice and may not return `ready` until every
-   integrity and smoke gate passes.
-3. The first Mode 2 UI is a managed external window plus CCEM controls. Embedding Chromium or
-   maintaining CEF is explicitly out of scope.
-4. Persistent profiles belong to CCEM's app-data directory, keyed and scoped by workspace/profile;
-   they never live inside the user's repository and never reuse browser data owned by another app.
-
-## Current evidence and remaining gates
-
-| Surface | Current proof | Gate still required |
-| --- | --- | --- |
-| Preview Browser | Registry, policy, artifacts, console, audit, and native tool routing are implemented and covered by tests | Complete the fixed native Agent sequence through the visible Tauri UI and capture the recent-activity control state |
-| Private CDP transport | FD 3/4 NUL-delimited JSON, no debug TCP listener, navigation, evaluation, screenshot, close | Re-run against the exact pinned full CfT archives used by releases |
-| Lifecycle | Normal close, forced process-group kill, verified stale-process signal, controller pipe-close cleanup | Implement platform supervisors for macOS/Linux and Windows Job Objects; verify real app crash/restart |
-| Full Chromium | Installed full Chrome 150 passed the headless architecture spike with an isolated profile | Verify a signed/pinned full CfT build in headed mode; never fall back to user Chrome |
-| Runtime delivery | Official version/download metadata and a signed-manifest design are known | Legal/signing review, trusted ingestion, downloader, atomic activation, rollback, multi-platform CI |
-| Login profile | Product boundary and directory ownership are decided | Persistence, isolation, lock, migration, reset, and restart behavior tests |
-
-## Architecture boundary
+Mode 2 is a real Chromium browser embedded as a native child inside the Workspace BrowserPanel:
 
 ```text
-Agent / trusted CCEM UI
-          |
-BrowserCapabilityService       semantic requests and bounded results
-          |
-BrowserPolicyGate              origin, permission, pause, upload/download rules
-          |
-BrowserSessionRegistry         lifecycle, visibility, generation, cancellation
-          |
-ChromiumLoginBackend           no raw handle crosses this boundary
-      /          \
-RuntimeManager   ProfileManager
-      |               |
-CDP pipe adapter      CCEM-owned user-data-dir
-      |
-Pinned managed Chromium process group / Job Object
-
-All actions -> BrowserAuditLog
-All outputs -> BrowserArtifactStore (page data remains untrusted)
+Tauri main window
+├── Wry WebView: CCEM React UI and trusted controls
+└── native CEF child surface: Mode 2 browser
 ```
 
-The backend interface is semantic, not mechanism-shaped. Initial operations:
+Mode 2 must never open a separately managed Chrome window or a separate always-on-top control
+window. The browser entry always opens Mode 2; Mode 1/Preview is not a product or Agent fallback.
 
-- `open`, `navigate`, `get_url`, `snapshot`, `screenshot`
-- `click`, `type`, `wait`
-- `read_console_log`, `read_network_log`
-- `pause`, `resume`, `close`
+The user owns manual login and can hand control to the Agent, pause it, or take over again. Agent
+actions use the bounded semantic backend; raw JavaScript, raw CDP, cookies, storage, passwords, and
+arbitrary response bodies are not exposed as Agent capabilities.
 
-CDP sessions, request ids, target ids, cookies, and storage internals remain private to the backend.
+## Hard safety constraints
 
-## Slice M2.0: trusted runtime preparation
+- Development and automated tests must not access the macOS system Keychain. Interactive macOS dev
+  uses `--use-mock-keychain` plus a private, stable, worktree-specific `browser-dev` root so login
+  state survives restart. Isolated debug smoke explicitly opts into an ephemeral temporary Profile.
+  Windows prototype data, when explicitly exercised on Windows, must remain under the isolated
+  debug root and never be reused by a release profile.
+- Ordinary tests must not execute `security`, signing, notarization, or Keychain tools. Code-signature
+  integration checks are explicit opt-in tests only.
+- A release build may use the system Keychain only after the final installed application has a stable,
+  pinned Developer ID identity. Repeated Safe Storage prompts are a release-blocking failure.
+- The pinned prebuilt CEF runtime starts with the generic `Chromium Safe Storage` service. Before any
+  signing step, release staging must find exactly one copy of that literal, replace the same 21-byte
+  slot with null-padded `CCEM Safe Storage`, and bind the source digest, branded digest, byte offset,
+  and method into release inventory. Signing and runtime bootstrap both fail closed if that exact
+  branding evidence is absent or the final framework contains the generic service. Release smoke
+  must still cover both a clean machine and a machine with an existing Chromium item; static
+  branding is necessary evidence, not proof that prompts cannot recur. Never delete or rewrite a
+  user's existing Keychain item, and do not ask users to click “Always Allow”.
+- The signed release smoke is CI-only and uses an exclusive temporary keychain under the exact
+  current-run root. It launches the same copied signed app twice per fixture, proves an encrypted
+  cookie survives the process restart in one isolated profile, compares the seeded generic Chromium
+  secret before/after without retaining it, restores the original keychain search/default state,
+  and removes every owned helper/profile/keychain temporary. The app/CEF child environment is an
+  allowlist and never inherits Apple, updater, GitHub token, or signing-key secrets.
+- Unsigned or partially signed macOS artifacts must not contain or enable the CEF overlay.
+- Windows release builds must fail closed unless CEF's renderer/GPU/utility sandbox is active.
+  `no_sandbox=1` is permitted only for an explicit local prototype and is never a release fallback.
+- No production IPC may launch the retired external Chrome for Testing runtime.
 
-### Build
+## Release matrix
 
-- Add a CCEM-signed runtime manifest containing platform, architecture, exact version, official
-  source URL, archive byte size, SHA-256, unpacked executable identity, and minimum protocol
-  version.
-- Download into an app-owned temporary directory with bounded retries, cancellation, progress, and
-  resume only when the server validators still match.
-- Verify archive size and SHA-256 before extraction. Reject links, path traversal, unexpected file
-  types, and executable layouts not present in the manifest.
-- Extract into a new versioned directory; apply private permissions; verify signing/notarization or
-  platform-native executable identity where available.
-- Run a private-pipe smoke against the unpacked binary before atomic activation.
-- Keep the previous verified runtime until the new one activates successfully. Failed candidates
-  never replace the active runtime.
-- Extend readiness with phase, progress, active version, candidate version, bounded error code, and
-  retryability while preserving the existing four top-level states.
-- Add settings actions: prepare, pause/resume download, retry, reinstall, delete, and show disk use.
+Required Mode 2 targets:
 
-### Acceptance
+- macOS arm64
+- macOS x86_64
+- Windows x86_64
 
-- An interrupted download or app restart never produces `ready` and resumes or restarts safely.
-- A corrupted archive, wrong hash, wrong executable, failed smoke, or failed signature leaves the
-  previous runtime active.
-- No mutable `latest` URL or local Playwright/system-Chrome path can become the trust root.
-- `ready` identifies the exact activated version and changes atomically.
-- Standard app startup and Preview Browser remain usable while preparation runs.
+Linux and Windows arm64 remain out of scope until their native surface, packaging, signing, and
+installed-app smoke paths are added explicitly.
 
-### Stop conditions
+## Phase 1: CEF host and process lifecycle
 
-- Stop redistribution work if legal/licensing or signing review is unresolved.
-- Stop activation if an official full CfT artifact cannot pass the headed pipe smoke on a supported
-  platform.
-- Do not add system Chrome as a fallback to make a gate green.
+Deliverables:
 
-## Slice M2.1: headed process and persistent profile manager
+- pin one exact CEF crate/runtime version;
+- load CEF before constructing any CEF-owned value;
+- initialize exactly once on the Tauri UI thread;
+- run the platform message pump without starving Tauri menus, resize, modal loops, or idle work;
+- bundle a dedicated CEF subprocess helper;
+- on Windows, replace the unsandboxed helper prototype with the CEF 150 sandbox bootstrap plus a
+  client DLL exporting `RunWinMain`, or an equally isolated sandboxed host-process architecture;
+- revoke Agent authority, close surfaces, drain helpers, and call CEF shutdown in the required order;
+- treat initialization failure as terminal for the current CCEM process.
 
-### Build
+Evidence:
 
-- Launch the pinned full runtime without headless mode in a dedicated process group on Unix and a
-  kill-on-close Job Object on Windows.
-- Give each profile an opaque id and an exclusive lock. Map it to exactly one workspace identity;
-  never derive authorization from a mutable display path alone.
-- Store profiles under CCEM app data with private permissions, versioned metadata, last-use time,
-  runtime compatibility, and cleanup state.
-- Reject concurrent launches of the same profile unless the existing owner is the live matching
-  CCEM runtime. Never bypass Chrome's lock files by deleting them blindly.
-- Keep startup metadata sufficient to verify exact executable, profile, transport, runtime marker,
-  pid/group or Job Object ownership, and controller identity before cleanup.
-- Retain cleanup metadata until process disappearance is proven. Reap only verified owned
-  processes; never kill by name.
-- Support close, force stop, crash recovery, profile reset, and delete. Reset/delete must require a
-  user confirmation and a stopped runtime.
-- Present a visible CCEM control surface containing profile identity, current origin, Agent control
-  state, pause/takeover, and close. The separate browser window must not be mistaken for user
-  Chrome.
+- Rust lifecycle and pump tests;
+- macOS and Windows target compilation;
+- real close/restart smoke proving no owned helper remains.
 
-### Acceptance
+## Phase 2: native BrowserPanel surface
 
-- A user can log into a representative owned or staging site, close CCEM, restart it, and remain
-  logged in only in the same CCEM profile.
-- Two workspaces and two profiles share no cookie, localStorage, IndexedDB, cache, download, or
-  service-worker state.
-- CCEM crash, forced browser kill, and machine restart leave no live owned runtime after recovery.
-- A forged or mismatched metadata record is refused without signaling an unrelated process.
-- Headed OAuth redirect, popup, iframe, and manual 2FA paths are exercised; passkeys are classified
-  separately and are not promised until verified.
+Deliverables:
 
-## Slice M2.2: production CDP adapter and semantic backend
+- attach CEF as an `NSView` child on macOS and an `HWND` child on Windows;
+- acquire hidden, then resize/show/hide/navigate/close through a generation-bound surface lease;
+- map DOM CSS coordinates to host logical bounds in the same direction as app zoom, then apply
+  monitor DPI exactly once in the native backend;
+- let real native-child clicks own browser focus; resize, zoom, visibility, and window activation
+  synchronization must never steal focus from trusted React controls;
+- keep conversation surfaces mutually exclusive with no stale native surface;
+- hide or disable CEF before any host overlay that must appear above it;
+- preserve Chinese IME, keyboard shortcuts, focus restoration, display scaling, and fullscreen changes;
+- retire a creating surface synchronously when no BrowserHost exists, and make late CEF callbacks
+  observe cancellation rather than resurrecting the surface or retaining its profile lease;
+- expose one controlled OAuth popup inside the BrowserPanel ownership boundary.
 
-### Build
+Popup policy:
 
-- Replace the synchronous spike client with a single owner task that multiplexes responses and
-  events by request/session/target id.
-- Give every request a total deadline, cancellation token, bounded response size, and structured
-  error. Continuous events may not extend a request forever.
-- Track target creation, navigation, redirect, frame, dialog, download, renderer crash, and process
-  termination in the shared registry. Increment generation when a target/session is recreated so
-  stale element references fail closed.
-- Implement Chromium screenshot and true accessibility snapshot, with a documented DOM interaction
-  fallback only when the AX result cannot represent a necessary control.
-- Implement trusted input through CDP input dispatch. Do not expose arbitrary page evaluation as an
-  Agent capability.
-- Reuse the Mode 1 artifact and audit contracts so callers receive stable paths and bounded
-  summaries independent of backend.
-- Keep one backend conformance suite and backend-specific capability flags; do not force Mode 1 to
-  imitate Chromium-only features.
+- require a user gesture and foreground disposition;
+- preserve the original CEF opener relationship so `postMessage` and `window.closed` work;
+- allow HTTPS and strict HTTP loopback navigation only;
+- block nested or unowned windows;
+- custom-scheme callbacks require an explicitly registered scheme, state, port/path policy, and
+  trusted callback dispatcher; otherwise block and close the popup without wedging handoff.
 
-### Acceptance
+Evidence:
 
-- The same native Agent script can select either backend for open, navigate, snapshot, screenshot,
-  click, type, wait, console, and close without receiving backend handles.
-- Pause or permission change cancels an active operation within one second and blocks the next one.
-- Renderer crash, target close, pipe EOF, timeout, and oversized frame produce explicit registry
-  states and bounded errors rather than hanging or crashing the desktop app.
-- Old element references fail after navigation or target generation change.
+- surface coordinator and popup policy tests;
+- real resize/focus/IME/overlay/popup gestures on each platform.
 
-## Slice M2.3: origin, network, upload, and download policy
+## Phase 3: semantic control, profile, and recovery
 
-### Build
+Deliverables:
 
-- Authorize normalized scheme/host/port rules per workspace and profile. Check initial URLs,
-  redirects, popups, iframes used for action, and every mutating semantic capability.
-- Keep page text unable to grant origins, change permission mode, select local files, or resume a
-  paused session.
-- Capture CDP Network metadata into a separate untrusted JSONL log. Request/response bodies remain
-  off by default.
-- Redact before disk: URL credentials and sensitive query values, Authorization, Cookie,
-  Set-Cookie, tokens, API keys, passwords, OTP-like fields, and configured secret values.
-- Default downloads to block or prompt, then write only to a CCEM-owned quarantine directory with
-  provenance. No automatic open or execute.
-- Permit uploads only after trusted UI selection from workspace-approved paths. The Agent receives
-  an opaque approved-file handle, never an arbitrary filesystem path picker.
-- Write the trusted audit decision before each action and a bounded result afterward. Typed content,
-  secrets, bodies, and raw page text must not enter the trusted audit log.
+- connect CEF DevTools observers to the existing bounded semantic backend;
+- run `navigate -> AX snapshot -> click -> type -> screenshot` without raw CDP exposure;
+- make User/Agent/Paused transitions atomic with popup admission and the execution fence;
+- cancel active Agent effects within one second on pause/takeover;
+- persist one app-global Default Profile shared across conversations/workspaces, while keeping each
+  explicitly created Profile isolated to its owner workspace;
+- make profile lock release retryable and never report cleanup success before persistence and unlock
+  both succeed;
+- recover explicitly from renderer crash, browser close, app force-exit, and restart;
+- keep redacted audit, console, and network artifacts; keep snapshots and screenshots in the
+  private CCEM-owned artifact store because those page-content artifacts are not content-redacted.
 
-### Acceptance
+Evidence:
 
-- Unauthorized navigation, redirect, popup action, download, and upload are denied before effect.
-- A red-team fixture cannot expand origin authorization, read an unapproved file, resume control,
-  or place a secret in network/audit artifacts.
-- Network logs contain no plaintext values for the blocked header, query, and body classes.
-- Audit records can reconstruct who/what/when/decision/result without storing typed secrets.
+- semantic, cancellation, provenance, profile, cleanup, and recovery tests;
+- signed production-runtime smoke on every release target that runs the bounded semantic chain,
+  overlaps a real write with Occlude, verifies the canonical app-owned PNG through strict chunk,
+  all-chunk CRC, bounded decode, size, and digest checks, proves workspace A/B Default opens share one
+  Profile while retaining distinct browser-session identities, then reopens an isolated Explicit New
+  Profile, and binds every result to the exact producer workflow and release identity;
+- installed-app persistent-login restart, app-global Default sharing plus Explicit New isolation,
+  focus/IME, OAuth popup, trusted
+  overlay, renderer-crash, and force-exit recovery observation. Automation is supporting evidence
+  for these interaction-sensitive cases, not a substitute for the real installed flow.
 
-## Slice M2.4: user journey and native Agent proof
+## Phase 4: packaging, signing, and updater integrity
 
-### Build
+macOS deliverables:
 
-- Add a clear Preview Browser / Login Browser entry split. Show readiness before the Login Browser
-  action; never replace the primary UI with a long explanation.
-- When unavailable, offer background prepare, progress, and Preview Browser. When failed, show a
-  bounded reason and retry/reinstall. When ready, open the profile immediately.
-- Make manual login the initial state. Agent control begins only after explicit handoff and displays
-  the active profile/origin.
-- Keep pause/takeover visible and reachable while the browser window is frontmost. Close and profile
-  reset have distinct consequences and labels.
-- Surface recent screenshot/snapshot/console/network/audit artifacts from the trusted CCEM UI.
+- stage the exact framework and all required Helper.app bundles atomically;
+- sign nested code from the inside out with hardened runtime and the minimum helper entitlements;
+- require the pinned Team ID, exact Developer ID identity, and notarization credentials together;
+- notarize, staple, and verify the final installed artifact;
+- fail closed when any signing or notarization input is absent.
 
-### End-to-end acceptance script
+Windows deliverables:
 
-1. Start with no runtime; verify Preview Browser remains immediate while background preparation
-   transitions through visible states.
-2. Activate the exact verified runtime and open a headed CCEM Login Browser profile.
-3. Log into a representative owned/staging app manually, close, restart, and prove persistence.
-4. Open a second workspace/profile and prove storage isolation.
-5. Authorize one origin and run a native Agent sequence: navigate, snapshot, type, click, wait,
-   screenshot, read console, and read redacted network metadata.
-6. Attempt an unauthorized redirect, blocked download, and unapproved upload; prove denial before
-   effect and inspect the audit record.
-7. Pause during an in-flight wait/action; prove cancellation within one second and no later action.
-8. Kill the renderer, browser process, and desktop controller in separate runs; prove explicit state,
-   recovery, and no orphan runtime.
-9. Inspect real UI state and saved artifacts. Build/test success and source assertions are supporting
-   evidence, not substitutes for this flow.
+- stage the exact `libcef.dll`, GPU libraries, resources, snapshots, locales, sandbox bootstrap,
+  and client DLL;
+- pass one broker-owned Windows sandbox context through both browser initialization and subprocess
+  execution, and reject any artifact or runtime carrying `--no-sandbox`;
+- sign the application and installer with the configured Authenticode identity;
+- install an inherited read/execute-only LPAC rule for `S-1-15-2-2` and fail installation if the
+  rule cannot be applied;
+- verify every signed executable/DLL, the final CEF inventory, and an installed-runtime attestation
+  before publication. The attestation must bind the current run and exact installer/executable
+  hashes, observe same-executable browser/renderer/GPU/utility processes without sandbox-disabling
+  flags, exercise Ready/CDP/hide/show/close/reopen, and prove clean process teardown.
 
-## Verification matrix
+Updater deliverables:
 
-Run each production slice on mac-arm64 and mac-x64, Windows x64/arm64 where supported, and Linux x64.
+- require repository immutable releases through the read-only GitHub settings endpoint before a
+  formal release build starts, using a dedicated settings token that is never shared with the
+  signed producer or release mutation. Non-publishing signed readiness intentionally skips this
+  release-policy check because it cannot create or modify a release;
+- verify the final updater archive contains one complete pinned CEF inventory;
+- test old-version to new-version replacement and prove no mixed CEF files remain;
+- keep updater signature verification separate from platform code-signature verification.
 
-- Unit: manifest verification, extraction traversal, readiness transitions, profile mapping/locks,
-  origin normalization, redaction, stale metadata refusal, generation invalidation.
-- Integration: exact pinned archive download, headed private-pipe smoke, process/job cleanup, profile
-  restart/isolation, CDP event routing, renderer crash, network/download/upload fixtures.
-- Desktop behavior: real gestures and state transitions through Tauri MCP or the strongest available
-  app automation, including manual-login handoff and pause.
-- Regression: Preview Browser native Agent flow on every Mode 2 milestone.
-- Delivery: separately verify branch/commit, merged local main, release tag, and downloadable artifact
-  when those stages are actually requested.
+Release transaction boundary:
 
-## Rollout
+- keep one production-only, read-only reusable signing producer for both readiness and release;
+  readiness exports exact current-attempt evidence only, while the tagged release caller may also
+  export same-run payload artifacts for its later publication transaction;
+- declare the exact signing secret names in the producer, resolve them only through its protected
+  Environment jobs, and never pass or inherit the release settings token, `GITHUB_TOKEN`, or another
+  publication credential into that workflow;
+- gate every secret-consuming producer job with the fixed `mode2-signing` Actions Environment;
+  before activation, restrict that Environment to protected `main` and formal `v*` tags, require a
+  reviewer, move all signing secrets into it, and remove the repository-level copies;
+- GitHub REST unsafe methods do not provide a compare-and-swap precondition for draft asset upload
+  or publication. Immutable releases narrow the post-publication window but do not make the draft
+  transaction atomic;
+- one trusted release workflow must remain the unique writer for the tag and draft. Repository tag
+  rules must prevent any other actor from moving or recreating the release tag;
+- every readiness/release entry must independently require the read-only GitHub branch metadata for
+  `main` to report `protected: true`; current-ref protection and source ancestry remain separate
+  checks, so protecting only a `v*` tag cannot authorize publication;
+- every mutation is fenced by the exact release id plus unique owner/source markers. Each uploaded
+  or reused asset is read back while the release is still a draft, and publication succeeds only
+  after both the PATCH response and a subsequent exact release GET preserve all nine asset ids,
+  sizes, SHA-256 digests, and uploaded states;
+- after publication, resolve the tag through GitHub's read-only commit-by-ref endpoint and require it
+  to remain the exact source commit. Any competing writer, missing digest, mutable publication, or
+  tag movement fails closed and produces no successful publication result.
 
-1. Developer flag: owned fixtures and staging apps only; collect classified failures locally.
-2. Internal opt-in: pinned runtime, explicit profiles, origin allowlist, downloads blocked.
-3. Public preview: normal SaaS with a documented compatibility matrix; no universal login claim.
-4. General availability only after multi-platform cleanup, redaction, update rollback, and runtime
-   signing gates remain green across at least one runtime update.
+Evidence:
 
-## Explicitly out of scope
+- fixture-based staging/signing/inventory tests that never touch local credentials;
+- signed CI artifacts plus post-build verification logs;
+- clean-machine install and updater smoke on every required target.
 
-- Taking over user Chrome, tabs, extensions, cookies, passwords, or profile directories.
-- CEF integration, Chromium fork maintenance, or an embedded browser engine in the first Mode 2.
-- Raw CDP, arbitrary JavaScript evaluation, raw cookie/storage export, or response bodies for Agents.
-- Universal anti-bot, passkey, payment, or every-site compatibility claims.
-- Semantic sensitive-action classification as the sole security boundary. Origin, permission, pause,
-  upload/download, and audit enforcement remain authoritative.
+## Phase 5: installed-app acceptance
 
-## Definition of ready
+Production readiness requires current evidence for this exact installed-app flow:
 
-Mode 2 is ready only when all of these are true at the same time:
+1. Open a Workspace and open the browser; it selects embedded Mode 2 directly.
+2. Confirm CEF appears only inside BrowserPanel.
+3. Complete manual login, including a controlled OAuth popup where applicable.
+4. Hand control to the Agent and perform one semantic read and one semantic write.
+5. Pause, show a trusted host confirmation with CEF hidden/disabled, then restore focus.
+6. Restart CCEM and prove login persistence in the same profile.
+7. Open a second conversation/workspace with Default and prove the login state is shared; then
+   create an explicit Profile and prove cookie and local-storage isolation.
+8. Exercise renderer crash, browser close, app force-exit, and recovery.
+9. Close Mode 2 and CCEM, then prove no owned CEF helper remains.
+10. Inspect redacted audit, network, and console artifacts, then verify that raw page-content
+    snapshots and screenshots remain confined to the private CCEM-owned artifact store.
+11. Install an update and prove the pinned CEF inventory is complete and unmixed.
+12. Prove development/test runs caused no macOS Safe Storage prompt; separately prove the stable
+    signed release does not enter a repeated prompt loop.
 
-- exact runtime artifact verified and activated;
-- headed runtime and isolated persistent profile proven;
-- private-pipe semantic backend and cancellation proven;
-- origin/upload/download/network-redaction policy proven before effect;
-- visible user handoff and pause proven through the real app;
-- crash/restart cleanup proven with no owned orphan process;
-- Preview Browser regression remains green.
+Build success, source assertions, unit tests, or a static screenshot support this evidence but cannot
+replace it.
 
-Anything less should be reported by its actual proof state, not summarized as “Login Browser ready”.
+## Stop conditions
+
+- If a platform cannot host a reliable native child surface, Mode 2 stays unavailable on that
+  platform; do not fall back to an external browser window.
+- If a CEF DevTools method cannot preserve an existing semantic safety invariant, change the adapter
+  or capability contract explicitly; do not bypass it with raw CDP.
+- If Safe Storage, nested signing, notarization, Authenticode, or updater inventory cannot be
+  reproduced on the release matrix, keep Mode 2 disabled in affected release artifacts.
+- The sandbox bootstrap/client-DLL path and LPAC installer hook are implemented, but they do not
+  become Windows production support until a real signed target build and installed-app attestation
+  pass on the Windows release runner. Missing or stale evidence must keep release delivery blocked.

@@ -201,7 +201,12 @@ pub fn find_record_by_ccem_session_id(
                AND ccem_session_id = ?2
              LIMIT 1",
         )
-        .map_err(|error| format!("Failed to prepare provenance lookup by ccem session: {}", error))?;
+        .map_err(|error| {
+            format!(
+                "Failed to prepare provenance lookup by ccem session: {}",
+                error
+            )
+        })?;
 
     let mut rows = stmt
         .query(params![client, ccem_session_id])
@@ -215,20 +220,40 @@ pub fn find_record_by_ccem_session_id(
     };
 
     Ok(Some(SessionProvenanceRecord {
-        ccem_session_id: row.get(0).map_err(|error| format!("Failed to read provenance ccem_session_id: {}", error))?,
-        client: row.get(1).map_err(|error| format!("Failed to read provenance client: {}", error))?,
+        ccem_session_id: row
+            .get(0)
+            .map_err(|error| format!("Failed to read provenance ccem_session_id: {}", error))?,
+        client: row
+            .get(1)
+            .map_err(|error| format!("Failed to read provenance client: {}", error))?,
         source_session_id: row
             .get::<_, Option<String>>(2)
             .map_err(|error| format!("Failed to read provenance source_session_id: {}", error))?
             .unwrap_or_default(),
-        env_name: row.get(3).map_err(|error| format!("Failed to read provenance env_name: {}", error))?,
-        config_source: row.get(4).map_err(|error| format!("Failed to read provenance config_source: {}", error))?,
-        working_dir: row.get(5).map_err(|error| format!("Failed to read provenance working_dir: {}", error))?,
-        perm_mode: row.get(6).map_err(|error| format!("Failed to read provenance perm_mode: {}", error))?,
-        launch_mode: row.get(7).map_err(|error| format!("Failed to read provenance launch_mode: {}", error))?,
-        started_via: row.get(8).map_err(|error| format!("Failed to read provenance started_via: {}", error))?,
-        created_at: row.get(9).map_err(|error| format!("Failed to read provenance created_at: {}", error))?,
-        updated_at: row.get(10).map_err(|error| format!("Failed to read provenance updated_at: {}", error))?,
+        env_name: row
+            .get(3)
+            .map_err(|error| format!("Failed to read provenance env_name: {}", error))?,
+        config_source: row
+            .get(4)
+            .map_err(|error| format!("Failed to read provenance config_source: {}", error))?,
+        working_dir: row
+            .get(5)
+            .map_err(|error| format!("Failed to read provenance working_dir: {}", error))?,
+        perm_mode: row
+            .get(6)
+            .map_err(|error| format!("Failed to read provenance perm_mode: {}", error))?,
+        launch_mode: row
+            .get(7)
+            .map_err(|error| format!("Failed to read provenance launch_mode: {}", error))?,
+        started_via: row
+            .get(8)
+            .map_err(|error| format!("Failed to read provenance started_via: {}", error))?,
+        created_at: row
+            .get(9)
+            .map_err(|error| format!("Failed to read provenance created_at: {}", error))?,
+        updated_at: row
+            .get(10)
+            .map_err(|error| format!("Failed to read provenance updated_at: {}", error))?,
     }))
 }
 
@@ -601,8 +626,8 @@ fn normalize_project_dir(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_source_session_id, find_record_by_ccem_session_id, list_records_by_client, register_launch,
-        spawn_codex_source_binding, state_db_path, SessionProvenanceUpsert,
+        bind_source_session_id, find_record_by_ccem_session_id, list_records_by_client,
+        register_launch, spawn_codex_source_binding, state_db_path, SessionProvenanceUpsert,
     };
     use chrono::Utc;
     use std::fs;
@@ -651,7 +676,6 @@ mod tests {
         assert!(find_record_by_ccem_session_id("claude", "missing")
             .expect("lookup missing")
             .is_none());
-
 
         let records = list_records_by_client("claude").expect("list records");
         let record = records.get("native-1").expect("native lookup");

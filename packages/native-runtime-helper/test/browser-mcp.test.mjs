@@ -36,7 +36,13 @@ test('browser MCP keeps a stable tool surface and enforces hot permission change
     createCcemBrowserMcpServer,
   } = await importBrowserMcpModule();
 
-  const readTools = ['get_url', 'read_console_log', 'screenshot', 'snapshot'];
+  const readTools = [
+    'get_url',
+    'read_console_log',
+    'read_network_log',
+    'screenshot',
+    'snapshot',
+  ];
   const allTools = browserToolNamesForPermissionMode('dev').sort();
 
   for (const mode of ['readonly', 'audit', 'plan', 'safe', 'ci']) {
@@ -88,12 +94,20 @@ test('browser MCP exposes interactive tools for development modes', async () => 
     'readonly',
   );
   assert.ok(readonlyAllowed?.includes('mcp__ccem-browser__get_url'));
-  assert.ok(readonlyAllowed?.includes('mcp__ccem-browser__evaluate'));
-  assert.ok(ensureBrowserMcpToolsAllowed(['Read'], 'dev')?.includes('mcp__ccem-browser__evaluate'));
+  assert.equal(readonlyAllowed?.includes('mcp__ccem-browser__evaluate'), false);
+  assert.equal(
+    ensureBrowserMcpToolsAllowed(['Read'], 'dev')?.includes('mcp__ccem-browser__evaluate'),
+    false,
+  );
+  assert.ok(ensureBrowserMcpToolsAllowed(
+    ['Read', 'mcp__ccem-browser__evaluate'],
+    'dev',
+  )?.includes('mcp__ccem-browser__evaluate'));
   assert.equal(ensureBrowserMcpToolsAllowed(undefined, 'dev'), undefined);
 
   const server = createCcemBrowserMcpServer('dev', async (toolName, args) => ({ toolName, args }));
   assert.ok(registeredToolNames(server).includes('evaluate'));
+  assert.ok(registeredToolNames(server).includes('read_network_log'));
 
   const navigate = server.instance._registeredTools.navigate.handler;
   const result = await navigate({ url: 'https://example.com' });
@@ -103,11 +117,62 @@ test('browser MCP exposes interactive tools for development modes', async () => 
   });
 
   const click = server.instance._registeredTools.click.handler;
-  const clickResult = await click({ snapshotId: 'snapshot-1', ref: 7 });
+  const clickResult = await click({ elementRef: 'element-7-opaque' });
   assert.deepEqual(JSON.parse(clickResult.content[0].text), {
     toolName: 'click',
-    args: { snapshotId: 'snapshot-1', ref: 7 },
+    args: { elementRef: 'element-7-opaque' },
   });
+
+  const readNetworkLog = server.instance._registeredTools.read_network_log.handler;
+  const networkResult = await readNetworkLog({});
+  assert.deepEqual(JSON.parse(networkResult.content[0].text), {
+    toolName: 'read_network_log',
+    args: {},
+  });
+
+  const pressKeyTool = server.instance._registeredTools.press_key;
+  const pressKey = pressKeyTool.handler;
+  const pressKeyResult = await pressKey({ key: 'Enter' });
+  assert.deepEqual(JSON.parse(pressKeyResult.content[0].text), {
+    toolName: 'press_key',
+    args: { key: 'Enter' },
+  });
+
+  const scrollTool = server.instance._registeredTools.scroll;
+  const scroll = scrollTool.handler;
+  const scrollResult = await scroll({ deltaY: -600 });
+  assert.deepEqual(JSON.parse(scrollResult.content[0].text), {
+    toolName: 'scroll',
+    args: { deltaY: -600 },
+  });
+
+  const evaluateTool = server.instance._registeredTools.evaluate;
+  const evaluate = evaluateTool.handler;
+  const evaluateResult = await evaluate({ script: 'document.title' });
+  assert.deepEqual(JSON.parse(evaluateResult.content[0].text), {
+    toolName: 'evaluate',
+    args: { script: 'document.title' },
+  });
+
+  assert.equal(pressKeyTool.inputSchema.safeParse({ key: 'Meta+L' }).success, false);
+  assert.equal(scrollTool.inputSchema.safeParse({ deltaY: 0 }).success, false);
+  assert.equal(scrollTool.inputSchema.safeParse({ deltaY: 2_001 }).success, false);
+  assert.equal(scrollTool.inputSchema.safeParse({ deltaY: 1.5 }).success, false);
+  assert.equal(evaluateTool.inputSchema.safeParse({ script: 'x'.repeat(32_769) }).success, false);
+  assert.equal(evaluateTool.inputSchema.safeParse({ script: '你'.repeat(11_000) }).success, false);
+});
+
+test('registered MCP tools exactly match the shared Rust parser vocabulary', async () => {
+  const vocabulary = JSON.parse(await fs.readFile(
+    path.join(packageDir, 'src', 'browser-tool-vocabulary.json'),
+    'utf8',
+  ));
+  const { createCcemBrowserMcpServer } = await importBrowserMcpModule();
+
+  assert.deepEqual(
+    registeredToolNames(createCcemBrowserMcpServer('dev', async () => ({}))),
+    [...vocabulary].sort(),
+  );
 });
 
 test('browser tool bridge resolves successful responses and rejects failures', async () => {
@@ -144,6 +209,12 @@ test('browser tool bridge resolves successful responses and rejects failures', a
     request_id: 'missing',
     ok: true,
   }), false);
+});
+
+test('browser bridge caller deadline stays beyond the production backend deadline', async () => {
+  const { BROWSER_TOOL_BRIDGE_TIMEOUT_MS } = await importBrowserMcpModule();
+  assert.equal(BROWSER_TOOL_BRIDGE_TIMEOUT_MS, 45_000);
+  assert.ok(BROWSER_TOOL_BRIDGE_TIMEOUT_MS > 30_000);
 });
 
 test('browser tool bridge rejects all pending requests when the session closes', async () => {

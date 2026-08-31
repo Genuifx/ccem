@@ -49,12 +49,19 @@ test('review capsule is the accessible external dialog trigger', async () => {
 
 test('review popover stays open as a modeless inspector while users interact with Workspace', async () => {
   const popover = await readSource('src', 'components', 'workspace', 'WorkspaceReviewPopover.tsx');
+  const popoverRoot = popover.match(/<Popover\b[^>]*>/)?.[0] ?? '';
   const outsideHandler = popover.match(/const handleInteractOutside[\s\S]*?\n  }, \[\]\);/)?.[0] ?? '';
 
   assert.match(
-    popover,
-    /<Popover\s+modal=\{false\}\s+open=\{isOpen\}\s+onOpenChange=\{handleOpenChange\}>/,
+    popoverRoot,
+    /\bmodal=\{false\}/,
     'review inspector should explicitly use Radix non-modal behavior',
+  );
+  assert.match(popoverRoot, /\bopen=\{gatedOpen\}/, 'native surface occlusion should gate rendering');
+  assert.match(
+    popoverRoot,
+    /\bonOpenChange=\{handleOpenChange\}/,
+    'controlled review state should own Popover changes regardless of prop order',
   );
   assert.match(
     popover,
