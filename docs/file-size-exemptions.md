@@ -5,6 +5,15 @@ The file-size CI gate blocks new source files over 1000 lines unless they are do
 - `apps/cli/src/index.ts`: Main CLI entrypoint still owns command registration and interactive flows.
 - `apps/desktop/src-tauri/src/analytics.rs`: Analytics aggregation and reporting logic has not been split yet.
 - `apps/desktop/src-tauri/src/browser.rs`: Browser instance ownership, runtime-alias fencing, and Agent tool routing remain together while the per-conversation Mode 2 identity contract is stabilized.
+- `apps/desktop/src-tauri/src/browser/login/backend.rs`: Login backend orchestration remains co-located with its Mode 2 navigation and persistence boundary while the embedded browser contract is stabilized.
+- `apps/desktop/src-tauri/src/browser/login/cdp/semantics.rs`: CDP semantic projection for Mode 2 navigation and lifecycle events remains centralized while the embedded browser contract is stabilized.
+- `apps/desktop/src-tauri/src/browser/login/cdp/semantics_tests.rs`: Existing CDP semantics regression coverage keeps the full navigation event matrix in one test module.
+- `apps/desktop/src-tauri/src/browser/login/cef/surface.rs`: The cross-platform CEF surface facade keeps platform child-view adapters co-located until signed runtime smoke coverage can validate a safe split.
+- `apps/desktop/src-tauri/src/browser/login/profile_tests.rs`: Existing profile regression coverage keeps the full Mode 2 profile scenario matrix in one test module.
+- `apps/desktop/src-tauri/src/browser/login/surface_commands/tests.rs`: Existing surface command regression coverage keeps its lifecycle and membership scenarios in one test module.
+- `apps/desktop/src/components/workspace/BrowserPanel.tsx`: Workspace embedded browser panel UI orchestration remains bundled while the Mode 2 surface is being iterated.
+- `apps/desktop/test/browser-panel-lifecycle.test.mjs`: Existing browser panel lifecycle regression coverage keeps the full attach/detach event matrix in one test module.
+- `apps/desktop/test/workspace-transcript-backfill.test.mjs`: Existing transcript backfill regression coverage keeps the full history projection matrix in one test module.
 - `apps/desktop/src-tauri/src/browser/login/cef/surface/macos.rs`: The macOS CEF child-view lifecycle and callback/FFI boundary remain co-located until signed runtime smoke coverage can validate a safe split.
 - `apps/desktop/src-tauri/src/browser/login/cef/surface/windows.rs`: The Windows CEF child-view lifecycle and callback/FFI boundary remain co-located until signed runtime smoke coverage can validate a safe split.
 - `apps/desktop/src-tauri/src/browser/login/cef/debug_smoke/runtime.rs`: The isolated Mock Keychain Mode 2 debug host keeps its multi-instance production-runtime scenario in one auditable harness while that gate is stabilized.

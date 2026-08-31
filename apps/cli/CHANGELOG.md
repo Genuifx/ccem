@@ -1,5 +1,11 @@
 # ccem
 
+## 2.77.0
+
+### Minor Changes
+
+- Ship the embedded Mode 2 browser as the only workspace browser: agent-default browser control, one embedded browser per conversation, hardened session persistence, and simplified navigation workflow.
+
 ## 2.76.0
 
 ### Minor Changes
