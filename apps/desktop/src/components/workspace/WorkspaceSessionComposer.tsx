@@ -57,6 +57,7 @@ import {
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { SelectedSkillContent, WorkspaceFileSuggestion } from '@/lib/tauri-ipc';
+import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
@@ -822,6 +823,10 @@ export function WorkspaceSessionComposer({
   const attachmentStripRef = useRef<HTMLDivElement | null>(null);
   const primaryActionButtonRef = useRef<HTMLButtonElement | null>(null);
   const promptAreaRef = useRef<PromptAreaHandle | null>(null);
+  const submitGuardRef = useRef<ReentryGuard | null>(null);
+  if (!submitGuardRef.current) {
+    submitGuardRef.current = createReentryGuard();
+  }
   const syncedPlainTextRef = useRef(value);
   const syncedValueRevisionRef = useRef(valueRevision);
   const previousAttachmentIdsRef = useRef<string[]>([]);
@@ -1264,7 +1269,7 @@ export function WorkspaceSessionComposer({
     };
   }, [addAttachments, workingDir]);
 
-  const handleComposerSubmit = useCallback(async () => {
+  const runComposerSubmit = useCallback(async () => {
     const promptValue = promptAreaRef.current?.getPlainText() ?? segmentsToPlainText(composerSegments);
     const currentAttachments = attachmentsRef.current;
     let text = ensureComposerImagePlaceholders(promptValue, currentAttachments);
@@ -1355,6 +1360,18 @@ export function WorkspaceSessionComposer({
     t,
     workspaceCommands,
   ]);
+
+  const handleComposerSubmit = useCallback(async () => {
+    const guard = submitGuardRef.current;
+    if (!guard || !guard.begin()) {
+      return false;
+    }
+    try {
+      return await runComposerSubmit();
+    } finally {
+      guard.end();
+    }
+  }, [runComposerSubmit]);
 
   const hasComposerAttentionPanel = queuedMessages.length > 0;
 

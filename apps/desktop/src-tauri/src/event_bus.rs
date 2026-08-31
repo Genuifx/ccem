@@ -221,6 +221,8 @@ pub enum SessionEventPayload {
         text: String,
         image_count: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<SessionPromptImage>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<Vec<SessionPromptAnnotation>>,
@@ -735,6 +737,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn user_prompt_client_message_id_round_trips_and_legacy_events_remain_compatible() {
+        let payload = SessionEventPayload::UserPrompt {
+            text: "queued follow-up".to_string(),
+            image_count: 0,
+            client_message_id: Some("client-message-1".to_string()),
+            images: None,
+            annotations: None,
+            canonical_hash: Some("hash-1".to_string()),
+        };
+
+        let encoded = serde_json::to_value(&payload).expect("serialize user prompt");
+        assert_eq!(encoded["client_message_id"], "client-message-1");
+        let decoded: SessionEventPayload =
+            serde_json::from_value(encoded).expect("deserialize user prompt");
+        assert_eq!(decoded, payload);
+
+        let legacy: SessionEventPayload = serde_json::from_str(
+            r#"{"type":"user_prompt","text":"legacy prompt","image_count":0}"#,
+        )
+        .expect("deserialize legacy user prompt");
+        assert!(matches!(
+            &legacy,
+            SessionEventPayload::UserPrompt {
+                client_message_id: None,
+                ..
+            }
+        ));
+        let legacy_reencoded =
+            serde_json::to_value(legacy).expect("re-serialize legacy user prompt");
+        assert!(legacy_reencoded.get("client_message_id").is_none());
     }
 
     #[test]

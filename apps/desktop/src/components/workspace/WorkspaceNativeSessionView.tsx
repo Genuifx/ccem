@@ -3125,6 +3125,7 @@ export function WorkspaceNativeSessionView({
       annotations: annotations.length > 0 ? annotations : undefined,
       timestamp: Date.now(),
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
+      deferUntilPersisted: true,
     };
 
     setIsSending(true);
@@ -3230,6 +3231,7 @@ export function WorkspaceNativeSessionView({
         : undefined,
       timestamp: Date.now(),
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
+      deferUntilPersisted: true,
     };
 
     const exitsPlanModeForPrompt = (

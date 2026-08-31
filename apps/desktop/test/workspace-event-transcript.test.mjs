@@ -818,6 +818,48 @@ test('filters optimistic native prompts already confirmed by the event log', asy
   );
 });
 
+test('matches persisted prompts by client message id before falling back to repeated text', async () => {
+  const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const prompts = [
+    { id: 'client-first', text: 'same follow up', afterEventSeq: 1 },
+    { id: 'client-second', text: 'same follow up', afterEventSeq: 1 },
+  ];
+
+  const pending = filterConfirmedLocalUserPrompts(
+    prompts,
+    [
+      event(2, {
+        type: 'user_prompt',
+        text: 'same follow up',
+        image_count: 0,
+        client_message_id: 'client-second',
+      }),
+    ],
+  );
+
+  assert.deepEqual(
+    pending.map((prompt) => prompt.id),
+    ['client-first'],
+  );
+});
+
+test('preserves optimistic prompt identity while unrelated replay events stream', async () => {
+  const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const prompts = [
+    { id: 'client-pending', text: 'not confirmed yet', afterEventSeq: 10 },
+  ];
+
+  const pending = filterConfirmedLocalUserPrompts(
+    prompts,
+    [
+      event(2, { type: 'user_prompt', text: 'older prompt', image_count: 0 }),
+      event(11, { type: 'assistant_chunk', text: 'still streaming' }),
+    ],
+  );
+
+  assert.equal(pending, prompts);
+});
+
 test('keeps optimistic prompts when matching persisted events predate their anchor', async () => {
   const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
 

@@ -1995,6 +1995,7 @@ impl NativeRuntimeManager {
                     .unwrap_or_default(),
                 options.initial_images.as_ref(),
                 options.initial_annotations.as_ref(),
+                None,
             )?;
             self.spawn_helper(app, &runtime_id, &options, handle.clone())?;
             self.summary_for(&runtime_id)
@@ -2618,6 +2619,7 @@ impl NativeRuntimeManager {
             display_text,
             images,
             annotations.as_ref(),
+            client_message_id,
             claude_managed,
             None,
             None,
@@ -2635,6 +2637,7 @@ impl NativeRuntimeManager {
         display_text: Option<&str>,
         images: Option<&Vec<PromptImage>>,
         annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
         claude_managed: bool,
         command_id_override: Option<&str>,
         admission_attempt: Option<u64>,
@@ -2839,6 +2842,7 @@ impl NativeRuntimeManager {
             display_text.unwrap_or(text),
             images,
             annotations,
+            client_message_id,
         ) {
             eprintln!("Failed to append written user prompt for {runtime_id}: {error}");
         }
@@ -2974,6 +2978,7 @@ impl NativeRuntimeManager {
                 display_text.as_deref(),
                 images.as_ref(),
                 annotations.as_ref(),
+                Some(&client_message_id),
                 true,
                 Some(&dispatch_command_id),
                 Some(dispatch_attempt),
@@ -7929,6 +7934,7 @@ impl NativeRuntimeManager {
         text: &str,
         images: Option<&Vec<PromptImage>>,
         annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
     ) -> Result<(), String> {
         let text = text.trim();
         let image_count = images.map(|items| items.len()).unwrap_or(0);
@@ -7945,6 +7951,10 @@ impl NativeRuntimeManager {
             SessionEventPayload::UserPrompt {
                 text: text.to_string(),
                 image_count: image_count as u64,
+                client_message_id: client_message_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
                 images: event_images,
                 annotations,
                 canonical_hash,
@@ -7962,7 +7972,7 @@ impl NativeRuntimeManager {
         let Some(text) = summarize_interactive_prompt_response(display_text, answers) else {
             return Ok(());
         };
-        self.append_user_prompt_event(runtime_id, &text, None, annotations)
+        self.append_user_prompt_event(runtime_id, &text, None, annotations, None)
     }
 
     fn deliver_and_append_interactive_prompt_response(
@@ -10844,6 +10854,7 @@ mod tests {
                 "continue",
                 Some(&images),
                 Some(&prompt_annotations),
+                Some("client-message-1"),
             )
             .expect("append user prompt event");
 
@@ -10855,6 +10866,7 @@ mod tests {
         let SessionEventPayload::UserPrompt {
             text,
             image_count,
+            client_message_id,
             images,
             annotations,
             canonical_hash,
@@ -10864,6 +10876,7 @@ mod tests {
         };
         assert_eq!(text, "continue");
         assert_eq!(*image_count, 1);
+        assert_eq!(client_message_id.as_deref(), Some("client-message-1"));
         assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
         let image = images
@@ -10899,6 +10912,7 @@ mod tests {
             persisted_json["canonical_hash"].as_str().map(str::len),
             Some(64)
         );
+        assert_eq!(persisted_json["client_message_id"], "client-message-1");
     }
 
     #[test]
@@ -10916,7 +10930,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let error = manager
-            .append_user_prompt_event(&runtime_id, "continue", None, Some(&annotations))
+            .append_user_prompt_event(&runtime_id, "continue", None, Some(&annotations), None)
             .expect_err("annotation overflow must fail");
 
         assert!(error.contains("at most 20 annotations"));
@@ -10970,6 +10984,7 @@ mod tests {
         let SessionEventPayload::UserPrompt {
             text,
             image_count,
+            client_message_id,
             images,
             annotations,
             canonical_hash,
@@ -10979,6 +10994,7 @@ mod tests {
         };
         assert_eq!(text, "Use the SQLite path");
         assert_eq!(*image_count, 0);
+        assert_eq!(client_message_id, &None);
         assert_eq!(images, &None);
         assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));

@@ -1437,6 +1437,7 @@ export type SessionEventPayload =
       type: 'user_prompt';
       text: string;
       image_count: number;
+      client_message_id?: string | null;
       images?: SessionPromptImage[] | null;
       annotations?: SessionPromptAnnotation[] | null;
       canonical_hash?: string | null;
