@@ -13,7 +13,7 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct FrozenNativeInputBatch {
+pub struct FrozenNativeInputMessage {
     client_message_id: String,
     text: String,
     display_text: Option<String>,
@@ -21,7 +21,7 @@ pub struct FrozenNativeInputBatch {
     annotations: Option<Vec<Value>>,
 }
 
-impl FrozenNativeInputBatch {
+impl FrozenNativeInputMessage {
     pub fn new(
         client_message_id: impl Into<String>,
         text: impl Into<String>,
@@ -58,8 +58,8 @@ impl FrozenNativeInputBatch {
         self.annotations.as_deref()
     }
 
-    pub fn into_parts(self) -> FrozenNativeInputParts {
-        FrozenNativeInputParts {
+    pub fn into_parts(self) -> FrozenNativeInputMessageParts {
+        FrozenNativeInputMessageParts {
             client_message_id: self.client_message_id,
             text: self.text,
             display_text: self.display_text,
@@ -70,12 +70,132 @@ impl FrozenNativeInputBatch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FrozenNativeInputParts {
+pub struct FrozenNativeInputMessageParts {
     pub client_message_id: String,
     pub text: String,
     pub display_text: Option<String>,
     pub images: Option<Vec<Value>>,
     pub annotations: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FrozenNativeInputBatch {
+    messages: Vec<FrozenNativeInputMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrozenNativeDispatchParts {
+    pub client_message_id: String,
+    pub text: String,
+    pub display_text: Option<String>,
+    pub images: Option<Vec<Value>>,
+    pub annotations: Option<Vec<Value>>,
+    pub messages: Vec<FrozenNativeInputMessage>,
+}
+
+impl FrozenNativeInputBatch {
+    pub fn new(
+        client_message_id: impl Into<String>,
+        text: impl Into<String>,
+        display_text: Option<String>,
+        images: Option<Vec<Value>>,
+        annotations: Option<Vec<Value>>,
+    ) -> Self {
+        Self {
+            messages: vec![FrozenNativeInputMessage::new(
+                client_message_id,
+                text,
+                display_text,
+                images,
+                annotations,
+            )],
+        }
+    }
+
+    pub fn client_message_id(&self) -> &str {
+        self.messages
+            .first()
+            .map(FrozenNativeInputMessage::client_message_id)
+            .unwrap_or("")
+    }
+
+    pub fn text(&self) -> &str {
+        self.messages
+            .first()
+            .map(FrozenNativeInputMessage::text)
+            .unwrap_or("")
+    }
+
+    pub fn display_text(&self) -> Option<&str> {
+        self.messages
+            .first()
+            .and_then(FrozenNativeInputMessage::display_text)
+    }
+
+    pub fn images(&self) -> Option<&[Value]> {
+        self.messages
+            .first()
+            .and_then(FrozenNativeInputMessage::images)
+    }
+
+    pub fn annotations(&self) -> Option<&[Value]> {
+        self.messages
+            .first()
+            .and_then(FrozenNativeInputMessage::annotations)
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn contains_client_message_id(&self, client_message_id: &str) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.client_message_id() == client_message_id)
+    }
+
+    pub fn messages(&self) -> &[FrozenNativeInputMessage] {
+        &self.messages
+    }
+
+    pub fn merge_pending(&mut self, mut other: Self) {
+        self.messages.append(&mut other.messages);
+    }
+
+    pub fn remove_client_message_id(
+        &mut self,
+        client_message_id: &str,
+    ) -> Option<FrozenNativeInputMessage> {
+        let index = self
+            .messages
+            .iter()
+            .position(|message| message.client_message_id() == client_message_id)?;
+        Some(self.messages.remove(index))
+    }
+
+    pub fn into_dispatch_parts(self) -> FrozenNativeDispatchParts {
+        let client_message_id = self.client_message_id().to_owned();
+        let text = combine_message_texts(&self.messages, FrozenNativeInputMessage::text);
+        let display_text = Some(combine_message_texts(&self.messages, |message| {
+            message.display_text().unwrap_or_else(|| message.text())
+        }))
+        .filter(|value| !value.trim().is_empty());
+        let images = flatten_message_values(&self.messages, FrozenNativeInputMessage::images);
+        let annotations =
+            flatten_message_values(&self.messages, FrozenNativeInputMessage::annotations);
+        FrozenNativeDispatchParts {
+            client_message_id,
+            text,
+            display_text,
+            images,
+            annotations,
+            messages: self.messages,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +208,7 @@ pub enum QueuedInputDeliveryState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedNativeInput {
     batch: FrozenNativeInputBatch,
+    merge_fence: Option<String>,
     delivery_state: QueuedInputDeliveryState,
     dispatch_attempt: u64,
     dispatch_command_id: Option<String>,
@@ -180,34 +301,57 @@ impl NativeInputQueue {
         &self,
         runtime_id: &str,
         batch: FrozenNativeInputBatch,
+        merge_fence: Option<&str>,
     ) -> Result<usize, NativeInputQueueError> {
         if runtime_id.trim().is_empty() {
             return Err(NativeInputQueueError::EmptyRuntimeId);
         }
-        if batch.client_message_id().trim().is_empty() {
+        if batch.is_empty()
+            || batch
+                .messages()
+                .iter()
+                .any(|message| message.client_message_id().trim().is_empty())
+        {
             return Err(NativeInputQueueError::EmptyClientMessageId);
         }
-
-        let fingerprint = batch_fingerprint(&batch);
         let mut queues = self.lock_queues();
         let mut seen = self.lock_seen();
         let runtime_seen = seen.entry(runtime_id.to_owned()).or_default();
-        if let Some(existing) = runtime_seen.get(batch.client_message_id()) {
-            return Err(if existing == &fingerprint {
-                NativeInputQueueError::DuplicateClientMessageId
-            } else {
-                NativeInputQueueError::ConflictingClientMessageId
-            });
+        for message in batch.messages() {
+            let fingerprint = batch_fingerprint(message);
+            if let Some(existing) = runtime_seen.get(message.client_message_id()) {
+                return Err(if existing == &fingerprint {
+                    NativeInputQueueError::DuplicateClientMessageId
+                } else {
+                    NativeInputQueueError::ConflictingClientMessageId
+                });
+            }
         }
         let queue = queues.entry(runtime_id.to_owned()).or_default();
-        runtime_seen.insert(batch.client_message_id().to_owned(), fingerprint);
+        for message in batch.messages() {
+            runtime_seen.insert(
+                message.client_message_id().to_owned(),
+                batch_fingerprint(message),
+            );
+        }
+        if let Some(merge_fence) = merge_fence {
+            if let Some(tail) = queue.back_mut() {
+                if tail.delivery_state == QueuedInputDeliveryState::Pending
+                    && tail.merge_fence.as_deref() == Some(merge_fence)
+                {
+                    tail.batch.merge_pending(batch);
+                    return Ok(queue.iter().map(|queued| queued.batch.len()).sum());
+                }
+            }
+        }
         queue.push_back(QueuedNativeInput {
             batch,
+            merge_fence: merge_fence.map(str::to_owned),
             delivery_state: QueuedInputDeliveryState::Pending,
             dispatch_attempt: 0,
             dispatch_command_id: None,
         });
-        Ok(queue.len())
+        Ok(queue.iter().map(|queued| queued.batch.len()).sum())
     }
 
     pub fn peek(&self, runtime_id: &str) -> Option<QueuedNativeInput> {
@@ -279,7 +423,11 @@ impl NativeInputQueue {
 
     /// Removes an exact head after a correlated helper fact proves admission.
     /// A late ACK is allowed to heal a locally timed-out uncertain receipt.
-    pub fn confirm_admitted(&self, runtime_id: &str, dispatch_command_id: &str) -> bool {
+    pub fn confirm_admitted(
+        &self,
+        runtime_id: &str,
+        dispatch_command_id: &str,
+    ) -> Option<QueuedNativeInput> {
         let mut queues = self.lock_queues();
         let should_remove = queues
             .get(runtime_id)
@@ -293,16 +441,16 @@ impl NativeInputQueue {
                     )
             });
         if !should_remove {
-            return false;
+            return None;
         }
         let queue = queues
             .get_mut(runtime_id)
             .expect("the checked runtime queue still exists");
-        queue.pop_front();
+        let confirmed = queue.pop_front();
         if queue.is_empty() {
             queues.remove(runtime_id);
         }
-        true
+        confirmed
     }
 
     pub fn release_dispatch(
@@ -318,7 +466,7 @@ impl NativeInputQueue {
         else {
             return false;
         };
-        if head.batch.client_message_id() != client_message_id
+        if !head.batch.contains_client_message_id(client_message_id)
             || head.dispatch_attempt != dispatch_attempt
             || head.delivery_state != QueuedInputDeliveryState::Dispatching
         {
@@ -346,7 +494,7 @@ impl NativeInputQueue {
         else {
             return false;
         };
-        if head.batch.client_message_id() != client_message_id
+        if !head.batch.contains_client_message_id(client_message_id)
             || head.dispatch_command_id.as_deref() != Some(dispatch_command_id)
             || head.dispatch_attempt != dispatch_attempt
             || head.delivery_state != QueuedInputDeliveryState::Dispatching
@@ -422,12 +570,41 @@ impl NativeInputQueue {
         let queue = queues.get_mut(runtime_id)?;
         let index = queue
             .iter()
-            .position(|queued| queued.batch.client_message_id() == client_message_id)?;
-        let removed = queue.remove(index);
+            .position(|queued| queued.batch.contains_client_message_id(client_message_id))?;
+        if !matches!(
+            queue[index].delivery_state,
+            QueuedInputDeliveryState::Pending
+        ) {
+            let removed = queue.remove(index);
+            if queue.is_empty() {
+                queues.remove(runtime_id);
+            }
+            return removed;
+        }
+        let queued = queue
+            .get_mut(index)
+            .expect("located queued batch must still exist");
+        let removed_message = queued.batch.remove_client_message_id(client_message_id)?;
+        let remove_batch = queued.batch.is_empty();
+        let delivery_state = queued.delivery_state;
+        let dispatch_attempt = queued.dispatch_attempt;
+        let dispatch_command_id = queued.dispatch_command_id.clone();
+        let merge_fence = queued.merge_fence.clone();
+        if remove_batch {
+            queue.remove(index);
+        }
         if queue.is_empty() {
             queues.remove(runtime_id);
         }
-        removed
+        Some(QueuedNativeInput {
+            batch: FrozenNativeInputBatch {
+                messages: vec![removed_message],
+            },
+            merge_fence,
+            delivery_state,
+            dispatch_attempt,
+            dispatch_command_id,
+        })
     }
 
     pub fn mark_claim_delivery_uncertain(
@@ -440,7 +617,7 @@ impl NativeInputQueue {
         let Some(queued) = queues.get_mut(runtime_id).and_then(|queue| {
             queue
                 .iter_mut()
-                .find(|queued| queued.batch.client_message_id() == client_message_id)
+                .find(|queued| queued.batch.contains_client_message_id(client_message_id))
         }) else {
             return false;
         };
@@ -528,16 +705,17 @@ impl NativeInputQueue {
     }
 
     pub fn clear(&self, runtime_id: &str) -> usize {
-        let removed = self
-            .lock_queues()
-            .remove(runtime_id)
-            .map_or(0, |queue| queue.len());
+        let removed = self.lock_queues().remove(runtime_id).map_or(0, |queue| {
+            queue.into_iter().map(|queued| queued.batch.len()).sum()
+        });
         self.lock_seen().remove(runtime_id);
         removed
     }
 
     pub fn count(&self, runtime_id: &str) -> usize {
-        self.lock_queues().get(runtime_id).map_or(0, VecDeque::len)
+        self.lock_queues().get(runtime_id).map_or(0, |queue| {
+            queue.iter().map(|queued| queued.batch.len()).sum()
+        })
     }
 
     pub fn delivery_uncertain_count(&self, runtime_id: &str) -> usize {
@@ -564,8 +742,45 @@ impl NativeInputQueue {
     }
 }
 
-fn batch_fingerprint(batch: &FrozenNativeInputBatch) -> [u8; 32] {
-    let bytes = serde_json::to_vec(batch)
+fn combine_message_texts(
+    messages: &[FrozenNativeInputMessage],
+    select: impl Fn(&FrozenNativeInputMessage) -> &str,
+) -> String {
+    let mut iter = messages.iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let first_text = select(first).trim().to_string();
+    let remaining = iter
+        .enumerate()
+        .map(|(index, message)| format!("{}. {}", index + 2, select(message).trim()))
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        return first_text;
+    }
+    [
+        first_text,
+        String::new(),
+        "另外还有这些后续消息，请按顺序继续处理：".to_string(),
+        remaining.join("\n\n"),
+    ]
+    .join("\n")
+}
+
+fn flatten_message_values(
+    messages: &[FrozenNativeInputMessage],
+    select: impl Fn(&FrozenNativeInputMessage) -> Option<&[Value]>,
+) -> Option<Vec<Value>> {
+    let flattened = messages
+        .iter()
+        .filter_map(select)
+        .flat_map(|values| values.iter().cloned())
+        .collect::<Vec<_>>();
+    (!flattened.is_empty()).then_some(flattened)
+}
+
+fn batch_fingerprint(message: &FrozenNativeInputMessage) -> [u8; 32] {
+    let bytes = serde_json::to_vec(message)
         .expect("frozen native input contains only JSON-serializable values");
     Sha256::digest(bytes).into()
 }
@@ -586,335 +801,5 @@ fn fresh_dispatch_command_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        FrozenNativeInputBatch, NativeInputClaimOutcome, NativeInputPopOutcome, NativeInputQueue,
-        NativeInputQueueError, QueuedInputDeliveryState,
-    };
-    use serde_json::json;
-
-    fn batch(client_message_id: &str, text: &str) -> FrozenNativeInputBatch {
-        FrozenNativeInputBatch::new(
-            client_message_id,
-            text,
-            Some(format!("display:{text}")),
-            Some(vec![json!({ "mediaType": "image/png", "data": text })]),
-            Some(vec![json!({ "quote": text, "note": "note" })]),
-        )
-    }
-
-    fn is_uuid_v4(value: &str) -> bool {
-        value.len() == 36
-            && value.as_bytes()[8] == b'-'
-            && value.as_bytes()[13] == b'-'
-            && value.as_bytes()[18] == b'-'
-            && value.as_bytes()[23] == b'-'
-            && value.as_bytes()[14] == b'4'
-            && matches!(value.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
-            && value
-                .bytes()
-                .enumerate()
-                .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit())
-    }
-
-    fn claim(queue: &NativeInputQueue, runtime_id: &str) -> (FrozenNativeInputBatch, u64, String) {
-        match queue.claim_next(runtime_id) {
-            NativeInputClaimOutcome::Claimed {
-                batch,
-                dispatch_attempt,
-                dispatch_command_id,
-            } => (batch, dispatch_attempt, dispatch_command_id),
-            other => panic!("expected claim, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn queues_are_fifo_and_isolated_per_runtime() {
-        let queue = NativeInputQueue::default();
-        queue.enqueue("runtime-a", batch("a-1", "one")).unwrap();
-        queue.enqueue("runtime-a", batch("a-2", "two")).unwrap();
-        queue.enqueue("runtime-b", batch("b-1", "other")).unwrap();
-
-        assert_eq!(queue.count("runtime-a"), 2);
-        assert_eq!(queue.count("runtime-b"), 1);
-        assert_eq!(queue.peek("runtime-a").unwrap().batch().text(), "one");
-
-        let NativeInputPopOutcome::Ready(first) = queue.pop("runtime-a") else {
-            panic!("expected first queued batch");
-        };
-        let NativeInputPopOutcome::Ready(second) = queue.pop("runtime-a") else {
-            panic!("expected second queued batch");
-        };
-        assert_eq!(first.client_message_id(), "a-1");
-        assert_eq!(second.client_message_id(), "a-2");
-        assert_eq!(queue.count("runtime-b"), 1);
-    }
-
-    #[test]
-    fn queued_payload_is_an_owned_snapshot() {
-        let queue = NativeInputQueue::default();
-        let mut images = vec![json!({ "data": "before" })];
-        let mut annotations = vec![json!({ "note": "before" })];
-        queue
-            .enqueue(
-                "runtime-a",
-                FrozenNativeInputBatch::new(
-                    "message-1",
-                    "prompt",
-                    Some("visible prompt".to_owned()),
-                    Some(images.clone()),
-                    Some(annotations.clone()),
-                ),
-            )
-            .unwrap();
-
-        images[0]["data"] = json!("after");
-        annotations[0]["note"] = json!("after");
-
-        let queued = queue.peek("runtime-a").unwrap();
-        assert_eq!(queued.batch().display_text(), Some("visible prompt"));
-        assert_eq!(queued.batch().images().unwrap()[0]["data"], "before");
-        assert_eq!(queued.batch().annotations().unwrap()[0]["note"], "before");
-    }
-
-    #[test]
-    fn duplicate_client_message_id_is_rejected_only_within_the_runtime() {
-        let queue = NativeInputQueue::default();
-        queue
-            .enqueue("runtime-a", batch("stable-id", "one"))
-            .unwrap();
-
-        assert_eq!(
-            queue.enqueue("runtime-a", batch("stable-id", "retry")),
-            Err(NativeInputQueueError::ConflictingClientMessageId)
-        );
-        assert_eq!(
-            queue.enqueue("runtime-a", batch("stable-id", "one")),
-            Err(NativeInputQueueError::DuplicateClientMessageId)
-        );
-        assert_eq!(
-            queue.enqueue("runtime-b", batch("stable-id", "other")),
-            Ok(1)
-        );
-
-        assert!(matches!(
-            queue.pop("runtime-a"),
-            NativeInputPopOutcome::Ready(_)
-        ));
-        assert_eq!(
-            queue.enqueue("runtime-a", batch("stable-id", "completed retry")),
-            Err(NativeInputQueueError::ConflictingClientMessageId)
-        );
-        assert_eq!(
-            queue.enqueue("runtime-a", batch("stable-id", "one")),
-            Err(NativeInputQueueError::DuplicateClientMessageId)
-        );
-    }
-
-    #[test]
-    fn delivery_uncertain_head_cannot_be_automatically_popped() {
-        let queue = NativeInputQueue::default();
-        queue
-            .enqueue("runtime-a", batch("message-1", "one"))
-            .unwrap();
-        queue
-            .enqueue("runtime-a", batch("message-2", "two"))
-            .unwrap();
-        let (_, attempt, _) = claim(&queue, "runtime-a");
-        assert!(queue.mark_claim_delivery_uncertain("runtime-a", "message-1", attempt));
-
-        let head = queue.peek("runtime-a").unwrap();
-        assert_eq!(
-            head.delivery_state(),
-            QueuedInputDeliveryState::DeliveryUncertain
-        );
-        assert_eq!(
-            queue.pop("runtime-a"),
-            NativeInputPopOutcome::BlockedByDeliveryUncertain {
-                client_message_id: "message-1".to_owned(),
-            }
-        );
-        assert_eq!(queue.count("runtime-a"), 2);
-
-        let removed = queue.remove("runtime-a", "message-1").unwrap();
-        assert_eq!(removed.batch().client_message_id(), "message-1");
-        assert!(matches!(
-            queue.pop("runtime-a"),
-            NativeInputPopOutcome::Ready(batch) if batch.client_message_id() == "message-2"
-        ));
-    }
-
-    #[test]
-    fn claim_is_single_owner_until_completed_released_or_uncertain() {
-        let queue = NativeInputQueue::default();
-        queue
-            .enqueue("runtime-a", batch("message-1", "one"))
-            .unwrap();
-        let (first, first_attempt, first_command) = claim(&queue, "runtime-a");
-        assert_eq!(first.client_message_id(), "message-1");
-        assert_eq!(first_attempt, 1);
-        assert!(is_uuid_v4(&first_command));
-        assert_eq!(
-            queue.claim_next("runtime-a"),
-            NativeInputClaimOutcome::AlreadyDispatching {
-                client_message_id: "message-1".to_owned(),
-            }
-        );
-        assert!(!queue.release_dispatch("runtime-a", "message-1", 2));
-        assert!(queue.release_dispatch("runtime-a", "message-1", 1));
-        let (_, second_attempt, second_command) = claim(&queue, "runtime-a");
-        assert_eq!(second_attempt, 2);
-        assert!(is_uuid_v4(&second_command));
-        assert_ne!(first_command, second_command);
-        assert!(!queue.complete_dispatch("runtime-a", &first_command));
-        assert!(queue.complete_dispatch("runtime-a", &second_command));
-        assert_eq!(queue.count("runtime-a"), 0);
-    }
-
-    #[test]
-    fn admission_timeout_only_marks_the_exact_dispatching_head_uncertain() {
-        let queue = NativeInputQueue::default();
-        queue
-            .enqueue("runtime-a", batch("message-1", "one"))
-            .unwrap();
-        assert!(!queue.mark_dispatch_delivery_uncertain("runtime-a", "foreign", 1));
-        let (_, attempt, command_id) = claim(&queue, "runtime-a");
-        assert_eq!(attempt, 1);
-        assert!(!queue.mark_dispatch_delivery_uncertain("runtime-a", "foreign", 1));
-        assert!(!queue.mark_dispatch_delivery_uncertain("runtime-a", &command_id, 2));
-        assert!(queue.mark_dispatch_delivery_uncertain("runtime-a", &command_id, attempt));
-        assert_eq!(
-            queue.claim_next("runtime-a"),
-            NativeInputClaimOutcome::BlockedByDeliveryUncertain {
-                client_message_id: "message-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn late_exact_helper_receipts_heal_a_local_admission_timeout() {
-        let queue = NativeInputQueue::default();
-        queue
-            .enqueue("runtime-a", batch("admitted", "one"))
-            .unwrap();
-        let (_, admitted_attempt, admitted_command) = claim(&queue, "runtime-a");
-        assert!(queue.mark_dispatch_delivery_uncertain(
-            "runtime-a",
-            &admitted_command,
-            admitted_attempt
-        ));
-        assert!(queue.confirm_admitted("runtime-a", &admitted_command));
-        assert_eq!(queue.count("runtime-a"), 0);
-
-        queue
-            .enqueue("runtime-a", batch("rejected", "two"))
-            .unwrap();
-        let (_, rejected_attempt, rejected_command) = claim(&queue, "runtime-a");
-        assert!(queue.mark_dispatch_delivery_uncertain(
-            "runtime-a",
-            &rejected_command,
-            rejected_attempt
-        ));
-        assert!(queue.confirm_rejected("runtime-a", &rejected_command));
-        let (retried, retry_attempt, retry_command) = claim(&queue, "runtime-a");
-        assert_eq!(retried.client_message_id(), "rejected");
-        assert_eq!(retry_attempt, 2);
-        assert_ne!(rejected_command, retry_command);
-
-        assert!(!queue.confirm_rejected("runtime-a", &rejected_command));
-        assert!(!queue.confirm_admitted("runtime-a", &rejected_command));
-        assert!(!queue.mark_dispatch_delivery_uncertain(
-            "runtime-a",
-            &rejected_command,
-            rejected_attempt
-        ));
-        assert_eq!(queue.peek("runtime-a").unwrap().dispatch_attempt(), 2);
-        assert_eq!(
-            queue.peek("runtime-a").unwrap().dispatch_command_id(),
-            Some(retry_command.as_str())
-        );
-    }
-
-    #[test]
-    fn remove_preserves_fifo_order_and_clear_is_runtime_scoped() {
-        let queue = NativeInputQueue::default();
-        queue.enqueue("runtime-a", batch("a-1", "one")).unwrap();
-        queue.enqueue("runtime-a", batch("a-2", "two")).unwrap();
-        queue.enqueue("runtime-a", batch("a-3", "three")).unwrap();
-        queue.enqueue("runtime-b", batch("b-1", "other")).unwrap();
-
-        assert_eq!(
-            queue
-                .remove("runtime-a", "a-2")
-                .unwrap()
-                .batch()
-                .client_message_id(),
-            "a-2"
-        );
-        assert!(matches!(
-            queue.pop("runtime-a"),
-            NativeInputPopOutcome::Ready(batch) if batch.client_message_id() == "a-1"
-        ));
-        assert!(matches!(
-            queue.pop("runtime-a"),
-            NativeInputPopOutcome::Ready(batch) if batch.client_message_id() == "a-3"
-        ));
-        assert_eq!(queue.clear("runtime-a"), 0);
-        assert_eq!(queue.clear("runtime-b"), 1);
-        assert_eq!(queue.count("runtime-b"), 0);
-    }
-
-    #[test]
-    fn exact_dispatch_removal_only_discards_the_claimed_head() {
-        let queue = NativeInputQueue::default();
-        queue.enqueue("runtime-a", batch("a-1", "one")).unwrap();
-        queue.enqueue("runtime-a", batch("a-2", "two")).unwrap();
-        let (_, _, command_id) = claim(&queue, "runtime-a");
-
-        assert!(queue.remove_dispatch("runtime-a", "foreign").is_none());
-        let removed = queue
-            .remove_dispatch("runtime-a", &command_id)
-            .expect("exact dispatch removed");
-        assert_eq!(removed.batch().client_message_id(), "a-1");
-        assert_eq!(
-            queue.peek("runtime-a").unwrap().batch().client_message_id(),
-            "a-2"
-        );
-    }
-
-    #[test]
-    fn exact_stop_can_remove_a_not_started_claim_after_it_returns_to_pending() {
-        let queue = NativeInputQueue::default();
-        queue.enqueue("runtime-a", batch("a-1", "one")).unwrap();
-        let (batch, attempt, command_id) = claim(&queue, "runtime-a");
-        assert!(queue.release_not_started(
-            "runtime-a",
-            batch.client_message_id(),
-            &command_id,
-            attempt,
-        ));
-        let pending = queue.peek("runtime-a").expect("pending head");
-        assert_eq!(pending.delivery_state(), QueuedInputDeliveryState::Pending);
-        assert_eq!(pending.dispatch_command_id(), Some(command_id.as_str()));
-        assert!(queue.remove_dispatch("runtime-a", "foreign").is_none());
-        assert!(queue.remove_dispatch("runtime-a", &command_id).is_some());
-        assert_eq!(queue.count("runtime-a"), 0);
-    }
-
-    #[test]
-    fn rejects_empty_identifiers_and_handles_missing_entries() {
-        let queue = NativeInputQueue::default();
-        assert_eq!(
-            queue.enqueue(" ", batch("message-1", "one")),
-            Err(NativeInputQueueError::EmptyRuntimeId)
-        );
-        assert_eq!(
-            queue.enqueue("runtime-a", batch(" ", "one")),
-            Err(NativeInputQueueError::EmptyClientMessageId)
-        );
-        assert!(!queue.mark_claim_delivery_uncertain("runtime-a", "missing", 1));
-        assert!(!queue.mark_command_delivery_uncertain("runtime-a", "missing"));
-        assert_eq!(queue.remove("runtime-a", "missing"), None);
-        assert_eq!(queue.pop("runtime-a"), NativeInputPopOutcome::Empty);
-    }
-}
+#[path = "native_input_queue_tests.rs"]
+mod tests;
