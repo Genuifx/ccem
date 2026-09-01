@@ -469,6 +469,8 @@ test('queued prompt stays a single tail row while the active turn streams and th
     timestamp: BASE_TS + 1_500,
     afterEventSeq: 1,
     deferUntilPersisted: true,
+    queuedBehindTurn: true,
+    queuedDeliveryState: 'pending',
   };
   const seed = [];
   const initialEvents = [
@@ -485,11 +487,18 @@ test('queued prompt stays a single tail row while the active turn streams and th
 
   const assertSingleQueuedProjection = () => {
     const messages = mod.finalizeTranscriptMessages(state);
+    const queuedRows = messages.filter((message) => message.uuid === queuedPrompt.id);
     assert.equal(
-      messages.filter((message) => message.uuid === queuedPrompt.id).length,
+      queuedRows.length,
       1,
       'one queued client message must render exactly once',
     );
+    assert.equal(
+      queuedRows[0].queuedPending,
+      true,
+      'a busy-queued prompt must render with a visible queued state',
+    );
+    assert.equal(queuedRows[0].queuedDeliveryState, 'pending');
     assert.equal(
       messages.filter((message) => message.msgType === 'assistant').length,
       1,
@@ -544,6 +553,12 @@ test('queued prompt stays a single tail row while the active turn streams and th
     'persisted confirmation must replace the optimistic row, not add another row',
   );
   assert.equal(confirmedMessages[1].uuid, 'user-prompt-4');
+  assert.equal(
+    confirmedMessages[1].queuedPending,
+    undefined,
+    'the persisted row must convert atomically to a plain user bubble',
+  );
+  assert.equal(confirmedMessages[1].queuedDeliveryState, undefined);
 });
 
 test('same-text queued prompts converge independently by client message id', async () => {

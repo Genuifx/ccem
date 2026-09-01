@@ -28,7 +28,7 @@ test('live session guidance delegates active or blocked turns to the backend que
     'if (queuedMessages.length > 0 && !hasBlockingAttention) {',
   );
 
-  assert.match(queueBranch, /await sendPromptBatch\(\[nextPrompt\]\);/);
+  assert.match(queueBranch, /await sendPromptBatch\(\[nextPrompt\], \{ queuedBehindTurn: true \}\);/);
   assert.doesNotMatch(queueBranch, /setQueuedMessages|stopNativeSession|handleStop|interrupt/);
 });
 

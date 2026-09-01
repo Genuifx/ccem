@@ -102,6 +102,7 @@ import {
   type NativeSessionAttentionState,
 } from './workspaceNativeAttention';
 import { selectNativeSessionProcessing } from './workspaceNativeSessionProjection';
+import { reconcileNativeQueuedPrompts } from './workspaceNativeQueueProjection';
 import { normalizeEffortForProvider } from './workspaceSessionPreferences';
 import { resolveWorkspaceRuntimePlanMode } from './workspaceRuntimePlanMode';
 import {
@@ -1442,6 +1443,7 @@ export function WorkspaceNativeSessionView({
     getNativeSessionEventPage,
     sendNativeSessionInput,
     flushNativeSessionInputQueue,
+    getNativeSessionInputQueue,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
@@ -1529,6 +1531,7 @@ export function WorkspaceNativeSessionView({
     runtimeId: session.runtime_id,
     messages: readStoredGuidanceQueue(session.runtime_id),
   }));
+  const queueSnapshotRequestSeqRef = useRef(0);
   const queuedMessages = queuedState.runtimeId === session.runtime_id ? queuedState.messages : [];
   const setQueuedMessages = useCallback((update: QueuedGuidanceMessagesUpdate) => {
     setQueuedState((previousState) => {
@@ -3088,7 +3091,10 @@ export function WorkspaceNativeSessionView({
     ].join('\n');
   }, [buildDispatchText]);
 
-  const sendPromptBatch = useCallback(async (prompts: QueuedGuidanceMessage[]) => {
+  const sendPromptBatch = useCallback(async (
+    prompts: QueuedGuidanceMessage[],
+    options?: { queuedBehindTurn?: boolean },
+  ) => {
     const allAttachments = prompts.flatMap((p) => p.attachments);
     const images = extractComposerImagePayloads(allAttachments);
     const annotations = collectQueuedPromptAnnotations(prompts);
@@ -3126,9 +3132,17 @@ export function WorkspaceNativeSessionView({
       timestamp: Date.now(),
       afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
       deferUntilPersisted: true,
+      ...(options?.queuedBehindTurn
+        ? { queuedBehindTurn: true, queuedDeliveryState: 'pending' as const }
+        : {}),
     };
 
     setIsSending(true);
+    if (options?.queuedBehindTurn) {
+      // A snapshot started before this submit cannot authoritatively classify
+      // the newly-created optimistic row.
+      queueSnapshotRequestSeqRef.current += 1;
+    }
     setLocalUserPrompts((previous) => [...previous, promptEntry]);
 
     try {
@@ -3536,7 +3550,7 @@ export function WorkspaceNativeSessionView({
       clearComposerDraft();
       setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       try {
-        await sendPromptBatch([nextPrompt]);
+        await sendPromptBatch([nextPrompt], { queuedBehindTurn: true });
         return true;
       } catch (error) {
         toast.error(t(
@@ -3661,6 +3675,44 @@ export function WorkspaceNativeSessionView({
 
     writeStoredGuidanceQueue(queuedState.runtimeId, queuedState.messages);
   }, [queuedState, session.runtime_id]);
+
+  // Reconcile optimistic rows with the backend-owned queue. Lifecycle-driven
+  // refreshes make admission, cancellation and uncertain delivery converge
+  // instead of leaving a stale queued badge after the queue changes.
+  useEffect(() => {
+    if (session.provider !== 'claude') {
+      return;
+    }
+    const requestSeq = queueSnapshotRequestSeqRef.current + 1;
+    queueSnapshotRequestSeqRef.current = requestSeq;
+    let cancelled = false;
+    void getNativeSessionInputQueue(session.runtime_id)
+      .then((items) => {
+        if (cancelled || queueSnapshotRequestSeqRef.current !== requestSeq) {
+          return;
+        }
+        setLocalUserPrompts((previous) => reconcileNativeQueuedPrompts(previous, items, {
+          activeCommandId: session.lifecycle?.active_command_id,
+          afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
+          expectedQueueCount: session.lifecycle?.queue_count,
+          isTerminal: isTerminalStatus(session.status),
+        }));
+      })
+      .catch((error) => {
+        console.error('Failed to load native input queue snapshot:', error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    getNativeSessionInputQueue,
+    session.lifecycle?.active_command_id,
+    session.lifecycle?.queue_count,
+    session.lifecycle?.state_revision,
+    session.provider,
+    session.runtime_id,
+    session.status,
+  ]);
 
   const handlePermission = useCallback(async (requestId: string, approved: boolean) => {
     setRespondingRequestId(requestId);

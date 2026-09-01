@@ -1559,6 +1559,18 @@ async fn flush_native_session_input_queue(
 }
 
 #[tauri::command]
+fn get_native_session_input_queue(
+    window: tauri::WebviewWindow,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+) -> Result<Vec<native_input_queue::QueuedNativeInputSnapshotItem>, String> {
+    if window.label() != "main" {
+        return Err("Native input queue previews are available only to the main workspace".into());
+    }
+    native_state.input_queue_snapshot(&runtime_id)
+}
+
+#[tauri::command]
 fn respond_native_session_permission(
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
@@ -5509,6 +5521,7 @@ fn main() {
             get_native_session_summary,
             send_native_session_input,
             flush_native_session_input_queue,
+            get_native_session_input_queue,
             respond_native_session_permission,
             respond_native_session_prompt,
             rewind_native_session_files,

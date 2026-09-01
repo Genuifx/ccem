@@ -13,7 +13,7 @@ use crate::native_helper_resource::native_helper_script_path;
 use crate::native_input_queue::{
     FrozenNativeInputBatch, FrozenNativeInputMessage, FrozenNativeInputMessageParts,
     NativeInputClaimOutcome, NativeInputQueue, NativeInputQueueError, QueuedInputDeliveryState,
-    QueuedNativeInput,
+    QueuedNativeInputSnapshotItem,
 };
 use crate::native_session_coordinator::{
     AdapterKind, InteractiveWaitOutcome, LifecycleDecision, NativeLifecycleProjection,
@@ -2877,6 +2877,28 @@ impl NativeRuntimeManager {
         runtime_id: &str,
     ) -> Result<(), String> {
         self.maybe_dispatch_queued(app, runtime_id, QueueDispatchTrigger::VisibleUserAction)
+    }
+
+    /// Renderer projection of prompts still waiting in the backend input
+    /// queue. This is the authoritative source for "queued" rows after a view
+    /// remount discards the optimistic local prompt state.
+    pub fn input_queue_snapshot(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Vec<QueuedNativeInputSnapshotItem>, String> {
+        let provider = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .map(|record| record.provider)
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if provider != NativeProvider::Claude {
+            return Err(format!(
+                "Native runtime {runtime_id} does not use the managed Claude input queue"
+            ));
+        }
+        Ok(self.input_queue.snapshot(runtime_id))
     }
 
     fn schedule_command_admission_deadline(
@@ -6761,7 +6783,6 @@ impl NativeRuntimeManager {
         } = payload
         {
             if let Some(command_id) = command_id.as_deref() {
-                let mut admitted_batch = None;
                 let queue_changed = match stage.as_str() {
                     "command_rejected"
                         if matches!(&decision, LifecycleDecision::Released { .. }) =>
@@ -6788,11 +6809,28 @@ impl NativeRuntimeManager {
                             LifecycleDecision::Ignored | LifecycleDecision::ProtocolError { .. }
                         ) =>
                     {
-                        admitted_batch = self
-                            .input_queue
-                            .confirm_admitted(runtime_id, command_id)
-                            .map(QueuedNativeInput::into_batch);
-                        admitted_batch.is_some()
+                        let admitted = self.input_queue.peek(runtime_id).filter(|queued| {
+                            queued.dispatch_command_id() == Some(command_id)
+                                && matches!(
+                                    queued.delivery_state(),
+                                    QueuedInputDeliveryState::Dispatching
+                                        | QueuedInputDeliveryState::DeliveryUncertain
+                                )
+                        });
+                        admitted.is_some_and(|queued| {
+                            if let Err(error) = self.append_queued_batch_user_prompt_events(
+                                runtime_id,
+                                queued.batch().messages(),
+                            ) {
+                                eprintln!(
+                                    "Failed to append admitted queued prompts for {runtime_id}: {error}"
+                                );
+                                return false;
+                            }
+                            self.input_queue
+                                .confirm_admitted(runtime_id, command_id)
+                                .is_some()
+                        })
                     }
                     "delivery_uncertain" => self
                         .input_queue
@@ -6800,15 +6838,6 @@ impl NativeRuntimeManager {
                     _ => false,
                 };
                 if queue_changed {
-                    if let Some(batch) = admitted_batch {
-                        if let Err(error) = self
-                            .append_queued_batch_user_prompt_events(runtime_id, batch.messages())
-                        {
-                            eprintln!(
-                                "Failed to append admitted queued prompts for {runtime_id}: {error}"
-                            );
-                        }
-                    }
                     self.lifecycle.note_queue_changed(runtime_id);
                 }
             }
@@ -7971,6 +8000,36 @@ impl NativeRuntimeManager {
         }
     }
 
+    fn build_user_prompt_event_payload(
+        &self,
+        text: &str,
+        images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
+    ) -> Result<Option<SessionEventPayload>, String> {
+        let text = text.trim();
+        let image_count = images.map(|items| items.len()).unwrap_or(0);
+        let annotations = validate_prompt_annotations(annotations)?;
+        if text.is_empty() && image_count == 0 && annotations.is_none() {
+            return Ok(None);
+        }
+        let event_images = prompt_images_for_event(images, &self.prompt_image_store)?;
+        let canonical_hash =
+            canonical_user_prompt_hash(text, event_images.as_ref(), annotations.as_ref());
+
+        Ok(Some(SessionEventPayload::UserPrompt {
+            text: text.to_string(),
+            image_count: image_count as u64,
+            client_message_id: client_message_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            images: event_images,
+            annotations,
+            canonical_hash,
+        }))
+    }
+
     fn append_user_prompt_event(
         &self,
         runtime_id: &str,
@@ -7979,30 +8038,15 @@ impl NativeRuntimeManager {
         annotations: Option<&Vec<SessionPromptAnnotation>>,
         client_message_id: Option<&str>,
     ) -> Result<(), String> {
-        let text = text.trim();
-        let image_count = images.map(|items| items.len()).unwrap_or(0);
-        let annotations = validate_prompt_annotations(annotations)?;
-        if text.is_empty() && image_count == 0 && annotations.is_none() {
+        let Some(payload) = self.build_user_prompt_event_payload(
+            text,
+            images,
+            annotations,
+            client_message_id,
+        )? else {
             return Ok(());
-        }
-        let event_images = prompt_images_for_event(images, &self.prompt_image_store)?;
-        let canonical_hash =
-            canonical_user_prompt_hash(text, event_images.as_ref(), annotations.as_ref());
-
-        self.append_event(
-            runtime_id,
-            SessionEventPayload::UserPrompt {
-                text: text.to_string(),
-                image_count: image_count as u64,
-                client_message_id: client_message_id
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-                images: event_images,
-                annotations,
-                canonical_hash,
-            },
-        )
+        };
+        self.append_event(runtime_id, payload)
     }
 
     fn append_queued_batch_user_prompt_events(
@@ -8010,6 +8054,10 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         messages: &[FrozenNativeInputMessage],
     ) -> Result<(), String> {
+        // Validate and materialize the entire merged batch before appending
+        // its first row. If a later prompt has malformed image/annotation
+        // data, a lifecycle retry must not replay an already-appended prefix.
+        let mut payloads = Vec::with_capacity(messages.len());
         for message in messages {
             let FrozenNativeInputMessageParts {
                 client_message_id,
@@ -8034,13 +8082,17 @@ impl NativeRuntimeManager {
                         "Failed to decode queued prompt annotations for {client_message_id}: {error}"
                     )
                 })?;
-            self.append_user_prompt_event(
-                runtime_id,
+            if let Some(payload) = self.build_user_prompt_event_payload(
                 display_text.as_deref().unwrap_or(&text),
                 decoded_images.as_ref(),
                 decoded_annotations.as_ref(),
                 Some(&client_message_id),
-            )?;
+            )? {
+                payloads.push(payload);
+            }
+        }
+        for payload in payloads {
+            self.append_event(runtime_id, payload)?;
         }
         Ok(())
     }
@@ -9225,7 +9277,9 @@ mod tests {
     };
     use crate::native_event_log::{NativeEventLog, MAX_EVENT_REPLAY_PAGE_BYTES};
     use crate::native_input_queue::NativeInputPopOutcome;
-    use crate::native_input_queue::{FrozenNativeInputBatch, NativeInputClaimOutcome};
+    use crate::native_input_queue::{
+        FrozenNativeInputBatch, FrozenNativeInputMessage, NativeInputClaimOutcome,
+    };
     use crate::prompt_image_store::PromptImageStore;
     use crate::router::{
         LaunchAuthKind, LaunchTransport, RouterAuthCapability, RouterConfig, RouterManager,
@@ -11153,6 +11207,43 @@ mod tests {
                 ("visible second request", Some("client-message-b")),
             ]
         );
+    }
+
+    #[test]
+    fn queued_dispatch_batch_preflights_every_prompt_before_projection() {
+        let runtime_id = format!(
+            "native-user-prompt-batch-preflight-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let messages = vec![
+            FrozenNativeInputMessage::new(
+                "client-message-valid",
+                "valid request",
+                None,
+                None,
+                None,
+            ),
+            FrozenNativeInputMessage::new(
+                "client-message-invalid",
+                "invalid request",
+                None,
+                None,
+                Some(vec![serde_json::json!({ "quote": 42, "note": "invalid" })]),
+            ),
+        ];
+
+        let error = manager
+            .append_queued_batch_user_prompt_events(&runtime_id, &messages)
+            .expect_err("a malformed later prompt must reject the whole projection batch");
+
+        assert!(error.contains("Failed to decode queued prompt annotations"));
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay events")
+            .events
+            .iter()
+            .all(|event| !matches!(event.payload, SessionEventPayload::UserPrompt { .. })));
     }
 
     #[test]

@@ -1714,9 +1714,15 @@ export function Workspace({
         id: session.provider_session_id,
         source: session.provider,
       });
-      const seedMessages = replayBatch
-        ? selectSeedMessagesForNativeReplay(historyMessages, replayBatch, seedBoundaryMessageCount)
-        : historyMessages;
+      // The persisted seed boundary remains authoritative even when a freshly
+      // restarted backend has not repopulated `last_event_seq` yet. Bypassing
+      // it in that window hydrates the provider's live turns as seed messages,
+      // then native replay renders the same turns a second time.
+      const seedMessages = selectSeedMessagesForNativeReplay(
+        historyMessages,
+        replayBatch,
+        seedBoundaryMessageCount,
+      );
 
       upsertLiveSessionEntry(session, {
         seedMessages,
@@ -3176,6 +3182,7 @@ export function Workspace({
         key: e.key,
         isComposing: e.isComposing,
         keyCode: e.keyCode,
+        repeat: e.repeat,
         defaultPrevented: e.defaultPrevented,
         target: e.target,
         isWorkspaceActive: isActive,

@@ -7,6 +7,7 @@ export interface WorkspaceEscapeInput {
   key: string;
   isComposing?: boolean;
   keyCode?: number;
+  repeat?: boolean;
   defaultPrevented?: boolean;
   target?: EventTarget | null;
   isWorkspaceActive: boolean;
@@ -92,10 +93,15 @@ export function hasOpenWorkspaceEscapeLayer(
  * Decide whether one physical Escape keydown may interrupt the foreground
  * native command. A coordinator command id is required: legacy status strings
  * are deliberately not accepted as ownership evidence.
+ *
+ * Auto-repeat keydowns are never a new stop request: a held Escape must not
+ * cancel a queued prompt whose command was admitted right after the first
+ * press released the previous turn.
  */
 export function decideWorkspaceEscape(input: WorkspaceEscapeInput): WorkspaceEscapeDecision {
   if (
     input.key !== 'Escape'
+    || input.repeat
     || input.defaultPrevented
     || input.isComposing
     || input.keyCode === 229

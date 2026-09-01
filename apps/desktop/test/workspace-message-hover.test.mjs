@@ -110,6 +110,27 @@ async function importWorkspaceMessageRenderer() {
           );
         }
 
+        export function renderQueuedPrompt(deliveryState) {
+          installNodeGlobals();
+          const message = {
+            msgType: 'user',
+            uuid: 'queued-user-prompt',
+            content: 'queued text',
+            queuedPending: true,
+            queuedDeliveryState: deliveryState,
+            timestamp: Date.parse('2026-09-01T00:00:01.000Z'),
+            segmentIndex: 0,
+            isCompactBoundary: false,
+          };
+          return renderToStaticMarkup(
+            React.createElement(LocaleProvider, null,
+              React.createElement(TooltipProvider, null,
+                React.createElement(WorkspaceMessageBubble, { message, prevRole: null })
+              )
+            )
+          );
+        }
+
         export function summarizeTranscriptItems(messages) {
           return buildWorkspaceTranscriptItems(messages).map((item) => ({
             key: item.key,
@@ -260,6 +281,21 @@ test('rendered user prompt keeps inline image thumbnails inside the same user bu
   assert.match(userBubbleHtml, /aria-label="[^"]*图片[^"]*"/);
   assert.doesNotMatch(userBubbleHtml, /\[Image #1\]/);
   assert.doesNotMatch(userBubbleHtml, /Images attached/);
+});
+
+test('queued prompt badge distinguishes waiting, dispatching, and uncertain delivery', async () => {
+  const { renderQueuedPrompt } = await importWorkspaceMessageRenderer();
+  const pending = renderQueuedPrompt('pending');
+  const dispatching = renderQueuedPrompt('dispatching');
+  const uncertain = renderQueuedPrompt('delivery_uncertain');
+
+  assert.match(pending, /排队中/);
+  assert.match(pending, /不会中断当前执行/);
+  assert.match(dispatching, /正在发送/);
+  assert.match(dispatching, /等待模型确认接收/);
+  assert.match(uncertain, /发送状态待确认/);
+  assert.match(uncertain, /已暂停自动重试以避免重复/);
+  assert.doesNotMatch(uncertain, /本轮结束后自动发送/);
 });
 
 test('uuid-less transcript item keys stay stable when older messages are prepended', async () => {

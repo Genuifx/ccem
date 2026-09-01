@@ -442,3 +442,51 @@ fn rejects_empty_identifiers_and_handles_missing_entries() {
     assert_eq!(queue.remove("runtime-a", "missing"), None);
     assert_eq!(queue.pop("runtime-a"), NativeInputPopOutcome::Empty);
 }
+
+#[test]
+fn snapshot_projects_fifo_messages_with_delivery_state() {
+    let queue = NativeInputQueue::default();
+    assert!(queue.snapshot("runtime-a").is_empty());
+
+    queue
+        .enqueue("runtime-a", batch("snap-1", "one"), None)
+        .unwrap();
+    queue
+        .enqueue("runtime-a", batch("snap-2", "two"), None)
+        .unwrap();
+
+    let pending = queue.snapshot("runtime-a");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|item| (item.client_message_id.as_str(), item.delivery_state))
+            .collect::<Vec<_>>(),
+        vec![("snap-1", "pending"), ("snap-2", "pending")]
+    );
+    assert_eq!(pending[0].display_text, "display:one");
+    assert_eq!(
+        pending[0].images,
+        Some(vec![json!({ "mediaType": "image/png", "data": "one" })])
+    );
+    assert_eq!(
+        pending[0].annotations,
+        Some(vec![json!({ "quote": "one", "note": "note" })])
+    );
+
+    let (_, _, command_id) = claim(&queue, "runtime-a");
+    let dispatching = queue.snapshot("runtime-a");
+    assert_eq!(dispatching[0].delivery_state, "dispatching");
+    assert_eq!(dispatching[1].delivery_state, "pending");
+
+    // An admitted head leaves the snapshot; the persisted user_prompt event
+    // takes over its projection from here.
+    assert!(queue.confirm_admitted("runtime-a", &command_id).is_some());
+    let remaining = queue.snapshot("runtime-a");
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|item| item.client_message_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["snap-2"]
+    );
+}

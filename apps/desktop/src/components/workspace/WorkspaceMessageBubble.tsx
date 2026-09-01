@@ -10,6 +10,7 @@ import {
   ChevronRight,
   Circle,
   ClipboardList,
+  Clock,
   Copy,
   FileImage,
   GitFork,
@@ -1954,6 +1955,17 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
   const hasMainContent = renderedContent && !(Array.isArray(renderedContent) && renderedContent.length === 0);
   const hasImages = imageBlocks.length > 0;
   const showMessageActions = isActionHovering || isActionFocusWithin;
+  const queuedDeliveryState = message.queuedDeliveryState ?? 'pending';
+  const queuedBadgeLabel = queuedDeliveryState === 'delivery_uncertain'
+    ? t('workspace.messageDeliveryUncertainBadge')
+    : queuedDeliveryState === 'dispatching'
+      ? t('workspace.messageDispatchingBadge')
+      : t('workspace.messageQueuedBadge');
+  const queuedBadgeHint = queuedDeliveryState === 'delivery_uncertain'
+    ? t('workspace.messageDeliveryUncertainHint')
+    : queuedDeliveryState === 'dispatching'
+      ? t('workspace.messageDispatchingHint')
+      : t('workspace.messageQueuedHint');
 
   if (!hasMainContent && !hasImages && teammateMessages.length === 0) {
     return null;
@@ -1978,6 +1990,21 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
               {renderedContent}
               {hasImages ? <WorkspaceImageStrip blocks={imageBlocks} isUser t={t} /> : null}
             </div>
+            {message.queuedPending ? (
+              <div
+                className="mt-1.5 flex items-center justify-end gap-1 text-[11px] text-muted-foreground"
+                title={queuedBadgeHint}
+              >
+                {queuedDeliveryState === 'delivery_uncertain' ? (
+                  <AlertCircle className="h-3 w-3 text-amber-500" />
+                ) : queuedDeliveryState === 'dispatching' ? (
+                  <LoaderCircle className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Clock className="h-3 w-3" />
+                )}
+                {queuedBadgeLabel}
+              </div>
+            ) : null}
             <MessageMetaBar message={message} isUser visible={showMessageActions} t={t} />
           </div>
       ) : null}

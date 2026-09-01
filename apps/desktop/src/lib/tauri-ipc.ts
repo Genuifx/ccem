@@ -363,6 +363,7 @@ export interface TauriCommands {
     void
   ];
   flush_native_session_input_queue: [{ runtimeId: string }, void];
+  get_native_session_input_queue: [{ runtimeId: string }, NativeQueuedInputSnapshotItem[]];
   respond_native_session_permission: [
     {
       runtimeId: string;
@@ -1056,6 +1057,18 @@ export interface NativeBackgroundTask {
   skip_transcript?: boolean | null;
   stop_request_id?: string | null;
   stop_failed?: boolean | null;
+}
+
+/**
+ * One prompt still owned by the backend native input queue: not yet admitted
+ * by the helper, so no persisted `user_prompt` event exists for it yet.
+ */
+export interface NativeQueuedInputSnapshotItem {
+  client_message_id: string;
+  display_text: string;
+  images?: SessionPromptImage[];
+  annotations?: SessionPromptAnnotation[];
+  delivery_state: 'pending' | 'dispatching' | 'delivery_uncertain';
 }
 
 /**

@@ -1222,6 +1222,23 @@ test('selects provider seed by persisted boundary count before text matching', a
   );
 });
 
+test('keeps the persisted seed boundary when replay metadata is temporarily unavailable', async () => {
+  const { selectSeedMessagesForNativeReplay } = await importWorkspaceEventTranscript();
+  const providerHistory = [
+    { msgType: 'user', uuid: 'live-user', content: 'queued prompt', segmentIndex: 0, isCompactBoundary: false },
+    { msgType: 'assistant', uuid: 'live-assistant', content: 'queued answer', segmentIndex: 0, isCompactBoundary: false },
+  ];
+
+  assert.deepEqual(
+    selectSeedMessagesForNativeReplay(providerHistory, null, 0),
+    [],
+  );
+  assert.deepEqual(
+    selectSeedMessagesForNativeReplay(providerHistory, null, 1).map((message) => message.uuid),
+    ['live-user'],
+  );
+});
+
 test('selects no provider seed when native replay covers the runtime start', async () => {
   const { selectSeedMessagesForNativeReplay } = await importWorkspaceEventTranscript();
   const seedMessages = [
@@ -1296,7 +1313,8 @@ test('skips provider seed hydration when the native boundary proves replay owner
   assert.equal(shouldSkipProviderSeedHydration(runtimeStartReplay, 2), false);
   assert.equal(shouldSkipProviderSeedHydration({ ...runtimeStartReplay, oldest_available_seq: 2 }, null), false);
   assert.equal(shouldSkipProviderSeedHydration({ ...runtimeStartReplay, truncated: true }, null), false);
-  assert.equal(shouldSkipProviderSeedHydration(null, 0), false);
+  assert.equal(shouldSkipProviderSeedHydration(null, 0), true);
+  assert.equal(shouldSkipProviderSeedHydration(null, 2), false);
 });
 
 test('detects whether a replay batch continuously covers its available sequence range', async () => {

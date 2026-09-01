@@ -236,6 +236,29 @@ impl QueuedNativeInput {
     }
 }
 
+/// Renderer-facing projection of one queued prompt that has not been admitted
+/// by the helper yet. `display_text` is the same preview the persisted
+/// `user_prompt` event will carry, so a remounted view can rebuild the exact
+/// pending row it would otherwise have lost with its local optimistic state.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueuedNativeInputSnapshotItem {
+    pub client_message_id: String,
+    pub display_text: String,
+    pub images: Option<Vec<Value>>,
+    pub annotations: Option<Vec<Value>>,
+    pub delivery_state: &'static str,
+}
+
+impl QueuedInputDeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Dispatching => "dispatching",
+            Self::DeliveryUncertain => "delivery_uncertain",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeInputQueueError {
     EmptyRuntimeId,
@@ -359,6 +382,36 @@ impl NativeInputQueue {
             .get(runtime_id)
             .and_then(|queue| queue.front())
             .cloned()
+    }
+
+    /// FIFO-ordered projection of every message still owned by the queue,
+    /// including a head that is mid-dispatch or delivery-uncertain: until the
+    /// helper proves admission, that prompt has not become a persisted
+    /// `user_prompt` and the renderer must keep showing it as queued.
+    pub fn snapshot(&self, runtime_id: &str) -> Vec<QueuedNativeInputSnapshotItem> {
+        self.lock_queues()
+            .get(runtime_id)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .flat_map(|queued| {
+                        let delivery_state = queued.delivery_state.as_str();
+                        queued.batch.messages().iter().map(move |message| {
+                            QueuedNativeInputSnapshotItem {
+                                client_message_id: message.client_message_id().to_owned(),
+                                display_text: message
+                                    .display_text()
+                                    .unwrap_or_else(|| message.text())
+                                    .to_owned(),
+                                images: message.images().map(<[Value]>::to_vec),
+                                annotations: message.annotations().map(<[Value]>::to_vec),
+                                delivery_state,
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Atomically reserves the FIFO head for one dispatcher without removing

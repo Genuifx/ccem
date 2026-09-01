@@ -22,6 +22,11 @@ export const COMPACTING_SUMMARY_TOKEN = '__ccem_context_compacting__';
 export const COMPACT_FAILED_SUMMARY_TOKEN = '__ccem_context_compact_failed__';
 export const TRANSCRIPT_GAP_SUMMARY_TOKEN = '__ccem_transcript_gap__';
 
+export type NativeQueuedPromptDeliveryState =
+  | 'pending'
+  | 'dispatching'
+  | 'delivery_uncertain';
+
 export interface LocalUserPrompt {
   id: string;
   text: string;
@@ -36,6 +41,14 @@ export interface LocalUserPrompt {
    * from the turn that was active when the user pressed Send.
    */
   deferUntilPersisted?: boolean;
+  /**
+   * The prompt entered the backend input queue behind a busy foreground turn
+   * (or a hard-blocking attention). Until the persisted `user_prompt`
+   * confirms admission, its tail row renders with a visible queued state so
+   * the user can tell it has not been sent to the model yet.
+   */
+  queuedBehindTurn?: boolean;
+  queuedDeliveryState?: NativeQueuedPromptDeliveryState;
 }
 
 interface PendingAssistantTurn {
@@ -74,6 +87,10 @@ function cloneMessages(messages: ConversationMessageData[]): ConversationMessage
 }
 
 function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
+  const queuedPending = prompt.queuedBehindTurn === true && prompt.deferUntilPersisted === true;
+  const queuedDeliveryState = queuedPending
+    ? (prompt.queuedDeliveryState ?? 'pending')
+    : undefined;
   const imageBlocks = createPromptImageBlocks(prompt.images);
   if (imageBlocks.length > 0) {
     const displayText = stripRenderedImageMarkers(prompt.text, imageBlocks);
@@ -90,6 +107,8 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
       timestamp: prompt.timestamp,
       segmentIndex: 0,
       isCompactBoundary: false,
+      ...(queuedPending ? { queuedPending: true } : {}),
+      ...(queuedDeliveryState ? { queuedDeliveryState } : {}),
       ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
     };
   }
@@ -101,6 +120,8 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
     timestamp: prompt.timestamp,
     segmentIndex: 0,
     isCompactBoundary: false,
+    ...(queuedPending ? { queuedPending: true } : {}),
+    ...(queuedDeliveryState ? { queuedDeliveryState } : {}),
     ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
   };
 }
@@ -417,12 +438,15 @@ export function shouldSkipProviderSeedHydration(
   replayBatch: ReplayBatch | null | undefined,
   seedBoundaryMessageCount?: number | null,
 ): boolean {
-  if (!replayBatch) {
-    return false;
-  }
-
+  // A persisted zero boundary proves that every provider-history turn belongs
+  // to native replay, even while a restarted backend temporarily reports no
+  // last_event_seq and therefore has no replay probe yet.
   if (seedBoundaryMessageCount === 0) {
     return true;
+  }
+
+  if (!replayBatch) {
+    return false;
   }
 
   return seedBoundaryMessageCount == null && nativeReplayCoversRuntimeStart(replayBatch);
@@ -850,6 +874,8 @@ function shallowEqualMessages(
     && previous.cacheCreationTokens === next.cacheCreationTokens
     && previous.cacheReadTokens === next.cacheReadTokens
     && previous.annotations === next.annotations
+    && previous.queuedPending === next.queuedPending
+    && previous.queuedDeliveryState === next.queuedDeliveryState
     && shallowEqualContent(previous.content, next.content);
 }
 
