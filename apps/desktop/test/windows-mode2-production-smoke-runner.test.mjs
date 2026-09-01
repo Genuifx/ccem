@@ -39,7 +39,7 @@ const EXECUTABLE_SHA = 'd'.repeat(64);
 const THUMBPRINT = 'A'.repeat(40);
 const TIMESTAMP_THUMBPRINT = 'E'.repeat(40);
 const PUBLISHER = 'CN=CCEM Release, O=CCEM';
-const REPOSITORY = 'Genuifx/claude-code-env-manager';
+const REPOSITORY = 'Genuifx/ccem';
 const WORKFLOW_REF =
   `${REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
 const PRODUCER_WORKFLOW_REF =

@@ -49,7 +49,7 @@ const repoDir = path.resolve(desktopDir, '..', '..');
 const windowsStageScript = path.join(desktopDir, 'scripts', 'stage-cef-windows.mjs');
 const inventoryScript = path.join(desktopDir, 'scripts', 'verify-mode2-release-inventory.mjs');
 const sourceCommit = 'a'.repeat(40);
-const repository = 'Genuifx/claude-code-env-manager';
+const repository = 'Genuifx/ccem';
 const workflowRef =
   `${repository}/.github/workflows/release-desktop.yml@refs/tags/v2.53.0`;
 const producerWorkflowRef =
@@ -534,7 +534,7 @@ test('release inventory set rejects mixed versions, missing targets, and Windows
 
 test('release mutation preflight allows only a missing or still-draft GitHub release', async () => {
   const request = (releases) => requireDraftGithubRelease({
-    repository: 'Genuifx/claude-code-env-manager',
+    repository: 'Genuifx/ccem',
     tag: 'v2.53.0',
     token: 'fixture-token',
     allowMissing: true,
@@ -605,11 +605,52 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.doesNotMatch(combinedWorkflow, /includeUpdaterJson|releaseDraft:/);
   assert.doesNotMatch(combinedWorkflow, /require-draft-github-release\.mjs/);
   const tauriActionBlocks = producerWorkflow.match(/uses: tauri-apps\/tauri-action@[\s\S]*?(?=\n\s{6}- name:)/gu) ?? [];
-  assert.equal(tauriActionBlocks.length, 1);
+  assert.equal(tauriActionBlocks.length, 2);
   for (const block of tauriActionBlocks) {
     assert.doesNotMatch(block, /GITHUB_TOKEN|tagName|releaseName|releaseBody|releaseDraft|includeUpdaterJson/,
       'tauri-action must build only and have no release mutation access');
   }
+  const productionBuildIndex = producerWorkflow.indexOf('- name: Build production bundles without release access');
+  const legacyBuildIndex = producerWorkflow.indexOf('- name: Build legacy unsigned bundles with Mode 2 excluded');
+  const signedSmokeIndex = producerWorkflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage and production behavior');
+  assert.ok(productionBuildIndex > 0 && productionBuildIndex < legacyBuildIndex);
+  assert.ok(legacyBuildIndex < signedSmokeIndex);
+  const productionBuildStep = producerWorkflow.slice(productionBuildIndex, legacyBuildIndex);
+  const legacyBuildStep = producerWorkflow.slice(legacyBuildIndex, signedSmokeIndex);
+  assert.match(productionBuildStep, /needs\.release-mode\.outputs\.production == 'true'/u);
+  assert.doesNotMatch(productionBuildStep, /legacyArgs|continue-on-error|failure\(\)/u);
+  assert.match(legacyBuildStep, /needs\.release-mode\.outputs\.production != 'true'/u);
+  assert.match(legacyBuildStep, /args: \$\{\{ matrix\.legacyArgs \}\}/u);
+  assert.doesNotMatch(
+    legacyBuildStep,
+    /needs\.release-mode\.outputs\.production == 'true'|steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)/u,
+    'a failed production build must not activate the legacy build',
+  );
+  assert.match(producerWorkflow, /legacyArgs: '--target aarch64-apple-darwin'/u);
+  assert.match(producerWorkflow, /legacyArgs: '--target x86_64-apple-darwin'/u);
+  assert.match(
+    producerWorkflow,
+    /legacyArgs: '--target x86_64-pc-windows-msvc --config src-tauri\/tauri\.windows\.conf\.json --bundles nsis,updater'/u,
+  );
+  for (const legacyArgs of producerWorkflow.match(/^\s+legacyArgs:.*$/gmu) ?? []) {
+    assert.doesNotMatch(legacyArgs, /tauri\.cef\.conf\.json|tauri\.windows-signing\.conf\.json/u);
+  }
+  assert.match(
+    producerWorkflow,
+    /Prove legacy macOS bundles exclude Mode 2[\s\S]*?verify-legacy-release-inventory\.mjs[\s\S]*?--updater-signature "\$signature_path"/u,
+  );
+  assert.match(
+    producerWorkflow,
+    /Prove legacy Windows bundle excludes Mode 2[\s\S]*?verify-legacy-release-inventory\.mjs[\s\S]*?--updater-signature \$signature\[0\]\.FullName/u,
+  );
+  const legacyVerifierSource = await fs.readFile(
+    path.join(desktopDir, 'scripts', 'verify-legacy-release-inventory.mjs'),
+    'utf8',
+  );
+  assert.match(legacyVerifierSource, /verifyTauriUpdaterSignature/u);
+  assert.match(legacyVerifierSource, /updaterSignatureVerification: signature\.algorithm/u);
+  assert.match(legacyVerifierSource, /mode2Included: false/u);
+  assert.match(legacyVerifierSource, /cefRuntimeVersion: null/u);
   const releaseModeIndex = producerWorkflow.indexOf('  release-mode:');
   const buildJobIndex = producerWorkflow.indexOf('  build-desktop:');
   const evidenceJobIndex = producerWorkflow.indexOf('  verify-evidence:');
@@ -637,7 +678,7 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   const buildJob = producerWorkflow.slice(buildJobIndex, evidenceJobIndex);
   assert.match(buildJob, /permissions:\n\s+actions: read\n\s+contents: read/u);
   assert.doesNotMatch(buildJob, /contents: write/u);
-  assert.ok(buildJob.indexOf('- name: Setup Node.js') < buildJob.indexOf('- name: Require a fresh current-attempt signed build'));
+  assert.ok(buildJob.indexOf('- name: Setup Node.js') < buildJob.indexOf('- name: Require a fresh current-attempt Desktop build'));
   assert.doesNotMatch(buildJob, /detect-actions-release-payload\.mjs|GITHUB_TOKEN/u);
   assert.match(buildJob, /name: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
   assert.match(buildJob, /retention-days: 30/u);
@@ -673,7 +714,22 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   assert.match(publishedUpdaterJob, /--range 0-0/u);
   assert.doesNotMatch(publishedUpdaterJob, /GITHUB_TOKEN|contents: write|secrets\./u);
   assert.doesNotMatch(workflow, /--data '\{"draft":true\}'/);
-  assert.doesNotMatch(workflow, /xattr -c|clear quarantine/);
+  const productionReleaseBodyIndex = workflow.indexOf('release_body<<${delimiter}');
+  const legacyReleaseBodyIndex = workflow.indexOf('legacy_release_body<<${legacy_delimiter}');
+  const releaseBodyEndIndex = workflow.indexOf('- name: Validate release version consistency');
+  assert.ok(
+    productionReleaseBodyIndex > 0
+      && productionReleaseBodyIndex < legacyReleaseBodyIndex
+      && legacyReleaseBodyIndex < releaseBodyEndIndex,
+  );
+  assert.doesNotMatch(
+    workflow.slice(productionReleaseBodyIndex, legacyReleaseBodyIndex),
+    /xattr -c|clear quarantine/u,
+  );
+  assert.match(
+    workflow.slice(legacyReleaseBodyIndex, releaseBodyEndIndex),
+    /legacy unsigned distribution path[\s\S]*CEF Mode 2 is excluded[\s\S]*xattr -c \/Applications\/CCEM\\ Desktop\.app/u,
+  );
   assert.doesNotMatch(workflow, /\/releases\/tags\//);
   assert.match(producerWorkflow, /APPLE_NOTARY_API_PRIVATE_KEY/);
   assert.match(producerWorkflow, /notary_key=.*RUNNER_TEMP/);

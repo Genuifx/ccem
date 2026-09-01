@@ -376,8 +376,10 @@ test('release DAG keeps builders read-only and defers one privileged transaction
     [...productionAction.matchAll(/^\s{10}([A-Za-z][A-Za-z0-9]*):/gmu)].map((match) => match[1]),
     ['projectPath', 'args'],
   );
-  assert.doesNotMatch(producerWorkflow, /Preview-only|contents: write|detect-actions-release-payload/u);
-  assert.match(producerWorkflow, /Require a fresh current-attempt signed build/u);
+  assert.doesNotMatch(producerWorkflow, /contents: write|detect-actions-release-payload/u);
+  assert.match(producerWorkflow, /Build legacy unsigned bundles with Mode 2 excluded/u);
+  assert.match(producerWorkflow, /verify-legacy-release-inventory\.mjs/u);
+  assert.match(producerWorkflow, /Require a fresh current-attempt Desktop build/u);
   assert.match(producerWorkflow, /inputs\.export_release_payload == true/u);
   assert.match(producerWorkflow, /name: mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
 
@@ -385,10 +387,21 @@ test('release DAG keeps builders read-only and defers one privileged transaction
   assert.match(releaseWorkflow, /recover_stale_draft:[\s\S]*default: 'false'/u);
   assert.match(releaseWorkflow, /git fetch --force --no-tags origin "refs\/tags\/\$\{current_tag\}:refs\/tags\/\$\{current_tag\}"/u);
   assert.match(releaseWorkflow, /Release tag \$\{current_tag\} must exist before desktop release builds start/u);
-  const immutableGate = stepBlock(releaseWorkflow, 'Require immutable GitHub Releases before signed build');
-  assert.match(immutableGate, /CCEM_RELEASE_SETTINGS_TOKEN: \$\{\{ secrets\.CCEM_RELEASE_SETTINGS_TOKEN \}\}/u);
-  assert.match(immutableGate, /verify-immutable-releases-enabled\.mjs/u);
-  assert.doesNotMatch(immutableGate, /GITHUB_TOKEN/u);
+  const protectedRefsGate = stepBlock(
+    releaseWorkflow,
+    'Require protected release refs before desktop build',
+  );
+  assert.match(protectedRefsGate, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/u);
+  assert.match(protectedRefsGate, /CCEM_RELEASE_CANDIDATE_TAG: \$\{\{ steps\.release-notes\.outputs\.current_tag \}\}/u);
+  assert.match(protectedRefsGate, /check-release-repository-settings\.mjs/u);
+  assert.doesNotMatch(protectedRefsGate, /CCEM_RELEASE_SETTINGS_TOKEN/u);
+  const readinessGate = stepBlock(
+    releaseWorkflow,
+    'Require successful pre-tag readiness for exact source',
+  );
+  assert.match(readinessGate, /CCEM_RELEASE_READINESS_TOKEN: \$\{\{ github\.token \}\}/u);
+  assert.match(readinessGate, /CCEM_RELEASE_SOURCE_COMMIT: \$\{\{ github\.sha \}\}/u);
+  assert.match(readinessGate, /check-pretag-readiness-runs\.mjs/u);
   const producerIndex = releaseWorkflow.indexOf('  signed-producer:');
   const transactionIndex = releaseWorkflow.indexOf('  publish-updater-manifest:');
   const universalIndex = releaseWorkflow.indexOf('  create-universal:');
@@ -397,6 +410,8 @@ test('release DAG keeps builders read-only and defers one privileged transaction
   assert.match(callJob, /permissions:\n\s+actions: read\n\s+contents: read/u);
   assert.match(callJob, /uses: \.\/\.github\/workflows\/mode2-signed-producer\.yml/u);
   assert.match(callJob, /export_release_payload: true/u);
+  assert.match(callJob, /TAURI_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/u);
+  assert.match(callJob, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD \}\}/u);
   assert.doesNotMatch(callJob, /contents: write|secrets:\s*inherit/u);
 
   const transaction = releaseWorkflow.slice(transactionIndex, universalIndex);
@@ -418,14 +433,8 @@ test('release DAG keeps builders read-only and defers one privileged transaction
     releaseWorkflow,
     'Verify exact nine assets and publish the locked draft',
   );
-  assert.match(
-    publishStep,
-    /CCEM_RELEASE_SETTINGS_TOKEN: \$\{\{ secrets\.CCEM_RELEASE_SETTINGS_TOKEN \}\}/u,
-  );
-  assert.equal(
-    releaseWorkflow.match(/CCEM_RELEASE_SETTINGS_TOKEN: \$\{\{ secrets\.CCEM_RELEASE_SETTINGS_TOKEN \}\}/gu)?.length,
-    2,
-  );
+  assert.doesNotMatch(publishStep, /CCEM_RELEASE_SETTINGS_TOKEN/u);
+  assert.doesNotMatch(releaseWorkflow, /CCEM_RELEASE_SETTINGS_TOKEN/u);
   assert.match(releaseWorkflow, /ensure-draft-github-release\.mjs/u);
   assert.match(transaction, /ALLOW_STALE_DRAFT_RECOVERY: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.recover_stale_draft \|\| 'false' \}\}/u);
   assert.equal(releaseWorkflow.match(/EXPECTED_RELEASE_ID: \$\{\{ steps\.draft-release\.outputs\.release_id \}\}/gu)?.length, 3);
@@ -908,18 +917,18 @@ test('publication rechecks exact draft and has no unpublish transition', async (
   assert.equal(draftPolicyCalled, false);
   assert.equal(keepDraftApi.requests.some(({ method }) => method === 'PATCH'), false);
 
-  const missingPolicyApi = fakeGitHub({
+  const noAdminTokenApi = fakeGitHub({
     initialRelease: releaseFixture({ assets: contract.assets }),
   });
-  await assert.rejects(
-    publishDraftGithubRelease({
-      client: clientFor(missingPolicyApi),
+  assert.deepEqual(
+    await publishDraftGithubRelease({
+      client: clientFor(noAdminTokenApi),
       desiredDraft: false,
       expectedAssets: contract.expectedAssets,
     }),
-    /immutable release preflight is required/u,
+    { state: 'published', releaseId: 42 },
   );
-  assert.equal(missingPolicyApi.requests.some(({ method }) => method === 'PATCH'), false);
+  assert.equal(noAdminTokenApi.requests.some(({ method }) => method === 'PATCH'), true);
 
   const disabledPolicyApi = fakeGitHub({
     initialRelease: releaseFixture({ assets: contract.assets }),

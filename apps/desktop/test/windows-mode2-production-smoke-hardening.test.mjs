@@ -31,11 +31,11 @@ test('attestation and summary reject every foreign signed-producer provenance fi
     ['repository', 'Other/repository'],
     [
       'workflowRef',
-      'Genuifx/claude-code-env-manager/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
+      'Genuifx/ccem/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
     ],
     [
       'producerWorkflowRef',
-      'Genuifx/claude-code-env-manager/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
+      'Genuifx/ccem/.github/workflows/release-desktop.yml@refs/tags/v2.53.0',
     ],
     ['job', 'signed-readiness'],
   ];

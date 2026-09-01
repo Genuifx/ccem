@@ -5,32 +5,31 @@ description: Publish a new ccem release, commit generated release files, or trig
 
 # Ccem Release
 
-先只看这几个文件，不要大范围读代码：
+只读取发布所需的最小集合：工作区状态、最近语义版本 tag、五处版本源、changeset，以及相关 release/readiness workflow。不要用本地构建成功代替远端交付证据。
 
-- `git status --short`
-- `git tag -l 'v*' --sort=-version:refname | head -n 5`
-- `apps/cli/package.json`
-- `apps/desktop/package.json`
-- `.github/workflows/release-cli.yml`
-- `.github/workflows/release-desktop.yml`
+发布状态必须按下面的顺序前进：
+
+```text
+BASELINE_CLEAN -> CANDIDATE_ON_MAIN -> READY -> TAGGED -> DELIVERED
+```
 
 规则：
 
-- 有未提交的 release 文件就直接 review 后提交。
-- 工作区干净且当前版本等于最新 tag 时，不要只触发 `workflow_dispatch`，那通常不是“新版本”。
-- `ccem` 默认走新 tag 发布，因为 CLI 和 Desktop workflow 都支持 tag 触发。
-- 如果 `main` 在最新 tag 之后还有新提交，且需要发下一版 beta，就补一个很小的 patch changeset，再跑 `pnpm version-packages`。
+- 每次发布前都先对账最近 tag 的精确 SHA：Release CLI、Release Desktop、GitHub Release 资产、`latest.json`、npm version 和 `dist-tags.latest`。无论 `main` 后面是否已有新提交，这一步都不能跳过。
+- 任一交付缺口都进入 `REPAIR_REQUIRED`。不得继续生成下一个普通 minor/patch，也不得移动旧 tag。修复后只能创建一个明确的 repair release。
+- release commit 先单独推到受保护的 `main`，此时绝不创建 tag。
+- 在该 commit 的精确 SHA/版本上，必须同时通过 `Mode 2 Signed Readiness` 与 `Release CLI Trusted Publisher Preflight`。run 的 `head_sha`、输入 SHA 和当前 `origin/main` 必须一致；candidate tag 仍须不存在。
+- readiness 失败时保留未打 tag 的 release commit，修复同一个候选版本；不得再次 bump。
+- 只有 `READY` 才能创建并显式推送不可变 tag。禁止 force-push、移动 tag、用 `--follow-tags` 隐式推 lightweight tag。
+- tag 后的 workflow、Release 资产、updater manifest 与 npm 是彼此独立的交付结果，必须分别核验。
 
 默认流程：
 
-1. 确认或生成下一版号
-2. 检查版本和 changelog diff
-3. 提交 `chore: release vX.Y.Z`
-4. `git tag vX.Y.Z`
-5. `git push origin main`
-6. `git push origin vX.Y.Z`
+1. fetch `origin/main` 与 tags，完成无条件 baseline 对账。
+2. 在隔离 worktree 跑本地门禁，生成并 review 下一版本；提交 `chore: release vX.Y.Z`。
+3. 再次确认远端没有竞态，只推 release commit 到 `main`。
+4. 对精确 release SHA 运行并等待两条 pre-tag readiness；任何 UNKNOWN/FAIL 都不得打 tag。
+5. 再次确认 `origin/main` 未前进、candidate tag 在本地和远端均不存在，然后创建并显式 push `vX.Y.Z`。
+6. 按精确 tag SHA 核验 CLI、Desktop、GitHub Release/资产、`latest.json`、npm；只在全部吻合时报告 `RELEASED`。
 
-注意：
-
-- `git push --follow-tags` 不会推 lightweight tag
-- 最终要明确汇报版本号、commit、tag push 是否成功
+最终报告必须分别列出 candidate commit、main push、两条 readiness、tag push、CLI、Desktop、Release 资产、`latest.json` 与 npm 的实际状态。

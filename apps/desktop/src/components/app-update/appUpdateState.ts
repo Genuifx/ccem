@@ -1,6 +1,6 @@
 import type { AppUpdateMetadata } from '@/lib/tauri-ipc';
 
-const RELEASE_URL_PREFIX = 'https://github.com/Genuifx/claude-code-env-manager/releases/tag/v';
+const RELEASE_URL_PREFIX = 'https://github.com/Genuifx/ccem/releases/tag/v';
 
 export type AppUpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'error';
 export type AppUpdateIndicatorTone = 'hidden' | 'available' | 'downloading' | 'ready' | 'error';

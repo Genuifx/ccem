@@ -31,7 +31,7 @@ import { MACOS_MODE2_PRODUCTION_PROOF_SCHEMA_VERSION } from '../scripts/macos-mo
 
 const NONCE = 'b'.repeat(64);
 const SOURCE_COMMIT = 'a'.repeat(40);
-const REPOSITORY = 'Genuifx/claude-code-env-manager';
+const REPOSITORY = 'Genuifx/ccem';
 const WORKFLOW_REF =
   `${REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
 const PRODUCER_WORKFLOW_REF =

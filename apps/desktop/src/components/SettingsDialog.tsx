@@ -191,7 +191,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Source Code</span>
                 <a
-                  href="https://github.com/anthropics/claude-code-env-manager"
+                  href="https://github.com/Genuifx/ccem"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-primary hover:underline"

@@ -1,10 +1,22 @@
-name: Mode 2 Signed Readiness
+name: Desktop Release Readiness
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/desktop/package.json'
+      - 'apps/desktop/src-tauri/tauri.conf.json'
+      - 'apps/desktop/src-tauri/Cargo.toml'
+      - 'apps/desktop/src-tauri/Cargo.lock'
   workflow_dispatch:
     inputs:
       expected_sha:
         description: 'Full 40-character main commit SHA to verify without publishing'
+        required: true
+        type: string
+      expected_version:
+        description: 'Exact unpublished Desktop version at expected_sha'
         required: true
         type: string
 
@@ -17,11 +29,15 @@ permissions: {}
 jobs:
   prepare-readiness:
     name: Bind Non-Publishing Readiness Source
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: release v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       version: ${{ steps.source.outputs.version }}
+      previous_desktop_tag: ${{ steps.source.outputs.previous_desktop_tag }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -34,17 +50,19 @@ jobs:
         id: source
         shell: bash
         env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.sha }}
+          EXPECTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_version || '' }}
           REF_PROTECTED: ${{ github.ref_protected }}
           SOURCE_COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
-            echo "Mode 2 signed readiness may run only from protected main." >&2
+            echo "Desktop release readiness may run only from protected main." >&2
             exit 1
           }
           [[ "$REF_PROTECTED" == "true" ]] || {
-            echo "Mode 2 signed readiness requires branch protection or a ruleset on main." >&2
+            echo "Desktop release readiness requires branch protection or a ruleset on main." >&2
             exit 1
           }
           [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$EXPECTED_SHA" == "$SOURCE_COMMIT" ]] || {
@@ -56,25 +74,59 @@ jobs:
             echo "Readiness checkout does not match GITHUB_SHA." >&2
             exit 1
           }
+          remote_main="$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')"
+          [[ "$remote_main" =~ ^[a-f0-9]{40}$ && "$remote_main" == "$SOURCE_COMMIT" ]] || {
+            echo "Readiness source is no longer the exact origin/main commit." >&2
+            exit 1
+          }
 
           version="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' apps/desktop/package.json | head -n1)"
           [[ -n "$version" ]] || {
             echo "Failed to determine desktop version." >&2
             exit 1
           }
+          if [[ -n "$EXPECTED_VERSION" && "$version" != "$EXPECTED_VERSION" ]]; then
+            echo "expected_version ${EXPECTED_VERSION} does not match Desktop version ${version}." >&2
+            exit 1
+          fi
           candidate_tag="v${version}"
+          [[ "$candidate_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "Desktop release readiness requires a stable, alpha, beta, or rc semantic version." >&2
+            exit 1
+          }
           set +e
           git ls-remote --exit-code --tags origin "refs/tags/${candidate_tag}" >/dev/null 2>&1
           tag_status=$?
           set -e
           if [[ "$tag_status" -eq 0 ]]; then
-            echo "Signed readiness requires an unpublished version; ${candidate_tag} already exists." >&2
+            echo "Desktop readiness requires an unpublished version; ${candidate_tag} already exists." >&2
             exit 1
           elif [[ "$tag_status" -ne 2 ]]; then
             echo "Could not prove that ${candidate_tag} is absent from origin." >&2
             exit 1
           fi
+          previous_tag="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/releases/latest" \
+              --jq '.tag_name'
+          )"
+          [[ "$previous_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Latest published Desktop release is not a stable semantic-version tag: ${previous_tag}" >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin "refs/tags/${previous_tag}:refs/tags/${previous_tag}" || {
+            echo "Latest published Desktop release tag ${previous_tag} is missing from origin." >&2
+            exit 1
+          }
+          previous_commit="$(git rev-parse "refs/tags/${previous_tag}^{commit}")"
+          git merge-base --is-ancestor "$previous_commit" "$checkout_commit" || {
+            echo "Latest published Desktop release ${previous_tag} is not an ancestor of ${checkout_commit}." >&2
+            exit 1
+          }
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "previous_desktop_tag=${previous_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Validate readiness version consistency
         env:
@@ -84,8 +136,14 @@ jobs:
       - name: Verify pinned browser runtime manifests
         run: node scripts/ci/check-browser-runtime-manifests.mjs
 
+      - name: Require protected release refs before desktop build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CCEM_RELEASE_CANDIDATE_TAG: v${{ steps.source.outputs.version }}
+        run: node scripts/ci/check-release-repository-settings.mjs
+
   signed-producer:
-    name: Produce Signed Evidence Without Publishing
+    name: Produce Desktop Evidence Without Publishing
     needs: prepare-readiness
     if: ${{ !cancelled() && needs.prepare-readiness.result == 'success' }}
     permissions:
@@ -96,5 +154,31 @@ jobs:
       version: ${{ needs.prepare-readiness.outputs.version }}
       source_commit: ${{ github.sha }}
       caller_workflow_ref: ${{ github.workflow_ref }}
+      previous_release_tag: ${{ needs.prepare-readiness.outputs.previous_desktop_tag }}
       export_release_payload: false
       release_tag: ''
+    secrets:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_NOTARY_API_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_API_PRIVATE_KEY }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+  readiness-complete:
+    name: Confirm Desktop Release Readiness
+    needs: [prepare-readiness, signed-producer]
+    if: >-
+      ${{ !cancelled() &&
+          needs.prepare-readiness.result == 'success' &&
+          needs.signed-producer.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Record successful exact-source readiness
+        run: echo "Desktop release readiness completed for ${GITHUB_SHA}."

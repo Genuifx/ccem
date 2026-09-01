@@ -63,7 +63,7 @@ interface InstallStatusState {
 
 type SectionId = 'appearance' | 'application' | 'notifications' | 'agentSkill' | 'ai' | 'permission' | 'router' | 'about';
 
-const CCEM_REPO_URL = 'https://github.com/Genuifx/claude-code-env-manager';
+const CCEM_REPO_URL = 'https://github.com/Genuifx/ccem';
 
 function normalizePerformanceMode(value: unknown): PerformancePreference {
   if (value === 'default' || value === 'reduced' || value === 'auto') {

@@ -38,7 +38,7 @@ const VERSION = '2.58.0';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const RUN_ID = '987654321';
 const RUN_ATTEMPT = '3';
-const REPOSITORY = 'Genuifx/claude-code-env-manager';
+const REPOSITORY = 'Genuifx/ccem';
 const WORKFLOW_REF =
   `${REPOSITORY}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
 const PRODUCER_WORKFLOW_REF =

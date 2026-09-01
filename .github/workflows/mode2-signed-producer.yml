@@ -1,7 +1,11 @@
-name: Mode 2 Signed Producer
+name: Desktop Release Producer
 
 on:
   workflow_call:
+    outputs:
+      release_mode:
+        description: 'production or legacy-unsigned mode selected once for the whole build'
+        value: ${{ jobs.release-mode.outputs.release_mode }}
     inputs:
       version:
         description: 'Exact desktop version to build'
@@ -13,6 +17,10 @@ on:
         type: string
       caller_workflow_ref:
         description: 'Exact caller workflow ref recorded in runtime evidence'
+        required: true
+        type: string
+      previous_release_tag:
+        description: 'Latest published Desktop release used by updater replacement verification'
         required: true
         type: string
       export_release_payload:
@@ -53,12 +61,13 @@ permissions: {}
 
 jobs:
   release-mode:
-    name: Validate Signed Producer Inputs
+    name: Validate Desktop Producer Inputs
     runs-on: ubuntu-latest
     environment: mode2-signing
     permissions:
       contents: read
     outputs:
+      release_mode: ${{ steps.release-mode.outputs.mode }}
       production: ${{ steps.release-mode.outputs.production }}
 
     steps:
@@ -74,6 +83,7 @@ jobs:
           EXPECTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
           EXPECTED_CALLER_WORKFLOW_REF: ${{ inputs.caller_workflow_ref }}
           EXPECTED_VERSION: ${{ inputs.version }}
+          PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
           EXPORT_RELEASE_PAYLOAD: ${{ inputs.export_release_payload }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           EVENT_NAME: ${{ github.event_name }}
@@ -84,26 +94,30 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]] || {
-            echo "Signed producer source_commit must be a full lowercase Git SHA" >&2
+            echo "Desktop producer source_commit must be a full lowercase Git SHA" >&2
             exit 1
           }
           source_commit="$(git rev-parse HEAD^{commit})"
           github_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
           [[ "$source_commit" == "$EXPECTED_SOURCE_COMMIT" && "$source_commit" == "$github_commit" ]] || {
-            echo "Signed producer checkout, caller input, and GITHUB_SHA do not match" >&2
+            echo "Desktop producer checkout, caller input, and GITHUB_SHA do not match" >&2
             exit 1
           }
           [[ "$EXPECTED_CALLER_WORKFLOW_REF" == "$GITHUB_WORKFLOW_REF" ]] || {
-            echo "Signed producer caller workflow ref does not match GitHub runtime context" >&2
+            echo "Desktop producer caller workflow ref does not match GitHub runtime context" >&2
+            exit 1
+          }
+          [[ "$PREVIOUS_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Desktop producer previous_release_tag must be a stable semantic-version tag" >&2
             exit 1
           }
           expected_producer_ref="${GITHUB_REPOSITORY}/.github/workflows/mode2-signed-producer.yml@${GITHUB_REF}"
           [[ "$PRODUCER_WORKFLOW_REF" == "$expected_producer_ref" ]] || {
-            echo "Signed producer job is not defined by the expected same-ref reusable workflow" >&2
+            echo "Desktop producer job is not defined by the expected same-ref reusable workflow" >&2
             exit 1
           }
           [[ "$PRODUCER_WORKFLOW_SHA" == "$EXPECTED_SOURCE_COMMIT" ]] || {
-            echo "Signed producer workflow source does not match the selected commit" >&2
+            echo "Desktop producer workflow source does not match the selected commit" >&2
             exit 1
           }
           if [[ "$EXPORT_RELEASE_PAYLOAD" == "true" ]]; then
@@ -140,13 +154,13 @@ jobs:
               echo "Non-publishing evidence is restricted to mode2-signed-readiness.yml" >&2
               exit 1
             }
-            [[ "$EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" == "refs/heads/main" ]] || {
+            [[ ( "$EVENT_NAME" == "workflow_dispatch" || "$EVENT_NAME" == "push" ) && "$GITHUB_REF" == "refs/heads/main" ]] || {
               echo "Signed readiness producer calls may run only from protected main" >&2
               exit 1
             }
           fi
           [[ "$REF_PROTECTED" == "true" ]] || {
-            echo "Signed producer requires a protected caller ref" >&2
+            echo "Desktop producer requires a protected caller ref" >&2
             exit 1
           }
           if ! main_protection_verified="$(
@@ -160,15 +174,23 @@ jobs:
             exit 1
           fi
           [[ "$main_protection_verified" == "true" ]] || {
-            echo "Signed producer requires the main branch to be protected" >&2
+            echo "Desktop producer requires the main branch to be protected" >&2
             exit 1
           }
           git fetch --force --no-tags origin \
             "refs/heads/main:refs/remotes/origin/main"
-          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
-            echo "Signed producer source ${source_commit} is not reachable from origin/main" >&2
-            exit 1
-          }
+          remote_main="$(git rev-parse refs/remotes/origin/main^{commit})"
+          if [[ "$EXPORT_RELEASE_PAYLOAD" == "true" ]]; then
+            git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+              echo "Desktop producer source ${source_commit} is not reachable from origin/main" >&2
+              exit 1
+            }
+          else
+            [[ "$remote_main" == "$source_commit" ]] || {
+              echo "Signed readiness source is no longer the exact origin/main commit" >&2
+              exit 1
+            }
+          fi
 
       - name: Validate version consistency
         env:
@@ -198,16 +220,10 @@ jobs:
           CCEM_OFFICIAL_WINDOWS_PUBLISHER: ${{ vars.CCEM_OFFICIAL_WINDOWS_PUBLISHER }}
         run: node apps/desktop/scripts/detect-release-mode.mjs
 
-      - name: Require complete production signing
-        if: ${{ steps.release-mode.outputs.production != 'true' }}
-        run: |
-          echo "Mode 2 signed producer requires complete Apple, Windows, notarization, and updater signing credentials." >&2
-          exit 1
-
   build-desktop:
     name: Build Desktop (${{ matrix.target }})
     needs: release-mode
-    if: ${{ always() && !cancelled() && needs.release-mode.result == 'success' && needs.release-mode.outputs.production == 'true' }}
+    if: ${{ always() && !cancelled() && needs.release-mode.result == 'success' }}
     permissions:
       actions: read
       contents: read
@@ -218,16 +234,19 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             args: '--target aarch64-apple-darwin --config src-tauri/tauri.cef.conf.json'
+            legacyArgs: '--target aarch64-apple-darwin'
             appleSigning: true
             windowsSigning: false
           - platform: macos-15-intel
             target: x86_64-apple-darwin
             args: '--target x86_64-apple-darwin --config src-tauri/tauri.cef.conf.json'
+            legacyArgs: '--target x86_64-apple-darwin'
             appleSigning: true
             windowsSigning: false
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             args: '--target x86_64-pc-windows-msvc --config src-tauri/target/release-gates/tauri.windows-signing.conf.json --bundles nsis,updater'
+            legacyArgs: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.windows.conf.json --bundles nsis,updater'
             appleSigning: false
             windowsSigning: true
 
@@ -250,7 +269,7 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
-      - name: Require a fresh current-attempt signed build
+      - name: Require a fresh current-attempt Desktop build
         id: release-payload
         shell: bash
         run: echo "reuse=false" >> "$GITHUB_OUTPUT"
@@ -277,7 +296,7 @@ jobs:
         run: pnpm --filter @ccem/core build
 
       - name: Detect Apple signing config
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.appleSigning }}
+        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning }}
         id: apple-signing
         shell: bash
         env:
@@ -455,6 +474,16 @@ jobs:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
 
+      - name: Build legacy unsigned bundles with Mode 2 excluded
+        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' }}
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          args: ${{ matrix.legacyArgs }}
+
       - name: Prove signed macOS Mode 2 Safe Storage and production behavior
         id: macos-safe-storage-smoke
         if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true' }}
@@ -625,6 +654,93 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Prove legacy macOS bundles exclude Mode 2
+        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' && matrix.appleSigning }}
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          CCEM_RELEASE_TARGET: ${{ matrix.target }}
+          CCEM_RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/${CCEM_RELEASE_TARGET}/release/bundle"
+          one_match() {
+            local label="$1"
+            shift
+            if [[ "$#" -ne 1 ]]; then
+              echo "Expected exactly one ${label}; found $#" >&2
+              printf '%s\n' "$@" >&2
+              exit 1
+            fi
+            printf '%s\n' "$1"
+          }
+          shopt -s nullglob
+          app_matches=("${bundle_root}/macos/"*.app)
+          dmg_matches=("${bundle_root}/dmg/"*.dmg)
+          updater_matches=("${bundle_root}/macos/"*.app.tar.gz)
+          signature_matches=("${bundle_root}/macos/"*.app.tar.gz.sig)
+          app_path="$(one_match 'legacy macOS app' "${app_matches[@]}")"
+          dmg_path="$(one_match 'legacy macOS DMG' "${dmg_matches[@]}")"
+          updater_path="$(one_match 'legacy macOS updater' "${updater_matches[@]}")"
+          signature_path="$(one_match 'legacy macOS updater signature' "${signature_matches[@]}")"
+          node scripts/verify-legacy-release-inventory.mjs \
+            --platform macos \
+            --target "$CCEM_RELEASE_TARGET" \
+            --version "$CCEM_RELEASE_VERSION" \
+            --source-commit "$GITHUB_SHA" \
+            --app "$app_path" \
+            --dmg "$dmg_path" \
+            --updater "$updater_path" \
+            --updater-signature "$signature_path" \
+            --output "src-tauri/target/release-gates/mode2-release-inventory-${CCEM_RELEASE_TARGET}.json"
+          node scripts/verify-dsh-bundle-smoke.mjs \
+            --app-bundle "$app_path" \
+            --evidence "$RUNNER_TEMP/dsh-legacy-bundle-smoke-${CCEM_RELEASE_TARGET}.json"
+
+      - name: Prove legacy Windows bundle excludes Mode 2
+        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' && matrix.windowsSigning }}
+        shell: pwsh
+        working-directory: apps/desktop
+        env:
+          CCEM_RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundleRoot = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          $installer = @(Get-ChildItem -LiteralPath $bundleRoot -File | Where-Object Name -Like '*-setup.exe')
+          if ($installer.Count -ne 1) { throw "Expected exactly one legacy Windows installer; found $($installer.Count)" }
+          $signature = @(Get-ChildItem -LiteralPath $bundleRoot -File | Where-Object Name -Like '*-setup.exe.sig')
+          if ($signature.Count -ne 1) { throw "Expected exactly one legacy Windows updater signature; found $($signature.Count)" }
+          node scripts/verify-legacy-release-inventory.mjs `
+            --platform windows `
+            --target x86_64-pc-windows-msvc `
+            --version $env:CCEM_RELEASE_VERSION `
+            --source-commit $env:GITHUB_SHA `
+            --app 'src-tauri/target/x86_64-pc-windows-msvc/release/ccem-desktop.exe' `
+            --installer $installer[0].FullName `
+            --updater-signature $signature[0].FullName `
+            --output 'src-tauri/target/release-gates/mode2-release-inventory-x86_64-pc-windows-msvc.json'
+          node scripts/verify-dsh-bundle-smoke.mjs `
+            --nsis-installer $installer[0].FullName `
+            --evidence "$env:RUNNER_TEMP/dsh-legacy-bundle-smoke-x86_64-pc-windows-msvc.json"
+
+      - name: Retain legacy unsigned Mode 2 exclusion evidence
+        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: legacy-unsigned-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: apps/desktop/src-tauri/target/release-gates/mode2-release-inventory-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain legacy DSH bundle smoke evidence
+        if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dsh-legacy-bundle-smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/dsh-legacy-bundle-smoke-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Prepare updater replacement challenge payload
         if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' && ((matrix.appleSigning && steps.apple-signing.outputs.enabled == 'true') || (matrix.windowsSigning && steps.windows-signing.outputs.enabled == 'true')) }}
         shell: bash
@@ -644,13 +760,23 @@ jobs:
         env:
           CCEM_UPDATER_REPLACEMENT_SMOKE_ALLOW: '1'
           CCEM_RELEASE_TARGET: ${{ matrix.target }}
+          CCEM_PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
         run: |
           set -euo pipefail
-          previous_tag="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null)"
-          if [[ ! "$previous_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Previous desktop tag is not an exact semantic release: ${previous_tag}" >&2
+          previous_tag="$CCEM_PREVIOUS_RELEASE_TAG"
+          if [[ ! "$previous_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Previous desktop tag is not an exact stable semantic release: ${previous_tag}" >&2
             exit 1
           fi
+          git fetch --force --no-tags origin "refs/tags/${previous_tag}:refs/tags/${previous_tag}" || {
+            echo "Previous published Desktop release tag ${previous_tag} is missing from origin" >&2
+            exit 1
+          }
+          previous_commit="$(git rev-parse "refs/tags/${previous_tag}^{commit}")"
+          git merge-base --is-ancestor "$previous_commit" "$GITHUB_SHA" || {
+            echo "Previous published Desktop release ${previous_tag} is not an ancestor of ${GITHUB_SHA}" >&2
+            exit 1
+          }
           previous_root="$(node -e "process.stdout.write(require('node:path').join(process.env.RUNNER_TEMP, 'ccem-updater-previous-source', process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT, process.env.CCEM_RELEASE_TARGET))")"
           provenance="$(node -e "process.stdout.write(require('node:path').join(process.env.RUNNER_TEMP, 'ccem-updater-previous-source', process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT, 'provenance-' + process.env.CCEM_RELEASE_TARGET + '.json'))")"
           node apps/desktop/scripts/prepare-updater-replacement-previous-source.mjs \
@@ -820,8 +946,26 @@ jobs:
           --tag "${TAG_NAME}"
           --source-commit "${GITHUB_SHA}"
 
-      - name: Upload immutable verified production payload
-        if: ${{ inputs.export_release_payload == true && steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production == 'true' }}
+      - name: Prepare this legacy target's immutable current-run payload
+        if: ${{ inputs.export_release_payload == true && steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' }}
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          TAG_NAME: ${{ inputs.release_tag }}
+          CCEM_RELEASE_TARGET: ${{ matrix.target }}
+        run: >-
+          node scripts/prepare-release-payload.mjs
+          --target "${CCEM_RELEASE_TARGET}"
+          --inventory "src-tauri/target/release-gates/mode2-release-inventory-${CCEM_RELEASE_TARGET}.json"
+          --output "src-tauri/target/release-gates/mode2-release-payload-${CCEM_RELEASE_TARGET}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --tag "${TAG_NAME}"
+          --source-commit "${GITHUB_SHA}"
+          --release-mode legacy-unsigned
+
+      - name: Upload immutable verified desktop payload
+        if: ${{ inputs.export_release_payload == true && steps.release-payload.outputs.reuse != 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
@@ -830,8 +974,8 @@ jobs:
           retention-days: 30
 
   verify-evidence:
-    name: Verify Signed Evidence Set
-    needs: build-desktop
+    name: Verify Desktop Evidence Set
+    needs: [release-mode, build-desktop]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && needs.build-desktop.result == 'success' }}
     permissions:
@@ -851,6 +995,7 @@ jobs:
           node-version: '22'
 
       - name: Download exact current-attempt signed evidence
+        if: ${{ needs.release-mode.outputs.production == 'true' }}
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: mode2-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}-*
@@ -858,6 +1003,7 @@ jobs:
           merge-multiple: false
 
       - name: Verify signed evidence set
+        if: ${{ needs.release-mode.outputs.production == 'true' }}
         run: >-
           node apps/desktop/scripts/verify-mode2-signed-readiness-evidence.mjs
           --evidence-root signed-evidence
@@ -870,20 +1016,58 @@ jobs:
           --producer-workflow-ref "${{ job.workflow_ref }}"
           --output signed-evidence-summary.json
 
-      - name: Reconfirm non-publishing candidate tag remains absent
+      - name: Download exact current-attempt legacy evidence
+        if: ${{ needs.release-mode.outputs.production != 'true' }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: legacy-unsigned-evidence-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: legacy-evidence
+          merge-multiple: false
+
+      - name: Verify legacy unsigned evidence set
+        if: ${{ needs.release-mode.outputs.production != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t inventories < <(
+            find legacy-evidence -type f -name 'mode2-release-inventory-*.json' -print | LC_ALL=C sort
+          )
+          if [[ "${#inventories[@]}" -ne 3 ]]; then
+            echo "Expected exactly three legacy inventory files; found ${#inventories[@]}" >&2
+            printf '%s\n' "${inventories[@]}" >&2
+            exit 1
+          fi
+          inventory_args=()
+          for inventory in "${inventories[@]}"; do
+            inventory_args+=(--inventory "$inventory")
+          done
+          node apps/desktop/scripts/verify-legacy-release-inventory.mjs \
+            --platform set \
+            --version "${{ inputs.version }}" \
+            --source-commit "${{ inputs.source_commit }}" \
+            "${inventory_args[@]}" \
+            --output legacy-evidence-summary.json
+
+      - name: Reconfirm non-publishing source and candidate remain current
         if: ${{ inputs.export_release_payload != true }}
         shell: bash
         env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          remote_main="$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')"
+          [[ "$remote_main" =~ ^[a-f0-9]{40}$ && "$remote_main" == "$SOURCE_COMMIT" ]] || {
+            echo "Desktop readiness source is no longer the exact origin/main commit." >&2
+            exit 1
+          }
           candidate_tag="v${VERSION}"
           set +e
           git ls-remote --exit-code --tags origin "refs/tags/${candidate_tag}" >/dev/null 2>&1
           tag_status=$?
           set -e
           if [[ "$tag_status" -eq 0 ]]; then
-            echo "Signed readiness candidate ${candidate_tag} was published while evidence was running." >&2
+            echo "Desktop readiness candidate ${candidate_tag} was published while evidence was running." >&2
             exit 1
           elif [[ "$tag_status" -ne 2 ]]; then
             echo "Could not re-confirm that ${candidate_tag} remains absent from origin." >&2
@@ -891,9 +1075,19 @@ jobs:
           fi
 
       - name: Retain aggregate signed evidence summary
+        if: ${{ needs.release-mode.outputs.production == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: mode2-signed-evidence-summary-${{ github.run_id }}-${{ github.run_attempt }}
           path: signed-evidence-summary.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain aggregate legacy evidence summary
+        if: ${{ needs.release-mode.outputs.production != 'true' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: legacy-unsigned-evidence-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: legacy-evidence-summary.json
           if-no-files-found: error
           retention-days: 90

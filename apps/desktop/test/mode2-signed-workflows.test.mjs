@@ -96,11 +96,11 @@ async function fakeProtectionCommands(t) {
   return bin;
 }
 
-const mutationSurface = /(?:contents:\s*write|write-all|GITHUB_TOKEN|api\.github\.com|uploads\.github\.com|ensure-draft-github-release|upload-draft-release-assets|publish-draft-github-release|github-draft-release-api|create-latest-from-release-payload|verify-immutable-releases-enabled|detect-actions-release-payload|gh\s+release)/u;
+const mutationSurface = /(?:contents:\s*write|write-all|api\.github\.com|uploads\.github\.com|ensure-draft-github-release|upload-draft-release-assets|publish-draft-github-release|github-draft-release-api|create-latest-from-release-payload|verify-immutable-releases-enabled|detect-actions-release-payload|gh\s+release)/u;
 
-test('signed producer is a fresh read-only three-target evidence pipeline', async () => {
+test('desktop producer is a fresh read-only mode-aware three-target evidence pipeline', async () => {
   const source = await workflow('mode2-signed-producer.yml');
-  assert.match(source, /^name: Mode 2 Signed Producer$/mu);
+  assert.match(source, /^name: Desktop Release Producer$/mu);
   assert.match(source, /^on:\n  workflow_call:/mu);
   assert.doesNotMatch(source, /^  (?:push|workflow_dispatch):/mu);
   assert.match(source, /^permissions: \{\}$/mu);
@@ -115,7 +115,7 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
   assert.match(source, /export_release_payload:[\s\S]*default: false/u);
   assert.match(
     source,
-    /- name: Require a fresh current-attempt signed build\n\s+id: release-payload\n\s+shell: bash\n\s+run: echo "reuse=false" >> "\$GITHUB_OUTPUT"/u,
+    /- name: Require a fresh current-attempt Desktop build\n\s+id: release-payload\n\s+shell: bash\n\s+run: echo "reuse=false" >> "\$GITHUB_OUTPUT"/u,
   );
   for (const stepName of [
     'Prepare updater replacement challenge payload',
@@ -124,8 +124,9 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
   ]) {
     assert.match(stepBlock(source, stepName), /\n\s+shell: bash\n/u);
   }
-  assert.match(source, /Require complete production signing/u);
-  assert.match(source, /steps\.release-mode\.outputs\.production != 'true'/u);
+  assert.match(source, /Detect complete cross-platform production signing/u);
+  assert.match(source, /release_mode: \$\{\{ steps\.release-mode\.outputs\.mode \}\}/u);
+  assert.match(source, /production: \$\{\{ steps\.release-mode\.outputs\.production \}\}/u);
   assert.match(source, /PRODUCER_WORKFLOW_REF: \$\{\{ job\.workflow_ref \}\}/u);
   assert.match(source, /PRODUCER_WORKFLOW_SHA: \$\{\{ job\.workflow_sha \}\}/u);
   assert.match(source, /mode2-signed-producer\.yml@\$\{GITHUB_REF\}/u);
@@ -145,6 +146,8 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
     source,
     /git merge-base --is-ancestor "\$source_commit" refs\/remotes\/origin\/main/u,
   );
+  assert.match(source, /remote_main="\$\(git rev-parse refs\/remotes\/origin\/main\^\{commit\}\)"/u);
+  assert.match(source, /Signed readiness source is no longer the exact origin\/main commit/u);
   assert.match(source, /\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+/u);
   assert.equal(
     source.match(/CCEM_MODE2_PRODUCER_WORKFLOW_REF: \$\{\{ job\.workflow_ref \}\}/gu)?.length,
@@ -163,8 +166,11 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
   assert.match(source, /Prove signed macOS Mode 2 Safe Storage and production behavior/u);
   assert.match(source, /Prove real previous-to-current updater replacement/u);
   assert.match(source, /Verify signed evidence set/u);
-  const finalTagGate = stepBlock(source, 'Reconfirm non-publishing candidate tag remains absent');
+  const finalTagGate = stepBlock(source, 'Reconfirm non-publishing source and candidate remain current');
   assert.match(finalTagGate, /if: \$\{\{ inputs\.export_release_payload != true \}\}/u);
+  assert.match(finalTagGate, /SOURCE_COMMIT: \$\{\{ inputs\.source_commit \}\}/u);
+  assert.match(finalTagGate, /git ls-remote origin refs\/heads\/main/u);
+  assert.match(finalTagGate, /remote_main.*SOURCE_COMMIT/u);
   assert.match(finalTagGate, /git ls-remote --exit-code --tags origin/u);
   assert.match(source, /mode2-signed-evidence-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
   assert.match(source, /mode2-release-payload-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.target \}\}/u);
@@ -174,10 +180,23 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
   assertExternalActionsPinned(source);
 
   const tauriBlocks = source.match(/uses: tauri-apps\/tauri-action@[\s\S]*?(?=\n\s{6}- name:)/gu) ?? [];
-  assert.equal(tauriBlocks.length, 1);
+  assert.equal(tauriBlocks.length, 2);
+  for (const block of tauriBlocks) {
+    assert.doesNotMatch(
+      block,
+      /GITHUB_TOKEN|tagName:|releaseId:|releaseName:|releaseBody:|releaseDraft:|includeUpdaterJson:/u,
+    );
+  }
+  const productionBuild = stepBlock(source, 'Build production bundles without release access');
+  const legacyBuild = stepBlock(source, 'Build legacy unsigned bundles with Mode 2 excluded');
+  assert.match(productionBuild, /needs\.release-mode\.outputs\.production == 'true'/u);
+  assert.doesNotMatch(productionBuild, /legacyArgs|continue-on-error|failure\(\)/u);
+  assert.match(legacyBuild, /needs\.release-mode\.outputs\.production != 'true'/u);
+  assert.match(legacyBuild, /args: \$\{\{ matrix\.legacyArgs \}\}/u);
   assert.doesNotMatch(
-    tauriBlocks[0],
-    /GITHUB_TOKEN|tagName:|releaseId:|releaseName:|releaseBody:|releaseDraft:|includeUpdaterJson:/u,
+    legacyBuild,
+    /steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)/u,
+    'legacy mode must be selected before the matrix and cannot be a production failure fallback',
   );
   for (const appleSecret of [
     'APPLE_SIGNING_IDENTITY',
@@ -186,30 +205,131 @@ test('signed producer is a fresh read-only three-target evidence pipeline', asyn
     'APPLE_PASSWORD',
   ]) {
     assert.match(
-      tauriBlocks[0],
+      productionBuild,
       new RegExp(`${appleSecret}: \\$\\{\\{ matrix\\.appleSigning && secrets\\.${appleSecret} \\|\\| '' \\}\\}`, 'u'),
     );
   }
+  assert.doesNotMatch(
+    legacyBuild,
+    /APPLE_SIGNING_IDENTITY|APPLE_TEAM_ID|APPLE_ID|APPLE_PASSWORD|CCEM_CEF_TARGET_TRIPLE/u,
+  );
+  const legacyArgs = source.match(/^\s+legacyArgs:.*$/gmu) ?? [];
+  assert.equal(legacyArgs.length, 3);
+  for (const args of legacyArgs) {
+    assert.doesNotMatch(args, /tauri\.cef\.conf\.json|tauri\.windows-signing\.conf\.json/u);
+  }
+  for (const stepName of [
+    'Prove legacy macOS bundles exclude Mode 2',
+    'Prove legacy Windows bundle excludes Mode 2',
+  ]) {
+    const verifier = stepBlock(source, stepName);
+    assert.match(verifier, /verify-legacy-release-inventory\.mjs/u);
+    assert.match(verifier, /--updater-signature/u);
+    assert.match(verifier, /needs\.release-mode\.outputs\.production != 'true'/u);
+  }
+  assert.match(
+    stepBlock(source, 'Prove legacy Windows bundle excludes Mode 2'),
+    /--app 'src-tauri\/target\/x86_64-pc-windows-msvc\/release\/ccem-desktop\.exe'/u,
+  );
+  const legacyVerifierSource = await fs.readFile(
+    path.join(desktopDir, 'scripts', 'verify-legacy-release-inventory.mjs'),
+    'utf8',
+  );
+  assert.match(legacyVerifierSource, /import \{ verifyTauriUpdaterSignature \}/u);
+  assert.match(legacyVerifierSource, /updaterSignatureVerification: signature\.algorithm/u);
+  assert.match(legacyVerifierSource, /minisign-ed25519-blake2b/u);
+  assert.match(legacyVerifierSource, /Mode 2\/CEF runtime path is forbidden/u);
 });
 
-test('manual readiness caller is main-and-SHA-bound and has no release capability', async () => {
+test('final non-publishing gate rejects readiness evidence after origin/main moves', async (t) => {
+  const source = await workflow('mode2-signed-producer.yml');
+  const script = stepRunScript(
+    source,
+    'Reconfirm non-publishing source and candidate remain current',
+  );
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-readiness-current-source-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, 'bin');
+  await fs.mkdir(bin);
+  await fs.writeFile(
+    path.join(bin, 'git'),
+    [
+      '#!/bin/sh',
+      'if [ "$*" = "ls-remote origin refs/heads/main" ]; then',
+      '  printf "%s\\trefs/heads/main\\n" "$TEST_REMOTE_MAIN"',
+      '  exit 0',
+      'fi',
+      'case "$*" in',
+      '  "ls-remote --exit-code --tags origin refs/tags/v2.78.1") exit 2 ;;',
+      'esac',
+      'printf "unexpected git command: %s\\n" "$*" >&2',
+      'exit 97',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  const sourceCommit = 'a'.repeat(40);
+  const environment = {
+    ...process.env,
+    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+    SOURCE_COMMIT: sourceCommit,
+    VERSION: '2.78.1',
+    TEST_REMOTE_MAIN: sourceCommit,
+  };
+  const current = spawnSync('bash', ['-c', script], {
+    cwd: repoDir,
+    env: environment,
+    encoding: 'utf8',
+  });
+  assert.equal(current.status, 0, current.stderr);
+
+  const stale = spawnSync('bash', ['-c', script], {
+    cwd: repoDir,
+    env: { ...environment, TEST_REMOTE_MAIN: 'b'.repeat(40) },
+    encoding: 'utf8',
+  });
+  assert.notEqual(stale.status, 0, 'stale readiness evidence unexpectedly passed');
+  assert.match(stale.stderr, /no longer the exact origin\/main commit/u);
+});
+
+test('readiness caller is release-commit-or-manual, main-and-SHA-bound, and has no release capability', async () => {
   const source = await workflow('mode2-signed-readiness.yml');
-  assert.match(source, /^name: Mode 2 Signed Readiness$/mu);
-  assert.match(source, /^on:\n  workflow_dispatch:/mu);
-  assert.doesNotMatch(source, /^  (?:push|workflow_call):/mu);
+  assert.match(source, /^name: Desktop Release Readiness$/mu);
+  assert.match(source, /^on:\n  push:\n\s+branches:\n\s+- main/mu);
+  assert.match(source, /^  workflow_dispatch:/mu);
+  assert.doesNotMatch(source, /^  workflow_call:/mu);
+  assert.match(source, /startsWith\(github\.event\.head_commit\.message, 'chore: release v'\)/u);
   assert.match(source, /expected_sha:[\s\S]*required: true/u);
+  assert.match(source, /expected_version:[\s\S]*required: true/u);
+  assert.match(source, /previous_desktop_tag: \$\{\{ steps\.source\.outputs\.previous_desktop_tag \}\}/u);
   assert.match(source, /refs\/heads\/main/u);
   assert.match(source, /REF_PROTECTED: \$\{\{ github\.ref_protected \}\}/u);
   assert.match(source, /\[\[ "\$REF_PROTECTED" == "true" \]\]/u);
-  assert.match(source, /EXPECTED_SHA: \$\{\{ inputs\.expected_sha \}\}/u);
+  assert.match(source, /EXPECTED_SHA: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.expected_sha \|\| github\.sha \}\}/u);
   assert.match(source, /SOURCE_COMMIT: \$\{\{ github\.sha \}\}/u);
   assert.match(source, /git ls-remote --exit-code --tags origin/u);
+  const settingsGate = stepBlock(
+    source,
+    'Require protected release refs before desktop build',
+  );
+  assert.match(settingsGate, /GITHUB_TOKEN: \$\{\{ github\.token \}\}/u);
+  assert.doesNotMatch(settingsGate, /CCEM_RELEASE_SETTINGS_TOKEN/u);
+  assert.match(settingsGate, /CCEM_RELEASE_CANDIDATE_TAG: v\$\{\{ steps\.source\.outputs\.version \}\}/u);
+  assert.match(settingsGate, /check-release-repository-settings\.mjs/u);
   assert.match(source, /^permissions: \{\}$/mu);
   assert.doesNotMatch(source, mutationSurface);
   assert.doesNotMatch(source, /secrets:\s*inherit/u);
   assert.match(source, /uses: \.\/\.github\/workflows\/mode2-signed-producer\.yml/u);
   assert.match(source, /export_release_payload: false/u);
-  assert.doesNotMatch(source, /^\s+secrets:/mu);
+  assert.match(
+    source,
+    /previous_release_tag: \$\{\{ needs\.prepare-readiness\.outputs\.previous_desktop_tag \}\}/u,
+  );
+  assert.match(source, /readiness-complete:[\s\S]*name: Confirm Desktop Release Readiness/u);
+  assert.match(source, /needs: \[prepare-readiness, signed-producer\]/u);
+  assert.match(source, /needs\.signed-producer\.result == 'success'/u);
+  assert.match(source, /TAURI_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/u);
+  assert.match(source, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD \}\}/u);
   assert.match(source, /permissions:\n\s+actions: read\n\s+contents: read/u);
   assertExternalActionsPinned(source);
 });
@@ -239,15 +359,27 @@ test('release caller keeps the only write token behind the shared producer', asy
       ?.length,
     2,
   );
+  const readinessGate = stepBlock(
+    source,
+    'Require successful pre-tag readiness for exact source',
+  );
+  assert.match(readinessGate, /CCEM_RELEASE_READINESS_TOKEN: \$\{\{ github\.token \}\}/u);
+  assert.match(readinessGate, /CCEM_RELEASE_SOURCE_COMMIT: \$\{\{ github\.sha \}\}/u);
+  assert.match(readinessGate, /check-pretag-readiness-runs\.mjs/u);
   assert.match(source, /Manual desktop release may run only from protected main\./u);
   assert.match(source, /Automatic desktop release requires a formal v\* tag push\./u);
   assert.equal(
-    source.match(/Desktop release requires a formal semantic-version tag\./gu)?.length,
+    source.match(/Desktop release requires a stable, alpha, beta, or rc semantic-version tag\./gu)?.length,
     2,
   );
   assert.match(source, /uses: \.\/\.github\/workflows\/mode2-signed-producer\.yml/u);
   assert.match(source, /export_release_payload: true/u);
-  assert.doesNotMatch(source, /^\s+secrets:/mu);
+  assert.match(
+    source,
+    /previous_release_tag: \$\{\{ needs\.prepare-release\.outputs\.previous_desktop_tag \}\}/u,
+  );
+  assert.match(source, /TAURI_SIGNING_PRIVATE_KEY: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY \}\}/u);
+  assert.match(source, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD: \$\{\{ secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD \}\}/u);
   assert.doesNotMatch(source, /secrets:\s*inherit/u);
   assert.equal(source.match(/contents: write/gu)?.length, 1);
   assert.doesNotMatch(source, /tauri-apps\/tauri-action|stage-cef-(?:macos|windows)|run-updater-replacement-smoke/u);
@@ -271,41 +403,30 @@ test('release caller keeps the only write token behind the shared producer', asy
   assertExternalActionsPinned(source);
 });
 
-test('release workflows ignore newer non-release tags when deriving the previous release', async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-previous-release-tag-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const runGit = (...args) => {
-    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
-    assert.equal(result.status, 0, result.stderr);
-    return result.stdout.trim();
-  };
-  runGit('init', '--quiet');
-  runGit('config', 'user.name', 'CCEM Test');
-  runGit('config', 'user.email', 'ccem-test@example.invalid');
-  await fs.writeFile(path.join(root, 'fixture.txt'), 'release\n');
-  runGit('add', 'fixture.txt');
-  runGit('commit', '--quiet', '-m', 'release');
-  runGit('tag', 'v2.62.0');
-  await fs.appendFile(path.join(root, 'fixture.txt'), 'snapshot\n');
-  runGit('commit', '--quiet', '-am', 'snapshot');
-  runGit('tag', 'snapshot-2026-07');
-  await fs.appendFile(path.join(root, 'fixture.txt'), 'candidate\n');
-  runGit('commit', '--quiet', '-am', 'candidate');
-
-  const tagPattern = 'v[0-9]*.[0-9]*.[0-9]*';
-  assert.equal(
-    runGit('describe', '--tags', '--match', tagPattern, '--abbrev=0', 'HEAD^'),
-    'v2.62.0',
-  );
-
-  const [releaseSource, producerSource] = await Promise.all([
+test('release workflows use the latest published Desktop release as the upgrade baseline', async () => {
+  const [releaseSource, readinessSource, producerSource] = await Promise.all([
     workflow('release-desktop.yml'),
+    workflow('mode2-signed-readiness.yml'),
     workflow('mode2-signed-producer.yml'),
   ]);
-  const guardedDescribe = `git describe --tags --match '${tagPattern}' --abbrev=0`;
-  assert.ok(releaseSource.includes(guardedDescribe));
-  assert.ok(producerSource.includes(guardedDescribe));
-  assert.doesNotMatch(`${releaseSource}\n${producerSource}`, /git describe --tags --abbrev=0/u);
+  for (const caller of [releaseSource, readinessSource]) {
+    assert.match(caller, /\/repos\/\$\{GITHUB_REPOSITORY\}\/releases\/latest/u);
+    assert.match(caller, /--jq '\.tag_name'/u);
+    assert.match(caller, /previous_desktop_tag=/u);
+  }
+  assert.match(
+    producerSource,
+    /previous_release_tag:[\s\S]*required: true[\s\S]*type: string/u,
+  );
+  assert.match(
+    producerSource,
+    /CCEM_PREVIOUS_RELEASE_TAG: \$\{\{ inputs\.previous_release_tag \}\}/u,
+  );
+  assert.match(producerSource, /previous_tag="\$CCEM_PREVIOUS_RELEASE_TAG"/u);
+  assert.doesNotMatch(
+    `${releaseSource}\n${readinessSource}\n${producerSource}`,
+    /git describe --tags/u,
+  );
 });
 
 test('protected tag cannot enter prepare, producer, or publish when main is unprotected', async (t) => {
@@ -315,7 +436,7 @@ test('protected tag cannot enter prepare, producer, or publish when main is unpr
   ]);
   const bin = await fakeProtectionCommands(t);
   const sourceCommit = 'a'.repeat(40);
-  const repository = 'Genuifx/claude-code-env-manager';
+  const repository = 'Genuifx/ccem';
   const tag = 'v2.58.0';
   const tagRef = `refs/tags/${tag}`;
   const callerWorkflowRef =
@@ -331,6 +452,7 @@ test('protected tag cannot enter prepare, producer, or publish when main is unpr
     REF_PROTECTED: 'true',
     SOURCE_COMMIT: sourceCommit,
     TAG_NAME: tag,
+    PREVIOUS_RELEASE_TAG: 'v2.57.0',
     GH_TOKEN: 'read-only-test-token',
   };
   const cases = [

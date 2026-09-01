@@ -5,6 +5,10 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { discoverTargetAssets } from './release-asset-discovery.mjs';
+import {
+  LEGACY_UNSIGNED_RELEASE_MODE,
+  PRODUCTION_SIGNED_RELEASE_MODE,
+} from './verify-legacy-release-inventory.mjs';
 
 const TARGET_ROLES = Object.freeze({
   'aarch64-apple-darwin': ['dmg', 'updater', 'updaterSignature'],
@@ -39,6 +43,16 @@ function validateSourceCommit(value) {
   const sourceCommit = required(value, 'source commit');
   if (!/^[a-f0-9]{40}$/u.test(sourceCommit)) fail('source commit must be a lowercase 40-character SHA');
   return sourceCommit;
+}
+
+function validateReleaseMode(value) {
+  const releaseMode = value === undefined
+    ? PRODUCTION_SIGNED_RELEASE_MODE
+    : required(value, 'release mode');
+  if (![PRODUCTION_SIGNED_RELEASE_MODE, LEGACY_UNSIGNED_RELEASE_MODE].includes(releaseMode)) {
+    fail(`unsupported release mode: ${releaseMode}`);
+  }
+  return releaseMode;
 }
 
 async function readJsonFile(candidate, label) {
@@ -94,6 +108,7 @@ export async function prepareReleasePayload({
   runAttempt,
   tag,
   sourceCommit,
+  releaseMode,
 }) {
   const exactTarget = required(target, 'release target');
   const expectedRoles = TARGET_ROLES[exactTarget];
@@ -102,14 +117,22 @@ export async function prepareReleasePayload({
   const exactRunAttempt = validateRunAttempt(runAttempt);
   const exactTag = required(tag, 'release tag');
   const exactSourceCommit = validateSourceCommit(sourceCommit);
+  const exactReleaseMode = validateReleaseMode(releaseMode);
   const inventoryRecord = await readJsonFile(inventoryPath, 'release inventory');
   const inventory = inventoryRecord.value;
+  const releaseModeMatches = exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+    ? inventory?.releaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+      && inventory.mode2Included === false
+      && inventory.cefRuntimeVersion === null
+    : (inventory?.releaseMode === undefined
+      || inventory.releaseMode === PRODUCTION_SIGNED_RELEASE_MODE)
+      && inventory.mode2Included === true;
   if (
     inventory?.platform !== exactTarget
     || inventory.sourceCommit !== exactSourceCommit
-    || inventory.mode2Included !== true
+    || !releaseModeMatches
   ) {
-    fail('release inventory does not bind the exact production target and source commit');
+    fail(`release inventory does not bind the exact ${exactReleaseMode} target and source commit`);
   }
   if (!sameSet(Object.keys(inventory.artifacts ?? {}), expectedRoles)) {
     fail(`${exactTarget} inventory has an invalid release artifact role set`);
@@ -159,6 +182,9 @@ export async function prepareReleasePayload({
       target: exactTarget,
       sourceCommit: exactSourceCommit,
       appVersion: inventory.appVersion,
+      ...(exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+        ? { releaseMode: LEGACY_UNSIGNED_RELEASE_MODE }
+        : {}),
       assets,
     };
     await fsp.writeFile(
@@ -185,6 +211,7 @@ function parseArgs(argv) {
     ['--run-attempt', 'runAttempt'],
     ['--tag', 'tag'],
     ['--source-commit', 'sourceCommit'],
+    ['--release-mode', 'releaseMode'],
   ]);
   for (let index = 0; index < argv.length; index += 2) {
     const key = options.get(argv[index]);

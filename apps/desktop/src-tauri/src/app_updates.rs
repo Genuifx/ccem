@@ -13,7 +13,7 @@ use crate::app_update_engine::{
 use crate::native_runtime::NativeRuntimeManager;
 
 const RELEASE_URL_PREFIX: &str =
-    "https://github.com/Genuifx/claude-code-env-manager/releases/tag/v";
+    "https://github.com/Genuifx/ccem/releases/tag/v";
 
 pub type PendingUpdate = PendingAppUpdate;
 
@@ -230,7 +230,7 @@ mod tests {
     fn release_url_points_to_matching_tag() {
         assert_eq!(
             release_url("2.1.0"),
-            "https://github.com/Genuifx/claude-code-env-manager/releases/tag/v2.1.0"
+            "https://github.com/Genuifx/ccem/releases/tag/v2.1.0"
         );
     }
 

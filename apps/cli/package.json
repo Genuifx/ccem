@@ -5,7 +5,7 @@
   "description": "Claude Code Environment Manager",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Genuifx/claude-code-env-manager.git",
+    "url": "git+https://github.com/Genuifx/ccem.git",
     "directory": "apps/cli"
   },
   "author": {

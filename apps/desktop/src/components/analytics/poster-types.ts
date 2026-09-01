@@ -19,7 +19,7 @@ export interface PosterCardProps {
   rangeModelData: Record<string, TokenUsageWithCost>;
 }
 
-export const GITHUB_URL = 'https://github.com/Genuifx/claude-code-env-manager';
+export const GITHUB_URL = 'https://github.com/Genuifx/ccem';
 export const POSTER_W = 440;
 export const POSTER_H = 720;
 

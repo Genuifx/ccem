@@ -64,6 +64,7 @@ test('release payload binds the exact positive run attempt', async (t) => {
     '--run-attempt', '7',
     '--tag', 'v2.58.0',
     '--source-commit', sourceCommit,
+    '--release-mode', 'production',
   ], {
     cwd: fixture.root,
     encoding: 'utf8',

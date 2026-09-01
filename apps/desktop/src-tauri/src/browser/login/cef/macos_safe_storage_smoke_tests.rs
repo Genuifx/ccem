@@ -4,11 +4,11 @@ use std::io::Write;
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NONCE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const TARGET: &str = "aarch64-apple-darwin";
-const REPOSITORY: &str = "Genuifx/claude-code-env-manager";
+const REPOSITORY: &str = "Genuifx/ccem";
 const WORKFLOW_REF: &str =
-    "Genuifx/claude-code-env-manager/.github/workflows/mode2-signed-readiness.yml@refs/heads/main";
+    "Genuifx/ccem/.github/workflows/mode2-signed-readiness.yml@refs/heads/main";
 const PRODUCER_WORKFLOW_REF: &str =
-    "Genuifx/claude-code-env-manager/.github/workflows/mode2-signed-producer.yml@refs/heads/main";
+    "Genuifx/ccem/.github/workflows/mode2-signed-producer.yml@refs/heads/main";
 const JOB: &str = "build-desktop";
 
 fn build() -> BuildIdentity<'static> {

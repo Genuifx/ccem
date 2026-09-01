@@ -5,6 +5,11 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { validateInventorySet } from './verify-mode2-release-inventory.mjs';
+import {
+  LEGACY_UNSIGNED_RELEASE_MODE,
+  PRODUCTION_SIGNED_RELEASE_MODE,
+  validateLegacyUnsignedInventorySet,
+} from './verify-legacy-release-inventory.mjs';
 
 export const RELEASE_TARGETS = Object.freeze([
   'aarch64-apple-darwin',
@@ -47,6 +52,16 @@ function validateSourceCommit(value) {
   const exact = required(value, 'source commit');
   if (!/^[a-f0-9]{40}$/u.test(exact)) fail('source commit must be a lowercase 40-character SHA');
   return exact;
+}
+
+function validateReleaseMode(value) {
+  const releaseMode = value === undefined
+    ? PRODUCTION_SIGNED_RELEASE_MODE
+    : required(value, 'release mode');
+  if (![PRODUCTION_SIGNED_RELEASE_MODE, LEGACY_UNSIGNED_RELEASE_MODE].includes(releaseMode)) {
+    fail(`unsupported release mode: ${releaseMode}`);
+  }
+  return releaseMode;
 }
 
 async function readJsonFile(candidate, label) {
@@ -118,6 +133,7 @@ export async function verifyReleasePayloads({
   runAttempt,
   inventoryOutput,
   contractOutput,
+  releaseMode,
 }) {
   const root = path.resolve(required(payloadRoot, 'payload root'));
   const exactVersion = required(version, 'release version');
@@ -125,6 +141,7 @@ export async function verifyReleasePayloads({
   const exactTag = required(tag, 'release tag');
   const exactRunId = validateRunId(runId);
   const exactRunAttempt = validateRunAttempt(runAttempt);
+  const exactReleaseMode = validateReleaseMode(releaseMode);
   await requireExactDirectory(root, 'payload root');
 
   const artifactDirectories = RELEASE_TARGETS.map(
@@ -144,6 +161,21 @@ export async function verifyReleasePayloads({
     const manifest = await readJsonFile(path.join(artifactRoot, 'payload-manifest.json'), `${target} payload manifest`);
     const inventory = await readJsonFile(path.join(artifactRoot, 'inventory.json'), `${target} inventory`);
     const expectedRoles = TARGET_ROLES[target];
+    const releaseModeMatches = exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+      ? manifest?.releaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+        && inventory?.releaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+        && inventory.mode2Included === false
+        && inventory.cefRuntimeVersion === null
+      : (manifest?.releaseMode === undefined
+        || manifest.releaseMode === PRODUCTION_SIGNED_RELEASE_MODE)
+        && (inventory?.releaseMode === undefined
+          || inventory.releaseMode === PRODUCTION_SIGNED_RELEASE_MODE)
+        && inventory.mode2Included === true;
+    const provenanceMatches = exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+      || (
+        inventory.updaterReplacementAttestation?.runId === exactRunId
+        && inventory.updaterReplacementAttestation?.runAttempt === exactRunAttempt
+      );
     if (
       manifest?.schemaVersion !== 1
       || manifest.runId !== exactRunId
@@ -155,12 +187,12 @@ export async function verifyReleasePayloads({
       || inventory?.platform !== target
       || inventory.sourceCommit !== exactSourceCommit
       || inventory.appVersion !== exactVersion
-      || inventory.updaterReplacementAttestation?.runId !== exactRunId
-      || inventory.updaterReplacementAttestation?.runAttempt !== exactRunAttempt
+      || !releaseModeMatches
+      || !provenanceMatches
       || !sameSet(Object.keys(manifest.assets ?? {}), expectedRoles)
       || !sameSet(Object.keys(inventory.artifacts ?? {}), expectedRoles)
     ) {
-      fail(`${target} payload does not bind the current run, tag, version, source, and target`);
+      fail(`${target} payload does not bind the current ${exactReleaseMode} run, tag, version, source, and target`);
     }
     const expectedAssetNames = expectedRoles.map((role) => manifest.assets[role]?.fileName);
     if (expectedAssetNames.some((name) => typeof name !== 'string') || new Set(expectedAssetNames).size !== expectedRoles.length) {
@@ -185,7 +217,9 @@ export async function verifyReleasePayloads({
     contractTargets.push({ target, assets: contractAssets });
   }
 
-  const aggregateInventory = validateInventorySet(inventories, exactVersion, exactSourceCommit);
+  const aggregateInventory = exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+    ? validateLegacyUnsignedInventorySet(inventories, exactVersion, exactSourceCommit)
+    : validateInventorySet(inventories, exactVersion, exactSourceCommit);
   const contract = {
     schemaVersion: 1,
     runId: exactRunId,
@@ -193,6 +227,9 @@ export async function verifyReleasePayloads({
     tag: exactTag,
     sourceCommit: exactSourceCommit,
     appVersion: exactVersion,
+    ...(exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
+      ? { releaseMode: LEGACY_UNSIGNED_RELEASE_MODE }
+      : {}),
     targets: contractTargets,
   };
   await writeJsonAtomically(inventoryOutput, aggregateInventory);
@@ -211,6 +248,7 @@ function parseArgs(argv) {
     ['--run-attempt', 'runAttempt'],
     ['--inventory-output', 'inventoryOutput'],
     ['--contract-output', 'contractOutput'],
+    ['--release-mode', 'releaseMode'],
   ]);
   for (let index = 0; index < argv.length; index += 2) {
     const key = options.get(argv[index]);

@@ -2,70 +2,396 @@ name: Release CLI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+    paths:
+      - 'apps/cli/package.json'
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: 'Exact 40-character protected-main commit to verify without publishing'
+        required: true
+        type: string
+      expected_version:
+        description: 'Exact unpublished ccem version expected at that commit'
+        required: true
+        type: string
 
 concurrency:
-  group: release-cli-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-cli
+  cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
 jobs:
   publish-cli:
-    name: Publish to npm
+    name: ${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && 'Preflight npm Trusted Publisher' || 'Publish to npm' }}
     runs-on: ubuntu-latest
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      npm_config_registry: https://registry.npmjs.org/
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Bind npm publication to a protected release tag
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        id: release-source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_NAME" == "push" ]] || {
+            echo "CLI publication requires a formal tag push." >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "CLI publication requires a stable, alpha, beta, or rc semantic-version tag ref." >&2
+            exit 1
+          }
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "CLI publication requires the selected release tag to be protected." >&2
+            exit 1
+          }
+          if ! main_protection_verified="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/branches/main" \
+              --jq '.protected == true'
+          )"; then
+            echo "Could not verify main branch protection through the GitHub API." >&2
+            exit 1
+          fi
+          [[ "$main_protection_verified" == "true" ]] || {
+            echo "CLI publication requires the main branch to be protected." >&2
+            exit 1
+          }
+
+          release_tag="${GITHUB_REF#refs/tags/}"
+          release_version="${release_tag#v}"
+          package_version="$(node -p "require('./apps/cli/package.json').version")"
+          [[ "$release_version" == "$package_version" ]] || {
+            echo "Release tag ${release_tag} does not match ccem package version ${package_version}." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin "refs/tags/${release_tag}:refs/tags/${release_tag}"
+          git fetch --force --no-tags origin "refs/heads/main:refs/remotes/origin/main"
+          source_commit="$(git rev-parse "${SOURCE_COMMIT}^{commit}")"
+          tag_commit="$(git rev-parse "refs/tags/${release_tag}^{commit}")"
+          [[ "$tag_commit" == "$source_commit" ]] || {
+            echo "Release tag ${release_tag} does not resolve to selected source ${source_commit}." >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main || {
+            echo "CLI release source ${source_commit} is not reachable from origin/main." >&2
+            exit 1
+          }
+          echo "tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${release_version}" >> "$GITHUB_OUTPUT"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '22'
           package-manager-cache: false
+
+      - name: Reject legacy npm token configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${NODE_AUTH_TOKEN+x}" ]]; then
+            echo "npm Trusted Publishing requires NODE_AUTH_TOKEN to be absent." >&2
+            exit 1
+          fi
+
+          npmrc_candidates=()
+          add_npmrc_candidate() {
+            local candidate="${1:-}"
+            local existing
+            [[ -n "$candidate" && "$candidate" != "undefined" && "$candidate" != "null" ]] || return 0
+            if [[ "${#npmrc_candidates[@]}" -gt 0 ]]; then
+              for existing in "${npmrc_candidates[@]}"; do
+                [[ "$existing" == "$candidate" ]] && return 0
+              done
+            fi
+            npmrc_candidates+=("$candidate")
+          }
+
+          if ! npm_userconfig="$(npm config get userconfig)"; then
+            echo "npm Trusted Publishing could not resolve the effective user npmrc path." >&2
+            exit 1
+          fi
+          if ! npm_globalconfig="$(npm config get globalconfig)"; then
+            echo "npm Trusted Publishing could not resolve the effective global npmrc path." >&2
+            exit 1
+          fi
+
+          add_npmrc_candidate "${GITHUB_WORKSPACE}/.npmrc"
+          add_npmrc_candidate "${GITHUB_WORKSPACE}/apps/cli/.npmrc"
+          add_npmrc_candidate "${npm_userconfig}"
+          add_npmrc_candidate "${npm_globalconfig}"
+          add_npmrc_candidate "${HOME:+${HOME}/.npmrc}"
+          add_npmrc_candidate "${NPM_CONFIG_USERCONFIG:-}"
+          add_npmrc_candidate "${npm_config_userconfig:-}"
+          add_npmrc_candidate "${NPM_CONFIG_GLOBALCONFIG:-}"
+          add_npmrc_candidate "${npm_config_globalconfig:-}"
+
+          for npmrc_path in "${npmrc_candidates[@]}"; do
+            [[ -f "$npmrc_path" ]] || continue
+            if grep --extended-regexp --ignore-case --quiet \
+              '^[[:space:]]*[^#;[:space:]][^#;]*registry[.]npmjs[.]org[^#;]*:_authToken[[:space:]]*=' \
+              "$npmrc_path"; then
+              echo "npm Trusted Publishing refuses an npmrc registry auth token entry." >&2
+              exit 1
+            fi
+          done
 
       - name: Setup npm trusted publishing
         run: |
-          npm install -g npm@^11.5.1
+          npm install -g npm@11.5.1 --registry=https://registry.npmjs.org/
           node --version
           npm --version
 
+      - name: Validate exact candidate and npm trusted publisher
+        if: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_SHA_INPUT: ${{ inputs.expected_sha }}
+          EXPECTED_VERSION_INPUT: ${{ inputs.expected_version }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "CLI Trusted Publisher preflight may run only from protected main." >&2
+            exit 1
+          }
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "CLI Trusted Publisher preflight requires branch protection or a ruleset on main." >&2
+            exit 1
+          }
+          package_version="$(node -p "require('./apps/cli/package.json').version")"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            expected_sha="$EXPECTED_SHA_INPUT"
+            expected_version="$EXPECTED_VERSION_INPUT"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            expected_sha="$SOURCE_COMMIT"
+            expected_version="$package_version"
+          else
+            echo "CLI Trusted Publisher preflight requires main push or workflow dispatch." >&2
+            exit 1
+          fi
+          [[ "$expected_sha" =~ ^[a-f0-9]{40}$ && "$expected_sha" == "$SOURCE_COMMIT" ]] || {
+            echo "expected_sha must exactly match the selected 40-character main commit." >&2
+            exit 1
+          }
+          [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "expected_version must be a stable, alpha, beta, or rc semantic version." >&2
+            exit 1
+          }
+
+          checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+          [[ "$checkout_commit" == "$SOURCE_COMMIT" ]] || {
+            echo "Preflight checkout does not match the selected source commit." >&2
+            exit 1
+          }
+          remote_main="$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')"
+          [[ "$remote_main" == "$SOURCE_COMMIT" ]] || {
+            echo "Preflight source is no longer the exact origin/main commit." >&2
+            exit 1
+          }
+
+          [[ "$expected_version" == "$package_version" ]] || {
+            echo "expected_version ${expected_version} does not match ccem package version ${package_version}." >&2
+            exit 1
+          }
+          node scripts/ci/check-release-version.mjs "$expected_version"
+          node scripts/ci/check-npm-publish-metadata.mjs "$GITHUB_REPOSITORY"
+
+          candidate_tag="v${expected_version}"
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${candidate_tag}" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [[ "$tag_status" -eq 0 ]]; then
+            echo "CLI preflight requires an unpublished candidate; ${candidate_tag} already exists." >&2
+            exit 1
+          elif [[ "$tag_status" -ne 2 ]]; then
+            echo "Could not prove that ${candidate_tag} is absent from origin." >&2
+            exit 1
+          fi
+
+          if ! npm_version_status="$(
+            curl --silent --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "https://registry.npmjs.org/ccem/${expected_version}"
+          )"; then
+            echo "Could not query npm for ccem@${expected_version}." >&2
+            exit 1
+          fi
+          if [[ "$npm_version_status" == "200" ]]; then
+            echo "ccem@${expected_version} is already published on npm while ${candidate_tag} is absent." >&2
+            exit 1
+          elif [[ "$npm_version_status" != "404" ]]; then
+            echo "Could not prove ccem@${expected_version} is absent from npm (HTTP ${npm_version_status})." >&2
+            exit 1
+          fi
+
+          [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] || {
+            echo "GitHub OIDC request environment is unavailable." >&2
+            exit 1
+          }
+          if ! oidc_response="$(
+            curl --fail --silent --show-error \
+              --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              --header "Accept: application/json" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org"
+          )"; then
+            echo "Failed to request GitHub OIDC token." >&2
+            exit 1
+          fi
+          if ! oidc_token="$(
+            printf '%s' "$oidc_response" | node -e '
+              let input = "";
+              process.stdin.setEncoding("utf8");
+              process.stdin.on("data", (chunk) => { input += chunk; });
+              process.stdin.on("end", () => {
+                try {
+                  const value = JSON.parse(input)?.value;
+                  if (typeof value !== "string" || value.length === 0) process.exit(1);
+                  process.stdout.write(value);
+                } catch {
+                  process.exit(1);
+                }
+              });
+            '
+          )"; then
+            unset oidc_response
+            echo "GitHub OIDC response did not contain a token." >&2
+            exit 1
+          fi
+          unset oidc_response
+
+          if ! exchange_status="$(
+            curl --silent --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ${oidc_token}" \
+              --header "Accept: application/json" \
+              "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/ccem"
+          )"; then
+            unset oidc_token
+            echo "npm Trusted Publisher OIDC exchange request failed." >&2
+            exit 1
+          fi
+          unset oidc_token
+          [[ "$exchange_status" == "201" ]] || {
+            echo "npm Trusted Publisher OIDC exchange returned HTTP ${exchange_status}." >&2
+            exit 1
+          }
+
+          echo "CLI Trusted Publisher preflight passed for ${candidate_tag} at ${SOURCE_COMMIT}."
+
+      - name: Validate npm trusted publishing identity
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: node scripts/ci/check-npm-publish-metadata.mjs "$GITHUB_REPOSITORY"
+
+      - name: Validate release version consistency
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        env:
+          EXPECTED_VERSION: ${{ steps.release-source.outputs.version }}
+        run: node scripts/ci/check-release-version.mjs "$EXPECTED_VERSION"
+
+      - name: Require successful pre-tag readiness for exact source
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        env:
+          CCEM_RELEASE_READINESS_TOKEN: ${{ github.token }}
+          CCEM_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+        run: node scripts/ci/check-pretag-readiness-runs.mjs
+
+      - name: Recheck protected release refs before CLI build
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CCEM_RELEASE_CANDIDATE_TAG: ${{ steps.release-source.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${GITHUB_TOKEN:-}" ]] || {
+            echo "GITHUB_TOKEN is required before CLI publication." >&2
+            exit 1
+          }
+          selected_release_tag="${GITHUB_REF#refs/tags/}"
+          [[ "$GITHUB_REF" == refs/tags/* && "$CCEM_RELEASE_CANDIDATE_TAG" == "$selected_release_tag" ]] || {
+            echo "Repository settings candidate tag must exactly match the selected release tag." >&2
+            exit 1
+          }
+          node scripts/ci/check-release-repository-settings.mjs \
+            --candidate-tag "$CCEM_RELEASE_CANDIDATE_TAG"
+
       - name: Install dependencies
-        run: pnpm install
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: pnpm install --frozen-lockfile
 
       - name: Build core
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: pnpm --filter @ccem/core build
 
       - name: Test CLI and dependencies
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: pnpm --filter ccem... test:run
 
       - name: Build CLI and dependencies
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         run: pnpm --filter ccem... build
 
       - name: Determine npm tag
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         id: npm-tag
+        env:
+          VERSION: ${{ steps.release-source.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          if [[ "$VERSION" == *"beta"* ]]; then
-            echo "tag=beta" >> $GITHUB_OUTPUT
-          elif [[ "$VERSION" == *"alpha"* ]]; then
-            echo "tag=alpha" >> $GITHUB_OUTPUT
-          elif [[ "$VERSION" == *"rc"* ]]; then
-            echo "tag=rc" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [[ "$VERSION" =~ -beta(\.|$) ]]; then
+            echo "tag=beta" >> "$GITHUB_OUTPUT"
+          elif [[ "$VERSION" =~ -alpha(\.|$) ]]; then
+            echo "tag=alpha" >> "$GITHUB_OUTPUT"
+          elif [[ "$VERSION" =~ -rc(\.|$) ]]; then
+            echo "tag=rc" >> "$GITHUB_OUTPUT"
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "Unsupported npm release channel for version ${VERSION}." >&2
+            exit 1
           fi
-          echo "Publishing with tag: $(cat $GITHUB_OUTPUT | grep tag | cut -d= -f2)"
 
       - name: Publish ccem (CLI)
-        run: |
-          cd apps/cli
-          npm publish --no-git-checks --tag ${{ steps.npm-tag.outputs.tag }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        working-directory: apps/cli
+        run: >-
+          npm publish
+          --registry=https://registry.npmjs.org/
+          --tag ${{ steps.npm-tag.outputs.tag }}

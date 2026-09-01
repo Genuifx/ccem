@@ -5,7 +5,6 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { DraftReleaseClient, exactAssetsNamed } from './github-draft-release-api.mjs';
-import { verifyImmutableReleasesEnabled } from './verify-immutable-releases-enabled.mjs';
 
 const TARGETS = [
   'aarch64-apple-darwin',
@@ -213,14 +212,15 @@ export async function publishDraftGithubRelease({
   requireImmutableReleasePolicy,
 }) {
   if (desiredDraft !== true && desiredDraft !== false) fail('desired draft state must be boolean');
-  if (!desiredDraft && typeof requireImmutableReleasePolicy !== 'function') {
-    fail('immutable release preflight is required for publication');
-  }
   if (!desiredDraft) {
-    // Recheck both mutable external policies after the signed build and asset
-    // uploads. The exact draft GET remains the final awaited request before PATCH.
+    // Recheck the mutable tag after the build and asset uploads. When supplied,
+    // an additional policy callback may run here, but publication does not require
+    // a long-lived repository-administration token. The GitHub publication response
+    // itself must still report immutable=true before this function can succeed.
     await client.requireExpectedTagCommit();
-    await requireImmutableReleasePolicy();
+    if (typeof requireImmutableReleasePolicy === 'function') {
+      await requireImmutableReleasePolicy();
+    }
   }
   // Contract files are loaded before this function. This exact id + tag GET is
   // the final awaited operation before PATCH, and it also gates the exact asset set.
@@ -264,12 +264,6 @@ async function main() {
     client,
     desiredDraft: desired === 'true',
     expectedAssets,
-    requireImmutableReleasePolicy: desired === 'false'
-      ? () => verifyImmutableReleasesEnabled({
-        repository: process.env.GITHUB_REPOSITORY,
-        token: process.env.CCEM_RELEASE_SETTINGS_TOKEN,
-      })
-      : undefined,
   });
   process.stdout.write(`[publish-draft-github-release] ${result.state}\n`);
 }

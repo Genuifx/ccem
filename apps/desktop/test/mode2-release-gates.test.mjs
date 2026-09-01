@@ -286,7 +286,7 @@ test('Mode 2 macOS signing requires complete Developer ID and notarization crede
   }), /exact official Developer ID Application identity/);
 });
 
-test('release mode permits Preview only with zero Apple signing values and gates production on both platforms', () => {
+test('release mode permits legacy unsigned only with zero platform signing values and gates production on both platforms', () => {
   const previewEnvironment = { ...macEnvironment, ...windowsEnvironment };
   for (const name of [
     'APPLE_CERTIFICATE',
@@ -298,13 +298,22 @@ test('release mode permits Preview only with zero Apple signing values and gates
     'APPLE_NOTARY_API_PRIVATE_KEY',
     'APPLE_NOTARY_API_KEY_ID',
     'APPLE_NOTARY_API_ISSUER',
+    'WINDOWS_CERTIFICATE',
+    'WINDOWS_CERTIFICATE_PASSWORD',
+    'WINDOWS_CERTIFICATE_THUMBPRINT',
+    'WINDOWS_TIMESTAMP_URL',
+    'CCEM_OFFICIAL_WINDOWS_PUBLISHER',
   ]) previewEnvironment[name] = '';
-  assert.deepEqual(detectReleaseMode(previewEnvironment), { mode: 'preview', production: false });
+  assert.deepEqual(
+    detectReleaseMode(previewEnvironment),
+    { mode: 'legacy-unsigned', production: false },
+  );
   assert.throws(
     () => detectReleaseMode({ ...previewEnvironment, APPLE_CERTIFICATE: 'partial' }),
-    /incomplete; refusing Preview fallback/,
+    /partial; refusing unsigned fallback/,
   );
-  assert.throws(() => detectReleaseMode(macEnvironment), /WINDOWS_CERTIFICATE is required/);
+  assert.throws(() => detectReleaseMode(macEnvironment), /partial; refusing unsigned fallback/);
+  assert.throws(() => detectReleaseMode(windowsEnvironment), /partial; refusing unsigned fallback/);
   assert.deepEqual(
     detectReleaseMode({ ...macEnvironment, ...windowsEnvironment }),
     { mode: 'production', production: true },

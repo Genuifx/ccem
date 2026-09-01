@@ -30,7 +30,7 @@ const updateInfo = {
   currentVersion: '2.10.0',
   channel: 'stable',
   releaseTag: 'v2.11.0',
-  releaseUrl: 'https://github.com/Genuifx/claude-code-env-manager/releases/tag/v2.11.0',
+  releaseUrl: 'https://github.com/Genuifx/ccem/releases/tag/v2.11.0',
   date: null,
   body: null,
 };

@@ -295,25 +295,43 @@ test('attestation writes atomically with private permissions', async (t) => {
   assert.deepEqual((await fs.readdir(root)).filter((name) => name.includes('.tmp-')), []);
 });
 
-test('signed producer imports once, pre-signs CEF, and has no unsigned fallback', async () => {
+test('desktop producer keeps production CEF signing strict and legacy mode preselected', async () => {
   const workflow = await fs.readFile(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml'), 'utf8');
   const importIndex = workflow.indexOf('uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466');
   const prepareIndex = workflow.indexOf('node scripts/stage-cef-macos.mjs --prepare-for-signing');
   const signIndex = workflow.indexOf('node scripts/sign-and-attest-cef-macos.mjs');
   const signedActionIndex = workflow.indexOf('- name: Build production bundles without release access');
-  const signedActionEndIndex = workflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage and production behavior');
+  const legacyActionIndex = workflow.indexOf('- name: Build legacy unsigned bundles with Mode 2 excluded');
+  const legacyActionEndIndex = workflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage and production behavior');
   assert.ok(importIndex > 0 && importIndex < prepareIndex && prepareIndex < signIndex && signIndex < signedActionIndex);
-  assert.ok(signedActionEndIndex > signedActionIndex);
+  assert.ok(signedActionIndex < legacyActionIndex && legacyActionIndex < legacyActionEndIndex);
   const signedAction = workflow.slice(
     signedActionIndex,
-    signedActionEndIndex,
+    legacyActionIndex,
   );
+  const legacyAction = workflow.slice(legacyActionIndex, legacyActionEndIndex);
   assert.doesNotMatch(signedAction, /APPLE_CERTIFICATE(?:_PASSWORD)?:/);
   assert.match(signedAction, /CCEM_CEF_TARGET_TRIPLE: \$\{\{ matrix\.target \}\}/);
+  assert.match(signedAction, /needs\.release-mode\.outputs\.production == 'true'/u);
+  assert.doesNotMatch(signedAction, /continue-on-error|failure\(\)|legacyArgs/u);
+  assert.match(legacyAction, /needs\.release-mode\.outputs\.production != 'true'/u);
+  assert.match(legacyAction, /args: \$\{\{ matrix\.legacyArgs \}\}/u);
+  assert.doesNotMatch(
+    legacyAction,
+    /steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)|CCEM_CEF_TARGET_TRIPLE/u,
+    'production build failure must not switch the already-selected release mode',
+  );
   assert.match(workflow, /aarch64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
   assert.match(workflow, /x86_64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
-  assert.doesNotMatch(workflow, /Build unsigned Preview-only macOS bundles/);
-  assert.doesNotMatch(workflow, /unsignedArgs:/);
+  const legacyArgs = workflow.match(/^\s+legacyArgs:.*$/gmu) ?? [];
+  assert.equal(legacyArgs.length, 3);
+  for (const args of legacyArgs) {
+    assert.doesNotMatch(args, /tauri\.cef\.conf\.json|tauri\.windows-signing\.conf\.json/u);
+  }
+  assert.match(workflow, /Prove legacy macOS bundles exclude Mode 2/u);
+  assert.match(workflow, /Prove legacy Windows bundle excludes Mode 2/u);
+  assert.match(workflow, /verify-legacy-release-inventory\.mjs/u);
+  assert.doesNotMatch(workflow, /Build unsigned Preview-only macOS bundles|unsignedArgs:/u);
 });
 
 test('signer has one fixed signing executable and no Keychain or notarization commands', async () => {

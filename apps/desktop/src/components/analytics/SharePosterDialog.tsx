@@ -72,7 +72,7 @@ interface PosterCardProps {
 
 /* ── Constants ── */
 
-const GITHUB_URL = 'https://github.com/Genuifx/claude-code-env-manager';
+const GITHUB_URL = 'https://github.com/Genuifx/ccem';
 const POSTER_W = 440;
 const POSTER_H = 720;
 const PREVIEW_SCALE_CAP = 0.78;
@@ -1030,7 +1030,7 @@ function PosterCard({
                 fontFamily: "'JetBrains Mono', monospace",
               }}
             >
-              github.com/Genuifx/claude-code-env-manager
+              github.com/Genuifx/ccem
             </div>
           </div>
           <div style={{ padding: 4, borderRadius: 8, background: tc.qrBg }}>

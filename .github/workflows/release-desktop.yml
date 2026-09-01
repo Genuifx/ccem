@@ -34,11 +34,15 @@ jobs:
     name: Prepare Exact Tagged Release
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
     outputs:
       release_body: ${{ steps.release-notes.outputs.release_body }}
+      legacy_release_body: ${{ steps.release-notes.outputs.legacy_release_body }}
       current_tag: ${{ steps.release-notes.outputs.current_tag }}
       version: ${{ steps.release-notes.outputs.version }}
+      prerelease: ${{ steps.release-notes.outputs.prerelease }}
+      previous_desktop_tag: ${{ steps.release-notes.outputs.previous_desktop_tag }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -96,6 +100,8 @@ jobs:
       - name: Generate release body
         id: release-notes
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
@@ -108,10 +114,15 @@ jobs:
             fi
             current_tag="v${version}"
           fi
-          [[ "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
-            echo "Desktop release requires a formal semantic-version tag." >&2
+          [[ "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "Desktop release requires a stable, alpha, beta, or rc semantic-version tag." >&2
             exit 1
           }
+          if [[ "$current_tag" =~ -(alpha|beta|rc)(\.|$) ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
 
           git fetch --force --no-tags origin "refs/tags/${current_tag}:refs/tags/${current_tag}" || {
             echo "Release tag ${current_tag} must exist before desktop release builds start" >&2
@@ -124,10 +135,35 @@ jobs:
             exit 1
           }
 
-          previous_tag="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          previous_tag="$(
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${GITHUB_REPOSITORY}/releases/latest" \
+              --jq '.tag_name'
+          )"
+          [[ "$previous_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Latest published Desktop release is not a stable semantic-version tag: ${previous_tag}" >&2
+            exit 1
+          }
+          [[ "$previous_tag" != "$current_tag" ]] || {
+            echo "Latest published Desktop release already uses ${current_tag}." >&2
+            exit 1
+          }
+          git fetch --force --no-tags origin "refs/tags/${previous_tag}:refs/tags/${previous_tag}" || {
+            echo "Latest published Desktop release tag ${previous_tag} is missing from origin." >&2
+            exit 1
+          }
+          previous_commit="$(git rev-parse "refs/tags/${previous_tag}^{commit}")"
+          git merge-base --is-ancestor "$previous_commit" "$source_commit" || {
+            echo "Latest published Desktop release ${previous_tag} is not an ancestor of ${source_commit}." >&2
+            exit 1
+          }
           version="${current_tag#v}"
           echo "current_tag=${current_tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "previous_desktop_tag=${previous_tag}" >> "$GITHUB_OUTPUT"
 
           delimiter="CCEM_RELEASE_BODY_$(date +%s)"
           {
@@ -157,6 +193,39 @@ jobs:
             echo "${delimiter}"
           } >> "$GITHUB_OUTPUT"
 
+          legacy_delimiter="CCEM_LEGACY_RELEASE_BODY_$(date +%s)"
+          {
+            echo "legacy_release_body<<${legacy_delimiter}"
+            echo "## CCEM Desktop v${version}"
+            echo
+            echo "### Downloads"
+            echo "- **Apple Silicon (M1/M2/M3/M4)**: \`CCEM-Desktop_*_aarch64.dmg\`"
+            echo "- **Intel Mac**: \`CCEM-Desktop_*_x64.dmg\`"
+            echo "- **Windows (x64)**: \`CCEM Desktop_*_x64-setup.exe\`"
+            echo
+            echo "### CLI"
+            echo '```bash'
+            echo "npm install -g ccem@${version}"
+            echo '```'
+            echo
+            echo "### Desktop trust and browser availability"
+            echo "These Desktop artifacts use the legacy unsigned distribution path. CEF Mode 2 is excluded and unavailable; browser sessions use Preview Browser behavior only."
+            echo "On macOS, if Gatekeeper blocks the app, clear quarantine after installing:"
+            echo
+            echo '```bash'
+            echo 'xattr -c /Applications/CCEM\ Desktop.app'
+            echo '```'
+            echo
+            echo "### Commits"
+            if [[ -n "$previous_tag" ]]; then
+              git log "${previous_tag}..${GITHUB_SHA}" --reverse --pretty=format:'- %s (%h)'
+            else
+              git log --reverse --pretty=format:'- %s (%h)'
+            fi
+            echo
+            echo "${legacy_delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Validate release version consistency
         env:
           EXPECTED_VERSION: ${{ steps.release-notes.outputs.version }}
@@ -165,13 +234,20 @@ jobs:
       - name: Verify pinned browser runtime manifests
         run: node scripts/ci/check-browser-runtime-manifests.mjs
 
-      - name: Require immutable GitHub Releases before signed build
+      - name: Require successful pre-tag readiness for exact source
         env:
-          CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
-        run: node apps/desktop/scripts/verify-immutable-releases-enabled.mjs
+          CCEM_RELEASE_READINESS_TOKEN: ${{ github.token }}
+          CCEM_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+        run: node scripts/ci/check-pretag-readiness-runs.mjs
+
+      - name: Require protected release refs before desktop build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CCEM_RELEASE_CANDIDATE_TAG: ${{ steps.release-notes.outputs.current_tag }}
+        run: node scripts/ci/check-release-repository-settings.mjs
 
   signed-producer:
-    name: Produce Exact Signed Desktop Evidence and Payloads
+    name: Produce Exact Desktop Evidence and Payloads
     needs: prepare-release
     if: ${{ !cancelled() && needs.prepare-release.result == 'success' }}
     permissions:
@@ -182,11 +258,24 @@ jobs:
       version: ${{ needs.prepare-release.outputs.version }}
       source_commit: ${{ github.sha }}
       caller_workflow_ref: ${{ github.workflow_ref }}
+      previous_release_tag: ${{ needs.prepare-release.outputs.previous_desktop_tag }}
       export_release_payload: true
       release_tag: ${{ needs.prepare-release.outputs.current_tag }}
+    secrets:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_NOTARY_API_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_API_PRIVATE_KEY }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   dsh_bundle_smoke:
-    name: Verify DSH in Exact Signed Payload (${{ matrix.target }})
+    name: Verify DSH in Exact Desktop Payload (${{ matrix.target }})
     needs: signed-producer
     if: ${{ !cancelled() && needs.signed-producer.result == 'success' }}
     runs-on: ${{ matrix.runner }}
@@ -219,7 +308,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Download this attempt's exact signed target payload
+      - name: Download this attempt's exact target payload
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: mode2-release-payload-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
@@ -243,7 +332,7 @@ jobs:
           )"
           updater_path="release-payload/${updater_relative}"
           [[ -f "$updater_path" ]] || {
-            echo "Signed macOS updater payload is missing: $updater_path" >&2
+            echo "macOS updater payload is missing: $updater_path" >&2
             exit 1
           }
           extract_root="$RUNNER_TEMP/dsh-payload-${{ matrix.target }}"
@@ -253,7 +342,7 @@ jobs:
           shopt -s nullglob
           app_matches=("$extract_root"/*.app)
           if [[ "${#app_matches[@]}" -ne 1 ]]; then
-            echo "Expected exactly one app in signed updater payload; found ${#app_matches[@]}" >&2
+            echo "Expected exactly one app in updater payload; found ${#app_matches[@]}" >&2
             printf '%s\n' "${app_matches[@]}" >&2
             exit 1
           fi
@@ -274,12 +363,12 @@ jobs:
           }
           $installer = Join-Path $payloadRoot ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
           if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-            throw "Signed Windows updater payload is missing: $installer"
+            throw "Windows updater payload is missing: $installer"
           }
           $evidence = Join-Path $env:RUNNER_TEMP "dsh-bundle-smoke-${{ matrix.target }}.json"
           node apps/desktop/scripts/verify-dsh-bundle-smoke.mjs --nsis-installer $installer --evidence $evidence
 
-      - name: Retain DSH signed-payload smoke evidence
+      - name: Retain DSH payload smoke evidence
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: dsh-bundle-smoke-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
@@ -354,8 +443,8 @@ jobs:
             echo "Desktop release requires the main branch to remain protected." >&2
             exit 1
           }
-          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
-            echo "Desktop release requires a formal semantic-version tag." >&2
+          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9A-Za-z-]+)*)?$ ]] || {
+            echo "Desktop release requires a stable, alpha, beta, or rc semantic-version tag." >&2
             exit 1
           }
           git fetch --force --no-tags origin \
@@ -384,6 +473,7 @@ jobs:
           --tag "${TAG_NAME}"
           --run-id "${GITHUB_RUN_ID}"
           --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --release-mode "${{ needs.signed-producer.outputs.release_mode }}"
           --inventory-output release-payloads/verified-release-inventory.json
           --contract-output release-payloads/verified-payload-contract.json
 
@@ -393,9 +483,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
           RELEASE_NAME: CCEM v${{ needs.prepare-release.outputs.version }}
-          RELEASE_BODY: ${{ needs.prepare-release.outputs.release_body }}
+          RELEASE_BODY: ${{ needs.signed-producer.outputs.release_mode == 'production' && needs.prepare-release.outputs.release_body || needs.prepare-release.outputs.legacy_release_body }}
           SOURCE_COMMIT: ${{ github.sha }}
-          PRERELEASE: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          PRERELEASE: ${{ needs.prepare-release.outputs.prerelease }}
           ALLOW_STALE_DRAFT_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.recover_stale_draft || 'false' }}
         run: node apps/desktop/scripts/ensure-draft-github-release.mjs
 
@@ -441,7 +531,6 @@ jobs:
       - name: Verify exact nine assets and publish the locked draft
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CCEM_RELEASE_SETTINGS_TOKEN: ${{ secrets.CCEM_RELEASE_SETTINGS_TOKEN }}
           TAG_NAME: ${{ needs.prepare-release.outputs.current_tag }}
           EXPECTED_RELEASE_ID: ${{ steps.draft-release.outputs.release_id }}
           EXPECTED_RELEASE_OWNER_RUN_ID: ${{ steps.draft-release.outputs.release_owner_run_id }}

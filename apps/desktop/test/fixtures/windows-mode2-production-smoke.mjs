@@ -6,7 +6,7 @@ import {
 } from '../../scripts/windows-mode2-production-smoke-contract.mjs';
 
 const sourceCommit = 'a'.repeat(40);
-const repository = 'Genuifx/claude-code-env-manager';
+const repository = 'Genuifx/ccem';
 const workflowRef =
   `${repository}/.github/workflows/mode2-signed-readiness.yml@refs/heads/main`;
 const producerWorkflowRef =

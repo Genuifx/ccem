@@ -11,12 +11,12 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/ccem"><img src="https://img.shields.io/npm/v/ccem.svg" alt="npm version" /></a>
-  <a href="https://github.com/Genuifx/claude-code-env-manager/stargazers"><img src="https://img.shields.io/github/stars/Genuifx/claude-code-env-manager" alt="GitHub stars" /></a>
-  <a href="https://github.com/Genuifx/claude-code-env-manager/releases"><img src="https://img.shields.io/github/v/release/Genuifx/claude-code-env-manager" alt="GitHub release" /></a>
-  <a href="https://github.com/Genuifx/claude-code-env-manager/actions/workflows/release-desktop.yml"><img src="https://github.com/Genuifx/claude-code-env-manager/actions/workflows/release-desktop.yml/badge.svg" alt="Release Desktop" /></a>
-  <a href="https://deepwiki.com/Genuifx/claude-code-env-manager"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <a href="https://github.com/Genuifx/claude-code-env-manager/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/ccem.svg" alt="license" /></a>
-  <a href="https://github.com/Genuifx/claude-code-env-manager/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
+  <a href="https://github.com/Genuifx/ccem/stargazers"><img src="https://img.shields.io/github/stars/Genuifx/ccem" alt="GitHub stars" /></a>
+  <a href="https://github.com/Genuifx/ccem/releases"><img src="https://img.shields.io/github/v/release/Genuifx/ccem" alt="GitHub release" /></a>
+  <a href="https://github.com/Genuifx/ccem/actions/workflows/release-desktop.yml"><img src="https://github.com/Genuifx/ccem/actions/workflows/release-desktop.yml/badge.svg" alt="Release Desktop" /></a>
+  <a href="https://deepwiki.com/Genuifx/ccem"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
+  <a href="https://github.com/Genuifx/ccem/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/ccem.svg" alt="license" /></a>
+  <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
 ![Shot](./screenshots/shots.webp)
@@ -129,7 +129,7 @@ ccem dev              # 用 dev 权限模式启动 Claude Code
 
 ### Desktop
 
-从 [GitHub Releases](https://github.com/Genuifx/claude-code-env-manager/releases) 下载：
+从 [GitHub Releases](https://github.com/Genuifx/ccem/releases) 下载：
 
 - **macOS**：`.dmg`（Apple Silicon / Intel）
 - **Windows**：`.exe` 安装包（x64）
@@ -295,7 +295,7 @@ ccem load https://your-server.com/api/env --key YOUR_KEY --secret YOUR_SECRET
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/Genuifx/claude-code-env-manager/releases) 下载：
+从 [GitHub Releases](https://github.com/Genuifx/ccem/releases) 下载：
 
 - **Windows x64**：`CCEM Desktop_*_x64-setup.exe`
 - **macOS（Apple Silicon / Intel）**：`.dmg` — macOS 10.15+
