@@ -2,7 +2,7 @@
 
 require 'psych'
 
-def walk_yaml(node, file, errors)
+def walk_yaml(node, file, errors, parent_key = nil)
   case node
   when Psych::Nodes::Document
     walk_yaml(node.root, file, errors)
@@ -11,13 +11,15 @@ def walk_yaml(node, file, errors)
     node.children.each_slice(2) do |key_node, value_node|
       if key_node.is_a?(Psych::Nodes::Scalar)
         key = key_node.value
-        if seen.key?(key)
-          errors << "#{file}:#{key_node.start_line + 1}: duplicate YAML key #{key.inspect}"
+        identity = parent_key == 'env' ? key.upcase : key
+        if seen.key?(identity)
+          label = parent_key == 'env' ? 'duplicate GitHub Actions env key' : 'duplicate YAML key'
+          errors << "#{file}:#{key_node.start_line + 1}: #{label} #{key.inspect}"
         else
-          seen[key] = key_node.start_line
+          seen[identity] = key_node.start_line
         end
       end
-      walk_yaml(value_node, file, errors)
+      walk_yaml(value_node, file, errors, key_node.is_a?(Psych::Nodes::Scalar) ? key_node.value : nil)
     end
   when Psych::Nodes::Sequence
     node.children.each { |child| walk_yaml(child, file, errors) }

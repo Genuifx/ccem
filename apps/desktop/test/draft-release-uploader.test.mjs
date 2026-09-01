@@ -477,6 +477,15 @@ test('release workflow has no duplicate YAML mapping keys', async (t) => {
   const rejected = spawnSync('ruby', [checker, duplicate], { encoding: 'utf8' });
   assert.equal(rejected.status, 1);
   assert.match(rejected.stderr, /duplicate YAML key "uses"/u);
+
+  const duplicateEnv = path.join(root, 'duplicate-env.yml');
+  await fs.writeFile(
+    duplicateEnv,
+    'jobs:\n  publish:\n    env:\n      NPM_CONFIG_REGISTRY: first\n      npm_config_registry: second\n',
+  );
+  const envRejected = spawnSync('ruby', [checker, duplicateEnv], { encoding: 'utf8' });
+  assert.equal(envRejected.status, 1);
+  assert.match(envRejected.stderr, /duplicate GitHub Actions env key "npm_config_registry"/u);
 });
 
 test('target uploader stops when the exact release becomes published', async (t) => {

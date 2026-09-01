@@ -295,6 +295,8 @@ test('final non-publishing gate rejects readiness evidence after origin/main mov
 test('readiness caller is release-commit-or-manual, main-and-SHA-bound, and has no release capability', async () => {
   const source = await workflow('mode2-signed-readiness.yml');
   assert.match(source, /^name: Desktop Release Readiness$/mu);
+  assert.match(source, /- '\.github\/workflows\/mode2-signed-readiness\.yml'/u);
+  assert.match(source, /- '\.github\/workflows\/mode2-signed-producer\.yml'/u);
   assert.match(source, /^on:\n  push:\n\s+branches:\n\s+- main/mu);
   assert.match(source, /^  workflow_dispatch:/mu);
   assert.doesNotMatch(source, /^  workflow_call:/mu);

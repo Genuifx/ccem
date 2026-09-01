@@ -8,6 +8,9 @@ on:
       - 'v*'
     paths:
       - 'apps/cli/package.json'
+      - '.github/workflows/release-cli.yml'
+      - 'scripts/ci/check-npm-publish-metadata.mjs'
+      - 'scripts/ci/check-release-repository-settings.mjs'
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -34,7 +37,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      npm_config_registry: https://registry.npmjs.org/
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

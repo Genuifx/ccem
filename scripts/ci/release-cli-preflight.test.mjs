@@ -290,7 +290,8 @@ test('workflow keeps the preflight on fixed actions and minimum OIDC permissions
   );
   assert.match(workflowSource, /node-version:\s*'22'/u);
   assert.match(workflowSource, /NPM_CONFIG_REGISTRY: https:\/\/registry\.npmjs\.org\//u);
-  assert.match(workflowSource, /npm_config_registry: https:\/\/registry\.npmjs\.org\//u);
+  assert.doesNotMatch(workflowSource, /^\s+npm_config_registry:/mu);
+  assert.match(workflowSource, /- '\.github\/workflows\/release-cli\.yml'/u);
   assert.match(
     workflowSource,
     /npm install (?:--global|-g) npm@11\.5\.1 --registry=https:\/\/registry\.npmjs\.org\//u,
