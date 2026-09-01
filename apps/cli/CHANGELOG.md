@@ -1,5 +1,11 @@
 # ccem
 
+## 2.78.0
+
+### Minor Changes
+
+- Release desktop native queued prompt lifecycle improvements.
+
 ## 2.77.0
 
 ### Minor Changes
