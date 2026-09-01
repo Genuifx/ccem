@@ -721,6 +721,7 @@ mod tests {
                 SessionEventPayload::UserPrompt {
                     text: "next turn".to_string(),
                     image_count: 0,
+                    client_message_id: None,
                     images: None,
                     annotations: None,
                     canonical_hash: None,

@@ -22,7 +22,7 @@ function sliceBetween(source, startNeedle, endNeedle) {
 
 test('composer submit reads live DOM text and attachment ref to avoid paste/submit races', async () => {
   const source = await readComposerSource();
-  const submitBlock = sliceBetween(source, 'const handleComposerSubmit = useCallback', 'const hasComposerAttentionPanel');
+  const submitBlock = sliceBetween(source, 'const runComposerSubmit = useCallback', 'const handleComposerSubmit = useCallback');
 
   assert.match(
     submitBlock,
@@ -40,7 +40,7 @@ test('composer submit reads live DOM text and attachment ref to avoid paste/subm
 
 test('composer submit clears the live PromptArea DOM after a successful send', async () => {
   const source = await readComposerSource();
-  const submitBlock = sliceBetween(source, 'const handleComposerSubmit = useCallback', 'const hasComposerAttentionPanel');
+  const submitBlock = sliceBetween(source, 'const runComposerSubmit = useCallback', 'const handleComposerSubmit = useCallback');
   const successIndex = submitBlock.indexOf('if (result !== false) {');
   const clearIndex = submitBlock.indexOf('promptAreaRef.current?.clear();');
   const attachmentResetIndex = submitBlock.indexOf('setAttachments([]);');
@@ -54,7 +54,7 @@ test('composer submit clears the live PromptArea DOM after a successful send', a
 
 test('composer submit refreshes skills only for potential references before resolving selected skill files', async () => {
   const source = await readComposerSource();
-  const submitBlock = sliceBetween(source, 'const handleComposerSubmit = useCallback', 'const hasComposerAttentionPanel');
+  const submitBlock = sliceBetween(source, 'const runComposerSubmit = useCallback', 'const handleComposerSubmit = useCallback');
   const refreshIndex = submitBlock.indexOf('await onRefreshSkills()');
   const resolveIndex = submitBlock.indexOf('selectedSkillFilesFromComposerText(promptValue, provider, latestInstalledSkills, workspaceCommands)');
 
@@ -70,7 +70,7 @@ test('composer submit refreshes skills only for potential references before reso
 
 test('composer submit surfaces selected skill read failures instead of sending raw slash prompts', async () => {
   const source = await readComposerSource();
-  const submitBlock = sliceBetween(source, 'const handleComposerSubmit = useCallback', 'const hasComposerAttentionPanel');
+  const submitBlock = sliceBetween(source, 'const runComposerSubmit = useCallback', 'const handleComposerSubmit = useCallback');
 
   assert.match(submitBlock, /toast\.error\(t\('workspace\.composerSkillReadFailed'\)\);/);
   assert.match(submitBlock, /return false;/);

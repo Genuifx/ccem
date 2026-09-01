@@ -461,6 +461,355 @@ test('head rebase consumes events that confirm the optimistic prompt in the same
   );
 });
 
+test('queued prompt stays outside the transcript until persisted admission then appears once', async () => {
+  const mod = await importTranscriptModule();
+  const queuedPrompt = {
+    id: 'client-message-queued-1',
+    text: 'follow up once',
+    timestamp: BASE_TS + 1_500,
+    afterEventSeq: 1,
+    deferUntilPersisted: true,
+    queuedBehindTurn: true,
+    queuedDeliveryState: 'pending',
+  };
+  const seed = [];
+  const initialEvents = [
+    ev(1, { type: 'assistant_chunk', text: 'active answer part one. ' }),
+  ];
+  let replayToken = { revision: 1 };
+  let state = mod.deriveTranscriptReset(
+    seed,
+    [],
+    initialEvents,
+    null,
+    { tokens: { seedMessages: seed, prompts: replayToken } },
+  );
+
+  const assertQueuedPromptAbsent = () => {
+    const messages = mod.finalizeTranscriptMessages(state);
+    assert.equal(
+      messages.filter((message) => message.uuid === queuedPrompt.id).length,
+      0,
+      'backend-owned queued prompts belong to the composer queue, not the transcript',
+    );
+  };
+
+  assertQueuedPromptAbsent();
+
+  const streamingEvents = [
+    ...initialEvents,
+    ev(2, { type: 'system_message', message: 'still working' }),
+    ev(3, { type: 'assistant_chunk', text: 'part two.' }),
+  ];
+  for (let end = 2; end <= streamingEvents.length; end += 1) {
+    replayToken = { revision: end };
+    state = mod.rebaseTranscriptHead(
+      state,
+      seed,
+      streamingEvents.slice(0, end),
+      [],
+      { seedMessages: seed, prompts: replayToken },
+    );
+    assertQueuedPromptAbsent();
+  }
+
+  const confirmedEvents = [
+    ...streamingEvents,
+    ev(4, {
+      type: 'user_prompt',
+      text: queuedPrompt.text,
+      image_count: 0,
+      client_message_id: queuedPrompt.id,
+    }),
+  ];
+  state = mod.rebaseTranscriptHead(
+    state,
+    seed,
+    confirmedEvents,
+    [],
+    { seedMessages: seed, prompts: { revision: 4 } },
+  );
+  const confirmedMessages = mod.finalizeTranscriptMessages(state);
+
+  assert.deepEqual(
+    confirmedMessages.map((message) => message.msgType),
+    ['assistant', 'user'],
+  );
+  assert.equal(
+    confirmedMessages.filter((message) => message.content === queuedPrompt.text).length,
+    1,
+    'persisted confirmation must replace the optimistic row, not add another row',
+  );
+  assert.equal(confirmedMessages[1].uuid, 'user-prompt-4');
+});
+
+test('same-text queued prompts converge independently by client message id', async () => {
+  const mod = await importTranscriptModule();
+  const seed = [];
+  const first = {
+    id: 'client-repeat-first',
+    text: 'repeat this',
+    afterEventSeq: 1,
+    deferUntilPersisted: true,
+  };
+  const second = {
+    id: 'client-repeat-second',
+    text: 'repeat this',
+    afterEventSeq: 1,
+    deferUntilPersisted: true,
+  };
+  const activeEvents = [
+    ev(1, { type: 'assistant_chunk', text: 'active answer' }),
+    ev(2, { type: 'assistant_chunk', text: ' continues' }),
+  ];
+  let state = mod.deriveTranscriptReset(
+    seed,
+    [first, second],
+    activeEvents,
+    null,
+    { tokens: { seedMessages: seed, prompts: { revision: 1 } } },
+  );
+
+  for (const prompt of [first, second]) {
+    assert.equal(
+      mod.finalizeTranscriptMessages(state).filter((message) => message.uuid === prompt.id).length,
+      1,
+    );
+  }
+
+  const firstConfirmedEvents = [
+    ...activeEvents,
+    ev(3, {
+      type: 'user_prompt',
+      text: first.text,
+      image_count: 0,
+      client_message_id: first.id,
+    }),
+  ];
+  state = mod.rebaseTranscriptHead(
+    state,
+    seed,
+    firstConfirmedEvents,
+    [second],
+    { seedMessages: seed, prompts: { revision: 2 } },
+  );
+  let messages = mod.finalizeTranscriptMessages(state);
+  assert.deepEqual(
+    messages.filter((message) => message.msgType === 'user').map((message) => message.uuid),
+    ['user-prompt-3', second.id],
+  );
+
+  const bothConfirmedEvents = [
+    ...firstConfirmedEvents,
+    ev(4, {
+      type: 'user_prompt',
+      text: second.text,
+      image_count: 0,
+      client_message_id: second.id,
+    }),
+  ];
+  state = mod.rebaseTranscriptHead(
+    state,
+    seed,
+    bothConfirmedEvents,
+    [],
+    { seedMessages: seed, prompts: { revision: 3 } },
+  );
+  messages = mod.finalizeTranscriptMessages(state);
+  assert.deepEqual(
+    messages.filter((message) => message.msgType === 'user').map((message) => message.uuid),
+    ['user-prompt-3', 'user-prompt-4'],
+  );
+});
+
+test('image-only queued prompt converges by client message id across storage representations', async () => {
+  const mod = await importTranscriptModule();
+  const seed = [];
+  const queuedPrompt = {
+    id: 'client-image-only',
+    text: '[Image #1]',
+    images: [{
+      mediaType: 'image/png',
+      base64Data: 'aW1hZ2UtYnl0ZXM=',
+      placeholder: '[Image #1]',
+    }],
+    afterEventSeq: 1,
+    deferUntilPersisted: true,
+  };
+  const activeEvents = [
+    ev(1, { type: 'assistant_chunk', text: 'finishing the active turn' }),
+  ];
+  let state = mod.deriveTranscriptReset(
+    seed,
+    [queuedPrompt],
+    activeEvents,
+    null,
+    { tokens: { seedMessages: seed, prompts: { revision: 1 } } },
+  );
+
+  assert.equal(
+    mod.finalizeTranscriptMessages(state).filter((message) => message.uuid === queuedPrompt.id).length,
+    1,
+  );
+
+  const confirmedEvents = [
+    ...activeEvents,
+    ev(2, {
+      type: 'user_prompt',
+      text: queuedPrompt.text,
+      image_count: 1,
+      client_message_id: queuedPrompt.id,
+      images: [{
+        mediaType: 'image/png',
+        storagePath: '/persisted/image.png',
+        sha256: 'persisted-image-hash',
+        placeholder: '[Image #1]',
+      }],
+    }),
+  ];
+  const pendingPrompts = mod.filterConfirmedLocalUserPrompts(
+    [queuedPrompt],
+    confirmedEvents,
+  );
+  state = mod.rebaseTranscriptHead(
+    state,
+    seed,
+    confirmedEvents,
+    pendingPrompts,
+    { seedMessages: seed, prompts: { revision: 2 } },
+  );
+  const messages = mod.finalizeTranscriptMessages(state);
+  const userMessages = messages.filter((message) => message.msgType === 'user');
+
+  assert.deepEqual(pendingPrompts, []);
+  assert.equal(userMessages.length, 1);
+  assert.equal(userMessages[0].uuid, 'user-prompt-2');
+  assert.deepEqual(userMessages[0].content, [{
+    type: 'image',
+    mediaType: 'image/png',
+    placeholder: '[Image #1]',
+    storagePath: '/persisted/image.png',
+    sha256: 'persisted-image-hash',
+  }]);
+});
+
+test('deferred interactive reply survives mixed confirmed history rebase without duplication', async () => {
+  const mod = await importTranscriptModule();
+  const seed = [];
+  const confirmedPrompt = {
+    id: 'client-confirmed-history',
+    text: 'earlier request',
+    afterEventSeq: 0,
+  };
+  const interactivePrompt = {
+    id: 'interactive-plan-reply',
+    text: 'approve this plan',
+    afterEventSeq: 2,
+    deferUntilPersisted: true,
+  };
+  const retainedLocalPrompts = [confirmedPrompt, interactivePrompt];
+  const initialEvents = [
+    ev(1, {
+      type: 'user_prompt',
+      text: confirmedPrompt.text,
+      image_count: 0,
+      client_message_id: confirmedPrompt.id,
+    }),
+    ev(2, { type: 'assistant_chunk', text: 'active answer part one. ' }),
+  ];
+  let pendingPrompts = mod.filterConfirmedLocalUserPrompts(
+    retainedLocalPrompts,
+    initialEvents,
+  );
+  let replay = mod.splitLocalUserPromptsForReplay(pendingPrompts);
+  let state = mod.deriveTranscriptReset(
+    seed,
+    replay.remainingPrompts,
+    initialEvents,
+    null,
+    { tokens: { seedMessages: seed, prompts: replay } },
+  );
+
+  const assertSingleInteractiveProjection = () => {
+    const messages = mod.finalizeTranscriptMessages(state);
+    assert.equal(
+      messages.filter((message) => message.uuid === interactivePrompt.id).length,
+      1,
+      'the interactive reply must remain one optimistic row',
+    );
+    assert.equal(
+      messages.filter((message) => message.msgType === 'assistant').length,
+      1,
+      'rebase must not split the active assistant turn around the reply',
+    );
+  };
+
+  assert.deepEqual(pendingPrompts.map((prompt) => prompt.id), [interactivePrompt.id]);
+  assertSingleInteractiveProjection();
+
+  const streamingEvents = [
+    ...initialEvents,
+    ev(3, { type: 'system_message', message: 'still working' }),
+    ev(4, { type: 'assistant_chunk', text: 'part two.' }),
+  ];
+  for (let end = initialEvents.length + 1; end <= streamingEvents.length; end += 1) {
+    const visibleEvents = streamingEvents.slice(0, end);
+    const nextPendingPrompts = mod.filterConfirmedLocalUserPrompts(
+      retainedLocalPrompts,
+      visibleEvents,
+    );
+    assert.notEqual(
+      nextPendingPrompts,
+      pendingPrompts,
+      'retained confirmed history recreates the replay input on each event update',
+    );
+    pendingPrompts = nextPendingPrompts;
+    replay = mod.splitLocalUserPromptsForReplay(pendingPrompts);
+    state = mod.rebaseTranscriptHead(
+      state,
+      seed,
+      visibleEvents,
+      replay.remainingPrompts,
+      { seedMessages: seed, prompts: replay },
+    );
+    assertSingleInteractiveProjection();
+  }
+
+  const confirmedEvents = [
+    ...streamingEvents,
+    ev(5, {
+      type: 'user_prompt',
+      text: interactivePrompt.text,
+      image_count: 0,
+    }),
+  ];
+  pendingPrompts = mod.filterConfirmedLocalUserPrompts(
+    retainedLocalPrompts,
+    confirmedEvents,
+  );
+  replay = mod.splitLocalUserPromptsForReplay(pendingPrompts);
+  state = mod.rebaseTranscriptHead(
+    state,
+    seed,
+    confirmedEvents,
+    replay.remainingPrompts,
+    { seedMessages: seed, prompts: replay },
+  );
+  const messages = mod.finalizeTranscriptMessages(state);
+
+  assert.deepEqual(pendingPrompts, []);
+  assert.equal(
+    messages.filter((message) => message.content === interactivePrompt.text).length,
+    1,
+    'the persisted interactive reply must replace its optimistic row',
+  );
+  assert.equal(
+    messages.filter((message) => message.msgType === 'assistant').length,
+    1,
+    'the completed active turn must remain one assistant message',
+  );
+});
+
 test('head rebase resets when replay backfills events below the consumed marker', async () => {
   const mod = await importTranscriptModule();
   const completeEvents = buildFixture(50);

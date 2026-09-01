@@ -31,6 +31,7 @@ import type {
   NativeEventReplayPage,
   NativeHandoffResult,
   NativePromptImageInput,
+  NativeQueuedInputSnapshotItem,
   SessionPromptAnnotation,
   NativeSessionSummary,
   RouterLaunchDraft,
@@ -1026,6 +1027,22 @@ export function useTauriCommands() {
     await invoke('flush_native_session_input_queue', { runtimeId });
   }, []);
 
+  const getNativeSessionInputQueue = useCallback(async (
+    runtimeId: string,
+  ): Promise<NativeQueuedInputSnapshotItem[]> => {
+    return invoke<NativeQueuedInputSnapshotItem[]>('get_native_session_input_queue', { runtimeId });
+  }, []);
+
+  const cancelNativeSessionQueuedInput = useCallback(async (
+    runtimeId: string,
+    clientMessageId: string,
+  ): Promise<number> => {
+    return invoke<number>('cancel_native_session_queued_input', {
+      runtimeId,
+      clientMessageId,
+    });
+  }, []);
+
   const respondNativeSessionPermission = useCallback(async (
     runtimeId: string,
     requestId: string,
@@ -1817,6 +1834,8 @@ export function useTauriCommands() {
     getNativeSessionSummary,
     sendNativeSessionInput,
     flushNativeSessionInputQueue,
+    getNativeSessionInputQueue,
+    cancelNativeSessionQueuedInput,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,

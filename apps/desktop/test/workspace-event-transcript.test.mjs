@@ -818,6 +818,63 @@ test('filters optimistic native prompts already confirmed by the event log', asy
   );
 });
 
+test('matches persisted prompts by client message id before falling back to repeated text', async () => {
+  const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const prompts = [
+    { id: 'client-first', text: 'same follow up', afterEventSeq: 1 },
+    { id: 'client-second', text: 'same follow up', afterEventSeq: 1 },
+  ];
+
+  const pending = filterConfirmedLocalUserPrompts(
+    prompts,
+    [
+      event(2, {
+        type: 'user_prompt',
+        text: 'same follow up',
+        image_count: 0,
+        client_message_id: 'client-second',
+      }),
+    ],
+  );
+
+  assert.deepEqual(
+    pending.map((prompt) => prompt.id),
+    ['client-first'],
+  );
+});
+
+test('exact client message identity beats a newer optimistic sequence fence', async () => {
+  const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const pending = filterConfirmedLocalUserPrompts(
+    [{ id: 'stable-client-id', text: 'queued text', afterEventSeq: 20 }],
+    [event(10, {
+      type: 'user_prompt',
+      text: 'queued text',
+      image_count: 0,
+      client_message_id: 'stable-client-id',
+    })],
+  );
+
+  assert.deepEqual(pending, []);
+});
+
+test('preserves optimistic prompt identity while unrelated replay events stream', async () => {
+  const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const prompts = [
+    { id: 'client-pending', text: 'not confirmed yet', afterEventSeq: 10 },
+  ];
+
+  const pending = filterConfirmedLocalUserPrompts(
+    prompts,
+    [
+      event(2, { type: 'user_prompt', text: 'older prompt', image_count: 0 }),
+      event(11, { type: 'assistant_chunk', text: 'still streaming' }),
+    ],
+  );
+
+  assert.equal(pending, prompts);
+});
+
 test('keeps optimistic prompts when matching persisted events predate their anchor', async () => {
   const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
 
@@ -1180,6 +1237,23 @@ test('selects provider seed by persisted boundary count before text matching', a
   );
 });
 
+test('keeps the persisted seed boundary when replay metadata is temporarily unavailable', async () => {
+  const { selectSeedMessagesForNativeReplay } = await importWorkspaceEventTranscript();
+  const providerHistory = [
+    { msgType: 'user', uuid: 'live-user', content: 'queued prompt', segmentIndex: 0, isCompactBoundary: false },
+    { msgType: 'assistant', uuid: 'live-assistant', content: 'queued answer', segmentIndex: 0, isCompactBoundary: false },
+  ];
+
+  assert.deepEqual(
+    selectSeedMessagesForNativeReplay(providerHistory, null, 0),
+    [],
+  );
+  assert.deepEqual(
+    selectSeedMessagesForNativeReplay(providerHistory, null, 1).map((message) => message.uuid),
+    ['live-user'],
+  );
+});
+
 test('selects no provider seed when native replay covers the runtime start', async () => {
   const { selectSeedMessagesForNativeReplay } = await importWorkspaceEventTranscript();
   const seedMessages = [
@@ -1254,7 +1328,8 @@ test('skips provider seed hydration when the native boundary proves replay owner
   assert.equal(shouldSkipProviderSeedHydration(runtimeStartReplay, 2), false);
   assert.equal(shouldSkipProviderSeedHydration({ ...runtimeStartReplay, oldest_available_seq: 2 }, null), false);
   assert.equal(shouldSkipProviderSeedHydration({ ...runtimeStartReplay, truncated: true }, null), false);
-  assert.equal(shouldSkipProviderSeedHydration(null, 0), false);
+  assert.equal(shouldSkipProviderSeedHydration(null, 0), true);
+  assert.equal(shouldSkipProviderSeedHydration(null, 2), false);
 });
 
 test('detects whether a replay batch continuously covers its available sequence range', async () => {

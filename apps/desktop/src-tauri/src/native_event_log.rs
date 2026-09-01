@@ -1949,6 +1949,7 @@ mod tests {
             payload: SessionEventPayload::UserPrompt {
                 text: "   ".to_string(),
                 image_count: 0,
+                client_message_id: None,
                 images: None,
                 annotations: None,
                 canonical_hash: None,
@@ -1983,6 +1984,7 @@ mod tests {
                     "很长的内容".repeat(80),
                 ),
                 image_count: 0,
+                client_message_id: None,
                 images: None,
                 annotations: None,
                 canonical_hash: None,
@@ -1996,6 +1998,7 @@ mod tests {
             payload: SessionEventPayload::UserPrompt {
                 text: "后续消息不能替代首条消息".to_string(),
                 image_count: 0,
+                client_message_id: None,
                 images: None,
                 annotations: None,
                 canonical_hash: None,
@@ -2048,6 +2051,7 @@ mod tests {
                 payload: SessionEventPayload::UserPrompt {
                     text: "后来抵达的第一条用户消息".to_string(),
                     image_count: 0,
+                    client_message_id: None,
                     images: None,
                     annotations: None,
                     canonical_hash: None,
@@ -2309,6 +2313,7 @@ mod tests {
             payload: SessionEventPayload::UserPrompt {
                 text: "start here".to_string(),
                 image_count: 0,
+                client_message_id: None,
                 images: None,
                 annotations: None,
                 canonical_hash: None,
@@ -2375,6 +2380,7 @@ mod tests {
             payload: SessionEventPayload::UserPrompt {
                 text: "start here".to_string(),
                 image_count: 0,
+                client_message_id: None,
                 images: None,
                 annotations: None,
                 canonical_hash: None,

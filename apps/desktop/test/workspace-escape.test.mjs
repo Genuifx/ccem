@@ -58,11 +58,41 @@ test('Escape stops only a visible active live session with an authoritative comm
     { defaultPrevented: true },
     { isComposing: true },
     { keyCode: 229 },
+    { repeat: true },
   ];
 
   for (const override of ignored) {
     assert.deepEqual(decideWorkspaceEscape(activeInput(override)), { kind: 'ignore' });
   }
+});
+
+test('a held Escape cannot interrupt the command admitted after its first press', async () => {
+  const { decideWorkspaceEscape } = await importWorkspaceEscape();
+
+  // First physical press stops the visible turn.
+  const first = decideWorkspaceEscape(activeInput());
+  assert.equal(first.kind, 'stop');
+
+  // The stop releases the turn and a queued prompt is admitted as a new
+  // command. Auto-repeat keydowns from the same physical press must not
+  // cancel it even though the command identity changed.
+  const repeatOnNewCommand = decideWorkspaceEscape(activeInput({
+    activeCommandId: 'command-2',
+    repeat: true,
+    lastRequestedCommand: { runtimeId: 'runtime-1', commandId: 'command-1' },
+  }));
+  assert.deepEqual(repeatOnNewCommand, { kind: 'ignore' });
+
+  // A distinct later press (repeat: false) remains a deliberate user stop.
+  const distinctPress = decideWorkspaceEscape(activeInput({
+    activeCommandId: 'command-2',
+    lastRequestedCommand: { runtimeId: 'runtime-1', commandId: 'command-1' },
+  }));
+  assert.deepEqual(distinctPress, {
+    kind: 'stop',
+    runtimeId: 'runtime-1',
+    commandId: 'command-2',
+  });
 });
 
 test('form controls, editable content, dialogs, menus, popovers, and command palettes own Escape', async () => {

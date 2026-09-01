@@ -14,8 +14,9 @@ use crate::native_event_log::{
 };
 use crate::native_helper_resource::native_helper_script_path;
 use crate::native_input_queue::{
-    FrozenNativeInputBatch, FrozenNativeInputParts, NativeInputClaimOutcome, NativeInputQueue,
-    NativeInputQueueError, QueuedInputDeliveryState,
+    FrozenNativeInputBatch, FrozenNativeInputMessage, FrozenNativeInputMessageParts,
+    NativeInputCancelOutcome, NativeInputClaimOutcome, NativeInputQueue, NativeInputQueueError,
+    QueuedInputDeliveryState, QueuedNativeInputSnapshotItem,
 };
 use crate::native_session_coordinator::{
     AdapterKind, InteractiveWaitOutcome, LifecycleDecision, NativeLifecycleProjection,
@@ -2464,6 +2465,7 @@ impl NativeRuntimeManager {
                     .unwrap_or_default(),
                 options.initial_images.as_ref(),
                 options.initial_annotations.as_ref(),
+                None,
             )?;
             self.spawn_helper(app, &runtime_id, &options, handle.clone())?;
             self.summary_for(&runtime_id)
@@ -2681,6 +2683,21 @@ impl NativeRuntimeManager {
             .delivery_uncertain_count
             .max(self.input_queue.delivery_uncertain_count(runtime_id));
         Some(projection)
+    }
+
+    fn input_merge_fence(&self, runtime_id: &str) -> Option<String> {
+        let projection = self.lifecycle.projection(runtime_id)?;
+        if let Some(command_id) = projection.active_command_id {
+            return Some(format!("command:{command_id}"));
+        }
+        projection.settings_pending.then(|| {
+            format!(
+                "settings:{}:{}:{}",
+                projection.helper_incarnation,
+                projection.query_generation,
+                projection.conversation_epoch
+            )
+        })
     }
 
     pub fn list_sessions(&self) -> Vec<NativeSessionSummary> {
@@ -3041,6 +3058,7 @@ impl NativeRuntimeManager {
                 .transpose()
                 .map_err(|error| format!("Failed to freeze queued prompt annotations: {error}"))?;
             self.lifecycle.ensure_session(runtime_id);
+            let merge_fence = self.input_merge_fence(runtime_id);
             match self.input_queue.enqueue(
                 runtime_id,
                 FrozenNativeInputBatch::new(
@@ -3050,6 +3068,7 @@ impl NativeRuntimeManager {
                     image_values,
                     annotation_values,
                 ),
+                merge_fence.as_deref(),
             ) {
                 Ok(queue_count) => {
                     self.lifecycle.note_queue_changed(runtime_id);
@@ -3087,9 +3106,11 @@ impl NativeRuntimeManager {
             display_text,
             images,
             annotations.as_ref(),
+            client_message_id,
             claude_managed,
             None,
             None,
+            true,
         )
     }
 
@@ -3104,9 +3125,11 @@ impl NativeRuntimeManager {
         display_text: Option<&str>,
         images: Option<&Vec<PromptImage>>,
         annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
         claude_managed: bool,
         command_id_override: Option<&str>,
         admission_attempt: Option<u64>,
+        append_user_prompt_event_after_write: bool,
     ) -> Result<(), String> {
         let _termination_guard = self
             .app_termination_lock
@@ -3303,13 +3326,16 @@ impl NativeRuntimeManager {
         ) {
             eprintln!("Failed to append prompt write observation for {runtime_id}: {error}");
         }
-        if let Err(error) = self.append_user_prompt_event(
-            runtime_id,
-            display_text.unwrap_or(text),
-            images,
-            annotations,
-        ) {
-            eprintln!("Failed to append written user prompt for {runtime_id}: {error}");
+        if append_user_prompt_event_after_write {
+            if let Err(error) = self.append_user_prompt_event(
+                runtime_id,
+                display_text.unwrap_or(text),
+                images,
+                annotations,
+                client_message_id,
+            ) {
+                eprintln!("Failed to append written user prompt for {runtime_id}: {error}");
+            }
         }
         Ok(())
     }
@@ -3320,6 +3346,77 @@ impl NativeRuntimeManager {
         runtime_id: &str,
     ) -> Result<(), String> {
         self.maybe_dispatch_queued(app, runtime_id, QueueDispatchTrigger::VisibleUserAction)
+    }
+
+    /// Renderer projection of prompts still waiting in the backend input
+    /// queue. This is the authoritative source for "queued" rows after a view
+    /// remount discards the optimistic local prompt state.
+    pub fn input_queue_snapshot(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Vec<QueuedNativeInputSnapshotItem>, String> {
+        let provider = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .map(|record| record.provider)
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if provider != NativeProvider::Claude {
+            return Err(format!(
+                "Native runtime {runtime_id} does not use the managed Claude input queue"
+            ));
+        }
+        Ok(self.input_queue.snapshot(runtime_id))
+    }
+
+    /// Cancels one exact prompt only while backend queue ownership still
+    /// proves delivery has not started. Dispatching and uncertain entries are
+    /// deliberately rejected because hiding them cannot guarantee non-delivery.
+    pub fn cancel_pending_queued_input(
+        &self,
+        runtime_id: &str,
+        client_message_id: &str,
+    ) -> Result<usize, String> {
+        let client_message_id = client_message_id.trim();
+        if client_message_id.is_empty() {
+            return Err("NATIVE_QUEUE_CANCEL_INVALID_ID: client_message_id must not be empty".into());
+        }
+        let provider = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .map(|record| record.provider)
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if provider != NativeProvider::Claude {
+            return Err(format!(
+                "Native runtime {runtime_id} does not use the managed Claude input queue"
+            ));
+        }
+
+        match self.input_queue.cancel_pending(runtime_id, client_message_id) {
+            NativeInputCancelOutcome::Cancelled { remaining_count } => {
+                self.lifecycle.note_queue_changed(runtime_id);
+                let _ = self.append_lifecycle_event(
+                    runtime_id,
+                    "prompt_queue_cancelled",
+                    format!(
+                        "client_message_id={client_message_id} queue_count={remaining_count}"
+                    ),
+                );
+                Ok(remaining_count)
+            }
+            NativeInputCancelOutcome::NotFound => Err(format!(
+                "NATIVE_QUEUE_CANCEL_TOO_LATE: queued prompt {client_message_id} was not found"
+            )),
+            NativeInputCancelOutcome::Dispatching => Err(format!(
+                "NATIVE_QUEUE_CANCEL_DISPATCHING: queued prompt {client_message_id} has started delivery"
+            )),
+            NativeInputCancelOutcome::DeliveryUncertain => Err(format!(
+                "NATIVE_QUEUE_CANCEL_UNCERTAIN: queued prompt {client_message_id} may already be delivered"
+            )),
+        }
     }
 
     fn schedule_command_admission_deadline(
@@ -3399,14 +3496,10 @@ impl NativeRuntimeManager {
                     | NativeInputClaimOutcome::BlockedByDeliveryUncertain { .. }
                     | NativeInputClaimOutcome::Empty => return Ok(()),
                 };
-            let FrozenNativeInputParts {
-                client_message_id,
-                text,
-                display_text,
-                images,
-                annotations,
-            } = batch.into_parts();
-            let decoded_images: Result<Option<Vec<PromptImage>>, String> = images
+            let dispatch_parts = batch.into_dispatch_parts();
+            let client_message_id = dispatch_parts.client_message_id.clone();
+            let decoded_images: Result<Option<Vec<PromptImage>>, String> = dispatch_parts
+                .images
                 .map(|values| serde_json::from_value(Value::Array(values)))
                 .transpose()
                 .map_err(|error| {
@@ -3415,7 +3508,8 @@ impl NativeRuntimeManager {
                     )
                 });
             let decoded_annotations: Result<Option<Vec<SessionPromptAnnotation>>, String> =
-                annotations
+                dispatch_parts
+                    .annotations
                 .map(|values| serde_json::from_value(Value::Array(values)))
                 .transpose()
                 .map_err(|error| {
@@ -3439,13 +3533,15 @@ impl NativeRuntimeManager {
             let dispatch = self.send_user_message_admitted(
                 app,
                 runtime_id,
-                &text,
-                display_text.as_deref(),
+                &dispatch_parts.text,
+                dispatch_parts.display_text.as_deref(),
                 images.as_ref(),
                 annotations.as_ref(),
+                None,
                 true,
                 Some(&dispatch_command_id),
                 Some(dispatch_attempt),
+                false,
             );
             match dispatch {
                 Ok(()) => {
@@ -7865,8 +7961,17 @@ impl NativeRuntimeManager {
                     {
                         self.input_queue.confirm_rejected(runtime_id, command_id)
                     }
+                    "command_abandoned"
+                        if !matches!(
+                            &decision,
+                            LifecycleDecision::Ignored | LifecycleDecision::ProtocolError { .. }
+                        ) =>
+                    {
+                        self.input_queue
+                            .remove_dispatch(runtime_id, command_id)
+                            .is_some()
+                    }
                     "command_admitted"
-                    | "command_abandoned"
                     | "sdk_command_state"
                     | "turn_result_observed"
                     | "legacy_turn_terminal"
@@ -7876,7 +7981,28 @@ impl NativeRuntimeManager {
                             LifecycleDecision::Ignored | LifecycleDecision::ProtocolError { .. }
                         ) =>
                     {
-                        self.input_queue.confirm_admitted(runtime_id, command_id)
+                        let admitted = self.input_queue.peek(runtime_id).filter(|queued| {
+                            queued.dispatch_command_id() == Some(command_id)
+                                && matches!(
+                                    queued.delivery_state(),
+                                    QueuedInputDeliveryState::Dispatching
+                                        | QueuedInputDeliveryState::DeliveryUncertain
+                                )
+                        });
+                        admitted.is_some_and(|queued| {
+                            if let Err(error) = self.append_queued_batch_user_prompt_events(
+                                runtime_id,
+                                queued.batch().messages(),
+                            ) {
+                                eprintln!(
+                                    "Failed to append admitted queued prompts for {runtime_id}: {error}"
+                                );
+                                return false;
+                            }
+                            self.input_queue
+                                .confirm_admitted(runtime_id, command_id)
+                                .is_some()
+                        })
                     }
                     "delivery_uncertain" => self
                         .input_queue
@@ -9271,33 +9397,101 @@ impl NativeRuntimeManager {
         }
     }
 
+    fn build_user_prompt_event_payload(
+        &self,
+        text: &str,
+        images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
+    ) -> Result<Option<SessionEventPayload>, String> {
+        let text = text.trim();
+        let image_count = images.map(|items| items.len()).unwrap_or(0);
+        let annotations = validate_prompt_annotations(annotations)?;
+        if text.is_empty() && image_count == 0 && annotations.is_none() {
+            return Ok(None);
+        }
+        let event_images = prompt_images_for_event(images, &self.prompt_image_store)?;
+        let canonical_hash =
+            canonical_user_prompt_hash(text, event_images.as_ref(), annotations.as_ref());
+
+        Ok(Some(SessionEventPayload::UserPrompt {
+            text: text.to_string(),
+            image_count: image_count as u64,
+            client_message_id: client_message_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            images: event_images,
+            annotations,
+            canonical_hash,
+        }))
+    }
+
     fn append_user_prompt_event(
         &self,
         runtime_id: &str,
         text: &str,
         images: Option<&Vec<PromptImage>>,
         annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
     ) -> Result<(), String> {
-        let text = text.trim();
-        let image_count = images.map(|items| items.len()).unwrap_or(0);
-        let annotations = validate_prompt_annotations(annotations)?;
-        if text.is_empty() && image_count == 0 && annotations.is_none() {
+        let Some(payload) = self.build_user_prompt_event_payload(
+            text,
+            images,
+            annotations,
+            client_message_id,
+        )? else {
             return Ok(());
-        }
-        let event_images = prompt_images_for_event(images, &self.prompt_image_store)?;
-        let canonical_hash =
-            canonical_user_prompt_hash(text, event_images.as_ref(), annotations.as_ref());
+        };
+        self.append_event(runtime_id, payload)
+    }
 
-        self.append_event(
-            runtime_id,
-            SessionEventPayload::UserPrompt {
-                text: text.to_string(),
-                image_count: image_count as u64,
-                images: event_images,
+    fn append_queued_batch_user_prompt_events(
+        &self,
+        runtime_id: &str,
+        messages: &[FrozenNativeInputMessage],
+    ) -> Result<(), String> {
+        // Validate and materialize the entire merged batch before appending
+        // its first row. If a later prompt has malformed image/annotation
+        // data, a lifecycle retry must not replay an already-appended prefix.
+        let mut payloads = Vec::with_capacity(messages.len());
+        for message in messages {
+            let FrozenNativeInputMessageParts {
+                client_message_id,
+                text,
+                display_text,
+                images,
                 annotations,
-                canonical_hash,
-            },
-        )
+            } = message.clone().into_parts();
+            let decoded_images: Option<Vec<PromptImage>> = images
+                .map(|values| serde_json::from_value(Value::Array(values)))
+                .transpose()
+                .map_err(|error| {
+                    format!(
+                        "Failed to decode queued prompt images for {client_message_id}: {error}"
+                    )
+                })?;
+            let decoded_annotations: Option<Vec<SessionPromptAnnotation>> = annotations
+                .map(|values| serde_json::from_value(Value::Array(values)))
+                .transpose()
+                .map_err(|error| {
+                    format!(
+                        "Failed to decode queued prompt annotations for {client_message_id}: {error}"
+                    )
+                })?;
+            if let Some(payload) = self.build_user_prompt_event_payload(
+                display_text.as_deref().unwrap_or(&text),
+                decoded_images.as_ref(),
+                decoded_annotations.as_ref(),
+                Some(&client_message_id),
+            )? {
+                payloads.push(payload);
+            }
+        }
+        for payload in payloads {
+            self.append_event(runtime_id, payload)?;
+        }
+        Ok(())
     }
 
     fn append_interactive_prompt_response_event(
@@ -9310,7 +9504,7 @@ impl NativeRuntimeManager {
         let Some(text) = summarize_interactive_prompt_response(display_text, answers) else {
             return Ok(());
         };
-        self.append_user_prompt_event(runtime_id, &text, None, annotations)
+        self.append_user_prompt_event(runtime_id, &text, None, annotations, None)
     }
 
     fn deliver_and_append_interactive_prompt_response(
@@ -10723,7 +10917,10 @@ mod tests {
         TodoSnapshotV1, ToolCategory, UserInputKind,
     };
     use crate::native_event_log::{NativeEventLog, MAX_EVENT_REPLAY_PAGE_BYTES};
-    use crate::native_input_queue::{FrozenNativeInputBatch, NativeInputClaimOutcome};
+    use crate::native_input_queue::{
+        FrozenNativeInputBatch, FrozenNativeInputMessage, NativeInputClaimOutcome,
+        NativeInputPopOutcome,
+    };
     use crate::native_session_coordinator::NativeLifecycleProjection;
     use crate::prompt_image_store::PromptImageStore;
     use crate::router::{
@@ -10827,7 +11024,18 @@ mod tests {
         })
     }
 
+    static NEXT_TEST_MANAGER_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
+    fn test_manager_namespace(runtime_id: &str) -> String {
+        format!(
+            "{runtime_id}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_MANAGER_NAMESPACE.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     fn manager_with_handle(runtime_id: &str) -> NativeRuntimeManager {
+        let storage_namespace = test_manager_namespace(runtime_id);
         let record = NativeSessionRecord {
             runtime_id: runtime_id.to_string(),
             provider: NativeProvider::Claude,
@@ -10863,14 +11071,13 @@ mod tests {
             lifecycle_transactions: Mutex::new(HashMap::new()),
             next_handle_generation: AtomicU64::new(2),
             state_path: std::env::temp_dir()
-                .join(format!("ccem-native-runtime-test-{runtime_id}.json")),
-            event_log: NativeEventLog::new(
-                std::env::temp_dir().join(format!("ccem-native-runtime-test-{runtime_id}.sqlite")),
-            ),
-            prompt_image_store: PromptImageStore::new(
-                std::env::temp_dir()
-                    .join(format!("ccem-native-runtime-test-{runtime_id}-attachments")),
-            ),
+                .join(format!("ccem-native-runtime-test-{storage_namespace}.json")),
+            event_log: NativeEventLog::new(std::env::temp_dir().join(format!(
+                "ccem-native-runtime-test-{storage_namespace}.sqlite"
+            ))),
+            prompt_image_store: PromptImageStore::new(std::env::temp_dir().join(format!(
+                "ccem-native-runtime-test-{storage_namespace}-attachments"
+            ))),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
             record_update_lock: Mutex::new(()),
@@ -10889,6 +11096,7 @@ mod tests {
         runtime_id: &str,
         records: Vec<NativeSessionRecord>,
     ) -> NativeRuntimeManager {
+        let storage_namespace = test_manager_namespace(runtime_id);
         NativeRuntimeManager {
             records: Mutex::new(
                 records
@@ -10905,13 +11113,13 @@ mod tests {
             input_queue: Default::default(),
             initializing_runtimes: Mutex::new(HashSet::new()),
             state_path: std::env::temp_dir().join(format!(
-                "ccem-native-runtime-reconcile-test-{runtime_id}.json"
+                "ccem-native-runtime-reconcile-test-{storage_namespace}.json"
             )),
             event_log: NativeEventLog::new(std::env::temp_dir().join(format!(
-                "ccem-native-runtime-reconcile-test-{runtime_id}.sqlite"
+                "ccem-native-runtime-reconcile-test-{storage_namespace}.sqlite"
             ))),
             prompt_image_store: PromptImageStore::new(std::env::temp_dir().join(format!(
-                "ccem-native-runtime-reconcile-test-{runtime_id}-attachments"
+                "ccem-native-runtime-reconcile-test-{storage_namespace}-attachments"
             ))),
             router_manager: OnceLock::new(),
             reconnect_lock: Mutex::new(()),
@@ -10969,6 +11177,7 @@ mod tests {
                     None,
                     None,
                 ),
+                None,
             )
             .expect("enqueue");
         manager.lifecycle.note_queue_changed(runtime_id);
@@ -10995,6 +11204,102 @@ mod tests {
             .expect("projection");
         assert_eq!(projection.queue_count, 1);
         assert_eq!(projection.delivery_uncertain_count, 1);
+    }
+
+    #[test]
+    fn cancelling_pending_input_updates_the_authoritative_lifecycle_projection() {
+        let runtime_id = "native-queue-cancel-projection";
+        let manager = manager_with_handle(runtime_id);
+        manager.lifecycle.ensure_session(runtime_id);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("cancel-me", "first", None, None, None),
+                Some("busy-command"),
+            )
+            .expect("enqueue first");
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("keep-me", "second", None, None, None),
+                Some("busy-command"),
+            )
+            .expect("enqueue second");
+        manager.lifecycle.note_queue_changed(runtime_id);
+        let before = manager
+            .lifecycle_projection(runtime_id)
+            .expect("projection before cancel");
+
+        assert_eq!(
+            manager.cancel_pending_queued_input(runtime_id, "cancel-me"),
+            Ok(1),
+        );
+        let after = manager
+            .lifecycle_projection(runtime_id)
+            .expect("projection after cancel");
+        assert_eq!(after.queue_count, 1);
+        assert!(after.state_revision > before.state_revision);
+        assert_eq!(
+            manager
+                .input_queue_snapshot(runtime_id)
+                .expect("snapshot")
+                .into_iter()
+                .map(|item| item.client_message_id)
+                .collect::<Vec<_>>(),
+            vec!["keep-me"],
+        );
+    }
+
+    #[test]
+    fn merge_fence_closes_when_the_blocking_command_releases() {
+        let runtime_id = "native-input-merge-fence";
+        let manager = manager_with_handle(runtime_id);
+        let incarnation = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .generation;
+        let command_id = manager
+            .lifecycle
+            .admit_prompt(runtime_id, incarnation)
+            .expect("admit blocking command");
+        let merge_fence = manager
+            .input_merge_fence(runtime_id)
+            .expect("active command supplies a merge fence");
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("queued-a", "first", None, None, None),
+                Some(&merge_fence),
+            )
+            .expect("enqueue pending input");
+
+        assert!(manager
+            .lifecycle
+            .abandon_admission(runtime_id, incarnation, &command_id));
+        assert_eq!(manager.input_merge_fence(runtime_id), None);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("queued-b", "second", None, None, None),
+                None,
+            )
+            .expect("enqueue input after blocker release");
+
+        let NativeInputPopOutcome::Ready(first) = manager.input_queue.pop(runtime_id) else {
+            panic!("expected first batch");
+        };
+        let NativeInputPopOutcome::Ready(second) = manager.input_queue.pop(runtime_id) else {
+            panic!("expected second batch");
+        };
+        assert_eq!(first.messages().len(), 1);
+        assert_eq!(second.messages().len(), 1);
     }
 
     #[test]
@@ -13426,6 +13731,7 @@ mod tests {
                 "continue",
                 Some(&images),
                 Some(&prompt_annotations),
+                Some("client-message-1"),
             )
             .expect("append user prompt event");
 
@@ -13437,6 +13743,7 @@ mod tests {
         let SessionEventPayload::UserPrompt {
             text,
             image_count,
+            client_message_id,
             images,
             annotations,
             canonical_hash,
@@ -13446,6 +13753,7 @@ mod tests {
         };
         assert_eq!(text, "continue");
         assert_eq!(*image_count, 1);
+        assert_eq!(client_message_id.as_deref(), Some("client-message-1"));
         assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
         let image = images
@@ -13481,6 +13789,138 @@ mod tests {
             persisted_json["canonical_hash"].as_str().map(str::len),
             Some(64)
         );
+        assert_eq!(persisted_json["client_message_id"], "client-message-1");
+    }
+
+    #[test]
+    fn queued_dispatch_batch_projects_each_original_user_prompt_once() {
+        let runtime_id = format!(
+            "native-user-prompt-batch-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        manager
+            .input_queue
+            .enqueue(
+                &runtime_id,
+                FrozenNativeInputBatch::new(
+                    "client-message-a",
+                    "first request",
+                    Some("visible first request".to_owned()),
+                    None,
+                    None,
+                ),
+                Some("command:blocker-a"),
+            )
+            .expect("queue first prompt");
+        manager
+            .input_queue
+            .enqueue(
+                &runtime_id,
+                FrozenNativeInputBatch::new(
+                    "client-message-b",
+                    "second request",
+                    Some("visible second request".to_owned()),
+                    None,
+                    None,
+                ),
+                Some("command:blocker-a"),
+            )
+            .expect("queue second prompt");
+        let incarnation = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(&runtime_id)
+            .expect("handle")
+            .generation;
+        let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(&runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected merged queue claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(&runtime_id, incarnation, &command_id, dispatch_attempt)
+            .expect("admit merged queued prompt");
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay before helper admission")
+            .events
+            .iter()
+            .all(|event| !matches!(event.payload, SessionEventPayload::UserPrompt { .. })));
+
+        manager
+            .process_helper_stdout(
+                &runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"{command_id}","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("admission receipt projects original prompts");
+
+        let events = manager
+            .replay_events(&runtime_id, None)
+            .expect("replay queued prompt projections")
+            .events;
+        let projected = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                SessionEventPayload::UserPrompt {
+                    text,
+                    client_message_id,
+                    ..
+                } => Some((text.as_str(), client_message_id.as_deref())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![
+                ("visible first request", Some("client-message-a")),
+                ("visible second request", Some("client-message-b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_dispatch_batch_preflights_every_prompt_before_projection() {
+        let runtime_id = format!(
+            "native-user-prompt-batch-preflight-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let manager = manager_with_handle(&runtime_id);
+        let messages = vec![
+            FrozenNativeInputMessage::new(
+                "client-message-valid",
+                "valid request",
+                None,
+                None,
+                None,
+            ),
+            FrozenNativeInputMessage::new(
+                "client-message-invalid",
+                "invalid request",
+                None,
+                None,
+                Some(vec![serde_json::json!({ "quote": 42, "note": "invalid" })]),
+            ),
+        ];
+
+        let error = manager
+            .append_queued_batch_user_prompt_events(&runtime_id, &messages)
+            .expect_err("a malformed later prompt must reject the whole projection batch");
+
+        assert!(error.contains("Failed to decode queued prompt annotations"));
+        assert!(manager
+            .replay_events(&runtime_id, None)
+            .expect("replay events")
+            .events
+            .iter()
+            .all(|event| !matches!(event.payload, SessionEventPayload::UserPrompt { .. })));
     }
 
     #[test]
@@ -13498,7 +13938,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let error = manager
-            .append_user_prompt_event(&runtime_id, "continue", None, Some(&annotations))
+            .append_user_prompt_event(&runtime_id, "continue", None, Some(&annotations), None)
             .expect_err("annotation overflow must fail");
 
         assert!(error.contains("at most 20 annotations"));
@@ -13552,6 +13992,7 @@ mod tests {
         let SessionEventPayload::UserPrompt {
             text,
             image_count,
+            client_message_id,
             images,
             annotations,
             canonical_hash,
@@ -13561,6 +14002,7 @@ mod tests {
         };
         assert_eq!(text, "Use the SQLite path");
         assert_eq!(*image_count, 0);
+        assert_eq!(client_message_id, &None);
         assert_eq!(images, &None);
         assert_eq!(annotations, &Some(prompt_annotations));
         assert_eq!(canonical_hash.as_deref().map(str::len), Some(64));
@@ -17256,6 +17698,7 @@ wait"#,
             .enqueue(
                 runtime_id,
                 FrozenNativeInputBatch::new("admitted-client", "queued", None, None, None),
+                None,
             )
             .expect("queue item");
         let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
@@ -17322,6 +17765,7 @@ wait"#,
             .enqueue(
                 runtime_id,
                 FrozenNativeInputBatch::new("queued-rejected-client", "queued", None, None, None),
+                None,
             )
             .expect("queue item");
         let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
@@ -17345,6 +17789,13 @@ wait"#,
                 ),
             )
             .expect("rejection processes");
+
+        assert!(manager
+            .replay_events(runtime_id, None)
+            .expect("replay rejected attempt")
+            .events
+            .iter()
+            .all(|event| !matches!(event.payload, SessionEventPayload::UserPrompt { .. })));
 
         assert!(manager
             .lifecycle
@@ -17400,6 +17851,24 @@ wait"#,
             retried.dispatch_command_id(),
             Some(retry_command_id.as_str())
         );
+
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"{retry_command_id}","command_id":"{retry_command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("retry admission processes");
+        let projected_prompt_count = manager
+            .replay_events(runtime_id, None)
+            .expect("replay admitted retry")
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, SessionEventPayload::UserPrompt { .. }))
+            .count();
+        assert_eq!(projected_prompt_count, 1);
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
     }
 
     #[test]
@@ -17419,6 +17888,7 @@ wait"#,
             .enqueue(
                 runtime_id,
                 FrozenNativeInputBatch::new("uncertain-client", "queued", None, None, None),
+                None,
             )
             .expect("queue item");
         let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
@@ -17523,6 +17993,7 @@ wait"#,
             .enqueue(
                 runtime_id,
                 FrozenNativeInputBatch::new("not-started-client", "queued", None, None, None),
+                None,
             )
             .expect("queue item");
         let (batch, dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id)

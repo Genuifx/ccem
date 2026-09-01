@@ -79,8 +79,17 @@ test('Plan approval uses one backend transaction and updates optimistic mode onl
   const planReplyBranch = source.indexOf("} else if (payload.kind === 'plan_exit')");
   const backendReply = source.indexOf('await respondNativeSessionPrompt', planReplyBranch);
   const optimisticExit = source.indexOf('if (exitsPlanModeForPrompt)', backendReply);
+  const interactivePromptEntry = source.slice(
+    source.indexOf('const promptEntry: LocalUserPrompt = {', source.indexOf('const sendInteractivePromptReply')),
+    source.indexOf('const exitsPlanModeForPrompt', source.indexOf('const sendInteractivePromptReply')),
+  );
   assert.ok(planReplyBranch >= 0 && backendReply > planReplyBranch);
   assert.ok(optimisticExit > backendReply, 'renderer mode changes only after backend success');
+  assert.match(
+    interactivePromptEntry,
+    /deferUntilPersisted: true,/,
+    'interactive and Plan replies must not anchor before their persisted user_prompt',
+  );
   assert.doesNotMatch(
     source.slice(planReplyBranch, backendReply),
     /applyRuntimePlanModeChange/,

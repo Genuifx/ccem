@@ -22,6 +22,11 @@ export const COMPACTING_SUMMARY_TOKEN = '__ccem_context_compacting__';
 export const COMPACT_FAILED_SUMMARY_TOKEN = '__ccem_context_compact_failed__';
 export const TRANSCRIPT_GAP_SUMMARY_TOKEN = '__ccem_transcript_gap__';
 
+export type NativeQueuedPromptDeliveryState =
+  | 'pending'
+  | 'dispatching'
+  | 'delivery_uncertain';
+
 export interface LocalUserPrompt {
   id: string;
   text: string;
@@ -29,6 +34,21 @@ export interface LocalUserPrompt {
   annotations?: SessionPromptAnnotation[];
   timestamp?: number;
   afterEventSeq?: number;
+  /**
+   * Coordinator-managed prompts can wait behind an already-running turn.
+   * Keep those prompts in the optimistic tail until their persisted
+   * `user_prompt` arrives instead of anchoring them before unrelated events
+   * from the turn that was active when the user pressed Send.
+   */
+  deferUntilPersisted?: boolean;
+  /**
+   * The prompt entered the backend input queue behind a busy foreground turn
+   * (or a hard-blocking attention). Until the persisted `user_prompt`
+   * confirms admission, the workspace projects it into the queue dock above
+   * the composer and excludes it from transcript derivation.
+   */
+  queuedBehindTurn?: boolean;
+  queuedDeliveryState?: NativeQueuedPromptDeliveryState;
 }
 
 interface PendingAssistantTurn {
@@ -207,34 +227,49 @@ export function filterConfirmedLocalUserPrompts(
     return prompts;
   }
 
-  const confirmedPrompts: Array<{ key: string; seq: number }> = [];
+  const confirmedPrompts: Array<{
+    clientMessageId?: string;
+    key: string;
+    seq: number;
+  }> = [];
   for (const event of events) {
     if (event.payload.type !== 'user_prompt') {
       continue;
     }
     const key = normalizePromptConfirmationText(event.payload.text, event.payload.images ?? null);
-    if (!key) {
+    const clientMessageId = event.payload.client_message_id?.trim() || undefined;
+    if (!key && !clientMessageId) {
       continue;
     }
-    confirmedPrompts.push({ key, seq: event.seq });
+    confirmedPrompts.push({ clientMessageId, key, seq: event.seq });
   }
 
   if (confirmedPrompts.length === 0) {
     return prompts;
   }
 
-  return prompts.filter((prompt) => {
+  let removedPrompt = false;
+  const remainingPrompts = prompts.filter((prompt) => {
     const key = normalizePromptConfirmationText(prompt.text, prompt.images ?? null);
-    const confirmedIndex = confirmedPrompts.findIndex((confirmed) =>
-      confirmed.key === key
-      && (prompt.afterEventSeq == null || confirmed.seq > prompt.afterEventSeq),
-    );
+    const confirmedIndex = confirmedPrompts.findIndex((confirmed) => {
+      if (confirmed.clientMessageId != null) {
+        // Backend client-message ids are unique for the runtime lifetime. An
+        // exact persisted identity wins even when a concurrent queue snapshot
+        // was fenced after that event; the sequence guard is only needed for
+        // legacy text matching where identical prompts can recur.
+        return confirmed.clientMessageId === prompt.id;
+      }
+      return confirmed.key === key
+        && (prompt.afterEventSeq == null || confirmed.seq > prompt.afterEventSeq);
+    });
     if (confirmedIndex === -1) {
       return true;
     }
     confirmedPrompts.splice(confirmedIndex, 1);
+    removedPrompt = true;
     return false;
   });
+  return removedPrompt ? remainingPrompts : prompts;
 }
 
 export function splitLocalUserPromptsForReplay(
@@ -400,12 +435,15 @@ export function shouldSkipProviderSeedHydration(
   replayBatch: ReplayBatch | null | undefined,
   seedBoundaryMessageCount?: number | null,
 ): boolean {
-  if (!replayBatch) {
-    return false;
-  }
-
+  // A persisted zero boundary proves that every provider-history turn belongs
+  // to native replay, even while a restarted backend temporarily reports no
+  // last_event_seq and therefore has no replay probe yet.
   if (seedBoundaryMessageCount === 0) {
     return true;
+  }
+
+  if (!replayBatch) {
+    return false;
   }
 
   return seedBoundaryMessageCount == null && nativeReplayCoversRuntimeStart(replayBatch);
@@ -1066,13 +1104,17 @@ function foldConsumeMatchingPrompt(
   event: SessionEventRecord,
   text: string,
   images: Array<unknown>,
+  clientMessageId?: string | null,
 ) {
   const key = normalizePromptConfirmationText(text, images);
-  if (!key || state.promptQueue.length === 0) {
+  const normalizedClientMessageId = clientMessageId?.trim() || undefined;
+  if ((!key && !normalizedClientMessageId) || state.promptQueue.length === 0) {
     return;
   }
   const index = state.promptQueue.findIndex((prompt) =>
-    normalizePromptConfirmationText(prompt.text, prompt.images ?? null) === key
+    (normalizedClientMessageId != null
+      ? prompt.id === normalizedClientMessageId
+      : normalizePromptConfirmationText(prompt.text, prompt.images ?? null) === key)
     && (prompt.afterEventSeq == null || event.seq > prompt.afterEventSeq),
   );
   if (index === -1) {
@@ -1094,7 +1136,11 @@ function foldFlushAnchoredPromptsBeforeEvent(
 
   const remaining: LocalUserPrompt[] = [];
   for (const prompt of state.promptQueue) {
-    if (prompt.afterEventSeq != null && event.seq > prompt.afterEventSeq) {
+    if (
+      !prompt.deferUntilPersisted
+      && prompt.afterEventSeq != null
+      && event.seq > prompt.afterEventSeq
+    ) {
       foldFlushPendingTurn(state);
       state.messages.push(createUserMessage(prompt));
     } else {
@@ -1105,7 +1151,9 @@ function foldFlushAnchoredPromptsBeforeEvent(
 }
 
 function foldFlushFirstUnanchoredPrompt(state: TranscriptDerivationState) {
-  const index = state.promptQueue.findIndex((prompt) => prompt.afterEventSeq == null);
+  const index = state.promptQueue.findIndex((prompt) =>
+    !prompt.deferUntilPersisted && prompt.afterEventSeq == null,
+  );
   if (index === -1) {
     return false;
   }
@@ -1235,9 +1283,13 @@ function foldTranscriptEvents(
           annotations: event.payload.annotations ?? undefined,
           timestamp: occurredAt,
         }));
-        if (text) {
-          foldConsumeMatchingPrompt(state, event, text, images);
-        }
+        foldConsumeMatchingPrompt(
+          state,
+          event,
+          text,
+          images,
+          event.payload.client_message_id,
+        );
         break;
       }
       case 'system_message': {

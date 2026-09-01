@@ -262,6 +262,15 @@ test('rendered user prompt keeps inline image thumbnails inside the same user bu
   assert.doesNotMatch(userBubbleHtml, /Images attached/);
 });
 
+test('native queued state is not rendered inside transcript message bubbles', async () => {
+  const component = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceMessageBubble.tsx'),
+    'utf8',
+  );
+
+  assert.doesNotMatch(component, /queuedPending|queuedDeliveryState/);
+});
+
 test('uuid-less transcript item keys stay stable when older messages are prepended', async () => {
   const { summarizeTranscriptItems } = await importWorkspaceMessageRenderer();
   const olderCompactBoundary = {

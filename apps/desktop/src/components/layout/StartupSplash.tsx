@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { MacFullscreenWindowControls } from './MacFullscreenWindowControls';
 import { ccemMotion, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 
@@ -7,9 +7,25 @@ interface StartupSplashProps {
   onExitComplete?: () => void;
 }
 
+const EXIT_FALLBACK_MS = 800;
+
 export function StartupSplash({ exiting = false, onExitComplete }: StartupSplashProps) {
   const splashRef = useRef<HTMLDivElement | null>(null);
   const centerRef = useRef<HTMLDivElement | null>(null);
+
+  // WebKit suspends requestAnimationFrame for hidden windows. GSAP's ticker
+  // then cannot finish the exit timeline, which used to leave the loaded app
+  // permanently covered by the splash. Timers still advance in that state, so
+  // keep animation as progressive enhancement and make removal deterministic.
+  useEffect(() => {
+    if (!exiting) {
+      return;
+    }
+    const fallbackId = window.setTimeout(() => {
+      onExitComplete?.();
+    }, EXIT_FALLBACK_MS);
+    return () => window.clearTimeout(fallbackId);
+  }, [exiting, onExitComplete]);
 
   useGSAP(() => {
     const splash = splashRef.current;

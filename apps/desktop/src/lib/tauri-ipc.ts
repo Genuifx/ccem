@@ -368,6 +368,11 @@ export interface TauriCommands {
     void
   ];
   flush_native_session_input_queue: [{ runtimeId: string }, void];
+  get_native_session_input_queue: [{ runtimeId: string }, NativeQueuedInputSnapshotItem[]];
+  cancel_native_session_queued_input: [
+    { runtimeId: string; clientMessageId: string },
+    number
+  ];
   respond_native_session_permission: [
     {
       runtimeId: string;
@@ -962,6 +967,18 @@ export interface NativeBackgroundTask {
 }
 
 /**
+ * One prompt still owned by the backend native input queue: not yet admitted
+ * by the helper, so no persisted `user_prompt` event exists for it yet.
+ */
+export interface NativeQueuedInputSnapshotItem {
+  client_message_id: string;
+  display_text: string;
+  images?: SessionPromptImage[];
+  annotations?: SessionPromptAnnotation[];
+  delivery_state: 'pending' | 'dispatching' | 'delivery_uncertain';
+}
+
+/**
  * Foreground lifecycle projection from the Rust coordinator: ids, states and
  * counts only — never prompt bodies, image paths, env vars or secrets.
  */
@@ -1340,6 +1357,7 @@ export type SessionEventPayload =
       type: 'user_prompt';
       text: string;
       image_count: number;
+      client_message_id?: string | null;
       images?: SessionPromptImage[] | null;
       annotations?: SessionPromptAnnotation[] | null;
       canonical_hash?: string | null;
