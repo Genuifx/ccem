@@ -287,6 +287,11 @@ test('native queued prompt renders in the dock before and outside the composer c
     queue.compareDocumentPosition(card) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
     'queue dock must precede the composer card',
   );
+  const heading = queue.querySelector('[data-ccem-composer-queue-heading]');
+  assert.ok(heading, 'queue heading must render');
+  assert.match(heading.textContent, /workspace\.composerGuideModel/);
+  assert.match(heading.textContent, /workspace\.composerQueuedWaiting/);
+  assert.doesNotMatch(queue.textContent, /workspace\.composerQueuedCount/);
   assert.match(item.textContent, /workspace\.messageQueuedBadge/);
   assert.match(queue.textContent, /workspace\.composerQueuedWaiting/);
   assert.doesNotMatch(queue.textContent, /workspace\.composerQueuedReady/);

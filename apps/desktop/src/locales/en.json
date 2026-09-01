@@ -465,8 +465,6 @@
     "composerPlanModeHintCodex": "Press Shift+Tab to send the next Codex prompt with /plan.",
     "composerPlanModeHintClaudeLocked": "This Claude session is already running in plan permission mode.",
     "composerGuideModel": "Guide model",
-    "composerQueuedTitle": "Message queue",
-    "composerQueuedCount": "{count} messages in queue",
     "composerQueuedWaiting": "Does not interrupt the current turn. Sends automatically after it finishes.",
     "composerQueuedReady": "Ready to send",
     "composerQueuedSendAll": "Send now",

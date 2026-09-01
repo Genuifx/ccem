@@ -109,12 +109,12 @@ test('composer presents queued messages as model guidance', async () => {
   assert.doesNotMatch(nativeViewSource, /queuedMessages=\{queuedMessages\}/);
   assert.match(composerSource, /MessageSquareQuote/);
   assert.match(composerSource, /data-ccem-composer-queue/);
+  assert.match(composerSource, /data-ccem-composer-queue-heading/);
   assert.match(composerSource, /composerQueuedWaiting/);
+  assert.doesNotMatch(composerSource, /composerQueuedCount|composerQueuedTitle/);
   assert.equal(zh.workspace.composerGuideModel, '引导模型');
-  assert.equal(zh.workspace.composerQueuedTitle, '消息队列');
   assert.match(zh.workspace.composerQueuedWaiting, /不会中断当前执行/);
   assert.equal(en.workspace.composerGuideModel, 'Guide model');
-  assert.equal(en.workspace.composerQueuedTitle, 'Message queue');
   assert.match(en.workspace.composerQueuedWaiting, /Does not interrupt/);
 });
 

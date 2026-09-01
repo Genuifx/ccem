@@ -677,14 +677,14 @@ function ComposerQueueDock({
         <div className="rounded-lg bg-primary/10 p-1.5 text-primary">
           <MessageSquareQuote className="h-3 w-3" />
         </div>
-        <div className="min-w-0 flex-1">
-          <p className="text-[11px] font-semibold leading-4 text-foreground">
-            {t('workspace.composerQueuedTitle')}
+        <div
+          data-ccem-composer-queue-heading
+          className="flex min-w-0 flex-1 items-center gap-2"
+        >
+          <p className="shrink-0 text-[11px] font-semibold leading-4 text-foreground">
+            {t('workspace.composerGuideModel')}
           </p>
-          <p className="text-[10px] leading-4 text-muted-foreground">
-            {t('workspace.composerQueuedCount').replace('{count}', String(messages.length))}
-          </p>
-          <p className="text-[10px] leading-4 text-muted-foreground/85">
+          <p className="min-w-0 truncate text-[10px] leading-4 text-muted-foreground/85">
             {t(queueHintKey)}
           </p>
         </div>

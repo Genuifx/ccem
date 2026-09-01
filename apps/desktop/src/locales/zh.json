@@ -465,8 +465,6 @@
     "composerPlanModeHintCodex": "Shift+Tab 让下一条 Codex 消息自动带上 /plan。",
     "composerPlanModeHintClaudeLocked": "当前 Claude 会话已经运行在 Plan 权限模式中。",
     "composerGuideModel": "引导模型",
-    "composerQueuedTitle": "消息队列",
-    "composerQueuedCount": "{count} 条消息在队列中",
     "composerQueuedWaiting": "不会中断当前执行，本轮结束后自动发送",
     "composerQueuedReady": "当前可发送",
     "composerQueuedSendAll": "立即发送",
