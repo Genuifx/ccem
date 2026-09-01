@@ -446,6 +446,20 @@ fn windows_mode2_uses_real_cef_modules_and_production_ipc_not_unsupported_stubs(
 }
 
 #[test]
+fn windows_cef_bindings_keep_private_util_imports_and_platform_callback_types() {
+    let surface = include_str!("cef/surface/windows.rs");
+    let host_shortcut = include_str!("cef/surface/host_shortcut.rs");
+    let bootstrap = include_str!("cef/bootstrap/windows.rs");
+
+    assert!(surface.contains("use util::{"));
+    assert!(!surface.contains("pub(super) use util::{"));
+    assert!(host_shortcut.contains("Option<&mut cef::sys::MSG>"));
+    assert!(host_shortcut.contains("_os_event: cef_os_event_type!(),"));
+    assert!(bootstrap.contains("let features = CefString::from(features.as_str());"));
+    assert!(!bootstrap.contains("CefString::from(enable_network_service_sandbox(&current))"));
+}
+
+#[test]
 fn mode2_navigation_actions_use_authoritative_cef_history_on_both_platforms() {
     for (platform, surface, host) in [
         (

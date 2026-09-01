@@ -125,6 +125,39 @@ function fileStat(filePath) {
   return { size: s.size, mtimeMs: s.mtimeMs };
 }
 
+async function sourceInstanceIdFor(root) {
+  const canonicalRoot = await fs.promises.realpath(root);
+  return createHash('sha256')
+    .update(canonicalRoot, 'utf8')
+    .digest('hex').slice(0, 16);
+}
+
+function createRootFailureFixture(tmpDir, name, cwd, sessionId) {
+  if (process.platform === 'win32') {
+    // chmod does not model Windows ACL denial. An invalid path still exercises
+    // the same root-resolution boundary and must fail closed on every platform.
+    return {
+      root: path.join(tmpDir, `${name}\0invalid`),
+      restore() {},
+    };
+  }
+
+  const root = path.join(tmpDir, name);
+  fs.mkdirSync(root, { recursive: true });
+  writeSession(root, cwd, sessionId, makeValidTurn(0));
+  const projectDir = fs.readdirSync(root)
+    .find((entry) => fs.statSync(path.join(root, entry)).isDirectory());
+  assert.ok(projectDir, 'fixture must contain a project directory');
+  const restrictedPath = path.join(root, projectDir);
+  fs.chmodSync(restrictedPath, 0o000);
+  return {
+    root,
+    restore() {
+      fs.chmodSync(restrictedPath, 0o755);
+    },
+  };
+}
+
 // --- Tests ---
 
 describe('dsh-history-helper', () => {
@@ -179,11 +212,9 @@ describe('dsh-history-helper', () => {
       assert.ok(result.data.length <= 3);
     });
 
-    test('sourceInstanceId = sha256(realpath)[0..16]', () => {
+    test('sourceInstanceId = sha256(realpath)[0..16]', async () => {
       const result = invokeHelper({ op: 'list', roots: [sessionsRoot] });
-      const expectedId = createHash('sha256')
-        .update(fs.realpathSync(sessionsRoot), 'utf8')
-        .digest('hex').slice(0, 16);
+      const expectedId = await sourceInstanceIdFor(sessionsRoot);
       assert.ok(result.data.length > 0);
       assert.equal(result.data[0].sourceInstanceId, expectedId);
     });
@@ -837,16 +868,14 @@ describe('dsh-history-helper', () => {
         `expected UNSUPPORTED_FORMAT code, got: ${result.code} (${result.message})`);
     });
 
-    test('UNSUPPORTED_FORMAT on detail when session uses unsupported version', () => {
+    test('UNSUPPORTED_FORMAT on detail when session uses unsupported version', async () => {
       const badRoot = path.join(tmpDir, 'bad-format-detail', 'sessions');
       fs.mkdirSync(badRoot, { recursive: true });
       const sid = 'bad-version-detail-001';
       writeSession(badRoot, '/tmp/bad-detail', sid, makeValidTurn(0), { version: 999 });
 
       // Compute the real sourceInstanceId for this root
-      const sourceInstanceId = createHash('sha256')
-        .update(fs.realpathSync(badRoot), 'utf8')
-        .digest('hex').slice(0, 16);
+      const sourceInstanceId = await sourceInstanceIdFor(badRoot);
 
       const result = invokeHelper(
         { op: 'detail', sourceInstanceId, sessionId: sid },
@@ -903,7 +932,7 @@ describe('dsh-history-helper', () => {
         `expected BUSY_CORRUPT, got: ${result.code} (${result.message})`);
     });
 
-    test('BUSY_CORRUPT on detail when session file is corrupt binary', () => {
+    test('BUSY_CORRUPT on detail when session file is corrupt binary', async () => {
       // Valid header + garbage line + turn/end (forces the scanner to throw during readFrom)
       const corruptRoot = path.join(tmpDir, 'corrupt-session-detail', 'sessions');
       fs.mkdirSync(corruptRoot, { recursive: true });
@@ -917,9 +946,7 @@ describe('dsh-history-helper', () => {
       fs.writeFileSync(path.join(sessionDir2, 'session.jsonl'), content);
 
       // Compute real sourceInstanceId
-      const sourceInstanceId = createHash('sha256')
-        .update(fs.realpathSync(corruptRoot), 'utf8')
-        .digest('hex').slice(0, 16);
+      const sourceInstanceId = await sourceInstanceIdFor(corruptRoot);
 
       const result = invokeHelper(
         { op: 'detail', sourceInstanceId, sessionId: sid },
@@ -968,77 +995,63 @@ describe('dsh-history-helper', () => {
   // =========================================================================
 
   describe('root errors fail closed', () => {
-    test('EACCES root on list returns BUSY_CORRUPT (not ok-empty)', () => {
-      // Create a root and restrict internal project dir to trigger EACCES on readdir
-      const restrictedRoot = path.join(tmpDir, 'restricted-list-root');
-      fs.mkdirSync(restrictedRoot, { recursive: true });
-      const sid = 'restricted-001';
-      writeSession(restrictedRoot, '/tmp/restricted', sid, makeValidTurn(0));
-      // Restrict the project-level directory (not the root itself, since realpath works)
-      const projectDir = fs.readdirSync(restrictedRoot).find(d => fs.statSync(path.join(restrictedRoot, d)).isDirectory());
-      if (projectDir) {
-        fs.chmodSync(path.join(restrictedRoot, projectDir), 0o000);
-      }
+    test('root failure on list returns BUSY_CORRUPT (not ok-empty)', () => {
+      const fixture = createRootFailureFixture(
+        tmpDir,
+        'restricted-list-root',
+        '/tmp/restricted',
+        'restricted-001',
+      );
       try {
-        const result = invokeHelper({ op: 'list', roots: [restrictedRoot] });
+        const result = invokeHelper({ op: 'list', roots: [fixture.root] });
         assert.equal(result.ok, false,
-          `EACCES list must fail closed, got ok=${result.ok}`);
+          `root failure on list must fail closed, got ok=${result.ok}`);
         assert.equal(result.code, 'BUSY_CORRUPT',
-          `expected BUSY_CORRUPT for EACCES root, got: ${result.code} (${result.message})`);
+          `expected BUSY_CORRUPT for failed list root, got: ${result.code} (${result.message})`);
       } finally {
-        if (projectDir) {
-          fs.chmodSync(path.join(restrictedRoot, projectDir), 0o755);
-        }
+        fixture.restore();
       }
     });
 
-    test('EACCES root on usage returns BUSY_CORRUPT (not ok-empty)', () => {
-      const restrictedRoot = path.join(tmpDir, 'restricted-usage-root');
-      fs.mkdirSync(restrictedRoot, { recursive: true });
-      writeSession(restrictedRoot, '/tmp/restricted-u', 'restricted-u-001', makeValidTurn(0));
-      const projectDir = fs.readdirSync(restrictedRoot).find(d => fs.statSync(path.join(restrictedRoot, d)).isDirectory());
-      if (projectDir) {
-        fs.chmodSync(path.join(restrictedRoot, projectDir), 0o000);
-      }
+    test('root failure on usage returns BUSY_CORRUPT (not ok-empty)', () => {
+      const fixture = createRootFailureFixture(
+        tmpDir,
+        'restricted-usage-root',
+        '/tmp/restricted-u',
+        'restricted-u-001',
+      );
       try {
-        const result = invokeHelper({ op: 'usage', roots: [restrictedRoot] });
+        const result = invokeHelper({ op: 'usage', roots: [fixture.root] });
         assert.equal(result.ok, false,
-          `EACCES usage must fail closed`);
+          'root failure on usage must fail closed');
         assert.equal(result.code, 'BUSY_CORRUPT',
-          `expected BUSY_CORRUPT for EACCES usage root, got: ${result.code}`);
+          `expected BUSY_CORRUPT for failed usage root, got: ${result.code}`);
       } finally {
-        if (projectDir) {
-          fs.chmodSync(path.join(restrictedRoot, projectDir), 0o755);
-        }
+        fixture.restore();
       }
     });
 
-    test('EACCES root on detail returns BUSY_CORRUPT (not SOURCE_NOT_FOUND)', () => {
-      const restrictedRoot = path.join(tmpDir, 'restricted-detail-root');
-      fs.mkdirSync(restrictedRoot, { recursive: true });
-      writeSession(restrictedRoot, '/tmp/restricted-d', 'restricted-d-001', makeValidTurn(0));
-      // Compute sourceInstanceId BEFORE restricting
-      const sourceInstanceId = createHash('sha256')
-        .update(fs.realpathSync(restrictedRoot), 'utf8')
-        .digest('hex').slice(0, 16);
-      // Remove read perm on internal directories to trigger EACCES on readdir/readFrom
-      const projectDir = fs.readdirSync(restrictedRoot).find(d => fs.statSync(path.join(restrictedRoot, d)).isDirectory());
-      if (projectDir) {
-        fs.chmodSync(path.join(restrictedRoot, projectDir), 0o000);
-      }
+    test('root failure on detail returns BUSY_CORRUPT (not SOURCE_NOT_FOUND)', async () => {
+      const fixture = createRootFailureFixture(
+        tmpDir,
+        'restricted-detail-root',
+        '/tmp/restricted-d',
+        'restricted-d-001',
+      );
+      const sourceInstanceId = process.platform === 'win32'
+        ? 'unreachable-source'
+        : await sourceInstanceIdFor(fixture.root);
       try {
         const result = invokeHelper(
           { op: 'detail', sourceInstanceId, sessionId: 'restricted-d-001' },
-          { __DSH_HISTORY_ROOTS: JSON.stringify([restrictedRoot]) },
+          { __DSH_HISTORY_ROOTS: JSON.stringify([fixture.root]) },
         );
         assert.equal(result.ok, false,
-          `EACCES detail must fail closed`);
+          'root failure on detail must fail closed');
         assert.equal(result.code, 'BUSY_CORRUPT',
-          `expected BUSY_CORRUPT for EACCES detail root, got: ${result.code} (${result.message})`);
+          `expected BUSY_CORRUPT for failed detail root, got: ${result.code} (${result.message})`);
       } finally {
-        if (projectDir) {
-          fs.chmodSync(path.join(restrictedRoot, projectDir), 0o755);
-        }
+        fixture.restore();
       }
     });
   });

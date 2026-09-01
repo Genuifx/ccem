@@ -163,7 +163,8 @@ cef::wrap_app! {
             };
             let name = CefString::from("enable-features");
             let current = CefString::from(&command_line.switch_value(Some(&name))).to_string();
-            let features = CefString::from(enable_network_service_sandbox(&current));
+            let features = enable_network_service_sandbox(&current);
+            let features = CefString::from(features.as_str());
             // CEF 150 leaves NetworkServiceSandbox disabled by default. Mode 2 explicitly
             // enables it in the broker without discarding any feature switches supplied by CEF.
             command_line.append_switch_with_value(Some(&name), Some(&features));

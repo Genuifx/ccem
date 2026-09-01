@@ -242,7 +242,7 @@ async function inspectMacUpdaterNative(updaterPath, version) {
   const temporary = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-updater-'));
   try {
     runCommand(TAR_PATH, ['-xzf', updaterPath, '-C', temporary, '--no-same-owner']);
-    return inspectLegacyMacApp(
+    return await inspectLegacyMacApp(
       await locateSingleMacApp(temporary),
       version,
       'macOS updater app',
@@ -260,7 +260,7 @@ async function inspectMacDmgNative(dmgPath, version) {
     await fsp.mkdir(mountPoint);
     runCommand(HDIUTIL_PATH, ['attach', '-readonly', '-nobrowse', '-mountpoint', mountPoint, dmgPath]);
     mounted = true;
-    return inspectLegacyMacApp(
+    return await inspectLegacyMacApp(
       await locateSingleMacApp(mountPoint),
       version,
       'macOS DMG app',

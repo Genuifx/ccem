@@ -29,7 +29,7 @@ mod util;
 
 pub(crate) use mutation::{native_window_observation, occlude, set_bounds, set_visible};
 
-pub(super) use util::{
+use util::{
     cef_hwnd, destroy_cef_child, inspect_child_window, position_window, prepare_profile_path,
     set_window_visible, win32_hwnd,
 };

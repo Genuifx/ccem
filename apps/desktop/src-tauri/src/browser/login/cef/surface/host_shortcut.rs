@@ -145,6 +145,20 @@ fn cef_key_phase(event_type: cef::KeyEventType) -> HostKeyPhase {
     }
 }
 
+#[cfg(target_os = "macos")]
+macro_rules! cef_os_event_type {
+    () => {
+        *mut u8
+    };
+}
+
+#[cfg(windows)]
+macro_rules! cef_os_event_type {
+    () => {
+        Option<&mut cef::sys::MSG>
+    };
+}
+
 #[cfg(any(target_os = "macos", windows))]
 cef::wrap_keyboard_handler! {
     pub(crate) struct HostShortcutKeyboardHandler {
@@ -157,7 +171,7 @@ cef::wrap_keyboard_handler! {
             &self,
             _browser: Option<&mut cef::Browser>,
             event: Option<&cef::KeyEvent>,
-            _os_event: *mut u8,
+            _os_event: cef_os_event_type!(),
             _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             use tauri::Emitter;

@@ -534,7 +534,20 @@ test('interrupt reconciles a command that never entered the helper foreground', 
 });
 
 test('interrupt atomically cancels a normal command pending helper admission', async (t) => {
-  const session = await startHelper(t, { scenario: 'full' });
+  const built = await buildHelperWithWireMock({ scenario: 'slow_fork' });
+  t.after(async () => {
+    await fs.rm(built.tempDir, { recursive: true, force: true });
+  });
+  const session = spawnTrackedHelper(t, built);
+  send(session, {
+    type: 'init',
+    provider: 'claude',
+    env_name: 'default',
+    perm_mode: 'dev',
+    working_dir: os.tmpdir(),
+    provider_session_id: 'parent-session',
+    fork_session: true,
+  });
   send(session, { type: 'prompt', text: 'cancel before admission', command_id: 'pending-normal' });
   send(session, {
     type: 'interrupt_turn',
@@ -545,7 +558,10 @@ test('interrupt atomically cancels a normal command pending helper admission', a
     'command_abandoned',
     'pending-normal',
   ), 'pending normal command abandoned');
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'initialization_settled',
+  ), 'slow initialization settled');
   assert.equal(lifecycleCount(session, 'command_admitted', 'pending-normal'), 0);
 });
 

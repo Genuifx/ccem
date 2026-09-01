@@ -276,7 +276,11 @@ exit "\${FAKE_SETTINGS_STATUS:-0}"
 test('workflow keeps the preflight on fixed actions and minimum OIDC permissions', () => {
   assert.match(workflowSource, /workflow_dispatch:\s*\n\s+inputs:\s*\n\s+expected_sha:/u);
   assert.match(workflowSource, /\n\s+expected_version:/u);
-  assert.match(workflowSource, /push:\s*\n\s+branches:\s*\n\s+- main\s*\n\s+tags:\s*\n\s+- 'v\*'\s*\n\s+paths:\s*\n\s+- 'apps\/cli\/package\.json'/u);
+  assert.match(workflowSource, /push:\s*\n\s+branches:\s*\n\s+- main\s*\n\s+tags:\s*\n\s+- 'v\*'/u);
+  assert.doesNotMatch(
+    workflowSource.slice(workflowSource.indexOf('on:'), workflowSource.indexOf('  workflow_dispatch:')),
+    /\n\s+paths:/u,
+  );
   assert.match(workflowSource, /permissions:\s*\n\s+actions:\s*read\s*\n\s+contents:\s*read\s*\n\s+id-token:\s*write/u);
   assert.doesNotMatch(workflowSource, /contents:\s*write|write-all/u);
   assert.doesNotMatch(workflowSource, /registry-url/u);
@@ -291,7 +295,10 @@ test('workflow keeps the preflight on fixed actions and minimum OIDC permissions
   assert.match(workflowSource, /node-version:\s*'22'/u);
   assert.match(workflowSource, /NPM_CONFIG_REGISTRY: https:\/\/registry\.npmjs\.org\//u);
   assert.doesNotMatch(workflowSource, /^\s+npm_config_registry:/mu);
-  assert.match(workflowSource, /- '\.github\/workflows\/release-cli\.yml'/u);
+  assert.match(
+    workflowSource,
+    /publish-cli:\s*\n\s+name:[^\n]+\n\s+if: >-\s*\n\s+github\.event_name == 'workflow_dispatch' \|\|\s*\n\s+startsWith\(github\.ref, 'refs\/tags\/'\) \|\|\s*\n\s+\(github\.ref == 'refs\/heads\/main' &&\s*\n\s+startsWith\(github\.event\.head_commit\.message, 'chore: release v'\)\)/u,
+  );
   assert.match(
     workflowSource,
     /npm install (?:--global|-g) npm@11\.5\.1 --registry=https:\/\/registry\.npmjs\.org\//u,

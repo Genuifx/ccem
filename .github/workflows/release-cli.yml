@@ -6,11 +6,6 @@ on:
       - main
     tags:
       - 'v*'
-    paths:
-      - 'apps/cli/package.json'
-      - '.github/workflows/release-cli.yml'
-      - 'scripts/ci/check-npm-publish-metadata.mjs'
-      - 'scripts/ci/check-release-repository-settings.mjs'
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -34,6 +29,11 @@ permissions:
 jobs:
   publish-cli:
     name: ${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && 'Preflight npm Trusted Publisher' || 'Publish to npm' }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.ref == 'refs/heads/main' &&
+        startsWith(github.event.head_commit.message, 'chore: release v'))
     runs-on: ubuntu-latest
     env:
       NPM_CONFIG_REGISTRY: https://registry.npmjs.org/

@@ -4,16 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - '.github/workflows/mode2-signed-readiness.yml'
-      - '.github/workflows/mode2-signed-producer.yml'
-      - 'apps/desktop/package.json'
-      - 'apps/desktop/src-tauri/tauri.conf.json'
-      - 'apps/desktop/src-tauri/Cargo.toml'
-      - 'apps/desktop/src-tauri/Cargo.lock'
-      - 'apps/desktop/scripts/detect-release-mode.mjs'
-      - 'apps/desktop/scripts/verify-legacy-release-inventory.mjs'
-      - 'scripts/ci/check-release-repository-settings.mjs'
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -27,7 +17,7 @@ on:
 
 concurrency:
   group: mode2-signed-readiness
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions: {}
 

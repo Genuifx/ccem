@@ -245,6 +245,40 @@ test('legacy macOS verifier rejects stale executable and tree copies in updater 
   );
 });
 
+test('legacy macOS verifier inspects the native Tauri updater before cleanup', {
+  skip: process.platform !== 'darwin',
+}, async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-native-updater-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const { app, executable } = await createMacApp(path.join(root, 'app'));
+  const dmg = await writeArtifact(root, `CCEM_Desktop_${version}_aarch64.dmg`, 'dmg');
+  const updaterPath = path.join(root, 'CCEM Desktop.app.tar.gz');
+  const archived = spawnSync('/usr/bin/tar', [
+    '-czf', updaterPath,
+    '-C', path.dirname(app),
+    path.basename(app),
+  ], { encoding: 'utf8' });
+  assert.equal(archived.status, 0, archived.stderr);
+  const updaterSignature = await writeArtifact(root, 'CCEM Desktop.app.tar.gz.sig', 'signature');
+  const packagedApp = {
+    executable: executable.metadata,
+    tree: await inspectLegacyBundleTree(app, 'native updater fixture'),
+  };
+
+  await assert.doesNotReject(() => inspectLegacyMacRelease({
+    target: 'aarch64-apple-darwin',
+    version,
+    sourceCommit,
+    appDir: app,
+    dmgPath: dmg.path,
+    updaterPath,
+    updaterSignaturePath: updaterSignature.path,
+  }, {
+    verifyUpdaterSignature: signatureVerification,
+    inspectDmg: async () => packagedApp,
+  }));
+});
+
 test('legacy Windows verifier rejects an installer containing a stale main executable', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-windows-binding-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
