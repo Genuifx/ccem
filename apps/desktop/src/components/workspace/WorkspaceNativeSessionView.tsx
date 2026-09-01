@@ -88,7 +88,10 @@ import {
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
 import { getWorkspaceForkTurnPreview } from './WorkspaceForkDialog';
 import { shouldPreserveRestoredReadingPosition } from './workspaceTranscriptTopWindowing';
-import { WorkspaceSessionComposer } from './WorkspaceSessionComposer';
+import {
+  WorkspaceSessionComposer,
+  type ComposerQueuedMessage,
+} from './WorkspaceSessionComposer';
 import {
   ComposerControls,
   normalizePermissionModeName,
@@ -102,7 +105,10 @@ import {
   type NativeSessionAttentionState,
 } from './workspaceNativeAttention';
 import { selectNativeSessionProcessing } from './workspaceNativeSessionProjection';
-import { reconcileNativeQueuedPrompts } from './workspaceNativeQueueProjection';
+import {
+  partitionNativeQueuedPromptPresentation,
+  reconcileNativeQueuedPrompts,
+} from './workspaceNativeQueueProjection';
 import { normalizeEffortForProvider } from './workspaceSessionPreferences';
 import { resolveWorkspaceRuntimePlanMode } from './workspaceRuntimePlanMode';
 import {
@@ -513,6 +519,27 @@ function isNativeSessionPlanRuntime(session: NativeSessionSummary) {
 
 function latestEventSeq(events: SessionEventRecord[]): number | null {
   return events[events.length - 1]?.seq ?? null;
+}
+
+function addObservedUserPromptClientMessageIds(
+  target: Set<string>,
+  events: SessionEventRecord[],
+) {
+  for (const event of events) {
+    if (event.payload.type !== 'user_prompt') {
+      continue;
+    }
+    const clientMessageId = event.payload.client_message_id?.trim();
+    if (clientMessageId) {
+      target.add(clientMessageId);
+    }
+  }
+}
+
+function observedUserPromptClientMessageIds(events: SessionEventRecord[]): Set<string> {
+  const observed = new Set<string>();
+  addObservedUserPromptClientMessageIds(observed, events);
+  return observed;
 }
 
 function hasImmediateAttentionEvent(events: SessionEventRecord[]) {
@@ -1444,6 +1471,7 @@ export function WorkspaceNativeSessionView({
     sendNativeSessionInput,
     flushNativeSessionInputQueue,
     getNativeSessionInputQueue,
+    cancelNativeSessionQueuedInput,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,
@@ -1483,6 +1511,9 @@ export function WorkspaceNativeSessionView({
   );
   const [events, setEvents] = useState<SessionEventRecord[]>(() =>
     readCachedNativeEvents(session.runtime_id).events,
+  );
+  const observedUserPromptClientMessageIdsRef = useRef<Set<string>>(
+    observedUserPromptClientMessageIds(events),
   );
   const [transcriptBackfillView, setTranscriptBackfillView] = useState<{
     runtimeId: string;
@@ -1532,18 +1563,24 @@ export function WorkspaceNativeSessionView({
     messages: readStoredGuidanceQueue(session.runtime_id),
   }));
   const queueSnapshotRequestSeqRef = useRef(0);
+  const cancellingNativeQueuedPromptIdsRef = useRef<Set<string>>(new Set());
   const queuedMessages = queuedState.runtimeId === session.runtime_id ? queuedState.messages : [];
+  const queuedStateRef = useRef(queuedState);
+  const queuedFlushLeaseRef = useRef<{
+    runtimeId: string;
+    promise: Promise<boolean>;
+  } | null>(null);
   const setQueuedMessages = useCallback((update: QueuedGuidanceMessagesUpdate) => {
-    setQueuedState((previousState) => {
-      const previousMessages = previousState.runtimeId === session.runtime_id
-        ? previousState.messages
-        : readStoredGuidanceQueue(session.runtime_id);
-
-      return {
-        runtimeId: session.runtime_id,
-        messages: resolveGuidanceMessagesUpdate(update, previousMessages),
-      };
-    });
+    const previousState = queuedStateRef.current;
+    const previousMessages = previousState.runtimeId === session.runtime_id
+      ? previousState.messages
+      : readStoredGuidanceQueue(session.runtime_id);
+    const nextState = {
+      runtimeId: session.runtime_id,
+      messages: resolveGuidanceMessagesUpdate(update, previousMessages),
+    };
+    queuedStateRef.current = nextState;
+    setQueuedState(nextState);
   }, [session.runtime_id]);
   const isHandoffPending = session.status === 'handoff_pending';
   const lastSeenSeqRef = useRef<number | null>(latestEventSeq(events));
@@ -2003,6 +2040,7 @@ export function WorkspaceNativeSessionView({
 
     lastSeenSeqRef.current = latestEventSeq(cachedEvents);
     latestEventsRef.current = cachedEvents;
+    observedUserPromptClientMessageIdsRef.current = observedUserPromptClientMessageIds(cachedEvents);
     previousMessagesRef.current = [];
     transcriptDerivationRef.current = null;
     sessionUsageDerivationRef.current = null;
@@ -2022,7 +2060,6 @@ export function WorkspaceNativeSessionView({
     setTranscriptBackfillView({ runtimeId: session.runtime_id, state: 'idle' });
     clearComposerDraft();
     setComposerPlanModeEnabled(isNativeSessionPlanRuntime(session));
-    setQueuedMessages([]);
     setLocalUserPrompts(initialPrompts);
     setSelectedFileCheckpoint(null);
     setIsRestoreDialogOpen(false);
@@ -2075,9 +2112,26 @@ export function WorkspaceNativeSessionView({
     [events, localUserPrompts],
   );
 
-  const replayLocalPrompts = useMemo(
-    () => splitLocalUserPromptsForReplay(unconfirmedLocalUserPrompts),
+  useEffect(() => {
+    setLocalUserPrompts((previous) => filterConfirmedLocalUserPrompts(previous, events));
+  }, [events]);
+
+  const nativeQueuedPromptPresentation = useMemo(
+    () => partitionNativeQueuedPromptPresentation(unconfirmedLocalUserPrompts),
     [unconfirmedLocalUserPrompts],
+  );
+
+  const composerQueuedMessages = useMemo<ComposerQueuedMessage[]>(
+    () => [
+      ...nativeQueuedPromptPresentation.composerQueuedMessages,
+      ...queuedMessages,
+    ],
+    [nativeQueuedPromptPresentation.composerQueuedMessages, queuedMessages],
+  );
+
+  const replayLocalPrompts = useMemo(
+    () => splitLocalUserPromptsForReplay(nativeQueuedPromptPresentation.transcriptPrompts),
+    [nativeQueuedPromptPresentation.transcriptPrompts],
   );
 
   const transcriptTerminalError = session.status === 'error'
@@ -2590,6 +2644,10 @@ export function WorkspaceNativeSessionView({
     const incrementalReplay = isInitialReplay
       ? null
       : inspectIncrementalTranscriptReplay(batch);
+    addObservedUserPromptClientMessageIds(
+      observedUserPromptClientMessageIdsRef.current,
+      batch.events,
+    );
     const initialReplayComplete = isInitialReplay
       && replayBatchCoversAvailableSequenceRange(batch);
     const acknowledgedSeq = incrementalReplay?.acknowledgedSeq ?? latestEventSeq(batch.events);
@@ -3154,8 +3212,6 @@ export function WorkspaceNativeSessionView({
         annotations.length > 0 ? annotations : undefined,
         clientMessageId,
       );
-      await pollEvents();
-      await refreshSummary({ force: true });
     } catch (error) {
       console.error('Failed to send native session input:', error);
       setLocalUserPrompts((previous) =>
@@ -3163,8 +3219,25 @@ export function WorkspaceNativeSessionView({
       );
       throw error;
     } finally {
+      // Submission is complete once the backend accepts or rejects it. The
+      // projection refresh below is best-effort and must not keep the composer
+      // locked or turn an accepted queue item into a retried duplicate.
       setIsSending(false);
     }
+
+    // Re-arm the composer submit guard as soon as the authoritative enqueue
+    // ACK arrives. A slow replay refresh must not swallow the user's next
+    // message while the current turn is still running.
+    void Promise.allSettled([
+      Promise.resolve().then(() => pollEvents()),
+      Promise.resolve().then(() => refreshSummary({ force: true })),
+    ]).then((refreshResults) => {
+      for (const result of refreshResults) {
+        if (result.status === 'rejected') {
+          console.error('Failed to refresh after accepted native input:', result.reason);
+        }
+      }
+    });
   }, [buildQueuedBatchText, pollEvents, refreshSummary, sendNativeSessionInput, session.runtime_id]);
 
   const applyRuntimePlanModeChange = useCallback(async (
@@ -3455,6 +3528,83 @@ export function WorkspaceNativeSessionView({
     performEffortChange(effort);
   }, [activeBackgroundTaskCount, performEffortChange]);
 
+  const flushQueuedMessages = useCallback((): Promise<boolean> => {
+    const runtimeId = session.runtime_id;
+    const existingLease = queuedFlushLeaseRef.current;
+    if (existingLease?.runtimeId === runtimeId) {
+      return existingLease.promise;
+    }
+
+    const currentState = queuedStateRef.current;
+    const currentMessages = currentState.runtimeId === runtimeId
+      ? currentState.messages
+      : readStoredGuidanceQueue(runtimeId);
+    if (currentMessages.length === 0) {
+      return Promise.resolve(true);
+    }
+    if (isSending || isTerminalStatus(session.status)) {
+      return Promise.resolve(false);
+    }
+
+    const promise = (async () => {
+      let pendingBatch: QueuedGuidanceMessage[] | null = null;
+      try {
+        if (!await waitForPendingEnvironmentUpdate()) {
+          return false;
+        }
+
+        const liveState = queuedStateRef.current;
+        const liveMessages = liveState.runtimeId === runtimeId
+          ? liveState.messages
+          : readStoredGuidanceQueue(runtimeId);
+        if (liveMessages.length === 0) {
+          return true;
+        }
+        if (collectQueuedPromptAnnotations(liveMessages) == null) {
+          toast.error(t('workspace.messageAnnotationsBatchLimit'));
+          return false;
+        }
+
+        pendingBatch = liveMessages;
+        setQueuedMessages([]);
+        await sendPromptBatch(pendingBatch, { queuedBehindTurn: true });
+        return true;
+      } catch (error) {
+        if (pendingBatch) {
+          setQueuedMessages((previous) => {
+            const existingIds = new Set(previous.map((message) => message.id));
+            return [
+              ...pendingBatch!.filter((message) => !existingIds.has(message.id)),
+              ...previous,
+            ];
+          });
+        }
+        toast.error(t(
+          error instanceof PromptAnnotationLimitError
+            ? 'workspace.messageAnnotationsBatchLimit'
+            : 'workspace.nativeSendFailed',
+        ));
+        return false;
+      }
+    })();
+    const lease = { runtimeId, promise };
+    queuedFlushLeaseRef.current = lease;
+    void promise.finally(() => {
+      if (queuedFlushLeaseRef.current === lease) {
+        queuedFlushLeaseRef.current = null;
+      }
+    }).catch(() => {});
+    return promise;
+  }, [
+    isSending,
+    sendPromptBatch,
+    session.runtime_id,
+    session.status,
+    setQueuedMessages,
+    t,
+    waitForPendingEnvironmentUpdate,
+  ]);
+
   const handleSend = useCallback(async (payload?: ComposerSubmitPayload) => {
     if (isSending) {
       return false;
@@ -3547,9 +3697,12 @@ export function WorkspaceNativeSessionView({
         toast.error(t('workspace.messageAnnotationsBatchLimit'));
         return false;
       }
-      clearComposerDraft();
-      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       try {
+        if (!await flushQueuedMessages()) {
+          return false;
+        }
+        clearComposerDraft();
+        setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
         await sendPromptBatch([nextPrompt], { queuedBehindTurn: true });
         return true;
       } catch (error) {
@@ -3562,20 +3715,21 @@ export function WorkspaceNativeSessionView({
       }
     }
 
-    if (queuedMessages.length > 0 && !hasBlockingAttention) {
-      const pendingBatch = [...queuedMessages, nextPrompt];
-      if (collectQueuedPromptAnnotations(pendingBatch) == null) {
-        toast.error(t('workspace.messageAnnotationsBatchLimit'));
+    const liveQueuedState = queuedStateRef.current;
+    const legacyQueueMigrationPending = (
+      liveQueuedState.runtimeId === session.runtime_id
+      && liveQueuedState.messages.length > 0
+    ) || queuedFlushLeaseRef.current?.runtimeId === session.runtime_id;
+    if (legacyQueueMigrationPending && !hasBlockingAttention) {
+      if (!await flushQueuedMessages()) {
         return false;
       }
-      clearComposerDraft();
-      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
-      setQueuedMessages([]);
       try {
-        await sendPromptBatch(pendingBatch);
+        await sendPromptBatch([nextPrompt], { queuedBehindTurn: true });
+        clearComposerDraft();
+        setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
         return true;
       } catch (error) {
-        setQueuedMessages(pendingBatch);
         toast.error(t(
           error instanceof PromptAnnotationLimitError
             ? 'workspace.messageAnnotationsBatchLimit'
@@ -3604,68 +3758,29 @@ export function WorkspaceNativeSessionView({
     hasHardBlockingAttention,
     hasBlockingAttention,
     hasQuickReplyPrompt,
+    flushQueuedMessages,
     isProcessingTurn,
     isSending,
     planExitApprovalPrompt,
-    queuedMessages,
     sendPromptBatch,
     sendInteractivePromptReply,
     session.project_dir,
+    session.runtime_id,
     sessionRuntimePermMode,
     t,
     waitForPendingEnvironmentUpdate,
   ]);
 
-  const flushQueuedMessages = useCallback(async () => {
-    if (
-      queuedMessages.length === 0
-      || isSending
-      || isTerminalStatus(session.status)
-    ) {
-      return;
-    }
-
-    if (!await waitForPendingEnvironmentUpdate()) {
-      return;
-    }
-    if (collectQueuedPromptAnnotations(queuedMessages) == null) {
-      toast.error(t('workspace.messageAnnotationsBatchLimit'));
-      return;
-    }
-
-    const pendingBatch = queuedMessages;
-    setQueuedMessages([]);
-
-    try {
-      await sendPromptBatch(pendingBatch);
-    } catch (error) {
-      setQueuedMessages((previous) => [...pendingBatch, ...previous]);
-      toast.error(t(
-        error instanceof PromptAnnotationLimitError
-          ? 'workspace.messageAnnotationsBatchLimit'
-          : 'workspace.nativeSendFailed',
-      ));
-    }
-  }, [
-    isSending,
-    queuedMessages,
-    sendPromptBatch,
-    session.status,
-    t,
-    waitForPendingEnvironmentUpdate,
-  ]);
-
   useEffect(() => {
-    setQueuedState((previousState) => {
-      if (previousState.runtimeId === session.runtime_id) {
-        return previousState;
-      }
-
-      return {
-        runtimeId: session.runtime_id,
-        messages: readStoredGuidanceQueue(session.runtime_id),
-      };
-    });
+    if (queuedStateRef.current.runtimeId === session.runtime_id) {
+      return;
+    }
+    const nextState = {
+      runtimeId: session.runtime_id,
+      messages: readStoredGuidanceQueue(session.runtime_id),
+    };
+    queuedStateRef.current = nextState;
+    setQueuedState(nextState);
   }, [session.runtime_id]);
 
   useEffect(() => {
@@ -3686,32 +3801,117 @@ export function WorkspaceNativeSessionView({
     const requestSeq = queueSnapshotRequestSeqRef.current + 1;
     queueSnapshotRequestSeqRef.current = requestSeq;
     let cancelled = false;
-    void getNativeSessionInputQueue(session.runtime_id)
-      .then((items) => {
+    void (async () => {
+      try {
+        const snapshotEventFence = latestEventSeq(latestEventsRef.current) ?? undefined;
+        const items = await getNativeSessionInputQueue(session.runtime_id);
         if (cancelled || queueSnapshotRequestSeqRef.current !== requestSeq) {
           return;
         }
-        setLocalUserPrompts((previous) => reconcileNativeQueuedPrompts(previous, items, {
-          activeCommandId: session.lifecycle?.active_command_id,
-          afterEventSeq: latestEventSeq(latestEventsRef.current) ?? undefined,
-          expectedQueueCount: session.lifecycle?.queue_count,
-          isTerminal: isTerminalStatus(session.status),
-        }));
-      })
-      .catch((error) => {
+        // Synchronize the backend event boundary before treating snapshot
+        // absence as cancellation. runPollEvents records client ids before its
+        // low-priority React commit, preventing a dequeue -> transcript gap.
+        const joinedExistingPoll =
+          pollEventsInFlightRef.current?.runtimeId === session.runtime_id;
+        await pollEvents();
+        // A poll that started before this snapshot may also predate the
+        // persisted user_prompt. Queue one fresh drain behind that lease.
+        if (joinedExistingPoll) {
+          await pollEvents();
+        }
+        if (cancelled || queueSnapshotRequestSeqRef.current !== requestSeq) {
+          return;
+        }
+        setLocalUserPrompts((previous) => filterConfirmedLocalUserPrompts(
+          reconcileNativeQueuedPrompts(previous, items, {
+            activeCommandId: session.lifecycle?.active_command_id,
+            afterEventSeq: snapshotEventFence,
+            expectedQueueCount: session.lifecycle?.queue_count,
+            isTerminal: isTerminalStatus(session.status),
+            observedClientMessageIds: observedUserPromptClientMessageIdsRef.current,
+          }),
+          latestEventsRef.current,
+        ));
+      } catch (error) {
         console.error('Failed to load native input queue snapshot:', error);
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
   }, [
     getNativeSessionInputQueue,
+    pollEvents,
     session.lifecycle?.active_command_id,
     session.lifecycle?.queue_count,
     session.lifecycle?.state_revision,
     session.provider,
     session.runtime_id,
     session.status,
+  ]);
+
+  const handleRemoveQueuedMessage = useCallback((clientMessageId: string) => {
+    const nativeMessage = nativeQueuedPromptPresentation.composerQueuedMessages.find(
+      (message) => message.id === clientMessageId,
+    );
+    if (!nativeMessage) {
+      setQueuedMessages((previous) => previous.filter(
+        (message) => message.id !== clientMessageId,
+      ));
+      return;
+    }
+    if (
+      !nativeMessage.removable
+      || cancellingNativeQueuedPromptIdsRef.current.has(clientMessageId)
+    ) {
+      return;
+    }
+
+    cancellingNativeQueuedPromptIdsRef.current.add(clientMessageId);
+    void (async () => {
+      try {
+        await cancelNativeSessionQueuedInput(session.runtime_id, clientMessageId);
+      } catch (error) {
+        console.error('Failed to cancel native queued prompt:', error);
+        toast.error(t('workspace.composerCancelQueuedFailed'));
+        void pollEvents().catch((pollError) => {
+          console.error('Failed to refresh events after rejected queue cancellation:', pollError);
+        });
+        void refreshSummary({ force: true }).catch((refreshError) => {
+          console.error('Failed to refresh summary after rejected queue cancellation:', refreshError);
+        });
+        cancellingNativeQueuedPromptIdsRef.current.delete(clientMessageId);
+        return;
+      }
+
+      try {
+        // Invalidate any snapshot that began before the backend cancellation;
+        // only a successful atomic cancel may hide the row optimistically.
+        queueSnapshotRequestSeqRef.current += 1;
+        setLocalUserPrompts((previous) => previous.filter(
+          (prompt) => prompt.id !== clientMessageId,
+        ));
+        const refreshResults = await Promise.allSettled([
+          pollEvents(),
+          refreshSummary({ force: true }),
+        ]);
+        for (const result of refreshResults) {
+          if (result.status === 'rejected') {
+            console.error('Failed to refresh after successful queue cancellation:', result.reason);
+          }
+        }
+      } finally {
+        cancellingNativeQueuedPromptIdsRef.current.delete(clientMessageId);
+      }
+    })();
+  }, [
+    cancelNativeSessionQueuedInput,
+    nativeQueuedPromptPresentation.composerQueuedMessages,
+    pollEvents,
+    refreshSummary,
+    session.runtime_id,
+    setQueuedMessages,
+    t,
   ]);
 
   const handlePermission = useCallback(async (requestId: string, approved: boolean) => {
@@ -4085,11 +4285,9 @@ export function WorkspaceNativeSessionView({
         codexInstalled={codexInstalled}
         opencodeInstalled={opencodeInstalled}
         onLaunchNewSession={onLaunchNewSession}
-        queuedMessages={queuedMessages}
+        queuedMessages={composerQueuedMessages}
         onFlushQueuedMessages={() => void flushQueuedMessages()}
-        onRemoveQueuedMessage={(id) => {
-          setQueuedMessages((previous) => previous.filter((message) => message.id !== id));
-        }}
+        onRemoveQueuedMessage={handleRemoveQueuedMessage}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
         annotations={sessionAnnotations.pendingAnnotations}
         onUpdateAnnotation={sessionAnnotations.updateAnnotation}

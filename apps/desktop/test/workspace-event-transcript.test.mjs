@@ -843,6 +843,21 @@ test('matches persisted prompts by client message id before falling back to repe
   );
 });
 
+test('exact client message identity beats a newer optimistic sequence fence', async () => {
+  const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
+  const pending = filterConfirmedLocalUserPrompts(
+    [{ id: 'stable-client-id', text: 'queued text', afterEventSeq: 20 }],
+    [event(10, {
+      type: 'user_prompt',
+      text: 'queued text',
+      image_count: 0,
+      client_message_id: 'stable-client-id',
+    })],
+  );
+
+  assert.deepEqual(pending, []);
+});
+
 test('preserves optimistic prompt identity while unrelated replay events stream', async () => {
   const { filterConfirmedLocalUserPrompts } = await importWorkspaceEventTranscript();
   const prompts = [

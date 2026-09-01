@@ -310,6 +310,14 @@ pub enum NativeInputClaimOutcome {
     Empty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeInputCancelOutcome {
+    Cancelled { remaining_count: usize },
+    NotFound,
+    Dispatching,
+    DeliveryUncertain,
+}
+
 #[derive(Debug, Default)]
 pub struct NativeInputQueue {
     queues: Mutex<HashMap<String, VecDeque<QueuedNativeInput>>>,
@@ -658,6 +666,52 @@ impl NativeInputQueue {
             dispatch_attempt,
             dispatch_command_id,
         })
+    }
+
+    /// Cancels one exact prompt only while the queue still proves it has not
+    /// started delivery. Claim and cancellation share the queue mutex, so the
+    /// winner is linearizable: once dispatching begins this method must refuse
+    /// rather than hiding a prompt that may already reach the helper.
+    pub fn cancel_pending(
+        &self,
+        runtime_id: &str,
+        client_message_id: &str,
+    ) -> NativeInputCancelOutcome {
+        let mut queues = self.lock_queues();
+        let Some(queue) = queues.get_mut(runtime_id) else {
+            return NativeInputCancelOutcome::NotFound;
+        };
+        let Some(index) = queue
+            .iter()
+            .position(|queued| queued.batch.contains_client_message_id(client_message_id))
+        else {
+            return NativeInputCancelOutcome::NotFound;
+        };
+
+        match queue[index].delivery_state {
+            QueuedInputDeliveryState::Dispatching => {
+                return NativeInputCancelOutcome::Dispatching;
+            }
+            QueuedInputDeliveryState::DeliveryUncertain => {
+                return NativeInputCancelOutcome::DeliveryUncertain;
+            }
+            QueuedInputDeliveryState::Pending => {}
+        }
+
+        let queued = queue
+            .get_mut(index)
+            .expect("located queued batch must still exist");
+        let Some(_) = queued.batch.remove_client_message_id(client_message_id) else {
+            return NativeInputCancelOutcome::NotFound;
+        };
+        if queued.batch.is_empty() {
+            queue.remove(index);
+        }
+        let remaining_count = queue.iter().map(|queued| queued.batch.len()).sum();
+        if queue.is_empty() {
+            queues.remove(runtime_id);
+        }
+        NativeInputCancelOutcome::Cancelled { remaining_count }
     }
 
     pub fn mark_claim_delivery_uncertain(

@@ -461,7 +461,7 @@ test('head rebase consumes events that confirm the optimistic prompt in the same
   );
 });
 
-test('queued prompt stays a single tail row while the active turn streams and then converges', async () => {
+test('queued prompt stays outside the transcript until persisted admission then appears once', async () => {
   const mod = await importTranscriptModule();
   const queuedPrompt = {
     id: 'client-message-queued-1',
@@ -479,34 +479,22 @@ test('queued prompt stays a single tail row while the active turn streams and th
   let replayToken = { revision: 1 };
   let state = mod.deriveTranscriptReset(
     seed,
-    [queuedPrompt],
+    [],
     initialEvents,
     null,
     { tokens: { seedMessages: seed, prompts: replayToken } },
   );
 
-  const assertSingleQueuedProjection = () => {
+  const assertQueuedPromptAbsent = () => {
     const messages = mod.finalizeTranscriptMessages(state);
-    const queuedRows = messages.filter((message) => message.uuid === queuedPrompt.id);
     assert.equal(
-      queuedRows.length,
-      1,
-      'one queued client message must render exactly once',
-    );
-    assert.equal(
-      queuedRows[0].queuedPending,
-      true,
-      'a busy-queued prompt must render with a visible queued state',
-    );
-    assert.equal(queuedRows[0].queuedDeliveryState, 'pending');
-    assert.equal(
-      messages.filter((message) => message.msgType === 'assistant').length,
-      1,
-      'the active assistant turn must not be split around a queued prompt',
+      messages.filter((message) => message.uuid === queuedPrompt.id).length,
+      0,
+      'backend-owned queued prompts belong to the composer queue, not the transcript',
     );
   };
 
-  assertSingleQueuedProjection();
+  assertQueuedPromptAbsent();
 
   const streamingEvents = [
     ...initialEvents,
@@ -519,10 +507,10 @@ test('queued prompt stays a single tail row while the active turn streams and th
       state,
       seed,
       streamingEvents.slice(0, end),
-      [queuedPrompt],
+      [],
       { seedMessages: seed, prompts: replayToken },
     );
-    assertSingleQueuedProjection();
+    assertQueuedPromptAbsent();
   }
 
   const confirmedEvents = [
@@ -553,12 +541,6 @@ test('queued prompt stays a single tail row while the active turn streams and th
     'persisted confirmation must replace the optimistic row, not add another row',
   );
   assert.equal(confirmedMessages[1].uuid, 'user-prompt-4');
-  assert.equal(
-    confirmedMessages[1].queuedPending,
-    undefined,
-    'the persisted row must convert atomically to a plain user bubble',
-  );
-  assert.equal(confirmedMessages[1].queuedDeliveryState, undefined);
 });
 
 test('same-text queued prompts converge independently by client message id', async () => {

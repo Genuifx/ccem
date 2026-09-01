@@ -12,8 +12,8 @@ use crate::native_event_log::{
 use crate::native_helper_resource::native_helper_script_path;
 use crate::native_input_queue::{
     FrozenNativeInputBatch, FrozenNativeInputMessage, FrozenNativeInputMessageParts,
-    NativeInputClaimOutcome, NativeInputQueue, NativeInputQueueError, QueuedInputDeliveryState,
-    QueuedNativeInputSnapshotItem,
+    NativeInputCancelOutcome, NativeInputClaimOutcome, NativeInputQueue, NativeInputQueueError,
+    QueuedInputDeliveryState, QueuedNativeInputSnapshotItem,
 };
 use crate::native_session_coordinator::{
     AdapterKind, InteractiveWaitOutcome, LifecycleDecision, NativeLifecycleProjection,
@@ -2899,6 +2899,55 @@ impl NativeRuntimeManager {
             ));
         }
         Ok(self.input_queue.snapshot(runtime_id))
+    }
+
+    /// Cancels one exact prompt only while backend queue ownership still
+    /// proves delivery has not started. Dispatching and uncertain entries are
+    /// deliberately rejected because hiding them cannot guarantee non-delivery.
+    pub fn cancel_pending_queued_input(
+        &self,
+        runtime_id: &str,
+        client_message_id: &str,
+    ) -> Result<usize, String> {
+        let client_message_id = client_message_id.trim();
+        if client_message_id.is_empty() {
+            return Err("NATIVE_QUEUE_CANCEL_INVALID_ID: client_message_id must not be empty".into());
+        }
+        let provider = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock native runtime records".to_string())?
+            .get(runtime_id)
+            .map(|record| record.provider)
+            .ok_or_else(|| format!("Native runtime {runtime_id} not found"))?;
+        if provider != NativeProvider::Claude {
+            return Err(format!(
+                "Native runtime {runtime_id} does not use the managed Claude input queue"
+            ));
+        }
+
+        match self.input_queue.cancel_pending(runtime_id, client_message_id) {
+            NativeInputCancelOutcome::Cancelled { remaining_count } => {
+                self.lifecycle.note_queue_changed(runtime_id);
+                let _ = self.append_lifecycle_event(
+                    runtime_id,
+                    "prompt_queue_cancelled",
+                    format!(
+                        "client_message_id={client_message_id} queue_count={remaining_count}"
+                    ),
+                );
+                Ok(remaining_count)
+            }
+            NativeInputCancelOutcome::NotFound => Err(format!(
+                "NATIVE_QUEUE_CANCEL_TOO_LATE: queued prompt {client_message_id} was not found"
+            )),
+            NativeInputCancelOutcome::Dispatching => Err(format!(
+                "NATIVE_QUEUE_CANCEL_DISPATCHING: queued prompt {client_message_id} has started delivery"
+            )),
+            NativeInputCancelOutcome::DeliveryUncertain => Err(format!(
+                "NATIVE_QUEUE_CANCEL_UNCERTAIN: queued prompt {client_message_id} may already be delivered"
+            )),
+        }
     }
 
     fn schedule_command_admission_deadline(
@@ -9546,6 +9595,52 @@ mod tests {
             .expect("projection");
         assert_eq!(projection.queue_count, 1);
         assert_eq!(projection.delivery_uncertain_count, 1);
+    }
+
+    #[test]
+    fn cancelling_pending_input_updates_the_authoritative_lifecycle_projection() {
+        let runtime_id = "native-queue-cancel-projection";
+        let manager = manager_with_handle(runtime_id);
+        manager.lifecycle.ensure_session(runtime_id);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("cancel-me", "first", None, None, None),
+                Some("busy-command"),
+            )
+            .expect("enqueue first");
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("keep-me", "second", None, None, None),
+                Some("busy-command"),
+            )
+            .expect("enqueue second");
+        manager.lifecycle.note_queue_changed(runtime_id);
+        let before = manager
+            .lifecycle_projection(runtime_id)
+            .expect("projection before cancel");
+
+        assert_eq!(
+            manager.cancel_pending_queued_input(runtime_id, "cancel-me"),
+            Ok(1),
+        );
+        let after = manager
+            .lifecycle_projection(runtime_id)
+            .expect("projection after cancel");
+        assert_eq!(after.queue_count, 1);
+        assert!(after.state_revision > before.state_revision);
+        assert_eq!(
+            manager
+                .input_queue_snapshot(runtime_id)
+                .expect("snapshot")
+                .into_iter()
+                .map(|item| item.client_message_id)
+                .collect::<Vec<_>>(),
+            vec!["keep-me"],
+        );
     }
 
     #[test]

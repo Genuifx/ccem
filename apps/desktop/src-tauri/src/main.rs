@@ -1571,6 +1571,24 @@ fn get_native_session_input_queue(
 }
 
 #[tauri::command]
+async fn cancel_native_session_queued_input(
+    window: tauri::WebviewWindow,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    client_message_id: String,
+) -> Result<usize, String> {
+    if window.label() != "main" {
+        return Err("Native queued prompts can be cancelled only from the main workspace".into());
+    }
+    let native_state = Arc::clone(native_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        native_state.cancel_pending_queued_input(&runtime_id, &client_message_id)
+    })
+    .await
+    .map_err(|error| format!("Native queue cancel task failed: {error}"))?
+}
+
+#[tauri::command]
 fn respond_native_session_permission(
     native_state: State<'_, Arc<NativeRuntimeManager>>,
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
@@ -5522,6 +5540,7 @@ fn main() {
             send_native_session_input,
             flush_native_session_input_queue,
             get_native_session_input_queue,
+            cancel_native_session_queued_input,
             respond_native_session_permission,
             respond_native_session_prompt,
             rewind_native_session_files,

@@ -44,8 +44,8 @@ export interface LocalUserPrompt {
   /**
    * The prompt entered the backend input queue behind a busy foreground turn
    * (or a hard-blocking attention). Until the persisted `user_prompt`
-   * confirms admission, its tail row renders with a visible queued state so
-   * the user can tell it has not been sent to the model yet.
+   * confirms admission, the workspace projects it into the queue dock above
+   * the composer and excludes it from transcript derivation.
    */
   queuedBehindTurn?: boolean;
   queuedDeliveryState?: NativeQueuedPromptDeliveryState;
@@ -87,10 +87,6 @@ function cloneMessages(messages: ConversationMessageData[]): ConversationMessage
 }
 
 function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
-  const queuedPending = prompt.queuedBehindTurn === true && prompt.deferUntilPersisted === true;
-  const queuedDeliveryState = queuedPending
-    ? (prompt.queuedDeliveryState ?? 'pending')
-    : undefined;
   const imageBlocks = createPromptImageBlocks(prompt.images);
   if (imageBlocks.length > 0) {
     const displayText = stripRenderedImageMarkers(prompt.text, imageBlocks);
@@ -107,8 +103,6 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
       timestamp: prompt.timestamp,
       segmentIndex: 0,
       isCompactBoundary: false,
-      ...(queuedPending ? { queuedPending: true } : {}),
-      ...(queuedDeliveryState ? { queuedDeliveryState } : {}),
       ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
     };
   }
@@ -120,8 +114,6 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
     timestamp: prompt.timestamp,
     segmentIndex: 0,
     isCompactBoundary: false,
-    ...(queuedPending ? { queuedPending: true } : {}),
-    ...(queuedDeliveryState ? { queuedDeliveryState } : {}),
     ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
   };
 }
@@ -259,12 +251,17 @@ export function filterConfirmedLocalUserPrompts(
   let removedPrompt = false;
   const remainingPrompts = prompts.filter((prompt) => {
     const key = normalizePromptConfirmationText(prompt.text, prompt.images ?? null);
-    const confirmedIndex = confirmedPrompts.findIndex((confirmed) =>
-      (confirmed.clientMessageId != null
-        ? confirmed.clientMessageId === prompt.id
-        : confirmed.key === key)
-      && (prompt.afterEventSeq == null || confirmed.seq > prompt.afterEventSeq),
-    );
+    const confirmedIndex = confirmedPrompts.findIndex((confirmed) => {
+      if (confirmed.clientMessageId != null) {
+        // Backend client-message ids are unique for the runtime lifetime. An
+        // exact persisted identity wins even when a concurrent queue snapshot
+        // was fenced after that event; the sequence guard is only needed for
+        // legacy text matching where identical prompts can recur.
+        return confirmed.clientMessageId === prompt.id;
+      }
+      return confirmed.key === key
+        && (prompt.afterEventSeq == null || confirmed.seq > prompt.afterEventSeq);
+    });
     if (confirmedIndex === -1) {
       return true;
     }
@@ -874,8 +871,6 @@ function shallowEqualMessages(
     && previous.cacheCreationTokens === next.cacheCreationTokens
     && previous.cacheReadTokens === next.cacheReadTokens
     && previous.annotations === next.annotations
-    && previous.queuedPending === next.queuedPending
-    && previous.queuedDeliveryState === next.queuedDeliveryState
     && shallowEqualContent(previous.content, next.content);
 }
 

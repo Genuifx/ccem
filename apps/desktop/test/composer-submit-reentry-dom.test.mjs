@@ -133,7 +133,61 @@ async function importHarness() {
       contents: `
         import React, { act, useState } from 'react';
         import { createRoot } from 'react-dom/client';
+        import { renderToStaticMarkup } from 'react-dom/server';
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
+
+        export function renderNativeQueuedComposer() {
+          return renderToStaticMarkup(
+            <WorkspaceSessionComposer
+              value=""
+              onValueChange={() => {}}
+              onSubmit={() => {}}
+              placeholder="composer input"
+              canSubmit={false}
+              submitLabel="send message"
+              queuedMessages={[{
+                id: 'native-queued-message',
+                text: 'wait above composer',
+                displayText: 'wait above composer',
+                deliveryState: 'pending',
+                removable: true,
+                flushable: false,
+              }]}
+              onFlushQueuedMessages={() => {}}
+              onRemoveQueuedMessage={() => {}}
+              queueCanFlush
+            />
+          );
+        }
+
+        export function renderMixedQueuedComposer() {
+          return renderToStaticMarkup(
+            <WorkspaceSessionComposer
+              value=""
+              onValueChange={() => {}}
+              onSubmit={() => {}}
+              placeholder="composer input"
+              canSubmit={false}
+              submitLabel="send message"
+              queuedMessages={[
+                {
+                  id: 'native-first',
+                  text: 'native first',
+                  deliveryState: 'pending',
+                  removable: true,
+                  flushable: false,
+                },
+                {
+                  id: 'legacy-second',
+                  text: 'legacy second',
+                },
+              ]}
+              onFlushQueuedMessages={() => {}}
+              onRemoveQueuedMessage={() => {}}
+              queueCanFlush
+            />
+          );
+        }
 
         export function mount(container) {
           const state = {
@@ -215,6 +269,55 @@ async function importHarness() {
   const imported = await import(pathToFileURL(outputPath).href);
   return { ...imported, tempDir };
 }
+
+test('native queued prompt renders in the dock before and outside the composer card', async () => {
+  const { renderNativeQueuedComposer } = await importHarness();
+  const dom = new JSDOM(`<!doctype html><html><body>${renderNativeQueuedComposer()}</body></html>`);
+  const queue = dom.window.document.querySelector('[data-ccem-composer-queue]');
+  const item = dom.window.document.querySelector(
+    '[data-ccem-composer-queued-message="native-queued-message"]',
+  );
+  const card = dom.window.document.querySelector('[data-composer-shell-card]');
+
+  assert.ok(queue, 'the composer queue dock must render');
+  assert.ok(item, 'the native queued prompt must render in the queue dock');
+  assert.ok(card, 'the composer card must render');
+  assert.equal(card.contains(item), false, 'queued prompt must not be inside the composer card');
+  assert.ok(
+    queue.compareDocumentPosition(card) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING,
+    'queue dock must precede the composer card',
+  );
+  assert.match(item.textContent, /workspace\.messageQueuedBadge/);
+  assert.match(queue.textContent, /workspace\.composerQueuedWaiting/);
+  assert.doesNotMatch(queue.textContent, /workspace\.composerQueuedReady/);
+  assert.ok(
+    item.querySelector('[aria-label="workspace.composerRemoveQueued"]'),
+    'pending backend-owned queue rows must expose the safe cancel action',
+  );
+  assert.equal(
+    queue.querySelector('button:not([aria-label="workspace.composerRemoveQueued"])'),
+    null,
+    'backend-owned queue rows must not expose the legacy flush action',
+  );
+});
+
+test('mixed native and legacy queues expose no misleading list-wide flush action', async () => {
+  const { renderMixedQueuedComposer } = await importHarness();
+  const dom = new JSDOM(`<!doctype html><html><body>${renderMixedQueuedComposer()}</body></html>`);
+  const queue = dom.window.document.querySelector('[data-ccem-composer-queue]');
+  const rows = [...dom.window.document.querySelectorAll('[data-ccem-composer-queued-message]')];
+
+  assert.ok(queue);
+  assert.deepEqual(
+    rows.map((row) => row.getAttribute('data-ccem-composer-queued-message')),
+    ['native-first', 'legacy-second'],
+  );
+  assert.equal(
+    queue.querySelector('button:not([aria-label="workspace.composerRemoveQueued"])'),
+    null,
+    'mixed queues must not expose a list-wide flush action that only flushes legacy rows',
+  );
+});
 
 function installDom() {
   const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {

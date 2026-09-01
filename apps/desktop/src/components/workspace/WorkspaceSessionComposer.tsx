@@ -13,9 +13,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
 import {
+  AlertCircle,
   ArrowUp,
   Box,
   Check,
+  Clock,
   Command,
   FileText,
   FolderTree,
@@ -56,7 +58,11 @@ import {
 } from '@/components/ui/popover';
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import type { SelectedSkillContent, WorkspaceFileSuggestion } from '@/lib/tauri-ipc';
+import type {
+  NativeQueuedInputSnapshotItem,
+  SelectedSkillContent,
+  WorkspaceFileSuggestion,
+} from '@/lib/tauri-ipc';
 import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { cn } from '@/lib/utils';
@@ -122,6 +128,9 @@ export interface ComposerQueuedMessage {
   displayText?: string;
   planMode?: boolean;
   attachments?: ComposerAttachment[];
+  deliveryState?: NativeQueuedInputSnapshotItem['delivery_state'];
+  removable?: boolean;
+  flushable?: boolean;
 }
 
 interface WorkspaceSessionComposerProps {
@@ -644,8 +653,26 @@ function ComposerQueueDock({
     return null;
   }
 
+  const allMessagesFlushable = messages.every((message) => message.flushable !== false);
+  const hasBackendOwnedMessage = messages.some((message) => message.flushable === false);
+  const hasDeliveryUncertain = messages.some(
+    (message) => message.deliveryState === 'delivery_uncertain',
+  );
+  const hasDispatching = messages.some(
+    (message) => message.deliveryState === 'dispatching',
+  );
+  const queueHintKey = hasDeliveryUncertain
+    ? 'workspace.messageDeliveryUncertainHint'
+    : hasDispatching
+      ? 'workspace.messageDispatchingHint'
+      : hasBackendOwnedMessage
+        ? 'workspace.composerQueuedWaiting'
+        : canFlush
+          ? 'workspace.composerQueuedReady'
+          : 'workspace.composerQueuedWaiting';
+
   return (
-    <div className="px-0.5 py-0.5">
+    <div data-ccem-composer-queue className="px-0.5 py-0.5">
       <div className="flex items-center gap-2.5">
         <div className="rounded-lg bg-primary/10 p-1.5 text-primary">
           <MessageSquareQuote className="h-3 w-3" />
@@ -658,10 +685,10 @@ function ComposerQueueDock({
             {t('workspace.composerQueuedCount').replace('{count}', String(messages.length))}
           </p>
           <p className="text-[10px] leading-4 text-muted-foreground/85">
-            {t(canFlush ? 'workspace.composerQueuedReady' : 'workspace.composerQueuedWaiting')}
+            {t(queueHintKey)}
           </p>
         </div>
-        {onFlush ? (
+        {onFlush && allMessagesFlushable ? (
           <Button
             type="button"
             size="sm"
@@ -678,6 +705,8 @@ function ComposerQueueDock({
         {messages.map((message, index) => (
           <div
             key={message.id}
+            data-ccem-composer-queued-message={message.id}
+            data-delivery-state={message.deliveryState}
             className="flex items-start gap-2 rounded-[16px] bg-surface px-2 py-1.5"
           >
             <div className="mt-0.5 rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-semibold leading-4 text-muted-foreground">
@@ -697,8 +726,35 @@ function ComposerQueueDock({
                   {t('workspace.composerPlanModeShort')}
                 </p>
               ) : null}
+              {message.deliveryState ? (
+                <p
+                  className="mt-0.5 flex items-center gap-1 text-[9px] leading-4 text-muted-foreground/85"
+                  title={t(
+                    message.deliveryState === 'delivery_uncertain'
+                      ? 'workspace.messageDeliveryUncertainHint'
+                      : message.deliveryState === 'dispatching'
+                        ? 'workspace.messageDispatchingHint'
+                        : 'workspace.messageQueuedHint',
+                  )}
+                >
+                  {message.deliveryState === 'delivery_uncertain' ? (
+                    <AlertCircle className="h-2.5 w-2.5 text-amber-500" />
+                  ) : message.deliveryState === 'dispatching' ? (
+                    <LoaderCircle className="h-2.5 w-2.5 animate-spin" />
+                  ) : (
+                    <Clock className="h-2.5 w-2.5" />
+                  )}
+                  {t(
+                    message.deliveryState === 'delivery_uncertain'
+                      ? 'workspace.messageDeliveryUncertainBadge'
+                      : message.deliveryState === 'dispatching'
+                        ? 'workspace.messageDispatchingBadge'
+                        : 'workspace.messageQueuedBadge',
+                  )}
+                </p>
+              ) : null}
             </div>
-            {onRemove ? (
+            {onRemove && message.removable !== false ? (
               <button
                 type="button"
                 className="rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"

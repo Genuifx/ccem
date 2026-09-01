@@ -1033,6 +1033,16 @@ export function useTauriCommands() {
     return invoke<NativeQueuedInputSnapshotItem[]>('get_native_session_input_queue', { runtimeId });
   }, []);
 
+  const cancelNativeSessionQueuedInput = useCallback(async (
+    runtimeId: string,
+    clientMessageId: string,
+  ): Promise<number> => {
+    return invoke<number>('cancel_native_session_queued_input', {
+      runtimeId,
+      clientMessageId,
+    });
+  }, []);
+
   const respondNativeSessionPermission = useCallback(async (
     runtimeId: string,
     requestId: string,
@@ -1825,6 +1835,7 @@ export function useTauriCommands() {
     sendNativeSessionInput,
     flushNativeSessionInputQueue,
     getNativeSessionInputQueue,
+    cancelNativeSessionQueuedInput,
     respondNativeSessionPermission,
     respondNativeSessionPrompt,
     rewindNativeSessionFiles,

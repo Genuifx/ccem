@@ -99,13 +99,6 @@ export interface ConversationMessageData {
   isCompactBoundary: boolean;
   planContent?: string;
   annotations?: Array<{ quote: string; note: string }>;
-  /**
-   * Optimistic user prompt still waiting in the native input queue behind a
-   * busy turn. Cleared atomically when the persisted `user_prompt` event with
-   * the same client message id replaces this row.
-   */
-  queuedPending?: boolean;
-  queuedDeliveryState?: 'pending' | 'dispatching' | 'delivery_uncertain';
 }
 
 export type ConversationMessageList = ConversationMessageData[] & {

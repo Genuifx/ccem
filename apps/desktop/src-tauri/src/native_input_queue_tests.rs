@@ -1,8 +1,11 @@
 use super::{
-    FrozenNativeInputBatch, FrozenNativeInputMessage, NativeInputClaimOutcome,
-    NativeInputPopOutcome, NativeInputQueue, NativeInputQueueError, QueuedInputDeliveryState,
+    FrozenNativeInputBatch, FrozenNativeInputMessage, NativeInputCancelOutcome,
+    NativeInputClaimOutcome, NativeInputPopOutcome, NativeInputQueue, NativeInputQueueError,
+    QueuedInputDeliveryState,
 };
 use serde_json::json;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 fn batch(client_message_id: &str, text: &str) -> FrozenNativeInputBatch {
     FrozenNativeInputBatch::new(
@@ -381,6 +384,98 @@ fn remove_preserves_fifo_order_and_clear_is_runtime_scoped() {
     assert_eq!(queue.clear("runtime-a"), 0);
     assert_eq!(queue.clear("runtime-b"), 1);
     assert_eq!(queue.count("runtime-b"), 0);
+}
+
+#[test]
+fn cancel_pending_removes_only_the_exact_message_and_keeps_its_id_retired() {
+    let queue = NativeInputQueue::default();
+    queue
+        .enqueue("runtime-a", batch("a-1", "one"), Some("blocker-a"))
+        .unwrap();
+    queue
+        .enqueue("runtime-a", batch("a-2", "two"), Some("blocker-a"))
+        .unwrap();
+    queue
+        .enqueue("runtime-a", batch("a-3", "three"), None)
+        .unwrap();
+
+    assert_eq!(
+        queue.cancel_pending("runtime-a", "a-1"),
+        NativeInputCancelOutcome::Cancelled { remaining_count: 2 }
+    );
+    assert_eq!(
+        queue
+            .snapshot("runtime-a")
+            .into_iter()
+            .map(|item| item.client_message_id)
+            .collect::<Vec<_>>(),
+        vec!["a-2", "a-3"]
+    );
+    assert_eq!(
+        queue.enqueue("runtime-a", batch("a-1", "one"), None),
+        Err(NativeInputQueueError::DuplicateClientMessageId),
+        "a cancelled client id stays retired so a stale renderer retry cannot replay it",
+    );
+}
+
+#[test]
+fn cancel_pending_refuses_claimed_or_uncertain_delivery_and_reports_missing_ids() {
+    let queue = NativeInputQueue::default();
+    queue
+        .enqueue("runtime-a", batch("dispatching", "one"), None)
+        .unwrap();
+    let (_, attempt, _) = claim(&queue, "runtime-a");
+    assert_eq!(
+        queue.cancel_pending("runtime-a", "dispatching"),
+        NativeInputCancelOutcome::Dispatching,
+    );
+    assert!(queue.mark_claim_delivery_uncertain("runtime-a", "dispatching", attempt));
+    assert_eq!(
+        queue.cancel_pending("runtime-a", "dispatching"),
+        NativeInputCancelOutcome::DeliveryUncertain,
+    );
+    assert_eq!(
+        queue.cancel_pending("runtime-a", "missing"),
+        NativeInputCancelOutcome::NotFound,
+    );
+    assert_eq!(queue.count("runtime-a"), 1);
+}
+
+#[test]
+fn cancel_and_claim_are_linearized_by_the_queue_owner() {
+    let queue = Arc::new(NativeInputQueue::default());
+    queue
+        .enqueue("runtime-a", batch("race", "one"), None)
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+
+    let cancel_queue = Arc::clone(&queue);
+    let cancel_barrier = Arc::clone(&barrier);
+    let cancel = thread::spawn(move || {
+        cancel_barrier.wait();
+        cancel_queue.cancel_pending("runtime-a", "race")
+    });
+    let claim_queue = Arc::clone(&queue);
+    let claim_barrier = Arc::clone(&barrier);
+    let claim = thread::spawn(move || {
+        claim_barrier.wait();
+        claim_queue.claim_next("runtime-a")
+    });
+    barrier.wait();
+
+    let cancel_outcome = cancel.join().expect("cancel thread");
+    let claim_outcome = claim.join().expect("claim thread");
+    match (cancel_outcome, claim_outcome) {
+        (
+            NativeInputCancelOutcome::Cancelled { remaining_count: 0 },
+            NativeInputClaimOutcome::Empty,
+        ) => {}
+        (
+            NativeInputCancelOutcome::Dispatching,
+            NativeInputClaimOutcome::Claimed { batch, .. },
+        ) => assert_eq!(batch.client_message_id(), "race"),
+        other => panic!("cancel/claim produced a non-linearizable outcome: {other:?}"),
+    }
 }
 
 #[test]
