@@ -189,6 +189,7 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
   }
   const productionBuild = stepBlock(source, 'Build production bundles without release access');
   const legacyBuild = stepBlock(source, 'Build legacy unsigned bundles with Mode 2 excluded');
+  const canonicalizeMacUpdater = stepBlock(source, 'Canonicalize macOS updater release asset names');
   assert.match(productionBuild, /needs\.release-mode\.outputs\.production == 'true'/u);
   assert.doesNotMatch(productionBuild, /legacyArgs|continue-on-error|failure\(\)/u);
   assert.match(legacyBuild, /needs\.release-mode\.outputs\.production != 'true'/u);
@@ -198,6 +199,25 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
     /steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)/u,
     'legacy mode must be selected before the matrix and cannot be a production failure fallback',
   );
+  assert.match(
+    canonicalizeMacUpdater,
+    /if: \$\{\{ steps\.release-payload\.outputs\.reuse != 'true' && matrix\.appleSigning \}\}/u,
+  );
+  assert.match(canonicalizeMacUpdater, /canonicalize-macos-release-assets\.mjs/u);
+  assert.match(canonicalizeMacUpdater, /--target "\$CCEM_RELEASE_TARGET"/u);
+  assert.doesNotMatch(
+    canonicalizeMacUpdater,
+    /needs\.release-mode\.outputs\.production|always\(\)|continue-on-error/u,
+  );
+  const productionBuildIndex = source.indexOf('      - name: Build production bundles without release access');
+  const legacyBuildIndex = source.indexOf('      - name: Build legacy unsigned bundles with Mode 2 excluded');
+  const canonicalizeIndex = source.indexOf('      - name: Canonicalize macOS updater release asset names');
+  const signedMacProofIndex = source.indexOf('      - name: Prove signed macOS Mode 2 Safe Storage and production behavior');
+  const legacyMacProofIndex = source.indexOf('      - name: Prove legacy macOS bundles exclude Mode 2');
+  assert.ok(productionBuildIndex < legacyBuildIndex);
+  assert.ok(legacyBuildIndex < canonicalizeIndex);
+  assert.ok(canonicalizeIndex < signedMacProofIndex);
+  assert.ok(canonicalizeIndex < legacyMacProofIndex);
   for (const appleSecret of [
     'APPLE_SIGNING_IDENTITY',
     'APPLE_TEAM_ID',
