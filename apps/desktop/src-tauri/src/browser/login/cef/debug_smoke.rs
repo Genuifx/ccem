@@ -279,6 +279,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn gate_accepts_exact_debug_macos_contract() {
         let root = "/private/tmp/ccem-mode2-smoke-a";
@@ -307,6 +308,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn gate_rejects_traversal_and_receipt_escape() {
         let traversal = valid_environment("/private/tmp/../tmp/ccem-mode2-smoke-a");

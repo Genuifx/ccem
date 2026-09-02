@@ -6,6 +6,9 @@ use std::path::Path;
 
 #[test]
 fn persistent_cef_profiles_are_direct_children_of_the_runtime_root() {
+    #[cfg(windows)]
+    let root = Path::new(r"C:\ccem-mode2-root");
+    #[cfg(not(windows))]
     let root = Path::new("/private/tmp/ccem-mode2-root");
     let cache = profile_cache_path(root, "profile-0123456789abcdef0123456789abcdef")
         .expect("valid opaque profile id");

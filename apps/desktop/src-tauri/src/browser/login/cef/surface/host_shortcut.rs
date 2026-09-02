@@ -382,27 +382,27 @@ mod tests {
     fn classifier_modifier_bits_match_the_linked_cef_abi() {
         assert_eq!(
             MODIFIER_SHIFT,
-            cef::sys::cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0,
+            cef::sys::cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0 as u32,
         );
         assert_eq!(
             MODIFIER_CONTROL,
-            cef::sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0,
+            cef::sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0 as u32,
         );
         assert_eq!(
             MODIFIER_ALT,
-            cef::sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0,
+            cef::sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0 as u32,
         );
         assert_eq!(
             MODIFIER_COMMAND,
-            cef::sys::cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0,
+            cef::sys::cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0 as u32,
         );
         assert_eq!(
             MODIFIER_ALT_GR,
-            cef::sys::cef_event_flags_t::EVENTFLAG_ALTGR_DOWN.0,
+            cef::sys::cef_event_flags_t::EVENTFLAG_ALTGR_DOWN.0 as u32,
         );
         assert_eq!(
             MODIFIER_REPEAT,
-            cef::sys::cef_event_flags_t::EVENTFLAG_IS_REPEAT.0,
+            cef::sys::cef_event_flags_t::EVENTFLAG_IS_REPEAT.0 as u32,
         );
     }
 }

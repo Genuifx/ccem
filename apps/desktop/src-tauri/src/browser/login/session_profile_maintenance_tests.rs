@@ -370,8 +370,12 @@ fn unavailable_manager_fails_mode2_ipc_but_preserves_optional_mode1_routing() {
         manager.list_snapshots().unwrap_err(),
         SessionManagerError::StateUnavailable
     );
-    let workspace = TrustedWorkspacePath::from_trusted_app(PathBuf::from("/tmp/ccem-mode1"))
-        .expect("trusted path");
+    #[cfg(windows)]
+    let workspace_dir = r"C:\ccem-mode1";
+    #[cfg(not(windows))]
+    let workspace_dir = "/tmp/ccem-mode1";
+    let workspace =
+        TrustedWorkspacePath::from_trusted_app(PathBuf::from(workspace_dir)).expect("trusted path");
     assert!(matches!(
         manager.open_default_profile(workspace.clone()),
         Err(SessionManagerError::StateUnavailable)
@@ -397,7 +401,7 @@ fn unavailable_manager_fails_mode2_ipc_but_preserves_optional_mode1_routing() {
     };
     assert!(manager
         .prepare_agent_tool_if_handed_off(
-            "/tmp/ccem-mode1",
+            workspace_dir,
             "browser-actor-11111111111111111111111111111111",
             authority.clone(),
             &request,

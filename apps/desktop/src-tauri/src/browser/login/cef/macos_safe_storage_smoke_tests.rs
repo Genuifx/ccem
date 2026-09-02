@@ -132,6 +132,7 @@ fn gate_requires_exact_github_build_identity() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn gate_accepts_only_exact_current_run_scenario_paths() {
     let gate = evaluate_gate(build(), &valid_environment());
@@ -157,6 +158,7 @@ fn gate_accepts_only_exact_current_run_scenario_paths() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn gate_rejects_path_escape_invalid_scenario_and_replay_receipt() {
     for (name, value) in [

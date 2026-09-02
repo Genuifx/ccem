@@ -26,10 +26,15 @@ fn workspace() -> TrustedWorkspaceIdentity {
 }
 
 fn host() -> EmbeddedHostProcessIdentity {
+    #[cfg(windows)]
+    let executable = PathBuf::from(r"C:\Program Files\CCEM\ccem-desktop.exe");
+    #[cfg(not(windows))]
+    let executable = PathBuf::from("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop");
+
     EmbeddedHostProcessIdentity {
         pid: 4242,
         birth_token: "mac:100:200".to_string(),
-        executable: PathBuf::from("/Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop"),
+        executable,
     }
 }
 
