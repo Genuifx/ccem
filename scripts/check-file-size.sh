@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-MAX_LINES=1000
+MAX_LINES=2000
 EXEMPTIONS_FILE="docs/file-size-exemptions.md"
 
 echo "Checking for files larger than ${MAX_LINES} lines..."

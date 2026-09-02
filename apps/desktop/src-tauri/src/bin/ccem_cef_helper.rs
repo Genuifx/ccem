@@ -91,7 +91,7 @@ fn initialize_cef_api() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn run_subprocess(sandbox_enabled: bool) {
+fn run_subprocess(_sandbox_enabled: bool) {
     use cef::{args::Args, execute_process, App};
 
     // Args owns CEF strings internally, so it must be constructed only after
@@ -99,7 +99,7 @@ fn run_subprocess(sandbox_enabled: bool) {
     let args = Args::new();
 
     #[cfg(target_os = "macos")]
-    let _sandbox = sandbox_enabled.then(|| {
+    let _sandbox = _sandbox_enabled.then(|| {
         let mut sandbox = cef::sandbox::Sandbox::new();
         sandbox.initialize(args.as_main_args());
         sandbox
