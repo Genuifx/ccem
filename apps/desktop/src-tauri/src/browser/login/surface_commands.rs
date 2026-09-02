@@ -32,6 +32,9 @@ const SURFACE_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 #[cfg(any(target_os = "macos", windows))]
 const SURFACE_CONTROL_AUTHORIZATION_TTL: Duration = Duration::from_secs(30);
 
+#[cfg(any(target_os = "macos", windows))]
+type AgentActorValidatorRef<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+
 #[cfg(any(
     not(debug_assertions),
     test,
@@ -1112,7 +1115,7 @@ impl LoginBrowserSurfaceManager {
         client_revision: u64,
         action: BrowserSurfaceControlActionArg,
         agent_actor_id: Option<String>,
-        agent_actor_validator: Option<&dyn Fn(&str) -> Result<(), String>>,
+        agent_actor_validator: Option<AgentActorValidatorRef<'_>>,
     ) -> Result<BrowserSurfaceSnapshotMutationResponse, String> {
         let _operation = self.mutation_operation()?;
         let Some((active, current)) =

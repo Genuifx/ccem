@@ -16,7 +16,6 @@ import {
   SPEC,
   workDir,
   capturePath,
-  fakeSleeperPath,
   writeFakeDsh,
   cleanupWorkDir,
   readCapture,
@@ -26,6 +25,40 @@ import {
 
 beforeAll(writeFakeDsh);
 afterAll(cleanupWorkDir);
+
+function fakeVersionProbe(versions: Record<string, string | null>) {
+  return async (bin: string, args: string[]): Promise<string | null> => {
+    expect(args).toEqual(['--version']);
+    return versions[path.basename(bin)] ?? null;
+  };
+}
+
+function writeProbeFixture(dir: string, name: string): string {
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, 'version-probe fixture\n', { mode: 0o755 });
+  return file;
+}
+
+function createSignalChild(): {
+  child: ChildProcess & EventEmitter;
+  spawnImpl: SpawnFn;
+  killedWith: NodeJS.Signals[];
+} {
+  const child = new EventEmitter() as ChildProcess & EventEmitter;
+  const killedWith: NodeJS.Signals[] = [];
+  (child as any).exitCode = null;
+  (child as any).signalCode = null;
+  (child as any).killed = false;
+  (child as any).pid = 99999;
+  (child as any).kill = (signal: NodeJS.Signals = 'SIGTERM') => {
+    killedWith.push(signal);
+    (child as any).killed = true;
+    setImmediate(() => child.emit('close', 143, null));
+    return true;
+  };
+  const spawnImpl: SpawnFn = () => child;
+  return { child, spawnImpl, killedWith };
+}
 
 describe('dsh launcher with fake dsh binary', () => {
   it('passes shell metacharacters as one literal argv element without executing them', async () => {
@@ -139,13 +172,18 @@ describe('dsh launcher with fake dsh binary', () => {
   });
 
   it('propagates a child signal as 128+signal', async () => {
+    const { child, spawnImpl } = createSignalChild();
     const result = await runDshTask({
       task: 'signal please',
       spec: SPEC,
       token: TOKEN,
       invocation: fakeInvocation(),
-      env: parentEnv({ FAKE_DSH_CAPTURE: capturePath, FAKE_DSH_MODE: 'signal' }),
+      env: parentEnv(),
       stdio: 'ignore',
+      spawnImpl,
+      onSpawned: () => {
+        setImmediate(() => child.emit('close', null, 'SIGTERM'));
+      },
     });
     expect(result.signal).toBe('SIGTERM');
     expect(result.exitCode).toBe(143);
@@ -188,23 +226,23 @@ describe('dsh launcher with fake dsh binary', () => {
 
 describe('dsh child signal handling', () => {
   it('reports 143 when the child handles SIGTERM and exits', async () => {
+    const { spawnImpl, killedWith } = createSignalChild();
     const result = await runDshTask({
       task: 'sleep forever',
       spec: SPEC,
       token: TOKEN,
-      invocation: fakeInvocation(fakeSleeperPath),
-      env: parentEnv({ FAKE_DSH_CAPTURE: capturePath }),
-      stdio: ['ignore', 'pipe', 'ignore'],
+      invocation: fakeInvocation(),
+      env: parentEnv(),
+      stdio: 'ignore',
+      spawnImpl,
       onSpawned: (child) => {
-        child.stdout!.once('data', () => {
-          child.kill('SIGTERM');
-        });
+        child.kill('SIGTERM');
       },
     });
 
     expect(result.exitCode).toBe(143);
     expect(result.signal).toBeNull();
-    expect(JSON.parse(fs.readFileSync(capturePath, 'utf-8')).signalReceived).toEqual(['SIGTERM']);
+    expect(killedWith).toEqual(['SIGTERM']);
   });
 });
 
@@ -219,54 +257,51 @@ describe('dsh run gate markers', () => {
   it('throws DSH_VERSION_UNREADABLE when version probe fails', async () => {
     const gateDir = path.join(workDir, 'gate-unread');
     fs.mkdirSync(gateDir, { recursive: true });
-    const dshBin = path.join(gateDir, 'dsh');
-    fs.writeFileSync(dshBin, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    writeProbeFixture(gateDir, 'dsh');
 
     await expect(runPreflightGate({
       env: { PATH: gateDir } as NodeJS.ProcessEnv,
       platform: 'linux',
+      exec: fakeVersionProbe({ dsh: null }),
     })).rejects.toMatchObject({ code: 'DSH_VERSION_UNREADABLE' });
   });
 
   it('throws DSH_VERSION_UNSUPPORTED for wrong dsh version', async () => {
     const gateDir = path.join(workDir, 'gate-unsup');
     fs.mkdirSync(gateDir, { recursive: true });
-    const dshBin = path.join(gateDir, 'dsh');
-    fs.writeFileSync(dshBin, '#!/bin/sh\necho "0.2.0"\n', { mode: 0o755 });
-    const nodeBin = path.join(gateDir, 'node');
-    fs.writeFileSync(nodeBin, '#!/bin/sh\necho "v24.12.0"\n', { mode: 0o755 });
+    writeProbeFixture(gateDir, 'dsh');
+    writeProbeFixture(gateDir, 'node');
 
     await expect(runPreflightGate({
       env: { PATH: gateDir } as NodeJS.ProcessEnv,
       platform: 'linux',
+      exec: fakeVersionProbe({ dsh: '0.2.0', node: '24.12.0' }),
     })).rejects.toMatchObject({ code: 'DSH_VERSION_UNSUPPORTED' });
   });
 
   it('throws NODE_VERSION_UNREADABLE when node version unreadable', async () => {
     const gateDir = path.join(workDir, 'gate-nodeunread');
     fs.mkdirSync(gateDir, { recursive: true });
-    const dshBin = path.join(gateDir, 'dsh');
-    fs.writeFileSync(dshBin, '#!/bin/sh\necho "0.1.1-rc.2"\n', { mode: 0o755 });
-    const nodeBin = path.join(gateDir, 'node');
-    fs.writeFileSync(nodeBin, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    writeProbeFixture(gateDir, 'dsh');
+    writeProbeFixture(gateDir, 'node');
 
     await expect(runPreflightGate({
       env: { PATH: gateDir } as NodeJS.ProcessEnv,
       platform: 'linux',
+      exec: fakeVersionProbe({ dsh: '0.1.1-rc.2', node: null }),
     })).rejects.toMatchObject({ code: 'NODE_VERSION_UNREADABLE' });
   });
 
   it('throws NODE_VERSION_UNSUPPORTED for old node', async () => {
     const gateDir = path.join(workDir, 'gate-nodeold');
     fs.mkdirSync(gateDir, { recursive: true });
-    const dshBin = path.join(gateDir, 'dsh');
-    fs.writeFileSync(dshBin, '#!/bin/sh\necho "0.1.1-rc.2"\n', { mode: 0o755 });
-    const nodeBin = path.join(gateDir, 'node');
-    fs.writeFileSync(nodeBin, '#!/bin/sh\necho "v20.0.0"\n', { mode: 0o755 });
+    writeProbeFixture(gateDir, 'dsh');
+    writeProbeFixture(gateDir, 'node');
 
     await expect(runPreflightGate({
       env: { PATH: gateDir } as NodeJS.ProcessEnv,
       platform: 'linux',
+      exec: fakeVersionProbe({ dsh: '0.1.1-rc.2', node: '20.0.0' }),
     })).rejects.toMatchObject({ code: 'NODE_VERSION_UNSUPPORTED' });
   });
 });
@@ -446,24 +481,23 @@ describe('dsh launcher spawn lifecycle (deterministic fake ChildProcess)', () =>
 describe('dsh signal forwarding via process.emit', () => {
   it('forwards SIGTERM to child via real process.emit and restores listener count', async () => {
     const initialListeners = process.listenerCount('SIGTERM');
+    const { spawnImpl, killedWith } = createSignalChild();
 
     const result = await runDshTask({
       task: 'sleep forever',
       spec: SPEC,
       token: TOKEN,
-      invocation: fakeInvocation(fakeSleeperPath),
-      env: parentEnv({ FAKE_DSH_CAPTURE: capturePath }),
-      stdio: ['ignore', 'pipe', 'ignore'],
-      onSpawned: (child) => {
-        child.stdout!.once('data', () => {
-          process.emit('SIGTERM', 'SIGTERM');
-        });
+      invocation: fakeInvocation(),
+      env: parentEnv(),
+      stdio: 'ignore',
+      spawnImpl,
+      onSpawned: () => {
+        process.emit('SIGTERM', 'SIGTERM');
       },
     });
 
     expect(result.exitCode).toBe(143);
-    const capture = JSON.parse(fs.readFileSync(capturePath, 'utf-8'));
-    expect(capture.signalReceived).toContain('SIGTERM');
+    expect(killedWith).toEqual(['SIGTERM']);
     expect(process.listenerCount('SIGTERM')).toBe(initialListeners);
   });
 

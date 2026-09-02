@@ -41,7 +41,7 @@ enum DefaultBindingState {
     },
     Bound {
         revision: u64,
-        descriptor: BrowserProfileDescriptor,
+        descriptor: Box<BrowserProfileDescriptor>,
     },
 }
 
@@ -65,7 +65,7 @@ impl BrowserProfileManager {
         let result = (|| {
             let state = self.load_default_binding()?;
             match state {
-                DefaultBindingState::Bound { descriptor, .. } => Ok(Some(descriptor)),
+                DefaultBindingState::Bound { descriptor, .. } => Ok(Some(*descriptor)),
                 DefaultBindingState::Uninitialized => {
                     if let Some(descriptor) =
                         self.legacy_default_candidate(owner_for_new_profile)?
@@ -235,7 +235,7 @@ impl BrowserProfileManager {
                     self.persist_default_binding(revision, DefaultBindingWrite::Bound(profile_id))?;
                 return Ok(DefaultBindingState::Bound {
                     revision: committed_revision,
-                    descriptor,
+                    descriptor: Box::new(descriptor),
                 });
             }
             (Some(profile_id), None) => profile_id,
@@ -243,7 +243,7 @@ impl BrowserProfileManager {
         match self.descriptor_unscoped(&profile_id) {
             Ok(descriptor) => Ok(DefaultBindingState::Bound {
                 revision,
-                descriptor,
+                descriptor: Box::new(descriptor),
             }),
             // A successful delete can crash after removing the profile but before publishing the
             // empty binding. Recover that exact committed absence without promoting an isolated

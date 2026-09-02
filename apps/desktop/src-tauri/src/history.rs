@@ -320,16 +320,13 @@ pub async fn get_conversation_history(
     let lim = normalize_history_limit(limit);
 
     // Legacy sources (sync)
-    let legacy_sessions = run_blocking({
-        let source_filter = source_filter;
-        let lim = lim;
-        move || load_legacy_history_sessions_filtered(source_filter, lim)
-    })
-    .await
-    .map_err(|e| HistoryCommandError {
-        code: "legacy_error".to_string(),
-        message: e,
-    })?;
+    let legacy_sessions =
+        run_blocking(move || load_legacy_history_sessions_filtered(source_filter, lim))
+            .await
+            .map_err(|e| HistoryCommandError {
+                code: "legacy_error".to_string(),
+                message: e,
+            })?;
 
     // DSH (async via helper)
     let dsh_result = if source_filter == Some(SOURCE_DSH) || source_filter.is_none() {
@@ -379,9 +376,8 @@ pub async fn search_conversation_history(
     let result_limit = normalize_history_limit(limit).unwrap_or(120);
 
     // Load legacy sessions (sync)
-    let legacy_sessions = run_blocking({
-        let source_filter = source_filter;
-        move || load_legacy_history_sessions_filtered(source_filter, Some(HISTORY_LIMIT_MAX))
+    let legacy_sessions = run_blocking(move || {
+        load_legacy_history_sessions_filtered(source_filter, Some(HISTORY_LIMIT_MAX))
     })
     .await
     .map_err(|e| HistoryCommandError {
@@ -484,7 +480,7 @@ fn load_legacy_history_sessions(limit: Option<usize>) -> Result<Vec<HistorySessi
 }
 
 /// Shared finalize step: overlay title overrides, annotations.
-fn finalize_history_sessions(sessions: &mut Vec<HistorySession>) {
+fn finalize_history_sessions(sessions: &mut [HistorySession]) {
     // Overlay user-edited title overrides
     let overrides = crate::title_overrides::TitleOverrides::load();
     for session in sessions.iter_mut() {
@@ -4198,6 +4194,12 @@ pub(crate) struct DshListError {
     pub(crate) message: String,
 }
 
+pub(crate) type DshHistoryListResult = Result<(Vec<HistorySession>, Vec<String>), DshListError>;
+pub(crate) type DshHistoryDetailResult =
+    Result<(Vec<ConversationMessage>, Vec<CompactSegment>, Vec<String>), String>;
+pub(crate) type LegacyHistoryDetailResult =
+    Result<(Vec<ConversationMessage>, Vec<CompactSegment>), String>;
+
 /// Typed command error for history IPC commands.
 /// Tauri serializes this as the error payload when a command returns Err.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6789,7 +6791,7 @@ pub fn orchestrate_history_list(
     source_filter: Option<&'static str>,
     limit: Option<usize>,
     legacy_sessions: Vec<HistorySession>,
-    dsh_result: Option<Result<(Vec<HistorySession>, Vec<String>), DshListError>>,
+    dsh_result: Option<DshHistoryListResult>,
 ) -> Result<HistoryListResult, HistoryCommandError> {
     let mut sessions = legacy_sessions;
     let mut diagnostics = Vec::new();
@@ -6842,10 +6844,8 @@ pub fn orchestrate_history_list(
 pub fn orchestrate_history_detail(
     _session_id: &str,
     source_hint: Option<&'static str>,
-    dsh_result: Option<
-        Result<(Vec<ConversationMessage>, Vec<CompactSegment>, Vec<String>), String>,
-    >,
-    legacy_result: Option<Result<(Vec<ConversationMessage>, Vec<CompactSegment>), String>>,
+    dsh_result: Option<DshHistoryDetailResult>,
+    legacy_result: Option<LegacyHistoryDetailResult>,
 ) -> Result<ConversationDetailPayload, HistoryCommandError> {
     if source_hint == Some(SOURCE_DSH) {
         let result = dsh_result.unwrap_or_else(|| Err("DSH result not provided".to_string()));

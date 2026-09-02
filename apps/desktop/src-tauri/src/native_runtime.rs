@@ -3078,7 +3078,7 @@ impl NativeRuntimeManager {
                         format!("client_message_id={client_message_id} queue_count={queue_count}"),
                     );
                 }
-                Err(NativeInputQueueError::DuplicateClientMessageId) => return Ok(()),
+                Err(NativeInputQueueError::DuplicateClientMessage) => return Ok(()),
                 Err(error) => return Err(format!("Failed to queue native input: {error}")),
             }
 
@@ -9728,11 +9728,12 @@ impl NativeRuntimeManager {
                             record.pending_settings_request_id = None;
                         }
                     }
-                } else if state == "deferred" && authoritative {
-                    if permission_scope.as_deref() != Some("runtime") {
-                        record.pending_env_name = pending_env_name;
-                        record.pending_effort = pending_effort;
-                    }
+                } else if state == "deferred"
+                    && authoritative
+                    && permission_scope.as_deref() != Some("runtime")
+                {
+                    record.pending_env_name = pending_env_name;
+                    record.pending_effort = pending_effort;
                 }
                 record.updated_at = Utc::now();
             })?;

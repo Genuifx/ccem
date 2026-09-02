@@ -104,7 +104,7 @@ fn browser_data_root() -> Result<PathBuf, String> {
             }
             return Ok(root);
         }
-        return Ok(crate::config::get_ccem_dir().join("browser-dev"));
+        Ok(crate::config::get_ccem_dir().join("browser-dev"))
     }
 
     #[cfg(not(debug_assertions))]

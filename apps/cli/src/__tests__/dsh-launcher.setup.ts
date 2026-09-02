@@ -57,30 +57,12 @@ if (mode === 'exit1') process.exit(1);
 if (mode === 'signal') process.kill(process.pid, 'SIGTERM');
 `;
 
-/** A fake dsh that sleeps until signaled — for signal-forwarding tests. */
-export const FAKE_DSH_SLEEPER = `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-const capture = process.env.FAKE_DSH_CAPTURE;
-const signalReceived = [];
-process.on('SIGTERM', () => { signalReceived.push('SIGTERM'); cleanup(); });
-process.on('SIGINT', () => { signalReceived.push('SIGINT'); cleanup(); });
-process.stdout.write('ready\\n');
-function cleanup() {
-  if (capture) writeFileSync(capture, JSON.stringify({ signalReceived }));
-  process.exit(128 + 15);
-}
-// Keep alive for up to 10s (tests kill it before that).
-setTimeout(() => process.exit(0), 10000);
-`;
-
 export const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-dsh-launcher-test-'));
-export const fakeDshPath = path.join(workDir, 'fake-dsh');
-export const fakeSleeperPath = path.join(workDir, 'fake-dsh-sleeper');
+export const fakeDshPath = path.join(workDir, 'fake-dsh.mjs');
 export const capturePath = path.join(workDir, 'capture.json');
 
 export function writeFakeDsh(): void {
   fs.writeFileSync(fakeDshPath, FAKE_DSH, { mode: 0o755 });
-  fs.writeFileSync(fakeSleeperPath, FAKE_DSH_SLEEPER, { mode: 0o755 });
 }
 
 export function readCapture(): FakeCapture {
@@ -88,7 +70,9 @@ export function readCapture(): FakeCapture {
 }
 
 export function fakeInvocation(bin: string = fakeDshPath): DshInvocation {
-  return { bin, prefix: [] };
+  // Route the JavaScript fixture through a real cross-platform executable;
+  // Windows cannot execute a POSIX shebang fixture directly.
+  return { bin: process.execPath, prefix: [bin] };
 }
 
 export function parentEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {

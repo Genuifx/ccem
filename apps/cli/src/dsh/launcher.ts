@@ -8,6 +8,7 @@ import { renderCordisPatch } from './patch.js';
 import {
   DSH_PROFILE,
   type DshInvocation,
+  type VersionProbeDeps,
   resolveBinOnPath,
   resolveDshInvocation,
   resolveDshRoot,
@@ -202,15 +203,18 @@ export interface DshGateResult {
   nodeVersion: string;
 }
 
+export interface DshPreflightOptions extends VersionProbeDeps {
+  platform?: NodeJS.Platform;
+}
+
 /**
  * Pre-flight runtime gate. Must pass before token decrypt or spawn.
  * Checks: binary resolution, dsh == 0.1.1-rc.2, node >= 22.19.0.
  * Returns the resolved invocation on success; throws DshProjectionError on failure.
  */
-export async function runPreflightGate(options: {
-  env?: NodeJS.ProcessEnv;
-  platform?: NodeJS.Platform;
-} = {}): Promise<DshGateResult> {
+export async function runPreflightGate(
+  options: DshPreflightOptions = {},
+): Promise<DshGateResult> {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
 
@@ -222,7 +226,8 @@ export async function runPreflightGate(options: {
     );
   }
 
-  const dshVersion = await probeBinVersion(invocation, { env });
+  const probeDeps = { env, exec: options.exec };
+  const dshVersion = await probeBinVersion(invocation, probeDeps);
   if (dshVersion === null) {
     throw new DshProjectionError(
       'DSH_VERSION_UNREADABLE',
@@ -243,7 +248,7 @@ export async function runPreflightGate(options: {
   const nodeBin = (platform === 'win32' && invocation.prefix.length > 0)
     ? invocation.bin
     : resolveBinOnPath('node', env, platform) ?? 'node';
-  const nodeVersion = await probeSimpleBinVersion(nodeBin, { env });
+  const nodeVersion = await probeSimpleBinVersion(nodeBin, probeDeps);
   if (nodeVersion === null) {
     throw new DshProjectionError(
       'NODE_VERSION_UNREADABLE',

@@ -81,11 +81,13 @@ describe('dsh environment resolution', () => {
 describe('dsh doctor report', () => {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-dsh-doctor-test-'));
   const binDir = path.join(workDir, 'bin');
+  const versionByBin = new Map<string, string>();
   fs.mkdirSync(binDir, { recursive: true });
 
   function writeBin(name: string, versionLine: string): string {
     const file = path.join(binDir, name);
-    fs.writeFileSync(file, `#!/bin/sh\necho "${versionLine}"\n`, { mode: 0o755 });
+    fs.writeFileSync(file, 'version-probe fixture\n', { mode: 0o755 });
+    versionByBin.set(file, extractVersionOutput(versionLine) ?? versionLine.trim());
     return file;
   }
 
@@ -93,6 +95,9 @@ describe('dsh doctor report', () => {
     return {
       env: { PATH: binDir, HOME: workDir } as NodeJS.ProcessEnv,
       platform: 'linux',
+      exec: async (bin, args) => args.includes('--version')
+        ? versionByBin.get(bin) ?? null
+        : null,
       ...overrides,
     };
   }

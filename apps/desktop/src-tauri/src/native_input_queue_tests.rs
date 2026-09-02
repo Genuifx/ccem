@@ -196,11 +196,11 @@ fn duplicate_client_message_id_is_rejected_only_within_the_runtime() {
 
     assert_eq!(
         queue.enqueue("runtime-a", batch("stable-id", "retry"), None),
-        Err(NativeInputQueueError::ConflictingClientMessageId)
+        Err(NativeInputQueueError::ConflictingClientMessage)
     );
     assert_eq!(
         queue.enqueue("runtime-a", batch("stable-id", "one"), None),
-        Err(NativeInputQueueError::DuplicateClientMessageId)
+        Err(NativeInputQueueError::DuplicateClientMessage)
     );
     assert_eq!(
         queue.enqueue("runtime-b", batch("stable-id", "other"), None),
@@ -213,11 +213,11 @@ fn duplicate_client_message_id_is_rejected_only_within_the_runtime() {
     ));
     assert_eq!(
         queue.enqueue("runtime-a", batch("stable-id", "completed retry"), None),
-        Err(NativeInputQueueError::ConflictingClientMessageId)
+        Err(NativeInputQueueError::ConflictingClientMessage)
     );
     assert_eq!(
         queue.enqueue("runtime-a", batch("stable-id", "one"), None),
-        Err(NativeInputQueueError::DuplicateClientMessageId)
+        Err(NativeInputQueueError::DuplicateClientMessage)
     );
 }
 
@@ -413,7 +413,7 @@ fn cancel_pending_removes_only_the_exact_message_and_keeps_its_id_retired() {
     );
     assert_eq!(
         queue.enqueue("runtime-a", batch("a-1", "one"), None),
-        Err(NativeInputQueueError::DuplicateClientMessageId),
+        Err(NativeInputQueueError::DuplicateClientMessage),
         "a cancelled client id stays retired so a stale renderer retry cannot replay it",
     );
 }
@@ -526,11 +526,11 @@ fn rejects_empty_identifiers_and_handles_missing_entries() {
     let queue = NativeInputQueue::default();
     assert_eq!(
         queue.enqueue(" ", batch("message-1", "one"), None),
-        Err(NativeInputQueueError::EmptyRuntimeId)
+        Err(NativeInputQueueError::EmptyRuntime)
     );
     assert_eq!(
         queue.enqueue("runtime-a", batch(" ", "one"), None),
-        Err(NativeInputQueueError::EmptyClientMessageId)
+        Err(NativeInputQueueError::EmptyClientMessage)
     );
     assert!(!queue.mark_claim_delivery_uncertain("runtime-a", "missing", 1));
     assert!(!queue.mark_command_delivery_uncertain("runtime-a", "missing"));

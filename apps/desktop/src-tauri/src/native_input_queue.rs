@@ -261,23 +261,21 @@ impl QueuedInputDeliveryState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeInputQueueError {
-    EmptyRuntimeId,
-    EmptyClientMessageId,
-    DuplicateClientMessageId,
-    ConflictingClientMessageId,
+    EmptyRuntime,
+    EmptyClientMessage,
+    DuplicateClientMessage,
+    ConflictingClientMessage,
 }
 
 impl fmt::Display for NativeInputQueueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyRuntimeId => formatter.write_str("runtime_id must not be empty"),
-            Self::EmptyClientMessageId => {
-                formatter.write_str("client_message_id must not be empty")
-            }
-            Self::DuplicateClientMessageId => {
+            Self::EmptyRuntime => formatter.write_str("runtime_id must not be empty"),
+            Self::EmptyClientMessage => formatter.write_str("client_message_id must not be empty"),
+            Self::DuplicateClientMessage => {
                 formatter.write_str("client_message_id is already queued for this runtime")
             }
-            Self::ConflictingClientMessageId => formatter.write_str(
+            Self::ConflictingClientMessage => formatter.write_str(
                 "client_message_id was already used for a different native input payload",
             ),
         }
@@ -335,7 +333,7 @@ impl NativeInputQueue {
         merge_fence: Option<&str>,
     ) -> Result<usize, NativeInputQueueError> {
         if runtime_id.trim().is_empty() {
-            return Err(NativeInputQueueError::EmptyRuntimeId);
+            return Err(NativeInputQueueError::EmptyRuntime);
         }
         if batch.is_empty()
             || batch
@@ -343,7 +341,7 @@ impl NativeInputQueue {
                 .iter()
                 .any(|message| message.client_message_id().trim().is_empty())
         {
-            return Err(NativeInputQueueError::EmptyClientMessageId);
+            return Err(NativeInputQueueError::EmptyClientMessage);
         }
         let mut queues = self.lock_queues();
         let mut seen = self.lock_seen();
@@ -352,9 +350,9 @@ impl NativeInputQueue {
             let fingerprint = batch_fingerprint(message);
             if let Some(existing) = runtime_seen.get(message.client_message_id()) {
                 return Err(if existing == &fingerprint {
-                    NativeInputQueueError::DuplicateClientMessageId
+                    NativeInputQueueError::DuplicateClientMessage
                 } else {
-                    NativeInputQueueError::ConflictingClientMessageId
+                    NativeInputQueueError::ConflictingClientMessage
                 });
             }
         }

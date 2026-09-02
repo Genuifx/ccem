@@ -2462,7 +2462,7 @@ fn ms_to_iso(ms: i64) -> String {
                 .timestamp_opt(secs, 0)
                 .single()
                 .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| format!("1970-01-01T00:00:00+00:00"))
+                .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string())
         }
     }
 }
@@ -2644,7 +2644,7 @@ fn build_dsh_cache_stats(
         );
         let timestamp = step
             .time
-            .map(|t| ms_to_iso(t))
+            .map(ms_to_iso)
             .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
 
         entries.push(CacheEntry {

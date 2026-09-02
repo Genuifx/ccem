@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -13,6 +13,13 @@ import {
 
 beforeAll(writeFakeDsh);
 afterAll(cleanupWorkDir);
+
+function fakeVersionProbe(versions: Record<string, string | null>) {
+  return vi.fn(async (bin: string, args: string[]): Promise<string | null> => {
+    expect(args).toEqual(['--version']);
+    return versions[path.basename(bin).toLowerCase()] ?? null;
+  });
+}
 
 describe('dsh Windows invocation resolution', () => {
   it('resolves POSIX dsh directly from PATH', () => {
@@ -171,18 +178,27 @@ describe('dsh Windows direct exe node version gate', () => {
     const gateDir = path.join(workDir, 'win-exe-gate-real');
     fs.mkdirSync(gateDir, { recursive: true });
     const dshBin = path.join(gateDir, 'dsh.exe');
-    fs.writeFileSync(dshBin, '#!/bin/sh\necho "0.1.1-rc.2"\n', { mode: 0o755 });
+    fs.writeFileSync(dshBin, 'version-probe fixture\n', { mode: 0o755 });
     const nodeBin = path.join(gateDir, 'node.exe');
-    fs.writeFileSync(nodeBin, '#!/bin/sh\necho "v24.12.0"\n', { mode: 0o755 });
+    fs.writeFileSync(nodeBin, 'version-probe fixture\n', { mode: 0o755 });
+    const exec = fakeVersionProbe({
+      'dsh.exe': '0.1.1-rc.2',
+      'node.exe': '24.12.0',
+    });
 
     const gate = await runPreflightGate({
       env: { PATH: gateDir, PATHEXT: '.EXE;.CMD' } as NodeJS.ProcessEnv,
       platform: 'win32',
+      exec,
     });
     expect(gate.invocation.prefix).toEqual([]);
     expect(gate.invocation.bin).toContain('dsh.exe');
     expect(gate.dshVersion).toBe('0.1.1-rc.2');
     expect(gate.nodeVersion).toBe('24.12.0');
+    expect(exec.mock.calls.map(([bin]) => path.basename(bin).toLowerCase())).toEqual([
+      'dsh.exe',
+      'node.exe',
+    ]);
   });
 });
 
@@ -195,7 +211,7 @@ describe('Windows direct dsh.exe / dsh.com: run/preflight and doctor node gate',
 
   function writeWinBin(name: string, versionOutput: string): string {
     const filePath = path.join(winDir, name);
-    fs.writeFileSync(filePath, `#!/bin/sh\necho "${versionOutput}"\n`, { mode: 0o755 });
+    fs.writeFileSync(filePath, `version-probe fixture: ${versionOutput}\n`, { mode: 0o755 });
     return filePath;
   }
 
@@ -226,14 +242,23 @@ describe('Windows direct dsh.exe / dsh.com: run/preflight and doctor node gate',
   it('preflight: direct .exe resolves node from PATH, not from invocation.bin', async () => {
     writeWinBin('dsh.exe', '0.1.1-rc.2');
     writeWinBin('node.exe', 'v24.12.0');
+    const exec = fakeVersionProbe({
+      'dsh.exe': '0.1.1-rc.2',
+      'node.exe': '24.12.0',
+    });
     const gate = await runPreflightGate({
       env: { PATH: winDir, PATHEXT: '.EXE;.CMD' } as NodeJS.ProcessEnv,
       platform: 'win32',
+      exec,
     });
     expect(gate.invocation.prefix).toEqual([]);
     expect(gate.invocation.bin).toContain('dsh.exe');
     expect(gate.dshVersion).toBe('0.1.1-rc.2');
     expect(gate.nodeVersion).toBe('24.12.0');
+    expect(exec.mock.calls.map(([bin]) => path.basename(bin).toLowerCase())).toEqual([
+      'dsh.exe',
+      'node.exe',
+    ]);
   });
 
   it('preflight: direct .com resolves node from PATH', async () => {
@@ -241,22 +266,36 @@ describe('Windows direct dsh.exe / dsh.com: run/preflight and doctor node gate',
     if (fs.existsSync(exePath)) fs.unlinkSync(exePath);
     writeWinBin('dsh.com', '0.1.1-rc.2');
     writeWinBin('node.exe', 'v22.19.0');
+    const exec = fakeVersionProbe({
+      'dsh.com': '0.1.1-rc.2',
+      'node.exe': '22.19.0',
+    });
     const gate = await runPreflightGate({
       env: { PATH: winDir, PATHEXT: '.COM;.EXE;.CMD' } as NodeJS.ProcessEnv,
       platform: 'win32',
+      exec,
     });
     expect(gate.invocation.prefix).toEqual([]);
     expect(gate.invocation.bin).toContain('dsh.com');
     expect(gate.nodeVersion).toBe('22.19.0');
+    expect(exec.mock.calls.map(([bin]) => path.basename(bin).toLowerCase())).toEqual([
+      'dsh.com',
+      'node.exe',
+    ]);
   });
 
   it('preflight: rejects when PATH node version is too old (direct exe)', async () => {
     writeWinBin('dsh.exe', '0.1.1-rc.2');
     writeWinBin('node.exe', 'v20.11.0');
+    const exec = fakeVersionProbe({
+      'dsh.exe': '0.1.1-rc.2',
+      'node.exe': '20.11.0',
+    });
     try {
       await runPreflightGate({
         env: { PATH: winDir, PATHEXT: '.EXE;.CMD' } as NodeJS.ProcessEnv,
         platform: 'win32',
+        exec,
       });
       expect.fail('should throw for unsupported node');
     } catch (err: any) {
@@ -269,10 +308,18 @@ describe('Windows direct dsh.exe / dsh.com: run/preflight and doctor node gate',
   it('doctor: direct .exe does not use invocation.bin as node', async () => {
     writeWinBin('dsh.exe', '0.1.1-rc.2');
     writeWinBin('node.exe', 'v24.12.0');
+    const exec = fakeVersionProbe({
+      'dsh.exe': '0.1.1-rc.2',
+      'node.exe': '24.12.0',
+    });
     const { collectDshDoctorReport } = await import('../dsh/doctor.js');
     const report = await collectDshDoctorReport(
       { envName: 'test', envConfig: { ANTHROPIC_BASE_URL: 'https://example.com', ANTHROPIC_AUTH_TOKEN: 'tok' } },
-      { env: { PATH: winDir, PATHEXT: '.EXE;.CMD', HOME: winDir } as NodeJS.ProcessEnv, platform: 'win32' },
+      {
+        env: { PATH: winDir, PATHEXT: '.EXE;.CMD', HOME: winDir } as NodeJS.ProcessEnv,
+        platform: 'win32',
+        exec,
+      },
     );
     expect(report.nodeVersion).toBe('24.12.0');
     const nodeCheck = report.checks.find((c) => c.id === 'node-version');
@@ -283,14 +330,22 @@ describe('Windows direct dsh.exe / dsh.com: run/preflight and doctor node gate',
   it('doctor: direct .com with old node version reports fail', async () => {
     const comDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-dsh-win-com-dr-'));
     const writeBin = (name: string, v: string) => {
-      fs.writeFileSync(path.join(comDir, name), `#!/bin/sh\necho "${v}"\n`, { mode: 0o755 });
+      fs.writeFileSync(path.join(comDir, name), `version-probe fixture: ${v}\n`, { mode: 0o755 });
     };
     writeBin('dsh.com', '0.1.1-rc.2');
     writeBin('node.exe', 'v18.0.0');
+    const exec = fakeVersionProbe({
+      'dsh.com': '0.1.1-rc.2',
+      'node.exe': '18.0.0',
+    });
     const { collectDshDoctorReport } = await import('../dsh/doctor.js');
     const report = await collectDshDoctorReport(
       { envName: 'test', envConfig: { ANTHROPIC_BASE_URL: 'https://example.com', ANTHROPIC_AUTH_TOKEN: 'tok' } },
-      { env: { PATH: comDir, PATHEXT: '.COM;.EXE;.CMD', HOME: comDir } as NodeJS.ProcessEnv, platform: 'win32' },
+      {
+        env: { PATH: comDir, PATHEXT: '.COM;.EXE;.CMD', HOME: comDir } as NodeJS.ProcessEnv,
+        platform: 'win32',
+        exec,
+      },
     );
     expect(report.nodeVersion).toBe('18.0.0');
     const nodeCheck = report.checks.find((c) => c.id === 'node-version');

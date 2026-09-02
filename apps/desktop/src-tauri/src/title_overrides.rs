@@ -398,7 +398,7 @@ impl TitleOverrides {
                 && self
                     .entries
                     .get(&key)
-                    .map_or(true, |entry| entry.title.trim() == title)
+                    .is_none_or(|entry| entry.title.trim() == title)
         })
     }
 
