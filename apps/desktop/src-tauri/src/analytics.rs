@@ -3185,13 +3185,13 @@ mod tests {
     use super::{
         aggregate_cache, aggregate_model_breakdown, build_local_opencode_cache_entries,
         cache_files_have_same_meta, calculate_streak, default_prices, detect_source_from_path,
-        dsh_provider_to_environment, extract_model_breakdown_bucket, format_week_bucket,
-        full_parse_jsonl, get_file_meta, lock_usage_snapshot, lock_usage_stats_memo,
-        model_price_lookup_count, normalize_usage_source, parse_claude_jsonl_reader,
-        parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
-        read_usage_cache_at, read_usage_summary_from, refresh_discovered_entry,
-        reset_model_price_lookup_count, retain_incomplete_source_entries, shared_usage_cache,
-        should_reuse_usage_stats, should_write_usage_cache, snapshot_is_fresh,
+        dsh_provider_to_environment, extract_date, extract_hour, extract_model_breakdown_bucket,
+        format_week_bucket, full_parse_jsonl, get_file_meta, lock_usage_snapshot,
+        lock_usage_stats_memo, model_price_lookup_count, normalize_usage_source,
+        parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
+        parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
+        refresh_discovered_entry, reset_model_price_lookup_count, retain_incomplete_source_entries,
+        shared_usage_cache, should_reuse_usage_stats, should_write_usage_cache, snapshot_is_fresh,
         update_global_rollup, usage_cache_path, write_json_atomic, write_usage_summary_to,
         CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheRollup, CacheRollupBucket,
         CacheStats, CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
@@ -4417,6 +4417,7 @@ mod tests {
     fn v6_migration_compacts_codex_rows_without_changing_analytics() {
         let temp = tempfile::tempdir().expect("v6 migration tempdir");
         let cache_path = temp.path().join("usage-cache.json");
+        let fixture_timestamp = "2026-03-06T10:15:00+08:00";
         let legacy = serde_json::json!({
             "version": 6,
             "files": {
@@ -4425,7 +4426,7 @@ mod tests {
                     "stats": {
                         "entries": [
                             {
-                                "timestamp": "2026-03-06T10:15:00+08:00",
+                                "timestamp": fixture_timestamp,
                                 "model": "gpt-5.4",
                                 "environment": "Local Codex",
                                 "usage": {
@@ -4437,7 +4438,7 @@ mod tests {
                                 }
                             },
                             {
-                                "timestamp": "2026-03-06T10:45:00+08:00",
+                                "timestamp": fixture_timestamp,
                                 "model": "gpt-5.4",
                                 "environment": "Local Codex",
                                 "usage": {
@@ -4482,8 +4483,10 @@ mod tests {
         assert_eq!(stats.total.output_tokens, 30);
         assert_eq!(stats.total.cache_read_tokens, 35);
         assert!((stats.total.cost - 0.75).abs() < 1e-9);
-        assert_eq!(stats.daily_history["2026-03-06"].input_tokens, 150);
-        assert_eq!(stats.hourly_history["2026-03-06T10"].input_tokens, 150);
+        let expected_date = extract_date(fixture_timestamp).expect("fixture local date");
+        let expected_hour = extract_hour(fixture_timestamp).expect("fixture local hour");
+        assert_eq!(stats.daily_history[&expected_date].input_tokens, 150);
+        assert_eq!(stats.hourly_history[&expected_hour].input_tokens, 150);
         assert_eq!(stats.by_model["gpt-5.4"].input_tokens, 150);
         assert_eq!(stats.by_environment["Local Codex"].input_tokens, 150);
     }

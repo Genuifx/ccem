@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 
 import {
   MODE2_SIGNED_PRODUCER_JOB,
@@ -399,7 +400,10 @@ test('CLI verifies and atomically writes one three-target signed-readiness aggre
   assert.equal(summary.targets[0].runtimeAttestation.kind, 'macos-mode2-production-runtime');
   assert.equal(summary.targets[2].runtimeAttestation.kind, 'windows-mode2-runtime');
   assert.match(summary.targets[0].inventorySha256, /^[a-f0-9]{64}$/u);
-  assert.equal((await fs.stat(fixture.output)).mode & 0o777, 0o600);
+  assert.equal((await fs.lstat(fixture.output)).isFile(), true);
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(fixture.output)).mode & 0o777, 0o600);
+  }
   assert.deepEqual(
     (await fs.readdir(fixture.sandbox)).filter((name) => name.includes('.tmp-')),
     [],
