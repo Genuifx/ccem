@@ -145,7 +145,7 @@ pub(super) fn set_window_visible(
 ) -> Result<WindowsNativeWindowObservation, String> {
     inspect_child_window(hwnd, parent)?;
     unsafe {
-        ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
     }
     let observation = inspect_child_window(hwnd, parent)?;
     validate_windows_native_window_observation(

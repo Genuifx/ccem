@@ -532,14 +532,14 @@ fn append_quoted(command: &mut Vec<u16>, argument: &OsStr) {
             continue;
         }
         if unit == b'"' as u16 {
-            command.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2 + 1));
+            command.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
         } else {
-            command.extend(std::iter::repeat(b'\\' as u16).take(backslashes));
+            command.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
         }
         backslashes = 0;
         command.push(unit);
     }
-    command.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2));
+    command.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
     command.push(b'"' as u16);
 }
 

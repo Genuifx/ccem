@@ -95,11 +95,11 @@ pub(crate) fn win_set_pipe_nowait(
     handle: std::os::windows::io::RawHandle,
 ) -> Result<(), std::io::Error> {
     use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_NOWAIT};
-    let mut mode: u32 = PIPE_NOWAIT;
+    let mode: u32 = PIPE_NOWAIT;
     let ret = unsafe {
         SetNamedPipeHandleState(
             handle as windows_sys::Win32::Foundation::HANDLE,
-            &mut mode,
+            &mode,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -522,7 +522,7 @@ pub(crate) fn invoke_helper_core<T: for<'de> Deserialize<'de>>(
                             .as_mut()
                             .unwrap()
                             .read(&mut chunk[..to_read])
-                            .map(|n| Some(n))
+                            .map(Some)
                     }
                 }
             };
@@ -634,7 +634,7 @@ pub(crate) fn invoke_helper_core<T: for<'de> Deserialize<'de>>(
                             .as_mut()
                             .unwrap()
                             .read(&mut chunk[..to_read])
-                            .map(|n| Some(n))
+                            .map(Some)
                     }
                 }
             };

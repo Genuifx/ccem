@@ -184,7 +184,7 @@ fn normalize_windows_path_identity_text(value: &str) -> String {
 pub fn canonical_path_for_evidence(candidate: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        return PathBuf::from(strip_windows_verbatim_prefix(&candidate.to_string_lossy()));
+        PathBuf::from(strip_windows_verbatim_prefix(&candidate.to_string_lossy()))
     }
     #[cfg(not(windows))]
     {
@@ -195,8 +195,8 @@ pub fn canonical_path_for_evidence(candidate: &Path) -> PathBuf {
 pub fn same_path_identity(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        return normalize_windows_path_identity_text(&left.to_string_lossy())
-            == normalize_windows_path_identity_text(&right.to_string_lossy());
+        normalize_windows_path_identity_text(&left.to_string_lossy())
+            == normalize_windows_path_identity_text(&right.to_string_lossy())
     }
     #[cfg(not(windows))]
     {
@@ -217,7 +217,7 @@ fn path_is_within_identity(candidate: &Path, root: &Path) -> bool {
         } else {
             format!("{root}\\")
         };
-        return candidate.starts_with(&prefix);
+        candidate.starts_with(&prefix)
     }
     #[cfg(not(windows))]
     {

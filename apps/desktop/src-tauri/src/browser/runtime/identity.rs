@@ -533,11 +533,13 @@ fn verify_windows_authenticode(path: &Path) -> Result<String, IdentityError> {
         hFile: null_mut(),
         pgKnownSubject: null_mut(),
     };
-    let mut trust_data = WINTRUST_DATA::default();
-    trust_data.cbStruct = size_of::<WINTRUST_DATA>() as u32;
-    trust_data.dwUIChoice = WTD_UI_NONE;
-    trust_data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
-    trust_data.dwUnionChoice = WTD_CHOICE_FILE;
+    let mut trust_data = WINTRUST_DATA {
+        cbStruct: size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        ..Default::default()
+    };
     trust_data.Anonymous.pFile = &mut file_info;
     trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
     trust_data.dwProvFlags = WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
@@ -703,13 +705,15 @@ fn windows_version_translations(data: &[u8]) -> Result<Vec<(u16, u16)>, Identity
         )
     } == 0
         || length == 0
-        || length % 4 != 0
+        || !length.is_multiple_of(4)
     {
         return Err(malformed_identity());
     }
     let offset = version_pointer_offset(data, pointer as *const u8, length as usize)?;
     Ok(data[offset..offset + length as usize]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pair| {
             (
                 u16::from_le_bytes([pair[0], pair[1]]),
@@ -739,7 +743,7 @@ fn query_windows_version_string(data: &[u8], query: &str) -> Result<Option<Strin
     {
         return Ok(None);
     }
-    if characters < 2 || characters > 4096 {
+    if !(2..=4096).contains(&characters) {
         return Err(malformed_identity());
     }
     let byte_length = (characters as usize)
@@ -747,7 +751,9 @@ fn query_windows_version_string(data: &[u8], query: &str) -> Result<Option<Strin
         .ok_or_else(malformed_identity)?;
     let offset = version_pointer_offset(data, pointer as *const u8, byte_length)?;
     let mut utf16 = data[offset..offset + byte_length]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     if utf16.pop() != Some(0) || utf16.contains(&0) {

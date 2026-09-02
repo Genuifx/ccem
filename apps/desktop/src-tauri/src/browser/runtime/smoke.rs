@@ -536,6 +536,7 @@ mod tests {
     struct EventFloodReader {
         frame: Vec<u8>,
         offset: usize,
+        reads: usize,
     }
 
     impl EventFloodReader {
@@ -543,17 +544,21 @@ mod tests {
             Self {
                 frame: frame(json!({ "method": "Page.frameNavigated", "params": {} })),
                 offset: 0,
+                reads: 0,
             }
         }
     }
 
     impl Read for EventFloodReader {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-            thread::sleep(Duration::from_millis(1));
+            if self.reads > 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
             let remaining = &self.frame[self.offset..];
             let read = remaining.len().min(output.len());
             output[..read].copy_from_slice(&remaining[..read]);
             self.offset = (self.offset + read) % self.frame.len();
+            self.reads += 1;
             Ok(read)
         }
     }
@@ -606,7 +611,7 @@ mod tests {
         let mut adapter = PrivatePipeAdapter::new(
             EventFloodReader::new(),
             Vec::<u8>::new(),
-            Duration::from_millis(8),
+            Duration::from_millis(250),
         );
         assert_eq!(
             adapter

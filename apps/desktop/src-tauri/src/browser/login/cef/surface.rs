@@ -20,9 +20,10 @@ mod renderer_recovery;
 #[cfg(any(target_os = "macos", windows))]
 use cef::*;
 use dispatch::run_cancellable_on_main;
+#[cfg(target_os = "macos")]
+pub(crate) use geometry::macos_child_bounds;
 pub(crate) use geometry::{
-    macos_child_bounds, profile_cache_path, LogicalViewport, NativeChildBounds,
-    WindowsNativeWindowObservation,
+    profile_cache_path, LogicalViewport, NativeChildBounds, WindowsNativeWindowObservation,
 };
 #[cfg(any(windows, test))]
 pub(crate) use geometry::{validate_windows_native_window_observation, windows_child_bounds};

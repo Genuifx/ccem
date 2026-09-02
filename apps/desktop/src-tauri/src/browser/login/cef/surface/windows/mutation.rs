@@ -44,7 +44,7 @@ pub(crate) fn set_bounds(surface_id: &str, bounds: NativeChildBounds) -> Result<
                 .filter_map(|moved_hwnd| {
                     position_window(moved_hwnd, parent, previous_bounds)
                         .err()
-                        .map(|rollback| format!("{rollback}"))
+                        .map(|rollback| rollback.to_string())
                 })
                 .collect::<Vec<_>>();
             return if rollback_errors.is_empty() {
@@ -102,7 +102,7 @@ pub(crate) fn set_visible(surface_id: &str, visible: bool) -> Result<(), String>
                 .filter_map(|(changed_hwnd, changed_visible)| {
                     set_window_visible(changed_hwnd, parent, bounds, changed_visible)
                         .err()
-                        .map(|rollback| format!("{rollback}"))
+                        .map(|rollback| rollback.to_string())
                 })
                 .collect::<Vec<_>>();
             return if rollback_errors.is_empty() {
@@ -147,20 +147,16 @@ pub(crate) fn occlude(surface_id: &str) -> Result<(), String> {
 }
 
 type PopupFocusChild = Option<(i32, Option<Browser>)>;
+type SurfaceFocusChildren = (
+    windows::Win32::Foundation::HWND,
+    NativeChildBounds,
+    bool,
+    Arc<SharedSurfaceState>,
+    Option<Browser>,
+    PopupFocusChild,
+);
 
-fn surface_focus_children(
-    surface_id: &str,
-) -> Result<
-    (
-        windows::Win32::Foundation::HWND,
-        NativeChildBounds,
-        bool,
-        Arc<SharedSurfaceState>,
-        Option<Browser>,
-        PopupFocusChild,
-    ),
-    String,
-> {
+fn surface_focus_children(surface_id: &str) -> Result<SurfaceFocusChildren, String> {
     SURFACES.with(|surfaces| {
         let surfaces = surfaces.borrow();
         let surface = surfaces

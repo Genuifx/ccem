@@ -121,9 +121,7 @@ pub(super) fn abort_pending_popup(
 ) {
     let removed = SURFACES.with(|surfaces| {
         let mut surfaces = surfaces.borrow_mut();
-        let Some(surface) = surfaces.get_mut(surface_id) else {
-            return None;
-        };
+        let surface = surfaces.get_mut(surface_id)?;
         let pending = surface
             .popup
             .as_ref()
