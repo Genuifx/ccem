@@ -125,7 +125,7 @@ export function createWindowsEvidenceRootAclCommand({ plan }) {
     '$valid = @($actualRules | Where-Object { -not $_.IsInherited -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and ([int64]$_.FileSystemRights -band $full) -eq $full -and $_.InheritanceFlags -eq $inheritance -and $_.PropagationFlags -eq [Security.AccessControl.PropagationFlags]::None })',
     '$actualOwnerSid = $actual.GetOwner([Security.Principal.SecurityIdentifier]).Value',
     'if (-not $actual.AreAccessRulesProtected -or $actualOwnerSid -ne $ownerSid.Value -or $actualRules.Count -ne 2 -or $valid.Count -ne 2 -or -not ($allowed -contains $ownerSid.Value) -or -not ($allowed -contains $systemSid.Value)) { throw "evidence root DACL verification failed" }',
-    '[PSCustomObject]@{ rootPath = $root; ownerSid = $ownerSid.Value; systemSid = $systemSid.Value; inheritanceProtected = $true; allowedSids = @($allowed); aceCount = $actualRules.Count; fullControlOnly = $true; reparseFree = $true } | ConvertTo-Json -Compress',
+    '[PSCustomObject]@{ rootPath = [string]$config.evidenceRoot; ownerSid = $ownerSid.Value; systemSid = $systemSid.Value; inheritanceProtected = $true; allowedSids = @($allowed); aceCount = $actualRules.Count; fullControlOnly = $true; reparseFree = $true } | ConvertTo-Json -Compress',
   ].join('\n'));
 }
 

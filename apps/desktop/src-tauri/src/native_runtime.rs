@@ -12390,14 +12390,20 @@ mod tests {
         .expect("spawn bounded writer");
         let acks = super::SettingsUpdateAckRegistry::default();
         let receiver = acks.register("settings-shared-deadline").unwrap();
-        let started = Instant::now();
-        let deadline = started + Duration::from_millis(100);
+        let release_barrier = Arc::new(Barrier::new(2));
+        let release_thread_barrier = Arc::clone(&release_barrier);
         let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
+            release_thread_barrier.wait();
+            release_thread_barrier.wait();
+            std::thread::sleep(Duration::from_millis(1_200));
             let (lock, changed) = released.as_ref();
             *lock.lock().unwrap() = true;
             changed.notify_all();
         });
+        release_barrier.wait();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        release_barrier.wait();
 
         writer
             .write_until(b"settings\n".to_vec(), deadline)
@@ -12410,7 +12416,7 @@ mod tests {
         .expect_err("missing applied ack uses only the remaining time");
 
         assert!(error.contains("acknowledgement timed out"));
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_millis(2_600));
         release.join().unwrap();
         acks.cancel("settings-shared-deadline").unwrap();
     }

@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -81,31 +80,20 @@ function assertReadOnlyMainProtectionApi(block) {
   assert.doesNotMatch(block, /gh api --method (?:POST|PUT|PATCH|DELETE)/u);
 }
 
-async function fakeProtectionCommands(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-main-protection-contract-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const bin = path.join(root, 'bin');
-  await fs.mkdir(bin);
-  await fs.writeFile(
-    path.join(bin, 'gh'),
-    '#!/bin/sh\nprintf "false\\n"\n',
-    { mode: 0o700 },
-  );
-  await fs.writeFile(
-    path.join(bin, 'git'),
-    [
-      '#!/bin/sh',
-      'if [ "$1" = "rev-parse" ]; then',
-      '  printf "%s\\n" "$TEST_SOURCE_COMMIT"',
-      '  exit 0',
-      'fi',
-      'printf "unexpected git command after failed main-protection gate: %s\\n" "$*" >&2',
-      'exit 97',
-      '',
-    ].join('\n'),
-    { mode: 0o700 },
-  );
-  return bin;
+function fakeProtectionCommandPrelude() {
+  return [
+    'gh() {',
+    '  printf "false\\n"',
+    '}',
+    'git() {',
+    'if [ "$1" = "rev-parse" ]; then',
+    '  printf "%s\\n" "$TEST_SOURCE_COMMIT"',
+    '  return 0',
+    'fi',
+    'printf "unexpected git command after failed main-protection gate: %s\\n" "$*" >&2',
+    'return 97',
+    '}',
+  ].join('\n');
 }
 
 const mutationSurface = /(?:contents:\s*write|write-all|api\.github\.com|uploads\.github\.com|ensure-draft-github-release|upload-draft-release-assets|publish-draft-github-release|github-draft-release-api|create-latest-from-release-payload|verify-immutable-releases-enabled|detect-actions-release-payload|gh\s+release)/u;
@@ -272,49 +260,41 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
   assert.match(legacyVerifierSource, /Mode 2\/CEF runtime path is forbidden/u);
 });
 
-test('final non-publishing gate rejects readiness evidence after origin/main moves', async (t) => {
+test('final non-publishing gate rejects readiness evidence after origin/main moves', async () => {
   const source = await workflow('mode2-signed-producer.yml');
   const script = stepRunScript(
     source,
     'Reconfirm non-publishing source and candidate remain current',
   );
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-readiness-current-source-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const bin = path.join(root, 'bin');
-  await fs.mkdir(bin);
-  await fs.writeFile(
-    path.join(bin, 'git'),
-    [
-      '#!/bin/sh',
-      'if [ "$*" = "ls-remote origin refs/heads/main" ]; then',
-      '  printf "%s\\trefs/heads/main\\n" "$TEST_REMOTE_MAIN"',
-      '  exit 0',
-      'fi',
-      'case "$*" in',
-      '  "ls-remote --exit-code --tags origin refs/tags/v2.78.1") exit 2 ;;',
-      'esac',
-      'printf "unexpected git command: %s\\n" "$*" >&2',
-      'exit 97',
-      '',
-    ].join('\n'),
-    { mode: 0o700 },
-  );
+  const testScript = [
+    'git() {',
+    'if [ "$*" = "ls-remote origin refs/heads/main" ]; then',
+    '  printf "%s\\trefs/heads/main\\n" "$TEST_REMOTE_MAIN"',
+    '  return 0',
+    'fi',
+    'case "$*" in',
+    '  "ls-remote --exit-code --tags origin refs/tags/v2.78.1") return 2 ;;',
+    'esac',
+    'printf "unexpected git command: %s\\n" "$*" >&2',
+    'return 97',
+    '}',
+    script,
+  ].join('\n');
   const sourceCommit = 'a'.repeat(40);
   const environment = {
     ...process.env,
-    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
     SOURCE_COMMIT: sourceCommit,
     VERSION: '2.78.1',
     TEST_REMOTE_MAIN: sourceCommit,
   };
-  const current = spawnSync('bash', ['-c', script], {
+  const current = spawnSync('bash', ['-c', testScript], {
     cwd: repoDir,
     env: environment,
     encoding: 'utf8',
   });
   assert.equal(current.status, 0, current.stderr);
 
-  const stale = spawnSync('bash', ['-c', script], {
+  const stale = spawnSync('bash', ['-c', testScript], {
     cwd: repoDir,
     env: { ...environment, TEST_REMOTE_MAIN: 'b'.repeat(40) },
     encoding: 'utf8',
@@ -470,7 +450,7 @@ test('protected tag cannot enter prepare, producer, or publish when main is unpr
     workflow('release-desktop.yml'),
     workflow('mode2-signed-producer.yml'),
   ]);
-  const bin = await fakeProtectionCommands(t);
+  const commandPrelude = fakeProtectionCommandPrelude();
   const sourceCommit = 'a'.repeat(40);
   const repository = 'Genuifx/ccem';
   const tag = 'v2.58.0';
@@ -479,7 +459,6 @@ test('protected tag cannot enter prepare, producer, or publish when main is unpr
     `${repository}/.github/workflows/release-desktop.yml@${tagRef}`;
   const commonEnvironment = {
     ...process.env,
-    PATH: `${bin}${path.delimiter}${process.env.PATH}`,
     TEST_SOURCE_COMMIT: sourceCommit,
     GITHUB_REPOSITORY: repository,
     GITHUB_REF: tagRef,
@@ -530,7 +509,7 @@ test('protected tag cannot enter prepare, producer, or publish when main is unpr
   ];
 
   for (const fixture of cases) {
-    const result = spawnSync('bash', ['-c', fixture.script], {
+    const result = spawnSync('bash', ['-c', `${commandPrelude}\n${fixture.script}`], {
       cwd: repoDir,
       env: fixture.environment,
       encoding: 'utf8',
