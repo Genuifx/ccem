@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -118,7 +119,9 @@ test('CEF helper hardened-runtime entitlements grant only Chromium JIT', async (
   assert.doesNotMatch(source, /disable-library-validation|allow-unsigned-executable-memory|get-task-allow/);
 });
 
-test('signing dry-run plans fixed codesign commands without executing them', async (t) => {
+test('signing dry-run plans fixed codesign commands without executing them', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable modes in the macOS CEF stage' : false,
+}, async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-cef-sign-plan-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const stage = await createStage(root);
@@ -225,7 +228,7 @@ test('signing identity pins the exact official Team ID and Developer ID authorit
 test('actual signer fails before codesign outside the explicit CI boundary', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-cef-sign-gate-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const stage = await createStage(root);
+  const stage = path.join(root, 'stage');
   const result = spawnSync(process.execPath, [
     signingScript,
     '--stage', stage,
@@ -291,7 +294,10 @@ test('attestation writes atomically with private permissions', async (t) => {
     sourceCommit,
     stageDigest: 'fixture',
   });
-  assert.equal((await fs.stat(target)).mode & 0o777, 0o600);
+  assert.equal((await fs.lstat(target)).isFile(), true);
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(target)).mode & 0o777, 0o600);
+  }
   assert.deepEqual((await fs.readdir(root)).filter((name) => name.includes('.tmp-')), []);
 });
 

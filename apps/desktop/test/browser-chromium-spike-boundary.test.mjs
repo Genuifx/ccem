@@ -2,36 +2,23 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const spikeSource = await readFile(
-  new URL('../src-tauri/src/browser/chromium_spike.rs', import.meta.url),
-  'utf8',
-);
-const spikeTests = await readFile(
-  new URL('../src-tauri/src/browser/chromium_spike_tests.rs', import.meta.url),
-  'utf8',
-);
-const browserSource = await readFile(
-  new URL('../src-tauri/src/browser.rs', import.meta.url),
-  'utf8',
-);
-const bootstrapSource = await readFile(
-  new URL('../src-tauri/src/browser/bootstrap.rs', import.meta.url),
-  'utf8',
-);
-const sessionSource = await readFile(
-  new URL('../src-tauri/src/browser/login/session.rs', import.meta.url),
-  'utf8',
-);
-const sessionTypesSource = await readFile(
-  new URL('../src-tauri/src/browser/login/session_types.rs', import.meta.url),
-  'utf8',
-);
-const mainSource = await readFile(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
-const permissionsSource = await readFile(
-  new URL('../src-tauri/permissions/trusted-app-commands.toml', import.meta.url),
-  'utf8',
-);
-const ipcSource = await readFile(new URL('../src/lib/tauri-ipc.ts', import.meta.url), 'utf8');
+const normalizeNewlines = (source) => source.replace(/\r\n?/g, '\n');
+const readSource = async (relativePath) =>
+  normalizeNewlines(await readFile(new URL(relativePath, import.meta.url), 'utf8'));
+
+const spikeSource = await readSource('../src-tauri/src/browser/chromium_spike.rs');
+const spikeTests = await readSource('../src-tauri/src/browser/chromium_spike_tests.rs');
+const browserSource = await readSource('../src-tauri/src/browser.rs');
+const bootstrapSource = await readSource('../src-tauri/src/browser/bootstrap.rs');
+const sessionSource = await readSource('../src-tauri/src/browser/login/session.rs');
+const sessionTypesSource = await readSource('../src-tauri/src/browser/login/session_types.rs');
+const mainSource = await readSource('../src-tauri/src/lib.rs');
+const permissionsSource = await readSource('../src-tauri/permissions/trusted-app-commands.toml');
+const ipcSource = await readSource('../src/lib/tauri-ipc.ts');
+
+test('source boundary scans normalize Windows checkout newlines', () => {
+  assert.equal(normalizeNewlines('before\r\nmarker\rafter'), 'before\nmarker\nafter');
+});
 
 test('managed Chromium spike uses private FD 3/4 CDP instead of a debug TCP port', () => {
   assert.match(spikeSource, /"--remote-debugging-pipe"/);

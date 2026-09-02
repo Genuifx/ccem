@@ -48,6 +48,19 @@ const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 const repoDir = path.resolve(desktopDir, '..', '..');
 const windowsStageScript = path.join(desktopDir, 'scripts', 'stage-cef-windows.mjs');
 const inventoryScript = path.join(desktopDir, 'scripts', 'verify-mode2-release-inventory.mjs');
+
+function normalizeRepoText(source) {
+  return source.replace(/\r\n?/g, '\n');
+}
+
+async function readRepoText(filePath) {
+  return normalizeRepoText(await fs.readFile(filePath, 'utf8'));
+}
+
+test('repo source reader normalizes CRLF and lone CR boundaries', () => {
+  assert.equal(normalizeRepoText('before\r\nmarker\rafter'), 'before\nmarker\nafter');
+});
+
 const sourceCommit = 'a'.repeat(40);
 const repository = 'Genuifx/ccem';
 const workflowRef =
@@ -569,8 +582,8 @@ test('release mutation preflight allows only a missing or still-draft GitHub rel
 
 test('release workflow gates Mode 2 delivery before updater publication', async () => {
   const [workflow, producerWorkflow] = await Promise.all([
-    fs.readFile(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'), 'utf8'),
-    fs.readFile(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml'), 'utf8'),
+    readRepoText(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml')),
+    readRepoText(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml')),
   ]);
   const combinedWorkflow = `${workflow}\n${producerWorkflow}`;
   const actionRefs = [...combinedWorkflow.matchAll(/^\s*-?\s*uses:\s+([^\s#]+)/gmu)]
@@ -643,9 +656,8 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
     producerWorkflow,
     /Prove legacy Windows bundle excludes Mode 2[\s\S]*?verify-legacy-release-inventory\.mjs[\s\S]*?--updater-signature \$signature\[0\]\.FullName/u,
   );
-  const legacyVerifierSource = await fs.readFile(
+  const legacyVerifierSource = await readRepoText(
     path.join(desktopDir, 'scripts', 'verify-legacy-release-inventory.mjs'),
-    'utf8',
   );
   assert.match(legacyVerifierSource, /verifyTauriUpdaterSignature/u);
   assert.match(legacyVerifierSource, /updaterSignatureVerification: signature\.algorithm/u);
@@ -667,9 +679,8 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   const releaseModeJob = producerWorkflow.slice(releaseModeIndex, buildJobIndex);
   assert.match(releaseModeJob, /detect-release-mode\.mjs/);
   assert.doesNotMatch(releaseModeJob, /GITHUB_TOKEN|ensure-draft|upload-draft|publish-draft/);
-  const releaseModeSource = await fs.readFile(
+  const releaseModeSource = await readRepoText(
     path.join(desktopDir, 'scripts', 'detect-release-mode.mjs'),
-    'utf8',
   );
   assert.match(releaseModeSource, /validateMacReleaseSigning\(environment\)/);
   assert.match(releaseModeSource, /validateWindowsReleaseSigning\(environment\)/);
@@ -778,11 +789,10 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
 });
 
 test('release gate test path cannot execute signing, Keychain, or notarization tools', async () => {
-  const inventorySource = await fs.readFile(inventoryScript, 'utf8');
-  const windowsStageSource = await fs.readFile(windowsStageScript, 'utf8');
-  const windowsSmokeSource = await fs.readFile(
+  const inventorySource = await readRepoText(inventoryScript);
+  const windowsStageSource = await readRepoText(windowsStageScript);
+  const windowsSmokeSource = await readRepoText(
     path.join(desktopDir, 'scripts', 'run-windows-mode2-production-smoke.mjs'),
-    'utf8',
   );
   assert.match(inventorySource, /CCEM_RELEASE_ALLOW_PLATFORM_VERIFICATION !== '1'/);
   assert.match(windowsStageSource, /CCEM_CEF_ALLOW_SIGNTOOL !== '1'/);

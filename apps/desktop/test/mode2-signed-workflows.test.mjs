@@ -9,9 +9,21 @@ import { fileURLToPath } from 'node:url';
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repoDir = path.resolve(desktopDir, '..', '..');
 
-async function workflow(name) {
-  return fs.readFile(path.join(repoDir, '.github', 'workflows', name), 'utf8');
+function normalizeRepoText(source) {
+  return source.replace(/\r\n?/g, '\n');
 }
+
+async function readRepoText(filePath) {
+  return normalizeRepoText(await fs.readFile(filePath, 'utf8'));
+}
+
+async function workflow(name) {
+  return readRepoText(path.join(repoDir, '.github', 'workflows', name));
+}
+
+test('repo source reader normalizes CRLF and lone CR boundaries', () => {
+  assert.equal(normalizeRepoText('before\r\nmarker\rafter'), 'before\nmarker\nafter');
+});
 
 function assertExternalActionsPinned(source) {
   const refs = [...source.matchAll(/^\s*(?:-\s*)?uses:\s+([^\s#]+)/gmu)]
@@ -251,9 +263,8 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
     stepBlock(source, 'Prove legacy Windows bundle excludes Mode 2'),
     /--app 'src-tauri\/target\/x86_64-pc-windows-msvc\/release\/ccem-desktop\.exe'/u,
   );
-  const legacyVerifierSource = await fs.readFile(
+  const legacyVerifierSource = await readRepoText(
     path.join(desktopDir, 'scripts', 'verify-legacy-release-inventory.mjs'),
-    'utf8',
   );
   assert.match(legacyVerifierSource, /import \{ verifyTauriUpdaterSignature \}/u);
   assert.match(legacyVerifierSource, /updaterSignatureVerification: signature\.algorithm/u);

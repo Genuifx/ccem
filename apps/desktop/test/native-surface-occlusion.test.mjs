@@ -9,6 +9,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
+function normalizeRepoText(source) {
+  return source.replace(/\r\n?/g, '\n');
+}
+
+async function readRepoText(...parts) {
+  return normalizeRepoText(await fs.readFile(path.join(desktopDir, ...parts), 'utf8'));
+}
+
+test('repo source reader normalizes CRLF and lone CR boundaries', () => {
+  assert.equal(normalizeRepoText('before\r\nmarker\rafter'), 'before\nmarker\nafter');
+});
+
 function deferred() {
   let resolve;
   let reject;
@@ -20,10 +32,7 @@ function deferred() {
 }
 
 async function importOcclusionStore() {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'lib', 'nativeSurfaceOcclusionStore.ts'),
-    'utf8',
-  );
+  const source = await readRepoText('src', 'lib', 'nativeSurfaceOcclusionStore.ts');
   const output = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.ES2022,
@@ -38,9 +47,10 @@ async function importOcclusionStore() {
 }
 
 async function importBrowserPanelParticipant() {
-  const source = await fs.readFile(
-    path.join(desktopDir, 'src', 'lib', 'browserPanelNativeSurfaceParticipant.ts'),
-    'utf8',
+  const source = await readRepoText(
+    'src',
+    'lib',
+    'browserPanelNativeSurfaceParticipant.ts',
   );
   const output = ts.transpileModule(source, {
     compilerOptions: {
@@ -296,35 +306,17 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
     projectPicker,
     reviewPopover,
   ] = await Promise.all([
-    fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
-    fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'BrowserPanel.tsx'),
-      'utf8',
-    ),
-    fs.readFile(
-      path.join(desktopDir, 'src', 'lib', 'browserPanelNativeSurfaceParticipant.ts'),
-      'utf8',
-    ),
-    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser.rs'), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'browser', 'commands.rs'), 'utf8'),
-    fs.readFile(
-      path.join(desktopDir, 'src-tauri', 'src', 'browser', 'webview.rs'),
-      'utf8',
-    ),
-    fs.readFile(path.join(desktopDir, 'src', 'lib', 'nativeSurfaceOcclusion.ts'), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src', 'components', 'ui', 'dialog.tsx'), 'utf8'),
-    fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'AllProjectsModal.tsx'),
-      'utf8',
-    ),
-    fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'ProjectPickerModal.tsx'),
-      'utf8',
-    ),
-    fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewPopover.tsx'),
-      'utf8',
-    ),
+    readRepoText('src', 'pages', 'Workspace.tsx'),
+    readRepoText('src', 'components', 'workspace', 'BrowserPanel.tsx'),
+    readRepoText('src', 'lib', 'browserPanelNativeSurfaceParticipant.ts'),
+    readRepoText('src-tauri', 'src', 'browser.rs'),
+    readRepoText('src-tauri', 'src', 'browser', 'commands.rs'),
+    readRepoText('src-tauri', 'src', 'browser', 'webview.rs'),
+    readRepoText('src', 'lib', 'nativeSurfaceOcclusion.ts'),
+    readRepoText('src', 'components', 'ui', 'dialog.tsx'),
+    readRepoText('src', 'components', 'workspace', 'AllProjectsModal.tsx'),
+    readRepoText('src', 'components', 'workspace', 'ProjectPickerModal.tsx'),
+    readRepoText('src', 'components', 'workspace', 'WorkspaceReviewPopover.tsx'),
   ]);
 
   assert.match(workspace, /const nativeSurfaceModalOccluded = useNativeSurfaceOccluded\(\)/);

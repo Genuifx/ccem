@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -196,7 +197,9 @@ test('CEF_PATH resolution accepts one exact pinned runtime and rejects ambiguity
   );
 });
 
-test('fixture staging is atomic and emits the complete CEF Helper.app layout', async (t) => {
+test('fixture staging is atomic and emits the complete CEF Helper.app layout', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
+}, async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-cef-stage-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const fixture = await createFixture(root);
@@ -300,7 +303,9 @@ test('dry-run with a fixture performs no staging writes', async (t) => {
   assert.equal(debugPlan.cargo.args.includes('--release'), false);
 });
 
-test('Apple signing configuration fails closed until an external attestation exists', async (t) => {
+test('Apple signing configuration fails closed until an external attestation exists', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
+}, async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-cef-signing-gate-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const fixture = await createFixture(root);

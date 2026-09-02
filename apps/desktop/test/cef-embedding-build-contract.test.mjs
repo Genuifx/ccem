@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauriDir = path.join(desktopDir, 'src-tauri');
 
+function normalizeSourceLineEndings(source) {
+  return source.replace(/\r\n?/gu, '\n');
+}
+
 test('embedded Login Browser pins CEF and splits macOS helper from Windows sandbox bootstrap', async () => {
   const [cargo, lockfile, helper, windowsBootstrap, windowsRuntime, producer] = await Promise.all([
     fs.readFile(path.join(tauriDir, 'Cargo.toml'), 'utf8'),
@@ -133,7 +137,7 @@ test('legacy external Login Browser launch and control surfaces are absent', asy
 });
 
 test('windowed CEF close stays inside BrowserPanel, drains before AppKit exits, and finalizes afterward', async () => {
-  const [surface, popup, pump, bootstrap, host, main] = await Promise.all([
+  const sources = await Promise.all([
     fs.readFile(path.join(tauriDir, 'src', 'browser', 'login', 'cef', 'surface', 'macos.rs'), 'utf8'),
     fs.readFile(path.join(tauriDir, 'src', 'browser', 'login', 'cef', 'surface', 'macos', 'popup.rs'), 'utf8'),
     fs.readFile(path.join(tauriDir, 'src', 'browser', 'login', 'cef', 'pump.rs'), 'utf8'),
@@ -141,6 +145,7 @@ test('windowed CEF close stays inside BrowserPanel, drains before AppKit exits, 
     fs.readFile(path.join(tauriDir, 'src', 'browser', 'login', 'cef', 'host.rs'), 'utf8'),
     fs.readFile(path.join(tauriDir, 'src', 'lib.rs'), 'utf8'),
   ]);
+  const [surface, popup, pump, bootstrap, host, main] = sources.map(normalizeSourceLineEndings);
 
   const doClose = surface.slice(surface.indexOf('fn do_close('), surface.indexOf('fn on_before_close('));
   const layerBackedIndex = surface.indexOf('parent.setWantsLayer(true)');

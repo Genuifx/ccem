@@ -105,8 +105,8 @@ test('canonical Tauri dev launcher prepares the exact macOS CEF development runt
 });
 
 test('CEF dev runtime parser accepts exactly one current Cargo build-script OUT_DIR', () => {
-  const current = '/private/tmp/current-cef-out';
-  const stale = '/private/tmp/stale-cef-out';
+  const current = path.join(os.tmpdir(), 'current-cef-out');
+  const stale = path.join(os.tmpdir(), 'stale-cef-out');
 
   assert.equal(parseCefOutDirFromCargoJson(cefCargoOutput(current)), current);
   assert.throws(
@@ -119,7 +119,9 @@ test('CEF dev runtime parser accepts exactly one current Cargo build-script OUT_
   );
 });
 
-test('macOS launcher builds the sibling helper and injects only the emitted CEF runtime', async (t) => {
+test('macOS launcher builds the sibling helper and injects only the emitted CEF runtime', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
+}, async (t) => {
   const fixture = await createCefDevelopmentFixture(t);
   const stale = await createCefDevelopmentFixture(t);
   let invocation;
@@ -179,7 +181,9 @@ test('macOS launcher builds the sibling helper and injects only the emitted CEF 
   );
 });
 
-test('macOS launcher preserves a valid explicit CEF override and rejects an invalid one', async (t) => {
+test('macOS launcher preserves a valid explicit CEF override and rejects an invalid one', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
+}, async (t) => {
   const fixture = await createCefDevelopmentFixture(t);
   const explicitFixture = await createCefDevelopmentFixture(t);
   const override = explicitFixture.framework;
@@ -229,7 +233,9 @@ test('macOS launcher preserves a valid explicit CEF override and rejects an inva
   );
 });
 
-test('CEF dev preparation rejects an incomplete framework before starting Tauri', async (t) => {
+test('CEF dev preparation rejects an incomplete framework before starting Tauri', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
+}, async (t) => {
   const fixture = await createCefDevelopmentFixture(t);
   const missing = path.join(fixture.frameworkRoot, 'Resources', 'icudtl.dat');
   await fs.unlink(missing);
@@ -365,16 +371,19 @@ test('canonical Tauri dev launcher makes the browser data root private and rejec
   const browserDataRoot = path.join(parent, 'persistent');
 
   await fs.mkdir(browserDataRoot, { mode: 0o755 });
-  await fs.chmod(browserDataRoot, 0o755);
-  await prepareBrowserDataRoot(browserDataRoot, { platform: 'darwin' });
-  assert.equal((await fs.stat(browserDataRoot)).mode & 0o777, 0o700);
+  if (process.platform !== 'win32') await fs.chmod(browserDataRoot, 0o755);
+  await prepareBrowserDataRoot(browserDataRoot, { platform: process.platform });
+  assert.equal((await fs.lstat(browserDataRoot)).isDirectory(), true);
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(browserDataRoot)).mode & 0o777, 0o700);
+  }
 
   const actual = path.join(parent, 'actual');
   const linked = path.join(parent, 'linked');
   await fs.mkdir(actual, { mode: 0o700 });
-  await fs.symlink(actual, linked);
+  await fs.symlink(actual, linked, process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(
-    prepareBrowserDataRoot(linked, { platform: 'darwin' }),
+    prepareBrowserDataRoot(linked, { platform: process.platform }),
     /browser data root must be a real directory, not a symlink/u,
   );
 });

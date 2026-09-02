@@ -15,6 +15,7 @@ import {
 } from '../scripts/updater-replacement-smoke-platform-runner.mjs';
 import {
   createWindowsEvidenceRootAclCommand,
+  validateWindowsEvidenceRootAclObservation,
 } from '../scripts/windows-mode2-production-smoke-inspection.mjs';
 
 test('macOS signature parser requires exact Team ID and bundle identifier', () => {
@@ -134,6 +135,51 @@ test('Windows updater ACL command rejects reparse ancestors and emits an exact p
     'FileSystemRights]::FullControl',
     '$actualRules.Count -ne 2',
   ]) assert.ok(source.includes(required), `missing Windows updater ACL check: ${required}`);
+});
+
+test('Windows updater ACL observation canonicalizes the exact owner and SYSTEM SID set', () => {
+  const rootPath = 'D:\\a\\_temp\\fixture\\evidence';
+  const ownerSid = 'S-1-5-21-1000-1000-1000-1001';
+  const observation = validateWindowsEvidenceRootAclObservation({
+    rootPath,
+    ownerSid,
+    systemSid: 'S-1-5-18',
+    inheritanceProtected: true,
+    allowedSids: [ownerSid, 'S-1-5-18'],
+    aceCount: 2,
+    fullControlOnly: true,
+    reparseFree: true,
+  }, { paths: { evidenceRoot: rootPath } });
+
+  assert.deepEqual(observation.allowedSids, ['S-1-5-18', ownerSid]);
+});
+
+test('Windows updater ACL observation still rejects duplicate or foreign SIDs', () => {
+  const rootPath = 'D:\\a\\_temp\\fixture\\evidence';
+  const ownerSid = 'S-1-5-21-1000-1000-1000-1001';
+  const fixture = (allowedSids) => ({
+    rootPath,
+    ownerSid,
+    systemSid: 'S-1-5-18',
+    inheritanceProtected: true,
+    allowedSids,
+    aceCount: 2,
+    fullControlOnly: true,
+    reparseFree: true,
+  });
+
+  for (const allowedSids of [
+    [ownerSid, ownerSid],
+    [ownerSid, 'S-1-5-18', 'S-1-5-32-545'],
+  ]) {
+    assert.throws(
+      () => validateWindowsEvidenceRootAclObservation(
+        fixture(allowedSids),
+        { paths: { evidenceRoot: rootPath } },
+      ),
+      /not protected for only the runner owner and SYSTEM/u,
+    );
+  }
 });
 
 test('owned-process census exposes a surviving descendant or challenge-bound helper', () => {

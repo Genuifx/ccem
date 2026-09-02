@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import process from 'node:process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -282,7 +283,9 @@ test('real runner rejects local, debug, non-GitHub, and missing explicit authori
   assert.equal(assertMacosSafeStorageSmokeAuthorization(environment, 'darwin'), true);
 });
 
-test('dry-run is pure and never executes a Keychain or GUI dependency', async () => {
+test('dry-run is pure and never executes a Keychain or GUI dependency', {
+  skip: process.platform === 'win32' ? 'requires POSIX absolute-path semantics' : false,
+}, async () => {
   let calls = 0;
   const result = await run(['--dry-run', '--app', sourceApp], {
     environment,
@@ -296,7 +299,9 @@ test('dry-run is pure and never executes a Keychain or GUI dependency', async ()
   assert.equal(calls, 0);
 });
 
-test('runner state machine restores Keychain state and removes every owned temporary surface', async () => {
+test('runner state machine restores Keychain state and removes every owned temporary surface', {
+  skip: process.platform === 'win32' ? 'requires POSIX private-directory and executable-mode semantics' : false,
+}, async () => {
   const temporary = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-safe-storage-runner-')),
   );
@@ -529,7 +534,9 @@ test('release summary binds target, app bytes, version, and full attestation dig
   }, expected), /does not prove/);
 });
 
-test('release inventory consumes only the exact private current-run attestation file', async (t) => {
+test('release inventory consumes only the exact private current-run attestation file', {
+  skip: process.platform === 'win32' ? 'requires POSIX ownership and private-file mode semantics' : false,
+}, async (t) => {
   const temporary = await fs.realpath(
     await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-safe-storage-release-')),
   );

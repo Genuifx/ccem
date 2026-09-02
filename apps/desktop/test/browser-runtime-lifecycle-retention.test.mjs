@@ -7,10 +7,22 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 
+function normalizeRepoText(source) {
+  return source.replace(/\r\n?/g, '\n');
+}
+
+async function readRepoText(...parts) {
+  return normalizeRepoText(await fs.readFile(path.join(desktopDir, ...parts), 'utf8'));
+}
+
+test('repo source reader normalizes CRLF and lone CR boundaries', () => {
+  assert.equal(normalizeRepoText('before\r\nmarker\rafter'), 'before\nmarker\nafter');
+});
+
 test('handoff preserves browser instances while quarantine and stop retire only exact Agent control', async () => {
   const [lib, nativeRuntime] = await Promise.all([
-    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'lib.rs'), 'utf8'),
-    fs.readFile(path.join(desktopDir, 'src-tauri', 'src', 'native_runtime.rs'), 'utf8'),
+    readRepoText('src-tauri', 'src', 'lib.rs'),
+    readRepoText('src-tauri', 'src', 'native_runtime.rs'),
   ]);
 
   const managedHandoffStart = lib.indexOf('fn handoff_native_session_to_terminal(');

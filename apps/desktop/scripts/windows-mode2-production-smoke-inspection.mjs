@@ -73,6 +73,9 @@ export function validateWindowsEvidenceRootAclObservation(observation, plan) {
     'aceCount', 'fullControlOnly', 'reparseFree',
   ], 'evidence-root ACL observation');
   exactWindowsPath(observation.rootPath, 'evidence-root ACL path');
+  const allowedSids = Array.isArray(observation.allowedSids)
+    ? [...observation.allowedSids].sort()
+    : null;
   if (
     !sameWindowsPath(observation.rootPath, plan.paths.evidenceRoot)
     || !/^S-1-(?:\d+-)+\d+$/u.test(observation.ownerSid ?? '')
@@ -81,10 +84,10 @@ export function validateWindowsEvidenceRootAclObservation(observation, plan) {
     || observation.aceCount !== 2
     || observation.fullControlOnly !== true
     || observation.reparseFree !== true
-    || JSON.stringify(observation.allowedSids)
+    || JSON.stringify(allowedSids)
       !== JSON.stringify([WINDOWS_SYSTEM_SID, observation.ownerSid].sort())
   ) fail('evidence root is not protected for only the runner owner and SYSTEM');
-  return observation;
+  return { ...observation, allowedSids };
 }
 
 export function createWindowsEvidenceRootAclCommand({ plan }) {

@@ -29,6 +29,19 @@ import { verifyImmutableReleasesEnabled } from '../scripts/verify-immutable-rele
 
 const desktopDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repoDir = path.resolve(desktopDir, '..', '..');
+
+function normalizeRepoText(source) {
+  return source.replace(/\r\n?/g, '\n');
+}
+
+async function readRepoText(filePath) {
+  return normalizeRepoText(await fs.readFile(filePath, 'utf8'));
+}
+
+test('repo source reader normalizes CRLF and lone CR boundaries', () => {
+  assert.equal(normalizeRepoText('before\r\nmarker\rafter'), 'before\nmarker\nafter');
+});
+
 const repository = 'fixture-owner/fixture-repo';
 const appVersion = '2.53.0';
 const tag = `v${appVersion}`;
@@ -363,8 +376,8 @@ test('immutable release preflight is read-only and fails closed unless enabled i
 
 test('release DAG keeps builders read-only and defers one privileged transaction until payload verification', async () => {
   const [releaseWorkflow, producerWorkflow] = await Promise.all([
-    fs.readFile(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml'), 'utf8'),
-    fs.readFile(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml'), 'utf8'),
+    readRepoText(path.join(repoDir, '.github', 'workflows', 'release-desktop.yml')),
+    readRepoText(path.join(repoDir, '.github', 'workflows', 'mode2-signed-producer.yml')),
   ]);
   const productionAction = stepBlock(producerWorkflow, 'Build production bundles without release access');
   assert.match(productionAction, /tauri-apps\/tauri-action@[a-f0-9]{40}/u);
@@ -449,17 +462,15 @@ test('release DAG keeps builders read-only and defers one privileged transaction
   assert.doesNotMatch(releaseWorkflow, /require-draft-github-release\.mjs/u);
   assert.doesNotMatch(`${releaseWorkflow}\n${producerWorkflow}`, /curl[\s\S]{0,180}-H ["']Authorization:/u);
   assert.doesNotMatch(`${releaseWorkflow}\n${producerWorkflow}`, /curl[\s\S]{0,180}(?:-X|--request) (?:POST|DELETE|PATCH)/u);
-  const uploaderSource = await fs.readFile(
+  const uploaderSource = await readRepoText(
     path.join(desktopDir, 'scripts', 'upload-draft-release-assets.mjs'),
-    'utf8',
   );
   assert.doesNotMatch(uploaderSource, /DELETE|deleteAsset|replaceVerifiedDmg/u);
-  const releaseApiSource = await fs.readFile(
+  const releaseApiSource = await readRepoText(
     path.join(desktopDir, 'scripts', 'github-draft-release-api.mjs'),
-    'utf8',
   );
   assert.doesNotMatch(releaseApiSource, /method:\s*['"]DELETE['"]/u);
-  const fileSizeGate = await fs.readFile(path.join(repoDir, 'scripts', 'check-file-size.sh'), 'utf8');
+  const fileSizeGate = await readRepoText(path.join(repoDir, 'scripts', 'check-file-size.sh'));
   assert.match(fileSizeGate, /-name "\*\.mjs"/u);
   assert.match(fileSizeGate, /-name "\*\.cjs"/u);
 });
