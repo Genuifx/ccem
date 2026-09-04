@@ -1,5 +1,11 @@
 # ccem
 
+## 2.78.2
+
+### Patch Changes
+
+- 678f432: Fix Desktop release publishing by canonicalizing macOS DMG and Windows installer asset names before GitHub upload.
+
 ## 2.78.1
 
 ### Patch Changes
