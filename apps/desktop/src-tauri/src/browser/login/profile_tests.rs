@@ -564,6 +564,21 @@ fn concurrent_lease_is_rejected_and_drop_requires_recovery_proof() {
 }
 
 #[test]
+fn platform_lock_contention_maps_to_profile_in_use() {
+    assert!(matches!(
+        profile_lock_error("test browser profile lock", fs2::lock_contended_error()),
+        ProfileError::ProfileInUse
+    ));
+    assert!(matches!(
+        profile_lock_error(
+            "test browser profile lock",
+            std::io::Error::other("unrelated lock failure")
+        ),
+        ProfileError::Io(_)
+    ));
+}
+
+#[test]
 fn embedded_reservation_holds_the_lock_without_publishing_launch_pending() {
     let (temp, manager) = manager();
     let workspace = workspace("workspace-embedded-reservation-001");

@@ -48,10 +48,11 @@ impl Drop for EnvGuard {
 #[test]
 fn dsh_helper_source_path_points_to_resources() {
     let path = source_dsh_helper_path();
-    assert!(path.ends_with("resources/dsh-history/lib/dsh-history-helper.mjs"));
-    assert!(path
-        .to_string_lossy()
-        .contains("apps/desktop/src-tauri/resources"));
+    let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("dsh-history")
+        .join(DSH_HELPER_RELATIVE);
+    assert_eq!(path, expected);
 }
 #[test]
 fn resolve_dsh_home_respects_env() {

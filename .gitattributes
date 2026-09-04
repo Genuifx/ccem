@@ -1,1 +1,3 @@
 apps/desktop/third-party/cef/LICENSE.txt text eol=lf
+apps/desktop/src-tauri/runtime-manifests/* text eol=lf
+*.rs text eol=lf

@@ -283,10 +283,7 @@ impl BrowserProfileManager {
             let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
             lock_file
                 .try_lock_exclusive()
-                .map_err(|error| match error.kind() {
-                    std::io::ErrorKind::WouldBlock => ProfileError::ProfileInUse,
-                    _ => io_error("reserve embedded browser profile", error),
-                })?;
+                .map_err(|error| profile_lock_error("reserve embedded browser profile", error))?;
             let descriptor = load_current_descriptor(&profile_dir, profile_id)?;
             verify_workspace(&descriptor, workspace_identity)?;
             if !descriptor.cleanup_state.is_stopped() {
@@ -317,10 +314,7 @@ impl BrowserProfileManager {
         let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
         lock_file
             .try_lock_exclusive()
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::WouldBlock => ProfileError::ProfileInUse,
-                _ => io_error("lock browser profile", error),
-            })?;
+            .map_err(|error| profile_lock_error("lock browser profile", error))?;
 
         let mut descriptor = load_current_descriptor(&profile_dir, profile_id)?;
         verify_workspace(&descriptor, workspace_identity)?;
@@ -485,12 +479,9 @@ impl BrowserProfileManager {
         let result = (|| {
             let profile_dir = self.checked_profile_dir(profile_id)?;
             let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
-            lock_file
-                .try_lock_exclusive()
-                .map_err(|error| match error.kind() {
-                    std::io::ErrorKind::WouldBlock => ProfileError::ProfileInUse,
-                    _ => io_error("lock browser profile for maintenance", error),
-                })?;
+            lock_file.try_lock_exclusive().map_err(|error| {
+                profile_lock_error("lock browser profile for maintenance", error)
+            })?;
             let descriptor = load_current_descriptor(&profile_dir, profile_id)?;
             verify_workspace(&descriptor, workspace_identity)?;
             Ok(ProfileMaintenanceLease {
@@ -917,6 +908,19 @@ fn verify_workspace(
         Ok(())
     } else {
         Err(ProfileError::WorkspaceMismatch)
+    }
+}
+
+fn profile_lock_error(context: &str, error: std::io::Error) -> ProfileError {
+    let contended = fs2::lock_contended_error();
+    let matches_platform_code = matches!(
+        (error.raw_os_error(), contended.raw_os_error()),
+        (Some(actual), Some(expected)) if actual == expected
+    );
+    if error.kind() == std::io::ErrorKind::WouldBlock || matches_platform_code {
+        ProfileError::ProfileInUse
+    } else {
+        io_error(context, error)
     }
 }
 

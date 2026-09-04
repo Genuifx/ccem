@@ -3,11 +3,8 @@ use std::path::PathBuf;
 
 #[test]
 fn durable_jsonl_sink_writes_pre_and_result_records() {
-    let path = std::env::temp_dir().join(format!(
-        "ccem-semantic-audit-{}-{}.jsonl",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ));
+    let temp = tempfile::tempdir().expect("temporary semantic audit root");
+    let path = temp.path().join("audit").join("semantic-audit.jsonl");
     let sink = JsonlSemanticAuditSink::new(&path);
     let pre = AuditPreRecord {
         operation_id: 1,
@@ -49,7 +46,6 @@ fn durable_jsonl_sink_writes_pre_and_result_records() {
     assert!(!contents.contains("guid"));
     assert!(!contents.contains("filename"));
     assert!(!contents.contains("path"));
-    std::fs::remove_file(path).expect("remove audit");
 }
 
 #[test]
