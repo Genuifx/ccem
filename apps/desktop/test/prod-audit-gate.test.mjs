@@ -7,13 +7,17 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
 import {
+  GITHUB_GLOBAL_ADVISORIES_ENDPOINT,
   NPM_BULK_AUDIT_ENDPOINT,
   PNPM_PRODUCTION_LIST_ARGS,
   auditProductionDependencies,
+  auditProductionDependenciesWithFallback,
+  auditProductionDependenciesWithGithubAdvisories,
   buildProductionDependencyIndex,
   decodeBulkHttpResponse,
   evaluateAuditReport,
   requestBulkAdvisories,
+  requestGithubAdvisories,
 } from '../../../scripts/ci/check-prod-audit.mjs';
 import { loadExpectedWorkspacePaths } from '../../../scripts/ci/prod-audit-workspaces.mjs';
 
@@ -61,6 +65,12 @@ function advisory({
   };
 }
 
+function transientAuditError(message) {
+  const error = new Error(message);
+  error.auditTransient = true;
+  return error;
+}
+
 test('production dependency listing is recursive, prod-only, unbounded-depth, and lockfile-only', () => {
   assert.deepEqual(PNPM_PRODUCTION_LIST_ARGS, [
     'list',
@@ -74,9 +84,19 @@ test('production dependency listing is recursive, prod-only, unbounded-depth, an
 });
 
 test('CI runs the production audit once and gates bundle smoke on it', async () => {
-  const source = await readFile(path.join(repoDir, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const source = (
+    await readFile(path.join(repoDir, '.github', 'workflows', 'ci.yml'), 'utf8')
+  ).replace(/\r\n?/gu, '\n');
   assert.equal(source.match(/^\s+run: pnpm audit:prod:high$/gmu)?.length, 1);
   assert.match(source, /\n  production-audit:\n    name: Production Dependency Audit\n/u);
+  assert.match(
+    source,
+    /\n  production-audit:\n[\s\S]*?    permissions:\n      contents: read\n/u,
+  );
+  assert.match(
+    source,
+    /      - name: Audit production dependencies\n        env:\n          GITHUB_TOKEN: \$\{\{ github\.token \}\}\n        run: pnpm audit:prod:high\n/u,
+  );
   assert.match(
     source,
     /\n  desktop-bundle-smoke:\n[\s\S]*?    needs:\n      - production-audit\n      - test\n/u,
@@ -108,6 +128,24 @@ test('workspace discovery binds pnpm output to every configured lockfile importe
   );
 });
 
+test('lockfile-only registry nodes do not require an installed package path', () => {
+  const chalk = dependency('chalk', '5.6.2', 'chalk-5');
+  delete chalk.path;
+
+  const index = dependencyIndex({ chalk });
+  assert.deepEqual(
+    [...index.get('chalk').get('5.6.2')],
+    ['apps/desktop>chalk'],
+  );
+
+  const linked = dependency('@ccem/core', 'link:../../packages/core', 'linked-core');
+  delete linked.path;
+  assert.throws(
+    () => dependencyIndex({ '@ccem/core': linked }),
+    /omitted the absolute linked package path/u,
+  );
+});
+
 test('bulk audit fails closed on operational, HTTP, encoding, and response-shape failures', async () => {
   const index = dependencyIndex({
     target: dependency('target', '1.0.0', 'target-1'),
@@ -118,7 +156,7 @@ test('bulk audit fails closed on operational, HTTP, encoding, and response-shape
       maxRoundAttempts: 1,
       retryDelayMs: 0,
       requestRound: async () => {
-        throw new Error('registry unavailable');
+        throw transientAuditError('registry unavailable');
       },
     }),
     /round 1\/1 failed after 1 attempt: registry unavailable/u,
@@ -198,7 +236,7 @@ test('bulk audit retries transient round failures but remains bounded and fail-c
     requestRound: async () => {
       recoveredAttempts += 1;
       if (recoveredAttempts < 3) {
-        throw new Error('temporary registry timeout');
+        throw transientAuditError('temporary registry timeout');
       }
       return {};
     },
@@ -219,12 +257,246 @@ test('bulk audit retries transient round failures but remains bounded and fail-c
       retryDelayMs: 0,
       requestRound: async () => {
         failedAttempts += 1;
-        throw new Error('registry unavailable');
+        throw transientAuditError('registry unavailable');
       },
     }),
     /round 1\/1 failed after 2 attempts: registry unavailable/u,
   );
   assert.equal(failedAttempts, 2);
+});
+
+test('GitHub Advisory fallback preserves exact versions and dependency paths', async () => {
+  const index = dependencyIndex({
+    'parent-a': dependency('parent-a', '1.0.0', 'parent-a', {
+      target: dependency('target', '1.2.3', 'target'),
+    }),
+    'parent-b': dependency('parent-b', '1.0.0', 'parent-b', {
+      target: dependency('target', '1.2.3', 'target'),
+    }),
+  });
+  const payloads = [];
+  const report = await auditProductionDependenciesWithGithubAdvisories(index, {
+    requestAdvisories: async packageVersions => {
+      payloads.push(packageVersions);
+      return {
+        advisories: packageVersions.includes('target@1.2.3')
+          ? [{
+              ghsa_id: 'GHSA-1111-2222-3333',
+              html_url: 'https://github.com/advisories/GHSA-1111-2222-3333',
+              summary: 'fixture high advisory',
+              type: 'reviewed',
+              severity: 'high',
+              withdrawn_at: null,
+              vulnerabilities: [{
+                package: { ecosystem: 'npm', name: 'target' },
+                vulnerable_version_range: '<2.0.0',
+              }],
+            }]
+          : [],
+        link: '',
+      };
+    },
+  });
+
+  assert.ok(payloads.flat().every(value => /@\d+\.\d+\.\d+/u.test(value)));
+  assert.deepEqual(report.advisories, [{
+    id: 'GHSA-1111-2222-3333',
+    module_name: 'target',
+    title: 'fixture high advisory',
+    severity: 'high',
+    url: 'https://github.com/advisories/GHSA-1111-2222-3333',
+    vulnerable_versions: '<2.0.0',
+    github_advisory_id: 'GHSA-1111-2222-3333',
+    findings: [{
+      version: '1.2.3',
+      paths: [
+        'apps/desktop>parent-a>target',
+        'apps/desktop>parent-b>target',
+      ],
+    }],
+    paths: [
+      'apps/desktop>parent-a>target',
+      'apps/desktop>parent-b>target',
+    ],
+  }]);
+  assert.equal(report.metadata.vulnerabilities.high, 1);
+});
+
+test('audit falls back only after transient npm failure and fails closed when GitHub also fails', async () => {
+  const index = dependencyIndex({
+    target: dependency('target', '1.0.0', 'target-1'),
+  });
+  const expected = {
+    advisories: [],
+    metadata: {
+      vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0 },
+    },
+  };
+  const fallbackMessages = [];
+  assert.equal(
+    await auditProductionDependenciesWithFallback(index, {
+      auditNpm: async () => {
+        throw transientAuditError('npm unavailable');
+      },
+      auditGithub: async () => expected,
+      onFallback: message => fallbackMessages.push(message),
+    }),
+    expected,
+  );
+  assert.deepEqual(fallbackMessages, [
+    'npm production audit unavailable (npm unavailable); using GitHub Advisory exact-version fallback.',
+  ]);
+
+  await assert.rejects(
+    auditProductionDependenciesWithFallback(index, {
+      auditNpm: async () => {
+        throw transientAuditError('npm unavailable');
+      },
+      auditGithub: async () => {
+        throw new Error('GitHub unavailable');
+      },
+    }),
+    /npm production audit failed: npm unavailable; GitHub Advisory fallback failed: GitHub unavailable/u,
+  );
+
+  let githubCalled = false;
+  await assert.rejects(
+    auditProductionDependenciesWithFallback(index, {
+      auditNpm: async () => {
+        throw new Error('invalid npm evidence');
+      },
+      auditGithub: async () => {
+        githubCalled = true;
+        return expected;
+      },
+    }),
+    /invalid npm evidence/u,
+  );
+  assert.equal(githubCalled, false);
+});
+
+test('npm audit does not retry or fall back after invalid evidence', async () => {
+  const index = dependencyIndex({
+    target: dependency('target', '1.0.0', 'target-1'),
+  });
+  let npmCalls = 0;
+  let githubCalled = false;
+
+  await assert.rejects(
+    auditProductionDependenciesWithFallback(index, {
+      auditNpm: dependencyIndexValue => auditProductionDependencies(dependencyIndexValue, {
+        maxRoundAttempts: 2,
+        retryDelayMs: 0,
+        requestRound: async () => {
+          npmCalls += 1;
+          if (npmCalls === 1) {
+            throw new Error('invalid npm evidence');
+          }
+          throw transientAuditError('npm unavailable');
+        },
+      }),
+      auditGithub: async () => {
+        githubCalled = true;
+        throw new Error('GitHub must not be called');
+      },
+    }),
+    /invalid npm evidence/u,
+  );
+  assert.equal(npmCalls, 1);
+  assert.equal(githubCalled, false);
+});
+
+test('GitHub Advisory fallback rejects pagination, unknown severity, and unbound evidence', async () => {
+  const index = dependencyIndex({
+    target: dependency('target', '1.0.0', 'target-1'),
+  });
+  await assert.rejects(
+    auditProductionDependenciesWithGithubAdvisories(index, {
+      requestAdvisories: async () => ({
+        advisories: [],
+        link: '<https://api.github.com/advisories?after=cursor>; rel="next"',
+      }),
+    }),
+    /paginated response/u,
+  );
+  await assert.rejects(
+    auditProductionDependenciesWithGithubAdvisories(index, {
+      requestAdvisories: async () => ({
+        advisories: [{
+          ghsa_id: 'GHSA-abcd-2222-3333',
+          html_url: 'https://github.com/advisories/GHSA-abcd-2222-3333',
+          summary: 'fixture advisory',
+          type: 'reviewed',
+          severity: 'unknown',
+          withdrawn_at: null,
+          vulnerabilities: [{
+            package: { ecosystem: 'npm', name: 'target' },
+            vulnerable_version_range: '<2.0.0',
+          }],
+        }],
+        link: '',
+      }),
+    }),
+    /severity is unknown/u,
+  );
+  await assert.rejects(
+    auditProductionDependenciesWithGithubAdvisories(index, {
+      requestAdvisories: async () => ({
+        advisories: [{
+          ghsa_id: 'GHSA-abcd-2222-3333',
+          html_url: 'https://github.com/advisories/GHSA-abcd-2222-3333',
+          summary: 'unbound fixture advisory',
+          type: 'reviewed',
+          severity: 'medium',
+          withdrawn_at: null,
+          vulnerabilities: [{
+            package: { ecosystem: 'npm', name: 'other-package' },
+            vulnerable_version_range: '<2.0.0',
+          }],
+        }],
+        link: '',
+      }),
+    }),
+    /returned unbound evidence/u,
+  );
+});
+
+test('GitHub Advisory request uses the fixed endpoint without authorization', async () => {
+  const captured = {};
+  const requestImpl = (url, options, callback) => {
+    captured.url = url;
+    captured.options = options;
+    const request = new EventEmitter();
+    request.destroy = () => {};
+    request.end = body => {
+      captured.body = body;
+      queueMicrotask(() => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.headers = {};
+        response.destroy = () => {};
+        callback(response);
+        response.emit('data', Buffer.from('[]'));
+        response.emit('end');
+      });
+    };
+    return request;
+  };
+  assert.deepEqual(
+    await requestGithubAdvisories(
+      ['target@1.0.0'],
+      { requestImpl, timeoutMs: 100, token: '' },
+    ),
+    { advisories: [], link: '' },
+  );
+  const requestUrl = new URL(captured.url);
+  assert.equal(requestUrl.origin + requestUrl.pathname, GITHUB_GLOBAL_ADVISORIES_ENDPOINT);
+  assert.equal(requestUrl.searchParams.get('type'), 'reviewed');
+  assert.equal(requestUrl.searchParams.get('ecosystem'), 'npm');
+  assert.equal(requestUrl.searchParams.get('affects'), 'target@1.0.0');
+  assert.equal(captured.options.method, 'GET');
+  assert.equal(captured.options.headers.authorization, undefined);
+  assert.equal(captured.body, undefined);
 });
 
 test('bulk request uses only the fixed official endpoint, no auth, and an overall timeout', async () => {
