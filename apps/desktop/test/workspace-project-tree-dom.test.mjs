@@ -454,6 +454,61 @@ test('ProjectTree keeps three ready active rows visible through runtime-to-provi
   assert.equal(scrollCalls.some((call) => call.key === MISSING_PROVIDER_KEY), false);
 });
 
+test('ProjectTree moves an existing session to its new recency position when activity advances', async (t) => {
+  const { dom } = installDom();
+  const { harness, tempDir } = await importProjectTreeHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+
+  let mounted;
+  t.after(async () => {
+    await mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const initialSessions = [
+    historySession({ id: 'newest', timestamp: BASE_TIMESTAMP }),
+    historySession({ id: 'middle', timestamp: BASE_TIMESTAMP - 1_000 }),
+    historySession({ id: 'scheduled', timestamp: BASE_TIMESTAMP - 2_000 }),
+  ];
+
+  mounted = await harness.mountProjectTree(container, {
+    historySessions: initialSessions,
+    liveEntries: [],
+    onSelect: () => {},
+  });
+
+  const projectNode = Array.from(container.querySelectorAll('[data-project-motion-key]'))
+    .find((element) => element.dataset.projectMotionKey === `project:main:${PROJECT}`);
+  assert.ok(projectNode);
+
+  const rowKeys = () => Array.from(projectNode.querySelectorAll('[data-workspace-session-key]'))
+    .map((element) => element.dataset.workspaceSessionKey);
+  assert.deepEqual(rowKeys(), [
+    'claude:newest',
+    'claude:middle',
+    'claude:scheduled',
+  ]);
+
+  await mounted.render({
+    historySessions: initialSessions.map((session) => (
+      session.id === 'scheduled'
+        ? { ...session, timestamp: BASE_TIMESTAMP - 500 }
+        : session
+    )),
+    liveEntries: [],
+    onSelect: () => {},
+  });
+
+  assert.deepEqual(rowKeys(), [
+    'claude:newest',
+    'claude:scheduled',
+    'claude:middle',
+  ]);
+});
+
 test('ProjectTree toggles between project groups and a time-sorted flat session list', async (t) => {
   const { dom } = installDom();
   const { harness, tempDir } = await importProjectTreeHarness();

@@ -190,6 +190,13 @@ export function stabilizeProjectNodeSessions(
       if (!nextSession || retainedKeys.has(key)) {
         continue;
       }
+      // A newer activity timestamp is an explicit reorder signal.
+      if (nextSession.timestamp > previousSession.timestamp) {
+        return {
+          ...node,
+          sessions: [...node.sessions].sort((left, right) => right.timestamp - left.timestamp),
+        };
+      }
       retainedSessions.push(nextSession);
       retainedKeys.add(key);
     }
