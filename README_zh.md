@@ -170,7 +170,7 @@ ccem cp <src> <dst>
 
 | 预设 | Base URL | 主模型 | 快速模型 |
 |---|---|---|---|
-| GLM（智谱） | `https://open.bigmodel.cn/api/anthropic` | glm-5.2[1m] | glm-4.7 |
+| GLM（智谱） | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3-flash |
 | KIMI（月之暗面） | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k3[1m] |
 | Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding |
 | MiniMax | `https://api.minimaxi.com/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] |

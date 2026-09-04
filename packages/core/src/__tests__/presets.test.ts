@@ -16,9 +16,9 @@ describe('presets', () => {
     it('should have GLM preset with correct structure', () => {
       expect(ENV_PRESETS.GLM).toBeDefined();
       expect(ENV_PRESETS.GLM.ANTHROPIC_BASE_URL).toContain('bigmodel.cn');
-      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]');
-      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]');
-      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4.7');
+      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3[1m]');
+      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3[1m]');
+      expect(ENV_PRESETS.GLM.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3-flash');
       expect(ENV_PRESETS.GLM.ANTHROPIC_MODEL).toBeDefined();
     });
 
