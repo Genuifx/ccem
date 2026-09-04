@@ -128,7 +128,7 @@ test('workspace discovery binds pnpm output to every configured lockfile importe
   );
 });
 
-test('lockfile-only registry nodes do not require an installed package path', () => {
+test('lockfile-only registry nodes ignore absent or relative installed package paths', () => {
   const chalk = dependency('chalk', '5.6.2', 'chalk-5');
   delete chalk.path;
 
@@ -137,6 +137,9 @@ test('lockfile-only registry nodes do not require an installed package path', ()
     [...index.get('chalk').get('5.6.2')],
     ['apps/desktop>chalk'],
   );
+
+  chalk.path = 'node_modules/chalk';
+  assert.ok(dependencyIndex({ chalk }).has('chalk'));
 
   const linked = dependency('@ccem/core', 'link:../../packages/core', 'linked-core');
   delete linked.path;

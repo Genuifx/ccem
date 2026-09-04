@@ -250,16 +250,14 @@ export function buildProductionDependencyIndex(
       }
       const stablePath = [...pathSegments, dependencyName].join('>');
       const isLinked = node.version.startsWith('link:');
-      let physicalPath;
-      if (node.path === undefined) {
-        if (isLinked) {
+      if (isLinked) {
+        if (node.path === undefined) {
           throw new Error(`pnpm list omitted the absolute linked package path at ${stablePath}.`);
         }
-      } else {
         if (typeof node.path !== 'string' || !path.isAbsolute(node.path)) {
-          throw new Error(`pnpm list returned a non-absolute package path at ${stablePath}.`);
+          throw new Error(`pnpm list returned a non-absolute linked package path at ${stablePath}.`);
         }
-        physicalPath = path.resolve(node.path);
+        const physicalPath = path.resolve(node.path);
         const physicalIdentity = physicalIdentities.get(physicalPath);
         if (
           physicalIdentity
@@ -271,9 +269,6 @@ export function buildProductionDependencyIndex(
           throw new Error(`pnpm list returned conflicting identities for ${physicalPath}.`);
         }
         physicalIdentities.set(physicalPath, { packageName, version: node.version });
-      }
-
-      if (isLinked) {
         const linkedRelative = path.relative(repoRoot, physicalPath);
         if (
           linkedRelative.startsWith(`..${path.sep}`)
