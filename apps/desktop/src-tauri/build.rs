@@ -21,5 +21,25 @@ fn main() {
         }
         println!("cargo:rustc-env=CCEM_APPLE_SIGNING_IDENTITY={signing_identity}");
     }
-    tauri_build::build()
+    let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let tauri_attributes = if windows_msvc {
+        tauri_build::Attributes::new()
+            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+    } else {
+        tauri_build::Attributes::new()
+    };
+    tauri_build::try_build(tauri_attributes).expect("failed to run Tauri build script");
+
+    if windows_msvc {
+        let manifest = std::path::Path::new(
+            &std::env::var("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"),
+        )
+        .join("windows-app-manifest.xml");
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        // `rustc-link-arg-tests` skips the `[lib]` unit-test harness. Use one linker
+        // manifest for every Windows MSVC executable, including that harness.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+    }
 }
