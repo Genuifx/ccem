@@ -7,6 +7,25 @@ on:
     branches: [main]
 
 jobs:
+  production-audit:
+    name: Production Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Audit production dependencies
+        run: pnpm audit:prod:high
+
   test:
     name: Test & Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -37,9 +56,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install tmux
 
-      - name: Audit production dependencies
-        run: pnpm audit:prod:high
-
       - name: Verify pinned browser runtime manifests
         run: pnpm check:browser-runtime-manifests
 
@@ -63,10 +79,12 @@ jobs:
 
   desktop-bundle-smoke:
     name: Desktop Bundle Smoke (${{ matrix.target }})
-    needs: test
+    needs:
+      - production-audit
+      - test
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 45
-    if: ${{ needs.test.result == 'success' }}
+    if: ${{ needs.production-audit.result == 'success' && needs.test.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:

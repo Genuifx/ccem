@@ -31,7 +31,10 @@ export const PNPM_PRODUCTION_LIST_ARGS = Object.freeze([
 
 const LIST_TIMEOUT_MS = 60_000;
 const HTTP_TIMEOUT_MS = 30_000;
-const AUDIT_TOTAL_TIMEOUT_MS = 45_000;
+const AUDIT_TOTAL_TIMEOUT_MS = 180_000;
+const AUDIT_MAX_ROUND_ATTEMPTS = 3;
+const AUDIT_RETRY_DELAY_MS = 1_000;
+const AUDIT_MAX_CONCURRENT_ROUNDS = 3;
 const MAX_LIST_STDOUT_BYTES = 64 * 1024 * 1024;
 const MAX_LIST_STDERR_BYTES = 1024 * 1024;
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -653,6 +656,9 @@ export async function auditProductionDependencies(
   {
     requestRound = requestBulkAdvisories,
     overallTimeoutMs = AUDIT_TOTAL_TIMEOUT_MS,
+    maxRoundAttempts = AUDIT_MAX_ROUND_ATTEMPTS,
+    retryDelayMs = AUDIT_RETRY_DELAY_MS,
+    maxConcurrentRounds = AUDIT_MAX_CONCURRENT_ROUNDS,
   } = {},
 ) {
   const rounds = buildAuditRounds(dependencyIndex);
@@ -660,38 +666,86 @@ export async function auditProductionDependencies(
   if (!Number.isSafeInteger(overallTimeoutMs) || overallTimeoutMs <= 0) {
     throw new Error('npm bulk audit overall timeout is invalid.');
   }
+  if (!Number.isSafeInteger(maxRoundAttempts) || maxRoundAttempts < 1 || maxRoundAttempts > 5) {
+    throw new Error('npm bulk audit round attempt count is invalid.');
+  }
+  if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0 || retryDelayMs > 30_000) {
+    throw new Error('npm bulk audit retry delay is invalid.');
+  }
+  if (
+    !Number.isSafeInteger(maxConcurrentRounds)
+    || maxConcurrentRounds < 1
+    || maxConcurrentRounds > 8
+  ) {
+    throw new Error('npm bulk audit round concurrency is invalid.');
+  }
 
   const startedAt = Date.now();
+  const requestAuditRound = async (round, roundIndex) => {
+    let document;
+    for (let attempt = 1; attempt <= maxRoundAttempts; attempt += 1) {
+      const remainingMs = overallTimeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) {
+        throw new Error(`npm bulk audit exceeded its ${overallTimeoutMs}ms overall timeout.`);
+      }
+      const overallTimeoutError =
+        new Error(`npm bulk audit exceeded its ${overallTimeoutMs}ms overall timeout.`);
+      let timeout;
+      const timeoutPromise = new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(overallTimeoutError), remainingMs);
+      });
+      try {
+        document = await Promise.race([
+          Promise.resolve().then(() => requestRound(round.payload)),
+          timeoutPromise,
+        ]);
+        break;
+      } catch (error) {
+        if (error === overallTimeoutError) {
+          throw error;
+        }
+        if (attempt === maxRoundAttempts) {
+          const attemptLabel = maxRoundAttempts === 1 ? 'attempt' : 'attempts';
+          throw new Error(
+            `npm bulk audit round ${roundIndex + 1}/${rounds.length} failed after `
+            + `${maxRoundAttempts} ${attemptLabel}: ${error.message}`,
+          );
+        }
+        const delayMs = retryDelayMs * (2 ** (attempt - 1));
+        const remainingAfterFailureMs = overallTimeoutMs - (Date.now() - startedAt);
+        if (remainingAfterFailureMs <= delayMs) {
+          throw new Error(`npm bulk audit exceeded its ${overallTimeoutMs}ms overall timeout.`);
+        }
+        if (delayMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    return document;
+  };
+
+  const documents = new Array(rounds.length);
+  let nextRoundIndex = 0;
+  const worker = async () => {
+    while (nextRoundIndex < rounds.length) {
+      const roundIndex = nextRoundIndex;
+      nextRoundIndex += 1;
+      documents[roundIndex] = await requestAuditRound(rounds[roundIndex], roundIndex);
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(maxConcurrentRounds, rounds.length) },
+      () => worker(),
+    ),
+  );
+
   let totalAdvisoryRecords = 0;
   for (const [roundIndex, round] of rounds.entries()) {
-    const remainingMs = overallTimeoutMs - (Date.now() - startedAt);
-    if (remainingMs <= 0) {
-      throw new Error(`npm bulk audit exceeded its ${overallTimeoutMs}ms overall timeout.`);
-    }
-    const overallTimeoutError =
-      new Error(`npm bulk audit exceeded its ${overallTimeoutMs}ms overall timeout.`);
-    let timeout;
-    const timeoutPromise = new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(overallTimeoutError), remainingMs);
-    });
-    let document;
-    try {
-      document = await Promise.race([
-        Promise.resolve().then(() => requestRound(round.payload)),
-        timeoutPromise,
-      ]);
-    } catch (error) {
-      if (error === overallTimeoutError) {
-        throw error;
-      }
-      throw new Error(
-        `npm bulk audit round ${roundIndex + 1}/${rounds.length} failed: ${error.message}`,
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
     const response = validateBulkAdvisoryDocument(
-      document,
+      documents[roundIndex],
       new Set(Object.keys(round.payload)),
     );
     totalAdvisoryRecords += [...response.values()]

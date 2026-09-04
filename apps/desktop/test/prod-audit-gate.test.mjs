@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -72,6 +73,16 @@ test('production dependency listing is recursive, prod-only, unbounded-depth, an
   ]);
 });
 
+test('CI runs the production audit once and gates bundle smoke on it', async () => {
+  const source = await readFile(path.join(repoDir, '.github', 'workflows', 'ci.yml'), 'utf8');
+  assert.equal(source.match(/^\s+run: pnpm audit:prod:high$/gmu)?.length, 1);
+  assert.match(source, /\n  production-audit:\n    name: Production Dependency Audit\n/u);
+  assert.match(
+    source,
+    /\n  desktop-bundle-smoke:\n[\s\S]*?    needs:\n      - production-audit\n      - test\n/u,
+  );
+});
+
 test('workspace discovery binds pnpm output to every configured lockfile importer', async () => {
   const expectedWorkspacePaths = await loadExpectedWorkspacePaths(repoDir);
   assert.deepEqual([...expectedWorkspacePaths].sort(), [
@@ -104,11 +115,13 @@ test('bulk audit fails closed on operational, HTTP, encoding, and response-shape
 
   await assert.rejects(
     auditProductionDependencies(index, {
+      maxRoundAttempts: 1,
+      retryDelayMs: 0,
       requestRound: async () => {
         throw new Error('registry unavailable');
       },
     }),
-    /round 1\/1 failed: registry unavailable/u,
+    /round 1\/1 failed after 1 attempt: registry unavailable/u,
   );
   await assert.rejects(
     auditProductionDependencies(index, {
@@ -172,6 +185,46 @@ test('bulk audit fails closed on operational, HTTP, encoding, and response-shape
     }),
     /exceeded its 5ms overall timeout/u,
   );
+});
+
+test('bulk audit retries transient round failures but remains bounded and fail-closed', async () => {
+  const index = dependencyIndex({
+    target: dependency('target', '1.0.0', 'target-1'),
+  });
+  let recoveredAttempts = 0;
+  const report = await auditProductionDependencies(index, {
+    maxRoundAttempts: 3,
+    retryDelayMs: 0,
+    requestRound: async () => {
+      recoveredAttempts += 1;
+      if (recoveredAttempts < 3) {
+        throw new Error('temporary registry timeout');
+      }
+      return {};
+    },
+  });
+  assert.equal(recoveredAttempts, 3);
+  assert.deepEqual(report.metadata.vulnerabilities, {
+    info: 0,
+    low: 0,
+    moderate: 0,
+    high: 0,
+    critical: 0,
+  });
+
+  let failedAttempts = 0;
+  await assert.rejects(
+    auditProductionDependencies(index, {
+      maxRoundAttempts: 2,
+      retryDelayMs: 0,
+      requestRound: async () => {
+        failedAttempts += 1;
+        throw new Error('registry unavailable');
+      },
+    }),
+    /round 1\/1 failed after 2 attempts: registry unavailable/u,
+  );
+  assert.equal(failedAttempts, 2);
 });
 
 test('bulk request uses only the fixed official endpoint, no auth, and an overall timeout', async () => {
@@ -319,6 +372,7 @@ test('rounds map a vulnerable package version only to its exact dependency paths
   let maximumActiveRequests = 0;
 
   const report = await auditProductionDependencies(index, {
+    maxConcurrentRounds: 2,
     requestRound: async payload => {
       payloads.push(payload);
       activeRequests += 1;
@@ -344,7 +398,7 @@ test('rounds map a vulnerable package version only to its exact dependency paths
   });
 
   assert.equal(payloads.length, 2);
-  assert.equal(maximumActiveRequests, 1);
+  assert.equal(maximumActiveRequests, 2);
   assert.deepEqual(
     report.advisories.find(value => value.module_name === 'shared')?.paths,
     [
