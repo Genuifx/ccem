@@ -93,6 +93,7 @@ function fakeGitHub({
   patchResponseOverride = null,
   postPublishExactOverride = null,
   tagCommitSha = sourceCommit,
+  uploadedAssetName = (name) => name,
 } = {}) {
   let release = copyRelease(initialRelease);
   let nextAssetId = 100;
@@ -137,9 +138,10 @@ function fakeGitHub({
     if (url.origin === 'https://uploads.github.com' && method === 'POST'
       && url.pathname === `/repos/${repository}/releases/42/assets`) {
       const bytes = await bodyBytes(options.body);
+      const requestedName = url.searchParams.get('name');
       const asset = {
         id: nextAssetId,
-        name: url.searchParams.get('name'),
+        name: uploadedAssetName(requestedName),
         size: bytes.length,
         digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
         state: 'uploaded',
@@ -642,6 +644,26 @@ test('idempotent upload accepts only an exact digest and never deletes collision
     /collision does not match current bytes/u,
   );
   assert.equal(mismatchApi.requests.some(({ method }) => ['POST', 'DELETE'].includes(method)), false);
+});
+
+test('upload fails closed when GitHub normalizes an unsafe requested filename', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-draft-normalized-name-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const candidate = await metadata(root, 'CCEM Desktop_2.53.0_aarch64.dmg', 'dmg-bytes');
+  const api = fakeGitHub({ uploadedAssetName: (name) => name.replaceAll(' ', '.') });
+
+  await assert.rejects(
+    uploadCandidateIdempotently(clientFor(api), candidate),
+    /did not return the exact uploaded asset metadata/u,
+  );
+  assert.deepEqual(api.release().assets.map(({ name }) => name), [
+    'CCEM.Desktop_2.53.0_aarch64.dmg',
+  ]);
+  assert.equal(
+    api.requests.filter(({ method, url }) => method === 'POST' && url.startsWith('https://uploads.github.com/')).length,
+    1,
+  );
+  assert.equal(api.requests.some(({ method }) => method === 'DELETE'), false);
 });
 
 test('draft reads retry bounded transient network and server failures', async () => {

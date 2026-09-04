@@ -737,6 +737,15 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
     workflow.slice(productionReleaseBodyIndex, legacyReleaseBodyIndex),
     /xattr -c|clear quarantine/u,
   );
+  for (const releaseBody of [
+    workflow.slice(productionReleaseBodyIndex, legacyReleaseBodyIndex),
+    workflow.slice(legacyReleaseBodyIndex, releaseBodyEndIndex),
+  ]) {
+    assert.match(releaseBody, /CCEM\.Desktop_\*_aarch64\.dmg/u);
+    assert.match(releaseBody, /CCEM\.Desktop_\*_x64\.dmg/u);
+    assert.match(releaseBody, /CCEM\.Desktop_\*_x64-setup\.exe/u);
+    assert.doesNotMatch(releaseBody, /CCEM-Desktop|CCEM Desktop_/u);
+  }
   assert.match(
     workflow.slice(legacyReleaseBodyIndex, releaseBodyEndIndex),
     /legacy unsigned distribution path[\s\S]*CEF Mode 2 is excluded[\s\S]*xattr -c \/Applications\/CCEM\\ Desktop\.app/u,

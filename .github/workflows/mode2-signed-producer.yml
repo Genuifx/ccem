@@ -484,17 +484,25 @@ jobs:
           projectPath: apps/desktop
           args: ${{ matrix.legacyArgs }}
 
-      - name: Canonicalize macOS updater release asset names
-        if: ${{ steps.release-payload.outputs.reuse != 'true' && matrix.appleSigning }}
+      - name: Canonicalize GitHub release asset names
+        if: ${{ steps.release-payload.outputs.reuse != 'true' }}
         shell: bash
         working-directory: apps/desktop
         env:
           CCEM_RELEASE_TARGET: ${{ matrix.target }}
+          CCEM_RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          node scripts/canonicalize-macos-release-assets.mjs \
+          bundle_root="src-tauri/target/${CCEM_RELEASE_TARGET}/release/bundle"
+          node scripts/canonicalize-installer-release-assets.mjs \
             --target "$CCEM_RELEASE_TARGET" \
-            --bundle-directory "src-tauri/target/${CCEM_RELEASE_TARGET}/release/bundle/macos"
+            --version "$CCEM_RELEASE_VERSION" \
+            --bundle-root "$bundle_root"
+          if [[ "$CCEM_RELEASE_TARGET" == *-apple-darwin ]]; then
+            node scripts/canonicalize-macos-release-assets.mjs \
+              --target "$CCEM_RELEASE_TARGET" \
+              --bundle-directory "${bundle_root}/macos"
+          fi
 
       - name: Prove signed macOS Mode 2 Safe Storage and production behavior
         id: macos-safe-storage-smoke

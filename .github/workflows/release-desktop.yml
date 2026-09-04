@@ -171,9 +171,9 @@ jobs:
             echo "## CCEM Desktop v${version}"
             echo
             echo "### Downloads"
-            echo "- **Apple Silicon (M1/M2/M3/M4)**: \`CCEM-Desktop_*_aarch64.dmg\`"
-            echo "- **Intel Mac**: \`CCEM-Desktop_*_x64.dmg\`"
-            echo "- **Windows (x64)**: \`CCEM Desktop_*_x64-setup.exe\`"
+            echo "- **Apple Silicon (M1/M2/M3/M4)**: \`CCEM.Desktop_*_aarch64.dmg\`"
+            echo "- **Intel Mac**: \`CCEM.Desktop_*_x64.dmg\`"
+            echo "- **Windows (x64)**: \`CCEM.Desktop_*_x64-setup.exe\`"
             echo
             echo "### CLI"
             echo '```bash'
@@ -199,9 +199,9 @@ jobs:
             echo "## CCEM Desktop v${version}"
             echo
             echo "### Downloads"
-            echo "- **Apple Silicon (M1/M2/M3/M4)**: \`CCEM-Desktop_*_aarch64.dmg\`"
-            echo "- **Intel Mac**: \`CCEM-Desktop_*_x64.dmg\`"
-            echo "- **Windows (x64)**: \`CCEM Desktop_*_x64-setup.exe\`"
+            echo "- **Apple Silicon (M1/M2/M3/M4)**: \`CCEM.Desktop_*_aarch64.dmg\`"
+            echo "- **Intel Mac**: \`CCEM.Desktop_*_x64.dmg\`"
+            echo "- **Windows (x64)**: \`CCEM.Desktop_*_x64-setup.exe\`"
             echo
             echo "### CLI"
             echo '```bash'
