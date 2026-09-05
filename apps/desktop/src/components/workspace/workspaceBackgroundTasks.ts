@@ -80,6 +80,7 @@ export function deriveWorkspaceBackgroundTasks(
   const hasLiveSummary = Array.isArray(session.background_tasks);
   const hasAuthoritativeNoLiveSummary = hasLiveSummary && session.last_event_seq == null;
   const summarySeq = hasLiveSummary ? (session.last_event_seq ?? 0) : 0;
+  let hasAuthoritativeLiveSet = hasLiveSummary;
   const active = new Map<string, NativeBackgroundTask>();
   const recent = new Map<string, NativeBackgroundTask>();
   const terminalIds = new Set<string>();
@@ -102,7 +103,12 @@ export function deriveWorkspaceBackgroundTasks(
         continue;
       }
       terminalIds.add(payload.task.task_id);
-      active.delete(payload.task.task_id);
+      if (!hasAuthoritativeLiveSet) {
+        active.delete(payload.task.task_id);
+      } else {
+        const live = active.get(payload.task.task_id);
+        if (live) active.set(payload.task.task_id, { ...live, status: 'settling', stop_request_id: undefined, stop_failed: undefined });
+      }
       recent.set(payload.task.task_id, payload.task);
       continue;
     }
@@ -116,9 +122,10 @@ export function deriveWorkspaceBackgroundTasks(
     }
 
     if (payload.type === 'background_tasks_changed') {
+      hasAuthoritativeLiveSet = true;
       active.clear();
       for (const task of payload.tasks) {
-        if (!isTerminalBackgroundTaskStatus(task.status) && !terminalIds.has(task.task_id)) {
+        if (!isTerminalBackgroundTaskStatus(task.status)) {
           active.set(task.task_id, task);
         }
       }
@@ -126,13 +133,10 @@ export function deriveWorkspaceBackgroundTasks(
     }
 
     if (payload.type === 'background_task_updated'
+      && (!hasAuthoritativeLiveSet || active.has(payload.task.task_id))
       && !terminalIds.has(payload.task.task_id)) {
       active.set(payload.task.task_id, payload.task);
     }
-  }
-
-  for (const taskId of terminalIds) {
-    active.delete(taskId);
   }
 
   return {

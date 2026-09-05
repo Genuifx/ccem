@@ -582,3 +582,25 @@ test('Workspace applies only the latest native restore without changing selectio
     /hasWorkspaceLiveActivityConflict\([\s\S]*const reconcileNativeActivity = async \(\) =>/,
   );
 });
+
+test('lifecycle-only revisions update, and late same-runtime summaries cannot resurrect ownership', async () => {
+  const { upsertWorkspaceLiveSessionEntry, reconcileWorkspaceLiveSessionsSnapshot } = await importWorkspaceLiveSessions();
+  const running = nativeSession({ lifecycle: { state_revision: 10, active_command_id: 'A', queue_count: 1 } });
+  const initial = upsertWorkspaceLiveSessionEntry({}, running);
+  const finished = { ...running, lifecycle: { state_revision: 11, active_command_id: null, queue_count: 0 } };
+  const current = upsertWorkspaceLiveSessionEntry(initial, finished);
+  assert.notEqual(current, initial);
+  assert.equal(current['native-1'].session.lifecycle.active_command_id, null);
+  for (const incoming of [running, { ...running, lifecycle: null }]) {
+    const upserted = upsertWorkspaceLiveSessionEntry(current, incoming);
+    const polled = reconcileWorkspaceLiveSessionsSnapshot(current, [incoming], initial);
+    for (const result of [upserted, polled]) {
+      assert.equal(result['native-1'].session.lifecycle.state_revision, 11);
+      assert.equal(result['native-1'].session.lifecycle.active_command_id, null);
+      assert.equal(result['native-1'].session.lifecycle.queue_count, 0);
+    }
+  }
+  const other = upsertWorkspaceLiveSessionEntry(current, { ...running, runtime_id: 'native-2', lifecycle: { state_revision: 1, active_command_id: 'B' } });
+  assert.equal(other['native-2'].session.lifecycle.state_revision, 1);
+  assert.equal(other['native-2'].session.lifecycle.active_command_id, 'B');
+});

@@ -3253,6 +3253,9 @@ export function Workspace({
   // send duplicate interrupt requests for the same command.
   const lastWorkspaceEscapeCommandRef = useRef<WorkspaceEscapeCommandIdentity | null>(null);
   const activeLiveStoppingId = activeLiveEntry?.session.runtime_id ?? null;
+  const activeLiveProvider = activeLiveEntry?.session.provider;
+  const activeLiveProviderProcessing = activeLiveEntry?.session.status === 'initializing'
+    || activeLiveEntry?.session.status === 'processing';
   const activeLiveCommandId = activeLiveEntry?.session.lifecycle?.active_command_id ?? null;
   const activeLiveSessionIsActive = (activeLiveEntry?.session.is_active ?? false)
     || activeLiveCommandId != null;
@@ -3271,6 +3274,8 @@ export function Workspace({
       isSessionActive: activeLiveSessionIsActive,
       runtimeId: activeLiveStoppingId,
       activeCommandId: activeLiveCommandId,
+      provider: activeLiveProvider,
+      isProviderProcessing: activeLiveProviderProcessing,
       lastRequestedCommand: lastWorkspaceEscapeCommandRef.current,
       hasOpenInteractionLayer: hasOpenWorkspaceEscapeLayer(document),
     });
@@ -3285,6 +3290,8 @@ export function Workspace({
     );
   }, [
     activeLiveCommandId,
+    activeLiveProvider,
+    activeLiveProviderProcessing,
     activeLiveSessionIsActive,
     activeLiveStoppingId,
     isActive,
@@ -3547,6 +3554,7 @@ export function Workspace({
           onRemoveAnnotation={historyAnnotations.removeAnnotation}
           onClearAnnotations={historyAnnotations.clearPendingAnnotations}
           onAnnotationsSent={historyAnnotations.markAllSent}
+          onAnnotationsRestore={historyAnnotations.restoreAnnotations}
           controls={(
             <ComposerControls
               provider={historyProvider}

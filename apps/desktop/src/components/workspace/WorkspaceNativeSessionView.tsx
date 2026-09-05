@@ -2995,11 +2995,12 @@ export function WorkspaceNativeSessionView({
     });
   }, [events.length, isVisible, messages.length]);
 
-  // A present coordinator projection fully replaces the legacy status/event
-  // heuristic. Only older runtimes that omit the projection use the fallback.
+  // Managed Claude ownership replaces status heuristics; other providers keep
+  // their own runtime processing and interruption contract.
   const isProcessingTurn = selectNativeSessionProcessing(
     session.lifecycle,
     () => shouldTreatNativeSessionAsProcessing(session.status, events),
+    session.provider,
   );
   const legacyFlushRevisionRef = useRef<string | null>(null);
   useEffect(() => {
@@ -3054,7 +3055,10 @@ export function WorkspaceNativeSessionView({
   const hasAttentionPanel = attentionState.permissions.length > 0
     || hasBlockingAttention
     || hasBackgroundTaskPanel;
+  const canStopForeground = session.lifecycle?.active_command_id != null
+    || (session.provider !== 'claude' && isProcessingTurn);
   const canSend = !isSending
+    && !(session.provider !== 'claude' && isProcessingTurn)
     && !isTerminalStatus(session.status)
     && (composerHasDraft || sessionAnnotations.pendingAnnotations.length > 0);
   const canShowFileRestorePoints = session.provider === 'claude'
@@ -3330,11 +3334,7 @@ export function WorkspaceNativeSessionView({
 
     setIsSending(true);
     setLocalUserPrompts((previous) => [...previous, promptEntry]);
-    if (payload.kind === 'text') {
-      clearComposerDraft();
-      setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
-    } else if (payload.kind === 'plan_exit') {
-      clearComposerDraft();
+    if (payload.kind === 'text' || payload.kind === 'plan_exit') {
       setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
     }
 
@@ -3379,8 +3379,8 @@ export function WorkspaceNativeSessionView({
         setComposerPlanModeEnabled(false);
         setSessionRuntimePermMode(sessionDisplayPermMode);
       }
-      await pollEvents();
-      await refreshSummary({ force: true });
+      // Refresh failure cannot turn an accepted attention reply into a retry.
+      await Promise.allSettled([pollEvents(), refreshSummary({ force: true })]);
       return true;
     } catch (error) {
       console.error('Failed to send interactive prompt reply:', error);
@@ -3400,7 +3400,6 @@ export function WorkspaceNativeSessionView({
     }
   }, [
     pollEvents,
-    clearComposerDraft,
     refreshSummary,
     respondNativeSessionPrompt,
     sendNativeSessionInput,
@@ -3606,7 +3605,7 @@ export function WorkspaceNativeSessionView({
   ]);
 
   const handleSend = useCallback(async (payload?: ComposerSubmitPayload) => {
-    if (isSending) {
+    if (isSending || (session.provider !== 'claude' && isProcessingTurn)) {
       return false;
     }
 
@@ -3701,7 +3700,6 @@ export function WorkspaceNativeSessionView({
         if (!await flushQueuedMessages()) {
           return false;
         }
-        clearComposerDraft();
         setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
         await sendPromptBatch([nextPrompt], { queuedBehindTurn: true });
         return true;
@@ -3726,7 +3724,6 @@ export function WorkspaceNativeSessionView({
       }
       try {
         await sendPromptBatch([nextPrompt], { queuedBehindTurn: true });
-        clearComposerDraft();
         setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
         return true;
       } catch (error) {
@@ -3741,7 +3738,6 @@ export function WorkspaceNativeSessionView({
 
     try {
       await sendPromptBatch([nextPrompt]);
-      clearComposerDraft();
       setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       return true;
     } catch (error) {
@@ -3754,7 +3750,6 @@ export function WorkspaceNativeSessionView({
     }
   }, [
     composerPlanModeEnabled,
-    clearComposerDraft,
     hasHardBlockingAttention,
     hasBlockingAttention,
     hasQuickReplyPrompt,
@@ -4130,7 +4125,8 @@ export function WorkspaceNativeSessionView({
 
   const hasComposerDraft = composerHasDraft;
   const hasComposerInput = hasComposerDraft || sessionAnnotations.pendingAnnotations.length > 0;
-  const shouldGuideModel = !isTerminalStatus(session.status)
+  const shouldGuideModel = session.provider === 'claude'
+    && !isTerminalStatus(session.status)
     && hasComposerInput
     && (isProcessingTurn || hasHardBlockingAttention);
   const transcriptBackfillState = transcriptBackfillView.runtimeId === session.runtime_id
@@ -4228,7 +4224,7 @@ export function WorkspaceNativeSessionView({
         submitLabel={t('workspace.composeSend')}
         loadingLabel={t('common.loading')}
         primaryActionLabel={
-          !hasComposerInput && session.lifecycle?.active_command_id != null
+          !hasComposerInput && canStopForeground
               ? t('workspace.nativeStop')
             : isTerminalStatus(session.status)
               ? t('workspace.newSession')
@@ -4237,7 +4233,7 @@ export function WorkspaceNativeSessionView({
                 : t('workspace.composeSend')
         }
         primaryActionIcon={
-          !hasComposerInput && session.lifecycle?.active_command_id != null
+          !hasComposerInput && canStopForeground
               ? <ProcessingActionIcon stopping={isStopping} />
             : isTerminalStatus(session.status)
               ? <SquarePen className="h-4 w-4" />
@@ -4246,14 +4242,14 @@ export function WorkspaceNativeSessionView({
                 : <ArrowUp className="h-4 w-4" />
         }
         primaryActionDisabled={
-          !hasComposerInput && session.lifecycle?.active_command_id != null
+          !hasComposerInput && canStopForeground
               ? isStopping
             : isTerminalStatus(session.status)
               ? false
               : undefined
         }
         onPrimaryAction={
-          !hasComposerInput && session.lifecycle?.active_command_id != null
+          !hasComposerInput && canStopForeground
               ? () => void handleStop()
             : isTerminalStatus(session.status)
               ? onStartNew
@@ -4294,6 +4290,7 @@ export function WorkspaceNativeSessionView({
         onRemoveAnnotation={sessionAnnotations.removeAnnotation}
         onClearAnnotations={sessionAnnotations.clearPendingAnnotations}
         onAnnotationsSent={sessionAnnotations.markAllSent}
+        onAnnotationsRestore={sessionAnnotations.restoreAnnotations}
         aboveComposer={hasAttentionPanel ? (
           <WorkspaceAttentionPanel
             provider={session.provider}

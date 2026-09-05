@@ -150,10 +150,23 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
   // Sending a prompt stamps sentAt instead of wiping the list: the highlight
   // and numbered marker stay at the original text, but the annotation is not
   // re-attached to later prompts.
-  const markAllSent = useCallback(() => {
+  const markAllSent = useCallback((submitted: WorkspaceAnnotation[]) => {
     updateItems((items) => items.map((item) => (
-      item.sentAt ? item : { ...item, sentAt: new Date().toISOString() }
+      item.sentAt || !submitted.some((sent) => (
+        sent.id === item.id && sent.quote === item.quote && sent.note === item.note
+      )) ? item : { ...item, sentAt: new Date().toISOString() }
     )));
+  }, [updateItems]);
+
+  const restoreAnnotations = useCallback((submitted: WorkspaceAnnotation[]) => {
+    updateItems((items) => {
+      const restored = [...items];
+      for (const sent of submitted) {
+        if (restored.some((item) => !item.sentAt && item.quote === sent.quote && item.note === sent.note)) continue;
+        restored.push({ ...sent, id: createAnnotationId(), sentAt: undefined });
+      }
+      return restored;
+    });
   }, [updateItems]);
 
   const clearPendingAnnotations = useCallback(() => {
@@ -170,6 +183,7 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     removeAnnotation,
     clearAnnotations,
     markAllSent,
+    restoreAnnotations,
     clearPendingAnnotations,
   }), [
     addAnnotation,
@@ -178,6 +192,7 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     clearAnnotations,
     clearPendingAnnotations,
     markAllSent,
+    restoreAnnotations,
     pendingAnnotations,
     removeAnnotation,
     updateAnnotation,

@@ -297,7 +297,8 @@ test('live and history workspace paths wire transcript selections into successfu
   ]);
 
   assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
-  assert.match(composerSource, /if \(result !== false\)[\s\S]*onAnnotationsSent\?\.\(\)/);
+  // ACK snapshot ownership is covered by the real annotation hook + composer
+  // DOM in composer-admission-dom.test.mjs (A sent, newly added B remains).
   assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.pendingAnnotations\.length > 0/);
   assert.match(
     liveSource,

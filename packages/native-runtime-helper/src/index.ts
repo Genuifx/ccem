@@ -312,6 +312,7 @@ let claudeLifecycleMode: ClaudeLifecycleMode = 'negotiating';
 let claudeSdkCapabilities: string[] | undefined;
 let claudePreInitLifecycleFrames: ClaudeSdkCommandLifecycleFrame[] = [];
 let claudeTurnResultObservation: ClaudeTurnResultObservation | null = null;
+let claudeLegacyIdleCommandId: string | null = null;
 let claudeLifecycleTerminalTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeLifecycleProtocolErrorKey: string | null = null;
 let claudeAuthoritativeTerminalCommandId: string | null = null;
@@ -1407,6 +1408,7 @@ function resetClaudeTurnTracking() {
   claudeLastAssistantMessageUuid = null;
   claudeDeferredForegroundResult = null;
   claudeTurnResultObservation = null;
+  claudeLegacyIdleCommandId = null;
 }
 
 function clearClaudeForegroundOwnership() {
@@ -1622,6 +1624,7 @@ function finishClaudeLegacyTurnAfterIdle() {
     claudeLifecycleMode !== 'legacy'
     || !claudeTurnAwaitingResult
     || !claudeTurnResultObservation
+    || claudeLegacyIdleCommandId !== claudeForegroundPromptUuid
   ) {
     return false;
   }
@@ -3441,9 +3444,7 @@ async function consumeClaudeMessages() {
           completeClaudeBackgroundToolIfTerminal(task);
         });
         emitClaudeBackgroundTasksChanged(change.tasks);
-        if (promotedTerminalTasks.length > 0) {
-          applyPendingClaudeSettingsAfterBackgroundTaskChange();
-        }
+        applyPendingClaudeSettingsAfterBackgroundTaskChange();
         continue;
       }
 
@@ -3492,7 +3493,15 @@ async function consumeClaudeMessages() {
       }
 
       if (message.type === 'system' && message.subtype === 'session_state_changed') {
+        const stateRecord = message as unknown as Record<string, unknown>;
+        const stateCommandId = stateRecord.user_message_uuid ?? stateRecord.command_uuid;
+        if (typeof stateCommandId === 'string' && stateCommandId !== claudeForegroundPromptUuid) {
+          continue;
+        }
         const nonHumanStateIngress = isClaudeBackgroundOwnedMessage(message);
+        if (!nonHumanStateIngress && claudeTurnAwaitingResult && claudeForegroundPromptAccepted) {
+          claudeLegacyIdleCommandId = message.state === 'idle' ? claudeForegroundPromptUuid : null;
+        }
         if (message.state !== claudeLastSessionState) {
           if (
             message.state === 'running'
@@ -3651,6 +3660,7 @@ async function consumeClaudeMessages() {
 
         emitClaudeResultUsage(message);
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
+        finishClaudeLegacyTurnAfterIdle();
         if (!resultObservation.failed) {
           emitClaudeUsageAfterTurn();
         }
@@ -4162,9 +4172,9 @@ async function ensureCodexThread() {
   return codexThread;
 }
 
-async function runCodexTurn(text: string, images?: PromptImage[] | null) {
+async function runCodexTurn(text: string, images: PromptImage[] | null | undefined, abortController: AbortController) {
   const thread = await ensureCodexThread();
-  currentAbortController = new AbortController();
+  abortController.signal.throwIfAborted();
 
   let input: import('@openai/codex-sdk').Input;
   const parts = buildPromptContentParts(text, images);
@@ -4188,7 +4198,7 @@ async function runCodexTurn(text: string, images?: PromptImage[] | null) {
 
   try {
     const streamed = await thread.runStreamed(input, {
-      signal: currentAbortController.signal,
+      signal: abortController.signal,
     });
 
     const seenTextByItem = new Map<string, string>();
@@ -4362,14 +4372,19 @@ async function runQueuedTurns() {
   }
 
   activeTurn = true;
+  const abortController = new AbortController();
+  currentAbortController = abortController;
   emitStatus('processing', 'Codex is processing a turn.');
   try {
-    await runCodexTurn(nextPrompt.text, nextPrompt.images);
+    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController);
     if (!stopped) {
       emitStatus('ready', 'Ready for the next prompt.');
     }
   } catch (error) {
     const isAbort = error instanceof Error && error.name === 'AbortError';
+    if (isAbort && !stopped) {
+      emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
+    }
     if (!isAbort) {
       const message = error instanceof Error ? error.message : String(error);
       emitEvent({
@@ -4383,8 +4398,10 @@ async function runQueuedTurns() {
       emitStatus('error', message);
     }
   } finally {
-    activeTurn = false;
-    currentAbortController = null;
+    if (currentAbortController === abortController) {
+      activeTurn = false;
+      currentAbortController = null;
+    }
     if (pendingSettings) {
       const hadEnvVars = pendingSettings.envVars !== undefined;
       applyPendingSettingsToInitCommand();
@@ -4629,7 +4646,9 @@ async function handleCommand(command: InputCommand) {
         emitClaudeInitializationSettled();
         enqueueClaudePrompt(initialText, initialImages, command.initial_command_id ?? undefined);
       } else {
-        emitStatus('ready', 'Native runtime helper initialized.');
+        if (!activeTurn && !stopped) {
+          emitStatus('ready', 'Native runtime helper initialized.');
+        }
         promptQueue.push({ text: initialText, images: initialImages });
         await runQueuedTurns();
       }
@@ -4637,7 +4656,9 @@ async function handleCommand(command: InputCommand) {
       await ensureClaudeSession();
       emitStatus('ready', 'Native runtime helper initialized.');
       emitClaudeInitializationSettled();
-    } else {
+    } else if (!activeTurn && !stopped) {
+      // Resumed Codex metadata lookup yields to concurrent prompt/interrupt
+      // commands. Initialization must not overwrite their execution status.
       emitStatus('ready', 'Native runtime helper initialized.');
     }
     return;
@@ -5367,14 +5388,14 @@ async function handleCommand(command: InputCommand) {
 
     // Tear down sessions so the next prompt starts a fresh turn.
     teardownCodexSession(false);
-    activeTurn = false;
-    currentAbortController = null;
     if (runtimeTeardown) {
       emitStatus('closed_idle', 'Codex runtime stopped.');
       finishClaudeRuntimeTeardown();
     } else {
       stopped = false;
-      emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
+      emitStatus(activeTurn ? 'processing' : 'ready', activeTurn
+        ? 'Waiting for interrupted Codex turn to settle.'
+        : 'Turn interrupted. Ready for the next prompt.');
     }
     return;
   }

@@ -190,7 +190,8 @@ interface WorkspaceSessionComposerProps {
   onUpdateAnnotation?: (id: string, note: string) => boolean;
   onRemoveAnnotation?: (id: string) => void;
   onClearAnnotations?: () => void;
-  onAnnotationsSent?: () => void;
+  onAnnotationsSent?: (submitted: WorkspaceAnnotation[]) => void;
+  onAnnotationsRestore?: (submitted: WorkspaceAnnotation[]) => void;
 }
 
 function attachmentIcon(attachment: ComposerAttachment) {
@@ -868,6 +869,7 @@ export function WorkspaceSessionComposer({
   onRemoveAnnotation,
   onClearAnnotations,
   onAnnotationsSent,
+  onAnnotationsRestore,
   routeRuntimeId = null,
   onNavigateEnvironments,
   routeDraft = null,
@@ -883,12 +885,16 @@ export function WorkspaceSessionComposer({
   if (!submitGuardRef.current) {
     submitGuardRef.current = createReentryGuard();
   }
+  const draftEditRevisionRef = useRef(0);
   const syncedPlainTextRef = useRef(value);
   const syncedValueRevisionRef = useRef(valueRevision);
   const previousAttachmentIdsRef = useRef<string[]>([]);
   const [composerSegments, setComposerSegments] = useState<Segment[]>(() => plainTextToSegments(value));
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const attachmentsRef = useRef(attachments);
+  const annotationsRef = useRef(annotations);
+  annotationsRef.current = annotations;
+  const [rejectedDrafts, setRejectedDrafts] = useState<{ segments: Segment[]; attachments: ComposerAttachment[]; annotations: WorkspaceAnnotation[] }[]>([]);
   const [recentFiles, setRecentFiles] = useState<ComposerRecentFile[]>([]);
   const [isDragTarget, setIsDragTarget] = useState(false);
   const [draggedFileCount, setDraggedFileCount] = useState(0);
@@ -1000,6 +1006,7 @@ export function WorkspaceSessionComposer({
     ) {
       return;
     }
+    draftEditRevisionRef.current += 1;
     syncedValueRevisionRef.current = valueRevision;
     syncedPlainTextRef.current = value;
     setComposerSegments(plainTextToSegments(value));
@@ -1040,6 +1047,7 @@ export function WorkspaceSessionComposer({
   }, [workingDir]);
 
   const syncComposerSegments = useCallback((segments: Segment[]) => {
+    draftEditRevisionRef.current += 1;
     setComposerSegments(segments);
     const plainText = segmentsToPlainText(segments);
     syncedPlainTextRef.current = plainText;
@@ -1326,6 +1334,9 @@ export function WorkspaceSessionComposer({
   }, [addAttachments, workingDir]);
 
   const runComposerSubmit = useCallback(async () => {
+    const submittedRevision = draftEditRevisionRef.current;
+    const submittedSegments = composerSegments;
+    const submittedAnnotations = annotations.slice();
     const promptValue = promptAreaRef.current?.getPlainText() ?? segmentsToPlainText(composerSegments);
     const currentAttachments = attachmentsRef.current;
     let text = ensureComposerImagePlaceholders(promptValue, currentAttachments);
@@ -1392,16 +1403,34 @@ export function WorkspaceSessionComposer({
     }
 
     const result = await onSubmit(payload);
+    if (result === false && (
+      draftEditRevisionRef.current !== submittedRevision
+      || attachmentsRef.current !== currentAttachments
+      || JSON.stringify(annotationsRef.current) !== JSON.stringify(submittedAnnotations)
+    )) {
+      setRejectedDrafts((previous) => [...previous, {
+        segments: submittedSegments,
+        annotations: submittedAnnotations,
+        attachments: currentAttachments.map((attachment) => attachment.kind === 'image'
+          ? { ...attachment, objectUrl: null } : attachment),
+      }]);
+    }
     if (result !== false) {
-      promptAreaRef.current?.clear();
+      // Admission only consumes this submission's snapshot. Edits made while
+      // the IPC (or skill expansion) awaited remain a separate, unsent draft.
+      if (draftEditRevisionRef.current === submittedRevision) {
+        promptAreaRef.current?.clear();
+      }
+      const submittedIds = new Set(currentAttachments.map((attachment) => attachment.id));
+      const remaining = attachmentsRef.current.filter((attachment) => !submittedIds.has(attachment.id));
       revokeComposerImageUrls(currentAttachments);
-      attachmentsRef.current = [];
-      setAttachments([]);
+      attachmentsRef.current = remaining;
+      setAttachments(remaining);
       setIsDragTarget(false);
       setDraggedFileCount(0);
       setInlineSkillPopover(null);
       setTriggerPanelState(null);
-      onAnnotationsSent?.();
+      onAnnotationsSent?.(submittedAnnotations);
     }
     return result;
   }, [
@@ -1713,6 +1742,35 @@ export function WorkspaceSessionComposer({
               ) : null}
             </div>
           ) : null}
+
+          {rejectedDrafts.map((rejectedDraft, index) => (
+            <div key={index} className="mb-2 flex items-center gap-2" data-composer-rejected-draft>
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{segmentsToPlainText(rejectedDraft.segments)}</span>
+              <Button size="sm" variant="outline" onClick={() => {
+                const presentIds = new Set(attachmentsRef.current.map((attachment) => attachment.id));
+                let imageIndex = getNextComposerImagePlaceholderIndex(attachmentsRef.current);
+                const restored = rejectedDraft.attachments.filter((attachment) => !presentIds.has(attachment.id))
+                  .map((attachment) => attachment.kind === 'image'
+                    ? { ...attachment, placeholder: createComposerImagePlaceholder(imageIndex++) }
+                    : attachment);
+                const restoredImages = new Map(restored.filter((attachment) => attachment.kind === 'image')
+                  .map((attachment) => [attachment.id, attachment]));
+                const restoredSegments = rejectedDraft.segments.map((segment) => {
+                  if (segment.type !== 'chip') return segment;
+                  const data = segment.data as ComposerPromptChipData | undefined;
+                  if (data?.kind !== 'image' || !data.attachmentId) return segment;
+                  const attachment = restoredImages.get(data.attachmentId);
+                  return attachment ? { ...segment, value: attachment.placeholder, displayText: attachment.placeholder,
+                    data: { ...data, placeholder: attachment.placeholder } } : segment;
+                });
+                const sameText = JSON.stringify(composerSegments) === JSON.stringify(restoredSegments);
+                syncComposerSegments(sameText ? composerSegments : [...composerSegments, { type: 'text', text: '\n\n' }, ...restoredSegments]);
+                addAttachments(restored);
+                onAnnotationsRestore?.(rejectedDraft.annotations);
+                setRejectedDrafts((previous) => previous.filter((_, itemIndex) => itemIndex !== index));
+              }}>{t('workspace.composerRecoverRejected')}</Button>
+            </div>
+          ))}
 
           <div className="relative min-h-[72px]">
             <PromptArea

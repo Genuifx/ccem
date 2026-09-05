@@ -641,6 +641,7 @@
     "composerImagePastedName": "Pasted image",
     "composerImageTooLarge": "Image exceeds the 10 MB size limit",
     "composerImageUnsupported": "Unsupported image format",
+    "composerRecoverRejected": "Restore unsent draft",
     "composerImageReadFailed": "Failed to read pasted image",
     "composerImagePreview": "Image preview",
     "composerImagePreviewOpen": "Preview image",

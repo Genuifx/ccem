@@ -44,7 +44,22 @@ export function areNativeSessionSummariesEqual(
     && previous.is_active === next.is_active
     && previous.last_event_seq === next.last_event_seq
     && previous.can_handoff_to_terminal === next.can_handoff_to_terminal
-    && previous.last_error === next.last_error;
+    && previous.last_error === next.last_error
+    && JSON.stringify(previous.lifecycle ?? null) === JSON.stringify(next.lifecycle ?? null);
+}
+
+// A late poll/IPC response must not roll back the coordinator's command or
+// queue ownership. Revisions are scoped to a runtime, never compared across it.
+function preserveNewerLifecycle(
+  previous: NativeSessionSummary,
+  incoming: NativeSessionSummary,
+): NativeSessionSummary {
+  if (previous.runtime_id !== incoming.runtime_id || !previous.lifecycle) return incoming;
+  if (!incoming.lifecycle
+    || incoming.lifecycle.state_revision < previous.lifecycle.state_revision) {
+    return { ...incoming, lifecycle: previous.lifecycle };
+  }
+  return incoming;
 }
 
 function mergeInitialUserPrompt(
@@ -74,7 +89,7 @@ function preserveNewerDisplayTitle(
   incoming: NativeSessionSummary,
   promptCandidate: NativeSessionSummary = incoming,
 ): NativeSessionSummary {
-  const incomingWithInitialPrompt = mergeInitialUserPrompt(previous, incoming, promptCandidate);
+  const incomingWithInitialPrompt = mergeInitialUserPrompt(previous, preserveNewerLifecycle(previous, incoming), promptCandidate);
   const previousProviderSessionId = previous.provider_session_id?.trim() || null;
   const incomingProviderSessionId = incomingWithInitialPrompt.provider_session_id?.trim() || null;
   if (previousProviderSessionId !== incomingProviderSessionId) {

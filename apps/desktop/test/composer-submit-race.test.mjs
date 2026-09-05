@@ -38,19 +38,9 @@ test('composer submit reads live DOM text and attachment ref to avoid paste/subm
   assert.match(submitBlock, /revokeComposerImageUrls\(currentAttachments\);/);
 });
 
-test('composer submit clears the live PromptArea DOM after a successful send', async () => {
-  const source = await readComposerSource();
-  const submitBlock = sliceBetween(source, 'const runComposerSubmit = useCallback', 'const handleComposerSubmit = useCallback');
-  const successIndex = submitBlock.indexOf('if (result !== false) {');
-  const clearIndex = submitBlock.indexOf('promptAreaRef.current?.clear();');
-  const attachmentResetIndex = submitBlock.indexOf('setAttachments([]);');
-
-  assert.notEqual(successIndex, -1, 'missing successful submit branch');
-  assert.notEqual(clearIndex, -1, 'successful submit must clear the visible editor DOM');
-  assert.notEqual(attachmentResetIndex, -1, 'missing attachment reset after successful submit');
-  assert.ok(clearIndex > successIndex, 'editor should clear only after onSubmit succeeds');
-  assert.ok(clearIndex < attachmentResetIndex, 'editor clear should run before attachment state resets');
-});
+// Successful cleanup (including slow ACK edits and rich payload ownership) is
+// exercised through the actual PromptArea DOM in composer-admission-dom.test.mjs.
+// An unconditional setAttachments([]) source assertion hid draft-loss races.
 
 test('composer submit refreshes skills only for potential references before resolving selected skill files', async () => {
   const source = await readComposerSource();

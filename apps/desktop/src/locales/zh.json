@@ -641,6 +641,7 @@
     "composerImagePastedName": "粘贴的图片",
     "composerImageTooLarge": "图片大小超过 10MB 限制",
     "composerImageUnsupported": "不支持的图片格式",
+    "composerRecoverRejected": "恢复未发送草稿",
     "composerImageReadFailed": "读取图片失败",
     "composerImagePreview": "图片预览",
     "composerImagePreviewOpen": "预览图片",

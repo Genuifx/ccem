@@ -62,10 +62,10 @@ test('uses live summary as the active baseline and applies only newer events', a
     ],
   );
 
-  assert.deepEqual(result.active.map((entry) => entry.task_id), ['live', 'new']);
+  assert.deepEqual(result.active.map((entry) => entry.task_id), ['live'], 'bookend updates cannot add membership to an authoritative live set');
 });
 
-test('terminal notification is monotonic across late snapshots and updates', async () => {
+test('terminal history is monotonic independently of full live membership', async () => {
   const { deriveWorkspaceBackgroundTasks } = await importModel();
   const completed = task('one', 'completed', 4);
   const result = deriveWorkspaceBackgroundTasks(
@@ -79,7 +79,7 @@ test('terminal notification is monotonic across late snapshots and updates', asy
     ],
   );
 
-  assert.deepEqual(result.active, []);
+  assert.deepEqual(result.active, [task('one', 'running', 4)], 'a newer full snapshot remains authoritative even after terminal history');
   assert.deepEqual(result.recent, [completed]);
 });
 
@@ -176,4 +176,17 @@ test('terminal duration stops at updated_at when SDK usage is unavailable', asyn
     backgroundTaskDurationMs(running, Date.parse('2026-08-17T00:01:00.000Z')),
     60_000,
   );
+});
+
+test('terminal-before-empty retains live settling and empty full snapshot releases it', async () => {
+  const { deriveWorkspaceBackgroundTasks } = await importModel();
+  const running = task('A', 'running', 1);
+  const settling = { ...running, status: 'settling', stop_request_id: undefined, stop_failed: undefined };
+  const completed = task('A', 'completed', 2);
+  const summary = { background_tasks: [running], last_event_seq: 1 };
+  const terminal = event(2, { type: 'background_task_updated', task: completed });
+  assert.deepEqual(deriveWorkspaceBackgroundTasks(summary, [terminal]), { active: [settling], recent: [completed] });
+  const empty = event(3, { type: 'background_tasks_changed', tasks: [] });
+  const late = event(4, { type: 'background_task_updated', task: task('A', 'running', 4) });
+  assert.deepEqual(deriveWorkspaceBackgroundTasks(summary, [terminal, empty, late]), { active: [], recent: [completed] });
 });

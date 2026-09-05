@@ -42962,6 +42962,8 @@ var ClaudeBackgroundTaskTracker = class {
   tasks = /* @__PURE__ */ new Map();
   backgroundTaskIds = /* @__PURE__ */ new Set();
   liveSnapshotIds = /* @__PURE__ */ new Set();
+  // Once the SDK supplies level signals, edges only enrich result history.
+  hasLiveSnapshot = false;
   backgroundToolUseIds = /* @__PURE__ */ new Set();
   taskIdByToolUseId = /* @__PURE__ */ new Map();
   taskIdByOwnerId = /* @__PURE__ */ new Map();
@@ -43075,7 +43077,12 @@ var ClaudeBackgroundTaskTracker = class {
     return Boolean(task && this.backgroundTaskIds.has(taskId) && ["pending", "running", "paused"].includes(task.status));
   }
   activeTasks() {
-    return [...this.tasks.values()].filter((task) => this.backgroundTaskIds.has(task.task_id) && !isTerminalStatus(task.status)).sort((left, right) => left.started_at.localeCompare(right.started_at)).map(cloneTask);
+    return [...this.tasks.values()].filter((task) => this.hasLiveSnapshot ? this.liveSnapshotIds.has(task.task_id) : this.backgroundTaskIds.has(task.task_id) && !isTerminalStatus(task.status)).sort((left, right) => left.started_at.localeCompare(right.started_at)).map((task) => ({
+      ...cloneTask(task),
+      // A terminal edge records the result, but cannot replace the SDK level.
+      // Keep live work gated until membership converges without rewriting history.
+      status: isTerminalStatus(task.status) ? "settling" : task.status
+    }));
   }
   applyStarted(message) {
     const existing = this.tasks.get(message.task_id);
@@ -43185,6 +43192,7 @@ var ClaudeBackgroundTaskTracker = class {
     return this.backgroundTaskIds.has(message.task_id) ? cloneTask(task) : null;
   }
   applySnapshot(entries) {
+    this.hasLiveSnapshot = true;
     const nextLiveIds = /* @__PURE__ */ new Set();
     const changed = [];
     for (const entry of entries) {
@@ -43250,7 +43258,6 @@ var ClaudeBackgroundTaskTracker = class {
     };
   }
   applyNotification(message) {
-    this.liveSnapshotIds.delete(message.task_id);
     const existing = this.tasks.get(message.task_id);
     const toolUseId = optionalString(message.tool_use_id) ?? existing?.tool_use_id;
     if (toolUseId) {
@@ -43332,7 +43339,11 @@ var ClaudeBackgroundTaskTracker = class {
     return cloneTask(task);
   }
   interruptAll(reason) {
-    const interrupted = this.activeTasks().map((task) => {
+    const interrupted = this.activeTasks().flatMap((task) => {
+      const recorded = this.tasks.get(task.task_id);
+      if (recorded && isTerminalStatus(recorded.status)) {
+        return [];
+      }
       const next = {
         ...task,
         status: "interrupted",
@@ -43340,7 +43351,7 @@ var ClaudeBackgroundTaskTracker = class {
         error: reason
       };
       this.tasks.set(task.task_id, next);
-      return cloneTask(next);
+      return [cloneTask(next)];
     });
     this.liveSnapshotIds.clear();
     this.priorStoppingStatuses.clear();
@@ -43469,6 +43480,7 @@ var claudeLifecycleMode = "negotiating";
 var claudeSdkCapabilities;
 var claudePreInitLifecycleFrames = [];
 var claudeTurnResultObservation = null;
+var claudeLegacyIdleCommandId = null;
 var claudeLifecycleTerminalTimer = null;
 var claudeLifecycleProtocolErrorKey = null;
 var claudeAuthoritativeTerminalCommandId = null;
@@ -44280,6 +44292,7 @@ function resetClaudeTurnTracking() {
   claudeLastAssistantMessageUuid = null;
   claudeDeferredForegroundResult = null;
   claudeTurnResultObservation = null;
+  claudeLegacyIdleCommandId = null;
 }
 function clearClaudeForegroundOwnership() {
   clearClaudeLifecycleTerminalTimer();
@@ -44441,7 +44454,7 @@ function observeClaudeTurnResult(detail, failed) {
   return true;
 }
 function finishClaudeLegacyTurnAfterIdle() {
-  if (claudeLifecycleMode !== "legacy" || !claudeTurnAwaitingResult || !claudeTurnResultObservation) {
+  if (claudeLifecycleMode !== "legacy" || !claudeTurnAwaitingResult || !claudeTurnResultObservation || claudeLegacyIdleCommandId !== claudeForegroundPromptUuid) {
     return false;
   }
   const observation = claudeTurnResultObservation;
@@ -45845,9 +45858,7 @@ async function consumeClaudeMessages() {
           completeClaudeBackgroundToolIfTerminal(task);
         });
         emitClaudeBackgroundTasksChanged(change.tasks);
-        if (promotedTerminalTasks.length > 0) {
-          applyPendingClaudeSettingsAfterBackgroundTaskChange();
-        }
+        applyPendingClaudeSettingsAfterBackgroundTaskChange();
         continue;
       }
       if (message.type === "system" && message.subtype === "task_notification") {
@@ -45892,7 +45903,15 @@ async function consumeClaudeMessages() {
         continue;
       }
       if (message.type === "system" && message.subtype === "session_state_changed") {
+        const stateRecord = message;
+        const stateCommandId = stateRecord.user_message_uuid ?? stateRecord.command_uuid;
+        if (typeof stateCommandId === "string" && stateCommandId !== claudeForegroundPromptUuid) {
+          continue;
+        }
         const nonHumanStateIngress = isClaudeBackgroundOwnedMessage(message);
+        if (!nonHumanStateIngress && claudeTurnAwaitingResult && claudeForegroundPromptAccepted) {
+          claudeLegacyIdleCommandId = message.state === "idle" ? claudeForegroundPromptUuid : null;
+        }
         if (message.state !== claudeLastSessionState) {
           if (message.state === "running" && claudeTurnAwaitingResult && !nonHumanStateIngress) {
             resetClaudeContentTracking();
@@ -45993,6 +46012,7 @@ async function consumeClaudeMessages() {
         claudeForegroundPromptAccepted = true;
         emitClaudeResultUsage(message);
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
+        finishClaudeLegacyTurnAfterIdle();
         if (!resultObservation.failed) {
           emitClaudeUsageAfterTurn();
         }
@@ -46428,9 +46448,9 @@ async function ensureCodexThread() {
   }
   return codexThread;
 }
-async function runCodexTurn(text, images) {
+async function runCodexTurn(text, images, abortController) {
   const thread = await ensureCodexThread();
-  currentAbortController = new AbortController();
+  abortController.signal.throwIfAborted();
   let input;
   const parts = buildPromptContentParts(text, images);
   const hasImages = parts.some((part) => part.type === "image");
@@ -46450,7 +46470,7 @@ async function runCodexTurn(text, images) {
   }
   try {
     const streamed = await thread.runStreamed(input, {
-      signal: currentAbortController.signal
+      signal: abortController.signal
     });
     const seenTextByItem = /* @__PURE__ */ new Map();
     const seenReasoningByItem = /* @__PURE__ */ new Map();
@@ -46602,14 +46622,19 @@ async function runQueuedTurns() {
     return;
   }
   activeTurn = true;
+  const abortController = new AbortController();
+  currentAbortController = abortController;
   emitStatus("processing", "Codex is processing a turn.");
   try {
-    await runCodexTurn(nextPrompt.text, nextPrompt.images);
+    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController);
     if (!stopped) {
       emitStatus("ready", "Ready for the next prompt.");
     }
   } catch (error48) {
     const isAbort = error48 instanceof Error && error48.name === "AbortError";
+    if (isAbort && !stopped) {
+      emitStatus("ready", "Turn interrupted. Ready for the next prompt.");
+    }
     if (!isAbort) {
       const message = error48 instanceof Error ? error48.message : String(error48);
       emitEvent({
@@ -46623,8 +46648,10 @@ async function runQueuedTurns() {
       emitStatus("error", message);
     }
   } finally {
-    activeTurn = false;
-    currentAbortController = null;
+    if (currentAbortController === abortController) {
+      activeTurn = false;
+      currentAbortController = null;
+    }
     if (pendingSettings) {
       const hadEnvVars = pendingSettings.envVars !== void 0;
       applyPendingSettingsToInitCommand();
@@ -46811,7 +46838,9 @@ async function handleCommand(command) {
         emitClaudeInitializationSettled();
         enqueueClaudePrompt(initialText, initialImages, command.initial_command_id ?? void 0);
       } else {
-        emitStatus("ready", "Native runtime helper initialized.");
+        if (!activeTurn && !stopped) {
+          emitStatus("ready", "Native runtime helper initialized.");
+        }
         promptQueue.push({ text: initialText, images: initialImages });
         await runQueuedTurns();
       }
@@ -46819,7 +46848,7 @@ async function handleCommand(command) {
       await ensureClaudeSession();
       emitStatus("ready", "Native runtime helper initialized.");
       emitClaudeInitializationSettled();
-    } else {
+    } else if (!activeTurn && !stopped) {
       emitStatus("ready", "Native runtime helper initialized.");
     }
     return;
@@ -47470,14 +47499,12 @@ async function handleCommand(command) {
     }
     currentAbortController?.abort();
     teardownCodexSession(false);
-    activeTurn = false;
-    currentAbortController = null;
     if (runtimeTeardown) {
       emitStatus("closed_idle", "Codex runtime stopped.");
       finishClaudeRuntimeTeardown();
     } else {
       stopped = false;
-      emitStatus("ready", "Turn interrupted. Ready for the next prompt.");
+      emitStatus(activeTurn ? "processing" : "ready", activeTurn ? "Waiting for interrupted Codex turn to settle." : "Turn interrupted. Ready for the next prompt.");
     }
     return;
   }

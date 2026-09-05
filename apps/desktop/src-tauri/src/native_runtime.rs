@@ -1159,6 +1159,7 @@ fn apply_background_task_event(
 
     match payload {
         SessionEventPayload::BackgroundTasksChanged { tasks } => {
+            handle.has_background_task_snapshot.store(true, Ordering::SeqCst);
             {
                 let mut background_tool_ids = handle
                     .background_tool_use_ids
@@ -1170,10 +1171,6 @@ fn apply_background_task_event(
                     }
                 }
             }
-            let terminal_ids = handle
-                .terminal_background_task_ids
-                .lock()
-                .map_err(|_| "Failed to lock terminal background task ids".to_string())?;
             let current_tasks = handle
                 .background_tasks
                 .lock()
@@ -1181,10 +1178,10 @@ fn apply_background_task_event(
             let mut next_tasks = HashMap::new();
             let mut invalidated_stop_ids = Vec::new();
             for task in tasks {
-                if task.status.is_terminal() || terminal_ids.contains(&task.task_id) {
-                    continue;
-                }
                 let mut next = task.clone();
+                if next.status.is_terminal() {
+                    next.status = NativeBackgroundTaskStatus::Settling;
+                }
                 if let Some(current) = current_tasks.get(&task.task_id) {
                     if current.status == NativeBackgroundTaskStatus::Stopping
                         && task.status == NativeBackgroundTaskStatus::Settling
@@ -1199,23 +1196,14 @@ fn apply_background_task_event(
                 next_tasks.insert(next.task_id.clone(), next);
             }
             for (task_id, current) in current_tasks.iter() {
-                if next_tasks.contains_key(task_id) || terminal_ids.contains(task_id) {
-                    continue;
-                }
-                let mut missing = current.clone();
-                if missing.status == NativeBackgroundTaskStatus::Stopping
-                    || missing.stop_request_id.is_some()
+                if !next_tasks.contains_key(task_id)
+                    && (current.status == NativeBackgroundTaskStatus::Stopping
+                        || current.stop_request_id.is_some())
                 {
                     invalidated_stop_ids.push(task_id.clone());
                 }
-                missing.status = NativeBackgroundTaskStatus::Settling;
-                missing.updated_at = Utc::now();
-                missing.stop_request_id = None;
-                missing.stop_failed = None;
-                next_tasks.insert(task_id.clone(), missing);
             }
             drop(current_tasks);
-            drop(terminal_ids);
             if !invalidated_stop_ids.is_empty() {
                 let mut pending_stops = handle
                     .pending_background_task_stops
@@ -1254,12 +1242,25 @@ fn apply_background_task_event(
             }
             if task.status.is_terminal() {
                 terminal_ids.insert(task.task_id.clone());
-                tasks.remove(&task.task_id);
+                if handle.has_background_task_snapshot.load(Ordering::SeqCst) {
+                    if let Some(live) = tasks.get_mut(&task.task_id) {
+                        live.status = NativeBackgroundTaskStatus::Settling;
+                        live.stop_request_id = None;
+                        live.stop_failed = None;
+                    }
+                } else {
+                    tasks.remove(&task.task_id);
+                }
                 handle
                     .pending_background_task_stops
                     .lock()
                     .map_err(|_| "Failed to lock pending background task stops".to_string())?
                     .remove(&task.task_id);
+                return Ok(true);
+            }
+            if handle.has_background_task_snapshot.load(Ordering::SeqCst)
+                && !tasks.contains_key(&task.task_id)
+            {
                 return Ok(true);
             }
             let mut next = task.clone();
@@ -1916,6 +1917,7 @@ struct NativeSessionHandle {
     child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
     background_tasks: Mutex<HashMap<String, NativeBackgroundTask>>,
+    has_background_task_snapshot: AtomicBool,
     terminal_background_task_ids: Mutex<HashSet<String>>,
     background_tool_use_ids: Mutex<HashSet<String>>,
     completed_background_tool_use_ids: Mutex<HashSet<String>>,
@@ -2096,6 +2098,8 @@ pub struct NativeRuntimeManager {
     /// Process-local FIFO. It intentionally has no disk sidecar and therefore
     /// preserves the product's existing app-restart semantics.
     input_queue: NativeInputQueue,
+    /// Accepted transport work awaiting transcript projection only. Never dispatched again.
+    pending_prompt_projections: Mutex<HashMap<String, Arc<Mutex<Vec<FrozenNativeInputMessage>>>>>,
     /// A freshly spawned Claude helper cannot accept queued prompts until its
     /// resume/fork identity and query bootstrap are settled. This fence is
     /// independent of presentation status, so an early abandonment cannot
@@ -2244,6 +2248,7 @@ impl NativeRuntimeManager {
             next_handle_generation: AtomicU64::new(1),
             lifecycle: Default::default(),
             input_queue: Default::default(),
+            pending_prompt_projections: Mutex::new(HashMap::new()),
             initializing_runtimes: Mutex::new(HashSet::new()),
             state_path,
             event_log: NativeEventLog::default(),
@@ -2428,6 +2433,7 @@ impl NativeRuntimeManager {
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(runtime_id.clone())),
             background_tasks: Mutex::new(HashMap::new()),
+            has_background_task_snapshot: AtomicBool::new(false),
             terminal_background_task_ids: Mutex::new(HashSet::new()),
             background_tool_use_ids: Mutex::new(HashSet::new()),
             completed_background_tool_use_ids: Mutex::new(HashSet::new()),
@@ -3461,6 +3467,41 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         trigger: QueueDispatchTrigger,
     ) -> Result<(), String> {
+        self.dispatch_queued_with(
+            runtime_id,
+            trigger,
+            |text, display_text, images, annotations, command_id, attempt| {
+                self.send_user_message_admitted(
+                    app,
+                    runtime_id,
+                    text,
+                    display_text,
+                    images,
+                    annotations,
+                    None,
+                    true,
+                    Some(command_id),
+                    Some(attempt),
+                    false,
+                )
+            },
+        )
+    }
+
+    /// Shared FIFO driver; the boundary owns helper connection and pipe delivery.
+    fn dispatch_queued_with(
+        self: &Arc<Self>,
+        runtime_id: &str,
+        trigger: QueueDispatchTrigger,
+        mut deliver: impl FnMut(
+            &str,
+            Option<&str>,
+            Option<&Vec<PromptImage>>,
+            Option<&Vec<SessionPromptAnnotation>>,
+            &str,
+            u64,
+        ) -> Result<(), String>,
+    ) -> Result<(), String> {
         if trigger != QueueDispatchTrigger::InitializationSettled
             && self
                 .initializing_runtimes
@@ -3530,18 +3571,13 @@ impl NativeRuntimeManager {
                 }
             };
 
-            let dispatch = self.send_user_message_admitted(
-                app,
-                runtime_id,
+            let dispatch = deliver(
                 &dispatch_parts.text,
                 dispatch_parts.display_text.as_deref(),
                 images.as_ref(),
                 annotations.as_ref(),
-                None,
-                true,
-                Some(&dispatch_command_id),
-                Some(dispatch_attempt),
-                false,
+                &dispatch_command_id,
+                dispatch_attempt,
             );
             match dispatch {
                 Ok(()) => {
@@ -4031,6 +4067,9 @@ impl NativeRuntimeManager {
                 )?;
             }
         }
+        // Local process teardown is itself authoritative evidence that no work
+        // remains live, independent of the helper's final result bookends.
+        self.append_event(runtime_id, SessionEventPayload::BackgroundTasksChanged { tasks: vec![] })?;
         Ok(tasks.len())
     }
 
@@ -7345,6 +7384,7 @@ impl NativeRuntimeManager {
                 start_seq,
             )),
             background_tasks: Mutex::new(HashMap::new()),
+            has_background_task_snapshot: AtomicBool::new(false),
             terminal_background_task_ids: Mutex::new(HashSet::new()),
             background_tool_use_ids: Mutex::new(HashSet::new()),
             completed_background_tool_use_ids: Mutex::new(HashSet::new()),
@@ -7981,28 +8021,7 @@ impl NativeRuntimeManager {
                             LifecycleDecision::Ignored | LifecycleDecision::ProtocolError { .. }
                         ) =>
                     {
-                        let admitted = self.input_queue.peek(runtime_id).filter(|queued| {
-                            queued.dispatch_command_id() == Some(command_id)
-                                && matches!(
-                                    queued.delivery_state(),
-                                    QueuedInputDeliveryState::Dispatching
-                                        | QueuedInputDeliveryState::DeliveryUncertain
-                                )
-                        });
-                        admitted.is_some_and(|queued| {
-                            if let Err(error) = self.append_queued_batch_user_prompt_events(
-                                runtime_id,
-                                queued.batch().messages(),
-                            ) {
-                                eprintln!(
-                                    "Failed to append admitted queued prompts for {runtime_id}: {error}"
-                                );
-                                return false;
-                            }
-                            self.input_queue
-                                .confirm_admitted(runtime_id, command_id)
-                                .is_some()
-                        })
+                        self.project_admitted_queued_prompts(runtime_id, command_id)
                     }
                     "delivery_uncertain" => self
                         .input_queue
@@ -9446,6 +9465,39 @@ impl NativeRuntimeManager {
         self.append_event(runtime_id, payload)
     }
 
+    fn project_admitted_queued_prompts(&self, runtime_id: &str, command_id: &str) -> bool {
+        // Claim the exact transport receipt before doing fallible observation I/O.
+        // This lock serializes projection retries, including duplicate concurrent
+        // receipts, without holding the FIFO lock while writing attachments.
+        let pending = self
+            .pending_prompt_projections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(runtime_id.to_owned())
+            .or_default()
+            .clone();
+        let mut messages = pending.lock().unwrap_or_else(|p| p.into_inner());
+        let admitted = self.input_queue.confirm_admitted(runtime_id, command_id);
+        let queue_changed = admitted.is_some();
+        if let Some(queued) = admitted {
+            messages.extend(queued.batch().messages().iter().cloned());
+        }
+        // A broken attachment must not suppress unrelated accepted history.
+        // Retain only failed observations; successful messages cannot be replayed.
+        messages.retain(|message| {
+            if let Err(error) = self.append_queued_batch_user_prompt_events(
+                runtime_id, std::slice::from_ref(message),
+            ) {
+                let _ = self.append_lifecycle_event(runtime_id, "prompt_history_projection_failed",
+                    format!("Accepted prompt history is pending; transport will not be replayed: {error}"));
+                true
+            } else {
+                false
+            }
+        });
+        queue_changed
+    }
+
     fn append_queued_batch_user_prompt_events(
         &self,
         runtime_id: &str,
@@ -9963,6 +10015,10 @@ impl NativeRuntimeManager {
         if result.is_ok() {
             self.lifecycle.clear_session(runtime_id);
             self.input_queue.clear(runtime_id);
+            self.pending_prompt_projections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(runtime_id);
         }
         result
     }
@@ -11009,6 +11065,7 @@ mod tests {
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(&runtime_id)),
             background_tasks: Mutex::new(HashMap::new()),
+            has_background_task_snapshot: AtomicBool::new(false),
             terminal_background_task_ids: Mutex::new(HashSet::new()),
             background_tool_use_ids: Mutex::new(HashSet::new()),
             completed_background_tool_use_ids: Mutex::new(HashSet::new()),
@@ -11088,6 +11145,7 @@ mod tests {
             terminal_handoff_preparations: Mutex::new(HashMap::new()),
             lifecycle: Default::default(),
             input_queue: Default::default(),
+            pending_prompt_projections: Mutex::new(HashMap::new()),
             initializing_runtimes: Mutex::new(HashSet::new()),
         };
         manager
@@ -11112,6 +11170,7 @@ mod tests {
             next_handle_generation: AtomicU64::new(1),
             lifecycle: Default::default(),
             input_queue: Default::default(),
+            pending_prompt_projections: Mutex::new(HashMap::new()),
             initializing_runtimes: Mutex::new(HashSet::new()),
             state_path: std::env::temp_dir().join(format!(
                 "ccem-native-runtime-reconcile-test-{storage_namespace}.json"
@@ -13630,6 +13689,7 @@ mod tests {
             next_handle_generation: AtomicU64::new(2),
             lifecycle: Default::default(),
             input_queue: Default::default(),
+            pending_prompt_projections: Mutex::new(HashMap::new()),
             initializing_runtimes: Mutex::new(HashSet::new()),
             state_path: std::env::temp_dir().join(format!(
                 "ccem-native-runtime-terminal-env-test-{runtime_id}.json"
@@ -13891,6 +13951,170 @@ mod tests {
                 ("visible second request", Some("client-message-b")),
             ]
         );
+    }
+
+    #[test]
+    fn admitted_image_projection_failure_releases_fifo_and_retries_history_without_replay() {
+        let runtime_id = "admitted-image-projection-failure";
+        let mut manager = manager_with_handle(runtime_id);
+        let root = std::env::temp_dir().join(test_manager_namespace(runtime_id));
+        std::fs::write(&root, "blocks directory creation").unwrap();
+        manager.prompt_image_store = PromptImageStore::new(root.clone());
+        manager.process_helper_stdout(runtime_id,
+            r#"{"type":"session_meta","provider_session_id":"conv-a","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#).unwrap();
+        let incarnation = manager.handles.lock().unwrap()[runtime_id].generation;
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new(
+                    "image-a",
+                    "image request",
+                    None,
+                    Some(vec![
+                        serde_json::json!({"mediaType":"image/png","base64Data":"aW1hZ2U="}),
+                    ]),
+                    None,
+                ),
+                None,
+            )
+            .unwrap();
+        let (attempt, command) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected claim: {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command, attempt)
+            .unwrap();
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("tail-b", "tail", None, None, None),
+                Some(&command),
+            )
+            .unwrap();
+        let admission = format!(
+            r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"admitted","command_id":"{command}","query_generation":1}}}}"#
+        );
+        manager
+            .process_helper_stdout(runtime_id, &admission)
+            .unwrap();
+        assert_eq!(
+            manager.input_queue.count(runtime_id),
+            1,
+            "admitted A must leave FIFO even if attachment I/O fails"
+        );
+        assert_eq!(
+            manager.pending_prompt_projections.lock().unwrap()[runtime_id]
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(manager.replay_events(runtime_id, None).unwrap().events.iter().any(|event|
+            matches!(&event.payload, SessionEventPayload::Lifecycle {stage, ..} if stage == "prompt_history_projection_failed")));
+        let terminal = format!(
+            r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"{command}","query_generation":1}}}}"#
+        );
+        manager
+            .process_helper_stdout(runtime_id, &terminal)
+            .unwrap();
+        assert!(manager
+            .lifecycle
+            .projection(runtime_id)
+            .unwrap()
+            .active_command_id
+            .is_none());
+        let tail_command = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                batch,
+            } => {
+                assert_eq!(
+                    batch.messages()[0].clone().into_parts().client_message_id,
+                    "tail-b"
+                );
+                manager
+                    .lifecycle
+                    .admit_queued_prompt(
+                        runtime_id,
+                        incarnation,
+                        &dispatch_command_id,
+                        dispatch_attempt,
+                    )
+                    .unwrap();
+                dispatch_command_id
+            }
+            other => panic!("B must be dispatchable: {other:?}"),
+        };
+        std::fs::remove_file(&root).unwrap();
+        let manager = Arc::new(manager);
+        let tail_ack = format!(
+            r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"admitted","command_id":"{tail_command}","query_generation":1}}}}"#
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let manager = &manager;
+                let tail_ack = &tail_ack;
+                scope.spawn(move || manager.process_helper_stdout(runtime_id, tail_ack).unwrap());
+            }
+        });
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        assert!(
+            manager.pending_prompt_projections.lock().unwrap()[runtime_id]
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let ids = manager
+            .replay_events(runtime_id, None)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                SessionEventPayload::UserPrompt {
+                    client_message_id, ..
+                } => client_message_id,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["image-a", "tail-b"],
+            "history retry and concurrent duplicate ACKs project each accepted message once"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_runtime_discards_retained_prompt_history_images() {
+        let runtime_id = "remove-pending-history";
+        let manager = manager_with_handle(runtime_id);
+        manager.pending_prompt_projections.lock().unwrap().insert(
+            runtime_id.to_owned(),
+            Arc::new(Mutex::new(vec![FrozenNativeInputMessage::new(
+                "accepted-a",
+                "A",
+                None,
+                Some(vec![
+                    serde_json::json!({"mediaType":"image/png","base64Data":"aW1hZ2U="}),
+                ]),
+                None,
+            )])),
+        );
+        manager.remove_record(runtime_id).unwrap();
+        assert!(!manager
+            .pending_prompt_projections
+            .lock()
+            .unwrap()
+            .contains_key(runtime_id));
     }
 
     #[test]
@@ -14194,11 +14418,8 @@ mod tests {
             .summary_for(&runtime_id)
             .expect("terminal summary")
             .last_event_seq;
-        assert!(manager
-            .summary_for(&runtime_id)
-            .expect("terminal summary")
-            .background_tasks
-            .is_empty());
+        assert_eq!(manager.summary_for(&runtime_id).unwrap().background_tasks[0].status,
+            NativeBackgroundTaskStatus::Settling, "terminal history cannot override full live membership");
 
         let mut enriched_terminal = completed.clone();
         enriched_terminal.tool_use_id = Some("tool-task-1-late".to_string());
@@ -14232,7 +14453,7 @@ mod tests {
             )
             .expect("ignore late terminal update");
         let after_late = manager.summary_for(&runtime_id).expect("late summary");
-        assert!(after_late.background_tasks.is_empty());
+        assert_eq!(after_late.background_tasks[0].status, NativeBackgroundTaskStatus::Settling);
         assert_eq!(after_late.last_event_seq, enriched_terminal_seq);
 
         let replay = manager
@@ -14244,6 +14465,44 @@ mod tests {
                 if task.status == NativeBackgroundTaskStatus::Completed
                     && task.tool_use_id.as_deref() == Some("tool-task-1-late")
         )));
+    }
+
+    #[test]
+    fn full_background_snapshot_controls_manager_live_membership_independent_of_edges() {
+        let runtime_id = "manager-full-background-membership";
+        let manager = manager_with_handle(runtime_id);
+        let send = |payload: SessionEventPayload| {
+            manager.process_helper_stdout(runtime_id, &serde_json::json!({"type":"event","payload":payload}).to_string()).unwrap();
+        };
+        let running = background_task("background-a", NativeBackgroundTaskStatus::Running);
+        send(SessionEventPayload::BackgroundTasksChanged {tasks: vec![running.clone()]});
+        assert!(manager.reject_background_task_termination(runtime_id, "switch", false).is_err());
+        send(SessionEventPayload::BackgroundTasksChanged {tasks: vec![]});
+        assert!(manager.active_background_tasks(runtime_id).unwrap().is_empty());
+        manager.reject_background_task_termination(runtime_id, "switch", false).unwrap();
+        // Late progress and result collection cannot resurrect absent live work.
+        send(SessionEventPayload::BackgroundTaskUpdated {task: running.clone()});
+        assert!(manager.active_background_tasks(runtime_id).unwrap().is_empty());
+        let mut terminal = running.clone();
+        terminal.status = NativeBackgroundTaskStatus::Completed;
+        send(SessionEventPayload::BackgroundTaskUpdated {task: terminal.clone()});
+        assert!(manager.active_background_tasks(runtime_id).unwrap().is_empty());
+        let mut live_settling = running.clone();
+        live_settling.status = NativeBackgroundTaskStatus::Settling;
+        send(SessionEventPayload::BackgroundTasksChanged {tasks: vec![live_settling]});
+        assert_eq!(manager.active_background_tasks(runtime_id).unwrap().len(), 1, "terminal IDs are result history, not a filter on an authoritative live snapshot");
+        assert!(manager.reject_background_task_termination(runtime_id, "switch", false).is_err());
+        send(SessionEventPayload::BackgroundTasksChanged {tasks: vec![]});
+        assert!(manager.active_background_tasks(runtime_id).unwrap().is_empty());
+
+        let second = background_task("background-b", NativeBackgroundTaskStatus::Running);
+        send(SessionEventPayload::BackgroundTasksChanged {tasks: vec![second.clone()]});
+        let mut completed = second;
+        completed.status = NativeBackgroundTaskStatus::Completed;
+        send(SessionEventPayload::BackgroundTaskUpdated {task: completed});
+        assert_eq!(manager.active_background_tasks(runtime_id).unwrap()[0].status, NativeBackgroundTaskStatus::Settling);
+        send(SessionEventPayload::BackgroundTasksChanged {tasks: vec![]});
+        assert!(manager.active_background_tasks(runtime_id).unwrap().is_empty());
     }
 
     #[test]
@@ -17938,6 +18197,138 @@ wait"#,
             .lock()
             .expect("handles")
             .contains_key(runtime_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_stop_releases_locks_and_tail_for_fenced_reconnect_without_new_send() {
+        let runtime_id = "uncertain-stop-pending-tail";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let incarnation = manager.handles.lock().unwrap()[runtime_id].generation;
+        manager.lifecycle.note_incarnation(runtime_id, incarnation);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("uncertain-a", "A", None, None, None),
+                None,
+            )
+            .unwrap();
+        let (attempt, command) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected A: {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command, attempt)
+            .unwrap();
+        manager
+            .lifecycle
+            .mark_delivery_uncertain(runtime_id, incarnation, &command, "lost ACK");
+        manager
+            .input_queue
+            .mark_dispatch_delivery_uncertain(runtime_id, &command, attempt);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("pending-b", "B", None, None, None),
+                Some(&command),
+            )
+            .unwrap();
+        manager
+            .stop_session_from_expected(runtime_id, Some("test"), Some(&command))
+            .unwrap();
+        // The IPC wrapper's following flush runs only after these guards drop.
+        assert!(manager.app_termination_lock.try_lock().is_ok());
+        assert!(manager.reconnect_lock.try_lock().is_ok());
+        assert_eq!(manager.input_queue.count(runtime_id), 1);
+        assert!(manager.handles.lock().unwrap().get(runtime_id).is_none());
+        let mut helper = Command::new("/bin/sh");
+        helper
+            .arg("-c")
+            .arg("IFS= read -r line; printf '%s\n' \"$line\"");
+        let (mut events, child) = super::spawn_native_helper_process(helper).unwrap();
+        let record = manager.records.lock().unwrap()[runtime_id].clone();
+        let handle = native_session_handle_with_generation(record, incarnation + 1);
+        *handle.child.lock().unwrap() = Some(child);
+        let mut sent_command = None;
+        manager
+            .dispatch_queued_with(
+                runtime_id,
+                super::QueueDispatchTrigger::VisibleUserAction,
+                |text, _, images, _, command_id, attempt| {
+                    assert_eq!(text, "B");
+                    assert!(manager.app_termination_lock.try_lock().is_ok());
+                    assert!(manager.reconnect_lock.try_lock().is_ok());
+                    assert!(matches!(
+                        manager.input_queue.claim_next(runtime_id),
+                        NativeInputClaimOutcome::AlreadyDispatching { .. }
+                    ));
+                    manager.insert_handle(runtime_id.to_owned(), handle.clone())?;
+                    manager.lifecycle.note_session_meta(
+                        runtime_id,
+                        incarnation + 1,
+                        Some("conv-b"),
+                        Some(&["msg_lifecycle_v1".to_owned()]),
+                        Some(1),
+                    );
+                    manager
+                        .lifecycle
+                        .admit_queued_prompt(runtime_id, incarnation + 1, command_id, attempt)
+                        .unwrap();
+                    let outcome = manager.write_to_live_child_outcome(
+                        &handle,
+                        &super::HelperInputCommand::Prompt {
+                            text,
+                            command_id: Some(command_id),
+                            images: images.map(Vec::as_slice),
+                        },
+                    );
+                    assert!(matches!(outcome, super::LiveWriteOutcome::Written));
+                    sent_command = Some(command_id.to_owned());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let received = tauri::async_runtime::block_on(async {
+            loop {
+                match events.recv().await.expect("helper output") {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(bytes) => {
+                        break serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Error(error) => {
+                        panic!("helper: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+        assert_eq!(received["text"], "B");
+        assert_eq!(received["command_id"].as_str(), sent_command.as_deref());
+        let tail_command = sent_command.unwrap();
+        assert_ne!(tail_command, command);
+        assert!(matches!(
+            manager
+                .lifecycle
+                .note_command_admitted(runtime_id, incarnation, &command, 1),
+            crate::native_session_coordinator::LifecycleDecision::Ignored
+        ));
+        manager.process_helper_stdout(runtime_id, &format!(r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"received","command_id":"{tail_command}","query_generation":1}}}}"#)).unwrap();
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        assert_eq!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .active_command_id
+                .as_deref(),
+            Some(tail_command.as_str())
+        );
     }
 
     #[test]

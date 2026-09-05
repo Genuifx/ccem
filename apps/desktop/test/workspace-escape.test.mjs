@@ -179,3 +179,15 @@ test('one command can be interrupted once while a changed command can be interru
     },
   );
 });
+
+test('unmanaged provider Escape uses runtime interrupt only while processing', async () => {
+  const { decideWorkspaceEscape } = await importWorkspaceEscape();
+  for (const provider of ['codex', 'opencode']) {
+    const input = activeInput({ provider, activeCommandId: null, isProviderProcessing: true });
+    assert.deepEqual(decideWorkspaceEscape(input), { kind: 'stop', runtimeId: 'runtime-1', commandId: null });
+    assert.deepEqual(decideWorkspaceEscape({ ...input, repeat: true }), { kind: 'ignore' });
+    assert.deepEqual(decideWorkspaceEscape({ ...input, isProviderProcessing: false }), { kind: 'ignore' });
+    // A new physical press after another provider turn must not be deduped by a null command id.
+    assert.equal(decideWorkspaceEscape({ ...input, lastRequestedCommand: { runtimeId: 'runtime-1', commandId: null } }).kind, 'stop');
+  }
+});

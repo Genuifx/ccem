@@ -107,3 +107,11 @@ test('Plan approval uses one backend transaction and updates optimistic mode onl
   assert.match(responseTransaction, /update_session_runtime_perm_mode_under_transition/);
   assert.match(responseTransaction, /wait_for_interactive_ack/);
 });
+
+test('Codex and OpenCode keep provider processing with empty coordinator projection', async () => {
+  const { selectNativeSessionProcessing } = await importNativeSessionProjection();
+  for (const provider of ['codex', 'opencode']) {
+    assert.equal(selectNativeSessionProcessing({ active_command_id: null }, () => true, provider), true);
+    assert.equal(selectNativeSessionProcessing({ active_command_id: null }, () => false, provider), false);
+  }
+});

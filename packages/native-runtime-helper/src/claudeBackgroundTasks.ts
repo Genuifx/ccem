@@ -183,6 +183,8 @@ export class ClaudeBackgroundTaskTracker {
   private readonly tasks = new Map<string, ClaudeBackgroundTask>();
   private readonly backgroundTaskIds = new Set<string>();
   private readonly liveSnapshotIds = new Set<string>();
+  // Once the SDK supplies level signals, edges only enrich result history.
+  private hasLiveSnapshot = false;
   private readonly backgroundToolUseIds = new Set<string>();
   private readonly taskIdByToolUseId = new Map<string, string>();
   private readonly taskIdByOwnerId = new Map<string, string>();
@@ -344,9 +346,16 @@ export class ClaudeBackgroundTaskTracker {
 
   activeTasks() {
     return [...this.tasks.values()]
-      .filter((task) => this.backgroundTaskIds.has(task.task_id) && !isTerminalStatus(task.status))
+      .filter((task) => this.hasLiveSnapshot
+        ? this.liveSnapshotIds.has(task.task_id)
+        : this.backgroundTaskIds.has(task.task_id) && !isTerminalStatus(task.status))
       .sort((left, right) => left.started_at.localeCompare(right.started_at))
-      .map(cloneTask);
+      .map((task) => ({
+        ...cloneTask(task),
+        // A terminal edge records the result, but cannot replace the SDK level.
+        // Keep live work gated until membership converges without rewriting history.
+        status: isTerminalStatus(task.status) ? 'settling' as const : task.status,
+      }));
   }
 
   applyStarted(message: TaskStartedMessage) {
@@ -472,6 +481,7 @@ export class ClaudeBackgroundTaskTracker {
   }
 
   applySnapshot(entries: BackgroundTaskSnapshotEntry[]) {
+    this.hasLiveSnapshot = true;
     const nextLiveIds = new Set<string>();
     const changed: ClaudeBackgroundTask[] = [];
 
@@ -542,7 +552,6 @@ export class ClaudeBackgroundTaskTracker {
   }
 
   applyNotification(message: TaskNotificationMessage) {
-    this.liveSnapshotIds.delete(message.task_id);
     const existing = this.tasks.get(message.task_id);
     const toolUseId = optionalString(message.tool_use_id) ?? existing?.tool_use_id;
     if (toolUseId) {
@@ -634,7 +643,11 @@ export class ClaudeBackgroundTaskTracker {
   }
 
   interruptAll(reason: string) {
-    const interrupted = this.activeTasks().map((task) => {
+    const interrupted = this.activeTasks().flatMap((task) => {
+      const recorded = this.tasks.get(task.task_id);
+      if (recorded && isTerminalStatus(recorded.status)) {
+        return [];
+      }
       const next: ClaudeBackgroundTask = {
         ...task,
         status: 'interrupted',
@@ -642,7 +655,7 @@ export class ClaudeBackgroundTaskTracker {
         error: reason,
       };
       this.tasks.set(task.task_id, next);
-      return cloneTask(next);
+      return [cloneTask(next)];
     });
     this.liveSnapshotIds.clear();
     this.priorStoppingStatuses.clear();

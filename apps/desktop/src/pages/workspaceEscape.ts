@@ -1,6 +1,6 @@
 export interface WorkspaceEscapeCommandIdentity {
   runtimeId: string;
-  commandId: string;
+  commandId: string | null;
 }
 
 export interface WorkspaceEscapeInput {
@@ -15,6 +15,8 @@ export interface WorkspaceEscapeInput {
   isSessionActive: boolean;
   runtimeId?: string | null;
   activeCommandId?: string | null;
+  provider?: string;
+  isProviderProcessing?: boolean;
   lastRequestedCommand?: WorkspaceEscapeCommandIdentity | null;
   hasOpenInteractionLayer?: boolean;
 }
@@ -91,8 +93,8 @@ export function hasOpenWorkspaceEscapeLayer(
 
 /**
  * Decide whether one physical Escape keydown may interrupt the foreground
- * native command. A coordinator command id is required: legacy status strings
- * are deliberately not accepted as ownership evidence.
+ * native command. Claude requires a coordinator command id; unmanaged providers
+ * use their runtime processing state and the provider interrupt protocol.
  *
  * Auto-repeat keydowns are never a new stop request: a held Escape must not
  * cancel a queued prompt whose command was admitted right after the first
@@ -115,13 +117,16 @@ export function decideWorkspaceEscape(input: WorkspaceEscapeInput): WorkspaceEsc
   }
 
   const runtimeId = input.runtimeId?.trim();
-  const commandId = input.activeCommandId?.trim();
-  if (!runtimeId || !commandId) {
+  const commandId = input.activeCommandId?.trim() || null;
+  const providerStop = (input.provider === 'codex' || input.provider === 'opencode')
+    && input.isProviderProcessing;
+  if (!runtimeId || (!commandId && !providerStop)) {
     return { kind: 'ignore' };
   }
 
   if (
-    input.lastRequestedCommand?.runtimeId === runtimeId
+    commandId != null
+    && input.lastRequestedCommand?.runtimeId === runtimeId
     && input.lastRequestedCommand.commandId === commandId
   ) {
     return { kind: 'ignore' };

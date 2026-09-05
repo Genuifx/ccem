@@ -76,8 +76,9 @@ test('requires task_notification for terminal state and never regresses it', asy
   assert.equal(provisional.status, 'settling');
 
   const removed = tracker.applySnapshot([]);
-  assert.equal(removed.tasks[0].status, 'settling');
-  assert.equal(tracker.hasUnsettledTasks(), true);
+  assert.deepEqual(removed.tasks, []);
+  assert.equal(tracker.getTask('task-1').status, 'settling');
+  assert.equal(tracker.hasUnsettledTasks(), false);
 
   const terminal = tracker.applyNotification({
     task_id: 'task-1',
@@ -96,7 +97,10 @@ test('requires task_notification for terminal state and never regresses it', asy
     task_type: 'agent',
     description: 'Stale running snapshot',
   }]);
-  assert.deepEqual(staleSnapshot.tasks, []);
+  assert.equal(staleSnapshot.tasks[0].status, 'settling');
+  assert.equal(tracker.hasUnsettledTasks(), true);
+  tracker.applySnapshot([]);
+  assert.equal(tracker.hasUnsettledTasks(), false);
   assert.equal(tracker.getTask('task-1').status, 'completed');
 
   const duplicateTerminal = tracker.applyNotification({
@@ -137,6 +141,9 @@ test('keeps stop provisional until notification and restores failures', async ()
   assert.equal(terminal.error, undefined);
   assert.equal(terminal.stop_request_id, undefined);
   assert.equal(terminal.stop_failed, undefined);
+  assert.equal(tracker.hasUnsettledTasks(), true);
+  assert.equal(tracker.activeTasks()[0].status, 'settling');
+  tracker.applySnapshot([]);
   assert.equal(tracker.hasUnsettledTasks(), false);
   assert.equal(tracker.markStopping('missing-task', 'stop-3'), null);
 });
@@ -256,8 +263,9 @@ test('empty replace snapshots settle launch-receipt tasks not seen in an earlier
   );
 
   const change = tracker.applySnapshot([]);
-  assert.equal(change.tasks[0].task_id, 'task-receipt');
-  assert.equal(change.tasks[0].status, 'settling');
+  assert.deepEqual(change.tasks, []);
+  assert.equal(tracker.getTask('task-receipt').status, 'settling');
+  assert.equal(tracker.hasUnsettledTasks(), false);
 });
 
 test('late correlation enriches the first terminal state without changing its outcome', async () => {
@@ -390,5 +398,34 @@ test('marks unresolved tasks interrupted when their query process is replaced', 
   const interrupted = tracker.interruptAll('Claude query restarted');
   assert.deepEqual(interrupted.map((task) => task.status), ['interrupted', 'interrupted']);
   assert.equal(interrupted.every((task) => task.error === 'Claude query restarted'), true);
+  assert.deepEqual(tracker.activeTasks(), []);
+});
+
+ test('authoritative live membership ignores delayed edges including previously unknown tasks', async () => {
+  const { ClaudeBackgroundTaskTracker } = await importBackgroundTasksModule();
+  const tracker = new ClaudeBackgroundTaskTracker(createClock());
+  tracker.applySnapshot([]);
+  tracker.applyLaunchReceipt('late-tool', 'Bash', {run_in_background:true}, {backgroundTaskId:'late-task'});
+  tracker.applyStarted({task_id:'late-task', tool_use_id:'late-tool', description:'late'});
+  assert.deepEqual(tracker.activeTasks(), []);
+  assert.equal(tracker.hasUnsettledTasks(), false);
+  tracker.applySnapshot([{task_id:'new-task',description:'live'}]);
+  assert.deepEqual(tracker.activeTasks().map(t => t.task_id), ['new-task']);
+  tracker.applySnapshot([]);
+  tracker.applyUpdated({task_id:'new-task',patch:{status:'running',is_backgrounded:true}});
+  assert.deepEqual(tracker.activeTasks(), []);
+ });
+
+test('query teardown clears live membership without overwriting an observed terminal result', async () => {
+  const { ClaudeBackgroundTaskTracker } = await importBackgroundTasksModule();
+  const tracker = new ClaudeBackgroundTaskTracker(createClock());
+  tracker.applySnapshot([{task_id:'completed-live',description:'completed'}, {task_id:'running-live',description:'running'}]);
+  tracker.applyNotification({task_id:'completed-live',status:'completed',summary:'successful output'});
+  assert.equal(tracker.hasUnsettledTasks(), true);
+  const interrupted=tracker.interruptAll('query ended');
+  assert.deepEqual(interrupted.map(task => task.task_id), ['running-live']);
+  assert.equal(tracker.getTask('completed-live').status, 'completed');
+  assert.equal(tracker.getTask('completed-live').terminal_summary, 'successful output');
+  assert.equal(tracker.getTask('running-live').status, 'interrupted');
   assert.deepEqual(tracker.activeTasks(), []);
 });
