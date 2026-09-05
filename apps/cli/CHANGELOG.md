@@ -1,5 +1,11 @@
 # ccem
 
+## 2.79.0
+
+### Minor Changes
+
+- Desktop inbox and draft lifecycle hardening, recently-active session promotion, and GLM preset refresh to glm-5.3.
+
 ## 2.78.2
 
 ### Patch Changes
