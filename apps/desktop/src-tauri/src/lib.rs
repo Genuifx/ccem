@@ -26,6 +26,8 @@ mod interactive_runtime;
 mod ipc_isolation_tests;
 mod jsonl_watcher;
 mod native_event_log;
+#[cfg(target_os = "macos")]
+mod native_execution_domain;
 mod native_helper_resource;
 mod native_input_queue;
 mod native_runtime;

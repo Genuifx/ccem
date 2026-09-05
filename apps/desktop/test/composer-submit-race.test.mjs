@@ -20,23 +20,8 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test('composer submit reads live DOM text and attachment ref to avoid paste/submit races', async () => {
-  const source = await readComposerSource();
-  const submitBlock = sliceBetween(source, 'const runComposerSubmit = useCallback', 'const handleComposerSubmit = useCallback');
-
-  assert.match(
-    submitBlock,
-    /promptAreaRef\.current\?\.getPlainText\(\) \?\? segmentsToPlainText\(composerSegments\)/,
-  );
-  assert.match(submitBlock, /const currentAttachments = attachmentsRef\.current;/);
-  assert.match(submitBlock, /let text = ensureComposerImagePlaceholders\(promptValue, currentAttachments\);/);
-  assert.match(
-    submitBlock,
-    /let displayText = ensureComposerImagePlaceholders\(buildComposerDisplayText\(promptValue\), currentAttachments\);/,
-  );
-  assert.match(submitBlock, /attachments: currentAttachments,/);
-  assert.match(submitBlock, /revokeComposerImageUrls\(currentAttachments\);/);
-});
+// Live structured snapshot, payload ownership, and same-batch input+submit
+// races are covered with real DOM behavior in composer-admission-dom.test.mjs.
 
 // Successful cleanup (including slow ACK edits and rich payload ownership) is
 // exercised through the actual PromptArea DOM in composer-admission-dom.test.mjs.

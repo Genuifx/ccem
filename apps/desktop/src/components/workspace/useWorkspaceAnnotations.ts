@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   MAX_WORKSPACE_ANNOTATIONS,
   MAX_WORKSPACE_ANNOTATION_NOTE_CHARS,
@@ -58,11 +58,11 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     items: readAnnotations(sessionKey),
   }));
 
+  const stateRef = useRef(state);
   useEffect(() => {
-    setState({
-      sessionKey,
-      items: readAnnotations(sessionKey),
-    });
+    const next = { sessionKey, items: readAnnotations(sessionKey) };
+    stateRef.current = next;
+    setState(next);
   }, [sessionKey]);
 
   const annotations = state.sessionKey === sessionKey ? state.items : [];
@@ -83,17 +83,22 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
   const updateItems = useCallback((
     updater: (items: WorkspaceAnnotation[]) => WorkspaceAnnotation[],
   ) => {
-    if (!sessionKey) {
-      return;
+    if (!sessionKey) return false;
+    // Commit against the latest synchronous state, including earlier restores
+    // in this event batch. Normalization must never evict current user input.
+    const current = stateRef.current.sessionKey === sessionKey
+      ? stateRef.current.items : readAnnotations(sessionKey);
+    const candidate = updater(current);
+    if (candidate.length > MAX_WORKSPACE_ANNOTATIONS
+      || candidate.reduce((total, item) => total + item.quote.length + item.note.length, 0) > MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS) {
+      return false;
     }
-    setState((previous) => {
-      const current = previous.sessionKey === sessionKey
-        ? previous.items
-        : readAnnotations(sessionKey);
-      const items = normalizeStoredWorkspaceAnnotations(updater(current));
-      writeAnnotations(sessionKey, items);
-      return { sessionKey, items };
-    });
+    const items = normalizeStoredWorkspaceAnnotations(candidate);
+    const next = { sessionKey, items };
+    stateRef.current = next;
+    writeAnnotations(sessionKey, items);
+    setState(next);
+    return true;
   }, [sessionKey]);
 
   const addAnnotation = useCallback((
@@ -113,14 +118,13 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
       return false;
     }
 
-    updateItems((items) => [...items, {
+    return updateItems((items) => [...items, {
       id: createAnnotationId(),
       quote: normalizedQuote,
       note: normalizedNote,
       createdAt: new Date().toISOString(),
       ...(anchor ? { anchor } : {}),
     }]);
-    return true;
   }, [annotationCharCount, annotations.length, updateItems]);
 
   const updateAnnotation = useCallback((id: string, note: string): boolean => {
@@ -133,10 +137,9 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     if (nextCharCount > MAX_WORKSPACE_ANNOTATION_TOTAL_CHARS) {
       return false;
     }
-    updateItems((items) => items.map((item) => (
+    return updateItems((items) => items.map((item) => (
       item.id === id ? { ...item, note: normalizedNote } : item
     )));
-    return true;
   }, [annotationCharCount, annotations, updateItems]);
 
   const removeAnnotation = useCallback((id: string) => {
@@ -159,10 +162,14 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
   }, [updateItems]);
 
   const restoreAnnotations = useCallback((submitted: WorkspaceAnnotation[]) => {
-    updateItems((items) => {
+    return updateItems((items) => {
       const restored = [...items];
       for (const sent of submitted) {
-        if (restored.some((item) => !item.sentAt && item.quote === sent.quote && item.note === sent.note)) continue;
+        if (restored.some((item) => !item.sentAt && item.quote === sent.quote && item.note === sent.note
+          && item.anchor?.startItemKey === sent.anchor?.startItemKey
+          && item.anchor?.startOffset === sent.anchor?.startOffset
+          && item.anchor?.endItemKey === sent.anchor?.endItemKey
+          && item.anchor?.endOffset === sent.anchor?.endOffset)) continue;
         restored.push({ ...sent, id: createAnnotationId(), sentAt: undefined });
       }
       return restored;

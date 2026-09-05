@@ -4402,13 +4402,16 @@ async function runQueuedTurns() {
       activeTurn = false;
       currentAbortController = null;
     }
-    if (pendingSettings) {
+    if (pendingSettings && !stopped) {
       const hadEnvVars = pendingSettings.envVars !== undefined;
       applyPendingSettingsToInitCommand();
       teardownCodexSession(hadEnvVars);
       emitStatus('ready', 'Settings applied.');
     }
-    if (!stopped) {
+    if (stopped) {
+      emitStatus('closed_idle', 'Codex runtime stopped.');
+      finishClaudeRuntimeTeardown();
+    } else {
       void runQueuedTurns();
     }
   }
@@ -5389,8 +5392,12 @@ async function handleCommand(command: InputCommand) {
     // Tear down sessions so the next prompt starts a fresh turn.
     teardownCodexSession(false);
     if (runtimeTeardown) {
-      emitStatus('closed_idle', 'Codex runtime stopped.');
-      finishClaudeRuntimeTeardown();
+      // Full Stop closes only after the SDK run and its finally have settled.
+      // The Desktop manager separately verifies the owned OS execution domain.
+      if (!activeTurn) {
+        emitStatus('closed_idle', 'Codex runtime stopped.');
+        finishClaudeRuntimeTeardown();
+      }
     } else {
       stopped = false;
       emitStatus(activeTurn ? 'processing' : 'ready', activeTurn

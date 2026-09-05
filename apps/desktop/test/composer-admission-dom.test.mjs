@@ -154,6 +154,9 @@ async function importHarness() {
     if (ts.isJsxAttribute(node) && ['primaryActionLabel', 'primaryActionDisabled', 'onPrimaryAction'].includes(node.name.getText(ast))) {
       primaryProps[node.name.getText(ast)] = node.initializer.expression.getText(ast);
     }
+    if (ts.isJsxExpression(node) && node.expression?.getText(ast).startsWith("hasComposerInput && session.provider !== 'claude' && canStopForeground")) {
+      primaryProps.secondaryStop = node.expression.getText(ast);
+    }
     ts.forEachChild(node, visit);
   }
   visit(ast);
@@ -170,6 +173,8 @@ async function importHarness() {
         import { selectNativeSessionProcessing } from '@/components/workspace/workspaceNativeSessionProjection';
         import { shouldTreatNativeSessionAsProcessing } from '@/components/workspace/workspaceEventTranscript';
         import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
+        import { Button } from '@/components/ui/button';
+        const ProcessingActionIcon = () => <span>stop</span>;
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
 
         export function renderNativeQueuedComposer() {
@@ -255,12 +260,13 @@ async function importHarness() {
               submitLabel="send message" placeholder="provider draft"
               primaryActionLabel={${primaryProps.primaryActionLabel}}
               primaryActionDisabled={${primaryProps.primaryActionDisabled}}
-              onPrimaryAction={${primaryProps.onPrimaryAction}} />;
+              onPrimaryAction={${primaryProps.onPrimaryAction}} secondaryActions={${primaryProps.secondaryStop}} />;
           }
           const root = createRoot(container);
           act(() => root.render(<Harness />));
           return {
             state,
+            async clickSend() { await act(async () => container.querySelector('button[aria-label="workspace.composeSend"]').click()); },
             async stop() { await act(async () => container.querySelector('button[aria-label="workspace.nativeStop"]').click()); },
             typeText(text) { act(() => { const editor = container.querySelector('[contenteditable="true"]'); editor.textContent = text; editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })); }); },
             async enter() { await act(async () => { container.querySelector('[contenteditable="true"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await Promise.resolve(); }); },
@@ -274,7 +280,13 @@ async function importHarness() {
             const [revision, setRevision] = useState(0);
             const annotationModel = useWorkspaceAnnotations('admission-test');
             state.annotations = annotationModel;
-            state.addAnnotation = (quote, note) => act(() => annotationModel.addAnnotation(quote, note));
+            state.addAnnotation = (quote, note, anchor) => act(() => annotationModel.addAnnotation(quote, note, anchor));
+            state.restoreTwice = (first, second) => {
+              let results;
+              act(() => { results = [annotationModel.restoreAnnotations(first), annotationModel.restoreAnnotations(second)]; });
+              return results;
+            };
+            state.removeAnnotation = id => act(() => annotationModel.removeAnnotation(id));
             state.editAnnotation = (id, note) => act(() => annotationModel.updateAnnotation(id, note));
             const isSending = false;
             const composerTextRef = { current: 'valuable follow-up draft' };
@@ -358,6 +370,28 @@ async function importHarness() {
                 editor().dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
               });
             },
+            appendText(text) {
+              act(() => {
+                editor().appendChild(document.createTextNode(text));
+                editor().dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+              });
+            },
+            async appendAndSubmitSameTick(text) {
+              await act(async () => {
+                editor().appendChild(document.createTextNode(text));
+                editor().dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+                container.querySelector('button[aria-label="send message"]').click();
+                await Promise.resolve(); await Promise.resolve();
+              });
+            },
+            async typeAndSubmitSameTick(text) {
+              await act(async () => {
+                editor().textContent = text;
+                editor().dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+                container.querySelector('button[aria-label="send message"]').click();
+                await Promise.resolve(); await Promise.resolve();
+              });
+            },
             async pasteText(text) {
               await act(async () => {
                 const event = new Event('paste', { bubbles: true, cancelable: true });
@@ -377,6 +411,8 @@ async function importHarness() {
               });
             },
             removeFirstAttachment() { act(() => container.querySelector('button[aria-label="workspace.composerRemoveAttachment"]').click()); },
+            recoverAllSameTick() { act(() => { for (const button of container.querySelectorAll('[data-composer-rejected-draft] button')) button.click(); }); },
+            recoverTwiceSameTick() { act(() => { const button = container.querySelector('[data-composer-rejected-draft] button'); button.click(); button.click(); }); },
             recover() { act(() => container.querySelector('[data-composer-rejected-draft] button').click()); },
             text() { return editor().textContent; },
             state,
@@ -896,4 +932,236 @@ test('accepted attention reply keeps new draft and cannot become retryable on re
   assert.equal(mounted.state.optimistic.length, 1);
   assert.equal(container.querySelector('[data-composer-rejected-draft]'), null);
   mounted.unmount();
+});
+
+test('independent acceptance: restoring rejected annotations never overwrites a newer note at the supported limit', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  for (let i = 0; i < 20; i++) mounted.state.addAnnotation('quote ' + i, 'original note ' + i);
+  assert.equal(mounted.state.annotations.pendingAnnotations.length, 20);
+  const editedId = mounted.state.annotations.pendingAnnotations[0].id;
+  await mounted.submit();
+  mounted.state.editAnnotation(editedId, 'NEW UNSENT NOTE');
+  await mounted.reject();
+  assert.equal(mounted.state.annotations.pendingAnnotations.find(a => a.id === editedId).note, 'NEW UNSENT NOTE');
+  mounted.recover();
+  const pending = mounted.state.annotations.pendingAnnotations;
+  console.log(JSON.stringify({finding:'annotation_recovery_at_limit', pendingNotes:pending.map(a=>a.note), recoveryRows:container.querySelectorAll('[data-composer-rejected-draft]').length}));
+  assert.ok(pending.some(a => a.note === 'NEW UNSENT NOTE'), 'new unsent annotation must survive restoring its older rejected version');
+  assert.equal(pending.length, 20);
+  assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 1);
+  assert.match(container.querySelector('[role="alert"]').textContent, /composerRecoveryLimit/);
+});
+
+test('independent acceptance: running Codex does not present an enabled Send action that silently does nothing', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountProvider(container);
+  t.after(() => { mounted.unmount(); restore(); });
+  mounted.typeText('next Codex prompt');
+  const send = container.querySelector('button[aria-label="workspace.composeSend"]');
+  const stop = container.querySelector('button[aria-label="workspace.nativeStop"]');
+  assert.ok(send);
+  await mounted.clickSend();
+  await mounted.enter();
+  console.log(JSON.stringify({finding:'busy_codex_noop_send', sendDisabled:send.disabled, hasStop:Boolean(stop), sends:mounted.state.sends, draft:container.querySelector('[contenteditable="true"]').textContent}));
+  assert.equal(send.disabled, true, 'unsupported busy submit must not be offered as enabled Send');
+  assert.ok(stop && !stop.disabled, 'Stop must remain available while drafting');
+  await mounted.stop();
+  assert.equal(mounted.state.stops.length, 1);
+});
+
+test('independent acceptance: ACK does not leave visible image chips with no corresponding unsent payload', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  await mounted.pasteImage('submitted-A.png');
+  await mounted.submit();
+  const originalImage = mounted.state.payloads[0].attachments[0];
+  mounted.appendText(' follow-up B about this image');
+  await mounted.resolve();
+  const afterAck = mounted.text();
+  await mounted.submit();
+  const second = mounted.state.payloads[1];
+  console.log(JSON.stringify({finding:'image_reference_after_ack', afterAck, secondText:second.text, secondAttachments:second.attachments.map(a => a.id), previousImagePlaceholder:originalImage.placeholder}));
+  await mounted.resolve();
+  assert.ok(!second.text.includes(originalImage.placeholder) || second.attachments.some(a=>a.id===originalImage.id), 'visible image reference must either remain backed by its image payload or be consumed with the submitted draft');
+});
+
+test('independent acceptance: rejected snapshot preserves live DOM text in input-submit same tick', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  await mounted.typeAndSubmitSameTick('EXACT_SUBMITTED_A');
+  assert.equal(mounted.state.payloads[0].text, 'EXACT_SUBMITTED_A');
+  mounted.typeText('NEW_B');
+  await mounted.reject();
+  const recoveryPreview = container.querySelector('[data-composer-rejected-draft]').textContent;
+  mounted.recover();
+  console.log(JSON.stringify({finding:'live_dom_rejected_snapshot', submitted:mounted.state.payloads[0].text, recoveryPreview, recoveredText:mounted.text()}));
+  assert.ok(mounted.text().includes('EXACT_SUBMITTED_A'), 'recovery must contain the actual submitted text, not a stale React render');
+});
+
+for (const limit of ['count', 'chars']) {
+  test(`recovery ${limit} capacity is transactional and retryable after making room`, async (t) => {
+    const { container, restore } = installDom();
+    const harness = await (importedHarnessPromise ??= importHarness());
+    const mounted = harness.mountFailure(container, true);
+    t.after(() => { mounted.unmount(); restore(); });
+    const count = limit === 'count' ? 19 : 4;
+    for (let i = 0; i < count; i++) mounted.state.addAnnotation(
+      limit === 'count' ? `quote ${i}` : `${i}${'q'.repeat(9999)}`,
+      limit === 'count' ? `original ${i}` : 'o'.repeat(1000),
+    );
+    const editedId = mounted.state.annotations.pendingAnnotations[0].id;
+    await mounted.pasteText('A attachment\n'.repeat(100));
+    await mounted.submit();
+    mounted.state.editAnnotation(editedId, limit === 'count' ? 'NEW' : 'N'.repeat(1000));
+    mounted.state.addAnnotation(limit === 'count' ? 'new extra quote' : 'b'.repeat(12000), limit === 'count' ? 'new extra note' : 'b'.repeat(4000));
+    const extraId = mounted.state.annotations.pendingAnnotations.at(-1).id;
+    mounted.typeText('current B');
+    await mounted.reject();
+    const before = structuredClone(mounted.state.annotations.annotations);
+    mounted.recover();
+    assert.deepEqual(mounted.state.annotations.annotations, before, 'failed recovery must mutate no annotations');
+    assert.equal(mounted.text(), 'current B', 'failed recovery must mutate no editor content');
+    assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 1);
+    mounted.state.removeAnnotation(extraId);
+    mounted.recover();
+    assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
+    assert.equal(container.querySelector('[role="alert"]'), null);
+    assert.ok(mounted.state.annotations.pendingAnnotations.some(a => a.id === editedId && a.note.startsWith('N')));
+    assert.ok(mounted.state.annotations.pendingAnnotations.some(a => a.note === (limit === 'count' ? 'original 0' : 'o'.repeat(1000))));
+    assert.match(mounted.text(), /current B/);
+    assert.match(mounted.text(), /valuable follow-up draft/);
+    await mounted.submit();
+    assert.equal(mounted.state.payloads[1].attachments.length, 1);
+    await mounted.resolve();
+  });
+}
+
+test('two annotation restores in one React batch share capacity and cannot evict existing input', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  for (let i = 0; i < 19; i++) mounted.state.addAnnotation(`quote ${i}`, `note ${i}`);
+  const snapshot = note => [{ id: note, quote: note, note, createdAt: new Date().toISOString() }];
+  assert.deepEqual(mounted.state.restoreTwice(snapshot('first'), snapshot('second')), [true, false]);
+  assert.equal(mounted.state.annotations.annotations.length, 20);
+  assert.ok(mounted.state.annotations.annotations.some(a => a.note === 'note 0'));
+  assert.ok(mounted.state.annotations.annotations.some(a => a.note === 'first'));
+  assert.equal(mounted.state.annotations.annotations.some(a => a.note === 'second'), false);
+});
+
+test('same-tick structured submission recovers its image chip and exact appended text', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  await mounted.pasteImage('A.png');
+  await mounted.appendAndSubmitSameTick('EXACT_SAME_TICK');
+  const first = mounted.state.payloads[0];
+  mounted.typeText('NEW B');
+  await mounted.reject();
+  mounted.recover();
+  await mounted.submit();
+  const second = mounted.state.payloads[1];
+  assert.match(second.text, /EXACT_SAME_TICK/);
+  assert.match(second.text, /NEW B/);
+  assert.equal(second.attachments.length, 1);
+  assert.equal(second.attachments[0].id, first.attachments[0].id);
+  assert.ok(second.text.includes(second.attachments[0].placeholder));
+  await mounted.resolve();
+});
+
+test('retained image after ACK reserves its placeholder and remains consistent with a newly pasted image', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  await mounted.pasteImage('A.png');
+  await mounted.submit();
+  mounted.appendText('follow-up');
+  await mounted.resolve();
+  await mounted.pasteImage('B.png');
+  await mounted.submit();
+  const images = mounted.state.payloads[1].attachments;
+  assert.equal(images.length, 2);
+  assert.equal(new Set(images.map(image => image.placeholder)).size, 2);
+  for (const image of images) assert.ok(mounted.state.payloads[1].text.includes(image.placeholder));
+  await mounted.resolve();
+});
+
+test('recovering distinct snapshots in the same batch preserves both and consumes each row once', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  await mounted.submit();
+  mounted.typeText('SECOND_REJECT');
+  await mounted.reject();
+  await mounted.submit();
+  mounted.typeText('CURRENT_THIRD');
+  await mounted.reject();
+  mounted.recoverAllSameTick();
+  assert.match(mounted.text(), /CURRENT_THIRD/);
+  assert.match(mounted.text(), /SECOND_REJECT/);
+  assert.match(mounted.text(), /valuable follow-up draft/);
+  assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
+});
+
+test('double-click recovery cannot duplicate a rejected draft', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  await mounted.submit();
+  mounted.typeText('CURRENT_B');
+  await mounted.reject();
+  mounted.recoverTwiceSameTick();
+  assert.equal(mounted.text().split('valuable follow-up draft').length - 1, 1);
+  assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
+});
+
+ test('independent review: distinct annotation anchors survive one recovery transaction', async (t) => {
+  const {container,restore}=installDom();
+  const harness=await (importedHarnessPromise ??= importHarness());
+  const mounted=harness.mountFailure(container,true);
+  t.after(()=>{mounted.unmount();restore();});
+  const anchor=key=>({startItemKey:key,startOffset:0,endItemKey:key,endOffset:25});
+  mounted.state.addAnnotation('same repeated source text','check this',anchor('message-a'));
+  mounted.state.addAnnotation('same repeated source text','check this',anchor('message-b'));
+  assert.equal(mounted.state.annotations.pendingAnnotations.length,2);
+  await mounted.submit();
+  for (const item of [...mounted.state.annotations.pendingAnnotations]) mounted.state.removeAnnotation(item.id);
+  mounted.typeText('New current B');
+  await mounted.reject();
+  assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length,1);
+  mounted.recover();
+  console.log(JSON.stringify({independent:'distinct-anchor-recovery',actual:mounted.state.annotations.pendingAnnotations,rows:container.querySelectorAll('[data-composer-rejected-draft]').length}));
+  assert.equal(mounted.state.annotations.pendingAnnotations.length,2,'two separate highlights must not collapse solely because quote/note match');
+ });
+
+test('recovery distinguishes same-message offsets and deduplicates an already-restored anchored version', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { mounted.unmount(); restore(); });
+  const anchor = offset => ({ startItemKey: 'same-message', startOffset: offset, endItemKey: 'same-message', endOffset: offset + 4 });
+  mounted.state.addAnnotation('same', 'note', anchor(0));
+  mounted.state.addAnnotation('same', 'note', anchor(10));
+  const original = structuredClone(mounted.state.annotations.pendingAnnotations);
+  mounted.state.editAnnotation(original[0].id, 'new note');
+  const result = mounted.state.restoreTwice(original, original);
+  assert.deepEqual(result, [true, true]);
+  const pending = mounted.state.annotations.pendingAnnotations;
+  assert.equal(pending.length, 3, 'edited original plus the two distinct original anchored versions');
+  assert.equal(pending.filter(a => a.note === 'note' && a.anchor.startOffset === 0).length, 1);
+  assert.equal(pending.filter(a => a.note === 'note' && a.anchor.startOffset === 10).length, 1);
+  assert.equal(pending.filter(a => a.note === 'new note').length, 1);
 });

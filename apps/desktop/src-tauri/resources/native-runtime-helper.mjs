@@ -46652,13 +46652,16 @@ async function runQueuedTurns() {
       activeTurn = false;
       currentAbortController = null;
     }
-    if (pendingSettings) {
+    if (pendingSettings && !stopped) {
       const hadEnvVars = pendingSettings.envVars !== void 0;
       applyPendingSettingsToInitCommand();
       teardownCodexSession(hadEnvVars);
       emitStatus("ready", "Settings applied.");
     }
-    if (!stopped) {
+    if (stopped) {
+      emitStatus("closed_idle", "Codex runtime stopped.");
+      finishClaudeRuntimeTeardown();
+    } else {
       void runQueuedTurns();
     }
   }
@@ -47500,8 +47503,10 @@ async function handleCommand(command) {
     currentAbortController?.abort();
     teardownCodexSession(false);
     if (runtimeTeardown) {
-      emitStatus("closed_idle", "Codex runtime stopped.");
-      finishClaudeRuntimeTeardown();
+      if (!activeTurn) {
+        emitStatus("closed_idle", "Codex runtime stopped.");
+        finishClaudeRuntimeTeardown();
+      }
     } else {
       stopped = false;
       emitStatus(activeTurn ? "processing" : "ready", activeTurn ? "Waiting for interrupted Codex turn to settle." : "Turn interrupted. Ready for the next prompt.");

@@ -1533,6 +1533,8 @@ impl Drop for NativeHelperChild {
 struct NativeProcessTree {
     process_group_id: i32,
     terminated: Mutex<bool>,
+    #[cfg(target_os = "macos")]
+    execution_domain: crate::native_execution_domain::NativeExecutionDomain,
 }
 
 fn terminate_process_tree_once(
@@ -1573,11 +1575,17 @@ impl NativeProcessTree {
         Ok(Self {
             process_group_id,
             terminated: Mutex::new(false),
+            #[cfg(target_os = "macos")]
+            execution_domain: crate::native_execution_domain::NativeExecutionDomain::attach(root_pid)?,
         })
     }
 
     fn kill(&self) -> Result<(), String> {
         terminate_process_tree_once(&self.terminated, || {
+            #[cfg(target_os = "macos")]
+            return self.execution_domain.kill();
+            #[cfg(not(target_os = "macos"))]
+            {
             if self.process_group_id <= 1 {
                 return Err("Refusing to kill an invalid native helper process group".to_string());
             }
@@ -1591,6 +1599,7 @@ impl NativeProcessTree {
                     "Failed to kill native helper process group {}: {error}",
                     self.process_group_id
                 ))
+            }
             }
         })
     }
@@ -3571,6 +3580,7 @@ impl NativeRuntimeManager {
                 }
             };
 
+            let before_delivery = self.lifecycle.projection(runtime_id);
             let dispatch = deliver(
                 &dispatch_parts.text,
                 dispatch_parts.display_text.as_deref(),
@@ -3653,7 +3663,25 @@ impl NativeRuntimeManager {
                         &client_message_id,
                         dispatch_attempt,
                     );
+                    // A terminal/settings ACK can request a drain while this
+                    // definitely-unsent head is still Dispatching. That drain
+                    // sees the claim and returns. Recheck after releasing it,
+                    // before our own queue revision bump, to consume that wakeup.
+                    // Retry only on new coordinator progress and current readiness;
+                    // unchanged blockers and uncertain writes must never spin/replay.
+                    let after_release = self.lifecycle.projection(runtime_id);
+                    let blocker_cleared = (error.starts_with("NATIVE_SESSION_BUSY:")
+                        || error.starts_with("SETTINGS_STALE:"))
+                        && before_delivery.as_ref().zip(after_release.as_ref()).is_some_and(
+                            |(before, after)| after.state_revision > before.state_revision
+                                && after.adapter == AdapterKind::FullLifecycle.as_str()
+                                && after.active_command_id.is_none()
+                                && !after.settings_pending,
+                        );
                     self.lifecycle.note_queue_changed(runtime_id);
+                    if blocker_cleared {
+                        continue;
+                    }
                     if error.starts_with("NATIVE_SESSION_BUSY:")
                         || error.starts_with("DELIVERY_UNCERTAIN:")
                         || error.starts_with("SETTINGS_STALE:")
@@ -6420,6 +6448,9 @@ impl NativeRuntimeManager {
             };
         }
 
+        // Do not report completion or retire the generation if owned tools
+        // could not be quiesced. The caller must see the stop failure.
+        let stop_handle = self.request_child_stop(runtime_id, false)?;
         if let Err(error) = self.append_event(
             runtime_id,
             SessionEventPayload::SessionCompleted {
@@ -6428,13 +6459,6 @@ impl NativeRuntimeManager {
         ) {
             errors.push(error);
         }
-        let stop_handle = match self.request_child_stop(runtime_id, false) {
-            Ok(handle) => handle,
-            Err(error) => {
-                errors.push(error);
-                None
-            }
-        };
         if let Some(handle) = stop_handle {
             if let Err(error) = self.update_record(runtime_id, |record| {
                 record.status = "interrupted".to_string();
@@ -8162,6 +8186,22 @@ impl NativeRuntimeManager {
         let output: HelperOutputEvent = serde_json::from_str(line)
             .map_err(|error| format!("Failed to parse helper event JSON: {}", error))?;
 
+        #[cfg(target_os = "macos")]
+        if matches!(&output, HelperOutputEvent::SessionMeta { .. })
+            || matches!(&output, HelperOutputEvent::Event { payload } if payload.get("type").and_then(Value::as_str) == Some("tool_use_started")
+                || (payload.get("type").and_then(Value::as_str) == Some("lifecycle") && payload.get("stage").and_then(Value::as_str) == Some("turn_started")))
+        {
+            let tree = self.handles.lock().ok()
+                .and_then(|handles| handles.get(runtime_id).filter(|h| h.generation == helper_incarnation).cloned())
+                .and_then(|handle| handle.child.lock().ok()
+                    .and_then(|child| child.as_ref().map(|c| Arc::clone(&c.process_tree))));
+            if let Some(tree) = tree {
+                // Retain provider ancestry before it can exit/reparent tools.
+                // Stop still does its own checked snapshot; this is not a drain.
+                tree.execution_domain.observe_lineage()?;
+            }
+        }
+
         match output {
             HelperOutputEvent::SessionMeta {
                 provider_session_id,
@@ -9131,6 +9171,16 @@ impl NativeRuntimeManager {
             return Ok(None);
         };
 
+        // Codex tools use independent process groups. Capture/quiesce them
+        // before Stop aborts the provider and destroys their parent lineage.
+        #[cfg(target_os = "macos")]
+        let resume_helper_after_stop = {
+            let tree = handle.child.lock()
+                .map_err(|_| "Native sidecar child mutex poisoned during stop")?
+                .as_ref().map(|child| Arc::clone(&child.process_tree));
+            tree.map(|tree| tree.execution_domain.prepare_stop()).transpose()?
+        };
+
         handle.alive.store(false, Ordering::SeqCst);
         let has_child = match handle.child.lock() {
             Ok(child) => child.is_some(),
@@ -9143,7 +9193,7 @@ impl NativeRuntimeManager {
             return Ok(None);
         }
 
-        match self.write_to_child(
+        let result = match self.write_to_child(
             &handle,
             &HelperInputCommand::Stop {
                 force_background_tasks,
@@ -9177,7 +9227,10 @@ impl NativeRuntimeManager {
                 );
                 Ok(None)
             }
-        }
+        };
+        #[cfg(target_os = "macos")]
+        if let Some(resume) = resume_helper_after_stop { resume.resume()?; }
+        result
     }
 
     fn request_child_prepare_stop(
@@ -18197,6 +18250,228 @@ wait"#,
             .lock()
             .expect("handles")
             .contains_key(runtime_id));
+    }
+
+    fn assert_fifo_wakeup_survives_claimed_head(settings: bool, late_blocker: bool) {
+        let runtime_id = if settings {
+            "fifo-settings-wakeup"
+        } else {
+            "fifo-terminal-wakeup"
+        };
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let generation = manager.handles.lock().unwrap()[runtime_id].generation;
+        manager.lifecycle.note_incarnation(runtime_id, generation);
+        manager.lifecycle.note_session_meta(
+            runtime_id,
+            generation,
+            Some("wakeup-conversation"),
+            Some(&["msg_lifecycle_v1".to_owned()]),
+            Some(1),
+        );
+        let start_blocker = || {
+            if settings {
+                manager
+                    .lifecycle
+                    .begin_settings_op(runtime_id, generation, "settings-a")
+                    .unwrap();
+            } else {
+                manager
+                    .lifecycle
+                    .admit_prompt_with_id(runtime_id, generation, "active-a")
+                    .unwrap();
+                manager
+                    .lifecycle
+                    .note_command_admitted(runtime_id, generation, "active-a", 1);
+            }
+        };
+        if !late_blocker {
+            start_blocker();
+        }
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("pending-b", "B", None, None, None),
+                None,
+            )
+            .unwrap();
+        let mut attempts = 0;
+        let mut writes = 0;
+        manager.dispatch_queued_with(runtime_id, super::QueueDispatchTrigger::VisibleUserAction,
+            |text, _, _, _, command, attempt| {
+                attempts += 1;
+                assert!(attempts <= 2, "retry must be driven by progress, never a busy loop");
+                assert_eq!(text, "B");
+                if attempts == 1 {
+                    if late_blocker { start_blocker(); }
+                    let blocked = manager.lifecycle.admit_queued_prompt(runtime_id, generation, command, attempt).unwrap_err();
+                    if settings {
+                        assert!(matches!(blocked, crate::native_session_coordinator::AdmissionError::SettingsPending {..}));
+                        manager.lifecycle.note_settings_ack(runtime_id, generation, Some("settings-a"), "applied", Some(1));
+                    } else {
+                        assert!(matches!(blocked, crate::native_session_coordinator::AdmissionError::Busy {..}));
+                        manager.process_helper_stdout(runtime_id,
+                            r#"{"type":"event","payload":{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"active-a","query_generation":1}}"#).unwrap();
+                    }
+                    // Deterministically run the authoritative drain at the lost-
+                    // wakeup boundary, before the original driver releases B.
+                    manager.dispatch_queued_with(runtime_id, super::QueueDispatchTrigger::AuthoritativeLifecycle,
+                        |_, _, _, _, _, _| panic!("B remains claimed by the first driver")).unwrap();
+                    return Err(blocked.to_message());
+                }
+                manager.lifecycle.admit_queued_prompt(runtime_id, generation, command, attempt).unwrap();
+                writes += 1;
+                manager.process_helper_stdout(runtime_id, &format!(r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"received","command_id":"{command}","query_generation":1}}}}"#)).unwrap();
+                manager.process_helper_stdout(runtime_id, &format!(r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"{command}","query_generation":1}}}}"#)).unwrap();
+                Ok(())
+            }).unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(writes, 1, "only definitely-unsent B is retried once");
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        let projection = manager.lifecycle.projection(runtime_id).unwrap();
+        assert!(projection.active_command_id.is_none() && !projection.settings_pending);
+        assert_eq!(manager.replay_events(runtime_id, None).unwrap().events.iter().filter(|event|
+            matches!(&event.payload, SessionEventPayload::UserPrompt {client_message_id, ..} if client_message_id.as_deref() == Some("pending-b"))).count(), 1);
+    }
+
+    #[test]
+    fn fifo_terminal_wakeup_racing_busy_release_dispatches_tail_once() {
+        assert_fifo_wakeup_survives_claimed_head(false, false);
+    }
+
+    #[test]
+    fn fifo_settings_applied_wakeup_racing_release_dispatches_tail_once() {
+        assert_fifo_wakeup_survives_claimed_head(true, false);
+    }
+
+    #[test]
+    fn fifo_blocker_started_after_delivery_snapshot_still_preserves_wakeup() {
+        assert_fifo_wakeup_survives_claimed_head(false, true);
+        assert_fifo_wakeup_survives_claimed_head(true, true);
+    }
+
+    #[test]
+    fn fifo_unchanged_or_uncertain_blockers_never_hot_retry() {
+        for blocker in ["busy", "settings", "uncertain"] {
+            let runtime_id = format!("fifo-no-spin-{blocker}");
+            let manager = Arc::new(manager_with_handle(&runtime_id));
+            let generation = manager.handles.lock().unwrap()[&runtime_id].generation;
+            manager.lifecycle.note_incarnation(&runtime_id, generation);
+            manager.lifecycle.note_session_meta(
+                &runtime_id,
+                generation,
+                Some("no-spin-conversation"),
+                Some(&["msg_lifecycle_v1".to_owned()]),
+                Some(1),
+            );
+            if blocker == "settings" {
+                manager
+                    .lifecycle
+                    .begin_settings_op(&runtime_id, generation, "settings-a")
+                    .unwrap();
+            } else {
+                manager
+                    .lifecycle
+                    .admit_prompt_with_id(&runtime_id, generation, "active-a")
+                    .unwrap();
+                if blocker == "uncertain" {
+                    manager.lifecycle.mark_delivery_uncertain(
+                        &runtime_id,
+                        generation,
+                        "active-a",
+                        "lost ACK",
+                    );
+                }
+            }
+            manager
+                .input_queue
+                .enqueue(
+                    &runtime_id,
+                    FrozenNativeInputBatch::new("pending-b", "B", None, None, None),
+                    None,
+                )
+                .unwrap();
+            let mut attempts = 0;
+            manager
+                .dispatch_queued_with(
+                    &runtime_id,
+                    super::QueueDispatchTrigger::VisibleUserAction,
+                    |_, _, _, _, command, attempt| {
+                        attempts += 1;
+                        assert_eq!(attempts, 1, "unchanged or uncertain blockers must not loop");
+                        Err(manager
+                            .lifecycle
+                            .admit_queued_prompt(&runtime_id, generation, command, attempt)
+                            .unwrap_err()
+                            .to_message())
+                    },
+                )
+                .unwrap();
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                manager
+                    .input_queue
+                    .peek(&runtime_id)
+                    .unwrap()
+                    .delivery_state(),
+                crate::native_input_queue::QueuedInputDeliveryState::Pending
+            );
+        }
+    }
+
+    #[test]
+    fn fifo_uncertain_current_delivery_is_not_retried_after_other_revision_changes() {
+        let runtime_id = "fifo-uncertain-current";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let generation = manager.handles.lock().unwrap()[runtime_id].generation;
+        manager.lifecycle.note_incarnation(runtime_id, generation);
+        manager.lifecycle.note_session_meta(
+            runtime_id,
+            generation,
+            Some("uncertain-conversation"),
+            Some(&["msg_lifecycle_v1".to_owned()]),
+            Some(1),
+        );
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("pending-b", "B", None, None, None),
+                None,
+            )
+            .unwrap();
+        let mut writes = 0;
+        manager
+            .dispatch_queued_with(
+                runtime_id,
+                super::QueueDispatchTrigger::VisibleUserAction,
+                |_, _, _, _, command, attempt| {
+                    writes += 1;
+                    assert_eq!(writes, 1, "possibly-written command must never replay");
+                    manager
+                        .lifecycle
+                        .admit_queued_prompt(runtime_id, generation, command, attempt)
+                        .unwrap();
+                    manager.lifecycle.mark_delivery_uncertain(
+                        runtime_id,
+                        generation,
+                        command,
+                        "partial pipe write",
+                    );
+                    manager.lifecycle.note_queue_changed(runtime_id);
+                    Err(format!("DELIVERY_UNCERTAIN: {command}"))
+                },
+            )
+            .unwrap();
+        assert_eq!(writes, 1);
+        assert_eq!(
+            manager
+                .input_queue
+                .peek(runtime_id)
+                .unwrap()
+                .delivery_state(),
+            crate::native_input_queue::QueuedInputDeliveryState::DeliveryUncertain
+        );
     }
 
     #[cfg(unix)]

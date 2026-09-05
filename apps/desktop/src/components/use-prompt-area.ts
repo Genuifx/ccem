@@ -1157,6 +1157,11 @@ export function usePromptArea({
         onChipAdd?.(newChip)
       },
       getPlainText: () => segmentsToPlainText(readSegmentsFromDOM()),
+      getSegments: () => readSegmentsFromDOM(),
+      setSegments: (segments) => {
+        onChange(segments)
+        renderSegmentsToDOM(segments)
+      },
       clear: () => {
         lastRenderedValue.current = []
         onChange([])

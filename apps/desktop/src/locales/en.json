@@ -641,6 +641,7 @@
     "composerImagePastedName": "Pasted image",
     "composerImageTooLarge": "Image exceeds the 10 MB size limit",
     "composerImageUnsupported": "Unsupported image format",
+    "composerRecoveryLimit": "Not enough annotation space. Remove an annotation or shorten notes, then restore again. Your rejected draft is still saved.",
     "composerRecoverRejected": "Restore unsent draft",
     "composerImageReadFailed": "Failed to read pasted image",
     "composerImagePreview": "Image preview",

@@ -191,7 +191,7 @@ interface WorkspaceSessionComposerProps {
   onRemoveAnnotation?: (id: string) => void;
   onClearAnnotations?: () => void;
   onAnnotationsSent?: (submitted: WorkspaceAnnotation[]) => void;
-  onAnnotationsRestore?: (submitted: WorkspaceAnnotation[]) => void;
+  onAnnotationsRestore?: (submitted: WorkspaceAnnotation[]) => boolean;
 }
 
 function attachmentIcon(attachment: ComposerAttachment) {
@@ -894,6 +894,8 @@ export function WorkspaceSessionComposer({
   const attachmentsRef = useRef(attachments);
   const annotationsRef = useRef(annotations);
   annotationsRef.current = annotations;
+  const recoveredDraftsRef = useRef(new WeakSet<object>());
+  const [recoveryBlocked, setRecoveryBlocked] = useState(false);
   const [rejectedDrafts, setRejectedDrafts] = useState<{ segments: Segment[]; attachments: ComposerAttachment[]; annotations: WorkspaceAnnotation[] }[]>([]);
   const [recentFiles, setRecentFiles] = useState<ComposerRecentFile[]>([]);
   const [isDragTarget, setIsDragTarget] = useState(false);
@@ -1335,9 +1337,9 @@ export function WorkspaceSessionComposer({
 
   const runComposerSubmit = useCallback(async () => {
     const submittedRevision = draftEditRevisionRef.current;
-    const submittedSegments = composerSegments;
+    const submittedSegments = promptAreaRef.current?.getSegments() ?? composerSegments;
     const submittedAnnotations = annotations.slice();
-    const promptValue = promptAreaRef.current?.getPlainText() ?? segmentsToPlainText(composerSegments);
+    const promptValue = segmentsToPlainText(submittedSegments);
     const currentAttachments = attachmentsRef.current;
     let text = ensureComposerImagePlaceholders(promptValue, currentAttachments);
     let displayText = ensureComposerImagePlaceholders(buildComposerDisplayText(promptValue), currentAttachments);
@@ -1353,8 +1355,10 @@ export function WorkspaceSessionComposer({
       }
     }
     const selectedSkillFiles = Array.from(new Set([
-      ...selectedSkillTokens
-        .filter((token) => token.path)
+      ...submittedSegments
+        .filter((segment): segment is ChipSegment => segment.type === 'chip')
+        .map(selectedTokenFromPromptChip)
+        .filter((token): token is ComposerToken => Boolean(token?.path))
         .map((token) => token.path as string),
       ...selectedSkillFilesFromComposerText(promptValue, provider, latestInstalledSkills, workspaceCommands),
     ]));
@@ -1422,8 +1426,11 @@ export function WorkspaceSessionComposer({
         promptAreaRef.current?.clear();
       }
       const submittedIds = new Set(currentAttachments.map((attachment) => attachment.id));
-      const remaining = attachmentsRef.current.filter((attachment) => !submittedIds.has(attachment.id));
-      revokeComposerImageUrls(currentAttachments);
+      const liveSegments = promptAreaRef.current?.getSegments() ?? [];
+      const remaining = attachmentsRef.current.filter((attachment) => !submittedIds.has(attachment.id)
+        || (attachment.kind === 'image' && composerSegmentsReferenceImageAttachment(liveSegments, attachment)));
+      const retainedIds = new Set(remaining.map((attachment) => attachment.id));
+      revokeComposerImageUrls(currentAttachments.filter((attachment) => !retainedIds.has(attachment.id)));
       attachmentsRef.current = remaining;
       setAttachments(remaining);
       setIsDragTarget(false);
@@ -1441,7 +1448,6 @@ export function WorkspaceSessionComposer({
     onRefreshSkills,
     onSubmit,
     provider,
-    selectedSkillTokens,
     t,
     workspaceCommands,
   ]);
@@ -1747,6 +1753,14 @@ export function WorkspaceSessionComposer({
             <div key={index} className="mb-2 flex items-center gap-2" data-composer-rejected-draft>
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{segmentsToPlainText(rejectedDraft.segments)}</span>
               <Button size="sm" variant="outline" onClick={() => {
+                if (recoveredDraftsRef.current.has(rejectedDraft)) return;
+                if (onAnnotationsRestore?.(rejectedDraft.annotations) === false) {
+                  setRecoveryBlocked(true);
+                  return;
+                }
+                recoveredDraftsRef.current.add(rejectedDraft);
+                setRecoveryBlocked(false);
+                const currentSegments = promptAreaRef.current?.getSegments() ?? composerSegments;
                 const presentIds = new Set(attachmentsRef.current.map((attachment) => attachment.id));
                 let imageIndex = getNextComposerImagePlaceholderIndex(attachmentsRef.current);
                 const restored = rejectedDraft.attachments.filter((attachment) => !presentIds.has(attachment.id))
@@ -1763,15 +1777,17 @@ export function WorkspaceSessionComposer({
                   return attachment ? { ...segment, value: attachment.placeholder, displayText: attachment.placeholder,
                     data: { ...data, placeholder: attachment.placeholder } } : segment;
                 });
-                const sameText = JSON.stringify(composerSegments) === JSON.stringify(restoredSegments);
-                syncComposerSegments(sameText ? composerSegments : [...composerSegments, { type: 'text', text: '\n\n' }, ...restoredSegments]);
+                const sameText = JSON.stringify(currentSegments) === JSON.stringify(restoredSegments);
+                const recoveredSegments: Segment[] = sameText ? currentSegments : [...currentSegments, { type: 'text', text: '\n\n' }, ...restoredSegments];
+                if (promptAreaRef.current) promptAreaRef.current.setSegments(recoveredSegments);
+                else syncComposerSegments(recoveredSegments);
                 addAttachments(restored);
-                onAnnotationsRestore?.(rejectedDraft.annotations);
-                setRejectedDrafts((previous) => previous.filter((_, itemIndex) => itemIndex !== index));
+                setRejectedDrafts((previous) => previous.filter((snapshot) => snapshot !== rejectedDraft));
               }}>{t('workspace.composerRecoverRejected')}</Button>
             </div>
           ))}
 
+          {recoveryBlocked ? <p role="alert" className="mb-2 text-xs text-destructive">{t('workspace.composerRecoveryLimit')}</p> : null}
           <div className="relative min-h-[72px]">
             <PromptArea
               ref={promptAreaRef}

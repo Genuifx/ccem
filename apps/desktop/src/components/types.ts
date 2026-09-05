@@ -295,6 +295,10 @@ export type PromptAreaHandle = {
   insertChip: (chip: Omit<ChipSegment, 'type'>) => void
   /** Get the current plain text (without chip markup) */
   getPlainText: () => string
+  /** Read structured content from the same live editor used for submission. */
+  getSegments: () => Segment[]
+  /** Replace editor content synchronously, including structured chips. */
+  setSegments: (segments: Segment[]) => void
   /** Clear all content */
   clear: () => void
 }

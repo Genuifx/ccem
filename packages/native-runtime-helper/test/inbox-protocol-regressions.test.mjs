@@ -198,3 +198,33 @@ test('resumed Codex init cannot publish ready over a concurrent active prompt', 
   await h.wait(o=>o.type==='status' && o.status==='ready');
  } finally {h.child.kill('SIGTERM');}
 });
+
+test('Codex full Stop waits for active run cleanup before closed_idle', async () => {
+ const h=launch('codex');
+ try {
+  await h.wait(o=>o.type==='status' && o.status==='ready');
+  h.send({type:'prompt',text:'A'});
+  await h.wait(o=>o.type==='mock_probe' && o.stage==='started' && o.input==='A');
+  h.send({type:'stop'});
+  await h.wait(o=>o.type==='mock_probe' && o.stage==='abort_signal' && o.input==='A');
+  await sleep(50);
+  assert.equal(h.outputs.some(o=>o.type==='status' && o.status==='closed_idle'),false);
+  assert.equal(h.child.exitCode,null);
+  await h.release();
+  await h.wait(o=>o.type==='status' && o.status==='closed_idle');
+  const finished=h.outputs.findIndex(o=>o.type==='mock_probe' && o.stage==='finished' && o.input==='A');
+  const closed=h.outputs.findIndex(o=>o.type==='status' && o.status==='closed_idle');
+  assert.ok(finished>=0 && finished<closed);
+ } finally {h.child.kill('SIGTERM');}
+});
+test('resumed Codex init plus full Stop cannot emit late ready', async () => {
+ const h=launch('codex','idle_first','A');
+ try {
+  await h.wait(o=>o.type==='mock_probe' && o.stage==='started' && o.input==='A');
+  h.send({type:'stop'});
+  await h.wait(o=>o.type==='mock_probe' && o.stage==='abort_signal' && o.input==='A');
+  await h.release();
+  await h.wait(o=>o.type==='status' && o.status==='closed_idle');
+  assert.equal(h.outputs.some(o=>o.type==='status' && o.status==='ready'),false);
+ } finally {h.child.kill('SIGTERM');}
+});

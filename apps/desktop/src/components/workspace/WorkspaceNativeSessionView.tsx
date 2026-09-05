@@ -4244,6 +4244,8 @@ export function WorkspaceNativeSessionView({
         primaryActionDisabled={
           !hasComposerInput && canStopForeground
               ? isStopping
+            : session.provider !== 'claude' && isProcessingTurn
+              ? true
             : isTerminalStatus(session.status)
               ? false
               : undefined
@@ -4328,6 +4330,12 @@ export function WorkspaceNativeSessionView({
         )}
         secondaryActions={(
           <>
+            {hasComposerInput && session.provider !== 'claude' && canStopForeground ? (
+              <Button type="button" size="icon" variant="ghost" aria-label={t('workspace.nativeStop')}
+                disabled={isStopping} onClick={() => void handleStop()}>
+                <ProcessingActionIcon stopping={isStopping} />
+              </Button>
+            ) : null}
             <ContextWindowIndicator
               usage={sessionUsage}
               provider={session.provider}
