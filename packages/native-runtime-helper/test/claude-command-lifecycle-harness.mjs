@@ -20,7 +20,7 @@ async function buildHelperWithWireMock(options = {}) {
   const permissionModeDelays = options.permissionModeDelays ?? {};
 
   await build({
-    entryPoints: [path.join(packageDir, 'src', 'index.ts')],
+    entryPoints: [options.entryPoint ?? path.join(packageDir, 'src', 'index.ts')],
     outfile,
     bundle: true,
     platform: 'node',
@@ -64,6 +64,8 @@ async function buildHelperWithWireMock(options = {}) {
             const usageHangs = ${JSON.stringify(usageHangs)};
             const terminalState = ${JSON.stringify(terminalState)};
             const permissionModeDelays = ${JSON.stringify(permissionModeDelays)};
+            const permissionCapabilityProbe = ${JSON.stringify(options.permissionCapabilityProbe ?? false)};
+            const probe = (value) => { if (permissionCapabilityProbe) process.stdout.write(JSON.stringify({type:'permission_probe',...value})+'\\n'); };
             let queryCount = 0;
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             const fullCapabilities = ['msg_lifecycle_v1', 'interrupt_receipt_v1'];
@@ -99,17 +101,23 @@ async function buildHelperWithWireMock(options = {}) {
             }
             export function query({ prompt, options }) {
               const thisQuery = ++queryCount;
+              probe({stage:'query',query:thisQuery,mode:options.permissionMode,allowBypass:options.allowDangerouslySkipPermissions});
               let closed = false;
               let localTurn = 0;
               let signalInterrupt;
               const interruptSignal = new Promise((resolve) => { signalInterrupt = resolve; });
               return {
                 close() {
+                  probe({stage:'close',query:thisQuery});
                   closed = true;
                 },
                 async interrupt() { signalInterrupt(); },
                 async setModel() {},
                 async setPermissionMode(mode) {
+                  probe({stage:'set_mode',query:thisQuery,mode});
+                  if (permissionCapabilityProbe && mode === 'bypassPermissions' && !options.allowDangerouslySkipPermissions) {
+                    throw new Error('Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions');
+                  }
                   const delay = permissionModeDelays[mode] ?? 0;
                   if (delay < 0) throw new Error('mock permission mode failure: ' + mode);
                   if (delay > 0) await sleep(delay);
@@ -158,9 +166,16 @@ async function buildHelperWithWireMock(options = {}) {
 
                   while (!closed) {
                     const next = await iterator.next();
-                    if (closed || next.done) return;
+                    if (closed || next.done) break;
                     const userMessage = next.value;
                     localTurn += 1;
+                    if (scenario === 'end_before_admission' && thisQuery === 1) {
+                      probe({stage:'unaccepted_prompt',query:thisQuery,commandId:userMessage.uuid});
+                      break;
+                    }
+                    if (thisQuery === 2 && localTurn === 1 && ${JSON.stringify(options.replacementAdmissionDelayMs ?? 0)} > 0) {
+                      await sleep(${JSON.stringify(options.replacementAdmissionDelayMs ?? 0)});
+                    }
 
                     if (scenario === 'query_failure' && thisQuery === 1) {
                       throw new Error('mock query failed after consuming the prompt');
@@ -194,6 +209,16 @@ async function buildHelperWithWireMock(options = {}) {
                     yield { ...userMessage, session_id };
                     yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
 
+                    if (scenario === 'browser_evaluate') {
+                      const result = await options.canUseTool('mcp__ccem-browser__evaluate', {script:'1 + 1'}, {toolUseID:'evaluate-'+localTurn});
+                      probe({stage:'evaluate',query:thisQuery,turn:localTurn,behavior:result.behavior});
+                    }
+                    if (scenario === 'permission_wait') {
+                      await options.canUseTool('Bash', {command:'echo protected'}, {toolUseID:'permission-tool'});
+                    }
+                    if (scenario === 'permission_background') {
+                      yield {type:'system',subtype:'background_tasks_changed',tasks:[{task_id:'live-bg',description:'live tool'}]};
+                    }
                     if (scenario === 'full_interrupt') {
                       await interruptSignal;
                       if (terminalDelayMs > 0) await sleep(terminalDelayMs);
@@ -324,6 +349,15 @@ async function buildHelperWithWireMock(options = {}) {
                       };
                     }
                     yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
+                  }
+                  if (thisQuery === 1 && ${JSON.stringify(options.closedLoopDelayMs ?? 0)} > 0) {
+                    await sleep(${JSON.stringify(options.closedLoopDelayMs ?? 0)});
+                    probe({stage:'loop_end',query:thisQuery});
+                    if (${JSON.stringify(options.closedLoopError ?? null)}) {
+                      const error = new Error('mock retired query failure');
+                      error.name = ${JSON.stringify(options.closedLoopError ?? 'Error')};
+                      throw error;
+                    }
                   }
                 },
               };

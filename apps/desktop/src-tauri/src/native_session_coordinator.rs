@@ -144,6 +144,7 @@ impl SettingsOpState {
 
 #[derive(Debug, Clone)]
 struct PendingSettingsOp {
+    received_failure_ack: bool,
     control_request_id: String,
     state: SettingsOpState,
     helper_incarnation: u64,

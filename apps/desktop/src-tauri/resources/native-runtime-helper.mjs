@@ -43512,6 +43512,7 @@ var pendingClaudeInteractivePrompts = /* @__PURE__ */ new Map();
 var startedToolNames = /* @__PURE__ */ new Map();
 var completedToolUseIds = /* @__PURE__ */ new Set();
 var pendingClaudeToolInputs = /* @__PURE__ */ new Map();
+var claudeQueryBypassCapabilities = /* @__PURE__ */ new WeakMap();
 var claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
 var claudeTaskProgressEmittedAt = /* @__PURE__ */ new Map();
 var claudeBackgroundSnapshotKey = "";
@@ -45280,6 +45281,9 @@ function applySettingsToInitCommand(settings) {
   if (!initCommand) return false;
   if (settings.permMode !== void 0) {
     initCommand.perm_mode = settings.permMode;
+    if (initCommand.provider === "claude" && settings.permissionScope === "display") {
+      initCommand.allow_dangerously_skip_permissions = normalizeClaudePermissionMode(settings.permMode).permissionMode === "bypassPermissions";
+    }
   }
   if (settings.envVars !== void 0) initCommand.env_vars = settings.envVars;
   if (settings.envName !== void 0) initCommand.env_name = settings.envName;
@@ -45353,6 +45357,24 @@ async function applyClaudePermissionSettingsCommand(command) {
   if (!initCommand || initCommand.provider !== "claude" || !isClaudePermissionOnlySettingsCommand(command)) {
     return false;
   }
+  const wantsBypass = normalizeClaudePermissionMode(command.perm_mode).permissionMode === "bypassPermissions";
+  const needsNewQuery = wantsBypass && currentClaudeQuery && claudeQueryBypassCapabilities.get(currentClaudeQuery)?.allowBypass !== true;
+  if (wantsBypass && (needsNewQuery || !currentClaudeQuery)) {
+    const pristineQuery = currentClaudeQuery && claudeQueryBypassCapabilities.get(currentClaudeQuery)?.admitted === false && claudeLastSessionState === null;
+    if (claudeInitializationPending || claudeInitializationError || pendingSettings || pendingClaudeCoordinatorAdmission || claudeTurnAwaitingResult || hasUnsettledClaudeBackgroundTasks() || pendingPermissions.size > 0 || pendingClaudeInteractivePrompts.size > 0 || stopped || runtimeTeardownPreparationId || claudeInterruptRequested || currentClaudeQuery && !pristineQuery && !isClaudeForegroundAndSdkIdle()) {
+      return "rejected_unchanged";
+    }
+    if (currentClaudeQuery && !closeClaudeQueryForRecovery(
+      captureCurrentClaudeQuerySnapshot(),
+      { allowUnsafeClose: !!pristineQuery }
+    )) {
+      return "rejected_unchanged";
+    }
+    browserEvaluateApprovedForSession = false;
+    applySettingsCommand(command);
+    return true;
+  }
+  browserEvaluateApprovedForSession = false;
   await applyClaudePermissionModeToQuery(currentClaudeQuery, command.perm_mode);
   applySettingsCommand(command);
   return true;
@@ -45506,7 +45528,7 @@ function buildClaudeQueryOptions() {
         return buildAllowedClaudeToolResult(input, options.toolUseID);
       }
       if (isBrowserEvaluateToolName(toolName)) {
-        if (permission.allowDangerouslySkipPermissions || browserEvaluateApprovedForSession) {
+        if (normalizeClaudePermissionMode(initCommand?.perm_mode ?? "safe").permissionMode === "bypassPermissions" || browserEvaluateApprovedForSession) {
           return rememberBrowserOwner(buildAllowedClaudeToolResult(input, options.toolUseID));
         }
         const result = await waitForPermission(toolName, input, {
@@ -45609,6 +45631,10 @@ async function consumeClaudeMessages() {
     prompt: inputQueue,
     options
   }));
+  claudeQueryBypassCapabilities.set(claudeQuery, {
+    allowBypass: options.allowDangerouslySkipPermissions === true,
+    admitted: false
+  });
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
@@ -45621,6 +45647,7 @@ async function consumeClaudeMessages() {
   claudeHiddenToolUseIds.clear();
   emitClaudeBackgroundTasksChanged([], true);
   let incompleteResponse = false;
+  let ownedQueryAtExit = false;
   try {
     for await (const message of claudeQuery) {
       if (!isCurrentClaudeQuerySnapshot(querySnapshot)) {
@@ -46027,6 +46054,7 @@ async function consumeClaudeMessages() {
     }
     incompleteResponse = claudeTurnAwaitingResult && (claudeForegroundCoordinatorStamped || pendingClaudePromptReplay === null) && !stopped && !claudeInterruptRequested && isCurrentClaudeQuerySnapshot(querySnapshot);
   } finally {
+    ownedQueryAtExit = claudeQuerySlot.isCurrent(querySnapshot);
     if (claudeQuerySlot.isCurrent(querySnapshot) && hasUnsettledClaudeBackgroundTasks()) {
       interruptClaudeBackgroundTasks("Claude query process ended before the background task settled.");
     }
@@ -46037,12 +46065,15 @@ async function consumeClaudeMessages() {
       clearClaudeIdleCloseTimer();
       clearCurrentClaudeQuerySnapshot(querySnapshot);
     }
-    if (initCommand?.provider === "claude" && pendingSettings && !claudeInputQueue && !currentClaudeQuery) {
+    if (ownedQueryAtExit && initCommand?.provider === "claude" && pendingSettings && !claudeInputQueue && !currentClaudeQuery) {
       applyPendingSettingsToInitCommand();
       if (!claudeTurnAwaitingResult) {
         emitStatus("ready", "Settings applied.");
       }
     }
+  }
+  if (!ownedQueryAtExit) {
+    return;
   }
   if (claudeLifecycleMode === "full" && claudeInterruptRequested && claudeTurnAwaitingResult && !stopped) {
     emitClaudeLifecycleProtocolError(
@@ -46065,6 +46096,9 @@ async function ensureClaudeSession() {
     }
     let loop;
     loop = consumeClaudeMessages().catch((error48) => {
+      if (claudeConsumeLoop !== loop) {
+        return;
+      }
       const isAbort = error48 instanceof Error && error48.name === "AbortError";
       if (stopped) {
         return;
@@ -46098,9 +46132,10 @@ async function ensureClaudeSession() {
       });
       emitStatus("error", message);
     }).finally(() => {
-      if (claudeConsumeLoop === loop) {
-        claudeConsumeLoop = null;
+      if (claudeConsumeLoop !== loop) {
+        return;
       }
+      claudeConsumeLoop = null;
       void replayPendingClaudePromptIfNeeded().catch((error48) => {
         const message = error48 instanceof Error ? error48.message : String(error48);
         emitEvent({
@@ -46185,6 +46220,8 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId) {
     parent_tool_use_id: null
   });
   claudeTurnAwaitingResult = true;
+  const launchCapability = currentClaudeQuery && claudeQueryBypassCapabilities.get(currentClaudeQuery);
+  if (launchCapability) launchCapability.admitted = true;
   emitEvent({
     type: "lifecycle",
     stage: "command_admitted",
@@ -47067,12 +47104,22 @@ async function handleCommand(command) {
         );
         return;
       }
-      if (command.perm_mode !== void 0) {
-        browserEvaluateApprovedForSession = false;
-      }
       if (isClaudePermissionOnlySettingsCommand(command)) {
         try {
-          if (await applyClaudePermissionSettingsCommand(command)) {
+          const permissionResult = await applyClaudePermissionSettingsCommand(command);
+          if (permissionResult === "rejected_unchanged") {
+            emitClaudeRuntimeSettingsChanged("failed", command.request_id, {
+              permMode: command.perm_mode,
+              permissionScope: command.permission_scope
+            });
+            emitSettingsUpdateResult(
+              command.request_id,
+              "rejected_unchanged",
+              "YOLO requires an idle query restart. Finish foreground, background, or pending permission work first; the current permissions are unchanged."
+            );
+            return;
+          }
+          if (permissionResult) {
             if (!claudeTurnAwaitingResult) {
               emitStatus("ready", "Settings applied.");
             }
@@ -47096,6 +47143,7 @@ async function handleCommand(command) {
           return;
         }
       }
+      if (command.perm_mode !== void 0) browserEvaluateApprovedForSession = false;
       if (initCommand.provider === "claude") {
         try {
           if (canApplySettingsImmediately()) {

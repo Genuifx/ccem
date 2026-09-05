@@ -1,6 +1,23 @@
 use super::*;
 
 impl NativeSessionCoordinator {
+    pub fn permission_settings_failure_ack_is_current(
+        &self,
+        runtime_id: &str,
+        helper_incarnation: u64,
+        control_request_id: &str,
+    ) -> bool {
+        self.lock_inner().get(runtime_id).is_some_and(|coordination| {
+            coordination.incarnation == Some(helper_incarnation)
+                && coordination.pending_permission_settings.as_ref().is_some_and(|op| {
+                    op.control_request_id == control_request_id
+                        && op.helper_incarnation == helper_incarnation
+                        && op.state == SettingsOpState::ReconcileRequired
+                        && op.received_failure_ack
+                })
+        })
+    }
+
     pub fn settings_request_is_current(&self, runtime_id: &str, control_request_id: &str) -> bool {
         self.lock_inner()
             .get(runtime_id)
@@ -52,6 +69,7 @@ impl NativeSessionCoordinator {
             }
         }
         coordination.pending_settings = Some(PendingSettingsOp {
+            received_failure_ack: false,
             control_request_id: control_request_id.to_string(),
             state: SettingsOpState::Pending,
             helper_incarnation,
@@ -104,6 +122,7 @@ impl NativeSessionCoordinator {
             }
         }
         coordination.pending_permission_settings = Some(PendingSettingsOp {
+            received_failure_ack: false,
             control_request_id: control_request_id.to_string(),
             state: SettingsOpState::Pending,
             helper_incarnation,
@@ -223,14 +242,18 @@ impl NativeSessionCoordinator {
             (None, Some(generation)) => op.query_generation = Some(generation),
             (None, None) => {}
         }
-        let parsed = if is_permission_op && parsed == SettingsOpState::Failed {
-            // Permission delivery is a cross-authority transaction. A helper-side failure is
-            // not dispatch-safe until the host finishes fail-closed quarantine, so retain a
-            // blocking state instead of releasing queued prompts from the stdout thread.
-            SettingsOpState::ReconcileRequired
-        } else {
-            parsed
-        };
+        if is_permission_op && parsed == SettingsOpState::Failed {
+            if op.received_failure_ack && op.state == SettingsOpState::Failed {
+                return LifecycleDecision::Ignored;
+            }
+            // A host timeout is not a helper receipt. Record only a correlated
+            // wire failure after incarnation and query-generation validation.
+            op.received_failure_ack = true;
+            op.state = SettingsOpState::ReconcileRequired;
+            coordination.bump();
+            self.settings_signal.notify_all();
+            return LifecycleDecision::Updated;
+        }
         if op.state == SettingsOpState::ReconcileRequired {
             // A definite late failure proves that no settings side effect was
             // committed, so the old local projection is authoritative and

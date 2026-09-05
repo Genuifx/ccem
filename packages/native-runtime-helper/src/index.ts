@@ -222,7 +222,7 @@ type HelperOutput =
   | {
       type: 'settings_update_result';
       request_id: string;
-      outcome: 'applied' | 'failed' | 'deferred';
+      outcome: 'applied' | 'failed' | 'deferred' | 'rejected_unchanged';
       detail?: string;
     }
   | {
@@ -351,6 +351,8 @@ const pendingClaudeInteractivePrompts = new Map<string, ClaudeInteractivePromptR
 const startedToolNames = new Map<string, string>();
 const completedToolUseIds = new Set<string>();
 const pendingClaudeToolInputs = new Map<string, Record<string, unknown>>();
+// Launch capabilities belong to the exact query, not its mutable permission mode.
+const claudeQueryBypassCapabilities = new WeakMap<object, { allowBypass: boolean; admitted: boolean }>();
 const claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
 const claudeTaskProgressEmittedAt = new Map<string, number>();
 let claudeBackgroundSnapshotKey = '';
@@ -433,7 +435,7 @@ function emitStatus(status: string, detail?: string) {
 
 function emitSettingsUpdateResult(
   requestId: string | undefined,
-  outcome: 'applied' | 'failed' | 'deferred',
+  outcome: 'applied' | 'failed' | 'deferred' | 'rejected_unchanged',
   detail?: string,
 ) {
   // New desktop runtimes always provide a correlation id. Keep accepting
@@ -2746,6 +2748,12 @@ function applySettingsToInitCommand(settings: RuntimeSettingsPatch) {
   if (!initCommand) return false;
   if (settings.permMode !== undefined) {
     initCommand.perm_mode = settings.permMode;
+    if (initCommand.provider === 'claude' && settings.permissionScope === 'display') {
+      // Preserve the explicit display choice across temporary runtime Plan mode.
+      // This grants future query capability, not current tool authorization.
+      initCommand.allow_dangerously_skip_permissions =
+        normalizeClaudePermissionMode(settings.permMode).permissionMode === 'bypassPermissions';
+    }
   }
   if (settings.envVars !== undefined) initCommand.env_vars = settings.envVars;
   if (settings.envName !== undefined) initCommand.env_name = settings.envName;
@@ -2839,6 +2847,37 @@ async function applyClaudePermissionSettingsCommand(command: UpdateSettingsComma
     return false;
   }
 
+  const wantsBypass = normalizeClaudePermissionMode(command.perm_mode!).permissionMode === 'bypassPermissions';
+  const needsNewQuery = wantsBypass && currentClaudeQuery
+    && claudeQueryBypassCapabilities.get(currentClaudeQuery)?.allowBypass !== true;
+  if (wantsBypass && (needsNewQuery || !currentClaudeQuery)) {
+    const pristineQuery = currentClaudeQuery
+      && claudeQueryBypassCapabilities.get(currentClaudeQuery)?.admitted === false
+      && claudeLastSessionState === null;
+    // No permission, query, pending-setting, or browser-cache mutation before
+    // this explicit upgrade is known to be safe. Live capable queries keep
+    // the existing in-place permission/Plan behavior.
+    if (claudeInitializationPending || claudeInitializationError || pendingSettings
+      || pendingClaudeCoordinatorAdmission || claudeTurnAwaitingResult
+      || hasUnsettledClaudeBackgroundTasks() || pendingPermissions.size > 0
+      || pendingClaudeInteractivePrompts.size > 0 || stopped
+      || runtimeTeardownPreparationId || claudeInterruptRequested
+      || (currentClaudeQuery && !pristineQuery && !isClaudeForegroundAndSdkIdle())) {
+      return 'rejected_unchanged' as const;
+    }
+    if (currentClaudeQuery && !closeClaudeQueryForRecovery(
+      captureCurrentClaudeQuerySnapshot(), { allowUnsafeClose: !!pristineQuery },
+    )) {
+      return 'rejected_unchanged' as const;
+    }
+    browserEvaluateApprovedForSession = false;
+    // The existing idle-settings contract acknowledges next-query configuration.
+    // Keep this ACK in the current generation; the next prompt creates a query
+    // with bypass capability through normalizeClaudePermissionMode('yolo').
+    applySettingsCommand(command);
+    return true;
+  }
+  browserEvaluateApprovedForSession = false;
   await applyClaudePermissionModeToQuery(currentClaudeQuery, command.perm_mode!);
   applySettingsCommand(command);
   return true;
@@ -3012,7 +3051,8 @@ function buildClaudeQueryOptions() {
         return buildAllowedClaudeToolResult(input, options.toolUseID);
       }
       if (isBrowserEvaluateToolName(toolName)) {
-        if (permission.allowDangerouslySkipPermissions || browserEvaluateApprovedForSession) {
+        if (normalizeClaudePermissionMode(initCommand?.perm_mode ?? 'safe').permissionMode === 'bypassPermissions'
+          || browserEvaluateApprovedForSession) {
           return rememberBrowserOwner(buildAllowedClaudeToolResult(input, options.toolUseID));
         }
         const result = await waitForPermission(toolName, input, {
@@ -3140,6 +3180,10 @@ async function consumeClaudeMessages() {
     prompt: inputQueue,
     options,
   }));
+  claudeQueryBypassCapabilities.set(claudeQuery, {
+    allowBypass: options.allowDangerouslySkipPermissions === true,
+    admitted: false,
+  });
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
@@ -3152,6 +3196,7 @@ async function consumeClaudeMessages() {
   claudeHiddenToolUseIds.clear();
   emitClaudeBackgroundTasksChanged([], true);
   let incompleteResponse = false;
+  let ownedQueryAtExit = false;
 
   try {
     for await (const message of claudeQuery) {
@@ -3680,6 +3725,7 @@ async function consumeClaudeMessages() {
       && !claudeInterruptRequested
       && isCurrentClaudeQuerySnapshot(querySnapshot);
   } finally {
+    ownedQueryAtExit = claudeQuerySlot.isCurrent(querySnapshot);
     if (claudeQuerySlot.isCurrent(querySnapshot) && hasUnsettledClaudeBackgroundTasks()) {
       interruptClaudeBackgroundTasks('Claude query process ended before the background task settled.');
     }
@@ -3691,7 +3737,8 @@ async function consumeClaudeMessages() {
       clearCurrentClaudeQuerySnapshot(querySnapshot);
     }
     if (
-      initCommand?.provider === 'claude'
+      ownedQueryAtExit
+      && initCommand?.provider === 'claude'
       && pendingSettings
       && !claudeInputQueue
       && !currentClaudeQuery
@@ -3701,6 +3748,12 @@ async function consumeClaudeMessages() {
         emitStatus('ready', 'Settings applied.');
       }
     }
+  }
+
+  // A retired iterator may finish after its replacement has started or stopped.
+  // Only its own generation can diagnose a missing foreground terminal.
+  if (!ownedQueryAtExit) {
+    return;
   }
 
   if (
@@ -3732,6 +3785,9 @@ async function ensureClaudeSession() {
     }
     let loop: Promise<void>;
     loop = consumeClaudeMessages().catch((error) => {
+      if (claudeConsumeLoop !== loop) {
+        return;
+      }
       const isAbort = error instanceof Error && error.name === 'AbortError';
       if (stopped) {
         return;
@@ -3766,9 +3822,10 @@ async function ensureClaudeSession() {
       });
       emitStatus('error', message);
     }).finally(() => {
-      if (claudeConsumeLoop === loop) {
-        claudeConsumeLoop = null;
+      if (claudeConsumeLoop !== loop) {
+        return;
       }
+      claudeConsumeLoop = null;
       void replayPendingClaudePromptIfNeeded().catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         emitEvent({
@@ -3869,6 +3926,8 @@ function enqueueClaudePrompt(
     parent_tool_use_id: null,
   });
   claudeTurnAwaitingResult = true;
+  const launchCapability = currentClaudeQuery && claudeQueryBypassCapabilities.get(currentClaudeQuery);
+  if (launchCapability) launchCapability.admitted = true;
   // Helper admission receipt: the prompt reached the SDK input queue and this
   // canonical command id now owns the foreground turn until its terminal.
   emitEvent({
@@ -4909,13 +4968,19 @@ async function handleCommand(command: InputCommand) {
         return;
       }
 
-      if (command.perm_mode !== undefined) {
-        browserEvaluateApprovedForSession = false;
-      }
-
       if (isClaudePermissionOnlySettingsCommand(command)) {
         try {
-          if (await applyClaudePermissionSettingsCommand(command)) {
+          const permissionResult = await applyClaudePermissionSettingsCommand(command);
+          if (permissionResult === 'rejected_unchanged') {
+            emitClaudeRuntimeSettingsChanged('failed', command.request_id, {
+              permMode: command.perm_mode,
+              permissionScope: command.permission_scope,
+            });
+            emitSettingsUpdateResult(command.request_id, 'rejected_unchanged',
+              'YOLO requires an idle query restart. Finish foreground, background, or pending permission work first; the current permissions are unchanged.');
+            return;
+          }
+          if (permissionResult) {
             // The correlated runtime_settings_changed(applied, request_id) ACK
             // has already been emitted by applySettingsCommand. A bare ready
             // here would clobber foreground ownership during a live turn.
@@ -4942,6 +5007,8 @@ async function handleCommand(command: InputCommand) {
           return;
         }
       }
+
+      if (command.perm_mode !== undefined) browserEvaluateApprovedForSession = false;
 
       if (initCommand.provider === 'claude') {
         try {

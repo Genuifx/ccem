@@ -624,6 +624,9 @@ fn permission_failure_keeps_fifo_blocked_for_host_quarantine() {
         LifecycleDecision::Updated
     );
     let projection = coordinator.projection(RT).expect("failed projection");
+    assert!(coordinator.permission_settings_failure_ack_is_current(
+        RT, INC, "settings-permission-failed"
+    ));
     assert!(projection.settings_pending);
     assert_eq!(
         projection.settings_state.as_deref(),
@@ -641,6 +644,71 @@ fn permission_failure_keeps_fifo_blocked_for_host_quarantine() {
         coordinator.admit_prompt(RT, INC),
         Err(AdmissionError::SettingsPending { .. })
     ));
+}
+
+#[test]
+fn permission_failure_receipt_requires_correlated_wire_ack_and_host_resolution() {
+    for timeout in [false, true] {
+        let coordinator = coordinator_with_incarnation();
+        negotiate_full(&coordinator);
+        let request = "permission-receipt";
+        coordinator.begin_permission_settings_op(RT, INC, request).unwrap();
+        if timeout {
+            assert_eq!(coordinator.wait_for_settings_ack(RT, request, Duration::ZERO),
+                SettingsWaitOutcome::Timeout);
+        } else {
+            coordinator.note_settings_uncertain(RT, INC, request);
+        }
+        // Even if a typed no-mutation result is available to the caller, a host
+        // uncertain state must not substitute for the missing lifecycle ACK.
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
+        for (incarnation, id, generation) in [
+            (INC - 1, request, Some(GEN)),
+            (INC, "wrong-request", Some(GEN)),
+            (INC, request, Some(GEN - 1)),
+            (INC, request, None),
+        ] {
+            assert_eq!(coordinator.note_settings_ack(RT, incarnation, Some(id), "failed", generation),
+                LifecycleDecision::Ignored);
+            assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
+        }
+        assert!(coordinator.admit_prompt(RT, INC).is_err());
+        assert_eq!(coordinator.note_settings_ack(RT, INC, Some(request), "failed", Some(GEN)),
+            LifecycleDecision::Updated);
+        assert!(coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC - 1, request));
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, "wrong-request"));
+        assert!(coordinator.admit_prompt(RT, INC).is_err(), "late ACK alone cannot release FIFO");
+        coordinator.note_settings_failed(RT, INC, request);
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, request),
+            "resolved receipt cannot be reused");
+        coordinator.admit_prompt(RT, INC).expect("host explicitly resolved unchanged rejection");
+        coordinator.begin_permission_settings_op(RT, INC, "replacement").unwrap();
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, "replacement"));
+        coordinator.note_settings_failed(RT, INC, "replacement");
+        assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, "replacement"),
+            "host resolution is not a wire receipt");
+    }
+}
+
+#[test]
+fn duplicate_permission_failure_after_host_resolution_does_not_block_fifo() {
+    let coordinator = coordinator_with_incarnation();
+    negotiate_full(&coordinator);
+    let request = "permission-resolved";
+    coordinator.begin_permission_settings_op(RT, INC, request).unwrap();
+    coordinator.note_settings_ack(RT, INC, Some(request), "failed", Some(GEN));
+    assert!(coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
+    coordinator.note_settings_failed(RT, INC, request);
+    assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
+    assert_eq!(coordinator.note_settings_ack(RT, INC, Some(request), "failed", Some(GEN)),
+        LifecycleDecision::Ignored);
+    assert!(!coordinator.projection(RT).unwrap().settings_pending);
+    coordinator.admit_prompt(RT, INC).expect("duplicate failure must not reblock FIFO");
+    coordinator.begin_permission_settings_op(RT, INC, "next-permission").unwrap();
+    assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, "next-permission"));
+    assert!(!coordinator.permission_settings_failure_ack_is_current(RT, INC, request));
 }
 
 #[test]

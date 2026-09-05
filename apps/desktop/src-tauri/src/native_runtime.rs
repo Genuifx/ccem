@@ -736,6 +736,7 @@ enum SettingsUpdateOutcome {
     Applied,
     Failed,
     Deferred,
+    RejectedUnchanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -885,7 +886,7 @@ fn wait_for_required_settings_ack(
             ..
         }) => Ok(()),
         Ok(SettingsUpdateAck {
-            outcome: SettingsUpdateOutcome::Failed,
+            outcome: SettingsUpdateOutcome::Failed | SettingsUpdateOutcome::RejectedUnchanged,
             detail,
         }) => Err(format!(
             "Native settings update {request_id} failed{}.",
@@ -938,6 +939,12 @@ fn lock_until<'a, T>(
 
 fn is_bypass_permission_mode(mode: &str) -> bool {
     matches!(mode, "yolo" | "bypassPermissions")
+}
+
+fn claude_permission_change_requires_delivery_first(current: &str, next: &str) -> bool {
+    (authorize_browser_tool(current, "click").is_err()
+        && authorize_browser_tool(next, "click").is_ok())
+        || (!is_bypass_permission_mode(current) && is_bypass_permission_mode(next))
 }
 
 fn effective_native_perm_mode<'a>(
@@ -5663,14 +5670,6 @@ impl NativeRuntimeManager {
                 ),
             })
         };
-        let expands = match self.browser_permission_change_expands(
-            &handle,
-            &next_perm_mode,
-            next_runtime_perm_mode.as_deref(),
-        ) {
-            Ok(expands) => expands,
-            Err(error) => return fail_closed(error),
-        };
         let deadline = Instant::now() + crate::native_session_coordinator::SETTINGS_ACK_WAIT;
         let lifecycle = match self.lifecycle_transaction_lock(runtime_id) {
             Ok(lifecycle) => lifecycle,
@@ -5685,8 +5684,28 @@ impl NativeRuntimeManager {
             Err(error) => return fail_closed(error),
         };
 
+        let original_settings = match handle.record.lock() {
+            Ok(record) => record.clone(),
+            Err(_) => return fail_closed("Failed to lock native session record".to_string()),
+        };
+        // Dev and YOLO share browser click authority, but YOLO still expands
+        // provider permission and may require a new query launch capability.
+        let deliver_first = claude_permission_change_requires_delivery_first(
+            effective_native_perm_mode(
+                &original_settings.perm_mode,
+                original_settings.runtime_perm_mode.as_deref(),
+            ),
+            effective_native_perm_mode(&next_perm_mode, next_runtime_perm_mode.as_deref()),
+        );
+        // Permission failures stay dispatch-blocking until this transaction has
+        // both the lifecycle ACK and a typed, exactly correlated no-mutation receipt.
+        let rejection_receipt = match handle.settings_update_acks.register(request_id) {
+            Ok(receiver) => receiver,
+            Err(error) => return fail_closed(error),
+        };
+        let rejected_unchanged = std::cell::Cell::new(false);
         let result = deliver_browser_permission_change(
-            expands,
+            deliver_first,
             || {
                 match self.write_to_live_child_outcome(&handle, command) {
                     LiveWriteOutcome::Written => {}
@@ -5705,6 +5724,21 @@ impl NativeRuntimeManager {
                         Err("PERMISSION_SETTINGS_DEFERRED: permission was not applied".to_string())
                     }
                     SettingsWaitOutcome::Failed => {
+                        if deliver_first {
+                            if let Ok(receipt) = rejection_receipt.recv_timeout(
+                                deadline.saturating_duration_since(Instant::now()),
+                            ) {
+                                if let Some(detail) = self.preserve_unchanged_permission_rejection(
+                                    &handle,
+                                    request_id,
+                                    &receipt,
+                                    &original_settings,
+                                )? {
+                                    rejected_unchanged.set(true);
+                                    return Err(detail);
+                                }
+                            }
+                        }
                         Err("SETTINGS_NOT_APPLIED: helper rejected permission update".to_string())
                     }
                     SettingsWaitOutcome::Timeout => Err(
@@ -5713,7 +5747,7 @@ impl NativeRuntimeManager {
                 }
             },
             || {
-                if expands {
+                if deliver_first {
                     self.verify_current_browser_permission_authority(
                         runtime_id,
                         &handle,
@@ -5730,13 +5764,66 @@ impl NativeRuntimeManager {
                     )
                 }
             },
-            || self.quarantine_permission_transition(app, runtime_id, &handle),
+            || {
+                if rejected_unchanged.get() {
+                    Ok(())
+                } else {
+                    self.quarantine_permission_transition(app, runtime_id, &handle)
+                }
+            },
         );
-        if result.is_err() {
+        let _ = handle.settings_update_acks.cancel(request_id);
+        if rejected_unchanged.get() {
+            self.schedule_queued_dispatch(
+                app,
+                runtime_id,
+                QueueDispatchTrigger::AuthoritativeLifecycle,
+            );
+        } else if result.is_err() {
             self.lifecycle
                 .note_settings_uncertain(runtime_id, handle.generation, request_id);
         }
         result
+    }
+
+    fn preserve_unchanged_permission_rejection(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        request_id: &str,
+        receipt: &SettingsUpdateAck,
+        original_settings: &NativeSessionRecord,
+    ) -> Result<Option<String>, String> {
+        if receipt.outcome != SettingsUpdateOutcome::RejectedUnchanged {
+            return Ok(None);
+        }
+        let runtime_id = original_settings.runtime_id.as_str();
+        if !self.lifecycle.permission_settings_failure_ack_is_current(
+            runtime_id,
+            handle.generation,
+            request_id,
+        )
+        {
+            return Err(
+                "Permission rejection did not match the current failed settings operation."
+                    .to_string(),
+            );
+        }
+        self.verify_current_browser_permission_authority(
+            runtime_id,
+            handle,
+            &original_settings.perm_mode,
+            original_settings.runtime_perm_mode.as_deref(),
+        )?;
+        // This host-only resolution runs after the exact no-mutation receipt;
+        // a generic helper failure must never release the permission barrier.
+        self.lifecycle
+            .note_settings_failed(runtime_id, handle.generation, request_id);
+        Ok(Some(format!(
+            "PERMISSION_CHANGE_REQUIRES_IDLE: {}",
+            receipt.detail.as_deref().unwrap_or(
+                "Wait for the current work to finish before changing permissions."
+            ),
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12160,6 +12247,42 @@ mod tests {
     }
 
     #[test]
+    fn claude_permission_dev_to_yolo_waits_for_provider_before_host_commit() {
+        for current in ["safe", "dev", "plan"] {
+            let deliver_first =
+                super::claude_permission_change_requires_delivery_first(current, "yolo");
+            for accepted in [false, true] {
+                let steps = Mutex::new(Vec::new());
+                let result = super::deliver_browser_permission_change(
+                    deliver_first,
+                    || {
+                        steps.lock().unwrap().push("provider");
+                        if accepted {
+                            Ok(())
+                        } else {
+                            Err("definite unchanged refusal".to_string())
+                        }
+                    },
+                    || {
+                        steps.lock().unwrap().push("host_commit");
+                        Ok(())
+                    },
+                    || Ok(()),
+                );
+                assert_eq!(result.is_ok(), accepted);
+                assert_eq!(
+                    *steps.lock().unwrap(),
+                    if accepted { vec!["provider", "host_commit"] } else { vec!["provider"] },
+                    "{current} to YOLO must not commit even equivalent browser permissions before provider ACK",
+                );
+            }
+        }
+        assert!(!super::claude_permission_change_requires_delivery_first("yolo", "safe"));
+        assert!(!super::claude_permission_change_requires_delivery_first("dev", "plan"));
+        assert!(super::claude_permission_change_requires_delivery_first("plan", "dev"));
+    }
+
+    #[test]
     fn permission_upgrade_quarantines_when_coordinator_gate_fails() {
         let steps = Mutex::new(Vec::new());
 
@@ -12431,6 +12554,241 @@ mod tests {
         .expect_err("failed ack must fail closed");
         assert!(error.contains("failed"));
         assert!(error.contains("provider rejected mode"));
+    }
+
+    #[test]
+    fn unchanged_permission_rejection_requires_both_receipts_and_keeps_old_authority() {
+        let runtime_id = "native-permission-unchanged";
+        let mut original = native_record(runtime_id, "ready", true);
+        original.perm_mode = "safe".to_string();
+        let manager = manager_with_records(runtime_id, vec![original.clone()]);
+        let handle = native_session_handle(original.clone());
+        manager
+            .handles
+            .lock()
+            .unwrap()
+            .insert(runtime_id.to_string(), Arc::clone(&handle));
+        let request_id = "settings-safe-yolo";
+        manager
+            .lifecycle
+            .begin_permission_settings_op(runtime_id, handle.generation, request_id)
+            .unwrap();
+        let receiver = handle.settings_update_acks.register(request_id).unwrap();
+
+        manager.process_helper_stdout(runtime_id,
+            r#"{"type":"event","payload":{"type":"runtime_settings_changed","state":"failed","request_id":"settings-safe-yolo","query_generation":1,"env_name":"DeepSeek","perm_mode":"safe","permission_scope":"display","effort":null,"pending_env_name":null,"pending_effort":null}}"#,
+        ).unwrap();
+        assert!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .settings_pending,
+            "the first failure ACK alone must not release FIFO"
+        );
+        assert!(receiver.try_recv().is_err());
+
+        manager.process_helper_stdout(runtime_id,
+            r#"{"type":"settings_update_result","request_id":"settings-wrong","outcome":"rejected_unchanged"}"#,
+        ).unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "wrong request cannot prove no mutation"
+        );
+        manager.process_helper_stdout(runtime_id,
+            r#"{"type":"settings_update_result","request_id":"settings-safe-yolo","outcome":"rejected_unchanged","detail":"Wait for the current work to finish."}"#,
+        ).unwrap();
+        let receipt = receiver.recv_timeout(Duration::from_millis(10)).unwrap();
+        assert!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .settings_pending,
+            "host authority verification must still happen after the receipt"
+        );
+
+        let detail = manager
+            .preserve_unchanged_permission_rejection(&handle, request_id, &receipt, &original)
+            .unwrap()
+            .expect("definite rejection");
+        assert!(detail.starts_with("PERMISSION_CHANGE_REQUIRES_IDLE:"));
+        assert!(
+            !manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .settings_pending
+        );
+        assert_eq!(
+            manager
+                .lifecycle
+                .wait_for_settings_convergence(runtime_id, Duration::ZERO),
+            super::SettingsWaitOutcome::Converged
+        );
+        assert_eq!(
+            manager.current_record(runtime_id).unwrap().perm_mode,
+            "safe"
+        );
+        assert_eq!(
+            handle.browser_permission.current_ticket().unwrap().mode(),
+            "safe"
+        );
+        assert!(!handle.permission_quarantined.load(Ordering::SeqCst));
+        assert!(manager.is_current_handle(runtime_id, &handle).unwrap());
+        manager
+            .lifecycle
+            .admit_prompt(runtime_id, handle.generation)
+            .expect("an explicitly unchanged rejection cannot strand ordinary input");
+    }
+
+    #[test]
+    fn unknown_permission_failure_keeps_reconciliation_barrier() {
+        let runtime_id = "native-permission-unknown";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .cloned()
+            .unwrap();
+        let original = manager.current_record(runtime_id).unwrap();
+        let request_id = "settings-unknown";
+        manager
+            .lifecycle
+            .begin_permission_settings_op(runtime_id, handle.generation, request_id)
+            .unwrap();
+        manager.lifecycle.note_settings_ack(
+            runtime_id,
+            handle.generation,
+            Some(request_id),
+            "failed",
+            Some(1),
+        );
+        let receipt = super::SettingsUpdateAck {
+            outcome: super::SettingsUpdateOutcome::Failed,
+            detail: Some("Provider rejected the settings update.".to_string()),
+        };
+        assert!(manager
+            .preserve_unchanged_permission_rejection(&handle, request_id, &receipt, &original,)
+            .unwrap()
+            .is_none());
+        assert!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .settings_pending
+        );
+        assert!(manager
+            .lifecycle
+            .admit_prompt(runtime_id, handle.generation)
+            .is_err());
+    }
+
+    #[test]
+    fn unchanged_permission_receipt_without_helper_failure_ack_stays_blocked() {
+        let runtime_id = "native-permission-missing-failed-ack";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .cloned()
+            .unwrap();
+        let original = manager.current_record(runtime_id).unwrap();
+        let request_id = "settings-missing-failed-ack";
+        manager
+            .lifecycle
+            .begin_permission_settings_op(runtime_id, handle.generation, request_id)
+            .unwrap();
+        manager
+            .lifecycle
+            .note_settings_uncertain(runtime_id, handle.generation, request_id);
+        let receiver = handle.settings_update_acks.register(request_id).unwrap();
+        manager.process_helper_stdout(runtime_id,
+            r#"{"type":"settings_update_result","request_id":"settings-missing-failed-ack","outcome":"rejected_unchanged"}"#,
+        ).unwrap();
+        let receipt = receiver.recv_timeout(Duration::from_millis(10)).unwrap();
+        assert!(
+            manager
+                .preserve_unchanged_permission_rejection(&handle, request_id, &receipt, &original,)
+                .is_err(),
+            "host uncertainty is not a received helper failure ACK"
+        );
+        assert!(
+            manager
+                .lifecycle
+                .projection(runtime_id)
+                .unwrap()
+                .settings_pending
+        );
+        assert!(manager
+            .lifecycle
+            .admit_prompt(runtime_id, handle.generation)
+            .is_err());
+    }
+
+    #[test]
+    fn unchanged_permission_receipt_cannot_preserve_changed_or_retired_authority() {
+        for retired in [false, true] {
+            let runtime_id = if retired {
+                "native-permission-retired"
+            } else {
+                "native-permission-changed"
+            };
+            let manager = manager_with_handle(runtime_id);
+            let handle = manager
+                .handles
+                .lock()
+                .unwrap()
+                .get(runtime_id)
+                .cloned()
+                .unwrap();
+            let original = manager.current_record(runtime_id).unwrap();
+            let request_id = "settings-stale-authority";
+            manager
+                .lifecycle
+                .begin_permission_settings_op(runtime_id, handle.generation, request_id)
+                .unwrap();
+            manager.lifecycle.note_settings_ack(
+                runtime_id,
+                handle.generation,
+                Some(request_id),
+                "failed",
+                Some(1),
+            );
+            if retired {
+                let replacement =
+                    native_session_handle_with_generation(original.clone(), handle.generation + 1);
+                manager
+                    .handles
+                    .lock()
+                    .unwrap()
+                    .insert(runtime_id.to_string(), replacement);
+            } else {
+                handle
+                    .browser_permission
+                    .update_with_invalidation("safe", |_| true)
+                    .unwrap();
+            }
+            let receipt = super::SettingsUpdateAck {
+                outcome: super::SettingsUpdateOutcome::RejectedUnchanged,
+                detail: None,
+            };
+            assert!(manager
+                .preserve_unchanged_permission_rejection(&handle, request_id, &receipt, &original,)
+                .is_err());
+            assert!(
+                manager
+                    .lifecycle
+                    .projection(runtime_id)
+                    .unwrap()
+                    .settings_pending
+            );
+        }
     }
 
     #[test]
