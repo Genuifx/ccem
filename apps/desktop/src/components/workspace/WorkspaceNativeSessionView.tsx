@@ -3651,37 +3651,21 @@ export function WorkspaceNativeSessionView({
       annotations: isCronCommand ? [] : annotations,
     });
 
-    if (!isCronCommand && hasQuickReplyPrompt && !isProcessingTurn && !hasHardBlockingAttention) {
-      const planExitReplies = planExitApprovalPrompt?.prompt.prompt_type === 'plan_exit'
-        ? promptQuickReplies(planExitApprovalPrompt.prompt)
-        : [];
-      if (
-        planExitApprovalPrompt
-        && attachments.length === 0
-        && isPlanExitApprovalText(displayText, planExitReplies)
-      ) {
-        return sendInteractivePromptReply({
-          kind: 'plan_exit',
-          toolUseId: planExitApprovalPrompt.toolUseId,
-          attentionSeq: planExitApprovalPrompt.eventSeq,
-          text: displayText,
-          requestText: text,
-          approved: true,
-          annotations,
-        });
-      }
-      if (planExitApprovalPrompt && attachments.length === 0) {
-        return sendInteractivePromptReply({
-          kind: 'plan_exit',
-          toolUseId: planExitApprovalPrompt.toolUseId,
-          attentionSeq: planExitApprovalPrompt.eventSeq,
-          text: displayText,
-          requestText: text,
-          approved: false,
-          annotations,
-        });
-      }
+    // A real Plan attention waits inside the active command. Answer that
+    // occurrence before the busy queue, whose drain waits for this very reply.
+    if (!isCronCommand && planExitApprovalPrompt && attachments.length === 0 && !hasHardBlockingAttention) {
+      return sendInteractivePromptReply({
+        kind: 'plan_exit',
+        toolUseId: planExitApprovalPrompt.toolUseId,
+        attentionSeq: planExitApprovalPrompt.eventSeq,
+        text: displayText,
+        requestText: text,
+        approved: isPlanExitApprovalText(displayText, promptQuickReplies(planExitApprovalPrompt.prompt)),
+        annotations,
+      });
+    }
 
+    if (!isCronCommand && hasQuickReplyPrompt && !isProcessingTurn && !hasHardBlockingAttention) {
       return sendInteractivePromptReply({
         kind: 'text',
         text,

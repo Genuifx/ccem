@@ -135,9 +135,13 @@ async function importHarness() {
   let stopCallback = '';
   let interactiveCallback = '';
   let sendGuard = '';
+  let promptQuickRepliesSource = '';
+  let syntheticPlanPredicateSource = '';
   const nativeExpressions = {};
   const primaryProps = {};
   function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'promptQuickReplies') promptQuickRepliesSource = node.getText(ast);
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'isSyntheticPlanExitPrompt') syntheticPlanPredicateSource = node.getText(ast);
     if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'handleSend') {
       sendCallback = node.initializer.arguments[0].getText(ast);
       sendGuard = node.initializer.arguments[0].body.statements[0].expression.getText(ast);
@@ -170,6 +174,10 @@ async function importHarness() {
         import React, { act, useState } from 'react';
         import { createRoot } from 'react-dom/client';
         import { renderToStaticMarkup } from 'react-dom/server';
+        import { getPlanExitPrimaryReply, isPlanExitApprovalText } from '@/components/workspace/workspaceNativeAttention';
+        ${promptQuickRepliesSource}
+        ${syntheticPlanPredicateSource}
+        import { isWorkspaceCronCommand, buildWorkspaceCronAgentPrompt } from '@/components/workspace/workspaceCronCommand';
         import { selectNativeSessionProcessing } from '@/components/workspace/workspaceNativeSessionProjection';
         import { shouldTreatNativeSessionAsProcessing } from '@/components/workspace/workspaceEventTranscript';
         import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
@@ -274,8 +282,8 @@ async function importHarness() {
           };
         }
 
-        export function mountFailure(container, processing, interactiveKind = null, annotationOverrides = null) {
-          const state = { calls: 0, reject: null, resolve: null, errors: [], result: null, payloads: [] };
+        export function mountFailure(container, processing, interactiveKind = null, annotationOverrides = null, route = {}) {
+          const state = { calls: 0, reject: null, resolve: null, errors: [], result: null, payloads: [], queueCalls: [], responses: [] };
           function Harness() {
             const [revision, setRevision] = useState(0);
             const annotationModel = useWorkspaceAnnotations('admission-test');
@@ -292,26 +300,28 @@ async function importHarness() {
             const composerTextRef = { current: 'valuable follow-up draft' };
             const composerPlanModeEnabled = false;
             const sessionRuntimePermMode = 'dev';
-            const session = { runtime_id: 'review-only-runtime', project_dir: '/tmp', provider: 'claude' };
-            const hasQuickReplyPrompt = false;
-            const hasHardBlockingAttention = false;
-            const hasBlockingAttention = false;
-            const isProcessingTurn = processing;
+            const session = { runtime_id: 'review-only-runtime', project_dir: '/tmp', provider: 'claude', status: processing ? 'processing' : 'ready', lifecycle: { active_command_id: processing ? 'active-plan-command' : null } };
+            const events = [];
+            const hasQuickReplyPrompt = Boolean(route.plan || route.synthetic);
+            const hasHardBlockingAttention = Boolean(route.hardBlock);
+            const hasBlockingAttention = hasQuickReplyPrompt || hasHardBlockingAttention;
+            const isProcessingTurn = ${nativeExpressions.isProcessingTurn};
             const queuedStateRef = { current: {runtimeId: session.runtime_id, messages: []} };
             const queuedFlushLeaseRef = { current: null };
-            const planExitApprovalPrompt = null;
+            const pendingPlan = route.plan || route.synthetic ? { toolUseId: 'real-exit-plan-tool', eventSeq: 42, rawName: 'ExitPlanMode', prompt: { prompt_type: 'plan_exit', plan_summary: route.synthetic ? 'Claude is ready to run the next step' : 'Concrete QA plan requiring user review', allowed_prompts: ['继续执行'] } } : null;
+            const planExitApprovalPrompt = pendingPlan && !isSyntheticPlanExitPrompt(pendingPlan.prompt) ? pendingPlan : null;
             const waitForPendingEnvironmentUpdate = async () => true;
-            const isWorkspaceCronCommand = () => false;
             const makePersistableGuidanceMessage = x => x;
             const parseWorkspacePromptAnnotations = x => x;
-            const collectQueuedPromptAnnotations = () => [];
+            const collectQueuedPromptAnnotations = () => route.queueAnnotationsBlocked ? null : [];
             const flushQueuedMessages = async () => true;
             const clearComposerDraft = () => setRevision(r => r + 1);
             const setComposerPlanModeEnabled = () => {};
             const toast = { error: error => state.errors.push(error) };
             const t = x => x;
             class PromptAnnotationLimitError extends Error {}
-            const sendPromptBatch = (prompts) => {
+            const sendPromptBatch = (prompts, options) => {
+              state.queueCalls.push({ prompts, options });
               state.calls++;
               state.payloads.push(prompts[0]);
               return new Promise((resolve, reject) => { state.reject = reject; state.resolve = resolve; });
@@ -327,7 +337,12 @@ async function importHarness() {
             const setSessionRuntimePermMode = () => {};
             const setLocalUserPrompts = updater => { state.optimistic = updater(state.optimistic ?? []); };
             const sendNativeSessionInput = (_, text) => sendPromptBatch([{ text }]);
-            const respondNativeSessionPrompt = (_, payload) => sendPromptBatch([payload]);
+            const respondNativeSessionPrompt = (runtimeId, payload) => {
+              state.responses.push({ runtimeId, payload });
+              state.calls++;
+              state.payloads.push(payload);
+              return new Promise((resolve, reject) => { state.reject = reject; state.resolve = resolve; });
+            };
             const pollEvents = async () => { if (state.refreshFails) throw new Error('REFRESH_FAILED_AFTER_ADMISSION'); };
             const refreshSummary = pollEvents;
             const sendInteractivePromptReply = ${interactiveCallback};
@@ -336,7 +351,7 @@ async function importHarness() {
               value={revision === 0 ? 'valuable follow-up draft' : ''}
               valueRevision={revision}
               onValueChange={() => {}}
-              onSubmit={async payload => { state.result = await (interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; }}
+              onSubmit={payload => { state.submission = (async () => { state.result = await (interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; })(); return state.submission; }}
               annotations={annotationOverrides ?? annotationModel.pendingAnnotations}
               onAnnotationsSent={annotationModel.markAllSent}
               onAnnotationsRestore={annotationModel.restoreAnnotations}
@@ -358,11 +373,12 @@ async function importHarness() {
             async reject() {
               await act(async () => {
                 state.reject(new Error('NATIVE_QUEUE_ENQUEUE_REJECTED'));
+                await state.submission;
                 await Promise.resolve();
               });
             },
             async resolve(value) {
-              await act(async () => { state.resolve(value); await Promise.resolve(); });
+              await act(async () => { state.resolve(value); await state.submission; await Promise.resolve(); });
             },
             typeText(text) {
               act(() => {
@@ -1279,4 +1295,102 @@ test('failed skill preprocessing preserves both drafts rich payload and requires
   assert.deepEqual(delivered.annotations.map(a => a.note), ['A note', 'B note']);
   await mounted.resolve();
   assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
+});
+
+for (const [text, decision] of [['继续执行', 'approve'], ['把最终回复改为 PLAN_REVISED，然后重新提交计划确认。', 'revise']]) {
+  test(`active Plan composer typed ${decision} answers exact attention instead of queueing`, async (t) => {
+    const { container, restore } = installDom();
+    const harness = await (importedHarnessPromise ??= importHarness());
+    const mounted = harness.mountFailure(container, true, null, null, { plan: true });
+    t.after(() => { mounted.unmount(); restore(); });
+    mounted.typeText(text);
+    await mounted.submit();
+    assert.equal(mounted.state.queueCalls.length, 0, 'Plan reply must not enter FIFO waiting on its own active command');
+    assert.equal(mounted.state.responses.length, 1);
+    assert.deepEqual(mounted.state.responses[0], {
+      runtimeId: 'review-only-runtime',
+      payload: {
+        toolUseId: 'real-exit-plan-tool', expectedAttentionSeq: 42, promptType: 'plan_exit',
+        displayText: text,
+        answers: decision === 'approve' ? { decision, approval: text } : { decision, feedback: text },
+        promptAnnotations: [],
+      },
+    });
+    await mounted.resolve();
+    assert.equal(mounted.state.result, true);
+    assert.equal(mounted.text(), '');
+  });
+}
+
+for (const scenario of ['noPlan', 'attachments', 'hardblock', 'synthetic', 'cron']) {
+  test(`active composer ${scenario} retains ordinary inbox route`, async (t) => {
+    const { container, restore } = installDom();
+    const harness = await (importedHarnessPromise ??= importHarness());
+    const mounted = harness.mountFailure(container, true, null, null, {
+      plan: scenario === 'attachments' || scenario === 'hardblock' || scenario === 'cron',
+      hardBlock: scenario === 'hardblock', synthetic: scenario === 'synthetic',
+    });
+    t.after(() => { mounted.unmount(); restore(); });
+    mounted.typeText(scenario === 'cron' ? '/ccem-cron 每天检查项目状态' : 'ordinary follow-up');
+    if (scenario === 'attachments') await mounted.pasteImage('follow-up.png');
+    await mounted.submit();
+    assert.equal(mounted.state.responses.length, 0);
+    assert.equal(mounted.state.queueCalls.length, 1);
+    assert.deepEqual(mounted.state.queueCalls[0].options, { queuedBehindTurn: true });
+    if (scenario === 'attachments') assert.equal(mounted.state.queueCalls[0].prompts[0].attachments.length, 1);
+    await mounted.resolve();
+    assert.equal(mounted.state.result, true);
+  });
+}
+
+for (const editDuringReply of [false, true]) {
+  test(`active Plan typed revision rejection retains ${editDuringReply ? 'new and rejected drafts' : 'unchanged draft'} without fallback enqueue`, async (t) => {
+    const { container, restore } = installDom();
+    const harness = await (importedHarnessPromise ??= importHarness());
+    const mounted = harness.mountFailure(container, true, null, null, { plan: true });
+    t.after(() => { mounted.unmount(); restore(); });
+    mounted.typeText('REVISION_A: change plan before executing');
+    await mounted.submit();
+    assert.equal(mounted.state.responses.length, 1);
+    assert.equal(mounted.state.queueCalls.length, 0);
+    if (editDuringReply) mounted.typeText('UNSENT_NEW_B');
+    await mounted.reject();
+    assert.equal(mounted.state.result, false);
+    assert.equal(mounted.state.queueCalls.length, 0, 'failed attention response must never fall back to queue');
+    assert.equal(mounted.state.optimistic.length, 0);
+    assert.equal(mounted.text(), editDuringReply ? 'UNSENT_NEW_B' : 'REVISION_A: change plan before executing');
+    if (editDuringReply) {
+      mounted.recover();
+      assert.match(mounted.text(), /REVISION_A/);
+      assert.match(mounted.text(), /UNSENT_NEW_B/);
+    }
+  });
+}
+
+test('active Plan typed approval classifies display text while preserving expanded request and annotations', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true, null, null, { plan: true, queueAnnotationsBlocked: true });
+  t.after(() => { mounted.unmount(); restore(); });
+  mounted.state.addAnnotation('reviewed plan source', 'keep the validation step');
+  mounted.typeText('继续执行');
+  await mounted.submit();
+  assert.equal(mounted.state.queueCalls.length, 0, 'attention reply cannot join or validate unrelated aggregate queue');
+  assert.equal(mounted.state.responses.length, 1);
+  const { runtimeId, payload } = mounted.state.responses[0];
+  assert.equal(runtimeId, 'review-only-runtime');
+  assert.equal(payload.toolUseId, 'real-exit-plan-tool');
+  assert.equal(payload.expectedAttentionSeq, 42);
+  assert.equal(payload.promptType, 'plan_exit');
+  assert.equal(payload.displayText, '继续执行', 'visible approval must exclude expanded context');
+  assert.equal(payload.answers.decision, 'approve', 'classification must use visible text, not expanded request');
+  assert.notEqual(payload.answers.approval, payload.displayText);
+  assert.match(payload.answers.approval, /继续执行/);
+  assert.match(payload.answers.approval, /reviewed plan source/);
+  assert.match(payload.answers.approval, /keep the validation step/);
+  assert.deepEqual(payload.promptAnnotations, [{ quote: 'reviewed plan source', note: 'keep the validation step' }]);
+  await mounted.resolve();
+  assert.equal(mounted.state.result, true);
+  assert.equal(mounted.text(), '');
+  assert.equal(mounted.state.annotations.pendingAnnotations.length, 0);
 });

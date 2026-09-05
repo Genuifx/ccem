@@ -299,21 +299,14 @@ test('live and history workspace paths wire transcript selections into successfu
   assert.match(composerSource, /text = buildComposerPromptWithAnnotations\(text, promptAnnotations\)/);
   // ACK snapshot ownership is covered by the real annotation hook + composer
   // DOM in composer-admission-dom.test.mjs (A sent, newly added B remains).
+  // Active Plan display-text classification, expanded request annotations, and
+  // bypass of unrelated queue aggregate limits are exercised by the rich Plan
+  // Composer -> handleSend DOM case in composer-admission-dom.test.mjs.
   assert.match(liveSource, /composerHasDraft \|\| sessionAnnotations\.pendingAnnotations\.length > 0/);
-  assert.match(
-    liveSource,
-    /isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*requestText: text,[\s\S]*annotations,/,
-    'plan review must classify visible text while preserving model context and annotation metadata',
-  );
   assert.match(
     liveSource,
     /promptType: 'plan_exit',[\s\S]*displayText: payload\.text,[\s\S]*approval: payload\.requestText \?\? payload\.text[\s\S]*promptAnnotations: payload\.annotations,/,
     'plan review must keep internal XML out of the bubble while persisting annotations',
-  );
-  assert.match(
-    liveSource,
-    /if \(!isCronCommand && hasQuickReplyPrompt[\s\S]*isPlanExitApprovalText\(displayText, planExitReplies\)[\s\S]*if \(isProcessingTurn \|\| hasHardBlockingAttention\) \{\s*if \(collectQueuedPromptAnnotations/,
-    'interactive replies must bypass aggregate limits for a queue they will not join',
   );
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
   assert.match(liveSource, /isActive=\{isVisible\}/);
