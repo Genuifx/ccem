@@ -101,6 +101,8 @@ fn signal(process: &Process, signal: i32) -> Result<(), String> {
     if !same_process(process, &current) || current.status == 5 {
         return Ok(());
     }
+    #[cfg(test)]
+    tests::injected_signal_error(process, signal)?;
     if unsafe { libc::kill(process.pid, signal) } == 0 {
         return Ok(());
     }
@@ -141,6 +143,8 @@ fn snapshot() -> Result<Vec<Process>, String> {
             }
             continue;
         }
+        #[cfg(test)]
+        tests::after_pid_inventory();
         let mut processes = Vec::new();
         for pid in pids.into_iter().take(count) {
             if let Some(process) = inspect(pid)? {
@@ -172,6 +176,17 @@ impl Drop for ResumeRoot {
     fn drop(&mut self) {
         if let Some(root) = self.0.take() {
             let _ = signal(&root, libc::SIGCONT);
+        }
+    }
+}
+
+// Roll back only state transitions owned by this operation. In particular,
+// a child already stopped before prepare_stop must remain stopped on error.
+struct ResumeStopped(Vec<Process>);
+impl Drop for ResumeStopped {
+    fn drop(&mut self) {
+        for process in &self.0 {
+            let _ = signal(process, libc::SIGCONT);
         }
     }
 }
@@ -213,47 +228,38 @@ impl NativeExecutionDomain {
         self.members().map(drop)
     }
 
-    fn freeze(&self) -> Result<(Vec<Process>, ResumeRoot), String> {
+    fn freeze(&self) -> Result<(Vec<Process>, ResumeStopped, ResumeRoot), String> {
         let resume = ResumeRoot(
             inspect(self.root.pid)?.filter(|p| same_process(p, &self.root) && p.status != 4),
         );
         signal(&self.root, libc::SIGSTOP)?;
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut frozen = Vec::new();
+        let mut frozen = ResumeStopped(Vec::new());
+        let mut stopped_inventory: Option<Vec<Process>> = None;
         loop {
-            let members = match self.members() {
-                Ok(members) => members,
-                Err(error) => {
-                    for process in &frozen {
-                        let _ = signal(process, libc::SIGCONT);
-                    }
-                    return Err(error);
-                }
-            };
+            let members = self.members()?;
             let mut settled = true;
             for process in &members {
                 if process.status != 4 && process.status != 5 {
                     settled = false;
-                    if let Err(error) = signal(process, libc::SIGSTOP) {
-                        for process in &frozen {
-                            let _ = signal(process, libc::SIGCONT);
-                        }
-                        return Err(error);
-                    }
-                    if !frozen.iter().any(|p: &Process| same_process(p, process)) {
-                        frozen.push(process.clone());
+                    signal(process, libc::SIGSTOP)?;
+                    if !frozen.0.iter().any(|p| same_process(p, process)) {
+                        frozen.0.push(process.clone());
                     }
                 }
             }
-            // A stopped parent cannot fork/reap new children. Re-enumerating
-            // after every discovered member is stopped closes the fork race.
-            if settled {
-                return Ok((members, resume));
+            // PID enumeration and per-PID inspection are not atomic: a parent
+            // may fork after enumeration and stop before inspection. Only an
+            // additional complete inventory, begun after all observed parents
+            // were stopped, can certify that no new child was missed.
+            if settled && stopped_inventory.as_ref().is_some_and(|previous| {
+                previous.len() == members.len()
+                    && previous.iter().all(|p| members.iter().any(|m| same_process(p, m)))
+            }) {
+                return Ok((members, frozen, resume));
             }
+            stopped_inventory = settled.then_some(members);
             if Instant::now() >= deadline {
-                for process in &frozen {
-                    let _ = signal(process, libc::SIGCONT);
-                }
                 return Err("Native execution domain did not quiesce".into());
             }
             thread::sleep(Duration::from_millis(5));
@@ -265,18 +271,13 @@ impl NativeExecutionDomain {
             .operation
             .lock()
             .map_err(|_| "Native execution operation lock poisoned")?;
-        let (members, mut resume) = self.freeze()?;
+        let (members, mut frozen, mut resume) = self.freeze()?;
         let targets = members
             .into_iter()
             .filter(|p| include_root || p.unique != self.root.unique)
             .collect::<Vec<_>>();
         for process in &targets {
-            if let Err(error) = signal(process, libc::SIGKILL) {
-                for process in &targets {
-                    let _ = signal(process, libc::SIGCONT);
-                }
-                return Err(error);
-            }
+            signal(process, libc::SIGKILL)?;
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -299,6 +300,7 @@ impl NativeExecutionDomain {
         if include_root {
             resume.0 = None;
         }
+        frozen.0.clear();
         Ok(resume)
     }
 
@@ -317,6 +319,173 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    thread_local! {
+        static FAIL_KILL: RefCell<Option<Process>> = const { RefCell::new(None) };
+        static AFTER_INVENTORY: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn injected_signal_error(process: &Process, requested: i32) -> Result<(), String> {
+        if requested == libc::SIGKILL && FAIL_KILL.with(|target|
+            target.borrow().as_ref().is_some_and(|target| same_process(target, process)))
+        {
+            Err("Injected EPERM for exact test-owned process".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn after_pid_inventory() {
+        let hook = AFTER_INVENTORY.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook { hook(); }
+    }
+
+    struct ResetHooks;
+    impl Drop for ResetHooks {
+        fn drop(&mut self) {
+            FAIL_KILL.with(|target| *target.borrow_mut() = None);
+            AFTER_INVENTORY.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    struct OwnedTestTree {
+        root: std::process::Child,
+        members: Rc<RefCell<Vec<Process>>>,
+        files: Vec<std::path::PathBuf>,
+    }
+    impl OwnedTestTree {
+        fn new(root: std::process::Child) -> Self {
+            let identity = inspect(root.id() as i32).unwrap().unwrap();
+            Self { root, members: Rc::new(RefCell::new(vec![identity])), files: vec![] }
+        }
+        fn remember(&self, pid: i32) -> Process {
+            let identity = inspect(pid).unwrap().unwrap();
+            self.members.borrow_mut().push(identity.clone());
+            identity
+        }
+    }
+    impl Drop for OwnedTestTree {
+        fn drop(&mut self) {
+            // A failed assertion must not strand this test's frozen workers.
+            FAIL_KILL.with(|target| *target.borrow_mut() = None);
+            AFTER_INVENTORY.with(|hook| *hook.borrow_mut() = None);
+            for member in self.members.borrow().iter().rev() {
+                let _ = signal(member, libc::SIGKILL);
+            }
+            let _ = self.root.wait();
+            for file in &self.files { let _ = std::fs::remove_file(file); }
+        }
+    }
+
+    fn wait_for_stopped(identity: &Process) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if inspect(identity.pid).unwrap().is_some_and(|current|
+                same_process(identity, &current) && current.status == 4)
+            { return; }
+            assert!(Instant::now() < deadline, "owned test process did not stop");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn failed_kill_preserves_a_child_stopped_before_the_operation() {
+        let root = Command::new("python3").args(["-u", "-c", r#"
+import os, sys, signal, time
+sys.stdin.readline()
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.kill(os.getpid(), signal.SIGSTOP)
+    time.sleep(30)
+    os._exit(0)
+print(pid, flush=True)
+sys.stdin.readline()
+"#]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut owned = OwnedTestTree::new(root);
+        let domain = NativeExecutionDomain::attach(owned.root.id()).unwrap();
+        owned.root.stdin.as_mut().unwrap().write_all(b"start\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(owned.root.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let child = owned.remember(line.trim().parse().unwrap());
+        wait_for_stopped(&child);
+        let _hooks = ResetHooks;
+        FAIL_KILL.with(|target| *target.borrow_mut() = Some(child.clone()));
+        let result = domain.prepare_stop();
+        FAIL_KILL.with(|target| *target.borrow_mut() = None);
+        thread::sleep(Duration::from_millis(30));
+        let after = inspect(child.pid).unwrap();
+        let root_after = inspect(owned.root.id() as i32).unwrap();
+        assert!(result.as_ref().err().is_some_and(|error| error.contains("Injected EPERM")));
+        assert!(after.is_some_and(|current| same_process(&child, &current) && current.status == 4),
+            "rollback must not resume a child stopped before this operation");
+        assert!(root_after.is_some_and(|current| same_process(&domain.root, &current) && current.status != 4),
+            "rollback must resume the root stopped by this operation");
+    }
+
+    #[test]
+    fn stop_catches_tool_forked_after_pid_inventory_before_parent_reports_stopped() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let fork_file = std::env::temp_dir().join(format!("ccem-domain-{}-{nonce}-fork", std::process::id()));
+        let tool_file = std::env::temp_dir().join(format!("ccem-domain-{}-{nonce}-tool", std::process::id()));
+        let root = Command::new("python3").args(["-u", "-c", r#"
+import os, sys, time, signal
+from pathlib import Path
+fork_file, tool_file = Path(sys.argv[1]), Path(sys.argv[2])
+sys.stdin.readline()
+worker = os.fork()
+if worker == 0:
+    while not fork_file.exists(): time.sleep(0.001)
+    tool = os.fork()
+    if tool == 0:
+        os.setsid()
+        os.execl('/bin/sleep', 'sleep', '30')
+    tool_file.write_text(str(tool))
+    os.kill(os.getpid(), signal.SIGSTOP)
+    time.sleep(30)
+    os._exit(0)
+print(worker, flush=True)
+sys.stdin.readline()
+"#]).arg(&fork_file).arg(&tool_file).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut owned = OwnedTestTree::new(root);
+        owned.files = vec![fork_file.clone(), tool_file.clone()];
+        let domain = NativeExecutionDomain::attach(owned.root.id()).unwrap();
+        owned.root.stdin.as_mut().unwrap().write_all(b"start\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(owned.root.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let worker = owned.remember(line.trim().parse().unwrap());
+        let late_tool = Rc::new(RefCell::new(None::<Process>));
+        let captured_tool = late_tool.clone();
+        let members = owned.members.clone();
+        let _hooks = ResetHooks;
+        AFTER_INVENTORY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(fork_file, b"fork").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&tool_file) {
+                    if let Ok(pid) = pid.trim().parse() {
+                        let tool = inspect(pid).unwrap().unwrap();
+                        members.borrow_mut().push(tool.clone());
+                        *captured_tool.borrow_mut() = Some(tool);
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "owned worker did not fork its tool");
+                thread::sleep(Duration::from_millis(1));
+            }
+            wait_for_stopped(&worker);
+        })));
+        let prepared = domain.prepare_stop();
+        let tool = late_tool.borrow().clone().expect("inventory hook must run");
+        let tool_survived = inspect(tool.pid).unwrap().is_some_and(|current|
+            same_process(&tool, &current) && current.status != 5);
+        assert!(prepared.is_ok(), "{:?}", prepared.as_ref().err());
+        assert!(!tool_survived, "Stop must catch a child forked after PID enumeration; a single settled inventory is insufficient");
+        drop(prepared);
+    }
 
     #[test]
     fn stop_reaps_separate_tool_group_before_helper_ack_and_preserves_sibling() {

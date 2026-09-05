@@ -1341,6 +1341,21 @@ export function WorkspaceSessionComposer({
     const submittedAnnotations = annotations.slice();
     const promptValue = segmentsToPlainText(submittedSegments);
     const currentAttachments = attachmentsRef.current;
+    // Only definite non-admission reaches this exit. Preparation failures and
+    // explicit submit rejection must preserve the same captured draft.
+    const rejectUnadmittedDraft = () => {
+      if (draftEditRevisionRef.current !== submittedRevision
+        || attachmentsRef.current !== currentAttachments
+        || JSON.stringify(annotationsRef.current) !== JSON.stringify(submittedAnnotations)) {
+        setRejectedDrafts((previous) => [...previous, {
+          segments: submittedSegments,
+          annotations: submittedAnnotations,
+          attachments: currentAttachments.map((attachment) => attachment.kind === 'image'
+            ? { ...attachment, objectUrl: null } : attachment),
+        }]);
+      }
+      return false;
+    };
     let text = ensureComposerImagePlaceholders(promptValue, currentAttachments);
     let displayText = ensureComposerImagePlaceholders(buildComposerDisplayText(promptValue), currentAttachments);
     let latestInstalledSkills = installedSkills;
@@ -1373,19 +1388,19 @@ export function WorkspaceSessionComposer({
         ));
         if (unreadableSkills.length > 0) {
           toast.error(t('workspace.composerSkillReadFailed'));
-          return false;
+          return rejectUnadmittedDraft();
         }
         text = buildComposerPromptWithSelectedSkills(displayText, selectedSkills);
       } catch (error) {
         console.error('Failed to read selected skill files for composer prompt:', error);
         toast.error(t('workspace.composerSkillReadFailed'));
-        return false;
+        return rejectUnadmittedDraft();
       }
     }
     const promptAnnotations = parseWorkspacePromptAnnotations(annotations);
     if (promptAnnotations == null) {
       toast.error(t('workspace.messageAnnotationsInvalid'));
-      return false;
+      return rejectUnadmittedDraft();
     }
     if (promptAnnotations.length > 0) {
       text = buildComposerPromptWithAnnotations(text, promptAnnotations);
@@ -1403,23 +1418,13 @@ export function WorkspaceSessionComposer({
     };
 
     if (!payload.text && payload.attachments.length === 0) {
-      return false;
+      return rejectUnadmittedDraft();
     }
 
     const result = await onSubmit(payload);
-    if (result === false && (
-      draftEditRevisionRef.current !== submittedRevision
-      || attachmentsRef.current !== currentAttachments
-      || JSON.stringify(annotationsRef.current) !== JSON.stringify(submittedAnnotations)
-    )) {
-      setRejectedDrafts((previous) => [...previous, {
-        segments: submittedSegments,
-        annotations: submittedAnnotations,
-        attachments: currentAttachments.map((attachment) => attachment.kind === 'image'
-          ? { ...attachment, objectUrl: null } : attachment),
-      }]);
-    }
-    if (result !== false) {
+    if (result === false) {
+      return rejectUnadmittedDraft();
+    } else {
       // Admission only consumes this submission's snapshot. Edits made while
       // the IPC (or skill expansion) awaited remain a separate, unsent draft.
       if (draftEditRevisionRef.current === submittedRevision) {

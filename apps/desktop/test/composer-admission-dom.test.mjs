@@ -41,7 +41,7 @@ const stubsPlugin = {
     }));
     builder.onLoad({ filter: /^tauri-core-stub$/, namespace: 'composer-submit-stubs' }, () => ({
       loader: 'js',
-      contents: 'export async function invoke() { return []; }',
+      contents: 'export async function invoke(command, args) { return globalThis.__acceptanceInvoke ? globalThis.__acceptanceInvoke(command, args) : []; }',
     }));
     builder.onResolve({ filter: /^@tauri-apps\/api\/window$/ }, () => ({
       path: 'tauri-window-stub', namespace: 'composer-submit-stubs',
@@ -274,7 +274,7 @@ async function importHarness() {
           };
         }
 
-        export function mountFailure(container, processing, interactiveKind = null) {
+        export function mountFailure(container, processing, interactiveKind = null, annotationOverrides = null) {
           const state = { calls: 0, reject: null, resolve: null, errors: [], result: null, payloads: [] };
           function Harness() {
             const [revision, setRevision] = useState(0);
@@ -337,7 +337,7 @@ async function importHarness() {
               valueRevision={revision}
               onValueChange={() => {}}
               onSubmit={async payload => { state.result = await (interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; }}
-              annotations={annotationModel.pendingAnnotations}
+              annotations={annotationOverrides ?? annotationModel.pendingAnnotations}
               onAnnotationsSent={annotationModel.markAllSent}
               onAnnotationsRestore={annotationModel.restoreAnnotations}
               placeholder="composer input"
@@ -361,8 +361,8 @@ async function importHarness() {
                 await Promise.resolve();
               });
             },
-            async resolve() {
-              await act(async () => { state.resolve(); await Promise.resolve(); });
+            async resolve(value) {
+              await act(async () => { state.resolve(value); await Promise.resolve(); });
             },
             typeText(text) {
               act(() => {
@@ -1164,4 +1164,108 @@ test('recovery distinguishes same-message offsets and deduplicates an already-re
   assert.equal(pending.filter(a => a.note === 'note' && a.anchor.startOffset === 0).length, 1);
   assert.equal(pending.filter(a => a.note === 'note' && a.anchor.startOffset === 10).length, 1);
   assert.equal(pending.filter(a => a.note === 'new note').length, 1);
+});
+
+for (const editDuringRead of [false, true]) {
+  test(`additional acceptance: skill-read failure ${editDuringRead ? 'retains rejected A alongside new B' : 'preserves unchanged draft'}`, async (t) => {
+    const { container, restore } = installDom();
+    const harness = await (importedHarnessPromise ??= importHarness());
+    const mounted = harness.mountFailure(container, true);
+    t.after(() => { delete globalThis.__acceptanceInvoke; mounted.unmount(); restore(); });
+    const requested = [];
+    globalThis.__acceptanceInvoke = (command, args) => {
+      if (command !== 'read_skill_files') return [];
+      requested.push(args);
+      return new Promise((resolve, reject) => { mounted.state.resolve = resolve; mounted.state.reject = reject; });
+    };
+    const original = 'ORIGINAL_A use [$review](/tmp/qa-review/SKILL.md)';
+    mounted.typeText(original);
+    await mounted.submit();
+    assert.equal(requested.length, 1);
+    assert.equal(mounted.state.calls, 0, 'admission should wait for selected skill content');
+    if (editDuringRead) mounted.typeText('NEW_UNSENT_B');
+    await mounted.reject();
+    const recoveryRows = container.querySelectorAll('[data-composer-rejected-draft]').length;
+    console.log(JSON.stringify({additional:'skill_read_failure', editDuringRead, draft:mounted.text(), recoveryRows, admissionCalls:mounted.state.calls}));
+    if (!editDuringRead) {
+      assert.equal(mounted.text(), original);
+    } else {
+      assert.equal(mounted.text(), 'NEW_UNSENT_B');
+      assert.equal(recoveryRows, 1, 'A failed before admission and must remain recoverable after B replaces it');
+      mounted.recover();
+      assert.match(mounted.text(), /ORIGINAL_A/);
+      assert.match(mounted.text(), /NEW_UNSENT_B/);
+    }
+  });
+}
+
+for (const failure of ['unreadable', 'annotation-validation']) {
+  for (const editDuringRead of [false, true]) {
+    test(`pre-admission ${failure} ${editDuringRead ? 'retains snapshot beside new draft' : 'leaves unchanged draft in place'}`, async (t) => {
+      const { container, restore } = installDom();
+      const harness = await (importedHarnessPromise ??= importHarness());
+      const invalidAnnotations = failure === 'annotation-validation'
+        ? Array.from({ length: 21 }, (_, i) => ({ id: `annotation-${i}`, quote: `quote ${i}`, note: 'note', createdAt: new Date().toISOString() }))
+        : null;
+      const mounted = harness.mountFailure(container, true, null, invalidAnnotations);
+      t.after(() => { delete globalThis.__acceptanceInvoke; mounted.unmount(); restore(); });
+      globalThis.__acceptanceInvoke = command => command === 'read_skill_files'
+        ? new Promise(resolve => { mounted.state.resolve = resolve; }) : [];
+      const original = 'ORIGINAL_A use [$review](/tmp/qa-review/SKILL.md)';
+      mounted.typeText(original);
+      await mounted.submit();
+      assert.equal(mounted.state.calls, 0);
+      if (editDuringRead) mounted.typeText('NEW_UNSENT_B');
+      await mounted.resolve(failure === 'unreadable'
+        ? [{ path: '/tmp/qa-review/SKILL.md', name: 'review', content: '', diagnostics: ['permission denied'] }]
+        : []);
+      assert.equal(mounted.state.calls, 0, 'preparation rejection cannot reach admission');
+      assert.equal(mounted.text(), editDuringRead ? 'NEW_UNSENT_B' : original);
+      assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, editDuringRead ? 1 : 0);
+      if (editDuringRead) {
+        assert.match(container.querySelector('[data-composer-rejected-draft]').textContent, /ORIGINAL_A/);
+        mounted.recover();
+        if (failure === 'unreadable') {
+          assert.match(mounted.text(), /ORIGINAL_A/);
+          assert.match(mounted.text(), /NEW_UNSENT_B/);
+        } else {
+          assert.equal(mounted.text(), 'NEW_UNSENT_B', 'invalid over-capacity annotation snapshot stays recoverable without corrupting current input');
+          assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 1);
+        }
+      }
+    });
+  }
+}
+
+test('failed skill preprocessing preserves both drafts rich payload and requires explicit recovery and retry', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { delete globalThis.__acceptanceInvoke; mounted.unmount(); restore(); });
+  globalThis.__acceptanceInvoke = command => command === 'read_skill_files'
+    ? new Promise((resolve, reject) => { mounted.state.resolve = resolve; mounted.state.reject = reject; }) : [];
+  mounted.typeText('ORIGINAL_A use [$review](/tmp/qa-review/SKILL.md)');
+  mounted.state.addAnnotation('A quote', 'A note');
+  await mounted.pasteImage('A.png');
+  await mounted.submit();
+  mounted.typeText('NEW_B');
+  mounted.state.addAnnotation('B quote', 'B note');
+  await mounted.pasteImage('B.png');
+  await mounted.reject();
+  assert.equal(mounted.state.calls, 0);
+  assert.match(mounted.text(), /NEW_B/);
+  assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 1);
+  mounted.recover();
+  assert.equal(mounted.state.calls, 0, 'restore is not an automatic send');
+  delete globalThis.__acceptanceInvoke;
+  await mounted.submit();
+  assert.equal(mounted.state.calls, 1);
+  const delivered = mounted.state.payloads[0];
+  assert.match(delivered.text, /NEW_B/);
+  assert.match(delivered.text, /ORIGINAL_A/);
+  assert.equal(delivered.attachments.length, 2);
+  assert.equal(new Set(delivered.attachments.map(a => a.placeholder)).size, 2);
+  assert.deepEqual(delivered.annotations.map(a => a.note), ['A note', 'B note']);
+  await mounted.resolve();
+  assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
 });
