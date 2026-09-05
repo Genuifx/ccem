@@ -402,13 +402,19 @@ async function importHarness() {
               });
             },
             async pasteImage(name) {
+              const attachmentCount = () => container.querySelectorAll('button[aria-label="workspace.composerRemoveAttachment"]').length;
+              const previousCount = attachmentCount();
               await act(async () => {
                 const file = new File(['test image bytes'], name, { type: 'image/png' });
                 const event = new Event('paste', { bubbles: true, cancelable: true });
                 Object.defineProperty(event, 'clipboardData', { value: { files: [file], items: [], getData: () => '' } });
                 editor().dispatchEvent(event);
-                await new Promise(resolve => setTimeout(resolve, 25));
               });
+              const deadline = Date.now() + 2000;
+              while (attachmentCount() <= previousCount) {
+                if (Date.now() >= deadline) throw new Error('Pasted image did not become an attachment');
+                await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+              }
             },
             removeFirstAttachment() { act(() => container.querySelector('button[aria-label="workspace.composerRemoveAttachment"]').click()); },
             recoverAllSameTick() { act(() => { for (const button of container.querySelectorAll('[data-composer-rejected-draft] button')) button.click(); }); },
@@ -975,6 +981,11 @@ test('independent acceptance: running Codex does not present an enabled Send act
 
 test('independent acceptance: ACK does not leave visible image chips with no corresponding unsent payload', async (t) => {
   const { container, restore } = installDom();
+  // FileReader completion can outlive a fixed short sleep under full-suite load.
+  const readAsDataURL = FileReader.prototype.readAsDataURL;
+  FileReader.prototype.readAsDataURL = function (file) {
+    setTimeout(() => readAsDataURL.call(this, file), 80);
+  };
   const harness = await (importedHarnessPromise ??= importHarness());
   const mounted = harness.mountFailure(container, true);
   t.after(() => { mounted.unmount(); restore(); });
