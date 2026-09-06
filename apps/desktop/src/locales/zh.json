@@ -1,4 +1,13 @@
 {
+  "startup": {
+    "preparing": "正在准备工作区…",
+    "configuration": "正在读取配置…",
+    "checkingSessions": "正在检查会话…",
+    "restoringSessions": "正在恢复会话…",
+    "startingServices": "正在连接服务…",
+    "ready": "准备就绪",
+    "failed": "启动未能完成，请重新打开应用。"
+  },
   "common": {
     "cancel": "取消",
     "delete": "删除",

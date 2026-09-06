@@ -20,6 +20,7 @@ import { scheduleAfterFirstPaint } from '@/lib/idle';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { EnvironmentsSkeleton } from '@/components/ui/skeleton-states';
 import { StartupSplash } from '@/components/layout/StartupSplash';
+import { useStartup } from '@/hooks/useStartup';
 import type { PetOpenSessionRequest } from '@/types/pet';
 import { AppUpdateProvider } from '@/components/app-update/AppUpdateProvider';
 import { runExclusiveLaunch } from '@/components/sessions/sessionLaunchAction';
@@ -110,7 +111,6 @@ function AppContent() {
   // Synchronous re-entry guard: React state can't block a second confirm within
   // the same tick, so a fast double-submit would hit the backend twice.
   const deleteEnvGuardRef = useRef(createDeleteGuard());
-  const [startupReady, setStartupReady] = useState(false);
   const [startupSplashVisible, setStartupSplashVisible] = useState(true);
   const [petOpenRequest, setPetOpenRequest] = useState<PetOpenSessionRequest | null>(null);
   const [workspaceSessionLinkRequest, setWorkspaceSessionLinkRequest] = useState<{ id: number; link: string } | null>(null);
@@ -151,6 +151,86 @@ function AppContent() {
     loadEnabledEnvironments,
     loadFromRemote,
   } = useTauriCommands();
+
+  const refreshCriticalData = useCallback(async () => {
+    const settingsPromise = invoke<{
+      defaultMode: string | null;
+      enabledEnvironments?: string[] | null;
+    }>('get_settings')
+      .then((settings) => {
+        const defaultMode = normalizeAppPermissionMode(settings.defaultMode);
+        if (defaultMode) {
+          setDefaultMode(defaultMode);
+          setPermissionMode(defaultMode);
+        }
+        // Prefer full settings payload; keep explicit null as legacy all-enabled.
+        useAppStore.getState().setEnabledEnvironments(settings.enabledEnvironments ?? null);
+      })
+      .catch(() => {
+        const saved = localStorage.getItem('ccem-settings');
+        if (!saved) {
+          return;
+        }
+        try {
+          const settings = JSON.parse(saved) as {
+            defaultMode?: unknown;
+            enabledEnvironments?: string[] | null;
+          };
+          const defaultMode = normalizeAppPermissionMode(settings.defaultMode);
+          if (defaultMode) {
+            setDefaultMode(defaultMode);
+            setPermissionMode(defaultMode);
+          }
+          if ('enabledEnvironments' in settings) {
+            useAppStore.getState().setEnabledEnvironments(settings.enabledEnvironments ?? null);
+          }
+        } catch {
+          // Ignore corrupt local fallback settings.
+        }
+      });
+    // Best-effort dedicated load so enablement still hydrates if settings payload is partial.
+    void loadEnabledEnvironments();
+    const envPromise = loadEnvironments().catch(() => {
+      // Fallback to presets if Tauri is not available (dev mode)
+      const envList: Environment[] = Object.entries(ENV_PRESETS).map(([name, config]) => ({
+        name,
+        baseUrl: config.ANTHROPIC_BASE_URL || '',
+        defaultOpusModel: config.ANTHROPIC_DEFAULT_OPUS_MODEL || '',
+        defaultSonnetModel: config.ANTHROPIC_DEFAULT_SONNET_MODEL,
+        defaultHaikuModel: config.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+        runtimeModel: config.ANTHROPIC_MODEL || 'opus',
+        limitWriteTools: Boolean(config.CCEM_LIMIT_WRITE_TOOLS),
+      }));
+      envList.unshift({
+        name: 'official',
+        baseUrl: 'https://api.anthropic.com',
+        defaultOpusModel: '',
+        defaultHaikuModel: 'claude-3-5-haiku-20241022',
+        runtimeModel: 'opus',
+        limitWriteTools: false,
+      });
+      setEnvironments(envList);
+    });
+    const currentEnvPromise = loadCurrentEnv().catch(() => {
+      setCurrentEnv('official');
+    });
+
+    await Promise.allSettled([
+      settingsPromise,
+      envPromise,
+      currentEnvPromise,
+    ]);
+  }, [
+    loadEnvironments,
+    loadEnabledEnvironments,
+    loadCurrentEnv,
+    setEnvironments,
+    setCurrentEnv,
+    setDefaultMode,
+    setPermissionMode,
+  ]);
+
+  const { ready: startupReady, phase: startupPhase } = useStartup(refreshCriticalData);
 
   const surfaceBackgroundTerminalPartial = useCallback((error: unknown) => {
     if (!isInteractiveSessionTerminalOpenError(error)) {
@@ -422,84 +502,6 @@ function AppContent() {
     surfaceBackgroundTerminalPartial,
   ]);
 
-  const refreshCriticalData = useCallback(async () => {
-    const settingsPromise = invoke<{
-      defaultMode: string | null;
-      enabledEnvironments?: string[] | null;
-    }>('get_settings')
-      .then((settings) => {
-        const defaultMode = normalizeAppPermissionMode(settings.defaultMode);
-        if (defaultMode) {
-          setDefaultMode(defaultMode);
-          setPermissionMode(defaultMode);
-        }
-        // Prefer full settings payload; keep explicit null as legacy all-enabled.
-        useAppStore.getState().setEnabledEnvironments(settings.enabledEnvironments ?? null);
-      })
-      .catch(() => {
-        const saved = localStorage.getItem('ccem-settings');
-        if (!saved) {
-          return;
-        }
-        try {
-          const settings = JSON.parse(saved) as {
-            defaultMode?: unknown;
-            enabledEnvironments?: string[] | null;
-          };
-          const defaultMode = normalizeAppPermissionMode(settings.defaultMode);
-          if (defaultMode) {
-            setDefaultMode(defaultMode);
-            setPermissionMode(defaultMode);
-          }
-          if ('enabledEnvironments' in settings) {
-            useAppStore.getState().setEnabledEnvironments(settings.enabledEnvironments ?? null);
-          }
-        } catch {
-          // Ignore corrupt local fallback settings.
-        }
-      });
-    // Best-effort dedicated load so enablement still hydrates if settings payload is partial.
-    void loadEnabledEnvironments();
-    const envPromise = loadEnvironments().catch(() => {
-      // Fallback to presets if Tauri is not available (dev mode)
-      const envList: Environment[] = Object.entries(ENV_PRESETS).map(([name, config]) => ({
-        name,
-        baseUrl: config.ANTHROPIC_BASE_URL || '',
-        defaultOpusModel: config.ANTHROPIC_DEFAULT_OPUS_MODEL || '',
-        defaultSonnetModel: config.ANTHROPIC_DEFAULT_SONNET_MODEL,
-        defaultHaikuModel: config.ANTHROPIC_DEFAULT_HAIKU_MODEL,
-        runtimeModel: config.ANTHROPIC_MODEL || 'opus',
-        limitWriteTools: Boolean(config.CCEM_LIMIT_WRITE_TOOLS),
-      }));
-      envList.unshift({
-        name: 'official',
-        baseUrl: 'https://api.anthropic.com',
-        defaultOpusModel: '',
-        defaultHaikuModel: 'claude-3-5-haiku-20241022',
-        runtimeModel: 'opus',
-        limitWriteTools: false,
-      });
-      setEnvironments(envList);
-    });
-    const currentEnvPromise = loadCurrentEnv().catch(() => {
-      setCurrentEnv('official');
-    });
-
-    await Promise.allSettled([
-      settingsPromise,
-      envPromise,
-      currentEnvPromise,
-    ]);
-  }, [
-    loadEnvironments,
-    loadEnabledEnvironments,
-    loadCurrentEnv,
-    setEnvironments,
-    setCurrentEnv,
-    setDefaultMode,
-    setPermissionMode,
-  ]);
-
   const refreshDeferredData = useCallback(async () => {
     const appConfigPromise = loadAppConfig().catch((err) => {
       console.error('Failed to load app config:', err);
@@ -535,52 +537,6 @@ function AppContent() {
     setCompanion,
   ]);
 
-  // Keep cold-start intentional: show the branded glass splash until critical
-  // config is ready, then fill in sessions and analytics after the first app paint.
-  useEffect(() => {
-    let cancelled = false;
-    let minimumTimerId: number | null = null;
-    let maxTimerId: number | null = null;
-    const startedAt = performance.now();
-    const minSplashMs = 760;
-    const maxSplashMs = 4800;
-
-    const finishStartup = () => {
-      if (cancelled) {
-        return;
-      }
-      if (maxTimerId !== null) {
-        window.clearTimeout(maxTimerId);
-        maxTimerId = null;
-      }
-
-      const elapsedMs = performance.now() - startedAt;
-      const remainingMs = Math.max(0, minSplashMs - elapsedMs);
-      minimumTimerId = window.setTimeout(() => {
-        if (!cancelled) {
-          setStartupReady(true);
-        }
-      }, remainingMs);
-    };
-
-    maxTimerId = window.setTimeout(() => {
-      if (!cancelled) {
-        setStartupReady(true);
-      }
-    }, maxSplashMs);
-
-    void refreshCriticalData().finally(finishStartup);
-
-    return () => {
-      cancelled = true;
-      if (minimumTimerId !== null) {
-        window.clearTimeout(minimumTimerId);
-      }
-      if (maxTimerId !== null) {
-        window.clearTimeout(maxTimerId);
-      }
-    };
-  }, [refreshCriticalData]);
 
   useEffect(() => {
     if (!startupReady) {
@@ -868,6 +824,7 @@ function AppContent() {
           {startupSplashVisible ? (
             <StartupSplash
               exiting={startupReady}
+              phase={startupPhase}
               onExitComplete={handleStartupSplashExitComplete}
             />
           ) : null}

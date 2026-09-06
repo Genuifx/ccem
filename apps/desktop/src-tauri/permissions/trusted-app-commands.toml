@@ -171,6 +171,7 @@ commands.allow = [
   "get_default_working_dir",
   "set_default_working_dir",
   "get_settings",
+  "get_startup_status",
   "save_settings",
   "save_language",
   "save_enabled_environments",

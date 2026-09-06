@@ -1,4 +1,13 @@
 {
+  "startup": {
+    "preparing": "Preparing your workspace…",
+    "configuration": "Loading configuration…",
+    "checkingSessions": "Checking sessions…",
+    "restoringSessions": "Restoring sessions…",
+    "startingServices": "Connecting services…",
+    "ready": "Ready",
+    "failed": "Startup could not finish. Please reopen the app."
+  },
   "common": {
     "cancel": "Cancel",
     "delete": "Delete",

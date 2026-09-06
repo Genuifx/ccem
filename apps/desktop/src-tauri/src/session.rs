@@ -329,8 +329,9 @@ impl SessionManager {
             return;
         }
 
-        let active_iterm_sessions = terminal::list_iterm_sessions();
-        let active_terminal_windows = terminal::list_terminal_app_windows();
+        let running = self.get_running_sessions();
+        let active_iterm_sessions = query_needed_terminal(&running, "iterm2", terminal::list_iterm_sessions);
+        let active_terminal_windows = query_needed_terminal(&running, "terminalapp", terminal::list_terminal_app_windows);
 
         {
             let mut sessions = self.lock_sessions();
@@ -347,8 +348,8 @@ impl SessionManager {
                 match (&session.terminal_type, &session.window_id) {
                     (Some(term_type), Some(wid)) => {
                         let is_alive = match term_type.as_str() {
-                            "iterm2" => active_iterm_sessions.contains(wid),
-                            "terminalapp" => active_terminal_windows.contains(wid),
+                            "iterm2" => terminal_window_is_present(&active_iterm_sessions, wid),
+                            "terminalapp" => terminal_window_is_present(&active_terminal_windows, wid),
                             _ => false,
                         };
 
@@ -370,6 +371,23 @@ impl SessionManager {
         }
         self.save_to_disk();
     }
+}
+
+fn query_needed_terminal(
+    sessions: &[Session], kind: &str,
+    query: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    if sessions.iter().any(|session| !session.is_tmux_backed() && session.terminal_type.as_deref() == Some(kind)) {
+        query()
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn terminal_window_is_present(result: &Result<Vec<String>, String>, id: &str) -> bool {
+    // Failure/timeout is unknown, so the next monitor pass can retry. It must
+    // not turn a live user's session into an interrupted session.
+    result.as_ref().map(|ids| ids.iter().any(|value| value == id)).unwrap_or(true)
 }
 
 /// Check if a process with the given PID is still running
@@ -481,11 +499,11 @@ pub fn start_session_monitor(app: AppHandle, manager: Arc<SessionManager>) {
             }
 
             // 2. Batch query all active terminal windows (single AppleScript call each)
-            let active_iterm_sessions = terminal::list_iterm_sessions();
-            let active_terminal_app_windows = terminal::list_terminal_app_windows();
+            let terminal_sessions = manager.get_running_terminal_sessions();
+            let active_iterm_sessions = query_needed_terminal(&terminal_sessions, "iterm2", terminal::list_iterm_sessions);
+            let active_terminal_app_windows = query_needed_terminal(&terminal_sessions, "terminalapp", terminal::list_terminal_app_windows);
 
             // 3. Check terminal-based sessions
-            let terminal_sessions = manager.get_running_terminal_sessions();
             for session in terminal_sessions {
                 let context = NotificationContext::new(
                     session.env_name.clone(),
@@ -525,8 +543,8 @@ pub fn start_session_monitor(app: AppHandle, manager: Arc<SessionManager>) {
                 // Then check if terminal window still exists
                 if let (Some(term_type), Some(wid)) = (&session.terminal_type, &session.window_id) {
                     let is_alive = match term_type.as_str() {
-                        "iterm2" => active_iterm_sessions.contains(wid),
-                        "terminalapp" => active_terminal_app_windows.contains(wid),
+                        "iterm2" => terminal_window_is_present(&active_iterm_sessions, wid),
+                        "terminalapp" => terminal_window_is_present(&active_terminal_app_windows, wid),
                         _ => true,
                     };
 
@@ -581,6 +599,23 @@ mod tests {
             iterm_session_id: None,
             tmux_target: Some(format!("ccem-{}:main", id.replace('-', ""))),
         }
+    }
+
+    #[test]
+    fn startup_skips_unneeded_terminal_queries_and_preserves_unknown_sessions() {
+        let session = sample_session("tmux-fixture");
+        let result = super::query_needed_terminal(&[session], "iterm2", || {
+            panic!("tmux restore must not start an AppleScript query");
+        });
+        assert_eq!(result.unwrap(), Vec::<String>::new());
+        let mut session = sample_session("terminal-fixture");
+        session.tmux_target = None;
+        session.terminal_type = Some("iterm2".into());
+        session.window_id = Some("42".into());
+        let result = super::query_needed_terminal(&[session], "iterm2", || Err("timeout".into()));
+        assert!(super::terminal_window_is_present(&result, "42"));
+        assert!(!super::terminal_window_is_present(&Ok(vec![]), "42"));
+        assert!(super::terminal_window_is_present(&Ok(vec!["42".into()]), "42"));
     }
 
     #[test]

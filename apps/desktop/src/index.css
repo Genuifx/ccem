@@ -907,7 +907,7 @@
 .startup-splash::before {
   content: "";
   position: absolute;
-  inset: -18%;
+  inset: 0;
   z-index: -3;
   background:
     conic-gradient(
@@ -917,9 +917,7 @@
       hsl(38 72% 44% / 0.045),
       hsl(211 85% 44% / 0.12)
     );
-  filter: blur(74px);
   opacity: 0.56;
-  animation: startup-liquid-drift 7.5s ease-in-out infinite alternate;
 }
 
 .startup-splash::after {
@@ -957,7 +955,6 @@
       transparent 58%
     );
   transform: translateX(-24%) rotate(-8deg);
-  animation: startup-sheen 4.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
 }
 
 .startup-splash-center {
@@ -967,7 +964,6 @@
   align-items: center;
   gap: 15px;
   padding: 0;
-  animation: startup-card-breathe 2.6s ease-in-out infinite;
 }
 
 .startup-logo-aura {
@@ -986,7 +982,38 @@
     );
   filter: blur(30px);
   opacity: 0.58;
-  animation: startup-aura-breathe 2.6s ease-in-out infinite;
+}
+
+.startup-progress {
+  position: absolute;
+  top: calc(100% + 28px);
+  width: 208px;
+}
+
+.startup-progress p {
+  margin-top: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  color: hsl(var(--muted-foreground));
+}
+
+.progress-indeterminate {
+  animation: progress-travel 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-travel {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(400%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-indeterminate { animation: none; transform: translateX(100%); }
+}
+
+:root[data-performance-mode='reduced'] .progress-indeterminate {
+  animation: none;
+  transform: translateX(100%);
 }
 
 .startup-logo {
@@ -1030,7 +1057,6 @@
       hsl(38 88% 68% / 0.18),
       hsl(211 100% 66% / 0.25)
     );
-  filter: blur(78px);
   opacity: 0.88;
 }
 
