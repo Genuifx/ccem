@@ -46,14 +46,20 @@ test('embedded Login Browser pins CEF and splits macOS helper from Windows sandb
   assert.doesNotMatch(cargo, /crate-type\s*=\s*\[[^\]]*"cdylib"/,
     'ordinary Cargo builds must remain rlib/bin builds');
 
-  const loadIndex = helper.indexOf('loader.load()');
+  const loadIndex = helper.indexOf('assert!(loader.load()');
   const apiIndex = helper.indexOf('api_hash(');
   const argsIndex = helper.indexOf('Args::new()');
   assert.ok(loadIndex > 0, 'helper must load the bundled CEF framework');
   assert.ok(apiIndex > loadIndex, 'CEF API table must initialize after framework load');
   assert.ok(argsIndex > apiIndex, 'CEF values must not be constructed before API initialization');
+  const nativeArgsIndex = helper.indexOf('let main_args = cef::MainArgs');
   const sandboxIndex = helper.indexOf('sandbox.initialize(');
-  assert.ok(sandboxIndex > argsIndex, 'macOS sandbox must initialize after CEF Args exist');
+  assert.ok(nativeArgsIndex > 0 && sandboxIndex > nativeArgsIndex,
+    'macOS sandbox must receive native arguments without calling the CEF API');
+  assert.ok(sandboxIndex < loadIndex,
+    'macOS sandbox must initialize before loading the CEF framework');
+  assert.match(helper, /let argc = [^;]+;\s*argv\.push\(std::ptr::null_mut\(\)\);/,
+    'native argv must end with a null sentinel excluded from argc');
   assert.match(helper, /execute_process\(/);
 
   assert.match(

@@ -307,7 +307,7 @@ test('desktop producer keeps production CEF signing strict and legacy mode prese
   const prepareIndex = workflow.indexOf('node scripts/stage-cef-macos.mjs --prepare-for-signing');
   const signIndex = workflow.indexOf('node scripts/sign-and-attest-cef-macos.mjs');
   const signedActionIndex = workflow.indexOf('- name: Build production bundles without release access');
-  const legacyActionIndex = workflow.indexOf('- name: Build legacy unsigned bundles with Mode 2 excluded');
+  const legacyActionIndex = workflow.indexOf('- name: Build without platform certificates with bundled macOS CEF');
   const legacyActionEndIndex = workflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage and production behavior');
   assert.ok(importIndex > 0 && importIndex < prepareIndex && prepareIndex < signIndex && signIndex < signedActionIndex);
   assert.ok(signedActionIndex < legacyActionIndex && legacyActionIndex < legacyActionEndIndex);
@@ -322,9 +322,11 @@ test('desktop producer keeps production CEF signing strict and legacy mode prese
   assert.doesNotMatch(signedAction, /continue-on-error|failure\(\)|legacyArgs/u);
   assert.match(legacyAction, /needs\.release-mode\.outputs\.production != 'true'/u);
   assert.match(legacyAction, /args: \$\{\{ matrix\.legacyArgs \}\}/u);
+  assert.match(legacyAction, /CCEM_CEF_TARGET_TRIPLE: \$\{\{ matrix\.target \}\}/u);
+  assert.doesNotMatch(legacyAction, /APPLE_CERTIFICATE|APPLE_SIGNING_IDENTITY|APPLE_TEAM_ID|APPLE_ID|APPLE_PASSWORD|CCEM_OFFICIAL_APPLE_TEAM_ID/u);
   assert.doesNotMatch(
     legacyAction,
-    /steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)|CCEM_CEF_TARGET_TRIPLE/u,
+    /steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)/u,
     'production build failure must not switch the already-selected release mode',
   );
   assert.match(workflow, /aarch64-apple-darwin --config src-tauri\/tauri\.cef\.conf\.json/);
@@ -332,9 +334,15 @@ test('desktop producer keeps production CEF signing strict and legacy mode prese
   const legacyArgs = workflow.match(/^\s+legacyArgs:.*$/gmu) ?? [];
   assert.equal(legacyArgs.length, 3);
   for (const args of legacyArgs) {
-    assert.doesNotMatch(args, /tauri\.cef\.conf\.json|tauri\.windows-signing\.conf\.json/u);
+    if (args.includes('apple-darwin')) {
+      assert.match(args, /--config src-tauri\/tauri\.cef\.conf\.json --config src-tauri\/tauri\.cef\.adhoc\.conf\.json/u);
+    } else {
+      assert.match(args, /x86_64-pc-windows-msvc --config src-tauri\/tauri\.windows\.conf\.json --bundles nsis,updater/u);
+      assert.doesNotMatch(args, /tauri\.cef\.conf\.json|tauri\.cef\.adhoc\.conf\.json/u);
+    }
+    assert.doesNotMatch(args, /tauri\.windows-signing\.conf\.json/u);
   }
-  assert.match(workflow, /Prove legacy macOS bundles exclude Mode 2/u);
+  assert.match(workflow, /Prove ad-hoc macOS app DMG and updater include CEF/u);
   assert.match(workflow, /Prove legacy Windows bundle excludes Mode 2/u);
   assert.match(workflow, /verify-legacy-release-inventory\.mjs/u);
   assert.doesNotMatch(workflow, /Build unsigned Preview-only macOS bundles|unsignedArgs:/u);

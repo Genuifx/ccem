@@ -1,8 +1,9 @@
 use super::cef::bootstrap::{
-    credential_store_policy, distribution_code_requirement, ensure_credential_store_marker,
+    adhoc_code_requirement, adhoc_credential_store_policy, credential_store_policy,
+    distribution_code_requirement, ensure_credential_store_marker,
     expected_credential_store_marker, resolve_runtime_layout, should_append_mock_keychain_switch,
-    verify_safe_storage_branding, CefCredentialStorePolicy, VerifiedMacCodeSignature,
-    VerifiedMacSafeStorageBranding,
+    verify_adhoc_dynamic_identity, verify_safe_storage_branding, CefCredentialStorePolicy,
+    VerifiedMacAdHocCodeSignature, VerifiedMacCodeSignature, VerifiedMacSafeStorageBranding,
 };
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -137,6 +138,145 @@ fn cef_bootstrap_disables_unsigned_or_wrong_team_release_bundles() {
         network_service_lpac_requested: false,
     };
     assert!(credential_store_policy(&layout, false, None, None).is_err());
+}
+
+#[test]
+fn cef_bootstrap_adhoc_keychain_requires_verified_bundled_sandbox_and_branding() {
+    let mut layout = super::cef::bootstrap::CefRuntimeLayout {
+        framework_path: "/Applications/CCEM Desktop.app/Contents/Frameworks/cef.framework".into(),
+        browser_subprocess_path: None,
+        bundled: true,
+        sandbox_enabled: true,
+        network_service_sandbox_requested: false,
+        network_service_lpac_requested: false,
+    };
+    let signature = VerifiedMacAdHocCodeSignature { _private: () };
+    let branding = VerifiedMacSafeStorageBranding { _private: () };
+    let policy = adhoc_credential_store_policy(&layout, Some(&signature), Some(&branding))
+        .expect("verified ad-hoc bundle may use the real Keychain");
+    assert_eq!(policy, CefCredentialStorePolicy::AdHocSystemKeychain);
+    assert!(!should_append_mock_keychain_switch(policy, None));
+    assert!(adhoc_credential_store_policy(&layout, None, Some(&branding)).is_err());
+    assert!(adhoc_credential_store_policy(&layout, Some(&signature), None).is_err());
+    layout.sandbox_enabled = false;
+    assert!(adhoc_credential_store_policy(&layout, Some(&signature), Some(&branding)).is_err());
+    layout.sandbox_enabled = true;
+    layout.bundled = false;
+    assert!(adhoc_credential_store_policy(&layout, Some(&signature), Some(&branding)).is_err());
+}
+
+#[test]
+fn cef_bootstrap_adhoc_requirement_binds_the_exact_code_and_rejects_certificate_identities() {
+    let inspection = "Identifier=com.ccem.desktop\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=0123456789abcdef0123456789abcdef01234567\nInfo.plist entries=24\nSealed Resources version=2 rules=13 files=9\n";
+    assert_eq!(
+        adhoc_code_requirement(inspection).expect("valid ad-hoc requirement"),
+        "identifier \"com.ccem.desktop\" and cdhash H\"0123456789abcdef0123456789abcdef01234567\""
+    );
+    for invalid in [
+        inspection.replace("Signature=adhoc", "Signature=unknown"),
+        inspection.replace("com.ccem.desktop", "com.example.impostor"),
+        inspection.replace("TeamIdentifier=not set", "TeamIdentifier=TEAM123456"),
+        inspection.replace("Info.plist entries=24", "Info.plist=not bound"),
+        inspection.replace("Info.plist entries=24", "Info.plist entries=0"),
+        inspection.replace(
+            "Sealed Resources version=2 rules=13 files=9",
+            "Sealed Resources=none",
+        ),
+        inspection.replace("Sealed Resources version=2", "Sealed Resources version=1"),
+        inspection.replace(
+            "CDHash=0123456789abcdef0123456789abcdef01234567",
+            "CDHash=bad",
+        ),
+        format!("{inspection}Authority=Developer ID Application: Example\n"),
+        format!("{inspection}Signature=adhoc\n"),
+        format!("{inspection}CDHash=0123456789abcdef0123456789abcdef01234567\n"),
+    ] {
+        assert!(
+            adhoc_code_requirement(&invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn cef_bootstrap_adhoc_dynamic_identity_matches_the_verified_bundle_without_a_resource_seal() {
+    let bundle = "Identifier=com.ccem.desktop\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=0123456789abcdef0123456789abcdef01234567\nInfo.plist entries=24\nSealed Resources version=2 rules=13 files=9\n";
+    let expected = adhoc_code_requirement(bundle).expect("verified bundle identity");
+    // codesign's +PID display exposes the active code directory but no bundle resource seal.
+    let process = "Identifier=com.ccem.desktop\nFormat=pid diskrep\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=0123456789abcdef0123456789abcdef01234567\nInfo.plist entries=24\nSealed Resources=none\n";
+    verify_adhoc_dynamic_identity(process, &expected).expect("same running code");
+    assert!(adhoc_code_requirement(process).is_err());
+    for invalid in [
+        process.replace(
+            "0123456789abcdef0123456789abcdef01234567",
+            "fedcba9876543210fedcba9876543210fedcba98",
+        ),
+        process.replace("com.ccem.desktop", "com.example.impostor"),
+        process.replace("Signature=adhoc", "Signature=unknown"),
+        process.replace("TeamIdentifier=not set", "TeamIdentifier=TEAM123456"),
+        process.replace(
+            "Format=pid diskrep",
+            "Format=app bundle with Mach-O thin (arm64)",
+        ),
+        process.replace("Format=pid diskrep\n", ""),
+        format!("{process}Format=pid diskrep\n"),
+        format!("{process}Authority=Developer ID Application: Example\n"),
+        format!("{process}CDHash=0123456789abcdef0123456789abcdef01234567\n"),
+    ] {
+        assert!(
+            verify_adhoc_dynamic_identity(&invalid, &expected).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn cef_bootstrap_adhoc_marker_never_adopts_mock_or_developer_id_profiles() {
+    let adhoc =
+        expected_credential_store_marker(CefCredentialStorePolicy::AdHocSystemKeychain, None)
+            .expect("ad-hoc Keychain marker");
+    let parsed: serde_json::Value = serde_json::from_slice(&adhoc).expect("marker JSON");
+    assert_eq!(parsed["credentialStore"], "macos-system-keychain-adhoc");
+    assert_eq!(parsed["safeStorageService"], "CCEM Safe Storage");
+    assert!(parsed["teamIdentifier"].is_null());
+    assert!(expected_credential_store_marker(
+        CefCredentialStorePolicy::AdHocSystemKeychain,
+        Some("TEAM123456"),
+    )
+    .is_err());
+
+    for (other, team) in [
+        (CefCredentialStorePolicy::MockKeychain, None),
+        (CefCredentialStorePolicy::SystemKeychain, Some("TEAM123456")),
+    ] {
+        let root = tempfile::tempdir().expect("isolated ad-hoc marker root");
+        ensure_credential_store_marker(
+            root.path(),
+            CefCredentialStorePolicy::AdHocSystemKeychain,
+            None,
+        )
+        .expect("write ad-hoc marker");
+        ensure_credential_store_marker(
+            root.path(),
+            CefCredentialStorePolicy::AdHocSystemKeychain,
+            None,
+        )
+        .expect("same ad-hoc scheme remains valid");
+        assert!(ensure_credential_store_marker(root.path(), other, team).is_err());
+        assert_eq!(
+            fs::read(root.path().join(".ccem-credential-store")).unwrap(),
+            adhoc
+        );
+
+        let root = tempfile::tempdir().expect("existing alternate marker root");
+        ensure_credential_store_marker(root.path(), other, team).expect("write alternate marker");
+        assert!(ensure_credential_store_marker(
+            root.path(),
+            CefCredentialStorePolicy::AdHocSystemKeychain,
+            None
+        )
+        .is_err());
+    }
 }
 
 #[test]
