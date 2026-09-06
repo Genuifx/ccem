@@ -1482,6 +1482,7 @@
     "retry": "重试"
   },
   "sideRail": {
+    "navigation": "应用导航",
     "workspace": "工作间",
     "sessions": "会话",
     "environments": "环境",

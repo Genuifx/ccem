@@ -21,6 +21,7 @@ interface SidebarContextValue {
 const SidebarContext = React.createContext<SidebarContextValue | null>(null);
 
 interface SidebarProviderProps extends React.HTMLAttributes<HTMLDivElement> {
+  mode?: 'inline' | 'floating';
   defaultOpen?: boolean;
   sidebarWidth?: number;
   sidebarShellPadding?: number;
@@ -48,6 +49,7 @@ const SidebarProvider = React.forwardRef<HTMLDivElement, SidebarProviderProps>(
   ({
     className,
     children,
+    mode = 'inline',
     defaultOpen = true,
     sidebarWidth = DEFAULT_SIDEBAR_WIDTH,
     sidebarShellPadding = DEFAULT_SIDEBAR_SHELL_PADDING,
@@ -55,15 +57,23 @@ const SidebarProvider = React.forwardRef<HTMLDivElement, SidebarProviderProps>(
     style,
     ...props
   }, ref) => {
-    const [open, setOpen] = React.useState(() => readInitialSidebarState(defaultOpen));
+    const [inlineOpen, setInlineOpen] = React.useState(() => readInitialSidebarState(defaultOpen));
+    const [floatingOpen, setFloatingOpen] = React.useState(false);
+    const open = mode === 'floating' ? floatingOpen : inlineOpen;
+    const setOpen = mode === 'floating' ? setFloatingOpen : setInlineOpen;
 
     React.useEffect(() => {
-      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, open ? 'expanded' : 'collapsed');
-    }, [open]);
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, inlineOpen ? 'expanded' : 'collapsed');
+    }, [inlineOpen]);
+
+    // A navigation menu is temporary; it must not replace the saved page layout.
+    React.useEffect(() => {
+      setFloatingOpen(false);
+    }, [mode]);
 
     const toggleSidebar = React.useCallback(() => {
       setOpen((currentOpen) => !currentOpen);
-    }, []);
+    }, [setOpen]);
 
     React.useEffect(() => {
       const handleKeyDown = (event: KeyboardEvent) => {
@@ -95,7 +105,7 @@ const SidebarProvider = React.forwardRef<HTMLDivElement, SidebarProviderProps>(
     }, [toggleSidebar]);
 
     const state: SidebarState = open ? 'expanded' : 'collapsed';
-    const sidebarShellWidth = open ? sidebarWidth + sidebarShellPadding : 0;
+    const sidebarShellWidth = mode === 'inline' && open ? sidebarWidth + sidebarShellPadding : 0;
 
     React.useEffect(() => {
       const root = document.documentElement;
@@ -116,7 +126,7 @@ const SidebarProvider = React.forwardRef<HTMLDivElement, SidebarProviderProps>(
         toggleSidebar,
         sidebarShellWidth,
       }),
-      [open, state, toggleSidebar, sidebarShellWidth]
+      [open, state, setOpen, toggleSidebar, sidebarShellWidth]
     );
 
     return (
@@ -124,6 +134,7 @@ const SidebarProvider = React.forwardRef<HTMLDivElement, SidebarProviderProps>(
         <div
           ref={ref}
           data-sidebar-state={state}
+          data-sidebar-mode={mode}
           className={className}
           style={{
             ...style,

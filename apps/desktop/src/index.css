@@ -797,7 +797,8 @@
 }
 
 [data-sidebar-state='collapsed'] .app-titlebar-row,
-[data-sidebar-state='collapsed'] .workspace-status-strip {
+[data-sidebar-state='collapsed'] .workspace-status-strip,
+[data-sidebar-mode='floating'] .workspace-status-strip {
   padding-left: var(--ccem-sidebar-toggle-leading-space);
 }
 

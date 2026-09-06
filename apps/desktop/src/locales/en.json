@@ -1482,6 +1482,7 @@
     "retry": "Retry"
   },
   "sideRail": {
+    "navigation": "App navigation",
     "workspace": "Workspace",
     "sessions": "Sessions",
     "environments": "Environments",
