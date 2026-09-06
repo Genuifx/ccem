@@ -1,5 +1,11 @@
 # ccem
 
+## 2.82.0
+
+### Minor Changes
+
+- feat(desktop): support task-level Codex model selection
+
 ## 2.81.1
 
 ### Patch Changes
