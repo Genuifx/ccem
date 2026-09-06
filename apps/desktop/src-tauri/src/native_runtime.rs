@@ -341,6 +341,9 @@ pub struct NativeSessionRecord {
     pub runtime_perm_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Requested task model, not a provider-confirmed usage claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_env_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,6 +400,9 @@ pub struct NativeSessionSummary {
     pub runtime_perm_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Requested task model, not a provider-confirmed usage claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_env_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,8 +472,23 @@ pub struct NativeSessionOptions {
     pub codex_base_url: Option<String>,
     pub codex_api_key: Option<String>,
     pub effort: Option<String>,
+    pub model: Option<String>,
     pub router_launch_draft: Option<RouterLaunchDraft>,
     pub router_record: Option<SessionRouterRecord>,
+}
+
+pub(crate) fn validate_task_model(provider: NativeProvider, model: Option<&str>) -> Result<(), String> {
+    let Some(model) = model else { return Ok(()); };
+    if provider != NativeProvider::Codex {
+        return Err("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.".into());
+    }
+    if model.is_empty() || model.len() > 256
+        || !model.as_bytes()[0].is_ascii_alphanumeric()
+        || !model.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:/-".contains(&c))
+    {
+        return Err("MODEL_INVALID: expected a model identifier (1-256 ASCII characters, starting with a letter or digit; no whitespace).".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -645,6 +666,8 @@ enum HelperInputCommand<'a> {
         codex_base_url: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         codex_api_key: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         effort: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1992,6 +2015,7 @@ impl NativeSessionHandle {
             perm_mode: record.perm_mode,
             runtime_perm_mode: record.runtime_perm_mode,
             effort: record.effort,
+            model: record.model,
             pending_env_name: record.pending_env_name,
             pending_effort: record.pending_effort,
             status: record.status,
@@ -2391,6 +2415,7 @@ impl NativeRuntimeManager {
             );
         }
         let mut options = options;
+        validate_task_model(options.provider, options.model.as_deref())?;
         self.prepare_router_launch(&mut options, false)?;
         options.initial_annotations =
             validate_prompt_annotations(options.initial_annotations.as_ref())?;
@@ -2417,6 +2442,7 @@ impl NativeRuntimeManager {
             perm_mode: options.perm_mode.clone(),
             runtime_perm_mode: options.runtime_perm_mode.clone(),
             effort: options.effort.clone(),
+            model: options.model.clone(),
             pending_env_name: None,
             pending_effort: None,
             pending_settings_request_id: None,
@@ -2772,6 +2798,7 @@ impl NativeRuntimeManager {
                         perm_mode: record.perm_mode,
                         runtime_perm_mode: record.runtime_perm_mode,
                         effort: record.effort,
+                        model: record.model,
                         pending_env_name: record.pending_env_name,
                         pending_effort: record.pending_effort,
                         status: record.status,
@@ -7752,6 +7779,7 @@ impl NativeRuntimeManager {
             codex_base_url: handle.codex_base_url.as_deref(),
             codex_api_key: handle.codex_api_key.as_deref(),
             effort: options.effort.as_deref(),
+            model: options.model.as_deref(),
             todo_snapshot_seed: todo_snapshot_seed.as_ref(),
             router: helper_router_init.as_ref(),
         };
@@ -10871,6 +10899,7 @@ impl NativeRuntimeManager {
                 perm_mode: record.perm_mode,
                 runtime_perm_mode: record.runtime_perm_mode,
                 effort: record.effort,
+                model: record.model,
                 pending_env_name: record.pending_env_name,
                 pending_effort: record.pending_effort,
                 status: record.status,
@@ -11242,6 +11271,7 @@ fn prepare_direct_router_launch(
 fn build_runtime_bootstrap_options(
     record: &NativeSessionRecord,
 ) -> Result<NativeSessionOptions, String> {
+    validate_task_model(record.provider, record.model.as_deref())?;
     let (mut helper_env_vars, mut terminal_env_vars, codex_base_url, codex_api_key) =
         match record.provider {
             NativeProvider::Claude => {
@@ -11277,6 +11307,7 @@ fn build_runtime_bootstrap_options(
         codex_base_url,
         codex_api_key,
         effort: record.effort.clone(),
+        model: record.model.clone(),
         router_launch_draft: None,
         router_record: record.router.clone(),
         fork_from_message_id: None,
@@ -11393,6 +11424,66 @@ mod tests {
     use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn task_model_validation_preserves_legacy_absence() {
+        for provider in [NativeProvider::Claude, NativeProvider::Codex] {
+            assert!(super::validate_task_model(provider, None).is_ok());
+        }
+        assert!(super::validate_task_model(NativeProvider::Codex, Some("gpt-6-astra")).is_ok());
+        assert!(super::validate_task_model(NativeProvider::Claude, Some("gpt-6-astra"))
+            .unwrap_err().contains("MODEL_PROVIDER_UNSUPPORTED"));
+        for invalid in ["", " ", "gpt 6", "gpt\n", "-model", "模型", &"a".repeat(257)] {
+            assert!(super::validate_task_model(NativeProvider::Codex, Some(invalid))
+                .unwrap_err().contains("MODEL_INVALID"));
+        }
+    }
+
+    #[test]
+    fn task_model_record_roundtrip_and_resume_preserve_requested_model() {
+        let mut record = native_record("task-model-roundtrip", "stopped", false);
+        record.provider = NativeProvider::Codex;
+        record.env_name = String::new(); // Native Codex, without reading user config.
+        record.provider_session_id = Some("provider-task-model".into());
+        let legacy = serde_json::to_value(&record).unwrap();
+        assert!(legacy.get("model").is_none());
+        let mut loaded: NativeSessionRecord = serde_json::from_value(legacy).unwrap();
+        assert!(loaded.model.is_none());
+        assert!(super::build_runtime_bootstrap_options(&loaded).unwrap().model.is_none());
+        loaded.model = Some("gpt-6-astra".into());
+        loaded.effort = Some("medium".into());
+        let state_path = std::env::temp_dir().join(format!("{}.json", test_manager_namespace("task-model-disk")));
+        super::persist_native_runtime_state_to(&state_path, vec![loaded]).unwrap();
+        let restored = read_native_runtime_state_from(&state_path).unwrap().sessions.remove(0);
+        fs::remove_file(state_path).unwrap();
+        let options = super::build_runtime_bootstrap_options(&restored).unwrap();
+        assert_eq!(options.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(options.effort.as_deref(), Some("medium"));
+        assert_eq!(options.provider_session_id, record.provider_session_id);
+        assert_eq!(native_session_handle(restored.clone()).summary().model, restored.model);
+        let manager = manager_with_records("task-model-roundtrip", vec![restored]);
+        assert_eq!(manager.list_sessions()[0].model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(manager.get_session_summary("task-model-roundtrip").unwrap().unwrap().model.as_deref(), Some("gpt-6-astra"));
+    }
+
+    #[test]
+    fn task_model_helper_init_serializes_only_explicit_selection() {
+        let env_vars = HashMap::new();
+        for model in [None, Some("gpt-6-astra")] {
+            let command = HelperInputCommand::Init {
+                provider: "codex", env_name: "", perm_mode: "yolo",
+                allow_dangerously_skip_permissions: false, working_dir: "/tmp/project",
+                env_vars: &env_vars, initial_prompt: None, initial_command_id: None,
+                initial_images: None, provider_session_id: Some("provider-resume"),
+                fork_session: None, fork_at_message_id: None, claude_path: None,
+                codex_path: None, codex_base_url: None, codex_api_key: None,
+                effort: Some("medium"), model, todo_snapshot_seed: None, router: None,
+            };
+            let value = serde_json::to_value(command).unwrap();
+            assert_eq!(value.get("model").and_then(|v| v.as_str()), model);
+            assert_eq!(value["provider_session_id"], "provider-resume");
+        }
+    }
+
     fn native_session_handle(record: NativeSessionRecord) -> Arc<NativeSessionHandle> {
         native_session_handle_with_terminal_env(record, HashMap::new())
     }
@@ -11504,6 +11595,7 @@ mod tests {
             perm_mode: "dev".to_string(),
             runtime_perm_mode: None,
             effort: None,
+            model: None,
             pending_env_name: None,
             pending_effort: None,
             pending_settings_request_id: None,
@@ -11808,6 +11900,7 @@ mod tests {
             perm_mode: "dev".to_string(),
             runtime_perm_mode: None,
             effort: None,
+            model: None,
             pending_env_name: None,
             pending_effort: None,
             pending_settings_request_id: None,
@@ -13552,6 +13645,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            model: None,
             router_launch_draft: None,
             router_record: None,
             fork_from_message_id: None,
@@ -14449,6 +14543,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            model: None,
             todo_snapshot_seed: None,
             router: None,
             initial_command_id: None,
@@ -14476,6 +14571,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            model: None,
             todo_snapshot_seed: None,
             router: None,
             initial_command_id: None,
@@ -14516,6 +14612,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            model: None,
             todo_snapshot_seed: None,
             router: None,
             fork_at_message_id: None,
@@ -14563,6 +14660,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            model: None,
             todo_snapshot_seed: Some(&seed),
             router: None,
             fork_at_message_id: None,
@@ -14596,6 +14694,7 @@ mod tests {
             codex_base_url: None,
             codex_api_key: None,
             effort: None,
+            model: None,
             todo_snapshot_seed: None,
             router: None,
             fork_at_message_id: None,

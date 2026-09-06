@@ -46590,7 +46590,8 @@ async function ensureCodexThread() {
       skipGitRepoCheck: true,
       sandboxMode: sandbox.sandboxMode,
       approvalPolicy: sandbox.approvalPolicy,
-      ...initCommand.effort ? { modelReasoningEffort: initCommand.effort } : {}
+      ...initCommand.effort ? { modelReasoningEffort: initCommand.effort } : {},
+      ...initCommand.model != null ? { model: initCommand.model } : {}
     };
     codexThread = currentProviderSessionId ? codexClient.resumeThread(currentProviderSessionId, threadOptions) : codexClient.startThread(threadOptions);
     if (currentProviderSessionId) {
@@ -46667,6 +46668,7 @@ async function runCodexTurn(text, images, abortController) {
         continue;
       }
       if (event.type === "turn.failed") {
+        if (initCommand?.model != null) throw new Error(event.error.message);
         emitEvent({
           type: "session_completed",
           reason: event.error.message
@@ -46921,6 +46923,14 @@ async function handleCommand(command) {
     return;
   }
   if (command.type === "init") {
+    if (command.model != null) {
+      if (command.provider !== "codex") {
+        throw new Error("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.");
+      }
+      if (typeof command.model !== "string" || command.model !== command.model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(command.model)) {
+        throw new Error("MODEL_INVALID: expected a model identifier (1-256 ASCII characters, starting with a letter or digit; no whitespace).");
+      }
+    }
     initCommand = command;
     if (command.provider === "claude") {
       beginClaudeInitialization();

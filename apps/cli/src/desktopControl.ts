@@ -17,6 +17,8 @@ export interface DesktopCreateSessionInput {
   runtimePermissionMode?: string | null;
   providerSessionId?: string | null;
   effort?: string | null;
+  /** Requested task model; only supported for Codex. */
+  model?: string | null;
   open?: boolean;
   routes?: Record<string, string>;
 }
@@ -57,6 +59,27 @@ export type DesktopControlRequester = (
   method: string,
   params?: unknown,
 ) => Promise<unknown>;
+
+export function validateDesktopTaskModel(provider: string, model: unknown): string | undefined {
+  if (model === undefined || model === null) return undefined;
+  if (provider !== 'codex') {
+    throw new Error('MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.');
+  }
+  if (typeof model !== 'string' || model !== model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(model)) {
+    throw new Error('MODEL_INVALID: expected a model identifier (1-256 ASCII letters, digits, dots, underscores, colons, slashes or hyphens; starting with a letter or digit).');
+  }
+  return model;
+}
+
+export function requireTaskModelCapability(health: unknown): void {
+  const capability = (health as {
+    capabilities?: { taskModelSelection?: { version?: unknown; providers?: unknown } };
+  } | null)?.capabilities?.taskModelSelection;
+  if (capability?.version !== 1 || !Array.isArray(capability.providers)
+    || !capability.providers.includes('codex')) {
+    throw new Error('MODEL_SELECTION_UNSUPPORTED: this Desktop does not advertise Codex task model selection v1. No session was created.');
+  }
+}
 
 export interface RequestDesktopControlOptions {
   /** AbortSignal provided by the caller. */

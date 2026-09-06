@@ -1023,6 +1023,8 @@ export interface NativeSessionSummary {
   perm_mode: string;
   runtime_perm_mode?: string | null;
   effort?: string | null;
+  /** Requested task model; provider acceptance is reported separately. */
+  model?: string | null;
   pending_env_name?: string | null;
   pending_effort?: string | null;
   status: string;

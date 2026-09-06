@@ -3,7 +3,7 @@ use crate::config::{self, resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::ReplayBatch;
 use crate::native_runtime::{
     NativeProvider, NativeRuntimeManager, NativeSessionOptions, NativeSessionSummary,
-    RouterLaunchDraft,
+    RouterLaunchDraft, validate_task_model,
 };
 use crate::proxy_debug::ProxyDebugManager;
 use crate::router::{
@@ -285,6 +285,7 @@ struct CreateSessionParams {
     runtime_permission_mode: Option<String>,
     provider_session_id: Option<String>,
     effort: Option<String>,
+    model: Option<String>,
     open: Option<bool>,
     router_launch_draft: Option<RouterLaunchDraft>,
     routes: Option<HashMap<String, String>>,
@@ -428,7 +429,7 @@ impl ExternalControlManager {
             created_at: now_rfc3339(),
         };
         let published_descriptor = if should_publish_control_descriptor() {
-            let path = control_descriptor_path();
+            let path = control_descriptor_path()?;
             write_descriptor_at(&path, &descriptor)?;
             Some(PublishedControlDescriptor {
                 path,
@@ -580,6 +581,7 @@ impl ExternalControlManager {
                 "pid": std::process::id(),
                 "running": true,
                 "version": env!("CARGO_PKG_VERSION"),
+                "capabilities": control_capabilities(),
             })),
             "ccem.workspace.listSessions" => {
                 let _mutation_guard = self.environment_mutations.lock()?;
@@ -874,6 +876,7 @@ impl ExternalControlManager {
     ) -> Result<ControlCreateSessionResult, String> {
         let mutation_guard = self.environment_mutations.lock()?;
         let provider = parse_native_provider(&params.provider)?;
+        validate_task_model(provider, params.model.as_deref())?;
         let router_launch_draft = resolve_external_router_launch_draft(&params)?;
         if provider != NativeProvider::Claude && router_launch_draft.is_some() {
             return Err(
@@ -925,6 +928,7 @@ impl ExternalControlManager {
                     codex_base_url: None,
                     codex_api_key: None,
                     effort: params.effort,
+                    model: params.model,
                     router_launch_draft,
                     router_record: None,
                     fork_from_message_id: None,
@@ -956,6 +960,7 @@ impl ExternalControlManager {
                     codex_base_url: None,
                     codex_api_key: None,
                     effort: params.effort,
+                    model: params.model,
                     router_launch_draft: None,
                     router_record: None,
                     fork_from_message_id: None,
@@ -1549,6 +1554,9 @@ fn find_snapshot_ref_by_label(snapshot: &Value, needle: &str) -> Option<u32> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlCreateSessionResult {
+    /// Requested model, not a provider-confirmed usage claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     runtime_id: String,
     provider: String,
     provider_session_id: Option<String>,
@@ -1562,6 +1570,7 @@ impl From<NativeSessionSummary> for ControlCreateSessionResult {
     fn from(summary: NativeSessionSummary) -> Self {
         let link = build_runtime_link(&summary);
         Self {
+            model: summary.model,
             runtime_id: summary.runtime_id,
             provider: summary.provider.as_str().to_string(),
             provider_session_id: summary.provider_session_id,
@@ -1576,6 +1585,8 @@ impl From<NativeSessionSummary> for ControlCreateSessionResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlSessionSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     runtime_id: String,
     provider: String,
     provider_session_id: Option<String>,
@@ -1598,6 +1609,7 @@ impl From<NativeSessionSummary> for ControlSessionSummary {
     fn from(summary: NativeSessionSummary) -> Self {
         let link = build_runtime_link(&summary);
         Self {
+            model: summary.model,
             runtime_id: summary.runtime_id,
             provider: summary.provider.as_str().to_string(),
             provider_session_id: summary.provider_session_id,
@@ -1991,8 +2003,26 @@ fn build_runtime_link(summary: &NativeSessionSummary) -> String {
     link
 }
 
-fn control_descriptor_path() -> PathBuf {
-    config::get_ccem_dir().join("control.json")
+fn control_capabilities() -> Value {
+    json!({ "taskModelSelection": { "version": 1, "providers": ["codex"] } })
+}
+
+fn control_descriptor_path() -> Result<PathBuf, String> {
+    let override_value = std::env::var("CCEM_CONTROL_FILE")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err("CCEM_CONTROL_FILE must be a valid absolute path".to_string()),
+        })?;
+    control_descriptor_path_for_override(&config::get_ccem_dir(), override_value.as_deref())
+}
+
+fn control_descriptor_path_for_override(default_dir: &Path, value: Option<&str>) -> Result<PathBuf, String> {
+    match value {
+        None => Ok(default_dir.join("control.json")),
+        Some(value) if Path::new(value.trim()).is_absolute() => Ok(PathBuf::from(value.trim())),
+        Some(_) => Err("CCEM_CONTROL_FILE must be an absolute path; refusing to publish a control descriptor".into()),
+    }
 }
 
 fn should_publish_control_descriptor() -> bool {
@@ -2628,6 +2658,71 @@ mod tests {
     }
 
     // --- Control descriptor publication ----------------------------------
+
+    #[test]
+    fn task_model_capability_and_create_params_contract() {
+        assert_eq!(control_capabilities(), json!({
+            "taskModelSelection": { "version": 1, "providers": ["codex"] }
+        }));
+        let legacy = create_session_params(json!({ "provider": "codex", "prompt": "start" }));
+        assert!(legacy.model.is_none());
+        let selected = create_session_params(json!({
+            "provider": "codex", "prompt": "start", "model": "gpt-6-astra", "effort": "medium"
+        }));
+        assert_eq!(selected.model.as_deref(), Some("gpt-6-astra"));
+        assert!(serde_json::from_value::<CreateSessionParams>(json!({
+            "provider": "codex", "prompt": "start", "model": 123
+        })).is_err());
+    }
+
+    #[test]
+    fn task_model_create_and_status_report_requested_selection_only() {
+        for model in [None, Some("gpt-6-astra")] {
+            let mut value = json!({
+                "runtime_id": "model-summary", "provider": "codex", "transport": "native_sdk",
+                "project_dir": "/tmp/project", "env_name": "", "perm_mode": "yolo",
+                "status": "initializing", "created_at": "2026-09-06T00:00:00Z",
+                "updated_at": "2026-09-06T00:00:00Z", "is_active": true,
+                "can_handoff_to_terminal": false
+            });
+            if let Some(model) = model { value["model"] = json!(model); }
+            let summary: NativeSessionSummary = serde_json::from_value(value).unwrap();
+            let created = serde_json::to_value(ControlCreateSessionResult::from(summary.clone())).unwrap();
+            let status = serde_json::to_value(ControlSessionSummary::from(summary)).unwrap();
+            for value in [created, status] {
+                assert_eq!(value.get("model").and_then(Value::as_str), model);
+                assert_eq!(value["status"], "initializing");
+            }
+        }
+    }
+
+    #[test]
+    fn control_descriptor_default_and_absolute_override_are_separate() {
+        let default_dir = std::env::temp_dir().join("ccem-default");
+        assert_eq!(control_descriptor_path_for_override(&default_dir, None).unwrap(), default_dir.join("control.json"));
+        let custom = temp_control_path("custom");
+        assert_eq!(control_descriptor_path_for_override(&default_dir, custom.to_str()).unwrap(), custom);
+        for invalid in ["", "   ", "relative/control.json", "~/control.json"] {
+            assert!(control_descriptor_path_for_override(&default_dir, Some(invalid)).unwrap_err().contains("absolute path"));
+        }
+    }
+
+    #[test]
+    fn custom_control_descriptor_cleanup_never_touches_default() {
+        let default = temp_control_path("default-preserved");
+        let custom = temp_control_path("custom-cleanup");
+        let installed = test_descriptor("http://127.0.0.1:1234/rpc", "installed", 111);
+        let owned = test_descriptor("http://127.0.0.1:5678/rpc", "owned", 222);
+        write_descriptor_at(&default, &installed).unwrap();
+        write_descriptor_at(&custom, &owned).unwrap();
+        remove_descriptor_if_owned(&custom, &installed);
+        assert!(custom.exists());
+        remove_descriptor_if_owned(&custom, &owned);
+        assert!(!custom.exists());
+        let remaining: ExternalControlDescriptor = serde_json::from_slice(&fs::read(&default).unwrap()).unwrap();
+        assert!(descriptor_owned_by_runtime(&remaining, &installed));
+        fs::remove_file(default).unwrap();
+    }
 
     fn test_descriptor(endpoint: &str, token: &str, pid: u32) -> ExternalControlDescriptor {
         ExternalControlDescriptor {

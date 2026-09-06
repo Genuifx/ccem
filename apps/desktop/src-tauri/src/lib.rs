@@ -1411,6 +1411,7 @@ async fn create_native_session(
                 .unwrap_or(&env_name);
             let resolved = resolve_claude_env(effective_env_name)?;
             NativeSessionOptions {
+                model: None,
                 provider,
                 env_name: resolved.env_name,
                 perm_mode: effective_perm_mode,
@@ -1441,6 +1442,7 @@ async fn create_native_session(
             let resolved = resolve_codex_runtime(&env_name)?;
             let proxy_env_vars = system_proxy::resolve_codex_proxy_env();
             NativeSessionOptions {
+                model: None,
                 provider,
                 env_name: if resolved.env_name.is_empty() {
                     env_name

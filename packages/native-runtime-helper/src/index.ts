@@ -81,6 +81,7 @@ type InitCommand = {
   codex_path?: string | null;
   codex_base_url?: string | null;
   codex_api_key?: string | null;
+  model?: string | null;
   effort?: string | null;
   allowed_tools?: string[] | null;
   disallowed_tools?: string[] | null;
@@ -4251,6 +4252,7 @@ async function ensureCodexThread() {
       sandboxMode: sandbox.sandboxMode,
       approvalPolicy: sandbox.approvalPolicy,
       ...(initCommand.effort ? { modelReasoningEffort: initCommand.effort } : {}),
+      ...(initCommand.model != null ? { model: initCommand.model } : {}),
     };
     codexThread = currentProviderSessionId
       ? codexClient.resumeThread(currentProviderSessionId, threadOptions)
@@ -4342,6 +4344,9 @@ async function runCodexTurn(text: string, images: PromptImage[] | null | undefin
     }
 
     if (event.type === 'turn.failed') {
+      // Explicit model selection must not look successful when the provider
+      // rejects it. Preserve the legacy status behavior for omitted models.
+      if (initCommand?.model != null) throw new Error(event.error.message);
       emitEvent({
         type: 'session_completed',
         reason: event.error.message,
@@ -4648,6 +4653,14 @@ async function handleCommand(command: InputCommand) {
   }
 
   if (command.type === 'init') {
+    if (command.model != null) {
+      if (command.provider !== 'codex') {
+        throw new Error('MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.');
+      }
+      if (typeof command.model !== 'string' || command.model !== command.model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(command.model)) {
+        throw new Error('MODEL_INVALID: expected a model identifier (1-256 ASCII characters, starting with a letter or digit; no whitespace).');
+      }
+    }
     initCommand = command;
     if (command.provider === 'claude') {
       beginClaudeInitialization();

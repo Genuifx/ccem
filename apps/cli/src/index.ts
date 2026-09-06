@@ -92,6 +92,9 @@ import {
   parseSinceOption,
   printJson,
   requestDesktopControl,
+  resolveDesktopControlDescriptor,
+  validateDesktopTaskModel,
+  requireTaskModelCapability,
   StaleDesktopControlDescriptorError,
 } from './desktopControl.js';
 import { registerDshCommands } from './dsh/cli.js';
@@ -1549,6 +1552,7 @@ desktopCmd
   .option('--runtime-perm <mode>', 'Runtime permission mode')
   .option('--provider-session-id <id>', 'Provider session id to continue')
   .option('--effort <level>', 'Codex effort level')
+  .option('--model <model>', 'Requested task model (Codex only)')
   .option('--open <value>', 'Open the created session in Desktop (true/false)')
   .option('--route <key=env>', 'Add a session route binding (repeatable)', collectDesktopRoute, [])
   .option('--routes-json <json>', 'Session route bindings as a JSON object')
@@ -1559,6 +1563,12 @@ desktopCmd
     if (provider !== 'claude' && provider !== 'codex') {
       throw new Error("Unsupported provider. Use 'claude' or 'codex'.");
     }
+    const model = validateDesktopTaskModel(provider, opts.model);
+    // Pin discovery once so capability checks and creation cannot target different apps.
+    const descriptor = model === undefined ? undefined : resolveDesktopControlDescriptor();
+    const request = descriptor === undefined ? requestDesktopControl
+      : (method: string, params?: unknown) => requestDesktopControl(method, params, descriptor);
+    if (model !== undefined) requireTaskModelCapability(await request('ccem.health'));
     const hasRouteOptions = opts.route.length > 0 || opts.routesJson !== undefined;
     const routes = provider === 'claude'
       ? parseDesktopRoutes(opts.route, opts.routesJson)
@@ -1568,7 +1578,7 @@ desktopCmd
         'Warning: Codex sessions do not support routing; --route and --routes-json were ignored.',
       ));
     }
-    const result = await requestDesktopControl('ccem.workspace.createSession', {
+    const result = await request('ccem.workspace.createSession', {
       provider,
       cwd: opts.cwd,
       prompt: opts.prompt,
@@ -1577,6 +1587,7 @@ desktopCmd
       runtimePermissionMode: opts.runtimePerm ?? null,
       providerSessionId: opts.providerSessionId ?? null,
       effort: opts.effort ?? null,
+      ...(model === undefined ? {} : { model }),
       open: parseOptionalBoolean(opts.open),
       ...(routes === undefined ? {} : { routes }),
     });
