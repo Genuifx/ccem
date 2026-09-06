@@ -1,5 +1,11 @@
 # ccem
 
+## 2.81.1
+
+### Patch Changes
+
+- Release v2.81.1: re-deliver the v2.81.0 changes on top of the fixed pre-tag readiness gate (exact-source dispatch readiness acceptance).
+
 ## 2.81.0
 
 ### Minor Changes
