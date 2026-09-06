@@ -33,6 +33,13 @@ const MAX_CREDENTIAL_STORE_MARKER_BYTES: u64 = 4096;
 const CHROMIUM_SAFE_STORAGE_SERVICE: &[u8; 21] = b"Chromium Safe Storage";
 const CCEM_SAFE_STORAGE_SERVICE_SLOT: &[u8; 21] = b"CCEM Safe Storage\0\0\0\0";
 
+#[cfg(feature = "macos-adhoc-cef")]
+const _: () = assert!(
+    option_env!("CCEM_OFFICIAL_APPLE_TEAM_ID").is_none()
+        && option_env!("CCEM_APPLE_SIGNING_IDENTITY").is_none(),
+    "macos-adhoc-cef cannot be combined with a Developer ID release identity"
+);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CefRuntimeLayout {
     pub(crate) framework_path: PathBuf,
@@ -48,6 +55,7 @@ pub(crate) struct CefRuntimeLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CefCredentialStorePolicy {
     SystemKeychain,
+    AdHocSystemKeychain,
     MockKeychain,
 }
 
@@ -71,6 +79,11 @@ pub(crate) fn should_append_mock_keychain_switch(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedMacCodeSignature {
+    pub(crate) _private: (),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedMacAdHocCodeSignature {
     pub(crate) _private: (),
 }
 
@@ -110,6 +123,20 @@ pub(crate) fn credential_store_policy(
     })?;
 
     Ok(CefCredentialStorePolicy::SystemKeychain)
+}
+
+pub(crate) fn adhoc_credential_store_policy(
+    layout: &CefRuntimeLayout,
+    signature: Option<&VerifiedMacAdHocCodeSignature>,
+    safe_storage_branding: Option<&VerifiedMacSafeStorageBranding>,
+) -> Result<CefCredentialStorePolicy, String> {
+    if !layout.bundled || !layout.sandbox_enabled {
+        return Err("ad-hoc Mode 2 requires a bundled sandboxed CEF runtime".to_string());
+    }
+    signature.ok_or_else(|| "ad-hoc CCEM bundle signature was not verified".to_string())?;
+    safe_storage_branding
+        .ok_or_else(|| "ad-hoc CEF runtime is not branded for CCEM Safe Storage".to_string())?;
+    Ok(CefCredentialStorePolicy::AdHocSystemKeychain)
 }
 
 fn count_safe_storage_service_literals(mut reader: impl Read) -> Result<(usize, usize), String> {
@@ -263,6 +290,126 @@ pub(crate) fn verify_current_process_requirement(requirement: &str) -> Result<()
     Ok(())
 }
 
+pub(crate) fn adhoc_code_requirement(inspection: &str) -> Result<String, String> {
+    adhoc_inspected_identity(inspection, true)
+}
+
+fn adhoc_inspected_identity(inspection: &str, bundle: bool) -> Result<String, String> {
+    let values = |prefix: &str| {
+        inspection
+            .lines()
+            .filter_map(move |line| line.strip_prefix(prefix))
+            .collect::<Vec<_>>()
+    };
+    if values("Signature=") != ["adhoc"]
+        || values("Identifier=") != [CCEM_BUNDLE_IDENTIFIER]
+        || !values("Authority=").is_empty()
+        || values("TeamIdentifier=")
+            .iter()
+            .any(|value| *value != "not set")
+    {
+        return Err("CCEM ad-hoc release requires an ad-hoc signature with its exact bundle identifier and no certificate identity".to_string());
+    }
+    let plist_entries = values("Info.plist entries=");
+    let resource_seals = values("Sealed Resources version=");
+    if bundle
+        && (plist_entries.len() != 1
+            || plist_entries[0]
+                .parse::<usize>()
+                .map_or(true, |count| count == 0)
+            || resource_seals.len() != 1
+            || !resource_seals[0].starts_with("2 ")
+            || !values("Info.plist=").is_empty()
+            || !values("Sealed Resources=").is_empty())
+    {
+        return Err(
+            "CCEM ad-hoc release requires a bound Info.plist and version 2 bundle resource seal"
+                .to_string(),
+        );
+    }
+    if !bundle && values("Format=") != ["pid diskrep"] {
+        return Err(
+            "CCEM ad-hoc process inspection did not return a dynamic code object".to_string(),
+        );
+    }
+    let hashes = values("CDHash=");
+    if hashes.len() != 1
+        || hashes[0].len() != 40
+        || !hashes[0].bytes().all(|value| value.is_ascii_hexdigit())
+    {
+        return Err("CCEM ad-hoc signature has no unambiguous code directory hash".to_string());
+    }
+    Ok(format!(
+        "identifier {} and cdhash H\"{}\"",
+        requirement_string_literal(CCEM_BUNDLE_IDENTIFIER),
+        hashes[0]
+    ))
+}
+
+pub(crate) fn verify_adhoc_dynamic_identity(
+    inspection: &str,
+    expected: &str,
+) -> Result<(), String> {
+    if adhoc_inspected_identity(inspection, false)? != expected {
+        return Err(
+            "running CCEM ad-hoc code identity does not match the verified bundle".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_adhoc_signature(
+    executable: &Path,
+) -> Result<VerifiedMacAdHocCodeSignature, String> {
+    let app_bundle = app_bundle_for_executable(executable)?;
+    let verification = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict", "--verbose=4"])
+        .arg(app_bundle)
+        .output()
+        .map_err(|error| format!("verify ad-hoc CCEM bundle signature: {error}"))?;
+    if !verification.status.success() {
+        return Err(format!(
+            "CCEM ad-hoc bundle signature verification failed: {}",
+            String::from_utf8_lossy(&verification.stderr).trim()
+        ));
+    }
+    let inspection = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(app_bundle)
+        .output()
+        .map_err(|error| format!("inspect ad-hoc CCEM signature: {error}"))?;
+    if !inspection.status.success() {
+        return Err("could not inspect the CCEM ad-hoc signature".to_string());
+    }
+    let requirement = adhoc_code_requirement(&String::from_utf8_lossy(&inspection.stderr))?;
+    // -R and verbose verification both trigger static requirement checks on
+    // codesign's +PID disk representation, which return EINVAL for ad-hoc code.
+    // Plain --verify checks dynamic validity. The complete bundle was checked
+    // above; bind this running code's exact identifier and CDHash separately.
+    let dynamic_target = format!("+{}", std::process::id());
+    let validity = Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg(&dynamic_target)
+        .output()
+        .map_err(|error| format!("verify running ad-hoc CCEM signature: {error}"))?;
+    if !validity.status.success() {
+        return Err(format!(
+            "running CCEM ad-hoc signature is invalid: {}",
+            String::from_utf8_lossy(&validity.stderr).trim()
+        ));
+    }
+    let dynamic = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(&dynamic_target)
+        .output()
+        .map_err(|error| format!("inspect running ad-hoc CCEM signature: {error}"))?;
+    if !dynamic.status.success() {
+        return Err("could not inspect the running CCEM ad-hoc signature".to_string());
+    }
+    verify_adhoc_dynamic_identity(&String::from_utf8_lossy(&dynamic.stderr), &requirement)?;
+    Ok(VerifiedMacAdHocCodeSignature { _private: () })
+}
+
 pub(crate) fn expected_credential_store_marker(
     policy: CefCredentialStorePolicy,
     team_identifier: Option<&str>,
@@ -286,6 +433,21 @@ pub(crate) fn expected_credential_store_marker(
                 credential_store: "macos-system-keychain",
                 application_identifier: CCEM_BUNDLE_IDENTIFIER,
                 team_identifier: Some(team_identifier),
+                safe_storage_service: Some("CCEM Safe Storage"),
+                derivation: "cef-binary-null-padded-service-v1",
+            }
+        }
+        CefCredentialStorePolicy::AdHocSystemKeychain => {
+            if team_identifier.is_some() {
+                return Err(
+                    "ad-hoc Keychain credential marker must not carry an Apple Team ID".to_string(),
+                );
+            }
+            CefCredentialStoreMarker {
+                schema_version: CREDENTIAL_STORE_MARKER_SCHEMA_VERSION,
+                credential_store: "macos-system-keychain-adhoc",
+                application_identifier: CCEM_BUNDLE_IDENTIFIER,
+                team_identifier: None,
                 safe_storage_service: Some("CCEM Safe Storage"),
                 derivation: "cef-binary-null-padded-service-v1",
             }
@@ -689,8 +851,15 @@ impl CefProcess {
         }
 
         let layout = resolve_runtime_layout(executable, framework_override)?;
-        let (signature, safe_storage_branding, team_identifier) = if cfg!(debug_assertions) {
-            (None, None, None)
+        let (credential_store_policy, team_identifier) = if cfg!(debug_assertions) {
+            (credential_store_policy(&layout, true, None, None)?, None)
+        } else if cfg!(feature = "macos-adhoc-cef") {
+            let signature = verify_adhoc_signature(executable)?;
+            let branding = verify_safe_storage_branding(&layout.framework_path)?;
+            (
+                adhoc_credential_store_policy(&layout, Some(&signature), Some(&branding))?,
+                None,
+            )
         } else {
             let team_identifier = option_env!("CCEM_OFFICIAL_APPLE_TEAM_ID").ok_or_else(|| {
                 "Mode 2 is disabled because this release has no pinned official Apple Team ID"
@@ -703,14 +872,11 @@ impl CefProcess {
             let signature =
                 verify_distribution_signature(executable, team_identifier, signing_identity)?;
             let branding = verify_safe_storage_branding(&layout.framework_path)?;
-            (Some(signature), Some(branding), Some(team_identifier))
+            (
+                credential_store_policy(&layout, false, Some(&signature), Some(&branding))?,
+                Some(team_identifier),
+            )
         };
-        let credential_store_policy = credential_store_policy(
-            &layout,
-            cfg!(debug_assertions),
-            signature.as_ref(),
-            safe_storage_branding.as_ref(),
-        )?;
         ensure_credential_store_marker(cache_root, credential_store_policy, team_identifier)?;
         let loader = FrameworkLoaderGuard::load(executable, &layout)?;
 

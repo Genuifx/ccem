@@ -1,4 +1,6 @@
 pub(crate) mod availability;
+#[cfg(all(target_os = "macos", feature = "macos-adhoc-cef", not(debug_assertions)))]
+pub(crate) mod adhoc_bundle_smoke;
 #[cfg(target_os = "macos")]
 pub(crate) mod bootstrap;
 #[cfg(windows)]

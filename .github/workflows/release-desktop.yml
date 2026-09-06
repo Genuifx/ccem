@@ -209,7 +209,7 @@ jobs:
             echo '```'
             echo
             echo "### Desktop trust and browser availability"
-            echo "These Desktop artifacts use the legacy unsigned distribution path. CEF Mode 2 is excluded and unavailable; browser sessions use Preview Browser behavior only."
+            echo "These Desktop artifacts use the legacy unsigned distribution path. macOS includes CEF with ad-hoc code signatures and System Keychain storage; these apps are not Developer ID-signed or notarized. Windows does not include CEF; its embedded browser is unavailable."
             echo "On macOS, if Gatekeeper blocks the app, clear quarantine after installing:"
             echo
             echo '```bash'

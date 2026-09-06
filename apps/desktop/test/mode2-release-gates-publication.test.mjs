@@ -624,7 +624,7 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
       'tauri-action must build only and have no release mutation access');
   }
   const productionBuildIndex = producerWorkflow.indexOf('- name: Build production bundles without release access');
-  const legacyBuildIndex = producerWorkflow.indexOf('- name: Build legacy unsigned bundles with Mode 2 excluded');
+  const legacyBuildIndex = producerWorkflow.indexOf('- name: Build without platform certificates with bundled macOS CEF');
   const signedSmokeIndex = producerWorkflow.indexOf('- name: Prove signed macOS Mode 2 Safe Storage and production behavior');
   assert.ok(productionBuildIndex > 0 && productionBuildIndex < legacyBuildIndex);
   assert.ok(legacyBuildIndex < signedSmokeIndex);
@@ -639,18 +639,19 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
     /needs\.release-mode\.outputs\.production == 'true'|steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)/u,
     'a failed production build must not activate the legacy build',
   );
-  assert.match(producerWorkflow, /legacyArgs: '--target aarch64-apple-darwin'/u);
-  assert.match(producerWorkflow, /legacyArgs: '--target x86_64-apple-darwin'/u);
+  for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
+    assert.ok(producerWorkflow.includes(`legacyArgs: '--target ${target} --config src-tauri/tauri.cef.conf.json --config src-tauri/tauri.cef.adhoc.conf.json'`));
+  }
   assert.match(
     producerWorkflow,
     /legacyArgs: '--target x86_64-pc-windows-msvc --config src-tauri\/tauri\.windows\.conf\.json --bundles nsis,updater'/u,
   );
   for (const legacyArgs of producerWorkflow.match(/^\s+legacyArgs:.*$/gmu) ?? []) {
-    assert.doesNotMatch(legacyArgs, /tauri\.cef\.conf\.json|tauri\.windows-signing\.conf\.json/u);
+    assert.doesNotMatch(legacyArgs, /tauri\.windows-signing\.conf\.json/u);
   }
   assert.match(
     producerWorkflow,
-    /Prove legacy macOS bundles exclude Mode 2[\s\S]*?verify-legacy-release-inventory\.mjs[\s\S]*?--updater-signature "\$signature_path"/u,
+    /Prove ad-hoc macOS app DMG and updater include CEF[\s\S]*?verify-legacy-release-inventory\.mjs[\s\S]*?--stage src-tauri\/target\/cef-bundle\/macos[\s\S]*?--updater-signature "\$signature_path"/u,
   );
   assert.match(
     producerWorkflow,
@@ -748,7 +749,7 @@ test('release workflow gates Mode 2 delivery before updater publication', async 
   }
   assert.match(
     workflow.slice(legacyReleaseBodyIndex, releaseBodyEndIndex),
-    /legacy unsigned distribution path[\s\S]*CEF Mode 2 is excluded[\s\S]*xattr -c \/Applications\/CCEM\\ Desktop\.app/u,
+    /legacy unsigned distribution path[\s\S]*macOS includes CEF with ad-hoc code signatures and System Keychain storage[\s\S]*Windows does not include CEF[\s\S]*xattr -c \/Applications\/CCEM\\ Desktop\.app/u,
   );
   assert.doesNotMatch(workflow, /\/releases\/tags\//);
   assert.match(producerWorkflow, /APPLE_NOTARY_API_PRIVATE_KEY/);

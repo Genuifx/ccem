@@ -906,7 +906,7 @@ fn require_mock_keychain_preflight(config: &MacosDebugMode2SmokeConfig) -> Resul
             )?;
             verify_mock_keychain_marker(&config.cef_cache_root)
         }
-        CefCredentialStorePolicy::SystemKeychain => {
+        CefCredentialStorePolicy::SystemKeychain | CefCredentialStorePolicy::AdHocSystemKeychain => {
             Err("macOS Mode 2 debug smoke refuses a system Keychain credential store".to_string())
         }
     }

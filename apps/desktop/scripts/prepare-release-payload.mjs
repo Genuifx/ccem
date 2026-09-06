@@ -8,6 +8,7 @@ import { discoverTargetAssets } from './release-asset-discovery.mjs';
 import {
   LEGACY_UNSIGNED_RELEASE_MODE,
   PRODUCTION_SIGNED_RELEASE_MODE,
+  validateLegacyUnsignedInventory,
 } from './verify-legacy-release-inventory.mjs';
 
 const TARGET_ROLES = Object.freeze({
@@ -122,8 +123,7 @@ export async function prepareReleasePayload({
   const inventory = inventoryRecord.value;
   const releaseModeMatches = exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
     ? inventory?.releaseMode === LEGACY_UNSIGNED_RELEASE_MODE
-      && inventory.mode2Included === false
-      && inventory.cefRuntimeVersion === null
+      && inventory.mode2Included === exactTarget.endsWith('apple-darwin')
     : (inventory?.releaseMode === undefined
       || inventory.releaseMode === PRODUCTION_SIGNED_RELEASE_MODE)
       && inventory.mode2Included === true;
@@ -133,6 +133,9 @@ export async function prepareReleasePayload({
     || !releaseModeMatches
   ) {
     fail(`release inventory does not bind the exact ${exactReleaseMode} target and source commit`);
+  }
+  if (exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE) {
+    validateLegacyUnsignedInventory(inventory, inventory.appVersion, exactSourceCommit);
   }
   if (!sameSet(Object.keys(inventory.artifacts ?? {}), expectedRoles)) {
     fail(`${exactTarget} inventory has an invalid release artifact role set`);
