@@ -651,7 +651,7 @@ test('source contract keeps debug mock Keychain separate and release smoke CI-on
   assert.match(productionRuntime, /production-origin-port/u);
   assert.match(productionRuntime, /bind_persistent_semantic_origin/u);
   assert.match(productionRuntime, /try_lock_exclusive/u);
-  assert.match(debugSmoke, /CefCredentialStorePolicy::MockKeychain/);
+  assert.match(debugSmoke, /CefCredentialStorePolicy::Mock/);
   assert.match(bootstrap, /use-mock-keychain/);
   const updaterGateIndex = desktopLib.indexOf('if updater_replacement_smoke::is_requested()');
   const safeStorageGateIndex = desktopLib.indexOf(

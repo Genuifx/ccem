@@ -54,9 +54,9 @@ pub(crate) struct CefRuntimeLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CefCredentialStorePolicy {
-    SystemKeychain,
-    AdHocSystemKeychain,
-    MockKeychain,
+    System,
+    AdHocSystem,
+    Mock,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,7 +74,7 @@ pub(crate) fn should_append_mock_keychain_switch(
     policy: CefCredentialStorePolicy,
     process_type: Option<&str>,
 ) -> bool {
-    policy == CefCredentialStorePolicy::MockKeychain && process_type.is_none_or(str::is_empty)
+    policy == CefCredentialStorePolicy::Mock && process_type.is_none_or(str::is_empty)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +102,7 @@ pub(crate) fn credential_store_policy(
     // macOS Keychain from that process causes repeated "Safe Storage" authorization
     // prompts and can accidentally bind a profile to a throw-away debug executable.
     if debug_build {
-        return Ok(CefCredentialStorePolicy::MockKeychain);
+        return Ok(CefCredentialStorePolicy::Mock);
     }
 
     // Chromium's mock keychain uses a fixed testing key. It is acceptable only for an
@@ -122,7 +122,7 @@ pub(crate) fn credential_store_policy(
             .to_string()
     })?;
 
-    Ok(CefCredentialStorePolicy::SystemKeychain)
+    Ok(CefCredentialStorePolicy::System)
 }
 
 pub(crate) fn adhoc_credential_store_policy(
@@ -136,7 +136,7 @@ pub(crate) fn adhoc_credential_store_policy(
     signature.ok_or_else(|| "ad-hoc CCEM bundle signature was not verified".to_string())?;
     safe_storage_branding
         .ok_or_else(|| "ad-hoc CEF runtime is not branded for CCEM Safe Storage".to_string())?;
-    Ok(CefCredentialStorePolicy::AdHocSystemKeychain)
+    Ok(CefCredentialStorePolicy::AdHocSystem)
 }
 
 fn count_safe_storage_service_literals(mut reader: impl Read) -> Result<(usize, usize), String> {
@@ -415,7 +415,7 @@ pub(crate) fn expected_credential_store_marker(
     team_identifier: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let marker = match policy {
-        CefCredentialStorePolicy::SystemKeychain => {
+        CefCredentialStorePolicy::System => {
             let team_identifier = team_identifier.ok_or_else(|| {
                 "system Keychain credential marker requires the verified Apple Team ID".to_string()
             })?;
@@ -437,7 +437,7 @@ pub(crate) fn expected_credential_store_marker(
                 derivation: "cef-binary-null-padded-service-v1",
             }
         }
-        CefCredentialStorePolicy::AdHocSystemKeychain => {
+        CefCredentialStorePolicy::AdHocSystem => {
             if team_identifier.is_some() {
                 return Err(
                     "ad-hoc Keychain credential marker must not carry an Apple Team ID".to_string(),
@@ -452,7 +452,7 @@ pub(crate) fn expected_credential_store_marker(
                 derivation: "cef-binary-null-padded-service-v1",
             }
         }
-        CefCredentialStorePolicy::MockKeychain => {
+        CefCredentialStorePolicy::Mock => {
             if team_identifier.is_some() {
                 return Err(
                     "mock Keychain credential marker must not carry an Apple Team ID".to_string(),

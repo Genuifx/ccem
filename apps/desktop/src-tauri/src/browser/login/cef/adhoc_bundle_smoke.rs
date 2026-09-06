@@ -215,7 +215,7 @@ fn exercise(
         return Err("CEF must be bundled and sandboxed".into());
     }
     let marker =
-        expected_credential_store_marker(CefCredentialStorePolicy::AdHocSystemKeychain, None)?;
+        expected_credential_store_marker(CefCredentialStorePolicy::AdHocSystem, None)?;
     validate_credential_store_marker(&root.join("cef-cache/.ccem-credential-store"), &marker)?;
     eprintln!(
         "CEF bundle smoke {}: bundled sandboxed runtime ready",

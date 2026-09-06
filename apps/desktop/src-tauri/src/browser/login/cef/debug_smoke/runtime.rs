@@ -898,15 +898,15 @@ fn require_mock_keychain_preflight(config: &MacosDebugMode2SmokeConfig) -> Resul
         network_service_lpac_requested: false,
     };
     match credential_store_policy(&inert_layout, true, None, None)? {
-        CefCredentialStorePolicy::MockKeychain => {
+        CefCredentialStorePolicy::Mock => {
             ensure_credential_store_marker(
                 &config.cef_cache_root,
-                CefCredentialStorePolicy::MockKeychain,
+                CefCredentialStorePolicy::Mock,
                 None,
             )?;
             verify_mock_keychain_marker(&config.cef_cache_root)
         }
-        CefCredentialStorePolicy::SystemKeychain | CefCredentialStorePolicy::AdHocSystemKeychain => {
+        CefCredentialStorePolicy::System | CefCredentialStorePolicy::AdHocSystem => {
             Err("macOS Mode 2 debug smoke refuses a system Keychain credential store".to_string())
         }
     }
@@ -2261,7 +2261,7 @@ fn verify_mock_keychain_marker(cache_root: &Path) -> Result<(), String> {
             marker.display()
         )
     })?;
-    if contents != expected_credential_store_marker(CefCredentialStorePolicy::MockKeychain, None)? {
+    if contents != expected_credential_store_marker(CefCredentialStorePolicy::Mock, None)? {
         return Err(
             "macOS Mode 2 debug smoke refuses a non-mock credential-store marker".to_string(),
         );

@@ -36,6 +36,8 @@ const inventoryScript = path.join(desktopDir, 'scripts', 'verify-legacy-release-
 const sourceCommit = 'a'.repeat(40);
 const version = '2.78.1';
 const signatureVerification = async () => ({ algorithm: 'minisign-ed25519-blake2b' });
+// These fixtures exercise real chmod/stat execute bits; Windows does not expose them.
+const macFilesystemFixture = { skip: process.platform === 'win32' };
 
 function digest(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -279,7 +281,7 @@ test('legacy tree verifier rejects every known Mode 2 runtime path and symlinks'
   await assert.rejects(inspectLegacyBundleTree(root), /contains a symlink/u);
 });
 
-test('legacy verifier includes macOS CEF while keeping Windows runtime excluded', async (t) => {
+test('legacy verifier includes macOS CEF while keeping Windows runtime excluded', macFilesystemFixture, async (t) => {
   const fixture = await createInventorySet(t);
   const inventories = fixture.items.map(({ inventory }) => inventory);
   const aggregate = validateLegacyUnsignedInventorySet(inventories, version, sourceCommit);
@@ -342,7 +344,7 @@ test('legacy verifier includes macOS CEF while keeping Windows runtime excluded'
   assert.equal(JSON.parse(await fsp.readFile(output, 'utf8')).releaseMode, LEGACY_UNSIGNED_RELEASE_MODE);
 });
 
-test('legacy macOS verifier rejects missing framework, helpers, resources, and legal files', async (t) => {
+test('legacy macOS verifier rejects missing framework, helpers, resources, and legal files', macFilesystemFixture, async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-cef-required-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const cases = [
@@ -366,7 +368,7 @@ test('legacy macOS verifier rejects missing framework, helpers, resources, and l
   }
 });
 
-test('legacy macOS verifier rejects changed or additional CEF files and non-executable helpers', async (t) => {
+test('legacy macOS verifier rejects changed or additional CEF files and non-executable helpers', macFilesystemFixture, async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-cef-content-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const item = await createMacInventory(root, 'aarch64-apple-darwin', 'content');
@@ -390,7 +392,7 @@ test('legacy macOS verifier rejects changed or additional CEF files and non-exec
   await assert.rejects(inspectLegacyMacRelease(options, operations), /executable differs from the pinned stage/u);
 });
 
-test('legacy macOS verifier requires native ad-hoc verification and pinned legal bytes', async (t) => {
+test('legacy macOS verifier requires native ad-hoc verification and pinned legal bytes', macFilesystemFixture, async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-cef-native-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const { verification: { options, operations } } = await createMacInventory(root, 'aarch64-apple-darwin', 'native-proof');
@@ -408,7 +410,7 @@ test('legacy macOS verifier requires native ad-hoc verification and pinned legal
   }), /does not match its CCEM Safe Storage branding evidence/u);
 });
 
-test('legacy macOS verifier rejects stale executable and tree copies in updater or DMG', async (t) => {
+test('legacy macOS verifier rejects stale executable and tree copies in updater or DMG', macFilesystemFixture, async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-mac-binding-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const item = await createMacInventory(root, 'aarch64-apple-darwin', 'binding');
@@ -493,7 +495,7 @@ async function placeBundleAssets(desktopRoot, target, files) {
   }
 }
 
-test('legacy payload mode is explicit and remains consumable by the unified verifier', async (t) => {
+test('legacy payload mode is explicit and remains consumable by the unified verifier', macFilesystemFixture, async (t) => {
   const fixture = await createInventorySet(t);
   const payloadRoot = path.join(fixture.root, 'payloads');
   const desktopRoot = path.join(fixture.root, 'desktop');

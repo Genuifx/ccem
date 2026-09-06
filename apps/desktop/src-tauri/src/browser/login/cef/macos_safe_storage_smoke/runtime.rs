@@ -668,7 +668,7 @@ fn expected_system_keychain_marker() -> Result<Vec<u8>, String> {
         "Safe Storage smoke release has no embedded official Apple Team ID".to_string()
     })?;
     expected_credential_store_marker(
-        CefCredentialStorePolicy::SystemKeychain,
+        CefCredentialStorePolicy::System,
         Some(team_identifier),
     )
 }

@@ -80,7 +80,7 @@ pub fn list_workspace_session_references(
     let workspace = workspace_path(&working_dir)?;
     let mut summaries = native_state.list_sessions();
     TitleOverrides::load().apply_native_session_titles(&mut summaries);
-    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
     Ok(summaries
         .into_iter()
         .filter(|s| {

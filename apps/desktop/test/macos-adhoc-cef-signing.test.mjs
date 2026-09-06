@@ -27,8 +27,8 @@ test('CEF signing seals libraries before framework and every helper without hard
   const signs = calls.filter((args) => args.includes('--sign'));
   assert.equal(signs.length, FRAMEWORK_NESTED_CODE_RELATIVES.length + 1 + HELPER_SPECS.length);
   assert.deepEqual(signs.slice(0, FRAMEWORK_NESTED_CODE_RELATIVES.length).map((args) => args.at(-1)),
-    FRAMEWORK_NESTED_CODE_RELATIVES.map((relative) => `/stage/${FRAMEWORK_NAME}/${relative}`));
-  assert.equal(signs[FRAMEWORK_NESTED_CODE_RELATIVES.length].at(-1), `/stage/${FRAMEWORK_NAME}`);
+    FRAMEWORK_NESTED_CODE_RELATIVES.map((relative) => path.join('/stage', FRAMEWORK_NAME, relative)));
+  assert.equal(signs[FRAMEWORK_NESTED_CODE_RELATIVES.length].at(-1), path.join('/stage', FRAMEWORK_NAME));
   for (const args of signs) {
     assert.equal(args[args.indexOf('--sign') + 1], '-');
     assert.ok(!args.includes('--deep') && !args.includes('--options'));

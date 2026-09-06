@@ -5594,7 +5594,7 @@ pub fn run_desktop_app() -> i32 {
 
     let app = builder
         .on_page_load(move |webview, payload| {
-            webcontent_recovery::handle_page_load(&webview, payload.event());
+            webcontent_recovery::handle_page_load(webview, payload.event());
             if webview.window().label() != "main" || payload.event() != PageLoadEvent::Finished {
                 return;
             }

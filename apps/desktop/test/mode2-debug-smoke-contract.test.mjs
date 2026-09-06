@@ -42,7 +42,7 @@ test('debug Mode 2 smoke binds canonical dev identity and cannot select system K
   assert.match(runtime, /com\.ccem\.desktop\.dev\.i/u);
   assert.match(runtime, /\/Applications\/CCEM Desktop\.app/u);
   assert.match(runtime, /private child of the system temporary directory/u);
-  assert.match(runtime, /CefCredentialStorePolicy::MockKeychain/u);
+  assert.match(runtime, /CefCredentialStorePolicy::Mock/u);
   assert.match(runtime, /chromium-mock-keychain-v2/u);
   assert.doesNotMatch(runtime, /\/usr\/bin\/security|login\.keychain/u);
   assert.match(runtime, /smoke root must use its canonical path without symlinks/u);

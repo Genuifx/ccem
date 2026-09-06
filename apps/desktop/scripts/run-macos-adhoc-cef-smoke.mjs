@@ -31,14 +31,14 @@ export function validateReceipt(receipt, { nonce, phase, root, executable, pid, 
   }
 }
 
-export async function runPhase({ executable, root, nonce, phase, origin, timeoutMs = 90_000 }) {
+export async function runPhase({ executable, root, nonce, phase, origin, timeoutMs = 90_000 }, { spawnProcess = spawn } = {}) {
   await writeFile(join(root, 'smoke-config.json'), JSON.stringify({ nonce, phase, origin }), { mode: 0o600 });
   const logPath = join(root, `${phase}.log`);
   const output = openSync(logPath, 'wx', 0o600);
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('CCEM_') && !key.startsWith('DYLD_')));
   let child;
   try {
-    child = spawn(executable, ['--cef-bundle-smoke', root], { env, stdio: ['ignore', output, output] });
+    child = spawnProcess(executable, ['--cef-bundle-smoke', root], { env, stdio: ['ignore', output, output] });
   } finally {
     closeSync(output);
   }

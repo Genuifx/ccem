@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,22 +56,36 @@ test('requires this process, phase, profile root, runtime facts and actual rende
 
 test('a successful exit without a receipt cannot pass', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ccem-smoke-test-'));
-  const executable = join(root, 'empty');
+  const executable = join(root, 'empty.cjs');
+  let child;
   try {
-    await writeFile(executable, '#!/bin/sh\nexit 0\n'); await chmod(executable, 0o700);
-    await assert.rejects(runPhase({ ...expected, root, executable, timeoutMs: 1_000 }), /ENOENT/);
+    await writeFile(executable, 'process.exitCode = 0;\n');
+    await assert.rejects(runPhase({ ...expected, root, executable, timeoutMs: 5_000 }, {
+      spawnProcess: (file, args, options) => (child = spawn(process.execPath, [file, ...args], options)),
+    }), error => error.code === 'ENOENT' && error.path === join(root, 'restore.json'));
+    assert.equal(child.exitCode, 0, 'the fixture must exit successfully before the missing receipt is rejected');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('timeout terminates only its spawned process and does not accept stale evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ccem-smoke-test-'));
-  const executable = join(root, 'hanging');
+  const executable = join(root, 'hanging.cjs');
   const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+  let child;
   try {
-    await writeFile(executable, `#!${process.execPath}\nsetInterval(() => {}, 1000);\n`); await chmod(executable, 0o700);
+    await writeFile(executable, 'setInterval(() => {}, 1000);\n');
     await writeFile(join(root, 'restore.json'), JSON.stringify(receipt()));
-    await assert.rejects(runPhase({ ...expected, root, executable, timeoutMs: 100 }), /timed out; only spawned PID/);
+    await assert.rejects(runPhase({ ...expected, root, executable, timeoutMs: 100 }, {
+      spawnProcess: (file, args, options) => (child = spawn(process.execPath, [file, ...args], options)),
+    }), error => error.message.includes(`timed out; only spawned PID ${child.pid} was terminated`));
+    assert.ok(child.exitCode !== null || child.signalCode !== null, 'the owned child must have exited');
     assert.equal(unrelated.exitCode, null);
     assert.doesNotThrow(() => process.kill(unrelated.pid, 0));
-  } finally { unrelated.kill('SIGTERM'); await rm(root, { recursive: true, force: true }); }
+  } finally {
+    if (unrelated.exitCode === null && unrelated.signalCode === null) {
+      unrelated.kill('SIGTERM');
+      await once(unrelated, 'exit');
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 });

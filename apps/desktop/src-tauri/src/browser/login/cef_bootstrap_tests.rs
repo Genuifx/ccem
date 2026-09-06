@@ -76,26 +76,26 @@ fn cef_bootstrap_never_uses_the_system_keychain_for_development_runtimes() {
     );
     assert_eq!(
         credential_store_policy(&layout, true, None, None).unwrap(),
-        CefCredentialStorePolicy::MockKeychain
+        CefCredentialStorePolicy::Mock
     );
 }
 
 #[test]
 fn cef_bootstrap_appends_mock_keychain_only_to_the_debug_browser_process() {
     assert!(should_append_mock_keychain_switch(
-        CefCredentialStorePolicy::MockKeychain,
+        CefCredentialStorePolicy::Mock,
         None
     ));
     assert!(should_append_mock_keychain_switch(
-        CefCredentialStorePolicy::MockKeychain,
+        CefCredentialStorePolicy::Mock,
         Some("")
     ));
     assert!(!should_append_mock_keychain_switch(
-        CefCredentialStorePolicy::MockKeychain,
+        CefCredentialStorePolicy::Mock,
         Some("renderer")
     ));
     assert!(!should_append_mock_keychain_switch(
-        CefCredentialStorePolicy::SystemKeychain,
+        CefCredentialStorePolicy::System,
         None
     ));
 }
@@ -115,11 +115,11 @@ fn cef_bootstrap_uses_the_system_keychain_only_for_verified_release_bundles() {
 
     assert_eq!(
         credential_store_policy(&layout, true, None, None).unwrap(),
-        CefCredentialStorePolicy::MockKeychain
+        CefCredentialStorePolicy::Mock
     );
     assert_eq!(
         credential_store_policy(&layout, false, Some(&signature), Some(&branding)).unwrap(),
-        CefCredentialStorePolicy::SystemKeychain
+        CefCredentialStorePolicy::System
     );
     assert_eq!(
         credential_store_policy(&layout, false, Some(&signature), None).unwrap_err(),
@@ -154,7 +154,7 @@ fn cef_bootstrap_adhoc_keychain_requires_verified_bundled_sandbox_and_branding()
     let branding = VerifiedMacSafeStorageBranding { _private: () };
     let policy = adhoc_credential_store_policy(&layout, Some(&signature), Some(&branding))
         .expect("verified ad-hoc bundle may use the real Keychain");
-    assert_eq!(policy, CefCredentialStorePolicy::AdHocSystemKeychain);
+    assert_eq!(policy, CefCredentialStorePolicy::AdHocSystem);
     assert!(!should_append_mock_keychain_switch(policy, None));
     assert!(adhoc_credential_store_policy(&layout, None, Some(&branding)).is_err());
     assert!(adhoc_credential_store_policy(&layout, Some(&signature), None).is_err());
@@ -233,32 +233,32 @@ fn cef_bootstrap_adhoc_dynamic_identity_matches_the_verified_bundle_without_a_re
 #[test]
 fn cef_bootstrap_adhoc_marker_never_adopts_mock_or_developer_id_profiles() {
     let adhoc =
-        expected_credential_store_marker(CefCredentialStorePolicy::AdHocSystemKeychain, None)
+        expected_credential_store_marker(CefCredentialStorePolicy::AdHocSystem, None)
             .expect("ad-hoc Keychain marker");
     let parsed: serde_json::Value = serde_json::from_slice(&adhoc).expect("marker JSON");
     assert_eq!(parsed["credentialStore"], "macos-system-keychain-adhoc");
     assert_eq!(parsed["safeStorageService"], "CCEM Safe Storage");
     assert!(parsed["teamIdentifier"].is_null());
     assert!(expected_credential_store_marker(
-        CefCredentialStorePolicy::AdHocSystemKeychain,
+        CefCredentialStorePolicy::AdHocSystem,
         Some("TEAM123456"),
     )
     .is_err());
 
     for (other, team) in [
-        (CefCredentialStorePolicy::MockKeychain, None),
-        (CefCredentialStorePolicy::SystemKeychain, Some("TEAM123456")),
+        (CefCredentialStorePolicy::Mock, None),
+        (CefCredentialStorePolicy::System, Some("TEAM123456")),
     ] {
         let root = tempfile::tempdir().expect("isolated ad-hoc marker root");
         ensure_credential_store_marker(
             root.path(),
-            CefCredentialStorePolicy::AdHocSystemKeychain,
+            CefCredentialStorePolicy::AdHocSystem,
             None,
         )
         .expect("write ad-hoc marker");
         ensure_credential_store_marker(
             root.path(),
-            CefCredentialStorePolicy::AdHocSystemKeychain,
+            CefCredentialStorePolicy::AdHocSystem,
             None,
         )
         .expect("same ad-hoc scheme remains valid");
@@ -272,7 +272,7 @@ fn cef_bootstrap_adhoc_marker_never_adopts_mock_or_developer_id_profiles() {
         ensure_credential_store_marker(root.path(), other, team).expect("write alternate marker");
         assert!(ensure_credential_store_marker(
             root.path(),
-            CefCredentialStorePolicy::AdHocSystemKeychain,
+            CefCredentialStorePolicy::AdHocSystem,
             None
         )
         .is_err());
@@ -346,13 +346,13 @@ fn cef_bootstrap_builds_an_apple_anchored_exact_release_requirement() {
 #[test]
 fn cef_bootstrap_never_reuses_a_profile_root_across_credential_store_schemes() {
     let root = tempfile::tempdir().expect("credential-store root");
-    ensure_credential_store_marker(root.path(), CefCredentialStorePolicy::MockKeychain, None)
+    ensure_credential_store_marker(root.path(), CefCredentialStorePolicy::Mock, None)
         .expect("write mock marker");
-    ensure_credential_store_marker(root.path(), CefCredentialStorePolicy::MockKeychain, None)
+    ensure_credential_store_marker(root.path(), CefCredentialStorePolicy::Mock, None)
         .expect("same scheme is idempotent");
     assert!(ensure_credential_store_marker(
         root.path(),
-        CefCredentialStorePolicy::SystemKeychain,
+        CefCredentialStorePolicy::System,
         Some("TEAM123456"),
     )
     .is_err());
@@ -363,7 +363,7 @@ fn cef_bootstrap_marker_binds_the_release_team_and_safe_storage_service() {
     let root = tempfile::tempdir().expect("system credential-store root");
     ensure_credential_store_marker(
         root.path(),
-        CefCredentialStorePolicy::SystemKeychain,
+        CefCredentialStorePolicy::System,
         Some("TEAM123456"),
     )
     .expect("write system marker");
@@ -372,7 +372,7 @@ fn cef_bootstrap_marker_binds_the_release_team_and_safe_storage_service() {
     assert_eq!(
         marker,
         expected_credential_store_marker(
-            CefCredentialStorePolicy::SystemKeychain,
+            CefCredentialStorePolicy::System,
             Some("TEAM123456"),
         )
         .expect("expected system marker")
@@ -386,7 +386,7 @@ fn cef_bootstrap_marker_binds_the_release_team_and_safe_storage_service() {
 
     assert!(ensure_credential_store_marker(
         root.path(),
-        CefCredentialStorePolicy::SystemKeychain,
+        CefCredentialStorePolicy::System,
         Some("OTHER12345"),
     )
     .is_err());
@@ -403,7 +403,7 @@ fn cef_bootstrap_refuses_to_adopt_nonempty_unmarked_profile_state() {
         .expect("write existing profile state");
     let error = ensure_credential_store_marker(
         root.path(),
-        CefCredentialStorePolicy::SystemKeychain,
+        CefCredentialStorePolicy::System,
         Some("TEAM123456"),
     )
     .expect_err("nonempty profile must not be adopted");
@@ -420,7 +420,7 @@ fn cef_bootstrap_refuses_symlinked_or_hardlinked_credential_markers() {
     fs::write(&outside, b"do not overwrite").expect("write outside marker");
     symlink(&outside, cache.join(".ccem-credential-store")).expect("symlink marker");
     assert!(
-        ensure_credential_store_marker(&cache, CefCredentialStorePolicy::MockKeychain, None,)
+        ensure_credential_store_marker(&cache, CefCredentialStorePolicy::Mock, None,)
             .is_err()
     );
     assert_eq!(
@@ -429,7 +429,7 @@ fn cef_bootstrap_refuses_symlinked_or_hardlinked_credential_markers() {
     );
 
     fs::remove_file(cache.join(".ccem-credential-store")).expect("remove symlink fixture");
-    ensure_credential_store_marker(&cache, CefCredentialStorePolicy::MockKeychain, None)
+    ensure_credential_store_marker(&cache, CefCredentialStorePolicy::Mock, None)
         .expect("write trusted marker");
     fs::hard_link(
         cache.join(".ccem-credential-store"),
@@ -437,7 +437,7 @@ fn cef_bootstrap_refuses_symlinked_or_hardlinked_credential_markers() {
     )
     .expect("hardlink marker");
     assert!(
-        ensure_credential_store_marker(&cache, CefCredentialStorePolicy::MockKeychain, None,)
+        ensure_credential_store_marker(&cache, CefCredentialStorePolicy::Mock, None,)
             .is_err()
     );
 }

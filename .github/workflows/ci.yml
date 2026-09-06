@@ -60,6 +60,9 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install tmux
 
+      - name: Verify Tauri package versions
+        run: pnpm check:tauri-versions
+
       - name: Verify pinned browser runtime manifests
         run: pnpm check:browser-runtime-manifests
 
