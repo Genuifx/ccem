@@ -37,6 +37,21 @@ try {
   results.push('reference selection/restored draft/current submit: no target send');
 
   await fresh(); await selectReference();
+  await page.evaluate(() => { window.sessionReferenceFixture.emptyText = true; });
+  await editor().click(); await editor().press('End');
+  await editor().pressSequentially(' 帮我给他发个消息：请检查失败路径');
+  await page.getByRole('button', { name: '发送当前消息', exact: true }).click();
+  await page.waitForFunction(() => window.sessionReferenceFixture.submissions.length === 1);
+  s = await state();
+  assert.match(s.submissions[0].text, /帮我给他发个消息：请检查失败路径/);
+  assert.match(s.submissions[0].text, /mcp__ccem-sessions__send_message/);
+  assert.match(s.submissions[0].text, /"text_available":false/);
+  assert.match(s.submissions[0].text, /native-design/);
+  assert.equal(s.handoffs.length, 0, 'Composer must delegate intent to the current model, not send by keyword');
+  assert.equal(await page.locator('[data-session-reference-panel]').count(), 0);
+  results.push('natural-language send request reaches current model with target identity and no extra dialog');
+
+  await fresh(); await selectReference();
   await editor().evaluate((element) => {
     const bytes = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8XcAAAAASUVORK5CYII='), (c) => c.charCodeAt(0));
     const transfer = new DataTransfer();

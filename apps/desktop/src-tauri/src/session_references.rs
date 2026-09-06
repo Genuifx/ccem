@@ -25,6 +25,7 @@ pub struct WorkspaceSessionReferenceContent {
     pub runtime_id: String,
     pub title: String,
     pub text: String,
+    pub text_available: bool,
     pub truncated: bool,
 }
 fn workspace_path(path: &str) -> Result<PathBuf, String> {
@@ -130,9 +131,6 @@ fn extract_text(
             _ => {}
         }
     }
-    if text.trim().is_empty() {
-        return Err("No recent user or assistant text is available".into());
-    }
     let count = text.chars().count();
     let truncated = tail_omitted || page.has_more || count > MAX_CHARS;
     if count > MAX_CHARS {
@@ -154,6 +152,7 @@ pub async fn read_workspace_session_reference(
         Ok(WorkspaceSessionReferenceContent {
             runtime_id,
             title: title(&summary),
+            text_available: !text.trim().is_empty(),
             text,
             truncated,
         })
@@ -210,28 +209,57 @@ pub async fn send_workspace_session_handoff(
     let mutations = Arc::clone(environment_mutations.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = mutations.lock()?;
-        let workspace = workspace_path(&working_dir)?;
-        let source = scoped_summary(&manager, &workspace, &source_runtime_id)?;
-        scoped_summary(&manager, &workspace, &target_runtime_id)?;
-        manager.ensure_session_handoff_target(&target_runtime_id)?;
-        let message = format!(
-            "[User-directed handoff from session {} ({})]\n{}",
-            title(&source),
-            source.runtime_id,
-            text.trim()
-        );
-        manager.send_user_message(
-            &app,
+        enqueue_workspace_session_handoff(
+            Some(&app),
+            &manager,
+            &working_dir,
+            &source_runtime_id,
             &target_runtime_id,
-            &message,
-            Some(&message),
-            None,
-            None,
-            Some(&client_message_id),
+            &text,
+            &client_message_id,
         )
     })
     .await
     .map_err(|e| format!("Session handoff failed: {e}"))?
+}
+
+/// Shared host admission for explicit UI sends and the current agent's tool.
+/// Callers hold the environment mutation guard; tool callers additionally hold
+/// source incarnation and permission authority until the immutable queue write.
+pub(crate) fn enqueue_workspace_session_handoff(
+    app: Option<&tauri::AppHandle>,
+    manager: &Arc<NativeRuntimeManager>,
+    working_dir: &str,
+    source_runtime_id: &str,
+    target_runtime_id: &str,
+    text: &str,
+    client_message_id: &str,
+) -> Result<(), String> {
+    validate_handoff(
+        source_runtime_id,
+        target_runtime_id,
+        text,
+        client_message_id,
+    )?;
+    let workspace = workspace_path(working_dir)?;
+    let source = scoped_summary(manager, &workspace, source_runtime_id)?;
+    scoped_summary(manager, &workspace, target_runtime_id)?;
+    manager.ensure_session_handoff_target(target_runtime_id)?;
+    let message = format!(
+        "[User-directed handoff from session {} ({})]\n{}",
+        title(&source),
+        source.runtime_id,
+        text.trim()
+    );
+    manager.send_user_message_with_dispatch(
+        app,
+        target_runtime_id,
+        &message,
+        Some(&message),
+        None,
+        None,
+        Some(client_message_id),
+    )
 }
 
 #[cfg(test)]
@@ -306,7 +334,11 @@ mod tests {
         p.decode_failure_count = 0;
         p.oversized_event_count = 1;
         assert!(extract_text(&p, false).is_err());
-        assert!(extract_text(&page(vec![]), false).is_err());
+        assert_eq!(extract_text(&page(vec![]), false).unwrap(), (String::new(), false));
+        let hidden_tail = page(vec![SessionEventPayload::SystemMessage {
+            message: "hidden".into(),
+        }]);
+        assert_eq!(extract_text(&hidden_tail, true).unwrap(), (String::new(), true));
     }
     #[test]
     fn unicode_tail_is_bounded_and_marked() {

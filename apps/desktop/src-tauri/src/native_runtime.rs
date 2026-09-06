@@ -699,6 +699,12 @@ enum HelperInputCommand<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<&'a str>,
     },
+    SessionHandoffResponse {
+        request_id: &'a str,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    },
     InterruptTurn {
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_command_id: Option<&'a str>,
@@ -1342,6 +1348,7 @@ fn helper_command_kind(command: &HelperInputCommand<'_>) -> &'static str {
         HelperInputCommand::RewindFiles { .. } => "rewind_files",
         HelperInputCommand::UsageQuery => "usage_query",
         HelperInputCommand::BrowserToolResponse { .. } => "browser_tool_response",
+        HelperInputCommand::SessionHandoffResponse { .. } => "session_handoff_response",
         HelperInputCommand::InterruptTurn { .. } => "interrupt_turn",
         HelperInputCommand::PrepareStop { .. } => "prepare_stop",
         HelperInputCommand::CancelPrepareStop { .. } => "cancel_prepare_stop",
@@ -1395,6 +1402,13 @@ enum HelperOutputEvent {
         tool: String,
         #[serde(default)]
         args: Value,
+    },
+    SessionHandoffRequest {
+        query_generation: u64,
+        command_id: String,
+        request_id: String,
+        target_runtime_id: String,
+        text: String,
     },
     SettingsUpdateResult {
         request_id: String,
@@ -1929,6 +1943,7 @@ struct NativeSessionHandle {
     record: Mutex<NativeSessionRecord>,
     browser_permission: BrowserPermissionAuthority,
     browser_permission_sync: Mutex<()>,
+    handoff_cancelled_command: Mutex<Option<String>>,
     settings_update_acks: SettingsUpdateAckRegistry,
     child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
@@ -2445,6 +2460,7 @@ impl NativeRuntimeManager {
                 record.runtime_perm_mode.as_deref(),
             )),
             browser_permission_sync: Mutex::new(()),
+            handoff_cancelled_command: Mutex::new(None),
             settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(runtime_id.clone())),
@@ -3022,6 +3038,29 @@ impl NativeRuntimeManager {
         annotations: Option<&Vec<SessionPromptAnnotation>>,
         client_message_id: Option<&str>,
     ) -> Result<(), String> {
+        self.send_user_message_with_dispatch(
+            Some(app),
+            runtime_id,
+            text,
+            display_text,
+            images,
+            annotations,
+            client_message_id,
+        )
+    }
+
+    // Tool handoffs must release source authority locks before dispatch can
+    // acquire the target helper lifecycle lock (including reciprocal sends).
+    pub(crate) fn send_user_message_with_dispatch(
+        self: &Arc<Self>,
+        app: Option<&AppHandle>,
+        runtime_id: &str,
+        text: &str,
+        display_text: Option<&str>,
+        images: Option<&Vec<PromptImage>>,
+        annotations: Option<&Vec<SessionPromptAnnotation>>,
+        client_message_id: Option<&str>,
+    ) -> Result<(), String> {
         let text = text.trim();
         let has_images = images.as_ref().is_some_and(|imgs| !imgs.is_empty());
         let annotations = validate_prompt_annotations(annotations)?;
@@ -3108,9 +3147,11 @@ impl NativeRuntimeManager {
             // immediately, but a busy foreground or pending settings ACK keeps
             // the immutable batch in backend memory for the next authoritative
             // lifecycle transition.
-            if let Err(error) =
+            if let Err(error) = if let Some(app) = app {
                 self.maybe_dispatch_queued(app, runtime_id, QueueDispatchTrigger::VisibleUserAction)
-            {
+            } else {
+                Ok(())
+            } {
                 let _ = self.set_last_error(runtime_id, error.clone());
                 let _ = self.append_lifecycle_event(
                     runtime_id,
@@ -3122,7 +3163,7 @@ impl NativeRuntimeManager {
         }
 
         self.send_user_message_admitted(
-            app,
+            app.ok_or("Non-Claude queue submission requires an app handle")?,
             runtime_id,
             text,
             display_text,
@@ -6499,6 +6540,10 @@ impl NativeRuntimeManager {
                 }
             }
             if let Some(handle) = stop_handle {
+                // Invalidate pending and later tool requests immediately at Stop
+                // admission, before provider interruption ACK/result arrives.
+                *handle.handoff_cancelled_command.lock().map_err(|_| "Failed to cancel pending handoffs")? =
+                    self.lifecycle.projection(runtime_id).and_then(|p| p.active_command_id);
                 match self.write_to_live_child_outcome(
                     &handle,
                     &HelperInputCommand::InterruptTurn {
@@ -7488,6 +7533,7 @@ impl NativeRuntimeManager {
                 record.runtime_perm_mode.as_deref(),
             )),
             browser_permission_sync: Mutex::new(()),
+            handoff_cancelled_command: Mutex::new(None),
             settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::with_start_seq(
@@ -8562,6 +8608,22 @@ impl NativeRuntimeManager {
                     args,
                 },
             ),
+            HelperOutputEvent::SessionHandoffRequest {
+                query_generation,
+                command_id,
+                request_id,
+                target_runtime_id,
+                text,
+            } => self.handle_session_handoff_request(
+                app,
+                runtime_id,
+                helper_incarnation,
+                query_generation,
+                command_id,
+                request_id,
+                target_runtime_id,
+                text,
+            ),
             HelperOutputEvent::SettingsUpdateResult {
                 request_id,
                 outcome,
@@ -8743,6 +8805,178 @@ impl NativeRuntimeManager {
         )
     }
 
+    /// Revalidate under the source lifecycle and permission locks immediately
+    /// before queue admission. Neither source identity nor workspace is supplied
+    /// by the model/tool payload.
+    fn session_handoff_source_workspace(
+        &self,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+    ) -> Result<String, String> {
+        if !self.is_current_handle(runtime_id, handle)?
+            || !handle.alive.load(Ordering::SeqCst)
+            || handle.permission_quarantined.load(Ordering::SeqCst)
+        {
+            return Err("Sending session helper is no longer current or available".into());
+        }
+        self.ensure_session_handoff_target(runtime_id)?;
+        let record = handle
+            .record
+            .lock()
+            .map_err(|_| "Failed to lock sending session")?;
+        let mode =
+            effective_native_perm_mode(&record.perm_mode, record.runtime_perm_mode.as_deref());
+        if !matches!(mode, "dev" | "yolo" | "bypassPermissions") {
+            return Err(format!("Session handoff is not allowed in {mode} mode"));
+        }
+        if record.provider != NativeProvider::Claude
+            || !record.is_active
+            || record.permission_quarantined
+            || is_native_terminal_status(&record.status)
+            || record.status.starts_with("handoff_")
+        {
+            return Err("Sending session is unavailable".into());
+        }
+        Ok(record.project_dir.clone())
+    }
+
+    fn session_handoff_foreground(
+        &self,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        query_generation: u64,
+        command_id: &str,
+    ) -> Result<u64, String> {
+        let projection = self
+            .lifecycle
+            .projection(runtime_id)
+            .ok_or("Sending foreground command is unavailable")?;
+        let cancelled = handle
+            .handoff_cancelled_command
+            .lock()
+            .map_err(|_| "Failed to lock handoff cancellation")?;
+        if projection.helper_incarnation != handle.generation
+            || projection.active_helper_incarnation != Some(handle.generation)
+            || projection.query_generation != query_generation
+            || projection.active_command_id.as_deref() != Some(command_id)
+            || !matches!(
+                projection.active_phase.as_deref(),
+                Some("helper_admitted" | "sdk_queued" | "sdk_started")
+            )
+            || cancelled.as_deref() == Some(command_id)
+        {
+            return Err("Session handoff belongs to a stopped or stale foreground command".into());
+        }
+        Ok(projection.conversation_epoch)
+    }
+
+    fn handle_session_handoff_request(
+        &self,
+        app: Option<&AppHandle>,
+        runtime_id: &str,
+        helper_incarnation: u64,
+        query_generation: u64,
+        command_id: String,
+        request_id: String,
+        target_runtime_id: String,
+        text: String,
+    ) -> Result<(), String> {
+        let handle = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock runtime handles")?
+            .get(runtime_id)
+            .filter(|handle| handle.generation == helper_incarnation)
+            .cloned()
+            .ok_or("Session handoff came from a stale helper")?;
+        let foreground =
+            self.session_handoff_foreground(runtime_id, &handle, query_generation, &command_id);
+        let app = app.ok_or("Session handoff requires an app handle")?.clone();
+        let manager = app
+            .try_state::<Arc<NativeRuntimeManager>>()
+            .map(|state| Arc::clone(state.inner()))
+            .ok_or("Native runtime manager is unavailable")?;
+        let mutations = app
+            .try_state::<Arc<crate::config::EnvironmentMutationCoordinator>>()
+            .map(|state| Arc::clone(state.inner()))
+            .ok_or("Environment coordinator is unavailable")?;
+        let source_runtime_id = runtime_id.to_string();
+        // Do not wait on environment/settings locks or target admission from the
+        // stdout pump: that pump must remain free to ingest ACKs and transitions.
+        tauri::async_runtime::spawn_blocking(move || {
+            let result = (|| {
+                if request_id.is_empty()
+                    || request_id.len() > 80
+                    || !request_id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                {
+                    return Err("Invalid session handoff request ID".to_string());
+                }
+                let _mutation = mutations.lock()?;
+                let _reconnect = manager
+                    .reconnect_lock
+                    .lock()
+                    .map_err(|_| "Failed to lock runtime coordinator")?;
+                let expected_epoch = foreground?;
+                let epoch = manager.session_handoff_foreground(
+                    &source_runtime_id,
+                    &handle,
+                    query_generation,
+                    &command_id,
+                )?;
+                if epoch != expected_epoch {
+                    return Err("Sending conversation changed before handoff".into());
+                }
+                let lifecycle = manager.lifecycle_transaction_lock(&source_runtime_id)?;
+                // Never wait for a lifecycle/permission transaction while owning
+                // reconnect: existing transitions may need this stdout pump.
+                let _lifecycle = lifecycle
+                    .try_lock()
+                    .map_err(|_| "Handoff was not submitted: sending session is changing")?;
+                let _authority = handle
+                    .browser_permission_sync
+                    .try_lock()
+                    .map_err(|_| "Handoff was not submitted: sending permissions are changing")?;
+                let workspace =
+                    manager.session_handoff_source_workspace(&source_runtime_id, &handle)?;
+                let client_message_id = format!("session-handoff:{source_runtime_id}:{request_id}");
+                crate::session_references::enqueue_workspace_session_handoff(
+                    None,
+                    &manager,
+                    &workspace,
+                    &source_runtime_id,
+                    &target_runtime_id,
+                    &text,
+                    &client_message_id,
+                )
+            })();
+            // Admission success acknowledges submission only, never execution.
+            // Always address the captured writer, never reconnect to a successor.
+            if manager
+                .is_current_handle(&source_runtime_id, &handle)
+                .unwrap_or(false)
+                && handle.alive.load(Ordering::SeqCst)
+            {
+                let _ = manager.write_to_child(
+                    &handle,
+                    &HelperInputCommand::SessionHandoffResponse {
+                        request_id: &request_id,
+                        ok: result.is_ok(),
+                        error: result.as_ref().err().map(String::as_str),
+                    },
+                );
+            }
+            if result.is_ok() {
+                let _ = manager.maybe_dispatch_queued(
+                    &app,
+                    &target_runtime_id,
+                    QueueDispatchTrigger::VisibleUserAction,
+                );
+            }
+        });
+        Ok(())
+    }
     fn handle_browser_tool_request(
         &self,
         app: Option<&AppHandle>,
@@ -11223,6 +11457,7 @@ mod tests {
                 ),
             ),
             browser_permission_sync: Mutex::new(()),
+            handoff_cancelled_command: Mutex::new(None),
             record: Mutex::new(record),
             settings_update_acks: super::SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
@@ -13020,6 +13255,199 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_handoff_protocol_roundtrip() {
+        let event: super::HelperOutputEvent = serde_json::from_value(serde_json::json!({
+            "type":"session_handoff_request", "query_generation":1, "command_id":"command-1", "request_id":"request-1", "target_runtime_id":"target", "text":"hello"
+        })).unwrap();
+        assert!(
+            matches!(event, super::HelperOutputEvent::SessionHandoffRequest { request_id, target_runtime_id, text, .. }
+            if request_id == "request-1" && target_runtime_id == "target" && text == "hello")
+        );
+        assert_eq!(
+            serde_json::to_value(HelperInputCommand::SessionHandoffResponse {
+                request_id: "request-1",
+                ok: false,
+                error: Some("not allowed"),
+            })
+            .unwrap(),
+            serde_json::json!({"type":"session_handoff_response", "request_id":"request-1", "ok":false, "error":"not allowed"})
+        );
+    }
+
+    #[test]
+    fn session_handoff_source_requires_current_live_unfenced_writable_claude() {
+        let record = native_record("handoff-source", "processing", true);
+        let manager = manager_with_records("handoff-source", vec![record.clone()]);
+        let handle = native_session_handle_with_generation(record.clone(), 2);
+        manager
+            .handles
+            .lock()
+            .unwrap()
+            .insert(record.runtime_id.clone(), Arc::clone(&handle));
+        for mode in ["dev", "yolo", "bypassPermissions"] {
+            handle.record.lock().unwrap().perm_mode = mode.into();
+            assert!(manager
+                .session_handoff_source_workspace(&record.runtime_id, &handle)
+                .is_ok());
+        }
+        for mode in ["plan", "safe", "readonly", "audit", "ci", "unknown"] {
+            handle.record.lock().unwrap().runtime_perm_mode = Some(mode.into());
+            assert!(
+                manager
+                    .session_handoff_source_workspace(&record.runtime_id, &handle)
+                    .is_err(),
+                "{mode}"
+            );
+        }
+        handle.record.lock().unwrap().runtime_perm_mode = None;
+        let stale = native_session_handle_with_generation(record.clone(), 1);
+        assert!(manager
+            .session_handoff_source_workspace(&record.runtime_id, &stale)
+            .is_err());
+        handle.alive.store(false, Ordering::SeqCst);
+        assert!(manager
+            .session_handoff_source_workspace(&record.runtime_id, &handle)
+            .is_err());
+        handle.alive.store(true, Ordering::SeqCst);
+        handle.permission_quarantined.store(true, Ordering::SeqCst);
+        assert!(manager
+            .session_handoff_source_workspace(&record.runtime_id, &handle)
+            .is_err());
+        handle.permission_quarantined.store(false, Ordering::SeqCst);
+        manager.fence_permission_quarantine(&record.runtime_id);
+        assert!(manager
+            .session_handoff_source_workspace(&record.runtime_id, &handle)
+            .is_err());
+    }
+
+    #[test]
+    fn session_handoff_foreground_rejects_stop_completion_and_replaced_query() {
+        let runtime_id = "handoff-foreground";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let handle = manager.handles.lock().unwrap()[runtime_id].clone();
+        manager
+            .lifecycle
+            .note_incarnation(runtime_id, handle.generation);
+        manager.lifecycle.note_session_meta(
+            runtime_id,
+            handle.generation,
+            Some("conversation"),
+            Some(&["msg_lifecycle_v1".to_owned()]),
+            Some(1),
+        );
+        manager
+            .lifecycle
+            .admit_prompt_with_id(runtime_id, handle.generation, "command-a")
+            .unwrap();
+        manager
+            .lifecycle
+            .note_command_admitted(runtime_id, handle.generation, "command-a", 1);
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-a")
+            .is_ok());
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 2, "command-a")
+            .is_err());
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-b")
+            .is_err());
+        // No provider process is needed: Stop admission invalidates the command
+        // even if writing the actual interrupt subsequently fails.
+        let _ = manager.stop_session_from_expected(runtime_id, Some("test"), Some("command-a"));
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-a")
+            .is_err());
+        manager.process_helper_stdout(runtime_id, r#"{"type":"event","payload":{"type":"lifecycle","stage":"sdk_command_state","detail":"completed","command_id":"command-a","query_generation":1}}"#).unwrap();
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-a")
+            .is_err());
+        manager
+            .lifecycle
+            .admit_prompt_with_id(runtime_id, handle.generation, "command-b")
+            .unwrap();
+        manager
+            .lifecycle
+            .note_command_admitted(runtime_id, handle.generation, "command-b", 1);
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-a")
+            .is_err());
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-b")
+            .is_ok());
+        manager.lifecycle.note_session_meta(
+            runtime_id,
+            handle.generation,
+            Some("conversation-next"),
+            Some(&["msg_lifecycle_v1".to_owned()]),
+            Some(2),
+        );
+        assert!(manager
+            .session_handoff_foreground(runtime_id, &handle, 1, "command-b")
+            .is_err());
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+    }
+
+    #[test]
+    fn session_handoff_shared_admission_queues_once_and_rejects_scope_without_wry() {
+        let workspace = std::env::temp_dir().canonicalize().unwrap();
+        let mut source = native_record("handoff-queue-source", "processing", true);
+        source.project_dir = workspace.to_string_lossy().into_owned();
+        let mut target = native_record("handoff-queue-target", "processing", true);
+        target.project_dir = source.project_dir.clone();
+        target.perm_mode = "readonly".into();
+        let mut outside = native_record("handoff-queue-outside", "processing", true);
+        outside.project_dir = "/".into();
+        let manager = Arc::new(manager_with_records(
+            "handoff-queue",
+            vec![source.clone(), target.clone(), outside],
+        ));
+        for _ in 0..2 {
+            crate::session_references::enqueue_workspace_session_handoff(
+                None,
+                &manager,
+                &source.project_dir,
+                &source.runtime_id,
+                &target.runtime_id,
+                "hello from current session",
+                "handoff-id-1",
+            )
+            .unwrap();
+        }
+        assert_eq!(manager.input_queue.count(&target.runtime_id), 1);
+        assert!(manager.handles.lock().unwrap().is_empty());
+        assert_eq!(
+            manager
+                .records
+                .lock()
+                .unwrap()
+                .get(&target.runtime_id)
+                .unwrap()
+                .perm_mode,
+            "readonly"
+        );
+        for (target_id, text) in [
+            (&source.runtime_id[..], "hello"),
+            ("handoff-queue-outside", "hello"),
+            (&target.runtime_id[..], " "),
+        ] {
+            assert!(
+                crate::session_references::enqueue_workspace_session_handoff(
+                    None,
+                    &manager,
+                    &source.project_dir,
+                    &source.runtime_id,
+                    target_id,
+                    text,
+                    "handoff-id-2"
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(manager.input_queue.count(&target.runtime_id), 1);
+        assert_eq!(manager.input_queue.count("handoff-queue-outside"), 0);
+        assert_eq!(manager.input_queue.count(&source.runtime_id), 0);
+    }
     #[test]
     fn session_handoff_target_rejects_unknown_inactive_terminal_and_quarantine() {
         let active = native_record("handoff-active", "processing", true);

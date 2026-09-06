@@ -64,7 +64,7 @@ export function ComposerSessionReferencePanel({
           onChange={(event) => setText(event.target.value)} disabled={sending || uncertain}
           maxLength={12000} className="min-h-40" /> : (
           <div className="max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-muted/40 p-3 text-xs" data-session-reference-preview>
-            {error ? t('workspace.sessionReferenceReadFailed') : snapshot?.text ?? t('workspace.sessionReferenceLoading')}
+            {error ? t('workspace.sessionReferenceReadFailed') : snapshot ? (snapshot.text_available === false ? t('workspace.sessionReferenceNoRecentText') : snapshot.text) : t('workspace.sessionReferenceLoading')}
           </div>
         )}
         {!handoff && snapshot?.truncated ? <p className="text-xs text-muted-foreground">{t('workspace.sessionReferenceTruncated')}</p> : null}

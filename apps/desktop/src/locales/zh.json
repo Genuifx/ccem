@@ -117,6 +117,7 @@
     "sessionReferenceHandoffHint": "将下面的文本提交给这个会话，按对方现有权限处理。不会发送附件或修改权限；当前草稿保留。",
     "sessionReferenceHandoffText": "交接内容",
     "sessionReferenceReadFailed": "无法读取引用会话，草稿已保留。请移除引用或稍后再试。",
+    "sessionReferenceNoRecentText": "近期没有可引用的对话文本，仍可向此会话发送消息。",
     "sessionReferenceLoading": "正在读取最近对话…",
     "sessionReferenceTruncated": "仅展示有长度限制的近期文本，不是完整历史。",
     "sessionReferenceClose": "关闭",

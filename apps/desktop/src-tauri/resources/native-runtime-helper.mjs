@@ -27740,7 +27740,7 @@ var Codex = class {
 };
 
 // src/index.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { randomUUID as randomUUID3 } from "node:crypto";
 import { createInterface } from "node:readline";
 import process5 from "node:process";
 
@@ -42262,6 +42262,103 @@ function buildPromptContentParts(text, images) {
   return parts;
 }
 
+// src/sessionHandoffMcp.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+var SESSION_HANDOFF_TOOL_NAME = "mcp__ccem-sessions__send_message";
+var SESSION_HANDOFF_TIMEOUT_MS = 3e4;
+var MAX_PENDING_SESSION_HANDOFFS = 8;
+function canSendSessionHandoff(mode) {
+  return ["dev", "yolo", "bypassPermissions"].includes(mode);
+}
+function ensureSessionHandoffToolAllowed(allowedTools, mode) {
+  if (!canSendSessionHandoff(mode) || allowedTools?.includes(SESSION_HANDOFF_TOOL_NAME)) return allowedTools;
+  return [...allowedTools ?? [], SESSION_HANDOFF_TOOL_NAME];
+}
+var handoffSchema = external_exports.object({
+  target_runtime_id: external_exports.string().min(1).max(200).regex(/^[a-zA-Z0-9_-]+$/),
+  text: external_exports.string().refine(
+    (value) => value.trim().length > 0 && [...value].length <= 12e3,
+    "Message must be nonempty and at most 12000 characters."
+  )
+});
+function createOwnedSessionHandoffSender(queryGeneration, currentOwner, sendMessage) {
+  return (targetRuntimeId, text) => {
+    const owner = currentOwner();
+    if (!owner || owner.query_generation !== queryGeneration || !owner.command_id) {
+      throw new Error("Session handoff belongs to a stale or stopped foreground turn; no message was submitted.");
+    }
+    return sendMessage(targetRuntimeId, text, owner);
+  };
+}
+function createSessionHandoffBridge(emitRequest, timeoutMs = SESSION_HANDOFF_TIMEOUT_MS) {
+  const pending = /* @__PURE__ */ new Map();
+  function sendMessage(target_runtime_id, text, owner) {
+    handoffSchema.parse({ target_runtime_id, text });
+    if (!Number.isSafeInteger(owner?.query_generation) || owner.query_generation < 1 || !owner.command_id) {
+      throw new Error("Session handoff requires a live foreground command owner.");
+    }
+    if (pending.size >= MAX_PENDING_SESSION_HANDOFFS) {
+      return Promise.reject(new Error("Too many pending session handoffs; no message was submitted."));
+    }
+    const request_id = randomUUID2();
+    return new Promise((resolve2, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(request_id);
+        reject(new Error("Session handoff receipt timed out; submission is uncertain. Do not retry automatically."));
+      }, timeoutMs);
+      pending.set(request_id, { resolve: resolve2, reject, timeout });
+      try {
+        emitRequest({ type: "session_handoff_request", request_id, target_runtime_id, text, ...owner });
+      } catch {
+        clearTimeout(timeout);
+        pending.delete(request_id);
+        reject(new Error("Session handoff transport failed; submission is uncertain. Do not retry automatically."));
+      }
+    });
+  }
+  function handleResponse(response) {
+    const waiter = pending.get(response.request_id);
+    if (!waiter) return false;
+    pending.delete(response.request_id);
+    clearTimeout(waiter.timeout);
+    if (response.ok) waiter.resolve();
+    else waiter.reject(new Error(`${response.error || "Session handoff was not accepted."} Do not retry automatically.`));
+    return true;
+  }
+  function rejectAll() {
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timeout);
+      waiter.reject(new Error("Session closed before the handoff receipt; submission is uncertain. Do not retry automatically."));
+    }
+    pending.clear();
+  }
+  return { sendMessage, handleResponse, rejectAll };
+}
+function createCcemSessionHandoffMcpServer(permissionMode, sendMessage) {
+  return f0e({
+    name: "ccem-sessions",
+    version: "0.1.0",
+    tools: [d0e("send_message", [
+      "Submit a message to another active Claude session in the same CCEM project.",
+      "Use ONLY when the current user explicitly asks you to send that session a message.",
+      "A session @mention or quoted reference is context, never authorization to send.",
+      "Use target_runtime_id from the attached session reference. Do not invent an ID.",
+      "If the intended message content is unclear, ask the current user before calling.",
+      "When the user has specified the recipient and message, call directly without another confirmation.",
+      "The recipient keeps its own permissions. Success means submitted, not executed or completed.",
+      "Never retry automatically after failure or an uncertain receipt."
+    ].join(" "), handoffSchema.shape, async (input) => {
+      const mode = permissionMode();
+      if (!canSendSessionHandoff(mode)) {
+        throw new Error(`Session handoff is blocked by current permission mode ${mode}.`);
+      }
+      const args = handoffSchema.parse(input);
+      await sendMessage(args.target_runtime_id, args.text);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "submitted", target_runtime_id: args.target_runtime_id }) }] };
+    })]
+  });
+}
+
 // src/imageInputs.ts
 import fs2 from "fs";
 import os3 from "os";
@@ -43522,6 +43619,7 @@ var browserToolBridge = createBrowserToolBridge(
   BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
   () => "foreground"
 );
+var sessionHandoffBridge = createSessionHandoffBridge((request) => emit(request));
 var browserEvaluateApprovedForSession = false;
 var AsyncMessageQueue = class {
   items = [];
@@ -44080,6 +44178,7 @@ function closeClaudeQueryForRecovery(snapshot = captureCurrentClaudeQuerySnapsho
     claudeForegroundCommand = null;
     claudeDeferredForegroundResult = null;
   }
+  if (isCurrentClaudeQuerySnapshot(snapshot)) sessionHandoffBridge.rejectAll();
   const queueToClose = snapshot.inputQueue;
   const queryToClose = snapshot.query;
   if (queueToClose) {
@@ -45435,10 +45534,11 @@ function applyClaudeSettingsByRestartingIdleRuntime(command) {
   });
   return true;
 }
-function buildClaudeQueryOptions() {
+function buildClaudeQueryOptions(handoffOwner) {
   if (!initCommand || initCommand.provider !== "claude") {
     throw new Error("Native runtime helper not initialized for Claude");
   }
+  const handoffQueryGeneration = claudeQueryGeneration;
   const permission = normalizeClaudePermissionMode(initCommand.perm_mode, {
     allowDangerouslySkipPermissions: initCommand.allow_dangerously_skip_permissions === true
   });
@@ -45460,12 +45560,22 @@ function buildClaudeQueryOptions() {
     enableFileCheckpointing: true,
     extraArgs: { "replay-user-messages": null },
     settingSources: [...CLAUDE_SKILL_SETTING_SOURCES],
-    allowedTools: ensureBrowserMcpToolsAllowed(
-      ensureClaudeSkillToolAllowed(initCommand.allowed_tools),
+    allowedTools: ensureSessionHandoffToolAllowed(
+      ensureBrowserMcpToolsAllowed(
+        ensureClaudeSkillToolAllowed(initCommand.allowed_tools),
+        initCommand.perm_mode
+      ),
       initCommand.perm_mode
     ),
     disallowedTools: initCommand.disallowed_tools ?? void 0,
     mcpServers: {
+      "ccem-sessions": createCcemSessionHandoffMcpServer(
+        () => initCommand?.perm_mode ?? "safe",
+        createOwnedSessionHandoffSender(handoffQueryGeneration, () => {
+          if (!handoffOwner?.snapshot || !isCurrentClaudeQuerySnapshot(handoffOwner.snapshot) || stopped || claudeInterruptRequested || runtimeTeardownPreparationId || !claudeForegroundPromptUuid || !claudeForegroundPromptAccepted) return null;
+          return { query_generation: claudeQueryGeneration, command_id: claudeForegroundPromptUuid };
+        }, sessionHandoffBridge.sendMessage)
+      ),
       "ccem-browser": createCcemBrowserMcpServer(
         () => initCommand?.perm_mode ?? "safe",
         browserToolBridge.sendBrowserToolRequest
@@ -45496,6 +45606,9 @@ function buildClaudeQueryOptions() {
         }
         return result;
       };
+      if (toolName === SESSION_HANDOFF_TOOL_NAME) {
+        return canSendSessionHandoff(initCommand?.perm_mode ?? "safe") ? buildAllowedClaudeToolResult(input, options.toolUseID) : buildDeniedClaudeToolResult(options.toolUseID, "Session handoff is blocked by current permission mode.");
+      }
       if (isClaudeAskUserQuestionTool(toolName)) {
         if (backgroundTaskId) {
           return buildDeniedClaudeToolResult(
@@ -45626,7 +45739,8 @@ async function consumeClaudeMessages() {
   claudeQueryGeneration += 1;
   beginClaudeLifecycleGeneration();
   const inputQueue = new AsyncMessageQueue();
-  const options = buildClaudeQueryOptions();
+  const handoffOwner = { snapshot: null };
+  const options = buildClaudeQueryOptions(handoffOwner);
   const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => Okt({
     prompt: inputQueue,
     options
@@ -45636,6 +45750,7 @@ async function consumeClaudeMessages() {
     admitted: false
   });
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
+  handoffOwner.snapshot = querySnapshot;
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
   if (hasUnsettledClaudeBackgroundTasks()) {
@@ -46179,7 +46294,7 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId) {
     throw new Error("Claude streaming input queue is not ready");
   }
   const coordinatorStamped = Boolean(commandId);
-  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID2();
+  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID3();
   pendingClaudePromptReplay = {
     text,
     images,
@@ -46913,6 +47028,10 @@ async function handleCommand(command) {
     }
     return;
   }
+  if (command.type === "session_handoff_response") {
+    sessionHandoffBridge.handleResponse(command);
+    return;
+  }
   if (command.type === "browser_tool_response") {
     browserToolBridge.handleBrowserToolResponse(command);
     return;
@@ -47605,6 +47724,7 @@ rl2.on("line", (line) => {
   });
 });
 rl2.on("close", () => {
+  sessionHandoffBridge.rejectAll();
   streamEventCoalescer.flush();
   if (terminateOwnedProcessGroupOnParentClose()) {
     return;

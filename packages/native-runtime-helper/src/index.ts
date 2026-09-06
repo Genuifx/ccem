@@ -32,6 +32,16 @@ import {
   ensureClaudeSkillToolAllowed,
 } from './claudeSkills';
 import { buildPromptContentParts, type PromptImage } from './promptContent';
+import {
+  createSessionHandoffBridge,
+  createOwnedSessionHandoffSender,
+  createCcemSessionHandoffMcpServer,
+  ensureSessionHandoffToolAllowed,
+  canSendSessionHandoff,
+  SESSION_HANDOFF_TOOL_NAME,
+  type SessionHandoffRequest,
+  type SessionHandoffResponse,
+} from './sessionHandoffMcp';
 import { normalizeClaudePermissionMode, normalizeCodexSandboxMode } from './permissionModes';
 import { createLocalImageInputs, cleanupTempFiles } from './imageInputs';
 import {
@@ -181,6 +191,7 @@ type InputCommand =
   | InteractivePromptResponseCommand
   | PermissionResponseCommand
   | BrowserToolResponseInputCommand
+  | SessionHandoffResponse
   | UpdateSettingsCommand
   | RewindFilesCommand
   | TitleQueryCommand
@@ -231,7 +242,8 @@ type HelperOutput =
       ready: boolean;
       detail?: string;
     }
-  | BrowserToolRequestOutput;
+  | BrowserToolRequestOutput
+  | SessionHandoffRequest;
 
 type PermissionResolver = {
   resolve: (approved: boolean) => void;
@@ -362,6 +374,7 @@ const browserToolBridge = createBrowserToolBridge(
   BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
   () => 'foreground',
 );
+const sessionHandoffBridge = createSessionHandoffBridge((request) => emit(request));
 let browserEvaluateApprovedForSession = false;
 
 type ClaudeQuerySnapshot = QuerySnapshot<ReturnType<typeof query>, AsyncMessageQueue<SDKUserMessage>>;
@@ -1104,6 +1117,7 @@ function closeClaudeQueryForRecovery(
     claudeDeferredForegroundResult = null;
   }
 
+  if (isCurrentClaudeQuerySnapshot(snapshot)) sessionHandoffBridge.rejectAll();
   const queueToClose = snapshot.inputQueue;
   const queryToClose = snapshot.query;
 
@@ -2950,11 +2964,12 @@ function applyClaudeSettingsByRestartingIdleRuntime(command: UpdateSettingsComma
   return true;
 }
 
-function buildClaudeQueryOptions() {
+function buildClaudeQueryOptions(handoffOwner?: { snapshot: ClaudeQuerySnapshot | null }) {
   if (!initCommand || initCommand.provider !== 'claude') {
     throw new Error('Native runtime helper not initialized for Claude');
   }
 
+  const handoffQueryGeneration = claudeQueryGeneration;
   const permission = normalizeClaudePermissionMode(initCommand.perm_mode, {
     allowDangerouslySkipPermissions: initCommand.allow_dangerously_skip_permissions === true,
   });
@@ -2977,12 +2992,24 @@ function buildClaudeQueryOptions() {
     enableFileCheckpointing: true,
     extraArgs: { 'replay-user-messages': null },
     settingSources: [...CLAUDE_SKILL_SETTING_SOURCES],
-    allowedTools: ensureBrowserMcpToolsAllowed(
-      ensureClaudeSkillToolAllowed(initCommand.allowed_tools),
+    allowedTools: ensureSessionHandoffToolAllowed(
+      ensureBrowserMcpToolsAllowed(
+        ensureClaudeSkillToolAllowed(initCommand.allowed_tools),
+        initCommand.perm_mode,
+      ),
       initCommand.perm_mode,
     ),
     disallowedTools: initCommand.disallowed_tools ?? undefined,
     mcpServers: {
+      'ccem-sessions': createCcemSessionHandoffMcpServer(
+        () => initCommand?.perm_mode ?? 'safe',
+        createOwnedSessionHandoffSender(handoffQueryGeneration, () => {
+          if (!handoffOwner?.snapshot || !isCurrentClaudeQuerySnapshot(handoffOwner.snapshot)
+            || stopped || claudeInterruptRequested || runtimeTeardownPreparationId
+            || !claudeForegroundPromptUuid || !claudeForegroundPromptAccepted) return null;
+          return { query_generation: claudeQueryGeneration, command_id: claudeForegroundPromptUuid };
+        }, sessionHandoffBridge.sendMessage),
+      ),
       'ccem-browser': createCcemBrowserMcpServer(
         () => initCommand?.perm_mode ?? 'safe',
         browserToolBridge.sendBrowserToolRequest,
@@ -3019,6 +3046,11 @@ function buildClaudeQueryOptions() {
         }
         return result;
       };
+      if (toolName === SESSION_HANDOFF_TOOL_NAME) {
+        return canSendSessionHandoff(initCommand?.perm_mode ?? 'safe')
+          ? buildAllowedClaudeToolResult(input, options.toolUseID)
+          : buildDeniedClaudeToolResult(options.toolUseID, 'Session handoff is blocked by current permission mode.');
+      }
       if (isClaudeAskUserQuestionTool(toolName)) {
         if (backgroundTaskId) {
           return buildDeniedClaudeToolResult(
@@ -3175,7 +3207,8 @@ async function consumeClaudeMessages() {
   beginClaudeLifecycleGeneration();
 
   const inputQueue = new AsyncMessageQueue<SDKUserMessage>();
-  const options = buildClaudeQueryOptions();
+  const handoffOwner: { snapshot: ClaudeQuerySnapshot | null } = { snapshot: null };
+  const options = buildClaudeQueryOptions(handoffOwner);
   const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => query({
     prompt: inputQueue,
     options,
@@ -3185,6 +3218,7 @@ async function consumeClaudeMessages() {
     admitted: false,
   });
   const querySnapshot = claudeQuerySlot.activate(claudeQuery, inputQueue);
+  handoffOwner.snapshot = querySnapshot;
   currentClaudeQuery = querySnapshot.query;
   claudeInputQueue = querySnapshot.inputQueue;
   if (hasUnsettledClaudeBackgroundTasks()) {
@@ -4749,6 +4783,11 @@ async function handleCommand(command: InputCommand) {
     return;
   }
 
+  if (command.type === 'session_handoff_response') {
+    sessionHandoffBridge.handleResponse(command);
+    return;
+  }
+
   if (command.type === 'browser_tool_response') {
     browserToolBridge.handleBrowserToolResponse(command);
     return;
@@ -5532,6 +5571,7 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => {
+  sessionHandoffBridge.rejectAll();
   streamEventCoalescer.flush();
   // Desktop launches the helper as a dedicated Unix process-group leader. Once parent stdin is
   // gone, kill that owned group first: telemetry and SDK cleanup can throw or block on broken I/O.

@@ -1771,4 +1771,5 @@ export interface WorkspaceSessionReferenceContent {
   title: string;
   text: string;
   truncated: boolean;
+  text_available: boolean;
 }

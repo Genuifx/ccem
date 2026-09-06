@@ -9,7 +9,7 @@ import { Toaster } from 'sonner';
 import '../../src/index.css';
 const state = {
   reads: [] as string[], handoffs: [] as unknown[], submissions: [] as unknown[],
-  failRead: false, failSend: false, canSend: true, readDelay: 0,
+  emptyText: false, failRead: false, failSend: false, canSend: true, readDelay: 0,
 };
 Object.assign(window, { sessionReferenceFixture: state });
 const fixtureInvoke = async (command: string, args: any = {}) => {
@@ -21,7 +21,7 @@ const fixtureInvoke = async (command: string, args: any = {}) => {
     state.reads.push(args.runtimeId);
     if (state.readDelay) await new Promise((resolve) => setTimeout(resolve, state.readDelay));
     if (state.failRead) throw Error('history unavailable');
-    return { runtime_id: args.runtimeId, title: '设计方案', text: 'User: 引用不应该发送消息。\nAssistant: 默认参考上下文，明确交接才发送。', truncated: true };
+    return { runtime_id: args.runtimeId, title: '设计方案', text_available: !state.emptyText, text: state.emptyText ? '' : 'User: 引用不应该发送消息。\nAssistant: 默认参考上下文，明确交接才发送。', truncated: true };
   }
   if (command === 'send_workspace_session_handoff') {
     state.handoffs.push(args);

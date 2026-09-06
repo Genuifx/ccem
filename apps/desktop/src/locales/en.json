@@ -117,6 +117,7 @@
     "sessionReferenceHandoffHint": "Submit the text below under the recipient’s existing permissions. Attachments and permission changes are excluded; your current draft stays.",
     "sessionReferenceHandoffText": "Handoff text",
     "sessionReferenceReadFailed": "Unable to read the referenced session. Draft preserved; remove the reference or try later.",
+    "sessionReferenceNoRecentText": "No recent conversation text is available. You can still send this session a message.",
     "sessionReferenceLoading": "Reading recent conversation…",
     "sessionReferenceTruncated": "Only bounded recent text is included, not the full history.",
     "sessionReferenceClose": "Close",
