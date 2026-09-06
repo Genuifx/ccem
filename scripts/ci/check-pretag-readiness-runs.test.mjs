@@ -17,7 +17,7 @@ function run(workflow, overrides = {}) {
     path: `.github/workflows/${workflow}`,
     head_sha: sourceCommit,
     head_branch: 'main',
-    event: 'push',
+    event: 'workflow_dispatch',
     status: 'completed',
     conclusion: 'success',
     run_attempt: 3,
@@ -79,7 +79,7 @@ function fixtureFetch(overrides = {}) {
   return { fetchImpl, requests };
 }
 
-test('requires successful exact-SHA main-push runs from both pre-tag workflows', async () => {
+test('accepts exact-SHA main dispatch readiness after a non-release-message commit', async () => {
   const fixture = fixtureFetch();
   const result = await verifyPretagReadinessRuns({
     repository,
@@ -102,7 +102,7 @@ test('requires successful exact-SHA main-push runs from both pre-tag workflows',
     assert.equal(request.options.headers.Authorization, `Bearer ${token}`);
     if (url.pathname.includes('/actions/workflows/')) {
       assert.equal(url.searchParams.get('branch'), 'main');
-      assert.equal(url.searchParams.get('event'), 'push');
+      assert.equal(url.searchParams.has('event'), false);
       assert.equal(url.searchParams.get('status'), 'success');
       assert.equal(url.searchParams.get('head_sha'), sourceCommit);
     } else {
@@ -112,10 +112,14 @@ test('requires successful exact-SHA main-push runs from both pre-tag workflows',
   }
 });
 
-test('fails closed for stale, manual, failed, or foreign workflow runs', async (t) => {
+test('fails closed for stale, untrusted-event, failed, or foreign workflow runs', async (t) => {
   const cases = [
     ['stale SHA', { head_sha: 'b'.repeat(40) }],
-    ['manual run', { event: 'workflow_dispatch' }],
+    ['pull request', { event: 'pull_request' }],
+    ['workflow run', { event: 'workflow_run' }],
+    ['scheduled run', { event: 'schedule' }],
+    ['failed run', { conclusion: 'failure' }],
+    ['skipped run', { conclusion: 'skipped' }],
     ['wrong branch', { head_branch: 'release' }],
     ['incomplete run', { status: 'in_progress', conclusion: null }],
     ['missing run attempt', { run_attempt: undefined }],
@@ -133,7 +137,7 @@ test('fails closed for stale, manual, failed, or foreign workflow runs', async (
           sourceCommit,
           fetchImpl: fixture.fetchImpl,
         }),
-        /has no successful main-push run for exact source/u,
+        /has no successful main push or workflow_dispatch run for exact source/u,
       );
     });
   }
@@ -229,4 +233,16 @@ test('fails closed on malformed input, denied API access, and invalid response b
       },
     );
   });
+});
+
+test('continues to accept release-commit push readiness and mixed triggers', async () => {
+  for (const events of [['push', 'push'], ['push', 'workflow_dispatch'], ['workflow_dispatch', 'push']]) {
+    const fixture = fixtureFetch(Object.fromEntries(
+      Object.keys(requiredJobs).map((workflow, index) => [workflow, { run: { event: events[index] } }]),
+    ));
+    const result = await verifyPretagReadinessRuns({
+      repository, token, sourceCommit, fetchImpl: fixture.fetchImpl,
+    });
+    assert.deepEqual(result.runIds, { 'release-cli.yml': 101, 'mode2-signed-readiness.yml': 202 });
+  }
 });

@@ -59,7 +59,8 @@ function workflowRunsUrl(repository, workflow, sourceCommit) {
     `${API_ORIGIN}/repos/${repository}/actions/workflows/${encodeURIComponent(workflow)}/runs`,
   );
   url.searchParams.set('branch', 'main');
-  url.searchParams.set('event', 'push');
+  // Both pre-tag workflows support protected-main dispatch after candidate fixes.
+  // Keep the event allowlist below; filtering to push here hides that evidence.
   url.searchParams.set('status', 'success');
   url.searchParams.set('head_sha', sourceCommit);
   url.searchParams.set('per_page', String(PAGE_SIZE));
@@ -111,7 +112,7 @@ function successfulExactRun(body, workflow, sourceCommit) {
     && run.path === expectedPath
     && run.head_sha === sourceCommit
     && run.head_branch === 'main'
-    && run.event === 'push'
+    && (run.event === 'push' || run.event === 'workflow_dispatch')
     && run.status === 'completed'
     && run.conclusion === 'success'
     && Number.isSafeInteger(run.id)
@@ -193,7 +194,7 @@ export async function verifyPretagReadinessRuns({
     );
     const run = successfulExactRun(body, workflow, exactSha);
     if (!run) {
-      fail(`${workflow} has no successful main-push run for exact source ${exactSha}`);
+      fail(`${workflow} has no successful main push or workflow_dispatch run for exact source ${exactSha}`);
     }
     const jobs = await loadExactAttemptJobs({
       repository: exactRepo,
