@@ -26,7 +26,7 @@ describe('presets', () => {
 
     it('should have MiniMax preset with correct structure', () => {
       expect(ENV_PRESETS.MiniMax).toBeDefined();
-      expect(ENV_PRESETS.MiniMax.ANTHROPIC_BASE_URL).toContain('minimaxi.com');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_BASE_URL).toBe('https://api.minimax.cn/anthropic');
     });
 
     it('should have DeepSeek preset with correct structure', () => {
