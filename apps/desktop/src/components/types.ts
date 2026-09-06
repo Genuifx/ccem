@@ -55,6 +55,8 @@ export type ChipStyle = 'pill' | 'inline'
  * A suggestion item shown in the trigger dropdown.
  */
 export type TriggerSuggestion = {
+  /** Optional visible group heading; indices still refer to selectable rows. */
+  group?: string
   /** Unique value/ID for this suggestion */
   value: string
   /** Display label shown in the dropdown */

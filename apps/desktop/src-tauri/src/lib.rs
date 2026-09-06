@@ -47,6 +47,7 @@ mod secure_fs;
 mod session;
 mod session_annotations;
 mod session_provenance;
+mod session_references;
 mod session_titles;
 mod skills;
 mod slash_commands;
@@ -5937,6 +5938,9 @@ pub fn run_desktop_app() -> i32 {
             codex_migration::preflight_codex_model_migration,
             create_native_session,
             list_native_sessions,
+            session_references::list_workspace_session_references,
+            session_references::read_workspace_session_reference,
+            session_references::send_workspace_session_handoff,
             get_native_session_summary,
             send_native_session_input,
             flush_native_session_input_queue,

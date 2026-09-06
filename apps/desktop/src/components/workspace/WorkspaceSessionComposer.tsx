@@ -32,8 +32,16 @@ import {
 import { Claude, Codex, OpenCode } from '@lobehub/icons';
 import { PromptArea } from '@/components/prompt-area';
 import { buildComposerRouteShortcutHandler } from '@/components/workspace/composerRouteShortcut';
-import { plainTextToSegments, segmentsToPlainText } from '@/components/segment-helpers';
+import { segmentsToPlainText } from '@/components/segment-helpers';
 import { TriggerPopover } from '@/components/trigger-popover';
+import { ComposerSessionReferencePanel, ComposerSessionReferenceStrip } from './ComposerSessionReferencePanel';
+import { sessionReferenceClient, type SessionReferenceClient } from './sessionReferenceClient';
+import {
+  handoffDraftText, MAX_SESSION_REFERENCES, resolveComposerSessionReferences,
+  restoreComposerSessionReferences, selectedSessionReferences, serializeComposerSessionReferences,
+  sessionReferenceFromChip, sessionReferenceSuggestions,
+  type ComposerSessionReference,
+} from './composerSessionReferences';
 import type {
   ChipClickContext,
   ChipSegment,
@@ -158,6 +166,9 @@ interface WorkspaceSessionComposerProps {
   provider?: WorkspaceComposerProvider;
   /** Active native session runtimeId — enables the Route pill above the textarea. */
   routeRuntimeId?: string | null;
+  /** Identity of the composer owner, independent of dynamic routing. */
+  currentRuntimeId?: string | null;
+  sessionReferencesClient?: SessionReferenceClient;
   onNavigateEnvironments?: () => void;
   /**
    * New-session Dynamic Routing opt-in draft (compose/history composers).
@@ -871,6 +882,8 @@ export function WorkspaceSessionComposer({
   onAnnotationsSent,
   onAnnotationsRestore,
   routeRuntimeId = null,
+  currentRuntimeId = null,
+  sessionReferencesClient = sessionReferenceClient,
   onNavigateEnvironments,
   routeDraft = null,
   onRouteDraftChange,
@@ -889,7 +902,9 @@ export function WorkspaceSessionComposer({
   const syncedPlainTextRef = useRef(value);
   const syncedValueRevisionRef = useRef(valueRevision);
   const previousAttachmentIdsRef = useRef<string[]>([]);
-  const [composerSegments, setComposerSegments] = useState<Segment[]>(() => plainTextToSegments(value));
+  const [composerSegments, setComposerSegments] = useState<Segment[]>(() => restoreComposerSessionReferences(value));
+  const [referencePreview, setReferencePreview] = useState<ComposerSessionReference | null>(null);
+  const sessionReferences = useMemo(() => selectedSessionReferences(composerSegments), [composerSegments]);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const attachmentsRef = useRef(attachments);
   const annotationsRef = useRef(annotations);
@@ -1011,7 +1026,8 @@ export function WorkspaceSessionComposer({
     draftEditRevisionRef.current += 1;
     syncedValueRevisionRef.current = valueRevision;
     syncedPlainTextRef.current = value;
-    setComposerSegments(plainTextToSegments(value));
+    setComposerSegments(restoreComposerSessionReferences(value));
+    setReferencePreview(null);
   }, [value, valueRevision]);
 
   useEffect(() => {
@@ -1051,7 +1067,7 @@ export function WorkspaceSessionComposer({
   const syncComposerSegments = useCallback((segments: Segment[]) => {
     draftEditRevisionRef.current += 1;
     setComposerSegments(segments);
-    const plainText = segmentsToPlainText(segments);
+    const plainText = serializeComposerSessionReferences(segments);
     syncedPlainTextRef.current = plainText;
     onValueChange(plainText);
   }, [onValueChange]);
@@ -1192,19 +1208,26 @@ export function WorkspaceSessionComposer({
         mode: 'dropdown',
         chipStyle: 'pill',
         chipClassName: 'ccem-prompt-chip',
-        accessibilityLabel: 'workspace file',
+        accessibilityLabel: t('workspace.sessionReferenceMentionLabel'),
         onSearch: async (query, { signal }) => {
-          if (!workingDir || !searchWorkspaceFiles) {
-            return [];
-          }
-          if (!query && attachments.length === 0 && recentFileSuggestions.length > 0) {
-            return recentFileSuggestions.map(composerSuggestionToTriggerSuggestion);
-          }
-          const files = await searchWorkspaceFiles(workingDir, query, 8);
-          if (signal.aborted) {
-            return [];
-          }
-          return suggestionQuery('file', '@', query, files);
+          if (!workingDir) return [];
+          const [sessionResult, fileResult] = await Promise.allSettled([
+            provider === 'claude'
+              ? sessionReferencesClient.list(workingDir, currentRuntimeId)
+              : Promise.resolve([]),
+            !query && attachments.length === 0 && recentFileSuggestions.length > 0
+              ? Promise.resolve(recentFileSuggestions.map(composerSuggestionToTriggerSuggestion))
+              : searchWorkspaceFiles
+                ? searchWorkspaceFiles(workingDir, query, 8).then((files) => suggestionQuery('file', '@', query, files))
+                : Promise.resolve([]),
+          ]);
+          if (signal.aborted) return [];
+          const sessions = sessionResult.status === 'fulfilled' ? sessionResult.value : [];
+          const files = fileResult.status === 'fulfilled' ? fileResult.value : [];
+          return [
+            ...sessionReferenceSuggestions(sessions, query, t('workspace.sessionReferenceGroup')),
+            ...files.map((suggestion) => ({ ...suggestion, group: t('workspace.sessionReferenceFileGroup') })),
+          ];
         },
         onSelect: (suggestion) => {
           const data = readComposerPromptChipData(suggestion.data);
@@ -1212,7 +1235,7 @@ export function WorkspaceSessionComposer({
         },
       },
     ];
-  }, [attachments.length, installedSkills, provider, recentFileSuggestions, searchWorkspaceFiles, workingDir, workspaceCommands]);
+  }, [attachments.length, currentRuntimeId, installedSkills, provider, recentFileSuggestions, searchWorkspaceFiles, workingDir, workspaceCommands, t, sessionReferencesClient]);
 
   const handlePromptChipAdd = useCallback((chip: ChipSegment) => {
     const data = readComposerPromptChipData(chip.data);
@@ -1223,6 +1246,12 @@ export function WorkspaceSessionComposer({
   }, [workingDir]);
 
   const handlePromptChipClick = useCallback((chip: ChipSegment, context: ChipClickContext) => {
+    const session = sessionReferenceFromChip(chip);
+    if (session) {
+      setReferencePreview(session);
+      setInlineSkillPopover(null);
+      return;
+    }
     const token = selectedTokenFromPromptChip(chip);
     if (!token) {
       setInlineSkillPopover(null);
@@ -1259,7 +1288,7 @@ export function WorkspaceSessionComposer({
     if (removed?.kind === 'image') {
       setComposerSegments((segments) => {
         const nextSegments = removeImageAttachmentFromSegments(segments, removed);
-        const plainText = segmentsToPlainText(nextSegments);
+        const plainText = serializeComposerSessionReferences(nextSegments);
         syncedPlainTextRef.current = plainText;
         onValueChange(plainText);
         return nextSegments;
@@ -1410,6 +1439,23 @@ export function WorkspaceSessionComposer({
       }
     }
 
+    if (selectedSessionReferences(submittedSegments).length > 0) {
+      if (!workingDir || provider !== 'claude'
+        || selectedSessionReferences(submittedSegments).length > MAX_SESSION_REFERENCES) {
+        toast.error(t('workspace.sessionReferenceLimit'));
+        return rejectUnadmittedDraft();
+      }
+      try {
+        text += await resolveComposerSessionReferences(submittedSegments, (runtimeId) => {
+          if (runtimeId === currentRuntimeId) return Promise.reject(new Error('self_reference'));
+          return sessionReferencesClient.read(workingDir, runtimeId);
+        });
+      } catch {
+        toast.error(t('workspace.sessionReferenceReadFailed'));
+        return rejectUnadmittedDraft();
+      }
+    }
+
     const payload: ComposerSubmitPayload = {
       text,
       displayText,
@@ -1455,6 +1501,9 @@ export function WorkspaceSessionComposer({
     provider,
     t,
     workspaceCommands,
+    workingDir,
+    currentRuntimeId,
+    sessionReferencesClient,
   ]);
 
   const handleComposerSubmit = useCallback(async () => {
@@ -1704,6 +1753,12 @@ export function WorkspaceSessionComposer({
                 <ComposerRouteDraftPill draft={routeDraft} onDraftChange={onRouteDraftChange} />
               ) : null}
             </div>
+          ) : null}
+          <ComposerSessionReferenceStrip references={sessionReferences} disabled={disabled} onSelect={setReferencePreview} />
+          {referencePreview && workingDir ? (
+            <ComposerSessionReferencePanel key={referencePreview.runtime_id} session={referencePreview} client={sessionReferencesClient}
+              workingDir={workingDir} sourceRuntimeId={currentRuntimeId}
+              draftText={handoffDraftText(composerSegments)} onClose={() => setReferencePreview(null)} />
           ) : null}
           {annotations.length > 0 && onUpdateAnnotation && onRemoveAnnotation && onClearAnnotations ? (
             <div className={cn(aboveTextarea ? 'mb-2' : 'mb-3')}>

@@ -10532,6 +10532,29 @@ impl NativeRuntimeManager {
         Ok((record.project_dir.clone(), record.browser_actor_id.clone()))
     }
 
+    /// Admission check for an explicit user handoff; does not change permissions.
+    pub(crate) fn ensure_session_handoff_target(&self, runtime_id: &str) -> Result<(), String> {
+        let fences = self
+            .permission_quarantine_fences
+            .lock()
+            .map_err(|_| "Failed to lock permission fences")?;
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| "Failed to lock session records")?;
+        let record = records.get(runtime_id).ok_or("Session is unavailable")?;
+        if fences.contains(runtime_id)
+            || record.permission_quarantined
+            || !record.is_active
+            || record.provider != NativeProvider::Claude
+            || is_native_terminal_status(&record.status)
+            || record.status.starts_with("handoff_")
+        {
+            return Err("Target session is unavailable for handoff".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn browser_actor_id_for_runtime(&self, runtime_id: &str) -> Result<String, String> {
         let quarantine_fences = self
             .permission_quarantine_fences
@@ -12934,6 +12957,102 @@ mod tests {
         let decoded: NativeSessionRecord =
             serde_json::from_slice(&encoded).expect("restore quarantine");
         assert!(decoded.permission_quarantined);
+    }
+
+    #[test]
+    fn session_reference_reads_disposable_persisted_tail_without_waking_runtime() {
+        let runtime_id = "reference-persisted-tail";
+        let manager = manager_with_records(
+            runtime_id,
+            vec![native_record(runtime_id, "stopped", false)],
+        );
+        assert!(crate::session_references::read_reference_text(&manager, runtime_id).is_err());
+        assert!(crate::session_references::read_reference_text(&manager, "unknown").is_err());
+        for seq in 1..=205 {
+            let payload = if seq == 205 {
+                SessionEventPayload::AssistantChunk {
+                    text: "latest visible response".into(),
+                }
+            } else if seq == 204 {
+                SessionEventPayload::ClaudeJson {
+                    message_type: None,
+                    raw_json: "private reasoning never copied".into(),
+                }
+            } else if seq == 203 {
+                SessionEventPayload::UserPrompt {
+                    text: "visible question".into(),
+                    image_count: 0,
+                    client_message_id: None,
+                    images: None,
+                    annotations: None,
+                    canonical_hash: None,
+                }
+            } else {
+                SessionEventPayload::SystemMessage {
+                    message: format!("hidden metadata {seq}"),
+                }
+            };
+            manager
+                .event_log
+                .append(&crate::event_bus::SessionEventRecord {
+                    runtime_id: runtime_id.into(),
+                    seq,
+                    occurred_at: Utc::now(),
+                    payload,
+                })
+                .unwrap();
+        }
+        let (text, truncated) =
+            crate::session_references::read_reference_text(&manager, runtime_id).unwrap();
+        assert_eq!(
+            text,
+            "\nUser: visible question\nAssistant: latest visible response"
+        );
+        assert!(truncated);
+        assert!(manager.handles.lock().unwrap().is_empty());
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+        assert!(
+            !manager
+                .get_session_summary(runtime_id)
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+    }
+
+    #[test]
+    fn session_handoff_target_rejects_unknown_inactive_terminal_and_quarantine() {
+        let active = native_record("handoff-active", "processing", true);
+        let mut quarantined = native_record("handoff-quarantined", "processing", true);
+        quarantined.permission_quarantined = true;
+        let mut codex = native_record("handoff-codex", "processing", true);
+        codex.provider = NativeProvider::Codex;
+        let manager = manager_with_records(
+            "handoff-eligibility",
+            vec![
+                active,
+                quarantined,
+                codex,
+                native_record("handoff-inactive", "ready", false),
+                native_record("handoff-stopped", "stopped", true),
+            ],
+        );
+        assert!(manager
+            .ensure_session_handoff_target("handoff-active")
+            .is_ok());
+        for id in [
+            "unknown",
+            "handoff-quarantined",
+            "handoff-codex",
+            "handoff-inactive",
+            "handoff-stopped",
+        ] {
+            assert!(manager.ensure_session_handoff_target(id).is_err(), "{id}");
+        }
+        manager.fence_permission_quarantine("handoff-active");
+        assert!(manager
+            .ensure_session_handoff_target("handoff-active")
+            .is_err());
     }
 
     #[test]
