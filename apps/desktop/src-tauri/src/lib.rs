@@ -5294,6 +5294,15 @@ fn desktop_context() -> tauri::Context<tauri::Wry> {
 }
 
 pub fn run_desktop_app() -> i32 {
+    if std::env::args_os().any(|argument| argument == "--cef-bundle-smoke") {
+        #[cfg(all(target_os = "macos", feature = "macos-adhoc-cef", not(debug_assertions)))]
+        return browser::login::cef::adhoc_bundle_smoke::run_requested(desktop_context());
+        #[cfg(not(all(target_os = "macos", feature = "macos-adhoc-cef", not(debug_assertions))))]
+        {
+            eprintln!("CEF bundle smoke requires a macOS release with macos-adhoc-cef enabled");
+            return 78;
+        }
+    }
     if updater_replacement_smoke::is_requested() {
         return updater_replacement_smoke::run_requested(desktop_context());
     }

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "features": ["macos-adhoc-cef"],
+    "beforeBuildCommand": "pnpm build && node scripts/prepare-adhoc-cef-before-bundle.mjs",
+    "beforeBundleCommand": "node scripts/macos-adhoc-cef-signing.mjs --verify-stage"
+  },
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    }
+  }
+}

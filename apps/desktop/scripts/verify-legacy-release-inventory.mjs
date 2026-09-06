@@ -6,7 +6,28 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { CEF_LEGAL_DIRECTORY } from './cef-runtime-contract.mjs';
+import {
+  CEF_FULL_VERSION,
+  CEF_LEGAL_DIRECTORY,
+  CEF_LEGAL_FILES,
+  CEF_LICENSE_SHA256,
+  CEF_LICENSE_SOURCE_COMMIT,
+  cefArchiveSpec,
+  inspectStagedCefLegalFiles,
+} from './cef-runtime-contract.mjs';
+import {
+  CEF_SAFE_STORAGE_BRANDING_METHOD,
+  CEF_UNBRANDED_SAFE_STORAGE_SERVICE,
+  CCEM_SAFE_STORAGE_SERVICE,
+  verifyCefMacosSafeStorageBranding,
+} from './cef-macos-safe-storage-branding.mjs';
+import {
+  assertRequiredMacCefFrameworkFiles,
+  compareMacCefFrameworkTrees,
+  requiredMacCefFrameworkFiles,
+} from './macos-cef-bundle-contract.mjs';
+import { macReleaseFileFingerprint } from './macos-macho-integrity.mjs';
+import { ADHOC_SIGNATURE_VERIFICATION, verifyAdHocMacApp } from './macos-adhoc-cef-signing.mjs';
 import {
   RELEASE_INVENTORY_SCHEMA_VERSION,
   readJson,
@@ -18,6 +39,7 @@ import {
 import {
   FRAMEWORK_NAME,
   HELPER_SPECS,
+  STAGE_MANIFEST_NAME,
 } from './stage-cef-macos.mjs';
 import {
   WINDOWS_MAIN_EXECUTABLE_NAME,
@@ -35,6 +57,9 @@ import {
 export const PRODUCTION_SIGNED_RELEASE_MODE = 'production';
 export const LEGACY_UNSIGNED_RELEASE_MODE = 'legacy-unsigned';
 export const LEGACY_UNSIGNED_PLATFORM_VERIFICATION = 'legacy-unsigned-mode2-runtime-absent';
+export const LEGACY_MAC_PLATFORM_VERIFICATION = 'adhoc-CEF';
+export const LEGACY_MAC_SIGNATURE_VERIFICATION = ADHOC_SIGNATURE_VERIFICATION;
+export const LEGACY_MAC_CEF_BUNDLE_VERIFICATION = 'complete-cef-bundle-content-v1';
 export const LEGACY_MODE2_EXCLUSION_SCHEMA_VERSION = 1;
 export const LEGACY_MODE2_EXCLUSION_VERIFICATION = 'known-mode2-bundle-contract-paths-absent-v1';
 
@@ -133,7 +158,7 @@ function assertNotMode2Path(relative) {
   }
 }
 
-export async function inspectLegacyBundleTree(root, label = 'legacy bundle') {
+export async function inspectLegacyBundleTree(root, label = 'legacy bundle', { rejectMode2 = true } = {}) {
   const exactRoot = await requireDirectory(root, label);
   const entries = [];
   const fileContents = [];
@@ -141,7 +166,7 @@ export async function inspectLegacyBundleTree(root, label = 'legacy bundle') {
     const children = await fsp.readdir(directory, { withFileTypes: true });
     for (const child of children) {
       const relative = relativeRoot ? `${relativeRoot}/${child.name}` : child.name;
-      assertNotMode2Path(relative);
+      if (rejectMode2) assertNotMode2Path(relative);
       const candidate = path.join(directory, child.name);
       const stat = await fsp.lstat(candidate);
       if (stat.isSymbolicLink()) fail(`${label} contains a symlink: ${relative}`);
@@ -151,7 +176,7 @@ export async function inspectLegacyBundleTree(root, label = 'legacy bundle') {
       } else if (stat.isFile()) {
         const normalized = normalizedRelative(relative);
         entries.push(`file:${normalized}`);
-        fileContents.push(`${normalized}:${stat.size}:${await sha256(candidate)}`);
+        fileContents.push(`${normalized}:${stat.mode & 0o777}:${stat.size}:${await sha256(candidate)}`);
       } else {
         fail(`${label} contains an unsupported filesystem entry: ${relative}`);
       }
@@ -183,7 +208,27 @@ function plistString(source, key) {
   return match ? xmlDecode(match[1]) : null;
 }
 
-async function inspectLegacyMacApp(appDir, version, label) {
+function pinnedSafeStorageBranding(target) {
+  const spec = cefArchiveSpec(target);
+  return {
+    schemaVersion: 1,
+    method: CEF_SAFE_STORAGE_BRANDING_METHOD,
+    sourceService: CEF_UNBRANDED_SAFE_STORAGE_SERVICE,
+    service: CCEM_SAFE_STORAGE_SERVICE,
+    byteOffset: spec.safeStorageByteOffset,
+    byteLength: Buffer.byteLength(CEF_UNBRANDED_SAFE_STORAGE_SERVICE),
+    sourceExecutableSha256: spec.frameworkExecutableSha256,
+    brandedExecutableSha256: spec.brandedFrameworkExecutableSha256,
+  };
+}
+
+async function requireExecutable(candidate, label) {
+  const record = await requireFile(candidate, label);
+  if ((record.stat.mode & 0o111) === 0) fail(`${label} is not executable`);
+  return macReleaseFileFingerprint(record.path, { requireMachO: true });
+}
+
+export async function inspectLegacyMacApp(appDir, version, target, stageDir, operations = {}, label = 'macOS app') {
   const exactApp = await requireDirectory(appDir, label);
   const infoPath = path.join(exactApp, 'Contents', 'Info.plist');
   const info = await requireFile(infoPath, `${label} Info.plist`);
@@ -203,9 +248,84 @@ async function inspectLegacyMacApp(appDir, version, label) {
     path.join(exactApp, 'Contents', 'MacOS', executableName),
     `${label} main executable`,
   );
+  await requireExecutable(path.join(exactApp, 'Contents', 'MacOS', executableName), `${label} main executable`);
+  const frameworks = await requireDirectory(path.join(exactApp, 'Contents', 'Frameworks'), `${label} Frameworks`);
+  const framework = path.join(frameworks, FRAMEWORK_NAME);
+  const exactStage = await requireDirectory(stageDir, 'CEF stage');
+  const stageManifest = await readJson(path.join(exactStage, STAGE_MANIFEST_NAME), 'CEF stage manifest');
+  const archive = cefArchiveSpec(target);
+  if (
+    stageManifest.schemaVersion !== 1
+    || stageManifest.build?.target !== target
+    || stageManifest.build?.profile !== 'release'
+    || stageManifest.cef?.runtimeVersion !== CEF_FULL_VERSION
+    || stageManifest.cef?.sourceFrameworkPinned !== true
+    || stageManifest.cef?.sourceFrameworkExecutableSha256 !== archive.frameworkExecutableSha256
+    || stageManifest.cef?.sourceFrameworkTreeSha256 !== archive.frameworkTreeSha256
+    || stageManifest.cef?.brandedFrameworkTreeSha256 !== archive.brandedFrameworkTreeSha256
+    || !sameJson(stageManifest.cef?.safeStorageBranding, pinnedSafeStorageBranding(target))
+  ) fail(`CEF stage does not prove the pinned ${target} release runtime`);
+  const stableCefResources = await compareMacCefFrameworkTrees({
+    stageFramework: path.join(exactStage, FRAMEWORK_NAME), bundledFramework: framework, target,
+  });
+  assertRequiredMacCefFrameworkFiles(stableCefResources, target);
+  for (const relative of requiredMacCefFrameworkFiles(target)) {
+    await requireFile(path.join(framework, relative), `CEF framework ${relative}`);
+  }
+  const frameworkExecutable = path.join(framework, 'Chromium Embedded Framework');
+  await requireExecutable(frameworkExecutable, 'CEF framework executable');
+  const cefSafeStorageBranding = pinnedSafeStorageBranding(target);
+  for (const executable of [frameworkExecutable, path.join(exactStage, FRAMEWORK_NAME, 'Chromium Embedded Framework')]) {
+    await (operations.verifySafeStorageBranding ?? verifyCefMacosSafeStorageBranding)(
+      executable, cefSafeStorageBranding, { allowSignedExecutable: true },
+    );
+  }
+  const helperBundles = HELPER_SPECS.map(({ bundleName }) => bundleName).sort();
+  const actualHelpers = (await fsp.readdir(frameworks))
+    .filter((entry) => /^ccem-desktop Helper(?: \(.+\))?\.app$/u.test(entry)).sort();
+  if (!sameJson(actualHelpers, helperBundles)) fail(`${label} Helper.app inventory mismatch`);
+  const helperExecutableHashes = {};
+  for (const spec of HELPER_SPECS) {
+    const helper = await requireDirectory(path.join(frameworks, spec.bundleName), spec.bundleName);
+    const helperInfo = await requireFile(path.join(helper, 'Contents', 'Info.plist'), `${spec.bundleName} Info.plist`);
+    const helperSource = await fsp.readFile(helperInfo.path, 'utf8');
+    for (const [key, value] of Object.entries({
+      CFBundleIdentifier: spec.bundleIdentifier,
+      CFBundleExecutable: spec.executableName,
+      CFBundleShortVersionString: version,
+      CFBundleVersion: version,
+    })) {
+      if (plistString(helperSource, key) !== value) fail(`${spec.bundleName} ${key} does not equal ${value}`);
+    }
+    helperExecutableHashes[spec.bundleName] = await requireExecutable(
+      path.join(helper, 'Contents', 'MacOS', spec.executableName), `${spec.bundleName} executable`,
+    );
+    if (helperExecutableHashes[spec.bundleName] !== await requireExecutable(
+      path.join(exactStage, spec.bundleName, 'Contents', 'MacOS', spec.executableName),
+      `staged ${spec.bundleName} executable`,
+    )) fail(`${spec.bundleName} executable differs from the pinned stage`);
+  }
+  const resources = path.join(exactApp, 'Contents', 'Resources');
+  for (const fileName of CEF_LEGAL_FILES) {
+    await requireFile(path.join(resources, CEF_LEGAL_DIRECTORY, fileName), `CEF legal ${fileName}`);
+  }
+  const stageLegal = await (operations.inspectCefLegal ?? inspectStagedCefLegalFiles)(
+    exactStage, target, stageManifest.legal,
+  );
+  const cefLegal = await (operations.inspectCefLegal ?? inspectStagedCefLegalFiles)(resources, target, stageLegal);
+  const signature = await (operations.verifyAppSignature ?? verifyAdHocMacApp)(exactApp);
+  if (signature?.verification !== LEGACY_MAC_SIGNATURE_VERIFICATION) {
+    fail(`${label} lacks native ad-hoc signature verification`);
+  }
   return {
     executable,
-    tree: await inspectLegacyBundleTree(exactApp, label),
+    tree: await inspectLegacyBundleTree(exactApp, label, { rejectMode2: false }),
+    helperBundles,
+    helperExecutableHashes,
+    stableCefResources,
+    cefLegal,
+    cefSafeStorageBranding,
+    signatureVerification: signature.verification,
   };
 }
 
@@ -238,21 +358,21 @@ function runCommand(program, args) {
   return result.stdout ?? '';
 }
 
-async function inspectMacUpdaterNative(updaterPath, version) {
+async function inspectMacUpdaterNative(updaterPath, version, target, stageDir, operations) {
   const temporary = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-updater-'));
   try {
     runCommand(TAR_PATH, ['-xzf', updaterPath, '-C', temporary, '--no-same-owner']);
     return await inspectLegacyMacApp(
       await locateSingleMacApp(temporary),
       version,
-      'macOS updater app',
+      target, stageDir, operations, 'macOS updater app',
     );
   } finally {
     await fsp.rm(temporary, { recursive: true, force: true });
   }
 }
 
-async function inspectMacDmgNative(dmgPath, version) {
+async function inspectMacDmgNative(dmgPath, version, target, stageDir, operations) {
   const temporary = await fsp.mkdtemp(path.join(os.tmpdir(), 'ccem-legacy-dmg-'));
   const mountPoint = path.join(temporary, 'mount');
   let mounted = false;
@@ -263,7 +383,7 @@ async function inspectMacDmgNative(dmgPath, version) {
     return await inspectLegacyMacApp(
       await locateSingleMacApp(mountPoint),
       version,
-      'macOS DMG app',
+      target, stageDir, operations, 'macOS DMG app',
     );
   } finally {
     if (mounted) runCommand(HDIUTIL_PATH, ['detach', mountPoint]);
@@ -350,7 +470,7 @@ export async function inspectLegacyMacRelease(options, operations = {}) {
   if (!MAC_TARGETS.has(options.target)) fail(`unsupported legacy macOS target: ${options.target}`);
   validateSourceCommit(options.sourceCommit);
   required(options.version, 'app version');
-  const app = await inspectLegacyMacApp(options.appDir, options.version, 'macOS app');
+  const app = await inspectLegacyMacApp(options.appDir, options.version, options.target, options.stageDir, operations);
   const dmg = await artifactMetadata(options.dmgPath, 'macOS DMG');
   const updater = await artifactMetadata(options.updaterPath, 'macOS updater');
   const signaturePath = options.updaterSignaturePath ?? `${options.updaterPath}.sig`;
@@ -361,11 +481,11 @@ export async function inspectLegacyMacRelease(options, operations = {}) {
   });
   const updaterApp = await (operations.inspectUpdater ?? inspectMacUpdaterNative)(
     path.resolve(options.updaterPath),
-    options.version,
+    options.version, options.target, options.stageDir, operations,
   );
   const dmgApp = await (operations.inspectDmg ?? inspectMacDmgNative)(
     path.resolve(options.dmgPath),
-    options.version,
+    options.version, options.target, options.stageDir, operations,
   );
   for (const [label, packagedApp] of [
     ['macOS updater app', updaterApp],
@@ -375,6 +495,7 @@ export async function inspectLegacyMacRelease(options, operations = {}) {
       !packagedApp
       || !sameFlatRecord(packagedApp.executable, app.executable)
       || !sameFlatRecord(packagedApp.tree, app.tree)
+      || !sameJson(packagedApp, app)
     ) {
       fail(`${label} executable/tree does not exactly match the verified macOS app`);
     }
@@ -385,18 +506,22 @@ export async function inspectLegacyMacRelease(options, operations = {}) {
     platform: options.target,
     appVersion: options.version,
     sourceCommit: options.sourceCommit,
-    mode2Included: false,
-    cefRuntimeVersion: null,
-    helperBundles: [],
-    stableCefResources: {},
-    platformVerification: LEGACY_UNSIGNED_PLATFORM_VERIFICATION,
+    mode2Included: true,
+    cefRuntimeVersion: CEF_FULL_VERSION,
+    helperBundles: app.helperBundles,
+    helperExecutableHashes: app.helperExecutableHashes,
+    stableCefResources: app.stableCefResources,
+    cefLegal: app.cefLegal,
+    cefSafeStorageBranding: app.cefSafeStorageBranding,
+    platformVerification: LEGACY_MAC_PLATFORM_VERIFICATION,
     updaterSignatureVerification: signature.algorithm,
     mainExecutable: app.executable,
-    mode2Exclusion: exclusionEvidence({
-      app: app.tree,
-      dmg: dmgApp.tree,
-      updater: updaterApp.tree,
-    }),
+    cefBundle: {
+      schemaVersion: 1,
+      verification: LEGACY_MAC_CEF_BUNDLE_VERIFICATION,
+      signatureVerification: app.signatureVerification,
+      inspectedContainers: { app: app.tree, dmg: dmgApp.tree, updater: updaterApp.tree },
+    },
     artifacts: { dmg, updater, updaterSignature },
   };
 }
@@ -464,6 +589,94 @@ function validateTreeRecord(record, label) {
   }
 }
 
+export function validateLegacyUnsignedInventory(inventory, expectedVersion, expectedSourceCommit) {
+  validateSourceCommit(expectedSourceCommit);
+  const platform = inventory?.platform;
+  const roles = TARGET_ROLES[platform];
+  const containers = TARGET_CONTAINERS[platform];
+  if (
+    !roles
+    || inventory.schemaVersion !== RELEASE_INVENTORY_SCHEMA_VERSION
+    || inventory.releaseMode !== LEGACY_UNSIGNED_RELEASE_MODE
+    || inventory.appVersion !== expectedVersion
+    || inventory.sourceCommit !== expectedSourceCommit
+    || inventory.updaterSignatureVerification !== 'minisign-ed25519-blake2b'
+  ) fail(`${platform} is not an exact legacy unsigned inventory`);
+  if (!sameSet(Object.keys(inventory.artifacts ?? {}), roles)) {
+    fail(`${platform} legacy inventory has an invalid artifact role set`);
+  }
+  for (const role of roles) validateArtifactRecord(inventory.artifacts[role], `${platform} ${role}`);
+  validateArtifactRecord(inventory.mainExecutable, `${platform} main executable`);
+  if (inventory.artifacts.updaterSignature.fileName !== `${inventory.artifacts.updater.fileName}.sig`) {
+    fail(`${platform} updater signature does not bind its updater artifact`);
+  }
+  if (MAC_TARGETS.has(platform)) {
+    const spec = cefArchiveSpec(platform);
+    const expectedHelpers = HELPER_SPECS.map(({ bundleName }) => bundleName).sort();
+    if (
+      inventory.mode2Included !== true
+      || inventory.cefRuntimeVersion !== CEF_FULL_VERSION
+      || inventory.platformVerification !== LEGACY_MAC_PLATFORM_VERIFICATION
+      || inventory.mode2Exclusion !== undefined
+      || !sameJson(inventory.helperBundles, expectedHelpers)
+      || !sameSet(Object.keys(inventory.helperExecutableHashes ?? {}), expectedHelpers)
+      || Object.values(inventory.helperExecutableHashes).some(
+        (value) => !/^ccem-macho-code-sha256-v1:[a-f0-9]{64}$/u.test(value),
+      )
+      || !sameJson(inventory.cefSafeStorageBranding, pinnedSafeStorageBranding(platform))
+      || inventory.cefLegal?.directory !== CEF_LEGAL_DIRECTORY
+      || inventory.cefLegal.license?.file !== 'LICENSE.txt'
+      || inventory.cefLegal.license?.sourceCommit !== CEF_LICENSE_SOURCE_COMMIT
+      || inventory.cefLegal.license?.sha256 !== CEF_LICENSE_SHA256
+      || inventory.cefLegal.credits?.file !== 'CREDITS.html'
+      || inventory.cefLegal.credits?.archiveName !== spec.name
+      || inventory.cefLegal.credits?.archiveSha1 !== spec.sha1
+      || inventory.cefLegal.credits?.sha256 !== spec.creditsSha256
+    ) fail(`${platform} is not an exact legacy unsigned macOS inventory with complete CEF`);
+    assertRequiredMacCefFrameworkFiles(inventory.stableCefResources ?? {}, platform);
+    for (const relative of requiredMacCefFrameworkFiles(platform)) {
+      if (!/^(?:sha256|ccem-macho-code-sha256-v1):[a-f0-9]{64}$/u.test(
+        inventory.stableCefResources[relative]?.fingerprint ?? '',
+      )) fail(`${platform} lacks a file-content fingerprint for ${relative}`);
+    }
+    const bundle = inventory.cefBundle;
+    if (
+      bundle?.schemaVersion !== 1
+      || bundle.verification !== LEGACY_MAC_CEF_BUNDLE_VERIFICATION
+      || bundle.signatureVerification !== LEGACY_MAC_SIGNATURE_VERIFICATION
+      || !sameSet(Object.keys(bundle.inspectedContainers ?? {}), containers)
+    ) fail(`${platform} lacks complete CEF bundle and ad-hoc signature proof`);
+    for (const role of containers) {
+      validateTreeRecord(bundle.inspectedContainers[role], `${platform} ${role}`);
+      if (!sameFlatRecord(bundle.inspectedContainers[role], bundle.inspectedContainers.app)) {
+        fail(`${platform} ${role} content does not match the verified macOS app`);
+      }
+    }
+  } else {
+    if (
+      inventory.mode2Included !== false
+      || inventory.cefRuntimeVersion !== null
+      || !sameJson(inventory.helperBundles, [])
+      || !sameJson(inventory.stableCefResources, {})
+      || inventory.platformVerification !== LEGACY_UNSIGNED_PLATFORM_VERIFICATION
+      || inventory.cefBundle !== undefined
+    ) fail(`${platform} is not an exact legacy unsigned, Mode 2-disabled inventory`);
+    const exclusion = inventory.mode2Exclusion;
+    if (
+      exclusion?.schemaVersion !== LEGACY_MODE2_EXCLUSION_SCHEMA_VERSION
+      || exclusion.verification !== LEGACY_MODE2_EXCLUSION_VERIFICATION
+      || exclusion.denylistSha256 !== LEGACY_MODE2_BUNDLE_DENYLIST_SHA256
+      || exclusion.denylistEntryCount !== LEGACY_MODE2_BUNDLE_DENYLIST.length
+      || exclusion.symlinkPolicy !== 'rejected'
+      || !sameSet(Object.keys(exclusion.inspectedContainers ?? {}), containers)
+    ) fail(`${platform} lacks the exact negative Mode 2 bundle proof`);
+    for (const role of containers) {
+      validateTreeRecord(exclusion.inspectedContainers[role], `${platform} ${role}`);
+    }
+  }
+  return inventory;
+}
+
 export function validateLegacyUnsignedInventorySet(inventories, expectedVersion, expectedSourceCommit) {
   validateSourceCommit(expectedSourceCommit);
   if (inventories.length !== RELEASE_TARGETS.length) {
@@ -475,47 +688,7 @@ export function validateLegacyUnsignedInventorySet(inventories, expectedVersion,
   }
   const artifactNames = new Set();
   for (const inventory of inventories) {
-    const roles = TARGET_ROLES[inventory.platform];
-    const containers = TARGET_CONTAINERS[inventory.platform];
-    if (
-      inventory.schemaVersion !== RELEASE_INVENTORY_SCHEMA_VERSION
-      || inventory.releaseMode !== LEGACY_UNSIGNED_RELEASE_MODE
-      || inventory.appVersion !== expectedVersion
-      || inventory.sourceCommit !== expectedSourceCommit
-      || inventory.mode2Included !== false
-      || inventory.cefRuntimeVersion !== null
-      || !sameJson(inventory.helperBundles, [])
-      || !sameJson(inventory.stableCefResources, {})
-      || inventory.platformVerification !== LEGACY_UNSIGNED_PLATFORM_VERIFICATION
-      || inventory.updaterSignatureVerification !== 'minisign-ed25519-blake2b'
-    ) {
-      fail(`${inventory.platform} is not an exact legacy unsigned, Mode 2-disabled inventory`);
-    }
-    if (!sameSet(Object.keys(inventory.artifacts ?? {}), roles)) {
-      fail(`${inventory.platform} legacy inventory has an invalid artifact role set`);
-    }
-    for (const role of roles) validateArtifactRecord(inventory.artifacts[role], `${inventory.platform} ${role}`);
-    validateArtifactRecord(inventory.mainExecutable, `${inventory.platform} main executable`);
-    if (
-      inventory.artifacts.updaterSignature.fileName
-      !== `${inventory.artifacts.updater.fileName}.sig`
-    ) {
-      fail(`${inventory.platform} updater signature does not bind its updater artifact`);
-    }
-    const exclusion = inventory.mode2Exclusion;
-    if (
-      exclusion?.schemaVersion !== LEGACY_MODE2_EXCLUSION_SCHEMA_VERSION
-      || exclusion.verification !== LEGACY_MODE2_EXCLUSION_VERIFICATION
-      || exclusion.denylistSha256 !== LEGACY_MODE2_BUNDLE_DENYLIST_SHA256
-      || exclusion.denylistEntryCount !== LEGACY_MODE2_BUNDLE_DENYLIST.length
-      || exclusion.symlinkPolicy !== 'rejected'
-      || !sameSet(Object.keys(exclusion.inspectedContainers ?? {}), containers)
-    ) {
-      fail(`${inventory.platform} lacks the exact negative Mode 2 bundle proof`);
-    }
-    for (const role of containers) {
-      validateTreeRecord(exclusion.inspectedContainers[role], `${inventory.platform} ${role}`);
-    }
+    validateLegacyUnsignedInventory(inventory, expectedVersion, expectedSourceCommit);
     for (const record of Object.values(inventory.artifacts)) {
       if (artifactNames.has(record.fileName)) fail(`duplicate release artifact basename: ${record.fileName}`);
       artifactNames.add(record.fileName);
@@ -526,13 +699,14 @@ export function validateLegacyUnsignedInventorySet(inventories, expectedVersion,
     releaseMode: LEGACY_UNSIGNED_RELEASE_MODE,
     appVersion: expectedVersion,
     sourceCommit: expectedSourceCommit,
-    mode2Included: false,
-    cefRuntimeVersion: null,
-    targets: inventories.map(({ platform, mode2Included, artifacts, mode2Exclusion }) => ({
-      platform,
-      mode2Included,
-      artifacts,
-      mode2Exclusion,
+    // The aggregate boolean means all targets include Mode 2; capability is target-specific.
+    mode2Included: inventories.every((inventory) => inventory.mode2Included),
+    mode2ByTarget: Object.fromEntries(inventories.map(({ platform, mode2Included }) => [platform, mode2Included])),
+    cefRuntimeVersion: CEF_FULL_VERSION,
+    targets: inventories.map(({ platform, mode2Included, cefRuntimeVersion, platformVerification,
+      artifacts, mode2Exclusion, cefBundle }) => ({
+      platform, mode2Included, cefRuntimeVersion, platformVerification, artifacts,
+      ...(mode2Exclusion ? { mode2Exclusion } : { cefBundle }),
     })),
   };
 }
@@ -553,6 +727,7 @@ function parseArgs(argv) {
     ['--version', 'version'],
     ['--source-commit', 'sourceCommit'],
     ['--app', 'appPath'],
+    ['--stage', 'stageDir'],
     ['--dmg', 'dmgPath'],
     ['--updater', 'updaterPath'],
     ['--installer', 'installerPath'],
@@ -589,7 +764,7 @@ export async function run(argv = process.argv.slice(2)) {
   validateSourceCommit(options.sourceCommit);
   let inventory;
   if (options.platform === 'macos') {
-    for (const key of ['target', 'appPath', 'dmgPath', 'updaterPath']) required(options[key], key);
+    for (const key of ['target', 'appPath', 'stageDir', 'dmgPath', 'updaterPath']) required(options[key], key);
     inventory = await inspectLegacyMacRelease({ ...options, appDir: options.appPath });
   } else if (options.platform === 'windows') {
     for (const key of ['target', 'appPath', 'installerPath', 'updaterSignaturePath']) required(options[key], key);

@@ -234,13 +234,13 @@ jobs:
           - platform: macos-latest
             target: aarch64-apple-darwin
             args: '--target aarch64-apple-darwin --config src-tauri/tauri.cef.conf.json'
-            legacyArgs: '--target aarch64-apple-darwin'
+            legacyArgs: '--target aarch64-apple-darwin --config src-tauri/tauri.cef.conf.json --config src-tauri/tauri.cef.adhoc.conf.json'
             appleSigning: true
             windowsSigning: false
           - platform: macos-15-intel
             target: x86_64-apple-darwin
             args: '--target x86_64-apple-darwin --config src-tauri/tauri.cef.conf.json'
-            legacyArgs: '--target x86_64-apple-darwin'
+            legacyArgs: '--target x86_64-apple-darwin --config src-tauri/tauri.cef.conf.json --config src-tauri/tauri.cef.adhoc.conf.json'
             appleSigning: true
             windowsSigning: false
           - platform: windows-latest
@@ -474,10 +474,11 @@ jobs:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
 
-      - name: Build legacy unsigned bundles with Mode 2 excluded
+      - name: Build without platform certificates with bundled macOS CEF
         if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' }}
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
+          CCEM_CEF_TARGET_TRIPLE: ${{ matrix.target }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -674,7 +675,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Prove legacy macOS bundles exclude Mode 2
+      - name: Prove ad-hoc macOS app DMG and updater include CEF
         if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' && matrix.appleSigning }}
         shell: bash
         working-directory: apps/desktop
@@ -705,6 +706,7 @@ jobs:
           signature_path="$(one_match 'legacy macOS updater signature' "${signature_matches[@]}")"
           node scripts/verify-legacy-release-inventory.mjs \
             --platform macos \
+            --stage src-tauri/target/cef-bundle/macos \
             --target "$CCEM_RELEASE_TARGET" \
             --version "$CCEM_RELEASE_VERSION" \
             --source-commit "$GITHUB_SHA" \
@@ -716,6 +718,8 @@ jobs:
           node scripts/verify-dsh-bundle-smoke.mjs \
             --app-bundle "$app_path" \
             --evidence "$RUNNER_TEMP/dsh-legacy-bundle-smoke-${CCEM_RELEASE_TARGET}.json"
+          node scripts/run-macos-adhoc-cef-smoke.mjs \
+            "$app_path" "$RUNNER_TEMP/cef-adhoc-smoke-${CCEM_RELEASE_TARGET}"
 
       - name: Prove legacy Windows bundle excludes Mode 2
         if: ${{ steps.release-payload.outputs.reuse != 'true' && needs.release-mode.outputs.production != 'true' && matrix.windowsSigning }}

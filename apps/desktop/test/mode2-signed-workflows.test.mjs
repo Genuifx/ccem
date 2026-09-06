@@ -188,12 +188,13 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
     );
   }
   const productionBuild = stepBlock(source, 'Build production bundles without release access');
-  const legacyBuild = stepBlock(source, 'Build legacy unsigned bundles with Mode 2 excluded');
+  const legacyBuild = stepBlock(source, 'Build without platform certificates with bundled macOS CEF');
   const canonicalizeReleaseAssets = stepBlock(source, 'Canonicalize GitHub release asset names');
   assert.match(productionBuild, /needs\.release-mode\.outputs\.production == 'true'/u);
   assert.doesNotMatch(productionBuild, /legacyArgs|continue-on-error|failure\(\)/u);
   assert.match(legacyBuild, /needs\.release-mode\.outputs\.production != 'true'/u);
   assert.match(legacyBuild, /args: \$\{\{ matrix\.legacyArgs \}\}/u);
+  assert.match(legacyBuild, /CCEM_CEF_TARGET_TRIPLE: \$\{\{ matrix\.target \}\}/u);
   assert.doesNotMatch(
     legacyBuild,
     /steps\.[^.]+\.(?:outcome|conclusion)|continue-on-error|failure\(\)|always\(\)/u,
@@ -213,10 +214,10 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
     /needs\.release-mode\.outputs\.production|always\(\)|continue-on-error/u,
   );
   const productionBuildIndex = source.indexOf('      - name: Build production bundles without release access');
-  const legacyBuildIndex = source.indexOf('      - name: Build legacy unsigned bundles with Mode 2 excluded');
+  const legacyBuildIndex = source.indexOf('      - name: Build without platform certificates with bundled macOS CEF');
   const canonicalizeIndex = source.indexOf('      - name: Canonicalize GitHub release asset names');
   const signedMacProofIndex = source.indexOf('      - name: Prove signed macOS Mode 2 Safe Storage and production behavior');
-  const legacyMacProofIndex = source.indexOf('      - name: Prove legacy macOS bundles exclude Mode 2');
+  const legacyMacProofIndex = source.indexOf('      - name: Prove ad-hoc macOS app DMG and updater include CEF');
   assert.ok(productionBuildIndex < legacyBuildIndex);
   assert.ok(legacyBuildIndex < canonicalizeIndex);
   assert.ok(canonicalizeIndex < signedMacProofIndex);
@@ -234,15 +235,21 @@ test('desktop producer is a fresh read-only mode-aware three-target evidence pip
   }
   assert.doesNotMatch(
     legacyBuild,
-    /APPLE_SIGNING_IDENTITY|APPLE_TEAM_ID|APPLE_ID|APPLE_PASSWORD|CCEM_CEF_TARGET_TRIPLE/u,
+    /APPLE_CERTIFICATE|APPLE_SIGNING_IDENTITY|APPLE_TEAM_ID|APPLE_ID|APPLE_PASSWORD|CCEM_OFFICIAL_APPLE_TEAM_ID/u,
   );
   const legacyArgs = source.match(/^\s+legacyArgs:.*$/gmu) ?? [];
   assert.equal(legacyArgs.length, 3);
   for (const args of legacyArgs) {
-    assert.doesNotMatch(args, /tauri\.cef\.conf\.json|tauri\.windows-signing\.conf\.json/u);
+    if (args.includes('apple-darwin')) {
+      assert.match(args, /--config src-tauri\/tauri\.cef\.conf\.json --config src-tauri\/tauri\.cef\.adhoc\.conf\.json/u);
+    } else {
+      assert.match(args, /x86_64-pc-windows-msvc --config src-tauri\/tauri\.windows\.conf\.json --bundles nsis,updater/u);
+      assert.doesNotMatch(args, /tauri\.cef\.conf\.json|tauri\.cef\.adhoc\.conf\.json/u);
+    }
+    assert.doesNotMatch(args, /tauri\.windows-signing\.conf\.json/u);
   }
   for (const stepName of [
-    'Prove legacy macOS bundles exclude Mode 2',
+    'Prove ad-hoc macOS app DMG and updater include CEF',
     'Prove legacy Windows bundle excludes Mode 2',
   ]) {
     const verifier = stepBlock(source, stepName);
