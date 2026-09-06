@@ -10,6 +10,8 @@ import {
   useState,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { isRecoveringWebcontent, registerWebcontentSessionSample } from '@/lib/webcontentRecovery';
+import { readRecoveryDraft, recoveryDraftKey } from '@/lib/recoveryDrafts';
 import {
   Check,
   ChevronDown,
@@ -58,6 +60,7 @@ import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
 import type { EffortLevel } from '@/components/workspace/ComposerControls';
 import type { PermissionModeName } from '@ccem/core/browser';
+import type { ComposerSubmitResult } from '@/components/workspace/composerSubmissionResult';
 import {
   buildComposerPromptPreview,
   buildComposerPromptText,
@@ -473,6 +476,23 @@ export function Workspace({
   const [messages, setMessages] = useState<ConversationMessageData[]>([]);
   const [segments, setSegments] = useState<HistorySegment[]>([]);
   const [historyEvents, setHistoryEvents] = useState<SessionEventRecord[]>([]);
+  const historyDiagnosticsRef = useRef({ historyEvents, messages });
+  historyDiagnosticsRef.current = { historyEvents, messages };
+  useEffect(() => registerWebcontentSessionSample(() => {
+    const sample = historyDiagnosticsRef.current;
+    let toolResultChars = 0;
+    for (const message of sample.messages) {
+      if (!Array.isArray(message.content)) continue;
+      for (const block of message.content) {
+        if (typeof block._result === 'string') toolResultChars += block._result.length;
+      }
+    }
+    return {
+      rawEventCount: sample.historyEvents.length,
+      projectedMessageCount: sample.messages.length,
+      toolResultChars,
+    };
+  }, false), []);
   const [historyTranscriptBackfillState, setHistoryTranscriptBackfillState] =
     useState<WorkspaceTranscriptBackfillState>('idle');
   const [activeSegment, setActiveSegment] = useState<number | null>(null);
@@ -1578,7 +1598,10 @@ export function Workspace({
       defaultPermMode: permissionMode,
     });
 
-    resetHistoryComposerText('');
+    resetHistoryComposerText(readRecoveryDraft(
+      recoveryDraftKey('history', selectedSession.source, selectedSession.id),
+      isRecoveringWebcontent(),
+    )?.text ?? '');
     setHistoryPlanModeEnabled(false);
     setHistoryEnv(controls.envName);
     setHistoryPermMode(controls.permMode);
@@ -1872,6 +1895,11 @@ export function Workspace({
   }, [activeLiveEntry, hydrateLiveEntryFromHistory, shouldHydrateLiveEntryFromHistory]);
 
   const effectiveComposeDir = composeDir || selectedWorkingDir || defaultWorkingDir || null;
+  const composeRecoveryDraftKey = recoveryDraftKey('compose', composeProvider, effectiveComposeDir ?? '');
+  useEffect(() => {
+    const recovered = readRecoveryDraft(composeRecoveryDraftKey, isRecoveringWebcontent());
+    if (recovered) resetComposePrompt(recovered.text);
+  }, [composeRecoveryDraftKey, resetComposePrompt]);
   const effectiveComposeDirLabel = effectiveComposeDir ? getProjectName(effectiveComposeDir) : null;
   const recentComposeFolders = useMemo(() => recent.slice(0, 5), [recent]);
   const shouldRenderWorkspaceReview = workspaceMode !== 'live' || !activeLiveEntry;
@@ -2696,7 +2724,7 @@ export function Workspace({
     setSessionTitle,
   ]);
 
-  const runCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload) => {
+  const runCreateNativeConversation = useCallback(async (payload?: ComposerSubmitPayload): Promise<ComposerSubmitResult> => {
     if (isCreatingNativeSession) {
       return false;
     }
@@ -2753,6 +2781,8 @@ export function Workspace({
       planModeEnabled: isCronCommand ? false : composePlanModeEnabled,
     });
 
+    let createAttempted = false;
+    let createAccepted = false;
     setIsCreatingNativeSession(true);
     try {
       const launch = await startAfterCodexModelMigrationGate({
@@ -2762,21 +2792,26 @@ export function Workspace({
         preflight: preflightCodexModelMigration,
         confirm: requestCodexModelMigrationDecision,
         acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
-        start: (codexMigrationProofToken) => createNativeSession({
-          provider: composeProvider,
-          envName: currentEnv,
-          permMode: dispatch.permMode,
-          runtimePermMode: dispatch.runtimePermMode,
-          workingDir,
-          initialPrompt: dispatch.prompt,
-          initialDisplayPrompt: previewPrompt,
-          initialImages: images.length > 0 ? images : undefined,
-          initialAnnotations: payload?.annotations,
-          effort: normalizeEffortForProvider(composeEffort, composeProvider),
-          seedBoundaryMessageCount: 0,
-          routerLaunchDraft,
-          codexMigrationProofToken,
-        }),
+        start: async (codexMigrationProofToken) => {
+          createAttempted = true;
+          const summary = await createNativeSession({
+            provider: composeProvider,
+            envName: currentEnv,
+            permMode: dispatch.permMode,
+            runtimePermMode: dispatch.runtimePermMode,
+            workingDir,
+            initialPrompt: dispatch.prompt,
+            initialDisplayPrompt: previewPrompt,
+            initialImages: images.length > 0 ? images : undefined,
+            initialAnnotations: payload?.annotations,
+            effort: normalizeEffortForProvider(composeEffort, composeProvider),
+            seedBoundaryMessageCount: 0,
+            routerLaunchDraft,
+            codexMigrationProofToken,
+          });
+          createAccepted = true;
+          return summary;
+        },
       });
       if (!launch.started) {
         if (launch.reason === 'preflight_changed') {
@@ -2828,6 +2863,7 @@ export function Workspace({
       return true;
     } catch (error) {
       console.error('Failed to create native workspace session:', error);
+      if (createAttempted) return createAccepted ? true : 'delivery_uncertain';
       // An opted-in launch failure must surface the backend's specific error
       // (e.g. ROUTER_* validation), not just the generic banner — the draft is
       // intentionally KEPT so the user can adjust and retry.
@@ -2885,7 +2921,7 @@ export function Workspace({
     }
   }, [runCreateNativeConversation]);
 
-  const runContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload) => {
+  const runContinueHistorySession = useCallback(async (payload?: ComposerSubmitPayload): Promise<ComposerSubmitResult> => {
     if (isResumingHistorySession) {
       return false;
     }
@@ -2979,6 +3015,8 @@ export function Workspace({
       permissionMode: historyPermMode,
       planModeEnabled: isCronCommand ? false : historyPlanModeEnabled,
     });
+    let createAttempted = false;
+    let createAccepted = false;
     setIsResumingHistorySession(true);
 
     try {
@@ -2989,23 +3027,28 @@ export function Workspace({
         preflight: preflightCodexModelMigration,
         confirm: requestCodexModelMigrationDecision,
         acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
-        start: (codexMigrationProofToken) => createNativeSession({
-          provider,
-          envName: historyEnv,
-          permMode: dispatch.permMode,
-          runtimePermMode: dispatch.runtimePermMode,
-          workingDir: selectedSession.project,
-          initialPrompt: dispatch.prompt,
-          initialDisplayPrompt: previewPrompt,
-          initialImages: images.length > 0 ? images : undefined,
-          initialAnnotations: payload?.annotations,
-          providerSessionId: selectedSession.id,
-          effort: normalizeEffortForProvider(historyEffort, provider),
-          seedBoundaryMessageCount: messages.length,
-          routerLaunchDraft,
-          resumeRouterFromRuntimeId,
-          codexMigrationProofToken,
-        }),
+        start: async (codexMigrationProofToken) => {
+          createAttempted = true;
+          const summary = await createNativeSession({
+            provider,
+            envName: historyEnv,
+            permMode: dispatch.permMode,
+            runtimePermMode: dispatch.runtimePermMode,
+            workingDir: selectedSession.project,
+            initialPrompt: dispatch.prompt,
+            initialDisplayPrompt: previewPrompt,
+            initialImages: images.length > 0 ? images : undefined,
+            initialAnnotations: payload?.annotations,
+            providerSessionId: selectedSession.id,
+            effort: normalizeEffortForProvider(historyEffort, provider),
+            seedBoundaryMessageCount: messages.length,
+            routerLaunchDraft,
+            resumeRouterFromRuntimeId,
+            codexMigrationProofToken,
+          });
+          createAccepted = true;
+          return summary;
+        },
       });
       if (!launch.started) {
         if (launch.reason === 'preflight_changed') {
@@ -3036,6 +3079,7 @@ export function Workspace({
       return true;
     } catch (error) {
       console.error('Failed to continue workspace history session:', error);
+      if (createAttempted) return createAccepted ? true : 'delivery_uncertain';
       if (routerLaunchDraft || resumeRouterFromRuntimeId) {
         const detail = error instanceof Error ? error.message : String(error);
         toast.error(detail || t('workspace.nativeCreateFailed'));
@@ -3231,12 +3275,13 @@ export function Workspace({
   }, [handlePickComposeDir]);
 
   const handleWorkspaceSubmitShortcut = useCallback(() => {
-    if (workspaceMode === 'history') {
-      void handleContinueHistorySession();
-      return;
-    }
-    void handleCreateNativeConversation();
-  }, [handleContinueHistorySession, handleCreateNativeConversation, workspaceMode]);
+    // Use the same rich-draft capture, admission guard and recovery journal as
+    // the visible send button. Hidden composers and stop actions are excluded.
+    const button = Array.from(workspaceColumnRef.current?.querySelectorAll<HTMLButtonElement>(
+      '[data-workspace-composer-submit]',
+    ) ?? []).find((candidate) => candidate.getClientRects().length > 0);
+    button?.click();
+  }, []);
 
   const shortcuts = useMemo(
     () => ({
@@ -3401,6 +3446,7 @@ export function Workspace({
           value={composePrompt}
           valueRevision={composePromptRevision}
           onValueChange={handleComposePromptChange}
+          recoveryDraftKey={composeRecoveryDraftKey}
           onSubmit={handleCreateNativeConversation}
           placeholder={t('workspace.composePlaceholder')}
           canSubmit={composeHasDraft && !!effectiveComposeDir && !isCreatingNativeSession}
@@ -3515,6 +3561,7 @@ export function Workspace({
           value={historyComposerText}
           valueRevision={historyComposerRevision}
           onValueChange={handleHistoryComposerTextChange}
+          recoveryDraftKey={recoveryDraftKey('history', selectedSession.source, selectedSession.id)}
           onSubmit={handleContinueHistorySession}
           placeholder={
             historyRouteResolutionStatus === 'resolving'

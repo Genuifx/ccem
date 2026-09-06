@@ -11,6 +11,9 @@ import { useAppStore, type Environment, type LaunchClient } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { useZoom } from '@/hooks/useZoom';
+import { useWebcontentLifecycle } from '@/hooks/useWebcontentLifecycle';
+import { hasRecoveredWebcontent } from '@/lib/webcontentRecovery';
+import { recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
 import { Toaster, toast } from 'sonner';
 import { LocaleProvider, useLocale } from '@/locales';
 import type { UsageStats } from '@/types/analytics';
@@ -112,6 +115,16 @@ function AppContent() {
   const deleteEnvGuardRef = useRef(createDeleteGuard());
   const [startupReady, setStartupReady] = useState(false);
   const [startupSplashVisible, setStartupSplashVisible] = useState(true);
+  useWebcontentLifecycle(startupReady && !startupSplashVisible);
+  const recoveryNoticeShownRef = useRef(false);
+  useEffect(() => {
+    if (!startupReady || startupSplashVisible || recoveryNoticeShownRef.current
+      || !hasRecoveredWebcontent()) return;
+    recoveryNoticeShownRef.current = true;
+    toast.info(t(recoveryDraftDiagnostics().uncertain > 0
+      ? 'common.webcontentRecoveredUncertain'
+      : 'common.webcontentRecovered'));
+  }, [startupReady, startupSplashVisible, t]);
   const [petOpenRequest, setPetOpenRequest] = useState<PetOpenSessionRequest | null>(null);
   const [workspaceSessionLinkRequest, setWorkspaceSessionLinkRequest] = useState<{ id: number; link: string } | null>(null);
   const [workspaceComposeSeed, setWorkspaceComposeSeed] = useState<{ id: number; value: string } | null>(null);
@@ -281,7 +294,7 @@ function AppContent() {
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [activeTab, startupReady], scope: appPageMotionRef });
+  }, { dependencies: [activeTab, startupReady], scope: appPageMotionRef, revertOnUpdate: true });
 
   const openWorkspaceCronCreate = useCallback(() => {
     setWorkspaceComposeSeed({ id: Date.now(), value: '/ccem-cron ' });
@@ -690,21 +703,27 @@ function AppContent() {
   }, [launchClaudeCode, launchClient, runLaunchOnce]);
 
   // Global keyboard shortcuts (Cmd+1..9 for tabs, Cmd+Enter/N for launch, Cmd+, for settings)
-  const globalShortcuts = useMemo(() => ({
-    'meta+1': () => navigateToTab('workspace'),
-    'meta+2': () => navigateToTab('sessions'),
-    'meta+3': () => navigateToTab('environments'),
-    'meta+4': () => navigateToTab('skills'),
-    'meta+5': () => navigateToTab('history'),
-    'meta+6': () => navigateToTab('cron'),
-    'meta+7': () => navigateToTab('chat-app'),
-    'meta+8': () => navigateToTab('analytics'),
-    'meta+9': () => navigateToTab('proxy-debug'),
-    'meta+enter': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
-    'meta+n': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
-    'meta+,': () => navigateToTab('settings'),
-    'meta+q': () => { void requestQuit(); },
-  }), [handleLaunch, navigateToTab, requestQuit, surfaceBackgroundTerminalPartial]);
+  const globalShortcuts = useMemo(() => {
+    const shortcuts: Record<string, () => void | Promise<unknown>> = {
+      'meta+1': () => navigateToTab('workspace'),
+      'meta+2': () => navigateToTab('sessions'),
+      'meta+3': () => navigateToTab('environments'),
+      'meta+4': () => navigateToTab('skills'),
+      'meta+5': () => navigateToTab('history'),
+      'meta+6': () => navigateToTab('cron'),
+      'meta+7': () => navigateToTab('chat-app'),
+      'meta+8': () => navigateToTab('analytics'),
+      'meta+9': () => navigateToTab('proxy-debug'),
+      'meta+n': () => handleLaunch().catch(surfaceBackgroundTerminalPartial),
+      'meta+,': () => navigateToTab('settings'),
+      'meta+q': () => { void requestQuit(); },
+    };
+    // Workspace owns submit, including its recovery journal and rich payload.
+    if (activeTab !== 'workspace') {
+      shortcuts['meta+enter'] = () => handleLaunch().catch(surfaceBackgroundTerminalPartial);
+    }
+    return shortcuts;
+  }, [activeTab, handleLaunch, navigateToTab, requestQuit, surfaceBackgroundTerminalPartial]);
 
   useKeyboardShortcuts(globalShortcuts);
 

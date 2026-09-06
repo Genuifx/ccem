@@ -36,7 +36,7 @@ test('legacy renderer queue migrates to backend during a live turn but stays ter
   const source = await readSource('components', 'workspace', 'WorkspaceNativeSessionView.tsx');
   const flushBlock = sliceBetween(
     source,
-    'const flushQueuedMessages = useCallback((): Promise<boolean> => {',
+    'const flushQueuedMessages = useCallback(',
     'const handleSend = useCallback',
   );
 

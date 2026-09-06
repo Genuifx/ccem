@@ -2,6 +2,10 @@
 identifier = "trusted-app-commands"
 description = "Allows CCEM application commands only for explicitly trusted application webviews."
 commands.allow = [
+  "webcontent_debug_main_process_id",
+  "webcontent_frontend_boot",
+  "webcontent_frontend_ready",
+  "webcontent_frontend_sample",
   "get_companion",
   "get_pet_notification_read_state",
   "mark_pet_notification_read",

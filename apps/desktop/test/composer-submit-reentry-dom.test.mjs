@@ -33,6 +33,13 @@ async function resolveDesktopSource(importPath) {
 const stubsPlugin = {
   name: 'ccem-composer-submit-reentry-stubs',
   setup(builder) {
+    builder.onResolve({ filter: /^@\/lib\/webcontentRecovery$/ }, () => ({
+      path: 'recovery-stub', namespace: 'composer-submit-stubs',
+    }));
+    builder.onLoad({ filter: /^recovery-stub$/, namespace: 'composer-submit-stubs' }, () => ({
+      loader: 'js',
+      contents: 'export function isRecoveringWebcontent() { return window.__ccemRecoveryTest === true; }',
+    }));
     builder.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({
       path: 'tauri-core-stub', namespace: 'composer-submit-stubs',
     }));
@@ -135,6 +142,11 @@ async function importHarness() {
         import { createRoot } from 'react-dom/client';
         import { renderToStaticMarkup } from 'react-dom/server';
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
+        import { readRecoveryDraft, writeRecoveryDraft, recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
+
+        export function seedRecovery(key, text, attachments) { writeRecoveryDraft(key, text, attachments); }
+        export function recoveredDraft(key) { return readRecoveryDraft(key, true); }
+        export function recoveryCounts() { return recoveryDraftDiagnostics(); }
 
         export function renderNativeQueuedComposer() {
           return renderToStaticMarkup(
@@ -189,20 +201,25 @@ async function importHarness() {
           );
         }
 
-        export function mount(container) {
+        export function mount(container, options = {}) {
           const state = {
             calls: 0,
             pending: [],
+            payloads: [],
           };
 
           function Harness() {
-            const [value, setValue] = useState('same-tick message');
+            const [value, setValue] = useState(() => options.recoveryKey
+              ? readRecoveryDraft(options.recoveryKey, true)?.text ?? '' : 'same-tick message');
             return (
               <WorkspaceSessionComposer
                 value={value}
+                recoveryDraftKey={options.recoveryKey}
                 onValueChange={setValue}
-                onSubmit={() => {
+                onSubmit={(payload) => {
                   state.calls += 1;
+                  state.payloads.push(payload);
+                  if (options.throwAfterDispatch) return Promise.reject(new Error('private transport error'));
                   return new Promise((resolve) => state.pending.push(resolve));
                 }}
                 placeholder="composer input"
@@ -239,6 +256,17 @@ async function importHarness() {
               })));
             },
             getCallCount() { return state.calls; },
+            getPayloads() { return state.payloads; },
+            getText() { return editor.textContent; },
+            recoverRejected() {
+              act(() => container.querySelector('[data-composer-rejected-draft] button').click());
+            },
+            typeText(text) {
+              act(() => {
+                editor.textContent = text;
+                editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+              });
+            },
             async resolveAll(result) {
               const pending = state.pending.splice(0);
               await act(async () => {
@@ -437,4 +465,110 @@ test('Enter plus send click submits once while pending and re-arms after complet
 
   assert.equal(callsWhilePending, 1, 'same-tick Enter and click must share one submission');
   assert.equal(callsAfterCompletion, 2, 'the guard must release after the first submission settles');
+});
+
+test('actual composer recovery restores text and image, never auto-sends, preserves rejection and clears admission', async (t) => {
+  const { container, restore } = installDom();
+  t.after(() => restore());
+  const harness = await (importedHarnessPromise ??= importHarness());
+  window.__ccemRecoveryTest = true;
+  const key = 'live:recovery-fixture';
+  const attachment = { id: 'recovery-image', kind: 'image', source: 'paste', name: 'recovered.png',
+    placeholder: '[Image #1]', mediaType: 'image/png', base64Data: 'aGVsbG8=', byteSize: 5, objectUrl: 'blob:dead' };
+  harness.seedRecovery(key, 'saved message [Image #1]', [attachment]);
+  const mounted = harness.mount(container, { recoveryKey: key });
+  assert.equal(mounted.getCallCount(), 0);
+  assert.match(mounted.getText(), /saved message/);
+  assert.equal(container.querySelector('[data-composer-attachment-chip] img').getAttribute('src'), 'data:image/png;base64,aGVsbG8=');
+  mounted.pressEnter();
+  assert.equal(mounted.getCallCount(), 1);
+  assert.equal(mounted.getPayloads()[0].attachments[0].base64Data, attachment.base64Data);
+  assert.equal(harness.recoveredDraft(key), null, 'in-flight snapshot is not sendable after crash');
+  assert.equal(harness.recoveryCounts().uncertain, 1);
+  await mounted.resolveAll(false);
+  assert.equal(harness.recoveredDraft(key).text, 'saved message [Image #1]');
+  mounted.pressEnter();
+  await mounted.resolveAll(true);
+  assert.equal(harness.recoveredDraft(key), null, 'accepted image and text must not resurrect');
+  assert.equal(harness.recoveryCounts().uncertain, 0);
+  mounted.unmount();
+  const remounted = harness.mount(container, { recoveryKey: key });
+  assert.equal(remounted.getText(), '');
+  assert.equal(remounted.getCallCount(), 0);
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 0);
+  remounted.unmount();
+});
+
+test('actual editor journals an unsent keystroke before unmount and preserves a newer draft after ACK', async (t) => {
+  const { container, restore } = installDom();
+  t.after(() => restore());
+  const harness = await (importedHarnessPromise ??= importHarness());
+  window.__ccemRecoveryTest = true;
+  const key = 'live:typing-fixture';
+  const mounted = harness.mount(container, { recoveryKey: key });
+  mounted.typeText('first unsent edit');
+  assert.equal(harness.recoveredDraft(key).text, 'first unsent edit');
+  mounted.pressEnter();
+  mounted.typeText('newer unsent edit');
+  await mounted.resolveAll(true);
+  assert.equal(harness.recoveredDraft(key).text, 'newer unsent edit');
+  mounted.unmount();
+  const remounted = harness.mount(container, { recoveryKey: key });
+  assert.equal(remounted.getText(), 'newer unsent edit');
+  assert.equal(remounted.getCallCount(), 0);
+  remounted.unmount();
+});
+
+test('rejected secondary card survives document replacement and restores only after an explicit click', async (t) => {
+  const { container, restore } = installDom(); t.after(() => restore());
+  const harness = await (importedHarnessPromise ??= importHarness()); window.__ccemRecoveryTest = true;
+  const key = 'live:rejected-crash-fixture';
+  harness.seedRecovery(key, 'older rejected draft [Image #1]', [{
+    id: 'rejected-image', kind: 'image', source: 'paste', name: 'rejected.png', placeholder: '[Image #1]',
+    mediaType: 'image/png', base64Data: 'aGVsbG8=', byteSize: 5, objectUrl: 'blob:dead',
+  }]);
+  const mounted = harness.mount(container, { recoveryKey: key });
+  mounted.pressEnter(); mounted.typeText('newer draft'); await mounted.resolveAll(false);
+  assert.equal(harness.recoveryCounts().rejected, 1); mounted.unmount();
+  const remounted = harness.mount(container, { recoveryKey: key });
+  assert.equal(remounted.getText(), 'newer draft'); assert.equal(remounted.getCallCount(), 0);
+  const rejected = container.querySelector('[data-composer-rejected-draft]');
+  assert.match(rejected.textContent, /older rejected draft/);
+  // Actual recovery button gesture; it merges into the editor and sends nothing.
+  remounted.recoverRejected();
+  assert.equal(remounted.getCallCount(), 0);
+  assert.equal(harness.recoveryCounts().rejected, 0);
+  assert.match(harness.recoveredDraft(key).text, /older rejected draft/);
+  assert.equal(harness.recoveredDraft(key).attachments[0].base64Data, 'aGVsbG8=');
+  assert.equal(container.querySelector('[data-composer-attachment-chip] img').getAttribute('src'), 'data:image/png;base64,aGVsbG8=');
+  remounted.unmount();
+});
+
+test('unexpected onSubmit rejection is handled without clearing the uncertain journal or producing a rejected draft', async (t) => {
+  const { container, restore } = installDom();
+  t.after(restore);
+  const harness = await (importedHarnessPromise ??= importHarness());
+  window.__ccemRecoveryTest = true;
+  const key = 'live:unexpected-submit-throw';
+  harness.seedRecovery(key, 'private unsent draft', []);
+  const mounted = harness.mount(container, { recoveryKey: key, throwAfterDispatch: true });
+  const originalWarn = console.warn; const warnings = [];
+  console.warn = (...args) => warnings.push(args);
+  try {
+    mounted.pressEnter();
+    await mounted.resolveAll(false);
+    assert.equal(mounted.getCallCount(), 1);
+    assert.equal(mounted.getText(), 'private unsent draft');
+    assert.equal(harness.recoveryCounts().uncertain, 1);
+    assert.equal(harness.recoveredDraft(key), null);
+    assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
+    assert.equal(warnings.length, 1);
+    assert.doesNotMatch(JSON.stringify(warnings), /private|transport error/);
+  } finally { console.warn = originalWarn; }
+  mounted.unmount();
+  const remounted = harness.mount(container, { recoveryKey: key });
+  assert.equal(remounted.getText(), '');
+  assert.equal(remounted.getCallCount(), 0);
+  assert.equal(harness.recoveryCounts().uncertain, 1);
+  remounted.unmount();
 });

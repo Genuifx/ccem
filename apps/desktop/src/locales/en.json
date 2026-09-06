@@ -1,5 +1,7 @@
 {
   "common": {
+    "webcontentRecovered": "Interface restored",
+    "webcontentRecoveredUncertain": "Interface restored. Some message deliveries are unconfirmed and were not resent. Check the conversation before sending again.",
     "cancel": "Cancel",
     "delete": "Delete",
     "edit": "Edit",
@@ -471,6 +473,7 @@
     "nativeTranscriptBackfillError": "Earlier transcript could not be loaded. Current messages remain available.",
     "nativeTranscriptBackfillPartial": "Some earlier transcript entries are unavailable. Readable messages remain visible.",
     "nativeSendFailed": "Failed to send message",
+    "composerDeliveryUncertain": "Delivery has not been confirmed. Check the conversation before deciding whether to resend.",
     "nativePermissionFailed": "Failed to handle permission request",
     "nativeSettingsFailed": "Failed to update session settings",
     "effortMinimal": "Minimal",

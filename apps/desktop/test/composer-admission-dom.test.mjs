@@ -36,6 +36,10 @@ async function resolveDesktopSource(importPath) {
 const stubsPlugin = {
   name: 'ccem-composer-submit-reentry-stubs',
   setup(builder) {
+    builder.onResolve({ filter: /^@\/lib\/webcontentRecovery$/ }, () => ({ path: 'recovery-stub', namespace: 'composer-submit-stubs' }));
+    builder.onLoad({ filter: /^recovery-stub$/, namespace: 'composer-submit-stubs' }, () => ({
+      loader: 'js', contents: 'export const isRecoveringWebcontent = () => Boolean(globalThis.window?.__ccemRecoveryTest);',
+    }));
     builder.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({
       path: 'tauri-core-stub', namespace: 'composer-submit-stubs',
     }));
@@ -59,7 +63,7 @@ const stubsPlugin = {
     }));
     builder.onLoad({ filter: /^sonner-stub$/, namespace: 'composer-submit-stubs' }, () => ({
       loader: 'js',
-      contents: 'export const toast = { error() {}, success() {}, warning() {} };',
+      contents: 'export const toast = { error(message, options) { globalThis.__acceptanceToasts?.push({ kind: "error", message, options }); }, success() {}, warning(message, options) { globalThis.__acceptanceToasts?.push({ kind: "warning", message, options }); } };',
     }));
     builder.onResolve({ filter: /^\.\/composerRouteDraft$/ }, (args) => {
       if (!args.importer.endsWith('WorkspaceSessionComposer.tsx')) return null;
@@ -165,6 +169,16 @@ async function importHarness() {
   }
   visit(ast);
   assert.ok(sendCallback, 'actual handleSend callback loaded');
+  const workspaceSource = await fs.readFile(path.join(desktopDir, 'src/pages/Workspace.tsx'), 'utf8');
+  const workspaceAst = ts.createSourceFile('workspace.tsx', workspaceSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const launchCallbacks = {};
+  function visitWorkspace(node) {
+    if (ts.isVariableDeclaration(node) && ['runCreateNativeConversation', 'runContinueHistorySession'].includes(node.name.getText(workspaceAst))) {
+      launchCallbacks[node.name.getText(workspaceAst)] = node.initializer.arguments[0].getText(workspaceAst);
+    }
+    ts.forEachChild(node, visitWorkspace);
+  }
+  visitWorkspace(workspaceAst);
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-composer-submit-reentry-'));
   const outputPath = path.join(tempDir, 'harness.cjs');
@@ -181,9 +195,16 @@ async function importHarness() {
         import { selectNativeSessionProcessing } from '@/components/workspace/workspaceNativeSessionProjection';
         import { shouldTreatNativeSessionAsProcessing } from '@/components/workspace/workspaceEventTranscript';
         import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
+        import { isRecoveringWebcontent as documentIsRecoveringWebcontent } from '@/lib/webcontentRecovery';
         import { Button } from '@/components/ui/button';
         const ProcessingActionIcon = () => <span>stop</span>;
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
+        import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult } from '@/components/workspace/composerSubmissionResult';
+        import { readRecoveryDraft, writeRecoveryDraft, recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
+        export const seedRecovery = writeRecoveryDraft;
+        export const recoveryCounts = recoveryDraftDiagnostics;
+        export const recoveryDraft = key => readRecoveryDraft(key, true);
+        export const classifyNativeFailure = nativeComposerFailureResult;
 
         export function renderNativeQueuedComposer() {
           return renderToStaticMarkup(
@@ -283,9 +304,11 @@ async function importHarness() {
         }
 
         export function mountFailure(container, processing, interactiveKind = null, annotationOverrides = null, route = {}) {
-          const state = { calls: 0, reject: null, resolve: null, errors: [], result: null, payloads: [], queueCalls: [], responses: [] };
+          const state = { calls: 0, reject: null, resolve: null, errors: [], warnings: [], result: null, payloads: [], queueCalls: [], responses: [] };
           function Harness() {
             const [revision, setRevision] = useState(0);
+            const [initialValue] = useState(() => route.recoveryKey
+              ? readRecoveryDraft(route.recoveryKey, true)?.text ?? '' : 'valuable follow-up draft');
             const annotationModel = useWorkspaceAnnotations('admission-test');
             state.annotations = annotationModel;
             state.addAnnotation = (quote, note, anchor) => act(() => annotationModel.addAnnotation(quote, note, anchor));
@@ -306,6 +329,7 @@ async function importHarness() {
             const hasHardBlockingAttention = Boolean(route.hardBlock);
             const hasBlockingAttention = hasQuickReplyPrompt || hasHardBlockingAttention;
             const isProcessingTurn = ${nativeExpressions.isProcessingTurn};
+            const isRecoveringWebcontent = () => route.recovered ?? documentIsRecoveringWebcontent();
             const queuedStateRef = { current: {runtimeId: session.runtime_id, messages: []} };
             const queuedFlushLeaseRef = { current: null };
             const pendingPlan = route.plan || route.synthetic ? { toolUseId: 'real-exit-plan-tool', eventSeq: 42, rawName: 'ExitPlanMode', prompt: { prompt_type: 'plan_exit', plan_summary: route.synthetic ? 'Claude is ready to run the next step' : 'Concrete QA plan requiring user review', allowed_prompts: ['继续执行'] } } : null;
@@ -317,7 +341,7 @@ async function importHarness() {
             const flushQueuedMessages = async () => true;
             const clearComposerDraft = () => setRevision(r => r + 1);
             const setComposerPlanModeEnabled = () => {};
-            const toast = { error: error => state.errors.push(error) };
+            const toast = { error: error => state.errors.push(error), warning: (message, options) => state.warnings.push({ message, options }) };
             const t = x => x;
             class PromptAnnotationLimitError extends Error {}
             const sendPromptBatch = (prompts, options) => {
@@ -347,11 +371,49 @@ async function importHarness() {
             const refreshSummary = pollEvents;
             const sendInteractivePromptReply = ${interactiveCallback};
             const handleSend = ${sendCallback};
+            const isCreatingNativeSession = false;
+            const isResumingHistorySession = false;
+            const composePromptRef = { current: initialValue };
+            const historyComposerTextRef = composePromptRef;
+            const effectiveComposeDir = route.noWorkingDir ? null : '/tmp';
+            const composeRouteDraftRef = { current: { optIn: false } };
+            const historyRouteDraftRef = composeRouteDraftRef;
+            const composeProvider = 'claude';
+            const currentEnv = 'fixture';
+            const historyEnv = currentEnv;
+            const permissionMode = 'dev';
+            const historyPermMode = permissionMode;
+            const composePlanModeEnabled = false;
+            const historyPlanModeEnabled = false;
+            const composeEffort = 'high';
+            const historyEffort = composeEffort;
+            const normalizeEffortForProvider = effort => effort;
+            const selectedSession = { source: 'claude', project: effectiveComposeDir, id: 'history-fixture' };
+            const messages = [];
+            const historyRouteResolutionStatusRef = { current: 'resolved' };
+            const isHistoryRouteContinuationBlocked = () => false;
+            const resolveComposerDispatch = ({prompt}) => ({ prompt, permMode: 'dev', runtimePermMode: 'dev' });
+            const setIsCreatingNativeSession = () => {};
+            const setIsResumingHistorySession = () => {};
+            const preflightCodexModelMigration = () => {};
+            const requestCodexModelMigrationDecision = () => {};
+            const acknowledgedCodexModelWarningsRef = { current: new Set() };
+            const startAfterCodexModelMigrationGate = async ({start}) => {
+              if (route.preflightFailure) throw new Error('preflight unavailable before create');
+              return { started: true, value: await start(undefined) };
+            };
+            const createNativeSession = payload => {
+              state.calls++; state.payloads.push(payload);
+              return new Promise((resolve, reject) => { state.reject = reject; state.resolve = resolve; });
+            };
+            const runCreateNativeConversation = ${launchCallbacks.runCreateNativeConversation};
+            const runContinueHistorySession = ${launchCallbacks.runContinueHistorySession};
             return <WorkspaceSessionComposer
-              value={revision === 0 ? 'valuable follow-up draft' : ''}
+              value={revision === 0 ? initialValue : ''}
               valueRevision={revision}
+              recoveryDraftKey={route.recoveryKey}
               onValueChange={() => {}}
-              onSubmit={payload => { state.submission = (async () => { state.result = await (interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; })(); return state.submission; }}
+              onSubmit={payload => { state.submission = (async () => { state.result = await (route.launch === 'compose' ? runCreateNativeConversation(payload) : route.launch === 'history' ? runContinueHistorySession(payload) : interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; })(); return state.submission; }}
               annotations={annotationOverrides ?? annotationModel.pendingAnnotations}
               onAnnotationsSent={annotationModel.markAllSent}
               onAnnotationsRestore={annotationModel.restoreAnnotations}
@@ -370,9 +432,11 @@ async function importHarness() {
                 await Promise.resolve(); await Promise.resolve();
               });
             },
-            async reject() {
+            async reject(error) {
               await act(async () => {
-                state.reject(new Error('NATIVE_QUEUE_ENQUEUE_REJECTED'));
+                state.reject(error ?? new Error(interactiveKind || route.plan
+                  ? 'INTERACTIVE_ATTENTION_STALE: occurrence is no longer current'
+                  : 'Failed to queue native input: client_message_id must not be empty'));
                 await state.submission;
                 await Promise.resolve();
               });
@@ -1393,4 +1457,85 @@ test('active Plan typed approval classifies display text while preserving expand
   assert.equal(mounted.state.result, true);
   assert.equal(mounted.text(), '');
   assert.equal(mounted.state.annotations.pendingAnnotations.length, 0);
+});
+
+for (const scenario of [
+  { name: 'idle live', processing: false },
+  { name: 'busy live', processing: true },
+  { name: 'interactive text', interactiveKind: 'text' },
+  { name: 'interactive Plan', interactiveKind: 'plan_exit' },
+  { name: 'interactive question', interactiveKind: 'ask_user_question' },
+  { name: 'new conversation', launch: 'compose' },
+  { name: 'history continuation', launch: 'history' },
+]) {
+  test(`actual ${scenario.name} lost ACK preserves editor but cannot restore a sendable submission`, async (t) => {
+    const { container, restore } = installDom();
+    t.after(restore);
+    const harness = await (importedHarnessPromise ??= importHarness());
+    window.__ccemRecoveryTest = true;
+    globalThis.__acceptanceToasts = [];
+    t.after(() => { delete globalThis.__acceptanceToasts; });
+    const key = `lost-ack-${scenario.name}`;
+    const image = { id: 'ack-image', kind: 'image', source: 'paste', name: 'context.png',
+      placeholder: '[Image #1]', mediaType: 'image/png', base64Data: 'aGVsbG8=', byteSize: 5, objectUrl: null };
+    harness.seedRecovery(key, 'saved context [Image #1]', [image]);
+    const route = { launch: scenario.launch, recoveryKey: key };
+    const mounted = harness.mountFailure(container, Boolean(scenario.processing), scenario.interactiveKind, null, route);
+    await mounted.submit();
+    assert.equal(mounted.state.calls, 1);
+    await mounted.reject(new Error('transport disconnected after request dispatch'));
+    assert.equal(mounted.state.result, 'delivery_uncertain');
+    assert.deepEqual(mounted.state.errors, []);
+    assert.deepEqual(globalThis.__acceptanceToasts, [{
+      kind: 'warning', message: 'workspace.composerDeliveryUncertain', options: { id: 'composer-delivery-uncertain' },
+    }]);
+    if (scenario.interactiveKind) assert.deepEqual(mounted.state.warnings, [{
+      message: 'workspace.composerDeliveryUncertain', options: { id: 'composer-delivery-uncertain' },
+    }], 'interactive reply uses the same toast id as Composer for deduplication');
+    assert.match(mounted.text(), /saved context/);
+    assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 0);
+    assert.equal(harness.recoveryCounts().uncertain, 1);
+    assert.equal(harness.recoveryDraft(key), null);
+    mounted.unmount();
+    const remounted = harness.mountFailure(container, Boolean(scenario.processing), scenario.interactiveKind, null, route);
+    assert.equal(remounted.text(), '');
+    assert.equal(remounted.state.calls, 0);
+    assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 0);
+    assert.equal(harness.recoveryCounts().uncertain, 1);
+    remounted.unmount();
+  });
+}
+
+for (const launch of ['compose', 'history']) {
+  test(`actual ${launch} preflight failure keeps its draft definitely unsubmitted`, async (t) => {
+    const { container, restore } = installDom();
+    t.after(restore);
+    const harness = await (importedHarnessPromise ??= importHarness());
+    window.__ccemRecoveryTest = true;
+    const key = `preflight-${launch}`;
+    harness.seedRecovery(key, 'unsubmitted draft', []);
+    const mounted = harness.mountFailure(container, false, null, null, { launch, recoveryKey: key, preflightFailure: true });
+    await mounted.submit();
+    assert.equal(mounted.state.calls, 0);
+    assert.equal(mounted.state.result, false);
+    assert.equal(harness.recoveryDraft(key).text, 'unsubmitted draft');
+    assert.equal(harness.recoveryCounts().uncertain, 0);
+    mounted.unmount();
+  });
+}
+
+test('only audited native pre-admission failures are classified as definite rejection', async () => {
+  const harness = await (importedHarnessPromise ??= importHarness());
+  for (const error of [
+    'Failed to queue native input: client_message_id must not be empty',
+    'INTERACTIVE_ATTENTION_STALE: occurrence expired',
+    'PLAN_SETTINGS_NOT_APPLIED: interactive reply was not sent',
+    'PLAN_SETTINGS_ACK_TIMEOUT: interactive reply was not sent',
+  ]) assert.equal(harness.classifyNativeFailure(new Error(error)), false);
+  for (const error of [
+    'NATIVE_QUEUE_ENQUEUE_REJECTED', 'transport disconnected',
+    'DELIVERY_UNCERTAIN: prompt may have reached helper',
+    'INTERACTIVE_RESPONSE_ACK_TIMEOUT: no acknowledgement',
+    'Native send task failed: worker exited',
+  ]) assert.equal(harness.classifyNativeFailure(new Error(error)), 'delivery_uncertain');
 });

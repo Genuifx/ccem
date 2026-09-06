@@ -850,7 +850,7 @@ const ToolCallRow = memo(function ToolCallRow({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [open, hasRenderedBody], scope: detailBodyRef });
+  }, { dependencies: [open, hasRenderedBody], scope: detailBodyRef, revertOnUpdate: true });
 
   return (
     <div className="workspace-tool-row-virtualized">
@@ -1025,7 +1025,7 @@ function WorkspaceToolDigestComponent({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [open, hasRenderedBody], scope: digestBodyRef });
+  }, { dependencies: [open, hasRenderedBody], scope: digestBodyRef, revertOnUpdate: true });
 
   return (
     <div className={cn('max-w-[760px]', className)}>

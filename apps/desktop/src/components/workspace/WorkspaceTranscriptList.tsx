@@ -352,6 +352,8 @@ export function WorkspaceTranscriptList({
     [displayItems],
   );
 
+  // Release completed tweens on updates too, so windowed-away rows can be
+  // collected while this session view stays mounted.
   useGSAP(() => {
     const list = listRef.current;
     const currentKeys = displayItems.map((item) => item.key);
@@ -410,7 +412,7 @@ export function WorkspaceTranscriptList({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [displayItemTailSignal], scope: listRef });
+  }, { dependencies: [displayItemTailSignal], scope: listRef, revertOnUpdate: true });
 
   // --- Top windowing (opt-in) ---------------------------------------------
   // Items more than N viewports above the scroll top collapse into a spacer.

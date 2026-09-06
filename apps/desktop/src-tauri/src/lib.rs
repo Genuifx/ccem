@@ -15,6 +15,7 @@ mod crypto;
 mod desktop_instance_lock;
 mod dev_instance;
 mod diagnostic_log;
+mod webcontent_recovery;
 mod doctor;
 mod dsh_history;
 mod event_bus;
@@ -5566,8 +5567,12 @@ pub fn run_desktop_app() -> i32 {
     #[cfg(any(target_os = "macos", windows))]
     let builder = builder.manage(cef_host_controller.clone());
 
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(webcontent_recovery::handle_termination);
+
     let app = builder
         .on_page_load(move |webview, payload| {
+            webcontent_recovery::handle_page_load(&webview, payload.event());
             if webview.window().label() != "main" || payload.event() != PageLoadEvent::Finished {
                 return;
             }
@@ -5864,6 +5869,11 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            webcontent_recovery::webcontent_debug_main_process_id,
+            webcontent_recovery::webcontent_frontend_boot,
+            webcontent_recovery::webcontent_frontend_ready,
+            webcontent_recovery::webcontent_frontend_sample,
             companion::get_companion,
             pet_notifications::get_pet_notification_read_state,
             pet_notifications::mark_pet_notification_read,
@@ -6117,6 +6127,7 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .setup(move |app| {
+            webcontent_recovery::initialize(app.handle());
             if automatic_background_services_enabled {
                 if let Err(error) = cleanup_orphaned_runtime_processes() {
                     eprintln!("Runtime orphan cleanup warning: {}", error);

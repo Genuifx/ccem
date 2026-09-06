@@ -12,6 +12,17 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
+import { isRecoveringWebcontent } from '@/lib/webcontentRecovery';
+import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, type ComposerSubmitResult } from './composerSubmissionResult';
+import { toRecoveredComposerDraft } from './composerRecovery';
+import {
+  beginRecoveryDraftSubmission,
+  discardRejectedRecoveryDraft,
+  finishRecoveryDraftSubmission,
+  readRecoveryDraft,
+  readRejectedRecoveryDrafts,
+  writeRecoveryDraft,
+} from '@/lib/recoveryDrafts';
 import {
   AlertCircle,
   ArrowUp,
@@ -136,8 +147,9 @@ export interface ComposerQueuedMessage {
 interface WorkspaceSessionComposerProps {
   value: string;
   valueRevision?: number;
+  recoveryDraftKey?: string;
   onValueChange: (value: string) => void;
-  onSubmit: (payload: ComposerSubmitPayload) => boolean | void | Promise<boolean | void>;
+  onSubmit: (payload: ComposerSubmitPayload) => ComposerSubmitResult | Promise<ComposerSubmitResult>;
   placeholder: string;
   disabled?: boolean;
   canSubmit: boolean;
@@ -828,6 +840,7 @@ function ComposerTriggerSuggestionPanel({
 export function WorkspaceSessionComposer({
   value,
   valueRevision = 0,
+  recoveryDraftKey,
   onValueChange,
   onSubmit,
   placeholder,
@@ -886,6 +899,7 @@ export function WorkspaceSessionComposer({
     submitGuardRef.current = createReentryGuard();
   }
   const draftEditRevisionRef = useRef(0);
+  const recoveryDraftIdRef = useRef<string | null>(null);
   const syncedPlainTextRef = useRef(value);
   const syncedValueRevisionRef = useRef(valueRevision);
   const previousAttachmentIdsRef = useRef<string[]>([]);
@@ -896,7 +910,7 @@ export function WorkspaceSessionComposer({
   annotationsRef.current = annotations;
   const recoveredDraftsRef = useRef(new WeakSet<object>());
   const [recoveryBlocked, setRecoveryBlocked] = useState(false);
-  const [rejectedDrafts, setRejectedDrafts] = useState<{ segments: Segment[]; attachments: ComposerAttachment[]; annotations: WorkspaceAnnotation[] }[]>([]);
+  const [rejectedDrafts, setRejectedDrafts] = useState<{ segments: Segment[]; attachments: ComposerAttachment[]; annotations: WorkspaceAnnotation[]; recoveryId?: string }[]>([]);
   const [recentFiles, setRecentFiles] = useState<ComposerRecentFile[]>([]);
   const [isDragTarget, setIsDragTarget] = useState(false);
   const [draggedFileCount, setDraggedFileCount] = useState(0);
@@ -1016,14 +1030,18 @@ export function WorkspaceSessionComposer({
 
   useEffect(() => {
     setRecentFiles(loadComposerRecentFiles(workingDir));
-    setAttachments((previous) => {
-      revokeComposerImageUrls(previous);
-      attachmentsRef.current = [];
-      return [];
-    });
+    setRejectedDrafts(readRejectedRecoveryDrafts(recoveryDraftKey, isRecoveringWebcontent()).map(toRecoveredComposerDraft));
+    const recovered = readRecoveryDraft(recoveryDraftKey, isRecoveringWebcontent());
+    const restored = recovered?.attachments ?? [];
+    // React can replay state updaters after an input edit; keep draft identity
+    // changes outside the updater so they cannot invalidate that newer edit.
+    revokeComposerImageUrls(attachmentsRef.current);
+    recoveryDraftIdRef.current = recovered?.id ?? null;
+    attachmentsRef.current = restored;
+    setAttachments(restored);
     setIsDragTarget(false);
     setDraggedFileCount(0);
-  }, [workingDir]);
+  }, [recoveryDraftKey, workingDir]);
 
   useEffect(() => {
     return () => {
@@ -1039,6 +1057,7 @@ export function WorkspaceSessionComposer({
     const next = mergeComposerAttachments(attachmentsRef.current, nextAttachments);
     attachmentsRef.current = next;
     setAttachments(next);
+    recoveryDraftIdRef.current = writeRecoveryDraft(recoveryDraftKey, syncedPlainTextRef.current, next);
     for (const attachment of nextAttachments) {
       if (attachment.kind !== 'file') {
         continue;
@@ -1046,15 +1065,16 @@ export function WorkspaceSessionComposer({
       saveComposerRecentFile(workingDir, attachment);
     }
     setRecentFiles(loadComposerRecentFiles(workingDir));
-  }, [workingDir]);
+  }, [recoveryDraftKey, workingDir]);
 
   const syncComposerSegments = useCallback((segments: Segment[]) => {
     draftEditRevisionRef.current += 1;
     setComposerSegments(segments);
     const plainText = segmentsToPlainText(segments);
     syncedPlainTextRef.current = plainText;
+    recoveryDraftIdRef.current = writeRecoveryDraft(recoveryDraftKey, plainText, attachmentsRef.current);
     onValueChange(plainText);
-  }, [onValueChange]);
+  }, [onValueChange, recoveryDraftKey]);
 
   const pruneUnreferencedImageAttachments = useCallback((segments: Segment[]) => {
     let changed = false;
@@ -1074,8 +1094,9 @@ export function WorkspaceSessionComposer({
     if (changed) {
       attachmentsRef.current = next;
       setAttachments(next);
+      recoveryDraftIdRef.current = writeRecoveryDraft(recoveryDraftKey, syncedPlainTextRef.current, next);
     }
-  }, []);
+  }, [recoveryDraftKey]);
 
   const handlePromptSegmentsChange = useCallback((segments: Segment[]) => {
     syncComposerSegments(segments);
@@ -1268,7 +1289,8 @@ export function WorkspaceSessionComposer({
     const next = previous.filter((attachment) => attachment.id !== id);
     attachmentsRef.current = next;
     setAttachments(next);
-  }, [onValueChange]);
+    recoveryDraftIdRef.current = writeRecoveryDraft(recoveryDraftKey, syncedPlainTextRef.current, next);
+  }, [onValueChange, recoveryDraftKey]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1337,17 +1359,26 @@ export function WorkspaceSessionComposer({
 
   const runComposerSubmit = useCallback(async () => {
     const submittedRevision = draftEditRevisionRef.current;
+    const capturedRecoveryDraftId = recoveryDraftIdRef.current;
     const submittedSegments = promptAreaRef.current?.getSegments() ?? composerSegments;
     const submittedAnnotations = annotations.slice();
     const promptValue = segmentsToPlainText(submittedSegments);
     const currentAttachments = attachmentsRef.current;
+    let submissionId: string | null = null;
     // Only definite non-admission reaches this exit. Preparation failures and
     // explicit submit rejection must preserve the same captured draft.
     const rejectUnadmittedDraft = () => {
       if (draftEditRevisionRef.current !== submittedRevision
         || attachmentsRef.current !== currentAttachments
         || JSON.stringify(annotationsRef.current) !== JSON.stringify(submittedAnnotations)) {
+        if (!submissionId) {
+          submissionId = beginRecoveryDraftSubmission(
+            recoveryDraftKey, promptValue, currentAttachments, capturedRecoveryDraftId, undefined, submittedAnnotations,
+          );
+          finishRecoveryDraftSubmission(recoveryDraftKey, submissionId, false);
+        }
         setRejectedDrafts((previous) => [...previous, {
+          ...(submissionId ? { recoveryId: submissionId } : {}),
           segments: submittedSegments,
           annotations: submittedAnnotations,
           attachments: currentAttachments.map((attachment) => attachment.kind === 'image'
@@ -1421,8 +1452,28 @@ export function WorkspaceSessionComposer({
       return rejectUnadmittedDraft();
     }
 
-    const result = await onSubmit(payload);
+    submissionId = beginRecoveryDraftSubmission(
+      recoveryDraftKey, promptValue, currentAttachments, capturedRecoveryDraftId, undefined, submittedAnnotations,
+    );
+    // A thrown transport error can mean admission succeeded before ACK loss.
+    // Only an explicit false result is a definite rejection.
+    let result: ComposerSubmitResult;
+    try {
+      result = await onSubmit(payload);
+    } catch {
+      console.warn('Composer submission acknowledgement unavailable', { uncertain: 1 });
+      toast.warning(t('workspace.composerDeliveryUncertain'), { id: COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID });
+      return 'delivery_uncertain';
+    }
+    if (result === 'delivery_uncertain') {
+      // Keep the live editor intact, but never restore an unacknowledged input
+      // as a sendable draft after document loss.
+      toast.warning(t('workspace.composerDeliveryUncertain'), { id: COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID });
+      return result;
+    }
+    finishRecoveryDraftSubmission(recoveryDraftKey, submissionId, result !== false);
     if (result === false) {
+      recoveryDraftIdRef.current = readRecoveryDraft(recoveryDraftKey, true)?.id ?? null;
       return rejectUnadmittedDraft();
     } else {
       // Admission only consumes this submission's snapshot. Edits made while
@@ -1438,6 +1489,11 @@ export function WorkspaceSessionComposer({
       revokeComposerImageUrls(currentAttachments.filter((attachment) => !retainedIds.has(attachment.id)));
       attachmentsRef.current = remaining;
       setAttachments(remaining);
+      recoveryDraftIdRef.current = writeRecoveryDraft(
+        recoveryDraftKey,
+        draftEditRevisionRef.current === submittedRevision ? '' : syncedPlainTextRef.current,
+        remaining,
+      );
       setIsDragTarget(false);
       setDraggedFileCount(0);
       setInlineSkillPopover(null);
@@ -1452,6 +1508,7 @@ export function WorkspaceSessionComposer({
     onAnnotationsSent,
     onRefreshSkills,
     onSubmit,
+    recoveryDraftKey,
     provider,
     t,
     workspaceCommands,
@@ -1580,7 +1637,7 @@ export function WorkspaceSessionComposer({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [attentionMotionKey], scope: composerShellRef });
+  }, { dependencies: [attentionMotionKey], scope: composerShellRef, revertOnUpdate: true });
 
   useGSAP(() => {
     const strip = attachmentStripRef.current;
@@ -1614,7 +1671,7 @@ export function WorkspaceSessionComposer({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [attachmentMotionKey, isDragTarget], scope: composerShellRef });
+  }, { dependencies: [attachmentMotionKey, isDragTarget], scope: composerShellRef, revertOnUpdate: true });
 
   useGSAP(() => {
     const button = primaryActionButtonRef.current;
@@ -1632,7 +1689,7 @@ export function WorkspaceSessionComposer({
         clearProps: 'transform',
       },
     );
-  }, { dependencies: [resolvedActionLabel, isSubmitting], scope: composerShellRef });
+  }, { dependencies: [resolvedActionLabel, isSubmitting], scope: composerShellRef, revertOnUpdate: true });
 
   return (
     <div className="px-2 pb-3 pt-2 sm:px-4">
@@ -1787,6 +1844,9 @@ export function WorkspaceSessionComposer({
                 if (promptAreaRef.current) promptAreaRef.current.setSegments(recoveredSegments);
                 else syncComposerSegments(recoveredSegments);
                 addAttachments(restored);
+                if (rejectedDraft.recoveryId && recoveryDraftIdRef.current) {
+                  discardRejectedRecoveryDraft(recoveryDraftKey, rejectedDraft.recoveryId);
+                }
                 setRejectedDrafts((previous) => previous.filter((snapshot) => snapshot !== rejectedDraft));
               }}>{t('workspace.composerRecoverRejected')}</Button>
             </div>
@@ -1855,6 +1915,7 @@ export function WorkspaceSessionComposer({
 
               <Button
                 ref={primaryActionButtonRef}
+                data-workspace-composer-submit={onPrimaryAction ? undefined : ''}
                 type="button"
                 size="icon"
                 variant={primaryActionVariant}

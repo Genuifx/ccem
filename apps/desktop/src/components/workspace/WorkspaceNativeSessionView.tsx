@@ -27,6 +27,8 @@ import {
   type ReactNode,
 } from 'react';
 import { toast } from 'sonner';
+import { isRecoveringWebcontent, registerWebcontentSessionSample } from '@/lib/webcontentRecovery';
+import { readRecoveryDraft, recoveryDraftKey } from '@/lib/recoveryDrafts';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -86,6 +88,7 @@ import {
   type ComposerSubmitPayload,
 } from './composerAttachments';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
+import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult, type ComposerSubmitResult } from './composerSubmissionResult';
 import { getWorkspaceForkTurnPreview } from './WorkspaceForkDialog';
 import { shouldPreserveRestoredReadingPosition } from './workspaceTranscriptTopWindowing';
 import {
@@ -817,7 +820,7 @@ function WorkspaceAttentionPanel({
   respondingRequestId: string | null;
   isSubmittingPrompt: boolean;
   onPermission: (requestId: string, approved: boolean) => void;
-  onSubmitPromptReply: (payload: InteractivePromptReplyPayload) => Promise<boolean>;
+  onSubmitPromptReply: (payload: InteractivePromptReplyPayload) => Promise<ComposerSubmitResult>;
 }) {
   const { t } = useLocale();
   const [promptStates, setPromptStates] = useState<Record<string, InteractivePromptState>>({});
@@ -908,7 +911,7 @@ function WorkspaceAttentionPanel({
         clearProps: 'opacity,visibility,transform',
       },
     );
-  }, { dependencies: [attentionMotionKey], scope: attentionPanelRef });
+  }, { dependencies: [attentionMotionKey], scope: attentionPanelRef, revertOnUpdate: true });
 
   const updatePromptState = useCallback((
     toolUseId: string,
@@ -1586,6 +1589,20 @@ export function WorkspaceNativeSessionView({
   const lastSeenSeqRef = useRef<number | null>(latestEventSeq(events));
   const latestEventsRef = useRef<SessionEventRecord[]>(events);
   const previousMessagesRef = useRef<ConversationMessageData[]>([]);
+  useEffect(() => registerWebcontentSessionSample(() => {
+    let toolResultChars = 0;
+    for (const message of previousMessagesRef.current) {
+      if (!Array.isArray(message.content)) continue;
+      for (const block of message.content) {
+        if (typeof block._result === 'string') toolResultChars += block._result.length;
+      }
+    }
+    return {
+      rawEventCount: latestEventsRef.current.length,
+      projectedMessageCount: previousMessagesRef.current.length,
+      toolResultChars,
+    };
+  }), [session.runtime_id]);
   // Incremental derivation state (plan 022): transcript messages, usage totals
   // and review evidence fold only appended events; a reset refolds from
   // scratch when the event list is not a suffix extension of what was folded.
@@ -2058,7 +2075,15 @@ export function WorkspaceNativeSessionView({
     prevEventCountRef.current = 0;
     setEvents(cachedEvents);
     setTranscriptBackfillView({ runtimeId: session.runtime_id, state: 'idle' });
-    clearComposerDraft();
+    const recoveredDraft = readRecoveryDraft(
+      recoveryDraftKey('live', session.runtime_id), isRecoveringWebcontent(),
+    );
+    if (recoveredDraft) {
+      handleComposerTextChange(recoveredDraft.text);
+      setComposerDraftRevision((revision) => revision + 1);
+    } else {
+      clearComposerDraft();
+    }
     setComposerPlanModeEnabled(isNativeSessionPlanRuntime(session));
     setLocalUserPrompts(initialPrompts);
     setSelectedFileCheckpoint(null);
@@ -2073,6 +2098,7 @@ export function WorkspaceNativeSessionView({
     setIsRefreshingGitSnapshot(false);
   }, [
     clearComposerDraft,
+    handleComposerTextChange,
     clearFileRewindTimeout,
     initialAnnotations,
     initialImages,
@@ -3007,6 +3033,7 @@ export function WorkspaceNativeSessionView({
     const lifecycle = session.lifecycle;
     if (
       !isVisible
+      || isRecoveringWebcontent()
       || lifecycle?.adapter !== 'legacy_serial'
       || lifecycle.active_command_id != null
       || (lifecycle.queue_count ?? 0) === 0
@@ -3297,7 +3324,7 @@ export function WorkspaceNativeSessionView({
 
   const sendInteractivePromptReply = useCallback(async (
     payload: InteractivePromptReplyPayload,
-  ) => {
+  ): Promise<ComposerSubmitResult> => {
     let requestText = '';
     let requestImages: NativePromptImageInput[] | undefined;
     if (payload.kind === 'text') {
@@ -3393,8 +3420,10 @@ export function WorkspaceNativeSessionView({
       } catch (refreshError) {
         console.error('Failed to refresh native session after interactive reply error:', refreshError);
       }
-      toast.error(t('workspace.nativeSendFailed'));
-      return false;
+      const result = nativeComposerFailureResult(error);
+      if (result === false) toast.error(t('workspace.nativeSendFailed'));
+      else toast.warning(t('workspace.composerDeliveryUncertain'), { id: COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID });
+      return result;
     } finally {
       setIsSending(false);
     }
@@ -3527,7 +3556,12 @@ export function WorkspaceNativeSessionView({
     performEffortChange(effort);
   }, [activeBackgroundTaskCount, performEffortChange]);
 
-  const flushQueuedMessages = useCallback((): Promise<boolean> => {
+  const flushQueuedMessages = useCallback((explicitRecoverySend = false): Promise<boolean> => {
+    // A new prompt is not consent to replay old input with an unknown ACK.
+    // Only the queue's explicit send action may release it after recovery.
+    if (isRecoveringWebcontent() && !explicitRecoverySend) {
+      return Promise.resolve(false);
+    }
     const runtimeId = session.runtime_id;
     const existingLease = queuedFlushLeaseRef.current;
     if (existingLease?.runtimeId === runtimeId) {
@@ -3604,7 +3638,7 @@ export function WorkspaceNativeSessionView({
     waitForPendingEnvironmentUpdate,
   ]);
 
-  const handleSend = useCallback(async (payload?: ComposerSubmitPayload) => {
+  const handleSend = useCallback(async (payload?: ComposerSubmitPayload): Promise<ComposerSubmitResult> => {
     if (isSending || (session.provider !== 'claude' && isProcessingTurn)) {
       return false;
     }
@@ -3681,19 +3715,20 @@ export function WorkspaceNativeSessionView({
         return false;
       }
       try {
-        if (!await flushQueuedMessages()) {
+        if (!isRecoveringWebcontent() && !await flushQueuedMessages()) {
           return false;
         }
         setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
         await sendPromptBatch([nextPrompt], { queuedBehindTurn: true });
         return true;
       } catch (error) {
-        toast.error(t(
+        const result = error instanceof PromptAnnotationLimitError ? false : nativeComposerFailureResult(error);
+        if (result === false) toast.error(t(
           error instanceof PromptAnnotationLimitError
             ? 'workspace.messageAnnotationsBatchLimit'
             : 'workspace.nativeSendFailed',
         ));
-        return false;
+        return result;
       }
     }
 
@@ -3702,7 +3737,7 @@ export function WorkspaceNativeSessionView({
       liveQueuedState.runtimeId === session.runtime_id
       && liveQueuedState.messages.length > 0
     ) || queuedFlushLeaseRef.current?.runtimeId === session.runtime_id;
-    if (legacyQueueMigrationPending && !hasBlockingAttention) {
+    if (!isRecoveringWebcontent() && legacyQueueMigrationPending && !hasBlockingAttention) {
       if (!await flushQueuedMessages()) {
         return false;
       }
@@ -3711,12 +3746,13 @@ export function WorkspaceNativeSessionView({
         setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
         return true;
       } catch (error) {
-        toast.error(t(
+        const result = error instanceof PromptAnnotationLimitError ? false : nativeComposerFailureResult(error);
+        if (result === false) toast.error(t(
           error instanceof PromptAnnotationLimitError
             ? 'workspace.messageAnnotationsBatchLimit'
             : 'workspace.nativeSendFailed',
         ));
-        return false;
+        return result;
       }
     }
 
@@ -3725,12 +3761,13 @@ export function WorkspaceNativeSessionView({
       setComposerPlanModeEnabled(sessionRuntimePermMode === 'plan');
       return true;
     } catch (error) {
-      toast.error(t(
+      const result = error instanceof PromptAnnotationLimitError ? false : nativeComposerFailureResult(error);
+      if (result === false) toast.error(t(
         error instanceof PromptAnnotationLimitError
           ? 'workspace.messageAnnotationsBatchLimit'
           : 'workspace.nativeSendFailed',
       ));
-      return false;
+      return result;
     }
   }, [
     composerPlanModeEnabled,
@@ -4087,6 +4124,7 @@ export function WorkspaceNativeSessionView({
   useEffect(() => {
     if (
       queuedMessages.length === 0
+      || isRecoveringWebcontent()
       || isSending
       || isTerminalStatus(session.status)
     ) {
@@ -4197,8 +4235,9 @@ export function WorkspaceNativeSessionView({
       </ScrollArea>
 
       <WorkspaceSessionComposer
-        value=""
+        value={composerTextRef.current}
         valueRevision={composerDraftRevision}
+        recoveryDraftKey={recoveryDraftKey('live', session.runtime_id)}
         onValueChange={handleComposerTextChange}
         onSubmit={handleSend}
         placeholder={t('workspace.composePlaceholder')}
@@ -4268,7 +4307,7 @@ export function WorkspaceNativeSessionView({
         opencodeInstalled={opencodeInstalled}
         onLaunchNewSession={onLaunchNewSession}
         queuedMessages={composerQueuedMessages}
-        onFlushQueuedMessages={() => void flushQueuedMessages()}
+        onFlushQueuedMessages={() => void flushQueuedMessages(true)}
         onRemoveQueuedMessage={handleRemoveQueuedMessage}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
         annotations={sessionAnnotations.pendingAnnotations}

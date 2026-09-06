@@ -7,6 +7,7 @@ import { TrayCockpit } from './pages/TrayCockpit';
 import { initPerformanceMode } from './lib/performance';
 import { initPerfLog } from './lib/perf-log';
 import { resolveDesktopWindowRoot } from './lib/windowRootRouting';
+import { initializeWebcontentRecovery } from './lib/webcontentRecovery';
 import './index.css';
 
 initPerformanceMode();
@@ -36,8 +37,11 @@ function resolveRoot() {
 
 const Root = resolveRoot();
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <Root />
-  </React.StrictMode>,
+const mount = () => ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode><Root /></React.StrictMode>,
 );
+if (Root === App) {
+  void initializeWebcontentRecovery().then(mount);
+} else {
+  mount();
+}

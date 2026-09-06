@@ -13,6 +13,9 @@ function extractRegisteredAppCommands(source) {
   assert.ok(block, 'lib.rs must contain the Tauri generate_handler command list');
 
   return block
+    // Conditional commands still need an explicit ACL. Remove their Rust cfg
+    // attributes before splitting so commas inside cfg(all(...)) are not names.
+    .replace(/#\[\s*cfg\b[^\]]*\]/g, '')
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean)

@@ -1,5 +1,7 @@
 {
   "common": {
+    "webcontentRecovered": "界面已恢复",
+    "webcontentRecoveredUncertain": "界面已恢复。部分消息的发送结果尚未确认，未自动重发，请先检查会话记录。",
     "cancel": "取消",
     "delete": "删除",
     "edit": "编辑",
@@ -471,6 +473,7 @@
     "nativeTranscriptBackfillError": "较早的转录加载失败，当前消息仍可查看。",
     "nativeTranscriptBackfillPartial": "部分较早的转录不可用，已保留可读取的消息。",
     "nativeSendFailed": "发送消息失败",
+    "composerDeliveryUncertain": "发送结果尚未确认，请先查看会话记录，再决定是否重发。",
     "nativePermissionFailed": "处理权限请求失败",
     "nativeSettingsFailed": "更新会话设置失败",
     "effortMinimal": "最低",

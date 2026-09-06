@@ -21,7 +21,7 @@ helper_name = "ccem-cef-helper"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "unstable"] }
+tauri = { version = "=2.11.5", features = ["tray-icon", "unstable"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
@@ -63,7 +63,7 @@ shared_child = "1.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 cef = { version = "=150.0.0", default-features = false, features = ["sandbox", "build-util"] }
 cef-objc2 = { package = "objc2", version = "0.6" }
-cef-objc2-app-kit = { package = "objc2-app-kit", version = "0.3", default-features = false, features = ["NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
+cef-objc2-app-kit = { package = "objc2-app-kit", version = "0.3", default-features = false, features = ["libc", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSView", "NSWindow"] }
 cef-objc2-foundation = { package = "objc2-foundation", version = "0.3", default-features = false, features = ["NSGeometry", "NSObject", "NSValue", "NSProcessInfo", "NSRunLoop", "NSThread", "NSTimer"] }
 objc2 = { version = "0.5.2", default-features = false }
 block2 = { version = "0.5.1" }
@@ -83,5 +83,5 @@ chromium-spike = []
 updater-replacement-smoke-harness = []
 
 [dev-dependencies]
-tauri = { version = "2", features = ["test"] }
+tauri = { version = "=2.11.5", features = ["test"] }
 tempfile = "3"
