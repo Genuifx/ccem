@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { Fragment, useEffect, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import { cn } from '@/lib/utils'
 import type { TriggerSuggestion } from './types'
@@ -130,6 +130,10 @@ export function TriggerPopover({
           const path = kind === 'skill' ? getSuggestionPath(suggestion) : null
 
           return (
+            <Fragment key={suggestion.value}>
+            {suggestion.group && suggestion.group !== suggestions[index - 1]?.group ? (
+              <div role="presentation" className="px-3 pb-1 pt-2 text-[10px] font-medium text-muted-foreground">{suggestion.group}</div>
+            ) : null}
             <button
               key={suggestion.value}
               ref={index === selectedIndex ? selectedRef : undefined}
@@ -186,6 +190,7 @@ export function TriggerPopover({
                 ) : null}
               </div>
             </button>
+            </Fragment>
           )
         })
       )}

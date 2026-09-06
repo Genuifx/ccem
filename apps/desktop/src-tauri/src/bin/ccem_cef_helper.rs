@@ -54,21 +54,48 @@ impl Drop for FrameworkLoader {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
     let executable = std::env::current_exe().expect("resolve bundled CEF helper executable");
     let loader = FrameworkLoader::new(&executable);
+
+    // CEF requires Seatbelt initialization before loading its framework. Build
+    // native argv without calling any dynamically loaded CEF APIs, and retain
+    // the backing strings for the lifetime of the sandbox context.
+    let arguments = std::env::args_os()
+        .map(|argument| {
+            CString::new(argument.as_os_str().as_bytes()).expect("native argv contains NUL")
+        })
+        .collect::<Vec<_>>();
+    let mut argv = arguments
+        .iter()
+        .map(|argument| argument.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    let argc = i32::try_from(argv.len()).expect("too many native arguments");
+    argv.push(std::ptr::null_mut());
+    let main_args = cef::MainArgs {
+        argc,
+        argv: argv.as_mut_ptr(),
+    };
+    let sandbox = loader.is_bundled().then(|| {
+        let mut sandbox = cef::sandbox::Sandbox::new();
+        sandbox.initialize(&main_args);
+        sandbox
+    });
     assert!(loader.load(), "load the bundled CEF framework");
 
     initialize_cef_api();
-    run_subprocess(loader.is_bundled());
+    run_subprocess();
 
     // Keep the framework loaded until all CEF-owned values have been dropped.
     drop(loader);
+    drop(sandbox);
 }
 
 #[cfg(all(target_os = "windows", debug_assertions))]
 fn main() {
     initialize_cef_api();
-    run_subprocess(false);
+    run_subprocess();
 }
 
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
@@ -91,19 +118,12 @@ fn initialize_cef_api() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn run_subprocess(_sandbox_enabled: bool) {
+fn run_subprocess() {
     use cef::{args::Args, execute_process, App};
 
     // Args owns CEF strings internally, so it must be constructed only after
     // the CEF API table is live.
     let args = Args::new();
-
-    #[cfg(target_os = "macos")]
-    let _sandbox = _sandbox_enabled.then(|| {
-        let mut sandbox = cef::sandbox::Sandbox::new();
-        sandbox.initialize(args.as_main_args());
-        sandbox
-    });
 
     let exit_code = execute_process(
         Some(args.as_main_args()),

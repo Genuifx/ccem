@@ -50,7 +50,7 @@ test('deferred attachment state processing after immediate mount input cannot re
     revokeComposerImageUrls() {}, setIsDragTarget() {}, setDraggedFileCount() {},
     // React may evaluate/replay a functional updater later than the effect.
     setAttachments: update => pendingAttachmentUpdates.push(update),
-    setComposerSegments() {}, segmentsToPlainText: segments => segments.map(s => s.text).join(''),
+    setComposerSegments() {}, serializeComposerSessionReferences: segments => segments.map(s => s.text).join(''),
     onValueChange() {},
   };
   const load = callback => new Function(...Object.keys(bindings), `${transpile(`const callback = ${callback};`)}; return callback;`)(...Object.values(bindings));

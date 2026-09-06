@@ -1,5 +1,11 @@
 # ccem
 
+## 2.80.0
+
+### Minor Changes
+
+- Release v2.80.0: minor version bump for the fixes and preset refresh accumulated since v2.79.0.
+
 ## 2.79.0
 
 ### Minor Changes

@@ -356,6 +356,9 @@ export interface TauriCommands {
     NativeSessionSummary
   ];
   list_native_sessions: [void, NativeSessionSummary[]];
+  list_workspace_session_references: [{ workingDir: string; currentRuntimeId?: string | null }, WorkspaceSessionReference[]];
+  read_workspace_session_reference: [{ workingDir: string; runtimeId: string }, WorkspaceSessionReferenceContent];
+  send_workspace_session_handoff: [{ workingDir: string; sourceRuntimeId: string; targetRuntimeId: string; text: string; clientMessageId: string }, void];
   send_native_session_input: [
     {
       runtimeId: string;
@@ -1755,4 +1758,18 @@ export interface LoadedEnv {
   name: string;
   originalName: string;
   renamed: boolean;
+}
+
+export interface WorkspaceSessionReference {
+  runtime_id: string;
+  title: string;
+  provider: 'claude';
+  can_send: boolean;
+}
+export interface WorkspaceSessionReferenceContent {
+  runtime_id: string;
+  title: string;
+  text: string;
+  truncated: boolean;
+  text_available: boolean;
 }

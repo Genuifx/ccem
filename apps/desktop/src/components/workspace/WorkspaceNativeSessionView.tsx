@@ -4297,6 +4297,7 @@ export function WorkspaceNativeSessionView({
         workingDir={session.project_dir}
         searchWorkspaceFiles={searchWorkspaceFiles}
         routeRuntimeId={session.provider === 'claude' ? session.runtime_id : null}
+        currentRuntimeId={session.runtime_id}
         onNavigateEnvironments={onNavigateEnvironments}
         planModeEnabled={composerPlanModeEnabled}
         onPlanModeEnabledChange={handlePlanModeEnabledChange}

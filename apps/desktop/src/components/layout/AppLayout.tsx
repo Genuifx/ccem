@@ -1,5 +1,7 @@
 import { ReactNode } from 'react';
-import { Home } from '@/lib/lucide-react';
+import { Home, LayoutGrid } from '@/lib/lucide-react';
+import { Button } from '@/components/ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { SideRail } from './SideRail';
 import { MacFullscreenWindowControls } from './MacFullscreenWindowControls';
 import { GlobalUpdateIndicator } from '@/components/app-update/GlobalUpdateIndicator';
@@ -30,7 +32,11 @@ export function AppLayout({
   fullBleed = false,
 }: AppLayoutProps) {
   return (
-    <SidebarProvider className="h-screen flex overflow-hidden relative" data-active-tab={activeTab}>
+    <SidebarProvider
+      mode={activeTab === 'workspace' ? 'floating' : 'inline'}
+      className="h-screen flex overflow-hidden relative"
+      data-active-tab={activeTab}
+    >
       <MacFullscreenWindowControls />
       <AppLayoutBody
         activeTab={activeTab}
@@ -80,7 +86,11 @@ function AppLayoutBody({
 
   return (
     <>
-      <AppSidebarToggleAnchor label={sidebarToggleLabel} />
+      {isWorkspace ? (
+        <WorkspaceNavigation onTabChange={onTabChange} onTabPrefetch={onTabPrefetch} />
+      ) : (
+        <AppSidebarToggleAnchor label={sidebarToggleLabel} />
+      )}
       {showWorkspaceShortcut ? (
         <CollapsedWorkspaceShortcut
           label={t('sideRail.backToWorkspace')}
@@ -90,11 +100,13 @@ function AppLayoutBody({
       ) : null}
       <GlobalUpdateIndicator />
 
-      <Sidebar>
-        {open && (
-          <SideRail activeTab={activeTab} onTabChange={onTabChange} onTabPrefetch={onTabPrefetch} glassMuted={false} />
-        )}
-      </Sidebar>
+      {!isWorkspace && (
+        <Sidebar>
+          {open && (
+            <SideRail activeTab={activeTab} onTabChange={onTabChange} onTabPrefetch={onTabPrefetch} glassMuted={false} />
+          )}
+        </Sidebar>
+      )}
 
       {/* Main content area — semi-transparent so ambient orbs bleed through glass panels */}
       <SidebarInset className="app-content-shell flex-1 flex flex-col min-w-0 relative z-10 overflow-hidden">
@@ -134,6 +146,50 @@ function AppLayoutBody({
         </main>
       </SidebarInset>
     </>
+  );
+}
+
+function WorkspaceNavigation({ onTabChange, onTabPrefetch }: Pick<AppLayoutProps, 'onTabChange' | 'onTabPrefetch'>) {
+  const { t } = useLocale();
+  const { open, setOpen } = useSidebar();
+  const label = t('sideRail.navigation');
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <div className="app-sidebar-toggle-anchor absolute z-[120]">
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            data-testid="workspace-navigation-trigger"
+            aria-label={label}
+            title={`${label} (⌘B)`}
+            className="h-7 w-7 rounded-md border-none bg-transparent p-0 text-muted-foreground/75 shadow-none hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <LayoutGrid className="h-[15px] w-[15px]" />
+          </Button>
+        </PopoverTrigger>
+      </div>
+      <PopoverContent
+        align="start"
+        sideOffset={8}
+        collisionPadding={8}
+        aria-label={label}
+        data-testid="workspace-navigation-menu"
+        className="z-[125] w-56 overflow-hidden rounded-xl p-0 shadow-xl"
+      >
+        <SideRail
+          activeTab="workspace"
+          floating
+          onTabChange={(tab) => {
+            setOpen(false);
+            onTabChange(tab);
+          }}
+          onTabPrefetch={onTabPrefetch}
+        />
+      </PopoverContent>
+    </Popover>
   );
 }
 

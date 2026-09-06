@@ -17,6 +17,9 @@ callback to recover the existing `main` WebView.
   out or rejected handshake fails closed for persisted input replay. A late valid
   identity can acknowledge readiness without lifting that replay protection.
 - Require a React-ready acknowledgement within 20 seconds after reload dispatch.
+  This acknowledges the mounted renderer, including a healthy startup progress
+  screen. Native startup completion separately gates access to the workspace;
+  slow backend recovery must not spend the renderer's retry budget.
   Hidden windows use a timer fallback because WebKit may suspend animation frames.
   Generation and document UUID reject old callbacks, samples and queued reloads.
   Main-thread dispatch has its own 20-second bound; an unresponsive dispatch

@@ -12,6 +12,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+#[path = "history_index_cache.rs"]
+mod index_cache;
+
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
@@ -2102,10 +2105,13 @@ fn supplement_claude_history_from_projects(
             .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         project_session_paths.truncate(limit);
 
-        for (_, _, path) in project_session_paths {
-            if let Some(candidate) = parse_claude_project_session_index(&path) {
-                merge_claude_history_session(session_map, candidate);
-            }
+        let paths = project_session_paths.into_iter().map(|(_, _, path)| path).collect::<Vec<_>>();
+        // Fixture/alternate directories never write the user's production cache.
+        let cache_path = dirs::home_dir()
+            .filter(|home| projects_dir == home.join(".claude/projects"))
+            .map(|_| crate::config::get_ccem_dir().join("workspace-history-index.json"));
+        for candidate in index_cache::load(&paths, cache_path.as_deref(), parse_claude_project_session_index) {
+            merge_claude_history_session(session_map, candidate);
         }
     }
 

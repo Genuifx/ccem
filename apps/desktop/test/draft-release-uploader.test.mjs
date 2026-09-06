@@ -392,7 +392,7 @@ test('release DAG keeps builders read-only and defers one privileged transaction
     ['projectPath', 'args'],
   );
   assert.doesNotMatch(producerWorkflow, /contents: write|detect-actions-release-payload/u);
-  assert.match(producerWorkflow, /Build legacy unsigned bundles with Mode 2 excluded/u);
+  assert.match(producerWorkflow, /Build without platform certificates with bundled macOS CEF/u);
   assert.match(producerWorkflow, /verify-legacy-release-inventory\.mjs/u);
   assert.match(producerWorkflow, /Require a fresh current-attempt Desktop build/u);
   assert.match(producerWorkflow, /inputs\.export_release_payload == true/u);

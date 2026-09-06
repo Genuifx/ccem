@@ -1660,8 +1660,40 @@ end tell"#,
     Ok(())
 }
 
+// An unavailable terminal is not an empty terminal. Bound the query and let
+// reconciliation preserve records when the OS cannot answer in time.
+fn query_terminal_windows(command: &mut Command, timeout: std::time::Duration) -> Result<Vec<String>, String> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn().map_err(|error| format!("Failed to query terminal: {error}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() { return Err("Terminal query failed".into()); }
+                let mut output = String::new();
+                if let Some(stdout) = child.stdout.take() {
+                    stdout.take(64 * 1024).read_to_string(&mut output)
+                        .map_err(|error| format!("Failed to read terminal query: {error}"))?;
+                }
+                return Ok(output.trim().split(", ").filter(|id| !id.is_empty()).map(str::to_owned).collect());
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Terminal query timed out".into());
+            }
+        }
+    }
+}
+
 /// Batch query all iTerm2 window IDs (single AppleScript call for performance)
-pub fn list_iterm_sessions() -> Vec<String> {
+pub fn list_iterm_sessions() -> Result<Vec<String>, String> {
     let script = r#"tell application "iTerm"
     if not running then return ""
     set windowIds to {}
@@ -1671,24 +1703,11 @@ pub fn list_iterm_sessions() -> Vec<String> {
     return windowIds
 end tell"#;
 
-    let output = Command::new("osascript").arg("-e").arg(script).output();
-
-    match output {
-        Ok(result) if result.status.success() => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            stdout
-                .trim()
-                .split(", ")
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        }
-        _ => Vec::new(),
-    }
+    query_terminal_windows(Command::new("osascript").arg("-e").arg(script), std::time::Duration::from_secs(3))
 }
 
 /// Batch query all Terminal.app window IDs (single AppleScript call for performance)
-pub fn list_terminal_app_windows() -> Vec<String> {
+pub fn list_terminal_app_windows() -> Result<Vec<String>, String> {
     let script = r#"tell application "Terminal"
     if not running then return ""
     set windowIds to {}
@@ -1698,20 +1717,7 @@ pub fn list_terminal_app_windows() -> Vec<String> {
     return windowIds
 end tell"#;
 
-    let output = Command::new("osascript").arg("-e").arg(script).output();
-
-    match output {
-        Ok(result) if result.status.success() => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            stdout
-                .trim()
-                .split(", ")
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        }
-        _ => Vec::new(),
-    }
+    query_terminal_windows(Command::new("osascript").arg("-e").arg(script), std::time::Duration::from_secs(3))
 }
 
 /// Close a terminal window by window ID
@@ -2265,6 +2271,23 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("mark fake binary executable");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_query_deadline_stops_only_the_owned_child() {
+        let started = std::time::Instant::now();
+        let result = super::query_terminal_windows(
+            std::process::Command::new("sh").args(["-c", "exec sleep 10"]),
+            std::time::Duration::from_millis(50),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let result = super::query_terminal_windows(
+            std::process::Command::new("sh").args(["-c", "printf '42, 73'"]),
+            std::time::Duration::from_secs(1),
+        ).unwrap();
+        assert_eq!(result, vec!["42", "73"]);
     }
 
     #[test]

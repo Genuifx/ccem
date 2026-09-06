@@ -209,6 +209,13 @@ async function buildHelperWithWireMock(options = {}) {
                     yield { ...userMessage, session_id };
                     yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
 
+                    if (scenario === 'session_handoff') {
+                      const args = {target_runtime_id:'native-recipient',text:'Please run the tests.'};
+                      const permission = await options.canUseTool('mcp__ccem-sessions__send_message', args, {toolUseID:'handoff-'+localTurn});
+                      if (permission.behavior !== 'allow') throw new Error('handoff permission denied');
+                      const result = await options.mcpServers['ccem-sessions'].instance._registeredTools.send_message.handler(args);
+                      process.stdout.write(JSON.stringify({type:'handoff_probe',result,allowedTools:options.allowedTools,disallowedTools:options.disallowedTools})+'\\n');
+                    }
                     if (scenario === 'browser_evaluate') {
                       const result = await options.canUseTool('mcp__ccem-browser__evaluate', {script:'1 + 1'}, {toolUseID:'evaluate-'+localTurn});
                       probe({stage:'evaluate',query:thisQuery,turn:localTurn,behavior:result.behavior});

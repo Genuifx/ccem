@@ -1,10 +1,10 @@
 import { useEffect } from 'react';
 import { acknowledgeWebcontentReady, sampleWebcontent } from '@/lib/webcontentRecovery';
 
-/** Ready means React committed the app, not just that HTML finished loading. */
-export function useWebcontentLifecycle(ready: boolean) {
+/** ACK a committed React screen, including startup progress before sessions are ready. */
+export function useWebcontentLifecycle(committed: boolean) {
   useEffect(() => {
-    if (!ready) return;
+    if (!committed) return;
     let cancelled = false;
     let frame: number | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
@@ -46,5 +46,5 @@ export function useWebcontentLifecycle(ready: boolean) {
       clearTimeout(readyFallback);
       clearInterval(interval);
     };
-  }, [ready]);
+  }, [committed]);
 }

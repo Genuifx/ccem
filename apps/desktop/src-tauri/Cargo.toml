@@ -1,6 +1,6 @@
 [package]
 name = "ccem-desktop"
-version = "2.79.0"
+version = "2.80.0"
 description = "CCEM Desktop Application"
 authors = ["Genuifx"]
 edition = "2021"
@@ -80,6 +80,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 chromium-spike = []
+macos-adhoc-cef = []
 updater-replacement-smoke-harness = []
 
 [dev-dependencies]

@@ -48,9 +48,11 @@ mod secure_fs;
 mod session;
 mod session_annotations;
 mod session_provenance;
+mod session_references;
 mod session_titles;
 mod skills;
 mod slash_commands;
+mod startup;
 mod system_proxy;
 mod telegram;
 mod terminal;
@@ -307,12 +309,15 @@ async fn get_environments(
 }
 
 #[tauri::command]
-fn get_current_env(
+async fn get_current_env(
     environment_mutations: State<'_, Arc<config::EnvironmentMutationCoordinator>>,
 ) -> Result<String, String> {
-    let _mutation_guard = environment_mutations.lock()?;
-    let cfg = config::read_config()?;
-    Ok(cfg.current.unwrap_or_else(|| "official".to_string()))
+    let environment_mutations = environment_mutations.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation_guard = environment_mutations.lock()?;
+        let cfg = config::read_config()?;
+        Ok(cfg.current.unwrap_or_else(|| "official".to_string()))
+    }).await.map_err(|error| format!("Failed to load current environment: {error}"))?
 }
 
 #[tauri::command]
@@ -1494,13 +1499,16 @@ async fn create_native_session(
 }
 
 #[tauri::command]
-fn list_native_sessions(
+async fn list_native_sessions(
     native_state: State<'_, Arc<NativeRuntimeManager>>,
-) -> Vec<NativeSessionSummary> {
-    let mut sessions = native_state.list_sessions();
-    title_overrides::TitleOverrides::enrich_native_session_titles(&mut sessions);
-    native_state.enrich_initial_user_prompts(&mut sessions);
-    sessions
+) -> Result<Vec<NativeSessionSummary>, String> {
+    let native_state = native_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sessions = native_state.list_sessions();
+        title_overrides::TitleOverrides::enrich_native_session_titles(&mut sessions);
+        native_state.enrich_initial_user_prompts(&mut sessions);
+        sessions
+    }).await.map_err(|error| format!("Failed to load native sessions: {error}"))
 }
 
 #[tauri::command]
@@ -3529,20 +3537,24 @@ fn set_default_working_dir(path: Option<String>) -> Result<(), String> {
 // ============================================
 
 #[tauri::command]
-fn get_settings(app: tauri::AppHandle) -> Result<DesktopSettings, String> {
-    let mut settings = config::read_settings()?;
-    // Merge defaultMode from config.json (source of truth for permission mode)
-    let cfg = config::read_config()?;
-    settings.default_mode = cfg.default_mode;
-    // Reflect actual system autostart state
-    {
-        use tauri_plugin_autostart::ManagerExt;
-        let autostart = app.autolaunch();
-        if let Ok(enabled) = autostart.is_enabled() {
-            settings.auto_start = enabled;
+async fn get_settings(app: tauri::AppHandle) -> Result<DesktopSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut settings = config::read_settings()?;
+        // Merge defaultMode from config.json (source of truth for permission mode)
+        let cfg = config::read_config()?;
+        settings.default_mode = cfg.default_mode;
+        // Reflect actual system autostart state
+        {
+            use tauri_plugin_autostart::ManagerExt;
+            let autostart = app.autolaunch();
+            if let Ok(enabled) = autostart.is_enabled() {
+                settings.auto_start = enabled;
+            }
         }
-    }
-    Ok(settings)
+        Ok(settings)
+    })
+    .await
+    .map_err(|error| format!("Failed to load desktop settings: {error}"))?
 }
 
 fn merge_settings_page_update(
@@ -5295,6 +5307,15 @@ fn desktop_context() -> tauri::Context<tauri::Wry> {
 }
 
 pub fn run_desktop_app() -> i32 {
+    if std::env::args_os().any(|argument| argument == "--cef-bundle-smoke") {
+        #[cfg(all(target_os = "macos", feature = "macos-adhoc-cef", not(debug_assertions)))]
+        return browser::login::cef::adhoc_bundle_smoke::run_requested(desktop_context());
+        #[cfg(not(all(target_os = "macos", feature = "macos-adhoc-cef", not(debug_assertions))))]
+        {
+            eprintln!("CEF bundle smoke requires a macOS release with macos-adhoc-cef enabled");
+            return 78;
+        }
+    }
     if updater_replacement_smoke::is_requested() {
         return updater_replacement_smoke::run_requested(desktop_context());
     }
@@ -5543,6 +5564,7 @@ pub fn run_desktop_app() -> i32 {
     );
 
     let builder = builder
+        .manage(Arc::new(startup::StartupState::default()))
         .manage(session_manager.clone())
         .manage(interactive_runtime_manager.clone())
         .manage(headless_runtime_manager.clone())
@@ -5898,6 +5920,7 @@ pub fn run_desktop_app() -> i32 {
             get_system_username,
             get_environments,
             get_current_env,
+            startup::get_startup_status,
             set_current_env,
             add_environment,
             update_environment,
@@ -5947,6 +5970,9 @@ pub fn run_desktop_app() -> i32 {
             codex_migration::preflight_codex_model_migration,
             create_native_session,
             list_native_sessions,
+            session_references::list_workspace_session_references,
+            session_references::read_workspace_session_reference,
+            session_references::send_workspace_session_handoff,
             get_native_session_summary,
             send_native_session_input,
             flush_native_session_input_queue,
@@ -6128,69 +6154,8 @@ pub fn run_desktop_app() -> i32 {
         })
         .setup(move |app| {
             webcontent_recovery::initialize(app.handle());
-            if automatic_background_services_enabled {
-                if let Err(error) = cleanup_orphaned_runtime_processes() {
-                    eprintln!("Runtime orphan cleanup warning: {}", error);
-                }
-
-                // Clean up stale exit files not belonging to any persisted session
-                cleanup_stale_exit_files_except(&session_manager_for_setup);
-
-                // Validate persisted sessions against actual terminal state
-                session_manager_for_setup.validate_and_reconcile();
-                match native_runtime_manager.reconcile_stale_records() {
-                    Ok(count) if count > 0 => {
-                        eprintln!("Reconciled {} stale native runtime record(s)", count);
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("Native runtime reconcile warning: {}", error),
-                }
-                if let Err(error) = interactive_manager_for_setup
-                    .rehydrate_existing(app.handle().clone(), session_manager_for_setup.clone())
-                {
-                    eprintln!("Interactive tmux rehydrate warning: {}", error);
-                }
-                match interactive_manager_for_setup.cleanup_orphaned_tmux_sessions() {
-                    Ok(cleaned) if !cleaned.is_empty() => {
-                        eprintln!(
-                            "Cleaned {} orphaned CCEM tmux target(s): {}",
-                            cleaned.len(),
-                            cleaned.join(", ")
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("Interactive tmux orphan cleanup warning: {}", error),
-                }
-            }
-
-            proxy_manager_for_setup.set_app_handle(app.handle().clone());
-            if automatic_background_services_enabled {
-                tauri::async_runtime::block_on(proxy_manager_for_setup.maybe_start_on_boot());
-            } else {
-                eprintln!(
-                    "CCEM named dev instance: automatic shared background services are disabled; \
-                     set CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1 for a targeted self-test"
-                );
-            }
-            // Debug control servers already use private random endpoints and do
-            // not publish the shared descriptor unless explicitly requested.
-            if let Err(error) = external_control_manager_for_setup.start(app.handle().clone()) {
-                eprintln!("External control startup warning: {}", error);
-            }
-
             // Load desktop settings once for startup logic
             let startup_settings = config::read_settings().unwrap_or_default();
-
-            // Sync autostart state from settings only for a single-owner run.
-            if automatic_background_services_enabled {
-                use tauri_plugin_autostart::ManagerExt;
-                let autostart = app.autolaunch();
-                if startup_settings.auto_start {
-                    let _ = autostart.enable();
-                } else {
-                    let _ = autostart.disable();
-                }
-            }
 
             // macOS titlebar and traffic-light position are configured in tauri.conf.json.
             // Keep decorum's macOS delegate out of the process so resize does not repaint controls.
@@ -6240,92 +6205,174 @@ pub fn run_desktop_app() -> i32 {
             let cron_scheduler = Arc::new(CronScheduler::default());
             app.manage(cron_scheduler.clone());
 
-            if automatic_background_services_enabled {
-                start_session_monitor(app.handle().clone(), session_manager_for_setup.clone());
+            let startup_app = app.handle().clone();
+            let startup_state = app.state::<Arc<startup::StartupState>>().inner().clone();
+            startup::start(startup_state, move |progress| {
+                // A named, service-isolated dev instance can exercise the real
+                // startup UI without running recovery against shared user data.
+                #[cfg(debug_assertions)]
+                if !automatic_background_services_enabled {
+                    if let Ok(delay) = std::env::var("CCEM_DESKTOP_STARTUP_TEST_DELAY_MS") {
+                        let delay = delay.parse::<u64>().unwrap_or(0).min(60_000);
+                        let until = std::time::Instant::now() + std::time::Duration::from_millis(delay);
+                        while std::time::Instant::now() < until {
+                            progress.checkpoint(startup::StartupPhase::RestoringSessions)?;
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
+                }
+                progress.checkpoint(startup::StartupPhase::CheckingSessions)?;
+                if automatic_background_services_enabled {
+                    if let Err(error) = cleanup_orphaned_runtime_processes() {
+                        eprintln!("Runtime orphan cleanup warning: {}", error);
+                    }
 
-                let cron_app = app.handle().clone();
-                start_cron_scheduler(cron_app, cron_scheduler, unified_session_manager.clone());
-                bot_binding_manager_for_setup.start_request_watcher(
-                    app.handle().clone(),
-                    unified_session_manager.clone(),
-                    native_runtime_manager.clone(),
+                    // Clean up stale exit files not belonging to any persisted session
+                    cleanup_stale_exit_files_except(&session_manager_for_setup);
+
+                    // Validate persisted sessions against actual terminal state
+                    session_manager_for_setup.validate_and_reconcile();
+                    progress.checkpoint(startup::StartupPhase::RestoringSessions)?;
+                    match native_runtime_manager.reconcile_stale_records() {
+                        Ok(count) if count > 0 => {
+                            eprintln!("Reconciled {} stale native runtime record(s)", count);
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("Native runtime reconcile warning: {}", error),
+                    }
+                    if let Err(error) = interactive_manager_for_setup
+                        .rehydrate_existing(startup_app.clone(), session_manager_for_setup.clone())
                     {
-                        let bot_binding_manager = bot_binding_manager_for_setup.clone();
-                        let wecom_manager = wecom_manager_for_setup.clone();
-                        move |infos| {
-                            for info in infos {
-                                if info.send_task_card {
-                                    let _ = deliver_bot_binding_task_card(
-                                        &bot_binding_manager,
-                                        &wecom_manager,
-                                        &info,
-                                    );
+                        eprintln!("Interactive tmux rehydrate warning: {}", error);
+                    }
+                    match interactive_manager_for_setup.cleanup_orphaned_tmux_sessions() {
+                        Ok(cleaned) if !cleaned.is_empty() => {
+                            eprintln!(
+                                "Cleaned {} orphaned CCEM tmux target(s): {}",
+                                cleaned.len(),
+                                cleaned.join(", ")
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("Interactive tmux orphan cleanup warning: {}", error),
+                    }
+                }
+
+                progress.checkpoint(startup::StartupPhase::StartingServices)?;
+                proxy_manager_for_setup.set_app_handle(startup_app.clone());
+                if automatic_background_services_enabled {
+                    tauri::async_runtime::block_on(proxy_manager_for_setup.maybe_start_on_boot());
+                } else {
+                    eprintln!(
+                        "CCEM named dev instance: automatic shared background services are disabled; \
+                         set CCEM_DESKTOP_DEV_BACKGROUND_SERVICES=1 for a targeted self-test"
+                    );
+                }
+                // Debug control servers already use private random endpoints and do
+                // not publish the shared descriptor unless explicitly requested.
+                if let Err(error) = external_control_manager_for_setup.start(startup_app.clone()) {
+                    eprintln!("External control startup warning: {}", error);
+                }
+
+                // Sync autostart state from settings only for a single-owner run.
+                if automatic_background_services_enabled {
+                    use tauri_plugin_autostart::ManagerExt;
+                    let autostart = startup_app.autolaunch();
+                    if startup_settings.auto_start {
+                        let _ = autostart.enable();
+                    } else {
+                        let _ = autostart.disable();
+                    }
+                }
+
+                if automatic_background_services_enabled {
+                    start_session_monitor(startup_app.clone(), session_manager_for_setup.clone());
+
+                    let cron_app = startup_app.clone();
+                    start_cron_scheduler(cron_app, cron_scheduler, unified_session_manager.clone());
+                    bot_binding_manager_for_setup.start_request_watcher(
+                        startup_app.clone(),
+                        unified_session_manager.clone(),
+                        native_runtime_manager.clone(),
+                        {
+                            let bot_binding_manager = bot_binding_manager_for_setup.clone();
+                            let wecom_manager = wecom_manager_for_setup.clone();
+                            move |infos| {
+                                for info in infos {
+                                    if info.send_task_card {
+                                        let _ = deliver_bot_binding_task_card(
+                                            &bot_binding_manager,
+                                            &wecom_manager,
+                                            &info,
+                                        );
+                                    }
                                 }
                             }
+                        },
+                    );
+                }
+
+                if let Ok(settings) = telegram::read_telegram_settings() {
+                    telegram_manager_for_setup.sync_settings(&settings);
+                    if automatic_background_services_enabled
+                        && settings.enabled
+                        && settings
+                            .bot_token
+                            .as_ref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        if let Err(error) = telegram_manager_for_setup.clone().start(
+                            startup_app.clone(),
+                            headless_runtime_manager.clone(),
+                            interactive_runtime_manager.clone(),
+                        ) {
+                            eprintln!("Telegram bridge auto-start warning: {}", error);
                         }
-                    },
-                );
-            }
-
-            if let Ok(settings) = telegram::read_telegram_settings() {
-                telegram_manager_for_setup.sync_settings(&settings);
-                if automatic_background_services_enabled
-                    && settings.enabled
-                    && settings
-                        .bot_token
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty())
-                {
-                    if let Err(error) = telegram_manager_for_setup.clone().start(
-                        app.handle().clone(),
-                        headless_runtime_manager.clone(),
-                        interactive_runtime_manager.clone(),
-                    ) {
-                        eprintln!("Telegram bridge auto-start warning: {}", error);
                     }
                 }
-            }
 
-            if let Ok(settings) = weixin::read_weixin_settings() {
-                weixin_manager_for_setup.sync_settings(&settings);
-                if automatic_background_services_enabled
-                    && settings.enabled
-                    && settings
-                        .bot_token
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty())
-                {
-                    if let Err(error) = weixin_manager_for_setup
-                        .clone()
-                        .start(app.handle().clone(), headless_runtime_manager.clone())
+                if let Ok(settings) = weixin::read_weixin_settings() {
+                    weixin_manager_for_setup.sync_settings(&settings);
+                    if automatic_background_services_enabled
+                        && settings.enabled
+                        && settings
+                            .bot_token
+                            .as_ref()
+                            .is_some_and(|value| !value.trim().is_empty())
                     {
-                        eprintln!("Weixin bridge auto-start warning: {}", error);
+                        if let Err(error) = weixin_manager_for_setup
+                            .clone()
+                            .start(startup_app.clone(), headless_runtime_manager.clone())
+                        {
+                            eprintln!("Weixin bridge auto-start warning: {}", error);
+                        }
                     }
                 }
-            }
 
-            if let Ok(settings) = wecom::read_wecom_settings() {
-                wecom_manager_for_setup.sync_settings(&settings);
-                if automatic_background_services_enabled
-                    && settings.enabled
-                    && settings.bots.iter().any(|bot| {
-                        bot.enabled
-                            && !bot.bot_id.trim().is_empty()
-                            && bot
-                                .secret
-                                .as_ref()
-                                .is_some_and(|value| !value.trim().is_empty())
-                    })
-                {
-                    if let Err(error) = wecom_manager_for_setup
-                        .clone()
-                        .start(app.handle().clone(), headless_runtime_manager.clone())
+                if let Ok(settings) = wecom::read_wecom_settings() {
+                    wecom_manager_for_setup.sync_settings(&settings);
+                    if automatic_background_services_enabled
+                        && settings.enabled
+                        && settings.bots.iter().any(|bot| {
+                            bot.enabled
+                                && !bot.bot_id.trim().is_empty()
+                                && bot
+                                    .secret
+                                    .as_ref()
+                                    .is_some_and(|value| !value.trim().is_empty())
+                        })
                     {
-                        eprintln!("WeCom bridge auto-start warning: {}", error);
+                        if let Err(error) = wecom_manager_for_setup
+                            .clone()
+                            .start(startup_app.clone(), headless_runtime_manager.clone())
+                        {
+                            eprintln!("WeCom bridge auto-start warning: {}", error);
+                        }
                     }
                 }
-            }
 
+                Ok(())
+            });
             Ok(())
         })
         .build(desktop_context())
@@ -6345,6 +6392,12 @@ pub fn run_desktop_app() -> i32 {
 
         if let RunEvent::ExitRequested { code, api, .. } = &event {
             let restarting = *code == Some(tauri::RESTART_EXIT_CODE);
+            let startup_state = app_handle.state::<Arc<startup::StartupState>>().inner().clone();
+            if !restarting && !startup_state.is_finished() {
+                api.prevent_exit();
+                startup::finish_before_exit(startup_state, app_handle.clone(), code.unwrap_or(0));
+                return;
+            }
             if restarting {
                 #[cfg(any(target_os = "macos", windows))]
                 {

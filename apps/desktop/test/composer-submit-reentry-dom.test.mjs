@@ -143,6 +143,7 @@ async function importHarness() {
         import { renderToStaticMarkup } from 'react-dom/server';
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
         import { readRecoveryDraft, writeRecoveryDraft, recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
+        export { serializeComposerSessionReferences as serializeDraftSegments } from '@/components/workspace/composerSessionReferences';
 
         export function seedRecovery(key, text, attachments) { writeRecoveryDraft(key, text, attachments); }
         export function recoveredDraft(key) { return readRecoveryDraft(key, true); }
@@ -215,6 +216,8 @@ async function importHarness() {
               <WorkspaceSessionComposer
                 value={value}
                 recoveryDraftKey={options.recoveryKey}
+                workingDir={options.workingDir}
+                sessionReferencesClient={options.sessionReferencesClient}
                 onValueChange={setValue}
                 onSubmit={(payload) => {
                   state.calls += 1;
@@ -258,6 +261,9 @@ async function importHarness() {
             getCallCount() { return state.calls; },
             getPayloads() { return state.payloads; },
             getText() { return editor.textContent; },
+            async flushPreparation() {
+              await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+            },
             recoverRejected() {
               act(() => container.querySelector('[data-composer-rejected-draft] button').click());
             },
@@ -572,3 +578,71 @@ test('unexpected onSubmit rejection is handled without clearing the uncertain jo
   assert.equal(harness.recoveryCounts().uncertain, 1);
   remounted.unmount();
 });
+
+for (const newerEdit of [false, true]) {
+  test(`session-reference and image identity survive rejected submission and crash${newerEdit ? ' beside newer input' : ''}`, async (t) => {
+    const { container, restore } = installDom();
+    t.after(restore);
+    const harness = await (importedHarnessPromise ??= importHarness());
+    window.__ccemRecoveryTest = true;
+    const key = `live:reference-recovery-${newerEdit}`;
+    const runtimeId = 'native-reference-target';
+    const referenceTitle = '设计 [Image #1] / 100%';
+    const text = harness.serializeDraftSegments([
+      { type: 'chip', trigger: '@', value: runtimeId, displayText: referenceTitle,
+        data: { kind: 'session', session: { runtime_id: runtimeId, title: referenceTitle, provider: 'claude', can_send: true } } },
+      { type: 'text', text: ' original draft [Image #1]' },
+    ]);
+    const image = { id: 'reference-image', kind: 'image', source: 'paste', name: 'context.png',
+      placeholder: '[Image #1]', mediaType: 'image/png', base64Data: 'aGVsbG8=', byteSize: 5, objectUrl: null };
+    harness.seedRecovery(key, text, [image]);
+    const reads = []; const sends = [];
+    const sessionReferencesClient = {
+      list: async () => [],
+      read: async (workingDir, id) => {
+        reads.push({ workingDir, id });
+        return { runtime_id: id, title: referenceTitle, text: 'quoted context', truncated: false };
+      },
+      send: async (...args) => { sends.push(args); },
+    };
+    const options = { recoveryKey: key, workingDir: '/tmp/reference-recovery', sessionReferencesClient };
+    const mounted = harness.mount(container, options);
+    assert.equal(reads.length, 0);
+    assert.match(container.querySelector('[data-session-reference-strip]').textContent, /设计/);
+    mounted.pressEnter();
+    await mounted.flushPreparation();
+    assert.equal(mounted.getCallCount(), 1);
+    assert.equal(mounted.getPayloads()[0].attachments[0].base64Data, image.base64Data);
+    assert.match(mounted.getPayloads()[0].text, /"runtime_id":"native-reference-target"/);
+    assert.doesNotMatch(mounted.getPayloads()[0].displayText, /ccem-session:/);
+    assert.equal(harness.recoveredDraft(key), null);
+    if (newerEdit) mounted.typeText('newer independent input');
+    await mounted.resolveAll(false);
+    mounted.unmount();
+
+    const remounted = harness.mount(container, options);
+    assert.equal(remounted.getCallCount(), 0);
+    assert.equal(reads.length, 1, 'remount must not read, send, or resolve references automatically');
+    if (newerEdit) {
+      assert.equal(remounted.getText(), 'newer independent input');
+      assert.equal(container.querySelectorAll('[data-composer-rejected-draft]').length, 1);
+      remounted.recoverRejected();
+      assert.match(remounted.getText(), /newer independent input/);
+    }
+    assert.match(harness.recoveredDraft(key).text, /\]\(ccem-session:native-reference-target\)/);
+    assert.match(container.querySelector('[data-session-reference-strip]').textContent, /设计/);
+    assert.equal(container.querySelector('[data-composer-attachment-chip] img').getAttribute('src'), 'data:image/png;base64,aGVsbG8=');
+    remounted.pressEnter();
+    await remounted.flushPreparation();
+    assert.equal(remounted.getCallCount(), 1);
+    assert.deepEqual(reads.map(read => read.id), [runtimeId, runtimeId]);
+    assert.match(remounted.getPayloads()[0].text, /"runtime_id":"native-reference-target"/);
+    assert.equal(remounted.getPayloads()[0].attachments[0].base64Data, image.base64Data);
+    await remounted.resolveAll(true);
+    assert.equal(harness.recoveredDraft(key), null, 'admitted reference/image input must not resurrect');
+    assert.equal(harness.recoveryCounts().uncertain, 0);
+    assert.equal(harness.recoveryCounts().rejected, 0);
+    assert.deepEqual(sends, [], 'references never send to the referenced task');
+    remounted.unmount();
+  });
+}

@@ -164,8 +164,7 @@ export async function verifyReleasePayloads({
     const releaseModeMatches = exactReleaseMode === LEGACY_UNSIGNED_RELEASE_MODE
       ? manifest?.releaseMode === LEGACY_UNSIGNED_RELEASE_MODE
         && inventory?.releaseMode === LEGACY_UNSIGNED_RELEASE_MODE
-        && inventory.mode2Included === false
-        && inventory.cefRuntimeVersion === null
+        && inventory.mode2Included === target.endsWith('apple-darwin')
       : (manifest?.releaseMode === undefined
         || manifest.releaseMode === PRODUCTION_SIGNED_RELEASE_MODE)
         && (inventory?.releaseMode === undefined

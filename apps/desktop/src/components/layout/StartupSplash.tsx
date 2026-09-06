@@ -1,17 +1,28 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { MacFullscreenWindowControls } from './MacFullscreenWindowControls';
 import { ccemMotion, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
+import { Progress } from '@/components/ui/progress';
+import { useLocale } from '@/locales';
+import type { StartupPhase } from '@/hooks/useStartup';
 
 interface StartupSplashProps {
   exiting?: boolean;
+  phase?: StartupPhase;
   onExitComplete?: () => void;
 }
 
 const EXIT_FALLBACK_MS = 800;
 
-export function StartupSplash({ exiting = false, onExitComplete }: StartupSplashProps) {
+export function StartupSplash({ exiting = false, phase = 'preparing', onExitComplete }: StartupSplashProps) {
+  const { t } = useLocale();
+  const [showProgress, setShowProgress] = useState(false);
   const splashRef = useRef<HTMLDivElement | null>(null);
   const centerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setShowProgress(true), 3000);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   // WebKit suspends requestAnimationFrame for hidden windows. GSAP's ticker
   // then cannot finish the exit timeline, which used to leave the loaded app
@@ -90,6 +101,14 @@ export function StartupSplash({ exiting = false, onExitComplete }: StartupSplash
         <div className="startup-logo-aura" aria-hidden="true" />
         <img src="/logo.png" alt="CCEM" className="startup-logo" />
         <div className="startup-brand" aria-hidden="true">CCEM</div>
+        {!exiting && (showProgress || phase === 'failed') ? (
+          <div className="startup-progress" data-startup-phase={phase}>
+            {phase !== 'failed' ? <Progress aria-label={t(`startup.${phase}`)} /> : null}
+            <p role={phase === 'failed' ? 'alert' : 'status'} aria-live="polite">
+              {t(`startup.${phase}`)}
+            </p>
+          </div>
+        ) : null}
       </div>
     </div>
   );

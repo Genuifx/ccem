@@ -10,6 +10,7 @@ interface SideRailProps {
   onTabChange: (tab: string) => void;
   onTabPrefetch?: (tab: string) => void;
   glassMuted?: boolean;
+  floating?: boolean;
 }
 
 interface NavItemDef {
@@ -78,6 +79,7 @@ function NavButton({
       data-testid={`nav-${item.id}`}
       data-sidebar-nav-item={item.id}
       aria-label={label}
+      aria-current={isActive ? 'page' : undefined}
       onClick={onClick}
       onMouseEnter={onPrefetch}
       onFocus={onPrefetch}
@@ -99,7 +101,7 @@ function NavButton({
   );
 }
 
-export function SideRail({ activeTab, onTabChange, onTabPrefetch, glassMuted }: SideRailProps) {
+export function SideRail({ activeTab, onTabChange, onTabPrefetch, glassMuted, floating = false }: SideRailProps) {
   const { t } = useLocale();
   const railRef = useRef<HTMLElement | null>(null);
   const activeIndicatorRef = useRef<HTMLSpanElement | null>(null);
@@ -151,27 +153,35 @@ export function SideRail({ activeTab, onTabChange, onTabPrefetch, glassMuted }: 
 
   return (
     <aside ref={railRef} className={cn(
-      'h-full shrink-0 flex flex-col glass-sidebar-panel glass-noise relative rounded-xl overflow-hidden',
-      'w-[200px] transition-[opacity,transform,background,border-color,box-shadow] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]',
+      'shrink-0 flex flex-col relative rounded-xl overflow-hidden',
+      floating
+        ? 'w-full max-h-[var(--radix-popover-content-available-height)] pt-3'
+        : 'h-full w-[200px] glass-sidebar-panel glass-noise transition-[opacity,transform,background,border-color,box-shadow] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]',
       glassMuted && "glass-sidebar-muted"
     )}>
-      <span
-        ref={activeIndicatorRef}
-        aria-hidden="true"
-        className="pointer-events-none absolute left-3 top-0 z-[1] rounded-lg border border-white/[0.08] bg-white/[0.065] shadow-[0_14px_34px_-26px_hsl(var(--primary)/0.65)]"
-      />
+      {!floating && (
+        <span
+          ref={activeIndicatorRef}
+          aria-hidden="true"
+          className="pointer-events-none absolute left-3 top-0 z-[1] rounded-lg border border-white/[0.08] bg-white/[0.065] shadow-[0_14px_34px_-26px_hsl(var(--primary)/0.65)]"
+        />
+      )}
 
       {/* Liquid glass aurora blobs */}
-      <div className="sidebar-aurora" aria-hidden="true">
-        <div className="sidebar-aurora-blob sidebar-aurora-blob-1" />
-        <div className="sidebar-aurora-blob sidebar-aurora-blob-2" />
-        <div className="sidebar-aurora-blob sidebar-aurora-blob-3" />
-      </div>
+      {!floating && (
+        <div className="sidebar-aurora" aria-hidden="true">
+          <div className="sidebar-aurora-blob sidebar-aurora-blob-1" />
+          <div className="sidebar-aurora-blob sidebar-aurora-blob-2" />
+          <div className="sidebar-aurora-blob sidebar-aurora-blob-3" />
+        </div>
+      )}
 
       {/* Traffic light + sidebar toggle spacer; remaining area stays draggable */}
-      <div className="sidebar-top-drag-region h-[52px] shrink-0 flex items-end pb-2 pr-3">
-        <div data-tauri-drag-region className="h-9 flex-1 rounded-full" />
-      </div>
+      {!floating && (
+        <div className="sidebar-top-drag-region h-[52px] shrink-0 flex items-end pb-2 pr-3">
+          <div data-tauri-drag-region className="h-9 flex-1 rounded-full" />
+        </div>
+      )}
 
       {/* Nav groups */}
       <nav className="relative z-10 flex-1 flex flex-col gap-4 overflow-y-auto px-3">
