@@ -21,7 +21,7 @@ export const ENV_PRESETS: Record<
     ANTHROPIC_BASE_URL: 'https://api.moonshot.cn/anthropic',
     ANTHROPIC_DEFAULT_OPUS_MODEL: 'kimi-k3[1m]',
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'kimi-k3[1m]',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'kimi-k3[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'kimi-k2.7-code',
     ANTHROPIC_MODEL: 'opus'
   },
   'KimiCodePlan': {
@@ -32,7 +32,7 @@ export const ENV_PRESETS: Record<
     ANTHROPIC_MODEL: 'opus'
   },
   'MiniMax': {
-    ANTHROPIC_BASE_URL: 'https://api.minimaxi.com/anthropic',
+    ANTHROPIC_BASE_URL: 'https://api.minimax.cn/anthropic',
     ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3[1m]',
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3[1m]',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3[1m]',

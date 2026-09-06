@@ -171,9 +171,9 @@ ccem cp <src> <dst>
 | Preset | Base URL | Main Model | Fast Model |
 |---|---|---|---|
 | GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3-flash |
-| KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k3[1m] |
+| KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k2.7-code |
 | Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding |
-| MiniMax | `https://api.minimaxi.com/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] |
+| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] |
 | DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-v4-pro[1m] | deepseek-v4-flash |
 | Bailian (Aliyun) | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.6-flash |
 | Bailian Code Plan | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-plus | qwen3.7-plus |
