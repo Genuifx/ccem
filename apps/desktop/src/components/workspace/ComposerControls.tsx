@@ -76,36 +76,43 @@ function environmentOpusModelLabel(environment: Environment): string {
 }
 
 /**
- * Discrete effort slider. Native range input keeps drag + keyboard quality;
- * the painted track is inset by half the thumb width so the gradient fill,
- * thumb stops and labels all land on the same positions.
+ * Discrete effort slider, styled after the reference: a continuous pill track
+ * (solid primary fill + neutral rest), small stop dots visible only on the
+ * unfilled portion, and an oversized white circular thumb. The painted track
+ * is inset by half the thumb width so fill edge, stop dots and thumb stops all
+ * land on the same positions. Current value is shown beside the section label.
  */
 function EffortSlider({
   levels,
   value,
   onChange,
   ariaLabel,
-  getLabel,
 }: {
   levels: EffortLevel[];
   value: EffortLevel;
   onChange: (level: EffortLevel) => void;
   ariaLabel: string;
-  getLabel: (level: EffortLevel) => string;
 }) {
   const lastIndex = levels.length - 1;
   const activeIndex = Math.max(0, levels.indexOf(value));
   const fillPct = lastIndex === 0 ? 100 : (activeIndex / lastIndex) * 100;
 
   return (
-    <div className="select-none pt-1.5 pb-4">
-      <div className="relative flex h-5 items-center">
-        <div
-          className="pointer-events-none absolute inset-x-2 h-1 rounded-full"
-          style={{
-            background: `linear-gradient(to right, hsl(var(--primary)) 0%, hsl(var(--primary)) ${fillPct}%, hsl(var(--primary) / 0.14) ${fillPct}%, hsl(var(--primary) / 0.14) 100%)`,
-          }}
-        />
+    <div className="select-none pt-1 pb-3.5">
+      <div className="relative flex h-7 items-center">
+        <div className="pointer-events-none absolute inset-x-[13px] h-3 rounded-full bg-foreground/[0.16]">
+          {levels.slice(1).map((level, index) => (
+            <span
+              key={level}
+              className="absolute top-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-foreground/50"
+              style={{ left: `${((index + 1) / lastIndex) * 100}%` }}
+            />
+          ))}
+          <div
+            className="absolute left-0 top-0 h-3 rounded-full bg-primary"
+            style={{ width: `${fillPct}%` }}
+          />
+        </div>
         <input
           type="range"
           min={0}
@@ -115,42 +122,18 @@ function EffortSlider({
           aria-label={ariaLabel}
           onChange={(event) => onChange(levels[Number(event.target.value)])}
           className={cn(
-            'relative h-5 w-full cursor-grab appearance-none bg-transparent outline-none',
+            'relative h-7 w-full cursor-grab appearance-none bg-transparent outline-none',
             'active:cursor-grabbing',
-            '[&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none',
-            '[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-popover',
-            '[&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-[0_1px_6px_rgba(0,0,0,0.45)]',
+            '[&::-webkit-slider-thumb]:h-[26px] [&::-webkit-slider-thumb]:w-[26px] [&::-webkit-slider-thumb]:appearance-none',
+            '[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white',
+            '[&::-webkit-slider-thumb]:shadow-[0_1px_4px_rgba(0,0,0,0.25),0_0_1px_rgba(0,0,0,0.15)]',
             '[&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:duration-100',
-            '[&:active::-webkit-slider-thumb]:scale-125',
-            '[&:focus-visible::-webkit-slider-thumb]:ring-2 [&:focus-visible::-webkit-slider-thumb]:ring-primary/40 [&:focus-visible::-webkit-slider-thumb]:ring-offset-1',
-            '[&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:appearance-none',
-            '[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-popover',
-            '[&::-moz-range-thumb]:bg-primary',
+            '[&:active::-webkit-slider-thumb]:scale-110',
+            '[&:focus-visible::-webkit-slider-thumb]:ring-2 [&:focus-visible::-webkit-slider-thumb]:ring-primary/40',
+            '[&::-moz-range-thumb]:h-[26px] [&::-moz-range-thumb]:w-[26px] [&::-moz-range-thumb]:appearance-none',
+            '[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:bg-white',
           )}
         />
-      </div>
-      <div className="relative mx-2 mt-1 h-3.5">
-        {levels.map((level, index) => {
-          const isFirst = index === 0;
-          const isLast = index === lastIndex;
-          return (
-            <button
-              key={level}
-              type="button"
-              style={{ left: isFirst ? undefined : `${(index / lastIndex) * 100}%` }}
-              className={cn(
-                'absolute top-0 whitespace-nowrap text-2xs transition-colors outline-none',
-                isFirst ? 'left-0' : isLast ? '-translate-x-full' : '-translate-x-1/2',
-                index === activeIndex
-                  ? 'cursor-default font-medium text-primary'
-                  : 'cursor-pointer text-muted-foreground/60 hover:text-foreground',
-              )}
-              onClick={() => onChange(level)}
-            >
-              {getLabel(level)}
-            </button>
-          );
-        })}
       </div>
     </div>
   );
@@ -308,8 +291,13 @@ export function ComposerControls({
           className="w-auto min-w-[300px] max-h-[min(400px,var(--radix-popover-content-available-height))] flex flex-col rounded-xl border border-border/40 bg-popover p-0 shadow-md"
         >
           <div className="shrink-0 p-1.5 pb-0">
-            <div className="px-2 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
-              {t('workspace.effortLabel')}
+            <div className="flex items-center justify-between gap-3 px-2 py-1.5">
+              <span className="text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
+                {t('workspace.effortLabel')}
+              </span>
+              <span className="text-2xs font-medium normal-case tracking-normal text-primary">
+                {t(EFFORT_I18N_KEYS[effort])}
+              </span>
             </div>
             <div className="px-2">
               <EffortSlider
@@ -317,7 +305,6 @@ export function ComposerControls({
                 value={effort}
                 onChange={onEffortChange}
                 ariaLabel={t('workspace.effortLabel')}
-                getLabel={(level) => t(EFFORT_I18N_KEYS[level])}
               />
             </div>
             <div className="mx-2 my-1.5 h-px border-t border-border/50" />
