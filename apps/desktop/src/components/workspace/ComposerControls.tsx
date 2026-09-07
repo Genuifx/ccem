@@ -76,8 +76,9 @@ function environmentOpusModelLabel(environment: Environment): string {
 }
 
 /**
- * Discrete effort slider: draggable native range + stop labels that are also
- * click targets. Keeps keyboard support from the native input.
+ * Discrete effort slider. Native range input keeps drag + keyboard quality;
+ * the painted track is inset by half the thumb width so the gradient fill,
+ * thumb stops and labels all land on the same positions.
  */
 function EffortSlider({
   levels,
@@ -94,29 +95,41 @@ function EffortSlider({
 }) {
   const lastIndex = levels.length - 1;
   const activeIndex = Math.max(0, levels.indexOf(value));
+  const fillPct = lastIndex === 0 ? 100 : (activeIndex / lastIndex) * 100;
 
   return (
-    <div className="pt-1 pb-4">
-      <input
-        type="range"
-        min={0}
-        max={lastIndex}
-        step={1}
-        value={activeIndex}
-        aria-label={ariaLabel}
-        onChange={(event) => onChange(levels[Number(event.target.value)])}
-        className={cn(
-          'h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted outline-none',
-          'focus-visible:ring-2 focus-visible:ring-primary/40',
-          '[&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none',
-          '[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-popover',
-          '[&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm',
-          '[&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:appearance-none',
-          '[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-popover',
-          '[&::-moz-range-thumb]:bg-primary',
-        )}
-      />
-      <div className="relative mt-1 h-3.5">
+    <div className="select-none pt-1.5 pb-4">
+      <div className="relative flex h-5 items-center">
+        <div
+          className="pointer-events-none absolute inset-x-2 h-1 rounded-full"
+          style={{
+            background: `linear-gradient(to right, hsl(var(--primary)) 0%, hsl(var(--primary)) ${fillPct}%, hsl(var(--primary) / 0.14) ${fillPct}%, hsl(var(--primary) / 0.14) 100%)`,
+          }}
+        />
+        <input
+          type="range"
+          min={0}
+          max={lastIndex}
+          step={1}
+          value={activeIndex}
+          aria-label={ariaLabel}
+          onChange={(event) => onChange(levels[Number(event.target.value)])}
+          className={cn(
+            'relative h-5 w-full cursor-grab appearance-none bg-transparent outline-none',
+            'active:cursor-grabbing',
+            '[&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none',
+            '[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-popover',
+            '[&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-[0_1px_6px_rgba(0,0,0,0.45)]',
+            '[&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:duration-100',
+            '[&:active::-webkit-slider-thumb]:scale-125',
+            '[&:focus-visible::-webkit-slider-thumb]:ring-2 [&:focus-visible::-webkit-slider-thumb]:ring-primary/40 [&:focus-visible::-webkit-slider-thumb]:ring-offset-1',
+            '[&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:appearance-none',
+            '[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-popover',
+            '[&::-moz-range-thumb]:bg-primary',
+          )}
+        />
+      </div>
+      <div className="relative mx-2 mt-1 h-3.5">
         {levels.map((level, index) => {
           const isFirst = index === 0;
           const isLast = index === lastIndex;
@@ -204,8 +217,33 @@ export function ComposerControls({
     [enabledEnvironments, envName, environments],
   );
 
+  /** Two-level menu: level 1 groups every environment by its aggregated opus model. */
+  const groupedEnvironments = useMemo(() => {
+    const byModel = new Map<string, Environment[]>();
+    for (const environment of selectableEnvironments) {
+      const model = environmentOpusModelLabel(environment);
+      const bucket = byModel.get(model);
+      if (bucket) {
+        bucket.push(environment);
+      } else {
+        byModel.set(model, [environment]);
+      }
+    }
+    return [...byModel.entries()].map(([model, envs]) => ({ model, envs }));
+  }, [selectableEnvironments]);
+
+  const [expandedModel, setExpandedModel] = useState<string | null>(null);
+
   const currentEnvironment = environments.find((e) => e.name === envName);
   const currentEnvironmentIconHint = resolveEnvironmentIconHint(currentEnvironment);
+  const currentModel = currentEnvironment ? environmentOpusModelLabel(currentEnvironment) : null;
+
+  // Each time the popover opens, expand the group holding the current environment.
+  useEffect(() => {
+    if (envEffortOpen) {
+      setExpandedModel(currentModel);
+    }
+  }, [envEffortOpen]);
   const isCodexProvider = provider === 'codex';
   const isEnvironmentLocked = isCodexProvider || environmentLocked;
   const environmentLockedBadge = isCodexProvider
@@ -301,61 +339,96 @@ export function ComposerControls({
           <ScrollArea
             type="always"
             data-ccem-composer-environment-scroll
-            className="min-h-0 max-h-[240px]"
+            className="min-h-0 max-h-[260px]"
             viewportClassName="pr-1"
           >
             <div className="flex flex-col gap-1 p-1.5 pt-0 pr-2">
-              {selectableEnvironments.map((environment) => (
-                <button
-                  key={environment.name}
-                  type="button"
-                  disabled={isEnvironmentLocked}
-                  aria-disabled={isEnvironmentLocked}
-                  className={cn(
-                    'flex w-full items-center gap-2.5 rounded-xl border px-2.5 py-1.5 text-left outline-none',
-                    'transition-colors',
-                    isEnvironmentLocked
-                      ? 'cursor-not-allowed border-transparent opacity-55'
-                      : 'cursor-pointer',
-                    !isEnvironmentLocked
-                      && environment.name !== envName
-                      && 'border-transparent hover:border-border/60 hover:bg-white/[0.05]',
-                    !isEnvironmentLocked
-                      && environment.name === envName
-                      && 'border-primary/50 bg-primary/[0.06]',
-                  )}
-                  onClick={() => {
-                    if (isEnvironmentLocked) {
-                      return;
-                    }
-                    onEnvChange(environment.name);
-                    setEnvEffortOpen(false);
-                  }}
-                >
-                  <span
-                    className={cn(
-                      'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-border-subtle bg-background/60',
-                      isEnvironmentLocked && 'opacity-60 grayscale',
+              {groupedEnvironments.map((group) => {
+                const isExpanded = expandedModel === group.model;
+                const isCurrentGroup = currentModel === group.model;
+                const groupIconEnv = group.envs.find((e) => e.name === envName) || group.envs[0];
+                return (
+                  <div key={group.model} className="flex flex-col gap-1">
+                    <button
+                      type="button"
+                      aria-expanded={isExpanded}
+                      className={cn(
+                        'flex w-full items-center gap-2.5 rounded-xl border px-2.5 py-1.5 text-left outline-none',
+                        'cursor-pointer transition-colors',
+                        'border-transparent hover:border-border/60 hover:bg-white/[0.05]',
+                        isCurrentGroup && 'border-primary/50 bg-primary/[0.06]',
+                        isEnvironmentLocked && 'opacity-80',
+                      )}
+                      onClick={() => setExpandedModel(isExpanded ? null : group.model)}
+                    >
+                      <span
+                        className={cn(
+                          'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-border-subtle bg-background/60',
+                          isEnvironmentLocked && 'opacity-60 grayscale',
+                        )}
+                      >
+                        <EnvironmentLobeIcon
+                          hint={resolveEnvironmentIconHint(groupIconEnv)}
+                          size={14}
+                        />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-[12.5px] font-medium leading-4 text-foreground">
+                          {group.model}
+                        </span>
+                        {isCurrentGroup && (
+                          <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
+                            {envName}
+                          </span>
+                        )}
+                      </span>
+                      {group.envs.length > 1 && (
+                        <span className="shrink-0 rounded-full border border-border/50 bg-muted/30 px-1.5 text-[10px] leading-4 tabular-nums text-muted-foreground">
+                          {group.envs.length}
+                        </span>
+                      )}
+                      <ChevronDown
+                        className={cn(
+                          'h-3.5 w-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150',
+                          isExpanded && 'rotate-180',
+                        )}
+                      />
+                    </button>
+                    {isExpanded && (
+                      <div className="ml-12 flex flex-col gap-0.5 border-l border-border/50 pl-2.5 pr-1">
+                        {group.envs.map((environment) => (
+                          <button
+                            key={environment.name}
+                            type="button"
+                            disabled={isEnvironmentLocked}
+                            aria-disabled={isEnvironmentLocked}
+                            className={cn(
+                              'flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[12px] outline-none',
+                              'transition-colors',
+                              isEnvironmentLocked
+                                ? 'cursor-not-allowed text-muted-foreground/45'
+                                : 'cursor-pointer glass-dropdown-item',
+                              !isEnvironmentLocked && environment.name === envName && 'text-primary',
+                            )}
+                            onClick={() => {
+                              if (isEnvironmentLocked) {
+                                return;
+                              }
+                              onEnvChange(environment.name);
+                              setEnvEffortOpen(false);
+                            }}
+                          >
+                            <span className="flex-1 truncate text-left">{environment.name}</span>
+                            {environment.name === envName && (
+                              <Check className="h-3.5 w-3.5 shrink-0 text-primary" />
+                            )}
+                          </button>
+                        ))}
+                      </div>
                     )}
-                  >
-                    <EnvironmentLobeIcon
-                      hint={resolveEnvironmentIconHint(environment)}
-                      size={14}
-                    />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[12.5px] font-medium leading-4 text-foreground">
-                      {environmentOpusModelLabel(environment)}
-                    </span>
-                    <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
-                      {environment.name}
-                    </span>
-                  </span>
-                  {environment.name === envName && (
-                    <Check className="h-3.5 w-3.5 shrink-0 text-primary" />
-                  )}
-                </button>
-              ))}
+                  </div>
+                );
+              })}
             </div>
           </ScrollArea>
         </PopoverContent>
