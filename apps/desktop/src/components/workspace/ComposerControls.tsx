@@ -181,7 +181,7 @@ function EffortSlider({
         'focus-visible:ring-2 focus-visible:ring-primary/30 rounded-full',
       )}
     >
-      <div className="pointer-events-none absolute inset-x-[13px] h-3 rounded-full bg-foreground/[0.16]">
+      <div className="pointer-events-none absolute inset-x-[13px] h-3 rounded-full bg-foreground/[0.2]">
         {levels.slice(1).map((level, index) => (
           <span
             key={level}
@@ -358,10 +358,10 @@ export function ComposerControls({
           align="start"
           side="top"
           sideOffset={6}
-          className="w-[300px] p-0"
+          className="w-[340px] p-0"
         >
-          <div className="px-2.5 pt-2">
-            <div className="flex items-center justify-between gap-3 px-0.5 py-1">
+          <div className="px-3 pt-2.5">
+            <div className="flex items-center justify-between gap-3 px-0.5 leading-4">
               <span className="text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
                 {t('workspace.effortLabel')}
               </span>
@@ -405,27 +405,40 @@ export function ComposerControls({
                   <DropdownMenuSub key={group.model}>
                     <DropdownMenuSubTrigger
                       className={cn(
-                        'gap-2.5 rounded-lg px-2.5 py-2 text-[12.5px]',
+                        'h-9 cursor-pointer gap-2.5 rounded-lg px-2.5 text-[12.5px] leading-none',
+                        'text-foreground/85 transition-colors',
+                        'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
+                        'data-[state=open]:bg-white/[0.08]',
                         isEnvironmentLocked && 'opacity-70',
                       )}
                     >
-                      <EnvironmentLobeIcon
-                        hint={resolveEnvironmentIconHint(groupIconEnv)}
-                        size={15}
-                      />
+                      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                        <EnvironmentLobeIcon
+                          hint={resolveEnvironmentIconHint(groupIconEnv)}
+                          size={16}
+                        />
+                      </span>
                       <span
                         className={cn(
-                          'min-w-0 max-w-[150px] truncate',
-                          isCurrentGroup ? 'font-medium text-foreground' : 'text-foreground/90',
+                          'min-w-0 max-w-[170px] truncate',
+                          isCurrentGroup && 'font-medium text-foreground',
                         )}
                       >
                         {group.model}
                       </span>
-                      <span className="ml-auto mr-1.5 shrink-0 text-[10px] tabular-nums text-muted-foreground/70">
+                      <span
+                        className={cn(
+                          'ml-auto mr-1 flex h-4 max-w-[110px] shrink-0 items-center justify-end truncate text-[10px] leading-4 tabular-nums',
+                          isCurrentGroup ? 'text-primary/80' : 'text-muted-foreground',
+                        )}
+                      >
                         {isCurrentGroup ? envName : group.envs.length}
                       </span>
                     </DropdownMenuSubTrigger>
-                    <DropdownMenuSubContent className="min-w-[180px] max-w-[240px] p-1">
+                    <DropdownMenuSubContent
+                      sideOffset={8}
+                      className="min-w-[190px] max-w-[240px] rounded-xl frosted-panel glass-noise shadow-dialog p-1"
+                    >
                       {group.envs.map((environment) => (
                         <DropdownMenuItem
                           key={environment.name}
@@ -433,7 +446,7 @@ export function ComposerControls({
                           onSelect={() => {
                             onEnvChange(environment.name);
                           }}
-                          className="gap-2 rounded-md px-2 py-1.5 text-[12.5px]"
+                          className="h-8 gap-2 rounded-lg px-2 text-[12.5px]"
                         >
                           <span className="w-3.5 shrink-0">
                             {environment.name === envName && (
