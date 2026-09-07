@@ -70,6 +70,79 @@ function isRiskyPermissionMode(mode: WorkspacePermissionModeName) {
   return mode === 'yolo';
 }
 
+/** Aggregated main model behind the environment's "opus" tier — the card's primary line. */
+function environmentOpusModelLabel(environment: Environment): string {
+  return environment.defaultOpusModel || environment.runtimeModel || 'opus';
+}
+
+/**
+ * Discrete effort slider: draggable native range + stop labels that are also
+ * click targets. Keeps keyboard support from the native input.
+ */
+function EffortSlider({
+  levels,
+  value,
+  onChange,
+  ariaLabel,
+  getLabel,
+}: {
+  levels: EffortLevel[];
+  value: EffortLevel;
+  onChange: (level: EffortLevel) => void;
+  ariaLabel: string;
+  getLabel: (level: EffortLevel) => string;
+}) {
+  const lastIndex = levels.length - 1;
+  const activeIndex = Math.max(0, levels.indexOf(value));
+
+  return (
+    <div className="pt-1 pb-4">
+      <input
+        type="range"
+        min={0}
+        max={lastIndex}
+        step={1}
+        value={activeIndex}
+        aria-label={ariaLabel}
+        onChange={(event) => onChange(levels[Number(event.target.value)])}
+        className={cn(
+          'h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted outline-none',
+          'focus-visible:ring-2 focus-visible:ring-primary/40',
+          '[&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none',
+          '[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-popover',
+          '[&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm',
+          '[&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:appearance-none',
+          '[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-popover',
+          '[&::-moz-range-thumb]:bg-primary',
+        )}
+      />
+      <div className="relative mt-1 h-3.5">
+        {levels.map((level, index) => {
+          const isFirst = index === 0;
+          const isLast = index === lastIndex;
+          return (
+            <button
+              key={level}
+              type="button"
+              style={{ left: isFirst ? undefined : `${(index / lastIndex) * 100}%` }}
+              className={cn(
+                'absolute top-0 whitespace-nowrap text-2xs transition-colors outline-none',
+                isFirst ? 'left-0' : isLast ? '-translate-x-full' : '-translate-x-1/2',
+                index === activeIndex
+                  ? 'cursor-default font-medium text-primary'
+                  : 'cursor-pointer text-muted-foreground/60 hover:text-foreground',
+              )}
+              onClick={() => onChange(level)}
+            >
+              {getLabel(level)}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function providerDisplayName(client: string) {
   if (client === 'codex') return 'Codex';
   if (client === 'opencode') return 'OpenCode';
@@ -194,31 +267,21 @@ export function ComposerControls({
           align="start"
           side="top"
           sideOffset={6}
-          className="w-auto min-w-[220px] max-h-[min(400px,var(--radix-popover-content-available-height))] flex flex-col rounded-xl border border-border/40 bg-popover p-0 shadow-md"
+          className="w-auto min-w-[300px] max-h-[min(400px,var(--radix-popover-content-available-height))] flex flex-col rounded-xl border border-border/40 bg-popover p-0 shadow-md"
         >
           <div className="shrink-0 p-1.5 pb-0">
             <div className="px-2 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
               {t('workspace.effortLabel')}
             </div>
-            {effortLevels.map((level) => (
-              <button
-                key={level}
-                type="button"
-                className={cn(
-                  'flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none',
-                  'cursor-pointer transition-colors',
-                  'glass-dropdown-item',
-                  level === effort && 'text-primary',
-                )}
-                onClick={() => {
-                  onEffortChange(level);
-                  setEnvEffortOpen(false);
-                }}
-              >
-                <span className="flex-1 text-left">{t(EFFORT_I18N_KEYS[level])}</span>
-                {level === effort && <Check className="h-3.5 w-3.5 text-primary" />}
-              </button>
-            ))}
+            <div className="px-2">
+              <EffortSlider
+                levels={effortLevels}
+                value={effort}
+                onChange={onEffortChange}
+                ariaLabel={t('workspace.effortLabel')}
+                getLabel={(level) => t(EFFORT_I18N_KEYS[level])}
+              />
+            </div>
             <div className="mx-2 my-1.5 h-px border-t border-border/50" />
             <div className="flex items-center justify-between gap-3 px-2 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
               <span>{t('workspace.environmentLabel')}</span>
@@ -238,10 +301,10 @@ export function ComposerControls({
           <ScrollArea
             type="always"
             data-ccem-composer-environment-scroll
-            className="min-h-0 max-h-[200px]"
+            className="min-h-0 max-h-[240px]"
             viewportClassName="pr-1"
           >
-            <div className="p-1.5 pt-0 pr-2">
+            <div className="flex flex-col gap-1 p-1.5 pt-0 pr-2">
               {selectableEnvironments.map((environment) => (
                 <button
                   key={environment.name}
@@ -249,12 +312,17 @@ export function ComposerControls({
                   disabled={isEnvironmentLocked}
                   aria-disabled={isEnvironmentLocked}
                   className={cn(
-                    'flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm outline-none',
+                    'flex w-full items-center gap-2.5 rounded-xl border px-2.5 py-1.5 text-left outline-none',
                     'transition-colors',
                     isEnvironmentLocked
-                      ? 'cursor-not-allowed text-muted-foreground/45 opacity-55'
-                      : 'cursor-pointer glass-dropdown-item',
-                    !isEnvironmentLocked && environment.name === envName && 'text-primary',
+                      ? 'cursor-not-allowed border-transparent opacity-55'
+                      : 'cursor-pointer',
+                    !isEnvironmentLocked
+                      && environment.name !== envName
+                      && 'border-transparent hover:border-border/60 hover:bg-white/[0.05]',
+                    !isEnvironmentLocked
+                      && environment.name === envName
+                      && 'border-primary/50 bg-primary/[0.06]',
                   )}
                   onClick={() => {
                     if (isEnvironmentLocked) {
@@ -264,12 +332,28 @@ export function ComposerControls({
                     setEnvEffortOpen(false);
                   }}
                 >
-                  <EnvironmentLobeIcon
-                    hint={resolveEnvironmentIconHint(environment)}
-                    size={13}
-                  />
-                  <span className="flex-1 text-left">{environment.name}</span>
-                  {environment.name === envName && <Check className="h-3.5 w-3.5 text-primary" />}
+                  <span
+                    className={cn(
+                      'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-border-subtle bg-background/60',
+                      isEnvironmentLocked && 'opacity-60 grayscale',
+                    )}
+                  >
+                    <EnvironmentLobeIcon
+                      hint={resolveEnvironmentIconHint(environment)}
+                      size={14}
+                    />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[12.5px] font-medium leading-4 text-foreground">
+                      {environmentOpusModelLabel(environment)}
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
+                      {environment.name}
+                    </span>
+                  </span>
+                  {environment.name === envName && (
+                    <Check className="h-3.5 w-3.5 shrink-0 text-primary" />
+                  )}
                 </button>
               ))}
             </div>
