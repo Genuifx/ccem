@@ -18,8 +18,8 @@ const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 // ccem 数据目录
 const CCEM_DIR = path.join(os.homedir(), '.ccem');
 
-// 缓存版本号（修改缓存结构时递增）
-const CACHE_VERSION = 1;
+// 缓存版本号（修改缓存结构或统计口径时递增）
+const CACHE_VERSION = 2;
 
 // 缓存文件路径
 const getCachePath = () => path.join(CCEM_DIR, 'usage-cache.json');
@@ -318,6 +318,7 @@ interface JSONLEntry {
   type?: string;
   timestamp?: string;
   message?: {
+    id?: string;
     model?: string;
     usage?: {
       input_tokens?: number;
@@ -330,6 +331,7 @@ interface JSONLEntry {
 
 async function parseJSONLFileAsync(filePath: string, prices: Record<string, ModelPrice>, signal?: AbortSignal): Promise<FileStats> {
   const entries: FileStatsEntry[] = [];
+  const messageEntryIndexes = new Map<string, number>();
 
   try {
     // 使用流式读取，避免一次性读取大文件占用过多内存和阻塞事件循环
@@ -379,11 +381,26 @@ async function parseJSONLFileAsync(filePath: string, prices: Record<string, Mode
         const price = getModelPrice(model, prices);
         const cost = calculateCost(usage, price);
 
-        entries.push({
+        const statsEntry: FileStatsEntry = {
           timestamp: entry.timestamp || new Date().toISOString(),
           model,
           usage: { ...usage, cost },
-        });
+        };
+
+        // 多个 content block / 流式快照会重复携带同一响应的 usage。
+        // 与 Desktop 一致，保留最后一次快照，避免重复累加或保留早期零值。
+        const messageId = entry.message.id;
+        if (typeof messageId === 'string' && messageId.length > 0) {
+          const index = messageEntryIndexes.get(messageId);
+          if (index !== undefined) {
+            entries[index] = statsEntry;
+          } else {
+            messageEntryIndexes.set(messageId, entries.length);
+            entries.push(statsEntry);
+          }
+        } else {
+          entries.push(statsEntry);
+        }
       } catch {
         // 跳过无效行
       }
