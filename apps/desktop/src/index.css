@@ -3556,3 +3556,19 @@ div[data-tauri-decorum-tb] {
 .pet-heart {
   animation: pet-float-up 2s ease-out forwards;
 }
+
+/* === Effort slider: max-level sheen ===
+   Restrained "pinned at the ceiling" cue — a soft highlight sweeps the
+   gradient once, rests, then repeats. Only rendered while at the top level. */
+@keyframes effort-sheen-sweep {
+  0% { transform: translateX(-160%); }
+  55%, 100% { transform: translateX(480%); }
+}
+.effort-sheen {
+  background: linear-gradient(105deg, transparent, hsl(0 0% 100% / 0.38), transparent);
+  animation: effort-sheen-sweep 3.8s var(--ease-default, ease-in-out) infinite;
+  will-change: transform;
+}
+@media (prefers-reduced-motion: reduce) {
+  .effort-sheen { animation: none; }
+}

@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import {
-  Check,
+  Brain,
   ChevronDown,
   Gauge,
   Lock,
@@ -10,6 +10,7 @@ import {
   ShieldBan,
   ShieldCheck,
   ShieldOff,
+  Zap,
 } from '@/lib/lucide-react';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import {
@@ -86,24 +87,34 @@ const EFFORT_THUMB_HALF = EFFORT_THUMB_SIZE / 2;
 const EFFORT_SPRING = 'cubic-bezier(0.34, 1.56, 0.64, 1)';
 
 /**
- * Discrete effort slider: continuous pill track (solid primary fill + neutral
- * rest), stop dots visible only on the unfilled portion, oversized white thumb.
- * Drag follows the pointer with zero latency; release / click / keyboard moves
- * animate with a springy transition.
+ * Discrete effort slider mixing the white-balance and brightness-slider
+ * idioms: a full-range primary gradient pill where the adjusted portion
+ * (left of the thumb) renders at full strength and the remainder is washed
+ * out, a hollow white ring thumb that lets the bright→dim transition show
+ * through, semantic end icons (Zap = fast/shallow, Brain = deep reasoning),
+ * and per-stop labels below (active stop highlighted, click to jump). Drag
+ * follows the pointer with zero latency; release / click / keyboard moves
+ * animate with a springy transition. Transitions live in inline styles so
+ * twMerge can't collapse competing `transition-*` classes.
  */
 function EffortSlider({
   levels,
+  labels,
   value,
   onChange,
   ariaLabel,
 }: {
   levels: EffortLevel[];
+  /** Translated short label per level, aligned with `levels`. */
+  labels: string[];
   value: EffortLevel;
   onChange: (level: EffortLevel) => void;
   ariaLabel: string;
 }) {
   const lastIndex = levels.length - 1;
   const activeIndex = Math.max(0, levels.indexOf(value));
+  /** Pinned at the ceiling — drives the restrained sheen sweep + glow boost. */
+  const atMax = lastIndex > 0 && activeIndex === lastIndex;
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragFraction, setDragFraction] = useState<number | null>(null);
   const isDragging = dragFraction !== null;
@@ -162,58 +173,111 @@ function EffortSlider({
 
   return (
     <div
-      ref={trackRef}
       role="slider"
       tabIndex={0}
       aria-label={ariaLabel}
       aria-valuemin={0}
       aria-valuemax={lastIndex}
       aria-valuenow={activeIndex}
-      aria-valuetext={levels[activeIndex]}
+      aria-valuetext={labels[activeIndex] ?? levels[activeIndex]}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       onKeyDown={handleKeyDown}
       className={cn(
-        'relative flex h-7 w-full touch-none select-none items-center outline-none',
+        'relative flex w-full touch-none select-none items-start gap-1 outline-none',
         'cursor-grab active:cursor-grabbing',
-        'focus-visible:ring-2 focus-visible:ring-primary/30 rounded-full',
+        'focus-visible:ring-2 focus-visible:ring-primary/30 rounded-lg',
       )}
     >
-      <div className="pointer-events-none absolute inset-x-[13px] h-3 rounded-full bg-foreground/[0.2]">
-        {levels.slice(1).map((level, index) => (
-          <span
-            key={level}
-            className="absolute top-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-foreground/50"
-            style={{ left: `${((index + 1) / lastIndex) * 100}%` }}
+      {/* Semantic end icons (brightness-slider style): fast/shallow → deep
+          reasoning. Pointer math clamps out-of-track clicks, so tapping an
+          icon jumps straight to that extreme. */}
+      <span className="flex h-7 w-4 shrink-0 items-center justify-center text-muted-foreground/55">
+        <Zap className="h-3 w-3" />
+      </span>
+      <div ref={trackRef} className="relative flex min-w-0 flex-1 flex-col">
+        <div className="relative flex h-7 items-center">
+          {/* Unadjusted remainder: the same primary ramp, washed out. */}
+          <div
+            className="pointer-events-none absolute inset-x-[13px] h-3 rounded-full"
+            style={{
+              backgroundImage: [
+                'linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0) 55%)',
+                'linear-gradient(90deg, hsl(var(--primary) / 0.10), hsl(var(--primary) / 0.16) 55%, hsl(var(--primary) / 0.26))',
+              ].join(', '),
+              boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.08)',
+            }}
           />
-        ))}
-        <div
-          className={cn(
-            'absolute left-0 top-0 h-3 rounded-full bg-primary',
-            !isDragging && 'transition-[width]',
+          {/* Adjusted portion: full-strength gradient clipped at the thumb
+              center — the straight cut edge shows through the hollow ring and
+              reads as the position marker. The element's own rounded-full
+              keeps the left end capped. */}
+          <div
+            className="pointer-events-none absolute inset-x-[13px] h-3 rounded-full"
+            style={{
+              backgroundImage: [
+                'linear-gradient(180deg, rgba(255,255,255,0.30), rgba(255,255,255,0) 55%)',
+                'linear-gradient(90deg, hsl(var(--primary) / 0.35), hsl(var(--primary) / 0.7) 55%, hsl(var(--primary)))',
+              ].join(', '),
+              clipPath: `inset(0 ${(1 - thumbFraction) * 100}% 0 0)`,
+              boxShadow: isDragging || atMax
+                ? '0 0 12px hsl(var(--primary-glow) / 0.5), 0 0 3px hsl(var(--primary-glow) / 0.35)'
+                : '0 0 8px hsl(var(--primary-glow) / 0.35), 0 0 2px hsl(var(--primary-glow) / 0.25)',
+              transition: isDragging
+                ? 'box-shadow 150ms ease'
+                : `clip-path 260ms ${EFFORT_SPRING}, box-shadow 150ms ease`,
+            }}
+          />
+          {/* Max-level sheen: one slow highlight sweep across the gradient,
+              then a rest. Rendered only while pinned at the top level. */}
+          {atMax && (
+            <div className="pointer-events-none absolute inset-x-[13px] h-3 overflow-hidden rounded-full">
+              <div className="effort-sheen absolute inset-y-0 w-1/3" />
+            </div>
           )}
-          style={{ width: pct, transitionDuration: isDragging ? undefined : '260ms', transitionTimingFunction: isDragging ? undefined : EFFORT_SPRING }}
-        />
+          {/* Hollow ring thumb: the bright→dim transition shows through the
+              ring; white stroke plus a hairline dark edge keeps it readable on
+              the washed-out end. */}
+          <div className="pointer-events-none absolute inset-x-[13px] top-1/2">
+            <div
+              className={cn(
+                'absolute top-1/2 h-[26px] w-[26px] -translate-x-1/2 -translate-y-1/2 rounded-full',
+                'border-[3px] border-white',
+                isDragging ? 'scale-110 bg-white/20' : 'hover:scale-105',
+              )}
+              style={{
+                left: pct,
+                boxShadow: isDragging
+                  ? '0 2px 8px rgba(0,0,0,0.3), 0 0 0 0.5px rgba(0,0,0,0.12), inset 0 0 0 0.5px rgba(0,0,0,0.15)'
+                  : '0 1px 4px rgba(0,0,0,0.25), 0 0 0 0.5px rgba(0,0,0,0.1), inset 0 0 0 0.5px rgba(0,0,0,0.12)',
+                transition: isDragging
+                  ? 'transform 150ms ease, box-shadow 150ms ease, background-color 150ms ease'
+                  : `left 260ms ${EFFORT_SPRING}, transform 260ms ${EFFORT_SPRING}, box-shadow 150ms ease, background-color 150ms ease`,
+              }}
+            />
+          </div>
+        </div>
+        {/* Stop labels — clicking one jumps via the root pointer handler. */}
+        <div className="relative mx-[13px] mt-0.5 h-4">
+          {levels.map((level, index) => (
+            <span
+              key={level}
+              className={cn(
+                'absolute top-0 -translate-x-1/2 whitespace-nowrap text-[10px] leading-4 tabular-nums transition-colors duration-150',
+                index === activeIndex ? 'font-medium text-primary' : 'text-muted-foreground/60',
+              )}
+              style={{ left: `${(lastIndex === 0 ? 0 : index / lastIndex) * 100}%` }}
+            >
+              {labels[index] ?? level}
+            </span>
+          ))}
+        </div>
       </div>
-      <div className="pointer-events-none absolute inset-x-[13px] top-1/2">
-        <div
-          className={cn(
-            'absolute top-1/2 h-[26px] w-[26px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-white',
-            'shadow-[0_1px_4px_rgba(0,0,0,0.25),0_0_1px_rgba(0,0,0,0.15)]',
-            'focus-visible:ring-2 focus-visible:ring-primary/40',
-            !isDragging && 'transition-[left]',
-            isDragging && 'scale-110',
-            !isDragging && 'transition-transform',
-          )}
-          style={{
-            left: pct,
-            transitionDuration: isDragging ? undefined : '260ms',
-            transitionTimingFunction: isDragging ? undefined : EFFORT_SPRING,
-          }}
-        />
-      </div>
+      <span className="flex h-7 w-4 shrink-0 items-center justify-center text-muted-foreground/55">
+        <Brain className="h-3 w-3" />
+      </span>
     </div>
   );
 }
@@ -360,17 +424,13 @@ export function ComposerControls({
           sideOffset={6}
           className="w-[340px] p-0"
         >
-          <div className="px-3 pt-2.5">
-            <div className="flex items-center justify-between gap-3 px-0.5 leading-4">
-              <span className="text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
-                {t('workspace.effortLabel')}
-              </span>
-              <span className="text-2xs font-medium normal-case tracking-normal text-primary">
-                {t(EFFORT_I18N_KEYS[effort])}
-              </span>
+          <div className="px-3 pt-2.5 pb-1">
+            <div className="px-0.5 leading-4 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
+              {t('workspace.effortLabel')}
             </div>
             <EffortSlider
               levels={effortLevels}
+              labels={effortLevels.map((level) => t(EFFORT_I18N_KEYS[level]))}
               value={effort}
               onChange={onEffortChange}
               ariaLabel={t('workspace.effortLabel')}
@@ -409,6 +469,7 @@ export function ComposerControls({
                         'text-foreground/85 transition-colors',
                         'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
                         'data-[state=open]:bg-white/[0.08]',
+                        isCurrentGroup && 'bg-primary/[0.07] data-[highlighted]:bg-primary/[0.1]',
                         isEnvironmentLocked && 'opacity-70',
                       )}
                     >
@@ -421,41 +482,65 @@ export function ComposerControls({
                       <span
                         className={cn(
                           'min-w-0 max-w-[170px] truncate',
-                          isCurrentGroup && 'font-medium text-foreground',
+                          isCurrentGroup && 'font-medium text-primary',
                         )}
                       >
                         {group.model}
                       </span>
-                      <span
-                        className={cn(
-                          'ml-auto mr-1 flex h-4 max-w-[110px] shrink-0 items-center justify-end truncate text-[10px] leading-4 tabular-nums',
-                          isCurrentGroup ? 'text-primary/80' : 'text-muted-foreground',
-                        )}
-                      >
-                        {isCurrentGroup ? envName : group.envs.length}
-                      </span>
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent
                       sideOffset={8}
-                      className="min-w-[190px] max-w-[240px] rounded-xl frosted-panel glass-noise shadow-dialog p-1"
+                      className="min-w-[200px] max-w-[260px] rounded-xl frosted-panel glass-noise shadow-dialog p-1"
                     >
-                      {group.envs.map((environment) => (
-                        <DropdownMenuItem
-                          key={environment.name}
-                          disabled={isEnvironmentLocked}
-                          onSelect={() => {
-                            onEnvChange(environment.name);
-                          }}
-                          className="h-8 gap-2 rounded-lg px-2 text-[12.5px]"
-                        >
-                          <span className="w-3.5 shrink-0">
-                            {environment.name === envName && (
-                              <Check className="h-3.5 w-3.5 text-primary" />
+                      {group.envs.map((environment) => {
+                        // Model lineup under the env name: opus · sonnet · haiku,
+                        // deduped (sonnet often aliases opus) and skipping gaps.
+                        const modelLine = [
+                          environment.defaultOpusModel,
+                          environment.defaultSonnetModel,
+                          environment.defaultHaikuModel,
+                        ]
+                          .filter((model, index, all): model is string => !!model && all.indexOf(model) === index)
+                          .join(' · ');
+                        const isActiveEnv = environment.name === envName;
+                        return (
+                          <DropdownMenuItem
+                            key={environment.name}
+                            disabled={isEnvironmentLocked}
+                            onSelect={() => {
+                              onEnvChange(environment.name);
+                            }}
+                            className={cn(
+                              'h-auto items-start gap-2 rounded-lg px-2 py-1.5 text-[12.5px]',
+                              isActiveEnv && 'bg-primary/[0.08] focus:bg-primary/[0.12] hover:bg-primary/[0.12]',
                             )}
-                          </span>
-                          <span className="min-w-0 truncate">{environment.name}</span>
-                        </DropdownMenuItem>
-                      ))}
+                          >
+                            <span className="min-w-0 flex-1">
+                              <span
+                                className={cn(
+                                  'block truncate leading-4',
+                                  isActiveEnv && 'font-medium text-primary',
+                                )}
+                              >
+                                {environment.name}
+                              </span>
+                              {modelLine && (
+                                <span
+                                  className={cn(
+                                    'mt-0.5 block truncate text-[10px] leading-3',
+                                    isActiveEnv ? 'text-primary/60' : 'text-muted-foreground/65',
+                                  )}
+                                >
+                                  {modelLine}
+                                </span>
+                              )}
+                            </span>
+                            {isActiveEnv && (
+                              <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                            )}
+                          </DropdownMenuItem>
+                        );
+                      })}
                     </DropdownMenuSubContent>
                   </DropdownMenuSub>
                 );
