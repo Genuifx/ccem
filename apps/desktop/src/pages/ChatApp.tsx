@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle } from '@/lib/lucide-react';
+import { AlertTriangle, ChevronDown } from '@/lib/lucide-react';
+import { Button } from '@/components/ui/button';
+import { HermesPanel } from '@/components/chat-app/hermes/HermesPanel';
 import { useLocale } from '@/locales';
 import { TelegramPanel } from '@/components/chat-app/telegram/TelegramPanel';
 import { WecomPanel } from '@/components/chat-app/wecom/WecomPanel';
@@ -30,6 +32,7 @@ const tabs: TabDef[] = REMOTE_PLATFORM_ORDER.map((id) => ({
 export function ChatApp() {
   const { t } = useLocale();
   const [activeTab, setActiveTab] = useState(tabs[0].id);
+  const [legacyOpen, setLegacyOpen] = useState(false);
   const [platformCapabilities, setPlatformCapabilities] = useState<PlatformCapabilities | null>(null);
   const { getPlatformCapabilities } = useTauriCommands();
   const currentTab = tabs.find((tab) => tab.id === activeTab) ?? tabs[0];
@@ -87,10 +90,18 @@ export function ChatApp() {
         onComplete: () => clearMotionProps(targets),
       },
     );
-  }, { scope: chatMotionRef, dependencies: [activeTab, showTmuxNotice] });
+  }, { scope: chatMotionRef, dependencies: [activeTab, showTmuxNotice, legacyOpen] });
 
   return (
     <div ref={chatMotionRef} className="page-transition-enter space-y-6">
+      <HermesPanel />
+      <section className="border-t border-border/50 pt-4">
+        <Button variant="ghost" className="w-full justify-between" aria-expanded={legacyOpen}
+          aria-controls="existing-chat-connections" onClick={() => setLegacyOpen((current) => !current)}>
+          {t('hermes.existingConnections')}
+          <ChevronDown className={`h-4 w-4 transition-transform ${legacyOpen ? 'rotate-180' : ''}`} />
+        </Button>
+        {legacyOpen && <div id="existing-chat-connections" className="mt-4 space-y-5">
       {/* tmux warning */}
       {showTmuxNotice && (
         <div data-chat-platform-warning className="rounded-2xl border border-warning/20 bg-warning/5 px-5 py-4">
@@ -142,6 +153,8 @@ export function ChatApp() {
       <div data-chat-platform-panel>
         {currentTab.panel()}
       </div>
+        </div>}
+      </section>
     </div>
   );
 }

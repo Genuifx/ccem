@@ -27740,7 +27740,7 @@ var Codex = class {
 };
 
 // src/index.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
+import { randomUUID as randomUUID4 } from "node:crypto";
 import { createInterface } from "node:readline";
 import process5 from "node:process";
 
@@ -43543,6 +43543,37 @@ function createStreamEventCoalescer(writePayload, options = {}) {
   return { emit: emit2, flush };
 }
 
+// src/inputOperation.ts
+import { randomUUID as randomUUID3 } from "node:crypto";
+var InputOperation = class {
+  constructor(provider, clientMessageIds, emit2, commandId) {
+    this.provider = provider;
+    this.emit = emit2;
+    this.commandId = commandId;
+    this.clientMessageIds = Array.isArray(clientMessageIds) ? [...new Set(clientMessageIds.filter((id) => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))] : [];
+  }
+  id = randomUUID3();
+  clientMessageIds;
+  started = false;
+  terminal = false;
+  observe(stage, detail, providerTurnId) {
+    if (this.terminal || stage === "started" && this.started) return;
+    if (stage === "started") this.started = true;
+    else this.terminal = true;
+    if (!this.clientMessageIds.length) return;
+    this.emit({
+      type: "input_operation",
+      operation_id: this.id,
+      client_message_ids: this.clientMessageIds,
+      provider: this.provider,
+      stage,
+      detail,
+      ...this.commandId ? { command_id: this.commandId } : {},
+      ...providerTurnId ? { provider_turn_id: providerTurnId } : {}
+    });
+  }
+};
+
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
 var CLAUDE_INCOMPLETE_RESPONSE_REASON = "Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.";
@@ -43567,6 +43598,9 @@ var claudeTurnCompletionEmitted = false;
 var claudeLastAssistantMessageUuid = null;
 var claudeTurnAwaitingResult = false;
 var claudeForegroundPromptUuid = null;
+var claudeInputOperation = null;
+var claudeInputResultCorrelated = false;
+var promptInputOperations = /* @__PURE__ */ new WeakMap();
 var claudeForegroundPromptAccepted = false;
 var claudeForegroundCommand = null;
 var claudeIngressOriginKind = null;
@@ -43744,6 +43778,7 @@ function emitClaudeLifecycleProtocolError(reason, commandId = claudeForegroundPr
   claudeLifecycleMode = "poisoned";
   clearClaudeLifecycleTerminalTimer();
   pendingClaudePromptReplay = null;
+  if (commandId === claudeForegroundPromptUuid) claudeInputOperation?.observe("unknown", reason);
   emitEvent({
     type: "lifecycle",
     stage: "lifecycle_protocol_error",
@@ -43865,6 +43900,7 @@ function processNegotiatedClaudeSdkCommandLifecycle(frame) {
   if (state === "queued" || state === "started") {
     claudeForegroundPromptAccepted = true;
     pendingClaudePromptReplay = null;
+    if (state === "started") claudeInputOperation?.observe("started", "Claude SDK started the command.");
     return;
   }
   if (CLAUDE_SDK_TERMINAL_STATES.has(state)) {
@@ -44172,6 +44208,8 @@ function closeClaudeQueryForRecovery(snapshot = captureCurrentClaudeQuerySnapsho
     return true;
   }
   if (isCurrentClaudeQuerySnapshot(snapshot)) {
+    claudeInputOperation?.observe("unknown", options.reason ?? "Claude query closed before a matching terminal.");
+    claudeInputOperation = null;
     claudeTurnAwaitingResult = false;
     claudeForegroundPromptUuid = null;
     claudeForegroundPromptAccepted = false;
@@ -44400,6 +44438,8 @@ function clearClaudeForegroundOwnership() {
   pendingClaudePromptReplay = null;
   claudeForegroundPromptAccepted = false;
   claudeForegroundPromptUuid = null;
+  claudeInputOperation = null;
+  claudeInputResultCorrelated = false;
   claudeForegroundCommand = null;
   claudeForegroundCoordinatorStamped = false;
   claudeDeferredForegroundResult = null;
@@ -44463,6 +44503,10 @@ function emitClaudeLegacyTurnTerminal(detail) {
   }
   claudeTurnCompletionEmitted = true;
   const completedCommandId = claudeForegroundPromptUuid;
+  claudeInputOperation?.observe(
+    claudeInputResultCorrelated ? claudeTurnResultObservation?.failed ? "failed" : "completed" : "unknown",
+    claudeInputResultCorrelated ? detail : "Legacy Claude terminal has no matching result user_message_uuid."
+  );
   clearClaudeForegroundOwnership();
   emitEvent({
     type: "lifecycle",
@@ -44497,6 +44541,10 @@ function finishClaudeFullLifecycleTurn(state, commandId) {
   claudeTurnCompletionEmitted = true;
   claudeAuthoritativeTerminalCommandId = commandId;
   rememberClaudeCommandId(claudeTerminalCommandIds, commandId);
+  claudeInputOperation?.observe(
+    state === "completed" && !(claudeInputResultCorrelated && observation?.failed) ? "completed" : "failed",
+    claudeInputResultCorrelated && observation?.detail || `Claude SDK command ${state}.`
+  );
   clearClaudeForegroundOwnership();
   claudeInterruptRequested = false;
   if (interruptedByRequest && state !== "completed" && !claudeInterruptCompletionEmitted) {
@@ -44573,6 +44621,7 @@ function finishClaudeLegacyTurnAfterIdle() {
 }
 function emitClaudeTurnInterrupted(detail = "Claude turn interrupted by desktop workspace.") {
   const interruptedCommandId = claudeForegroundPromptUuid;
+  claudeInputOperation?.observe("failed", detail);
   clearClaudeForegroundOwnership();
   claudeLastSessionState = "idle";
   claudeInterruptRequested = false;
@@ -44620,6 +44669,7 @@ function emitClaudeDeliveryUncertain(reason) {
   claudeLifecycleMode = "poisoned";
   clearClaudeLifecycleTerminalTimer();
   pendingClaudePromptReplay = null;
+  claudeInputOperation?.observe("unknown", reason);
   emitEvent({
     type: "lifecycle",
     stage: "delivery_uncertain",
@@ -44639,6 +44689,8 @@ function emitClaudeIncompleteResponse() {
   }
   claudeTurnAwaitingResult = false;
   const incompleteCommandId = claudeForegroundPromptUuid;
+  claudeInputOperation?.observe("unknown", CLAUDE_INCOMPLETE_RESPONSE_REASON);
+  claudeInputOperation = null;
   claudeForegroundPromptUuid = null;
   claudeForegroundPromptAccepted = false;
   claudeForegroundCommand = null;
@@ -45885,6 +45937,9 @@ async function consumeClaudeMessages() {
         if (currentHumanEcho) {
           claudeForegroundPromptAccepted = true;
           pendingClaudePromptReplay = null;
+          if (claudeLifecycleMode === "legacy" && message.uuid === claudeForegroundPromptUuid) {
+            claudeInputOperation?.observe("started", "Claude SDK accepted the matching human input.");
+          }
         }
         const checkpoint = backgroundOwned ? null : buildClaudeFileCheckpointEvent(message, currentProviderSessionId);
         if (checkpoint) {
@@ -46153,6 +46208,7 @@ async function consumeClaudeMessages() {
         pendingClaudePromptReplay = null;
         claudeForegroundPromptAccepted = true;
         emitClaudeResultUsage(message);
+        claudeInputResultCorrelated = correlatedCommandId === claudeForegroundPromptUuid;
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
         finishClaudeLegacyTurnAfterIdle();
         if (!resultObservation.failed) {
@@ -46289,12 +46345,12 @@ async function ensureClaudePromptQueueReady() {
     await ensureClaudeSession();
   }
 }
-function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId) {
+function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, operation) {
   if (!claudeInputQueue) {
     throw new Error("Claude streaming input queue is not ready");
   }
   const coordinatorStamped = Boolean(commandId);
-  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID3();
+  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID4();
   pendingClaudePromptReplay = {
     text,
     images,
@@ -46304,6 +46360,8 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId) {
   claudeInterruptRequested = false;
   claudeInterruptCompletionEmitted = false;
   claudeForegroundPromptUuid = messageUuid;
+  claudeInputOperation = operation ?? null;
+  claudeInputResultCorrelated = false;
   claudeAuthoritativeTerminalCommandId = null;
   claudeForegroundCoordinatorStamped = coordinatorStamped;
   claudeForegroundPromptAccepted = false;
@@ -46601,7 +46659,7 @@ async function ensureCodexThread() {
   }
   return codexThread;
 }
-async function runCodexTurn(text, images, abortController) {
+async function runCodexTurn(text, images, abortController, operation) {
   const thread = await ensureCodexThread();
   abortController.signal.throwIfAborted();
   let input;
@@ -46642,6 +46700,7 @@ async function runCodexTurn(text, images, abortController) {
         continue;
       }
       if (event.type === "turn.started") {
+        operation?.observe("started", "Codex SDK started the turn.");
         emitEvent({
           type: "lifecycle",
           stage: "turn_started",
@@ -46651,6 +46710,7 @@ async function runCodexTurn(text, images, abortController) {
       }
       if (event.type === "turn.completed") {
         const outputTokens = event.usage.output_tokens ?? 0;
+        operation?.observe("completed", `Codex SDK completed the turn \xB7 output ${outputTokens} tokens`);
         emitEvent({
           type: "lifecycle",
           stage: "turn_completed",
@@ -46668,6 +46728,7 @@ async function runCodexTurn(text, images, abortController) {
         continue;
       }
       if (event.type === "turn.failed") {
+        operation?.observe("failed", event.error.message);
         if (initCommand?.model != null) throw new Error(event.error.message);
         emitEvent({
           type: "session_completed",
@@ -46780,12 +46841,14 @@ async function runQueuedTurns() {
   currentAbortController = abortController;
   emitStatus("processing", "Codex is processing a turn.");
   try {
-    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController);
+    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
+    nextPrompt.operation?.observe("unknown", "Codex stream ended without a turn terminal.");
     if (!stopped) {
       emitStatus("ready", "Ready for the next prompt.");
     }
   } catch (error48) {
     const isAbort = error48 instanceof Error && error48.name === "AbortError";
+    nextPrompt.operation?.observe("unknown", error48 instanceof Error ? error48.message : String(error48));
     if (isAbort && !stopped) {
       emitStatus("ready", "Turn interrupted. Ready for the next prompt.");
     }
@@ -47334,14 +47397,21 @@ async function handleCommand(command) {
     if (!command.text.trim() && !hasImages) {
       return;
     }
+    if (initCommand?.provider === "claude" && command.client_message_ids?.length && !command.command_id) {
+      command.command_id = randomUUID4();
+    }
+    const operation = new InputOperation(initCommand?.provider ?? "codex", command.client_message_ids, emitEvent, command.command_id);
+    promptInputOperations.set(command, operation);
     if (runtimeTeardownPreparationId) {
       throw new Error("Native runtime is preparing to close and cannot accept a new prompt.");
     }
     if (initCommand?.provider === "claude") {
       if (!reserveClaudeCoordinatorAdmission(command.command_id)) {
+        operation.observe("failed", "Claude rejected the input before dispatch: foreground busy.");
         return;
       }
       if (!await waitForClaudeInitializationForCommand(command.command_id)) {
+        operation.observe("failed", "Claude initialization rejected the input before dispatch.");
         return;
       }
       await waitForClaudeInterruptToSettle();
@@ -47356,11 +47426,12 @@ async function handleCommand(command) {
         if (command.command_id) {
           cancelledClaudeCoordinatorAdmissions.delete(command.command_id);
         }
+        operation.observe("failed", "Claude input was cancelled before dispatch.");
         return;
       }
-      enqueueClaudePrompt(command.text.trim(), command.images, command.command_id);
+      enqueueClaudePrompt(command.text.trim(), command.images, command.command_id, void 0, operation);
     } else {
-      promptQueue.push({ text: command.text.trim(), images: command.images });
+      promptQueue.push({ text: command.text.trim(), images: command.images, operation });
       await runQueuedTurns();
     }
     return;
@@ -47416,6 +47487,9 @@ async function handleCommand(command) {
     stopped = runtimeTeardown;
     if (runtimeTeardown) {
       runtimeTeardownPreparationId = null;
+      for (const queued of promptQueue.splice(0)) {
+        queued.operation?.observe("failed", "Runtime stopped before this queued input was dispatched.");
+      }
     }
     clearClaudeIdleCloseTimer();
     pendingClaudePromptReplay = null;
@@ -47719,6 +47793,8 @@ rl2.on("line", (line) => {
     }
     if (command.type === "prompt") {
       releaseClaudeCoordinatorAdmission(command.command_id);
+      const operation = promptInputOperations.get(command);
+      operation?.observe(operation === claudeInputOperation ? "unknown" : "failed", message);
     }
     if (command.type === "init" && command.provider === "claude" && command.initial_command_id && claudeForegroundPromptUuid !== command.initial_command_id) {
       emitClaudeCommandRejected(command.initial_command_id, message);

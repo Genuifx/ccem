@@ -185,6 +185,8 @@ commands.allow = [
   "send_test_notification",
   "get_telegram_settings",
   "get_wecom_settings",
+  "hermes_status",
+  "hermes_action",
   "get_wecom_task_binding_defaults",
   "get_wecom_task_binding_options",
   "get_weixin_settings",

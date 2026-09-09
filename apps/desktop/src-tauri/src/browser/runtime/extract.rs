@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use zip::ZipArchive;
 
 use super::manifest::RuntimeArtifact;
@@ -19,6 +20,7 @@ const UNIX_SYMLINK: u32 = 0o120000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractionErrorCode {
+    Cancelled,
     InvalidArchive,
     ArchiveSizeMismatch,
     DestinationConflict,
@@ -86,9 +88,26 @@ pub fn extract_runtime_archive(
     candidate_root: &Path,
     artifact: &RuntimeArtifact,
 ) -> Result<ExtractionOutcome, ExtractionError> {
+    extract_runtime_archive_with_cancel(
+        archive_path,
+        candidate_root,
+        artifact,
+        &AtomicBool::new(false),
+    )
+}
+
+/// The default Browser entry point remains uncancellable. Hermes opts in with its operation
+/// flag so closing an installation can stop between entries or bounded file-copy chunks.
+pub(crate) fn extract_runtime_archive_with_cancel(
+    archive_path: &Path,
+    candidate_root: &Path,
+    artifact: &RuntimeArtifact,
+    cancelled: &AtomicBool,
+) -> Result<ExtractionOutcome, ExtractionError> {
+    check_cancelled(cancelled)?;
     validate_archive_file(archive_path, artifact.archive.byte_size)?;
     prepare_empty_candidate(candidate_root)?;
-    let result = extract_inner(archive_path, candidate_root, artifact);
+    let result = extract_inner(archive_path, candidate_root, artifact, cancelled);
     if result.is_err() {
         let _ = fs::remove_dir_all(candidate_root);
     }
@@ -99,6 +118,7 @@ fn extract_inner(
     archive_path: &Path,
     candidate_root: &Path,
     artifact: &RuntimeArtifact,
+    cancelled: &AtomicBool,
 ) -> Result<ExtractionOutcome, ExtractionError> {
     let mut archive_file = File::open(archive_path).map_err(|_| io_error())?;
     let central_entry_count =
@@ -111,7 +131,7 @@ fn extract_inner(
     if archive.len() != central_entry_count {
         return Err(ExtractionError::new(ExtractionErrorCode::DuplicatePath));
     }
-    let plans = preflight_archive(&mut archive, artifact)?;
+    let plans = preflight_archive(&mut archive, artifact, cancelled)?;
     let declared_symlinks = artifact
         .layout
         .symlinks
@@ -121,6 +141,7 @@ fn extract_inner(
     let mut unpacked_bytes = 0_u64;
 
     for plan in plans.iter().filter(|plan| plan.kind != EntryKind::Symlink) {
+        check_cancelled(cancelled)?;
         let destination = candidate_root.join(&plan.relative_path);
         match plan.kind {
             EntryKind::Directory => ensure_private_directories(candidate_root, &destination)?,
@@ -138,6 +159,7 @@ fn extract_inner(
                     plan.size,
                     artifact.archive.max_file_bytes,
                     plan.unix_mode,
+                    cancelled,
                 )?;
                 unpacked_bytes =
                     checked_total(unpacked_bytes, actual, artifact.archive.max_unpacked_bytes)?;
@@ -148,6 +170,7 @@ fn extract_inner(
 
     let mut created_symlinks = BTreeSet::new();
     for plan in plans.iter().filter(|plan| plan.kind == EntryKind::Symlink) {
+        check_cancelled(cancelled)?;
         let declared = declared_symlinks
             .get(plan.portable_path.as_str())
             .ok_or_else(|| ExtractionError::new(ExtractionErrorCode::SymlinkNotDeclared))?;
@@ -182,6 +205,7 @@ fn extract_inner(
             ExtractionErrorCode::RequiredEntryMissing,
         ));
     }
+    check_cancelled(cancelled)?;
     let executable = candidate_root.join(&artifact.layout.executable.relative_path);
     let executable_metadata = fs::symlink_metadata(&executable)
         .map_err(|_| ExtractionError::new(ExtractionErrorCode::RequiredEntryMissing))?;
@@ -283,6 +307,7 @@ fn little_u32(bytes: &[u8]) -> u32 {
 fn preflight_archive(
     archive: &mut ZipArchive<File>,
     artifact: &RuntimeArtifact,
+    cancelled: &AtomicBool,
 ) -> Result<Vec<EntryPlan>, ExtractionError> {
     if archive.len() as u64 > artifact.archive.max_entries {
         return Err(ExtractionError::new(
@@ -301,6 +326,7 @@ fn preflight_archive(
     let mut path_kinds = BTreeMap::new();
     let mut declared_total = 0_u64;
     for index in 0..archive.len() {
+        check_cancelled(cancelled)?;
         let entry = archive
             .by_index(index)
             .map_err(|_| ExtractionError::new(ExtractionErrorCode::InvalidArchive))?;
@@ -462,14 +488,17 @@ fn reject_tree_conflict(
             return Err(ExtractionError::new(ExtractionErrorCode::InvalidPath));
         }
     }
-    if kind != EntryKind::Directory
-        && existing.keys().any(|existing_path| {
-            existing_path
-                .strip_prefix(path)
-                .is_some_and(|tail| tail.starts_with('/'))
-        })
-    {
-        return Err(ExtractionError::new(ExtractionErrorCode::InvalidPath));
+    if kind != EntryKind::Directory {
+        // Descendants occupy one contiguous range in this ordered map. Looking up its lower
+        // bound avoids rescanning every earlier entry for every file in a large archive.
+        let child_prefix = format!("{path}/");
+        if existing
+            .range(child_prefix.clone()..)
+            .next()
+            .is_some_and(|(existing_path, _)| existing_path.starts_with(&child_prefix))
+        {
+            return Err(ExtractionError::new(ExtractionErrorCode::InvalidPath));
+        }
     }
     Ok(())
 }
@@ -546,6 +575,7 @@ fn write_new_file_bounded<R: Read>(
     declared_size: u64,
     maximum: u64,
     unix_mode: Option<u32>,
+    cancelled: &AtomicBool,
 ) -> Result<u64, ExtractionError> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -558,6 +588,7 @@ fn write_new_file_bounded<R: Read>(
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
+        check_cancelled(cancelled)?;
         let count = reader
             .read(&mut buffer)
             .map_err(|_| ExtractionError::new(ExtractionErrorCode::InvalidArchive))?;
@@ -580,6 +611,14 @@ fn write_new_file_bounded<R: Read>(
     output.sync_all().map_err(|_| io_error())?;
     set_private_file(destination, unix_mode)?;
     Ok(copied)
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ExtractionError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(ExtractionError::new(ExtractionErrorCode::Cancelled))
+    } else {
+        Ok(())
+    }
 }
 
 fn read_symlink_target<R: Read>(
@@ -759,6 +798,145 @@ mod tests {
             .start_file(name, SimpleFileOptions::default().unix_permissions(0o755))
             .unwrap();
         writer.write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn file_tree_conflicts_reject_parent_before_child_and_child_before_parent() {
+        for names in [
+            ["runtime-root/tree", "runtime-root/tree/child"],
+            ["runtime-root/tree/child", "runtime-root/tree"],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = write_zip(&temp, |writer| {
+                add_file(writer, "runtime-root/App/Browser", b"browser");
+                for name in names {
+                    add_file(writer, name, b"data");
+                }
+            });
+            let artifact = artifact(fs::metadata(&archive).unwrap().len());
+            let candidate = temp.path().join("candidate");
+            assert_eq!(
+                extract_runtime_archive(&archive, &candidate, &artifact)
+                    .unwrap_err()
+                    .code,
+                ExtractionErrorCode::InvalidPath,
+            );
+            assert!(!candidate.exists());
+        }
+    }
+
+    #[test]
+    fn tree_conflicts_preserve_directory_and_neighboring_prefix_semantics() {
+        let mut existing = BTreeMap::from([
+            ("node-old".into(), EntryKind::File),
+            ("node.ext/child".into(), EntryKind::File),
+            ("node0/child".into(), EntryKind::File),
+            ("nodes/child".into(), EntryKind::File),
+        ]);
+        for kind in [EntryKind::File, EntryKind::Symlink] {
+            assert!(reject_tree_conflict("node", kind, &existing).is_ok());
+            assert!(reject_tree_conflict("node.ext", kind, &existing).is_err());
+        }
+        // An explicit directory may occur after an already listed child.
+        assert!(reject_tree_conflict("node.ext", EntryKind::Directory, &existing).is_ok());
+        existing.insert("node".into(), EntryKind::Directory);
+        assert!(reject_tree_conflict("node/child", EntryKind::File, &existing).is_ok());
+        existing.insert("node/child".into(), EntryKind::File);
+        assert!(reject_tree_conflict("node", EntryKind::File, &existing).is_err());
+        assert!(reject_tree_conflict("node", EntryKind::Directory, &existing).is_ok());
+        assert!(reject_tree_conflict("node/child/deeper", EntryKind::File, &existing).is_err());
+    }
+
+    #[test]
+    fn large_archive_preflight_handles_thirty_thousand_files() {
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let archive = write_zip(&temp, |writer| {
+            add_file(writer, "runtime-root/App/Browser", b"browser");
+            for index in 0..30_000 {
+                add_file(
+                    writer,
+                    &format!("runtime-root/source/module_{index:05}.py"),
+                    b"x",
+                );
+            }
+        });
+        let mut artifact = artifact(fs::metadata(&archive).unwrap().len());
+        artifact.archive.max_entries = 30_001;
+        artifact.archive.max_unpacked_bytes = 30_007;
+        let mut archive = ZipArchive::new(File::open(archive).unwrap()).unwrap();
+        let started = Instant::now();
+        let plans = preflight_archive(&mut archive, &artifact, &AtomicBool::new(false)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(plans.len(), 30_001);
+        eprintln!("30,001-entry ZIP preflight completed in {elapsed:?}");
+        // A generous bound catches the former minutes-long quadratic scan, without requiring
+        // a microbenchmark's timing precision from a shared CI machine.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "ZIP preflight took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_extraction_does_not_create_a_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = write_zip(&temp, |writer| {
+            add_file(writer, "runtime-root/App/Browser", b"browser");
+        });
+        let artifact = artifact(fs::metadata(&archive).unwrap().len());
+        let candidate = temp.path().join("candidate");
+        let error = extract_runtime_archive_with_cancel(
+            &archive,
+            &candidate,
+            &artifact,
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ExtractionErrorCode::Cancelled);
+        assert!(!candidate.exists());
+    }
+
+    #[test]
+    fn cancellation_during_real_zip_copy_removes_candidate_and_retry_succeeds() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let payload = vec![17; 16 * 1024 * 1024];
+        let archive = write_zip(&temp, |writer| {
+            add_file(writer, "runtime-root/App/payload", &payload);
+            add_file(writer, "runtime-root/App/Browser", b"browser");
+        });
+        let mut artifact = artifact(fs::metadata(&archive).unwrap().len());
+        artifact.archive.max_file_bytes = payload.len() as u64;
+        artifact.archive.max_unpacked_bytes = payload.len() as u64 + 7;
+        let candidate = temp.path().join("candidate");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                extract_runtime_archive_with_cancel(&archive, &candidate, &artifact, &cancelled)
+            });
+            let started = Instant::now();
+            while fs::metadata(candidate.join("App/payload")).map_or(true, |m| m.len() == 0) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "extractor made no progress"
+                );
+                std::thread::yield_now();
+            }
+            cancelled.store(true, Ordering::Release);
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().code,
+                ExtractionErrorCode::Cancelled
+            );
+        });
+        assert!(
+            !candidate.exists(),
+            "cancelled candidate must be fully removed"
+        );
+        let result = extract_runtime_archive(&archive, &candidate, &artifact).unwrap();
+        assert_eq!(result.unpacked_bytes, payload.len() as u64 + 7);
+        assert_eq!(fs::read(candidate.join("App/Browser")).unwrap(), b"browser");
     }
 
     #[cfg(unix)]

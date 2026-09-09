@@ -91,7 +91,7 @@ pub(crate) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
             text: truncate_text(detail, 1200),
         }),
         // Router request ledger entries — telemetry-grade, not for bot chat.
-        SessionEventPayload::RoutedRequest { .. } => None,
+        SessionEventPayload::RoutedRequest { .. } | SessionEventPayload::InputOperation { .. } => None,
         SessionEventPayload::StdErrLine { line } if !line.trim().is_empty() => Some(EventSummary {
             kind: RemoteEventKind::Error,
             title: "stderr".to_string(),

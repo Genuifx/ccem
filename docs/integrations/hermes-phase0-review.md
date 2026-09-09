@@ -1,5 +1,7 @@
 # REQ-0007 接手 review 与阶段 0
 
+后续托管实现与当前行为见 [CCEM 托管 Hermes 集成](hermes-managed-integration.md)。下文保留接手时的阶段 0 结论和被否定方案的证据，不作为后续实现状态。
+
 日期：2026-09-09 至 09-10。状态：阶段 0a 本地接手、review 和安全修复已验证；完整阶段 0 未通过。
 
 用户本轮要求接手 Hermes 集成，先 review，再按指定 complex-feature-dev-mode 推进。

@@ -542,9 +542,14 @@ impl ExternalControlManager {
         }
 
         let expected_auth = format!("Bearer {}", self.token);
-        if request.headers.get("authorization").map(String::as_str) != Some(expected_auth.as_str())
-        {
+        let authorization = request.headers.get("authorization").map(String::as_str).unwrap_or("");
+        let bridge = app.try_state::<Arc<crate::hermes_bridge::HermesBridgeManager>>();
+        let bridge_authorized = bridge.as_ref().is_some_and(|b| b.authorized_token(authorization));
+        if authorization != expected_auth && !bridge_authorized {
             return HttpResponse::json_error(401, None, -32001, "Unauthorized");
+        }
+        if bridge_authorized && request.body.len() > 64 * 1024 {
+            return HttpResponse::json_error(413, None, -32600, "Bridge request too large");
         }
 
         let rpc = match serde_json::from_slice::<JsonRpcRequest>(&request.body) {
@@ -559,6 +564,13 @@ impl ExternalControlManager {
             }
         };
         let id = rpc.id.clone();
+
+        if bridge_authorized {
+            return match bridge.expect("authorized bridge exists").handle_rpc(app, authorization, &rpc.method, rpc.params) {
+                Ok(result) => HttpResponse::json_result(id, result),
+                Err(error) => HttpResponse::json_error(200, id, -32000, &error),
+            };
+        }
 
         // Method allowlist: reject unknown JSON-RPC methods with -32601.
         if !is_allowed_method(&rpc.method) {

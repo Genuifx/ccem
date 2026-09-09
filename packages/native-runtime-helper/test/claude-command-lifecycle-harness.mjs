@@ -77,7 +77,7 @@ async function buildHelperWithWireMock(options = {}) {
                 type: 'result',
                 subtype: 'success',
                 result: 'done ' + turn,
-                user_message_uuid: userMessage.uuid,
+                user_message_uuid: ${JSON.stringify(options.omitResultCorrelation ?? false)} ? undefined : userMessage.uuid,
                 usage: {
                   input_tokens: 1,
                   output_tokens: 2,

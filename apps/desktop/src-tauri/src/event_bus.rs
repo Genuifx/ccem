@@ -229,6 +229,19 @@ pub enum SessionEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         canonical_hash: Option<String>,
     },
+    /// Correlation from an actual native-helper invocation. This does not
+    /// deduplicate external client IDs and is independent of session status.
+    InputOperation {
+        operation_id: String,
+        client_message_ids: Vec<String>,
+        provider: String,
+        stage: String,
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_turn_id: Option<String>,
+    },
     SystemMessage {
         message: String,
     },
@@ -770,6 +783,25 @@ mod tests {
         let legacy_reencoded =
             serde_json::to_value(legacy).expect("re-serialize legacy user prompt");
         assert!(legacy_reencoded.get("client_message_id").is_none());
+    }
+
+    #[test]
+    fn input_operation_preserves_batch_ids_without_inventing_a_provider_turn_id() {
+        let raw = serde_json::json!({
+            "type": "input_operation",
+            "operation_id": "invocation-a",
+            "client_message_ids": ["client-a", "client-b"],
+            "provider": "claude",
+            "stage": "completed",
+            "detail": "SDK completed the matching command",
+            "command_id": "command-a"
+        });
+        let payload: SessionEventPayload = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(payload).unwrap(), raw);
+        let legacy: SessionEventPayload = serde_json::from_str(
+            r#"{"type":"lifecycle","stage":"turn_completed","detail":"legacy"}"#,
+        ).unwrap();
+        assert!(matches!(legacy, SessionEventPayload::Lifecycle { command_id: None, .. }));
     }
 
     #[test]
