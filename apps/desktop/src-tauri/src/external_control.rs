@@ -625,6 +625,17 @@ impl ExternalControlManager {
                     .ok_or_else(|| format!("Native runtime {} not found", params.runtime_id))?;
                 Ok(serde_json::to_value(session).map_err(|error| error.to_string())?)
             }
+            "ccem.remote.getEvents" => {
+                let params = deserialize_params::<EventsParams>(rpc.params)?;
+                let since = Some(params.since_seq.unwrap_or(0));
+                let batch = self.native_runtime.replay_event_page(
+                    &params.runtime_id,
+                    since,
+                    None,
+                    params.limit.unwrap_or(100),
+                )?;
+                Ok(crate::remote_bridge::project_batch(batch, since))
+            }
             "ccem.workspace.getEvents" => {
                 let params = deserialize_params::<EventsParams>(rpc.params)?;
                 let events = self.native_runtime.replay_events_limited(
@@ -2225,6 +2236,7 @@ fn is_allowed_method_for_build(method: &str, _debug_assertions: bool) -> bool {
             | "ccem.environment.delete"
             | "ccem.workspace.getSession"
             | "ccem.workspace.getEvents"
+            | "ccem.remote.getEvents"
             | "ccem.workspace.sendInput"
             | "ccem.workspace.openSession"
             | "ccem.workspace.createSession"
@@ -2502,6 +2514,7 @@ mod tests {
             "ccem.environment.delete",
             "ccem.workspace.getSession",
             "ccem.workspace.getEvents",
+            "ccem.remote.getEvents",
             "ccem.workspace.sendInput",
             "ccem.workspace.openSession",
             "ccem.workspace.createSession",

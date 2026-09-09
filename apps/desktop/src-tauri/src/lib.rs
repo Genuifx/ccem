@@ -42,6 +42,7 @@ mod pet_window;
 mod prompt_image_store;
 mod proxy_debug;
 mod remote;
+mod remote_bridge;
 mod router;
 mod runtime;
 mod secure_fs;

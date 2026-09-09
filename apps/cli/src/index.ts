@@ -1,3 +1,4 @@
+import { registerRemoteBridge } from './remoteBridge.js';
 import { Command } from 'commander';
 import Conf from 'conf';
 import inquirer from 'inquirer';
@@ -1960,5 +1961,7 @@ registerDshCommands(program, {
   getRegistries,
   getCurrentEnvName: () => (config.get('current') as string | undefined) ?? '',
 });
+
+registerRemoteBridge(program);
 
 await program.parseAsync(process.argv).catch(handleCliError);
