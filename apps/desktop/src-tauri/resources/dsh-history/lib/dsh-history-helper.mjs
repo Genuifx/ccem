@@ -41,14 +41,14 @@ function isArrayBufferSource(value) {
   return isArrayBufferLike(value) || ArrayBuffer.isView(value);
 }
 var Binary;
-(function(Binary2) {
-  Binary2.is = isArrayBufferLike;
-  Binary2.isSource = isArrayBufferSource;
+(function(Binary3) {
+  Binary3.is = isArrayBufferLike;
+  Binary3.isSource = isArrayBufferSource;
   function fromSource(source) {
     if (ArrayBuffer.isView(source)) return source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
     else return source;
   }
-  Binary2.fromSource = fromSource;
+  Binary3.fromSource = fromSource;
   function toBase64(source) {
     source = fromSource(source);
     if (typeof Buffer !== "undefined") return Buffer.from(source).toString("base64");
@@ -57,18 +57,18 @@ var Binary;
     for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
     return btoa(binary);
   }
-  Binary2.toBase64 = toBase64;
+  Binary3.toBase64 = toBase64;
   function fromBase64(source) {
     if (typeof Buffer !== "undefined") return fromSource(Buffer.from(source, "base64"));
     return Uint8Array.from(atob(source), (c) => c.charCodeAt(0));
   }
-  Binary2.fromBase64 = fromBase64;
+  Binary3.fromBase64 = fromBase64;
   function toHex(source) {
     source = fromSource(source);
     if (typeof Buffer !== "undefined") return Buffer.from(source).toString("hex");
     return Array.from(new Uint8Array(source), (byte) => byte.toString(16).padStart(2, "0")).join("");
   }
-  Binary2.toHex = toHex;
+  Binary3.toHex = toHex;
   function fromHex(source) {
     if (typeof Buffer !== "undefined") return fromSource(Buffer.from(source, "hex"));
     const hex3 = source.length % 2 === 0 ? source : source.slice(0, source.length - 1);
@@ -76,7 +76,7 @@ var Binary;
     for (let i = 0; i < hex3.length; i += 2) buffer.push(parseInt(`${hex3[i]}${hex3[i + 1]}`, 16));
     return Uint8Array.from(buffer).buffer;
   }
-  Binary2.fromHex = fromHex;
+  Binary3.fromHex = fromHex;
 })(Binary || (Binary = {}));
 var base64ToArrayBuffer = Binary.fromBase64;
 var arrayBufferToBase64 = Binary.toBase64;
@@ -157,34 +157,34 @@ function paramCase(source) {
 }
 var hyphenate = paramCase;
 var Time;
-(function(Time2) {
-  Time2.millisecond = 1;
-  Time2.second = 1e3;
-  Time2.minute = Time2.second * 60;
-  Time2.hour = Time2.minute * 60;
-  Time2.day = Time2.hour * 24;
-  Time2.week = Time2.day * 7;
+(function(Time3) {
+  Time3.millisecond = 1;
+  Time3.second = 1e3;
+  Time3.minute = Time3.second * 60;
+  Time3.hour = Time3.minute * 60;
+  Time3.day = Time3.hour * 24;
+  Time3.week = Time3.day * 7;
   let timezoneOffset = (/* @__PURE__ */ new Date()).getTimezoneOffset();
   function setTimezoneOffset(offset) {
     timezoneOffset = offset;
   }
-  Time2.setTimezoneOffset = setTimezoneOffset;
+  Time3.setTimezoneOffset = setTimezoneOffset;
   function getTimezoneOffset() {
     return timezoneOffset;
   }
-  Time2.getTimezoneOffset = getTimezoneOffset;
-  function getDateNumber(date6 = /* @__PURE__ */ new Date(), offset) {
-    if (typeof date6 === "number") date6 = new Date(date6);
+  Time3.getTimezoneOffset = getTimezoneOffset;
+  function getDateNumber(date7 = /* @__PURE__ */ new Date(), offset) {
+    if (typeof date7 === "number") date7 = new Date(date7);
     if (offset === void 0) offset = timezoneOffset;
-    return Math.floor((date6.valueOf() / Time2.minute - offset) / 1440);
+    return Math.floor((date7.valueOf() / Time3.minute - offset) / 1440);
   }
-  Time2.getDateNumber = getDateNumber;
+  Time3.getDateNumber = getDateNumber;
   function fromDateNumber(value, offset) {
-    const date6 = new Date(value * Time2.day);
+    const date7 = new Date(value * Time3.day);
     if (offset === void 0) offset = timezoneOffset;
-    return new Date(+date6 + offset * Time2.minute);
+    return new Date(+date7 + offset * Time3.minute);
   }
-  Time2.fromDateNumber = fromDateNumber;
+  Time3.fromDateNumber = fromDateNumber;
   const numeric = /\d+(?:\.\d+)?/.source;
   const timeRegExp = new RegExp(`^${[
     "w(?:eek(?:s)?)?",
@@ -196,34 +196,34 @@ var Time;
   function parseTime(source) {
     const capture = timeRegExp.exec(source);
     if (!capture) return 0;
-    return (parseFloat(capture[1]) * Time2.week || 0) + (parseFloat(capture[2]) * Time2.day || 0) + (parseFloat(capture[3]) * Time2.hour || 0) + (parseFloat(capture[4]) * Time2.minute || 0) + (parseFloat(capture[5]) * Time2.second || 0);
+    return (parseFloat(capture[1]) * Time3.week || 0) + (parseFloat(capture[2]) * Time3.day || 0) + (parseFloat(capture[3]) * Time3.hour || 0) + (parseFloat(capture[4]) * Time3.minute || 0) + (parseFloat(capture[5]) * Time3.second || 0);
   }
-  Time2.parseTime = parseTime;
-  function parseDate(date6) {
-    const parsed = parseTime(date6);
-    if (parsed) date6 = Date.now() + parsed;
-    else if (/^\d{1,2}(:\d{1,2}){1,2}$/.test(date6)) date6 = `${(/* @__PURE__ */ new Date()).toLocaleDateString()}-${date6}`;
-    else if (/^\d{1,2}-\d{1,2}-\d{1,2}(:\d{1,2}){1,2}$/.test(date6)) date6 = `${(/* @__PURE__ */ new Date()).getFullYear()}-${date6}`;
-    return date6 ? new Date(date6) : /* @__PURE__ */ new Date();
+  Time3.parseTime = parseTime;
+  function parseDate(date7) {
+    const parsed = parseTime(date7);
+    if (parsed) date7 = Date.now() + parsed;
+    else if (/^\d{1,2}(:\d{1,2}){1,2}$/.test(date7)) date7 = `${(/* @__PURE__ */ new Date()).toLocaleDateString()}-${date7}`;
+    else if (/^\d{1,2}-\d{1,2}-\d{1,2}(:\d{1,2}){1,2}$/.test(date7)) date7 = `${(/* @__PURE__ */ new Date()).getFullYear()}-${date7}`;
+    return date7 ? new Date(date7) : /* @__PURE__ */ new Date();
   }
-  Time2.parseDate = parseDate;
+  Time3.parseDate = parseDate;
   function format(ms) {
     const abs = Math.abs(ms);
-    if (abs >= Time2.day - Time2.hour / 2) return Math.round(ms / Time2.day) + "d";
-    else if (abs >= Time2.hour - Time2.minute / 2) return Math.round(ms / Time2.hour) + "h";
-    else if (abs >= Time2.minute - Time2.second / 2) return Math.round(ms / Time2.minute) + "m";
-    else if (abs >= Time2.second) return Math.round(ms / Time2.second) + "s";
+    if (abs >= Time3.day - Time3.hour / 2) return Math.round(ms / Time3.day) + "d";
+    else if (abs >= Time3.hour - Time3.minute / 2) return Math.round(ms / Time3.hour) + "h";
+    else if (abs >= Time3.minute - Time3.second / 2) return Math.round(ms / Time3.minute) + "m";
+    else if (abs >= Time3.second) return Math.round(ms / Time3.second) + "s";
     return ms + "ms";
   }
-  Time2.format = format;
+  Time3.format = format;
   function toDigits(source, length = 2) {
     return source.toString().padStart(length, "0");
   }
-  Time2.toDigits = toDigits;
+  Time3.toDigits = toDigits;
   function template(template2, time3 = /* @__PURE__ */ new Date()) {
     return template2.replace("yyyy", time3.getFullYear().toString()).replace("yy", time3.getFullYear().toString().slice(2)).replace("MM", toDigits(time3.getMonth() + 1)).replace("dd", toDigits(time3.getDate())).replace("hh", toDigits(time3.getHours())).replace("mm", toDigits(time3.getMinutes())).replace("ss", toDigits(time3.getSeconds())).replace("SSS", toDigits(time3.getMilliseconds(), 3));
   }
-  Time2.template = template;
+  Time3.template = template;
 })(Time || (Time = {}));
 
 // ../../node_modules/.pnpm/@deepseek-ai+cordis@4.0.1/node_modules/@deepseek-ai/cordis/lib/index.js
@@ -329,11 +329,11 @@ function withProp(target, prop, value) {
     writable: false
   }));
 }
-function createShadow(ctx, target, property2, receiver) {
-  if (!property2) return receiver;
-  const origin = Reflect.getOwnPropertyDescriptor(target, property2)?.value;
+function createShadow(ctx, target, property3, receiver) {
+  if (!property3) return receiver;
+  const origin = Reflect.getOwnPropertyDescriptor(target, property3)?.value;
   if (!origin) return receiver;
-  return withProp(receiver, property2, ctx.extend({ [symbols.shadow]: origin }));
+  return withProp(receiver, property3, ctx.extend({ [symbols.shadow]: origin }));
 }
 function createShadowMethod(ctx, value, outer, shadow) {
   return new Proxy(value, { apply: (target, thisArg, args) => {
@@ -1372,8 +1372,8 @@ var Fiber = class {
     let inFlight;
     let removeWrapper = () => false;
     const waitForSetup = () => {
-      setupBarrier ??= new Promise((resolve3, reject) => {
-        resolveSetup = resolve3;
+      setupBarrier ??= new Promise((resolve4, reject) => {
+        resolveSetup = resolve4;
         rejectSetup = reject;
       });
       return setupBarrier;
@@ -1622,10 +1622,10 @@ function Inject(name, config2) {
       const inject = (value[symbols.metadata] ??= {}).inject ??= /* @__PURE__ */ Object.create(null);
       inject[name] = config2;
       decorator.addInitializer(function() {
-        const property2 = this[symbols.tracker]?.property;
+        const property3 = this[symbols.tracker]?.property;
         (this[symbols.initHooks] ??= []).push(() => {
           this.ctx.inject(inject, (ctx) => {
-            return value.call(property2 ? withProps(this, { [property2]: ctx }) : this);
+            return value.call(property3 ? withProps(this, { [property3]: ctx }) : this);
           });
         });
       });
@@ -1633,16 +1633,16 @@ function Inject(name, config2) {
   };
 }
 (function(Inject2) {
-  function resolve3(inject, result = /* @__PURE__ */ Object.create(null)) {
+  function resolve4(inject, result = /* @__PURE__ */ Object.create(null)) {
     if (!inject) return result;
     if (Array.isArray(inject)) for (const name of inject) result[name] = null;
     else if (Reflect.has(inject, symbols.checkProto)) {
-      Object.assign(result, resolve3(Object.getPrototypeOf(inject)));
+      Object.assign(result, resolve4(Object.getPrototypeOf(inject)));
       for (const name of Object.keys(inject)) result[name] = inject[name] ?? null;
     } else for (const name of Object.keys(inject)) result[name] = inject[name] ?? null;
     return result;
   }
-  Inject2.resolve = resolve3;
+  Inject2.resolve = resolve4;
 })(Inject || (Inject = {}));
 var RegistryService = class {
   ctx;
@@ -2118,10 +2118,10 @@ Schema.prototype.experimental = function experimental() {
 };
 Schema.prototype.pattern = function pattern(regexp) {
   const schema = Schema(this);
-  const pattern2 = pick(regexp, ["source", "flags"]);
+  const pattern3 = pick(regexp, ["source", "flags"]);
   schema.meta = {
     ...schema.meta,
-    pattern: pattern2
+    pattern: pattern3
   };
   return schema;
 };
@@ -2158,12 +2158,12 @@ Schema.prototype.simplify = function simplify(value) {
 Schema.prototype.toString = function toString(inline) {
   return formatters[this.type]?.(this, inline) ?? `Schema<${this.type}>`;
 };
-Schema.prototype.role = function role(role, extra2) {
+Schema.prototype.role = function role(role, extra3) {
   const schema = Schema(this);
   schema.meta = {
     ...schema.meta,
     role,
-    extra: extra2
+    extra: extra3
   };
   return schema;
 };
@@ -2184,8 +2184,8 @@ for (const key of [
   return schema;
 } });
 var resolvers = {};
-Schema.extend = function extend(type, resolve3) {
-  resolvers[type] = resolve3;
+Schema.extend = function extend(type, resolve4) {
+  resolvers[type] = resolve4;
 };
 Schema.resolve = function resolve(data, schema, options = {}, strict = false) {
   if (!schema) return [data];
@@ -2233,7 +2233,7 @@ Schema.from = function from(source) {
   else throw new TypeError(`cannot infer schema from ${source}`);
 };
 Schema.lazy = function lazy(builder) {
-  const toJSON2 = () => {
+  const toJSON3 = () => {
     if (!schema.inner[kSchema]) {
       schema.inner = schema.builder();
       schema.inner.meta = {
@@ -2246,7 +2246,7 @@ Schema.lazy = function lazy(builder) {
   const schema = new Schema({
     type: "lazy",
     builder,
-    inner: { toJSON: toJSON2 }
+    inner: { toJSON: toJSON3 }
   });
   return schema;
 };
@@ -2258,9 +2258,9 @@ Schema.percent = function percent() {
 };
 Schema.date = function date() {
   return Schema.union([Schema.is(Date), Schema.transform(Schema.string().role("datetime"), (value, options) => {
-    const date6 = new Date(value);
-    if (isNaN(+date6)) throw new ValidationError2(`invalid date "${value}"`, options);
-    return date6;
+    const date7 = new Date(value);
+    if (isNaN(+date7)) throw new ValidationError2(`invalid date "${value}"`, options);
+    return date7;
   }, true)]);
 };
 Schema.regExp = function regExp(flag = "") {
@@ -2443,25 +2443,25 @@ Schema.extend("object", (data, { dict }, options, strict) => {
   if (!strict) merge(result, data);
   return [result];
 });
-Schema.extend("union", (data, { list, toString: toString2 }, options, strict) => {
+Schema.extend("union", (data, { list, toString: toString3 }, options, strict) => {
   const messages = [];
   for (const inner of list) try {
     return Schema.resolve(data, inner, options, strict);
   } catch (error51) {
     messages.push(error51);
   }
-  throw new ValidationError2(`expected ${toString2()} but got ${JSON.stringify(data)}`, options);
+  throw new ValidationError2(`expected ${toString3()} but got ${JSON.stringify(data)}`, options);
 });
-Schema.extend("intersect", (data, { list, toString: toString2 }, options, strict) => {
+Schema.extend("intersect", (data, { list, toString: toString3 }, options, strict) => {
   if (!list.length) return [data];
   let result;
   for (const inner of list) {
     const value = Schema.resolve(data, inner, options, true)[0];
     if (isNullable(value)) continue;
     if (isNullable(result)) result = value;
-    else if (typeof result !== typeof value) throw new ValidationError2(`expected ${toString2()} but got ${JSON.stringify(data)}`, options);
+    else if (typeof result !== typeof value) throw new ValidationError2(`expected ${toString3()} but got ${JSON.stringify(data)}`, options);
     else if (typeof value === "object") merge(result ??= {}, value);
-    else if (result !== value) throw new ValidationError2(`expected ${toString2()} but got ${JSON.stringify(data)}`, options);
+    else if (result !== value) throw new ValidationError2(`expected ${toString3()} but got ${JSON.stringify(data)}`, options);
   }
   if (!strict && isPlainObject(data)) merge(result, data);
   return [result];
@@ -2554,7 +2554,7 @@ defineMethod("transform", [
 // ../../node_modules/.pnpm/@deepseek-ai+dsh-session-persistence-jsonl@0.1.1-rc.2_@deepseek-ai+cordis@4.0.1_@deepse_14f57a8dc717fa4ab0d46db3acee4cf9/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js
 import { readdirSync } from "node:fs";
 import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";
-import { dirname, join, parse, resolve as resolve2, toNamespacedPath } from "node:path";
+import { dirname, join, parse, resolve as resolve3, toNamespacedPath } from "node:path";
 import { performance } from "node:perf_hooks";
 import { scheduler } from "node:timers/promises";
 import { randomBytes } from "node:crypto";
@@ -2564,6 +2564,794 @@ import { isAbsolute } from "node:path";
 
 // ../../node_modules/.pnpm/@deepseek-ai+dsh-llm@0.1.1-rc.2_@deepseek-ai+cordis@4.0.1_@deepseek-ai+dsh-attachment@0_de8559ed89b7370843bac1bad71a6196/node_modules/@deepseek-ai/dsh-llm/lib/index.js
 import { createRequire } from "node:module";
+
+// ../../node_modules/.pnpm/@deepseek-ai+cosmokit@1.8.3/node_modules/@deepseek-ai/cosmokit/lib/index.js
+function isNullable2(value) {
+  return value === null || value === void 0;
+}
+function isPlainObject2(data) {
+  return data && typeof data === "object" && !Array.isArray(data);
+}
+function filterKeys2(object2, filter) {
+  return Object.fromEntries(Object.entries(object2).filter(([key, value]) => filter(key, value)));
+}
+function mapValues2(object2, transform2) {
+  return Object.fromEntries(Object.entries(object2).map(([key, value]) => [key, transform2(value, key)]));
+}
+function pick2(source, keys, forced) {
+  if (!keys) return { ...source };
+  const result = {};
+  for (const key of keys) if (forced || source[key] !== void 0) result[key] = source[key];
+  return result;
+}
+function is2(type, value) {
+  if (arguments.length === 1) return (value2) => is2(type, value2);
+  return type in globalThis && value instanceof globalThis[type] || Object.prototype.toString.call(value).slice(8, -1) === type;
+}
+function isArrayBufferLike2(value) {
+  return is2("ArrayBuffer", value) || is2("SharedArrayBuffer", value);
+}
+function isArrayBufferSource2(value) {
+  return isArrayBufferLike2(value) || ArrayBuffer.isView(value);
+}
+var Binary2;
+(function(Binary3) {
+  Binary3.is = isArrayBufferLike2;
+  Binary3.isSource = isArrayBufferSource2;
+  function fromSource(source) {
+    if (ArrayBuffer.isView(source)) return source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
+    else return source;
+  }
+  Binary3.fromSource = fromSource;
+  function toBase64(source) {
+    source = fromSource(source);
+    if (typeof Buffer !== "undefined") return Buffer.from(source).toString("base64");
+    let binary = "";
+    const bytes = new Uint8Array(source);
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+  Binary3.toBase64 = toBase64;
+  function fromBase64(source) {
+    if (typeof Buffer !== "undefined") return fromSource(Buffer.from(source, "base64"));
+    return Uint8Array.from(atob(source), (c) => c.charCodeAt(0));
+  }
+  Binary3.fromBase64 = fromBase64;
+  function toHex(source) {
+    source = fromSource(source);
+    if (typeof Buffer !== "undefined") return Buffer.from(source).toString("hex");
+    return Array.from(new Uint8Array(source), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  Binary3.toHex = toHex;
+  function fromHex(source) {
+    if (typeof Buffer !== "undefined") return fromSource(Buffer.from(source, "hex"));
+    const hex3 = source.length % 2 === 0 ? source : source.slice(0, source.length - 1);
+    const buffer = [];
+    for (let i = 0; i < hex3.length; i += 2) buffer.push(parseInt(`${hex3[i]}${hex3[i + 1]}`, 16));
+    return Uint8Array.from(buffer).buffer;
+  }
+  Binary3.fromHex = fromHex;
+})(Binary2 || (Binary2 = {}));
+var base64ToArrayBuffer2 = Binary2.fromBase64;
+var arrayBufferToBase642 = Binary2.toBase64;
+var hexToArrayBuffer2 = Binary2.fromHex;
+var arrayBufferToHex2 = Binary2.toHex;
+function clone2(source, refs = /* @__PURE__ */ new Map()) {
+  if (!source || typeof source !== "object") return source;
+  if (is2("Date", source)) return new Date(source.valueOf());
+  if (is2("RegExp", source)) return new RegExp(source.source, source.flags);
+  if (isArrayBufferLike2(source)) return source.slice(0);
+  if (ArrayBuffer.isView(source)) return source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
+  const cached2 = refs.get(source);
+  if (cached2) return cached2;
+  if (Array.isArray(source)) {
+    const result2 = [];
+    refs.set(source, result2);
+    source.forEach((value, index) => {
+      result2[index] = Reflect.apply(clone2, null, [value, refs]);
+    });
+    return result2;
+  }
+  const result = Object.create(Object.getPrototypeOf(source));
+  refs.set(source, result);
+  for (const key of Reflect.ownKeys(source)) {
+    const descriptor = { ...Reflect.getOwnPropertyDescriptor(source, key) };
+    if ("value" in descriptor) descriptor.value = Reflect.apply(clone2, null, [descriptor.value, refs]);
+    Reflect.defineProperty(result, key, descriptor);
+  }
+  return result;
+}
+function deepEqual2(a, b, strict) {
+  if (a === b) return true;
+  if (!strict && isNullable2(a) && isNullable2(b)) return true;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== "object") return false;
+  if (!a || !b) return false;
+  function check2(test, then) {
+    return test(a) ? test(b) ? then(a, b) : false : test(b) ? false : void 0;
+  }
+  return check2(Array.isArray, (a2, b2) => a2.length === b2.length && a2.every((item, index) => deepEqual2(item, b2[index]))) ?? check2(is2("Date"), (a2, b2) => a2.valueOf() === b2.valueOf()) ?? check2(is2("RegExp"), (a2, b2) => a2.source === b2.source && a2.flags === b2.flags) ?? check2(isArrayBufferLike2, (a2, b2) => {
+    if (a2.byteLength !== b2.byteLength) return false;
+    const viewA = new Uint8Array(a2);
+    const viewB = new Uint8Array(b2);
+    for (let i = 0; i < viewA.length; i++) if (viewA[i] !== viewB[i]) return false;
+    return true;
+  }) ?? Object.keys({
+    ...a,
+    ...b
+  }).every((key) => deepEqual2(a[key], b[key], strict));
+}
+var Time2;
+(function(Time3) {
+  Time3.millisecond = 1;
+  Time3.second = 1e3;
+  Time3.minute = Time3.second * 60;
+  Time3.hour = Time3.minute * 60;
+  Time3.day = Time3.hour * 24;
+  Time3.week = Time3.day * 7;
+  let timezoneOffset = (/* @__PURE__ */ new Date()).getTimezoneOffset();
+  function setTimezoneOffset(offset) {
+    timezoneOffset = offset;
+  }
+  Time3.setTimezoneOffset = setTimezoneOffset;
+  function getTimezoneOffset() {
+    return timezoneOffset;
+  }
+  Time3.getTimezoneOffset = getTimezoneOffset;
+  function getDateNumber(date7 = /* @__PURE__ */ new Date(), offset) {
+    if (typeof date7 === "number") date7 = new Date(date7);
+    if (offset === void 0) offset = timezoneOffset;
+    return Math.floor((date7.valueOf() / Time3.minute - offset) / 1440);
+  }
+  Time3.getDateNumber = getDateNumber;
+  function fromDateNumber(value, offset) {
+    const date7 = new Date(value * Time3.day);
+    if (offset === void 0) offset = timezoneOffset;
+    return new Date(+date7 + offset * Time3.minute);
+  }
+  Time3.fromDateNumber = fromDateNumber;
+  const numeric = /\d+(?:\.\d+)?/.source;
+  const timeRegExp = new RegExp(`^${[
+    "w(?:eek(?:s)?)?",
+    "d(?:ay(?:s)?)?",
+    "h(?:our(?:s)?)?",
+    "m(?:in(?:ute)?(?:s)?)?",
+    "s(?:ec(?:ond)?(?:s)?)?"
+  ].map((unit) => `(${numeric}${unit})?`).join("")}$`);
+  function parseTime(source) {
+    const capture = timeRegExp.exec(source);
+    if (!capture) return 0;
+    return (parseFloat(capture[1]) * Time3.week || 0) + (parseFloat(capture[2]) * Time3.day || 0) + (parseFloat(capture[3]) * Time3.hour || 0) + (parseFloat(capture[4]) * Time3.minute || 0) + (parseFloat(capture[5]) * Time3.second || 0);
+  }
+  Time3.parseTime = parseTime;
+  function parseDate(date7) {
+    const parsed = parseTime(date7);
+    if (parsed) date7 = Date.now() + parsed;
+    else if (/^\d{1,2}(:\d{1,2}){1,2}$/.test(date7)) date7 = `${(/* @__PURE__ */ new Date()).toLocaleDateString()}-${date7}`;
+    else if (/^\d{1,2}-\d{1,2}-\d{1,2}(:\d{1,2}){1,2}$/.test(date7)) date7 = `${(/* @__PURE__ */ new Date()).getFullYear()}-${date7}`;
+    return date7 ? new Date(date7) : /* @__PURE__ */ new Date();
+  }
+  Time3.parseDate = parseDate;
+  function format(ms) {
+    const abs = Math.abs(ms);
+    if (abs >= Time3.day - Time3.hour / 2) return Math.round(ms / Time3.day) + "d";
+    else if (abs >= Time3.hour - Time3.minute / 2) return Math.round(ms / Time3.hour) + "h";
+    else if (abs >= Time3.minute - Time3.second / 2) return Math.round(ms / Time3.minute) + "m";
+    else if (abs >= Time3.second) return Math.round(ms / Time3.second) + "s";
+    return ms + "ms";
+  }
+  Time3.format = format;
+  function toDigits(source, length = 2) {
+    return source.toString().padStart(length, "0");
+  }
+  Time3.toDigits = toDigits;
+  function template(template2, time3 = /* @__PURE__ */ new Date()) {
+    return template2.replace("yyyy", time3.getFullYear().toString()).replace("yy", time3.getFullYear().toString().slice(2)).replace("MM", toDigits(time3.getMonth() + 1)).replace("dd", toDigits(time3.getDate())).replace("hh", toDigits(time3.getHours())).replace("mm", toDigits(time3.getMinutes())).replace("ss", toDigits(time3.getSeconds())).replace("SSS", toDigits(time3.getMilliseconds(), 3));
+  }
+  Time3.template = template;
+})(Time2 || (Time2 = {}));
+
+// ../../node_modules/.pnpm/@deepseek-ai+schemastery@3.18.2/node_modules/@deepseek-ai/schemastery/lib/index.mjs
+var kSchema2 = Symbol.for("schemastery");
+var kValidationError3 = Symbol.for("ValidationError");
+globalThis.__schemastery_index__ ??= 0;
+globalThis.__schemastery_refs__ = void 0;
+var ValidationError3 = class extends TypeError {
+  options;
+  name = "ValidationError";
+  constructor(message, options) {
+    let prefix = "$";
+    for (const segment of options.path || []) if (typeof segment === "string") prefix += "." + segment;
+    else if (typeof segment === "number") prefix += "[" + segment + "]";
+    else if (typeof segment === "symbol") prefix += `[Symbol(${segment.toString()})]`;
+    if (prefix.startsWith(".")) prefix = prefix.slice(1);
+    super((prefix === "$" ? "" : `${prefix} `) + message);
+    this.options = options;
+  }
+  static is(error51) {
+    return !!error51?.[kValidationError3];
+  }
+};
+Object.defineProperty(ValidationError3.prototype, kValidationError3, { value: true });
+var Schema2 = function(options) {
+  const schema = function(data, options2 = {}) {
+    return Schema2.resolve(data, schema, options2)[0];
+  };
+  if (options.refs) {
+    const refs = mapValues2(options.refs, (options2) => new Schema2(options2));
+    const getRef = (uid) => refs[uid];
+    for (const key in refs) {
+      const options2 = refs[key];
+      options2.sKey = getRef(options2.sKey);
+      options2.inner = getRef(options2.inner);
+      options2.list = options2.list && options2.list.map(getRef);
+      options2.dict = options2.dict && mapValues2(options2.dict, getRef);
+    }
+    return refs[options.uid];
+  }
+  Object.assign(schema, options);
+  if (typeof schema.callback === "string") try {
+    schema.callback = new Function("return " + schema.callback)();
+  } catch {
+  }
+  Object.defineProperty(schema, "uid", { value: globalThis.__schemastery_index__++ });
+  Object.setPrototypeOf(schema, Schema2.prototype);
+  schema.meta ||= {};
+  schema.toString = schema.toString.bind(schema);
+  return schema;
+};
+Schema2.prototype = Object.create(Function.prototype);
+Schema2.prototype[kSchema2] = true;
+Object.defineProperty(Schema2.prototype, "~standard", { get() {
+  return {
+    version: 1,
+    vendor: "schemastery",
+    validate: (value) => {
+      try {
+        return { value: Schema2.resolve(value, this, {})[0] };
+      } catch (error51) {
+        if (ValidationError3.is(error51)) return { issues: [{
+          message: error51.message,
+          path: error51.options.path
+        }] };
+        throw error51;
+      }
+    }
+  };
+} });
+Schema2.ValidationError = ValidationError3;
+Schema2.prototype.toJSON = function toJSON2() {
+  if (globalThis.__schemastery_refs__) {
+    globalThis.__schemastery_refs__[this.uid] ??= JSON.parse(JSON.stringify({ ...this }));
+    return this.uid;
+  }
+  globalThis.__schemastery_refs__ = { [this.uid]: { ...this } };
+  globalThis.__schemastery_refs__[this.uid] = JSON.parse(JSON.stringify({ ...this }));
+  const result = {
+    uid: this.uid,
+    refs: globalThis.__schemastery_refs__
+  };
+  globalThis.__schemastery_refs__ = void 0;
+  return result;
+};
+Schema2.prototype.set = function set2(key, value) {
+  this.dict[key] = value;
+  return this;
+};
+Schema2.prototype.push = function push2(value) {
+  this.list.push(value);
+  return this;
+};
+function mergeDesc2(original, messages) {
+  const result = typeof original === "string" ? { "": original } : { ...original };
+  for (const locale in messages) {
+    const value = messages[locale];
+    if (value?.$description || value?.$desc) result[locale] = value.$description || value.$desc;
+    else if (typeof value === "string") result[locale] = value;
+  }
+  return result;
+}
+function getInner2(value) {
+  return value?.$value ?? value?.$inner;
+}
+function extractKeys2(data) {
+  return filterKeys2(data ?? {}, (key) => !key.startsWith("$"));
+}
+Schema2.prototype.i18n = function i18n2(messages) {
+  const schema = Schema2(this);
+  const desc = mergeDesc2(schema.meta.description, messages);
+  if (Object.keys(desc).length) schema.meta.description = desc;
+  if (schema.dict) schema.dict = mapValues2(schema.dict, (inner, key) => {
+    return inner.i18n(mapValues2(messages, (data) => getInner2(data)?.[key] ?? data?.[key]));
+  });
+  if (schema.list) schema.list = schema.list.map((inner, index) => {
+    return inner.i18n(mapValues2(messages, (data = {}) => {
+      if (Array.isArray(getInner2(data))) return getInner2(data)[index];
+      if (Array.isArray(data)) return data[index];
+      return extractKeys2(data);
+    }));
+  });
+  if (schema.inner) schema.inner = schema.inner.i18n(mapValues2(messages, (data) => {
+    if (getInner2(data)) return getInner2(data);
+    return extractKeys2(data);
+  }));
+  if (schema.sKey) schema.sKey = schema.sKey.i18n(mapValues2(messages, (data) => data?.$key));
+  return schema;
+};
+Schema2.prototype.extra = function extra2(key, value) {
+  const schema = Schema2(this);
+  schema.meta = {
+    ...schema.meta,
+    [key]: value
+  };
+  return schema;
+};
+for (const key of [
+  "required",
+  "disabled",
+  "collapse",
+  "hidden",
+  "loose"
+]) Object.assign(Schema2.prototype, { [key](value = true) {
+  const schema = Schema2(this);
+  schema.meta = {
+    ...schema.meta,
+    [key]: value
+  };
+  return schema;
+} });
+Schema2.prototype.deprecated = function deprecated2() {
+  const schema = Schema2(this);
+  schema.meta.badges ||= [];
+  schema.meta.badges.push({
+    text: "deprecated",
+    type: "danger"
+  });
+  return schema;
+};
+Schema2.prototype.experimental = function experimental2() {
+  const schema = Schema2(this);
+  schema.meta.badges ||= [];
+  schema.meta.badges.push({
+    text: "experimental",
+    type: "warning"
+  });
+  return schema;
+};
+Schema2.prototype.pattern = function pattern2(regexp) {
+  const schema = Schema2(this);
+  const pattern3 = pick2(regexp, ["source", "flags"]);
+  schema.meta = {
+    ...schema.meta,
+    pattern: pattern3
+  };
+  return schema;
+};
+Schema2.prototype.simplify = function simplify2(value) {
+  if (deepEqual2(value, this.meta.default, this.type === "dict")) return null;
+  if (isNullable2(value)) return value;
+  if (this.type === "object" || this.type === "dict") {
+    const result = {};
+    for (const key in value) {
+      const item = (this.type === "object" ? this.dict[key] : this.inner)?.simplify(value[key]);
+      if (this.type === "dict" || !isNullable2(item)) result[key] = item;
+    }
+    if (deepEqual2(result, this.meta.default, this.type === "dict")) return null;
+    return result;
+  } else if (this.type === "array" || this.type === "tuple") {
+    const result = [];
+    value.forEach((value2, index) => {
+      const schema = this.type === "array" ? this.inner : this.list[index];
+      const item = schema ? schema.simplify(value2) : value2;
+      result.push(item);
+    });
+    return result;
+  } else if (this.type === "intersect") {
+    const result = {};
+    for (const item of this.list) Object.assign(result, item.simplify(value));
+    return result;
+  } else if (this.type === "union") for (const schema of this.list) try {
+    Schema2.resolve(value, schema, {});
+    return schema.simplify(value);
+  } catch {
+  }
+  return value;
+};
+Schema2.prototype.toString = function toString2(inline) {
+  return formatters2[this.type]?.(this, inline) ?? `Schema<${this.type}>`;
+};
+Schema2.prototype.role = function role2(role2, extra3) {
+  const schema = Schema2(this);
+  schema.meta = {
+    ...schema.meta,
+    role: role2,
+    extra: extra3
+  };
+  return schema;
+};
+for (const key of [
+  "default",
+  "link",
+  "comment",
+  "description",
+  "max",
+  "min",
+  "step"
+]) Object.assign(Schema2.prototype, { [key](value) {
+  const schema = Schema2(this);
+  schema.meta = {
+    ...schema.meta,
+    [key]: value
+  };
+  return schema;
+} });
+var resolvers2 = {};
+Schema2.extend = function extend2(type, resolve4) {
+  resolvers2[type] = resolve4;
+};
+Schema2.resolve = function resolve2(data, schema, options = {}, strict = false) {
+  if (!schema) return [data];
+  if (options.ignore?.(data, schema)) return [data];
+  if (isNullable2(data) && schema.type !== "lazy") {
+    if (schema.meta.required) throw new ValidationError3(`missing required value`, options);
+    let current = schema;
+    let fallback = schema.meta.default;
+    while (current?.type === "intersect" && isNullable2(fallback)) {
+      current = current.list[0];
+      fallback = current?.meta.default;
+    }
+    if (isNullable2(fallback)) return [data];
+    data = clone2(fallback);
+  }
+  const callback = resolvers2[schema.type];
+  if (!callback) throw new ValidationError3(`unsupported type "${schema.type}"`, options);
+  try {
+    return callback(data, schema, options, strict);
+  } catch (error51) {
+    if (!schema.meta.loose) throw error51;
+    return [schema.meta.default];
+  }
+};
+Schema2.from = function from2(source) {
+  if (isNullable2(source)) return Schema2.any();
+  else if ([
+    "string",
+    "number",
+    "boolean"
+  ].includes(typeof source)) return Schema2.const(source).required();
+  else if (source[kSchema2]) return source;
+  else if (typeof source === "function") switch (source) {
+    case String:
+      return Schema2.string().required();
+    case Number:
+      return Schema2.number().required();
+    case Boolean:
+      return Schema2.boolean().required();
+    case Function:
+      return Schema2.function().required();
+    default:
+      return Schema2.is(source).required();
+  }
+  else throw new TypeError(`cannot infer schema from ${source}`);
+};
+Schema2.lazy = function lazy2(builder) {
+  const toJSON3 = () => {
+    if (!schema.inner[kSchema2]) {
+      schema.inner = schema.builder();
+      schema.inner.meta = {
+        ...schema.meta,
+        ...schema.inner.meta
+      };
+    }
+    return schema.inner.toJSON();
+  };
+  const schema = new Schema2({
+    type: "lazy",
+    builder,
+    inner: { toJSON: toJSON3 }
+  });
+  return schema;
+};
+Schema2.natural = function natural2() {
+  return Schema2.number().step(1).min(0);
+};
+Schema2.percent = function percent2() {
+  return Schema2.number().step(0.01).min(0).max(1).role("slider");
+};
+Schema2.date = function date2() {
+  return Schema2.union([Schema2.is(Date), Schema2.transform(Schema2.string().role("datetime"), (value, options) => {
+    const date7 = new Date(value);
+    if (isNaN(+date7)) throw new ValidationError3(`invalid date "${value}"`, options);
+    return date7;
+  }, true)]);
+};
+Schema2.regExp = function regExp2(flag = "") {
+  return Schema2.union([Schema2.is(RegExp), Schema2.transform(Schema2.string().role("regexp", { flag }), (value, options) => {
+    try {
+      return new RegExp(value, flag);
+    } catch (e) {
+      throw new ValidationError3(e.message, options);
+    }
+  }, true)]);
+};
+Schema2.arrayBuffer = function arrayBuffer2(encoding) {
+  return Schema2.union([
+    Schema2.is(ArrayBuffer),
+    Schema2.is(SharedArrayBuffer),
+    Schema2.transform(Schema2.any(), (value, options) => {
+      if (Binary2.isSource(value)) return Binary2.fromSource(value);
+      throw new ValidationError3(`expected ArrayBufferSource but got ${value}`, options);
+    }, true),
+    ...encoding ? [Schema2.transform(Schema2.string(), (value, options) => {
+      try {
+        return encoding === "base64" ? Binary2.fromBase64(value) : Binary2.fromHex(value);
+      } catch (e) {
+        throw new ValidationError3(e.message, options);
+      }
+    }, true)] : []
+  ]);
+};
+Schema2.extend("lazy", (data, schema, options, strict) => {
+  if (!schema.inner[kSchema2]) {
+    schema.inner = schema.builder();
+    schema.inner.meta = {
+      ...schema.meta,
+      ...schema.inner.meta
+    };
+  }
+  return Schema2.resolve(data, schema.inner, options, strict);
+});
+Schema2.extend("any", (data) => {
+  return [data];
+});
+Schema2.extend("never", (data, _, options) => {
+  throw new ValidationError3(`expected nullable but got ${data}`, options);
+});
+Schema2.extend("const", (data, { value }, options) => {
+  if (deepEqual2(data, value)) return [value];
+  throw new ValidationError3(`expected ${value} but got ${data}`, options);
+});
+function checkWithinRange2(data, meta3, description, options, skipMin = false) {
+  const { max = Infinity, min = -Infinity } = meta3;
+  if (data > max) throw new ValidationError3(`expected ${description} <= ${max} but got ${data}`, options);
+  if (data < min && !skipMin) throw new ValidationError3(`expected ${description} >= ${min} but got ${data}`, options);
+}
+Schema2.extend("string", (data, { meta: meta3 }, options) => {
+  if (typeof data !== "string") throw new ValidationError3(`expected string but got ${data}`, options);
+  if (meta3.pattern) {
+    const regexp = new RegExp(meta3.pattern.source, meta3.pattern.flags);
+    if (!regexp.test(data)) throw new ValidationError3(`expect string to match regexp ${regexp}`, options);
+  }
+  checkWithinRange2(data.length, meta3, "string length", options);
+  return [data];
+});
+function decimalShift2(data, digits) {
+  const str = data.toString();
+  if (str.includes("e")) return data * Math.pow(10, digits);
+  const index = str.indexOf(".");
+  if (index === -1) return data * Math.pow(10, digits);
+  const frac = str.slice(index + 1);
+  const integer2 = str.slice(0, index);
+  if (frac.length <= digits) return +(integer2 + frac.padEnd(digits, "0"));
+  return +(integer2 + frac.slice(0, digits) + "." + frac.slice(digits));
+}
+function isMultipleOf2(data, min, step) {
+  step = Math.abs(step);
+  if (!/^\d+\.\d+$/.test(step.toString())) return (data - min) % step === 0;
+  const index = step.toString().indexOf(".");
+  const digits = step.toString().slice(index + 1).length;
+  return Math.abs(decimalShift2(data, digits) - decimalShift2(min, digits)) % decimalShift2(step, digits) === 0;
+}
+Schema2.extend("number", (data, { meta: meta3 }, options) => {
+  if (typeof data !== "number") throw new ValidationError3(`expected number but got ${data}`, options);
+  checkWithinRange2(data, meta3, "number", options);
+  const { step } = meta3;
+  if (step && !isMultipleOf2(data, meta3.min ?? 0, step)) throw new ValidationError3(`expected number multiple of ${step} but got ${data}`, options);
+  return [data];
+});
+Schema2.extend("boolean", (data, _, options) => {
+  if (typeof data === "boolean") return [data];
+  throw new ValidationError3(`expected boolean but got ${data}`, options);
+});
+Schema2.extend("bitset", (data, { bits, meta: meta3 }, options) => {
+  let value = 0, keys = [];
+  if (typeof data === "number") {
+    value = data;
+    for (const key in bits) if (data & bits[key]) keys.push(key);
+  } else if (Array.isArray(data)) {
+    keys = data;
+    for (const key of keys) {
+      if (typeof key !== "string") throw new ValidationError3(`expected string but got ${key}`, options);
+      if (key in bits) value |= bits[key];
+    }
+  } else throw new ValidationError3(`expected number or array but got ${data}`, options);
+  if (value === meta3.default) return [value];
+  return [value, keys];
+});
+Schema2.extend("function", (data, _, options) => {
+  if (typeof data === "function") return [data];
+  throw new ValidationError3(`expected function but got ${data}`, options);
+});
+Schema2.extend("is", (data, { constructor }, options) => {
+  if (typeof constructor === "function") {
+    if (data instanceof constructor) return [data];
+    throw new ValidationError3(`expected ${constructor.name} but got ${data}`, options);
+  } else {
+    if (isNullable2(data)) throw new ValidationError3(`expected ${constructor} but got ${data}`, options);
+    let prototype = Object.getPrototypeOf(data);
+    while (prototype) {
+      if (prototype.constructor?.name === constructor) return [data];
+      prototype = Object.getPrototypeOf(prototype);
+    }
+    throw new ValidationError3(`expected ${constructor} but got ${data}`, options);
+  }
+});
+function property2(data, key, schema, options) {
+  try {
+    const [value, adapted] = Schema2.resolve(data[key], schema, {
+      ...options,
+      path: [...options.path || [], key]
+    });
+    if (adapted !== void 0) data[key] = adapted;
+    return value;
+  } catch (e) {
+    if (!options?.autofix) throw e;
+    delete data[key];
+    return schema.meta.default;
+  }
+}
+Schema2.extend("array", (data, { inner, meta: meta3 }, options) => {
+  if (!Array.isArray(data)) throw new ValidationError3(`expected array but got ${data}`, options);
+  checkWithinRange2(data.length, meta3, "array length", options, !isNullable2(inner.meta.default));
+  return [data.map((_, index) => property2(data, index, inner, options))];
+});
+Schema2.extend("dict", (data, { inner, sKey }, options, strict) => {
+  if (!isPlainObject2(data)) throw new ValidationError3(`expected object but got ${data}`, options);
+  const result = {};
+  for (const key in data) {
+    let rKey;
+    try {
+      rKey = Schema2.resolve(key, sKey, options)[0];
+    } catch (error51) {
+      if (strict) continue;
+      throw error51;
+    }
+    result[rKey] = property2(data, key, inner, options);
+    data[rKey] = data[key];
+    if (key !== rKey) delete data[key];
+  }
+  return [result];
+});
+Schema2.extend("tuple", (data, { list }, options, strict) => {
+  if (!Array.isArray(data)) throw new ValidationError3(`expected array but got ${data}`, options);
+  const result = list.map((inner, index) => property2(data, index, inner, options));
+  if (strict) return [result];
+  result.push(...data.slice(list.length));
+  return [result];
+});
+function merge2(result, data) {
+  for (const key in data) {
+    if (key in result) continue;
+    result[key] = data[key];
+  }
+}
+Schema2.extend("object", (data, { dict }, options, strict) => {
+  if (!isPlainObject2(data)) throw new ValidationError3(`expected object but got ${data}`, options);
+  const result = {};
+  for (const key in dict) {
+    const value = property2(data, key, dict[key], options);
+    if (!isNullable2(value) || key in data) result[key] = value;
+  }
+  if (!strict) merge2(result, data);
+  return [result];
+});
+Schema2.extend("union", (data, { list, toString: toString3 }, options, strict) => {
+  const messages = [];
+  for (const inner of list) try {
+    return Schema2.resolve(data, inner, options, strict);
+  } catch (error51) {
+    messages.push(error51);
+  }
+  throw new ValidationError3(`expected ${toString3()} but got ${JSON.stringify(data)}`, options);
+});
+Schema2.extend("intersect", (data, { list, toString: toString3 }, options, strict) => {
+  if (!list.length) return [data];
+  let result;
+  for (const inner of list) {
+    const value = Schema2.resolve(data, inner, options, true)[0];
+    if (isNullable2(value)) continue;
+    if (isNullable2(result)) result = value;
+    else if (typeof result !== typeof value) throw new ValidationError3(`expected ${toString3()} but got ${JSON.stringify(data)}`, options);
+    else if (typeof value === "object") merge2(result ??= {}, value);
+    else if (result !== value) throw new ValidationError3(`expected ${toString3()} but got ${JSON.stringify(data)}`, options);
+  }
+  if (!strict && isPlainObject2(data)) merge2(result, data);
+  return [result];
+});
+Schema2.extend("transform", (data, { inner, callback, preserve }, options) => {
+  const [result, adapted = data] = Schema2.resolve(data, inner, options, true);
+  if (preserve) return [callback(result)];
+  else return [callback(result), callback(adapted)];
+});
+var formatters2 = {};
+function defineMethod2(name, keys, format) {
+  formatters2[name] = format;
+  Object.assign(Schema2, { [name](...args) {
+    const schema = new Schema2({ type: name });
+    keys.forEach((key, index) => {
+      switch (key) {
+        case "sKey":
+          schema.sKey = args[index] ?? Schema2.string();
+          break;
+        case "inner":
+          schema.inner = Schema2.from(args[index]);
+          break;
+        case "list":
+          schema.list = args[index].map(Schema2.from);
+          break;
+        case "dict":
+          schema.dict = mapValues2(args[index], Schema2.from);
+          break;
+        case "bits":
+          schema.bits = {};
+          for (const key2 in args[index]) {
+            if (typeof args[index][key2] !== "number") continue;
+            schema.bits[key2] = args[index][key2];
+          }
+          break;
+        case "callback": {
+          const callback = schema.callback = args[index];
+          callback["toJSON"] ||= () => callback.toString();
+          break;
+        }
+        case "constructor": {
+          const constructor = schema.constructor = args[index];
+          if (typeof constructor === "function") constructor["toJSON"] ||= () => constructor["name"];
+          break;
+        }
+        default:
+          schema[key] = args[index];
+      }
+    });
+    if (name === "object" || name === "dict") schema.meta.default = {};
+    else if (name === "array" || name === "tuple") schema.meta.default = [];
+    else if (name === "bitset") schema.meta.default = 0;
+    return schema;
+  } });
+}
+defineMethod2("is", ["constructor"], ({ constructor }) => {
+  if (typeof constructor === "function") return constructor.name;
+  else return constructor;
+});
+defineMethod2("any", [], () => "any");
+defineMethod2("never", [], () => "never");
+defineMethod2("const", ["value"], ({ value }) => typeof value === "string" ? JSON.stringify(value) : value);
+defineMethod2("string", [], () => "string");
+defineMethod2("number", [], () => "number");
+defineMethod2("boolean", [], () => "boolean");
+defineMethod2("bitset", ["bits"], () => "bitset");
+defineMethod2("function", [], () => "function");
+defineMethod2("array", ["inner"], ({ inner }) => `${inner.toString(true)}[]`);
+defineMethod2("dict", ["inner", "sKey"], ({ inner, sKey }) => `{ [key: ${sKey.toString()}]: ${inner.toString()} }`);
+defineMethod2("tuple", ["list"], ({ list }) => `[${list.map((inner) => inner.toString()).join(", ")}]`);
+defineMethod2("object", ["dict"], ({ dict }) => {
+  if (Object.keys(dict).length === 0) return "{}";
+  return `{ ${Object.entries(dict).map(([key, inner]) => {
+    return `${key}${inner.meta.required ? "" : "?"}: ${inner.toString()}`;
+  }).join(", ")} }`;
+});
+defineMethod2("union", ["list"], ({ list }, inline) => {
+  const result = list.map(({ toString: format }) => format()).join(" | ");
+  return inline ? `(${result})` : result;
+});
+defineMethod2("intersect", ["list"], ({ list }) => {
+  return `${list.map((inner) => inner.toString(true)).join(" & ")}`;
+});
+defineMethod2("transform", [
+  "inner",
+  "callback",
+  "preserve"
+], ({ inner }, isInner) => inner.toString(isInner));
 
 // ../../node_modules/.pnpm/@deepseek-ai+dsh-timeout@0.1.1-rc.2_@deepseek-ai+cordis@4.0.1_@deepseek-ai+dsh-invarian_13401da53fdd229a45877adbff64345d/node_modules/@deepseek-ai/dsh-timeout/lib/index.js
 var MAX_TIMER_DELAY_MS = 2147483647;
@@ -2632,22 +3420,22 @@ var DEFAULT_RETRYABLE_CODES = Object.freeze([
   "TIMEOUT",
   "TRANSPORT"
 ]);
-var backoffSchema = Schema.object({
-  initialDelayMs: Schema.number().max(MAX_TIMER_DELAY_MS).default(DEFAULT_INITIAL_DELAY_MS),
-  maxDelayMs: Schema.number().max(MAX_TIMER_DELAY_MS).default(DEFAULT_MAX_DELAY_MS),
-  jitterRatio: Schema.number().min(0).max(1).default(DEFAULT_JITTER_RATIO)
+var backoffSchema = Schema2.object({
+  initialDelayMs: Schema2.number().max(MAX_TIMER_DELAY_MS).default(DEFAULT_INITIAL_DELAY_MS),
+  maxDelayMs: Schema2.number().max(MAX_TIMER_DELAY_MS).default(DEFAULT_MAX_DELAY_MS),
+  jitterRatio: Schema2.number().min(0).max(1).default(DEFAULT_JITTER_RATIO)
 });
-var normalPolicySchema = Schema.object({
-  mode: Schema.const("normal").required(),
-  maxRetries: Schema.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_RETRIES),
-  retryableCodes: Schema.array(Schema.string()).default([...DEFAULT_RETRYABLE_CODES]),
+var normalPolicySchema = Schema2.object({
+  mode: Schema2.const("normal").required(),
+  maxRetries: Schema2.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_RETRIES),
+  retryableCodes: Schema2.array(Schema2.string()).default([...DEFAULT_RETRYABLE_CODES]),
   backoff: backoffSchema
 });
-var alwaysPolicySchema = Schema.object({
-  mode: Schema.const("always").required(),
+var alwaysPolicySchema = Schema2.object({
+  mode: Schema2.const("always").required(),
   backoff: backoffSchema
 });
-var RetryPolicySchema = Schema.union([normalPolicySchema, alwaysPolicySchema]);
+var RetryPolicySchema = Schema2.union([normalPolicySchema, alwaysPolicySchema]);
 var { version } = createRequire(import.meta.url)("../package.json");
 function assertNever(value, context) {
   const rendered = JSON.stringify(value) ?? String(value);
@@ -3043,8 +3831,8 @@ function canonicalHeader(header) {
     ...header.tools !== void 0 && header.tools.length > 0 ? { tools: header.tools } : {}
   };
 }
-function foldRequestHeader(events, from2) {
-  let state = from2;
+function foldRequestHeader(events, from3) {
+  let state = from3;
   for (const event of events) if (event.type === "request/header") state = canonicalHeader(event.data.header);
   return state;
 }
@@ -4443,7 +5231,7 @@ var SessionPreparations = class {
   }
 };
 function observeQueuedAbort(operation, signal, started = () => false) {
-  return new Promise((resolve3, reject) => {
+  return new Promise((resolve4, reject) => {
     let settled = false;
     const finish = (callback) => {
       if (settled) return;
@@ -4466,7 +5254,7 @@ function observeQueuedAbort(operation, signal, started = () => false) {
     signal.addEventListener("abort", onAbort, { once: true });
     operation.then((value) => {
       finish(() => {
-        resolve3(value);
+        resolve4(value);
       });
     }, (reason) => {
       finish(() => {
@@ -4569,7 +5357,7 @@ var SessionWriteBehind = class {
     }
   }
   /** Await overlapping work, drain to quiescence, and settle the shared barrier. */
-  async drainBarrier(resolve3, reject) {
+  async drainBarrier(resolve4, reject) {
     try {
       const overlapping = this.active;
       if (overlapping !== void 0) {
@@ -4583,7 +5371,7 @@ var SessionWriteBehind = class {
       return;
     }
     this.barrier = void 0;
-    resolve3();
+    resolve4();
   }
   /** Start one stable pending prefix, retaining it in order if durability fails. */
   startWrite(background) {
@@ -5993,7 +6781,7 @@ async function publishNewFileWin32(existing, replacement) {
   if (api.moveFileExW(toNamespacedPath(existing), toNamespacedPath(replacement), MOVEFILE_WRITE_THROUGH) === 0) throw win32Error("MoveFileExW", api.getLastError(), existing, replacement);
 }
 async function ensureDurableDirectoryWin32(target) {
-  const absolute = resolve2(target);
+  const absolute = resolve3(target);
   const root = parse(absolute).root;
   await assertDirectory(root);
   const segments = absolute.slice(root.length).split(/[\\/]+/).filter((part) => part.length > 0);
@@ -6061,7 +6849,7 @@ var JsonlSessionPersistence = class extends SessionPersistence {
   constructor(ctx, config2) {
     super(ctx);
     this.config = config2;
-    this.root = resolve2(config2.root);
+    this.root = resolve3(config2.root);
     const preparedSessionCacheSize = config2.preparedSessionCacheSize ?? DEFAULT_PREPARED_SESSION_CACHE_SIZE;
     const writeBatchMaxDelayMs = config2.writeBatchMaxDelayMs ?? DEFAULT_WRITE_BATCH_MAX_DELAY_MS;
     this.packChunks = config2.packChunks ?? DEFAULT_PACK_CHUNKS;
@@ -6819,7 +7607,7 @@ __export(external_exports, {
   check: () => check,
   cidrv4: () => cidrv42,
   cidrv6: () => cidrv62,
-  clone: () => clone2,
+  clone: () => clone3,
   codec: () => codec,
   coerce: () => coerce_exports,
   config: () => config,
@@ -6827,7 +7615,7 @@ __export(external_exports, {
   cuid: () => cuid3,
   cuid2: () => cuid22,
   custom: () => custom,
-  date: () => date4,
+  date: () => date5,
   decode: () => decode2,
   decodeAsync: () => decodeAsync2,
   describe: () => describe2,
@@ -6870,7 +7658,7 @@ __export(external_exports, {
   jwt: () => jwt,
   keyof: () => keyof,
   ksuid: () => ksuid2,
-  lazy: () => lazy2,
+  lazy: () => lazy3,
   length: () => _length,
   literal: () => literal,
   locales: () => locales_exports,
@@ -6926,7 +7714,7 @@ __export(external_exports, {
   safeEncodeAsync: () => safeEncodeAsync2,
   safeParse: () => safeParse2,
   safeParseAsync: () => safeParseAsync2,
-  set: () => set2,
+  set: () => set3,
   setErrorMap: () => setErrorMap,
   size: () => _size,
   slugify: () => _slugify,
@@ -7203,7 +7991,7 @@ __export(core_exports2, {
   _void: () => _void,
   _xid: () => _xid,
   _xor: () => _xor,
-  clone: () => clone2,
+  clone: () => clone3,
   config: () => config,
   createStandardJSONSchemaMethod: () => createStandardJSONSchemaMethod,
   createToJSONSchemaMethod: () => createToJSONSchemaMethod,
@@ -7340,14 +8128,14 @@ __export(util_exports, {
   captureStackTrace: () => captureStackTrace,
   cleanEnum: () => cleanEnum,
   cleanRegex: () => cleanRegex,
-  clone: () => clone2,
+  clone: () => clone3,
   cloneDef: () => cloneDef,
   createTransparentProxy: () => createTransparentProxy,
   defineLazy: () => defineLazy,
   esc: () => esc,
   escapeRegex: () => escapeRegex,
   explicitlyAborted: () => explicitlyAborted,
-  extend: () => extend2,
+  extend: () => extend3,
   finalizeIssue: () => finalizeIssue,
   floatSafeRemainder: () => floatSafeRemainder,
   getElementAtPath: () => getElementAtPath,
@@ -7357,11 +8145,11 @@ __export(util_exports, {
   getSizableOrigin: () => getSizableOrigin,
   hexToUint8Array: () => hexToUint8Array,
   isObject: () => isObject2,
-  isPlainObject: () => isPlainObject2,
+  isPlainObject: () => isPlainObject3,
   issue: () => issue,
   joinValues: () => joinValues,
   jsonStringifyReplacer: () => jsonStringifyReplacer,
-  merge: () => merge2,
+  merge: () => merge3,
   mergeDefs: () => mergeDefs,
   normalizeParams: () => normalizeParams,
   nullish: () => nullish,
@@ -7371,7 +8159,7 @@ __export(util_exports, {
   optionalKeys: () => optionalKeys,
   parsedType: () => parsedType,
   partial: () => partial,
-  pick: () => pick2,
+  pick: () => pick3,
   prefixIssues: () => prefixIssues,
   primitiveTypes: () => primitiveTypes,
   promiseAllObject: () => promiseAllObject,
@@ -7414,10 +8202,10 @@ function jsonStringifyReplacer(_, value) {
   return value;
 }
 function cached(getter) {
-  const set3 = false;
+  const set4 = false;
   return {
     get value() {
-      if (!set3) {
+      if (!set4) {
         const value = getter();
         Object.defineProperty(this, "value", { value });
         return value;
@@ -7537,7 +8325,7 @@ var allowsEval = /* @__PURE__ */ cached(() => {
     return false;
   }
 });
-function isPlainObject2(o) {
+function isPlainObject3(o) {
   if (isObject2(o) === false)
     return false;
   const ctor = o.constructor;
@@ -7554,7 +8342,7 @@ function isPlainObject2(o) {
   return true;
 }
 function shallowClone(o) {
-  if (isPlainObject2(o))
+  if (isPlainObject3(o))
     return { ...o };
   if (Array.isArray(o))
     return [...o];
@@ -7629,7 +8417,7 @@ var primitiveTypes = /* @__PURE__ */ new Set([
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function clone2(inst, def, params) {
+function clone3(inst, def, params) {
   const cl = new inst._zod.constr(def ?? inst._zod.def);
   if (!def || params?.parent)
     cl._zod.parent = inst;
@@ -7707,7 +8495,7 @@ var BIGINT_FORMAT_RANGES = {
   int64: [/* @__PURE__ */ BigInt("-9223372036854775808"), /* @__PURE__ */ BigInt("9223372036854775807")],
   uint64: [/* @__PURE__ */ BigInt(0), /* @__PURE__ */ BigInt("18446744073709551615")]
 };
-function pick2(schema, mask) {
+function pick3(schema, mask) {
   const currDef = schema._zod.def;
   const checks = currDef.checks;
   const hasChecks = checks && checks.length > 0;
@@ -7730,7 +8518,7 @@ function pick2(schema, mask) {
     },
     checks: []
   });
-  return clone2(schema, def);
+  return clone3(schema, def);
 }
 function omit(schema, mask) {
   const currDef = schema._zod.def;
@@ -7755,10 +8543,10 @@ function omit(schema, mask) {
     },
     checks: []
   });
-  return clone2(schema, def);
+  return clone3(schema, def);
 }
-function extend2(schema, shape) {
-  if (!isPlainObject2(shape)) {
+function extend3(schema, shape) {
+  if (!isPlainObject3(shape)) {
     throw new Error("Invalid input to extend: expected a plain object");
   }
   const checks = schema._zod.def.checks;
@@ -7778,10 +8566,10 @@ function extend2(schema, shape) {
       return _shape;
     }
   });
-  return clone2(schema, def);
+  return clone3(schema, def);
 }
 function safeExtend(schema, shape) {
-  if (!isPlainObject2(shape)) {
+  if (!isPlainObject3(shape)) {
     throw new Error("Invalid input to safeExtend: expected a plain object");
   }
   const def = mergeDefs(schema._zod.def, {
@@ -7791,9 +8579,9 @@ function safeExtend(schema, shape) {
       return _shape;
     }
   });
-  return clone2(schema, def);
+  return clone3(schema, def);
 }
-function merge2(a, b) {
+function merge3(a, b) {
   if (a._zod.def.checks?.length) {
     throw new Error(".merge() cannot be used on object schemas containing refinements. Use .safeExtend() instead.");
   }
@@ -7808,7 +8596,7 @@ function merge2(a, b) {
     },
     checks: b._zod.def.checks ?? []
   });
-  return clone2(a, def);
+  return clone3(a, def);
 }
 function partial(Class2, schema, mask) {
   const currDef = schema._zod.def;
@@ -7846,7 +8634,7 @@ function partial(Class2, schema, mask) {
     },
     checks: []
   });
-  return clone2(schema, def);
+  return clone3(schema, def);
 }
 function required(Class2, schema, mask) {
   const def = mergeDefs(schema._zod.def, {
@@ -7877,7 +8665,7 @@ function required(Class2, schema, mask) {
       return shape;
     }
   });
-  return clone2(schema, def);
+  return clone3(schema, def);
 }
 function aborted(x, startIndex = 0) {
   if (x.aborted === true)
@@ -8255,7 +9043,7 @@ __export(regexes_exports, {
   cidrv6: () => cidrv6,
   cuid: () => cuid,
   cuid2: () => cuid2,
-  date: () => date2,
+  date: () => date3,
   datetime: () => datetime,
   domain: () => domain,
   duration: () => duration,
@@ -8348,7 +9136,7 @@ var domain = /^([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
 var httpProtocol = /^https?$/;
 var e164 = /^\+[1-9]\d{6,14}$/;
 var dateSource = `(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))`;
-var date2 = /* @__PURE__ */ new RegExp(`^${dateSource}$`);
+var date3 = /* @__PURE__ */ new RegExp(`^${dateSource}$`);
 function timeSource(args) {
   const hhmm = `(?:[01]\\d|2[0-3]):[0-5]\\d`;
   const regex = typeof args.precision === "number" ? args.precision === -1 ? `${hhmm}` : args.precision === 0 ? `${hhmm}:[0-5]\\d` : `${hhmm}:[0-5]\\d\\.\\d{${args.precision}}` : `${hhmm}(?::[0-5]\\d(?:\\.\\d+)?)?`;
@@ -8839,12 +9627,12 @@ var $ZodCheckUpperCase = /* @__PURE__ */ $constructor("$ZodCheckUpperCase", (ins
 var $ZodCheckIncludes = /* @__PURE__ */ $constructor("$ZodCheckIncludes", (inst, def) => {
   $ZodCheck.init(inst, def);
   const escapedRegex = escapeRegex(def.includes);
-  const pattern2 = new RegExp(typeof def.position === "number" ? `^.{${def.position}}${escapedRegex}` : escapedRegex);
-  def.pattern = pattern2;
+  const pattern3 = new RegExp(typeof def.position === "number" ? `^.{${def.position}}${escapedRegex}` : escapedRegex);
+  def.pattern = pattern3;
   inst._zod.onattach.push((inst2) => {
     const bag = inst2._zod.bag;
     bag.patterns ?? (bag.patterns = /* @__PURE__ */ new Set());
-    bag.patterns.add(pattern2);
+    bag.patterns.add(pattern3);
   });
   inst._zod.check = (payload) => {
     if (payload.value.includes(def.includes, def.position))
@@ -8862,12 +9650,12 @@ var $ZodCheckIncludes = /* @__PURE__ */ $constructor("$ZodCheckIncludes", (inst,
 });
 var $ZodCheckStartsWith = /* @__PURE__ */ $constructor("$ZodCheckStartsWith", (inst, def) => {
   $ZodCheck.init(inst, def);
-  const pattern2 = new RegExp(`^${escapeRegex(def.prefix)}.*`);
-  def.pattern ?? (def.pattern = pattern2);
+  const pattern3 = new RegExp(`^${escapeRegex(def.prefix)}.*`);
+  def.pattern ?? (def.pattern = pattern3);
   inst._zod.onattach.push((inst2) => {
     const bag = inst2._zod.bag;
     bag.patterns ?? (bag.patterns = /* @__PURE__ */ new Set());
-    bag.patterns.add(pattern2);
+    bag.patterns.add(pattern3);
   });
   inst._zod.check = (payload) => {
     if (payload.value.startsWith(def.prefix))
@@ -8885,12 +9673,12 @@ var $ZodCheckStartsWith = /* @__PURE__ */ $constructor("$ZodCheckStartsWith", (i
 });
 var $ZodCheckEndsWith = /* @__PURE__ */ $constructor("$ZodCheckEndsWith", (inst, def) => {
   $ZodCheck.init(inst, def);
-  const pattern2 = new RegExp(`.*${escapeRegex(def.suffix)}$`);
-  def.pattern ?? (def.pattern = pattern2);
+  const pattern3 = new RegExp(`.*${escapeRegex(def.suffix)}$`);
+  def.pattern ?? (def.pattern = pattern3);
   inst._zod.onattach.push((inst2) => {
     const bag = inst2._zod.bag;
     bag.patterns ?? (bag.patterns = /* @__PURE__ */ new Set());
-    bag.patterns.add(pattern2);
+    bag.patterns.add(pattern3);
   });
   inst._zod.check = (payload) => {
     if (payload.value.endsWith(def.suffix))
@@ -8906,9 +9694,9 @@ var $ZodCheckEndsWith = /* @__PURE__ */ $constructor("$ZodCheckEndsWith", (inst,
     });
   };
 });
-function handleCheckPropertyResult(result, payload, property2) {
+function handleCheckPropertyResult(result, payload, property3) {
   if (result.issues.length) {
-    payload.issues.push(...prefixIssues(property2, result.issues));
+    payload.issues.push(...prefixIssues(property3, result.issues));
   }
 }
 var $ZodCheckProperty = /* @__PURE__ */ $constructor("$ZodCheckProperty", (inst, def) => {
@@ -9254,7 +10042,7 @@ var $ZodISODateTime = /* @__PURE__ */ $constructor("$ZodISODateTime", (inst, def
   $ZodStringFormat.init(inst, def);
 });
 var $ZodISODate = /* @__PURE__ */ $constructor("$ZodISODate", (inst, def) => {
-  def.pattern ?? (def.pattern = date2);
+  def.pattern ?? (def.pattern = date3);
   $ZodStringFormat.init(inst, def);
 });
 var $ZodISOTime = /* @__PURE__ */ $constructor("$ZodISOTime", (inst, def) => {
@@ -10128,7 +10916,7 @@ function mergeValues(a, b) {
   if (a instanceof Date && b instanceof Date && +a === +b) {
     return { valid: true, data: a };
   }
-  if (isPlainObject2(a) && isPlainObject2(b)) {
+  if (isPlainObject3(a) && isPlainObject3(b)) {
     const bKeys = Object.keys(b);
     const sharedKeys = Object.keys(a).filter((key) => bKeys.indexOf(key) !== -1);
     const newObj = { ...a, ...b };
@@ -10314,7 +11102,7 @@ var $ZodRecord = /* @__PURE__ */ $constructor("$ZodRecord", (inst, def) => {
   $ZodType.init(inst, def);
   inst._zod.parse = (payload, ctx) => {
     const input = payload.value;
-    if (!isPlainObject2(input)) {
+    if (!isPlainObject3(input)) {
       payload.issues.push({
         expected: "record",
         code: "invalid_type",
@@ -10625,8 +11413,8 @@ var $ZodOptional = /* @__PURE__ */ $constructor("$ZodOptional", (inst, def) => {
     return def.innerType._zod.values ? /* @__PURE__ */ new Set([...def.innerType._zod.values, void 0]) : void 0;
   });
   defineLazy(inst._zod, "pattern", () => {
-    const pattern2 = def.innerType._zod.pattern;
-    return pattern2 ? new RegExp(`^(${cleanRegex(pattern2.source)})?$`) : void 0;
+    const pattern3 = def.innerType._zod.pattern;
+    return pattern3 ? new RegExp(`^(${cleanRegex(pattern3.source)})?$`) : void 0;
   });
   inst._zod.parse = (payload, ctx) => {
     if (def.innerType._zod.optin === "optional") {
@@ -10655,8 +11443,8 @@ var $ZodNullable = /* @__PURE__ */ $constructor("$ZodNullable", (inst, def) => {
   defineLazy(inst._zod, "optin", () => def.innerType._zod.optin);
   defineLazy(inst._zod, "optout", () => def.innerType._zod.optout);
   defineLazy(inst._zod, "pattern", () => {
-    const pattern2 = def.innerType._zod.pattern;
-    return pattern2 ? new RegExp(`^(${cleanRegex(pattern2.source)}|null)$`) : void 0;
+    const pattern3 = def.innerType._zod.pattern;
+    return pattern3 ? new RegExp(`^(${cleanRegex(pattern3.source)}|null)$`) : void 0;
   });
   defineLazy(inst._zod, "values", () => {
     return def.innerType._zod.values ? /* @__PURE__ */ new Set([...def.innerType._zod.values, null]) : void 0;
@@ -17683,12 +18471,12 @@ function _length(length, params) {
   });
 }
 // @__NO_SIDE_EFFECTS__
-function _regex(pattern2, params) {
+function _regex(pattern3, params) {
   return new $ZodCheckRegex({
     check: "string_format",
     format: "regex",
     ...normalizeParams(params),
-    pattern: pattern2
+    pattern: pattern3
   });
 }
 // @__NO_SIDE_EFFECTS__
@@ -17735,10 +18523,10 @@ function _endsWith(suffix, params) {
   });
 }
 // @__NO_SIDE_EFFECTS__
-function _property(property2, schema, params) {
+function _property(property3, schema, params) {
   return new $ZodCheckProperty({
     check: "property",
-    property: property2,
+    property: property3,
     schema,
     ...normalizeParams(params)
   });
@@ -18663,11 +19451,11 @@ var nanProcessor = (_schema, ctx, _json, _params) => {
 };
 var templateLiteralProcessor = (schema, _ctx, json2, _params) => {
   const _json = json2;
-  const pattern2 = schema._zod.pattern;
-  if (!pattern2)
+  const pattern3 = schema._zod.pattern;
+  if (!pattern3)
     throw new Error("Pattern not found in template literal");
   _json.type = "string";
-  _json.pattern = pattern2.source;
+  _json.pattern = pattern3.source;
 };
 var fileProcessor = (schema, _ctx, json2, _params) => {
   const _json = json2;
@@ -18856,8 +19644,8 @@ var recordProcessor = (schema, ctx, _json, params) => {
       path: [...params.path, "patternProperties", "*"]
     });
     json2.patternProperties = {};
-    for (const pattern2 of patterns) {
-      json2.patternProperties[pattern2.source] = valueSchema;
+    for (const pattern3 of patterns) {
+      json2.patternProperties[pattern3.source] = valueSchema;
     }
   } else {
     if (ctx.target === "draft-07" || ctx.target === "draft-2020-12") {
@@ -19200,7 +19988,7 @@ __export(schemas_exports2, {
   cuid: () => cuid3,
   cuid2: () => cuid22,
   custom: () => custom,
-  date: () => date4,
+  date: () => date5,
   describe: () => describe2,
   discriminatedUnion: () => discriminatedUnion,
   e164: () => e1642,
@@ -19229,7 +20017,7 @@ __export(schemas_exports2, {
   jwt: () => jwt,
   keyof: () => keyof,
   ksuid: () => ksuid2,
-  lazy: () => lazy2,
+  lazy: () => lazy3,
   literal: () => literal,
   looseObject: () => looseObject,
   looseRecord: () => looseRecord,
@@ -19255,7 +20043,7 @@ __export(schemas_exports2, {
   readonly: () => readonly,
   record: () => record,
   refine: () => refine,
-  set: () => set2,
+  set: () => set3,
   strictObject: () => strictObject,
   string: () => string2,
   stringFormat: () => stringFormat,
@@ -19323,7 +20111,7 @@ __export(iso_exports, {
   ZodISODateTime: () => ZodISODateTime,
   ZodISODuration: () => ZodISODuration,
   ZodISOTime: () => ZodISOTime,
-  date: () => date3,
+  date: () => date4,
   datetime: () => datetime2,
   duration: () => duration2,
   time: () => time2
@@ -19339,7 +20127,7 @@ var ZodISODate = /* @__PURE__ */ $constructor("ZodISODate", (inst, def) => {
   $ZodISODate.init(inst, def);
   ZodStringFormat.init(inst, def);
 });
-function date3(params) {
+function date4(params) {
   return _isoDate(ZodISODate, params);
 }
 var ZodISOTime = /* @__PURE__ */ $constructor("ZodISOTime", (inst, def) => {
@@ -19488,7 +20276,7 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
       return this.check(...chks);
     },
     clone(def2, params) {
-      return clone2(this, def2, params);
+      return clone3(this, def2, params);
     },
     brand() {
       return this;
@@ -19661,7 +20449,7 @@ var ZodString = /* @__PURE__ */ $constructor("ZodString", (inst, def) => {
   inst.cidrv6 = (params) => inst.check(_cidrv6(ZodCIDRv6, params));
   inst.e164 = (params) => inst.check(_e164(ZodE164, params));
   inst.datetime = (params) => inst.check(datetime2(params));
-  inst.date = (params) => inst.check(date3(params));
+  inst.date = (params) => inst.check(date4(params));
   inst.time = (params) => inst.check(time2(params));
   inst.duration = (params) => inst.check(duration2(params));
 });
@@ -20038,7 +20826,7 @@ var ZodDate = /* @__PURE__ */ $constructor("ZodDate", (inst, def) => {
   inst.minDate = c.minimum ? new Date(c.minimum) : null;
   inst.maxDate = c.maximum ? new Date(c.maximum) : null;
 });
-function date4(params) {
+function date5(params) {
   return _date(ZodDate, params);
 }
 var ZodArray = /* @__PURE__ */ $constructor("ZodArray", (inst, def) => {
@@ -20239,7 +21027,7 @@ function record(keyType, valueType, params) {
   });
 }
 function partialRecord(keyType, valueType, params) {
-  const k = clone2(keyType);
+  const k = clone3(keyType);
   k._zod.values = void 0;
   return new ZodRecord({
     type: "record",
@@ -20285,7 +21073,7 @@ var ZodSet = /* @__PURE__ */ $constructor("ZodSet", (inst, def) => {
   inst.max = (...args) => inst.check(_maxSize(...args));
   inst.size = (...args) => inst.check(_size(...args));
 });
-function set2(valueType, params) {
+function set3(valueType, params) {
   return new ZodSet({
     type: "set",
     valueType,
@@ -20606,7 +21394,7 @@ var ZodLazy = /* @__PURE__ */ $constructor("ZodLazy", (inst, def) => {
   inst._zod.processJSONSchema = (ctx, json2, params) => lazyProcessor(inst, ctx, json2, params);
   inst.unwrap = () => inst._zod.def.getter();
 });
-function lazy2(getter) {
+function lazy3(getter) {
   return new ZodLazy({
     type: "lazy",
     getter
@@ -20688,7 +21476,7 @@ var stringbool = (...args) => _stringbool({
   String: ZodString
 }, ...args);
 function json(params) {
-  const jsonSchema = lazy2(() => {
+  const jsonSchema = lazy3(() => {
     return union([string2(params), number2(), boolean2(), _null3(), array(jsonSchema), record(string2(), jsonSchema)]);
   });
   return jsonSchema;
@@ -21037,9 +21825,9 @@ function convertBaseSchema(schema, ctx) {
         const patternProps = schema.patternProperties;
         const patternKeys = Object.keys(patternProps);
         const looseRecords = [];
-        for (const pattern2 of patternKeys) {
-          const patternValue = convertSchema(patternProps[pattern2], ctx);
-          const keySchema = z.string().regex(new RegExp(pattern2));
+        for (const pattern3 of patternKeys) {
+          const patternValue = convertSchema(patternProps[pattern3], ctx);
+          const keySchema = z.string().regex(new RegExp(pattern3));
           looseRecords.push(z.looseRecord(keySchema, patternValue));
         }
         const schemasToIntersect = [];
@@ -21212,7 +22000,7 @@ var coerce_exports = {};
 __export(coerce_exports, {
   bigint: () => bigint3,
   boolean: () => boolean3,
-  date: () => date5,
+  date: () => date6,
   number: () => number3,
   string: () => string3
 });
@@ -21228,7 +22016,7 @@ function boolean3(params) {
 function bigint3(params) {
   return _coercedBigint(ZodBigInt, params);
 }
-function date5(params) {
+function date6(params) {
   return _coercedDate(ZodDate, params);
 }
 
