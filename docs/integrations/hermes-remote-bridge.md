@@ -7,6 +7,11 @@ that their contracts cannot safely support a managed chat integration. Existing
 Desktop channels are unchanged; Hermes is not enabled or migrated by this work.
 
 See [the takeover review and stage gates](hermes-phase0-review.md).
+The subsequent [live verification record](hermes-live-verification.md) proves one
+real CCEM task notification to the user's WeCom chat and a native Hermes status
+round trip. It also reproduces timeout fallback and concurrent queue-pruning
+duplicate-send risks. The test does not enable the managed bridge or certify
+its pending authentication, idempotency, installation, or migration contracts.
 
 ## Protocol
 
