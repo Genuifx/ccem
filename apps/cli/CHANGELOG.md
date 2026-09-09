@@ -1,5 +1,11 @@
 # ccem
 
+## 2.83.0
+
+### Minor Changes
+
+- Desktop composer effort slider and environment model menu redesign; CLI usage dedup by response ID; dependency security fix bundling @xmldom/xmldom 0.9.12 via plist 3.1.1.
+
 ## 2.82.0
 
 ### Minor Changes
