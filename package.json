@@ -43,14 +43,15 @@
     "overrides": {
       "@types/react": "18.3.27",
       "@types/react-dom": "18.3.7",
-      "@xmldom/xmldom": "0.8.13",
+      "@xmldom/xmldom": "0.9.12",
       "fast-uri": "3.1.7",
       "hono": "4.12.27",
       "ip-address": "10.3.1",
       "js-cookie": "3.0.8",
       "lodash": "4.18.1",
       "lodash-es": "4.18.1",
-      "ws": "8.21.0"
+      "ws": "8.21.0",
+      "iterm2-version>plist": "3.1.1"
     }
   },
   "packageManager": "pnpm@10.27.0+sha512.72d699da16b1179c14ba9e64dc71c9a40988cbdc65c264cb0e489db7de917f20dcf4d64d8723625f2969ba52d4b7e2a1170682d9ac2a5dcaeaab732b7e16f04a"
