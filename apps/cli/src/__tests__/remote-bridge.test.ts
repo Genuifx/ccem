@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { Command } from 'commander';
 import {
   parseRemoteCursor, registerRemoteBridge, relayRemoteBatch, renderRemoteEvent,
-  sendHermesMessage, validateRemoteInput, type RemoteEventBatch,
+  sendHermesMessage, type RemoteEventBatch,
 } from '../remoteBridge.js';
 
 const event = (seq: number) => ({ version: 1 as const, event_id: `run:${seq}`, runtime_id: 'run', seq,
@@ -86,10 +86,52 @@ process.stdin.on('end', () => {
     for (const raw of ['', '-1', '1.5', '9007199254740992']) expect(() => parseRemoteCursor(raw)).toThrow();
     expect(parseRemoteCursor('0')).toBe(0);
   });
+  it('bounds receipt bytes, rejects invalid UTF-8, and preserves split code points', async () => {
+    await expect(sendHermesMessage('feishu:chat', 'text', await fixture(`
+process.stdin.resume(); console.log(JSON.stringify({success:true, note:'中'.repeat(30000)}));
+`))).rejects.toThrow('oversized');
+    await expect(sendHermesMessage('feishu:chat', 'text', await fixture(`
+process.stdin.resume(); process.stdout.write(Buffer.concat([
+  Buffer.from('{"success":true,"note":"'), Buffer.from([255]), Buffer.from('"}')
+]));
+`))).rejects.toThrow('did not confirm');
+    await expect(sendHermesMessage('feishu:chat', 'text', await fixture(`
+process.stdin.resume(); const value = Buffer.from(JSON.stringify({success:true,note:'中'}));
+const split = value.indexOf(0xe4) + 1;
+process.stdout.write(value.subarray(0, split));
+setTimeout(() => process.stdout.write(value.subarray(split)), 30);
+`))).resolves.toBeUndefined();
+  });
+  it('reaps its own child even when it ignores SIGTERM after an oversized receipt', async () => {
+    const executable = await fixture(`
+const fs = require('node:fs');
+fs.writeFileSync(__filename + '.pid', String(process.pid));
+process.on('SIGTERM', () => {});
+process.stdin.resume(); setInterval(() => {}, 1000);
+process.stdout.write('x'.repeat(65537));
+`);
+    try {
+      await expect(sendHermesMessage('feishu:chat', 'text', executable, { killGraceMs: 30 }))
+        .rejects.toThrow('oversized');
+      const pid = Number(await readFile(executable + '.pid', 'utf8'));
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      // Exact fixture ownership only, including cleanup if the assertion regresses.
+      const pid = Number(await readFile(executable + '.pid', 'utf8').catch(() => '0'));
+      if (pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch { /* already reaped */ } }
+    }
+  });
+  it('reports timeouts as unknown and handles an executable that cannot start', async () => {
+    const executable = await fixture('process.stdin.resume(); setInterval(() => {}, 1000);');
+    await expect(sendHermesMessage('feishu:chat', 'text', executable, { timeoutMs: 600 }))
+      .rejects.toThrow('delivery is unknown');
+    await expect(sendHermesMessage('feishu:chat', 'text', '/ccem-missing-hermes'))
+      .rejects.toThrow('could not be started');
+  });
 });
 
 describe('remote command behavior over loopback RPC', () => {
-  it('queries status and sends only confirmed input with source-scoped idempotency', async () => {
+  it('keeps local queries working but blocks every remote side effect before RPC', async () => {
     const calls: any[] = [];
     const server = createServer((req, res) => {
       let body = '';
@@ -114,20 +156,19 @@ describe('remote command behavior over loopback RPC', () => {
         await program.parseAsync(['node', 'ccem', 'remote', ...args]);
       };
       await run(['status', 'run']);
-      const args = ['send', 'run', '--platform', 'feishu', '--chat-id', 'chat', '--message-id', 'msg1', '--text', 'continue'];
-      await expect(run([...args, '--confirm', 'different'])).rejects.toThrow('confirmation');
-      expect(calls).toHaveLength(1);
-      await run([...args, '--confirm', 'run']);
-      await run([...args, '--confirm', 'run']);
-      expect(calls[0].method).toBe('ccem.workspace.getSession');
-      expect(calls[1].method).toBe('ccem.workspace.sendInput');
-      expect(calls[1].params.clientMessageId).toBe(calls[2].params.clientMessageId);
-      expect(JSON.parse(calls[1].params.clientMessageId)).toEqual(['hermes', 'feishu', 'chat', 'msg1']);
+      await run(['events', 'run', '--since', '12']);
+      for (const platform of ['feishu', 'wecom', 'wechat', 'weixin', 'personal-wechat', 'future-platform']) {
+        const args = ['send', 'run', '--platform', platform, '--chat-id', 'chat', '--message-id', 'msg1', '--text', 'continue'];
+        for (const confirmation of ['run', 'different']) {
+          await expect(run([...args, '--confirm', confirmation])).rejects.toThrow('CAPABILITY_UNAVAILABLE');
+        }
+        await expect(run(['relay', 'run', '--to', `${platform}:chat`, '--since', '0']))
+          .rejects.toThrow('CAPABILITY_UNAVAILABLE');
+      }
+      expect(calls.map(call => call.method)).toEqual(['ccem.workspace.getSession', 'ccem.remote.getEvents']);
+      expect(calls[1].params).toEqual({ runtimeId: 'run', sinceSeq: 12, limit: 100 });
     } finally {
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
-  });
-  it('rejects personal Weixin writes even when confirmed', () => {
-    for (const platform of ['wechat', 'weixin']) expect(() => validateRemoteInput(platform, 'chat', 'run', 'run', 'msg1')).toThrow('notification-only');
   });
 });

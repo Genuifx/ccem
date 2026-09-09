@@ -1,10 +1,12 @@
 # Hermes remote event bridge (migration groundwork)
 
-This is an opt-in CLI integration for native CCEM Desktop sessions. Hermes is the
-only delivery transport for `ccem remote relay`; there is no SDK fallback. This
-change does **not** make Hermes the Desktop-wide default or retire existing
-Telegram/WeCom/Weixin integrations. Their existing configuration and behavior
-remain available. Do not run a legacy relay and Hermes relay for the same route.
+This is local administrative event inspection for native CCEM Desktop sessions.
+The prototype's `remote relay` and `remote send` commands now fail with
+`CAPABILITY_UNAVAILABLE` before any RPC or process launch. REQ-0007 phase 0 found
+that their contracts cannot safely support a managed chat integration. Existing
+Desktop channels are unchanged; Hermes is not enabled or migrated by this work.
+
+See [the takeover review and stage gates](hermes-phase0-review.md).
 
 ## Protocol
 
@@ -36,53 +38,77 @@ The existing authenticated Desktop control server remains bound to loopback.
 The projection lives in `remote_bridge.rs` and is shared with legacy bot-binding
 outboxes. Wire names of legacy frames are unchanged. Stable event identities
 combine runtime ID and sequence. The cursor advances over raw records, including
-telemetry filtered out of the chat projection. Integrity flags are preserved;
-the CLI refuses unavailable or gapped history instead of silently skipping it.
+telemetry filtered out of the chat projection. Local inspection prints integrity
+flags; the preserved batch helper refuses unavailable or gapped history before sending.
 
-## Use from Hermes
+## Local inspection
 
-Hermes authenticates the source platform and chat, decides which sessions the
-caller may access, and asks the user to confirm writes. The CCEM CLI only uses
-the local authenticated control endpoint. Platform/chat strings are provenance,
-not credentials. Do not expose the CLI or the Desktop token directly to chats.
+These commands use the existing local administrative control token, which has
+broader access than a chat plugin should receive. Do not expose this CLI or the
+Desktop token to chats. A future Hermes plugin needs a distinct scoped token,
+trusted source context, workspace policy, and a real confirmation contract.
 
 ```sh
 ccem remote status <runtime-id>
 ccem remote events <runtime-id> --since 0
-ccem remote relay <runtime-id> --to feishu:<chat-id> --since <acknowledged-seq>
-ccem remote send <runtime-id> --platform feishu --chat-id <chat-id> \
-  --message-id <stable-source-message-id> --text '<confirmed input>' \
-  --confirm <runtime-id>
 ```
 
-`relay` sends one batch (at most 100 source events) via the installed `hermes`
-executable using `send --to ... --file - --json`. It requires an explicit chat;
-no implicit home channel is selected. Hermes must already be configured by its
-owner. Any platform supported by that Hermes installation can be targeted.
+## Preserved transport groundwork (not enabled)
 
-After success, retain the returned `nextCursor` and use it on the next call.
-Use exactly one relay owner per route. No scheduler, cursor file, or migration
-state is installed by this command. Starting at zero intentionally replays
-available history. `hasMore` distinguishes normal pagination from missing history. Decode failures
-and oversized omitted rows cause delivery to stop; they are never acknowledged
-as delivered events.
+The batch renderer and subprocess helper remain available to regression tests
+and later managed transport work. They are not wired to an active sender.
+The prototype invoked `send --to ... --file - --json`; this cannot be the default
+for every Hermes platform. The pinned WeCom sender opens a second WebSocket in
+a standalone process, while an in-process call can reuse the gateway adapter.
+The pinned Telegram sender may remove an invalid thread ID and retry in the
+parent chat. Neither behavior meets the managed route contract.
+
+The batch helper validates source integrity before any send. `hasMore`
+distinguishes pagination from missing history; decode failures and oversized
+omitted rows stop delivery. Its returned cursor is not a durable outbox or a
+delivery ledger. A future service must persist scanning and receipt state
+separately and must never retry an uncertain send automatically.
 
 Each successful send requires both exit code zero and JSON `success: true` with
 no error/skip. Failure stops the batch and reports the last confirmed cursor.
 There is no automatic retry or transport fallback. A timeout or lost response
 may mean the message arrived: inspect the destination before retrying, using the
 visible event ID to identify it. This is not an exactly-once delivery guarantee.
-The child process has a 30-second timeout and a bounded response buffer.
+The child process has a 30-second timeout, a 64 KiB byte limit and strict UTF-8
+decoding. Failure terminates only the owned child, escalating to SIGKILL after
+a 250 ms grace period. Pipe cleanup is also bounded. A syntactically valid
+receipt still cannot prove exact target delivery or platform read status.
 
 Session text is piped without a shell and media/control directives are broken
 with a zero-width separator so output cannot request local file uploads.
 
-`send` requires confirmation matching the target runtime and a stable message ID.
-Hermes must obtain real user confirmation before supplying that option. Retries
-reuse a source-scoped idempotency key. Personal Weixin/Wechat writes are rejected;
-it is notification-only. This adapter exposes input, not session termination,
-permission approval, or arbitrary RPC dispatch. Existing local Desktop CLI
-commands remain local administrative capabilities.
+The old `--confirm <runtimeId>` flag was a caller assertion, not proof of user
+confirmation. A repeated `clientMessageId` also did not deduplicate every native
+Provider. Therefore `remote send` is blocked for all platform names, including
+aliases and unknown platforms. Future personal Weixin routes remain notification
+only through route permissions enforced by the restricted bridge itself.
+
+## Reproduce phase 0 locally
+
+```sh
+<absolute-python> scripts/hermes/probe-compatibility.py \
+  --source <absolute-hermes-checkout> --python <absolute-python> \
+  --output .artifacts/hermes-phase0/compatibility.json
+
+python3 -m unittest discover -s scripts/hermes -p 'test_*.py' -v
+```
+
+The probe runs actual Hermes receipt/command/sender implementations with
+synthetic inputs and SDK fixtures in a temporary `HERMES_HOME`. Its workers
+inherit no credentials, allow writes only under their temporary directory,
+refuse external profile/data reads, and deny Python socket connections, datagram
+sends and subprocess launches. Source reads are limited to code; the Python runtime can read its own
+dependencies. The synthetic gateway lookup avoids importing the live runner and
+its project `.env` loader. This guard is not a sandbox for arbitrary untrusted native code;
+run it only against a reviewed checkout. It does not start a gateway, register
+a real account, install dependencies, or send a platform message. Exit 2 means
+phase 0 is incomplete; the JSON report names the remaining gates. The current
+probe is deliberately unable to certify the full integration.
 
 ## Migration and acceptance still required
 

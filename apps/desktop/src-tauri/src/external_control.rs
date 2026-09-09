@@ -497,13 +497,17 @@ impl ExternalControlManager {
     }
 
     fn handle_connection(self: &Arc<Self>, app: &AppHandle, mut stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+        if let Err(error) = configure_control_stream(&stream) {
+            eprintln!("External control stream configuration failed: {}", error);
+            return;
+        }
         let response = match read_http_request(&mut stream) {
             Ok(request) => self.handle_http_request(app, request),
             Err(error) => HttpResponse::json_error(400, None, -32700, &error),
         };
-        let _ = stream.write_all(&response.to_bytes());
+        if let Err(error) = stream.write_all(&response.to_bytes()) {
+            eprintln!("External control response write failed: {}", error);
+        }
     }
 
     fn handle_http_request(&self, app: &AppHandle, request: HttpRequest) -> HttpResponse {
@@ -1761,6 +1765,14 @@ impl HttpResponse {
     }
 }
 
+fn configure_control_stream(stream: &TcpStream) -> std::io::Result<()> {
+    // Accepted sockets inherit the listener's O_NONBLOCK on macOS. Timeouts
+    // alone do not make write_all wait, so large replies would be truncated.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))
+}
+
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     read_http_request_with_deadline(stream, SOCKET_IO_TIMEOUT)
 }
@@ -2361,6 +2373,37 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    #[test]
+    fn accepted_nonblocking_listener_delivers_large_response_to_slow_reader() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let deadline = Instant::now() + SOCKET_IO_TIMEOUT;
+        let (mut server, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept synthetic client: {error}"),
+            }
+        };
+        // Linux does not inherit O_NONBLOCK from accept; force the macOS state
+        // as well so this behavior regression runs on both platforms.
+        server.set_nonblocking(true).unwrap();
+        configure_control_stream(&server).unwrap();
+        let response = HttpResponse::json(200, json!({ "synthetic": "x".repeat(8 * 1024 * 1024) }));
+        let expected = response.to_bytes();
+        let writer = thread::spawn(move || server.write_all(&response.to_bytes()));
+        client.set_read_timeout(Some(SOCKET_IO_TIMEOUT)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        writer.join().unwrap().expect("complete response write");
+        assert_eq!(received.len(), expected.len());
+        assert!(received == expected, "response bytes must be complete and unchanged");
     }
 
     #[test]

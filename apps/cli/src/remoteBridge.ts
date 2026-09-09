@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { TextDecoder } from 'node:util';
 import type { Command } from 'commander';
 import { printJson, requestDesktopControl } from './desktopControl.js';
 
@@ -51,41 +52,79 @@ export async function sendHermesMessage(
   target: string,
   message: string,
   executable = 'hermes',
+  limits: { timeoutMs?: number; killGraceMs?: number } = {},
 ): Promise<void> {
   validateHermesTarget(target);
+  const timeoutMs = limits.timeoutMs ?? 30_000;
+  const killGraceMs = limits.killGraceMs ?? 250;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000
+    || !Number.isSafeInteger(killGraceMs) || killGraceMs < 1 || killGraceMs > 1000) {
+    throw new Error('Invalid Hermes process limits.');
+  }
   await new Promise<void>((resolve, reject) => {
     const child = spawn(executable, ['send', '--to', target, '--file', '-', '--json'], {
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    let stdout = '';
-    let failed = false;
-    const fail = (reason: string) => {
-      if (failed) return;
-      failed = true;
-      child.kill();
-      reject(new Error(reason));
-    };
-    const timer = setTimeout(() => fail('Hermes delivery timed out; delivery is unknown. Inspect the destination before retrying.'), 30_000);
-    child.on('error', () => fail('Hermes could not be started; no fallback channel was used.'));
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-      if (stdout.length > 64 * 1024) fail('Hermes returned an oversized response; delivery is unknown.');
-    });
-    // Drain without echoing potentially sensitive platform diagnostics.
-    child.stderr.resume();
-    child.stdin.on('error', () => fail('Hermes did not accept the message; delivery is unknown.'));
-    child.on('close', (code) => {
+    const chunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let failure: string | undefined;
+    let settled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let reapTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      if (failed) return;
+      clearTimeout(killTimer);
+      clearTimeout(reapTimer);
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (failure) {
+        reject(new Error(failure));
+        return;
+      }
       let result: { success?: unknown; skipped?: unknown; error?: unknown } | null = null;
-      try { result = JSON.parse(stdout); } catch { /* rejected below */ }
+      try {
+        const stdout = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+        result = JSON.parse(stdout);
+      } catch { /* malformed receipts, including invalid UTF-8, are unknown delivery */ }
       if (code !== 0 || result?.success !== true || result.skipped || result.error) {
         reject(new Error('Hermes did not confirm delivery; no fallback channel was used. Inspect the destination before retrying.'));
         return;
       }
       resolve();
+    };
+    const fail = (reason: string) => {
+      if (failure || settled) return;
+      failure = reason;
+      clearTimeout(timer);
+      child.stdin.destroy();
+      // Only this ChildProcess is owned by this call. Never kill by name or port.
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        // A descendant could retain a pipe after the direct child has exited.
+        // Bound that wait too; this path never confirms delivery or retries.
+        reapTimer = setTimeout(() => {
+          child.unref();
+          finish(null);
+        }, 1000);
+      }, killGraceMs);
+    };
+    const timer = setTimeout(() => fail('Hermes delivery timed out; delivery is unknown. Inspect the destination before retrying.'), timeoutMs);
+    child.on('error', () => fail('Hermes could not be started; no fallback channel was used.'));
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failure || settled) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > 64 * 1024) fail('Hermes returned an oversized response; delivery is unknown.');
+      else chunks.push(chunk);
     });
+    // Drain without echoing potentially sensitive platform diagnostics.
+    child.stderr.resume();
+    child.stdin.on('error', () => fail('Hermes did not accept the message; delivery is unknown.'));
+    child.on('close', finish);
     child.stdin.end(message);
   });
 }
@@ -132,15 +171,11 @@ export async function relayRemoteBatch(
   return { nextCursor: batch.nextCursor!, delivered, hasMore: batch.hasMore };
 }
 
-export function validateRemoteInput(platform: string, chatId: string, runtimeId: string, confirm: string, messageId: string): void {
-  validateHermesTarget(`${platform}:${chatId}`);
-  if (platform === 'weixin' || platform === 'wechat') throw new Error('Personal Weixin is notification-only.');
-  if (confirm !== runtimeId) throw new Error('Write input requires explicit user confirmation: --confirm must equal the runtime ID.');
-  if (!messageId.trim()) throw new Error('A stable platform message ID is required.');
-}
+const REMOTE_WRITE_UNAVAILABLE = 'CAPABILITY_UNAVAILABLE: Remote input requires a scoped bridge token, trusted chat confirmation and durable input deduplication. CLI source/confirmation arguments cannot authorize it.';
+const REMOTE_RELAY_UNAVAILABLE = 'CAPABILITY_UNAVAILABLE: Remote relay requires a verified managed Hermes transport. Standalone CLI sends can replace a live gateway connection or change a thread target.';
 
 export function registerRemoteBridge(program: Command): void {
-  const remote = program.command('remote').description('Local event bridge for Hermes (platform identity is verified by Hermes)');
+  const remote = program.command('remote').description('Local administrative event inspection; managed Hermes integration is not enabled');
   remote.command('status <runtimeId>').action(async (runtimeId: string) => {
     printJson(await requestDesktopControl('ccem.workspace.getSession', { runtimeId }));
   });
@@ -152,11 +187,9 @@ export function registerRemoteBridge(program: Command): void {
   remote.command('relay <runtimeId>')
     .requiredOption('--to <target>', 'Explicit Hermes platform:chat_id[:thread_id]')
     .requiredOption('--since <seq>', 'Last acknowledged cursor; explicit 0 replays available history')
-    .action(async (runtimeId: string, opts: { to: string; since: string }) => {
-      const since = parseRemoteCursor(opts.since)!;
-      validateHermesTarget(opts.to);
-      const batch = await requestDesktopControl<RemoteEventBatch>('ccem.remote.getEvents', { runtimeId, sinceSeq: since, limit: 100 });
-      printJson(await relayRemoteBatch(batch, runtimeId, since, opts.to));
+    .description('Unavailable until managed transport capability checks pass')
+    .action(() => {
+      throw new Error(REMOTE_RELAY_UNAVAILABLE);
     });
   remote.command('send <runtimeId>')
     .requiredOption('--platform <platform>', 'Authenticated Hermes source platform')
@@ -164,14 +197,8 @@ export function registerRemoteBridge(program: Command): void {
     .requiredOption('--message-id <id>', 'Stable platform message ID for idempotency')
     .requiredOption('--text <text>', 'Confirmed input')
     .requiredOption('--confirm <runtimeId>', 'Repeat the runtime ID after obtaining user confirmation')
-    .action(async (runtimeId: string, opts: { platform: string; chatId: string; messageId: string; text: string; confirm: string }) => {
-      validateRemoteInput(opts.platform, opts.chatId, runtimeId, opts.confirm, opts.messageId);
-      if (!opts.text.trim()) throw new Error('Input text must not be empty.');
-      printJson(await requestDesktopControl('ccem.workspace.sendInput', {
-        runtimeId,
-        clientMessageId: JSON.stringify(['hermes', opts.platform, opts.chatId, opts.messageId]),
-        text: opts.text,
-        displayText: null,
-      }));
+    .description('Unavailable until trusted inbound bridge capability checks pass')
+    .action(() => {
+      throw new Error(REMOTE_WRITE_UNAVAILABLE);
     });
 }
