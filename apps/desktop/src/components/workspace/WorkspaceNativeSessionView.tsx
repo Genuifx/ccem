@@ -1324,6 +1324,7 @@ function WorkspaceAttentionPanel({
         }
 
         const Icon = isPlanExitPrompt ? ClipboardList : MessageSquareQuote;
+        const isCollapsed = isPlanExitPrompt && collapsedPromptIds.has(promptOccurrenceId);
 
         return (
           <div
@@ -1361,24 +1362,40 @@ function WorkspaceAttentionPanel({
               <span className="shrink-0 rounded-md bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/80">
                 {entry.rawName}
               </span>
+              {isPlanExitPrompt ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 shrink-0 rounded-md text-muted-foreground"
+                  aria-label={t(isCollapsed ? 'workspace.nativePromptExpand' : 'workspace.nativePromptCollapse')}
+                  aria-expanded={!isCollapsed}
+                  aria-controls={`plan-exit-body-${promptOccurrenceId}`}
+                  onClick={() => togglePromptCollapsed(promptOccurrenceId)}
+                >
+                  {isCollapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+                </Button>
+              ) : null}
             </div>
-            {bodyLines.length > 0 ? (
-              isPlanExitPrompt ? (
-                <div className="mt-1.5 text-foreground/90">
-                  <MarkdownRenderer content={bodyLines[0]!} className="text-[12px] leading-relaxed" />
-                </div>
+            <div id={`plan-exit-body-${promptOccurrenceId}`} hidden={isCollapsed}>
+              {bodyLines.length > 0 ? (
+                isPlanExitPrompt ? (
+                  <div className="mt-1.5 text-foreground/90">
+                    <MarkdownRenderer content={bodyLines[0]!} className="text-[12px] leading-relaxed" />
+                  </div>
+                ) : (
+                  <div className="mt-1.5 space-y-1 text-[12px] leading-relaxed text-foreground/90">
+                    {bodyLines.map((line, index) => (
+                      <p key={`${promptOccurrenceId}-line-${index}`}>{line}</p>
+                    ))}
+                  </div>
+                )
               ) : (
-                <div className="mt-1.5 space-y-1 text-[12px] leading-relaxed text-foreground/90">
-                  {bodyLines.map((line, index) => (
-                    <p key={`${promptOccurrenceId}-line-${index}`}>{line}</p>
-                  ))}
-                </div>
-              )
-            ) : (
-              <p className="mt-1.5 text-[11px] text-muted-foreground/75">
-                {t('workspace.nativeReplyHint')}
-              </p>
-            )}
+                <p className="mt-1.5 text-[11px] text-muted-foreground/75">
+                  {t('workspace.nativeReplyHint')}
+                </p>
+              )}
+            </div>
             {quickReplies.length > 0 && !primaryPlanExitReply ? (
               <div className={cn(
                 'mt-2 flex flex-wrap gap-1.5',
@@ -3080,7 +3097,8 @@ export function WorkspaceNativeSessionView({
     && (backgroundTaskModel.active.length > 0 || backgroundTaskModel.recent.length > 0)
     && !bgTasksDismissed;
   const hasAttentionPanel = attentionState.permissions.length > 0
-    || hasBlockingAttention
+    || Boolean(attentionState.terminalPrompt)
+    || attentionState.prompts.some((entry) => entry.prompt.prompt_type !== 'plan_exit')
     || hasBackgroundTaskPanel;
   const canStopForeground = session.lifecycle?.active_command_id != null
     || (session.provider !== 'claude' && isProcessingTurn);
@@ -4320,7 +4338,10 @@ export function WorkspaceNativeSessionView({
         aboveComposer={hasAttentionPanel ? (
           <WorkspaceAttentionPanel
             provider={session.provider}
-            attentionState={attentionState}
+            attentionState={{
+              ...attentionState,
+              prompts: attentionState.prompts.filter((entry) => entry.prompt.prompt_type !== 'plan_exit'),
+            }}
             backgroundTasks={hasBackgroundTaskPanel ? (
               <WorkspaceBackgroundTasksPopover
                 activeTasks={backgroundTaskModel.active}
@@ -4337,6 +4358,21 @@ export function WorkspaceNativeSessionView({
             onSubmitPromptReply={async (payload) => {
               return await sendInteractivePromptReply(payload);
             }}
+          />
+        ) : null}
+        floatingAboveComposer={hasPlanExitPrompt ? (
+          <WorkspaceAttentionPanel
+            provider={session.provider}
+            attentionState={{
+              permissions: [],
+              prompts: attentionState.prompts.filter((entry) => entry.prompt.prompt_type === 'plan_exit'),
+              terminalPrompt: null,
+            }}
+            backgroundTasks={null}
+            respondingRequestId={respondingRequestId}
+            isSubmittingPrompt={isSending}
+            onPermission={handlePermission}
+            onSubmitPromptReply={sendInteractivePromptReply}
           />
         ) : null}
         controls={(

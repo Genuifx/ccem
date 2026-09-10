@@ -164,6 +164,7 @@ interface WorkspaceSessionComposerProps {
   submitLabel: string;
   loadingLabel?: string;
   aboveComposer?: ReactNode;
+  floatingAboveComposer?: ReactNode;
   aboveTextarea?: ReactNode;
   onPrimaryAction?: () => void | Promise<void>;
   primaryActionLabel?: string;
@@ -767,6 +768,7 @@ export function WorkspaceSessionComposer({
   submitLabel,
   loadingLabel = submitLabel,
   aboveComposer,
+  floatingAboveComposer,
   aboveTextarea,
   onPrimaryAction,
   primaryActionLabel,
@@ -809,6 +811,21 @@ export function WorkspaceSessionComposer({
 }: WorkspaceSessionComposerProps) {
   const { t } = useLocale();
   const composerShellRef = useRef<HTMLDivElement | null>(null);
+  const [floatingAttentionMaxHeight, setFloatingAttentionMaxHeight] = useState(440);
+  useEffect(() => {
+    const shell = composerShellRef.current;
+    if (!floatingAboveComposer || !shell) return;
+    // Keep Plan's header reachable when a tall inline dock leaves little room above it.
+    const measure = () => setFloatingAttentionMaxHeight(Math.max(48, shell.getBoundingClientRect().top + 10));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(shell);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [floatingAboveComposer]);
   const attentionDockRef = useRef<HTMLDivElement | null>(null);
   const attachmentStripRef = useRef<HTMLDivElement | null>(null);
   const primaryActionButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -1528,7 +1545,7 @@ export function WorkspaceSessionComposer({
         )}
         style={{ transitionTimingFunction: 'cubic-bezier(0.25, 1, 0.5, 1)' }}
       >
-        <div className="space-y-1">
+        <div className="max-h-[min(35vh,280px)] space-y-1 overflow-y-auto overscroll-contain">
           {aboveComposer ? (
             <div className="max-h-[min(60vh,440px)] overflow-y-auto pr-0.5">
               {aboveComposer}
@@ -1648,10 +1665,17 @@ export function WorkspaceSessionComposer({
   }, { dependencies: [resolvedActionLabel, isSubmitting], scope: composerShellRef, revertOnUpdate: true });
 
   return (
-    <div className="px-2 pb-3 pt-2 sm:px-4">
+    <div className="shrink-0 px-2 pb-3 pt-2 sm:px-4">
       <div ref={composerShellRef} className="relative mx-auto w-full max-w-5xl">
+        {floatingAboveComposer ? (
+          <div data-composer-attention-layout="overlay" className="workspace-attention-dock pointer-events-none absolute inset-x-0 bottom-[calc(100%-18px)] z-30 flex justify-center">
+            <div style={{ maxHeight: `min(60vh, 440px, ${floatingAttentionMaxHeight}px)` }} className="pointer-events-auto w-[95%] overflow-y-auto overscroll-contain rounded-t-[18px] border-x border-t border-border/70 bg-surface-raised px-2.5 pt-2 pb-6 shadow-lg">
+              {floatingAboveComposer}
+            </div>
+          </div>
+        ) : null}
         {combinedAboveComposer ? (
-          <div ref={attentionDockRef} className="workspace-attention-dock pointer-events-none absolute inset-x-0 bottom-[calc(100%-18px)] z-10 flex justify-center">
+          <div ref={attentionDockRef} data-composer-attention-layout="inline" className="workspace-attention-dock relative z-10 -mb-[18px] flex justify-center">
             <div className="pointer-events-auto w-[95%]">
               {combinedAboveComposer}
             </div>
