@@ -23,6 +23,13 @@ function getRingColor(percentage: number): string {
 /**
  * Context ring in the composer secondary actions.
  *
+ * The ring is ALWAYS rendered — every session shows the usage entry point.
+ * Before any usage/context event arrives (fresh session, events still
+ * replaying, providers without context events) it renders the neutral
+ * placeholder ring instead of vanishing; the hover panel explains the empty
+ * state. Hiding the entry point entirely made the composer usage area look
+ * intermittently missing.
+ *
  * Hovering the ring opens the full session usage panel; the pointer can move
  * onto the panel (refresh button) without closing it. There is deliberately no
  * separate hover tooltip — the panel itself is the hover surface, so the old
@@ -34,8 +41,6 @@ export function ContextWindowIndicator({
   onRefreshUsage,
 }: ContextWindowIndicatorProps) {
   const { t } = useLocale();
-
-  if (usage.turnCount === 0 && !usage.context && !usage.sessionUsage) return null;
 
   const hasContext = usage.context !== null;
   const percentage = Math.max(0, Math.min(100, usage.context?.percentage ?? 0));
