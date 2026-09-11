@@ -1,5 +1,11 @@
 # ccem
 
+## 2.84.0
+
+### Minor Changes
+
+- Desktop fixes: hide embedded browser surfaces when the frontend reboots and reserve composer space for regular attention panels; dependency update bundling @xmldom/xmldom 0.9.12 via plist 3.1.1.
+
 ## 2.83.0
 
 ### Minor Changes
