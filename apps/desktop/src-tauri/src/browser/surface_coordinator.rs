@@ -196,6 +196,23 @@ impl BrowserSurfaceCoordinator {
         BrowserSurfaceApplyOutcome::Applied(current.clone())
     }
 
+    /// Invalidates the current lease without a client acknowledgement.
+    ///
+    /// The frontend boot barrier uses this when the document that owned the
+    /// lease no longer exists: every later sync or release from that document
+    /// must be a no-op, and the retained native surface stays hidden until a
+    /// fresh document acquires the slot again.
+    pub(crate) fn invalidate_lease(&mut self) -> Option<BrowserSurfaceSnapshot> {
+        let current = self.current.as_mut()?;
+        if !current.lease_active {
+            return None;
+        }
+
+        current.lease_active = false;
+        current.lifecycle = BrowserSurfaceLifecycle::Hidden;
+        Some(current.clone())
+    }
+
     /// Commits the terminal close transition after the native/session owner has
     /// accepted and completed its bounded close operation.
     ///

@@ -28,6 +28,74 @@ fn recovery_record(
 const CONCURRENCY_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[test]
+fn frontend_boot_epoch_reset_readmits_the_rebuilt_document_revision_sequence() {
+    let manager = LoginBrowserSurfaceManager::default();
+    let mut state = manager.state().expect("Login surface state");
+    assert!(state
+        .presentation_epoch
+        .accepts_login_visibility(7, "panel-a", true));
+    assert!(state
+        .presentation_epoch
+        .accepts_login_visibility(9, "panel-a", false));
+    // The rebuilt document restarts its own revision sequence at 1, which the
+    // previous document's high-water mark would reject as stale.
+    assert!(!state
+        .presentation_epoch
+        .accepts_login_visibility(1, "panel-a", true));
+    state.presentation_epoch.reset();
+    assert!(state
+        .presentation_epoch
+        .accepts_login_visibility(1, "panel-a", true));
+    assert_eq!(
+        state.presentation_epoch.owner,
+        Some(PresentationOwner::Login("panel-a".to_string()))
+    );
+}
+
+#[test]
+fn frontend_boot_barrier_stays_state_only_and_defers_the_native_hide() {
+    let recovery = include_str!("../../../webcontent_recovery.rs");
+    assert!(
+        recovery.contains("reset_embedded_surfaces_for_frontend_boot"),
+        "the main frontend boot must reset embedded native surfaces"
+    );
+
+    let surfaces = include_str!("../surface_commands.rs");
+    let reset_at = surfaces
+        .find("fn reset_for_frontend_boot")
+        .expect("the boot barrier exists");
+    let deferred_at = surfaces
+        .find("fn hide_surfaces_left_by_previous_document")
+        .expect("the native hide is deferred");
+    assert!(
+        reset_at < deferred_at,
+        "the state reset precedes the deferred native hide"
+    );
+
+    let reset_body = &surfaces[reset_at..deferred_at];
+    assert!(
+        reset_body.contains("invalidate_lease()"),
+        "the boot barrier invalidates the previous document's leases"
+    );
+    assert!(
+        reset_body.contains("presentation_epoch.reset()"),
+        "the boot barrier restarts the presentation epoch"
+    );
+    assert!(
+        reset_body.contains("spawn_blocking"),
+        "the native hide is deferred to a blocking worker"
+    );
+    assert!(
+        !reset_body.contains("cef_host."),
+        "the boot command runs on the main thread: main-thread-affine native visibility must stay off this path"
+    );
+    assert!(
+        surfaces[deferred_at..].contains("set_surface_visible"),
+        "the deferred hide applies the native visibility"
+    );
+}
+
+#[test]
 fn blocked_acquire_lifecycle_allows_login_and_preview_presentation_mutations() {
     let manager = Arc::new(LoginBrowserSurfaceManager::default());
     let (acquire_blocked_tx, acquire_blocked_rx) = mpsc::sync_channel(0);

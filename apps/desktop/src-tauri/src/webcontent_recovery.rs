@@ -610,19 +610,54 @@ pub async fn webcontent_debug_main_process_id(webview: Webview) -> Result<i32, S
     .map_err(|_| "Main WebView process probe worker failed".to_string())?
 }
 
+/// A rebuilt main document cannot own native browser surfaces.
+///
+/// Hides every retained embedded surface, invalidates the leases minted for the
+/// previous document, and restarts the presentation epoch, so an orphaned native
+/// view can never outlive the UI document that used to own it. The rebuilt UI
+/// re-acquires and syncs whatever panel it actually shows again.
+fn reset_embedded_surfaces_for_frontend_boot(app: &tauri::AppHandle) {
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let Some(surfaces) = app.try_state::<std::sync::Arc<
+            crate::browser::login::surface_commands::LoginBrowserSurfaceManager,
+        >>() else {
+            return;
+        };
+        let Some(cef_host) =
+            app.try_state::<std::sync::Arc<crate::browser::login::cef::host::CefHostController>>()
+        else {
+            return;
+        };
+        if let Err(error) = surfaces
+            .inner()
+            .reset_for_frontend_boot(app, cef_host.inner())
+        {
+            eprintln!("CCEM frontend boot native surface reset failed: {error}");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = app;
+}
+
 #[tauri::command]
 pub fn webcontent_frontend_boot(
+    app: tauri::AppHandle,
     webview: Webview,
     state: tauri::State<'_, WebContentRecovery>,
     document_id: String,
 ) -> Result<FrontendBoot, String> {
     require_main(&webview)?;
-    let mut state = state
-        .0
-        .lock()
-        .map_err(|_| "Renderer recovery state unavailable")?;
-    let result = state.policy.boot(&document_id)?;
-    state.record("frontend_boot");
+    let result = {
+        let mut state = state
+            .0
+            .lock()
+            .map_err(|_| "Renderer recovery state unavailable")?;
+        let result = state.policy.boot(&document_id)?;
+        state.record("frontend_boot");
+        result
+    };
+    reset_embedded_surfaces_for_frontend_boot(&app);
     Ok(result)
 }
 

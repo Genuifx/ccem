@@ -151,6 +151,16 @@ impl PresentationEpoch {
     fn allows_preview_show(&self, session_id: &str) -> bool {
         matches!(self.owner.as_ref(), Some(PresentationOwner::Preview(owner)) if owner == session_id)
     }
+
+    /// Starts a fresh presentation epoch for a rebuilt frontend document.
+    ///
+    /// The client revision sequence restarts together with its document, so
+    /// keeping the previous high-water mark would reject every visibility intent
+    /// from the rebuilt UI as stale.
+    fn reset(&mut self) {
+        self.last_applied = 0;
+        self.owner = None;
+    }
 }
 
 #[derive(Clone)]
@@ -235,6 +245,10 @@ impl<T> BrowserSurfaceInstanceRegistry<T> {
         self.instances
             .get(panel_session_id)
             .map(|instance| (panel_session_id, instance))
+    }
+
+    fn panel_session_ids(&self) -> Vec<String> {
+        self.instances.keys().cloned().collect()
     }
 }
 
@@ -1425,6 +1439,91 @@ impl LoginBrowserSurfaceManager {
             }
         }
         Ok(())
+    }
+
+    /// Frontend boot barrier: a freshly booted document owns no native surface.
+    ///
+    /// This runs on the boot command's thread, so it only touches manager state:
+    /// native visibility is applied on the main thread and must never run inline
+    /// here. Invalidating the previous document's leases makes every late sync or
+    /// release a no-op, and restarting the presentation epoch lets the rebuilt UI
+    /// acquire and sync its panels again. The native hide is deferred to a
+    /// blocking worker; physical CEF runtimes stay retained, so a re-acquired
+    /// panel keeps its page.
+    pub(crate) fn reset_for_frontend_boot(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        cef_host: &Arc<CefHostController>,
+    ) -> Result<(), String> {
+        let superseded: Vec<crate::browser::surface_coordinator::BrowserSurfaceSnapshot> = {
+            let mut state = self.state()?;
+            let panel_session_ids = state.instances.panel_session_ids();
+            let mut superseded = Vec::new();
+            for panel_session_id in panel_session_ids {
+                if let Some(instance) = state.instances.get_mut(&panel_session_id) {
+                    if let Some(snapshot) = instance.coordinator.invalidate_lease() {
+                        superseded.push(snapshot);
+                    }
+                }
+                state.instances.deactivate(&panel_session_id);
+            }
+            state.presentation_epoch.reset();
+            superseded
+        };
+
+        let manager = Arc::clone(self);
+        let app = app.clone();
+        let cef_host = Arc::clone(cef_host);
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) =
+                manager.hide_surfaces_left_by_previous_document(&app, &cef_host, &superseded)
+            {
+                eprintln!("CCEM frontend boot native surface hide failed: {error}");
+            }
+        });
+        Ok(())
+    }
+
+    /// Hides retained surfaces that the rebuilt document never re-acquired.
+    ///
+    /// Runs on a blocking worker because native visibility is main-thread affine.
+    fn hide_surfaces_left_by_previous_document(
+        &self,
+        app: &AppHandle,
+        cef_host: &Arc<CefHostController>,
+        superseded: &[crate::browser::surface_coordinator::BrowserSurfaceSnapshot],
+    ) -> Result<(), String> {
+        let _operation = self.mutation_operation()?;
+        let mut first_error: Option<String> = None;
+        for snapshot in superseded {
+            let stale: Vec<String> = {
+                let state = self.state()?;
+                state
+                    .instances
+                    .instances
+                    .values()
+                    .filter(|instance| {
+                        // A panel re-acquired by the rebuilt document keeps the
+                        // visibility it already synced; only surfaces that still
+                        // carry the superseded lease need the native hide.
+                        instance.lease_id == snapshot.lease.lease_id
+                            && instance.generation == snapshot.lease.generation
+                    })
+                    .map(|instance| instance.surface_id.clone())
+                    .collect()
+            };
+            for surface_id in stale {
+                if let Err(error) = cef_host.set_surface_visible(app, surface_id, false) {
+                    first_error.get_or_insert(error);
+                }
+            }
+            self.emit_surface_state(app, snapshot, "frontend_boot_reset", None);
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn emit_surface_state(

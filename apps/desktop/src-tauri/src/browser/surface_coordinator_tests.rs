@@ -48,6 +48,48 @@ fn acquire_is_last_wins_with_opaque_lease_and_monotonic_generation() {
 }
 
 #[test]
+fn invalidated_lease_rejects_late_sync_and_release_until_a_new_acquire() {
+    let mut coordinator = BrowserSurfaceCoordinator::new();
+    let acquired = coordinator
+        .acquire(BrowserSurfaceBackend::Login, 3)
+        .expect("lease");
+    let (lease_id, generation) = lease_identity(&acquired);
+    coordinator
+        .mark_ready(&lease_id, generation)
+        .expect("ready transition");
+
+    let invalidated = coordinator
+        .invalidate_lease()
+        .expect("active lease is invalidated");
+    assert!(!invalidated.lease_active);
+    assert_eq!(invalidated.lifecycle, BrowserSurfaceLifecycle::Hidden);
+
+    // A document that no longer exists cannot resurrect its surface...
+    assert_eq!(
+        coordinator.sync(&lease_id, generation, 99),
+        BrowserSurfaceApplyOutcome::Noop
+    );
+    assert_eq!(
+        coordinator.release(
+            &lease_id,
+            generation,
+            100,
+            BrowserSurfaceReleaseDisposition::Hide,
+        ),
+        BrowserSurfaceApplyOutcome::Noop
+    );
+    // ...and invalidation is idempotent.
+    assert!(coordinator.invalidate_lease().is_none());
+
+    // The rebuilt document acquires a fresh lease for the retained surface.
+    let reacquired = coordinator
+        .acquire(BrowserSurfaceBackend::Login, 1)
+        .expect("rebuilt document acquire");
+    assert!(reacquired.current.lease_active);
+    assert!(reacquired.current.lease.generation > generation);
+}
+
+#[test]
 fn sync_requires_both_current_identity_and_strictly_newer_revision() {
     let mut coordinator = BrowserSurfaceCoordinator::new();
     let acquired = coordinator
