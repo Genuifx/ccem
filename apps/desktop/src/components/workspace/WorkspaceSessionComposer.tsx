@@ -842,6 +842,7 @@ export function WorkspaceSessionComposer({
     };
   }, [floatingAboveComposer]);
   const attentionDockRef = useRef<HTMLDivElement | null>(null);
+  const composerDropTargetRef = useRef<HTMLDivElement | null>(null);
   const attachmentStripRef = useRef<HTMLDivElement | null>(null);
   const primaryActionButtonRef = useRef<HTMLButtonElement | null>(null);
   const promptAreaRef = useRef<PromptAreaHandle | null>(null);
@@ -1266,11 +1267,14 @@ export function WorkspaceSessionComposer({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    setIsDragTarget(false);
+    setDraggedFileCount(0);
+    if (disabled) return;
 
     void getCurrentWindow()
       .onDragDropEvent((event) => {
-        const shell = composerShellRef.current;
-        if (!shell) {
+        const shell = composerDropTargetRef.current;
+        if (cancelled || !shell) {
           return;
         }
         const payload = event.payload;
@@ -1283,7 +1287,8 @@ export function WorkspaceSessionComposer({
           const scale = window.devicePixelRatio || 1;
           const x = payload.position.x / scale;
           const y = payload.position.y / scale;
-          return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+          return rect.width > 0 && rect.height > 0
+            && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
         })();
 
         if (payload.type === 'enter') {
@@ -1309,7 +1314,10 @@ export function WorkspaceSessionComposer({
           return;
         }
 
-        addAttachments(payload.paths.map((path: string) => createComposerFileAttachment(path, workingDir, 'drop')));
+        const paths = payload.paths.filter((path) => path.trim().length > 0);
+        if (paths.length === 0) return;
+        addAttachments(paths.map((path) => createComposerFileAttachment(path, workingDir, 'drop')));
+        promptAreaRef.current?.focus();
       })
       .then((dispose) => {
         if (cancelled) {
@@ -1326,7 +1334,7 @@ export function WorkspaceSessionComposer({
       cancelled = true;
       unlisten?.();
     };
-  }, [addAttachments, workingDir]);
+  }, [addAttachments, disabled, workingDir]);
 
   const runComposerSubmit = useCallback(async () => {
     setSkillReadError(null);
@@ -1743,7 +1751,9 @@ export function WorkspaceSessionComposer({
         ) : null}
 
         <div
+          ref={composerDropTargetRef}
           data-composer-shell-card
+          data-composer-drop-active={isDragTarget || undefined}
           className={cn(
             'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-5 py-3 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
             isDragTarget && 'border-primary/45 bg-primary/[0.035]',

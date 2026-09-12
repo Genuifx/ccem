@@ -54,7 +54,11 @@ const stubsPlugin = {
       loader: 'js',
       contents: `
         export function getCurrentWindow() {
-          return { async onDragDropEvent() { return () => {}; } };
+          return { async onDragDropEvent(handler) {
+            window.__composerDragHandlers ??= new Set();
+            window.__composerDragHandlers.add(handler);
+            return () => window.__composerDragHandlers.delete(handler);
+          } };
         }
       `,
     }));
@@ -217,6 +221,7 @@ async function importHarness() {
                 value={value}
                 recoveryDraftKey={options.recoveryKey}
                 workingDir={options.workingDir}
+                disabled={options.disabled}
                 sessionReferencesClient={options.sessionReferencesClient}
                 onValueChange={setValue}
                 onSubmit={(payload) => {
@@ -234,7 +239,7 @@ async function importHarness() {
 
           const root = createRoot(container);
           act(() => root.render(<Harness />));
-          const editor = container.querySelector('[contenteditable="true"]');
+          const editor = container.querySelector('[contenteditable]');
           const sendButton = container.querySelector('button[aria-label="send message"]');
           if (!editor || !sendButton) throw new Error('composer controls did not mount');
 
@@ -257,6 +262,12 @@ async function importHarness() {
                 bubbles: true,
                 cancelable: true,
               })));
+            },
+            drag(payload) {
+              act(() => { for (const handler of window.__composerDragHandlers ?? []) handler({ payload }); });
+            },
+            removeFile() {
+              act(() => container.querySelector('[data-composer-attachment-chip] button').click());
             },
             getCallCount() { return state.calls; },
             getPayloads() { return state.payloads; },
@@ -646,3 +657,51 @@ for (const newerEdit of [false, true]) {
     remounted.unmount();
   });
 }
+
+
+test('native file drops target only the composer card, deduplicate, remove and submit references', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mount(container, { workingDir: '/project' });
+  t.after(() => { mounted.unmount(); restore(); });
+  Object.defineProperty(window, 'devicePixelRatio', { value: 2, configurable: true });
+  const card = container.querySelector('[data-composer-shell-card]');
+  card.getBoundingClientRect = () => ({ left: 100, top: 200, right: 500, bottom: 400, width: 400, height: 200 });
+  card.parentElement.getBoundingClientRect = () => ({ left: 100, top: 100, right: 500, bottom: 500, width: 400, height: 400 });
+  const paths = ['/project/你好 world.md', '/outside/spec.pdf', '/project/你好 world.md'];
+  const inside = { x: 600, y: 600 };
+  mounted.drag({ type: 'enter', paths, position: { x: 600, y: 300 } });
+  assert.doesNotMatch(card.textContent, /workspace.composerAttachmentDropHint/, 'queue above card is not a drop target');
+  mounted.drag({ type: 'over', position: inside });
+  assert.match(card.textContent, /workspace.composerAttachmentDropHint/);
+  mounted.drag({ type: 'leave' });
+  assert.doesNotMatch(card.textContent, /workspace.composerAttachmentDropHint/);
+  mounted.drag({ type: 'drop', paths, position: { x: 600, y: 300 } });
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 0);
+  mounted.drag({ type: 'drop', paths, position: inside });
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 2);
+  assert.equal(document.activeElement, container.querySelector('[contenteditable="true"]'));
+  mounted.drag({ type: 'drop', paths, position: inside });
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 2);
+  mounted.removeFile();
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 1);
+  mounted.pressEnter();
+  assert.equal(mounted.getCallCount(), 1);
+  assert.equal(mounted.getPayloads()[0].attachments.length, 1);
+  assert.equal(mounted.getPayloads()[0].attachments[0].absolutePath, '/project/你好 world.md');
+  await mounted.resolveAll(true);
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 0);
+});
+
+test('disabled composer ignores native file drag and drop', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mount(container, { disabled: true });
+  container.querySelector('[data-composer-shell-card]').getBoundingClientRect = () => ({ left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 });
+  t.after(() => { mounted.unmount(); restore(); });
+  mounted.drag({ type: 'enter', paths: ['/tmp/a.txt'], position: { x: 0, y: 0 } });
+  mounted.drag({ type: 'drop', paths: ['/tmp/a.txt'], position: { x: 0, y: 0 } });
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 0);
+  assert.doesNotMatch(container.textContent, /workspace.composerAttachmentDropHint/);
+  assert.equal(mounted.getCallCount(), 0);
+});
