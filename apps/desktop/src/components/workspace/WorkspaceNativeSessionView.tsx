@@ -2192,11 +2192,24 @@ export function WorkspaceNativeSessionView({
       const knownSeams = rawTailSeamsRef.current.length > 0
         ? rawTailSeamsRef.current
         : (isMount ? readCachedNativeEvents(session.runtime_id).seams : []);
+      // The poll marker and events render together, before the layout effect
+      // copies the marker into refs. Reading only the refs here would fold an
+      // unloaded seam into a gap message that incremental appends then retain.
+      const scope = runtimeRequestScopeRef.current;
+      const initialReplayMarker = pollReplayCommitMarker?.isInitialReplay
+        && pollReplayCommitMarker.runtimeId === scope.runtimeId
+        && pollReplayCommitMarker.generation === scope.generation
+        && !(transcriptBackfillCommitMarker?.runtimeId === scope.runtimeId
+          && transcriptBackfillCommitMarker.generation === scope.generation
+          && transcriptBackfillCommitMarker.commitId > pollReplayCommitMarker.commitId)
+        ? pollReplayCommitMarker
+        : null;
+      const unloadedGapStarts = initialReplayMarker
+        ? initialReplayMarker.initialUnloadedGapStarts
+        : (!rawTailSettledRef.current ? initialReplayUnloadedGapStartsRef.current : []);
       const suppressed = new Set([
         ...knownSeams,
-        ...(!rawTailSettledRef.current
-          ? initialReplayUnloadedGapStartsRef.current
-          : []),
+        ...unloadedGapStarts,
       ]);
       return suppressed.size > 0 ? suppressed : undefined;
     };
@@ -2246,7 +2259,7 @@ export function WorkspaceNativeSessionView({
     }
     transcriptDerivationRef.current = state;
     return finalizeTranscriptMessages(state);
-  }, [events, replayLocalPrompts, seedMessages, transcriptTerminalError]);
+  }, [events, pollReplayCommitMarker, replayLocalPrompts, seedMessages, transcriptBackfillCommitMarker, transcriptTerminalError]);
 
   const messages = useMemo(
     () => stabilizeMessageRefs(rawMessages, previousMessagesRef.current),
