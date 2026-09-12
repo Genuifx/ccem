@@ -1586,6 +1586,23 @@ function finishClaudeFullLifecycleTurn(state: ClaudeSdkCommandState, commandId: 
         ? { assistant_message_uuid: claudeLastAssistantMessageUuid }
         : {}),
     });
+  } else {
+    // FullLifecycle's raw sdk_command_state frames never reach the desktop
+    // transcript's turn fold, so a normally-completed turn would keep its
+    // synthetic `assistant-turn-<seq>` uuid and lose the per-turn fork anchor
+    // (and the queue/UI turn boundary) that LegacySerial terminals provide.
+    // Project the same turn_completed edge the legacy path emits.
+    emitEvent({
+      type: 'lifecycle',
+      stage: 'turn_completed',
+      detail: observation?.detail ?? '',
+      query_generation: claudeQueryGeneration,
+      command_id: commandId,
+      user_message_uuid: commandId,
+      ...(claudeLastAssistantMessageUuid
+        ? { assistant_message_uuid: claudeLastAssistantMessageUuid }
+        : {}),
+    });
   }
 
   if (observation?.failed) {

@@ -44510,6 +44510,16 @@ function finishClaudeFullLifecycleTurn(state, commandId) {
       user_message_uuid: commandId,
       ...claudeLastAssistantMessageUuid ? { assistant_message_uuid: claudeLastAssistantMessageUuid } : {}
     });
+  } else {
+    emitEvent({
+      type: "lifecycle",
+      stage: "turn_completed",
+      detail: observation?.detail ?? "",
+      query_generation: claudeQueryGeneration,
+      command_id: commandId,
+      user_message_uuid: commandId,
+      ...claudeLastAssistantMessageUuid ? { assistant_message_uuid: claudeLastAssistantMessageUuid } : {}
+    });
   }
   if (observation?.failed) {
     emitEvent({

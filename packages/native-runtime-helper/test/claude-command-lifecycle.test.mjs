@@ -996,3 +996,27 @@ test('hung usage probes do not block the next FullLifecycle terminal', async (t)
     'completed',
   ), 'second raw terminal despite hung usage');
 });
+
+test('FullLifecycle normal completion projects turn_completed with the assistant message uuid', async (t) => {
+  const session = await startHelper(t, {
+    scenario: 'full',
+    assistantUuid: 'assistant-anchor',
+  }, {
+    initial_prompt: 'turn with a fork anchor',
+  });
+
+  await waitForOutput(session, (output) => output.type === 'event'
+    && output.payload?.type === 'lifecycle'
+    && output.payload.stage === 'turn_completed'
+    && output.payload.assistant_message_uuid === 'assistant-anchor-1', [
+    'turn_completed with assistant_message_uuid',
+    'the desktop transcript needs the provider uuid to offer the per-turn fork anchor',
+  ].join(': '));
+
+  send(session, { type: 'prompt', text: 'second turn keeps anchors per turn', command_id: 'anchor-two' });
+  await waitForOutput(session, (output) => output.type === 'event'
+    && output.payload?.type === 'lifecycle'
+    && output.payload.stage === 'turn_completed'
+    && output.payload.assistant_message_uuid === 'assistant-anchor-2'
+    && output.payload.command_id === 'anchor-two', 'second turn_completed anchors its own uuid');
+});

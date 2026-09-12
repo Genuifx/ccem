@@ -18,6 +18,7 @@ async function buildHelperWithWireMock(options = {}) {
   const usageHangs = options.usageHangs ?? false;
   const terminalState = options.terminalState ?? 'completed';
   const permissionModeDelays = options.permissionModeDelays ?? {};
+  const assistantUuidPrefix = options.assistantUuid ?? null;
 
   await build({
     entryPoints: [options.entryPoint ?? path.join(packageDir, 'src', 'index.ts')],
@@ -65,6 +66,7 @@ async function buildHelperWithWireMock(options = {}) {
             const terminalState = ${JSON.stringify(terminalState)};
             const permissionModeDelays = ${JSON.stringify(permissionModeDelays)};
             const permissionCapabilityProbe = ${JSON.stringify(options.permissionCapabilityProbe ?? false)};
+            const assistantUuidPrefix = ${JSON.stringify(assistantUuidPrefix)};
             const probe = (value) => { if (permissionCapabilityProbe) process.stdout.write(JSON.stringify({type:'permission_probe',...value})+'\\n'); };
             let queryCount = 0;
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -208,6 +210,18 @@ async function buildHelperWithWireMock(options = {}) {
 
                     yield { ...userMessage, session_id };
                     yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
+                    if (assistantUuidPrefix) {
+                      yield {
+                        type: 'assistant',
+                        uuid: assistantUuidPrefix + '-' + localTurn,
+                        session_id,
+                        parent_tool_use_id: null,
+                        message: {
+                          role: 'assistant',
+                          content: [{ type: 'text', text: 'mock response ' + localTurn }],
+                        },
+                      };
+                    }
 
                     if (scenario === 'session_handoff') {
                       const args = {target_runtime_id:'native-recipient',text:'Please run the tests.'};
