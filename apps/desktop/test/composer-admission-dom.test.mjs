@@ -500,6 +500,12 @@ async function importHarness() {
             recoverAllSameTick() { act(() => { for (const button of container.querySelectorAll('[data-composer-rejected-draft] button')) button.click(); }); },
             recoverTwiceSameTick() { act(() => { const button = container.querySelector('[data-composer-rejected-draft] button'); button.click(); button.click(); }); },
             recover() { act(() => container.querySelector('[data-composer-rejected-draft] button').click()); },
+            click(selector, flushes = 0) {
+              return act(async () => {
+                container.querySelector(selector).click();
+                for (let i = 0; i < flushes; i += 1) await Promise.resolve();
+              });
+            },
             text() { return editor().textContent; },
             state,
             unmount() { act(() => root.unmount()); },
@@ -1369,6 +1375,70 @@ for (const failure of ['unreadable', 'annotation-validation']) {
     });
   }
 }
+
+test('unreadable skill read failure shows a persistent inline error strip with retry and dismiss', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  globalThis.__acceptanceToasts = [];
+  t.after(() => { delete globalThis.__acceptanceInvoke; delete globalThis.__acceptanceToasts; mounted.unmount(); restore(); });
+  globalThis.__acceptanceInvoke = command => command === 'read_skill_files'
+    ? new Promise(resolve => { mounted.state.resolve = resolve; }) : [];
+  const original = 'ORIGINAL_A use [$review](/tmp/qa-review/SKILL.md)';
+  mounted.typeText(original);
+  await mounted.submit();
+  assert.equal(mounted.state.calls, 0, 'admission waits for skill content');
+  await mounted.resolve([
+    {
+      skillFile: '/tmp/qa-review/SKILL.md',
+      name: null,
+      content: '',
+      diagnostics: ['Failed to read selected skill: ENOENT (os error 2)'],
+    },
+  ]);
+  assert.equal(mounted.state.calls, 0, 'unreadable skill aborts before admission');
+  assert.equal(mounted.text(), original, 'draft stays in the composer');
+  assert.ok(
+    globalThis.__acceptanceToasts.some(entry => entry.message === 'workspace.composerSkillReadFailed'),
+    'toast feedback is retained',
+  );
+  const strip = container.querySelector('[data-composer-skill-read-error]');
+  assert.ok(strip, 'inline skill-read error strip must render');
+  assert.equal(strip.getAttribute('role'), 'alert');
+  assert.match(strip.textContent, /composerSkillReadErrorTitle/);
+  assert.match(strip.textContent, /composerSkillReadErrorHint/);
+  assert.match(strip.textContent, /qa-review/, 'failing skill identity uses the skill directory name');
+  await mounted.click('[data-composer-skill-read-error] [aria-label="common.close"]');
+  assert.equal(container.querySelector('[data-composer-skill-read-error]'), null, 'dismiss removes the strip');
+
+  // Retry: the same draft resubmits, and a now-readable skill reaches admission
+  // while the strip is cleared by the new submit attempt.
+  globalThis.__acceptanceInvoke = () => [];
+  mounted.typeText(original);
+  await mounted.submit();
+  assert.equal(container.querySelector('[data-composer-skill-read-error]'), null, 'a fresh submit attempt clears the stale strip');
+  assert.equal(mounted.state.calls, 1, 'retry path reaches admission once the skill reads');
+  await mounted.resolve();
+});
+
+test('skill read transport failure also surfaces the inline error strip without skill names', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, true);
+  t.after(() => { delete globalThis.__acceptanceInvoke; mounted.unmount(); restore(); });
+  globalThis.__acceptanceInvoke = command => command === 'read_skill_files'
+    ? new Promise((resolve, reject) => { mounted.state.reject = reject; }) : [];
+  mounted.typeText('use [$review](/tmp/qa-review/SKILL.md)');
+  await mounted.submit();
+  await mounted.reject(new Error('skill read transport down'));
+  assert.equal(mounted.state.calls, 0);
+  const strip = container.querySelector('[data-composer-skill-read-error]');
+  assert.ok(strip, 'inline skill-read error strip must render for transport failures');
+  assert.equal(strip.getAttribute('role'), 'alert');
+  assert.match(strip.textContent, /composerSkillReadErrorTitle/);
+  assert.doesNotMatch(strip.textContent, /qa-review/, 'transport failure cannot blame a specific skill');
+  assert.ok(container.querySelector('[data-composer-skill-read-retry]'), 'retry action stays available');
+});
 
 test('failed skill preprocessing preserves both drafts rich payload and requires explicit recovery and retry', async (t) => {
   const { container, restore } = installDom();

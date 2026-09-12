@@ -300,6 +300,8 @@
     "globalSearchSectionProjects": "项目",
     "globalSearchSectionSessions": "会话",
     "composerSkillReadFailed": "读取所选技能失败，请刷新技能或检查全局链接。",
+    "composerSkillReadErrorTitle": "读取所选技能失败，消息未发送",
+    "composerSkillReadErrorHint": "请检查技能文件后重试，或移除失效技能再发送。",
     "refresh": "刷新工作间",
     "refreshing": "刷新中...",
     "refreshFailed": "刷新工作间失败",

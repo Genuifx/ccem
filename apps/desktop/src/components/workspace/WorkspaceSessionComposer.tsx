@@ -140,6 +140,21 @@ import {
   type WorkspaceAnnotation,
 } from './workspaceAnnotationModel';
 
+function skillReadErrorLabel(skillFile: string, name?: string | null): string {
+  const trimmedName = name?.trim();
+  if (trimmedName) {
+    return trimmedName;
+  }
+  const segments = skillFile.split('/').filter(Boolean);
+  const fileName = segments[segments.length - 1];
+  // Skill files are conventionally named SKILL.md; the parent directory is the
+  // skill identity users recognize.
+  if (fileName && fileName !== 'SKILL.md') {
+    return fileName;
+  }
+  return segments[segments.length - 2] || skillFile;
+}
+
 export interface ComposerQueuedMessage {
   id: string;
   text: string;
@@ -854,6 +869,10 @@ export function WorkspaceSessionComposer({
   const [draggedFileCount, setDraggedFileCount] = useState(0);
   const [inlineSkillPopover, setInlineSkillPopover] = useState<InlineSkillPopoverState | null>(null);
   const [triggerPanelState, setTriggerPanelState] = useState<PromptAreaTriggerPanelState | null>(null);
+  // Persisted explanation for a send that was aborted because a selected skill
+  // file could not be read. Transient toasts alone are easy to miss next to the
+  // composer, so the strip stays until the next submit attempt or dismissal.
+  const [skillReadError, setSkillReadError] = useState<string[] | null>(null);
   const [previewingImageId, setPreviewingImageId] = useState<string | null>(null);
   const [previewImageSize, setPreviewImageSize] = useState<{ width: number; height: number } | null>(null);
   const composerPlainText = useMemo(() => segmentsToPlainText(composerSegments), [composerSegments]);
@@ -1310,6 +1329,7 @@ export function WorkspaceSessionComposer({
   }, [addAttachments, workingDir]);
 
   const runComposerSubmit = useCallback(async () => {
+    setSkillReadError(null);
     const submittedRevision = draftEditRevisionRef.current;
     const capturedRecoveryDraftId = recoveryDraftIdRef.current;
     const submittedSegments = promptAreaRef.current?.getSegments() ?? composerSegments;
@@ -1371,12 +1391,19 @@ export function WorkspaceSessionComposer({
           && skill.diagnostics.some((diagnostic) => diagnostic.trim().length > 0)
         ));
         if (unreadableSkills.length > 0) {
+          console.error('Unreadable selected skill files aborted composer submit:', unreadableSkills.map(
+            (skill) => ({ skillFile: skill.skillFile, diagnostics: skill.diagnostics }),
+          ));
+          setSkillReadError(unreadableSkills.map(
+            (skill) => skillReadErrorLabel(skill.skillFile, skill.name),
+          ));
           toast.error(t('workspace.composerSkillReadFailed'));
           return rejectUnadmittedDraft();
         }
         text = buildComposerPromptWithSelectedSkills(displayText, selectedSkills);
       } catch (error) {
         console.error('Failed to read selected skill files for composer prompt:', error);
+        setSkillReadError([]);
         toast.error(t('workspace.composerSkillReadFailed'));
         return rejectUnadmittedDraft();
       }
@@ -1839,6 +1866,51 @@ export function WorkspaceSessionComposer({
           ))}
 
           {recoveryBlocked ? <p role="alert" className="mb-2 text-xs text-destructive">{t('workspace.composerRecoveryLimit')}</p> : null}
+          {skillReadError !== null ? (
+            <div
+              role="alert"
+              data-composer-skill-read-error
+              className="mb-2 flex items-start justify-between gap-3 rounded-lg border border-destructive/25 bg-destructive/10 px-3 py-2"
+            >
+              <div className="flex min-w-0 items-start gap-2">
+                <AlertCircle aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+                <div className="min-w-0">
+                  <p className="text-xs font-medium leading-5 text-destructive">
+                    {t('workspace.composerSkillReadErrorTitle')}
+                    {skillReadError.length > 0 ? (
+                      <span className="font-normal text-muted-foreground">：{skillReadError.join(' / ')}</span>
+                    ) : null}
+                  </p>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t('workspace.composerSkillReadErrorHint')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <Button
+                  type="button"
+                  data-composer-skill-read-retry
+                  variant="outline"
+                  size="sm"
+                  className="h-6 rounded-full px-2.5 text-[11px] text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  disabled={disabled || isSubmitting}
+                  onClick={() => void handleComposerSubmit()}
+                >
+                  {t('common.retry')}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 rounded-full text-muted-foreground hover:text-foreground"
+                  aria-label={t('common.close')}
+                  onClick={() => setSkillReadError(null)}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <div className="relative min-h-[72px]">
             <PromptArea
               ref={promptAreaRef}

@@ -300,6 +300,8 @@
     "globalSearchSectionProjects": "Projects",
     "globalSearchSectionSessions": "Conversations",
     "composerSkillReadFailed": "Failed to read the selected skill. Refresh skills or check the global link.",
+    "composerSkillReadErrorTitle": "Failed to read the selected skill. The message was not sent",
+    "composerSkillReadErrorHint": "Check the skill file and retry, or remove the unavailable skill before sending.",
     "refresh": "Refresh workspace",
     "refreshing": "Refreshing...",
     "refreshFailed": "Failed to refresh workspace",
