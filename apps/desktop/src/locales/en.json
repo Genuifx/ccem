@@ -663,6 +663,8 @@
     "messageAnnotationIndex": "Annotation {index}",
     "messageAnnotationsInvalid": "These annotations are no longer valid. Review them before sending.",
     "messageAnnotationsBatchLimit": "A sent message can include up to 20 annotations. Send the queued annotations first.",
+    "transcriptFilesAttached": "{count} files attached",
+    "transcriptTextSnippetsAttached": "{count} text snippets",
     "composerSearchingFiles": "Searching files...",
     "composerRecentFiles": "Recent files",
     "composerAttachmentsLabel": "Attachments",

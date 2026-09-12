@@ -61,6 +61,8 @@
 
 两种形态，看你喜欢哪种。
 
+以下功能说明面向当前源码；下载版本的能力和平台支持以对应发布说明及附件为准。
+
 | 功能 | CLI | Desktop |
 |---|---|---|
 | 多模型环境切换 | ✅ | ✅ |
@@ -74,7 +76,8 @@
 | Telegram 远程控制 | — | ✅ |
 | 微信远程控制 | — | ✅ |
 | 企业微信 Bot 桥接 | — | ✅ |
-| 定时任务 | — | ✅ |
+| 定时任务 | ✅ 创建、列出、删除 | ✅ 管理与调度执行 |
+| Desktop 会话查询 | ✅ 需运行 Desktop | ✅ |
 | 系统托盘迷你面板 | — | ✅ |
 | 对话历史浏览器 | — | ✅ |
 | API 请求调试 | — | ✅ |
@@ -85,7 +88,7 @@
 | 自动更新 | — | ✅ |
 | 分享海报（AI 编程周报） | — | ✅ |
 
-两边共享同一份配置（`~/.ccem/config.json`），Desktop 改了环境 CLI 立刻生效，反过来也一样。
+两边共享环境配置文件（`~/.ccem/config.json`）。切换配置不会自动更新已有终端的环境变量；用 `ccem run <cmd>` 将当前配置应用到新命令，或按下方 Shell 集成说明更新当前终端。
 
 ---
 
@@ -122,7 +125,7 @@ npx ccem              # 交互菜单 — 无需安装就能用
 
 ```bash
 npm install -g ccem
-ccem add kimi         # 添加环境（自动填好 URL 和模型）
+ccem add kimi         # 添加具名环境，按提示选择预设或自行填写配置
 ccem use kimi         # 切换
 ccem dev              # 用 dev 权限模式启动 Claude Code
 ```
@@ -140,7 +143,7 @@ ccem dev              # 用 dev 权限模式启动 Claude Code
 
 # CLI
 
-终端里搞定环境切换、权限管理、用量统计、Skill 安装。
+终端里管理环境、权限、用量、Skill 和定时任务，也能查询正在运行的 Desktop 会话。
 
 ## 安装
 
@@ -154,7 +157,7 @@ npm install -g ccem
 
 ```bash
 ccem              # 交互菜单
-ccem add kimi     # 添加环境，自动填好 URL 和模型
+ccem add kimi     # 添加具名环境，交互选择预设或自行填写配置
 ccem use kimi     # 切换环境
 ccem ls           # 列出所有环境
 ccem current      # 当前环境
@@ -256,10 +259,41 @@ ccem load https://your-server.com/api/env --key YOUR_KEY --secret YOUR_SECRET
 
 服务端代码在 `server/`。AES-256-GCM 带认证加密（v2）、Rate Limiting、热加载。
 
+## 从 CLI 管理定时任务
+
+下面的命令在当前目录创建一个暂停状态的工作日检查任务；审阅后可到 Desktop 的定时任务页面启用：
+
+```bash
+ccem cron create --name weekday-review --schedule '0 9 * * 1-5' \
+  --prompt '检查当前项目并总结需要关注的问题' \
+  --disabled --json
+ccem cron list --json
+```
+
+用 `--working-dir <path>` 指定其他目录。删除时执行 `ccem cron delete <selector>`，其中 selector 是任务的精确 ID 或名称。
+
+## 从 CLI 查询 Desktop
+
+先启动 Desktop，再检查本机控制端点并列出工作台会话：
+
+```bash
+ccem desktop health --json
+ccem desktop sessions --json
+```
+
+从列表取得 runtime ID 后，查询该会话的状态和事件：
+
+```bash
+ccem desktop status <runtimeId> --json
+ccem desktop events <runtimeId> --since 0 --limit 50 --json
+```
+
+这些命令连接正在运行的 Desktop；仅安装 CLI 不会启动 Desktop 会话服务。
+
 ## CLI 命令速查
 
 <details>
-<summary><b>展开完整列表</b></summary>
+<summary><b>展开常用命令</b></summary>
 
 | 命令 | 说明 |
 |---|---|
@@ -282,6 +316,13 @@ ccem load https://your-server.com/api/env --key YOUR_KEY --secret YOUR_SECRET
 | `ccem setup init` | 初始化（跳过引导 + 关遥测） |
 | `ccem usage [--json]` | 用量统计 |
 | `ccem skill add/ls/rm` | Skill 管理 |
+| `ccem cron create [options]` | 创建定时任务记录 |
+| `ccem cron list [--json]` | 列出定时任务 |
+| `ccem cron delete <selector> [--json]` | 按精确 ID 或名称删除定时任务 |
+| `ccem desktop health [--json]` | 检查 Desktop 控制端点 |
+| `ccem desktop sessions [--json]` | 列出工作台会话 |
+| `ccem desktop status <runtimeId> [--json]` | 查询会话状态 |
+| `ccem desktop events <runtimeId> [--since <seq>] [--limit <count>] [--json]` | 读取会话事件 |
 
 </details>
 
@@ -329,9 +370,9 @@ Workspace 是会话的管理中枢——不只是一个启动器，而是一个�
 
 ![History](./screenshots/history.webp)
 
-Desktop 同时支持 **Claude Code** 和 **OpenAI Codex CLI** 两个运行时。Dashboard 启动面板有下拉菜单——选 Claude 还是 Codex，点一下就跑。
+Desktop 同时支持 **Claude Code** 和 **OpenAI Codex CLI** 两个运行时。在 Workspace 选择工作目录和助手，输入任务并提交，即可创建对应会话。
 
-选 Claude 时，环境切换和权限模式正常工作。选 Codex 时，这些控件自动隐藏——Codex 有自己的配置体系。
+两种助手分别解析各自的运行配置，需要对应运行时与认证配置可用。启动选项并非完全相同：例如，动态路由目前仅适用于 Claude 会话。
 
 两种会话在统一视图中管理，各自带着正确的图标和状态。Proxy Debug 同时抓取两个引擎的 API 流量。
 
@@ -366,11 +407,11 @@ ccem Desktop 不只是 Claude Code 管理器——它是你本地 AI 编程助�
 
 ![Cron Tasks](./screenshots/cron.webp)
 
-写好 cron 表达式和 prompt，ccem 按计划自动跑 Claude Code 任务，完成后把结果推到 Telegram、微信或企微。
+填写五段式 cron 表达式、工作目录和 prompt，保存并启用任务。自动执行依赖正在运行且启用了后台服务的 Desktop 调度器，按本机时间匹配计划；CLI 创建任务记录本身不会启动调度器。
 
 - **模板**：PR Review、测试执行、文档生成、安全审计、Changelog
 - **AI 生成**：用自然语言描述需求，自动生成 cron 表达式和 prompt
-- **结果自动推送**：跑完（或跑挂）结果自动发到绑定的聊天工具
+- **结果通知**：任务结束后尝试发送摘要到已配置的 Telegram；企业微信还需为任务启用通知并配置目标。发送是否成功应以渠道回执为准
 - **运行历史**：每次执行的状态、耗时、日志
 - **下次运行预览**：查看接下来几次的执行时间
 - **失败重试**：一键重跑
@@ -385,6 +426,8 @@ GitHub 风格的使用统计，Claude Code 和 Codex 数据统一展示。
 - 一键切换 Claude / Codex / 全部视图
 - 连续使用天数 + 趋势箭头（和上周对比涨跌）
 - **分享海报**：一键生成你的 AI 编程周报
+
+费用按可读取的用量记录和模型价格计算。价格未覆盖全部 Token 时，界面显示“已知费用”及未定价 Token 数；这里的金额不等同于服务商的完整账单。
 
 ## Tray Cockpit — 系统托盘迷你面板
 

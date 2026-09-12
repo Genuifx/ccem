@@ -61,6 +61,8 @@ Or maybe you want Claude to run tests every night, review PRs, push results to y
 
 Two flavors. Pick whichever fits.
 
+The feature descriptions below refer to the current source tree. For a downloaded version, check its release notes and available platform assets.
+
 | Feature | CLI | Desktop |
 |---|---|---|
 | Multi-model environment switching | ✅ | ✅ |
@@ -74,7 +76,8 @@ Two flavors. Pick whichever fits.
 | Telegram remote control | — | ✅ |
 | WeChat remote control | — | ✅ |
 | WeCom (企业微信) bot bridge | — | ✅ |
-| Cron scheduled tasks | — | ✅ |
+| Cron scheduled tasks | ✅ Create, list, delete | ✅ Manage and execute schedules |
+| Desktop session queries | ✅ Requires running Desktop | ✅ |
 | System tray mini-dashboard | — | ✅ |
 | Conversation history browser | — | ✅ |
 | API proxy debugging | — | ✅ |
@@ -85,7 +88,7 @@ Two flavors. Pick whichever fits.
 | Auto-update | — | ✅ |
 | Share poster (AI coding weekly report) | — | ✅ |
 
-Both share the same config file (`~/.ccem/config.json`). Change an environment in Desktop, CLI picks it up instantly — and vice versa.
+Both share the environment config file (`~/.ccem/config.json`). Switching configurations does not update environment variables in an existing shell. Use `ccem run <cmd>` to apply the current configuration to a new command, or follow the Shell Integration instructions below to update your current shell.
 
 ---
 
@@ -122,7 +125,7 @@ Or install globally:
 
 ```bash
 npm install -g ccem
-ccem add kimi         # Add an environment (auto-fills URL and models)
+ccem add kimi         # Name an environment, then choose a preset or enter settings
 ccem use kimi         # Switch to it
 ccem dev              # Launch Claude Code in dev permission mode
 ```
@@ -140,7 +143,7 @@ Launch, add an environment, pick Claude or Codex, hit go.
 
 # CLI
 
-Environment switching, permissions, usage stats, and skill installation — all from your terminal.
+Manage environments, permissions, usage, skills, and scheduled task records from your terminal, and query sessions in a running Desktop app.
 
 ## Install
 
@@ -154,7 +157,7 @@ npm install -g ccem
 
 ```bash
 ccem              # Interactive menu
-ccem add kimi     # Add with preset (auto-fills URL + models)
+ccem add kimi     # Name an environment, then choose a preset or enter settings
 ccem use kimi     # Switch environment
 ccem ls           # List all environments
 ccem current      # Show active environment
@@ -256,10 +259,41 @@ ccem load https://your-server.com/api/env --key YOUR_KEY --secret YOUR_SECRET
 
 Server code lives in `server/`. AES-256-GCM encryption with authenticated envelope (v2), rate limiting, and hot-reload. See `server/` in the repo for full deployment instructions.
 
+## Manage Scheduled Tasks from the CLI
+
+Create a disabled weekday review task in the current directory, then review and enable it on Desktop's scheduled tasks page:
+
+```bash
+ccem cron create --name weekday-review --schedule '0 9 * * 1-5' \
+  --prompt 'Inspect the current project and summarize issues that need attention' \
+  --disabled --json
+ccem cron list --json
+```
+
+Use `--working-dir <path>` to choose another directory. To delete a task, run `ccem cron delete <selector>`, where selector is its exact ID or name.
+
+## Query Desktop from the CLI
+
+Start Desktop, then check its local control endpoint and list workspace sessions:
+
+```bash
+ccem desktop health --json
+ccem desktop sessions --json
+```
+
+Use a runtime ID from the list to query a session's status and events:
+
+```bash
+ccem desktop status <runtimeId> --json
+ccem desktop events <runtimeId> --since 0 --limit 50 --json
+```
+
+These commands connect to a running Desktop app. Installing the CLI alone does not start the Desktop session service.
+
 ## CLI Command Reference
 
 <details>
-<summary><b>Full list</b></summary>
+<summary><b>Common commands</b></summary>
 
 | Command | Description |
 |---|---|
@@ -282,6 +316,13 @@ Server code lives in `server/`. AES-256-GCM encryption with authenticated envelo
 | `ccem setup init` | Initialize (skip onboarding, disable telemetry) |
 | `ccem usage [--json]` | Usage stats |
 | `ccem skill add/ls/rm` | Skill management |
+| `ccem cron create [options]` | Create a scheduled task record |
+| `ccem cron list [--json]` | List scheduled tasks |
+| `ccem cron delete <selector> [--json]` | Delete a task by exact ID or name |
+| `ccem desktop health [--json]` | Check the Desktop control endpoint |
+| `ccem desktop sessions [--json]` | List workspace sessions |
+| `ccem desktop status <runtimeId> [--json]` | Query session status |
+| `ccem desktop events <runtimeId> [--since <seq>] [--limit <count>] [--json]` | Read session events |
 
 </details>
 
@@ -329,9 +370,9 @@ The Workspace is where sessions live. It's not just a launcher — it's a full c
 
 ![History](./screenshots/history.webp)
 
-Desktop supports both **Claude Code** and **OpenAI Codex CLI** as runtimes. The Dashboard launch panel has a dropdown — pick Claude or Codex, hit launch.
+Desktop supports both **Claude Code** and **OpenAI Codex CLI** as runtimes. In Workspace, choose a working directory and provider, enter your task, and submit to create a session.
 
-When Claude is selected, environment switching and permission modes work as usual. When Codex is selected, those controls hide — Codex manages its own config.
+Each provider resolves its own runtime configuration and requires the corresponding runtime and authentication to be available. Launch options differ: dynamic routing, for example, currently applies only to Claude sessions.
 
 Both session types appear in a unified view, with proper icons and status indicators. Proxy Debug captures traffic from both engines.
 
@@ -366,11 +407,11 @@ Full enterprise WeChat bot bridge with multi-bot management, WebSocket connectiv
 
 ![Cron Tasks](./screenshots/cron.webp)
 
-Write a cron expression and a prompt — ccem runs Claude Code on schedule and pushes results to Telegram, WeChat, or WeCom.
+Set a five-field cron expression, working directory, and prompt, then save and enable the task. Automatic execution requires a running Desktop scheduler with background services enabled and uses local machine time. Creating a task record through the CLI does not start the scheduler.
 
 - **Templates**: PR Review, Test Runner, Doc Generation, Security Audit, Changelog
 - **AI generation**: Describe what you want in natural language, get a cron expression + prompt generated
-- **Auto-push**: Results land in your bound chat app when done (or on failure)
+- **Result notifications**: After a run ends, ccem attempts to send a summary to configured Telegram notifications. WeCom also requires task notifications to be enabled and a target configured. Confirm delivery through the destination channel
 - **Run history**: Status, duration, logs for every execution
 - **Next run preview**: See when upcoming runs will fire
 - **Retry on failure**: One-click re-run
@@ -385,6 +426,8 @@ GitHub-style usage statistics for both Claude Code and Codex, unified.
 - Switch between Claude, Codex, or combined with one click
 - Consecutive active days streak + trend arrows (up/down vs. last week)
 - **Share poster**: generate your AI Coding weekly report
+
+Costs are calculated from readable usage records and model prices. When pricing does not cover all tokens, the UI shows the known cost and the unpriced token count. These amounts are not a complete provider bill.
 
 ## Tray Cockpit — System Tray Mini-Dashboard
 

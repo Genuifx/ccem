@@ -12,9 +12,11 @@ import {
   ClipboardList,
   Copy,
   FileImage,
+  FileText,
   GitBranch,
   ImageIcon,
   LoaderCircle,
+  Paperclip,
   Scissors,
   Terminal,
   Wrench,
@@ -45,7 +47,12 @@ import {
   COMPACTING_SUMMARY_TOKEN,
   TRANSCRIPT_GAP_SUMMARY_TOKEN,
 } from './workspaceEventTranscript';
-import { stripRenderedImageMarkers } from './transcriptIdentity';
+import {
+  splitAttachmentSummaryLines,
+  stripRenderedImageMarkers,
+  type AttachmentSummaryKind,
+  type AttachmentSummaryLine,
+} from './transcriptIdentity';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { WorkspaceMessageAnnotationsPopover } from './WorkspaceMessageAnnotationsPopover';
 
@@ -1743,6 +1750,27 @@ function WorkspaceImageStrip({
   );
 }
 
+function AttachmentSummaryChip({ kind, count }: { kind: AttachmentSummaryKind; count: number }) {
+  const { t } = useLocale();
+  const isTextSnippet = kind === 'text-snippets';
+  const label = t(isTextSnippet
+    ? 'workspace.transcriptTextSnippetsAttached'
+    : 'workspace.transcriptFilesAttached')
+    .replace('{count}', String(count));
+  const Icon = isTextSnippet ? FileText : Paperclip;
+
+  return (
+    <span
+      data-workspace-attachment-summary={kind}
+      data-count={count}
+      className="inline-flex h-7 items-center gap-1.5 rounded-full border border-border/40 bg-surface px-2.5 text-[11px] font-medium text-foreground/85"
+    >
+      <Icon className="h-3.5 w-3.5 text-muted-foreground" />
+      {label}
+    </span>
+  );
+}
+
 function renderTextBlock(text: string, isUser: boolean, t: (key: string) => string) {
   const { cleanText, command } = parseMessageText(text);
   const commandArgs = command?.args?.trim() || '';
@@ -1790,8 +1818,9 @@ function renderContentBlocks(
   blocks: ConversationContentBlock[],
   isUser: boolean,
   t: (key: string) => string,
-): { content: React.ReactNode[]; images: ConversationContentBlock[] } {
+): { content: React.ReactNode[]; images: ConversationContentBlock[]; summaries: AttachmentSummaryLine[] } {
   const result: React.ReactNode[] = [];
+  const summaries: AttachmentSummaryLine[] = [];
   const imageBlocks = blocks.filter((block) => block.type === 'image');
   let index = 0;
 
@@ -1815,9 +1844,15 @@ function renderContentBlocks(
 
     switch (block.type) {
       case 'text': {
-        const visibleText = isUser && imageBlocks.length > 0
-          ? stripRenderedImageMarkers(block.text || '', imageBlocks)
-          : block.text || '';
+        let visibleText = block.text || '';
+        if (isUser) {
+          if (imageBlocks.length > 0) {
+            visibleText = stripRenderedImageMarkers(visibleText, imageBlocks);
+          }
+          const split = splitAttachmentSummaryLines(visibleText);
+          visibleText = split.text;
+          summaries.push(...split.summaries);
+        }
         if (visibleText.trim()) {
           result.push(<div key={`text-${index}`}>{renderTextBlock(visibleText, isUser, t)}</div>);
         }
@@ -1842,7 +1877,7 @@ function renderContentBlocks(
     index += 1;
   }
 
-  return { content: result, images: imageBlocks };
+  return { content: result, images: imageBlocks, summaries };
 }
 
 function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: WorkspaceMessageBubbleProps) {
@@ -1862,12 +1897,13 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
   const currentRole = isUser ? 'user' : 'assistant';
   const spacingClass = prevRole == null ? 'mt-0' : prevRole === currentRole ? 'mt-4' : 'mt-8';
 
-  const { renderedContent, teammateMessages, imageBlocks } = useMemo(() => {
+  const { renderedContent, teammateMessages, imageBlocks, attachmentSummaries } = useMemo(() => {
     if (isSummary || message.isCompactBoundary || message.planContent) {
       return {
         renderedContent: null as React.ReactNode,
         teammateMessages: [] as TeammateMessage[],
         imageBlocks: [] as ConversationContentBlock[],
+        attachmentSummaries: [] as AttachmentSummaryLine[],
       };
     }
 
@@ -1882,10 +1918,13 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
     const content = message.content;
     let nextRenderedContent: React.ReactNode = null;
     let nextImageBlocks: ConversationContentBlock[] = [];
+    let nextSummaries: AttachmentSummaryLine[] = [];
 
     if (typeof content === 'string') {
       collect(content);
-      nextRenderedContent = renderTextBlock(content, isUser, t);
+      const split = isUser ? splitAttachmentSummaryLines(content) : { text: content, summaries: [] };
+      nextSummaries = split.summaries;
+      nextRenderedContent = renderTextBlock(split.text, isUser, t);
     } else if (Array.isArray(content)) {
       content.forEach((block) => {
         if (block.type === 'text' && block.text) {
@@ -1899,17 +1938,20 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
         const rendered = renderContentBlocks(content, isUser, t);
         nextRenderedContent = rendered.content;
         nextImageBlocks = rendered.images;
+        nextSummaries = rendered.summaries;
       }
     } else if (content && typeof content === 'object') {
       const rendered = renderContentBlocks([content as ConversationContentBlock], isUser, t);
       nextRenderedContent = rendered.content;
       nextImageBlocks = rendered.images;
+      nextSummaries = rendered.summaries;
     }
 
     return {
       renderedContent: nextRenderedContent,
       teammateMessages: collected,
       imageBlocks: nextImageBlocks,
+      attachmentSummaries: nextSummaries,
     };
   }, [isSummary, isUser, message.content, message.isCompactBoundary, message.planContent, t]);
 
@@ -1952,16 +1994,17 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
   }
 
   const hasMainContent = renderedContent && !(Array.isArray(renderedContent) && renderedContent.length === 0);
+  const hasAttachmentSummaries = attachmentSummaries.length > 0;
   const hasImages = imageBlocks.length > 0;
   const showMessageActions = isActionHovering || isActionFocusWithin;
 
-  if (!hasMainContent && !hasImages && teammateMessages.length === 0) {
+  if (!hasMainContent && !hasImages && !hasAttachmentSummaries && teammateMessages.length === 0) {
     return null;
   }
 
   return (
     <div className={cn(spacingClass, 'workspace-msg-virtualized')}>
-      {isUser && (hasMainContent || hasImages) ? (
+      {isUser && (hasMainContent || hasImages || hasAttachmentSummaries) ? (
           <div
             className="relative ml-auto max-w-[78%] min-w-[220px] pb-6"
             onPointerEnter={() => setIsActionHovering(true)}
@@ -1976,6 +2019,13 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
                 </div>
               ) : null}
               {renderedContent}
+              {hasAttachmentSummaries ? (
+                <div className={cn('flex flex-wrap items-center gap-1.5', hasMainContent && 'mt-3')}>
+                  {attachmentSummaries.map((summary) => (
+                    <AttachmentSummaryChip key={summary.kind} kind={summary.kind} count={summary.count} />
+                  ))}
+                </div>
+              ) : null}
               {hasImages ? <WorkspaceImageStrip blocks={imageBlocks} isUser t={t} /> : null}
             </div>
             <MessageMetaBar message={message} isUser visible={showMessageActions} t={t} />

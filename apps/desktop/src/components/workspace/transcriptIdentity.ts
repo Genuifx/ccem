@@ -1,7 +1,41 @@
 const GENERIC_IMAGE_PLACEHOLDER_RE = /\[Image #\d+\]/gi;
 const IMAGE_SUMMARY_LINE_RE = /^Images attached:\s*\d+\s*$/i;
+const ATTACHMENT_SUMMARY_LINE_RE = /^(Files attached|Text snippets attached):\s*(\d+)\s*$/i;
 const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g;
 const PROMPT_TIME_MATCH_WINDOW_MS = 10 * 60 * 1000;
+
+export type AttachmentSummaryKind = 'files' | 'text-snippets';
+
+export interface AttachmentSummaryLine {
+  kind: AttachmentSummaryKind;
+  count: number;
+}
+
+/**
+ * Splits composer-generated attachment summary lines ("Files attached: N" /
+ * "Text snippets attached: N") out of a user prompt so the transcript can
+ * render them as chips instead of raw text. Image summary lines stay with the
+ * text because the image strip fallback depends on them.
+ */
+export function splitAttachmentSummaryLines(text: string): {
+  text: string;
+  summaries: AttachmentSummaryLine[];
+} {
+  const summaries: AttachmentSummaryLine[] = [];
+  const keptLines = text.split(/\r?\n/).filter((line) => {
+    const match = ATTACHMENT_SUMMARY_LINE_RE.exec(line.trim());
+    if (!match) {
+      return true;
+    }
+    summaries.push({
+      kind: match[1].toLowerCase() === 'files attached' ? 'files' : 'text-snippets',
+      count: Number(match[2]),
+    });
+    return false;
+  });
+
+  return { text: keptLines.join('\n'), summaries };
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
