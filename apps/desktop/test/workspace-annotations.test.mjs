@@ -380,7 +380,7 @@ test('anchored annotations never fall back to first-match quote search', async (
   assert.match(annotationsSource, /workspace\.annotationSaveFailed/);
 });
 
-test('sent annotations persist on the transcript instead of being cleared', async () => {
+test('sent annotations persist within the turn and are evicted by the next accepted turn', async () => {
   const { normalizeStoredWorkspaceAnnotations } = await importWorkspaceAnnotations();
 
   // Round-trip keeps the sentAt stamp so markers survive a remount.
@@ -420,12 +420,22 @@ test('sent annotations persist on the transcript instead of being cleared', asyn
   ]);
   assert.equal(parsed.length, 1);
 
-  const [liveSource, historySource] = await Promise.all([
+  const [liveSource, historySource, hookSource] = await Promise.all([
     fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceNativeSessionView.tsx'), 'utf8'),
     fs.readFile(path.join(desktopDir, 'src', 'pages', 'Workspace.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src', 'components', 'workspace', 'useWorkspaceAnnotations.ts'), 'utf8'),
   ]);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.pendingAnnotations\}/);
   assert.match(liveSource, /onClearAnnotations=\{sessionAnnotations\.clearPendingAnnotations\}/);
   assert.match(historySource, /annotations=\{historyAnnotations\.pendingAnnotations\}/);
   assert.match(historySource, /onClearAnnotations=\{historyAnnotations\.clearPendingAnnotations\}/);
+
+  // Accepting a new turn's prompt must evict the previous turn's sent
+  // annotations (REQ: turn-scoped notation, no 20-limit buildup in long
+  // sessions). Behavioral coverage lives in composer-admission-dom.test.mjs.
+  assert.match(
+    hookSource,
+    /\.filter\(\(item\) => !item\.sentAt\)/,
+    'markAllSent must drop previously sent annotations when the next turn is accepted',
+  );
 });

@@ -864,6 +864,48 @@ for (const processing of [false, true]) {
   });
 }
 
+test('accepting a new turn evicts the previous turn\'s sent annotations and selection styles', async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mountFailure(container, false);
+  t.after(() => { mounted.unmount(); restore(); });
+
+  // Turn 1: annotated prompt is accepted; its sent marker stays for this turn.
+  mounted.state.addAnnotation('turn one quote', 'turn one note');
+  await mounted.submit();
+  await mounted.resolve();
+  assert.equal(mounted.state.annotations.pendingAnnotations.length, 0);
+  assert.deepEqual(mounted.state.annotations.annotations.map((a) => a.note), ['turn one note']);
+  assert.ok(mounted.state.annotations.annotations[0].sentAt, 'current turn sent marker must stay visible');
+
+  // Turn 2 (annotation-only): accepting the new input evicts turn one's styles.
+  mounted.state.addAnnotation('turn two quote', 'turn two note');
+  await mounted.submit();
+  await mounted.resolve();
+  assert.deepEqual(
+    mounted.state.annotations.annotations.map((a) => a.note),
+    ['turn two note'],
+    'previous turn annotation highlights/markers must be cleaned on next-turn acceptance',
+  );
+
+  // A plain turn with no new annotations still clears the leftover styles.
+  mounted.typeText('plain follow-up without annotations');
+  await mounted.submit();
+  await mounted.resolve();
+  assert.equal(mounted.state.annotations.annotations.length, 0);
+
+  // Long sessions keep the annotation budget available turn after turn.
+  for (let turn = 4; turn <= 24; turn++) {
+    mounted.state.addAnnotation(`quote ${turn}`, `note ${turn}`);
+    assert.ok(mounted.state.annotations.canAddAnnotation, `annotation budget must remain available (turn ${turn})`);
+    await mounted.submit();
+    await mounted.resolve();
+    assert.equal(mounted.state.annotations.annotations.length, 1, 'sent annotations must not accumulate across turns');
+  }
+  assert.equal(mounted.state.annotations.pendingAnnotations.length, 0);
+  assert.ok(mounted.state.annotations.canAddAnnotation);
+});
+
 test('multiple rejected submissions retain separate recoverable snapshots', async (t) => {
   const { container, restore } = installDom();
   t.after(restore);

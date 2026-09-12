@@ -152,13 +152,17 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
 
   // Sending a prompt stamps sentAt instead of wiping the list: the highlight
   // and numbered marker stay at the original text, but the annotation is not
-  // re-attached to later prompts.
+  // re-attached to later prompts. Accepting the next turn's prompt evicts the
+  // previous turn's sent annotations (their highlight + marker go with them),
+  // so annotations stay turn-scoped and long sessions never accumulate
+  // toward the annotation limit.
   const markAllSent = useCallback((submitted: WorkspaceAnnotation[]) => {
-    updateItems((items) => items.map((item) => (
-      item.sentAt || !submitted.some((sent) => (
+    const sentAt = new Date().toISOString();
+    updateItems((items) => items
+      .filter((item) => !item.sentAt)
+      .map((item) => (submitted.some((sent) => (
         sent.id === item.id && sent.quote === item.quote && sent.note === item.note
-      )) ? item : { ...item, sentAt: new Date().toISOString() }
-    )));
+      )) ? { ...item, sentAt } : item)));
   }, [updateItems]);
 
   const restoreAnnotations = useCallback((submitted: WorkspaceAnnotation[]) => {

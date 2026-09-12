@@ -20,7 +20,8 @@ export interface WorkspaceAnnotation {
   /**
    * Set when the annotation has been sent with a prompt. Sent annotations
    * keep their transcript highlight + marker but are no longer attached to
-   * subsequent prompts.
+   * subsequent prompts. They are evicted when the next turn's prompt is
+   * accepted, keeping annotations scoped to a single turn.
    */
   sentAt?: string;
   anchor?: WorkspaceAnnotationAnchor;
