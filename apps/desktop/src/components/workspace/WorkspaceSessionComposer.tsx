@@ -37,11 +37,16 @@ import {
   MessageSquareQuote,
   Paperclip,
   Plus,
+  Square,
   X,
 } from '@/lib/lucide-react';
 import { Claude, Codex, OpenCode } from '@lobehub/icons';
 import { PromptArea } from '@/components/prompt-area';
 import { buildComposerRouteShortcutHandler } from '@/components/workspace/composerRouteShortcut';
+import {
+  COMPOSER_ESC_INTERRUPT_ARM_TIMEOUT_MS,
+  decideComposerEscInterrupt,
+} from '@/components/workspace/composerEscInterrupt';
 import { segmentsToPlainText } from '@/components/segment-helpers';
 import { TriggerPopover } from '@/components/trigger-popover';
 import { ComposerSessionReferencePanel, ComposerSessionReferenceStrip } from './ComposerSessionReferencePanel';
@@ -230,6 +235,10 @@ interface WorkspaceSessionComposerProps {
   onClearAnnotations?: () => void;
   onAnnotationsSent?: (submitted: WorkspaceAnnotation[]) => void;
   onAnnotationsRestore?: (submitted: WorkspaceAnnotation[]) => boolean;
+  /** Whether the owning session is running, so Esc inside the composer arms a confirm-interrupt. */
+  escInterruptAvailable?: boolean;
+  /** Performs the session interrupt after the second Esc confirmation. */
+  onEscInterrupt?: () => void | Promise<void>;
 }
 
 function suggestionIcon(kind: ComposerSuggestion['kind']) {
@@ -817,6 +826,8 @@ export function WorkspaceSessionComposer({
   onClearAnnotations,
   onAnnotationsSent,
   onAnnotationsRestore,
+  escInterruptAvailable = false,
+  onEscInterrupt,
   routeRuntimeId = null,
   currentRuntimeId = null,
   sessionReferencesClient = sessionReferenceClient,
@@ -870,6 +881,38 @@ export function WorkspaceSessionComposer({
   const [draggedFileCount, setDraggedFileCount] = useState(0);
   const [inlineSkillPopover, setInlineSkillPopover] = useState<InlineSkillPopoverState | null>(null);
   const [triggerPanelState, setTriggerPanelState] = useState<PromptAreaTriggerPanelState | null>(null);
+  // Two-step Esc interrupt: armed by the first Escape while the owning
+  // session runs, confirmed by the second. Any other keystroke, the session
+  // stopping, or a short timeout restores the normal primary action.
+  const [escInterruptArmed, setEscInterruptArmed] = useState(false);
+  const escInterruptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disarmEscInterrupt = useCallback(() => {
+    if (escInterruptTimerRef.current !== null) {
+      clearTimeout(escInterruptTimerRef.current);
+      escInterruptTimerRef.current = null;
+    }
+    setEscInterruptArmed(false);
+  }, []);
+  const armEscInterrupt = useCallback(() => {
+    if (escInterruptTimerRef.current !== null) {
+      clearTimeout(escInterruptTimerRef.current);
+    }
+    escInterruptTimerRef.current = setTimeout(() => {
+      escInterruptTimerRef.current = null;
+      setEscInterruptArmed(false);
+    }, COMPOSER_ESC_INTERRUPT_ARM_TIMEOUT_MS);
+    setEscInterruptArmed(true);
+  }, []);
+  useEffect(() => () => {
+    if (escInterruptTimerRef.current !== null) {
+      clearTimeout(escInterruptTimerRef.current);
+    }
+  }, []);
+  useEffect(() => {
+    if (!escInterruptAvailable && escInterruptArmed) {
+      disarmEscInterrupt();
+    }
+  }, [escInterruptAvailable, escInterruptArmed, disarmEscInterrupt]);
   // Persisted explanation for a send that was aborted because a selected skill
   // file could not be read. Transient toasts alone are easy to miss next to the
   // composer, so the strip stays until the next submit attempt or dismissal.
@@ -898,11 +941,18 @@ export function WorkspaceSessionComposer({
     || composerPlainText.trim().length > 0
     || attachments.length > 0
     || annotations.length > 0;
-  const resolvedActionLabel = isSubmitting ? loadingLabel : (primaryActionLabel ?? submitLabel);
-  const resolvedPrimaryDisabled = primaryActionDisabled ?? (!canSubmitWithAttachments || disabled);
-  const resolvedPrimaryIcon = isSubmitting
-    ? <LoaderCircle className="h-4 w-4 animate-spin" />
-    : (primaryActionIcon ?? <ArrowUp className="h-4 w-4" />);
+  const escInterruptArmedLabel = t('workspace.composerEscInterruptArmed');
+  const resolvedActionLabel = escInterruptArmed
+    ? escInterruptArmedLabel
+    : isSubmitting ? loadingLabel : (primaryActionLabel ?? submitLabel);
+  const resolvedPrimaryDisabled = escInterruptArmed
+    ? false
+    : primaryActionDisabled ?? (!canSubmitWithAttachments || disabled);
+  const resolvedPrimaryIcon = escInterruptArmed
+    ? <Square className="h-3.5 w-3.5 fill-current stroke-[2.5]" />
+    : isSubmitting
+      ? <LoaderCircle className="h-4 w-4 animate-spin" />
+      : (primaryActionIcon ?? <ArrowUp className="h-4 w-4" />);
   const capabilities = getComposerCapabilities(provider);
   const planButtonVisible = planModeAvailable ?? Boolean(onPlanModeEnabledChange);
   const routeDraftPillVisible = isRouteDraftPillVisible(routeDraft, provider);
@@ -1946,6 +1996,31 @@ export function WorkspaceSessionComposer({
                   return;
                 }
 
+                const escInterruptDecision = decideComposerEscInterrupt({
+                  key: event.key,
+                  isArmed: escInterruptArmed,
+                  available: escInterruptAvailable,
+                  triggerPanelOpen: triggerPanelState != null,
+                  isComposing: event.nativeEvent.isComposing,
+                  keyCode: event.nativeEvent.keyCode,
+                  repeat: event.nativeEvent.repeat,
+                  defaultPrevented: event.defaultPrevented,
+                });
+                if (escInterruptDecision.kind === 'arm') {
+                  event.preventDefault();
+                  armEscInterrupt();
+                  return;
+                }
+                if (escInterruptDecision.kind === 'confirm') {
+                  event.preventDefault();
+                  disarmEscInterrupt();
+                  void onEscInterrupt?.();
+                  return;
+                }
+                if (escInterruptDecision.kind === 'disarm') {
+                  disarmEscInterrupt();
+                }
+
                 if (event.key === 'Tab' && event.shiftKey && planButtonVisible && onPlanModeEnabledChange) {
                   event.preventDefault();
                   onPlanModeEnabledChange(!planModeEnabled);
@@ -1984,6 +2059,7 @@ export function WorkspaceSessionComposer({
               <Button
                 ref={primaryActionButtonRef}
                 data-workspace-composer-submit={onPrimaryAction ? undefined : ''}
+                data-esc-interrupt={escInterruptArmed ? 'armed' : undefined}
                 type="button"
                 size="icon"
                 variant={primaryActionVariant}
@@ -1991,6 +2067,11 @@ export function WorkspaceSessionComposer({
                 title={resolvedActionLabel}
                 disabled={resolvedPrimaryDisabled}
                 onClick={() => {
+                  if (escInterruptArmed) {
+                    disarmEscInterrupt();
+                    void onEscInterrupt?.();
+                    return;
+                  }
                   if (onPrimaryAction) {
                     void onPrimaryAction();
                     return;

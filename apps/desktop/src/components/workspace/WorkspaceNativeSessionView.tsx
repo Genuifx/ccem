@@ -3975,12 +3975,12 @@ export function WorkspaceNativeSessionView({
     }
   }, [pollEvents, refreshSummary, respondNativeSessionPermission, session.runtime_id, t]);
 
-  const handleStop = useCallback(async () => {
+  const handleStop = useCallback(async (source = 'native_session_stop_button') => {
     setIsStopping(true);
     try {
       await stopNativeSession(
         session.runtime_id,
-        'native_session_stop_button',
+        source,
         session.lifecycle?.active_command_id ?? null,
       );
       await refreshSummary({ force: true });
@@ -4311,6 +4311,8 @@ export function WorkspaceNativeSessionView({
               ? onStartNew
               : undefined
         }
+        escInterruptAvailable={canStopForeground}
+        onEscInterrupt={() => void handleStop('composer_escape')}
         primaryActionVariant={
           isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
             ? 'outline'

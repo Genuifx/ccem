@@ -521,6 +521,7 @@
     "historyRouterResolveFailed": "无法确认这段历史会话的路由状态，请刷新后重试。",
     "nativeStop": "停止",
     "nativeStopFailed": "停止原生会话失败",
+    "composerEscInterruptArmed": "再按一次 Esc 停止",
     "backgroundTasks": "后台任务",
     "backgroundTasksHint": "父轮次结束后，后台任务仍会继续运行。",
     "backgroundTasksActiveCount": "{count} 个后台任务运行中",
