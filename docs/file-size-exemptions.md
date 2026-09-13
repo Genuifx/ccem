@@ -27,3 +27,4 @@ The file-size CI gate blocks new source files over 2000 lines unless they are do
 - `apps/desktop/src/pages/Workspace.tsx`: Workspace navigation, history, compose, and live-session coordination remain centralized during the workspace redesign.
 - `packages/native-runtime-helper/src/index.ts`: Bundled helper protocol, Claude SDK bridge, and Codex SDK bridge are still packaged as one sidecar entrypoint.
 - `packages/native-runtime-helper/test/claude-session-restart.test.mjs`: Existing restart and recovery integration scenarios share a large stateful fixture suite.
+- `apps/desktop/src/components/workspace/WorkspaceSessionComposer.tsx`: Workspace composer orchestration (attachments, skills, submit flow) has grown past the gate on main and awaits incremental splitting.

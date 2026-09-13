@@ -1,5 +1,11 @@
 # ccem
 
+## 2.85.0
+
+### Minor Changes
+
+- Desktop: stabilize embedded browser startup, handoff, and session recovery; harden composer with double-Esc interrupt confirmation, file-drop references, and attachment summary chips; scope transcript annotations per turn and stabilize late-content scrolling; emit turn_completed with assistant uuid in FullLifecycle mode and auto-activate browser control for native sessions; drop the unnecessary DSH unavailable banner from Analytics.
+
 ## 2.84.0
 
 ### Minor Changes
