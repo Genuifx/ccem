@@ -371,13 +371,14 @@ test('cost-incomplete-annotation testid exists in Analytics markup', async () =>
   assert.match(analyticsSource, /totalUnpricedTokens/);
 });
 
-// ── Test: DSH source status indicator exists ───────────────────────────────
-test('DSH source status indicator exists for unavailable DSH', async () => {
+// ── Regression: DSH unavailable banner intentionally removed ───────────────
+test('Analytics no longer renders a DSH source status indicator', async () => {
   const analyticsSource = await fs.readFile(
     path.join(desktopDir, 'src/pages/Analytics.tsx'), 'utf-8'
   );
-  assert.match(analyticsSource, /data-testid="dsh-source-status"/);
-  assert.match(analyticsSource, /dshStatus/);
+  // REQ-0012: the warning strip for missing DSH is removed from the page.
+  assert.doesNotMatch(analyticsSource, /data-testid="dsh-source-status"/);
+  assert.doesNotMatch(analyticsSource, /dshStatus/);
 });
 
 // ── Test: Cost milestones guard with costIncomplete ────────────────────────
@@ -474,13 +475,32 @@ test('Analytics omits the provider distribution card even when provider data exi
   dom.window.close();
 });
 
-// ── Blocker 2 regression: dshStatus visible for both all and dsh sources ───
-test('dshStatus indicator shows for usageSource dsh as well as all', async () => {
-  const analyticsSource = await fs.readFile(
-    path.join(desktopDir, 'src/pages/Analytics.tsx'), 'utf-8'
+// ── Regression: DSH unavailable banner removed from rendered markup ────────
+test('Analytics omits DSH unavailable banner even when dshStatus.available is false', async () => {
+  // usageSource defaults to 'all'; with dshStatus unavailable the old warning
+  // strip used to render here. REQ-0012 removes it from the page entirely.
+  const stats = {
+    ...makeUsageStats(),
+    dshStatus: { available: false, error: 'helper missing', sessionCount: 0 },
+  };
+  const { dom, mod, React } = await createTestEnv();
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  globalThis.__analyticsStore._reset();
+  globalThis.__analyticsStore._setState({ usageStats: stats });
+  const html = renderToStaticMarkup(React.createElement(mod.Analytics));
+
+  assert.equal(
+    html.includes('dsh-source-status'),
+    false,
+    'DSH source status banner must not render',
   );
-  // The condition should include both 'all' and 'dsh'
-  assert.match(analyticsSource, /usageSource\s*===\s*['"]all['"]\s*\|\|\s*usageSource\s*===\s*['"]dsh['"]/);
+  assert.equal(
+    html.includes('DSH:'),
+    false,
+    'DSH unavailable warning text must not render',
+  );
+
+  dom.window.close();
 });
 
 // ── Blocker 3 regression: dailyActivities memo depends on viewStats ────────

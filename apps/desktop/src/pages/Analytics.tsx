@@ -579,13 +579,6 @@ export function Analytics() {
             />
           </div>
 
-          {/* DSH source status indicator */}
-          {viewStats?.dshStatus && (usageSource === 'all' || usageSource === 'dsh') && !viewStats.dshStatus.available && (
-            <div data-testid="dsh-source-status" className="col-span-full mt-2 rounded-lg border border-[hsl(var(--warning)/0.3)] bg-[hsl(var(--warning)/0.06)] px-4 py-2 text-xs text-[hsl(var(--warning-foreground))]">
-              DSH: {viewStats.dshStatus.error ?? 'unavailable'}
-            </div>
-          )}
-
           <div className="min-w-0">
             <HeatmapCalendar activities={dailyActivities} compact={false} />
           </div>
