@@ -70,11 +70,14 @@ import { useAppStore } from '@/store';
 import type { InstalledSkill, LaunchClient } from '@/store';
 import type { PermissionModeName } from '@ccem/core/browser';
 
-function isNearBottom(container: HTMLDivElement): boolean {
+/** Keyboard keys whose default action scrolls the transcript upward. */
+const SCROLL_UP_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
+
+function isNearBottom(container: HTMLElement): boolean {
   return container.scrollHeight - container.clientHeight - container.scrollTop <= 48;
 }
 
-function scrollToLatest(container: HTMLDivElement) {
+function scrollToLatest(container: HTMLElement) {
   container.scrollTo({ top: container.scrollHeight });
 }
 import type {
@@ -88,6 +91,10 @@ import {
   type ComposerSubmitPayload,
 } from './composerAttachments';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
+import {
+  attachTranscriptResizeCompensator,
+  isTranscriptUserScrollIntervention,
+} from './workspaceTranscriptScrollControl';
 import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult, type ComposerSubmitResult } from './composerSubmissionResult';
 import { getWorkspaceForkTurnPreview } from './WorkspaceForkDialog';
 import { shouldPreserveRestoredReadingPosition } from './workspaceTranscriptTopWindowing';
@@ -1651,8 +1658,15 @@ export function WorkspaceNativeSessionView({
   const cacheFlushPendingRef = useRef(false);
   const lastSummaryRefreshTimestampRef = useRef(0);
   const containerRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const programmaticScrollRef = useRef(false);
   const autoScrollDetachedRef = useRef(false);
+  /**
+   * Exact scrollTop value the last programmatic pin assigned (post-clamp). A
+   * scroll event materially below/above this value while the programmatic flag
+   * is up can only come from user input (scrollbar drag, touch, keyboard).
+   */
+  const lastProgrammaticScrollTopRef = useRef(0);
   const pendingBackfillScrollAnchorRef = useRef<{
     commit: TranscriptBackfillCommitIdentity;
     key: string | null;
@@ -2923,6 +2937,17 @@ export function WorkspaceNativeSessionView({
         return;
       }
       if (programmaticScrollRef.current) {
+        // The scroll position materially differs from the exact value the
+        // programmatic pin assigned → the user intervened mid-sequence
+        // (scrollbar drag, touch pan). Cancel the pin immediately instead of
+        // waiting for the wheel event, which never fires for those gestures.
+        if (isTranscriptUserScrollIntervention({
+          programmaticTarget: lastProgrammaticScrollTopRef.current,
+          currentScrollTop: container.scrollTop,
+        })) {
+          cancelPendingAutoScroll();
+          autoScrollDetachedRef.current = true;
+        }
         return;
       }
       autoScrollDetachedRef.current = !isNearBottom(container);
@@ -2933,14 +2958,66 @@ export function WorkspaceNativeSessionView({
         autoScrollDetachedRef.current = true;
       }
     };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!SCROLL_UP_KEYS.has(event.key)) {
+        return;
+      }
+      // Keyboard scroll-away must cancel the pin before the browser scrolls:
+      // the scroll event alone would only detach after the position moved.
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, [contenteditable="true"]')) {
+        return;
+      }
+      cancelPendingAutoScroll();
+      autoScrollDetachedRef.current = true;
+    };
 
     container.addEventListener('scroll', handleScroll, { passive: true });
     container.addEventListener('wheel', handleWheel, { passive: true });
+    container.addEventListener('keydown', handleKeyDown);
     return () => {
       container.removeEventListener('scroll', handleScroll);
       container.removeEventListener('wheel', handleWheel);
+      container.removeEventListener('keydown', handleKeyDown);
     };
   }, [cancelPendingAutoScroll, isVisible, session.runtime_id]);
+
+  // Unified content-resize scroll control (diagnosis candidate 1): tool digest
+  // auto expand/collapse, markdown image loads and the lazy code-highlighter
+  // swap change content height AFTER the event-count-driven pin ladder above
+  // has finished its fixed passes. In follow mode a resize re-pins to the
+  // bottom; in reading mode the first visible item (captured at the last real
+  // scroll, i.e. before the resize) is re-applied, so late growth above the
+  // viewport can no longer move the reading position.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !isVisible) {
+      return;
+    }
+    const pinToBottomAfterResize = (target: HTMLElement) => {
+      programmaticScrollRef.current = true;
+      scrollToLatest(target);
+      lastProgrammaticScrollTopRef.current = target.scrollTop;
+      requestAnimationFrame(() => {
+        scrollToLatest(target);
+        lastProgrammaticScrollTopRef.current = target.scrollTop;
+        // The event-count ladder owns the flag while it is still settling;
+        // otherwise this two-pass pin is complete.
+        if (scrollFrameRef.current === null && scrollSettleTimeoutRef.current === null) {
+          programmaticScrollRef.current = false;
+        }
+      });
+    };
+    const controller = attachTranscriptResizeCompensator({
+      container,
+      getContentElement: () => contentRef.current,
+      isFollowMode: () => !autoScrollDetachedRef.current,
+      scrollToBottom: pinToBottomAfterResize,
+    });
+    return () => {
+      controller.dispose();
+    };
+  }, [isVisible, session.runtime_id]);
 
   // Clean up any pending scroll animation frame on unmount
   useEffect(() => () => {
@@ -3036,13 +3113,17 @@ export function WorkspaceNativeSessionView({
     }
 
     programmaticScrollRef.current = true;
-    scrollToLatest(container);
+    const scrollToLatestTracked = (target: HTMLDivElement) => {
+      scrollToLatest(target);
+      lastProgrammaticScrollTopRef.current = target.scrollTop;
+    };
+    scrollToLatestTracked(container);
     scrollFrameRef.current = requestAnimationFrame(() => {
-      scrollToLatest(container);
+      scrollToLatestTracked(container);
       scrollFrameRef.current = requestAnimationFrame(() => {
         scrollFrameRef.current = null;
         scrollSettleTimeoutRef.current = window.setTimeout(() => {
-          scrollToLatest(container);
+          scrollToLatestTracked(container);
           programmaticScrollRef.current = false;
           autoScrollDetachedRef.current = !isNearBottom(container);
           scrollSettleTimeoutRef.current = null;
@@ -4226,7 +4307,7 @@ export function WorkspaceNativeSessionView({
       />
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div className="mx-auto max-w-[960px] px-8 py-8">
+        <div ref={contentRef} className="mx-auto max-w-[960px] px-8 py-8">
           {transcriptBackfillState !== 'idle' ? (
             <div className="sticky top-2 z-10">
               <WorkspaceTranscriptBackfillStatus

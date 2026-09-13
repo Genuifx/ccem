@@ -1,5 +1,6 @@
 import { Suspense, lazy, memo, useCallback, useEffect, useState } from 'react';
 import Markdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Check, Copy, Maximize2, X } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
@@ -21,6 +22,19 @@ interface CodeHighlighterProps {
   language: string;
   codeTone: NonNullable<MarkdownRendererProps['codeTone']>;
 }
+
+/**
+ * Shared metrics between the PlainCodeBlock fallback and the lazy highlighter
+ * themes. Every value the swap changes (padding, font, size, line height) must
+ * come from here: when the Suspense fallback and the highlighted node disagree,
+ * the swap itself shifts block heights and jars the transcript scroll.
+ */
+const CODE_BLOCK_METRICS = {
+  default: { padding: '0.75rem 1rem', fontSize: '12px', lineHeight: '1.6' },
+  reading: { padding: '0.875rem 1rem', fontSize: '12.5px', lineHeight: '1.65' },
+} as const;
+/** Matches the app's Tailwind `font-mono` stack (tailwind.config.js). */
+const CODE_FONT_FAMILY = "'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace";
 
 let syntaxLanguagesRegistered = false;
 
@@ -96,14 +110,16 @@ const LazyCodeHighlighter = lazy(async () => {
       ...oneDark['pre[class*="language-"]'],
       background: 'transparent',
       margin: 0,
-      padding: '0.75rem 1rem',
-      fontSize: '12px',
-      lineHeight: '1.6',
+      fontFamily: CODE_FONT_FAMILY,
+      padding: CODE_BLOCK_METRICS.default.padding,
+      fontSize: CODE_BLOCK_METRICS.default.fontSize,
+      lineHeight: CODE_BLOCK_METRICS.default.lineHeight,
     },
     'code[class*="language-"]': {
       ...oneDark['code[class*="language-"]'],
       background: 'transparent',
-      fontSize: '12px',
+      fontFamily: CODE_FONT_FAMILY,
+      fontSize: CODE_BLOCK_METRICS.default.fontSize,
     },
   };
 
@@ -114,15 +130,17 @@ const LazyCodeHighlighter = lazy(async () => {
       background: 'transparent',
       color: 'var(--workspace-reading-code-text)',
       margin: 0,
-      padding: '0.875rem 1rem',
-      fontSize: '12.5px',
-      lineHeight: '1.65',
+      fontFamily: CODE_FONT_FAMILY,
+      padding: CODE_BLOCK_METRICS.reading.padding,
+      fontSize: CODE_BLOCK_METRICS.reading.fontSize,
+      lineHeight: CODE_BLOCK_METRICS.reading.lineHeight,
     },
     'code[class*="language-"]': {
       ...coldarkCold['code[class*="language-"]'],
       background: 'transparent',
       color: 'var(--workspace-reading-code-text)',
-      fontSize: '12.5px',
+      fontFamily: CODE_FONT_FAMILY,
+      fontSize: CODE_BLOCK_METRICS.reading.fontSize,
     },
     comment: {
       ...coldarkCold.comment,
@@ -248,14 +266,20 @@ function PlainCodeBlock({
   code: string;
   codeTone: NonNullable<MarkdownRendererProps['codeTone']>;
 }) {
+  const metrics = CODE_BLOCK_METRICS[codeTone];
   return (
     <pre
       className={cn(
-        'overflow-x-auto px-4 py-3 font-mono',
+        'overflow-x-auto font-mono',
         codeTone === 'reading'
-          ? 'text-[12.5px] leading-[1.65] text-[color:var(--workspace-reading-code-text)]'
-          : 'text-[12px] leading-[1.6] text-white/85'
+          ? 'text-[color:var(--workspace-reading-code-text)]'
+          : 'text-white/85'
       )}
+      style={{
+        padding: metrics.padding,
+        fontSize: metrics.fontSize,
+        lineHeight: metrics.lineHeight,
+      }}
     >
       <code>{code}</code>
     </pre>
@@ -315,14 +339,30 @@ function CodeBlockFrame({
 function MarkdownImage({
   src,
   alt,
+  width,
+  height,
   isUser,
 }: {
   src?: string;
   alt?: string;
+  width?: number | string;
+  height?: number | string;
   isUser: boolean;
 }) {
   const { t } = useLocale();
   const [open, setOpen] = useState(false);
+  // Markdown images carry no intrinsic size until loaded; without a reserved
+  // box the load event changes layout height under the reader. When the
+  // markdown supplies width/height the browser reserves the aspect ratio
+  // itself; otherwise a fixed placeholder box is held until `onLoad`.
+  const hasIntrinsicSize = Boolean(width && height);
+  const [loaded, setLoaded] = useState(false);
+  // Streaming content can swap the image at the same component position; the
+  // load state belongs to the current src, not to the component instance.
+  useEffect(() => {
+    setLoaded(false);
+  }, [src]);
+  const reservePlaceholder = !loaded && !hasIntrinsicSize;
 
   useEffect(() => {
     if (!open) return;
@@ -357,13 +397,21 @@ function MarkdownImage({
           isUser
             ? 'border-white/20 hover:border-white/40'
             : 'border-border/40 hover:border-border/70',
+          reservePlaceholder && 'h-[150px] w-[min(100%,320px)]',
         )}
       >
         <img
           src={src}
           alt={alt || ''}
+          width={width}
+          height={height}
           loading="lazy"
-          className="block max-h-[300px] max-w-full object-contain transition group-hover:scale-[1.01]"
+          onLoad={() => setLoaded(true)}
+          onError={() => setLoaded(true)}
+          className={cn(
+            'block max-h-[300px] max-w-full object-contain transition group-hover:scale-[1.01]',
+            reservePlaceholder && 'invisible',
+          )}
         />
         <span className="pointer-events-none absolute bottom-1.5 right-1.5 inline-flex h-6 w-6 items-center justify-center rounded-md bg-black/55 text-white/85 opacity-0 backdrop-blur-sm transition group-hover:opacity-100">
           <Maximize2 className="h-3 w-3" />
@@ -396,24 +444,33 @@ function MarkdownImage({
   );
 }
 
-// Memoized on primitive props (content/className/variant/codeTone): when the
-// surrounding transcript re-renders during streaming, unchanged message bodies
-// skip react-markdown entirely so their DOM text nodes — and any user
-// selection anchored to them — survive.
-export const MarkdownRenderer = memo(function MarkdownRenderer({
-  content,
-  className,
-  variant = 'default',
-  codeTone = 'default',
-}: MarkdownRendererProps) {
+/**
+ * Component map for react-markdown, memoized by the stable inputs it closes
+ * over. Rebuilding the map per render handed react-markdown a fresh set of
+ * inline function components, and swapping a component TYPE at the same
+ * position remounts the subtree (React's preserving-and-resetting-state
+ * rule): during streaming, every content delta replaced code/img/p nodes,
+ * losing their DOM identity, internal state and selection. The cache keys are
+ * primitives, so identical contexts reuse the exact same component types and
+ * streaming deltas reconcile in place instead of remounting.
+ */
+const markdownComponentsCache = new Map<string, Components>();
+
+const REMARK_PLUGINS = [remarkGfm];
+
+function getMarkdownComponents(
+  variant: NonNullable<MarkdownRendererProps['variant']>,
+  codeTone: NonNullable<MarkdownRendererProps['codeTone']>,
+  shouldReduceCodeRendering: boolean,
+): Components {
+  const cacheKey = `${variant}|${codeTone}|${shouldReduceCodeRendering}`;
+  const cached = markdownComponentsCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
   const isUser = variant === 'user';
   const isReadingCode = codeTone === 'reading';
-  const shouldReduceCodeRendering = getPerformanceMode() === 'reduced';
-  return (
-    <div className={cn('markdown-content', className)}>
-      <Markdown
-        remarkPlugins={[remarkGfm]}
-        components={{
+  const components: Components = {
           // Headings
           h1: ({ children }) => (
             <h1 className={cn('text-[17px] font-semibold mt-4 mb-2 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h1>
@@ -555,10 +612,32 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
           ),
 
           // Images — clickable to open lightbox
-          img: ({ src, alt }) => (
-            <MarkdownImage src={src} alt={alt} isUser={isUser} />
+          img: ({ src, alt, width, height }) => (
+            <MarkdownImage src={src} alt={alt} width={width} height={height} isUser={isUser} />
           ),
-        }}
+  };
+
+  markdownComponentsCache.set(cacheKey, components);
+  return components;
+}
+
+// Memoized on primitive props (content/className/variant/codeTone): when the
+// surrounding transcript re-renders during streaming, unchanged message bodies
+// skip react-markdown entirely so their DOM text nodes — and any user
+// selection anchored to them — survive.
+export const MarkdownRenderer = memo(function MarkdownRenderer({
+  content,
+  className,
+  variant = 'default',
+  codeTone = 'default',
+}: MarkdownRendererProps) {
+  const shouldReduceCodeRendering = getPerformanceMode() === 'reduced';
+  const components = getMarkdownComponents(variant, codeTone, shouldReduceCodeRendering);
+  return (
+    <div className={cn('markdown-content', className)}>
+      <Markdown
+        remarkPlugins={REMARK_PLUGINS}
+        components={components}
       >
         {content}
       </Markdown>

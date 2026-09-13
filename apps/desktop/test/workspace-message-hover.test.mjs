@@ -170,7 +170,7 @@ test('workspace message actions are revealed by explicit transcript content hove
     'utf8',
   );
 
-  assert.match(component, /className=\{cn\(spacingClass,\s*'workspace-msg-virtualized'\)\}/);
+  assert.match(component, /className=\{cn\(effectiveSpacingClass,\s*'workspace-msg-virtualized'\)\}/);
   assert.doesNotMatch(component, /workspace-msg-virtualized\s+group\/msg/);
   assert.doesNotMatch(component, /group\/msg\s+workspace-msg-virtualized/);
   assert.doesNotMatch(component, /group-hover\/msg/);

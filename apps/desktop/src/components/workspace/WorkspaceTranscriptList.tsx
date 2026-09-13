@@ -18,6 +18,7 @@ import {
   computeTopSpacerHeight,
   createTranscriptItemHeightCache,
   isWindowingViewportMeasurable,
+  shouldMeasureTranscriptItem,
   transcriptItemIntersectsViewport,
   type TranscriptItemHeightCache,
 } from './workspaceTranscriptTopWindowing';
@@ -95,9 +96,10 @@ function measureTranscriptItemOuterHeight(
   element: HTMLElement,
   key: string,
   cache: TranscriptItemHeightCache,
+  options?: { refreshMargin?: boolean },
 ): number {
   let margin = cache.margins.get(key);
-  if (margin == null) {
+  if (margin == null || options?.refreshMargin) {
     const style = window.getComputedStyle(element);
     margin = Math.max(0, Number.parseFloat(style.marginTop) || 0)
       + Math.max(0, Number.parseFloat(style.marginBottom) || 0);
@@ -671,9 +673,16 @@ export function WorkspaceTranscriptList({
       if (!key) {
         continue;
       }
-      const outerHeight = measureTranscriptItemOuterHeight(child, key, cache);
-      if (outerHeight > (cache.margins.get(key) ?? 0)) {
-        cache.heights.set(key, outerHeight);
+      // Incremental maintenance (streaming used to force a layout read for
+      // EVERY rendered row on EVERY commit): a row is measured only when it
+      // is new or its spacing class changed; the item ResizeObserver keeps
+      // mounted rows' heights fresh between commits.
+      if (shouldMeasureTranscriptItem(cache, key, child.className)) {
+        const outerHeight = measureTranscriptItemOuterHeight(child, key, cache, { refreshMargin: true });
+        if (outerHeight > (cache.margins.get(key) ?? 0)) {
+          cache.heights.set(key, outerHeight);
+        }
+        cache.signatures.set(key, child.className);
       }
       measuredChildren.push({ key, element: child });
     }
@@ -772,12 +781,32 @@ export function WorkspaceTranscriptList({
           );
         }
 
+        // The measured wrapper owns the inter-message margin (mirroring the
+        // bubble's own mt rule, which it drops via suppressSpacing): margins
+        // that collapse out of a bare wrapper are invisible to the outer-height
+        // measurement, so every windowed message row under-counted its flow
+        // box by the spacing. Summary/compact-boundary bubbles keep their own
+        // margins and get a bare wrapper instead.
+        const message = item.message;
+        const selfMargined = message.msgType === 'summary' || Boolean(message.isCompactBoundary);
+        const messageSpacingClass = selfMargined
+          ? 'mt-0'
+          : prevRole == null
+            ? 'mt-0'
+            : prevRole === item.role
+              ? 'mt-4'
+              : 'mt-8';
         return (
-          <div key={item.key} data-transcript-item-key={item.key}>
+          <div
+            key={item.key}
+            data-transcript-item-key={item.key}
+            className={messageSpacingClass}
+          >
             <WorkspaceMessageBubble
-              message={item.message}
+              message={message}
               prevRole={prevRole}
               onForkTurn={onForkTurn}
+              suppressSpacing={!selfMargined}
             />
           </div>
         );

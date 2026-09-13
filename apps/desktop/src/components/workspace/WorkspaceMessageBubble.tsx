@@ -64,6 +64,14 @@ interface WorkspaceMessageBubbleProps {
    * stable callback: the bubble memo comparator ignores prop identity.
    */
   onForkTurn?: (message: ConversationMessageData) => void;
+  /**
+   * The transcript list renders the inter-message spacing on its measured
+   * wrapper (so the windowing spacer math includes the margin). When set, the
+   * bubble drops its own top margin for the standard/plan branches; summary
+   * and compact-boundary branches keep their own margins (their wrappers use
+   * `mt-0`).
+   */
+  suppressSpacing?: boolean;
 }
 
 /** Live turns without a provider uuid use the synthetic `assistant-turn-<seq>` id. */
@@ -947,6 +955,14 @@ function WorkspaceToolDigestComponent({
   const [hasRenderedBody, setHasRenderedBody] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const previousAutoExpandedRef = useRef(autoExpanded);
+  /**
+   * Programmatic (auto) expand/collapse skips the grid size transition: an
+   * animated height change during streaming is exactly the "content grows
+   * after the scroll pin" jitter the transcript compensator has to chase.
+   * Manual clicks keep the transition; the read happens at render time, after
+   * the ref is set alongside the state update that triggers it.
+   */
+  const skipSizeTransitionRef = useRef(false);
   const digestBodyRef = useRef<HTMLDivElement | null>(null);
   const { summary, toolCount, thinkingCount } = useMemo(() => {
     const toolEntries = entries.filter((e) => e.type === 'tool_use');
@@ -991,9 +1007,11 @@ function WorkspaceToolDigestComponent({
 
   useEffect(() => {
     if (autoExpanded && (thinkingCount > 0 || toolCount > 0)) {
+      skipSizeTransitionRef.current = true;
       setHasRenderedBody(true);
       setOpen(true);
     } else if (previousAutoExpandedRef.current && !autoExpanded) {
+      skipSizeTransitionRef.current = true;
       setOpen(false);
     }
 
@@ -1040,6 +1058,7 @@ function WorkspaceToolDigestComponent({
         type="button"
         aria-expanded={open}
         onClick={() => {
+          skipSizeTransitionRef.current = false;
           setOpen((current) => {
             if (!current && !hasRenderedBody) {
               startTransition(() => setHasRenderedBody(true));
@@ -1070,7 +1089,8 @@ function WorkspaceToolDigestComponent({
       {hasRenderedBody ? (
         <div
           className={cn(
-            'grid transition-all duration-250 ease-out',
+            'grid',
+            skipSizeTransitionRef.current ? null : 'transition-all duration-250 ease-out',
             open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
           )}
         >
@@ -1880,7 +1900,7 @@ function renderContentBlocks(
   return { content: result, images: imageBlocks, summaries };
 }
 
-function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: WorkspaceMessageBubbleProps) {
+function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn, suppressSpacing = false }: WorkspaceMessageBubbleProps) {
   const { t } = useLocale();
   const [isActionHovering, setIsActionHovering] = useState(false);
   const [isActionFocusWithin, setIsActionFocusWithin] = useState(false);
@@ -1896,6 +1916,7 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
         : message.summary || t('history.summaryLabel');
   const currentRole = isUser ? 'user' : 'assistant';
   const spacingClass = prevRole == null ? 'mt-0' : prevRole === currentRole ? 'mt-4' : 'mt-8';
+  const effectiveSpacingClass = suppressSpacing ? null : spacingClass;
 
   const { renderedContent, teammateMessages, imageBlocks, attachmentSummaries } = useMemo(() => {
     if (isSummary || message.isCompactBoundary || message.planContent) {
@@ -1987,7 +2008,7 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
 
   if (message.planContent) {
     return (
-      <div className={spacingClass}>
+      <div className={effectiveSpacingClass ?? 'mt-0'}>
         <PlanBlock content={message.planContent} label={t('history.plan')} />
       </div>
     );
@@ -2003,7 +2024,7 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
   }
 
   return (
-    <div className={cn(spacingClass, 'workspace-msg-virtualized')}>
+    <div className={cn(effectiveSpacingClass, 'workspace-msg-virtualized')}>
       {isUser && (hasMainContent || hasImages || hasAttachmentSummaries) ? (
           <div
             className="relative ml-auto max-w-[78%] min-w-[220px] pb-6"
@@ -2075,5 +2096,7 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn }: Work
 
 export const WorkspaceMessageBubble = memo(
   WorkspaceMessageBubbleComponent,
-  (prevProps, nextProps) => prevProps.prevRole === nextProps.prevRole && prevProps.message === nextProps.message
+  (prevProps, nextProps) => prevProps.prevRole === nextProps.prevRole
+    && prevProps.message === nextProps.message
+    && prevProps.suppressSpacing === nextProps.suppressSpacing
 );

@@ -231,3 +231,27 @@ test('switch-back preserves a restored reading position without blocking normal 
     }), false, 'a reader already at the tail may keep following it');
   });
 });
+
+test('maintenance measures only new rows and spacing-class changes, not cached stable rows', async () => {
+  await withModule((mod) => {
+    const cache = mod.createTranscriptItemHeightCache();
+    cache.width = 900;
+
+    // New key: must measure.
+    assert.equal(mod.shouldMeasureTranscriptItem(cache, 'msg-1', 'mt-4'), true);
+
+    // After measuring at this signature, the same signature skips (streaming
+    // commits re-visit every rendered row without forcing layout reads).
+    cache.heights.set('msg-1', 120);
+    cache.signatures.set('msg-1', 'mt-4');
+    assert.equal(mod.shouldMeasureTranscriptItem(cache, 'msg-1', 'mt-4'), false);
+
+    // A role transition changes the spacing class on the same row: the flow
+    // box margin changed, so it must be re-measured (with a fresh margin).
+    assert.equal(mod.shouldMeasureTranscriptItem(cache, 'msg-1', 'mt-8'), true);
+
+    // A width reset drops the cache entirely: everything measures again.
+    const fresh = mod.createTranscriptItemHeightCache();
+    assert.equal(mod.shouldMeasureTranscriptItem(fresh, 'msg-1', 'mt-4'), true);
+  });
+});

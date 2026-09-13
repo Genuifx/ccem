@@ -30,10 +30,34 @@ export interface TranscriptItemHeightCache {
   heights: Map<string, number>;
   /** Vertical margin per item key (measured once; stable for a given key). */
   margins: Map<string, number>;
+  /**
+   * className signature per item key at the time its height was measured.
+   * Lets the per-commit maintenance pass skip forced-layout reads for rows
+   * that are already cached AND unchanged (streaming commits re-visit every
+   * rendered row); the item ResizeObserver keeps mounted rows fresh between
+   * commits, so only new rows and spacing-class changes need re-measuring.
+   */
+  signatures: Map<string, string>;
 }
 
 export function createTranscriptItemHeightCache(): TranscriptItemHeightCache {
-  return { width: null, heights: new Map(), margins: new Map() };
+  return { width: null, heights: new Map(), margins: new Map(), signatures: new Map() };
+}
+
+/**
+ * Decide whether the maintenance pass must measure a row. True when the row
+ * was never measured, or its className signature changed since (spacing
+ * classes move with role transitions, changing the flow-box margin).
+ */
+export function shouldMeasureTranscriptItem(
+  cache: TranscriptItemHeightCache,
+  key: string,
+  classNameSignature: string,
+): boolean {
+  if (!cache.heights.has(key)) {
+    return true;
+  }
+  return cache.signatures.get(key) !== classNameSignature;
 }
 
 /**
