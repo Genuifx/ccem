@@ -62,6 +62,7 @@ import {
   FolderOpenIcon,
   FolderSearchIcon,
   FolderTreeIcon,
+  GitBranchIcon,
   GitCompareIcon,
   GitForkIcon,
   GitPullRequestIcon,
@@ -257,6 +258,7 @@ export const FolderSearch = createIcon(FolderSearchIcon, 'FolderSearch');
 export const FolderTree = createIcon(FolderTreeIcon, 'FolderTree');
 export const Gauge = createIcon(DashboardSpeed01Icon, 'Gauge');
 export const Gem = createIcon(DiamondIcon, 'Gem');
+export const GitBranch = createIcon(GitBranchIcon, 'GitBranch');
 export const GitFork = createIcon(GitForkIcon, 'GitFork');
 export const GitPullRequest = createIcon(GitPullRequestIcon, 'GitPullRequest');
 export const Globe = createIcon(Globe02Icon, 'Globe');

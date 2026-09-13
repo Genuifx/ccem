@@ -12,7 +12,7 @@ import {
   ClipboardList,
   Copy,
   FileImage,
-  GitFork,
+  GitBranch,
   ImageIcon,
   LoaderCircle,
   Scissors,
@@ -1329,7 +1329,7 @@ const MessageMetaBar = memo(function MessageMetaBar({
                 'text-muted-foreground/50 hover:bg-muted/50',
               )}
             >
-              <GitFork className="h-3.5 w-3.5" />
+              <GitBranch className="h-3.5 w-3.5" />
             </button>
           </TooltipTrigger>
           <TooltipContent>
