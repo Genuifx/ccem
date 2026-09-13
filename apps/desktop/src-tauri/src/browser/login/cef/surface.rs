@@ -215,6 +215,19 @@ impl CefSurfaceConnection {
 }
 
 impl CefSurfaceStateHandle {
+    #[cfg(test)]
+    pub(crate) fn from_test_snapshot(snapshot: CefSurfaceSnapshot) -> Self {
+        Self {
+            shared: Arc::new(SharedSurfaceState {
+                initial_url: snapshot.current_url.clone(),
+                state: Mutex::new(snapshot),
+                focus_restore: Mutex::new(focus_restore::FocusRestoreIntent::default()),
+                initial_document_started: AtomicBool::new(true),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> CefSurfaceSnapshot {
         self.shared.snapshot()
     }

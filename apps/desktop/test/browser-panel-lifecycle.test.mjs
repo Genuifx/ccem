@@ -51,6 +51,7 @@ const browserPanelTestStubs = {
     virtual(/^@\/locales$/, 'locales');
     virtual(/^@\/hooks\/useNativeBrowserSurfaceGeometrySync$/, 'geometry-sync');
     virtual(/^@\/hooks\/useZoom$/, 'zoom');
+    virtual(/^@\/lib\/webcontentRecovery$/, 'webcontent-recovery');
     virtual(/^@\/lib\/lucide-react$/, 'icons');
     virtual(/^@\/components\/ui\/button$/, 'button');
     virtual(/^@\/components\/ui\/input$/, 'input');
@@ -92,7 +93,18 @@ const browserPanelTestStubs = {
             }
           `,
           'geometry-sync': `
-            export function useNativeBrowserSurfaceGeometrySync() {}
+            export function useNativeBrowserSurfaceGeometrySync(_frameRef, syncBounds, enabled = true) {
+              globalThis.${bridgeKey}.React.useEffect(() => {
+                if (enabled) syncBounds();
+              }, [enabled, syncBounds]);
+            }
+          `,
+          'webcontent-recovery': `
+            // This suite isolates the real Panel lifecycle. Recovery protocol and
+            // metadata acknowledgement are exercised by the workspace recovery suite.
+            export function invokeBrowserCommand(command, args) {
+              return globalThis.${bridgeKey}.invoke(command, args);
+            }
           `,
           zoom: `
             export const CCEM_ZOOM_STORAGE_KEY = 'ccem.test.zoom';
@@ -208,11 +220,16 @@ async function importBrowserPanelHarness() {
         }
 
         export async function flushEffects() {
-          await act(async () => {
-            await Promise.resolve();
-            await new Promise((resolve) => setTimeout(resolve, 0));
-            await Promise.resolve();
-          });
+          // Initial geometry schedules a frame, then commits viewport state, then
+          // starts acquisition and its state/control effects. Drain each React
+          // commit boundary without waiting on intentionally blocked IPC gates.
+          for (let turn = 0; turn < 3; turn += 1) {
+            await act(async () => {
+              await Promise.resolve();
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              await Promise.resolve();
+            });
+          }
         }
 
         export function click(element) {
@@ -493,6 +510,121 @@ function createBridge({
 function callsFor(bridge, command) {
   return bridge.calls.filter((call) => call.command === command);
 }
+
+test('a restored hidden panel waits for positive bounds and reconnects without recreating on later visibility changes', async (t) => {
+  const dom = installDom();
+  // An off-Space main WebContent can have valid layout while animation frames
+  // are suspended. Acquisition must not wait for a frame to be delivered.
+  const suspendedAnimationFrame = () => 0;
+  globalThis.requestAnimationFrame = suspendedAnimationFrame;
+  Object.defineProperty(dom.window, 'requestAnimationFrame', { configurable: true, value: suspendedAnimationFrame });
+  const bridge = createBridge({
+    acquireSurfaceIds: ['retained-cef-surface'],
+    acquireSnapshot: { url: 'https://retained.example.test/', title: 'Retained page' },
+  });
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  let mounted;
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+  // Model the browser's real display:none geometry. The shared suite fixture
+  // normally gives every frame positive bounds, including hidden frames.
+  Object.defineProperty(dom.window.HTMLElement.prototype, 'getBoundingClientRect', {
+    configurable: true,
+    value() {
+      return new dom.window.DOMRect(0, 0,
+        container.style.display === 'none' ? 0 : 720,
+        container.style.display === 'none' ? 0 : 480);
+    },
+  });
+  const invoke = bridge.invoke;
+  bridge.invoke = async (command, args) => {
+    if (command === 'browser_surface_acquire') {
+      assert.ok(args.viewport.width > 0 && args.viewport.height > 0, 'native acquire rejects zero-size bounds');
+    }
+    return invoke(command, args);
+  };
+  const props = {
+    locale: 'zh', backend: 'login', sessionId: 'runtime:restored-hidden:3',
+    workingDir: '/workspace', profileMode: 'default', presentationRevision: 1,
+    isActiveSurface: false, surfaceOccluded: true, onClose() {},
+  };
+  container.style.display = 'none';
+  mounted = harness.mountBrowserPanel(container, props);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 0,
+    'hydrating a hidden panel must not acquire with zero-size bounds');
+  assert.equal(callsFor(bridge, 'browser_surface_release').length, 0);
+
+  container.style.display = 'block';
+  mounted.render({ ...props, isActiveSurface: true, surfaceOccluded: false, presentationRevision: 2 });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'ready');
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 1);
+  assert.ok(container.textContent.includes('https://retained.example.test/'));
+  assert.ok(callsFor(bridge, 'browser_surface_sync').some(call => call.args.visible === true));
+
+  container.style.display = 'none';
+  mounted.render({ ...props, presentationRevision: 3 });
+  await harness.flushEffects();
+  container.style.display = 'block';
+  mounted.render({ ...props, isActiveSurface: true, surfaceOccluded: false, presentationRevision: 4 });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 1,
+    'only the initial usable geometry may trigger acquisition');
+  assert.equal(callsFor(bridge, 'browser_surface_release').length, 0);
+  assert.equal(callsFor(bridge, 'browser_surface_sync').at(-1).args.visible, true);
+});
+
+test('the acquire retry button reconnects the same panel identity after a transient failure', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({ acquireSnapshot: { url: 'https://retained.example.test/' } });
+  const invoke = bridge.invoke;
+  let fail = true;
+  bridge.invoke = async (command, args) => {
+    if (command === 'browser_surface_acquire' && fail) {
+      fail = false;
+      bridge.calls.push({ command, args });
+      throw new Error('Transient acquisition failure');
+    }
+    return invoke(command, args);
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  let mounted;
+  t.after(async () => {
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+  const sessionId = 'runtime:recoverable-acquire:3';
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh', backend: 'login', sessionId,
+    workingDir: '/workspace', profileMode: 'default', presentationRevision: 1,
+    isActiveSurface: true, surfaceOccluded: false, onClose() {},
+  });
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'failed');
+  const retry = container.querySelector('[data-ccem-browser-retry="true"]');
+  assert.ok(retry, 'failed acquisition exposes a usable retry gesture');
+  harness.click(retry);
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'ready');
+  assert.equal(container.querySelector('[data-ccem-browser-retry="true"]'), null);
+  assert.deepEqual(callsFor(bridge, 'browser_surface_acquire').map(call => call.args.panelSessionId), [sessionId, sessionId]);
+  assert.equal(callsFor(bridge, 'browser_surface_release').length, 0,
+    'retrying an unacquired panel must not close its retained runtime');
+});
 
 test('Login locale changes retain its lease until the panel actually unmounts', async (t) => {
   const dom = installDom();
@@ -1171,15 +1303,11 @@ test('Login A and B default to their exact Agent once per lease, retain leases a
   await harness.flushEffects();
 
   const acquireCalls = callsFor(bridge, 'browser_surface_acquire');
-  assert.equal(acquireCalls.length, 2);
+  assert.equal(acquireCalls.length, 1, 'B waits until its first visible geometry before acquisition');
   const leaseA = acquireCalls.find((call) => (
     call.args.panelSessionId === propsA.sessionId
   ))?.args;
-  const leaseB = acquireCalls.find((call) => (
-    call.args.panelSessionId === propsB.sessionId
-  ))?.args;
   assert.ok(leaseA);
-  assert.ok(leaseB);
   assert.deepEqual(
     callsFor(bridge, 'browser_surface_control').map(({ args }) => ({
       leaseId: args.leaseId,
@@ -1204,6 +1332,9 @@ test('Login A and B default to their exact Agent once per lease, retain leases a
   });
   await harness.flushEffects();
   await harness.flushEffects();
+
+  assert.deepEqual(callsFor(bridge, 'browser_surface_acquire').map(call => call.args.panelSessionId),
+    [propsA.sessionId, propsB.sessionId], 'B acquires its own identity when first selected');
 
   mountedA.render({ ...propsA, isActiveSurface: true, presentationRevision: 3 });
   mountedB.render({

@@ -1,5 +1,6 @@
 use super::*;
 use crate::native_runtime::NativeRuntimeManager;
+use crate::webcontent_recovery::with_frontend_browser_document;
 
 fn ensure_trusted_main_window(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
@@ -14,6 +15,8 @@ fn ensure_trusted_main_window(window: &WebviewWindow) -> Result<(), String> {
 pub(crate) async fn browser_surface_acquire(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     panel_session_id: String,
     backend: BrowserSurfaceBackendArg,
     working_dir: Option<String>,
@@ -31,19 +34,22 @@ pub(crate) async fn browser_surface_acquire(
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        manager.acquire_login(
-            &app,
-            &sessions,
-            &cef_host,
-            panel_session_id,
-            backend,
-            working_dir,
-            profile_mode,
-            profile_id,
-            initial_url,
-            viewport,
-            client_revision,
-        )
+        with_frontend_browser_document(&app, &frontend_document_id, frontend_generation, || {
+            crate::webcontent_recovery::require_saved_browser_target(&app, &panel_session_id)?;
+            manager.acquire_login(
+                &app,
+                &sessions,
+                &cef_host,
+                panel_session_id,
+                backend,
+                working_dir,
+                profile_mode,
+                profile_id,
+                initial_url,
+                viewport,
+                client_revision,
+            )
+        })
     })
     .await
     .map_err(|error| format!("join browser surface acquire: {error}"))?
@@ -54,6 +60,8 @@ pub(crate) async fn browser_surface_acquire(
 #[tauri::command]
 pub(crate) async fn browser_surface_acquire(
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     _panel_session_id: String,
     _backend: BrowserSurfaceBackendArg,
     _working_dir: Option<String>,
@@ -72,6 +80,8 @@ pub(crate) async fn browser_surface_acquire(
 pub(crate) async fn browser_surface_sync(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     lease_id: String,
     generation: u64,
     client_revision: u64,
@@ -85,16 +95,18 @@ pub(crate) async fn browser_surface_sync(
     let manager = Arc::clone(manager.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        manager.sync(
-            &app,
-            &cef_host,
-            lease_id,
-            generation,
-            client_revision,
-            viewport,
-            visible,
-            presentation_revision,
-        )
+        with_frontend_browser_document(&app, &frontend_document_id, frontend_generation, || {
+            manager.sync(
+                &app,
+                &cef_host,
+                lease_id,
+                generation,
+                client_revision,
+                viewport,
+                visible,
+                presentation_revision,
+            )
+        })
     })
     .await
     .map_err(|error| format!("join browser surface sync: {error}"))?
@@ -112,6 +124,8 @@ pub(crate) async fn browser_surface_sync(window: WebviewWindow) -> Result<(), St
 pub(crate) async fn browser_surface_release(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     lease_id: String,
     generation: u64,
     client_revision: u64,
@@ -125,14 +139,28 @@ pub(crate) async fn browser_surface_release(
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        manager.release(
+        crate::webcontent_recovery::with_frontend_browser_document_exclusive(
             &app,
-            &sessions,
-            &cef_host,
-            lease_id,
-            generation,
-            client_revision,
-            disposition,
+            &frontend_document_id,
+            frontend_generation,
+            || {
+                let closed_panel = manager.release(
+                    &app,
+                    &sessions,
+                    &cef_host,
+                    lease_id,
+                    generation,
+                    client_revision,
+                    disposition,
+                )?;
+                if let Some(panel_session_id) = closed_panel {
+                    crate::webcontent_recovery::forget_closed_browser_target(
+                        &app,
+                        &panel_session_id,
+                    )?;
+                }
+                Ok(())
+            },
         )
     })
     .await
@@ -151,6 +179,8 @@ pub(crate) async fn browser_surface_release(window: WebviewWindow) -> Result<(),
 pub(crate) async fn browser_surface_navigate(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     lease_id: String,
     generation: u64,
     client_revision: u64,
@@ -165,15 +195,17 @@ pub(crate) async fn browser_surface_navigate(
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        manager.navigate(
-            &app,
-            &sessions,
-            &cef_host,
-            lease_id,
-            generation,
-            client_revision,
-            parsed.to_string(),
-        )
+        with_frontend_browser_document(&app, &frontend_document_id, frontend_generation, || {
+            manager.navigate(
+                &app,
+                &sessions,
+                &cef_host,
+                lease_id,
+                generation,
+                client_revision,
+                parsed.to_string(),
+            )
+        })
     })
     .await
     .map_err(|error| format!("join browser surface navigate: {error}"))?
@@ -191,6 +223,8 @@ pub(crate) async fn browser_surface_navigate(window: WebviewWindow) -> Result<()
 pub(crate) async fn browser_surface_navigation_action(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     lease_id: String,
     generation: u64,
     client_revision: u64,
@@ -204,15 +238,17 @@ pub(crate) async fn browser_surface_navigation_action(
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        manager.navigation_action(
-            &app,
-            &sessions,
-            &cef_host,
-            lease_id,
-            generation,
-            client_revision,
-            action,
-        )
+        with_frontend_browser_document(&app, &frontend_document_id, frontend_generation, || {
+            manager.navigation_action(
+                &app,
+                &sessions,
+                &cef_host,
+                lease_id,
+                generation,
+                client_revision,
+                action,
+            )
+        })
     })
     .await
     .map_err(|error| format!("join browser surface navigation action: {error}"))?
@@ -222,6 +258,8 @@ pub(crate) async fn browser_surface_navigation_action(
 #[tauri::command]
 pub(crate) async fn browser_surface_navigation_action(
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
 ) -> Result<BrowserSurfaceSnapshotMutationResponse, String> {
     ensure_trusted_main_window(&window)?;
     Err("Embedded Login Browser is not available on this platform.".to_string())
@@ -232,6 +270,8 @@ pub(crate) async fn browser_surface_navigation_action(
 pub(crate) async fn browser_surface_control(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     lease_id: String,
     generation: u64,
     client_revision: u64,
@@ -263,36 +303,38 @@ pub(crate) async fn browser_surface_control(
     let cef_host = Arc::clone(cef_host.inner());
     let native_runtime = Arc::clone(native_runtime.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        let (agent_actor_id, validate_actor) = match agent_runtime {
-            Some((runtime_id, expected_actor_id)) => {
-                let validate_actor = move |actor_id: &str| {
-                    let current_actor_id =
-                        native_runtime.browser_actor_id_for_runtime(&runtime_id)?;
-                    if current_actor_id != actor_id {
-                        return Err(
-                            "Login Browser Agent handoff conversation changed during commit."
-                                .to_string(),
-                        );
-                    }
-                    Ok(())
-                };
-                (Some(expected_actor_id), Some(validate_actor))
-            }
-            None => (None, None),
-        };
-        manager.transition_control(
-            &app,
-            &sessions,
-            &cef_host,
-            lease_id,
-            generation,
-            client_revision,
-            action,
-            agent_actor_id,
-            validate_actor
-                .as_ref()
-                .map(|validator| validator as &dyn Fn(&str) -> Result<(), String>),
-        )
+        with_frontend_browser_document(&app, &frontend_document_id, frontend_generation, || {
+            let (agent_actor_id, validate_actor) = match agent_runtime {
+                Some((runtime_id, expected_actor_id)) => {
+                    let validate_actor = move |actor_id: &str| {
+                        let current_actor_id =
+                            native_runtime.browser_actor_id_for_runtime(&runtime_id)?;
+                        if current_actor_id != actor_id {
+                            return Err(
+                                "Login Browser Agent handoff conversation changed during commit."
+                                    .to_string(),
+                            );
+                        }
+                        Ok(())
+                    };
+                    (Some(expected_actor_id), Some(validate_actor))
+                }
+                None => (None, None),
+            };
+            manager.transition_control(
+                &app,
+                &sessions,
+                &cef_host,
+                lease_id,
+                generation,
+                client_revision,
+                action,
+                agent_actor_id,
+                validate_actor
+                    .as_ref()
+                    .map(|validator| validator as &dyn Fn(&str) -> Result<(), String>),
+            )
+        })
     })
     .await
     .map_err(|error| format!("join browser surface control transition: {error}"))?
@@ -310,6 +352,8 @@ pub(crate) async fn browser_surface_control(window: WebviewWindow) -> Result<(),
 pub(crate) async fn browser_surface_close_popup(
     app: AppHandle,
     window: WebviewWindow,
+    frontend_document_id: String,
+    frontend_generation: u64,
     lease_id: String,
     generation: u64,
     client_revision: u64,
@@ -322,14 +366,16 @@ pub(crate) async fn browser_surface_close_popup(
     let sessions = Arc::clone(sessions.inner());
     let cef_host = Arc::clone(cef_host.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        manager.close_popup(
-            &app,
-            &sessions,
-            &cef_host,
-            lease_id,
-            generation,
-            client_revision,
-        )
+        with_frontend_browser_document(&app, &frontend_document_id, frontend_generation, || {
+            manager.close_popup(
+                &app,
+                &sessions,
+                &cef_host,
+                lease_id,
+                generation,
+                client_revision,
+            )
+        })
     })
     .await
     .map_err(|error| format!("join Login Browser popup close: {error}"))?

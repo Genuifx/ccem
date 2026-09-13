@@ -76,7 +76,7 @@ async function mountStartupRecovery() {
   const invoke = async (command, args) => {
     calls.push({ command, args, at: now });
     if (command === 'get_startup_status') return nativePhase;
-    if (command === 'webcontent_frontend_boot') return { generation: 7, recovered: true };
+    if (command === 'webcontent_frontend_boot') return { documentId: args.documentId, generation: 7, recovered: true };
     if (command === 'webcontent_frontend_ready') return true;
   };
   const recovery = {};

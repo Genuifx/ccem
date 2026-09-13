@@ -362,7 +362,7 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
     assert.ok(commandStart > 0 && commandEnd > commandStart, `${command} must be async`);
     assert.match(
       browserCommands.slice(commandStart, commandEnd),
-      /run_blocking_browser_command\(/,
+      /run_blocking_frontend_browser_command\(/,
       `${command} must leave the Tauri UI thread before waiting for the native surface lane`,
     );
   }

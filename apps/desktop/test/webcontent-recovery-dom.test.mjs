@@ -63,13 +63,14 @@ async function mountQueue({ recovered, pendingBoot = false } = {}) {
   let resolveBoot;
   const bootReply = pendingBoot
     ? new Promise((resolve) => { resolveBoot = resolve; })
-    : Promise.resolve({ generation: 2, recovered });
+    : Promise.resolve({ documentId: 'queue-document', generation: 2, recovered });
   const bootTimers = new Map();
-  new Function('require', 'exports', 'window', 'setTimeout', 'clearTimeout', transpile(
+  new Function('require', 'exports', 'window', 'setTimeout', 'clearTimeout', 'crypto', transpile(
     await fs.readFile(path.join(sourceDir, 'lib/webcontentRecovery.ts'), 'utf8'),
   ))(
     () => ({ invoke: () => bootReply }), module, { __TAURI_INTERNALS__: {} },
     (fn) => { bootTimers.set(1, fn); return 1; }, (id) => bootTimers.delete(id),
+    { randomUUID: () => 'queue-document' },
   );
   const boot = module.initializeWebcontentRecovery();
   if (!pendingBoot) await boot;
@@ -128,7 +129,7 @@ async function mountQueue({ recovered, pendingBoot = false } = {}) {
         }
       });
     },
-    async resolveBoot() { resolveBoot?.({ generation: 2, recovered: true }); await boot; },
+    async resolveBoot() { resolveBoot?.({ documentId: 'queue-document', generation: 2, recovered: true }); await boot; },
     unmount() { React.act(() => root.unmount()); assert.equal(timers.size, 0); container.remove(); },
   };
 }

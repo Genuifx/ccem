@@ -90,7 +90,7 @@ test('Workspace propagates one epoch to every Mode 2 panel and sync captures it'
 
 test('Mode 2 acquire lifetime stays stable across active, occlusion, and presentation updates', async () => {
   const panel = await readRepoText('src', 'components', 'workspace', 'BrowserPanel.tsx');
-  const acquireStart = panel.indexOf('  useEffect(() => {\n    let disposed = false;');
+  const acquireStart = panel.lastIndexOf('  useEffect(() => {', panel.indexOf('    if (!acquireViewport) return;'));
   const nextEffect = panel.indexOf('\n\n  useEffect(() => {\n    if (!isSurfaceReady) return;', acquireStart);
   assert.notEqual(acquireStart, -1, 'Mode 2 acquire effect should exist');
   assert.notEqual(nextEffect, -1, 'Mode 2 acquire effect should have a bounded lifetime');
@@ -105,7 +105,7 @@ test('Mode 2 acquire lifetime stays stable across active, occlusion, and present
   );
   assert.match(
     dependencyList,
-    /\[loginProfileId, profileMode, sessionId, showLifecycleError, surfaceOrdering, workingDir\]/,
+    /\[acquireRevision, acquireViewport, loginProfileId, profileMode, sessionId, showLifecycleError, surfaceOrdering, workingDir\]/,
   );
   assert.match(
     acquireEffect,

@@ -23,7 +23,7 @@ async function recoveryHarness({ native = true, invoke, heap, uuid, draftCounts 
   const calls = [];
   const timers = new Map();
   let nextTimer = 0;
-  const bridge = invoke ?? (async () => ({ generation: 7, recovered: true }));
+  const bridge = invoke ?? (async (_command, args) => ({ documentId: args.documentId, generation: 7, recovered: true }));
   const window = native ? { __TAURI_INTERNALS__: {} } : {};
   const document = {
     visibilityState: 'visible',
@@ -36,7 +36,12 @@ async function recoveryHarness({ native = true, invoke, heap, uuid, draftCounts 
       ? { recoveryDraftDiagnostics: () => draftCounts ?? { drafts: 0, uncertain: 0, failedWrites: 0 } }
       : { invoke(command, args) { calls.push({ command, args }); return bridge(command, args); } },
     module, window, document, performance, { randomUUID: uuid ?? (() => 'renderer-document-1') },
-    (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+    (fn, delay) => {
+      const id = ++nextTimer;
+      timers.set(id, { fn, delay });
+      if (delay < 3000) queueMicrotask(() => { timers.delete(id); fn(); });
+      return id;
+    },
     (id) => timers.delete(id),
     { warn() {} },
   );
@@ -76,7 +81,7 @@ test('actual main bootstrap waits for the native document fence before mounting 
   );
   assert.equal(mounts.length, 0);
   assert.equal(harness.module.isRecoveringWebcontent(), true, 'unresolved boot cannot authorize replay');
-  gate.resolve({ generation: 7, recovered: true });
+  gate.resolve({ documentId: 'renderer-document-1', generation: 7, recovered: true });
   await harness.module.initializeWebcontentRecovery();
   await Promise.resolve();
   assert.equal(mounts.length, 1);
@@ -86,7 +91,7 @@ test('actual main bootstrap waits for the native document fence before mounting 
 
 test('fresh/recovered document identity and generation are forwarded to ready and samples', async () => {
   for (const recovered of [false, true]) {
-    const harness = await recoveryHarness({ invoke: async () => ({ generation: 12, recovered }) });
+    const harness = await recoveryHarness({ invoke: async (_command, args) => ({ documentId: args.documentId, generation: 12, recovered }) });
     assert.equal(await harness.module.acknowledgeWebcontentReady(), false);
     await harness.module.sampleWebcontent();
     assert.equal(harness.calls.length, 0);
@@ -104,7 +109,11 @@ test('fresh/recovered document identity and generation are forwarded to ready an
 });
 
 test('rejected or malformed boot resolves for UI startup but keeps automatic replay fenced', async () => {
-  for (const value of [null, {}, { generation: -1, recovered: false }, { generation: 1.5, recovered: false }, { generation: 1, recovered: 'false' }]) {
+  for (const value of [null, {}, { generation: 0, recovered: false },
+    { documentId: 'another-document', generation: 0, recovered: false },
+    { documentId: 'renderer-document-1', generation: -1, recovered: false },
+    { documentId: 'renderer-document-1', generation: 1.5, recovered: false },
+    { documentId: 'renderer-document-1', generation: 1, recovered: 'false' }]) {
     const harness = await recoveryHarness({ invoke: async () => value });
     await harness.module.initializeWebcontentRecovery();
     assert.equal(harness.module.isRecoveringWebcontent(), true);
@@ -125,7 +134,7 @@ test('late boot identity enables ready/telemetry after timeout without reauthori
   harness.timeout();
   await boot;
   assert.equal(harness.module.isRecoveringWebcontent(), true);
-  gate.resolve({ generation: 0, recovered: false });
+  gate.resolve({ documentId: 'renderer-document-1', generation: 0, recovered: false });
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(harness.module.isRecoveringWebcontent(), true);
@@ -203,7 +212,7 @@ test('sampling is single-flight and releases its lease after failure', async () 
   const gate = deferred();
   let firstSample = true;
   const harness = await recoveryHarness({ invoke: async (command) => {
-    if (command === 'webcontent_frontend_boot') return { generation: 7, recovered: true };
+    if (command === 'webcontent_frontend_boot') return { documentId: 'renderer-document-1', generation: 7, recovered: true };
     if (firstSample) { firstSample = false; return gate.promise; }
   } });
   await harness.module.initializeWebcontentRecovery();

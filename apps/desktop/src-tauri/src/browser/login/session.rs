@@ -934,3 +934,5 @@ impl std::error::Error for SessionManagerError {}
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::Fixture as SessionLifecycleFixture;
