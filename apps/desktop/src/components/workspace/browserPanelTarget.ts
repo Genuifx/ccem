@@ -246,6 +246,21 @@ export function toggleDefaultBrowserPanelTarget(
   };
 }
 
+/** Agent requests reveal once; duplicate notifications must never toggle or recreate a panel. */
+export function openDefaultBrowserPanelTarget(
+  targets: Record<string, BrowserPanelTarget | undefined>,
+  ownerSessionId: string,
+  workingDir: string,
+  allocateInstanceId: () => number,
+): Record<string, BrowserPanelTarget | undefined> {
+  const existing = targets[ownerSessionId];
+  if (existing && existing.workingDir.trim() === workingDir.trim()) {
+    if (isBrowserPanelTargetVisible(existing)) return targets;
+    return { ...targets, [ownerSessionId]: setBrowserPanelTargetVisible(existing, true) };
+  }
+  return toggleDefaultBrowserPanelTarget(targets, ownerSessionId, workingDir, allocateInstanceId);
+}
+
 /**
  * A compose draft has a stable semantic owner id. Retire its mounted Mode 2
  * target when the selected folder changes so the old native lease cannot be

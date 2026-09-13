@@ -31,6 +31,22 @@ async function importBrowserPanelTarget() {
   return import(pathToFileURL(outputPath).href);
 }
 
+test('Agent requests reveal once, retain hidden panels, and create a distinct blank panel for each conversation', async () => {
+  const { openDefaultBrowserPanelTarget } = await importBrowserPanelTarget();
+  const first = openDefaultBrowserPanelTarget({}, 'runtime:a', '/workspace', () => 1);
+  assert.equal(first['runtime:a'].visible, true);
+  assert.equal(first['runtime:a'].defaultUrl, undefined);
+  assert.equal(openDefaultBrowserPanelTarget(first, 'runtime:a', '/workspace', () => 2), first);
+  const hidden = { ...first, 'runtime:a': { ...first['runtime:a'], visible: false } };
+  const reopened = openDefaultBrowserPanelTarget(hidden, 'runtime:a', '/workspace', () => 3);
+  assert.equal(reopened['runtime:a'].visible, true);
+  assert.equal(reopened['runtime:a'].instanceId, first['runtime:a'].instanceId);
+  const second = openDefaultBrowserPanelTarget(reopened, 'runtime:b', '/workspace', () => 4);
+  assert.equal(second['runtime:a'], reopened['runtime:a']);
+  assert.notEqual(second['runtime:b'].surfaceSessionId, second['runtime:a'].surfaceSessionId);
+  assert.equal(second['runtime:b'].profileMode, 'default');
+});
+
 test('a late provider id and live/history round trip retain one browser instance key', async () => {
   const {
     createBrowserPanelSessionKeyRegistry,

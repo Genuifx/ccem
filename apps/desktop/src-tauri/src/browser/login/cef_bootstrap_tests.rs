@@ -1,8 +1,8 @@
 use super::cef::bootstrap::{
-    adhoc_code_requirement, adhoc_credential_store_policy, credential_store_policy,
+    adhoc_credential_store_policy, credential_store_policy,
     distribution_code_requirement, ensure_credential_store_marker,
     expected_credential_store_marker, resolve_runtime_layout, should_append_mock_keychain_switch,
-    verify_adhoc_dynamic_identity, verify_safe_storage_branding, CefCredentialStorePolicy,
+    verify_adhoc_bundle_inspection, verify_safe_storage_branding, CefCredentialStorePolicy,
     VerifiedMacAdHocCodeSignature, VerifiedMacCodeSignature, VerifiedMacSafeStorageBranding,
 };
 use std::fs;
@@ -166,12 +166,9 @@ fn cef_bootstrap_adhoc_keychain_requires_verified_bundled_sandbox_and_branding()
 }
 
 #[test]
-fn cef_bootstrap_adhoc_requirement_binds_the_exact_code_and_rejects_certificate_identities() {
+fn cef_bootstrap_adhoc_inspection_requires_bundle_seal_and_rejects_certificate_identities() {
     let inspection = "Identifier=com.ccem.desktop\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=0123456789abcdef0123456789abcdef01234567\nInfo.plist entries=24\nSealed Resources version=2 rules=13 files=9\n";
-    assert_eq!(
-        adhoc_code_requirement(inspection).expect("valid ad-hoc requirement"),
-        "identifier \"com.ccem.desktop\" and cdhash H\"0123456789abcdef0123456789abcdef01234567\""
-    );
+    verify_adhoc_bundle_inspection(inspection).expect("valid ad-hoc bundle inspection");
     for invalid in [
         inspection.replace("Signature=adhoc", "Signature=unknown"),
         inspection.replace("com.ccem.desktop", "com.example.impostor"),
@@ -192,42 +189,17 @@ fn cef_bootstrap_adhoc_requirement_binds_the_exact_code_and_rejects_certificate_
         format!("{inspection}CDHash=0123456789abcdef0123456789abcdef01234567\n"),
     ] {
         assert!(
-            adhoc_code_requirement(&invalid).is_err(),
+            verify_adhoc_bundle_inspection(&invalid).is_err(),
             "accepted {invalid:?}"
         );
     }
 }
 
 #[test]
-fn cef_bootstrap_adhoc_dynamic_identity_matches_the_verified_bundle_without_a_resource_seal() {
-    let bundle = "Identifier=com.ccem.desktop\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=0123456789abcdef0123456789abcdef01234567\nInfo.plist entries=24\nSealed Resources version=2 rules=13 files=9\n";
-    let expected = adhoc_code_requirement(bundle).expect("verified bundle identity");
+fn cef_bootstrap_adhoc_bundle_inspection_rejects_process_metadata_without_a_resource_seal() {
     // codesign's +PID display exposes the active code directory but no bundle resource seal.
-    let process = "Identifier=com.ccem.desktop\nFormat=pid diskrep\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=0123456789abcdef0123456789abcdef01234567\nInfo.plist entries=24\nSealed Resources=none\n";
-    verify_adhoc_dynamic_identity(process, &expected).expect("same running code");
-    assert!(adhoc_code_requirement(process).is_err());
-    for invalid in [
-        process.replace(
-            "0123456789abcdef0123456789abcdef01234567",
-            "fedcba9876543210fedcba9876543210fedcba98",
-        ),
-        process.replace("com.ccem.desktop", "com.example.impostor"),
-        process.replace("Signature=adhoc", "Signature=unknown"),
-        process.replace("TeamIdentifier=not set", "TeamIdentifier=TEAM123456"),
-        process.replace(
-            "Format=pid diskrep",
-            "Format=app bundle with Mach-O thin (arm64)",
-        ),
-        process.replace("Format=pid diskrep\n", ""),
-        format!("{process}Format=pid diskrep\n"),
-        format!("{process}Authority=Developer ID Application: Example\n"),
-        format!("{process}CDHash=0123456789abcdef0123456789abcdef01234567\n"),
-    ] {
-        assert!(
-            verify_adhoc_dynamic_identity(&invalid, &expected).is_err(),
-            "accepted {invalid:?}"
-        );
-    }
+    let process = "Identifier=com.ccem.desktop\nFormat=pid diskrep\nSignature=adhoc\nTeamIdentifier=not set\nCDHash=fedcba9876543210fedcba9876543210fedcba98\nInfo.plist entries=24\nSealed Resources=none\n";
+    assert!(verify_adhoc_bundle_inspection(process).is_err());
 }
 
 #[test]

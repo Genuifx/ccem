@@ -211,10 +211,9 @@ test('browser tool bridge resolves successful responses and rejects failures', a
   }), false);
 });
 
-test('browser bridge caller deadline stays beyond the production backend deadline', async () => {
+test('browser bridge caller deadline allows cold activation followed by the production command deadline', async () => {
   const { BROWSER_TOOL_BRIDGE_TIMEOUT_MS } = await importBrowserMcpModule();
-  assert.equal(BROWSER_TOOL_BRIDGE_TIMEOUT_MS, 45_000);
-  assert.ok(BROWSER_TOOL_BRIDGE_TIMEOUT_MS > 30_000);
+  assert.ok(BROWSER_TOOL_BRIDGE_TIMEOUT_MS >= 20_000 + 30_000 + 5_000);
 });
 
 test('browser tool bridge rejects all pending requests when the session closes', async () => {

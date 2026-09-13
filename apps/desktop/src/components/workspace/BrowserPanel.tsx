@@ -38,6 +38,7 @@ import { useNativeBrowserSurfaceGeometrySync } from '@/hooks/useNativeBrowserSur
 import { CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
 import { buildNativeBrowserBounds, normalizeBrowserBoundsZoom } from './browserPanelGeometry';
 import { BrowserPanelNavigation, BrowserPanelTabStrip } from './BrowserPanelChrome';
+import type { BrowserAgentStatus } from './browserActivation';
 
 interface BrowserPanelSharedProps {
   backend: 'login';
@@ -53,6 +54,7 @@ interface BrowserPanelSharedProps {
   surfaceOccluded?: boolean;
   /** Active native runtime whose opaque actor lineage owns Agent control. */
   agentSessionId?: string;
+  onAgentStatus?: (status: BrowserAgentStatus) => void;
   onResizeStart?: (event: ReactPointerEvent<HTMLDivElement>) => void;
   onHostShortcut?: (action: BrowserSurfaceHostShortcutAction) => void;
   onClose: () => void;
@@ -104,6 +106,7 @@ export function BrowserPanel({
   isActiveSurface = true,
   surfaceOccluded = false,
   agentSessionId,
+  onAgentStatus,
   onResizeStart,
   onHostShortcut,
   onClose,
@@ -126,6 +129,8 @@ export function BrowserPanel({
   const autoHandoffAttemptedLeaseRef = useRef<string | null>(null);
   const onHostShortcutRef = useRef(onHostShortcut);
   onHostShortcutRef.current = onHostShortcut;
+  const onAgentStatusRef = useRef(onAgentStatus);
+  onAgentStatusRef.current = onAgentStatus;
   const presentationRevisionRef = useRef(presentationRevision);
   presentationRevisionRef.current = presentationRevision;
   const initialUrlRef = useRef(defaultUrl);
@@ -243,6 +248,14 @@ export function BrowserPanel({
     if (snapshot.popup_loading !== undefined) setPopupLoading(snapshot.popup_loading);
     if (snapshot.popup_error !== undefined) setPopupError(snapshot.popup_error ?? null);
   }, [t]);
+
+  useEffect(() => {
+    if (lifecycle === 'failed' || sessionStatus !== 'running') {
+      onAgentStatusRef.current?.('unavailable');
+    } else if (isSurfaceReady) {
+      onAgentStatusRef.current?.(!autoHandoff ? 'disabled' : control === 'agent' ? 'ready' : 'pending');
+    }
+  }, [agentSessionId, autoHandoff, control, isSurfaceReady, lifecycle, sessionStatus]);
 
   const readViewport = useCallback(() => {
     const frame = frameRef.current;
@@ -721,8 +734,8 @@ export function BrowserPanel({
     if (surfaceClosingRef.current) return;
     const lease = surfaceLeaseRef.current;
     if (!lease) {
-      if (lifecycle === 'failed' || lifecycle === 'closed') onClose();
-      else showActionError(t('workspace.browserSurfaceUnavailable'));
+      // Unmount immediately during startup; the acquire effect closes any lease that arrives late.
+      onClose();
       return;
     }
 
@@ -749,7 +762,7 @@ export function BrowserPanel({
       showActionError(String(closeError));
       setIsClosingSurface(false);
     }
-  }, [lifecycle, onClose, showActionError, surfaceOrdering, t]);
+  }, [onClose, showActionError, surfaceOrdering]);
 
   const cancelUrlEditing = useCallback(() => {
     setUrlInput(currentUrl ?? '');
@@ -837,6 +850,7 @@ export function BrowserPanel({
           autoHandoffAttemptedLeaseRef.current = null;
         }
       } else {
+        if (action === 'handoff') onAgentStatusRef.current?.('unavailable');
         showActionError(String(controlError));
       }
     } finally {

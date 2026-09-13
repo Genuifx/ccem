@@ -102,9 +102,9 @@ const ALL_TOOLS = new Set<BrowserToolName>(browserToolVocabulary as BrowserToolN
 // An explicit caller-provided allow-list entry remains an intentional pre-approval.
 const AUTO_APPROVED_TOOLS = [...ALL_TOOLS].filter((name) => name !== 'evaluate');
 
-// The Rust Login Browser backend has a 30-second total command deadline. Keep the MCP caller
-// deadline strictly later so it cannot time out, retry, and race an effect that Rust still owns.
-export const BROWSER_TOOL_BRIDGE_TIMEOUT_MS = 45_000;
+// Allow up to 20 seconds to open/handoff a first-use surface plus the backend's 30-second
+// command deadline. The caller must not time out while Rust still owns a possible effect.
+export const BROWSER_TOOL_BRIDGE_TIMEOUT_MS = 60_000;
 
 export function browserToolNamesForPermissionMode(permMode: string): BrowserToolName[] {
   if (

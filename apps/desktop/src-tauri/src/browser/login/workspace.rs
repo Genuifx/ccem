@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -79,6 +80,7 @@ pub(crate) struct WorkspaceIdentityStore {
     root: PathBuf,
     registry_path: PathBuf,
     lock_path: PathBuf,
+    mutation: Arc<Mutex<()>>,
 }
 
 impl WorkspaceIdentityStore {
@@ -91,6 +93,7 @@ impl WorkspaceIdentityStore {
             registry_path: root.join("workspaces.json"),
             lock_path: root.join("workspaces.lock"),
             root,
+            mutation: Arc::new(Mutex::new(())),
         })
     }
 
@@ -107,6 +110,12 @@ impl WorkspaceIdentityStore {
             return Err(WorkspaceIdentityError::WorkspaceUnavailable);
         }
         let path_sha256 = canonical_path_sha256(&canonical);
+        // Acquisition and Agent routing share this store. Serialize their short registry
+        // transaction locally; the nonblocking file lock still rejects independent owners.
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| WorkspaceIdentityError::LockUnavailable)?;
         let lock = self.acquire_lock()?;
         let mut registry = self.load_registry()?;
         let now = Utc::now().to_rfc3339();
@@ -378,6 +387,7 @@ fn sync_directory(path: &Path) -> Result<(), WorkspaceIdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     #[test]
     fn same_canonical_workspace_reuses_app_owned_identity() {
@@ -410,6 +420,70 @@ mod tests {
             store.resolve(&left).unwrap(),
             store.resolve(&right).unwrap()
         );
+    }
+
+    #[test]
+    fn concurrent_resolves_on_the_store_and_its_clones_keep_one_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let store = WorkspaceIdentityStore::new(temp.path().join("identity")).unwrap();
+        let clones = (0..7).map(|_| store.clone()).collect::<Vec<_>>();
+        let barrier = Barrier::new(clones.len() + 1);
+        let results = std::thread::scope(|scope| {
+            let workers = std::iter::once(&store)
+                .chain(clones.iter())
+                .map(|store| {
+                    let workspace = &workspace;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        (0..4)
+                            .map(|_| {
+                                barrier.wait();
+                                store.resolve(workspace)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let failures = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "same-store browser callers must not contend on the file lock: {failures:?}"
+        );
+        let identity = results[0].as_ref().unwrap();
+        assert!(results
+            .iter()
+            .all(|result| result.as_ref().unwrap() == identity));
+        let registry = store.load_registry().unwrap();
+        assert_eq!(registry.records.len(), 1);
+        assert_eq!(registry.records[0].workspace_id, identity.as_str());
+    }
+
+    #[test]
+    fn an_independently_held_registry_lock_still_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let root = temp.path().join("identity");
+        let store = WorkspaceIdentityStore::new(root.clone()).unwrap();
+        let independent = WorkspaceIdentityStore::new(root).unwrap();
+        let lock = independent.acquire_lock().unwrap();
+        assert_eq!(
+            store.resolve(&workspace),
+            Err(WorkspaceIdentityError::LockUnavailable)
+        );
+        assert!(store.load_registry().unwrap().records.is_empty());
+        drop(lock);
+        assert!(store.resolve(&workspace).is_ok());
     }
 
     #[test]

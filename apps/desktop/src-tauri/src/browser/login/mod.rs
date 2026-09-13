@@ -6,6 +6,8 @@ pub(crate) mod cef;
 #[cfg(test)]
 mod cef_availability_tests;
 #[cfg(all(test, target_os = "macos"))]
+mod cef_adhoc_update_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod cef_bootstrap_tests;
 #[cfg(test)]
 mod cef_devtools_bridge_tests;

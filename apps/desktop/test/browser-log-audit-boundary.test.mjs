@@ -29,15 +29,13 @@ test('preview browser console logs are untrusted, bounded, redacted JSONL', asyn
 
 test('Mode 2 durable audit precedes browser effects and never stores typed text or scripts', async () => {
   const [nativeRuntimeSource, capabilitySource, logsSource] = await Promise.all([
-    fs.readFile(path.join(rustDir, 'native_runtime.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'native_runtime', 'browser_activation.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'login', 'capability.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'logs.rs'), 'utf8'),
   ]);
 
-  const dispatch = nativeRuntimeSource.match(
-    /fn handle_browser_tool_request\([\s\S]*?\n    fn mark_process_exit/,
-  )?.[0] ?? '';
-  assert.match(dispatch, /login\.execute_prepared_agent_tool\(&request, prepared\)/);
+  const dispatch = nativeRuntimeSource;
+  assert.match(dispatch, /login\.execute_prepared_agent_tool\(request, prepared\)/);
   assert.doesNotMatch(dispatch, /browser\.run_tool/);
   assert.ok(
     capabilitySource.indexOf('self.audit.write_pre(&pre_record)')
