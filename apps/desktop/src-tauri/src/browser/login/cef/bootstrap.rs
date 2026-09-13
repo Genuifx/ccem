@@ -290,11 +290,7 @@ pub(crate) fn verify_current_process_requirement(requirement: &str) -> Result<()
     Ok(())
 }
 
-pub(crate) fn adhoc_code_requirement(inspection: &str) -> Result<String, String> {
-    adhoc_inspected_identity(inspection, true)
-}
-
-fn adhoc_inspected_identity(inspection: &str, bundle: bool) -> Result<String, String> {
+pub(crate) fn verify_adhoc_bundle_inspection(inspection: &str) -> Result<(), String> {
     let values = |prefix: &str| {
         inspection
             .lines()
@@ -312,24 +308,18 @@ fn adhoc_inspected_identity(inspection: &str, bundle: bool) -> Result<String, St
     }
     let plist_entries = values("Info.plist entries=");
     let resource_seals = values("Sealed Resources version=");
-    if bundle
-        && (plist_entries.len() != 1
-            || plist_entries[0]
-                .parse::<usize>()
-                .map_or(true, |count| count == 0)
-            || resource_seals.len() != 1
-            || !resource_seals[0].starts_with("2 ")
-            || !values("Info.plist=").is_empty()
-            || !values("Sealed Resources=").is_empty())
+    if plist_entries.len() != 1
+        || plist_entries[0]
+            .parse::<usize>()
+            .map_or(true, |count| count == 0)
+        || resource_seals.len() != 1
+        || !resource_seals[0].starts_with("2 ")
+        || !values("Info.plist=").is_empty()
+        || !values("Sealed Resources=").is_empty()
     {
         return Err(
             "CCEM ad-hoc release requires a bound Info.plist and version 2 bundle resource seal"
                 .to_string(),
-        );
-    }
-    if !bundle && values("Format=") != ["pid diskrep"] {
-        return Err(
-            "CCEM ad-hoc process inspection did not return a dynamic code object".to_string(),
         );
     }
     let hashes = values("CDHash=");
@@ -338,22 +328,6 @@ fn adhoc_inspected_identity(inspection: &str, bundle: bool) -> Result<String, St
         || !hashes[0].bytes().all(|value| value.is_ascii_hexdigit())
     {
         return Err("CCEM ad-hoc signature has no unambiguous code directory hash".to_string());
-    }
-    Ok(format!(
-        "identifier {} and cdhash H\"{}\"",
-        requirement_string_literal(CCEM_BUNDLE_IDENTIFIER),
-        hashes[0]
-    ))
-}
-
-pub(crate) fn verify_adhoc_dynamic_identity(
-    inspection: &str,
-    expected: &str,
-) -> Result<(), String> {
-    if adhoc_inspected_identity(inspection, false)? != expected {
-        return Err(
-            "running CCEM ad-hoc code identity does not match the verified bundle".to_string(),
-        );
     }
     Ok(())
 }
@@ -381,32 +355,10 @@ pub(crate) fn verify_adhoc_signature(
     if !inspection.status.success() {
         return Err("could not inspect the CCEM ad-hoc signature".to_string());
     }
-    let requirement = adhoc_code_requirement(&String::from_utf8_lossy(&inspection.stderr))?;
-    // -R and verbose verification both trigger static requirement checks on
-    // codesign's +PID disk representation, which return EINVAL for ad-hoc code.
-    // Plain --verify checks dynamic validity. The complete bundle was checked
-    // above; bind this running code's exact identifier and CDHash separately.
-    let dynamic_target = format!("+{}", std::process::id());
-    let validity = Command::new("/usr/bin/codesign")
-        .arg("--verify")
-        .arg(&dynamic_target)
-        .output()
-        .map_err(|error| format!("verify running ad-hoc CCEM signature: {error}"))?;
-    if !validity.status.success() {
-        return Err(format!(
-            "running CCEM ad-hoc signature is invalid: {}",
-            String::from_utf8_lossy(&validity.stderr).trim()
-        ));
-    }
-    let dynamic = Command::new("/usr/bin/codesign")
-        .args(["--display", "--verbose=4"])
-        .arg(&dynamic_target)
-        .output()
-        .map_err(|error| format!("inspect running ad-hoc CCEM signature: {error}"))?;
-    if !dynamic.status.success() {
-        return Err("could not inspect the running CCEM ad-hoc signature".to_string());
-    }
-    verify_adhoc_dynamic_identity(&String::from_utf8_lossy(&dynamic.stderr), &requirement)?;
+    verify_adhoc_bundle_inspection(&String::from_utf8_lossy(&inspection.stderr))?;
+    // The updater replaces the bundle and removes its backup before the user restarts.
+    // The old process can then have a different CDHash or no inspectable on-disk image.
+    // Validate the installed bundle without binding browser startup to the old process.
     Ok(VerifiedMacAdHocCodeSignature { _private: () })
 }
 
