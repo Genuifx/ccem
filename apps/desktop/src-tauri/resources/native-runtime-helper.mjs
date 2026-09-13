@@ -41956,7 +41956,7 @@ var READ_TOOLS = /* @__PURE__ */ new Set([
 ]);
 var ALL_TOOLS = new Set(browser_tool_vocabulary_default);
 var AUTO_APPROVED_TOOLS = [...ALL_TOOLS].filter((name) => name !== "evaluate");
-var BROWSER_TOOL_BRIDGE_TIMEOUT_MS = 45e3;
+var BROWSER_TOOL_BRIDGE_TIMEOUT_MS = 6e4;
 function browserToolNamesForPermissionMode(permMode) {
   if (permMode === "readonly" || permMode === "audit" || permMode === "plan" || permMode === "safe" || permMode === "ci") {
     return [...READ_TOOLS];

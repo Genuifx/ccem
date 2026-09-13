@@ -49,7 +49,7 @@ test('handoff preserves browser instances while quarantine and stop retire only 
   assert.doesNotMatch(stop, /destroy_browser_session|BrowserManager|\.close\(/);
 
   const sessionMetaStart = nativeRuntime.indexOf('fn process_helper_stdout_line(');
-  const sessionMetaEnd = nativeRuntime.indexOf('\n\n    fn handle_browser_tool_request', sessionMetaStart);
+  const sessionMetaEnd = nativeRuntime.indexOf('\n    fn mark_process_exit', sessionMetaStart);
   const sessionMeta = nativeRuntime.slice(sessionMetaStart, sessionMetaEnd);
   assert.match(sessionMeta, /complete_terminal_handoff/);
   assert.match(sessionMeta, /retire_login_browser_agent_control/);

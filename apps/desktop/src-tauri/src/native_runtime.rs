@@ -68,14 +68,14 @@ use tauri_plugin_shell::{
     ShellExt,
 };
 
+mod browser_activation;
+
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const NATIVE_PERMISSION_QUARANTINE_KILL_TIMEOUT: Duration = Duration::from_secs(3);
 const NATIVE_SETTINGS_UPDATE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_HELPER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_HELPER_WRITE_QUEUE_CAPACITY: usize = 16;
 const NATIVE_HELPER_RETIRING_ERROR: &str = "Native runtime helper is retiring";
-const NATIVE_BROWSER_HANDOFF_GRACE_PERIOD: Duration = Duration::from_secs(5);
-const NATIVE_BROWSER_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ACTIVE_BACKGROUND_TASK_SHUTDOWN_ERROR: &str = "Cannot close this native runtime while Claude background tasks remain active. Retry with force after confirming their results may be lost.";
 const MAX_PROMPT_ANNOTATIONS: usize = 20;
 const MAX_PROMPT_ANNOTATION_QUOTE_CHARS: usize = 12_000;
@@ -1967,6 +1967,7 @@ struct NativeSessionHandle {
     browser_permission: BrowserPermissionAuthority,
     browser_permission_sync: Mutex<()>,
     handoff_cancelled_command: Mutex<Option<String>>,
+    browser_requests: Arc<browser_activation::NativeBrowserRequests>,
     settings_update_acks: SettingsUpdateAckRegistry,
     child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
@@ -2487,6 +2488,7 @@ impl NativeRuntimeManager {
             )),
             browser_permission_sync: Mutex::new(()),
             handoff_cancelled_command: Mutex::new(None),
+            browser_requests: Arc::default(),
             settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(runtime_id.clone())),
@@ -7561,6 +7563,7 @@ impl NativeRuntimeManager {
             )),
             browser_permission_sync: Mutex::new(()),
             handoff_cancelled_command: Mutex::new(None),
+            browser_requests: Arc::default(),
             settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::with_start_seq(
@@ -8630,6 +8633,7 @@ impl NativeRuntimeManager {
             } => self.handle_browser_tool_request(
                 app,
                 runtime_id,
+                helper_incarnation,
                 BrowserToolRequest {
                     request_id,
                     tool,
@@ -9005,140 +9009,6 @@ impl NativeRuntimeManager {
         });
         Ok(())
     }
-    fn handle_browser_tool_request(
-        &self,
-        app: Option<&AppHandle>,
-        runtime_id: &str,
-        request: BrowserToolRequest,
-    ) -> Result<(), String> {
-        let handle = self
-            .handles
-            .lock()
-            .map_err(|_| "Failed to lock native runtime handles".to_string())?
-            .get(runtime_id)
-            .cloned()
-            .ok_or_else(|| format!("Native runtime {} helper is not connected", runtime_id))?;
-        if handle.permission_quarantined.load(Ordering::SeqCst) {
-            return Err(
-                "Native runtime helper is quarantined after an incomplete permission update."
-                    .to_string(),
-            );
-        }
-
-        let response = (|| {
-            let app =
-                app.ok_or_else(|| "Browser tool request requires an app handle.".to_string())?;
-            let login = app
-                .try_state::<Arc<crate::browser::login::session::LoginBrowserSessionManager>>()
-                .map(|state| Arc::clone(&state))
-                .ok_or_else(|| "Mode 2 browser manager is not registered.".to_string())?;
-            let (workspace_dir, browser_actor_id) = {
-                let record = handle
-                    .record
-                    .lock()
-                    .map_err(|_| "Failed to lock native session record".to_string())?;
-                if !is_valid_browser_actor_id(&record.browser_actor_id) {
-                    return Err("Native browser actor lineage is unavailable.".to_string());
-                }
-                (record.project_dir.clone(), record.browser_actor_id.clone())
-            };
-            let workspace = crate::browser::login::session::TrustedWorkspacePath::from_trusted_app(
-                PathBuf::from(&workspace_dir),
-            )
-            .map_err(|error| error.to_string())?;
-            let handoff_deadline = Instant::now() + NATIVE_BROWSER_HANDOFF_GRACE_PERIOD;
-            let prepared = loop {
-                if !handle.alive.load(Ordering::SeqCst)
-                    || handle.permission_quarantined.load(Ordering::SeqCst)
-                    || !self.is_current_handle(runtime_id, &handle)?
-                {
-                    return Err(
-                        "Mode 2 browser handoff wait was cancelled with the native session."
-                            .to_string(),
-                    );
-                }
-                let prepared = {
-                    // Permission updates may cancel this wait between attempts. Never hold this
-                    // lock, the native record lock, or the Login Browser registry while sleeping.
-                    let _sync = handle.browser_permission_sync.lock().map_err(|_| {
-                        "Failed to lock native browser permission authority".to_string()
-                    })?;
-                    if handle.permission_quarantined.load(Ordering::SeqCst) {
-                        return Err(
-                            "Native runtime helper is quarantined after an incomplete permission update."
-                                .to_string(),
-                        );
-                    }
-                    let authority = handle.browser_permission.current_ticket().map_err(|_| {
-                        "Native browser permission authority is unavailable".to_string()
-                    })?;
-                    {
-                        let record = handle
-                            .record
-                            .lock()
-                            .map_err(|_| "Failed to lock native session record".to_string())?;
-                        let recorded_mode = effective_native_perm_mode(
-                            record.perm_mode.as_str(),
-                            record.runtime_perm_mode.as_deref(),
-                        );
-                        if recorded_mode != authority.mode() {
-                            return Err(
-                                "Native browser permission authority is out of sync.".to_string()
-                            );
-                        }
-                    }
-                    login.prepare_agent_tool_if_handed_off(
-                        &workspace_dir,
-                        &browser_actor_id,
-                        authority,
-                        &request,
-                    )?
-                };
-                if let Some(prepared) = prepared {
-                    break prepared;
-                }
-                if !login
-                    .agent_handoff_expected_for_actor(&workspace, &browser_actor_id)
-                    .map_err(|error| error.to_string())?
-                {
-                    return Err(
-                        "Mode 2 browser is not handed off to this exact session actor.".to_string(),
-                    );
-                }
-                let now = Instant::now();
-                if now >= handoff_deadline {
-                    return Err(
-                        "Mode 2 browser handoff did not become ready for this exact session actor."
-                            .to_string(),
-                    );
-                }
-                thread::sleep(NATIVE_BROWSER_HANDOFF_POLL_INTERVAL.min(handoff_deadline - now));
-            };
-            login.execute_prepared_agent_tool(&request, prepared)
-        })();
-
-        match response {
-            Ok(result) => self.write_to_child(
-                &handle,
-                &HelperInputCommand::BrowserToolResponse {
-                    request_id: &request.request_id,
-                    ok: true,
-                    result: Some(&result),
-                    error: None,
-                },
-            ),
-            Err(error) => self.write_to_child(
-                &handle,
-                &HelperInputCommand::BrowserToolResponse {
-                    request_id: &request.request_id,
-                    ok: false,
-                    result: None,
-                    error: Some(&error),
-                },
-            ),
-        }
-    }
-
     fn mark_process_exit(
         &self,
         runtime_id: &str,
@@ -11549,6 +11419,7 @@ mod tests {
             ),
             browser_permission_sync: Mutex::new(()),
             handoff_cancelled_command: Mutex::new(None),
+            browser_requests: Arc::default(),
             record: Mutex::new(record),
             settings_update_acks: super::SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
@@ -11581,7 +11452,7 @@ mod tests {
         )
     }
 
-    fn manager_with_handle(runtime_id: &str) -> NativeRuntimeManager {
+    pub(super) fn manager_with_handle(runtime_id: &str) -> NativeRuntimeManager {
         let storage_namespace = test_manager_namespace(runtime_id);
         let record = NativeSessionRecord {
             runtime_id: runtime_id.to_string(),

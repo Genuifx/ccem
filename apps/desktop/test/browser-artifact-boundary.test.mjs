@@ -11,15 +11,15 @@ test('Mode 2 agent browser artifacts are app-owned and routed through the exact 
   const [agentServiceSource, artifactSource, nativeRuntimeSource] = await Promise.all([
     fs.readFile(path.join(rustDir, 'browser', 'login', 'agent_service.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'login', 'agent_service', 'artifacts.rs'), 'utf8'),
-    fs.readFile(path.join(rustDir, 'native_runtime.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'native_runtime', 'browser_activation.rs'), 'utf8'),
   ]);
 
   assert.match(nativeRuntimeSource, /record\.project_dir\.clone\(\)/);
   assert.match(
     nativeRuntimeSource,
-    /prepare_agent_tool_if_handed_off\([\s\S]*&workspace_dir,[\s\S]*&browser_actor_id,[\s\S]*authority,[\s\S]*&request/,
+    /prepare_agent_tool_if_handed_off\([\s\S]*&workspace_dir,[\s\S]*&browser_actor_id,[\s\S]*authority,[\s\S]*request/,
   );
-  assert.match(nativeRuntimeSource, /login\.execute_prepared_agent_tool\(&request, prepared\)/);
+  assert.match(nativeRuntimeSource, /login\.execute_prepared_agent_tool\(request, prepared\)/);
   assert.doesNotMatch(nativeRuntimeSource, /browser\.run_tool_with_permission/);
 
   assert.match(agentServiceSource, /serialize_agent_result\(result, &lease\.artifact_root\)/);

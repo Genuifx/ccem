@@ -57,6 +57,7 @@ import {
 } from '@/pages/workspaceEscape';
 import type { RouterLaunchDraft } from '@ccem/core/browser';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
+import { useNativeBrowserActivation } from '@/components/workspace/useNativeBrowserActivation';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
 import type { EffortLevel } from '@/components/workspace/ComposerControls';
 import type { PermissionModeName } from '@ccem/core/browser';
@@ -164,6 +165,7 @@ import type { BrowserPanelTarget } from '@/components/workspace/browserPanelTarg
 import {
   createBrowserPanelSessionKeyRegistry,
   isBrowserPanelTargetVisible,
+  openDefaultBrowserPanelTarget,
   matchesBrowserPanelHistorySession,
   rebindBrowserPanelTarget,
   retireBrowserPanelTargetForWorkingDirChange,
@@ -553,7 +555,14 @@ export function Workspace({
     Record<string, BrowserPanelTarget | undefined>
   >({});
   const browserTargetBySessionIdRef = useRef(browserTargetBySessionId);
-  browserTargetBySessionIdRef.current = browserTargetBySessionId;
+  const updateBrowserPanelTargets = useCallback((
+    update: (targets: typeof browserTargetBySessionId) => typeof browserTargetBySessionId,
+  ) => {
+    const next = update(browserTargetBySessionIdRef.current);
+    browserTargetBySessionIdRef.current = next;
+    setBrowserTargetBySessionId(next);
+    return next;
+  }, []);
   const browserPanelInstanceSeqRef = useRef(0);
   const browserPanelSessionKeyRegistryRef = useRef(createBrowserPanelSessionKeyRegistry());
   const browserPresentationRevisionAllocatorRef = useRef(
@@ -1552,22 +1561,63 @@ export function Workspace({
     occluded: activeVisibleBrowserTarget ? browserSurfaceOccluded : false,
   });
 
+  const browserActivation = useNativeBrowserActivation({
+    isActive,
+    selectedOwner: activeBrowserSessionId,
+    ownerFor: (session) => browserPanelSessionKeyRegistryRef.current.resolveLive({
+      provider: session.provider,
+      providerSessionId: session.provider_session_id,
+      runtimeId: session.runtime_id,
+    }),
+    reveal: (session, ownerSessionId) => {
+      upsertLiveSessionEntry(session);
+      const previousTarget = browserTargetBySessionIdRef.current[ownerSessionId];
+      const targets = updateBrowserPanelTargets((previous) => openDefaultBrowserPanelTarget(
+        previous, ownerSessionId, session.project_dir,
+        () => browserPanelInstanceSeqRef.current += 1,
+      ));
+      if (activeBrowserAgentSessionId !== session.runtime_id) {
+        setActiveLiveRuntimeId(session.runtime_id);
+        setComposeDir(session.project_dir);
+        setSelectedWorkingDir(session.project_dir);
+        setWorkspaceMode('live');
+      }
+      onNavigate('workspace');
+      const revealedTarget = targets[ownerSessionId];
+      if (!revealedTarget || revealedTarget === previousTarget) return;
+      return () => {
+        updateBrowserPanelTargets((current) => {
+          const target = current[ownerSessionId];
+          // A late native cancellation cannot remove a manually reopened instance.
+          if (target?.instanceId !== revealedTarget.instanceId) return current;
+          const next = { ...current };
+          if (previousTarget) next[ownerSessionId] = { ...target, visible: false };
+          else delete next[ownerSessionId];
+          return next;
+        });
+      };
+    },
+  });
+
   const closeBrowserPanel = useCallback((sessionId: string) => {
-    setBrowserTargetBySessionId((previous) => {
+    browserActivation.cancel(sessionId, true);
+    updateBrowserPanelTargets((previous) => {
       if (!previous[sessionId]) return previous;
       const next = { ...previous };
       delete next[sessionId];
-      browserTargetBySessionIdRef.current = next;
       return next;
     });
-  }, []);
+  }, [browserActivation, updateBrowserPanelTargets]);
 
   const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
     if (!workingDir?.trim()) {
       toast.error(t('workspace.loginBrowserNeedsWorkspace'));
       return;
     }
-    setBrowserTargetBySessionId((previous) => {
+    const target = browserTargetBySessionIdRef.current[activeBrowserSessionId];
+    if (isBrowserPanelTargetVisible(target)) browserActivation.cancel(activeBrowserSessionId, true);
+    else browserActivation.reopen(activeBrowserSessionId, !target);
+    updateBrowserPanelTargets((previous) => {
       return toggleDefaultBrowserPanelTarget(
         previous,
         activeBrowserSessionId,
@@ -1575,7 +1625,7 @@ export function Workspace({
         () => browserPanelInstanceSeqRef.current += 1,
       );
     });
-  }, [activeBrowserSessionId, t]);
+  }, [activeBrowserSessionId, browserActivation, t, updateBrowserPanelTargets]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
@@ -2104,14 +2154,14 @@ export function Workspace({
 
   useEffect(() => {
     if (workspaceMode !== 'compose') return;
-    setBrowserTargetBySessionId((previous) => (
+    updateBrowserPanelTargets((previous) => (
       retireBrowserPanelTargetForWorkingDirChange(
         previous,
         WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
         skillsContext.workingDir,
       )
     ));
-  }, [skillsContext.workingDir, workspaceMode]);
+  }, [skillsContext.workingDir, updateBrowserPanelTargets, workspaceMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2826,15 +2876,13 @@ export function Workspace({
         providerSessionId: summary.provider_session_id,
         runtimeId: summary.runtime_id,
       });
-      setBrowserTargetBySessionId((previous) => {
-        const next = rebindBrowserPanelTarget(
+      updateBrowserPanelTargets((previous) => (
+        rebindBrowserPanelTarget(
           previous,
           WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
           liveBrowserSessionId,
-        );
-        browserTargetBySessionIdRef.current = next;
-        return next;
-      });
+        )
+      ));
       upsertLiveSessionEntry(summary, {
         initialPrompt: previewPrompt,
         initialImages: images.length > 0 ? images : null,
@@ -2896,6 +2944,7 @@ export function Workspace({
     resetComposePrompt,
     scheduleWorkspaceRefresh,
     setSelectedWorkingDir,
+    updateBrowserPanelTargets,
     upsertLiveSessionEntry,
     t,
   ]);
@@ -3937,6 +3986,7 @@ export function Workspace({
                 {...target}
                 {...panelProps}
                 agentSessionId={panelAgentSessionId}
+                onAgentStatus={(status) => browserActivation.status(sessionId, status)}
               />
             </div>
           );

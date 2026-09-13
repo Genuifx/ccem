@@ -1527,6 +1527,33 @@ fn get_native_session_summary(
 }
 
 #[tauri::command]
+fn get_native_browser_activation(
+    window: tauri::WebviewWindow,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    request_id: String,
+) -> Result<NativeSessionSummary, String> {
+    if window.label() != "main" {
+        return Err("Browser activation is restricted to the trusted main window.".to_string());
+    }
+    native_state.get_browser_activation(&runtime_id, &request_id)
+}
+
+#[tauri::command]
+fn reject_native_browser_activation(
+    window: tauri::WebviewWindow,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    request_id: String,
+    reason: String,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Browser activation is restricted to the trusted main window.".to_string());
+    }
+    native_state.reject_browser_activation(&runtime_id, &request_id, &reason)
+}
+
+#[tauri::command]
 async fn send_native_session_input(
     app: tauri::AppHandle,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
@@ -5976,6 +6003,8 @@ pub fn run_desktop_app() -> i32 {
             session_references::read_workspace_session_reference,
             session_references::send_workspace_session_handoff,
             get_native_session_summary,
+            get_native_browser_activation,
+            reject_native_browser_activation,
             send_native_session_input,
             flush_native_session_input_queue,
             get_native_session_input_queue,

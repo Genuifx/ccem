@@ -8,7 +8,7 @@ const rustDir = path.join(desktopDir, 'src-tauri', 'src');
 
 test('browser tool dispatch uses a current revision-bound native permission authority', async () => {
   const [nativeRuntimeSource, browserSource, policySource] = await Promise.all([
-    fs.readFile(path.join(rustDir, 'native_runtime.rs'), 'utf8'),
+    fs.readFile(path.join(rustDir, 'native_runtime', 'browser_activation.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser.rs'), 'utf8'),
     fs.readFile(path.join(rustDir, 'browser', 'policy.rs'), 'utf8'),
   ]);
@@ -18,18 +18,15 @@ test('browser tool dispatch uses a current revision-bound native permission auth
   )?.[0] ?? '';
   assert.doesNotMatch(requestShape, /perm_mode|permission_mode/);
 
-  const dispatch = nativeRuntimeSource.match(
-    /fn handle_browser_tool_request\([\s\S]*?\n    fn mark_process_exit/,
-  )?.[0] ?? '';
+  const dispatch = nativeRuntimeSource;
   assert.match(dispatch, /browser_permission_sync[\s\S]*current_ticket/);
   assert.match(dispatch, /effective_native_perm_mode[\s\S]*authority\.mode\(\)/);
   assert.ok(dispatch.indexOf('current_ticket') < dispatch.indexOf('prepare_agent_tool_if_handed_off'));
   assert.match(
     dispatch,
-    /prepare_agent_tool_if_handed_off\([\s\S]*?&workspace_dir,[\s\S]*?&browser_actor_id,[\s\S]*?authority,[\s\S]*?&request/,
+    /prepare_agent_tool_if_handed_off\([\s\S]*?&workspace_dir,[\s\S]*?&browser_actor_id,[\s\S]*?authority,[\s\S]*?request/,
   );
-  assert.match(dispatch, /Mode 2 browser is not handed off to this exact session actor/);
-  assert.match(dispatch, /login\.execute_prepared_agent_tool\(&request, prepared\)/);
+  assert.match(dispatch, /login\.execute_prepared_agent_tool\(request, prepared\)/);
   assert.doesNotMatch(dispatch, /browser\.run_tool_with_permission/);
 
   assert.match(policySource, /"readonly" \| "audit" \| "plan" \| "safe" \| "ci"/);
