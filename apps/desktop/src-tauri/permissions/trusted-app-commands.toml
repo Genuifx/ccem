@@ -4,6 +4,7 @@ description = "Allows CCEM application commands only for explicitly trusted appl
 commands.allow = [
   "webcontent_debug_main_process_id",
   "webcontent_frontend_boot",
+  "webcontent_browser_workspace_save",
   "webcontent_frontend_ready",
   "webcontent_frontend_sample",
   "get_companion",

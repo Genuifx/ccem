@@ -7,11 +7,11 @@ import {
   useRef,
   useState,
 } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open as openExternalUrl } from '@tauri-apps/plugin-shell';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
 import { useLocale } from '@/locales';
 import {
   applyBrowserSurfaceMutationResponseForLease,
@@ -39,6 +39,7 @@ import { CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
 import { buildNativeBrowserBounds, normalizeBrowserBoundsZoom } from './browserPanelGeometry';
 import { BrowserPanelNavigation, BrowserPanelTabStrip } from './BrowserPanelChrome';
 import type { BrowserAgentStatus } from './browserActivation';
+import { invokeBrowserCommand } from '@/lib/webcontentRecovery';
 
 interface BrowserPanelSharedProps {
   backend: 'login';
@@ -68,7 +69,7 @@ class BrowserControlSupersededError extends Error {}
 class BrowserNavigationSupersededError extends Error {}
 
 const browserSurfaceClient = createBrowserSurfaceClient({
-  invoke: (command, args) => invoke(command, args),
+  invoke: invokeBrowserCommand,
 });
 
 function readCurrentAppZoom(): number {
@@ -168,6 +169,8 @@ export function BrowserPanel({
   const [isPopupCloseBusy, setIsPopupCloseBusy] = useState(false);
   const [isClosingSurface, setIsClosingSurface] = useState(false);
   const [isSurfaceReady, setIsSurfaceReady] = useState(false);
+  const [acquireViewport, setAcquireViewport] = useState<ReturnType<typeof buildNativeBrowserBounds> | null>(null);
+  const [acquireRevision, setAcquireRevision] = useState(0);
   const controlRef = useRef(control);
   controlRef.current = control;
   const autoHandoffRef = useRef(autoHandoff);
@@ -260,7 +263,8 @@ export function BrowserPanel({
   const readViewport = useCallback(() => {
     const frame = frameRef.current;
     if (!frame) return null;
-    return buildNativeBrowserBounds(frame.getBoundingClientRect(), readCurrentAppZoom());
+    const viewport = buildNativeBrowserBounds(frame.getBoundingClientRect(), readCurrentAppZoom());
+    return viewport.width > 0 && viewport.height > 0 ? viewport : null;
   }, []);
 
   const syncSurface = useCallback((
@@ -344,10 +348,13 @@ export function BrowserPanel({
 
   const syncBounds = useCallback(() => {
     if (!isActiveSurfaceRef.current) return;
+    const initialViewport = readViewport();
+    if (initialViewport) setAcquireViewport((previous) => previous ?? initialViewport);
     if (syncFrameRef.current !== null) cancelAnimationFrame(syncFrameRef.current);
     syncFrameRef.current = requestAnimationFrame(() => {
       syncFrameRef.current = null;
-      if (!readViewport()) return;
+      const viewport = readViewport();
+      if (!viewport) return;
       void syncSurface(true, presentationRevision).catch((boundsError) => {
         console.error('Failed to sync browser bounds:', boundsError);
       });
@@ -378,6 +385,9 @@ export function BrowserPanel({
   };
 
   useEffect(() => {
+    // Recovered hidden panels have no layout yet. Reconnect on their first real
+    // presentation; later hide/show transitions retain the same acquired lease.
+    if (!acquireViewport) return;
     let disposed = false;
     let unlistenState: (() => void) | null = null;
     let unlistenHostShortcut: (() => void) | null = null;
@@ -416,16 +426,6 @@ export function BrowserPanel({
       return;
     }
 
-    const viewport = lifecycleActionsRef.current.readViewport();
-    if (!viewport) {
-      lifecycleActionsRef.current.showLifecycleError(
-        tRef.current('workspace.browserSurfaceUnavailable'),
-      );
-      setLifecycle('failed');
-      setIsBusy(false);
-      return;
-    }
-
     const profileSelection: BrowserSurfaceProfileSelection = profileMode === 'saved'
       ? { profileMode: 'saved', profileId: loginProfileId!.trim() }
       : { profileMode };
@@ -435,7 +435,7 @@ export function BrowserPanel({
       workingDir: workingDir.trim(),
       ...profileSelection,
       initialUrl: initialUrlRef.current,
-      viewport,
+      viewport: acquireViewport,
     };
 
     const applySurfaceState = (state: BrowserSurfaceStateChangedEvent) => {
@@ -566,7 +566,7 @@ export function BrowserPanel({
         });
       }
     };
-  }, [loginProfileId, profileMode, sessionId, showLifecycleError, surfaceOrdering, workingDir]);
+  }, [acquireRevision, acquireViewport, loginProfileId, profileMode, sessionId, showLifecycleError, surfaceOrdering, workingDir]);
 
   useEffect(() => {
     if (!isSurfaceReady) return;
@@ -1071,8 +1071,19 @@ export function BrowserPanel({
       />
 
       {error || popupError ? (
-        <div className="border-b border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          {popupError || error}
+        <div className="flex items-center gap-2 border-b border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <span className="min-w-0 flex-1">{popupError || error}</span>
+          {lifecycle === 'failed' && !isSurfaceReady ? (
+            <Button
+              variant="outline"
+              size="sm"
+              data-ccem-browser-retry="true"
+              disabled={isBusy || !isActiveSurface || surfaceOccluded}
+              onClick={() => setAcquireRevision((revision) => revision + 1)}
+            >
+              {t('common.retry')}
+            </Button>
+          ) : null}
         </div>
       ) : null}
 

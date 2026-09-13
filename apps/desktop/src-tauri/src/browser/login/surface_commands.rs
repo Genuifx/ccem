@@ -43,6 +43,8 @@ type AgentActorValidatorRef<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 mod production_smoke;
 mod protocol;
 #[cfg(any(target_os = "macos", windows))]
+mod frontend_reset;
+#[cfg(any(target_os = "macos", windows))]
 mod recovery_projection;
 mod request;
 #[cfg(any(
@@ -99,6 +101,8 @@ struct LoginBrowserSurfaceState {
     unavailable_reason: Option<String>,
     #[cfg(any(target_os = "macos", windows))]
     recovery: EmbeddedRecoveryRegistry,
+    #[cfg(any(target_os = "macos", windows))]
+    frontend_hides: frontend_reset::PendingFrontendHides,
 }
 
 /// The one native browser panel is shared across concurrently mounted React panels. Per-panel
@@ -341,7 +345,10 @@ impl LoginBrowserSurfaceManager {
         )?
         .to_string();
 
-        if let Some(existing) = self.state()?.instances.get(&panel_session_id).cloned() {
+        // An if-let scrutinee keeps its temporary MutexGuard alive for the body.
+        // Clone in its own scope before reacquire takes the state lock again.
+        let existing = { self.state()?.instances.get(&panel_session_id).cloned() };
+        if let Some(existing) = existing {
             // Native/session preflight does not own the presentation lane. The retained surface
             // carries a thread-safe state handle, so reacquire never waits on a main-thread CEF
             // snapshot while blocking another panel's hide/show.
@@ -855,7 +862,9 @@ impl LoginBrowserSurfaceManager {
         } else {
             None
         };
-        state.instances.remove(panel_session_id);
+        if let Some(instance) = state.instances.remove(panel_session_id) {
+            state.frontend_hides.confirmed_visibility(&instance.surface_id);
+        }
         if state
             .profile_groups
             .get(&profile_id)
@@ -945,6 +954,7 @@ impl LoginBrowserSurfaceManager {
             cef_host.set_surface_viewport(app, active.surface_id.clone(), viewport.validate()?)?;
         }
         if visible == Some(true) {
+            self.hide_pending_frontend_surfaces_locked(app, cef_host, None)?;
             self.hide_active_before_activation(app, cef_host, &active.panel_session_id)?;
             if let Err(error) = cef_host.set_surface_visible(app, active.surface_id.clone(), true) {
                 let _ = cef_host.set_surface_visible(app, active.surface_id.clone(), false);
@@ -954,6 +964,9 @@ impl LoginBrowserSurfaceManager {
         } else if visible == Some(false) {
             cef_host.set_surface_visible(app, active.surface_id.clone(), false)?;
             self.state()?.instances.deactivate(&active.panel_session_id);
+        }
+        if visible.is_some() {
+            self.state()?.frontend_hides.confirmed_visibility(&active.surface_id);
         }
         self.emit_surface_state(app, &current, "sync", None);
         Ok(())
@@ -968,7 +981,7 @@ impl LoginBrowserSurfaceManager {
         generation: u64,
         client_revision: u64,
         disposition: BrowserSurfaceReleaseArg,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         let _destructive = self.release_operation()?;
         match disposition {
             BrowserSurfaceReleaseArg::Hide => {
@@ -985,7 +998,7 @@ impl LoginBrowserSurfaceManager {
                 let Some((active, _current)) =
                     self.apply_instance_revision(&lease_id, generation, client_revision)?
                 else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 // Session close revokes Agent authority before its embedded backend closes CEF.
                 sessions
@@ -1017,9 +1030,31 @@ impl LoginBrowserSurfaceManager {
                 if let Some(closed) = closed {
                     self.emit_surface_state(app, &closed, "closed", None);
                 }
+                Ok(Some(active.panel_session_id))
             }
         }
-        Ok(())
+    }
+
+    /// Removing an exact physical target commits its close before metadata ACK,
+    /// including when the UI still has a lease and may disappear before unmount.
+    pub(crate) fn close_removed_workspace_target(
+        &self,
+        sessions: &LoginBrowserSessionManager,
+        panel_session_id: &str,
+    ) -> Result<bool, String> {
+        let _destructive = self.release_operation()?;
+        let retained = {
+            self.state()?.instances.get(panel_session_id).cloned()
+        };
+        let Some(retained) = retained else {
+            return Ok(false);
+        };
+        match sessions.close(&retained.session) {
+            Ok(()) | Err(SessionManagerError::SessionNotFound) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        self.remove_instance_and_empty_profile_group(&retained.panel_session_id, &retained.profile_id);
+        Ok(true)
     }
 
     fn navigate(
@@ -1339,7 +1374,9 @@ impl LoginBrowserSurfaceManager {
         let Ok(mut state) = self.state() else {
             return;
         };
-        state.instances.remove(panel_session_id);
+        if let Some(instance) = state.instances.remove(panel_session_id) {
+            state.frontend_hides.confirmed_visibility(&instance.surface_id);
+        }
         if state
             .profile_groups
             .get(profile_id)
@@ -1375,6 +1412,8 @@ impl LoginBrowserSurfaceManager {
                 "Preview Browser show is stale for the current presentation owner.".to_string(),
             );
         }
+        #[cfg(any(target_os = "macos", windows))]
+        self.hide_pending_frontend_surfaces_locked(app, cef_host, None)?;
         self.hide_active_login_for_preview(app, sessions, cef_host)?;
         operation()
     }
@@ -1406,6 +1445,8 @@ impl LoginBrowserSurfaceManager {
             return Ok(None);
         }
         if preview_will_be_visible {
+            #[cfg(any(target_os = "macos", windows))]
+            self.hide_pending_frontend_surfaces_locked(app, cef_host, None)?;
             self.hide_active_login_for_preview(app, sessions, cef_host)?;
         }
         operation().map(Some)
@@ -1439,91 +1480,6 @@ impl LoginBrowserSurfaceManager {
             }
         }
         Ok(())
-    }
-
-    /// Frontend boot barrier: a freshly booted document owns no native surface.
-    ///
-    /// This runs on the boot command's thread, so it only touches manager state:
-    /// native visibility is applied on the main thread and must never run inline
-    /// here. Invalidating the previous document's leases makes every late sync or
-    /// release a no-op, and restarting the presentation epoch lets the rebuilt UI
-    /// acquire and sync its panels again. The native hide is deferred to a
-    /// blocking worker; physical CEF runtimes stay retained, so a re-acquired
-    /// panel keeps its page.
-    pub(crate) fn reset_for_frontend_boot(
-        self: &Arc<Self>,
-        app: &AppHandle,
-        cef_host: &Arc<CefHostController>,
-    ) -> Result<(), String> {
-        let superseded: Vec<crate::browser::surface_coordinator::BrowserSurfaceSnapshot> = {
-            let mut state = self.state()?;
-            let panel_session_ids = state.instances.panel_session_ids();
-            let mut superseded = Vec::new();
-            for panel_session_id in panel_session_ids {
-                if let Some(instance) = state.instances.get_mut(&panel_session_id) {
-                    if let Some(snapshot) = instance.coordinator.invalidate_lease() {
-                        superseded.push(snapshot);
-                    }
-                }
-                state.instances.deactivate(&panel_session_id);
-            }
-            state.presentation_epoch.reset();
-            superseded
-        };
-
-        let manager = Arc::clone(self);
-        let app = app.clone();
-        let cef_host = Arc::clone(cef_host);
-        tauri::async_runtime::spawn_blocking(move || {
-            if let Err(error) =
-                manager.hide_surfaces_left_by_previous_document(&app, &cef_host, &superseded)
-            {
-                eprintln!("CCEM frontend boot native surface hide failed: {error}");
-            }
-        });
-        Ok(())
-    }
-
-    /// Hides retained surfaces that the rebuilt document never re-acquired.
-    ///
-    /// Runs on a blocking worker because native visibility is main-thread affine.
-    fn hide_surfaces_left_by_previous_document(
-        &self,
-        app: &AppHandle,
-        cef_host: &Arc<CefHostController>,
-        superseded: &[crate::browser::surface_coordinator::BrowserSurfaceSnapshot],
-    ) -> Result<(), String> {
-        let _operation = self.mutation_operation()?;
-        let mut first_error: Option<String> = None;
-        for snapshot in superseded {
-            let stale: Vec<String> = {
-                let state = self.state()?;
-                state
-                    .instances
-                    .instances
-                    .values()
-                    .filter(|instance| {
-                        // A panel re-acquired by the rebuilt document keeps the
-                        // visibility it already synced; only surfaces that still
-                        // carry the superseded lease need the native hide.
-                        instance.lease_id == snapshot.lease.lease_id
-                            && instance.generation == snapshot.lease.generation
-                    })
-                    .map(|instance| instance.surface_id.clone())
-                    .collect()
-            };
-            for surface_id in stale {
-                if let Err(error) = cef_host.set_surface_visible(app, surface_id, false) {
-                    first_error.get_or_insert(error);
-                }
-            }
-            self.emit_surface_state(app, snapshot, "frontend_boot_reset", None);
-        }
-
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
     }
 
     fn emit_surface_state(
@@ -1616,3 +1572,5 @@ fn current_watcher_lease(
 #[cfg(test)]
 #[path = "surface_commands/tests.rs"]
 mod tests;
+#[cfg(all(test, any(target_os = "macos", windows)))]
+pub(crate) use tests::retained_workspace_manager_fixture;

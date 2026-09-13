@@ -27,7 +27,7 @@ test('workspace browser renders as a retained sidebar sibling of the workspace c
   assert.match(workspaceSource, /const browserPanelOpen = activeVisibleBrowserTarget !== null/);
   assert.match(
     workspaceSource,
-    /<WorkspaceStatusStrip[\s\S]*browserOpen=\{browserPanelOpen\}[\s\S]*onToggleBrowser=\{\(\) => toggleActiveBrowser\(skillsContext\.workingDir\)\}/,
+    /<WorkspaceStatusStrip[\s\S]*browserOpen=\{browserPanelOpen\}[\s\S]*onToggleBrowser=\{browserWorkspaceReady \? \(\) => toggleActiveBrowser\(skillsContext\.workingDir\) : undefined\}/,
   );
   assert.match(
     workspaceSource,

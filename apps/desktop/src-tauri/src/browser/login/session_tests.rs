@@ -270,9 +270,9 @@ impl SessionOwnedBackend for FakeBackend {
     }
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     _temp: tempfile::TempDir,
-    manager: Arc<LoginBrowserSessionManager>,
+    pub(crate) manager: Arc<LoginBrowserSessionManager>,
     state: Arc<Mutex<FakeSupervisorState>>,
     workspace_a: PathBuf,
     workspace_b: PathBuf,
@@ -280,7 +280,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let temp = tempfile::tempdir().expect("session fixture");
         let session_root = temp.path().join("login-browser");
         let workspace_a = temp.path().join("workspace-a");
@@ -301,6 +301,16 @@ impl Fixture {
 
     fn trusted(path: &Path) -> TrustedWorkspacePath {
         TrustedWorkspacePath::from_trusted_app(path.to_path_buf()).expect("trusted workspace")
+    }
+
+    pub(crate) fn open_workspace_removal_pair(&self) -> (OpenedLoginBrowserSession, OpenedLoginBrowserSession) {
+        let first = self.manager.open_default_profile(Self::trusted(&self.workspace_a)).unwrap();
+        let second = self.manager.open_new_profile(Self::trusted(&self.workspace_b)).unwrap();
+        (first, second)
+    }
+
+    pub(crate) fn close_count(&self) -> usize {
+        self.state.lock().unwrap().close_count
     }
 }
 

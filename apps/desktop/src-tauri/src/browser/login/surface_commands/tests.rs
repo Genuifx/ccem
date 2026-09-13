@@ -27,6 +27,47 @@ fn recovery_record(
 
 const CONCURRENCY_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn retained_workspace_manager_fixture(
+    first: &super::super::session::OpenedLoginBrowserSession,
+    second: &super::super::session::OpenedLoginBrowserSession,
+) -> Arc<LoginBrowserSurfaceManager> {
+    use super::super::cef::surface::CefSurfaceLifecycle;
+    let manager = Arc::new(LoginBrowserSurfaceManager::default());
+    for (panel_id, opened) in [("runtime:session-a:2", first), ("runtime:session-b:3", second)] {
+        let mut coordinator = BrowserSurfaceCoordinator::new();
+        let lease = coordinator.acquire(BrowserSurfaceBackend::Login, 1).unwrap().current.lease;
+        coordinator.mark_ready(&lease.lease_id, lease.generation).unwrap();
+        let native_state = CefSurfaceStateHandle::from_test_snapshot(CefSurfaceSnapshot {
+            revision: 1,
+            surface_id: panel_id.into(),
+            profile_id: opened.snapshot.profile_id.clone(),
+            lifecycle: CefSurfaceLifecycle::Ready,
+            devtools_attached: true,
+            current_url: "https://example.com/retained".into(),
+            can_go_back: false,
+            can_go_forward: false,
+            title: Some("Retained workspace fixture".into()),
+            visible: true,
+            error: None,
+            recovery_state: None,
+            popup: None,
+            user_popups_allowed: true,
+        });
+        manager.state().unwrap().instances.insert(panel_id.into(), ActiveLoginSurface {
+            coordinator,
+            lease_id: lease.lease_id,
+            generation: lease.generation,
+            panel_session_id: panel_id.into(),
+            surface_id: panel_id.into(),
+            profile_id: opened.snapshot.profile_id.clone(),
+            session: opened.handle.clone(),
+            native_state,
+        });
+    }
+    manager
+}
+
 #[test]
 fn frontend_boot_epoch_reset_readmits_the_rebuilt_document_revision_sequence() {
     let manager = LoginBrowserSurfaceManager::default();
@@ -49,49 +90,6 @@ fn frontend_boot_epoch_reset_readmits_the_rebuilt_document_revision_sequence() {
     assert_eq!(
         state.presentation_epoch.owner,
         Some(PresentationOwner::Login("panel-a".to_string()))
-    );
-}
-
-#[test]
-fn frontend_boot_barrier_stays_state_only_and_defers_the_native_hide() {
-    let recovery = include_str!("../../../webcontent_recovery.rs");
-    assert!(
-        recovery.contains("reset_embedded_surfaces_for_frontend_boot"),
-        "the main frontend boot must reset embedded native surfaces"
-    );
-
-    let surfaces = include_str!("../surface_commands.rs");
-    let reset_at = surfaces
-        .find("fn reset_for_frontend_boot")
-        .expect("the boot barrier exists");
-    let deferred_at = surfaces
-        .find("fn hide_surfaces_left_by_previous_document")
-        .expect("the native hide is deferred");
-    assert!(
-        reset_at < deferred_at,
-        "the state reset precedes the deferred native hide"
-    );
-
-    let reset_body = &surfaces[reset_at..deferred_at];
-    assert!(
-        reset_body.contains("invalidate_lease()"),
-        "the boot barrier invalidates the previous document's leases"
-    );
-    assert!(
-        reset_body.contains("presentation_epoch.reset()"),
-        "the boot barrier restarts the presentation epoch"
-    );
-    assert!(
-        reset_body.contains("spawn_blocking"),
-        "the native hide is deferred to a blocking worker"
-    );
-    assert!(
-        !reset_body.contains("cef_host."),
-        "the boot command runs on the main thread: main-thread-affine native visibility must stay off this path"
-    );
-    assert!(
-        surfaces[deferred_at..].contains("set_surface_visible"),
-        "the deferred hide applies the native visibility"
     );
 }
 

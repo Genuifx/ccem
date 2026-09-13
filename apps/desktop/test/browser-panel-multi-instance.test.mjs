@@ -365,7 +365,7 @@ test('Workspace retains inactive Mode 2 panels and wires the status button to th
   assert.match(workspaceSource, /delete next\[sessionId\]/);
   assert.match(
     workspaceSource,
-    /onToggleBrowser=\{\(\) => toggleActiveBrowser\(skillsContext\.workingDir\)\}/,
+    /onToggleBrowser=\{browserWorkspaceReady \? \(\) => toggleActiveBrowser\(skillsContext\.workingDir\) : undefined\}/,
   );
   assert.match(
     workspaceSource,

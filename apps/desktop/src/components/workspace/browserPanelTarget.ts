@@ -37,6 +37,11 @@ export interface BrowserPanelLiveSessionIdentity {
   runtimeId: string;
 }
 
+export interface BrowserPanelSessionKeys {
+  runtime: Array<[string, string]>;
+  provider: Array<[string, string]>;
+}
+
 /**
  * Prefer the provider's durable session id so a history entry and its restored
  * live runtime address the same BrowserPanel. A runtime-only session still gets
@@ -59,9 +64,9 @@ export function resolveLiveBrowserPanelSessionKey({
  * after the runtime starts. History resolves through that same entry while the
  * runtime is alive, rather than remounting and closing its native surface.
  */
-export function createBrowserPanelSessionKeyRegistry() {
-  const keyByRuntimeId = new Map<string, string>();
-  const keyByProviderSessionId = new Map<string, string>();
+export function createBrowserPanelSessionKeyRegistry(restored?: BrowserPanelSessionKeys) {
+  const keyByRuntimeId = new Map<string, string>(restored?.runtime);
+  const keyByProviderSessionId = new Map<string, string>(restored?.provider);
 
   const providerSessionKey = (
     provider: string,
@@ -82,6 +87,12 @@ export function createBrowserPanelSessionKeyRegistry() {
   };
 
   return {
+    snapshot(): BrowserPanelSessionKeys {
+      return {
+        runtime: [...keyByRuntimeId],
+        provider: [...keyByProviderSessionId],
+      };
+    },
     resolveLive,
     resolveHistory({
       provider,

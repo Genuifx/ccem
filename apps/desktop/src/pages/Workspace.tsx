@@ -11,6 +11,7 @@ import {
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { isRecoveringWebcontent, registerWebcontentSessionSample } from '@/lib/webcontentRecovery';
+import { useBrowserWorkspaceRecovery } from '@/components/workspace/useBrowserWorkspaceRecovery';
 import { readRecoveryDraft, recoveryDraftKey } from '@/lib/recoveryDrafts';
 import {
   Check,
@@ -161,9 +162,7 @@ import {
   calculateBrowserPanelWidthPercent,
   clampBrowserPanelWidthPercent,
 } from '@/components/workspace/browserPanelLayout';
-import type { BrowserPanelTarget } from '@/components/workspace/browserPanelTarget';
 import {
-  createBrowserPanelSessionKeyRegistry,
   isBrowserPanelTargetVisible,
   openDefaultBrowserPanelTarget,
   matchesBrowserPanelHistorySession,
@@ -551,20 +550,15 @@ export function Workspace({
   const codexModelMigrationDecisionRef = useRef<((shouldContinue: boolean) => void) | null>(null);
   const acknowledgedCodexModelWarningsRef = useRef(new Set<string>());
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
-  const [browserTargetBySessionId, setBrowserTargetBySessionId] = useState<
-    Record<string, BrowserPanelTarget | undefined>
-  >({});
-  const browserTargetBySessionIdRef = useRef(browserTargetBySessionId);
-  const updateBrowserPanelTargets = useCallback((
-    update: (targets: typeof browserTargetBySessionId) => typeof browserTargetBySessionId,
-  ) => {
-    const next = update(browserTargetBySessionIdRef.current);
-    browserTargetBySessionIdRef.current = next;
-    setBrowserTargetBySessionId(next);
-    return next;
-  }, []);
-  const browserPanelInstanceSeqRef = useRef(0);
-  const browserPanelSessionKeyRegistryRef = useRef(createBrowserPanelSessionKeyRegistry());
+  const {
+    ready: browserWorkspaceReady,
+    targets: browserTargetBySessionId,
+    targetsRef: browserTargetBySessionIdRef,
+    updateTargets: updateBrowserPanelTargets,
+    instanceSequenceRef: browserPanelInstanceSeqRef,
+    sessionKeyRegistryRef: browserPanelSessionKeyRegistryRef,
+  } = useBrowserWorkspaceRecovery();
+  const browserComposeRecoveryCheckedRef = useRef(false);
   const browserPresentationRevisionAllocatorRef = useRef(
     createBrowserPresentationRevisionAllocator(),
   );
@@ -784,10 +778,12 @@ export function Workspace({
   }, []);
 
   useEffect(() => {
+    if (!browserComposeRecoveryCheckedRef.current
+      && browserTargetBySessionIdRef.current[WORKSPACE_BROWSER_COMPOSE_SESSION_ID]) return;
     if (selectedWorkingDir && selectedWorkingDir !== composeDir) {
       setComposeDir(selectedWorkingDir);
     }
-  }, [composeDir, selectedWorkingDir]);
+  }, [browserWorkspaceReady, composeDir, selectedWorkingDir]);
 
   useEffect(() => {
     if (!composeSeed || composeSeed.id === lastComposeSeedIdRef.current) {
@@ -1521,7 +1517,7 @@ export function Workspace({
       });
     }
     return WORKSPACE_BROWSER_COMPOSE_SESSION_ID;
-  }, [activeLiveEntry, liveSessionsByRuntimeId, selectedSession, workspaceMode]);
+  }, [activeLiveEntry, browserWorkspaceReady, liveSessionsByRuntimeId, selectedSession, workspaceMode]);
   const activeBrowserAgentSessionId = useMemo(() => {
     if (workspaceMode === 'live') {
       return resolveActiveBrowserAgentSessionId(activeLiveEntry?.session);
@@ -1562,7 +1558,7 @@ export function Workspace({
   });
 
   const browserActivation = useNativeBrowserActivation({
-    isActive,
+    isActive: isActive && browserWorkspaceReady,
     selectedOwner: activeBrowserSessionId,
     ownerFor: (session) => browserPanelSessionKeyRegistryRef.current.resolveLive({
       provider: session.provider,
@@ -1610,6 +1606,7 @@ export function Workspace({
   }, [browserActivation, updateBrowserPanelTargets]);
 
   const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
+    if (!browserWorkspaceReady) return;
     if (!workingDir?.trim()) {
       toast.error(t('workspace.loginBrowserNeedsWorkspace'));
       return;
@@ -1625,7 +1622,7 @@ export function Workspace({
         () => browserPanelInstanceSeqRef.current += 1,
       );
     });
-  }, [activeBrowserSessionId, browserActivation, t, updateBrowserPanelTargets]);
+  }, [activeBrowserSessionId, browserActivation, browserWorkspaceReady, t, updateBrowserPanelTargets]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
@@ -2153,6 +2150,17 @@ export function Workspace({
   ]);
 
   useEffect(() => {
+    if (!browserWorkspaceReady) return;
+    if (!browserComposeRecoveryCheckedRef.current) {
+      const restoredDraft = browserTargetBySessionIdRef.current[WORKSPACE_BROWSER_COMPOSE_SESSION_ID];
+      if (restoredDraft && (composeDir !== restoredDraft.workingDir
+        || selectedWorkingDir !== restoredDraft.workingDir)) {
+        setComposeDir(restoredDraft.workingDir);
+        setSelectedWorkingDir(restoredDraft.workingDir);
+        return;
+      }
+      browserComposeRecoveryCheckedRef.current = true;
+    }
     if (workspaceMode !== 'compose') return;
     updateBrowserPanelTargets((previous) => (
       retireBrowserPanelTargetForWorkingDirChange(
@@ -2161,7 +2169,7 @@ export function Workspace({
         skillsContext.workingDir,
       )
     ));
-  }, [skillsContext.workingDir, updateBrowserPanelTargets, workspaceMode]);
+  }, [browserWorkspaceReady, composeDir, selectedWorkingDir, setSelectedWorkingDir, skillsContext.workingDir, updateBrowserPanelTargets, workspaceMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3824,7 +3832,7 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={browserPanelOpen}
-            onToggleBrowser={() => toggleActiveBrowser(skillsContext.workingDir)}
+            onToggleBrowser={browserWorkspaceReady ? () => toggleActiveBrowser(skillsContext.workingDir) : undefined}
             envContext={statusStripEnvContext}
             activeRuntimeId={
               workspaceMode === 'live' && activeLiveEntry?.session.provider === 'claude'

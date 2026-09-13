@@ -5923,6 +5923,7 @@ pub fn run_desktop_app() -> i32 {
             #[cfg(all(target_os = "macos", debug_assertions))]
             webcontent_recovery::webcontent_debug_main_process_id,
             webcontent_recovery::webcontent_frontend_boot,
+            webcontent_recovery::webcontent_browser_workspace_save,
             webcontent_recovery::webcontent_frontend_ready,
             webcontent_recovery::webcontent_frontend_sample,
             companion::get_companion,
