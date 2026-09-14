@@ -1,5 +1,11 @@
 # ccem
 
+## 2.86.0
+
+### Minor Changes
+
+- Desktop: unblock native terminal handoff and merge the terminal handoff repair.
+
 ## 2.85.0
 
 ### Minor Changes
