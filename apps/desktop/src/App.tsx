@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { DeleteEnvConfirmDialog } from '@/components/DeleteEnvConfirmDialog';
@@ -122,7 +122,6 @@ function AppContent() {
   const hasAnimatedAppPageRef = useRef(false);
   const lastFocusSyncAtRef = useRef(0);
   const launchInFlightRef = useRef<Set<string>>(new Set());
-  const [, startTransition] = useTransition();
 
   const { setEnvironments, setCurrentEnv, setPermissionMode, setDefaultMode, setUsageStats, setContinuousUsageDays, setCompanion, environments, launchClient, error, setError } = useAppStore(
     (state) => ({
@@ -328,12 +327,16 @@ function AppContent() {
     preloadSettingsPage,
   ]);
 
+  // Tab switches must stay urgent. Wrapping setActiveTab in startTransition
+  // let the 140ms active-session poll (urgent setEvents batches) interrupt the
+  // transition render faster than it could finish, so long transcripts starved
+  // the switch and every entry point (sidebar / menu / ⌘N / tray) went dead.
+  // Pages are lazy() + prefetched above, so the Suspense skeleton already
+  // covers the (pre-warmed) load.
   const navigateToTab = useCallback((tab: string) => {
     prefetchTab(tab);
-    startTransition(() => {
-      setActiveTab(tab);
-    });
-  }, [prefetchTab, startTransition]);
+    setActiveTab(tab);
+  }, [prefetchTab]);
 
   const handleStartupSplashExitComplete = useCallback(() => {
     setStartupSplashVisible(false);
