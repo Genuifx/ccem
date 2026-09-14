@@ -2362,88 +2362,94 @@ test('app teardown reports the post-Result SDK settling window instead of preten
   })}\n`);
 });
 
-test('terminal handoff preparation freezes the idle Query before final revalidation', async (t) => {
-  const helperPath = await buildHelperWithMockClaudeSdk({
-    keepAliveAfterResult: true,
-    peerStartsAfterIdleMs: 120,
-    logClose: true,
+for (const [variant, lifecycleOptions] of [
+  ['legacy idle', {}],
+  ['authoritative terminal without session idle', { advertiseLifecycle: true, yieldIdleAfterResult: false }],
+]) {
+  test(`terminal handoff preparation freezes the idle Query before final revalidation (${variant})`, async (t) => {
+    const helperPath = await buildHelperWithMockClaudeSdk({
+      keepAliveAfterResult: true,
+      peerStartsAfterIdleMs: 120,
+      logClose: true,
+      ...lifecycleOptions,
+    });
+    const helper = spawn(process.execPath, [helperPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    t.after(() => helper.kill('SIGTERM'));
+
+    const outputs = [];
+    const stderrRef = { value: '' };
+    let stdoutBuffer = '';
+    helper.stdout.setEncoding('utf8');
+    helper.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk;
+      let newlineIndex = stdoutBuffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        if (line) outputs.push(JSON.parse(line));
+        newlineIndex = stdoutBuffer.indexOf('\n');
+      }
+    });
+    helper.stderr.setEncoding('utf8');
+    helper.stderr.on('data', (chunk) => { stderrRef.value += chunk; });
+
+    helper.stdin.write(`${JSON.stringify({
+      type: 'init',
+      provider: 'claude',
+      env_name: 'default',
+      perm_mode: 'dev',
+      working_dir: os.tmpdir(),
+      initial_prompt: 'finish before handoff',
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'status'
+        && output.status === 'ready'
+        && output.detail === 'Ready for the next prompt.',
+      stderrRef,
+      'idle foreground before handoff prepare',
+    );
+
+    const prepare = {
+      type: 'prepare_stop',
+      request_id: 'handoff-recheck',
+      require_idle: true,
+    };
+    helper.stdin.write(`${JSON.stringify(prepare)}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'teardown_prepared'
+        && output.request_id === 'handoff-recheck'
+        && output.ready === true,
+      stderrRef,
+      'initial idle handoff preparation',
+    );
+    await waitForStderr(
+      stderrRef,
+      /__MOCK_CLAUDE_CLOSE__/,
+      'idle Query frozen during handoff preparation',
+    );
+    const turnStartedCountAfterFreeze = outputs.filter((output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_started').length;
+
+    await delay(180);
+    helper.stdin.write(`${JSON.stringify({ ...prepare, finalize: true })}\n`);
+    await waitForOutput(
+      outputs,
+      () => outputs.filter((output) => output.type === 'teardown_prepared'
+        && output.request_id === 'handoff-recheck'
+        && output.ready === true).length === 2,
+      stderrRef,
+      'final handoff idle recheck after the old Query was frozen',
+    );
+    assert.equal(outputs.filter((output) => output.type === 'event'
+      && output.payload?.type === 'lifecycle'
+      && output.payload.stage === 'turn_started').length, turnStartedCountAfterFreeze);
   });
-  const helper = spawn(process.execPath, [helperPath], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  t.after(() => helper.kill('SIGTERM'));
-
-  const outputs = [];
-  const stderrRef = { value: '' };
-  let stdoutBuffer = '';
-  helper.stdout.setEncoding('utf8');
-  helper.stdout.on('data', (chunk) => {
-    stdoutBuffer += chunk;
-    let newlineIndex = stdoutBuffer.indexOf('\n');
-    while (newlineIndex >= 0) {
-      const line = stdoutBuffer.slice(0, newlineIndex).trim();
-      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-      if (line) outputs.push(JSON.parse(line));
-      newlineIndex = stdoutBuffer.indexOf('\n');
-    }
-  });
-  helper.stderr.setEncoding('utf8');
-  helper.stderr.on('data', (chunk) => { stderrRef.value += chunk; });
-
-  helper.stdin.write(`${JSON.stringify({
-    type: 'init',
-    provider: 'claude',
-    env_name: 'default',
-    perm_mode: 'dev',
-    working_dir: os.tmpdir(),
-    initial_prompt: 'finish before handoff',
-  })}\n`);
-  await waitForOutput(
-    outputs,
-    (output) => output.type === 'status'
-      && output.status === 'ready'
-      && output.detail === 'Ready for the next prompt.',
-    stderrRef,
-    'idle foreground before handoff prepare',
-  );
-
-  const prepare = {
-    type: 'prepare_stop',
-    request_id: 'handoff-recheck',
-    require_idle: true,
-  };
-  helper.stdin.write(`${JSON.stringify(prepare)}\n`);
-  await waitForOutput(
-    outputs,
-    (output) => output.type === 'teardown_prepared'
-      && output.request_id === 'handoff-recheck'
-      && output.ready === true,
-    stderrRef,
-    'initial idle handoff preparation',
-  );
-  await waitForStderr(
-    stderrRef,
-    /__MOCK_CLAUDE_CLOSE__/,
-    'idle Query frozen during handoff preparation',
-  );
-  const turnStartedCountAfterFreeze = outputs.filter((output) => output.type === 'event'
-    && output.payload?.type === 'lifecycle'
-    && output.payload.stage === 'turn_started').length;
-
-  await delay(180);
-  helper.stdin.write(`${JSON.stringify(prepare)}\n`);
-  await waitForOutput(
-    outputs,
-    () => outputs.filter((output) => output.type === 'teardown_prepared'
-      && output.request_id === 'handoff-recheck'
-      && output.ready === true).length === 2,
-    stderrRef,
-    'final handoff idle recheck after the old Query was frozen',
-  );
-  assert.equal(outputs.filter((output) => output.type === 'event'
-    && output.payload?.type === 'lifecycle'
-    && output.payload.stage === 'turn_started').length, turnStartedCountAfterFreeze);
-});
+}
 
 test('forced terminal handoff defers background interruption until final preparation', async (t) => {
   const helperPath = await buildHelperWithBackgroundRaceMock();
@@ -2525,97 +2531,123 @@ test('forced terminal handoff defers background interruption until final prepara
   );
 });
 
-test('teardown preparation gates an active foreground turn without interrupting it before commit', async (t) => {
-  const helperPath = await buildHelperWithMockClaudeSdk({
-    delayMsBeforeResult: 350,
-    keepAliveAfterResult: true,
-    logInterrupt: true,
-  });
-  const helper = spawn(process.execPath, [helperPath], { stdio: ['pipe', 'pipe', 'pipe'] });
-  t.after(() => helper.kill('SIGTERM'));
+for (const afterAuthoritativeTurn of [false, true]) {
+  test(`teardown preparation gates an active foreground turn without interrupting it before commit (after authoritative turn: ${afterAuthoritativeTurn})`, async (t) => {
+    const helperPath = await buildHelperWithMockClaudeSdk({
+      delayMsBeforeResult: 350,
+      keepAliveAfterResult: true,
+      logInterrupt: true,
+      advertiseLifecycle: afterAuthoritativeTurn,
+      yieldIdleAfterResult: !afterAuthoritativeTurn,
+    });
+    const helper = spawn(process.execPath, [helperPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+    t.after(() => helper.kill('SIGTERM'));
 
-  const outputs = [];
-  const stderrRef = { value: '' };
-  let stdoutBuffer = '';
-  helper.stdout.setEncoding('utf8');
-  helper.stdout.on('data', (chunk) => {
-    stdoutBuffer += chunk;
-    let newlineIndex = stdoutBuffer.indexOf('\n');
-    while (newlineIndex >= 0) {
-      const line = stdoutBuffer.slice(0, newlineIndex).trim();
-      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-      if (line) outputs.push(JSON.parse(line));
-      newlineIndex = stdoutBuffer.indexOf('\n');
+    const outputs = [];
+    const stderrRef = { value: '' };
+    let stdoutBuffer = '';
+    helper.stdout.setEncoding('utf8');
+    helper.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk;
+      let newlineIndex = stdoutBuffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        if (line) outputs.push(JSON.parse(line));
+        newlineIndex = stdoutBuffer.indexOf('\n');
+      }
+    });
+    helper.stderr.setEncoding('utf8');
+    helper.stderr.on('data', (chunk) => { stderrRef.value += chunk; });
+
+    helper.stdin.write(`${JSON.stringify({
+      type: 'init',
+      provider: 'claude',
+      env_name: 'default',
+      perm_mode: 'dev',
+      working_dir: os.tmpdir(),
+      initial_prompt: 'active foreground turn',
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'event'
+        && output.payload?.type === 'assistant_chunk'
+        && output.payload.text === 'mock response 1',
+      stderrRef,
+      'active foreground output',
+    );
+
+    if (afterAuthoritativeTurn) {
+      await waitForOutput(
+        outputs,
+        (output) => output.type === 'event'
+          && output.payload?.type === 'lifecycle'
+          && output.payload.stage === 'turn_completed',
+        stderrRef,
+        'authoritative first turn completion without SDK idle',
+      );
+      helper.stdin.write(`${JSON.stringify({ type: 'prompt', text: 'second active foreground turn' })}\n`);
+      await waitForOutput(
+        outputs,
+        (output) => output.type === 'event'
+          && output.payload?.type === 'assistant_chunk'
+          && output.payload.text === 'mock response 2',
+        stderrRef,
+        'second foreground output after authoritative completion',
+      );
     }
-  });
-  helper.stderr.setEncoding('utf8');
-  helper.stderr.on('data', (chunk) => { stderrRef.value += chunk; });
 
-  helper.stdin.write(`${JSON.stringify({
-    type: 'init',
-    provider: 'claude',
-    env_name: 'default',
-    perm_mode: 'dev',
-    working_dir: os.tmpdir(),
-    initial_prompt: 'active foreground turn',
-  })}\n`);
-  await waitForOutput(
-    outputs,
-    (output) => output.type === 'event'
-      && output.payload?.type === 'assistant_chunk'
-      && output.payload.text === 'mock response 1',
-    stderrRef,
-    'active foreground output',
-  );
-
-  helper.stdin.write(`${JSON.stringify({
-    type: 'prepare_stop',
-    request_id: 'prepare-handoff-active',
-    require_idle: true,
-  })}\n`);
-  await waitForOutput(
-    outputs,
-    (output) => output.type === 'teardown_prepared'
-      && output.request_id === 'prepare-handoff-active'
-      && output.ready === false,
-    stderrRef,
-    'terminal handoff rejects active foreground turn',
-  );
-  assert.doesNotMatch(stderrRef.value, /__MOCK_CLAUDE_INTERRUPT__/);
-  assert.equal(outputs.some((output) => output.type === 'event'
-    && output.payload?.type === 'lifecycle'
-    && output.payload.stage === 'turn_interrupted'), false);
-
-  helper.stdin.write(`${JSON.stringify({
-    type: 'cancel_prepare_stop',
-    request_id: 'prepare-handoff-active',
-  })}\n`);
-  helper.stdin.write(`${JSON.stringify({
-    type: 'prepare_stop',
-    request_id: 'prepare-active',
-  })}\n`);
-  await waitForOutput(
-    outputs,
-    (output) => output.type === 'teardown_prepared'
-      && output.request_id === 'prepare-active'
-      && output.ready === true,
-    stderrRef,
-    'app termination may gate an active foreground turn without interrupting it',
-  );
-  helper.stdin.write(`${JSON.stringify({
-    type: 'cancel_prepare_stop',
-    request_id: 'prepare-active',
-  })}\n`);
-  await waitForOutput(
-    outputs,
-    (output) => output.type === 'event'
+    const outputsBeforePreparation = outputs.length;
+    helper.stdin.write(`${JSON.stringify({
+      type: 'prepare_stop',
+      request_id: 'prepare-handoff-active',
+      require_idle: true,
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'teardown_prepared'
+        && output.request_id === 'prepare-handoff-active'
+        && output.ready === false,
+      stderrRef,
+      'terminal handoff rejects active foreground turn',
+    );
+    assert.doesNotMatch(stderrRef.value, /__MOCK_CLAUDE_INTERRUPT__/);
+    assert.equal(outputs.some((output) => output.type === 'event'
       && output.payload?.type === 'lifecycle'
-      && output.payload.stage === 'turn_completed',
-    stderrRef,
-    'foreground turn completes after cancelled preparation',
-  );
-  assert.doesNotMatch(stderrRef.value, /__MOCK_CLAUDE_INTERRUPT__/);
-});
+      && output.payload.stage === 'turn_interrupted'), false);
+
+    helper.stdin.write(`${JSON.stringify({
+      type: 'cancel_prepare_stop',
+      request_id: 'prepare-handoff-active',
+    })}\n`);
+    helper.stdin.write(`${JSON.stringify({
+      type: 'prepare_stop',
+      request_id: 'prepare-active',
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'teardown_prepared'
+        && output.request_id === 'prepare-active'
+        && output.ready === true,
+      stderrRef,
+      'app termination may gate an active foreground turn without interrupting it',
+    );
+    helper.stdin.write(`${JSON.stringify({
+      type: 'cancel_prepare_stop',
+      request_id: 'prepare-active',
+    })}\n`);
+    await waitForOutput(
+      outputs,
+      (output) => output.type === 'event'
+        && output.payload?.type === 'lifecycle'
+        && output.payload.stage === 'turn_completed'
+        && outputs.indexOf(output) >= outputsBeforePreparation,
+      stderrRef,
+      'foreground turn completes after cancelled preparation',
+    );
+    assert.doesNotMatch(stderrRef.value, /__MOCK_CLAUDE_INTERRUPT__/);
+  });
+}
 
 test('idle teardown closes the captured Claude query and exits instead of accepting a reconnect', async (t) => {
   const helperPath = await buildHelperWithMockClaudeSdk({

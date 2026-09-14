@@ -4597,9 +4597,8 @@ async function prepareNativeRuntimeStop(
     }
 
     if (requireIdle && (
-      claudeTurnAwaitingResult
+      !isClaudeForegroundAndSdkIdle()
       || claudeInterruptRequested
-      || claudeLastSessionState !== 'idle'
     )) {
       emitTeardownPrepared(
         normalizedRequestId,

@@ -1952,11 +1952,38 @@ fn stop_native_background_task(
 }
 
 #[tauri::command]
-fn handoff_native_session_to_terminal(
+async fn handoff_native_session_to_terminal(
     app: tauri::AppHandle,
     state: State<'_, Arc<SessionManager>>,
     interactive_state: State<'_, Arc<InteractiveRuntimeManager>>,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    terminal_type: Option<TerminalType>,
+    allow_background_task_termination: Option<bool>,
+) -> Result<NativeHandoffResult, String> {
+    let state = state.inner().clone();
+    let interactive_state = interactive_state.inner().clone();
+    let native_state = native_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handoff_native_session_to_terminal_blocking(
+            app,
+            state,
+            interactive_state,
+            native_state,
+            runtime_id,
+            terminal_type,
+            allow_background_task_termination,
+        )
+    })
+    .await
+    .map_err(|error| format!("Native terminal handoff task failed: {error}"))?
+}
+
+fn handoff_native_session_to_terminal_blocking(
+    app: tauri::AppHandle,
+    state: Arc<SessionManager>,
+    interactive_state: Arc<InteractiveRuntimeManager>,
+    native_state: Arc<NativeRuntimeManager>,
     runtime_id: String,
     terminal_type: Option<TerminalType>,
     allow_background_task_termination: Option<bool>,
@@ -1968,7 +1995,7 @@ fn handoff_native_session_to_terminal(
         allow_background_task_termination,
         |handoff| {
             let attach_terminal = attach_terminal_for_native_terminal(handoff.terminal);
-            let session_manager = state.inner().clone();
+            let session_manager = state.clone();
             let session = interactive_state.create_session(
                 app.clone(),
                 session_manager,
@@ -1987,7 +2014,7 @@ fn handoff_native_session_to_terminal(
             )?;
 
             if let Err(error) =
-                open_tmux_backed_session_in_terminal(state.inner(), &session.id, attach_terminal)
+                open_tmux_backed_session_in_terminal(&state, &session.id, attach_terminal)
             {
                 let _ = interactive_state.stop_session(&session.id);
                 state.remove_session(&session.id);
