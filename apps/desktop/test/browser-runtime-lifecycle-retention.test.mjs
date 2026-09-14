@@ -20,9 +20,10 @@ test('repo source reader normalizes CRLF and lone CR boundaries', () => {
 });
 
 test('handoff preserves browser instances while quarantine and stop retire only exact Agent control', async () => {
-  const [lib, nativeRuntime] = await Promise.all([
+  const [lib, nativeRuntime, terminalHandoff] = await Promise.all([
     readRepoText('src-tauri', 'src', 'lib.rs'),
     readRepoText('src-tauri', 'src', 'native_runtime.rs'),
+    readRepoText('src-tauri', 'src', 'native_runtime', 'terminal_handoff.rs'),
   ]);
 
   const managedHandoffStart = lib.indexOf('fn handoff_native_session_to_terminal(');
@@ -51,7 +52,8 @@ test('handoff preserves browser instances while quarantine and stop retire only 
   const sessionMetaStart = nativeRuntime.indexOf('fn process_helper_stdout_line(');
   const sessionMetaEnd = nativeRuntime.indexOf('\n    fn mark_process_exit', sessionMetaStart);
   const sessionMeta = nativeRuntime.slice(sessionMetaStart, sessionMetaEnd);
-  assert.match(sessionMeta, /complete_terminal_handoff/);
-  assert.match(sessionMeta, /retire_login_browser_agent_control/);
+  assert.match(terminalHandoff, /complete_terminal_handoff/);
+  assert.match(terminalHandoff, /retire_login_browser_agent_control/);
+  assert.doesNotMatch(terminalHandoff, /destroy_browser_session|retire_browser_agent_control/);
   assert.doesNotMatch(sessionMeta, /destroy_browser_session|retire_browser_agent_control/);
 });

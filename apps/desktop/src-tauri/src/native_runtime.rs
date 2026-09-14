@@ -69,6 +69,8 @@ use tauri_plugin_shell::{
 };
 
 mod browser_activation;
+mod terminal_handoff;
+use terminal_handoff::TerminalHandoffPreparation;
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const NATIVE_PERMISSION_QUARANTINE_KILL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2147,7 +2149,7 @@ pub struct NativeRuntimeManager {
     settings_update_lock: Mutex<()>,
     app_termination_lock: Mutex<()>,
     app_termination_in_progress: AtomicBool,
-    terminal_handoff_preparations: Mutex<HashMap<String, String>>,
+    terminal_handoff_preparations: Mutex<HashMap<String, TerminalHandoffPreparation>>,
     /// Foreground lifecycle coordinator: the single owner of active command,
     /// settings ACK state, adapter kind and the incarnation/query/epoch fences.
     lifecycle: crate::native_session_coordinator::NativeSessionCoordinator,
@@ -4987,6 +4989,8 @@ impl NativeRuntimeManager {
                 "Native runtime router coordinator is poisoned.",
             )
         })?;
+        self.reject_reconnect_during_handoff(&request.runtime_id)
+            .map_err(|error| RouterServiceError::new("ROUTER_SESSION_TRANSITION", error))?;
         let mut records = self.records.lock().map_err(|_| {
             RouterServiceError::new(
                 "ROUTER_STATE_UNAVAILABLE",
@@ -5282,6 +5286,8 @@ impl NativeRuntimeManager {
                 "Native runtime router coordinator is poisoned.",
             )
         })?;
+        self.reject_reconnect_during_handoff(runtime_id)
+            .map_err(|error| RouterServiceError::new("ROUTER_SESSION_TRANSITION", error))?;
         let previous_record = self
             .records
             .lock()
@@ -6727,6 +6733,10 @@ impl NativeRuntimeManager {
         if self.app_termination_in_progress.load(Ordering::SeqCst) {
             return Err("CCEM is already closing native runtimes.".to_string());
         }
+        let _settings_guard = self
+            .settings_update_lock
+            .lock()
+            .map_err(|_| "Failed to lock native settings updates".to_string())?;
         let _reconnect_guard = self
             .reconnect_lock
             .lock()
@@ -6782,39 +6792,26 @@ impl NativeRuntimeManager {
             ),
         )?;
 
-        let preparation_id = format!(
-            "pending-terminal-handoff-{}-{}",
-            runtime_id,
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        self.terminal_handoff_preparations
-            .lock()
-            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
-            .insert(runtime_id.to_string(), preparation_id.clone());
+        let preparation_id = self.reserve_terminal_handoff(runtime_id)?;
 
         if record.provider_session_id.is_some() {
-            let prepare_result = match self.request_child_prepare_stop(
+            drop(_reconnect_guard);
+            self.prepare_terminal_handoff_child(
                 runtime_id,
                 &preparation_id,
-                true,
                 allow_background_task_termination,
                 true,
-            ) {
-                Ok(Some(handle)) => self.await_child_prepare_stop(
-                    runtime_id,
-                    &preparation_id,
-                    &handle,
-                    allow_background_task_termination,
-                ),
-                Ok(None) => Ok(()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = prepare_result {
-                self.cancel_terminal_handoff_preparation(runtime_id, Some(&preparation_id));
-                return Err(error);
-            }
-            let result =
-                self.complete_terminal_handoff(record, terminal, allow_background_task_termination);
+            )?;
+            let result = self.complete_terminal_handoff(
+                record,
+                terminal,
+                allow_background_task_termination,
+                &preparation_id,
+            );
+            let _reconnect_guard = self
+                .reconnect_lock
+                .lock()
+                .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
             if let Err(error) = result {
                 self.fail_pending_terminal_handoff(runtime_id, &preparation_id, &error)?;
                 return Err(error);
@@ -6863,10 +6860,11 @@ impl NativeRuntimeManager {
         terminal_type: Option<TerminalType>,
         allow_background_task_termination: bool,
     ) -> Result<NativeTerminalHandoff, String> {
-        let _transition_guard = self
-            .app_termination_lock
+        // The managed caller owns app_termination_lock for the whole transition.
+        let coordinator = self
+            .reconnect_lock
             .lock()
-            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
         if self.app_termination_in_progress.load(Ordering::SeqCst) {
             return Err("CCEM is already closing native runtimes.".to_string());
         }
@@ -6890,37 +6888,14 @@ impl NativeRuntimeManager {
             .ok_or_else(|| "Session id is not ready for terminal handoff yet".to_string())?;
         let mut env_vars = self.terminal_env_vars_for_record(&record)?;
         inject_ccem_runtime_env(&mut env_vars, &record.runtime_id);
-        let preparation_id = format!(
-            "terminal-handoff-{}-{}",
-            runtime_id,
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        if let Some(handle) = self.request_child_prepare_stop(
+        let preparation_id = self.reserve_terminal_handoff(runtime_id)?;
+        drop(coordinator);
+        self.prepare_terminal_handoff_child(
             runtime_id,
             &preparation_id,
-            true,
             allow_background_task_termination,
             false,
-        )? {
-            if let Err(error) = self.await_child_prepare_stop(
-                runtime_id,
-                &preparation_id,
-                &handle,
-                allow_background_task_termination,
-            ) {
-                self.cancel_child_prepare_stop(runtime_id, &preparation_id);
-                return Err(error);
-            }
-        } else if record.is_active && !native_status_allows_file_rewind(&record.status) {
-            return Err(
-                "Finish the current foreground turn before continuing this session in Terminal."
-                    .to_string(),
-            );
-        }
-        self.terminal_handoff_preparations
-            .lock()
-            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
-            .insert(runtime_id.to_string(), preparation_id.clone());
+        )?;
 
         Ok(NativeTerminalHandoff {
             runtime_id: record.runtime_id.clone(),
@@ -6948,14 +6923,27 @@ impl NativeRuntimeManager {
         launch: impl FnOnce(&NativeTerminalHandoff) -> Result<T, String>,
         cleanup: impl FnOnce(&T),
     ) -> Result<(NativeTerminalHandoff, T), String> {
-        let _reconnect_guard = self
-            .reconnect_lock
+        let _transition_guard = self
+            .app_termination_lock
             .lock()
-            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        let _settings_guard = self
+            .settings_update_lock
+            .lock()
+            .map_err(|_| "Failed to lock native settings updates".to_string())?;
         let handoff = self.prepare_terminal_handoff(
             runtime_id,
             terminal_type,
             allow_background_task_termination,
+        )?;
+        let coordinator = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        self.validate_terminal_handoff(
+            runtime_id,
+            handoff.preparation_id.as_deref().unwrap(),
+            false,
         )?;
         let frozen_handle = self.freeze_current_handle_for_handoff(runtime_id)?;
         let launched = match launch(&handoff) {
@@ -6965,12 +6953,10 @@ impl NativeRuntimeManager {
                     runtime_id,
                     handoff.preparation_id.as_deref(),
                 );
-                if let Some(handle) = frozen_handle.as_ref() {
-                    handle.alive.store(true, Ordering::SeqCst);
-                }
                 return Err(launch_error);
             }
         };
+        drop(coordinator);
 
         if let Err(error) = self.complete_managed_terminal_handoff(
             runtime_id,
@@ -6979,6 +6965,11 @@ impl NativeRuntimeManager {
             handoff.preparation_id.as_deref(),
         ) {
             cleanup(&launched);
+            let _coordinator = self
+                .reconnect_lock
+                .lock()
+                .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+            self.cancel_terminal_handoff_preparation(runtime_id, handoff.preparation_id.as_deref());
             if let Some(handle) = frozen_handle.as_ref() {
                 if self.is_current_handle(runtime_id, handle).unwrap_or(false) {
                     handle.alive.store(true, Ordering::SeqCst);
@@ -6994,13 +6985,35 @@ impl NativeRuntimeManager {
         runtime_id: &str,
         preparation_id: Option<&str>,
     ) {
-        let removed = self
-            .terminal_handoff_preparations
-            .lock()
-            .ok()
-            .and_then(|mut preparations| preparations.remove(runtime_id));
-        if let Some(request_id) = preparation_id.or(removed.as_deref()) {
-            self.cancel_child_prepare_stop(runtime_id, request_id);
+        let removed =
+            self.terminal_handoff_preparations
+                .lock()
+                .ok()
+                .and_then(|mut preparations| {
+                    let matches = preparations.get(runtime_id).is_some_and(|entry| {
+                        preparation_id.is_none_or(|id| entry.request_id == id)
+                    });
+                    if matches {
+                        preparations.remove(runtime_id)
+                    } else {
+                        None
+                    }
+                });
+        if let Some(preparation) = removed {
+            if let Some(handle) = preparation.helper.as_ref() {
+                if self.is_current_handle(runtime_id, handle).unwrap_or(false) {
+                    if let Ok(mut acknowledgements) = handle.teardown_preparations.lock() {
+                        acknowledgements.remove(&preparation.request_id);
+                    }
+                    let _ = self.write_to_child(
+                        handle,
+                        &HelperInputCommand::CancelPrepareStop {
+                            request_id: &preparation.request_id,
+                        },
+                    );
+                    handle.alive.store(true, Ordering::SeqCst);
+                }
+            }
         }
     }
 
@@ -7010,6 +7023,13 @@ impl NativeRuntimeManager {
         preparation_id: &str,
         error: &str,
     ) -> Result<(), String> {
+        if self
+            .validate_terminal_handoff(runtime_id, preparation_id, true)
+            .is_err()
+        {
+            self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
+            return Ok(());
+        }
         self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
         self.update_record(runtime_id, |record| {
             if record.status == "handoff_pending" || record.status == "handoff_finalizing" {
@@ -7036,44 +7056,20 @@ impl NativeRuntimeManager {
         allow_background_task_termination: bool,
         preparation_id: Option<&str>,
     ) -> Result<(), String> {
-        let record = self.current_record(runtime_id)?;
-        let expected_preparation = self
-            .terminal_handoff_preparations
-            .lock()
-            .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
-            .get(runtime_id)
-            .cloned();
-        if expected_preparation.as_deref() != preparation_id {
-            return Err("Terminal handoff preparation is no longer current.".to_string());
-        }
         let preparation_id =
             preparation_id.ok_or_else(|| "Terminal handoff preparation is missing.".to_string())?;
-        if let Some(handle) = self.request_child_prepare_stop(
+        self.prepare_terminal_handoff_child(
             runtime_id,
             preparation_id,
-            true,
             allow_background_task_termination,
             true,
-        )? {
-            if let Err(error) = self.await_child_prepare_stop(
-                runtime_id,
-                preparation_id,
-                &handle,
-                allow_background_task_termination,
-            ) {
-                self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
-                return Err(error);
-            }
-        } else {
-            let latest_record = self.current_record(runtime_id)?;
-            if latest_record.is_active && !native_status_allows_file_rewind(&latest_record.status) {
-                self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
-                return Err(
-                    "Finish the current foreground turn before continuing this session in Terminal."
-                        .to_string(),
-                );
-            }
-        }
+        )?;
+        let coordinator = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        self.validate_terminal_handoff(runtime_id, preparation_id, false)?;
+        let record = self.current_record(runtime_id)?;
         if let Err(error) = self.reject_background_task_termination(
             runtime_id,
             "handoff this session",
@@ -7086,7 +7082,18 @@ impl NativeRuntimeManager {
             entry.status = "handoff_closing".to_string();
             entry.updated_at = Utc::now();
         })?;
-        if let Err(error) = self.shutdown_child(runtime_id, allow_background_task_termination) {
+        drop(coordinator);
+        let shutdown = self.shutdown_terminal_handoff_child(
+            runtime_id,
+            preparation_id,
+            allow_background_task_termination,
+        );
+        let _coordinator = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        self.validate_terminal_handoff(runtime_id, preparation_id, true)?;
+        if let Err(error) = shutdown {
             self.cancel_terminal_handoff_preparation(runtime_id, Some(preparation_id));
             self.update_record(runtime_id, |entry| {
                 entry.status = record.status.clone();
@@ -7104,7 +7111,7 @@ impl NativeRuntimeManager {
             entry.pending_handoff_terminal = None;
             entry.pending_handoff_allow_background_task_termination = false;
         })?;
-        self.append_event(
+        self.append_terminal_handoff_event(
             runtime_id,
             SessionEventPayload::Lifecycle {
                 stage: "handoff".to_string(),
@@ -7209,8 +7216,14 @@ impl NativeRuntimeManager {
         record: NativeSessionRecord,
         terminal: TerminalType,
         allow_background_task_termination: bool,
+        preparation_id: &str,
     ) -> Result<(), String> {
         let runtime_id = record.runtime_id.clone();
+        let coordinator = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        self.validate_terminal_handoff(&runtime_id, preparation_id, false)?;
         let provider_session_id = record
             .provider_session_id
             .clone()
@@ -7229,7 +7242,18 @@ impl NativeRuntimeManager {
             entry.status = "handoff_closing".to_string();
             entry.updated_at = Utc::now();
         })?;
-        if let Err(error) = self.shutdown_child(&runtime_id, allow_background_task_termination) {
+        drop(coordinator);
+        let shutdown = self.shutdown_terminal_handoff_child(
+            &runtime_id,
+            preparation_id,
+            allow_background_task_termination,
+        );
+        let _coordinator = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        self.validate_terminal_handoff(&runtime_id, preparation_id, true)?;
+        if let Err(error) = shutdown {
             self.update_record(&runtime_id, |entry| {
                 entry.status = record.status.clone();
                 entry.is_active = record.is_active;
@@ -7305,7 +7329,7 @@ impl NativeRuntimeManager {
         }) {
             errors.push(error);
         }
-        if let Err(error) = self.append_event(
+        if let Err(error) = self.append_terminal_handoff_event(
             runtime_id,
             SessionEventPayload::Lifecycle {
                 stage: "handoff".to_string(),
@@ -7426,6 +7450,7 @@ impl NativeRuntimeManager {
             .reconnect_lock
             .lock()
             .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        self.reject_reconnect_during_handoff(runtime_id)?;
         if let Some(handle) = self
             .handles
             .lock()
@@ -7504,6 +7529,7 @@ impl NativeRuntimeManager {
         force_direct: bool,
         rollback_record: Option<&NativeSessionRecord>,
     ) -> Result<(Arc<NativeSessionHandle>, NativeSessionOptions), String> {
+        self.reject_reconnect_during_handoff(runtime_id)?;
         let mut record = self
             .records
             .lock()
@@ -7516,7 +7542,9 @@ impl NativeRuntimeManager {
                 "Native runtime {runtime_id} is quarantined after an incomplete permission update."
             ));
         }
-        if matches!(record.status.as_str(), "stopped" | "handoff") {
+        if matches!(record.status.as_str(), "stopped" | "handoff")
+            || record.status.starts_with("handoff_")
+        {
             return Err(format!(
                 "Native runtime {runtime_id} cannot reconnect from terminal status {}.",
                 record.status
@@ -7954,7 +7982,13 @@ impl NativeRuntimeManager {
             self.lifecycle
                 .note_incarnation(runtime_id, helper_incarnation);
         }
-        self.process_helper_stdout_with_app(None, runtime_id, line, helper_incarnation)
+        self.process_helper_stdout_with_app(None, runtime_id, line, helper_incarnation)?;
+        // Synchronous test entry point has no output pump to keep unblocked.
+        // Production claims under the coordinator and finalizes on a worker.
+        if let Some(preparation) = self.claim_pending_terminal_handoff(runtime_id)? {
+            let _ = self.finish_pending_terminal_handoff(None, runtime_id, preparation);
+        }
+        Ok(())
     }
 
     /// Feeds coordinator-relevant helper events into the lifecycle
@@ -8296,7 +8330,24 @@ impl NativeRuntimeManager {
                 .map_err(|_| "Failed to lock native initialization fences".to_string())?
                 .remove(runtime_id);
         }
+        let pending_handoff = if result.is_ok() {
+            self.claim_pending_terminal_handoff(runtime_id)?
+        } else {
+            None
+        };
         drop(_reconnect_guard);
+        if let Some(preparation) = pending_handoff {
+            let manager = Arc::clone(self);
+            let app = app.cloned();
+            let runtime_id = runtime_id.to_owned();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) =
+                    manager.finish_pending_terminal_handoff(app.as_ref(), &runtime_id, preparation)
+                {
+                    eprintln!("Pending terminal handoff for {runtime_id} failed: {error}");
+                }
+            });
+        }
         if let Some(app) = app.filter(|_| {
             request_queue_autodrain
                 || (!defer_queue_autodrain
@@ -8398,7 +8449,17 @@ impl NativeRuntimeManager {
                     );
                 }
 
-                if let Some(terminal) = pending_handoff_terminal {
+                // SessionMeta may be repeated. Only the initial pending state
+                // sends prepare; later metadata must not erase an admitted ACK.
+                if pending_handoff_terminal.is_some()
+                    && self.current_record(runtime_id)?.status == "handoff_pending"
+                {
+                    let helper = self
+                        .handles
+                        .lock()
+                        .map_err(|_| "Failed to lock native runtime handles".to_string())?
+                        .get(runtime_id)
+                        .cloned();
                     let preparation_id = {
                         let mut preparations =
                             self.terminal_handoff_preparations.lock().map_err(|_| {
@@ -8406,15 +8467,18 @@ impl NativeRuntimeManager {
                             })?;
                         preparations
                             .entry(runtime_id.to_string())
-                            .or_insert_with(|| {
-                                format!(
-                                    "pending-terminal-handoff-{}-{}",
-                                    runtime_id,
+                            .or_insert_with(|| TerminalHandoffPreparation {
+                                request_id: format!(
+                                    "pending-terminal-handoff-{runtime_id}-{}",
                                     Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                                )
+                                ),
+                                helper,
+                                finalization_claimed: false,
                             })
+                            .request_id
                             .clone()
                     };
+                    self.validate_terminal_handoff(runtime_id, &preparation_id, false)?;
                     match self.request_child_prepare_stop(
                         runtime_id,
                         &preparation_id,
@@ -8422,44 +8486,10 @@ impl NativeRuntimeManager {
                         pending_handoff_allow_background_task_termination,
                         true,
                     ) {
-                        Ok(Some(_)) => {
-                            self.update_record(runtime_id, |record| {
-                                record.status = "handoff_finalizing".to_string();
-                                record.updated_at = Utc::now();
-                            })?;
-                        }
-                        Ok(None) => {
-                            let record = self.current_record(runtime_id)?;
-                            let browser_identity =
-                                (record.project_dir.clone(), record.browser_actor_id.clone());
-                            let result = self.complete_terminal_handoff(
-                                record,
-                                terminal,
-                                pending_handoff_allow_background_task_termination,
-                            );
-                            self.terminal_handoff_preparations
-                                .lock()
-                                .map_err(|_| {
-                                    "Failed to lock native terminal handoff state".to_string()
-                                })?
-                                .remove(runtime_id);
-                            match result {
-                                Ok(()) => {
-                                    if let Some(app) = app {
-                                        retire_login_browser_agent_control(
-                                            app,
-                                            &browser_identity.0,
-                                            &browser_identity.1,
-                                        )?;
-                                    }
-                                }
-                                Err(error) => self.fail_pending_terminal_handoff(
-                                    runtime_id,
-                                    &preparation_id,
-                                    &error,
-                                )?,
-                            }
-                        }
+                        Ok(_) => self.update_record(runtime_id, |record| {
+                            record.status = "handoff_finalizing".to_string();
+                            record.updated_at = Utc::now();
+                        })?,
                         Err(error) => {
                             self.fail_pending_terminal_handoff(runtime_id, &preparation_id, &error)?
                         }
@@ -8685,68 +8715,8 @@ impl NativeRuntimeManager {
                 ready,
                 detail,
             } => {
-                let pending_handoff = {
-                    let expected = self
-                        .terminal_handoff_preparations
-                        .lock()
-                        .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
-                        .get(runtime_id)
-                        .cloned();
-                    if expected.as_deref() != Some(request_id.as_str()) {
-                        None
-                    } else {
-                        let record = self.current_record(runtime_id)?;
-                        if record.status == "handoff_finalizing" {
-                            record.pending_handoff_terminal.map(|terminal| {
-                                (
-                                    terminal,
-                                    record.pending_handoff_allow_background_task_termination,
-                                )
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                };
-                if let Some((terminal, allow_background_task_termination)) = pending_handoff {
-                    if !ready {
-                        let error = detail
-                            .unwrap_or_else(|| "Native helper is not safe to close.".to_string());
-                        return self.fail_pending_terminal_handoff(runtime_id, &request_id, &error);
-                    }
-                    let record = self.current_record(runtime_id)?;
-                    let browser_identity =
-                        (record.project_dir.clone(), record.browser_actor_id.clone());
-                    let result = self.complete_terminal_handoff(
-                        record,
-                        terminal,
-                        allow_background_task_termination,
-                    );
-                    self.terminal_handoff_preparations
-                        .lock()
-                        .map_err(|_| "Failed to lock native terminal handoff state".to_string())?
-                        .remove(runtime_id);
-                    match result {
-                        Ok(()) => {
-                            if let Some(app) = app {
-                                retire_login_browser_agent_control(
-                                    app,
-                                    &browser_identity.0,
-                                    &browser_identity.1,
-                                )?;
-                            }
-                            return Ok(());
-                        }
-                        Err(error) => {
-                            return self.fail_pending_terminal_handoff(
-                                runtime_id,
-                                &request_id,
-                                &error,
-                            );
-                        }
-                    }
-                }
-
+                // Store the receipt and let the handoff worker consume it.
+                // Closing here would wait for this same output pump to process exit.
                 let handles = self
                     .handles
                     .lock()
@@ -10447,6 +10417,9 @@ impl NativeRuntimeManager {
                 Err(errors.join("; "))
             };
         }
+        if let Err(error) = self.invalidate_handoff_for_retired_helper(runtime_id, handle) {
+            errors.push(error);
+        }
         if let Err(error) = self.expire_interactive_attention(runtime_id) {
             errors.push(error);
         }
@@ -11246,6 +11219,10 @@ fn dedupe_nonempty(values: &mut Vec<String>) {
     values.retain(|value| !value.trim().is_empty() && seen.insert(value.clone()));
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "native_runtime_handoff_tests.rs"]
+mod handoff_tests;
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -11389,7 +11366,7 @@ mod tests {
         assert_eq!(descendants, vec![101, 102, 103]);
     }
 
-    fn native_session_handle_with_generation(
+    pub(super) fn native_session_handle_with_generation(
         record: NativeSessionRecord,
         generation: u64,
     ) -> Arc<NativeSessionHandle> {
@@ -16910,7 +16887,11 @@ mod tests {
             .expect("handoff preparations")
             .insert(
                 runtime_id.to_string(),
-                "pending-handoff-request".to_string(),
+                super::TerminalHandoffPreparation {
+                    request_id: "pending-handoff-request".to_string(),
+                    helper: manager.handles.lock().unwrap().get(runtime_id).cloned(),
+                    finalization_claimed: false,
+                },
             );
 
         manager
@@ -18033,7 +18014,7 @@ wait"#,
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn managed_handoff_serializes_replacement_until_old_generation_is_retired() {
+    fn managed_handoff_serializes_launch_and_rejects_reconnect_during_retirement() {
         let runtime_id = "native-handoff-serialized-replacement";
         let manager = Arc::new(manager_with_handle(runtime_id));
         let old_handle = manager
@@ -18075,20 +18056,14 @@ wait"#,
                 .lock()
                 .expect("replacement coordinator");
             replacement_acquired.send(()).expect("replacement acquired");
-            let mut record = replacement_manager
-                .records
-                .lock()
-                .expect("records")
-                .get(&replacement_runtime_id)
-                .expect("record")
-                .clone();
-            record.status = "processing".to_string();
-            record.is_active = true;
-            let replacement = native_session_handle_with_generation(record, 2);
-            replacement_manager
-                .insert_handle(replacement_runtime_id, Arc::clone(&replacement))
-                .expect("insert replacement after handoff");
-            replacement
+            match replacement_manager.prepare_reconnect_handle_locked(
+                &replacement_runtime_id,
+                false,
+                None,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("handoff must reject reconnect before replacing its helper"),
+            }
         });
 
         manager
@@ -18114,15 +18089,17 @@ wait"#,
             )
             .expect("managed handoff");
 
-        let replacement = replacement_thread.join().expect("replacement thread");
-        assert!(manager
-            .is_current_handle(runtime_id, &replacement)
-            .expect("replacement current check"));
-        assert!(replacement.alive.load(Ordering::SeqCst));
-        assert!(!NativeRuntimeManager::same_handle(
-            &replacement,
-            &old_handle
-        ));
+        let error = replacement_thread.join().expect("replacement thread");
+        assert!(
+            error.contains("preparing to continue in Terminal")
+                || error.contains("cannot reconnect from terminal status handoff"),
+            "{error}"
+        );
+        assert!(!manager.handles.lock().unwrap().contains_key(runtime_id));
+        assert_eq!(
+            manager.current_record(runtime_id).unwrap().status,
+            "handoff"
+        );
     }
 
     #[cfg(target_os = "macos")]
