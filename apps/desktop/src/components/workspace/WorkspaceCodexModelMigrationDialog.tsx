@@ -36,7 +36,7 @@ export function WorkspaceCodexModelMigrationDialog({
     >
       <DialogContent
         showCloseButton={false}
-        className="frosted-panel glass-noise sm:max-w-lg"
+        className="sm:max-w-lg"
         data-codex-model-migration-dialog
       >
         {warning ? (

@@ -4770,7 +4770,7 @@ export function WorkspaceNativeSessionView({
     >
       <DialogContent
         data-ccem-background-task-risk-dialog
-        className="frosted-panel glass-noise max-w-[440px] border-none p-5"
+        className="max-w-[440px] p-5"
       >
         <DialogHeader>
           <DialogTitle>{t('workspace.backgroundTasksRestartWarningTitle')}</DialogTitle>
@@ -4832,7 +4832,7 @@ export function WorkspaceNativeSessionView({
         }
       }}
     >
-      <DialogContent className="frosted-panel glass-noise max-w-[420px] border-none p-5">
+      <DialogContent className="max-w-[420px] p-5">
         <DialogHeader>
           <DialogTitle>{t('workspace.nativeRestoreConfirmTitle')}</DialogTitle>
           <DialogDescription>

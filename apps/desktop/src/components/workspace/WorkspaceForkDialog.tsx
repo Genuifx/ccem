@@ -78,7 +78,7 @@ export function WorkspaceForkDialog({
       if (submitting) return;
       onOpenChange(next);
     }}>
-      <DialogContent className="frosted-panel glass-noise sm:max-w-md">
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <GitFork className="h-4 w-4 text-primary" />

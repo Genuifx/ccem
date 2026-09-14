@@ -116,7 +116,7 @@ export function InstallDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent ref={installDialogMotionRef} className="frosted-panel glass-noise sm:max-w-md">
+      <DialogContent ref={installDialogMotionRef} className="sm:max-w-md">
         <DialogHeader data-skill-install-motion>
           <DialogTitle>{t('skills.installDialogTitle')}</DialogTitle>
           <DialogDescription>{displayName}</DialogDescription>

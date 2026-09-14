@@ -102,7 +102,7 @@ export function NativeBackgroundTaskAppGuardProvider({ children }: { children: R
       >
         <DialogContent
           data-ccem-background-task-app-guard
-          className="frosted-panel glass-noise max-w-[440px] border-none p-5"
+          className="max-w-[440px] p-5"
         >
           <DialogHeader>
             <DialogTitle>

@@ -395,7 +395,7 @@ export function WorkspaceBackgroundTasksPopover({
       >
         <DialogContent
           data-ccem-background-task-stop-dialog
-          className="frosted-panel glass-noise max-w-[420px] rounded-2xl border-none p-5"
+          className="max-w-[420px] p-5"
         >
           <DialogHeader>
             <DialogTitle>{t('workspace.backgroundTaskStopConfirmTitle')}</DialogTitle>
