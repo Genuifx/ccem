@@ -500,6 +500,7 @@
     "nativeEmptyHint": "Send a prompt and the native runtime will stream here.",
     "nativeTranscriptBackfillLoading": "Recovering earlier transcript; current messages remain available...",
     "nativeTranscriptBackfillError": "Earlier transcript could not be loaded. Current messages remain available.",
+    "nativeTranscriptSyncError": "New messages could not be synced. Retrying automatically.",
     "nativeTranscriptBackfillPartial": "Some earlier transcript entries are unavailable. Readable messages remain visible.",
     "nativeSendFailed": "Failed to send message",
     "composerDeliveryUncertain": "Delivery has not been confirmed. Check the conversation before deciding whether to resend.",

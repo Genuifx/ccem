@@ -160,6 +160,7 @@ import {
   resolveTranscriptBackfillPresentation,
   resolveCommittedReplayCursor,
   replayBatchCoversSequenceAfter,
+  runTranscriptBackfillWithRetry,
   runTranscriptPagedBackfill,
   transcriptBackfillCommitMatches,
   NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT,
@@ -167,6 +168,7 @@ import {
   type TranscriptBackfillCommitIdentity,
   type TranscriptPartialObservation,
 } from './workspaceTranscriptBackfill';
+import { recordPerfMark } from '@/lib/perf-log';
 import {
   WorkspaceTranscriptBackfillStatus,
   type WorkspaceTranscriptBackfillState,
@@ -325,6 +327,7 @@ interface WorkspaceNativeSessionViewProps {
 const ACTIVE_POLL_INTERVAL_MS = 140;
 const IDLE_POLL_INTERVAL_MS = 700;
 const TERMINAL_POLL_INTERVAL_MS = 1100;
+const FAILED_POLL_INTERVAL_MS = 5000;
 const SUMMARY_REFRESH_COOLDOWN_MS = 2000;
 // Streaming flushes of the sessionStorage mirror are trailing-edge and at
 // most one per interval; idle/terminal/switch/unmount flush immediately. The
@@ -1546,13 +1549,23 @@ export function WorkspaceNativeSessionView({
     runtimeId: string;
     state: WorkspaceTranscriptBackfillState;
   }>(() => ({ runtimeId: session.runtime_id, state: 'idle' }));
+  const [transcriptPollFailure, setTranscriptPollFailure] = useState<{
+    runtimeId: string;
+    generation: number;
+    attemptId: number;
+  } | null>(null);
+  const transcriptPollAttemptRef = useRef(0);
   const [transcriptBackfillCommitMarker, setTranscriptBackfillCommitMarker] = useState<{
     runtimeId: string;
     generation: number;
     commitId: number;
+    acknowledgedSeq: number | null;
+    resetLastSeen: boolean;
+    startedWithSeq: number | null;
   } | null>(null);
   const [pollReplayCommitMarker, setPollReplayCommitMarker] = useState<(
     TranscriptBackfillCommitIdentity & {
+      attemptId: number;
       isInitialReplay: boolean;
       acknowledgedSeq: number | null;
       resetLastSeen: boolean;
@@ -1801,9 +1814,16 @@ export function WorkspaceNativeSessionView({
 
   useLayoutEffect(() => {
     const pendingCommit = transcriptBackfillCommitPendingRef.current;
-    if (transcriptBackfillCommitMatches(pendingCommit, transcriptBackfillCommitMarker)) {
+    if (transcriptBackfillCommitMarker
+      && transcriptBackfillCommitMatches(pendingCommit, transcriptBackfillCommitMarker)) {
       transcriptBackfillCommitPendingRef.current = null;
       initialReplayRuntimeRef.current = session.runtime_id;
+      lastSeenSeqRef.current = resolveCommittedReplayCursor(
+        lastSeenSeqRef.current,
+        transcriptBackfillCommitMarker.acknowledgedSeq,
+        transcriptBackfillCommitMarker.resetLastSeen
+          && lastSeenSeqRef.current === transcriptBackfillCommitMarker.startedWithSeq,
+      );
     }
   }, [session.runtime_id, transcriptBackfillCommitMarker]);
 
@@ -1861,6 +1881,28 @@ export function WorkspaceNativeSessionView({
     return currentScope.runtimeId === scope.runtimeId
       && currentScope.generation === scope.generation;
   }, []);
+
+  useLayoutEffect(() => {
+    if (!pollReplayCommitMarker || !isRuntimeRequestCurrent(pollReplayCommitMarker)) {
+      return;
+    }
+    const marker = pollReplayCommitMarker;
+    recordPerfMark('nativeTranscript.poll-commit', {
+      runtimeId: marker.runtimeId,
+      generation: marker.generation,
+      attemptId: marker.attemptId,
+      acknowledgedSeq: marker.acknowledgedSeq,
+    });
+    // Clear a read failure only after its replacement has actually committed.
+    // An older queued transition must not hide a newer failure.
+    setTranscriptPollFailure((current) => (
+      current?.runtimeId === marker.runtimeId
+      && current.generation <= marker.generation
+      && current.attemptId <= marker.attemptId
+        ? null
+        : current
+    ));
+  }, [isRuntimeRequestCurrent, pollReplayCommitMarker]);
 
   const captureBackfillReadingAnchor = useCallback((
     commit: TranscriptBackfillCommitIdentity,
@@ -2586,14 +2628,6 @@ export function WorkspaceNativeSessionView({
       [],
     );
     const replayCursor = fullBatch.newest_available_seq ?? latestEventSeq(fullBatch.events);
-    if (replayCursor != null) {
-      lastSeenSeqRef.current = Math.max(lastSeenSeqRef.current ?? replayCursor, replayCursor);
-    } else if (
-      result.status === 'success'
-      && lastSeenSeqRef.current === request.startedWithSeq
-    ) {
-      lastSeenSeqRef.current = null;
-    }
 
     if (resolution.clearProvisionalGaps) {
       rawTailSeamsRef.current = [];
@@ -2631,6 +2665,11 @@ export function WorkspaceNativeSessionView({
     const commitMarker = {
       ...requestScope,
       commitId: transcriptBackfillCommitSequenceRef.current + 1,
+      acknowledgedSeq: replayCursor,
+      startedWithSeq: request.startedWithSeq,
+      resetLastSeen: replayCursor == null
+        && result.status === 'success'
+        && lastSeenSeqRef.current === request.startedWithSeq,
     };
     transcriptBackfillCommitSequenceRef.current = commitMarker.commitId;
     transcriptBackfillCommitPendingRef.current = commitMarker;
@@ -2671,19 +2710,26 @@ export function WorkspaceNativeSessionView({
     if (!isVisible || !isRuntimeRequestCurrent(requestScope)) {
       return false;
     }
+    const attemptId = ++transcriptPollAttemptRef.current;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    incrementalReplayAbortRef.current?.abort();
+    incrementalReplayAbortRef.current = controller;
     let batch: ReplayBatch;
-    if (isInitialReplay) {
-      batch = await getNativeSessionEvents(
-        session.runtime_id,
-        null,
-        INITIAL_EVENT_REPLAY_LIMIT,
-      );
-    } else {
-      const controller = new AbortController();
-      incrementalReplayAbortRef.current?.abort();
-      incrementalReplayAbortRef.current = controller;
-      try {
-        const result = await runTranscriptPagedBackfill({
+    try {
+      const result = isInitialReplay
+        ? await runTranscriptBackfillWithRetry({
+          load: () => getNativeSessionEvents(
+            session.runtime_id,
+            null,
+            INITIAL_EVENT_REPLAY_LIMIT,
+          ),
+          isComplete: () => true,
+          physicalRequestKey: `${session.runtime_id}:initial`,
+          physicalRequestScope: session.runtime_id,
+          signal: controller.signal,
+        })
+        : await runTranscriptPagedBackfill({
           initialAfterSeq: sinceSeq,
           loadPage: (afterSeq, snapshotNewestSeq) => getNativeSessionEventPage(
             session.runtime_id,
@@ -2693,19 +2739,29 @@ export function WorkspaceNativeSessionView({
           ),
           isComplete: (replay) => replayBatchCoversSequenceAfter(replay, sinceSeq),
           physicalRequestKey: `${session.runtime_id}:incremental`,
+          physicalRequestScope: session.runtime_id,
           signal: controller.signal,
         });
-        if (result.status === 'cancelled') {
-          return false;
+      if (result.status === 'cancelled') {
+        return false;
+      }
+      if (result.status === 'error') {
+        if (isRuntimeRequestCurrent(requestScope)) {
+          setTranscriptPollFailure({ ...requestScope, attemptId });
+          recordPerfMark('nativeTranscript.poll-error', {
+            ...requestScope,
+            attemptId,
+            afterSeq: sinceSeq,
+            elapsedMs: Date.now() - startedAt,
+            errorKind: result.error instanceof Error ? result.error.name : 'unknown',
+          });
         }
-        if (result.status === 'error') {
-          throw result.error;
-        }
-        batch = result.value;
-      } finally {
-        if (incrementalReplayAbortRef.current === controller) {
-          incrementalReplayAbortRef.current = null;
-        }
+        throw result.error;
+      }
+      batch = result.value;
+    } finally {
+      if (incrementalReplayAbortRef.current === controller) {
+        incrementalReplayAbortRef.current = null;
       }
     }
     if (!isRuntimeRequestCurrent(requestScope)) {
@@ -2726,8 +2782,17 @@ export function WorkspaceNativeSessionView({
       || incrementalReplay?.state === 'partial';
 
     if (shouldCommit) {
+      recordPerfMark('nativeTranscript.poll-response', {
+        ...requestScope,
+        attemptId,
+        afterSeq: sinceSeq,
+        receivedMaxSeq: latestEventSeq(batch.events),
+        eventCount: batch.events.length,
+        elapsedMs: Date.now() - startedAt,
+      });
       const commitMarker = {
         ...requestScope,
+        attemptId,
         commitId: transcriptBackfillCommitSequenceRef.current + 1,
         isInitialReplay,
         acknowledgedSeq,
@@ -2805,6 +2870,15 @@ export function WorkspaceNativeSessionView({
       } else {
         startTransition(commitPollReplay);
       }
+    } else if (!transcriptBackfillCommitPendingRef.current) {
+      // A successful empty page also confirms the live cursor is caught up.
+      setTranscriptPollFailure((current) => (
+        current?.runtimeId === requestScope.runtimeId
+        && current.generation <= requestScope.generation
+        && current.attemptId <= attemptId
+          ? null
+          : current
+      ));
     }
 
     if (isInitialReplay && !initialReplayComplete) {
@@ -2846,7 +2920,9 @@ export function WorkspaceNativeSessionView({
     [events],
   );
 
-  const pollIntervalMs = isSending
+  const pollIntervalMs = transcriptPollFailure?.runtimeId === session.runtime_id
+    ? FAILED_POLL_INTERVAL_MS
+    : isSending
     || session.status === 'initializing'
     || session.status === 'processing'
     ? ACTIVE_POLL_INTERVAL_MS
@@ -4266,6 +4342,7 @@ export function WorkspaceNativeSessionView({
   const transcriptBackfillState = transcriptBackfillView.runtimeId === session.runtime_id
     ? transcriptBackfillView.state
     : 'idle';
+  const hasTranscriptPollFailure = transcriptPollFailure?.runtimeId === session.runtime_id;
 
   return (
     <>
@@ -4308,15 +4385,23 @@ export function WorkspaceNativeSessionView({
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
         <div ref={contentRef} className="mx-auto max-w-[960px] px-8 py-8">
-          {transcriptBackfillState !== 'idle' ? (
+          {hasTranscriptPollFailure || transcriptBackfillState !== 'idle' ? (
             <div className="sticky top-2 z-10">
               <WorkspaceTranscriptBackfillStatus
-                state={transcriptBackfillState}
+                state={hasTranscriptPollFailure ? 'error' : transcriptBackfillState}
                 loadingMessage={t('workspace.nativeTranscriptBackfillLoading')}
-                errorMessage={t('workspace.nativeTranscriptBackfillError')}
+                errorMessage={t(hasTranscriptPollFailure
+                  ? 'workspace.nativeTranscriptSyncError'
+                  : 'workspace.nativeTranscriptBackfillError')}
                 partialMessage={t('workspace.nativeTranscriptBackfillPartial')}
                 retryLabel={t('common.retry')}
-                onRetry={() => void backfillInitialReplay()}
+                onRetry={() => {
+                  if (hasTranscriptPollFailure) {
+                    void pollEvents().catch(() => {});
+                  } else {
+                    void backfillInitialReplay();
+                  }
+                }}
               />
             </div>
           ) : null}

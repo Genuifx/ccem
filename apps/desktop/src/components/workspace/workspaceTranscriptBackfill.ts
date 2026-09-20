@@ -72,6 +72,7 @@ interface TranscriptBackfillOptions<T> {
   load: () => Promise<T>;
   isComplete: (value: T) => boolean;
   physicalRequestKey?: string;
+  physicalRequestScope?: string;
   retryDelaysMs?: readonly number[];
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -79,7 +80,16 @@ interface TranscriptBackfillOptions<T> {
 
 const DEFAULT_RETRY_DELAYS_MS = [350, 1_000] as const;
 const DEFAULT_TIMEOUT_MS = 8_000;
-const physicalBackfillReads = new Map<string, Promise<unknown>>();
+interface PhysicalBackfillRead {
+  promise: Promise<unknown>;
+  expiresAt: number;
+}
+
+const physicalBackfillReads = new Map<string, PhysicalBackfillRead>();
+// Timeout/abort only stops the waiter, not Rust. Keep every unresolved read
+// charged to its runtime, including superseded pages and hidden views.
+const pendingPhysicalBackfillReads = new Map<string, Set<PhysicalBackfillRead>>();
+const MAX_PENDING_READS_PER_RUNTIME = 2;
 const DEFAULT_MAX_BACKFILL_PAGES = 100_000;
 export const NATIVE_TRANSCRIPT_REPLAY_PAGE_LIMIT = 2_000;
 
@@ -87,6 +97,13 @@ class TranscriptBackfillTimeoutError extends Error {
   constructor(timeoutMs: number) {
     super(`Transcript backfill timed out after ${timeoutMs}ms`);
     this.name = 'TranscriptBackfillTimeoutError';
+  }
+}
+
+class TranscriptBackfillBusyError extends Error {
+  constructor() {
+    super('Transcript reads are still pending; retry after a read settles');
+    this.name = 'TranscriptBackfillBusyError';
   }
 }
 
@@ -157,31 +174,44 @@ function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
 
 function acquirePhysicalBackfillRead<T>(
   requestKey: string | undefined,
+  scopeKey: string | undefined,
+  timeoutMs: number,
   load: () => Promise<T>,
-): Promise<T> {
+): PhysicalBackfillRead {
   if (!requestKey) {
-    return Promise.resolve().then(load);
+    return { promise: Promise.resolve().then(load), expiresAt: performance.now() + timeoutMs };
   }
 
   const activeRead = physicalBackfillReads.get(requestKey);
-  if (activeRead) {
-    return activeRead as Promise<T>;
+  if (activeRead && performance.now() < activeRead.expiresAt) {
+    return activeRead;
   }
 
-  const nextRead = Promise.resolve().then(load);
+  const scope = scopeKey ?? requestKey;
+  const pending = pendingPhysicalBackfillReads.get(scope) ?? new Set<PhysicalBackfillRead>();
+  if (pending.size >= MAX_PENDING_READS_PER_RUNTIME) {
+    // Do not keep attaching waiters to an expired, never-settling Promise.
+    // Its release handler will free capacity if it eventually settles.
+    throw new TranscriptBackfillBusyError();
+  }
+
+  const nextRead: PhysicalBackfillRead = {
+    promise: Promise.resolve().then(load),
+    expiresAt: performance.now() + timeoutMs,
+  };
+  pending.add(nextRead);
+  pendingPhysicalBackfillReads.set(scope, pending);
   physicalBackfillReads.set(requestKey, nextRead);
-  nextRead.then(
-    () => {
-      if (physicalBackfillReads.get(requestKey) === nextRead) {
-        physicalBackfillReads.delete(requestKey);
-      }
-    },
-    () => {
-      if (physicalBackfillReads.get(requestKey) === nextRead) {
-        physicalBackfillReads.delete(requestKey);
-      }
-    },
-  );
+  const release = () => {
+    pending.delete(nextRead);
+    if (pending.size === 0) {
+      pendingPhysicalBackfillReads.delete(scope);
+    }
+    if (physicalBackfillReads.get(requestKey) === nextRead) {
+      physicalBackfillReads.delete(requestKey);
+    }
+  };
+  void nextRead.promise.then(release, release);
   return nextRead;
 }
 
@@ -189,6 +219,7 @@ export async function runTranscriptBackfillWithRetry<T>({
   load,
   isComplete,
   physicalRequestKey,
+  physicalRequestScope,
   retryDelaysMs = DEFAULT_RETRY_DELAYS_MS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   signal,
@@ -202,9 +233,15 @@ export async function runTranscriptBackfillWithRetry<T>({
     }
 
     attempts += 1;
+    let physicalRead: PhysicalBackfillRead | undefined;
     try {
       const value = await runWithTimeout(
-        () => acquirePhysicalBackfillRead(physicalRequestKey, load),
+        () => {
+          physicalRead = acquirePhysicalBackfillRead(
+            physicalRequestKey, physicalRequestScope, timeoutMs, load,
+          );
+          return physicalRead.promise as Promise<T>;
+        },
         timeoutMs,
         signal,
       );
@@ -213,15 +250,21 @@ export async function runTranscriptBackfillWithRetry<T>({
       }
       return { status: 'success', attempts, value };
     } catch (error) {
+      if (error instanceof TranscriptBackfillTimeoutError && physicalRead) {
+        // Timer scheduling can precede the lease deadline. Expire the exact
+        // acquired read, so the next caller cannot rejoin a timed-out request.
+        physicalRead.expiresAt = 0;
+      }
       if (isCancelled(error, signal)) {
         return { status: 'cancelled', attempts };
       }
       lastError = error;
-      // Tauri invoke has no cancellation channel. A timed-out read may still
-      // be running in Rust, so an automatic retry would stack physical full
-      // replays. End this round; an explicit Retry reuses the per-runtime
-      // physical lease until that read actually settles.
-      if (error instanceof TranscriptBackfillTimeoutError) {
+      // End this round. The next poll/Retry may replace an expired read, but
+      // all unresolved physical work still counts against the runtime limit.
+      if (
+        error instanceof TranscriptBackfillTimeoutError
+        || error instanceof TranscriptBackfillBusyError
+      ) {
         break;
       }
     }
@@ -251,6 +294,7 @@ interface TranscriptPagedBackfillOptions {
   isComplete: (value: ReplayBatch) => boolean;
   initialAfterSeq?: number | null;
   physicalRequestKey?: string;
+  physicalRequestScope?: string;
   retryDelaysMs?: readonly number[];
   timeoutMs?: number;
   maxPages?: number;
@@ -277,6 +321,7 @@ export async function runTranscriptPagedBackfill({
   isComplete,
   initialAfterSeq = null,
   physicalRequestKey,
+  physicalRequestScope = physicalRequestKey,
   retryDelaysMs,
   timeoutMs,
   maxPages = DEFAULT_MAX_BACKFILL_PAGES,
@@ -307,6 +352,7 @@ export async function runTranscriptPagedBackfill({
               pageRequestCursor ?? 'start',
             ].join(':')
           : undefined,
+        physicalRequestScope,
         ...(retryDelaysMs ? { retryDelaysMs } : {}),
         ...(timeoutMs != null ? { timeoutMs } : {}),
         signal,

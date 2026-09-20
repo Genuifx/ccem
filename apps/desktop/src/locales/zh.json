@@ -500,6 +500,7 @@
     "nativeEmptyHint": "发一条消息，原生 runtime 会在这里持续流式输出。",
     "nativeTranscriptBackfillLoading": "正在补全较早的转录，当前消息仍可查看…",
     "nativeTranscriptBackfillError": "较早的转录加载失败，当前消息仍可查看。",
+    "nativeTranscriptSyncError": "新消息同步失败，正在自动重试。",
     "nativeTranscriptBackfillPartial": "部分较早的转录不可用，已保留可读取的消息。",
     "nativeSendFailed": "发送消息失败",
     "composerDeliveryUncertain": "发送结果尚未确认，请先查看会话记录，再决定是否重发。",
