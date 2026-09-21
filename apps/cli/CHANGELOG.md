@@ -1,5 +1,11 @@
 # ccem
 
+## 2.87.0
+
+### Minor Changes
+
+- Desktop: recover stalled transcript reads and merge the read-recovery repair.
+
 ## 2.86.0
 
 ### Minor Changes
