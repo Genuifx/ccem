@@ -611,7 +611,7 @@ test('transcript backfill times out without stacking another physical load', asy
   assert.equal(calls, 1);
 });
 
-test('retrying a timed-out runtime reuses its still-pending physical read', async () => {
+test('retrying a timed-out runtime replaces its still-pending physical read', async () => {
   const mod = await importBackfillModule();
   const run = mod.runTranscriptBackfillWithRetry ?? missingRunner;
   let calls = 0;
@@ -623,7 +623,7 @@ test('retrying a timed-out runtime reuses its still-pending physical read', asyn
   const options = {
     load: () => {
       calls += 1;
-      return physicalRead;
+      return calls === 1 ? physicalRead : Promise.resolve(expectedBatch);
     },
     isComplete: (batch) => batch.complete,
     physicalRequestKey: 'runtime-timeout-retry',
@@ -636,7 +636,7 @@ test('retrying a timed-out runtime reuses its still-pending physical read', asyn
 
   const retryResultPromise = run({ ...options, timeoutMs: 100 });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(calls, 1, 'Retry must not start a second physical replay');
+  assert.equal(calls, 2, 'Retry may start one bounded replacement for an expired read');
 
   resolveLoad(expectedBatch);
   assert.deepEqual(await retryResultPromise, {
@@ -644,7 +644,7 @@ test('retrying a timed-out runtime reuses its still-pending physical read', asyn
     attempts: 1,
     value: expectedBatch,
   });
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test('a timed-out physical read releases its runtime lease after rejection', async () => {

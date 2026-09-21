@@ -24,7 +24,8 @@ async function loadRender() {
       memo = node.initializer.getText(ast);
     }
     if (ts.isCallExpression(node) && node.expression.getText(ast) === 'useLayoutEffect'
-      && node.arguments[0]?.getText(ast).includes('const marker = pollReplayCommitMarker;')) {
+      && node.arguments[0]?.getText(ast).includes('const marker = pollReplayCommitMarker;')
+      && node.arguments[0]?.getText(ast).includes('resolveCommittedReplayCursor(')) {
       effect = node.getText(ast);
     }
     ts.forEachChild(node, visit);

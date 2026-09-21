@@ -800,7 +800,7 @@ test('live native view always issues one limited initial replay before increment
   );
   assert.match(
     source,
-    /if \(isInitialReplay\) \{[\s\S]*getNativeSessionEvents\([\s\S]*null,[\s\S]*INITIAL_EVENT_REPLAY_LIMIT,[\s\S]*\}[\s\S]*initialAfterSeq: sinceSeq/,
+    /const result = isInitialReplay\s*\? await runTranscriptBackfillWithRetry\([\s\S]*getNativeSessionEvents\([\s\S]*null,[\s\S]*INITIAL_EVENT_REPLAY_LIMIT,[\s\S]*: await runTranscriptPagedBackfill\([\s\S]*initialAfterSeq: sinceSeq/,
   );
   assert.match(
     source,
