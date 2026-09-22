@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# -I deliberately omits the script directory from sys.path. Load only this
+# verified bundle's companion module, never a project/user module of that name.
+_setup_spec = importlib.util.spec_from_file_location("ccem_gateway_onboarding", Path(__file__).with_name("ccem_gateway_onboarding.py"))
+_setup_module = importlib.util.module_from_spec(_setup_spec)
+_setup_spec.loader.exec_module(_setup_module)
 
 PROTOCOL = 1
 FRAME_LIMIT = 64 * 1024
@@ -91,6 +98,7 @@ class Host:
         self.stopped = asyncio.Event()
         self.loop = asyncio.get_running_loop()
         self.command_slots = asyncio.Semaphore(4)
+        self.setup = _setup_module.WeComSetup()
 
     def snapshot(self):
         with self.lock:
@@ -135,8 +143,14 @@ class Host:
                 available = bool(entry.check_fn())
             except Exception:
                 available = False
+            qr_available = available and entry.name == "wecom"
+            if qr_available:
+                try:
+                    _setup_module.tls_context()
+                except _setup_module.SetupError:
+                    qr_available = False
             self.platforms.append({"id": entry.name, "label": entry.label, "available": available,
-                                   "strictSend": True, "fields": fields})
+                                   "strictSend": True, "fields": fields, "qrSetup": qr_available})
         self.platforms.sort(key=lambda p: p["id"])
         self.state = "configured" if self.boot.get("platform") else "unconfigured"
         self.publish()
@@ -277,12 +291,32 @@ class Host:
                 self.publish()
             return None  # handled; never let Hermes send a second ordinary reply
 
+    def validate_begin_setup(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("setup_invalid_request")
+        platform = params.get("platform")
+        identifier = _setup_module.validate_begin(params.get("id"), platform)
+        if not any(p["id"] == platform and p.get("qrSetup") is True for p in self.platforms):
+            raise ValueError("setup_platform_not_available")
+        return identifier, platform
+
     async def request(self, method, params):
         if method == "status":
             return self.snapshot()
         if method == "stop":
+            self.setup.clear()
             self.stopped.set()
             return {"ok": True}
+        if method in ("beginSetup", "pollSetup", "cancelSetup"):
+            if not isinstance(params, dict):
+                raise ValueError("setup_invalid_request")
+            identifier = params.get("id")
+            if method == "beginSetup":
+                identifier, platform = self.validate_begin_setup(params)
+                return await self.setup.begin(identifier, platform)
+            if method == "pollSetup":
+                return await self.setup.poll(identifier)
+            return self.setup.cancel(identifier)
         if method == "openPairing":
             if self.state != "running":
                 raise ValueError("gateway_not_running")
@@ -326,22 +360,60 @@ class Host:
                 await asyncio.sleep(5)
                 self.publish()
         heartbeat_task = asyncio.create_task(heartbeat())
-        while not self.stopped.is_set():
-            frame = await asyncio.to_thread(read_frame)
-            if frame is None:
-                break
+        setup_jobs = {}
+        async def respond(frame):
             identifier = frame.get("id")
-            if not isinstance(identifier, str) or len(identifier) > 256:
-                raise ValueError("invalid_request_id")
             try:
                 result = await self.request(frame.get("method"), frame.get("params", {}))
                 emit({"id": identifier, "result": result})
+                # Setup task handles remain bounded in setup_jobs. Do not keep
+                # a QR URL or credentials in a completed task's return value.
+                return result if frame.get("method") == "cancelSetup" else None
+            except asyncio.CancelledError:
+                emit({"id": identifier, "error": "setup_cancelled"})
             except Exception as exc:
                 emit({"id": identifier, "error": str(exc)[:160] if isinstance(exc, ValueError) else "host_request_failed"})
-        initialization.cancel()
-        heartbeat_task.cancel()
-        if self.runner:
-            await asyncio.wait_for(self.runner.stop(), timeout=2)
+        async def cancel_jobs(identifier=None):
+            jobs = [job for job, owner in setup_jobs.values() if identifier is None or owner == identifier]
+            for job in jobs:
+                job.cancel()
+            if jobs:
+                await asyncio.gather(*jobs, return_exceptions=True)
+        try:
+            while not self.stopped.is_set():
+                frame = await asyncio.to_thread(read_frame)
+                if frame is None:
+                    break
+                identifier = frame.get("id")
+                if not isinstance(identifier, str) or len(identifier) > 256:
+                    raise ValueError("invalid_request_id")
+                method = frame.get("method")
+                params = frame.get("params", {})
+                if method in ("beginSetup", "pollSetup") and isinstance(params, dict):
+                    if method == "beginSetup":
+                        try:
+                            self.validate_begin_setup(params)
+                        except ValueError as exc:
+                            emit({"id": identifier, "error": str(exc)})
+                            continue
+                        self.setup.clear("superseded")
+                        await cancel_jobs()
+                    elif method in setup_jobs and not setup_jobs[method][0].done():
+                        emit({"id": identifier, "error": "setup_poll_in_progress"})
+                        continue
+                    setup_jobs[method] = (asyncio.create_task(respond(frame)), params.get("id"))
+                else:
+                    result = await respond(frame)
+                    if method == "cancelSetup" and result and result.get("state") == "cancelled":
+                        await cancel_jobs(result["id"])
+        finally:
+            self.setup.clear()
+            await cancel_jobs()
+            initialization.cancel()
+            heartbeat_task.cancel()
+            await asyncio.gather(initialization, heartbeat_task, return_exceptions=True)
+            if self.runner:
+                await asyncio.wait_for(self.runner.stop(), timeout=2)
 
 
 def render_result(result):
@@ -383,6 +455,9 @@ def main():
             os.environ["HERMES_HOME"] = temporary
             from gateway.managed_contracts import StrictTarget, strict_send_supported
             assert strict_send_supported("wecom") and StrictTarget
+            from plugins.platforms.wecom.adapter import WeComAdapter, check_wecom_requirements
+            assert WeComAdapter and check_wecom_requirements(), "WeCom transport dependencies are unavailable"
+            assert _setup_module.WeComSetup and _setup_module.tls_context()
         emit({"ok": True, "protocolVersion": PROTOCOL})
         return
     if not args.source or not args.profile or not args.source.is_absolute() or not args.profile.is_absolute():

@@ -171,6 +171,21 @@ fn cancelled_challenge_is_never_submitted() {
     assert!(f.store().confirm(&r, "confirm", &c, "runtime-a").is_err());
 }
 #[test]
+fn replacing_channel_rotates_account_and_revokes_old_pending_input() {
+    let mut f = Fixture::new();
+    let route = f.route();
+    let pending = challenge(&mut f, &route);
+    f.store().set_setting("accountRef", "old-account").unwrap();
+    f.store().replace_channel("wecom", "encrypted-new-credentials", &["WECOM_BOT_ID".into(), "WECOM_SECRET".into()]).unwrap();
+    assert_ne!(f.store().setting("accountRef").unwrap().as_deref(), Some("old-account"));
+    assert_eq!(f.store().setting("channelSecrets").unwrap().as_deref(), Some("encrypted-new-credentials"));
+    assert!(f.store().routes().unwrap().iter().all(|r| !r.enabled));
+    assert!(f.store().confirm(&route, "after-replacement", &pending, "runtime-a").is_err());
+    f.restart();
+    assert_eq!(f.store().setting("platform").unwrap().as_deref(), Some("wecom"));
+    assert!(f.store().route(&source()).is_err());
+}
+#[test]
 fn exact_invocation_is_required_for_terminal_state() {
     let mut f = Fixture::new();
     let r = f.route();

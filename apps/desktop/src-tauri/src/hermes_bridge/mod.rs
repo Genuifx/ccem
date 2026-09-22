@@ -1,6 +1,7 @@
 //! CCEM owns workspace policy, confirmations, operation state and the durable outbox.
 mod poll;
 mod process;
+mod setup;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -19,7 +20,7 @@ use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -51,6 +52,8 @@ pub struct HermesBridgeManager {
     shutdown: AtomicBool,
     install_requested: AtomicBool,
     last_error: Mutex<Option<String>>,
+    setup: Mutex<Option<setup::Setup>>,
+    setup_workers: AtomicUsize,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -93,6 +96,8 @@ impl HermesBridgeManager {
             shutdown: AtomicBool::new(false),
             install_requested: AtomicBool::new(false),
             last_error: Mutex::new(None),
+            setup: Mutex::new(None),
+            setup_workers: AtomicUsize::new(0),
         }
     }
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
@@ -136,6 +141,7 @@ impl HermesBridgeManager {
             .map(|a| json!(a))
             .unwrap_or(json!([]));
         result["pairing"] = result["gateway"]["pairing"].clone();
+        result["setup"] = self.setup_snapshot();
         if self.root.join("bridge.sqlite3").exists() {
             if let Err(error)=self.with_store(|s|{
                 result["routes"]=json!(s.routes()?);
@@ -240,6 +246,12 @@ impl HermesBridgeManager {
         }
         let _lifecycle = self.lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?;
         match action {
+            "beginSetup" => {
+                self.begin_setup_locked(app, payload["platform"].as_str().ok_or("platform_required")?)?;
+            }
+            "cancelSetup" => {
+                self.cancel_setup_locked(payload["id"].as_str().ok_or("setup_id_required")?)?;
+            }
             "install" => {
                 self.with_store(|_| Ok(()))?;
                 if self.install_requested.load(Ordering::Acquire) {
@@ -249,6 +261,7 @@ impl HermesBridgeManager {
                     .installer
                     .prepare_install()
                     .map_err(|e| e.to_string())?;
+                self.invalidate_setup_locked();
                 self.install_requested.store(true, Ordering::Release);
                 self.stop_locked();
                 let manager = self.clone();
@@ -265,6 +278,7 @@ impl HermesBridgeManager {
                 });
             }
             "removeRuntime" => {
+                self.invalidate_setup_locked();
                 self.stop_locked();
                 self.with_store(|s| s.set_setting("enabled", "false"))?;
                 self.installer.remove_runtime().map_err(|e| e.to_string())?;
@@ -272,6 +286,7 @@ impl HermesBridgeManager {
             "configureChannel" => {
                 let platform = payload["platform"].as_str().ok_or("platform_required")?;
                 let fields = payload["fields"].as_object().ok_or("fields_required")?;
+                self.invalidate_setup_locked();
                 let snapshot = self
                     .gateway
                     .lock()
@@ -326,24 +341,11 @@ impl HermesBridgeManager {
                 let cipher =
                     crypto::encrypt(&serde_json::to_string(&merged).map_err(|e| e.to_string())?)?;
                 self.stop_locked();
-                self.with_store(|s| {
-                    for r in s.routes()? {
-                        if r.enabled {
-                            s.disable_route(&r.id)?
-                        }
-                    }
-                    s.set_setting("accountRef", &random_id())?;
-                    s.set_setting("platform", platform)?;
-                    s.set_setting("channelSecrets", &cipher)?;
-                    s.set_setting(
-                        "configuredFields",
-                        &json!(merged.keys().collect::<Vec<_>>()).to_string(),
-                    )?;
-                    s.set_setting("enabled", "true")
-                })?;
+                self.with_store(|s| s.replace_channel(platform, &cipher, &merged.keys().cloned().collect::<Vec<_>>()))?;
                 self.start_locked(app, true)?;
             }
             "start" => {
+                self.invalidate_setup_locked();
                 let connect = self.with_store(|s| {
                     let configured = s.setting("platform")?.is_some();
                     s.set_setting("enabled", if configured { "true" } else { "false" })?;
@@ -352,6 +354,7 @@ impl HermesBridgeManager {
                 self.start_locked(app, connect)?;
             }
             "stop" => {
+                self.invalidate_setup_locked();
                 self.with_store(|s| s.set_setting("enabled", "false"))?;
                 self.start_locked(app, false)?;
             }
@@ -597,6 +600,7 @@ impl HermesBridgeManager {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _guard = self.lifecycle.lock().unwrap();
+        self.invalidate_setup_locked();
         self.stop_locked()
     }
 }

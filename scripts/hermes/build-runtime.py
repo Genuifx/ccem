@@ -191,9 +191,11 @@ def prepare(args: argparse.Namespace) -> dict:
     if sha256(source / "uv.lock") != LOCK_HASH:
         raise ValueError("Hermes lock does not match the reviewed baseline")
     # Export the exact dependency solution before applying CCEM's reviewed gateway patch.
+    # Upstream's wecom extra only adds XML support. Its sms extra contains solely
+    # the pinned shared aiohttp transport; exporting it does not enable SMS.
     requirements = cache / "requirements.lock.txt"
     requirements.write_text(run([args.uv, "export", "--frozen", "--no-dev", "--no-emit-project",
-        "--extra", "wecom", "--extra", "feishu", "--format", "requirements-txt"], cwd=source))
+        "--extra", "wecom", "--extra", "feishu", "--extra", "sms", "--format", "requirements-txt"], cwd=source))
     site = package / "python/lib/python3.11/site-packages"
     print("Installing the locked wheel closure in the build artifact", flush=True)
     subprocess.run([args.uv, "pip", "install", "--python", str(python), "--target", str(site),
@@ -243,6 +245,7 @@ def finalize(args: argparse.Namespace) -> dict:
         run(["git", "apply", str(patch)], cwd=source, env=patch_env)
         write_json(stamp, {"sha256": sha256(patch)})
     shutil.copy2(host, package / "ccem_gateway_host.py")
+    shutil.copy2(host.with_name("ccem_gateway_onboarding.py"), package / "ccem_gateway_onboarding.py")
     regularize_links(package)
     for path in package.rglob("__pycache__"):
         shutil.rmtree(path)

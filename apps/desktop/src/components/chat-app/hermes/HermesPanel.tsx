@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import { Bot, Copy, Play, RefreshCw, Square } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -19,6 +20,19 @@ import {
 } from '@/lib/hermes-ipc';
 
 const INSTALLING = new Set(['checking', 'downloading', 'verifying', 'extracting', 'activating']);
+const SETUP_CANCELLABLE = new Set(['generating', 'waiting']);
+const SETUP_WAIT_MS = 300_000;
+const SETUP_ERROR_KEYS = new Map([
+  ['setup_request_failed', 'hermes.scanRequestFailed'],
+  ['setup_invalid_response', 'hermes.scanInvalidResponse'],
+  ['setup_invalid_credentials', 'hermes.scanInvalidCredentials'],
+  ['setup_connection_failed', 'hermes.scanConnectionFailed'],
+  ['setup_pairing_failed', 'hermes.scanPairingFailed'],
+  ['setup_not_supported', 'hermes.scanNotSupported'],
+  ['setup_expired', 'hermes.scanExpired'],
+  ['setup_busy_retry', 'hermes.scanBusyRetry'],
+  ['setup_already_connecting', 'hermes.scanAlreadyConnecting'],
+]);
 
 function timestamp(value: string | number): number {
   return typeof value === 'number' ? (value < 1e12 ? value * 1000 : value) : Date.parse(value);
@@ -30,6 +44,10 @@ function errorText(error: unknown, secrets: string[] = []): string {
     : String(error);
   for (const secret of secrets.filter(Boolean)) message = message.split(secret).join('••••••');
   return message;
+}
+
+function setupErrorKey(error: unknown): string {
+  return SETUP_ERROR_KEYS.get(errorText(error).trim()) ?? 'hermes.scanError';
 }
 
 type RunAction = <A extends HermesAction>(action: A, payload?: HermesActionPayloads[A]) => Promise<boolean>;
@@ -108,26 +126,31 @@ export function HermesPanel() {
   const { t, lang } = useLocale();
   const [status, setStatus] = useState<HermesStatus | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
+  const [setupRequestError, setSetupRequestError] = useState<string | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
   const [busy, setBusy] = useState<HermesAction | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [platformId, setPlatformId] = useState('');
   const [fields, setFields] = useState<Record<string, string>>({});
   const [copied, setCopied] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [now, setNow] = useState(Date.now());
   const mounted = useRef(false);
+  const latestStatus = useRef<HermesStatus | null>(null);
   const pendingAction = useRef<HermesAction | null>(null);
   const pendingCancel = useRef(false);
   const pollPending = useRef(false);
   const mutationRevision = useRef(0);
   const secrets = useRef<string[]>([]);
+  const setupDeadline = useRef<{ id: string; deadline: number } | null>(null);
 
   const refresh = useCallback(async () => {
-    if (pollPending.current) return;
+    if (pollPending.current || (pendingAction.current && pendingAction.current !== 'install')) return;
     pollPending.current = true;
     const revision = mutationRevision.current;
     try {
       const next = await getHermesStatus();
-      if (mounted.current && revision === mutationRevision.current) { setStatus(next); setReadError(null); }
+      if (mounted.current && revision === mutationRevision.current) { latestStatus.current = next; setStatus(next); setReadError(null); }
     } catch (error) {
       if (mounted.current && revision === mutationRevision.current) setReadError(errorText(error, secrets.current));
     } finally {
@@ -138,7 +161,7 @@ export function HermesPanel() {
   useEffect(() => {
     mounted.current = true;
     void refresh();
-    const interval = window.setInterval(() => void refresh(), 2000);
+    const interval = window.setInterval(() => { setNow(Date.now()); void refresh(); }, 2000);
     return () => { mounted.current = false; window.clearInterval(interval); };
   }, [refresh]);
 
@@ -148,7 +171,8 @@ export function HermesPanel() {
     if (platforms.some((item) => item.id === platformId)) return;
     const configuredId = status?.gateway.configuredPlatform;
     const next = platforms.some((item) => item.id === configuredId)
-      ? configuredId! : platforms.find((item) => item.available && item.strictSend)?.id ?? '';
+      ? configuredId! : (platforms.find((item) => item.available && item.strictSend && item.qrSetup)
+        ?? platforms.find((item) => item.available && item.strictSend))?.id ?? '';
     if (next === platformId) return;
     setPlatformId(next);
     setFields({});
@@ -164,12 +188,16 @@ export function HermesPanel() {
     const revision = ++mutationRevision.current;
     const redact = [...secrets.current];
     setRequestError(null);
+    setSetupRequestError(null);
     try {
       const next = await performHermesAction(action, payload);
-      if (mounted.current && revision === mutationRevision.current) setStatus(next);
+      if (mounted.current && revision === mutationRevision.current) { latestStatus.current = next; setStatus(next); }
       return true;
     } catch (error) {
-      if (mounted.current && revision === mutationRevision.current) setRequestError(errorText(error, redact));
+      if (mounted.current && revision === mutationRevision.current) {
+        if (action === 'beginSetup' || action === 'cancelSetup') setSetupRequestError(setupErrorKey(error));
+        else setRequestError(errorText(error, redact));
+      }
       return false;
     } finally {
       if (isCancel) { pendingCancel.current = false; if (mounted.current) setCancelling(false); }
@@ -189,6 +217,34 @@ export function HermesPanel() {
   const running = status?.gateway.state === 'running';
   const transitioning = ['starting', 'stopping', 'configuring'].includes(status?.gateway.state ?? '');
   const configured = Boolean(status?.gateway.configuredPlatform);
+  const setup = status?.setup;
+  if (setup && setupDeadline.current?.id !== setup.id) {
+    setupDeadline.current = { id: setup.id, deadline: Date.now() + SETUP_WAIT_MS };
+  }
+  const waitDeadline = setupDeadline.current ? Math.min(setupDeadline.current.deadline,
+    setup?.expiresAt === undefined ? Infinity : timestamp(setup.expiresAt)) : undefined;
+  const setupExpired = setup && SETUP_CANCELLABLE.has(setup.state) && waitDeadline !== undefined && waitDeadline <= now;
+  const setupState = setupExpired ? 'expired' : setup?.state;
+  const setupConnecting = setup?.state === 'connecting';
+  const setupPending = setup && SETUP_CANCELLABLE.has(setup.state);
+  const qrPlatform = (platform?.qrSetup && platform.available && platform.strictSend ? platform : undefined)
+    ?? platforms.find((item) => item.qrSetup && item.available && item.strictSend);
+  const showSetup = !running && !manualOpen && Boolean(
+    (setup && setup.state !== 'connected') || (!configured && qrPlatform),
+  );
+  const showManual = !running && !setupConnecting && (manualOpen || (!configured && !showSetup));
+  const switchToManual = async () => {
+    if (disabled || setupConnecting) return;
+    if (setupPending) {
+      if (!await run('cancelSetup', { id: setup.id })) return;
+      if (latestStatus.current?.setup?.state === 'connecting') return;
+    }
+    setManualOpen(true);
+  };
+  const beginSetup = () => {
+    const id = setup?.platform ?? qrPlatform?.id;
+    if (id) void run('beginSetup', { platform: id });
+  };
   const needsMetadata = !configured && platforms.length === 0;
   const isConfiguredPlatform = status?.gateway.configuredPlatform === platformId;
   const configuredFields = isConfiguredPlatform ? status?.gateway.configuredFields ?? [] : [];
@@ -196,9 +252,15 @@ export function HermesPanel() {
   const configChanged = !isConfiguredPlatform || platform?.fields.some((field) => Boolean(fields[field.key]?.trim()));
   const progress = status?.installer.totalBytes ? Math.min(100, (status.installer.downloadedBytes / status.installer.totalBytes) * 100) : null;
   const pairingActive = status?.pairing && timestamp(status.pairing.expiresAt) > Date.now();
+  const setupStatusError = setupState === 'error' && !manualOpen && !setupRequestError
+    && !(setup?.error === 'setup_pairing_failed' && status?.pairing);
   const visibleError = requestError ?? readError;
   const recentOperations = [...(status?.operations ?? [])].sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt)).slice(0, 8);
   const recentDeliveries = [...(status?.deliveries ?? [])].sort((a, b) => timestamp(b.createdAt) - timestamp(a.createdAt)).slice(0, 5);
+
+  useEffect(() => {
+    if (running) { setManualOpen(false); setFields({}); }
+  }, [running]);
 
   return (
     <div className="space-y-5" data-hermes-panel>
@@ -207,7 +269,7 @@ export function HermesPanel() {
           <div className="rounded-xl bg-primary/10 p-2.5 text-primary"><Bot className="h-5 w-5" /></div>
           <div><h2 className="text-xl font-semibold">{t('hermes.title')}</h2><p className="text-sm text-muted-foreground">{t('hermes.subtitle')}</p></div>
         </div>
-        <Button size="icon" variant="ghost" aria-label={t('hermes.refresh')} onClick={() => { setRequestError(null); void refresh(); }}>
+        <Button size="icon" variant="ghost" aria-label={t('hermes.refresh')} onClick={() => { setRequestError(null); setSetupRequestError(null); void refresh(); }}>
           <RefreshCw className="h-4 w-4" />
         </Button>
       </div>
@@ -223,7 +285,7 @@ export function HermesPanel() {
           <CardContent className="space-y-4">
             {installed ? <div className="flex items-center justify-between gap-3 text-sm">
               <span className="text-muted-foreground">{t('hermes.version', { version: status.installer.version ?? '—' })}</span>
-              {!running && !transitioning && <Button size="sm" variant="ghost" disabled={disabled} onClick={() => void run('removeRuntime')}>{t('hermes.removeComponent')}</Button>}
+              {!running && !transitioning && <Button size="sm" variant="ghost" disabled={disabled || Boolean(setupPending) || setupConnecting} onClick={() => void run('removeRuntime')}>{t('hermes.removeComponent')}</Button>}
             </div> : <p className="text-sm text-muted-foreground">{t('hermes.installDescription')}</p>}
             {installing && <div className="space-y-2">
               <Progress value={progress} aria-label={t('hermes.installProgress')} />
@@ -245,7 +307,31 @@ export function HermesPanel() {
           </CardTitle></CardHeader>
           <CardContent className="space-y-4">
             {status.gateway.error && <p role="alert" className="text-sm text-destructive">{errorText(status.gateway.error, secrets.current)}</p>}
-            {platforms.length === 0 ? <p className="text-sm text-muted-foreground">{t(transitioning ? 'hermes.loadingPlatforms' : 'hermes.noPlatforms')}</p> : <form className="space-y-4" onSubmit={(event) => {
+            {setupRequestError && <p role="alert" className="text-sm text-destructive" data-hermes-setup-request-error>{t(setupRequestError)}</p>}
+            {setupStatusError && <p role="alert" className="text-sm text-destructive" data-hermes-setup-error>{t(setupErrorKey(setup?.error))}</p>}
+            {running && <p className="text-sm font-medium">{t('hermes.channelConnected', { platform: platforms.find((item) => item.id === status.gateway.configuredPlatform)?.label ?? status.gateway.configuredPlatform ?? '' })}</p>}
+            {!running && configured && !showSetup && !manualOpen && <p className="text-sm text-muted-foreground">{t('hermes.savedConnection', { platform: platforms.find((item) => item.id === status.gateway.configuredPlatform)?.label ?? status.gateway.configuredPlatform ?? '' })}</p>}
+            {showSetup && <div className="space-y-4 rounded-xl border border-border/60 bg-background/40 p-5" data-hermes-setup data-setup-state={setupState ?? 'idle'}>
+              <div className="space-y-1"><h3 className="text-sm font-medium">{t('hermes.scanTitle')}</h3>
+                <p className="text-sm text-muted-foreground">{t('hermes.scanDescription')}</p>
+              </div>
+              {setupState === 'waiting' && setup?.qrPayload && <div className="flex justify-center">
+                <div className="rounded-xl bg-white p-2"><QRCodeSVG value={setup.qrPayload} size={208} level="M" marginSize={4} role="img" aria-label={t('hermes.scanQrLabel')} /></div>
+              </div>}
+              {(setupState === 'generating' || setupState === 'waiting' || setupState === 'connecting') && <p role="status" className="text-center text-sm text-muted-foreground">
+                {t(setupState === 'generating' ? 'hermes.scanGenerating' : setupState === 'connecting' ? 'hermes.scanConnecting' : 'hermes.scanWaiting')}
+              </p>}
+              {setupState === 'expired' && <p role="status" className="text-sm text-muted-foreground">{t('hermes.scanExpired')}</p>}
+              {setupState === 'cancelled' && <p role="status" className="text-sm text-muted-foreground">{t('hermes.scanCancelled')}</p>}
+              <div className="flex flex-wrap justify-center gap-2">
+                {setupState !== 'generating' && setupState !== 'connecting' && <Button size="sm" disabled={disabled || transitioning} onClick={beginSetup}>
+                  {t(setupState === 'waiting' ? 'hermes.scanRefresh' : setupState === 'expired' || setupState === 'error' ? 'hermes.scanRetry' : 'hermes.scanGenerate')}
+                </Button>}
+                {setupPending && !setupExpired && <Button size="sm" variant="ghost" disabled={disabled} onClick={() => void run('cancelSetup', { id: setup.id })}>{t('hermes.cancel')}</Button>}
+              </div>
+            </div>}
+            {platforms.length === 0 && !showSetup && !running && <p className="text-sm text-muted-foreground">{t(transitioning ? 'hermes.loadingPlatforms' : 'hermes.noPlatforms')}</p>}
+            {platforms.length > 0 && showManual && <form className="space-y-4" data-hermes-manual onSubmit={(event) => {
               event.preventDefault();
               if (!configValid || !configChanged || !platform) return;
               const submitted = Object.fromEntries(platform.fields.filter((field) => fields[field.key]?.trim()).map((field) => [field.key, fields[field.key].trim()]));
@@ -269,13 +355,17 @@ export function HermesPanel() {
                 <Button type="submit" variant="outline" size="sm" disabled={disabled || !configValid || !configChanged}>{t('hermes.saveChannel')}</Button>
               </>}
             </form>}
-            <div className="flex flex-wrap items-center gap-3 border-t border-border/40 pt-4">
-              <Button size="sm" disabled={disabled || transitioning || (!running && !configured && !needsMetadata)} onClick={() => void run(running ? 'stop' : 'start')}>
+            {!running && !transitioning && <div className="flex flex-wrap gap-2">
+              {!showManual && <Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => void switchToManual()}>{t(configured ? 'hermes.editConnection' : 'hermes.manualConnect')}</Button>}
+              {manualOpen && !configured && qrPlatform && <Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => { setManualOpen(false); setFields({}); setPlatformId(qrPlatform.id); }}>{t('hermes.useScan')}</Button>}
+            </div>}
+            {(running || configured || (needsMetadata && !showSetup)) && <div className="flex flex-wrap items-center gap-3 border-t border-border/40 pt-4">
+              {running && <Button size="sm" disabled={disabled} onClick={() => { setCopied(false); void run('openPairing'); }}>{t('hermes.newPairing')}</Button>}
+              <Button size="sm" variant={running ? 'ghost' : 'default'} disabled={disabled || transitioning || setupConnecting} onClick={() => void run(running ? 'stop' : 'start')}>
                 {running ? <Square className="mr-2 h-3.5 w-3.5" /> : <Play className="mr-2 h-3.5 w-3.5" />}
                 {running ? t('hermes.stop') : t(needsMetadata ? 'hermes.loadPlatforms' : 'hermes.start')}
               </Button>
-              {running && <Button size="sm" variant="outline" disabled={disabled} onClick={() => { setCopied(false); void run('openPairing'); }}>{t('hermes.newPairing')}</Button>}
-            </div>
+            </div>}
             {status.pairing && <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 space-y-2">
               <p className="text-sm">{pairingActive ? t('hermes.pairingInstruction') : t('hermes.pairingExpired')}</p>
               {pairingActive && <>

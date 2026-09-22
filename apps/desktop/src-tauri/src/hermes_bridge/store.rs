@@ -131,9 +131,19 @@ pub struct Delivery {
     pub created_at: i64,
 }
 
+struct StoreOwner(File);
+impl Drop for StoreOwner {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the open file description until exec,
+        // even with CLOEXEC. Closing only our descriptor would retain the lock.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 pub struct Store {
     db: Connection,
-    _owner: File,
+    // Fields drop in declaration order: close SQLite before releasing ownership.
+    _owner: StoreOwner,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, String> {
@@ -153,6 +163,7 @@ impl Store {
         owner
             .try_lock_exclusive()
             .map_err(|_| "bridge_owned_by_another_process".to_string())?;
+        let owner = StoreOwner(owner);
         let db = Connection::open(root.join("bridge.sqlite3")).map_err(err)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS routes(id TEXT PRIMARY KEY, source_key TEXT UNIQUE NOT NULL, data TEXT NOT NULL);
@@ -188,6 +199,25 @@ impl Store {
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         self.db.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![key,value]).map_err(err)?;
         Ok(())
+    }
+    /// Credentials, account generation and old authorizations change together.
+    pub fn replace_channel(&mut self, platform: &str, cipher: &str, fields: &[String]) -> Result<(), String> {
+        let routes = self.routes()?;
+        let tx = self.db.transaction().map_err(err)?;
+        for mut route in routes.into_iter().filter(|r| r.enabled) {
+            route.enabled = false;
+            route.generation += 1;
+            tx.execute("UPDATE routes SET data=?1 WHERE id=?2", params![serde_json::to_string(&route).map_err(err)?, route.id]).map_err(err)?;
+            tx.execute("UPDATE challenges SET state='revoked' WHERE route_id=?1 AND state='pending'", [&route.id]).map_err(err)?;
+        }
+        for (key, value) in [
+            ("accountRef", random_id()), ("platform", platform.into()),
+            ("channelSecrets", cipher.into()), ("configuredFields", json!(fields).to_string()),
+            ("enabled", "true".into()),
+        ] {
+            tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![key,value]).map_err(err)?;
+        }
+        tx.commit().map_err(err)
     }
     fn list<T: serde::de::DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, String> {
         let mut query = self.db.prepare(sql).map_err(err)?;
@@ -588,4 +618,102 @@ fn read_operation(db: &Connection, id: &str) -> Result<Operation, String> {
         .map_err(err)?
         .ok_or("operation_not_found")?;
     serde_json::from_str(&raw).map_err(err)
+}
+
+#[cfg(test)]
+mod channel_transaction_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn closing_store_releases_ownership_while_an_inherited_description_survives() {
+        use std::os::fd::AsRawFd;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let flags = unsafe { libc::fcntl(store._owner.0.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        // dup and fork share the same open file description. Holding this clone
+        // deterministically models the window before a concurrent child execs.
+        let inherited = store._owner.0.try_clone().unwrap();
+        drop(store);
+
+        let reopened = Store::open(root.path())
+            .expect("a completed owner must release its lock before child exec");
+        assert!(Store::open(root.path()).is_err(), "the new owner stays exclusive");
+        drop(inherited);
+        assert!(Store::open(root.path()).is_err(), "closing the old inherited handle cannot unlock the new owner");
+        drop(reopened);
+        assert!(Store::open(root.path()).is_ok());
+    }
+
+    fn settings(store: &Store) -> Vec<(String, String)> {
+        let mut query = store.db.prepare("SELECT id,data FROM settings ORDER BY id").unwrap();
+        query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn failed_channel_replacement_rolls_back_credentials_account_and_authorizations() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let database = root.path().join("state");
+        let mut store = Store::open(&database).unwrap();
+        let source = Source {
+            account_ref: "old-account".into(),
+            platform: "telegram".into(),
+            profile: "private".into(),
+            transport_profile: "private".into(),
+            user_id: "fixture-user".into(),
+            chat_id: "fixture-chat".into(),
+            thread_id: None,
+            chat_type: "dm".into(),
+        };
+        for (key, value) in [
+            ("accountRef", "old-account"),
+            ("platform", "telegram"),
+            ("channelSecrets", "old-encrypted-credentials"),
+            ("configuredFields", "[\"TELEGRAM_BOT_TOKEN\"]"),
+            ("enabled", "true"),
+        ] {
+            store.set_setting(key, value).unwrap();
+        }
+        let route = store.approve_route(source.clone(), vec![workspace.to_string_lossy().into()], true, true).unwrap();
+        let prepared = store.prepare(&route, "original-input", "fixture-runtime", "original text").unwrap();
+        let challenge = prepared["challenge"].as_str().unwrap();
+        let challenge_state = |store: &Store| -> String {
+            store.db.query_row("SELECT state FROM challenges WHERE id=?1", [challenge], |row| row.get(0)).unwrap()
+        };
+        let old_settings = settings(&store);
+        let old_route = json!(store.route(&source).unwrap());
+
+        // Fail after accountRef, platform, channelSecrets and route/challenge
+        // revocation have already been written inside the transaction.
+        store.db.execute_batch("CREATE TRIGGER fail_channel_replacement BEFORE INSERT ON settings
+            WHEN NEW.id = 'configuredFields'
+            BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;").unwrap();
+        let fields = ["WECOM_BOT_ID".into(), "WECOM_SECRET".into()];
+        let error = store.replace_channel("wecom", "new-encrypted-credentials", &fields).unwrap_err();
+        assert!(error.contains("injected replacement failure"));
+        assert_eq!(settings(&store), old_settings);
+        assert_eq!(json!(store.route(&source).unwrap()), old_route);
+        assert_eq!(store.challenge_runtime(&route, challenge).unwrap(), "fixture-runtime");
+        assert_eq!(challenge_state(&store), "pending");
+
+        drop(store);
+        let mut store = Store::open(&database).unwrap();
+        assert_eq!(settings(&store), old_settings);
+        assert_eq!(json!(store.route(&source).unwrap()), old_route);
+        assert_eq!(store.challenge_runtime(&route, challenge).unwrap(), "fixture-runtime");
+        assert_eq!(challenge_state(&store), "pending");
+
+        store.db.execute_batch("DROP TRIGGER fail_channel_replacement;").unwrap();
+        store.replace_channel("wecom", "new-encrypted-credentials", &fields).unwrap();
+        assert_eq!(store.setting("channelSecrets").unwrap().as_deref(), Some("new-encrypted-credentials"));
+        assert_ne!(store.setting("accountRef").unwrap().as_deref(), Some("old-account"));
+        assert!(store.route(&source).is_err());
+        assert_eq!(challenge_state(&store), "revoked");
+        assert!(store.confirm(&route, "later-confirmation", challenge, "fixture-runtime").is_err());
+    }
 }

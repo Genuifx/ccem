@@ -16,7 +16,17 @@ export interface HermesPlatform {
   label: string;
   available: boolean;
   strictSend: boolean;
+  qrSetup?: boolean;
   fields: Array<{ key: string; label: string; secret: boolean; required: boolean }>;
+}
+
+export interface HermesSetup {
+  id: string;
+  platform: string;
+  state: 'generating' | 'waiting' | 'connecting' | 'connected' | 'expired' | 'cancelled' | 'error';
+  qrPayload?: string;
+  expiresAt?: number;
+  error?: string;
 }
 
 export interface HermesPendingPairing {
@@ -51,6 +61,7 @@ export interface HermesStatus {
     configuredPlatform?: string | null;
     configuredFields?: string[];
   };
+  setup?: HermesSetup | null;
   pairing?: { code: string; expiresAt: string | number } | null;
   pending: HermesPendingPairing[];
   routes: HermesRoute[];
@@ -64,6 +75,8 @@ export interface HermesActionPayloads {
   cancelInstall: undefined;
   removeRuntime: undefined;
   configureChannel: { platform: string; fields: Record<string, string> };
+  beginSetup: { platform: string };
+  cancelSetup: { id: string };
   start: undefined;
   stop: undefined;
   openPairing: undefined;

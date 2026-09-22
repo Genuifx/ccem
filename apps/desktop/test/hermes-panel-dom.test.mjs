@@ -23,6 +23,11 @@ let handler;
 const platform = { id: 'custom-transport', label: 'Dynamic Transport', available: true, strictSend: true,
   fields: [{ key: 'DYNAMIC_ACCOUNT', label: 'Account', secret: false, required: true },
     { key: 'DYNAMIC_SECRET', label: 'Secret', secret: true, required: true }] };
+const qrPlatform = { ...platform, id: 'wecom', label: 'WeCom', qrSetup: true };
+const qrSetup = { id: 'qr-one', platform: 'wecom', state: 'waiting', qrPayload: 'https://work.weixin.qq.com/ccem-fixture-one', expiresAt: Date.now() + 300000 };
+function qrSnapshot(patch = {}) {
+  return snapshot({ gateway: { state: 'unconfigured', platforms: [qrPlatform] }, ...patch });
+}
 const source = { platform: platform.id, profile: 'profile-one', transportProfile: 'transport-one', accountRef: 'bot-account-reference-one',
   userId: 'actual-user', chatId: 'actual-chat', threadId: 'actual-thread', chatType: 'dm' };
 const pending = { id: 'pair-one', source, expiresAt: Date.now() + 600000 };
@@ -68,7 +73,7 @@ test.before(async () => {
       builder.onResolve({ filter: /^@\/components\/chat-app\/(telegram|wecom|weixin)\// }, (args) => ({ path: args.path.split('/').at(-1), namespace: 'hermes-stub' }));
       builder.onLoad({ filter: /.*/, namespace: 'hermes-stub' }, (args) => {
         if (args.path === 'ipc') return { contents: 'export const invoke=(name,args)=>globalThis.__hermesInvoke(name,args);', loader: 'js' };
-        if (args.path === 'locale') return { contents: `export function useLocale(){return {lang:'en',t:(key,params={})=>key+Object.values(params).map(value=>' '+value).join('')}}`, loader: 'js' };
+        if (args.path === 'locale') return { contents: `export function useLocale(){return {lang:'en',t:(key,params={})=>globalThis.__hermesTranslate?.(key,params)??key+Object.values(params).map(value=>' '+value).join('')}}`, loader: 'js' };
         if (args.path === 'hooks') return { contents: `const methods={getPlatformCapabilities:async()=>({tmuxSupported:false,tmuxInstalled:false})}; export function useTauriCommands(){return methods}`, loader: 'js' };
         if (args.path === 'motion') return { contents: `export const ccemMotion={};export const clearMotionProps=()=>{};export const getMotionTargets=()=>[];export const gsap={};export const shouldReduceMotion=()=>true;export const useGSAP=()=>{};`, loader: 'js' };
         return { contents: `import React from 'react'; export function ${args.path}(){return React.createElement('div',{'data-legacy-panel':true},'Existing platform')}`, loader: 'js', resolveDir: desktop };
@@ -90,6 +95,7 @@ test.beforeEach(() => {
   invokeCalls = [];
   intervalCallbacks = [];
   handler = async () => structuredClone(current);
+  globalThis.__hermesTranslate = undefined;
   globalThis.__hermesInvoke = async (name, args) => { invokeCalls.push({ name, args }); return handler(name, args); };
   dom.window.setInterval = (callback) => { intervalCallbacks.push(callback); return intervalCallbacks.length; };
   dom.window.clearInterval = (id) => { intervalCallbacks[id - 1] = null; };
@@ -167,6 +173,282 @@ test('a rejected install request can be retried without ever enabling premature 
   assert.ok(container.querySelector('[role="alert"]').textContent.includes('install reservation unavailable'));
 });
 
+test('QR-capable platforms default to scan setup without exposing credential fields', async () => {
+  current = qrSnapshot();
+  const generation = deferred();
+  handler = async (name, args) => args?.action === 'beginSetup' ? generation.promise : structuredClone(current);
+  await mount();
+  assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'idle');
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET'), null);
+  assert.equal(container.textContent.includes('DYNAMIC_SECRET'), false);
+  assert.equal(actions().length, 0, 'opening the page does not create a bot');
+  const generate = button('hermes.scanGenerate');
+  await harness.act(async () => { generate.click(); generate.click(); });
+  assert.equal(actions('beginSetup').length, 1);
+  assert.deepEqual(actions('beginSetup')[0].args.payload, { platform: 'wecom' });
+  await harness.act(async () => generation.resolve(qrSnapshot({ setup: { ...qrSetup, state: 'generating', qrPayload: undefined } })));
+  assert.ok(container.textContent.includes('hermes.scanGenerating'));
+  assert.equal(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'), null);
+  current = qrSnapshot({ setup: qrSetup });
+  await poll();
+  const qr = container.querySelector('svg[aria-label="hermes.scanQrLabel"]');
+  assert.ok(qr?.querySelector('path'), 'the received QR payload produces a real SVG QR code');
+  assert.ok(container.textContent.includes('hermes.scanWaiting'));
+});
+
+test('switching to manual connection cancels the pending QR setup before revealing the form', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  const cancellation = deferred();
+  handler = async (name, args) => args?.action === 'cancelSetup' ? cancellation.promise : structuredClone(current);
+  await mount();
+  await click(button('hermes.manualConnect'));
+  assert.deepEqual(actions('cancelSetup')[0].args.payload, { id: 'qr-one' });
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.equal(button('hermes.manualConnect').disabled, true);
+  await harness.act(async () => cancellation.resolve(qrSnapshot({ setup: { ...qrSetup, state: 'cancelled', qrPayload: undefined } })));
+  assert.ok(container.querySelector('[data-hermes-manual]'));
+  assert.equal(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'), null);
+  await input('hermes-field-DYNAMIC_ACCOUNT', 'manual-account');
+  await input('hermes-field-DYNAMIC_SECRET', 'manual-secret');
+  assert.equal(button('hermes.saveChannel').disabled, false);
+  current = qrSnapshot({ setup: { ...qrSetup, state: 'cancelled' } });
+  await poll();
+  assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, 'manual-secret', 'status polling preserves the manual draft');
+  handler = async (name, args) => args?.action === 'configureChannel'
+    ? qrSnapshot({ gateway: { state: 'running', platforms: [qrPlatform], configuredPlatform: 'wecom' } }) : structuredClone(current);
+  await click(button('hermes.saveChannel'));
+  assert.deepEqual(actions('configureChannel')[0].args.payload, { platform: 'wecom', fields: { DYNAMIC_ACCOUNT: 'manual-account', DYNAMIC_SECRET: 'manual-secret' } });
+  assert.ok(button('hermes.newPairing'));
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+});
+
+test('a rejected scan cancellation keeps the QR flow visible and can be retried', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  handler = async (name, args) => {
+    if (args?.action === 'cancelSetup') throw new Error('setup cancellation unavailable');
+    return structuredClone(current);
+  };
+  await mount();
+  await click(button('hermes.manualConnect'));
+  assert.equal(container.querySelector('[role="alert"]').textContent, 'hermes.scanError');
+  assert.equal(container.textContent.includes('setup cancellation unavailable'), false);
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.ok(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'));
+  assert.equal(button('hermes.manualConnect').disabled, false);
+  handler = async (name, args) => args?.action === 'cancelSetup'
+    ? qrSnapshot({ setup: { ...qrSetup, state: 'cancelled', qrPayload: undefined } }) : structuredClone(current);
+  await click(button('hermes.manualConnect'));
+  assert.ok(container.querySelector('[data-hermes-manual]'));
+});
+
+test('cancelled scan setup can be restarted and a manual draft can return to the scan entry', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  handler = async (name, args) => {
+    if (args?.action === 'cancelSetup') return qrSnapshot({ setup: { ...qrSetup, state: 'cancelled', qrPayload: undefined } });
+    if (args?.action === 'beginSetup') return qrSnapshot({ setup: { ...qrSetup, id: 'qr-two', state: 'generating', qrPayload: undefined } });
+    return structuredClone(current);
+  };
+  await mount();
+  await click(button('hermes.cancel'));
+  assert.ok(container.textContent.includes('hermes.scanCancelled'));
+  assert.equal(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'), null);
+  await click(button('hermes.manualConnect'));
+  await input('hermes-field-DYNAMIC_SECRET', 'draft-secret');
+  await click(button('hermes.useScan'));
+  assert.ok(button('hermes.scanGenerate'));
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  await click(button('hermes.scanGenerate'));
+  assert.equal(actions('beginSetup').length, 1);
+  assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'generating');
+});
+
+test('refresh uses a new QR payload and timed-out setup hides the old code before retry', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  handler = async (name, args) => args?.action === 'beginSetup'
+    ? qrSnapshot({ setup: { ...qrSetup, id: 'qr-two', qrPayload: 'https://work.weixin.qq.com/ccem-fixture-two' } }) : structuredClone(current);
+  await mount();
+  const firstQr = container.querySelector('svg[aria-label="hermes.scanQrLabel"]').innerHTML;
+  await click(button('hermes.scanRefresh'));
+  assert.notEqual(container.querySelector('svg[aria-label="hermes.scanQrLabel"]').innerHTML, firstQr);
+  current = qrSnapshot({ setup: { ...qrSetup, id: 'qr-two', expiresAt: Date.now() - 1000 } });
+  await poll();
+  assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'expired');
+  assert.equal(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'), null);
+  assert.ok(container.textContent.includes('hermes.scanExpired'));
+  await click(button('hermes.scanRetry'));
+  assert.equal(actions('beginSetup').length, 2);
+});
+
+test('the client stops showing a QR after five minutes even while a status read hangs', async (context) => {
+  const startedAt = Date.now();
+  context.mock.method(Date, 'now', () => startedAt);
+  current = qrSnapshot({ setup: { ...qrSetup, expiresAt: undefined } });
+  await mount();
+  assert.ok(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'));
+  const hangingRead = deferred();
+  handler = async () => hangingRead.promise;
+  await poll();
+  context.mock.method(Date, 'now', () => startedAt + 300001);
+  await poll();
+  assert.equal(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'), null);
+  assert.ok(button('hermes.scanRetry'));
+  await harness.act(async () => hangingRead.resolve(qrSnapshot({ setup: { ...qrSetup, expiresAt: undefined } })));
+});
+
+test('QR errors expose retry and manual fallback without prefilling any credentials', async () => {
+  current = qrSnapshot({ setup: { ...qrSetup, state: 'error', qrPayload: undefined, error: 'setup_request_failed' } });
+  await mount();
+  assert.equal(container.querySelector('[role="alert"]').textContent, 'hermes.scanRequestFailed');
+  assert.equal(container.textContent.includes('setup_request_failed'), false);
+  assert.ok(button('hermes.scanRetry'));
+  await click(button('hermes.manualConnect'));
+  assert.equal(actions('cancelSetup').length, 0, 'finished errors need no cancellation');
+  assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, '');
+});
+
+test('fixed setup errors render localized recovery guidance in both languages', async () => {
+  const cases = [
+    ['setup_request_failed', 'scanRequestFailed'],
+    ['setup_invalid_response', 'scanInvalidResponse'],
+    ['setup_invalid_credentials', 'scanInvalidCredentials'],
+    ['setup_connection_failed', 'scanConnectionFailed'],
+    ['setup_pairing_failed', 'scanPairingFailed'],
+    ['setup_not_supported', 'scanNotSupported'],
+    ['setup_expired', 'scanExpired'],
+  ];
+  current = qrSnapshot();
+  await mount();
+  for (const lang of ['zh', 'en']) {
+    const locale = JSON.parse(await fs.readFile(path.join(desktop, `src/locales/${lang}.json`), 'utf8'));
+    globalThis.__hermesTranslate = (key) => key.split('.').reduce((value, part) => value?.[part], locale);
+    for (const [code, key] of cases) {
+      current = qrSnapshot({ setup: { ...qrSetup, state: 'error', qrPayload: undefined, error: code } });
+      await poll();
+      const alert = container.querySelector('[data-hermes-setup-error]');
+      assert.equal(alert.textContent, locale.hermes[key], `${lang}: ${code} has specific recovery guidance`);
+      assert.equal(container.textContent.includes(code), false);
+      assert.ok(button(locale.hermes.scanRetry));
+      assert.ok(button(locale.hermes.manualConnect));
+    }
+  }
+});
+
+test('a connected bot with failed automatic pairing offers account linking without recreating the bot', async () => {
+  const locale = JSON.parse(await fs.readFile(path.join(desktop, 'src/locales/zh.json'), 'utf8'));
+  globalThis.__hermesTranslate = (key) => key.split('.').reduce((value, part) => value?.[part], locale);
+  current = qrSnapshot({ gateway: { state: 'running', platforms: [qrPlatform], configuredPlatform: 'wecom' },
+    setup: { ...qrSetup, state: 'error', qrPayload: undefined, error: 'setup_pairing_failed' } });
+  handler = async (name, args) => args?.action === 'openPairing'
+    ? { ...structuredClone(current), pairing: { code: 'RETRY123', expiresAt: Date.now() + 120000 } }
+    : structuredClone(current);
+  await mount();
+  assert.equal(container.querySelector('[data-hermes-setup-error]').textContent, locale.hermes.scanPairingFailed);
+  assert.ok(container.textContent.includes('连接本人账号'));
+  assert.equal(container.querySelector('[data-hermes-setup]'), null);
+  assert.equal(container.querySelector('svg[aria-label="hermes.scanQrLabel"]'), null);
+  for (const label of ['scanGenerate', 'scanRefresh', 'scanRetry']) assert.equal(button(locale.hermes[label]), undefined);
+  await click(button(locale.hermes.newPairing));
+  assert.equal(actions('openPairing').length, 1);
+  assert.equal(actions('beginSetup').length, 0, 'account-linking recovery never starts bot creation again');
+  assert.equal(container.querySelector('code').textContent, '/ccem connect RETRY123');
+  assert.equal(container.querySelector('[data-hermes-setup-error]'), null, 'the successful retry removes the obsolete pairing failure');
+});
+
+test('unknown setup status errors never render raw details or prefix-matched messages', async () => {
+  const rawError = 'setup_request_failed: upstream rejected secret=do-not-display';
+  current = qrSnapshot({ setup: { ...qrSetup, state: 'error', qrPayload: undefined, error: rawError } });
+  await mount();
+  assert.equal(container.querySelector('[role="alert"]').textContent, 'hermes.scanError');
+  assert.equal(container.textContent.includes(rawError), false);
+  assert.equal(container.textContent.includes('do-not-display'), false);
+  assert.ok(button('hermes.scanRetry'));
+});
+
+test('begin and cancel setup failures stay local with actionable messages and safe unknown fallback', async () => {
+  current = qrSnapshot();
+  handler = async (name, args) => {
+    if (args?.action === 'beginSetup') throw new Error('setup_busy_retry');
+    if (args?.action === 'cancelSetup') throw 'setup_already_connecting';
+    return structuredClone(current);
+  };
+  await mount();
+  await click(button('hermes.scanGenerate'));
+  assert.equal(container.querySelector('[data-hermes-setup-request-error]').textContent, 'hermes.scanBusyRetry');
+  assert.equal(container.textContent.includes('setup_busy_retry'), false);
+  assert.equal(button('hermes.scanGenerate').disabled, false);
+  current = qrSnapshot({ setup: qrSetup });
+  await poll();
+  await click(button('hermes.manualConnect'));
+  assert.equal(container.querySelector('[data-hermes-setup-request-error]').textContent, 'hermes.scanAlreadyConnecting');
+  assert.equal(container.textContent.includes('setup_already_connecting'), false);
+  assert.equal(container.querySelector('[data-hermes-manual]'), null, 'an unsuccessful cancellation never opens a conflicting configuration form');
+  handler = async (name, args) => {
+    if (args?.action === 'beginSetup') throw { message: 'socket failure with private-payload' };
+    return structuredClone(current);
+  };
+  await click(button('hermes.scanRefresh'));
+  assert.equal(container.querySelector('[data-hermes-setup-request-error]').textContent, 'hermes.scanError');
+  assert.equal(container.textContent.includes('private-payload'), false);
+});
+
+test('connecting setup cannot be cancelled or replaced with manual configuration', async () => {
+  current = qrSnapshot({ setup: { ...qrSetup, state: 'connecting', qrPayload: undefined } });
+  await mount();
+  assert.ok(container.textContent.includes('hermes.scanConnecting'));
+  assert.equal(button('hermes.cancel'), undefined);
+  assert.equal(button('hermes.scanRefresh'), undefined);
+  assert.equal(button('hermes.manualConnect').disabled, true);
+  await click(button('hermes.manualConnect'));
+  assert.equal(actions('cancelSetup').length, 0);
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+});
+
+test('a scan completing at cancellation keeps the UI in connecting state', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  handler = async (name, args) => args?.action === 'cancelSetup'
+    ? qrSnapshot({ setup: { ...qrSetup, state: 'connecting', qrPayload: undefined } }) : structuredClone(current);
+  await mount();
+  await click(button('hermes.manualConnect'));
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.ok(container.textContent.includes('hermes.scanConnecting'));
+});
+
+test('a stale QR status cannot reopen a cancelled scan after switching to manual', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  await mount();
+  const stale = deferred();
+  handler = async (name, args) => name === 'hermes_status' ? stale.promise
+    : qrSnapshot({ setup: { ...qrSetup, state: 'cancelled', qrPayload: undefined } });
+  await poll();
+  await click(button('hermes.manualConnect'));
+  await harness.act(async () => stale.resolve(qrSnapshot({ setup: qrSetup })));
+  assert.ok(container.querySelector('[data-hermes-manual]'));
+  assert.equal(container.querySelector('[data-hermes-setup]'), null);
+  await click(button('hermes.useScan'));
+  assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'cancelled');
+});
+
+test('QR connection advances to the backend pairing code without inventing a chat identity', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  await mount();
+  current = qrSnapshot({ setup: { ...qrSetup, state: 'connected', qrPayload: undefined },
+    gateway: { state: 'running', platforms: [qrPlatform], configuredPlatform: 'wecom' },
+    pairing: { code: 'NATIVE987', expiresAt: Date.now() + 120000 } });
+  await poll();
+  assert.equal(container.querySelector('[data-hermes-setup]'), null);
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.equal(container.querySelector('code').textContent, '/ccem connect NATIVE987');
+  assert.ok(container.textContent.includes('hermes.channelConnected WeCom'));
+  assert.equal(actions('openPairing').length, 0, 'backend already opened the nonce; rendering does not rotate it');
+  assert.equal(actions('approvePairing').length, 0);
+  assert.equal(container.querySelector('[data-hermes-pairing]'), null, 'scanning is not proof of a native chat sender');
+  current = { ...current, pending: [{ ...pending, source: { ...source, platform: 'wecom' } }] };
+  await poll();
+  assert.ok(container.querySelector('[data-hermes-pairing="pair-one"]'));
+  assert.equal(button('hermes.approvePairing').disabled, true, 'workspace authorization remains an explicit step');
+});
+
 test('dynamic configuration sends only known fields and clears entered secrets after successful save', async () => {
   handler = async (name, args) => args?.action === 'configureChannel' ? snapshot({ gateway: {
     state: 'running', platforms: [platform], configuredPlatform: platform.id, configuredFields: ['DYNAMIC_ACCOUNT', 'DYNAMIC_SECRET'],
@@ -181,6 +463,8 @@ test('dynamic configuration sends only known fields and clears entered secrets a
   assert.equal(container.textContent.includes('secret-value-123'), false);
   current = snapshot({ gateway: { state: 'stopped', platforms: [platform], configuredPlatform: platform.id, configuredFields: ['DYNAMIC_ACCOUNT', 'DYNAMIC_SECRET'] } });
   await poll();
+  assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET'), null, 'saved connections offer restart before configuration');
+  await click(button('hermes.editConnection'));
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, '');
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').placeholder, 'hermes.alreadyConfigured');
   assert.equal(button('hermes.saveChannel').disabled, true, 'unchanged saved settings do not revoke pairings through a redundant save');
@@ -212,6 +496,7 @@ test('stopping the channel reloads editable metadata without reconnecting or ent
   assert.equal(button('hermes.start').disabled, true);
   current = snapshot({ gateway: { state: 'configured', platforms: [platform], ...configured } });
   await poll();
+  await click(button('hermes.editConnection'));
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, '');
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').placeholder, 'hermes.alreadyConfigured');
   await input('hermes-field-DYNAMIC_ACCOUNT', 'replacement-account');
@@ -225,7 +510,7 @@ test('platform metadata with strictSend=false cannot start the new channel path'
   current = snapshot({ gateway: { state: 'ready', platforms: [{ ...platform, strictSend: false }] } });
   await mount();
   assert.equal(button('hermes.saveChannel').disabled, true);
-  assert.equal(button('hermes.start').disabled, true);
+  assert.equal(button('hermes.start'), undefined);
   assert.equal(actions().length, 0);
 });
 
