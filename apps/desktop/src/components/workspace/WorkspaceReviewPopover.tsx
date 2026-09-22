@@ -1,6 +1,7 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
+import { useWorkspaceSidePanel } from './WorkspaceSidePanel';
 import {
-  ArrowLeft,
   Bot,
   Check,
   CheckCircle2,
@@ -50,7 +51,6 @@ interface WorkspaceReviewPopoverProps {
   isLive?: boolean;
 }
 
-type ReviewPage = 'main' | WorkspaceReviewDetailPage;
 type TaskTone = 'completed' | 'current' | 'failed' | 'next';
 
 function interpolate(template: string, values: Record<string, string | number>) {
@@ -202,7 +202,12 @@ export function WorkspaceReviewPopover({
 }: WorkspaceReviewPopoverProps) {
   const { t } = useLocale();
   const gatedOpen = useNativeSurfaceOcclusion(isOpen);
-  const [page, setPage] = useState<ReviewPage>('main');
+  const sidePanel = useWorkspaceSidePanel();
+  const detailPage = sidePanel?.tab === 'files' || sidePanel?.tab === 'agents' ? sidePanel.tab : null;
+  const openDetail = (page: WorkspaceReviewDetailPage) => {
+    sidePanel?.open(page);
+    onOpenChange(false);
+  };
   const envColor = getEnvColorVar(session.env_name);
 
   const completedTodos = useMemo(
@@ -236,9 +241,6 @@ export function WorkspaceReviewPopover({
 
   const handleOpenChange = useCallback((nextOpen: boolean) => {
     onOpenChange(nextOpen);
-    if (!nextOpen) {
-      setPage('main');
-    }
   }, [onOpenChange]);
 
   const handleInteractOutside = useCallback((event: { preventDefault: () => void }) => {
@@ -248,8 +250,7 @@ export function WorkspaceReviewPopover({
   const branchLabel = gitSnapshot?.is_repo
     ? `${gitSnapshot.branch || '—'}${gitSnapshot.sha ? ` · ${gitSnapshot.sha.slice(0, 7)}` : ''}`
     : '—';
-  const detailPage = page === 'files' || page === 'agents' ? page : null;
-  const width = detailPage ? 'min(820px, calc(100vw - 24px))' : 'min(400px, calc(100vw - 24px))';
+  const width = 'min(400px, calc(100vw - 24px))';
   const sessionIsActive = ['initializing', 'processing', 'running'].includes(session.status);
   const sessionHasFailed = ['error', 'failed', 'interrupted'].includes(session.status);
   const hasTodoProgress = model.todoSource !== 'unavailable' && model.todoTotal > 0;
@@ -275,6 +276,7 @@ export function WorkspaceReviewPopover({
       : t('workspace.reviewProgress');
 
   return (
+    <>
     <Popover modal={false} open={gatedOpen} onOpenChange={handleOpenChange}>
       <PopoverAnchor virtualRef={workspaceReviewTriggerRef} />
       <PopoverContent
@@ -295,7 +297,6 @@ export function WorkspaceReviewPopover({
         style={{
           width,
           maxHeight: 'min(70vh, 560px)',
-          ...(detailPage ? { height: 'min(70vh, 560px)' } : {}),
         }}
         className={cn(
           'frosted-panel glass-noise z-[80] flex overflow-hidden rounded-2xl border border-[hsl(var(--glass-border-light))]/55 bg-popover/95 p-0 shadow-2xl backdrop-blur-xl',
@@ -304,18 +305,6 @@ export function WorkspaceReviewPopover({
       >
         <div className="flex min-h-0 w-full flex-col">
           <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border-subtle/55 px-3">
-            {detailPage ? (
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                className="h-8 w-8 shrink-0 rounded-full"
-                aria-label={t('workspace.reviewBack')}
-                onClick={() => setPage('main')}
-              >
-                <ArrowLeft className="h-4 w-4" />
-              </Button>
-            ) : (
               <span className="relative flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-surface-raised/70">
                 {sessionIsActive ? (
                   <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -325,24 +314,14 @@ export function WorkspaceReviewPopover({
                   <CheckCircle2 className="h-4 w-4 text-success" />
                 )}
               </span>
-            )}
             <div className="min-w-0 flex-1">
               <h2 id={`${WORKSPACE_REVIEW_POPOVER_ID}-title`} className="truncate text-[13px] font-semibold text-foreground">
-                {detailPage === 'files'
-                  ? t('workspace.reviewChangedFiles')
-                  : detailPage === 'agents'
-                    ? t('workspace.reviewSubagents')
-                    : t('workspace.reviewTitle')}
+                {t('workspace.reviewTitle')}
               </h2>
               <p className="truncate text-[10px] text-muted-foreground">
-                {detailPage === 'files'
-                  ? interpolate(t('workspace.reviewFilesCount'), { count: model.changedFiles.length })
-                  : detailPage === 'agents'
-                    ? session.env_name
-                    : `${session.env_name} · ${session.provider}`}
+                {`${session.env_name} · ${session.provider}`}
               </p>
             </div>
-            {!detailPage ? (
               <Button
                 type="button"
                 size="icon"
@@ -354,7 +333,6 @@ export function WorkspaceReviewPopover({
               >
                 <RefreshCw className={cn('h-3.5 w-3.5', isRefreshingGit && 'animate-spin')} />
               </Button>
-            ) : null}
             <Button
               type="button"
               size="icon"
@@ -367,18 +345,6 @@ export function WorkspaceReviewPopover({
             </Button>
           </header>
 
-          {detailPage ? (
-            <WorkspaceReviewDetails
-              page={detailPage}
-              session={session}
-              model={model}
-              onLoadDiff={onLoadDiff}
-              onLoadMediaPreview={onLoadMediaPreview}
-              onLoadSubagents={onLoadSubagents}
-              isLive={isLive}
-            />
-          ) : (
-            <>
               <ScrollArea className="min-h-0 flex-1">
                 <div className="space-y-3 px-3.5 py-3">
                   <section className="space-y-1.5 border-b border-border-subtle/45 pb-2.5">
@@ -451,9 +417,9 @@ export function WorkspaceReviewPopover({
                         icon={FileDiff}
                         label={t('workspace.reviewChangedFiles')}
                         count={model.changedFiles.length}
-                        onClick={() => setPage('files')}
+                        onClick={() => openDetail('files')}
                       />
-                      <EvidenceRow icon={PackageCheck} label={t('workspace.reviewArtifacts')} count={model.artifacts.length} />
+                      <EvidenceRow icon={PackageCheck} label={t('workspace.reviewArtifacts')} count={model.artifacts.length} onClick={() => openDetail('files')} />
                       <EvidenceRow
                         icon={CircleAlert}
                         label={t('workspace.reviewFailedTools')}
@@ -461,7 +427,7 @@ export function WorkspaceReviewPopover({
                         tone="danger"
                       />
                       {onLoadSubagents ? (
-                        <EvidenceRow icon={Bot} label={t('workspace.reviewSubagents')} onClick={() => setPage('agents')} />
+                        <EvidenceRow icon={Bot} label={t('workspace.reviewSubagents')} onClick={() => openDetail('agents')} />
                       ) : null}
                     </div>
                   </details>
@@ -473,10 +439,26 @@ export function WorkspaceReviewPopover({
                 <span className="min-w-0 truncate">{t('workspace.reviewEnvironment')} · {session.env_name}</span>
                 <span className="ml-auto shrink-0 font-mono">{t('workspace.reviewBranch')} · {branchLabel}</span>
               </footer>
-            </>
-          )}
         </div>
       </PopoverContent>
     </Popover>
+    {detailPage && sidePanel?.target ? createPortal(
+      <WorkspaceReviewDetails
+        key={`${session.runtime_id}:${session.project_dir}`}
+        page={detailPage}
+        session={session}
+        model={model}
+        gitSnapshot={gitSnapshot}
+        onLoadDiff={onLoadDiff}
+        onLoadMediaPreview={onLoadMediaPreview}
+        onLoadSubagents={onLoadSubagents}
+        onRefreshGit={onRefreshGit}
+        isRefreshingGit={isRefreshingGit}
+        requestedPath={sidePanel.filePath}
+        requestRevision={sidePanel.revision}
+        isLive={isLive}
+      />, sidePanel.target,
+    ) : null}
+    </>
   );
 }

@@ -7,15 +7,24 @@ import {
   FileDiff,
   FileText,
   LoaderCircle,
+  RefreshCw,
+  PanelLeft,
   Users,
 } from '@/lib/lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { MarkdownRenderer } from '@/components/history/MarkdownRenderer';
+import { WorkspaceFileLinkContext, useWorkspaceFileLinks } from './WorkspaceFileLinkContext';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
 import type {
   NativeSessionSummary,
   WorkspaceFileDiff,
+  WorkspaceFilePreview,
+  WorkspaceFileSuggestion,
+  WorkspaceGitSnapshot,
   WorkspaceMediaKind,
   WorkspaceMediaPreview,
 } from '@/lib/tauri-ipc';
@@ -39,6 +48,11 @@ interface WorkspaceReviewDetailsProps {
   onLoadMediaPreview?: (filePath: string) => Promise<WorkspaceMediaPreview>;
   onLoadSubagents?: (detailAgentId: string | null) => Promise<SessionSubagentsPayload>;
   isLive?: boolean;
+  gitSnapshot?: WorkspaceGitSnapshot | null;
+  requestedPath?: string;
+  requestRevision?: number;
+  onRefreshGit?: () => void;
+  isRefreshingGit?: boolean;
 }
 
 const MEDIA_EXTENSION_KIND: Record<string, WorkspaceMediaKind> = {
@@ -238,41 +252,54 @@ function MediaPreview({
 }
 
 function FilesDetail({
-  session,
-  model,
-  onLoadDiff,
-  onLoadMediaPreview,
-}: Pick<WorkspaceReviewDetailsProps, 'session' | 'model' | 'onLoadDiff' | 'onLoadMediaPreview'>) {
+  session, model, onLoadDiff, onLoadMediaPreview, gitSnapshot,
+  requestedPath, requestRevision, onRefreshGit, isRefreshingGit,
+}: WorkspaceReviewDetailsProps) {
   const { t } = useLocale();
+  const fileLinks = useWorkspaceFileLinks();
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [mode, setMode] = useState<'preview' | 'source' | 'diff'>('preview');
+  const [scope, setScope] = useState('git');
+  const [showList, setShowList] = useState(true);
+  const [query, setQuery] = useState('');
+  const [suggestions, setSuggestions] = useState<WorkspaceFileSuggestion[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searching, setSearching] = useState(false);
   const [diff, setDiff] = useState<WorkspaceFileDiff | null>(null);
   const [mediaPreview, setMediaPreview] = useState<WorkspaceMediaPreview | null>(null);
+  const [textPreview, setTextPreview] = useState<WorkspaceFilePreview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRequestSeqRef = useRef(0);
+  const loaders = useRef({ onLoadDiff, onLoadMediaPreview });
+  loaders.current = { onLoadDiff, onLoadMediaPreview };
+  const markdown = (path: string) => /\.(md|markdown|mdown)$/i.test(path);
 
-  useEffect(() => () => {
-    fileRequestSeqRef.current += 1;
-  }, []);
+  useEffect(() => () => { fileRequestSeqRef.current += 1; }, []);
 
-  const selectFile = useCallback(async (path: string) => {
-    const requestSeq = fileRequestSeqRef.current + 1;
-    fileRequestSeqRef.current = requestSeq;
+  const selectFile = useCallback(async (path: string, requestedMode?: 'preview' | 'source' | 'diff') => {
+    const nextMode = requestedMode ?? (markdown(path) || mediaKindForPath(path) ? 'preview' : 'source');
+    const requestSeq = ++fileRequestSeqRef.current;
     setSelectedPath(path);
+    setMode(nextMode);
     setDiff(null);
+    setTextPreview(null);
     setMediaPreview(null);
     setError(null);
     setLoading(true);
     try {
-      const mediaKind = mediaKindForPath(path);
-      if (mediaKind && onLoadMediaPreview) {
-        const preview = await onLoadMediaPreview(path);
+      if (nextMode === 'diff') {
+        const next = await loaders.current.onLoadDiff(path);
         if (requestSeq !== fileRequestSeqRef.current) return;
-        setMediaPreview(preview);
+        setDiff(next);
+      } else if (mediaKindForPath(path) && loaders.current.onLoadMediaPreview) {
+        const next = await loaders.current.onLoadMediaPreview(path);
+        if (requestSeq !== fileRequestSeqRef.current) return;
+        setMediaPreview(next);
       } else {
-        const nextDiff = await onLoadDiff(path);
+        const next = await invoke<WorkspaceFilePreview>('get_workspace_file_preview', { workingDir: session.project_dir, filePath: path });
         if (requestSeq !== fileRequestSeqRef.current) return;
-        setDiff(nextDiff);
+        setTextPreview(next);
       }
     } catch (requestError) {
       if (requestSeq !== fileRequestSeqRef.current) return;
@@ -280,98 +307,106 @@ function FilesDetail({
     } finally {
       if (requestSeq === fileRequestSeqRef.current) setLoading(false);
     }
-  }, [onLoadDiff, onLoadMediaPreview]);
+  }, [session.project_dir]);
+
+  useEffect(() => {
+    if (requestedPath) void selectFile(requestedPath, model.changedFiles.find(file => file.path === requestedPath)?.status === 'deleted' ? 'diff' : undefined);
+  }, [requestedPath, requestRevision, selectFile]);
+
+  useEffect(() => {
+    if (scope !== 'browse') return;
+    let cancelled = false;
+    setSearching(true);
+    setSearchError(null);
+    const timer = window.setTimeout(() => {
+      void invoke<WorkspaceFileSuggestion[]>('search_workspace_files', { workingDir: session.project_dir, query, limit: 40 })
+        .then((files) => { if (!cancelled) setSuggestions(files.filter((file) => !file.is_dir)); })
+        .catch((err) => { if (!cancelled) { setSuggestions([]); setSearchError(String(err)); } })
+        .finally(() => { if (!cancelled) setSearching(false); });
+    }, 180);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [query, scope, session.project_dir]);
 
   const openInEditor = async (path: string) => {
     try {
-      await invoke<boolean>('open_file_in_workspace', {
-        workingDir: session.project_dir,
-        filePath: path,
-      });
-    } catch (openError) {
-      const message = String(openError);
-      if (message.includes('escapes working dir')) {
-        toast.error(t('workspace.reviewPathOutsideWorkspace'));
-      } else {
-        toast.error(`${t('workspace.reviewOpenFailed')}：${message}`);
-      }
+      await invoke<boolean>('open_file_in_workspace', { workingDir: session.project_dir, filePath: path });
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('escapes working dir')) toast.error(t('workspace.reviewPathOutsideWorkspace'));
+      else toast.error(message);
     }
   };
-
+  const files = model.changedFiles.filter((file) => scope === 'session' ? file.source !== 'git' : file.source !== 'sdk');
+  const rows = scope === 'browse'
+    ? suggestions.map((file) => ({ path: file.relative_path, status: '', source: 'browse' }))
+    : files.filter((file) => file.path.toLowerCase().includes(query.toLowerCase()));
   return (
-    <div className="flex min-h-0 flex-1" data-review-page="files">
-      <div className="flex w-[min(290px,38%)] shrink-0 flex-col border-r border-border-subtle/50">
-        <ScrollArea className="min-h-0 flex-1">
-          {model.changedFiles.length === 0 ? (
-            <p className="px-4 py-5 text-xs text-muted-foreground">{t('workspace.reviewNoChangedFiles')}</p>
-          ) : (
-            <div className="py-1.5">
-              {model.changedFiles.map((file) => {
-                const mark = statusMark(file.status);
-                const active = selectedPath === file.path;
-                return (
-                  <button
-                    key={file.path}
-                    type="button"
-                    data-review-file-row
-                    onClick={() => void selectFile(file.path)}
-                    className={cn(
-                      'flex w-full items-center gap-2 px-3 py-2 text-left transition-colors',
-                      active ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55',
-                    )}
-                  >
-                    <FileText className="h-3.5 w-3.5 shrink-0 opacity-60" />
-                    <span className="min-w-0 flex-1 truncate text-[12px]" title={file.path}>{file.path}</span>
-                    {file.additions != null || file.deletions != null ? (
-                      <span className="shrink-0 font-mono text-[10px] tabular-nums">
-                        <span className="text-success">+{file.additions ?? 0}</span>{' '}
-                        <span className="text-destructive">-{file.deletions ?? 0}</span>
-                      </span>
-                    ) : null}
-                    <span className={cn('w-3 font-mono text-[10px] font-semibold', mark.className)}>{mark.letter}</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </ScrollArea>
+    <div className="flex min-h-0 flex-1 flex-col" data-review-page="files">
+      <div className="flex items-center gap-2 border-b border-border-subtle/50 px-3 py-2">
+        <Tabs value={scope} onValueChange={setScope} className="min-w-0 flex-1">
+          <TabsList className="h-8 bg-transparent p-0" aria-label={t('workspace.fileSources')}>
+            <TabsTrigger value="git" className="px-2 text-[11px]">{t('workspace.filesGit')} {model.changedFiles.filter((file) => file.source !== 'sdk').length}</TabsTrigger>
+            <TabsTrigger value="session" className="px-2 text-[11px]">{t('workspace.filesSession')} {model.changedFiles.filter((file) => file.source !== 'git').length}</TabsTrigger>
+            <TabsTrigger value="browse" className="px-2 text-[11px]">{t('workspace.filesBrowse')}</TabsTrigger>
+          </TabsList>
+        </Tabs>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewRefresh')} disabled={isRefreshingGit} onClick={onRefreshGit}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshingGit && 'animate-spin')} /></Button>
       </div>
-      <div className="flex min-w-0 flex-1 flex-col">
-        {selectedPath ? (
-          <>
-            <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border-subtle/40 px-3">
-              <p className="min-w-0 flex-1 truncate text-xs font-medium" title={selectedPath}>{basename(selectedPath)}</p>
-              {diff && !diff.is_binary ? (
-                <span className="font-mono text-[10px] tabular-nums">
-                  <span className="text-success">+{diff.additions}</span>{' '}
-                  <span className="text-destructive">-{diff.deletions}</span>
-                </span>
-              ) : null}
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                className="h-7 w-7 rounded-full"
-                aria-label={t('workspace.reviewOpenInEditor')}
-                onClick={() => void openInEditor(selectedPath)}
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </Button>
+      <p className="border-b border-border-subtle/40 px-4 py-2 text-[10px] leading-relaxed text-muted-foreground">
+        {t(scope === 'git' ? 'workspace.filesGitHint' : scope === 'session' ? 'workspace.filesSessionHint' : 'workspace.filesBrowseHint')}
+      </p>
+      <div className="flex min-h-0 flex-1">
+        {showList ? <div className="flex w-[32%] min-w-[140px] max-w-[260px] shrink-0 flex-col border-r border-border-subtle/50">
+          <div className="p-2"><Input aria-label={t('workspace.filesSearch')} placeholder={t('workspace.filesSearch')} value={query} onChange={(event) => setQuery(event.target.value)} className="h-8 px-2 text-xs" /></div>
+          <ScrollArea className="min-h-0 flex-1">
+            {scope === 'git' && gitSnapshot?.error ? <p className="px-3 py-3 text-xs text-muted-foreground">{gitSnapshot.error}</p> : null}
+            {searchError && scope === 'browse' ? <p className="px-3 py-3 text-xs text-destructive">{searchError}</p> : null}
+            {rows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{searching && scope === 'browse' ? t('workspace.reviewLoading') : t('workspace.filesEmpty')}</p> : rows.map((file) => (
+              <button key={file.path} type="button" data-review-file-row title={file.path} onClick={() => {
+                if (fileLinks) fileLinks.openFile(file.path);
+                else void selectFile(file.path, file.status === 'deleted' ? 'diff' : undefined);
+              }} className={cn('flex w-full items-center gap-2 px-3 py-2 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
+                <FileText className="h-3.5 w-3.5 shrink-0 opacity-60" /><span className="min-w-0 flex-1 truncate">{file.path}</span>
+                {file.status ? <span className={cn('font-mono text-[10px]', statusMark(file.status).className)}>{statusMark(file.status).letter}</span> : null}
+              </button>
+            ))}
+          </ScrollArea>
+        </div> : null}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border-subtle/40 px-2">
+            <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesToggleList')} aria-pressed={showList} onClick={() => setShowList(!showList)}><PanelLeft className="h-3.5 w-3.5" /></Button>
+            <p className="min-w-0 flex-1 truncate text-xs font-medium" title={selectedPath ?? ''}>{selectedPath ? basename(selectedPath) : t('workspace.sidePanelFiles')}</p>
+            {selectedPath ? <>
+              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesRefreshPreview')} onClick={() => void selectFile(selectedPath, mode)}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
+              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewOpenInEditor')} onClick={() => void openInEditor(selectedPath)}><ExternalLink className="h-3.5 w-3.5" /></Button>
+            </> : null}
+          </div>
+          {selectedPath ? <>
+            <div className="border-b border-border-subtle/40 px-3 py-1.5">
+              <p className="mb-1 truncate font-mono text-[10px] text-muted-foreground" title={selectedPath}>{selectedPath}</p>
+              <Tabs value={mode} onValueChange={(value) => void selectFile(selectedPath, value as typeof mode)}>
+                <TabsList className="h-7 bg-transparent p-0" aria-label={t('workspace.filesView')}>
+                  {markdown(selectedPath) || mediaKindForPath(selectedPath) ? <TabsTrigger className="px-2 py-1 text-[11px]" value="preview">{t('workspace.filesPreview')}</TabsTrigger> : null}
+                  {!mediaKindForPath(selectedPath) ? <TabsTrigger className="px-2 py-1 text-[11px]" value="source">{t('workspace.filesSource')}</TabsTrigger> : null}
+                  <TabsTrigger className="px-2 py-1 text-[11px]" value="diff">{t('workspace.filesDiff')}</TabsTrigger>
+                </TabsList>
+              </Tabs>
             </div>
             <ScrollArea className="min-h-0 flex-1">
-              {onLoadMediaPreview && mediaKindForPath(selectedPath) ? (
-                <MediaPreview preview={mediaPreview} loading={loading} error={error} />
-              ) : (
-                <DiffPreview diff={diff} loading={loading} error={error} />
-              )}
+              {mode === 'diff' ? <DiffPreview diff={diff} loading={loading} error={error} />
+                : mediaKindForPath(selectedPath) ? <MediaPreview preview={mediaPreview} loading={loading} error={error} />
+                : loading ? <p role="status" className="p-4 text-xs text-muted-foreground">{t('workspace.reviewLoading')}</p>
+                : error ? <p role="alert" className="p-4 text-xs text-destructive">{error}</p>
+                : textPreview?.is_binary ? <p className="p-4 text-xs text-muted-foreground">{t('workspace.reviewBinaryUnavailable')}</p>
+                : textPreview ? <>
+                  {textPreview.truncated ? <p className="p-3 text-xs text-warning">{t('workspace.filesTruncated')}</p> : null}
+                  {mode === 'preview' && markdown(selectedPath)
+                    ? <WorkspaceFileLinkContext.Provider value={fileLinks ? { ...fileLinks, documentPath: selectedPath } : null}><div data-ccem-markdown-preview className="p-5"><MarkdownRenderer content={textPreview.content} codeTone="reading" /></div></WorkspaceFileLinkContext.Provider>
+                    : <pre data-ccem-file-source className="whitespace-pre-wrap break-words p-4 font-mono text-[11px] leading-relaxed">{textPreview.content}</pre>}
+                </> : null}
             </ScrollArea>
-          </>
-        ) : (
-          <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-            <FileDiff className="h-6 w-6 text-muted-foreground/35" />
-            <p className="text-xs text-muted-foreground">{t('workspace.reviewSelectFile')}</p>
-          </div>
-        )}
+          </> : <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center"><FileDiff className="h-6 w-6 text-muted-foreground/35" /><p className="text-xs text-muted-foreground">{t('workspace.reviewSelectFile')}</p></div>}
+        </div>
       </div>
     </div>
   );
@@ -388,15 +423,18 @@ function AgentsDetail({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSeqRef = useRef(0);
+  const inFlightRef = useRef(false);
+  const canLoad = Boolean(onLoadSubagents);
   const loadRef = useRef(onLoadSubagents);
 
   useEffect(() => {
     loadRef.current = onLoadSubagents;
   }, [onLoadSubagents]);
 
-  const load = useCallback(async (agentId: string | null) => {
+  const load = useCallback(async (agentId: string | null, poll = false) => {
     const loader = loadRef.current;
-    if (!loader) return;
+    if (!loader || (poll && inFlightRef.current)) return;
+    inFlightRef.current = true;
     const requestSeq = requestSeqRef.current + 1;
     requestSeqRef.current = requestSeq;
     setLoading(true);
@@ -410,7 +448,7 @@ function AgentsDetail({
       if (requestSeq !== requestSeqRef.current) return;
       setError(String(loadError));
     } finally {
-      if (requestSeq === requestSeqRef.current) setLoading(false);
+      if (requestSeq === requestSeqRef.current) { inFlightRef.current = false; setLoading(false); }
     }
   }, []);
 
@@ -419,7 +457,7 @@ function AgentsDetail({
     return () => {
       requestSeqRef.current += 1;
     };
-  }, [load]);
+  }, [canLoad, load]);
 
   useEffect(() => {
     const next = resolveSubagentSelection(subagents, selectedAgentId);
@@ -430,12 +468,11 @@ function AgentsDetail({
     }
   }, [load, selectedAgentId, subagents]);
 
-  const hasRunningAgent = subagents.some((agent) => agent.status === 'running');
   useEffect(() => {
-    if (!isLive || !hasRunningAgent) return;
-    const intervalId = window.setInterval(() => void load(selectedAgentId), 1500);
+    if (!isLive || !canLoad) return;
+    const intervalId = window.setInterval(() => void load(selectedAgentId, true), 1500);
     return () => window.clearInterval(intervalId);
-  }, [hasRunningAgent, isLive, load, selectedAgentId]);
+  }, [isLive, canLoad, load, selectedAgentId]);
 
   const selectedIndex = subagents.findIndex((agent) => agent.agentId === selectedAgentId);
   const selected = selectedIndex >= 0 ? subagents[selectedIndex] : null;

@@ -15,7 +15,7 @@ test('workspace browser renders as a retained sidebar sibling of the workspace c
 
   assert.match(
     workspaceSource,
-    /data-ccem-workspace-browser-layout=\{browserPanelOpen \? 'shell-browser-split' : 'workspace'\}/,
+    /data-ccem-workspace-browser-layout=\{sidePanelOpen \? 'shell-browser-split' : 'workspace'\}/,
   );
   assert.match(workspaceSource, /ref=\{browserLayoutRef\}/);
   assert.match(workspaceSource, /data-ccem-workspace-column="true"/);
@@ -27,7 +27,7 @@ test('workspace browser renders as a retained sidebar sibling of the workspace c
   assert.match(workspaceSource, /const browserPanelOpen = activeVisibleBrowserTarget !== null/);
   assert.match(
     workspaceSource,
-    /<WorkspaceStatusStrip[\s\S]*browserOpen=\{browserPanelOpen\}[\s\S]*onToggleBrowser=\{browserWorkspaceReady \? \(\) => toggleActiveBrowser\(skillsContext\.workingDir\) : undefined\}/,
+    /<WorkspaceStatusStrip[\s\S]*browserOpen=\{sidePanelOpen\}[\s\S]*onToggleBrowser=\{browserWorkspaceReady \? \(\) => toggleActiveBrowser\(skillsContext\.workingDir\) : undefined\}/,
   );
   assert.match(
     workspaceSource,
@@ -68,7 +68,7 @@ test('status-strip browser entry is one direct open-hide toggle and preserves th
   assert.match(statusStripSource, /onToggleBrowser\?: \(\) => void/);
   assert.match(statusStripSource, /data-ccem-workspace-browser-toggle="true"/);
   assert.match(statusStripSource, /onClick=\{onToggleBrowser\}/);
-  assert.match(statusStripSource, /browserOpen \? 'workspace\.browserClose' : 'workspace\.browserOpen'/);
+  assert.match(statusStripSource, /browserOpen \? 'workspace\.sidePanelClose' : 'workspace\.sidePanelOpen'/);
   assert.match(statusStripSource, /PanelRightOpen/);
   assert.match(statusStripSource, /PanelRightClose/);
   assert.doesNotMatch(

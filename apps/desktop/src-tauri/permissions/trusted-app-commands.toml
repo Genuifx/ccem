@@ -215,6 +215,7 @@ commands.allow = [
   "clear_proxy_traffic",
   "get_workspace_git_snapshot",
   "get_workspace_file_diff",
+  "get_workspace_file_preview",
   "get_workspace_media_preview",
   "open_file_in_workspace",
   "open_text_in_vscode",

@@ -159,7 +159,7 @@ function getString(input: Record<string, unknown>, keys: string[]): string | nul
 
 function toolPathFromSummary(summary: string): string | null {
   const trimmed = summary.trim();
-  if (!trimmed || trimmed.startsWith('{') || /\s/.test(trimmed)) {
+  if (!trimmed || trimmed.startsWith('{') || /[\r\n]/.test(trimmed) || trimmed.endsWith('…')) {
     return null;
   }
   if (!/[/.\\]/.test(trimmed) && !/\.[a-z0-9]{1,8}$/i.test(trimmed)) {
@@ -209,113 +209,6 @@ function gitStatusLabel(status: string) {
   return value || 'changed';
 }
 
-function buildChangedFiles(
-  events: SessionEventRecord[],
-  gitSnapshot: WorkspaceGitSnapshot | null | undefined,
-): ReviewChangedFile[] {
-  const files = new Map<string, ReviewChangedFile>();
-  const mutatingToolCandidates = events
-    .filter((event) =>
-      event.payload.type === 'tool_use_started'
-      && (
-        event.payload.category.category === 'execution'
-        || event.payload.category.category === 'file_op'
-        || event.payload.raw_name === 'file_change'
-      ))
-    .map((event) => {
-      if (event.payload.type !== 'tool_use_started') {
-        throw new Error('unreachable');
-      }
-      return {
-        toolUseId: event.payload.tool_use_id,
-        seq: event.seq,
-      };
-    });
-
-  const addSdkFile = (
-    path: string,
-    status: string,
-    toolUseId: string,
-    sourceSeq: number,
-  ) => {
-    const current = files.get(path);
-    if (current) {
-      current.source = current.source === 'git' ? 'matched' : current.source;
-      if (!current.toolUseIds.includes(toolUseId)) {
-        current.toolUseIds.push(toolUseId);
-      }
-      if (!current.sourceSeqs.includes(sourceSeq)) {
-        current.sourceSeqs.push(sourceSeq);
-      }
-      return;
-    }
-    files.set(path, {
-      path,
-      status,
-      source: 'sdk',
-      additions: null,
-      deletions: null,
-      toolUseIds: [toolUseId],
-      sourceSeqs: [sourceSeq],
-    });
-  };
-
-  for (const file of gitSnapshot?.files ?? []) {
-    files.set(file.path, {
-      path: file.path,
-      status: gitStatusLabel(file.status),
-      source: 'git',
-      additions: file.additions,
-      deletions: file.deletions,
-      toolUseIds: [],
-      sourceSeqs: [],
-    });
-  }
-
-  for (const event of events) {
-    if (event.payload.type !== 'tool_use_started' && event.payload.type !== 'tool_use_completed') {
-      continue;
-    }
-    const isFileEvent = event.payload.raw_name === 'file_change'
-      || (
-        event.payload.type === 'tool_use_started'
-        && event.payload.category.category === 'file_op'
-      );
-    if (!isFileEvent) {
-      continue;
-    }
-    const summary = event.payload.type === 'tool_use_started'
-      ? event.payload.input_summary
-      : event.payload.result_summary;
-    const structuredChanges = structuredFileChanges(summary);
-    if (structuredChanges.length > 0) {
-      for (const change of structuredChanges) {
-        addSdkFile(change.path, change.status, event.payload.tool_use_id, event.seq);
-      }
-      continue;
-    }
-
-    const path = toolPathFromSummary(summary);
-    if (!path) {
-      continue;
-    }
-    addSdkFile(path, 'sdk', event.payload.tool_use_id, event.seq);
-  }
-
-  const fallbackTool = mutatingToolCandidates[mutatingToolCandidates.length - 1];
-  if (fallbackTool) {
-    for (const file of files.values()) {
-      if (file.source !== 'git' || file.toolUseIds.length > 0) {
-        continue;
-      }
-      file.toolUseIds.push(fallbackTool.toolUseId);
-      file.sourceSeqs.push(fallbackTool.seq);
-    }
-  }
-
-  return Array.from(files.values()).sort((left, right) => left.path.localeCompare(right.path));
-}
-
 function artifactKind(path: string): ReviewArtifact['kind'] | null {
   const lower = path.toLowerCase();
   const ext = lower.split('.').pop() ?? '';
@@ -349,45 +242,6 @@ function buildArtifacts(files: ReviewChangedFile[]): ReviewArtifact[] {
     .filter((artifact): artifact is ReviewArtifact => Boolean(artifact));
 }
 
-function buildToolEvidence(events: SessionEventRecord[]): ReviewToolEvidence[] {
-  const tools = new Map<string, ReviewToolEvidence>();
-  for (const event of events) {
-    if (event.payload.type === 'tool_use_started') {
-      tools.set(event.payload.tool_use_id, {
-        id: event.payload.tool_use_id,
-        seq: event.seq,
-        toolUseId: event.payload.tool_use_id,
-        rawName: event.payload.raw_name,
-        category: categoryName(event.payload.category),
-        inputSummary: event.payload.input_summary,
-        startedAt: event.occurred_at,
-      });
-      continue;
-    }
-    if (event.payload.type === 'tool_use_completed') {
-      const current = tools.get(event.payload.tool_use_id);
-      if (current) {
-        current.resultSummary = event.payload.result_summary;
-        current.success = event.payload.success;
-        current.completedAt = event.occurred_at;
-      } else {
-        tools.set(event.payload.tool_use_id, {
-          id: event.payload.tool_use_id,
-          seq: event.seq,
-          toolUseId: event.payload.tool_use_id,
-          rawName: event.payload.raw_name,
-          category: 'unknown',
-          inputSummary: '',
-          resultSummary: event.payload.result_summary,
-          success: event.payload.success,
-          completedAt: event.occurred_at,
-        });
-      }
-    }
-  }
-  return Array.from(tools.values()).sort((left, right) => left.seq - right.seq);
-}
-
 /**
  * Incremental review fold (plan 022). The status-strip summary needs full
  * session history (changed-file and tool evidence totals), but the live view's
@@ -401,19 +255,28 @@ export interface WorkspaceReviewEventFold {
     toolUseIds: string[];
     sourceSeqs: number[];
   }>;
-  /** Newest execution/file_op/file_change tool start, for git fallback attribution. */
-  lastMutatingTool: { toolUseId: string; seq: number } | null;
   /** Tool evidence keyed by tool_use_id (starts updated by completions). */
   tools: Map<string, ReviewToolEvidence>;
 }
 
-function isMutatingToolStart(payload: SessionEventRecord['payload']): boolean {
-  return payload.type === 'tool_use_started'
-    && (
-      payload.category.category === 'execution'
-      || payload.category.category === 'file_op'
-      || payload.raw_name === 'file_change'
-    );
+function isWritingTool(name: string) {
+  return /^(?:write|edit|multiedit|notebookedit|apply_patch|file_change)$/i.test(name);
+}
+
+function normalizeReviewPath(path: string, workingDir?: string | null): string {
+  const normalize = (value: string) => {
+    const absolute = value.startsWith('/');
+    const parts: string[] = [];
+    for (const part of value.replace(/\\/g, '/').split('/')) {
+      if (!part || part === '.') continue;
+      if (part === '..' && parts.length && parts[parts.length - 1] !== '..') parts.pop();
+      else parts.push(part);
+    }
+    return (absolute ? '/' : '') + parts.join('/');
+  };
+  const normalized = normalize(path);
+  const root = workingDir ? normalize(workingDir).replace(/\/$/, '') : '';
+  return root && normalized.startsWith(`${root}/`) ? normalized.slice(root.length + 1) : normalized;
 }
 
 /** Fold `events` into `previous` (or a fresh accumulator when null). */
@@ -423,11 +286,10 @@ export function foldWorkspaceReviewEvents(
 ): WorkspaceReviewEventFold {
   const fold: WorkspaceReviewEventFold = previous
     ? {
-      sdkFiles: new Map(previous.sdkFiles),
-      lastMutatingTool: previous.lastMutatingTool,
-      tools: new Map(previous.tools),
+      sdkFiles: new Map([...previous.sdkFiles].map(([path, file]) => [path, { ...file, toolUseIds: [...file.toolUseIds], sourceSeqs: [...file.sourceSeqs] }])),
+      tools: new Map([...previous.tools].map(([id, tool]) => [id, { ...tool }])),
     }
-    : { sdkFiles: new Map(), lastMutatingTool: null, tools: new Map() };
+    : { sdkFiles: new Map(), tools: new Map() };
 
   const addSdkFile = (
     path: string,
@@ -455,16 +317,8 @@ export function foldWorkspaceReviewEvents(
   for (const event of events) {
     const { payload } = event;
 
-    if (payload.type === 'tool_use_started' && isMutatingToolStart(payload)) {
-      fold.lastMutatingTool = { toolUseId: payload.tool_use_id, seq: event.seq };
-    }
-
     if (payload.type === 'tool_use_started' || payload.type === 'tool_use_completed') {
-      const isFileEvent = payload.raw_name === 'file_change'
-        || (
-          payload.type === 'tool_use_started'
-          && payload.category.category === 'file_op'
-        );
+      const isFileEvent = isWritingTool(payload.raw_name);
       if (isFileEvent) {
         const summary = payload.type === 'tool_use_started'
           ? payload.input_summary
@@ -475,7 +329,10 @@ export function foldWorkspaceReviewEvents(
             addSdkFile(change.path, change.status, payload.tool_use_id, event.seq);
           }
         } else {
-          const path = toolPathFromSummary(summary);
+          const parsed = safeJson(summary);
+          const path = parsed && typeof parsed === 'object'
+            ? getString(parsed as Record<string, unknown>, ['file_path', 'filePath', 'path', 'target_file', 'notebook_path'])
+            : payload.type === 'tool_use_started' ? toolPathFromSummary(summary) : null;
           if (path) {
             addSdkFile(path, 'sdk', payload.tool_use_id, event.seq);
           }
@@ -520,30 +377,12 @@ export function foldWorkspaceReviewEvents(
   return fold;
 }
 
-/** Assemble the status-strip summary from a fold plus the git snapshot. */
-export function buildWorkspaceReviewSummaryFromFold(
+/** One source of truth for the compact summary and the full file list. */
+function reviewFilesFromFold(
   fold: WorkspaceReviewEventFold | null,
   gitSnapshot?: WorkspaceGitSnapshot | null,
-): WorkspaceReviewSummary {
-  if (!fold) {
-    const artifactsFromGit = buildArtifacts(
-      (gitSnapshot?.files ?? []).map((file) => ({
-        path: file.path,
-        status: gitStatusLabel(file.status),
-        source: 'git' as const,
-        additions: file.additions,
-        deletions: file.deletions,
-        toolUseIds: [],
-        sourceSeqs: [],
-      })),
-    );
-    return {
-      failedTools: 0,
-      changedFiles: gitSnapshot?.files.length ?? 0,
-      artifacts: artifactsFromGit.length,
-    };
-  }
-
+  workingDir?: string | null,
+): ReviewChangedFile[] {
   const files = new Map<string, ReviewChangedFile>();
   for (const file of gitSnapshot?.files ?? []) {
     files.set(file.path, {
@@ -557,11 +396,14 @@ export function buildWorkspaceReviewSummaryFromFold(
     });
   }
 
-  for (const [path, sdkFile] of fold.sdkFiles) {
+  for (const [rawPath, sdkFile] of fold?.sdkFiles ?? []) {
+    const toolUseIds = sdkFile.toolUseIds.filter((id) => fold?.tools.get(id)?.success !== false);
+    if (toolUseIds.length === 0) continue;
+    const path = normalizeReviewPath(rawPath, workingDir ?? gitSnapshot?.root);
     const current = files.get(path);
     if (current) {
       current.source = current.source === 'git' ? 'matched' : current.source;
-      for (const toolUseId of sdkFile.toolUseIds) {
+      for (const toolUseId of toolUseIds) {
         if (!current.toolUseIds.includes(toolUseId)) {
           current.toolUseIds.push(toolUseId);
         }
@@ -579,28 +421,22 @@ export function buildWorkspaceReviewSummaryFromFold(
       source: 'sdk',
       additions: null,
       deletions: null,
-      toolUseIds: [...sdkFile.toolUseIds],
+      toolUseIds: [...toolUseIds],
       sourceSeqs: [...sdkFile.sourceSeqs],
     });
   }
 
-  const fallbackTool = fold.lastMutatingTool;
-  if (fallbackTool) {
-    for (const file of files.values()) {
-      if (file.source !== 'git' || file.toolUseIds.length > 0) {
-        continue;
-      }
-      file.toolUseIds.push(fallbackTool.toolUseId);
-      file.sourceSeqs.push(fallbackTool.seq);
-    }
-  }
+  return Array.from(files.values()).sort((left, right) => left.path.localeCompare(right.path));
+}
 
-  const changedFiles = Array.from(files.values())
-    .sort((left, right) => left.path.localeCompare(right.path));
-
+export function buildWorkspaceReviewSummaryFromFold(
+  fold: WorkspaceReviewEventFold | null,
+  gitSnapshot?: WorkspaceGitSnapshot | null,
+  workingDir?: string | null,
+): WorkspaceReviewSummary {
+  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, workingDir);
   return {
-    failedTools: Array.from(fold.tools.values())
-      .reduce((count, tool) => count + (tool.success === false ? 1 : 0), 0),
+    failedTools: Array.from(fold?.tools.values() ?? []).filter((tool) => tool.success === false).length,
     changedFiles: changedFiles.length,
     artifacts: buildArtifacts(changedFiles).length,
   };
@@ -609,30 +445,37 @@ export function buildWorkspaceReviewSummaryFromFold(
 export function buildWorkspaceReviewSummary({
   events,
   gitSnapshot,
+  workingDir,
 }: {
   events: SessionEventRecord[];
   gitSnapshot?: WorkspaceGitSnapshot | null;
+  workingDir?: string | null;
 }): WorkspaceReviewSummary {
   return buildWorkspaceReviewSummaryFromFold(
     foldWorkspaceReviewEvents(null, events),
     gitSnapshot,
+    workingDir,
   );
 }
 
 export function buildWorkspaceReviewModel({
+  session,
   events,
   messages,
   gitSnapshot,
+  eventFold,
 }: {
   session: NativeSessionSummary;
   events: SessionEventRecord[];
   messages: ConversationMessageData[];
   gitSnapshot?: WorkspaceGitSnapshot | null;
+  eventFold?: WorkspaceReviewEventFold | null;
 }): WorkspaceReviewModel {
   const todoState = buildWorkspaceTodos(events, messages);
   const todos = todoState.items;
-  const changedFiles = buildChangedFiles(events, gitSnapshot);
-  const tools = buildToolEvidence(events);
+  const fold = eventFold ?? foldWorkspaceReviewEvents(null, events);
+  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, session.project_dir);
+  const tools = Array.from(fold.tools.values()).sort((left, right) => left.seq - right.seq);
   const failedTools = tools.filter((tool) => tool.success === false);
 
   return {
