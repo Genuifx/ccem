@@ -1310,15 +1310,23 @@ fn debug_compare_sessions(
     unified_state.debug_compare_sessions()
 }
 
-fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: bool) -> String {
-    if !limit_write_tools {
+fn prepare_workspace_initial_prompt(initial_prompt: &str, limit_write_tools: bool) -> String {
+    // A guidance-only prompt must not start an otherwise empty session turn.
+    if initial_prompt.trim().is_empty() {
         return initial_prompt.to_string();
     }
-
-    format!(
-        "<system_tip>{}</system_tip>\n\n{initial_prompt}",
-        user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP,
-    )
+    let mut prompt = format!(
+        "<system_tip>{}</system_tip>\n\n",
+        user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+    );
+    if limit_write_tools {
+        prompt.push_str(&format!(
+            "<system_tip>{}</system_tip>\n\n",
+            user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        ));
+    }
+    prompt.push_str(initial_prompt);
+    prompt
 }
 
 #[tauri::command]
@@ -1418,7 +1426,7 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode.clone(),
                 working_dir: effective_working_dir,
-                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                initial_prompt: Some(prepare_workspace_initial_prompt(
                     &initial_prompt,
                     resolved.limit_write_tools,
                 )),
@@ -1453,7 +1461,7 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode,
                 working_dir: effective_working_dir,
-                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                initial_prompt: Some(prepare_workspace_initial_prompt(
                     &initial_prompt,
                     resolved.limit_write_tools,
                 )),
@@ -6532,14 +6540,17 @@ mod tests {
     use super::{
         build_remote_load_args, build_remote_load_stdin_payload,
         collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
-        parse_git_status, prepend_write_tool_limit_system_tip,
+        parse_git_status, prepare_workspace_initial_prompt,
         RemoteEnvConfig, WorkspaceGitChangedFile,
     };
     use crate::router::{
         rename_router_config_environment, router_config_environment_references, RouterConfig,
         RouterProfile,
     };
-    use crate::user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP;
+    use crate::user_prompt_display::{
+        normalize_user_visible_prompt, WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+        WRITE_TOOL_LIMIT_SYSTEM_TIP,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -6620,13 +6631,32 @@ mod tests {
     }
 
     #[test]
-    fn write_tool_limit_tip_is_prefixed_only_when_enabled() {
+    fn workspace_initial_prompt_includes_preview_guidance_and_optional_write_limit() {
         let prompt = "Update the configuration";
-        assert_eq!(
-            prepend_write_tool_limit_system_tip(prompt, true),
-            format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{prompt}"),
-        );
-        assert_eq!(prepend_write_tool_limit_system_tip(prompt, false), prompt);
+        for limit_write_tools in [false, true] {
+            let prepared = prepare_workspace_initial_prompt(prompt, limit_write_tools);
+            assert!(prepared.starts_with(&format!(
+                "<system_tip>{WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>\n\n"
+            )));
+            assert_eq!(prepared.contains(WRITE_TOOL_LIMIT_SYSTEM_TIP), limit_write_tools);
+            assert!(prepared.ends_with(prompt));
+            assert_eq!(
+                normalize_user_visible_prompt(&prepared),
+                Some(prompt.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_initial_prompt_does_not_start_guidance_only_turns() {
+        for prompt in ["", " \n\t"] {
+            for limit_write_tools in [false, true] {
+                assert_eq!(
+                    prepare_workspace_initial_prompt(prompt, limit_write_tools),
+                    prompt
+                );
+            }
+        }
     }
 
     #[test]

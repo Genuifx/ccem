@@ -34,6 +34,15 @@ no saved before/after snapshot for each session.
 
 ## Links in conversation Markdown
 
+Workspace-created Claude and Codex sessions receive file-preview guidance in
+their non-empty initial text prompt, including when resuming a saved provider
+session. It asks the agent to link confirmed local deliverables when the requested response format
+allows it, URL-encode the path, and keep the clickable link outside code fences.
+This uses the existing hidden `system_tip` transport prefix, not a provider system
+role; the original user prompt remains the displayed message and session label.
+Already-running provider sessions receive the guidance when newly created or
+resumed through the updated Workspace launch path.
+
 Use a regular Markdown link with the dedicated in-app protocol:
 
 ```markdown

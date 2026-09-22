@@ -1,17 +1,29 @@
 pub(crate) const WRITE_TOOL_LIMIT_SYSTEM_TIP: &str = "请注意分片写入，不要一次性写入太多内容到文件中，Write/Edit 失败 → 不要重试相同内容 → 改用更小的分块";
+pub(crate) const WORKSPACE_FILE_PREVIEW_SYSTEM_TIP: &str = "CCEM 工作区文件预览：在回复格式允许时，为已生成或修改、确认存在且需要用户查看的主要文件提供可点击的 Markdown 链接，例如 [预览报告](ccem-file://preview?path=docs%2Freport.md)。path 使用当前会话工作目录内的相对路径或绝对路径，并对整个参数值做 URL 编码（包括中文、空格、#、?、% 等）；实际交付链接不要放在代码块中。点击后会在右侧「文件」标签打开，Markdown 默认渲染，显示磁盘上的当前内容。path 只能指向工作目录内的真实本地文件，不能填写网页 URL 或虚构路径。用户指定的输出格式优先。";
+
+pub(crate) fn strip_internal_system_tips(raw: &str) -> &str {
+    let mut prompt = raw;
+    // Strip only exact CCEM-owned tips; preserve user-authored XML verbatim.
+    while prompt.starts_with("<system_tip>") {
+        let user_prompt = [
+            WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+            WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        ]
+        .iter()
+        .find_map(|tip| prompt.strip_prefix(&format!("<system_tip>{tip}</system_tip>")));
+        let Some(user_prompt) = user_prompt else {
+            break;
+        };
+        prompt = user_prompt.trim_start();
+    }
+    prompt
+}
 
 /// Recover the user-authored part of a persisted prompt without truncating it.
 /// The sidebar owns visual ellipsis; this function only removes CCEM's hidden
 /// transport wrappers so internal instructions never become a session label.
 pub(crate) fn normalize_user_visible_prompt(raw: &str) -> Option<String> {
-    let mut prompt = raw.trim();
-
-    if prompt.starts_with("<system_tip>") {
-        let internal_tip = format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>");
-        if let Some(user_prompt) = prompt.strip_prefix(&internal_tip) {
-            prompt = user_prompt.trim_start();
-        }
-    }
+    let prompt = strip_internal_system_tips(raw.trim());
 
     let has_internal_wrapper = [
         "<selected_skills>",
@@ -49,7 +61,10 @@ pub(crate) fn normalize_user_visible_prompt(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_user_visible_prompt, WRITE_TOOL_LIMIT_SYSTEM_TIP};
+    use super::{
+        normalize_user_visible_prompt, WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+        WRITE_TOOL_LIMIT_SYSTEM_TIP,
+    };
 
     #[test]
     fn preserves_plain_prompt_without_truncating_or_flattening_it() {
@@ -65,6 +80,19 @@ mod tests {
             )),
             Some("真正的用户请求".to_string()),
         );
+    }
+
+    #[test]
+    fn removes_preview_and_write_tips_without_polluting_session_labels() {
+        let user_prompt = "请生成报告\n\n保留第二段";
+        for tips in [
+            format!("<system_tip>{WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>"),
+            format!("<system_tip>{WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>\n\n<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>"),
+            format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n<system_tip>{WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>"),
+        ] {
+            assert_eq!(normalize_user_visible_prompt(&format!("{tips}\n\n{user_prompt}")), Some(user_prompt.to_string()));
+            assert_eq!(normalize_user_visible_prompt(&format!("{tips}\n\n<selected_skills>hidden</selected_skills>\n<user_request>{user_prompt}</user_request>")), Some(user_prompt.to_string()));
+        }
     }
 
     #[test]
