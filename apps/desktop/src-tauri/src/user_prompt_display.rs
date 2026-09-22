@@ -1,5 +1,8 @@
 pub(crate) const WRITE_TOOL_LIMIT_SYSTEM_TIP: &str = "请注意分片写入，不要一次性写入太多内容到文件中，Write/Edit 失败 → 不要重试相同内容 → 改用更小的分块";
-pub(crate) const WORKSPACE_FILE_PREVIEW_SYSTEM_TIP: &str = "CCEM 工作区文件预览：在回复格式允许时，为已生成或修改、确认存在且需要用户查看的主要文件提供可点击的 Markdown 链接，例如 [预览报告](ccem-file://preview?path=docs%2Freport.md)。path 使用当前会话工作目录内的相对路径或绝对路径，并对整个参数值做 URL 编码（包括中文、空格、#、?、% 等）；实际交付链接不要放在代码块中。点击后会在右侧「文件」标签打开，Markdown 默认渲染，显示磁盘上的当前内容。path 只能指向工作目录内的真实本地文件，不能填写网页 URL 或虚构路径。用户指定的输出格式优先。";
+pub(crate) const WORKSPACE_FILE_PREVIEW_SYSTEM_TIP: &str = "交付文件时，提供预览链接，如 [预览报告](ccem-file://preview?path=docs%2Freport.md)。path 为工作目录内已存在文件的相对路径，需 URL 编码。链接放在代码块外；Markdown 在侧栏渲染。用户指定的输出格式优先。";
+
+// Keep previously persisted guidance hidden when reading older sessions.
+const LEGACY_WORKSPACE_FILE_PREVIEW_SYSTEM_TIP: &str = "CCEM 工作区文件预览：在回复格式允许时，为已生成或修改、确认存在且需要用户查看的主要文件提供可点击的 Markdown 链接，例如 [预览报告](ccem-file://preview?path=docs%2Freport.md)。path 使用当前会话工作目录内的相对路径或绝对路径，并对整个参数值做 URL 编码（包括中文、空格、#、?、% 等）；实际交付链接不要放在代码块中。点击后会在右侧「文件」标签打开，Markdown 默认渲染，显示磁盘上的当前内容。path 只能指向工作目录内的真实本地文件，不能填写网页 URL 或虚构路径。用户指定的输出格式优先。";
 
 pub(crate) fn strip_internal_system_tips(raw: &str) -> &str {
     let mut prompt = raw;
@@ -7,6 +10,7 @@ pub(crate) fn strip_internal_system_tips(raw: &str) -> &str {
     while prompt.starts_with("<system_tip>") {
         let user_prompt = [
             WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+            LEGACY_WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
             WRITE_TOOL_LIMIT_SYSTEM_TIP,
         ]
         .iter()
@@ -62,8 +66,8 @@ pub(crate) fn normalize_user_visible_prompt(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_user_visible_prompt, WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
-        WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        normalize_user_visible_prompt, LEGACY_WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+        WORKSPACE_FILE_PREVIEW_SYSTEM_TIP, WRITE_TOOL_LIMIT_SYSTEM_TIP,
     };
 
     #[test]
@@ -93,6 +97,17 @@ mod tests {
             assert_eq!(normalize_user_visible_prompt(&format!("{tips}\n\n{user_prompt}")), Some(user_prompt.to_string()));
             assert_eq!(normalize_user_visible_prompt(&format!("{tips}\n\n<selected_skills>hidden</selected_skills>\n<user_request>{user_prompt}</user_request>")), Some(user_prompt.to_string()));
         }
+    }
+
+    #[test]
+    fn keeps_legacy_preview_guidance_hidden_in_saved_sessions() {
+        let prompt = format!(
+            "<system_tip>{LEGACY_WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>\n\n<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n请生成报告\n\n保留第二段",
+        );
+        assert_eq!(
+            normalize_user_visible_prompt(&prompt),
+            Some("请生成报告\n\n保留第二段".to_string()),
+        );
     }
 
     #[test]
