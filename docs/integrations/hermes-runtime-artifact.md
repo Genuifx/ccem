@@ -11,20 +11,20 @@
 | 私有 Python | CPython 3.11.16，Astral python-build-standalone 20260901，macOS arm64 install_only_stripped |
 | Python 下载字节 | 26,961,472 |
 | Python SHA-256 | `768f05cf200273bbdda9a5955a5a6892a4b22f2a0b1e4b0a9160f5c7fce86816` |
-| 依赖 | 原始 uv.lock 的 core + wecom + feishu + sms，固定 wheel 闭包；sms 仅用于取得共享传输依赖 `aiohttp==3.14.3` |
+| 依赖 | 原始 uv.lock 的 core + wecom + feishu + messaging，固定 wheel 闭包，包含 `aiohttp==3.14.3` 和五渠道 SDK |
 | 桥协议 | 1，源码应用 `scripts/hermes/patches/0001-managed-gateway-contracts.patch` |
-| 本地组件版本 | `2026.9.22.1`，签名清单 sequence 2 |
-| 已审核补丁 SHA-256 | `5eea41ed92d22eceb5a0dbf2687d178e750e6646d12745fc89aae84488b1446e` |
-| 已打包 host SHA-256 | `78c8756caf58068fb868f16c3efd04b720abaede3c1603c44691e7642ebb2287` |
-| 已打包 QR helper SHA-256 | `07ac4fe5bb2b67f28c293b069b374690a498c49cf3ed71b0a7a1f71378bcf938` |
+| 本地组件版本 | `2026.9.23.3`，签名清单 sequence 5 |
+| 已审核补丁 SHA-256 | `0caa8b78df6b95a7109ccefa6f00d9018c3f70ac24cb2ee1c76de7af3035cc88` |
+| 已打包 host SHA-256 | `fefec0d196ab7f0ec533230c2dababa444ade46e58dafa43c7e14e366e3cc625` |
+| 已打包 QR helper SHA-256 | `0cb81f5cbc150dc7538b51665b5677ea93e10030ef04439372acc08f5bf5b668` |
 
 构建使用 Astral 的便携 Python 分发。uv 官方说明其托管 Python 来自该项目；install-only 分发提供完整解释器布局。便携构建仍有兼容性限制，因此构建门包括移动目录后执行真实 Python、host 导入检查、Mach-O 依赖检查，不能用“venv 可运行”代替重定位验证。[uv Python 版本](https://docs.astral.sh/uv/concepts/python-versions/)、[Python 分发结构](https://github.com/astral-sh/python-build-standalone/blob/main/docs/distributions.rst)、[已知兼容性差异](https://github.com/astral-sh/python-build-standalone/blob/main/docs/quirks.rst)。
 
-本机系统 uv 0.9.3 无法解析此 lock 的新配置。验证时使用下载到本次 `.artifacts` 的独立 uv 0.12.12，没有修改系统工具。构建端依赖允许下载；用户组件不会携带 uv，也不依赖用户 PATH 中的 Python/Node/Hermes。Telegram 未列入当前依赖闭包，向导须显示不可用，不能由用户现场安装 SDK 补足。
+本机系统 uv 0.9.3 无法解析此 lock 的新配置。验证时使用下载到本次 `.artifacts` 的独立 uv 0.12.12，没有修改系统工具。构建端依赖允许下载；用户组件不会携带 uv，也不依赖用户 PATH 中的 Python/Node/Hermes。Telegram、Discord、Slack 已加入当前依赖闭包；未集成平台仍显示不可用，不能让用户在客户端现场安装 SDK 补足。
 
-上游 `wecom` extra 只增加 XML 依赖，单独导出它不能保证企业微信适配器可用。构建脚本额外导出同一锁文件的 `sms` extra，因为该 extra 仅包含 `aiohttp==3.14.3`；这不会启用短信渠道。扫码 helper 与企业微信连接使用包内传输依赖，扫码 HTTPS 显式使用包内 certifi 根证书，避免依赖构建机的 OpenSSL 证书路径。
+上游 `wecom` extra 只增加 XML 依赖，单独导出它不能保证企业微信适配器可用。当前 `messaging` 闭包同时提供共享传输依赖 `aiohttp==3.14.3`，不再需要旧包为此导出的 `sms` extra。扫码 helper 与企业微信连接使用包内传输依赖，扫码 HTTPS 显式使用包内 certifi 根证书，避免依赖构建机的 OpenSSL 证书路径。
 
-包内 `ccem_gateway_onboarding.py` 提供扫码创建协议，由 `ccem_gateway_host.py` 从固定同目录路径加载；两个文件均进入签名文件清单。UI 只有收到企业微信可用且 `qrSetup=true` 时才显示默认扫码入口，手动配置继续保留。成功凭据经私有进程管道交给 CCEM 后端加密保存并连接，再进入私聊口令与桌面工作区授权；扫码不会直接授予任务访问权限。取消、过期及授权边界见 [用户路径](hermes-managed-integration.md#用户路径)。
+包内 `ccem_gateway_onboarding.py` 提供扫码创建协议，由 `ccem_gateway_host.py` 从固定同目录路径加载；两个文件均进入签名文件清单。UI 只有收到平台可用且 `qrSetup=true` 时才显示默认扫码入口，当前为企业微信和 Telegram，手动配置继续保留。成功凭据经私有进程管道交给 CCEM 后端加密保存并连接，再进入私聊口令与桌面工作区授权；扫码不会直接授予任务访问权限。取消、过期及授权边界见 [用户路径](hermes-managed-integration.md#用户路径)。
 
 ## 安装与恢复契约
 
@@ -36,15 +36,17 @@
 
 重复安装同一签名清单会重新验证全部文件，通过后保留原指针，不重复解包。已安装 payload 被改写时拒绝启动，并明确要求卸载组件再安装；此路径保留外部授权 profile，不假称可自动修复所有本地损坏。
 
-候选包在私有 staging 解压，真实 Python 以 `-I -B` 运行 `ccem_gateway_host.py --self-test`。自检实际导入企业微信适配器并要求 `check_wecom_requirements()` 成功，同时加载 QR helper 和 TLS 根证书；缺少传输依赖会直接失败。健康检查取消/超时会 kill 并 wait 该次自有子进程。成功后才提交版本指针；失败保留之前已验证版本。安装序列水位保留在 `manifest-sequence.json`，卸载不会重置它。已下载断点在进程重启后的状态中显示 `paused`，由用户重试继续，启动应用不会自行恢复下载。
+候选包在私有 staging 解压，真实 Python 以 `-I -B` 运行 `ccem_gateway_host.py --self-test`。自检实际导入企微适配器并检查全部五个托管渠道的依赖和严格投递能力，同时加载 QR helper 和 TLS 根证书；缺少传输依赖会直接失败。健康检查取消/超时会 kill 并 wait 该次自有子进程。成功后才提交版本指针；失败保留之前已验证版本。安装序列水位保留在 `manifest-sequence.json`，卸载不会重置它。已下载断点在进程重启后的状态中显示 `paused`，由用户重试继续，启动应用不会自行恢复下载。
 
 进程管理器通过 `lease_runtime()` 获得 `HermesRuntimeLease`，持有到子进程完全退出。安装激活与卸载遇到被占用版本会失败，不能覆盖运行中的解释器。`remove_runtime()` 只清运行时、候选包与下载缓存，保留水位/租约记录和外部 profile；这与撤销凭证或重置授权是不同操作。
 
 ## 制品构建及测试
 
-`scripts/hermes/build-runtime.py --stage prepare` 下载固定 Python，取精确 Git archive，校验原始锁文件，用 `uv export --frozen --extra wecom --extra feishu --extra sms` 导出哈希依赖并仅安装 wheel。`--stage finalize` 应用已审核补丁、复制 host 与 QR helper、移动目录运行自检，然后生成 ZIP、文件 inventory、签名清单及构建 receipt。`--signing-seed` 指向受限权限的 32-byte Ed25519 构建密钥；本地测试私钥只能留在被忽略的 `.artifacts`，不得提交。
+2026-09-23 的五渠道运行包与当前验收见 [多渠道验收记录](hermes-multichannel-verification.md)。后文 9 月 22 日及更早的测量保留为历史基线。
 
-2026-09-22 的扫码版完成重定位自检，包内 host/helper 哈希与当前源码一致。以下命令在实际私有包上通过 4 项回归，不修改包、不连接聊天平台：
+`scripts/hermes/build-runtime.py --stage prepare` 下载固定 Python，取精确 Git archive，校验原始锁文件，用 `uv export --frozen --extra wecom --extra feishu --extra messaging` 导出哈希依赖并仅安装 wheel。`messaging` 包含 Telegram、Discord 和 Slack SDK，沿用同一份上游锁文件。`--stage finalize` 应用已审核补丁、复制 host 与 QR helper、移动目录运行自检，然后生成 ZIP、文件 inventory、签名清单及构建 receipt。自检实际探测五个托管平台的依赖与严格投递契约，缺少任一项便失败；返回的能力写入签名包身份，安装器不以静态渠道枚举替代完整性检查。`--signing-seed` 指向受限权限的 32-byte Ed25519 构建密钥；本地测试私钥只能留在被忽略的 `.artifacts`，不得提交。
+
+2026-09-22 的扫码版完成重定位自检，包内 host/helper 哈希与当时源码一致。以下命令在当时的实际私有包上通过 4 项回归，不修改包、不连接聊天平台：
 
 ```bash
 python3 -I -B scripts/hermes/test-runtime-package.py \

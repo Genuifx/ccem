@@ -49,7 +49,8 @@ sys.argv = [sys.argv[1], '--self-test']
 runpy.run_path(sys.argv[0], run_name='__main__')
 """)
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        self.assertEqual(json.loads(result.stdout), {"ok": True, "protocolVersion": 1})
+        self.assertEqual(json.loads(result.stdout), {"ok": True, "protocolVersion": 1,
+                                                   "channels": ["wecom", "telegram", "feishu", "discord", "slack"]})
 
     def test_same_self_test_fails_when_aiohttp_is_missing(self):
         result = self.execute("""
@@ -87,13 +88,38 @@ async def verify():
     await host.initialize()
     wecom = next(item for item in host.platforms if item['id'] == 'wecom')
     assert wecom['available'] is True and wecom['qrSetup'] is True
-    assert all(item['qrSetup'] is False for item in host.platforms if item['id'] != 'wecom')
+    assert next(item for item in host.platforms if item['id'] == 'telegram')['qrSetup'] is True
+    assert all(item['qrSetup'] is False for item in host.platforms if item['id'] not in ('wecom', 'telegram'))
     assert host.state == 'unconfigured'
+    expected = {'wecom', 'telegram', 'feishu', 'discord', 'slack'}
+    usable = {item['id'] for item in host.platforms if item['available'] and item['strictSend']}
+    assert usable == expected, usable
+    for item in host.platforms:
+        assert 'unavailableReason' in item
+        if item['id'] in expected:
+            assert item['identityFields'] and item['unavailableReason'] is None
+        else:
+            assert item['unavailableReason'] == 'integration_unsupported'
+    assert any(item['id'] not in expected for item in host.platforms)
 asyncio.run(verify())
 print(json.dumps({'ok': True}))
 """)
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         self.assertEqual(json.loads(result.stdout), {"ok": True})
+
+    def test_self_test_rejects_missing_telegram_dependency(self):
+        result = self.execute("""
+import importlib.abc, runpy, sys
+class MissingTelegram(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'telegram' or fullname.startswith('telegram.'):
+            raise ModuleNotFoundError('synthetic missing Telegram SDK')
+sys.meta_path.insert(0, MissingTelegram())
+sys.argv = [sys.argv[1], '--self-test']
+runpy.run_path(sys.argv[0], run_name='__main__')
+""")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('telegram transport dependencies are unavailable', result.stderr)
 
 
 if __name__ == "__main__":

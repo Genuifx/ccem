@@ -1,4 +1,4 @@
-"""Bounded WeCom scan-to-create requests for the private managed gateway.
+"""Bounded scan-to-create requests for the private managed gateway.
 
 The provider's polling code and bot credentials never enter a status snapshot.
 Only the caller of poll() receives credentials, once, over the private host pipe.
@@ -11,9 +11,11 @@ import re
 import ssl
 import time
 import urllib.parse
+from datetime import datetime
 
 GENERATE_URL = "https://work.weixin.qq.com/ai/qc/generate?source=hermes"
 QUERY_URL = "https://work.weixin.qq.com/ai/qc/query_result"
+TELEGRAM_URL = "https://setup.hermes-agent.nousresearch.com/v1/telegram/pairings"
 RESPONSE_LIMIT = 64 * 1024
 REQUEST_TIMEOUT = 8
 SESSION_TIMEOUT = 300
@@ -40,7 +42,7 @@ def _identifier(value):
 
 def validate_begin(identifier, platform):
     identifier = _identifier(identifier)
-    if platform != "wecom":
+    if platform not in ("wecom", "telegram"):
         raise SetupError("setup_platform_not_supported")
     return identifier
 
@@ -68,15 +70,48 @@ def _qr_payload(value):
     return value
 
 
-async def _fetch_json(url):
+def _telegram_qr_payload(value):
+    value = _text(value, 4096)
+    try:
+        url = urllib.parse.urlsplit(value)
+        valid = (url.scheme == "https" and url.hostname == "t.me"
+                 and url.port in (None, 443) and not url.username and not url.password
+                 and not url.fragment)
+        query = urllib.parse.parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
+        create_link = (re.fullmatch(r"/newbot/[A-Za-z0-9_]{5,32}/[A-Za-z0-9_]{5,32}", url.path)
+                       and set(query).issubset({"name"}) and all(len(v) == 1 for v in query.values()))
+        # The official broker may first open its manager bot using Telegram's
+        # private /start deep link. The broker chooses the bot; neither the UI
+        # nor user env can supply this URL. Do not allow group or arbitrary links.
+        start_link = (re.fullmatch(r"/[A-Za-z][A-Za-z0-9_]{4,31}", url.path)
+                      and url.path.lower().endswith("bot") and set(query) == {"start"}
+                      and len(query["start"]) == 1
+                      and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", query["start"][0]))
+        valid = valid and (create_link or start_link)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SetupError("setup_invalid_qr_url")
+    return value
+
+
+async def _fetch_json(url, *, method="GET", payload=None, bearer=None):
     # Both URLs originate here. No renderer-provided URL, redirect, or proxy can
     # move a polling capability to another endpoint.
     parsed = urllib.parse.urlsplit(url)
-    if url != GENERATE_URL and not (
+    wecom = method == "GET" and payload is None and bearer is None and (url == GENERATE_URL or (
         parsed.scheme == "https" and parsed.netloc == "work.weixin.qq.com"
         and parsed.path == "/ai/qc/query_result" and not parsed.fragment
         and list(urllib.parse.parse_qs(parsed.query)) == ["scode"]
-    ):
+    ))
+    telegram_create = method == "POST" and url == TELEGRAM_URL and payload == {"bot_name": "CCEM"} and bearer is None
+    telegram_poll = (method == "GET" and payload is None and isinstance(bearer, str)
+                     and 1 <= len(bearer) <= 4096 and bearer == bearer.strip()
+                     and all(32 <= ord(c) < 127 for c in bearer)
+                     and parsed.scheme == "https" and parsed.netloc == "setup.hermes-agent.nousresearch.com"
+                     and re.fullmatch(r"/v1/telegram/pairings/[A-Za-z0-9_-]{1,128}", parsed.path)
+                     and not parsed.query and not parsed.fragment)
+    if not (wecom or telegram_create or telegram_poll):
         raise SetupError("setup_invalid_endpoint")
     try:
         import aiohttp
@@ -86,10 +121,13 @@ async def _fetch_json(url):
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         connector = aiohttp.TCPConnector(ssl=tls_context())
         async with aiohttp.ClientSession(timeout=timeout, trust_env=False, connector=connector) as client:
-            async with client.get(url, allow_redirects=False, headers={"User-Agent": "HermesAgent/1.0"}) as response:
+            headers = {"User-Agent": "HermesAgent/1.0"}
+            if bearer:
+                headers["Authorization"] = "Bearer " + bearer
+            async with client.request(method, url, allow_redirects=False, headers=headers, json=payload) as response:
                 if 300 <= response.status < 400:
                     raise SetupError("setup_redirect_rejected")
-                if response.status != 200:
+                if response.status not in ((200, 201) if telegram_create else (200,)):
                     raise SetupError("setup_request_failed")
                 if response.content_length is not None and response.content_length > RESPONSE_LIMIT:
                     raise SetupError("setup_response_too_large")
@@ -116,6 +154,8 @@ async def _fetch_json(url):
 
 
 class WeComSetup:
+    platform = "wecom"
+
     def __init__(self, *, fetch_json=_fetch_json, monotonic=time.monotonic, wall_clock=time.time):
         self._fetch_json = fetch_json
         self._monotonic = monotonic
@@ -160,6 +200,8 @@ class WeComSetup:
 
     async def begin(self, identifier, platform):
         identifier = validate_begin(identifier, platform)
+        if platform != "wecom":
+            raise SetupError("setup_platform_not_supported")
         self.clear("superseded")
         session = {"id": identifier, "scode": None, "deadline": self._monotonic() + SESSION_TIMEOUT,
                    "expiresAt": int((self._wall_clock() + SESSION_TIMEOUT) * 1000)}
@@ -223,3 +265,90 @@ class WeComSetup:
         self._session(identifier)
         self.clear()
         return {"id": identifier, "state": "cancelled"}
+
+
+class TelegramSetup(WeComSetup):
+    """Pinned Hermes managed-bot protocol; no user profile/env override is read.
+
+    Nous brokers the bot creation. Returned owner_user_id is deliberately not
+    converted into workspace authorization: desktop pairing is still required.
+    """
+
+    platform = "telegram"
+
+    async def begin(self, identifier, platform):
+        identifier = validate_begin(identifier, platform)
+        if platform != "telegram":
+            raise SetupError("setup_platform_not_supported")
+        self.clear("superseded")
+        session = {"id": identifier, "scode": None, "deadline": self._monotonic() + SESSION_TIMEOUT,
+                   "expiresAt": int((self._wall_clock() + SESSION_TIMEOUT) * 1000)}
+        self._current, self._terminal = session, None
+        self._expiry = asyncio.get_running_loop().call_later(SESSION_TIMEOUT, self._expire, session)
+        try:
+            data = await self._fetch_json(TELEGRAM_URL, method="POST", payload={"bot_name": "CCEM"})
+            self._check(session)
+            if not isinstance(data, dict):
+                raise SetupError("setup_invalid_response")
+            pairing_id = _identifier(data.get("pairing_id"))
+            poll_token = _text(data.get("poll_token"))
+            if not poll_token.isascii():
+                raise SetupError("setup_invalid_response")
+            deep_link = _telegram_qr_payload(data.get("deep_link"))
+            qr_payload = _telegram_qr_payload(data.get("qr_payload") or deep_link)
+            if qr_payload != deep_link:
+                raise SetupError("setup_invalid_qr_url")
+            if data.get("expires_at") is not None:
+                try:
+                    expiry = datetime.fromisoformat(_text(data["expires_at"]).replace("Z", "+00:00"))
+                    if expiry.tzinfo is None:
+                        raise ValueError("timezone required")
+                    remaining = min(SESSION_TIMEOUT, expiry.timestamp() - self._wall_clock())
+                    session["deadline"] = self._monotonic() + remaining
+                    session["expiresAt"] = int((self._wall_clock() + remaining) * 1000)
+                    self._expiry.cancel()
+                    self._expiry = asyncio.get_running_loop().call_later(max(0, remaining), self._expire, session)
+                    self._check(session)
+                except SetupError:
+                    raise
+                except (ValueError, OverflowError):
+                    raise SetupError("setup_invalid_response") from None
+            session["scode"] = {"pairing_id": pairing_id, "poll_token": poll_token}
+            return {"id": identifier, "state": "waiting", "qrPayload": qr_payload, "expiresAt": session["expiresAt"]}
+        except (asyncio.CancelledError, SetupError):
+            if self._current is session:
+                self.clear("failed")
+            raise
+        except Exception:
+            if self._current is session:
+                self.clear("failed")
+            raise SetupError("setup_request_failed") from None
+
+    async def poll(self, identifier):
+        session = self._session(identifier)
+        if not session["scode"]:
+            raise SetupError("setup_not_ready")
+        try:
+            secret = session["scode"]
+            data = await self._fetch_json(TELEGRAM_URL + "/" + secret["pairing_id"], bearer=secret["poll_token"])
+            self._check(session)
+            if not isinstance(data, dict):
+                raise SetupError("setup_invalid_response")
+            status = _text(data.get("status"), 64)
+            if status in ("expired", "cancelled", "failed"):
+                raise SetupError("setup_" + status)
+            if status != "ready":
+                return {"id": identifier, "state": "waiting"}
+            token = data.get("token")
+            if not isinstance(token, str) or len(token) > 4096 or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", token):
+                raise SetupError("setup_credentials_missing")
+            self.clear("consumed")
+            return {"id": identifier, "state": "ready", "platform": "telegram", "fields": {"TELEGRAM_BOT_TOKEN": token}}
+        except (asyncio.CancelledError, SetupError):
+            if self._current is session:
+                self.clear("failed")
+            raise
+        except Exception:
+            if self._current is session:
+                self.clear("failed")
+            raise SetupError("setup_request_failed") from None

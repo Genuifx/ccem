@@ -50,17 +50,21 @@ fn owns(route: &Route, runtime: &str, id: &str, operations: &[Operation]) -> boo
     })
 }
 
-pub(super) fn poll(manager: &HermesBridgeManager) -> Result<(), String> {
+pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), String> {
     if !manager
-        .gateway
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|g| g.process.snapshot()["state"] == "running")
+        .with_store(|s| s.connection(account).map(|c| c.enabled))
+        .unwrap_or(false)
+        || !manager
+            .connection_process(account)
+            .is_ok_and(|p| p.snapshot()["state"] == "running")
     {
         return Ok(());
     }
-    let routes = manager.with_store(|store| store.routes())?;
+    let routes: Vec<_> = manager
+        .with_store(|store| store.routes())?
+        .into_iter()
+        .filter(|r| r.source.account_ref == account)
+        .collect();
     let sessions: Vec<_> = manager
         .native
         .list_sessions()
@@ -91,23 +95,47 @@ pub(super) fn poll(manager: &HermesBridgeManager) -> Result<(), String> {
                 None,
                 100,
             )?;
-            manager.with_store(|store| project_page(store, route, session, &page))
+            let _guard = manager
+                .lifecycle
+                .lock()
+                .map_err(|_| "bridge_lock_poisoned")?;
+            manager.with_store(|store| {
+                if !store
+                    .connection(account)
+                    .map(|c| c.enabled)
+                    .unwrap_or(false)
+                    || !store
+                        .route(&route.source)
+                        .is_ok_and(|current| current.generation == route.generation)
+                {
+                    return Ok(());
+                }
+                project_page(store, route, session, &page)
+            })
         },
         || {
             let deliveries = manager.with_store(|store| store.deliveries())?;
             drain_outbox(
-                deliveries,
+                deliveries_for_account(deliveries, &routes),
                 |id| {
                     let _guard = manager
                         .lifecycle
                         .lock()
                         .map_err(|_| "bridge_lock_poisoned")?;
-                    let process = manager.host_process()?;
+                    if !manager
+                        .with_store(|s| s.connection(account).map(|c| c.enabled))
+                        .unwrap_or(false)
+                    {
+                        return Ok(None);
+                    }
+                    let Ok(process) = manager.connection_process(account) else {
+                        return Ok(None);
+                    };
                     if process.snapshot()["state"] != "running" {
                         return Ok(None);
                     }
                     manager
-                        .with_store(|store| reserve_delivery(store, id))
+                        .with_store(|store| reserve_account_delivery(store, account, id))
                         .map(|reserved| {
                             reserved.map(|(delivery, route)| DeliveryReservation {
                                 delivery,
@@ -125,19 +153,30 @@ pub(super) fn poll(manager: &HermesBridgeManager) -> Result<(), String> {
                         .lock()
                         .map_err(|_| "bridge_lock_poisoned")?;
                     let same_host = manager
-                        .host_process()
+                        .connection_process(account)
                         .is_ok_and(|process| std::sync::Arc::ptr_eq(&process, &reserved.transport));
                     manager.with_store(|store| {
-                        finish_delivery(store, &reserved.delivery, receipt, same_host)
+                        let enabled = store.connection(account).is_ok_and(|c| c.enabled);
+                        finish_delivery(store, &reserved.delivery, receipt, same_host && enabled)
                     })
                 },
             )
         },
     )?;
     if !issues.is_empty() {
-        *manager.last_error.lock().unwrap() = Some(issues.join("; "));
+        return Err(issues.join("; "));
     }
     Ok(())
+}
+
+// Select this connection before imposing the bounded send budget. A paused or
+// failing account's older messages cannot consume a healthy account's budget.
+fn deliveries_for_account(deliveries: Vec<Delivery>, routes: &[Route]) -> Vec<Delivery> {
+    let route_ids: std::collections::HashSet<_> = routes.iter().map(|r| r.id.as_str()).collect();
+    deliveries
+        .into_iter()
+        .filter(|d| route_ids.contains(d.route_id.as_str()))
+        .collect()
 }
 
 /// A missing history belongs to that runtime, and cannot block another runtime
@@ -391,6 +430,27 @@ struct DeliveryReservation<T> {
     delivery: Delivery,
     route: Route,
     transport: T,
+}
+
+fn reserve_account_delivery(
+    store: &mut Store,
+    account: &str,
+    id: &str,
+) -> Result<Option<(Delivery, Route)>, String> {
+    if !store.connection(account).is_ok_and(|c| c.enabled) {
+        return Ok(None);
+    }
+    let Some(delivery) = store.delivery(id)? else {
+        return Ok(None);
+    };
+    if !store
+        .routes()?
+        .iter()
+        .any(|r| r.id == delivery.route_id && r.source.account_ref == account)
+    {
+        return Ok(None);
+    }
+    reserve_delivery(store, id)
 }
 
 fn reserve_delivery(store: &mut Store, id: &str) -> Result<Option<(Delivery, Route)>, String> {

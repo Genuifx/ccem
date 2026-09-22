@@ -191,11 +191,11 @@ def prepare(args: argparse.Namespace) -> dict:
     if sha256(source / "uv.lock") != LOCK_HASH:
         raise ValueError("Hermes lock does not match the reviewed baseline")
     # Export the exact dependency solution before applying CCEM's reviewed gateway patch.
-    # Upstream's wecom extra only adds XML support. Its sms extra contains solely
-    # the pinned shared aiohttp transport; exporting it does not enable SMS.
+    # The upstream messaging extra supplies Telegram, Discord and Slack plus
+    # their shared transport. Keep the original lock, including wheel hashes.
     requirements = cache / "requirements.lock.txt"
     requirements.write_text(run([args.uv, "export", "--frozen", "--no-dev", "--no-emit-project",
-        "--extra", "wecom", "--extra", "feishu", "--extra", "sms", "--format", "requirements-txt"], cwd=source))
+        "--extra", "wecom", "--extra", "feishu", "--extra", "messaging", "--format", "requirements-txt"], cwd=source))
     site = package / "python/lib/python3.11/site-packages"
     print("Installing the locked wheel closure in the build artifact", flush=True)
     subprocess.run([args.uv, "pip", "install", "--python", str(python), "--target", str(site),
@@ -260,13 +260,16 @@ def finalize(args: argparse.Namespace) -> dict:
         result = json.loads(raw)
         if result.get("ok") is not True or result.get("protocolVersion") != 1:
             raise ValueError("Relocated host health/protocol gate failed")
+        channels = result.get("channels")
+        if not isinstance(channels, list) or not channels or any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) for name in channels) or len(set(channels)) != len(channels):
+            raise ValueError("Relocated host did not attest its managed channel capabilities")
     finally:
         relocated.rename(package)
     audit = native_audit(package)
     files = inventory(package)
     write_json(package / "runtime.json", {"schemaVersion": 1, "protocolVersion": 1, "hermesCommit": COMMIT,
         "uvLockSha256": LOCK_HASH, "pythonVersion": PYTHON_VERSION, "platform": "macos", "architecture": "aarch64",
-        "channels": ["wecom", "feishu"], "files": files})
+        "channels": channels, "files": files})
     files = inventory(package)
     version_dir = output / args.version
     version_dir.mkdir(exist_ok=True)

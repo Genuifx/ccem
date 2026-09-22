@@ -654,6 +654,165 @@ fn replacing_gateway_during_inflight_delivery_keeps_result_unknown_without_retry
 }
 
 #[test]
+fn one_accounts_backlog_and_blocked_send_do_not_starve_another_account() {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::{thread, time::Duration};
+    let mut f = Fixture::new();
+    let a = f
+        .store()
+        .save_connection(None, "test", None, "cipher-a", &[], true)
+        .unwrap();
+    let b = f
+        .store()
+        .save_connection(None, "test", None, "cipher-b", &[], true)
+        .unwrap();
+    let template = f.route("template");
+    let mut source_a = template.source.clone();
+    source_a.account_ref = a.account_ref.clone();
+    let mut source_b = template.source.clone();
+    source_b.account_ref = b.account_ref.clone();
+    let route_a = f
+        .store()
+        .approve_route(source_a, template.workspaces.clone(), true, true)
+        .unwrap();
+    let route_b = f
+        .store()
+        .approve_route(source_b, template.workspaces, true, true)
+        .unwrap();
+    let older: Vec<_> = (0..20)
+        .map(|i| make_delivery(&route_a, &format!("a-{i}"), format!("a-{i}")))
+        .collect();
+    f.store().enqueue_page("seed-a", 1, &older).unwrap();
+    let newer = make_delivery(&route_b, "b", "B completion".into());
+    f.store()
+        .enqueue_page("seed-b", 1, &[newer.clone()])
+        .unwrap();
+    // Stop pauses the target without changing delivery state or route authority.
+    f.store()
+        .set_connection_enabled(&a.account_ref, false)
+        .unwrap();
+    assert!(
+        reserve_account_delivery(f.store(), &a.account_ref, &older[0].id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.store().delivery(&older[0].id).unwrap().unwrap().status,
+        "pending"
+    );
+    assert!(
+        reserve_account_delivery(f.store(), &b.account_ref, &older[0].id)
+            .unwrap()
+            .is_none()
+    );
+    f.store()
+        .set_connection_enabled(&a.account_ref, true)
+        .unwrap();
+
+    let store = Arc::new(Mutex::new(f.store.take().unwrap()));
+    let policy = Arc::new(Mutex::new(()));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let worker_store = store.clone();
+    let worker_policy = policy.clone();
+    let worker = thread::spawn(move || {
+        let deliveries = deliveries_for_account(
+            worker_store.lock().unwrap().deliveries().unwrap(),
+            &[route_a],
+        );
+        let mut first = true;
+        drain_outbox(
+            deliveries,
+            |id| {
+                let _guard = worker_policy.lock().unwrap();
+                reserve_account_delivery(&mut worker_store.lock().unwrap(), &a.account_ref, id).map(
+                    |r| {
+                        r.map(|(delivery, route)| DeliveryReservation {
+                            delivery,
+                            route,
+                            transport: (),
+                        })
+                    },
+                )
+            },
+            |_| {
+                if first {
+                    first = false;
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                Ok(json!({"status":"sent"}))
+            },
+            |reserved, receipt| {
+                let _guard = worker_policy.lock().unwrap();
+                finish_delivery(
+                    &mut worker_store.lock().unwrap(),
+                    &reserved.delivery,
+                    receipt,
+                    true,
+                )
+            },
+        )
+        .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deliveries =
+        deliveries_for_account(store.lock().unwrap().deliveries().unwrap(), &[route_b]);
+    drain_outbox(
+        deliveries,
+        |id| {
+            let _guard = policy
+                .try_lock()
+                .expect("A's network wait releases the policy lock");
+            reserve_account_delivery(&mut store.lock().unwrap(), &b.account_ref, id).map(|r| {
+                r.map(|(delivery, route)| DeliveryReservation {
+                    delivery,
+                    route,
+                    transport: (),
+                })
+            })
+        },
+        |reserved| {
+            assert_eq!(reserved.route.source.account_ref, b.account_ref);
+            Ok(json!({"status":"sent"}))
+        },
+        |reserved, receipt| {
+            finish_delivery(
+                &mut store.lock().unwrap(),
+                &reserved.delivery,
+                receipt,
+                true,
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .delivery(&newer.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "sent",
+        "B completes before A is released"
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .delivery(&older[0].id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "sending"
+    );
+    release_tx.send(()).unwrap();
+    worker.join().unwrap();
+    f.store = Some(Arc::try_unwrap(store).ok().unwrap().into_inner().unwrap());
+}
+
+#[test]
 fn all_replay_integrity_failures_preserve_the_previous_cursor_and_input_state() {
     let mut f = Fixture::new();
     let route = f.route("one");

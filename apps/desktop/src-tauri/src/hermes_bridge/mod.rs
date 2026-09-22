@@ -1,7 +1,9 @@
 //! CCEM owns workspace policy, confirmations, operation state and the durable outbox.
+mod connection_config;
 mod poll;
 mod process;
 mod setup;
+mod startup;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -18,6 +20,7 @@ use process::GatewayProcess;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -26,12 +29,12 @@ use std::{
     thread,
     time::Duration,
 };
-use store::{digest, now, random_id, Delivery, Route, Source, Store};
+use store::{digest, now, random_id, ConnectionRecord, Delivery, Route, Source, Store};
 use tauri::{AppHandle, Manager};
 
 struct OwnedGateway {
     process: Arc<GatewayProcess>,
-    connect: bool,
+    token: String,
     _lease: HermesRuntimeLease,
 }
 impl Drop for OwnedGateway {
@@ -44,13 +47,19 @@ pub struct HermesBridgeManager {
     root: PathBuf,
     pub installer: HermesInstaller,
     store: Mutex<Option<Store>>,
-    gateway: Mutex<Option<OwnedGateway>>,
-    token: Mutex<Option<String>>,
+    discovery: Mutex<Option<OwnedGateway>>,
+    gateways: Mutex<HashMap<String, OwnedGateway>>,
+    connection_errors: Mutex<HashMap<String, String>>,
+    failures: Mutex<HashMap<String, u32>>,
+    polling: Mutex<HashSet<String>>,
     lifecycle: Mutex<()>,
+    startup: startup::StartupQueue,
     native: Arc<NativeRuntimeManager>,
     environment: Arc<EnvironmentMutationCoordinator>,
     shutdown: AtomicBool,
     install_requested: AtomicBool,
+    install_cancelled: AtomicBool,
+    runtime_removing: AtomicBool,
     last_error: Mutex<Option<String>>,
     setup: Mutex<Option<setup::Setup>>,
     setup_workers: AtomicUsize,
@@ -88,13 +97,19 @@ impl HermesBridgeManager {
             installer: HermesInstaller::new(root.join("runtime")),
             root,
             store: Mutex::new(None),
-            gateway: Mutex::new(None),
-            token: Mutex::new(None),
+            discovery: Mutex::new(None),
+            gateways: Mutex::new(HashMap::new()),
+            connection_errors: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+            polling: Mutex::new(HashSet::new()),
             lifecycle: Mutex::new(()),
+            startup: startup::StartupQueue::default(),
             native,
             environment,
             shutdown: AtomicBool::new(false),
             install_requested: AtomicBool::new(false),
+            install_cancelled: AtomicBool::new(false),
+            runtime_removing: AtomicBool::new(false),
             last_error: Mutex::new(None),
             setup: Mutex::new(None),
             setup_workers: AtomicUsize::new(0),
@@ -107,50 +122,88 @@ impl HermesBridgeManager {
         }
         f(store.as_mut().expect("initialized"))
     }
+    fn account_for_token(&self, header: &str) -> Option<String> {
+        let gateways = self.gateways.lock().unwrap();
+        resolve_bearer(
+            header,
+            gateways
+                .iter()
+                .filter(|(_, g)| g.process.alive())
+                .map(|(account, g)| (account.as_str(), g.token.as_str())),
+        )
+    }
     pub fn authorized_token(&self, header: &str) -> bool {
-        let token = self.token.lock().unwrap();
-        let Some(token) = token.as_ref() else {
-            return false;
-        };
-        let expected = format!("Bearer {token}");
-        header.len() == expected.len()
-            && header
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0u8, |a, (b, c)| a | (b ^ c))
-                == 0
+        self.account_for_token(header).is_some()
     }
     pub fn status(&self) -> Value {
         let mut gateway = self
             .host_process()
             .ok()
-            .map(|process| process.snapshot())
+            .map(|p| p.snapshot())
             .unwrap_or(json!({"state":"stopped","platforms":[]}));
-        if let Some(error) = self.last_error.lock().unwrap().as_ref() {
-            gateway["error"] = json!(error)
+        if let Some(object) = gateway.as_object_mut() {
+            object.remove("pending");
+            object.remove("pairing");
         }
-        let mut result = json!({"installer":self.installer.status(),"gateway":gateway,"pending":[],"routes":[],"operations":[],"deliveries":[],"workspaces":[]});
+        if self.startup.discovery_pending() {
+            gateway["state"] = json!("starting");
+        }
+        if let Some(error) = self.last_error.lock().unwrap().as_ref() {
+            gateway["error"] = json!(error);
+        }
+        let mut result = json!({"installer":self.installer.status(),"gateway":gateway,"connections":[],"pending":[],"pairing":null,"routes":[],"operations":[],"deliveries":[],"workspaces":[],"setup":self.setup_snapshot()});
         if self.install_requested.load(Ordering::Acquire)
+            && !self.runtime_removing.load(Ordering::Acquire)
             && ["not_installed", "installed", "error"]
                 .contains(&result["installer"]["state"].as_str().unwrap_or(""))
         {
-            result["installer"]["state"] = json!("checking")
+            result["installer"]["state"] = json!("checking");
         }
-        result["pending"] = result["gateway"]["pending"]
-            .as_array()
-            .map(|a| json!(a))
-            .unwrap_or(json!([]));
-        result["pairing"] = result["gateway"]["pairing"].clone();
-        result["setup"] = self.setup_snapshot();
         if self.root.join("bridge.sqlite3").exists() {
-            if let Err(error)=self.with_store(|s|{
-                result["routes"]=json!(s.routes()?);
-                result["operations"]=json!(s.operations()?.into_iter().take(30).map(|op|json!({"id":op.id,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail,"updatedAt":op.updated_at})).collect::<Vec<_>>());
-                result["deliveries"]=json!(s.deliveries()?.into_iter().take(30).collect::<Vec<_>>());
-                if let Some(p)=s.setting("platform")? {result["gateway"]["configuredPlatform"]=json!(p)}
-                if let Some(keys)=s.setting("configuredFields")?{result["gateway"]["configuredFields"]=serde_json::from_str(&keys).unwrap_or(json!([]))}
-                Ok(())
-            }){result["gateway"]["error"]=json!(error)}
+            let records = self.with_store(|s| {
+                let routes = s.routes()?;
+                result["operations"] = json!(s.operations()?.into_iter().take(30).map(|op| {
+                    let account = routes.iter().find(|r| r.id == op.route_id).map(|r| &r.source.account_ref);
+                    json!({"id":op.id,"accountRef":account,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail,"updatedAt":op.updated_at})
+                }).collect::<Vec<_>>());
+                result["routes"] = json!(routes);
+                result["deliveries"] = json!(s.deliveries()?.into_iter().take(30).collect::<Vec<_>>());
+                s.connections()
+            });
+            match records {
+                Ok(records) => {
+                    result["connections"] = json!(records
+                        .iter()
+                        .map(|record| {
+                            let mut public = record.public_status();
+                            if let Ok(process) = self.connection_process(&record.account_ref) {
+                                let snapshot = process.snapshot();
+                                public["state"] = snapshot["state"].clone();
+                                public["error"] = snapshot["error"].clone();
+                                public["pending"] = snapshot["pending"]
+                                    .as_array()
+                                    .map(|v| json!(v))
+                                    .unwrap_or(json!([]));
+                                public["pairing"] = snapshot["pairing"].clone();
+                            } else if record.enabled
+                                && self.startup.connection_pending(&record.account_ref)
+                            {
+                                public["state"] = json!("starting");
+                            }
+                            if let Some(error) = self
+                                .connection_errors
+                                .lock()
+                                .unwrap()
+                                .get(&record.account_ref)
+                            {
+                                apply_connection_error(&mut public, error);
+                            }
+                            public
+                        })
+                        .collect::<Vec<_>>())
+                }
+                Err(error) => result["gateway"]["error"] = json!(error),
+            }
         }
         let mut workspaces: Vec<_> = self
             .native
@@ -164,75 +217,73 @@ impl HermesBridgeManager {
         result["workspaces"] = json!(workspaces);
         result
     }
-    fn host_request(&self, method: &str, params: Value) -> Result<Value, String> {
-        let process = self.host_process()?;
-        process.request(method, params)
-    }
+    // Discovery has no registered bridge capability and never owns a connection.
     fn host_process(&self) -> Result<Arc<GatewayProcess>, String> {
-        self.gateway
+        self.discovery
             .lock()
             .unwrap()
             .as_ref()
-            .map(|gateway| gateway.process.clone())
+            .map(|g| g.process.clone())
             .ok_or_else(|| "gateway_not_running".into())
     }
-    fn stop_locked(&self) {
-        *self.token.lock().unwrap() = None;
-        let gateway = self.gateway.lock().unwrap().take();
-        drop(gateway);
+    fn connection_process(&self, account: &str) -> Result<Arc<GatewayProcess>, String> {
+        self.gateways
+            .lock()
+            .unwrap()
+            .get(account)
+            .map(|g| g.process.clone())
+            .ok_or_else(|| "gateway_not_running".into())
     }
-    fn start_locked(&self, app: &AppHandle, connect: bool) -> Result<(), String> {
-        self.stop_locked();
-        let lease = self.installer.lease_runtime().map_err(|e| e.to_string())?;
+    fn stop_connection_locked(&self, account: &str) {
+        self.startup.cancel_connection(account);
+        let gateway = self.gateways.lock().unwrap().remove(account);
+        drop(gateway); // Revoke the token before waiting on this exact child.
+    }
+    fn stop_locked(&self) {
+        self.startup.cancel_all();
+        let gateways = std::mem::take(&mut *self.gateways.lock().unwrap());
+        let discovery = self.discovery.lock().unwrap().take();
+        drop(gateways);
+        drop(discovery);
+    }
+    fn spawn_gateway(
+        &self,
+        app: &AppHandle,
+        connection: Option<&ConnectionRecord>,
+        lease: HermesRuntimeLease,
+    ) -> Result<OwnedGateway, String> {
         let port = app
             .state::<Arc<ExternalControlManager>>()
             .current_port()
             .ok_or("control_server_not_running")?;
-        let (instance, account, platform, fields) = self.with_store(|s| {
+        let instance = self.with_store(|s| {
             let instance = s.setting("instance")?.unwrap_or_else(random_id);
             s.set_setting("instance", &instance)?;
-            let fields = match s.setting("channelSecrets")? {
-                Some(cipher) => serde_json::from_str::<Value>(&crypto::decrypt(&cipher)?)
-                    .map_err(|_| "channel_config_corrupt")?,
-                None => json!({}),
-            };
-            Ok((
-                instance,
-                s.setting("accountRef")?
-                    .unwrap_or_else(|| "unconfigured".into()),
-                s.setting("platform")?,
-                fields,
-            ))
+            Ok(instance)
         })?;
-        if connect && platform.is_none() {
-            return Err("channel_not_configured".into());
-        }
+        let fields = connection
+            .map(|c| decode_fields(&c.cipher))
+            .transpose()?
+            .map(|v| json!(v))
+            .unwrap_or(json!({}));
+        let account = connection
+            .map(|c| c.account_ref.as_str())
+            .unwrap_or("discovery");
         let token = random_id();
-        // One token exists for one host lifetime. The administrator descriptor never crosses this pipe.
-        *self.token.lock().unwrap() = Some(token.clone());
-        let boot = json!({"protocolVersion":1,"instanceId":instance,"accountRef":account,"endpoint":format!("http://127.0.0.1:{port}/rpc"),"token":token,"platform":platform,"fields":fields,"connect":connect});
+        let boot = json!({"protocolVersion":1,"instanceId":instance,"accountRef":account,"endpoint":format!("http://127.0.0.1:{port}/rpc"),"token":token,"platform":connection.map(|c| &c.platform),"fields":fields,"connect":connection.is_some()});
         let launch = &lease.launch;
-        match GatewayProcess::spawn(
+        let process = GatewayProcess::spawn(
             &launch.python,
             &launch.host,
             &launch.source,
-            &self.root.join("profiles").join(&account),
+            &self.root.join("profiles").join(account),
             boot,
-        ) {
-            Ok(process) => {
-                *self.gateway.lock().unwrap() = Some(OwnedGateway {
-                    process: Arc::new(process),
-                    connect,
-                    _lease: lease,
-                });
-                *self.last_error.lock().unwrap() = None;
-                Ok(())
-            }
-            Err(e) => {
-                *self.token.lock().unwrap() = None;
-                Err(e)
-            }
-        }
+        )?;
+        Ok(OwnedGateway {
+            process: Arc::new(process),
+            token,
+            _lease: lease,
+        })
     }
     pub fn action(
         self: &Arc<Self>,
@@ -242,12 +293,28 @@ impl HermesBridgeManager {
     ) -> Result<Value, String> {
         if action == "cancelInstall" {
             self.installer.cancel();
+            self.install_cancelled.store(true, Ordering::Release);
+            self.startup.wake();
             return Ok(self.status());
         }
-        let _lifecycle = self.lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?;
+        if action == "removeRuntime" {
+            return self.remove_runtime();
+        }
+        if action == "openPairing" || action == "approvePairing" {
+            return self.pairing_action(app, action, &payload);
+        }
+        let _lifecycle =
+            if ["cancelSetup", "stop", "removeChannel", "disableRoute"].contains(&action) {
+                self.lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?
+            } else {
+                idle_lifecycle(&self.lifecycle, &self.install_requested)?
+            };
         match action {
             "beginSetup" => {
-                self.begin_setup_locked(app, payload["platform"].as_str().ok_or("platform_required")?)?;
+                self.begin_setup_locked(
+                    app,
+                    payload["platform"].as_str().ok_or("platform_required")?,
+                )?;
             }
             "cancelSetup" => {
                 self.cancel_setup_locked(payload["id"].as_str().ok_or("setup_id_required")?)?;
@@ -257,6 +324,8 @@ impl HermesBridgeManager {
                 if self.install_requested.load(Ordering::Acquire) {
                     return Err("installation_already_running".into());
                 }
+                let had_runtime = self.installer.status().launch.is_some();
+                self.install_cancelled.store(false, Ordering::Release);
                 let reservation = self
                     .installer
                     .prepare_install()
@@ -267,131 +336,68 @@ impl HermesBridgeManager {
                 let manager = self.clone();
                 let app = app.clone();
                 thread::spawn(move || {
-                    let result = reservation.run().map_err(|e| e.to_string()).and_then(|_| {
-                        let _guard = manager.lifecycle.lock().unwrap();
-                        manager.start_locked(&app, false)
-                    });
-                    if let Err(e) = result {
-                        *manager.last_error.lock().unwrap() = Some(e)
-                    }
+                    // An in-flight verifier may already own the old runtime's
+                    // shared lease. Wait outside the lifecycle lock before the
+                    // installer requests exclusive activation. Cancellation can
+                    // settle immediately without attempting activation.
+                    manager
+                        .startup
+                        .wait_idle(|| manager.install_cancelled.load(Ordering::Acquire));
+                    let install_result = reservation.run().map_err(|e| e.to_string());
+                    let _guard = manager.lifecycle.lock().unwrap();
                     manager.install_requested.store(false, Ordering::Release);
+                    if !manager.shutdown.load(Ordering::Acquire)
+                        && (had_runtime || install_result.is_ok())
+                    {
+                        // Explicit updates restore every enabled connection on
+                        // either the new runtime or the intact previous runtime.
+                        let _ = manager.start_discovery_locked(&app);
+                        if let Ok(connections) = manager.with_store(|s| s.connections()) {
+                            for connection in connections.into_iter().filter(|c| c.enabled) {
+                                let _ =
+                                    manager.start_connection_locked(&app, &connection.account_ref);
+                            }
+                        }
+                    }
+                    if let Err(error) = install_result {
+                        *manager.last_error.lock().unwrap() = Some(error);
+                    }
                 });
             }
-            "removeRuntime" => {
-                self.invalidate_setup_locked();
-                self.stop_locked();
-                self.with_store(|s| s.set_setting("enabled", "false"))?;
-                self.installer.remove_runtime().map_err(|e| e.to_string())?;
-            }
             "configureChannel" => {
-                let platform = payload["platform"].as_str().ok_or("platform_required")?;
-                let fields = payload["fields"].as_object().ok_or("fields_required")?;
-                self.invalidate_setup_locked();
-                let snapshot = self
-                    .gateway
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .ok_or("gateway_not_running")?
-                    .process
-                    .snapshot();
-                let meta = snapshot["platforms"]
-                    .as_array()
-                    .and_then(|a| a.iter().find(|v| v["id"] == platform))
-                    .ok_or("platform_not_supported")?;
-                if meta["strictSend"] != true || meta["available"] != true {
-                    return Err("platform_not_available".into());
+                self.configure_channel_locked(app, &payload)?;
+            }
+            "refreshPlatforms" => {
+                if self.setup_in_progress() {
+                    return Err("setup_in_progress".into());
                 }
-                let schema = meta["fields"].as_array().ok_or("platform_schema_missing")?;
-                let old = self.with_store(|s| {
-                    if s.setting("platform")?.as_deref() == Some(platform) {
-                        s.setting("channelSecrets")?
-                            .map(|s| crypto::decrypt(&s))
-                            .transpose()
-                    } else {
-                        Ok(None)
-                    }
-                })?;
-                let mut merged: serde_json::Map<String, Value> = old
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                for (k, v) in fields {
-                    if !schema.iter().any(|s| s["key"] == *k) {
-                        return Err("unknown_channel_field".into());
-                    }
-                    let value = v.as_str().ok_or("invalid_channel_field")?;
-                    if value.len() > 4096 || value.contains('\0') {
-                        return Err("invalid_channel_field".into());
-                    }
-                    if !value.is_empty() {
-                        merged.insert(k.clone(), json!(value));
-                    }
-                }
-                for field in schema {
-                    if field["required"] == true
-                        && merged
-                            .get(field["key"].as_str().unwrap_or(""))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .is_empty()
-                    {
-                        return Err("required_channel_field_missing".into());
-                    }
-                }
-                let cipher =
-                    crypto::encrypt(&serde_json::to_string(&merged).map_err(|e| e.to_string())?)?;
-                self.stop_locked();
-                self.with_store(|s| s.replace_channel(platform, &cipher, &merged.keys().cloned().collect::<Vec<_>>()))?;
-                self.start_locked(app, true)?;
+                self.start_discovery_locked(app)?;
             }
             "start" => {
-                self.invalidate_setup_locked();
-                let connect = self.with_store(|s| {
-                    let configured = s.setting("platform")?.is_some();
-                    s.set_setting("enabled", if configured { "true" } else { "false" })?;
-                    Ok(configured)
-                })?;
-                self.start_locked(app, connect)?;
+                let account = payload["accountRef"]
+                    .as_str()
+                    .ok_or("account_ref_required")?;
+                self.with_store(|s| s.set_connection_enabled(account, true))?;
+                self.start_connection_locked(app, account)?;
             }
             "stop" => {
-                self.invalidate_setup_locked();
-                self.with_store(|s| s.set_setting("enabled", "false"))?;
-                self.start_locked(app, false)?;
+                let account = payload["accountRef"]
+                    .as_str()
+                    .ok_or("account_ref_required")?;
+                self.invalidate_setup_for_account(account);
+                self.with_store(|s| s.set_connection_enabled(account, false))?;
+                self.stop_connection_locked(account);
+                self.connection_errors.lock().unwrap().remove(account);
             }
-            "openPairing" => {
-                self.host_request("openPairing", json!({}))?;
-            }
-            "approvePairing" => {
-                let id = payload["id"].as_str().ok_or("pairing_id_required")?;
-                let workspaces: Vec<String> = serde_json::from_value(payload["workspaces"].clone())
-                    .map_err(|_| "workspace_scope_required")?;
-                // Validate scopes before granting Hermes native authorization.
-                for path in &workspaces {
-                    if !std::path::Path::new(path).is_dir() {
-                        return Err("workspace_not_found".into());
-                    }
-                }
-                if workspaces.is_empty() {
-                    return Err("workspace_scope_required".into());
-                }
-                let approved = self.host_request("approvePairing", json!({"id":id}))?;
-                let source: Source = serde_json::from_value(approved["source"].clone())
-                    .map_err(|_| "invalid_pairing_response")?;
-                // Capture before committing approval: a completion racing the
-                // approval must be replayed, never included in a later baseline.
-                let baselines: Vec<_> = self.native.list_sessions().into_iter()
-                    .map(|session| (session.runtime_id, session.project_dir, session.last_event_seq.unwrap_or(0)))
-                    .collect();
-                self.with_store(|s| {
-                    s.approve_route_with_baselines(
-                        source,
-                        workspaces,
-                        payload["allowInput"] == true,
-                        payload["notifications"] != false,
-                        &baselines,
-                    )
-                    .map(|_| ())
-                })?;
+            "removeChannel" => {
+                let account = payload["accountRef"]
+                    .as_str()
+                    .ok_or("account_ref_required")?;
+                self.invalidate_setup_for_account(account);
+                self.with_store(|s| s.remove_connection(account))?;
+                self.stop_connection_locked(account);
+                self.connection_errors.lock().unwrap().remove(account);
+                self.failures.lock().unwrap().remove(account);
             }
             "disableRoute" => {
                 self.with_store(|s| {
@@ -400,6 +406,30 @@ impl HermesBridgeManager {
             }
             _ => return Err("unknown_hermes_action".into()),
         }
+        Ok(self.status())
+    }
+    fn remove_runtime(&self) -> Result<Value, String> {
+        {
+            let _guard = idle_lifecycle(&self.lifecycle, &self.install_requested)?;
+            self.with_store(|s| {
+                for connection in s.connections()? {
+                    s.set_connection_enabled(&connection.account_ref, false)?;
+                }
+                Ok(())
+            })?;
+            self.runtime_removing.store(true, Ordering::Release);
+            self.install_requested.store(true, Ordering::Release);
+            self.invalidate_setup_locked();
+            self.stop_locked();
+        }
+        // Preserve the synchronous remove action, while allowing stop/remove of
+        // individual accounts and status reads during a previous verification.
+        self.startup.wait_idle(|| false);
+        let result = self.installer.remove_runtime().map_err(|e| e.to_string());
+        let _guard = self.lifecycle.lock().unwrap();
+        self.install_requested.store(false, Ordering::Release);
+        self.runtime_removing.store(false, Ordering::Release);
+        result?;
         Ok(self.status())
     }
     fn scoped_session(&self, route: &Route, id: &str) -> Result<NativeSessionSummary, String> {
@@ -421,9 +451,9 @@ impl HermesBridgeManager {
     ) -> Result<Value, String> {
         // Calls cannot run while local approval/route revocation changes the policy generation.
         let _lifecycle = self.lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?;
-        if !self.authorized_token(authorization) {
-            return Err("bridge_token_revoked".into());
-        }
+        let account = self
+            .account_for_token(authorization)
+            .ok_or("bridge_token_revoked")?;
         if ![
             "ccem.bridge.list",
             "ccem.bridge.status",
@@ -439,12 +469,7 @@ impl HermesBridgeManager {
         }
         let p: BridgeParams =
             serde_json::from_value(params).map_err(|_| "invalid_bridge_request")?;
-        let route = self.with_store(|s| {
-            if s.setting("accountRef")?.as_deref() != Some(&p.source.account_ref) {
-                return Err("account_not_authorized".into());
-            }
-            s.route(&p.source)
-        })?;
+        let route = self.with_store(|s| s.route_for_account(&account, &p.source))?;
         match method {
             "ccem.bridge.list" => {
                 let mut sessions: Vec<_> = self
@@ -544,7 +569,6 @@ impl HermesBridgeManager {
         let weak = Arc::downgrade(self);
         let app = app.clone();
         thread::spawn(move || {
-            let mut failures = 0;
             let mut initialized = false;
             loop {
                 thread::sleep(Duration::from_secs(2));
@@ -552,50 +576,134 @@ impl HermesBridgeManager {
                 if manager.shutdown.load(Ordering::Acquire) {
                     break;
                 }
+                if manager.install_requested.load(Ordering::Acquire) {
+                    // The explicit install worker restores saved connections.
+                    // Startup and recovery must not reacquire old runtime leases.
+                    initialized = true;
+                    continue;
+                }
                 if !initialized {
                     initialized = true;
                     if manager.installer.status().launch.is_some() {
-                        let connect = background_services
-                            && manager
-                                .with_store(
-                                    |s| Ok(s.setting("enabled")?.as_deref() == Some("true")),
-                                )
-                                .unwrap_or(false);
-                        let _guard = manager.lifecycle.lock().unwrap();
-                        if let Err(e) = manager.start_locked(&app, connect) {
-                            *manager.last_error.lock().unwrap() = Some(e);
-                            failures += 1
+                        let Ok(_guard) =
+                            idle_lifecycle(&manager.lifecycle, &manager.install_requested)
+                        else {
+                            continue;
+                        };
+                        let _ = manager.start_discovery_locked(&app);
+                        if background_services {
+                            let connections =
+                                manager.with_store(|s| s.connections()).unwrap_or_default();
+                            for connection in connections.into_iter().filter(|c| c.enabled) {
+                                let _ =
+                                    manager.start_connection_locked(&app, &connection.account_ref);
+                            }
                         }
                     }
                 }
-                let gateway_state = manager
-                    .gateway
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|g| (g.process.alive(), g.connect));
-                let alive = gateway_state.map(|s| s.0);
-                if alive == Some(false) {
-                    *manager.token.lock().unwrap() = None;
-                    if failures < 3 {
-                        let _guard = manager.lifecycle.lock().unwrap();
-                        let _ = manager.start_locked(&app, gateway_state.is_some_and(|s| s.1));
-                        failures += 1;
-                    } else {
-                        *manager.last_error.lock().unwrap() =
-                            Some("gateway_stopped_retry_required".into())
+                let discovery = manager.host_process().ok();
+                if discovery.as_ref().is_some_and(|p| !p.alive()) && !manager.setup_in_progress() {
+                    let Ok(_guard) = idle_lifecycle(&manager.lifecycle, &manager.install_requested)
+                    else {
+                        continue;
+                    };
+                    if manager.setup_in_progress()
+                        || !discovery.as_ref().is_some_and(|old| {
+                            manager
+                                .host_process()
+                                .is_ok_and(|current| Arc::ptr_eq(old, &current))
+                        })
+                    {
+                        continue;
+                    }
+                    let count = *manager
+                        .failures
+                        .lock()
+                        .unwrap()
+                        .get("discovery")
+                        .unwrap_or(&0);
+                    if count < 3 {
+                        let _ = manager.start_discovery_locked(&app);
+                        manager
+                            .failures
+                            .lock()
+                            .unwrap()
+                            .insert("discovery".into(), count + 1);
                     }
                 }
-                if alive == Some(true) {
-                    if let Err(e) = manager.poll() {
-                        *manager.last_error.lock().unwrap() = Some(e)
+                let processes: Vec<_> = manager
+                    .gateways
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(account, g)| (account.clone(), g.process.clone()))
+                    .collect();
+                for (account, process) in processes {
+                    if !process.alive() {
+                        let Ok(_guard) =
+                            idle_lifecycle(&manager.lifecycle, &manager.install_requested)
+                        else {
+                            break;
+                        };
+                        if !manager
+                            .connection_process(&account)
+                            .is_ok_and(|p| Arc::ptr_eq(&p, &process))
+                        {
+                            continue;
+                        }
+                        if !manager
+                            .with_store(|s| s.connection(&account).map(|c| c.enabled))
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let count = *manager.failures.lock().unwrap().get(&account).unwrap_or(&0);
+                        if count < 3 {
+                            let _ = manager.start_connection_locked(&app, &account);
+                            manager
+                                .failures
+                                .lock()
+                                .unwrap()
+                                .insert(account.clone(), count + 1);
+                        } else {
+                            manager
+                                .connection_errors
+                                .lock()
+                                .unwrap()
+                                .insert(account.clone(), "gateway_stopped_retry_required".into());
+                        }
+                    } else if process.snapshot()["state"] == "running" {
+                        manager.schedule_poll(&account);
                     }
                 }
             }
         });
     }
-    fn poll(&self) -> Result<(), String> {
-        poll::poll(self)
+    fn schedule_poll(self: &Arc<Self>, account: &str) {
+        if !self.polling.lock().unwrap().insert(account.into()) {
+            return;
+        }
+        let manager = self.clone();
+        let account = account.to_string();
+        thread::spawn(move || {
+            let result = poll::poll(&manager, &account);
+            let _guard = manager.lifecycle.lock().unwrap();
+            if manager
+                .with_store(|s| s.connection(&account).map(|c| c.enabled))
+                .unwrap_or(false)
+                && manager
+                    .connection_process(&account)
+                    .is_ok_and(|p| p.snapshot()["state"] == "running")
+            {
+                let mut errors = manager.connection_errors.lock().unwrap();
+                if let Err(error) = result {
+                    errors.insert(account.clone(), error);
+                } else {
+                    errors.remove(&account);
+                }
+            }
+            manager.polling.lock().unwrap().remove(&account);
+        });
     }
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
@@ -603,6 +711,47 @@ impl HermesBridgeManager {
         self.invalidate_setup_locked();
         self.stop_locked()
     }
+}
+fn idle_lifecycle<'a>(
+    lifecycle: &'a Mutex<()>,
+    install_requested: &AtomicBool,
+) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+    let guard = lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?;
+    // Recheck after acquiring the lock: an install may have reserved the runtime
+    // while a watcher or UI action was waiting for an earlier lifecycle action.
+    if install_requested.load(Ordering::Acquire) {
+        return Err("installation_already_running".into());
+    }
+    Ok(guard)
+}
+
+fn resolve_bearer<'a>(
+    header: &str,
+    mut accounts: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    accounts.find_map(|(account, token)| {
+        let expected = format!("Bearer {token}");
+        (header.len() == expected.len()
+            && header
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0)
+            .then(|| account.to_string())
+    })
+}
+fn apply_connection_error(public: &mut Value, error: &str) {
+    // Projection failures belong to event history. Preserve the host's network
+    // state so a live connection remains pairable and can still be stopped.
+    if public["error"].is_null() {
+        public["error"] = json!(error);
+    }
+    if public["state"] == "stopped" {
+        public["state"] = json!("error");
+    }
+}
+fn decode_fields(cipher: &str) -> Result<serde_json::Map<String, Value>, String> {
+    serde_json::from_str(&crypto::decrypt(cipher)?).map_err(|_| "channel_config_corrupt".into())
 }
 fn make_delivery(route: &Route, event: &str, text: String) -> Delivery {
     Delivery {
@@ -616,18 +765,34 @@ fn make_delivery(route: &Route, event: &str, text: String) -> Delivery {
     }
 }
 fn bounded_chat_text(text: &str) -> String {
-    if text.len() <= 3500 {
+    const LIMIT: usize = 1800;
+    if text.len() <= LIMIT {
         return text.into();
     }
-    let mut end = 3490;
-    while !text.is_char_boundary(end) {
+    // Generated query commands are the user's way back to the full result.
+    // Reserve their bytes before shortening potentially long task output.
+    let tail = text.rsplit_once('\n').filter(|(_, tail)| {
+        (tail.starts_with("/ccem operation ") || tail.starts_with("/ccem status "))
+            && tail.len() + 4 < LIMIT
+    });
+    let (body, budget) = match tail {
+        Some((body, tail)) => (body, LIMIT - tail.len() - 4), // Ellipsis + newline.
+        None => (text, LIMIT - '…'.len_utf8()),
+    };
+    let mut end = budget.min(body.len());
+    while !body.is_char_boundary(end) {
         end -= 1
     }
-    format!("{}…", &text[..end])
+    match tail {
+        Some((_, tail)) => format!("{}…\n{tail}", &body[..end]),
+        None => format!("{}…", &body[..end]),
+    }
 }
 
 #[tauri::command]
-pub async fn hermes_status(manager: tauri::State<'_, Arc<HermesBridgeManager>>) -> Result<Value, String> {
+pub async fn hermes_status(
+    manager: tauri::State<'_, Arc<HermesBridgeManager>>,
+) -> Result<Value, String> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || manager.status())
         .await

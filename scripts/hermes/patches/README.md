@@ -2,7 +2,7 @@
 
 `0001-managed-gateway-contracts.patch` 仅适用于 Hermes 基线
 `bc1330eebc0aa8a443501b5f62586eb7361353a5`。补丁 SHA-256：
-`5eea41ed92d22eceb5a0dbf2687d178e750e6646d12745fc89aae84488b1446e`。
+`0caa8b78df6b95a7109ccefa6f00d9018c3f70ac24cb2ee1c76de7af3035cc88`。
 在打包源码树中应用；不要对用户正在运行的 Hermes checkout 原地打补丁。
 
 ```sh
@@ -17,10 +17,19 @@ git apply /path/to/0001-managed-gateway-contracts.patch
   前保存，实际鉴权后才生成 frozen `TrustedCommandContext`；内部事件不能获得它。
 - `gateway.managed_contracts.send_strict(runner, StrictTarget(...), text, timeout=30.0)`：
   使用显式 transport profile 的现有 adapter，单次发送；返回
-  `sent / not_sent / unknown`。不新建连接、不取 home chat、不拆分、不重试。
+  `sent / not_sent / unknown`。不另起平台 receiver、不取 home chat、不拆分、不重试。
 - `strict_send_supported(platform)` / `STRICT_SEND_PLATFORMS`：能力声明与账号在线状态分开。
   Telegram 限数值 chat/thread ID，线程拒绝不降级。WeCom 限私聊，直接选择唯一新
   req_id 的主动请求；不尝试 passive，群聊明确拒绝。ACK ID 与消息 ID 分开返回。
+- Feishu、Discord、Slack 增加私聊顶层消息出口，线程目标在发送前拒绝。三者绕过 SDK
+  重试、拆消息和回复降级，使用固定官方 HTTPS 地址、验证 TLS、禁止重定向、10 秒超时、
+  64 KiB 回包上限的一次消息 POST；回包必须同时确认原生聊天 ID 和消息 ID。
+  Feishu 的 tenant token 只缓存于当前 adapter 内存；Slack 限一个 workspace/token，
+  不读独立发送器的多工作区 token 文件。Discord/Slack 沿用已连接 adapter 的显式代理。
+- 五个 adapter 的 `await strict_delivery_ready()` 检查实际 SDK 传输，后台任务
+  启动不等于在线。Telegram 轮询降级与企微 socket 关闭时也保持未就绪，恢复后才开放配对。Slack、Discord 的 integration-only 原生真人私聊可进入 Desktop nonce
+  配对 hook；后续命令仍经过 Gateway 鉴权。群私聊、群聊和合成 interaction 不能配对。
+  Slack 使用 `!ccem`，由原有插件命令注册表转换为网关命令。
 - `gateway.integration_only=true`：保留鉴权、配对、插件命令和原生诊断命令，禁用模型、
   exec quick commands、cron、自动恢复/重投、后台 agent、MCP 发现及模型预热。
 
@@ -40,10 +49,23 @@ integration-only 入站逐条执行，不经过聊天文本合并，连续命令
 ## 本地验证
 
 已验证补丁可应用到精确基线的独立 Git index，也通过当前源码树的反向 apply check。
-测试从隔离 Hermes worktree 的实际源码导入，使用临时 HERMES_HOME；新测试禁止联网，
-只替换平台传输边界。新契约 15 项通过，包括真实插件发现/鉴权、两个主体与聊天、
+测试从隔离 Hermes worktree 的实际源码导入，使用临时 HERMES_HOME。原契约禁止联网，
+只替换平台传输边界，本轮重新执行 15 项通过，包括真实插件发现/鉴权、两个主体与聊天、
 身份篡改拒绝、内部事件、旧回调、None/空回调无自动第二条、ACK 丢失与线程拒绝，
 以及真实 WeCom 入站缺消息 ID、仅请求 ID、连续命令及文本批处理的行为回归。
+
+`scripts/hermes/test-multichannel-contracts.py` 使用私有包的真实 SDK 和 aiohttp，
+仅放行测试进程的 loopback HTTP fixture，本轮 22 项全部通过。覆盖单次成功、500、429、
+收包前断线、超时取消、重定向拒绝、错误目标/线程/消息 ID、畸形或过大回包、凭据脱敏、
+不拆消息、不切 profile、传输 readiness、显式代理、Slack 单账号限制，以及实际 Discord
+Message / Slack `!ccem` / Feishu DM 的原生身份与未授权命令拒绝。
+
+```sh
+/path/to/private/python/bin/python3.11 -I -B scripts/hermes/test-multichannel-contracts.py \
+  --source /path/to/patched/hermes
+```
+
+以下是原契约建立时的其他聚焦回归命令；本轮的实际重复执行范围是上述 15 + 22 项。
 
 ```sh
 scripts/run_tests.sh tests/gateway/test_managed_contracts.py

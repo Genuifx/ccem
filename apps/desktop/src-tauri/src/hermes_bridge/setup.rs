@@ -5,12 +5,43 @@ use std::time::Instant;
 
 const WAIT_MS: i64 = 300_000;
 
+#[derive(Default)]
+pub(super) struct ConnectionWait {
+    deadline: Option<Instant>,
+}
+
+impl ConnectionWait {
+    pub(super) fn ready(
+        &mut self,
+        at: Instant,
+        pending: bool,
+        process_state: Option<&str>,
+    ) -> Result<bool, String> {
+        let Some(state) = process_state else {
+            return if pending {
+                Ok(false)
+            } else {
+                Err("setup_connection_failed".into())
+            };
+        };
+        // Inventory verification may be queued behind other accounts. Only a
+        // published process starts the bounded network handshake budget.
+        let deadline = *self.deadline.get_or_insert(at + Duration::from_secs(60));
+        if at >= deadline || matches!(state, "error" | "stopped") {
+            return Err("setup_connection_failed".into());
+        }
+        Ok(state == "running")
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Setup {
     id: String,
     platform: String,
     state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
     expires_at: i64,
@@ -24,6 +55,7 @@ impl Setup {
             id: random_id(),
             platform: platform.into(),
             state: "generating".into(),
+            account_ref: None,
             qr_payload: None,
             expires_at: at + WAIT_MS,
             error: None,
@@ -55,9 +87,12 @@ impl Setup {
             || reply["state"] != "waiting"
             || payload.len() > 4096
             || url.scheme() != "https"
-            || url.host_str() != Some("work.weixin.qq.com")
-            || url.path() != "/ai/qc/c"
+            || !allowed_qr_url(&self.platform, &url)
             || url.port().is_some()
+            || payload
+                .strip_prefix("https://")
+                .and_then(|p| p.split('/').next())
+                .is_some_and(|authority| authority.contains(':'))
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
@@ -76,28 +111,71 @@ impl Setup {
     }
 }
 
+fn allowed_qr_url(platform: &str, url: &reqwest::Url) -> bool {
+    match platform {
+        "wecom" => url.host_str() == Some("work.weixin.qq.com") && url.path() == "/ai/qc/c",
+        "telegram" => {
+            if url.host_str() != Some("t.me") {
+                return false;
+            }
+            let query: Vec<_> = url.query_pairs().collect();
+            if let Some(path) = url.path().strip_prefix("/newbot/") {
+                let parts: Vec<_> = path.split('/').collect();
+                return parts.len() == 2
+                    && parts.iter().all(|part| {
+                        (5..=32).contains(&part.len())
+                            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    })
+                    && (query.is_empty()
+                        || (query.len() == 1
+                            && query[0].0 == "name"
+                            && query[0].1.len() <= 256
+                            && !query[0].1.chars().any(char::is_control)));
+            }
+            // The official broker can also return a private manager-bot start
+            // link. Its nonce grants setup continuation, never CCEM authority.
+            let username = url.path().strip_prefix('/').unwrap_or("");
+            (5..=32).contains(&username.len())
+                && username.as_bytes()[0].is_ascii_alphabetic()
+                && username
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && username.to_ascii_lowercase().ends_with("bot")
+                && query.len() == 1
+                && query[0].0 == "start"
+                && (1..=64).contains(&query[0].1.len())
+                && query[0]
+                    .1
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        }
+        _ => false,
+    }
+}
+
 // Never let a malformed success reuse one credential from an old bot.
 fn complete_credentials(
     id: &str,
     platform: &str,
     reply: &Value,
 ) -> Result<serde_json::Map<String, Value>, String> {
-    if platform != "wecom"
-        || reply["id"] != id
-        || reply["platform"] != platform
-        || reply["state"] != "ready"
-    {
+    if reply["id"] != id || reply["platform"] != platform || reply["state"] != "ready" {
         return Err("setup_invalid_response".into());
     }
     let fields = reply["fields"]
         .as_object()
         .ok_or("setup_invalid_credentials")?;
-    if fields.len() != 2 {
+    let expected: &[&str] = match platform {
+        "wecom" => &["WECOM_BOT_ID", "WECOM_SECRET"],
+        "telegram" => &["TELEGRAM_BOT_TOKEN"],
+        _ => return Err("setup_not_supported".into()),
+    };
+    if fields.len() != expected.len() {
         return Err("setup_invalid_credentials".into());
     }
-    for key in ["WECOM_BOT_ID", "WECOM_SECRET"] {
+    for key in expected {
         let value = fields
-            .get(key)
+            .get(*key)
             .and_then(Value::as_str)
             .ok_or("setup_invalid_credentials")?;
         if value.trim().is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
@@ -114,6 +192,7 @@ fn public_error(error: &str) -> &'static str {
         "setup_invalid_response" => "setup_invalid_response",
         "setup_connection_failed" => "setup_connection_failed",
         "setup_pairing_failed" => "setup_pairing_failed",
+        "connection_already_configured" => "connection_already_configured",
         "setup_not_supported" | "unknown_host_method" => "setup_not_supported",
         _ => "setup_request_failed",
     }
@@ -162,6 +241,23 @@ fn finish_pairing(
 }
 
 impl HermesBridgeManager {
+    pub(super) fn setup_in_progress(&self) -> bool {
+        self.setup.lock().unwrap().as_mut().is_some_and(|s| {
+            s.expire(now());
+            s.active(&s.id)
+        })
+    }
+    pub(super) fn invalidate_setup_for_account(&self, account: &str) {
+        let mut current = self.setup.lock().unwrap();
+        if let Some(setup) = current
+            .as_mut()
+            .filter(|s| s.account_ref.as_deref() == Some(account))
+        {
+            if setup.active(&setup.id) {
+                setup.finish("cancelled", None);
+            }
+        }
+    }
     pub(super) fn setup_snapshot(&self) -> Value {
         let mut current = self.setup.lock().unwrap();
         if let Some(setup) = current.as_mut() {
@@ -217,8 +313,11 @@ impl HermesBridgeManager {
             return Err("setup_busy_retry".into());
         }
         let host = self.host_process()?;
+        if self.startup.discovery_pending() || !host.alive() {
+            return Err("gateway_not_running".into());
+        }
         let snapshot = host.snapshot();
-        if platform != "wecom"
+        if !["wecom", "telegram"].contains(&platform)
             || !snapshot["platforms"].as_array().is_some_and(|ps| {
                 ps.iter().any(|p| {
                     p["id"] == platform
@@ -257,7 +356,7 @@ impl HermesBridgeManager {
         Ok(())
     }
     fn run_setup(
-        &self,
+        self: &Arc<Self>,
         app: &AppHandle,
         host: &Arc<GatewayProcess>,
         id: &str,
@@ -298,51 +397,78 @@ impl HermesBridgeManager {
             let cipher = crypto::encrypt(
                 &serde_json::to_string(&fields).map_err(|_| "setup_invalid_credentials")?,
             )?;
-            {
+            let account = {
                 let _lifecycle = self.lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?;
                 if !self.setup_current(id) {
                     return Ok(());
                 }
-                // Close the cancellation window before the single atomic credential replacement.
-                self.setup
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .unwrap()
-                    .finish("connecting", None);
-                self.stop_locked();
-                self.with_store(|s| {
-                    s.replace_channel(
+                if !self
+                    .host_process()
+                    .is_ok_and(|current| Arc::ptr_eq(host, &current))
+                {
+                    return Err("setup_connection_failed".into());
+                }
+                let snapshot = host.snapshot();
+                let meta = snapshot["platforms"]
+                    .as_array()
+                    .and_then(|ps| ps.iter().find(|p| p["id"] == platform))
+                    .cloned()
+                    .unwrap_or(json!({}));
+                self.ensure_unique_connection_locked(platform, &fields, None, &meta)?;
+                let connection = self.with_store(|s| {
+                    s.save_connection(
+                        None,
                         platform,
+                        None,
                         &cipher,
                         &fields.keys().cloned().collect::<Vec<_>>(),
+                        true,
                     )
                 })?;
-                self.start_locked(app, true)
-                    .map_err(|_| "setup_connection_failed")?;
-            }
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while self.setup_current(id) && Instant::now() < deadline {
-                let process = self.host_process().map_err(|_| "setup_connection_failed")?;
-                match process.snapshot()["state"].as_str() {
-                    Some("running") => {
-                        return finish_pairing(
-                            &self.lifecycle,
-                            &self.setup,
-                            &self.shutdown,
-                            id,
-                            &process,
-                            || self.host_process(),
-                        );
-                    }
-                    Some("error" | "stopped") => return Err("setup_connection_failed".into()),
-                    _ => thread::sleep(Duration::from_millis(250)),
+                // The credentials and new identity commit together; existing
+                // connections and their authorizations remain untouched.
+                {
+                    let mut current = self.setup.lock().unwrap();
+                    let setup = current.as_mut().unwrap();
+                    setup.account_ref = Some(connection.account_ref.clone());
+                    setup.finish("connecting", None);
                 }
+                self.start_connection_locked(app, &connection.account_ref)
+                    .map_err(|_| "setup_connection_failed")?;
+                connection.account_ref
+            };
+            let mut wait = ConnectionWait::default();
+            while self.setup_current(id) {
+                let (process, pending) = {
+                    // Publishing a gateway also removes its pending marker.
+                    // Read both atomically so that handoff cannot look failed.
+                    let _guard = self.lifecycle.lock().map_err(|_| "bridge_lock_poisoned")?;
+                    if !self.setup_current(id) {
+                        return Ok(());
+                    }
+                    (
+                        self.connection_process(&account).ok(),
+                        self.startup.connection_pending(&account),
+                    )
+                };
+                let snapshot = process.as_ref().map(|p| p.snapshot());
+                if wait.ready(
+                    Instant::now(),
+                    pending,
+                    snapshot.as_ref().and_then(|s| s["state"].as_str()),
+                )? {
+                    return finish_pairing(
+                        &self.lifecycle,
+                        &self.setup,
+                        &self.shutdown,
+                        id,
+                        process.as_ref().unwrap(),
+                        || self.connection_process(&account),
+                    );
+                }
+                thread::sleep(Duration::from_millis(250));
             }
-            if !self.setup_current(id) {
-                return Ok(());
-            }
-            return Err("setup_connection_failed".into());
+            return Ok(());
         }
         Ok(())
     }
@@ -406,5 +532,146 @@ mod tests {
             public_error("request failed?secret=private-test-secret"),
             "setup_request_failed"
         );
+    }
+
+    #[test]
+    fn telegram_qr_restricts_host_path_query_and_complete_credentials() {
+        let valid = "https://t.me/newbot/HermesSetupBot/ExampleBot?name=Example";
+        let mut setup = Setup::new("telegram", 100);
+        let id = setup.id.clone();
+        let reply = |url| json!({"id":id,"state":"waiting","qrPayload":url,"expiresAt":300100});
+        for invalid in [
+            "https://t.me.evil.test/newbot/HermesSetupBot/ExampleBot",
+            "https://t.me/newbot/HermesSetupBot/ExampleBot/extra",
+            "https://t.me/newbot/HermesSetupBot/ExampleBot?token=secret",
+            "https://t.me/newbot/HermesSetupBot/ExampleBot?name=A&name=B",
+            "https://t.me/newbot/HermesSetupBot/%45xampleBot",
+            "https://t.me/newbot/HermesSetupBot/ExampleBot#secret",
+            "https://t.me:443/newbot/HermesSetupBot/ExampleBot",
+            "https://user@t.me/newbot/HermesSetupBot/ExampleBot",
+            "http://t.me/newbot/HermesSetupBot/ExampleBot",
+        ] {
+            assert!(
+                setup.accept_qr(&id, &reply(invalid), 101).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(setup.accept_qr(&id, &reply(valid), 101).unwrap());
+        let complete = json!({"id":id,"platform":"telegram","state":"ready","fields":{"TELEGRAM_BOT_TOKEN":"123:private-token"}});
+        assert!(complete_credentials(&id, "telegram", &complete).is_ok());
+        let mut partial = complete.clone();
+        partial["fields"] = json!({});
+        assert!(complete_credentials(&id, "telegram", &partial).is_err());
+        partial["fields"] = json!({"TELEGRAM_BOT_TOKEN":"123:private-token", "owner_user_id":"not-a-trusted-identity"});
+        assert!(complete_credentials(&id, "telegram", &partial).is_err());
+        setup.account_ref = Some("new-connection".into());
+        setup.finish("connected", None);
+        let public = json!(setup);
+        assert_eq!(public["accountRef"], "new-connection");
+        assert!(!public.to_string().contains("private-token"));
+    }
+
+    #[test]
+    fn telegram_private_manager_start_link_accepts_only_the_official_broker_shape() {
+        let mut setup = Setup::new("telegram", 100);
+        let id = setup.id.clone();
+        let reply = |url| json!({"id":id,"state":"waiting","qrPayload":url,"expiresAt":300100});
+        for invalid in [
+            "https://t.me/HermesSetupBot?startgroup=nonce",
+            "https://t.me/HermesSetupBot?start=nonce&start=other",
+            "https://t.me/HermesSetupBot?start=nonce&extra=x",
+            "https://t.me/HermesSetupBot?start=",
+            "https://t.me/HermesSetupBot?start=contains%20space",
+            "https://t.me/HermesSetupBot?start=has.dot",
+            "https://t.me/HermesSetupBot/path?start=nonce",
+            "https://t.me/HermesSetup?start=nonce",
+            "https://t.me/_HermesBot?start=nonce",
+            "https://t.me/1HermesBot?start=nonce",
+            "https://t.me/Abot?start=nonce",
+            "https://t.me/%48ermesSetupBot?start=nonce",
+            "https://t.me:443/HermesSetupBot?start=nonce",
+            "https://user@t.me/HermesSetupBot?start=nonce",
+            "https://t.me/HermesSetupBot?start=nonce#fragment",
+            "https://t.me.evil.test/HermesSetupBot?start=nonce",
+            "http://t.me/HermesSetupBot?start=nonce",
+        ] {
+            assert!(
+                setup.accept_qr(&id, &reply(invalid), 101).is_err(),
+                "{invalid}"
+            );
+        }
+        let too_long = format!("https://t.me/HermesSetupBot?start={}", "a".repeat(65));
+        assert!(setup.accept_qr(&id, &reply(&too_long), 101).is_err());
+        assert!(setup
+            .accept_qr(
+                &id,
+                &reply("https://t.me/Hermes_SetupBOT?start=valid_nonce-123"),
+                101
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn telegram_qr_credentials_add_an_account_without_replacing_an_authorized_wecom_bot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        let existing = store
+            .save_connection(
+                None,
+                "wecom",
+                None,
+                "encrypted-wecom-pair",
+                &["WECOM_BOT_ID".into(), "WECOM_SECRET".into()],
+                true,
+            )
+            .unwrap();
+        let source = Source {
+            account_ref: existing.account_ref.clone(),
+            platform: "wecom".into(),
+            profile: "profile".into(),
+            transport_profile: "transport".into(),
+            user_id: "verified-user".into(),
+            chat_id: "verified-dm".into(),
+            thread_id: None,
+            chat_type: "dm".into(),
+        };
+        let route = store
+            .approve_route(
+                source.clone(),
+                vec![root.path().to_string_lossy().into()],
+                true,
+                true,
+            )
+            .unwrap();
+        let reply = json!({"id":"new-qr","state":"ready","platform":"telegram","fields":{"TELEGRAM_BOT_TOKEN":"123:private-token"},"owner_user_id":"untrusted-qr-owner"});
+        let fields = complete_credentials("new-qr", "telegram", &reply).unwrap();
+        let added = store
+            .save_connection(
+                None,
+                "telegram",
+                None,
+                "encrypted-complete-telegram-token",
+                &fields.keys().cloned().collect::<Vec<_>>(),
+                true,
+            )
+            .unwrap();
+        assert_ne!(added.account_ref, existing.account_ref);
+        assert_eq!(store.connections().unwrap().len(), 2);
+        assert_eq!(
+            store.connection(&existing.account_ref).unwrap().cipher,
+            "encrypted-wecom-pair"
+        );
+        assert_eq!(
+            json!(store
+                .route_for_account(&existing.account_ref, &source)
+                .unwrap()),
+            json!(route)
+        );
+        assert_eq!(
+            store.routes().unwrap().len(),
+            1,
+            "QR owner does not receive a route or bypass DM pairing"
+        );
+        assert_eq!(added.configured_fields, ["TELEGRAM_BOT_TOKEN"]);
     }
 }

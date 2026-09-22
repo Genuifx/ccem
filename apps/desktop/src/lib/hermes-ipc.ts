@@ -17,6 +17,10 @@ export interface HermesPlatform {
   available: boolean;
   strictSend: boolean;
   qrSetup?: boolean;
+  unavailableReason?: 'dependency_missing' | 'integration_unsupported' | null;
+  setupUrl?: string | null;
+  setupService?: string | null;
+  commandPrefix?: string;
   fields: Array<{ key: string; label: string; secret: boolean; required: boolean }>;
 }
 
@@ -27,6 +31,19 @@ export interface HermesSetup {
   qrPayload?: string;
   expiresAt?: number;
   error?: string;
+  accountRef?: string | null;
+}
+
+export interface HermesConnection {
+  accountRef: string;
+  platform: string;
+  label: string;
+  configuredFields: string[];
+  enabled: boolean;
+  state: string;
+  error?: string | null;
+  pending: HermesPendingPairing[];
+  pairing?: { code: string; expiresAt: string | number } | null;
 }
 
 export interface HermesPendingPairing {
@@ -49,6 +66,7 @@ export interface HermesStatus {
   installer: {
     state: string;
     version?: string | null;
+    launch?: { runtimeRoot: string; python: string; source: string; host: string } | null;
     downloadedBytes: number;
     totalBytes?: number | null;
     error?: { code: string; message: string; retryable?: boolean } | string | null;
@@ -58,12 +76,9 @@ export interface HermesStatus {
     state: string;
     error?: string | null;
     platforms: HermesPlatform[];
-    configuredPlatform?: string | null;
-    configuredFields?: string[];
   };
+  connections: HermesConnection[];
   setup?: HermesSetup | null;
-  pairing?: { code: string; expiresAt: string | number } | null;
-  pending: HermesPendingPairing[];
   routes: HermesRoute[];
   operations: Array<{ id: string; runtimeId: string; state: string; detail: string; updatedAt: string | number }>;
   deliveries: Array<{ id: string; status: string; createdAt: string | number }>;
@@ -74,17 +89,21 @@ export interface HermesActionPayloads {
   install: undefined;
   cancelInstall: undefined;
   removeRuntime: undefined;
-  configureChannel: { platform: string; fields: Record<string, string> };
+  configureChannel: { platform: string; fields: Record<string, string>; accountRef?: string; label?: string };
+  refreshPlatforms: undefined;
   beginSetup: { platform: string };
   cancelSetup: { id: string };
-  start: undefined;
-  stop: undefined;
-  openPairing: undefined;
-  approvePairing: { id: string; workspaces: string[]; allowInput: boolean; notifications: boolean };
+  start: { accountRef: string };
+  stop: { accountRef: string };
+  removeChannel: { accountRef: string };
+  openPairing: { accountRef: string };
+  approvePairing: { accountRef: string; id: string; workspaces: string[]; allowInput: boolean; notifications: boolean };
   disableRoute: { id: string };
 }
 
 export type HermesAction = keyof HermesActionPayloads;
+
+export type HermesRunAction = <A extends HermesAction>(action: A, payload?: HermesActionPayloads[A], secrets?: string[]) => Promise<boolean>;
 
 export function getHermesStatus(): Promise<HermesStatus> {
   return invoke<HermesStatus>('hermes_status');

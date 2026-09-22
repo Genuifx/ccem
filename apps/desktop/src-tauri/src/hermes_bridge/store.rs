@@ -10,6 +10,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[path = "connections.rs"]
+mod connections;
+pub use connections::ConnectionRecord;
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -172,8 +176,10 @@ impl Store {
             CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, route_id TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, route_id TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cursors(id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, data TEXT NOT NULL);").map_err(err)?;
-        let store = Self { db, _owner: owner };
+            CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS connections(account_ref TEXT PRIMARY KEY, platform TEXT NOT NULL, label TEXT NOT NULL, cipher TEXT NOT NULL, configured_fields TEXT NOT NULL, enabled INTEGER NOT NULL);").map_err(err)?;
+        let mut store = Self { db, _owner: owner };
+        store.migrate_connections()?;
         // A crash may have occurred after an external side effect. Never infer a safe retry.
         for mut op in store.operations()? {
             if ["submitting", "running"].contains(&op.state.as_str()) {
@@ -199,25 +205,6 @@ impl Store {
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         self.db.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![key,value]).map_err(err)?;
         Ok(())
-    }
-    /// Credentials, account generation and old authorizations change together.
-    pub fn replace_channel(&mut self, platform: &str, cipher: &str, fields: &[String]) -> Result<(), String> {
-        let routes = self.routes()?;
-        let tx = self.db.transaction().map_err(err)?;
-        for mut route in routes.into_iter().filter(|r| r.enabled) {
-            route.enabled = false;
-            route.generation += 1;
-            tx.execute("UPDATE routes SET data=?1 WHERE id=?2", params![serde_json::to_string(&route).map_err(err)?, route.id]).map_err(err)?;
-            tx.execute("UPDATE challenges SET state='revoked' WHERE route_id=?1 AND state='pending'", [&route.id]).map_err(err)?;
-        }
-        for (key, value) in [
-            ("accountRef", random_id()), ("platform", platform.into()),
-            ("channelSecrets", cipher.into()), ("configuredFields", json!(fields).to_string()),
-            ("enabled", "true".into()),
-        ] {
-            tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![key,value]).map_err(err)?;
-        }
-        tx.commit().map_err(err)
     }
     fn list<T: serde::de::DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, String> {
         let mut query = self.db.prepare(sql).map_err(err)?;
@@ -302,7 +289,11 @@ impl Store {
     fn write_route(&mut self, route: &Route) -> Result<(), String> {
         self.write_route_with_baselines(route, &[])
     }
-    fn write_route_with_baselines(&mut self, route: &Route, baselines: &[(String, String, u64)]) -> Result<(), String> {
+    fn write_route_with_baselines(
+        &mut self,
+        route: &Route,
+        baselines: &[(String, String, u64)],
+    ) -> Result<(), String> {
         let tx = self.db.transaction().map_err(err)?;
         tx.execute("INSERT INTO routes VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET source_key=excluded.source_key,data=excluded.data", params![route.id,route.source.key(),serde_json::to_string(route).map_err(err)?]).map_err(err)?;
         tx.execute(
@@ -310,10 +301,16 @@ impl Store {
             [&route.id],
         )
         .map_err(err)?;
-        for (runtime, project, seq) in baselines.iter().filter(|(_, project, _)| route.permits(project)) {
+        for (runtime, project, seq) in baselines
+            .iter()
+            .filter(|(_, project, _)| route.permits(project))
+        {
             let _ = project;
-            tx.execute("INSERT INTO cursors VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq",
-                params![format!("{}:{}:{runtime}", route.id, route.generation), seq]).map_err(err)?;
+            tx.execute(
+                "INSERT INTO cursors VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq",
+                params![format!("{}:{}:{runtime}", route.id, route.generation), seq],
+            )
+            .map_err(err)?;
         }
         tx.commit().map_err(err)
     }
@@ -573,9 +570,15 @@ impl Store {
         self.list("SELECT data FROM outbox ORDER BY rowid DESC")
     }
     pub fn delivery(&self, id: &str) -> Result<Option<Delivery>, String> {
-        let raw: Option<String> = self.db.query_row("SELECT data FROM outbox WHERE id=?1", [id], |row| row.get(0))
-            .optional().map_err(err)?;
-        raw.map(|raw| serde_json::from_str(&raw).map_err(err)).transpose()
+        let raw: Option<String> = self
+            .db
+            .query_row("SELECT data FROM outbox WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(err)?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(err))
+            .transpose()
     }
     pub fn save_delivery(&self, d: &Delivery) -> Result<(), String> {
         self.db
@@ -640,17 +643,17 @@ mod channel_transaction_tests {
 
         let reopened = Store::open(root.path())
             .expect("a completed owner must release its lock before child exec");
-        assert!(Store::open(root.path()).is_err(), "the new owner stays exclusive");
+        assert!(
+            Store::open(root.path()).is_err(),
+            "the new owner stays exclusive"
+        );
         drop(inherited);
-        assert!(Store::open(root.path()).is_err(), "closing the old inherited handle cannot unlock the new owner");
+        assert!(
+            Store::open(root.path()).is_err(),
+            "closing the old inherited handle cannot unlock the new owner"
+        );
         drop(reopened);
         assert!(Store::open(root.path()).is_ok());
-    }
-
-    fn settings(store: &Store) -> Vec<(String, String)> {
-        let mut query = store.db.prepare("SELECT id,data FROM settings ORDER BY id").unwrap();
-        query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap().map(Result::unwrap).collect()
     }
 
     #[test]
@@ -660,8 +663,18 @@ mod channel_transaction_tests {
         fs::create_dir_all(&workspace).unwrap();
         let database = root.path().join("state");
         let mut store = Store::open(&database).unwrap();
+        let old = store
+            .save_connection(
+                None,
+                "telegram",
+                None,
+                "old-encrypted-credentials",
+                &["TELEGRAM_BOT_TOKEN".into()],
+                true,
+            )
+            .unwrap();
         let source = Source {
-            account_ref: "old-account".into(),
+            account_ref: old.account_ref.clone(),
             platform: "telegram".into(),
             profile: "private".into(),
             transport_profile: "private".into(),
@@ -670,50 +683,98 @@ mod channel_transaction_tests {
             thread_id: None,
             chat_type: "dm".into(),
         };
-        for (key, value) in [
-            ("accountRef", "old-account"),
-            ("platform", "telegram"),
-            ("channelSecrets", "old-encrypted-credentials"),
-            ("configuredFields", "[\"TELEGRAM_BOT_TOKEN\"]"),
-            ("enabled", "true"),
-        ] {
-            store.set_setting(key, value).unwrap();
-        }
-        let route = store.approve_route(source.clone(), vec![workspace.to_string_lossy().into()], true, true).unwrap();
-        let prepared = store.prepare(&route, "original-input", "fixture-runtime", "original text").unwrap();
+        let route = store
+            .approve_route(
+                source.clone(),
+                vec![workspace.to_string_lossy().into()],
+                true,
+                true,
+            )
+            .unwrap();
+        let prepared = store
+            .prepare(&route, "original-input", "fixture-runtime", "original text")
+            .unwrap();
         let challenge = prepared["challenge"].as_str().unwrap();
         let challenge_state = |store: &Store| -> String {
-            store.db.query_row("SELECT state FROM challenges WHERE id=?1", [challenge], |row| row.get(0)).unwrap()
+            store
+                .db
+                .query_row(
+                    "SELECT state FROM challenges WHERE id=?1",
+                    [challenge],
+                    |row| row.get(0),
+                )
+                .unwrap()
         };
-        let old_settings = settings(&store);
         let old_route = json!(store.route(&source).unwrap());
 
-        // Fail after accountRef, platform, channelSecrets and route/challenge
-        // revocation have already been written inside the transaction.
-        store.db.execute_batch("CREATE TRIGGER fail_channel_replacement BEFORE INSERT ON settings
-            WHEN NEW.id = 'configuredFields'
-            BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;").unwrap();
-        let fields = ["WECOM_BOT_ID".into(), "WECOM_SECRET".into()];
-        let error = store.replace_channel("wecom", "new-encrypted-credentials", &fields).unwrap_err();
+        // Fail after route/challenge revocation, before the atomic credential edit.
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER fail_channel_replacement BEFORE INSERT ON connections
+            BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;",
+            )
+            .unwrap();
+        let fields = ["TELEGRAM_BOT_TOKEN".into()];
+        let error = store
+            .save_connection(
+                Some(&old.account_ref),
+                "telegram",
+                None,
+                "new-encrypted-credentials",
+                &fields,
+                true,
+            )
+            .unwrap_err();
         assert!(error.contains("injected replacement failure"));
-        assert_eq!(settings(&store), old_settings);
+        assert_eq!(
+            store.connection(&old.account_ref).unwrap().cipher,
+            old.cipher
+        );
+        assert_eq!(store.connections().unwrap().len(), 1);
         assert_eq!(json!(store.route(&source).unwrap()), old_route);
-        assert_eq!(store.challenge_runtime(&route, challenge).unwrap(), "fixture-runtime");
+        assert_eq!(
+            store.challenge_runtime(&route, challenge).unwrap(),
+            "fixture-runtime"
+        );
         assert_eq!(challenge_state(&store), "pending");
 
         drop(store);
         let mut store = Store::open(&database).unwrap();
-        assert_eq!(settings(&store), old_settings);
+        assert_eq!(
+            store.connection(&old.account_ref).unwrap().cipher,
+            old.cipher
+        );
         assert_eq!(json!(store.route(&source).unwrap()), old_route);
-        assert_eq!(store.challenge_runtime(&route, challenge).unwrap(), "fixture-runtime");
+        assert_eq!(
+            store.challenge_runtime(&route, challenge).unwrap(),
+            "fixture-runtime"
+        );
         assert_eq!(challenge_state(&store), "pending");
 
-        store.db.execute_batch("DROP TRIGGER fail_channel_replacement;").unwrap();
-        store.replace_channel("wecom", "new-encrypted-credentials", &fields).unwrap();
-        assert_eq!(store.setting("channelSecrets").unwrap().as_deref(), Some("new-encrypted-credentials"));
-        assert_ne!(store.setting("accountRef").unwrap().as_deref(), Some("old-account"));
+        store
+            .db
+            .execute_batch("DROP TRIGGER fail_channel_replacement;")
+            .unwrap();
+        store
+            .save_connection(
+                Some(&old.account_ref),
+                "telegram",
+                None,
+                "new-encrypted-credentials",
+                &fields,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store.connection(&old.account_ref).unwrap().cipher,
+            "new-encrypted-credentials"
+        );
+        assert_eq!(store.connections().unwrap().len(), 1);
         assert!(store.route(&source).is_err());
         assert_eq!(challenge_state(&store), "revoked");
-        assert!(store.confirm(&route, "later-confirmation", challenge, "fixture-runtime").is_err());
+        assert!(store
+            .confirm(&route, "later-confirmation", challenge, "fixture-runtime")
+            .is_err());
     }
 }

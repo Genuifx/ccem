@@ -34,6 +34,74 @@ FRAME_LIMIT = 64 * 1024
 _wire = sys.stdout
 _wire_lock = threading.Lock()
 
+# Capability metadata ships with the reviewed Hermes runtime, not with the
+# Desktop channel picker. New adapters do not require a CCEM platform enum.
+MANAGED_CHANNELS = ("wecom", "telegram", "feishu", "discord", "slack")
+PLATFORM_IDENTITY_FIELDS = {
+    "wecom": ["WECOM_BOT_ID"],
+    "telegram": ["TELEGRAM_BOT_TOKEN"],
+    "feishu": ["FEISHU_APP_ID"],
+    "discord": ["DISCORD_BOT_TOKEN"],
+    "slack": ["SLACK_BOT_TOKEN"],
+}
+FIELD_LABELS = {
+    "WECOM_BOT_ID": "Bot ID", "WECOM_SECRET": "Bot secret",
+    "TELEGRAM_BOT_TOKEN": "Bot token", "DISCORD_BOT_TOKEN": "Bot token",
+    "FEISHU_APP_ID": "App ID", "FEISHU_APP_SECRET": "App secret",
+    "SLACK_BOT_TOKEN": "Bot token", "SLACK_APP_TOKEN": "App token",
+}
+
+
+def command_prefix(platform):
+    return "!ccem" if platform == "slack" else "/ccem"
+
+
+def notification_text(text, platform):
+    # The bridge owns this final line. Keep user/task text verbatim, including
+    # any slash-command examples inside the notification body.
+    body, separator, last = text.rpartition("\n")
+    if separator and last.startswith(("/ccem operation ", "/ccem status ")):
+        return body + separator + command_prefix(platform) + last[len("/ccem"):]
+    return text
+
+
+def platform_metadata(entry, strict_supported):
+    """Passive registry probe: unsupported platforms stay discoverable.
+
+    Never invoke ensure_deps_fn or setup_fn here; an ordinary status read must
+    neither install packages nor create/login to an external account.
+    """
+    fields = []
+    for required in entry.required_env:
+        key = required if isinstance(required, str) else required.get("name", "")
+        if not key or not key.replace("_", "").isalnum() or not key.isupper():
+            continue
+        fields.append({"key": key, "label": FIELD_LABELS.get(key, key.replace("_", " ")),
+                       "secret": any(word in key for word in ("SECRET", "TOKEN", "PASSWORD", "KEY")),
+                       "required": required.get("required", True) if isinstance(required, dict) else True})
+    try:
+        available = bool(entry.check_fn())
+    except Exception:
+        available = False
+    strict = strict_supported(entry.name)
+    qr = available and strict and entry.name in ("wecom", "telegram")
+    if qr:
+        try:
+            _setup_module.tls_context()
+        except _setup_module.SetupError:
+            qr = False
+    result = {"id": entry.name, "label": entry.label, "available": available,
+              "strictSend": strict, "fields": fields, "qrSetup": qr,
+              "maxMessageLength": getattr(entry, "max_message_length", 0),
+              "commandPrefix": command_prefix(entry.name),
+              "identityFields": PLATFORM_IDENTITY_FIELDS.get(entry.name, []),
+              "unavailableReason": "integration_unsupported" if not strict else "dependency_missing" if not available else None}
+    if entry.name in MANAGED_CHANNELS:
+        result["setupUrl"] = "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/" + entry.name
+    if entry.name == "telegram":
+        result["setupService"] = "Hermes"
+    return result
+
 
 def emit(value):
     data = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -89,6 +157,7 @@ class Host:
             raise ValueError("invalid_bridge_capability")
         self.boot, self.profile = boot, profile
         self.runner = None
+        self.transport_ready = False
         self.state = "configuring"
         self.error = None
         self.platforms = []
@@ -108,7 +177,7 @@ class Host:
                 self.pairing = None
             state = self.state
             if state == "running" and self.runner:
-                connected = any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
+                connected = self.transport_ready and any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
                 state = "running" if connected else "reconnecting"
             return {"state": state, "error": self.error, "platforms": self.platforms,
                     "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeSource")} for p in self.pending.values()],
@@ -116,6 +185,23 @@ class Host:
 
     def publish(self):
         emit({"event": "status", "payload": self.snapshot()})
+
+    async def refresh_transport_status(self):
+        self.transport_ready = False
+        if not self.runner:
+            return False
+        for key, adapter in self.runner.adapters.items():
+            if str(getattr(key, "value", key)) != self.boot.get("platform") or getattr(adapter, "is_connected", False) is not True:
+                continue
+            ready = getattr(adapter, "strict_delivery_ready", None)
+            try:
+                if ready is not None and await asyncio.wait_for(ready(), timeout=1.0) is not True:
+                    continue
+            except Exception:
+                continue
+            self.transport_ready = True
+            break
+        return self.transport_ready
 
     async def initialize(self):
         # Only this private profile is visible to the child; no project plugins,
@@ -130,45 +216,27 @@ class Host:
         from gateway.managed_contracts import strict_send_supported
         discover_plugins()
         for entry in platform_registry.all_entries():
-            if not strict_send_supported(entry.name):
-                continue
-            fields = []
-            for required in entry.required_env:
-                key = required if isinstance(required, str) else required.get("name", "")
-                if not key or not key.replace("_", "").isalnum() or not key.isupper():
-                    continue
-                fields.append({"key": key, "label": key.replace("_", " "),
-                               "secret": any(word in key for word in ("SECRET", "TOKEN", "PASSWORD", "KEY")), "required": True})
-            try:
-                available = bool(entry.check_fn())
-            except Exception:
-                available = False
-            qr_available = available and entry.name == "wecom"
-            if qr_available:
-                try:
-                    _setup_module.tls_context()
-                except _setup_module.SetupError:
-                    qr_available = False
-            self.platforms.append({"id": entry.name, "label": entry.label, "available": available,
-                                   "strictSend": True, "fields": fields, "qrSetup": qr_available})
-        self.platforms.sort(key=lambda p: p["id"])
+            self.platforms.append(platform_metadata(entry, strict_send_supported))
+        self.platforms.sort(key=lambda p: (not (p["available"] and p["strictSend"]), p["id"]))
         self.state = "configured" if self.boot.get("platform") else "unconfigured"
         self.publish()
         if not self.boot.get("connect"):
             return
         platform = self.boot.get("platform")
-        meta = next((p for p in self.platforms if p["id"] == platform and p["available"]), None)
+        meta = next((p for p in self.platforms if p["id"] == platform and p["available"] and p["strictSend"]), None)
         if not meta:
             raise ValueError("platform_not_available")
         fields = self.boot.get("fields", {})
         allowed = {f["key"] for f in meta["fields"]}
         if set(fields) - allowed:
             raise ValueError("unknown_channel_field")
-        for key in allowed:
-            value = fields.get(key)
-            if not isinstance(value, str) or not value or len(value) > 4096 or "\0" in value:
+        for field in meta["fields"]:
+            key = field["key"]
+            value = fields.get(key, "")
+            if not isinstance(value, str) or len(value) > 4096 or "\0" in value or (field["required"] and not value):
                 raise ValueError("required_channel_field_missing")
-            os.environ[key] = value
+            if value:
+                os.environ[key] = value
         # The capability is never copied into environment, profile config or adapter metadata.
         from gateway.config import load_gateway_config
         from gateway.run import GatewayRunner
@@ -188,7 +256,12 @@ class Host:
         self.publish()
         await self.runner.start()
         adapters = getattr(self.runner, "adapters", {})
-        if not any(str(getattr(k, "value", k)) == platform and getattr(adapter, "is_connected", False) is True for k, adapter in adapters.items()):
+        deadline = time.monotonic() + 30
+        while adapters and time.monotonic() < deadline:
+            if await self.refresh_transport_status():
+                break
+            await asyncio.sleep(0.2)
+        if not self.transport_ready:
             raise ValueError("channel_connection_failed")
         self.state = "running"
         self.publish()
@@ -205,7 +278,7 @@ class Host:
         source = event.source
         # Pairing is an observation only. It cannot read a task or authorize input.
         from gateway.managed_contracts import native_source_message_id
-        if not source or not source.user_id or not source.chat_id or source.chat_type != "dm" or not native_source_message_id(event):
+        if not source or not source.user_id or not source.chat_id or source.chat_type != "dm" or source.thread_id or not native_source_message_id(event):
             return {"action": "skip", "reason": "invalid_pairing_source"}
         with self.lock:
             self.snapshot()
@@ -253,6 +326,10 @@ class Host:
         from gateway.managed_contracts import send_strict, StrictTarget
         target = StrictTarget(profile=context.transport_profile, platform=context.platform,
                               chat_id=context.chat_id, thread_id=context.thread_id)
+        maximum = next((p.get("maxMessageLength") for p in self.platforms if p["id"] == context.platform), 0)
+        maximum = min(3500, maximum) if isinstance(maximum, int) and maximum > 0 else 3500
+        input_limit = min(2000, max(0, maximum - 600))
+        prefix = command_prefix(context.platform)
         async with self.command_slots:
             try:
                 args = raw_args.strip().split(maxsplit=2)
@@ -265,8 +342,8 @@ class Host:
                     if method == "input":
                         if len(args) != 3:
                             raise ValueError("input_text_required")
-                        if len(args[2].encode("utf-8")) > 2000:
-                            await send_strict(self.runner, target, "继续任务的指令太长，请缩短到 2000 UTF-8 字节以内后重试。")
+                        if len(args[2].encode("utf-8")) > input_limit:
+                            await send_strict(self.runner, target, f"继续任务的指令太长，请缩短到 {input_limit} UTF-8 字节以内后重试。")
                             return None
                         params["text"] = args[2]
                     elif method == "events" and len(args) == 3:
@@ -276,13 +353,13 @@ class Host:
                 elif method == "operation" and len(args) == 2:
                     params["operationId"] = args[1]
                 else:
-                    await send_strict(self.runner, target, "/ccem list\n/ccem status <runtime>\n/ccem events <runtime> [cursor]\n/ccem input <runtime> <text>\n/ccem confirm <challenge>\n/ccem cancel <challenge>\n/ccem operation <operation>")
+                    await send_strict(self.runner, target, "\n".join(prefix + " " + line for line in ("list", "status <runtime>", "events <runtime> [cursor]", "input <runtime> <text>", "confirm <challenge>", "cancel <challenge>", "operation <operation>")))
                     return None
                 result = await asyncio.to_thread(self.rpc, method, params)
-                text = render_result(result)
+                text = render_result(result, maximum, prefix)
             except (ValueError, urllib.error.URLError, TimeoutError):
                 # Avoid echoing credentials, arbitrary exception strings or task content on transport errors.
-                text = "CCEM 请求未完成。请在桌面检查连接、工作区授权或确认有效期；已提交任务可用 /ccem operation 查询。"
+                text = f"CCEM 请求未完成。请在桌面检查连接、工作区授权或确认有效期；已提交任务可用 {prefix} operation 查询。"
             except Exception:
                 text = "CCEM 请求失败；请在桌面检查连接状态。"
             receipt = await send_strict(self.runner, target, text)
@@ -313,12 +390,15 @@ class Host:
             identifier = params.get("id")
             if method == "beginSetup":
                 identifier, platform = self.validate_begin_setup(params)
+                if self.setup.platform != platform:
+                    self.setup.clear("superseded")
+                    self.setup = _setup_module.TelegramSetup() if platform == "telegram" else _setup_module.WeComSetup()
                 return await self.setup.begin(identifier, platform)
             if method == "pollSetup":
                 return await self.setup.poll(identifier)
             return self.setup.cancel(identifier)
         if method == "openPairing":
-            if self.state != "running":
+            if self.snapshot()["state"] != "running":
                 raise ValueError("gateway_not_running")
             with self.lock:
                 self.pending.clear()
@@ -344,7 +424,7 @@ class Host:
             target = StrictTarget(**params["target"])
             if target.platform != self.boot.get("platform"):
                 return {"status": "not_sent", "error_code": "platform_mismatch"}
-            return await send_strict(self.runner, target, str(params["text"]), timeout=30.0)
+            return await send_strict(self.runner, target, notification_text(str(params["text"]), target.platform), timeout=30.0)
         raise ValueError("unknown_host_method")
 
     async def serve(self):
@@ -358,6 +438,8 @@ class Host:
         async def heartbeat():
             while not self.stopped.is_set():
                 await asyncio.sleep(5)
+                if self.state == "running":
+                    await self.refresh_transport_status()
                 self.publish()
         heartbeat_task = asyncio.create_task(heartbeat())
         setup_jobs = {}
@@ -416,21 +498,25 @@ class Host:
                 await asyncio.wait_for(self.runner.stop(), timeout=2)
 
 
-def render_result(result):
+def render_result(result, maximum=3500, prefix="/ccem"):
     if not isinstance(result, dict):
         return "CCEM：请求已处理。"
     if "challenge" in result:
-        return f"继续任务 {result['runtimeId']}\n\n{result['text']}\n\n两分钟内发送：\n/ccem confirm {result['challenge']}\n取消：/ccem cancel {result['challenge']}"
+        preview = f"继续任务 {result['runtimeId']}\n\n{result['text']}\n\n两分钟内发送：\n{prefix} confirm {result['challenge']}\n取消：{prefix} cancel {result['challenge']}"
+        if len(preview.encode("utf-8")) > maximum:
+            # Never ask a user to approve a truncated instruction.
+            raise ValueError("confirmation_preview_too_large")
+        return preview
     if "sessions" in result:
-        return limit_utf8("\n\n".join(f"{limit_utf8(s.get('title') or 'Task', 60)} · {s['status']}\n{s['runtimeId']}" for s in result["sessions"]), 3500) or "授权工作区暂无任务。"
+        return limit_utf8("\n\n".join(f"{limit_utf8(s.get('title') or 'Task', 60)} · {s['status']}\n{s['runtimeId']}" for s in result["sessions"]), maximum) or "授权工作区暂无任务。"
     if "events" in result:
         if not result.get("sourceAvailable") or result.get("gapDetected") or result.get("decodeFailureCount", 0) or result.get("oversizedEventCount", 0):
             return "事件记录不完整，请在 CCEM 查看任务。"
         events = "\n\n".join(f"{limit_utf8(e['title'], 120)}\n{limit_utf8(e['text'], 360)}" for e in result["events"])
-        return (limit_utf8(events, 3200) or "暂无新事件。") + f"\n游标：{result.get('nextCursor')}"
+        return (limit_utf8(events, maximum - 300) or "暂无新事件。") + f"\n游标：{result.get('nextCursor')}"
     if "operationId" in result:
-        return f"操作 {result['operationId']}\n{result['state']}\n{limit_utf8(result.get('detail', ''), 2500)}\n/ccem operation {result['operationId']}"
-    return limit_utf8("\n".join(str(result[k]) for k in ("title", "runtimeId", "status", "state", "updatedAt") if result.get(k) is not None), 3500)
+        return f"操作 {result['operationId']}\n{result['state']}\n{limit_utf8(result.get('detail', ''), min(2500, maximum - 350))}\n{prefix} operation {result['operationId']}"
+    return limit_utf8("\n".join(str(result[k]) for k in ("title", "runtimeId", "status", "state", "updatedAt") if result.get(k) is not None), maximum)
 
 
 def limit_utf8(value, maximum):
@@ -457,8 +543,16 @@ def main():
             assert strict_send_supported("wecom") and StrictTarget
             from plugins.platforms.wecom.adapter import WeComAdapter, check_wecom_requirements
             assert WeComAdapter and check_wecom_requirements(), "WeCom transport dependencies are unavailable"
-            assert _setup_module.WeComSetup and _setup_module.tls_context()
-        emit({"ok": True, "protocolVersion": PROTOCOL})
+            assert _setup_module.WeComSetup and _setup_module.TelegramSetup and _setup_module.tls_context()
+            os.environ["HERMES_BUNDLED_PLUGINS"] = str(source / "plugins")
+            from hermes_cli.plugins import discover_plugins
+            from gateway.platform_registry import platform_registry
+            discover_plugins()
+            for name in MANAGED_CHANNELS:
+                entry = platform_registry.get(name)
+                assert entry and entry.check_fn(), f"{name} transport dependencies are unavailable"
+                assert strict_send_supported(name), f"{name} managed delivery is unavailable"
+        emit({"ok": True, "protocolVersion": PROTOCOL, "channels": list(MANAGED_CHANNELS)})
         return
     if not args.source or not args.profile or not args.source.is_absolute() or not args.profile.is_absolute():
         parser.error("private absolute source/profile paths required")

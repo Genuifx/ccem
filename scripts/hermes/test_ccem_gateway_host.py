@@ -16,9 +16,53 @@ import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 
 class NativePairingProvenance(unittest.IsolatedAsyncioTestCase):
+    async def test_running_status_requires_the_adapter_transport_readiness(self):
+        host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+                                "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc",
+                                "platform": "slack"}, Path(os.environ["HERMES_HOME"]))
+        ready = False
+        async def strict_delivery_ready():
+            return ready
+        host.runner = types.SimpleNamespace(adapters={"slack": types.SimpleNamespace(is_connected=True, strict_delivery_ready=strict_delivery_ready)})
+        host.state = "running"
+        self.assertFalse(await host.refresh_transport_status())
+        self.assertEqual(host.snapshot()["state"], "reconnecting")
+        ready = True
+        self.assertTrue(await host.refresh_transport_status())
+        self.assertEqual(host.snapshot()["state"], "running")
+        ready = False
+        await host.refresh_transport_status()
+        self.assertEqual(host.snapshot()["state"], "reconnecting")
+
+    async def test_discord_input_budget_is_checked_before_requesting_confirmation(self):
+        host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+                                "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc",
+                                "platform": "discord"}, Path(os.environ["HERMES_HOME"]))
+        host.platforms = [{"id": "discord", "maxMessageLength": 2000}]
+        context = types.SimpleNamespace(platform="discord", profile="default", transport_profile="default",
+                                        user_id="user", chat_id="chat", thread_id=None, chat_type="dm", source_message_id="native-id")
+        replies, requests = [], []
+        async def send(runner, target, text):
+            replies.append(text)
+            return {"status": "sent"}
+        def rpc(method, params):
+            requests.append(params)
+            return {"runtimeId": "native-" + "r" * 48, "text": params["text"], "challenge": "c" * 48}
+        host.rpc = rpc
+        with patch("gateway.managed_contracts.send_strict", send):
+            await host.command("input runtime " + "x" * 1500, context)
+            self.assertEqual(requests, [])
+            self.assertIn("1400", replies[-1])
+            await host.command("input runtime " + "x" * 1400, context)
+            self.assertEqual(len(requests), 1)
+            self.assertIn("x" * 1400, replies[-1])
+            self.assertIn("/ccem confirm", replies[-1])
+            self.assertLessEqual(len(replies[-1].encode()), 2000)
+
     async def test_synthetic_ids_cannot_consume_pairing_nonce(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.wecom.adapter import WeComAdapter

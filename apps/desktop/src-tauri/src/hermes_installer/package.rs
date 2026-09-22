@@ -64,7 +64,7 @@ pub(super) fn verify_package(
         || identity.python_version != HERMES_PYTHON_VERSION
         || identity.platform != "macos"
         || identity.architecture != "aarch64"
-        || identity.channels != ["wecom", "feishu"]
+        || !valid_channels(&identity.channels)
         || identity.files.len() > 60_000
     {
         return Err(failure(
@@ -165,6 +165,51 @@ pub(super) fn verify_package(
         }
     }
     Ok(())
+}
+
+// The signed runtime supplies its own channel catalog. Adding a reviewed
+// Hermes adapter must not require a second platform enum in the desktop.
+fn valid_channels(channels: &[String]) -> bool {
+    let unique: BTreeSet<_> = channels.iter().collect();
+    !channels.is_empty()
+        && channels.len() <= 64
+        && unique.len() == channels.len()
+        && channels.iter().all(|channel| {
+            !channel.is_empty()
+                && channel.len() <= 64
+                && channel.as_bytes()[0].is_ascii_lowercase()
+                && channel
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+}
+
+#[cfg(test)]
+mod channel_inventory_tests {
+    use super::valid_channels;
+
+    #[test]
+    fn accepts_signed_extensible_inventory_without_a_desktop_platform_enum() {
+        assert!(valid_channels(&["wecom".into(), "feishu".into()]));
+        assert!(valid_channels(&[
+            "wecom".into(),
+            "new_reviewed_channel".into()
+        ]));
+        for names in [
+            vec![],
+            vec!["wecom", "wecom"],
+            vec![""],
+            vec!["../wecom"],
+            vec!["WeCom"],
+            vec!["a-b"],
+            vec!["1channel"],
+        ] {
+            assert!(!valid_channels(
+                &names.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+        assert!(!valid_channels(&["a".repeat(65)]));
+    }
 }
 
 pub(super) fn health_check(

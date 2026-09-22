@@ -363,7 +363,7 @@ class HttpsTests(unittest.IsolatedAsyncioTestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix="ccem-qr-https-")
         directory = Path(cls.directory.name)
         config = directory / "openssl.cnf"
-        config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=work.weixin.qq.com\n[ext]\nsubjectAltName=DNS:work.weixin.qq.com\n")
+        config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=work.weixin.qq.com\n[ext]\nsubjectAltName=DNS:work.weixin.qq.com,DNS:setup.hermes-agent.nousresearch.com\n")
         cls.cert, cls.key = directory / "cert.pem", directory / "key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                         "-keyout", str(cls.key), "-out", str(cls.cert), "-config", str(config)],
@@ -393,7 +393,7 @@ class HttpsTests(unittest.IsolatedAsyncioTestCase):
         port = site._server.sockets[0].getsockname()[1]
         class LocalResolver(aiohttp.abc.AbstractResolver):
             async def resolve(self, host, target_port=0, family=socket.AF_INET):
-                if host != "work.weixin.qq.com":
+                if host not in ("work.weixin.qq.com", "setup.hermes-agent.nousresearch.com"):
                     raise AssertionError("external DNS is prohibited")
                 return [{"hostname": host, "host": "127.0.0.1", "port": port,
                          "family": socket.AF_INET, "proto": 0, "flags": 0}]
@@ -466,6 +466,31 @@ class HttpsTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "^setup_invalid_endpoint$"):
             await qr._fetch_json("https://example.com/ai/qc/query_result?scode=private")
         self.assertEqual(self.requests, [])
+
+    async def test_telegram_https_create_and_poll_confine_bearer_to_fixed_endpoint(self):
+        async def handler(request):
+            if request.method == "POST":
+                self.assertEqual(request.path, "/v1/telegram/pairings")
+                self.assertNotIn("Authorization", request.headers)
+                self.assertEqual(await request.json(), {"bot_name": "CCEM"})
+                return self.web.json_response({"pairing_id": "session"}, status=201)
+            self.assertEqual(request.path, "/v1/telegram/pairings/session")
+            self.assertEqual(request.headers["Authorization"], "Bearer synthetic-private-token")
+            return self.web.json_response({"status": "waiting"})
+        self.handler = handler
+        created = await qr._fetch_json(qr.TELEGRAM_URL, method="POST", payload={"bot_name": "CCEM"})
+        self.assertEqual(created, {"pairing_id": "session"})
+        self.assertEqual(await qr._fetch_json(qr.TELEGRAM_URL + "/session", bearer="synthetic-private-token"), {"status": "waiting"})
+        for url in (qr.GENERATE_URL, "https://example.com/v1/telegram/pairings/session", qr.TELEGRAM_URL + "/../else"):
+            with self.assertRaisesRegex(ValueError, "^setup_invalid_endpoint$"):
+                await qr._fetch_json(url, bearer="synthetic-private-token")
+        self.assertEqual(len(self.requests), 2)
+
+    async def test_telegram_poll_redirect_never_forwards_bearer(self):
+        self.handler = lambda request: self.web.Response(status=302, headers={"Location": "https://work.weixin.qq.com/should-not-follow"})
+        with self.assertRaisesRegex(ValueError, "^setup_redirect_rejected$"):
+            await qr._fetch_json(qr.TELEGRAM_URL + "/session", bearer="synthetic-private-token")
+        self.assertEqual(self.requests, ["/v1/telegram/pairings/session"])
 
 
 if __name__ == "__main__":

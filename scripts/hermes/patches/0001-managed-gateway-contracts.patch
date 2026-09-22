@@ -29,7 +29,7 @@ index f75324d..a7a09ff 100644
              stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
 diff --git a/gateway/managed_contracts.py b/gateway/managed_contracts.py
 new file mode 100644
-index 0000000..d033009
+index 0000000..e04183c
 --- /dev/null
 +++ b/gateway/managed_contracts.py
 @@ -0,0 +1,167 @@
@@ -51,7 +51,7 @@ index 0000000..d033009
 +
 +
 +INTEGRATION_NATIVE_COMMANDS = frozenset({"help", "status", "whoami", "platforms", "version", "start"})
-+STRICT_SEND_PLATFORMS = frozenset({"telegram", "wecom"})
++STRICT_SEND_PLATFORMS = frozenset({"telegram", "wecom", "feishu", "discord", "slack"})
 +
 +
 +def strict_send_supported(platform: str) -> bool:
@@ -200,6 +200,104 @@ index 0000000..d033009
 +                       message_id=result.message_id, receipt_id=result.receipt_id)
 +    return receipt(result.delivery_status, result.error, actual=actual,
 +                   message_id=result.message_id, receipt_id=result.receipt_id)
+diff --git a/gateway/managed_http.py b/gateway/managed_http.py
+new file mode 100644
+index 0000000..e829ad4
+--- /dev/null
++++ b/gateway/managed_http.py
+@@ -0,0 +1,92 @@
++"""Bounded one-attempt HTTP transport for managed adapter delivery.
++
++The adapters own authentication. This module never discovers credentials,
++retries a request, follows redirects, or accepts a caller-supplied endpoint.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import re
++import ssl
++
++import aiohttp
++import certifi
++
++
++_ENDPOINTS = {
++    ("feishu", "token"): "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
++    ("feishu", "message"): "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
++    ("lark", "token"): "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
++    ("lark", "message"): "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
++    ("slack", "message"): "https://slack.com/api/chat.postMessage",
++    ("discord", "message"): "https://discord.com/api/v10/channels/{chat_id}/messages",
++}
++MAX_RESPONSE_BYTES = 65536
++
++
++class StrictHTTPError(Exception):
++    """Fixed error codes only: never retain provider bodies, tokens or URLs."""
++
++
++async def post_json(platform, operation, payload, *, token=None, chat_id=None, proxy=None, proxy_auth=None):
++    url = _ENDPOINTS.get((platform, operation))
++    if url is None:
++        raise StrictHTTPError("invalid_endpoint")
++    if platform == "discord":
++        if not isinstance(chat_id, str) or not re.fullmatch(r"[1-9][0-9]{0,24}", chat_id):
++            raise StrictHTTPError("invalid_target")
++        url = url.format(chat_id=chat_id)
++    headers = {"Accept": "application/json"}
++    if token is not None:
++        if not isinstance(token, str) or not token or any(c.isspace() for c in token):
++            raise StrictHTTPError("invalid_authentication")
++        headers["Authorization"] = ("Bot " if platform == "discord" else "Bearer ") + token
++    context = ssl.create_default_context(cafile=certifi.where())
++    try:
++        # aiohttp 3.14 retries only idempotent methods; POST is not in that set.
++        # A fresh session also prevents ambient cookies/auth or redirect state.
++        async with aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=10), trust_env=False,
++        ) as session:
++            async with session.post(url, json=payload, headers=headers, ssl=context,
++                                    allow_redirects=False, proxy=proxy, proxy_auth=proxy_auth) as response:
++                if 300 <= response.status < 400:
++                    raise StrictHTTPError("redirect_refused")
++                chunks, size = [], 0
++                async for chunk in response.content.iter_chunked(16384):
++                    size += len(chunk)
++                    if size > MAX_RESPONSE_BYTES:
++                        raise StrictHTTPError("response_too_large")
++                    chunks.append(chunk)
++                try:
++                    body = json.loads(b"".join(chunks).decode("utf-8"))
++                except (UnicodeError, ValueError):
++                    raise StrictHTTPError("invalid_response") from None
++                if not isinstance(body, dict):
++                    raise StrictHTTPError("invalid_response")
++                return response.status, body
++    except asyncio.CancelledError:
++        raise
++    except StrictHTTPError:
++        raise
++    except Exception:
++        raise StrictHTTPError("transport_exception") from None
++
++
++def valid_text(text, maximum):
++    if not isinstance(text, str) or not text.strip():
++        return False
++    try:
++        return len(text.encode("utf-16-le")) // 2 <= maximum
++    except UnicodeError:
++        return False
++
++
++def identifier(value):
++    return value if isinstance(value, str) and value and value == value.strip() else None
++
++
++def native_identifier(value, pattern):
++    return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
 diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
 index d7eb6da..d3b1041 100644
 --- a/gateway/platforms/base.py
@@ -658,8 +756,383 @@ index e6c3956..f83ca68 100644
  
  
  _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index f97bfae..86441f5 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -1007,6 +1007,16 @@ class DiscordAdapter(BasePlatformAdapter):
+             return preview.text
+         return _format_discord_markdown_link(preview.text, preview.url)
+ 
++    STRICT_DELIVERY_CAPABLE = True
++
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id, content, *, thread_id=None, metadata=None):
++        from .strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.DISCORD)
+         self._client: Optional[commands.Bot] = None
+@@ -1364,6 +1374,12 @@ class DiscordAdapter(BasePlatformAdapter):
+         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+             return False, False
+         role_authorized = False
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner):
++            # Let the gateway's Desktop-nonce hook see native private messages.
++            # This is transport admission only; command authorization stays there.
++            return (isinstance(message.channel, discord.DMChannel)
++                    and not getattr(message.author, "bot", False)), False
+         if getattr(message.author, "bot", False):
+             allow_bots = self._get_allow_bots()
+             if allow_bots == "none":
+@@ -4743,6 +4759,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         channel_id = str(interaction.channel_id)
+         return MessageEvent(
+             text=text, message_type=msg_type, source=source, raw_message=interaction,
++            message_id_is_synthetic=True, allow_gateway_control=False,
+             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+         )
+ 
+@@ -5928,6 +5945,9 @@ class DiscordAdapter(BasePlatformAdapter):
+         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
+     ) -> bool:
+         """Handle one Discord message and report whether it reached dispatch."""
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner) and not isinstance(message.channel, discord.DMChannel):
++            return False
+         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
+         #
+         # Config (discord.* in config.yaml or DISCORD_* env vars):
+diff --git a/plugins/platforms/discord/strict_delivery.py b/plugins/platforms/discord/strict_delivery.py
+new file mode 100644
+index 0000000..04dbb82
+--- /dev/null
++++ b/plugins/platforms/discord/strict_delivery.py
+@@ -0,0 +1,40 @@
++"""One Discord REST delivery, bypassing discord.py's built-in HTTP retry loop."""
++
++import re
++
++from gateway.managed_contracts import strict_result
++from gateway.managed_http import StrictHTTPError, native_identifier, post_json, valid_text
++
++
++async def ready(adapter):
++    client = getattr(adapter, "_client", None)
++    return bool(adapter.is_connected and client and client.is_ready())
++
++
++async def send_strict(adapter, chat_id, content, *, thread_id=None):
++    if not isinstance(chat_id, str) or not re.fullmatch(r"[1-9][0-9]{0,24}", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if not valid_text(content, 2000):
++        return strict_result("not_sent", "invalid_text")
++    client = getattr(adapter, "_client", None)
++    token = getattr(getattr(client, "http", None), "token", None)
++    if not await ready(adapter) or not token:
++        return strict_result("not_sent", "live_adapter_unavailable")
++    try:
++        status, body = await post_json("discord", "message", {
++            "content": content, "allowed_mentions": {"parse": []}, "tts": False,
++        }, token=token, chat_id=chat_id, proxy=getattr(client.http, "proxy", None),
++           proxy_auth=getattr(client.http, "proxy_auth", None))
++    except StrictHTTPError as error:
++        return strict_result("unknown", str(error))
++    if 400 <= status < 500:
++        return strict_result("not_sent", "platform_rejected")
++    if not 200 <= status < 300:
++        return strict_result("unknown", "unconfirmed_response")
++    actual = {"chat_id": native_identifier(body.get("channel_id"), r"[1-9][0-9]{0,24}"), "thread_id": None}
++    message_id = native_identifier(body.get("id"), r"[1-9][0-9]{0,24}")
++    if actual["chat_id"] != chat_id or not message_id or body.get("message_reference"):
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual, message_id=message_id)
++    return strict_result("sent", target=actual, message_id=message_id)
+diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
+index 7614366..85460c0 100644
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -1202,6 +1202,16 @@ class FeishuAdapter(BasePlatformAdapter):
+     _SPLIT_THRESHOLD = 4000  # chunk near Feishu's ~4096-char client split → continuation almost certain
+ 
+     # --- Lifecycle — init / settings / connect / disconnect ---
++    STRICT_DELIVERY_CAPABLE = True
++
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id, content, *, thread_id=None, metadata=None):
++        from .strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.FEISHU)
+         self._settings = self._load_settings(config.extra or {})
+@@ -1985,6 +1995,9 @@ class FeishuAdapter(BasePlatformAdapter):
+         if not message or not sender or not getattr(sender, "sender_id", None):
+             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
+             return
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner) and getattr(message, "chat_type", None) != "p2p":
++            return
+         message_id = getattr(message, "message_id", None)
+         if not message_id or await self._is_duplicate(message_id):
+             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
+@@ -2366,8 +2379,8 @@ class FeishuAdapter(BasePlatformAdapter):
+         )
+         synthetic_event = MessageEvent(
+             text=text, message_type=message_type, source=source, raw_message=raw_message,
+-            message_id=message_id, channel_prompt=self._resolve_channel_prompt(chat_id),
+-            timestamp=datetime.now(),
++            message_id=message_id, message_id_is_synthetic=True, allow_gateway_control=False,
++            channel_prompt=self._resolve_channel_prompt(chat_id), timestamp=datetime.now(),
+         )
+         await self._handle_message_with_guards(synthetic_event)
+ 
+diff --git a/plugins/platforms/feishu/strict_delivery.py b/plugins/platforms/feishu/strict_delivery.py
+new file mode 100644
+index 0000000..b21e37d
+--- /dev/null
++++ b/plugins/platforms/feishu/strict_delivery.py
+@@ -0,0 +1,77 @@
++"""One text create request to the explicit native Feishu/Lark chat ID."""
++
++import asyncio
++import json
++import re
++import time
++
++from gateway.managed_contracts import strict_result
++from gateway.managed_http import StrictHTTPError, identifier, native_identifier, post_json, valid_text
++
++
++async def ready(adapter):
++    connection = getattr(getattr(adapter, "_ws_client", None), "_conn", None)
++    state = getattr(getattr(connection, "state", None), "name", None)
++    return bool(adapter.is_connected and getattr(adapter, "_client", None)
++                and getattr(adapter, "_connection_mode", None) == "websocket"
++                and connection is not None and state == "OPEN")
++
++
++async def tenant_token(adapter, domain):
++    # The token belongs to this live adapter, never an ambient profile. Token
++    # acquisition is separate from delivery: failure here sends no message.
++    lock = getattr(adapter, "_ccem_token_lock", None)
++    if lock is None:
++        lock = adapter._ccem_token_lock = asyncio.Lock()
++    async with lock:
++        identity = (domain, adapter._app_id, adapter._app_secret)
++        cached = getattr(adapter, "_ccem_tenant_token", None)
++        if cached and cached[1] > time.monotonic() and cached[2] == identity:
++            return cached[0]
++        status, body = await post_json(domain, "token", {
++            "app_id": adapter._app_id, "app_secret": adapter._app_secret,
++        })
++        token, expires = identifier(body.get("tenant_access_token")), body.get("expire")
++        if (status != 200 or type(body.get("code")) is not int or body["code"] != 0
++                or not token or type(expires) is not int or expires <= 60):
++            raise StrictHTTPError("authentication_unavailable")
++        adapter._ccem_tenant_token = (token, time.monotonic() + min(expires - 60, 7200), identity)
++        return token
++
++
++async def send_strict(adapter, chat_id, content, *, thread_id=None):
++    if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9]+", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if not valid_text(content, 4000):
++        return strict_result("not_sent", "invalid_text")
++    domain = getattr(adapter, "_domain_name", None)
++    if domain not in {"feishu", "lark"}:
++        return strict_result("not_sent", "invalid_domain")
++    if not await ready(adapter):
++        return strict_result("not_sent", "live_adapter_unavailable")
++    try:
++        token = await tenant_token(adapter, domain)
++    except StrictHTTPError:
++        return strict_result("not_sent", "authentication_unavailable")
++    try:
++        status, body = await post_json(domain, "message", {
++            "receive_id": chat_id, "msg_type": "text",
++            "content": json.dumps({"text": content}, ensure_ascii=False),
++        }, token=token)
++    except StrictHTTPError as error:
++        return strict_result("unknown", str(error))
++    if 400 <= status < 500 or (status == 200 and type(body.get("code")) is int and body["code"] != 0):
++        return strict_result("not_sent", "platform_rejected")
++    if status != 200 or type(body.get("code")) is not int or body["code"] != 0:
++        return strict_result("unknown", "unconfirmed_response")
++    data = body.get("data")
++    data = data if isinstance(data, dict) else {}
++    actual = {"chat_id": native_identifier(data.get("chat_id"), r"oc_[A-Za-z0-9]+"),
++              "thread_id": native_identifier(data.get("thread_id"), r"omt_[A-Za-z0-9]+")}
++    message_id = native_identifier(data.get("message_id"), r"om_[A-Za-z0-9]+")
++    if (actual != {"chat_id": chat_id, "thread_id": None} or not message_id
++            or data.get("thread_id") not in (None, "")):
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual, message_id=message_id)
++    return strict_result("sent", target=actual, message_id=message_id)
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 0bc4b94..71a96a1 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -883,6 +883,16 @@ class SlackAdapter(BasePlatformAdapter):
+     _socket_ping_stale_factor = 4
+     _socket_first_ping_grace_s = 60.0
+ 
++    STRICT_DELIVERY_CAPABLE = True
++
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id, content, *, thread_id=None, metadata=None):
++        from .strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.SLACK)
+         self._app: Optional[Any] = None
+@@ -1625,7 +1635,15 @@ class SlackAdapter(BasePlatformAdapter):
+         proxy_url = _resolve_slack_proxy_url()
+         if proxy_url:
+             logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
+-        bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner):
++            from .strict_delivery import single_bot_token
++            if not single_bot_token(raw_token):
++                self._set_fatal_error("managed_single_account_required", "One Slack bot token is required", retryable=False)
++                return False
++            bot_tokens = [raw_token]
++        else:
++            bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
+         lock_acquired = False
+         try:
+             if not self._acquire_platform_lock("slack-app-token", app_token, "Slack app token"):
+@@ -3962,6 +3980,11 @@ class SlackAdapter(BasePlatformAdapter):
+         the synthetic reaction ts. Channels: real reply → per-thread; top-level with
+         ``reply_in_thread`` → ts as synthetic root; else None (``thread_ts == ts`` is no reply)."""
+         if is_dm:
++            from gateway.managed_contracts import integration_only
++            if integration_only(self.gateway_runner):
++                # A top-level DM stays top-level. Real threaded input retains its
++                # native thread and is rejected by managed DM pairing/strict send.
++                return event.get("thread_ts") or None
+             thread_ts = event.get("thread_ts") or assistant_meta.get("thread_ts")
+             if not thread_ts and self._dm_top_level_threads_as_sessions():
+                 thread_ts = ts
+@@ -4249,6 +4272,13 @@ class SlackAdapter(BasePlatformAdapter):
+             self._remember_channel_team(channel_id, team_id)
+         channel_type = event.get("channel_type", "") or ("im" if channel_id.startswith("D") else "")
+         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner) and (
++            channel_type != "im" or event.get("type") != "message"
++            or event.get("_hermes_force_process") or len(self._team_clients) != 1
++            or team_id not in self._team_clients
++        ):
++            return
+         if is_dm and self._slack_disable_dms():
+             logger.info(
+                 "[Slack] Ignoring DM because Slack DMs are disabled: channel=%s user=%s",
+@@ -4259,7 +4289,9 @@ class SlackAdapter(BasePlatformAdapter):
+         is_one_to_one_dm = channel_type == "im"
+         # Reject unauthorized users before the expensive lookups/downloads;
+         # the runner's own auth check only runs after MessageEvent is built.
+-        if self._early_reject_unauthorized(user_id, channel_id, is_dm):
++        # Managed DM pairing runs in the gateway pre-dispatch hook. Keep its
++        # nonce challenge reachable; the gateway still authorizes every command.
++        if not integration_only(self.gateway_runner) and self._early_reject_unauthorized(user_id, channel_id, is_dm):
+             return
+         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
+         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+@@ -4344,7 +4376,7 @@ class SlackAdapter(BasePlatformAdapter):
+         source = self.build_source(
+             chat_id=channel_id,
+             chat_name=channel_name,
+-            chat_type="dm" if is_dm else "group",
++            chat_type="dm" if is_dm and event.get("channel_type") != "mpim" else "group",
+             user_id=user_id,
+             user_name=user_name,
+             thread_id=thread_ts,
+@@ -5656,7 +5688,8 @@ class SlackAdapter(BasePlatformAdapter):
+         event = MessageEvent(
+             text=text,
+             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
+-            source=source, raw_message=command)
++            source=source, raw_message=command,
++            message_id_is_synthetic=True, allow_gateway_control=False)
+         # Stash response_url so the first reply for this channel+user goes ephemeral. COMMAND
+         # events only: free-form "/hermes <question>" replies must stay public.
+         response_url = command.get("response_url", "")
+diff --git a/plugins/platforms/slack/strict_delivery.py b/plugins/platforms/slack/strict_delivery.py
+new file mode 100644
+index 0000000..0b1d33b
+--- /dev/null
++++ b/plugins/platforms/slack/strict_delivery.py
+@@ -0,0 +1,52 @@
++"""One authenticated workspace, one exact DM, one chat.postMessage attempt."""
++
++import re
++
++from gateway.managed_contracts import strict_result
++from gateway.managed_http import StrictHTTPError, native_identifier, post_json, valid_text
++
++
++def single_bot_token(value):
++    # Managed accounts never load upstream's saved multi-workspace token file.
++    return isinstance(value, str) and re.fullmatch(r"xoxb-[A-Za-z0-9-]+", value) is not None
++
++
++async def ready(adapter):
++    return (adapter.is_connected and len(getattr(adapter, "_team_clients", {})) == 1
++            and await adapter._socket_transport_connected() is True)
++
++
++async def send_strict(adapter, chat_id, content, *, thread_id=None):
++    if not isinstance(chat_id, str) or not re.fullmatch(r"D[A-Z0-9]+", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if not valid_text(content, 4000):
++        return strict_result("not_sent", "invalid_text")
++    clients = getattr(adapter, "_team_clients", {})
++    if not await ready(adapter):
++        return strict_result("not_sent", "live_adapter_unavailable")
++    client = next(iter(clients.values()))
++    token = getattr(client, "token", None)
++    if not single_bot_token(token):
++        return strict_result("not_sent", "invalid_authentication")
++    try:
++        status, body = await post_json("slack", "message", {
++            "channel": chat_id, "text": content, "mrkdwn": False, "parse": "none",
++            "unfurl_links": False, "unfurl_media": False, "reply_broadcast": False,
++        }, token=token, proxy=getattr(adapter, "_proxy_url", None))
++    except StrictHTTPError as error:
++        return strict_result("unknown", str(error))
++    if 400 <= status < 500 or (status == 200 and body.get("ok") is False):
++        return strict_result("not_sent", "platform_rejected")
++    if status != 200 or body.get("ok") is not True:
++        return strict_result("unknown", "unconfirmed_response")
++    message = body.get("message")
++    message = message if isinstance(message, dict) else {}
++    actual = {"chat_id": native_identifier(body.get("channel"), r"D[A-Z0-9]+"),
++              "thread_id": native_identifier(message.get("thread_ts"), r"[0-9]{10,16}\.[0-9]{6}")}
++    message_id = native_identifier(body.get("ts"), r"[0-9]{10,16}\.[0-9]{6}")
++    if (actual != {"chat_id": chat_id, "thread_id": None} or not message_id
++            or message.get("ts") != message_id or message.get("thread_ts") not in (None, "")):
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual, message_id=message_id)
++    return strict_result("sent", target=actual, message_id=message_id)
 diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
-index 73afb13..5b59d98 100644
+index 73afb13..7542326 100644
 --- a/plugins/platforms/telegram/adapter.py
 +++ b/plugins/platforms/telegram/adapter.py
 @@ -369,6 +369,7 @@ class TelegramAdapter(BasePlatformAdapter):
@@ -681,10 +1154,14 @@ index 73afb13..5b59d98 100644
          if not self._bot:
              live = self._replacement_telegram_adapter()
              if live is not None:
-@@ -3383,6 +3388,10 @@ class TelegramAdapter(BasePlatformAdapter):
+@@ -3383,6 +3388,14 @@ class TelegramAdapter(BasePlatformAdapter):
                  retryable=(self._looks_like_connect_timeout(e) or self._looks_like_pool_timeout(e) or not is_timeout),
                  error_kind=error_kind)
  
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
 +    async def send_strict(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
 +        from plugins.platforms.telegram.strict_delivery import send_strict
 +        return await send_strict(self, chat_id, content, thread_id=thread_id)
@@ -694,10 +1171,10 @@ index 73afb13..5b59d98 100644
          """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
 diff --git a/plugins/platforms/telegram/strict_delivery.py b/plugins/platforms/telegram/strict_delivery.py
 new file mode 100644
-index 0000000..c948f90
+index 0000000..76d9233
 --- /dev/null
 +++ b/plugins/platforms/telegram/strict_delivery.py
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,55 @@
 +"""Single plain-text Bot API request, preserving the explicit Telegram target."""
 +
 +from __future__ import annotations
@@ -706,6 +1183,11 @@ index 0000000..c948f90
 +import re
 +
 +from gateway.managed_contracts import strict_result
++
++
++async def ready(adapter):
++    return bool(adapter.is_connected and adapter._bot
++                and not getattr(adapter, "_send_path_degraded", False))
 +
 +
 +async def send_strict(adapter, chat_id: str, content: str, *, thread_id=None):
@@ -723,7 +1205,7 @@ index 0000000..c948f90
 +        return strict_result("not_sent", "invalid_text")
 +    if utf16_length > adapter.MAX_MESSAGE_LENGTH:
 +        return strict_result("not_sent", "text_too_long")
-+    if not adapter.is_connected or not adapter._bot or getattr(adapter, "_send_path_degraded", False):
++    if not await ready(adapter):
 +        return strict_result("not_sent", "live_adapter_unavailable")
 +    kwargs = {"chat_id": int(chat_id), "text": content, "parse_mode": None}
 +    if thread_id is not None and thread_id != adapter._GENERAL_TOPIC_THREAD_ID:
@@ -749,7 +1231,7 @@ index 0000000..c948f90
 +                             message_id=str(message_id) if message_id else None)
 +    return strict_result("sent", target=actual, message_id=str(message_id))
 diff --git a/plugins/platforms/wecom/adapter.py b/plugins/platforms/wecom/adapter.py
-index 383d42a..429e764 100644
+index 383d42a..e417345 100644
 --- a/plugins/platforms/wecom/adapter.py
 +++ b/plugins/platforms/wecom/adapter.py
 @@ -112,6 +112,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
@@ -788,10 +1270,14 @@ index 383d42a..429e764 100644
          if not chat_id:
              return SendResult(success=False, error="chat_id is required")
          metadata = metadata or {}  # pops mutate the caller's dict on purpose (consumed flags)
-@@ -639,6 +645,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
+@@ -639,6 +645,14 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
          force_proactive = bool(metadata.pop("force_proactive_send", False))
          return await self._enqueue_chat_send(chat_id, lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive), is_control=is_control)
  
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
 +    async def send_strict(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
 +        from plugins.platforms.wecom.strict_delivery import send_strict
 +        return await send_strict(self, chat_id, content, thread_id=thread_id)
@@ -801,10 +1287,10 @@ index 383d42a..429e764 100644
          try:
 diff --git a/plugins/platforms/wecom/strict_delivery.py b/plugins/platforms/wecom/strict_delivery.py
 new file mode 100644
-index 0000000..052ec1a
+index 0000000..b5df058
 --- /dev/null
 +++ b/plugins/platforms/wecom/strict_delivery.py
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,87 @@
 +"""One uniquely correlated WeCom DM request on the existing socket; no retries."""
 +
 +from __future__ import annotations
@@ -812,6 +1298,10 @@ index 0000000..052ec1a
 +import asyncio
 +
 +from gateway.managed_contracts import strict_result
++
++
++async def ready(adapter):
++    return bool(adapter.is_connected and adapter._ws and not adapter._ws.closed)
 +
 +
 +async def send_strict(adapter, chat_id: str, content: str, *, thread_id=None):
@@ -831,7 +1321,7 @@ index 0000000..052ec1a
 +    # payload, conservatively bounded by UTF-8 bytes before that helper is used.
 +    if byte_length > adapter.MAX_MESSAGE_LENGTH:
 +        return strict_result("not_sent", "text_too_long")
-+    if not adapter.is_connected or not adapter._ws or adapter._ws.closed:
++    if not await ready(adapter):
 +        return strict_result("not_sent", "live_adapter_unavailable")
 +
 +    cancelled = False
@@ -1361,10 +1851,10 @@ index 0000000..544a9e3
 +        assert Path(inspect.getfile(obj)).resolve().is_relative_to(root)
 diff --git a/website/docs/developer-guide/managed-gateway-contracts.md b/website/docs/developer-guide/managed-gateway-contracts.md
 new file mode 100644
-index 0000000..a903f28
+index 0000000..6c23a23
 --- /dev/null
 +++ b/website/docs/developer-guide/managed-gateway-contracts.md
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,148 @@
 +# Managed gateway contracts
 +
 +These optional interfaces support applications that own a gateway and supply
@@ -1457,6 +1947,24 @@ index 0000000..a903f28
 +WeCom ACK may omit the actual message ID: `message_id` then remains `None`, while
 +`receipt_id` is the correlated request ID. An ACK timeout never triggers a passive
 +or proactive retry. These are transport ACKs, not recipient read receipts.
++
++Feishu, Discord, and Slack support the managed one-to-one, top-level DM flow;
++thread targets fail before sending. Their strict paths perform one message POST
++to a fixed official HTTPS endpoint through `gateway.managed_http`, with verified
++TLS, redirects disabled, a 10-second deadline and a 64 KiB response limit. They
++bypass SDK retries, message splitting, format fallbacks and automatic thread
++creation. Confirmed native chat and message IDs are required. Feishu fetches a
++tenant token for the live adapter and caches it only in memory; authentication
++failure occurs before message delivery. Slack requires exactly one workspace
++token and does not load the standalone multi-workspace token file.
++
++All five adapters expose async `strict_delivery_ready()` to distinguish a
++started background task from a connected transport. Telegram polling degradation
++and a closed WeCom socket remain unready until their existing transport recovers.
++Consumers should wait for readiness before offering pairing. Slack's typed command prefix is `!`, normalized
++through the existing plugin command registry. Managed DM admission allows the
++gateway's pairing hook to see unapproved senders; it does not grant command
++authority. Group DMs, groups, and synthetic interaction requests cannot pair.
 +
 +Adapters expose `send_strict(chat_id, content, *, thread_id=None)` as an optional
 +capability. Legacy `send(..., metadata={"strict_target": True, ...})` also enters
