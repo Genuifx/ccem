@@ -1,13 +1,55 @@
 import { Suspense, lazy, memo, useCallback, useEffect, useState } from 'react';
-import Markdown from 'react-markdown';
+import Markdown, { defaultUrlTransform } from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { invoke } from '@tauri-apps/api/core';
+import type { WorkspaceMediaPreview } from '@/lib/tauri-ipc';
 import { Check, Copy, Maximize2, X } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { getPerformanceMode } from '@/lib/performance';
 import { isMarkdownCodeBlock } from './markdownCodeBlocks';
 import { Dialog, DialogContent, DialogOverlay, DialogPortal } from '@/components/ui/dialog';
+import { useWorkspaceFileLinks } from '@/components/workspace/WorkspaceFileLinkContext';
+import { resolveWorkspaceDocumentLink, workspaceFileLinkPath } from '@/components/workspace/workspaceFileLinks';
+
+function MarkdownLink({ href, children, className }: React.ComponentProps<'a'>) {
+  const workspace = useWorkspaceFileLinks();
+  const path = href ? workspaceFileLinkPath(href) : null;
+  if (path && workspace) {
+    return <a href={href} className={className} data-ccem-file-link onClick={(event) => {
+      event.preventDefault();
+      workspace.openFile(resolveWorkspaceDocumentLink(path, /^ccem-file:|^file:/i.test(href!) ? undefined : workspace.documentPath));
+    }}>{children}</a>;
+  }
+  if (/^(?:ccem-file|file):/i.test(href ?? '')) return <span className={className}>{children}</span>;
+  return <a href={href} target={href?.startsWith('#') ? undefined : '_blank'} rel="noopener noreferrer" className={className}>{children}</a>;
+}
+
+function workspaceMarkdownUrlTransform(url: string, key: string) {
+  if (key === 'href' && workspaceFileLinkPath(url)) return url;
+  if (key === 'src' && /^file:/i.test(url) && workspaceFileLinkPath(url)) return url;
+  return defaultUrlTransform(url);
+}
+
+function WorkspaceMarkdownImage(props: React.ComponentProps<typeof MarkdownImage>) {
+  const workspace = useWorkspaceFileLinks();
+  const localPath = workspace?.workingDir && props.src ? workspaceFileLinkPath(props.src) : null;
+  const path = localPath ? resolveWorkspaceDocumentLink(localPath, workspace?.documentPath) : null;
+  const [preview, setPreview] = useState<{ path: string; root: string; src: string | null } | null>(null);
+  const root = workspace?.workingDir;
+  useEffect(() => {
+    if (!path || !root) return;
+    let cancelled = false;
+    void invoke<WorkspaceMediaPreview>('get_workspace_media_preview', { workingDir: root, filePath: path })
+      .then((result) => { if (!cancelled) setPreview({ path, root, src: result.kind === 'image' ? result.data_url ?? null : null }); })
+      .catch(() => { if (!cancelled) setPreview({ path, root, src: null }); });
+    return () => { cancelled = true; };
+  }, [path, root]);
+  if (!path) return <MarkdownImage {...props} />;
+  if (!preview || preview.path !== path || preview.root !== root || !preview.src) return <span className="text-xs text-muted-foreground">{props.alt || localPath}</span>;
+  return <MarkdownImage {...props} src={preview.src} />;
+}
 
 interface MarkdownRendererProps {
   content: string;
@@ -503,17 +545,15 @@ function getMarkdownComponents(
 
           // Links
           a: ({ href, children }) => (
-            <a
+            <MarkdownLink
               href={href}
-              target="_blank"
-              rel="noopener noreferrer"
               className={cn(
                 'underline-offset-2',
                 isUser ? 'text-white/90' : 'text-primary hover:underline'
               )}
             >
               {children}
-            </a>
+            </MarkdownLink>
           ),
 
           // Blockquote
@@ -613,7 +653,7 @@ function getMarkdownComponents(
 
           // Images — clickable to open lightbox
           img: ({ src, alt, width, height }) => (
-            <MarkdownImage src={src} alt={alt} width={width} height={height} isUser={isUser} />
+            <WorkspaceMarkdownImage src={src} alt={alt} width={width} height={height} isUser={isUser} />
           ),
   };
 
@@ -637,6 +677,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
     <div className={cn('markdown-content', className)}>
       <Markdown
         remarkPlugins={REMARK_PLUGINS}
+        urlTransform={workspaceMarkdownUrlTransform}
         components={components}
       >
         {content}

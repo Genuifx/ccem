@@ -181,6 +181,7 @@ import {
   foldSessionUsageEvents,
   type SessionUsageFold,
 } from './workspaceUsage';
+import { useWorkspaceSidePanel } from './WorkspaceSidePanel';
 import { LazyWorkspaceReviewPopover } from './LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
@@ -1595,6 +1596,8 @@ export function WorkspaceNativeSessionView({
   const setReviewPanelOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
   const isReviewPopoverOpen = isVisible && reviewPanelOpen;
+  const sidePanel = useWorkspaceSidePanel();
+  const isReviewDetailOpen = isVisible && (sidePanel?.tab === 'files' || sidePanel?.tab === 'agents');
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [isRefreshingGitSnapshot, setIsRefreshingGitSnapshot] = useState(false);
   const [respondingRequestId, setRespondingRequestId] = useState<string | null>(null);
@@ -2368,7 +2371,7 @@ export function WorkspaceNativeSessionView({
         consumedCount: events.length,
         fold,
       };
-      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot);
+      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir);
     }
     const selection = selectEventAppendRange(
       events,
@@ -2396,11 +2399,11 @@ export function WorkspaceNativeSessionView({
     }
     // Idle: reuse the fold (pruned head is already accounted for). The git
     // snapshot only participates in assembly, so git refreshes never refold.
-    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot);
-  }, [events, gitSnapshot]);
+    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir);
+  }, [events, gitSnapshot, session.project_dir]);
   const reviewModel = useMemo(
     () => {
-      if (!isReviewPopoverOpen) {
+      if (!isReviewPopoverOpen && !isReviewDetailOpen) {
         return null;
       }
 
@@ -2409,9 +2412,10 @@ export function WorkspaceNativeSessionView({
         events,
         messages,
         gitSnapshot,
+        eventFold: reviewFoldRef.current?.fold,
       });
     },
-    [events, gitSnapshot, isReviewPopoverOpen, messages, session],
+    [events, gitSnapshot, isReviewPopoverOpen, isReviewDetailOpen, messages, session],
   );
 
   // Publish review summary to the status-strip entry pill while this live session owns the view.
@@ -2536,7 +2540,7 @@ export function WorkspaceNativeSessionView({
       return;
     }
 
-    const delay = isReviewPopoverOpen ? 250 : 1200;
+    const delay = isReviewPopoverOpen || isReviewDetailOpen ? 250 : 1200;
     const timeoutId = window.setTimeout(() => {
       void refreshGitSnapshot();
     }, delay);
@@ -2547,6 +2551,7 @@ export function WorkspaceNativeSessionView({
   }, [
     events.length,
     isReviewPopoverOpen,
+    isReviewDetailOpen,
     isVisible,
     refreshGitSnapshot,
     session.status,
@@ -4347,7 +4352,7 @@ export function WorkspaceNativeSessionView({
   return (
     <>
     <div className="relative flex h-full min-h-0 flex-col">
-      {isReviewPopoverOpen && reviewModel ? (
+      {(isReviewPopoverOpen || isReviewDetailOpen) && reviewModel ? (
         <Suspense fallback={null}>
           <LazyWorkspaceReviewPopover
             key={`${session.runtime_id}:${session.project_dir}`}

@@ -438,7 +438,7 @@ test('uses structured Codex file_change summaries as SDK file evidence', async (
   assert.equal(model.artifacts.find((artifact) => artifact.path === 'docs/result.json')?.kind, 'json');
 });
 
-test('attaches git-only changed files to the latest mutating tool candidate', async () => {
+test('does not attribute git-only changes to an unrelated shell tool', async () => {
   const { buildWorkspaceReviewModel } = await importWorkspaceReview();
   const model = buildWorkspaceReviewModel({
     session: session(),
@@ -469,8 +469,8 @@ test('attaches git-only changed files to the latest mutating tool candidate', as
   });
 
   assert.equal(model.changedFiles[0].source, 'git');
-  assert.deepEqual(model.changedFiles[0].toolUseIds, ['bash-1']);
-  assert.deepEqual(model.artifacts[0].toolUseIds, ['bash-1']);
+  assert.deepEqual(model.changedFiles[0].toolUseIds, []);
+  assert.deepEqual(model.artifacts[0].toolUseIds, []);
 });
 
 test('recognizes expected artifact file types from changed files', async () => {
@@ -576,4 +576,26 @@ test('selection loss clears history events and prevents stale review publication
     source,
     /const workspaceReviewEvents = useMemo\([\s\S]*workspaceMode === 'history' && selectedSession[\s\S]*\? historyEvents[\s\S]*: \[\],[\s\S]*\[historyEvents, selectedSession, workspaceMode\]/,
   );
+});
+
+test('file evidence excludes reads and failed writes, deduplicates paths, and ignores result prose', async () => {
+  const { buildWorkspaceReviewModel, foldWorkspaceReviewEvents, buildWorkspaceReviewSummaryFromFold } = await importWorkspaceReview();
+  const start = (seq, id, name, path) => event(seq, { type: 'tool_use_started', tool_use_id: id, raw_name: name, input_summary: path, category: { category: 'file_op' } });
+  const end = (seq, id, name, success, result) => event(seq, { type: 'tool_use_completed', tool_use_id: id, raw_name: name, success, result_summary: result });
+  const events = [
+    start(1, 'read', 'Read', 'read.md'),
+    start(2, 'bad', 'Write', 'failed.md'), end(3, 'bad', 'Write', false, 'Denied'),
+    start(4, 'write', 'Write', '/repo/docs/my report.md'),
+    end(5, 'write', 'Write', true, 'File created successfully at: /repo/docs/my report.md'),
+  ];
+  const gitSnapshot = { is_repo: true, root: '/repo', files: [{ path: 'docs/my report.md', status: 'M' }, { path: 'manual.md', status: 'M' }] };
+  const fold = foldWorkspaceReviewEvents(null, events);
+  const model = buildWorkspaceReviewModel({ session: session(), events: [], messages: [], gitSnapshot, eventFold: fold });
+  assert.deepEqual(model.changedFiles.map(file => [file.path, file.source]), [['docs/my report.md', 'matched'], ['manual.md', 'git']]);
+  assert.deepEqual(model.changedFiles[1].toolUseIds, []);
+  assert.equal(buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, '/repo').changedFiles, model.changedFiles.length, 'retained fold survives event pruning');
+  const earlier = foldWorkspaceReviewEvents(null, events.slice(0, 2));
+  const later = foldWorkspaceReviewEvents(earlier, events.slice(2));
+  assert.equal(earlier.tools.get('bad').success, undefined, 'append does not mutate an earlier fold');
+  assert.equal(later.tools.get('bad').success, false);
 });

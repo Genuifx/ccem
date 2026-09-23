@@ -2396,6 +2396,7 @@ fn parse_claude_conversation_file(
         }
 
         if msg_type == "user" {
+            strip_internal_tips_from_user_content(&mut content);
             let Some(normalized_content) = normalize_claude_user_content(&content) else {
                 continue;
             };
@@ -2476,6 +2477,26 @@ fn append_claude_meta_images_to_parent(messages: &mut [ConversationMessage], par
     };
     combined.extend(images);
     parent.content = serde_json::Value::Array(combined);
+}
+
+fn strip_internal_tips_from_user_content(content: &mut serde_json::Value) {
+    match content {
+        serde_json::Value::String(text) => {
+            if crate::user_prompt_display::strip_internal_system_tips(text) != text.as_str() {
+                *text = crate::user_prompt_display::normalize_user_visible_prompt(text).unwrap_or_default();
+            }
+        }
+        serde_json::Value::Array(blocks) => {
+            for block in blocks {
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                    if let Some(text) = block.get_mut("text") {
+                        strip_internal_tips_from_user_content(text);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_claude_user_content(content: &serde_json::Value) -> Option<serde_json::Value> {
@@ -3740,8 +3761,11 @@ fn push_message(
     messages: &mut Vec<ConversationMessage>,
     segments: &mut [CompactSegment],
     current_segment: usize,
-    message: ConversationMessage,
+    mut message: ConversationMessage,
 ) {
+    if message.msg_type == "user" {
+        strip_internal_tips_from_user_content(&mut message.content);
+    }
     if let Some(seg) = segments.get_mut(current_segment) {
         seg.message_count += 1;
     }
@@ -6045,6 +6069,34 @@ mod tests {
         assert_eq!(meta.result_summary.as_deref(), Some("Done\nagentId: a123"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_preview_prompt_guidance_is_hidden_in_claude_and_codex_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = crate::prepare_workspace_initial_prompt("请生成报告", true);
+        let image = serde_json::json!({ "type": "image", "source": { "type": "base64", "data": "image-data", "media_type": "image/png" } });
+        let claude = temp.path().join("claude.jsonl");
+        let lines = [
+            serde_json::json!({ "type": "user", "uuid": "user-one", "message": { "content": [{ "type": "text", "text": prompt }, image.clone()] } }),
+            serde_json::json!({ "type": "assistant", "uuid": "assistant-one", "message": { "content": prompt } }),
+        ];
+        fs::write(&claude, lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+        let (messages, _) = parse_claude_conversation_file(&claude).unwrap();
+        assert_eq!(messages[0].content[0]["text"], "请生成报告");
+        assert_eq!(messages[0].content[1], image, "attached images remain intact");
+        assert_eq!(messages[1].content, prompt, "assistant content is never stripped");
+
+        let codex = temp.path().join("codex.jsonl");
+        // Exercise both supported Codex transcript formats.
+        for line in [
+            serde_json::json!({ "type": "event_msg", "payload": { "type": "user_message", "message": prompt } }),
+            serde_json::json!({ "type": "response_item", "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": prompt }] } }),
+        ] {
+            fs::write(&codex, line.to_string()).unwrap();
+            let (messages, _) = super::parse_codex_conversation_file(&codex).unwrap();
+            assert_eq!(messages[0].content[0]["text"], "请生成报告");
+        }
     }
 
     #[test]

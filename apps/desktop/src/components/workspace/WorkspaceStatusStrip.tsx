@@ -485,8 +485,8 @@ export function WorkspaceStatusStrip({
         <button
           type="button"
           data-ccem-workspace-browser-toggle="true"
-          aria-label={t(browserOpen ? 'workspace.browserClose' : 'workspace.browserOpen')}
-          title={t(browserOpen ? 'workspace.browserClose' : 'workspace.browserOpen')}
+          aria-label={t(browserOpen ? 'workspace.sidePanelClose' : 'workspace.sidePanelOpen')}
+          title={t(browserOpen ? 'workspace.sidePanelClose' : 'workspace.sidePanelOpen')}
           onClick={onToggleBrowser}
           className={cn(
             'group relative inline-flex h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none items-center justify-center rounded-full p-0',

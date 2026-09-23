@@ -68,6 +68,7 @@ mod wecom;
 mod weixin;
 mod workspace_decorations;
 mod workspace_search;
+mod workspace_file_preview;
 
 #[cfg(target_os = "windows")]
 mod windows_bootstrap;
@@ -1309,15 +1310,23 @@ fn debug_compare_sessions(
     unified_state.debug_compare_sessions()
 }
 
-fn prepend_write_tool_limit_system_tip(initial_prompt: &str, limit_write_tools: bool) -> String {
-    if !limit_write_tools {
+fn prepare_workspace_initial_prompt(initial_prompt: &str, limit_write_tools: bool) -> String {
+    // A guidance-only prompt must not start an otherwise empty session turn.
+    if initial_prompt.trim().is_empty() {
         return initial_prompt.to_string();
     }
-
-    format!(
-        "<system_tip>{}</system_tip>\n\n{initial_prompt}",
-        user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP,
-    )
+    let mut prompt = format!(
+        "<system_tip>{}</system_tip>\n\n",
+        user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+    );
+    if limit_write_tools {
+        prompt.push_str(&format!(
+            "<system_tip>{}</system_tip>\n\n",
+            user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP,
+        ));
+    }
+    prompt.push_str(initial_prompt);
+    prompt
 }
 
 #[tauri::command]
@@ -1417,7 +1426,7 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode.clone(),
                 working_dir: effective_working_dir,
-                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                initial_prompt: Some(prepare_workspace_initial_prompt(
                     &initial_prompt,
                     resolved.limit_write_tools,
                 )),
@@ -1452,7 +1461,7 @@ async fn create_native_session(
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode,
                 working_dir: effective_working_dir,
-                initial_prompt: Some(prepend_write_tool_limit_system_tip(
+                initial_prompt: Some(prepare_workspace_initial_prompt(
                     &initial_prompt,
                     resolved.limit_write_tools,
                 )),
@@ -4300,7 +4309,13 @@ struct WorkspaceGitSnapshot {
 }
 
 fn run_git_command(working_dir: &str, args: &[&str]) -> Result<String, String> {
+    run_git_command_raw(working_dir, args).map(|output| output.trim().to_string())
+}
+
+fn run_git_command_raw(working_dir: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
+        .arg("--literal-pathspecs")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(working_dir)
         .args(args)
@@ -4308,7 +4323,7 @@ fn run_git_command(working_dir: &str, args: &[&str]) -> Result<String, String> {
         .map_err(|error| format!("Failed to run git: {}", error))?;
 
     if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -4319,66 +4334,36 @@ fn run_git_command(working_dir: &str, args: &[&str]) -> Result<String, String> {
     })
 }
 
-fn normalize_git_changed_path(raw_path: &str) -> String {
-    let path = raw_path.trim().trim_matches('"');
-
-    if let Some(open_brace_index) = path.find('{') {
-        if let Some(close_brace_offset) = path[open_brace_index + 1..].find('}') {
-            let close_brace_index = open_brace_index + 1 + close_brace_offset;
-            let inner = &path[open_brace_index + 1..close_brace_index];
-            if let Some((_, new_name)) = inner.rsplit_once(" => ") {
-                return format!(
-                    "{}{}{}",
-                    &path[..open_brace_index],
-                    new_name.trim().trim_matches('"'),
-                    &path[close_brace_index + 1..],
-                );
-            }
-        }
+fn parse_git_status(output: &str) -> Vec<(String, String)> {
+    let mut records = output.split('\0');
+    let mut files = Vec::new();
+    while let Some(record) = records.next() {
+        let Some(status) = record.get(..2) else { continue; };
+        let Some(path) = record.get(3..).filter(|path| !path.is_empty()) else { continue; };
+        files.push((path.to_string(), status.trim().to_string()));
+        // Porcelain -z puts the destination first, then the original path.
+        if status.contains('R') || status.contains('C') { records.next(); }
     }
-
-    path.rsplit_once(" -> ")
-        .or_else(|| path.rsplit_once(" => "))
-        .map(|(_, new_path)| new_path.trim().trim_matches('"').to_string())
-        .unwrap_or_else(|| path.to_string())
-}
-
-fn parse_git_status_line(line: &str) -> Option<(String, String)> {
-    if line.len() < 4 {
-        return None;
-    }
-    let status = line.get(0..2)?.trim().to_string();
-    let raw_path = line.get(3..)?.trim();
-    let path = normalize_git_changed_path(raw_path);
-    if path.is_empty() {
-        return None;
-    }
-    Some((path, status))
-}
-
-fn parse_numstat_value(value: &str) -> Option<u64> {
-    value.parse::<u64>().ok()
+    files
 }
 
 fn merge_git_numstat(files: &mut HashMap<String, WorkspaceGitChangedFile>, output: &str) {
-    for line in output.lines() {
-        let mut parts = line.splitn(3, '\t');
-        let additions = parts.next().and_then(parse_numstat_value);
-        let deletions = parts.next().and_then(parse_numstat_value);
-        let Some(raw_path) = parts.next().map(str::trim).filter(|path| !path.is_empty()) else {
-            continue;
-        };
-        let path = normalize_git_changed_path(raw_path);
-        let entry = files
-            .entry(path.clone())
-            .or_insert_with(|| WorkspaceGitChangedFile {
-                path: path.clone(),
-                status: "M".to_string(),
-                additions: None,
-                deletions: None,
-            });
-        entry.additions = Some(entry.additions.unwrap_or(0) + additions.unwrap_or(0));
-        entry.deletions = Some(entry.deletions.unwrap_or(0) + deletions.unwrap_or(0));
+    let mut records = output.split('\0');
+    while let Some(record) = records.next() {
+        let mut parts = record.splitn(3, '\t');
+        let additions = parts.next().and_then(|value| value.parse::<u64>().ok());
+        let deletions = parts.next().and_then(|value| value.parse::<u64>().ok());
+        let Some(mut path) = parts.next() else { continue; };
+        if path.is_empty() {
+            records.next(); // old rename path
+            let Some(destination) = records.next() else { continue; };
+            path = destination;
+        }
+        // Status is authoritative. Numstat must not invent another file.
+        if let Some(entry) = files.get_mut(path) {
+            entry.additions = additions.map(|value| entry.additions.unwrap_or(0) + value);
+            entry.deletions = deletions.map(|value| entry.deletions.unwrap_or(0) + value);
+        }
     }
 }
 
@@ -4423,27 +4408,21 @@ fn get_workspace_git_snapshot(working_dir: String) -> Result<WorkspaceGitSnapsho
     )
     .ok();
 
+    let working = std::path::Path::new(&working_dir).canonicalize().map_err(|error| error.to_string())?;
+    let root_path = std::path::Path::new(&root).canonicalize().map_err(|error| error.to_string())?;
+    let prefix = working.strip_prefix(&root_path).map_err(|error| error.to_string())?;
     let mut files = HashMap::new();
-    if let Ok(status_output) = run_git_command(&working_dir, &["status", "--porcelain=v1"]) {
-        for line in status_output.lines() {
-            if let Some((path, status)) = parse_git_status_line(line) {
-                files.insert(
-                    path.clone(),
-                    WorkspaceGitChangedFile {
-                        path,
-                        status,
-                        additions: None,
-                        deletions: None,
-                    },
-                );
-            }
-        }
+    let status_output = run_git_command_raw(&working_dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."])?;
+    for (repo_path, status) in parse_git_status(&status_output) {
+        let Ok(relative) = std::path::Path::new(&repo_path).strip_prefix(prefix) else { continue; };
+        let path = relative.to_string_lossy().to_string();
+        files.insert(path.clone(), WorkspaceGitChangedFile { path, status, additions: None, deletions: None });
     }
-
-    if let Ok(output) = run_git_command(&working_dir, &["diff", "--numstat"]) {
-        merge_git_numstat(&mut files, &output);
-    }
-    if let Ok(output) = run_git_command(&working_dir, &["diff", "--cached", "--numstat"]) {
+    for args in [
+        vec!["diff", "--numstat", "-z", "--relative", "--no-ext-diff", "--no-textconv", "--", "."],
+        vec!["diff", "--cached", "--numstat", "-z", "--relative", "--no-ext-diff", "--no-textconv", "--", "."],
+    ] {
+        let output = run_git_command_raw(&working_dir, &args)?;
         merge_git_numstat(&mut files, &output);
     }
 
@@ -4631,37 +4610,27 @@ fn get_workspace_file_diff(
         Err(error) => return Ok(not_repo(Some(error))),
     }
 
-    // Detect untracked files — they have no HEAD/index entry, so use --no-index against /dev/null.
-    let status = run_git_command(
-        &working_dir,
-        &["status", "--porcelain=v1", "--", &file_path],
-    )
-    .unwrap_or_default();
-    let is_untracked = status.lines().any(|line| line.starts_with("??"));
-
-    let raw = if is_untracked {
-        // --no-index exits non-zero when files differ, so tolerate the error and use stdout.
+    // Canonicalize to enforce the boundary, but preserve the leaf symlink's
+    // identity when asking Git for its changes.
+    resolve_workspace_path(&working_dir, &file_path)?;
+    let absolute_path = std::path::Path::new(&working_dir).join(&file_path);
+    let absolute = absolute_path.to_string_lossy();
+    let status = run_git_command_raw(
+        &working_dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", &absolute],
+    )?;
+    let is_untracked = parse_git_status(&status).iter().any(|(_, status)| status == "??");
+    let has_head = run_git_command(&working_dir, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let raw = if is_untracked || !has_head {
         let output = Command::new("git")
-            .arg("-C")
-            .arg(&working_dir)
-            .args([
-                "diff",
-                "--no-color",
-                "--no-index",
-                "--",
-                "/dev/null",
-                &file_path,
-            ])
-            .output()
-            .map_err(|error| format!("Failed to run git: {}", error))?;
+            .arg("--literal-pathspecs").arg("-C").arg(&working_dir)
+            .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-index", "--", "/dev/null", &absolute])
+            .output().map_err(|error| format!("Failed to run git: {}", error))?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
         String::from_utf8_lossy(&output.stdout).to_string()
     } else {
-        run_git_command(
-            &working_dir,
-            &["diff", "--no-color", "HEAD", "--", &file_path],
-        )
-        .or_else(|_| run_git_command(&working_dir, &["diff", "--no-color", "--", &file_path]))
-        .unwrap_or_default()
+        run_git_command_raw(&working_dir, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD", "--", &absolute])?
     };
 
     let (lines, additions, deletions, is_binary, truncated) =
@@ -6161,6 +6130,7 @@ pub fn run_desktop_app() -> i32 {
             clear_proxy_traffic,
             get_workspace_git_snapshot,
             get_workspace_file_diff,
+            workspace_file_preview::get_workspace_file_preview,
             get_workspace_media_preview,
             open_file_in_workspace,
             open_text_in_vscode,
@@ -6570,14 +6540,17 @@ mod tests {
     use super::{
         build_remote_load_args, build_remote_load_stdin_payload,
         collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
-        normalize_git_changed_path, parse_git_status_line, prepend_write_tool_limit_system_tip,
+        parse_git_status, prepare_workspace_initial_prompt,
         RemoteEnvConfig, WorkspaceGitChangedFile,
     };
     use crate::router::{
         rename_router_config_environment, router_config_environment_references, RouterConfig,
         RouterProfile,
     };
-    use crate::user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP;
+    use crate::user_prompt_display::{
+        normalize_user_visible_prompt, WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+        WRITE_TOOL_LIMIT_SYSTEM_TIP,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -6658,13 +6631,32 @@ mod tests {
     }
 
     #[test]
-    fn write_tool_limit_tip_is_prefixed_only_when_enabled() {
+    fn workspace_initial_prompt_includes_preview_guidance_and_optional_write_limit() {
         let prompt = "Update the configuration";
-        assert_eq!(
-            prepend_write_tool_limit_system_tip(prompt, true),
-            format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{prompt}"),
-        );
-        assert_eq!(prepend_write_tool_limit_system_tip(prompt, false), prompt);
+        for limit_write_tools in [false, true] {
+            let prepared = prepare_workspace_initial_prompt(prompt, limit_write_tools);
+            assert!(prepared.starts_with(&format!(
+                "<system_tip>{WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>\n\n"
+            )));
+            assert_eq!(prepared.contains(WRITE_TOOL_LIMIT_SYSTEM_TIP), limit_write_tools);
+            assert!(prepared.ends_with(prompt));
+            assert_eq!(
+                normalize_user_visible_prompt(&prepared),
+                Some(prompt.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_initial_prompt_does_not_start_guidance_only_turns() {
+        for prompt in ["", " \n\t"] {
+            for limit_write_tools in [false, true] {
+                assert_eq!(
+                    prepare_workspace_initial_prompt(prompt, limit_write_tools),
+                    prompt
+                );
+            }
+        }
     }
 
     #[test]
@@ -6731,53 +6723,24 @@ mod tests {
     }
 
     #[test]
-    fn git_status_parser_keeps_final_rename_path() {
+    fn git_status_parser_keeps_paths_and_rename_destination() {
         assert_eq!(
-            parse_git_status_line("R  old/path.txt -> new/path.txt"),
-            Some(("new/path.txt".to_string(), "R".to_string()))
-        );
-        assert_eq!(
-            parse_git_status_line("?? docs/report.html"),
-            Some(("docs/report.html".to_string(), "??".to_string()))
+            parse_git_status(" M alpha.txt\0R  new/报告.md\0old/path.txt\0?? outputs/my report.md\0"),
+            vec![("alpha.txt".into(), "M".into()), ("new/报告.md".into(), "R".into()), ("outputs/my report.md".into(), "??".into())]
         );
     }
 
     #[test]
-    fn git_changed_path_normalizes_numstat_rename_syntax() {
-        assert_eq!(
-            normalize_git_changed_path("src/{old_name.rs => new_name.rs}"),
-            "src/new_name.rs"
-        );
-        assert_eq!(
-            normalize_git_changed_path("old/path.txt => new/path.txt"),
-            "new/path.txt"
-        );
-    }
-
-    #[test]
-    fn git_numstat_merges_worktree_and_cached_counts() {
-        let mut files = HashMap::from([(
-            "src/app.ts".to_string(),
-            WorkspaceGitChangedFile {
-                path: "src/app.ts".to_string(),
-                status: "M".to_string(),
-                additions: None,
-                deletions: None,
-            },
-        )]);
-
-        merge_git_numstat(
-            &mut files,
-            "2\t1\tsrc/app.ts\n-\t-\tassets/{old.png => logo.png}",
-        );
-        merge_git_numstat(&mut files, "3\t4\tsrc/app.ts");
-
+    fn git_numstat_merges_worktree_and_cached_counts_without_inventing_files() {
+        let mut files = HashMap::from([("src/app.ts".to_string(), WorkspaceGitChangedFile {
+            path: "src/app.ts".to_string(), status: "M".to_string(), additions: None, deletions: None,
+        })]);
+        merge_git_numstat(&mut files, "2\t1\tsrc/app.ts\0-\t-\t\0assets/old.png\0assets/logo.png\0");
+        merge_git_numstat(&mut files, "3\t4\tsrc/app.ts\0");
         let app = files.get("src/app.ts").unwrap();
         assert_eq!(app.additions, Some(5));
         assert_eq!(app.deletions, Some(5));
-        let logo = files.get("assets/logo.png").unwrap();
-        assert_eq!(logo.additions, Some(0));
-        assert_eq!(logo.deletions, Some(0));
+        assert_eq!(files.len(), 1);
     }
 
     #[test]

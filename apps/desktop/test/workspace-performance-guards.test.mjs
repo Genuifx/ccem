@@ -27,13 +27,13 @@ test('workspace review popover stays lazy and only mounts while open', async () 
   );
   assert.match(
     workspace,
-    /shouldRenderWorkspaceReview && workspaceReviewOpen && workspaceReviewModel/,
-    'Workspace page should only mount the lazy popover when the review panel is open',
+    /shouldRenderWorkspaceReview && \(workspaceReviewOpen \|\| sidePanelDetailOpen\) && workspaceReviewModel/,
+    'Workspace page should only mount the lazy review UI when its popover or side panel detail is open',
   );
   assert.match(
     nativeView,
-    /isReviewPopoverOpen && reviewModel/,
-    'Native session view should only mount the lazy popover when the review panel is open',
+    /\(isReviewPopoverOpen \|\| isReviewDetailOpen\) && reviewModel/,
+    'Native session view should only mount the lazy review UI when its popover or side panel detail is open',
   );
 
   assert.match(

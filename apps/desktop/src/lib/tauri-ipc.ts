@@ -160,6 +160,7 @@ export interface TauriCommands {
   ];
   get_workspace_git_snapshot: [{ workingDir: string }, WorkspaceGitSnapshot];
   get_workspace_file_diff: [{ workingDir: string; filePath: string }, WorkspaceFileDiff];
+  get_workspace_file_preview: [{ workingDir: string; filePath: string }, WorkspaceFilePreview];
   get_workspace_media_preview: [
     { workingDir: string; filePath: string },
     WorkspaceMediaPreview,
@@ -1239,6 +1240,14 @@ export interface WorkspaceFileDiff {
   lines: WorkspaceDiffLine[];
   truncated: boolean;
   error?: string | null;
+}
+
+export interface WorkspaceFilePreview {
+  path: string;
+  content: string;
+  byte_size: number;
+  is_binary: boolean;
+  truncated: boolean;
 }
 
 export type WorkspaceMediaKind = 'image' | 'audio' | 'video' | 'unsupported';

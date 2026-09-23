@@ -57,6 +57,8 @@ import {
   type WorkspaceEscapeCommandIdentity,
 } from '@/pages/workspaceEscape';
 import type { RouterLaunchDraft } from '@ccem/core/browser';
+import { WorkspaceSidePanel, WorkspaceSidePanelContext, useWorkspaceSidePanelController } from '@/components/workspace/WorkspaceSidePanel';
+import { WorkspaceFileLinkContext } from '@/components/workspace/WorkspaceFileLinkContext';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { useNativeBrowserActivation } from '@/components/workspace/useNativeBrowserActivation';
 import { ComposerControls } from '@/components/workspace/ComposerControls';
@@ -156,8 +158,6 @@ import {
 } from '@/components/workspace/workspaceLiveSessions';
 import {
   BROWSER_PANEL_DEFAULT_WIDTH_PERCENT,
-  BROWSER_PANEL_MAX_WIDTH_PERCENT,
-  BROWSER_PANEL_MIN_WIDTH_PX,
   BROWSER_PANEL_WIDTH_STORAGE_KEY,
   calculateBrowserPanelWidthPercent,
   clampBrowserPanelWidthPercent,
@@ -170,7 +170,6 @@ import {
   retireBrowserPanelTargetForWorkingDirChange,
   resolveActiveBrowserAgentSessionId,
   resolveHistoryBrowserAgentSessionId,
-  toggleDefaultBrowserPanelTarget,
   WORKSPACE_BROWSER_COMPOSE_SESSION_ID,
 } from '@/components/workspace/browserPanelTarget';
 import { createBrowserPresentationRevisionAllocator } from '@/components/workspace/browserPresentationRevision';
@@ -1545,8 +1544,15 @@ export function Workspace({
     ? activeBrowserTarget
     : null;
   const browserPanelOpen = activeVisibleBrowserTarget !== null;
+  const sidePanelWorkingDir = workspaceMode === 'live'
+    ? activeLiveEntry?.session.project_dir ?? ''
+    : workspaceMode === 'history' ? selectedSession?.project ?? '' : composeDir || selectedWorkingDir || defaultWorkingDir || '';
+  const sidePanel = useWorkspaceSidePanelController(`${activeBrowserSessionId}:${sidePanelWorkingDir}`, browserPanelOpen);
+  const sidePanelOpen = sidePanel.tab !== null;
+  const sidePanelDetailOpen = isActive && (sidePanel.tab === 'files' || sidePanel.tab === 'agents');
   const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
   const browserSurfaceOccluded = !isActive
+    || sidePanel.tab !== 'browser'
     || isGlobalSearchOpen
     || nativeSurfaceModalOccluded;
   const presentationSurfaceSessionId = activeBrowserTarget?.surfaceSessionId
@@ -1566,6 +1572,7 @@ export function Workspace({
       runtimeId: session.runtime_id,
     }),
     reveal: (session, ownerSessionId) => {
+      const restoreSidePanel = sidePanel.revealBrowser(`${ownerSessionId}:${session.project_dir}`);
       upsertLiveSessionEntry(session);
       const previousTarget = browserTargetBySessionIdRef.current[ownerSessionId];
       const targets = updateBrowserPanelTargets((previous) => openDefaultBrowserPanelTarget(
@@ -1580,8 +1587,9 @@ export function Workspace({
       }
       onNavigate('workspace');
       const revealedTarget = targets[ownerSessionId];
-      if (!revealedTarget || revealedTarget === previousTarget) return;
       return () => {
+        restoreSidePanel();
+        if (!revealedTarget || revealedTarget === previousTarget) return;
         updateBrowserPanelTargets((current) => {
           const target = current[ownerSessionId];
           // A late native cancellation cannot remove a manually reopened instance.
@@ -1596,6 +1604,7 @@ export function Workspace({
   });
 
   const closeBrowserPanel = useCallback((sessionId: string) => {
+    sidePanel.close();
     browserActivation.cancel(sessionId, true);
     updateBrowserPanelTargets((previous) => {
       if (!previous[sessionId]) return previous;
@@ -1603,26 +1612,39 @@ export function Workspace({
       delete next[sessionId];
       return next;
     });
-  }, [browserActivation, updateBrowserPanelTargets]);
+  }, [browserActivation, sidePanel.close, updateBrowserPanelTargets]);
 
-  const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
+  const selectActiveBrowser = useCallback((workingDir: string | null | undefined) => {
     if (!browserWorkspaceReady) return;
     if (!workingDir?.trim()) {
       toast.error(t('workspace.loginBrowserNeedsWorkspace'));
       return;
     }
+    sidePanel.open('browser');
     const target = browserTargetBySessionIdRef.current[activeBrowserSessionId];
-    if (isBrowserPanelTargetVisible(target)) browserActivation.cancel(activeBrowserSessionId, true);
-    else browserActivation.reopen(activeBrowserSessionId, !target);
-    updateBrowserPanelTargets((previous) => {
-      return toggleDefaultBrowserPanelTarget(
-        previous,
-        activeBrowserSessionId,
-        workingDir,
-        () => browserPanelInstanceSeqRef.current += 1,
-      );
-    });
-  }, [activeBrowserSessionId, browserActivation, browserWorkspaceReady, t, updateBrowserPanelTargets]);
+    browserActivation.reopen(activeBrowserSessionId, !target);
+    updateBrowserPanelTargets((previous) => openDefaultBrowserPanelTarget(
+      previous, activeBrowserSessionId, workingDir,
+      () => browserPanelInstanceSeqRef.current += 1,
+    ));
+  }, [activeBrowserSessionId, browserActivation, browserWorkspaceReady, sidePanel.open, t, updateBrowserPanelTargets]);
+  const closeSidePanel = useCallback(() => {
+    browserActivation.cancel(activeBrowserSessionId, true);
+    sidePanel.close();
+  }, [activeBrowserSessionId, browserActivation, sidePanel.close]);
+  const userSidePanel = useMemo(() => ({
+    ...sidePanel,
+    close: closeSidePanel,
+    open: (tab: 'browser' | 'files' | 'agents', filePath?: string) => {
+      if (tab !== 'browser') browserActivation.cancel(activeBrowserSessionId, true);
+      return sidePanel.open(tab, filePath);
+    },
+  }), [sidePanel, closeSidePanel, activeBrowserSessionId, browserActivation]);
+  const fileLinkTarget = useMemo(() => ({ workingDir: sidePanelWorkingDir, openFile: (path: string) => userSidePanel.open('files', path) }), [sidePanelWorkingDir, userSidePanel.open]);
+  const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
+    if (sidePanelOpen) closeSidePanel();
+    else selectActiveBrowser(workingDir);
+  }, [sidePanelOpen, closeSidePanel, selectActiveBrowser]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
@@ -2014,12 +2036,13 @@ export function Workspace({
     () => buildWorkspaceReviewSummary({
       events: workspaceReviewEvents,
       gitSnapshot: workspaceGitSnapshot,
+      workingDir: workspaceReviewWorkingDir,
     }),
-    [workspaceGitSnapshot, workspaceReviewEvents],
+    [workspaceGitSnapshot, workspaceReviewEvents, workspaceReviewWorkingDir],
   );
   const workspaceReviewModel = useMemo(
     () => {
-      if (!workspaceReviewOpen || !shouldRenderWorkspaceReview) {
+      if ((!workspaceReviewOpen && !sidePanelDetailOpen) || !shouldRenderWorkspaceReview) {
         return null;
       }
 
@@ -2037,6 +2060,7 @@ export function Workspace({
       workspaceMode,
       workspaceReviewEvents,
       workspaceReviewOpen,
+      sidePanelDetailOpen,
       workspaceReviewSession,
     ],
   );
@@ -2107,7 +2131,7 @@ export function Workspace({
     if (!isActive || !shouldRenderWorkspaceReview) {
       return;
     }
-    const delay = workspaceReviewOpen ? 250 : 1200;
+    const delay = workspaceReviewOpen || sidePanelDetailOpen ? 250 : 1200;
     const timeoutId = window.setTimeout(() => {
       void refreshWorkspaceGitSnapshot();
     }, delay);
@@ -2120,6 +2144,7 @@ export function Workspace({
     refreshWorkspaceGitSnapshot,
     shouldRenderWorkspaceReview,
     workspaceReviewOpen,
+    sidePanelDetailOpen,
     workspaceReviewWorkingDir,
     workspaceMode,
   ]);
@@ -3812,10 +3837,12 @@ export function Workspace({
   }
 
   return (
+    <WorkspaceSidePanelContext.Provider value={userSidePanel}>
+    <WorkspaceFileLinkContext.Provider value={fileLinkTarget}>
     <div className="page-transition-enter flex h-full flex-col">
       <div
         ref={browserLayoutRef}
-        data-ccem-workspace-browser-layout={browserPanelOpen ? 'shell-browser-split' : 'workspace'}
+        data-ccem-workspace-browser-layout={sidePanelOpen ? 'shell-browser-split' : 'workspace'}
         className="flex min-h-0 flex-1 overflow-hidden"
       >
         <div
@@ -3823,7 +3850,7 @@ export function Workspace({
           data-ccem-workspace-column="true"
           className={cn(
             'flex min-h-0 min-w-0 flex-col overflow-hidden',
-            browserPanelOpen
+            sidePanelOpen
               ? 'ml-3 mb-3 flex-1'
               : 'mx-3 mb-3 flex-1',
           )}
@@ -3831,7 +3858,7 @@ export function Workspace({
           <WorkspaceStatusStrip
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
-            browserOpen={browserPanelOpen}
+            browserOpen={sidePanelOpen}
             onToggleBrowser={browserWorkspaceReady ? () => toggleActiveBrowser(skillsContext.workingDir) : undefined}
             envContext={statusStripEnvContext}
             activeRuntimeId={
@@ -3868,7 +3895,7 @@ export function Workspace({
             />
 
             <div className="workspace-reading-surface relative flex min-w-0 flex-1 flex-col overflow-hidden">
-              {shouldRenderWorkspaceReview && workspaceReviewOpen && workspaceReviewModel ? (
+              {shouldRenderWorkspaceReview && (workspaceReviewOpen || sidePanelDetailOpen) && workspaceReviewModel ? (
                 <Suspense fallback={null}>
                   <LazyWorkspaceReviewPopover
                     key={`${workspaceReviewSession.runtime_id}:${workspaceReviewSession.project_dir}`}
@@ -3954,10 +3981,17 @@ export function Workspace({
           </div>
         </div>
 
+        <WorkspaceSidePanel
+          controller={userSidePanel}
+          width={browserPanelWidthPercent}
+          onResizeStart={handleBrowserPanelResizeStart}
+          onSelectBrowser={() => selectActiveBrowser(skillsContext.workingDir)}
+        >
         {Object.entries(browserTargetBySessionId).map(([sessionId, target]) => {
           if (!target) return null;
           const isPanelActive = sessionId === activeBrowserSessionId
-            && isBrowserPanelTargetVisible(target);
+            && isBrowserPanelTargetVisible(target)
+            && sidePanel.tab === 'browser';
           const panelAgentSessionId = sessionId === activeBrowserSessionId
             ? activeBrowserAgentSessionId ?? undefined
             : undefined;
@@ -3980,14 +4014,10 @@ export function Workspace({
               data-ccem-browser-panel-owner={sessionId}
               data-ccem-browser-panel-instance={target.instanceId}
               className={cn(
-                'h-full shrink-0',
+                'min-h-0 flex-1 flex-col',
                 isPanelActive ? 'flex' : 'hidden',
               )}
-              style={isPanelActive ? {
-                flex: `0 0 ${browserPanelWidthPercent}%`,
-                maxWidth: `${BROWSER_PANEL_MAX_WIDTH_PERCENT}%`,
-                minWidth: BROWSER_PANEL_MIN_WIDTH_PX,
-              } : undefined}
+
             >
               <BrowserPanel
                 key={panelKey}
@@ -3999,6 +4029,7 @@ export function Workspace({
             </div>
           );
         })}
+        </WorkspaceSidePanel>
       </div>
 
       <WorkspaceForkDialog
@@ -4030,5 +4061,7 @@ export function Workspace({
         onContinue={() => settleCodexModelMigrationDecision(true)}
       />
     </div>
+    </WorkspaceFileLinkContext.Provider>
+    </WorkspaceSidePanelContext.Provider>
   );
 }
