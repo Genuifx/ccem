@@ -1,5 +1,11 @@
 # ccem
 
+## 2.88.0
+
+### Minor Changes
+
+- Workspace side panel: move review details into the side panel, link session file previews, and shorten file preview guidance.
+
 ## 2.87.0
 
 ### Minor Changes
