@@ -384,9 +384,12 @@ export function ComposerControls({
             type="button"
             className={cn(
               'flex h-8 min-w-0 max-w-full items-center gap-2 rounded-xl px-2.5 text-[12px] text-foreground',
-              'cursor-pointer outline-none transition-all duration-150',
+              // Transition colors/shadow only: animating layout props (padding,
+              // width) lets the compact/expanded swap get stuck mid-transition
+              // when the state flips before the composer is first painted.
+              'cursor-pointer outline-none transition-[background-color,box-shadow] duration-150',
               'hover:bg-white/[0.06] focus:ring-2 focus:ring-primary/30',
-              'max-[760px]:px-1.5',
+              'max-[760px]:px-1.5 group-data-[compact]/composer-footer:px-1.5',
             )}
           >
             <span
@@ -398,7 +401,7 @@ export function ComposerControls({
               <span className={cn('flex shrink-0', isEnvironmentLocked && 'opacity-45 grayscale')}>
                 <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />
               </span>
-              <span className="min-w-0 max-w-[120px] truncate max-[760px]:hidden">{envName}</span>
+              <span className="min-w-0 max-w-[120px] truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden">{envName}</span>
               {isEnvironmentLocked && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -412,9 +415,9 @@ export function ComposerControls({
                 </Tooltip>
               )}
             </span>
-            <span className="text-muted-foreground/60 max-[760px]:hidden">·</span>
-            <Gauge className="h-3 w-3 shrink-0 text-muted-foreground max-[760px]:hidden" />
-            <span className="shrink-0 whitespace-nowrap text-muted-foreground max-[760px]:hidden">{t(EFFORT_I18N_KEYS[effort])}</span>
+            <span className="text-muted-foreground/60 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">·</span>
+            <Gauge className="h-3 w-3 shrink-0 text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden" />
+            <span className="shrink-0 whitespace-nowrap text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden">{t(EFFORT_I18N_KEYS[effort])}</span>
             <ChevronDown className="h-3 w-3 shrink-0 opacity-50" />
           </button>
         </DropdownMenuTrigger>
@@ -570,6 +573,11 @@ export function ComposerControls({
           className={cn(
             'h-8 w-auto min-w-[112px] shrink-0 rounded-xl px-2.5 text-[12px] text-foreground',
             'max-[760px]:min-w-0 max-[760px]:px-1.5',
+            'group-data-[compact]/composer-footer:min-w-0 group-data-[compact]/composer-footer:px-1.5',
+            // Narrow the shared SelectTrigger's transition-all to colors/shadow
+            // so the compact min-width/padding swap applies instantly instead
+            // of animating (and potentially sticking) layout properties.
+            'transition-[background-color,box-shadow]',
             isRiskyPermissionMode(normalizedPermMode) && 'text-destructive',
           )}
         >
@@ -583,7 +591,7 @@ export function ComposerControls({
                     isRiskyPermissionMode(normalizedPermMode) && 'text-destructive',
                   )}
                 />
-                <span className="truncate max-[760px]:hidden">
+                <span className="truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
                   {getWorkspacePermissionModeDisplayName(normalizedPermMode)}
                 </span>
               </span>

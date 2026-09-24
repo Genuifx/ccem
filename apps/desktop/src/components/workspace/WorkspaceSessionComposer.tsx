@@ -779,6 +779,14 @@ function ComposerTriggerSuggestionPanel({
   );
 }
 
+/**
+ * Below this composer footer width the model/permission controls collapse to
+ * icon-only triggers (their text labels carry the
+ * `group-data-[compact]/composer-footer:hidden` variant). Sized so the full
+ * labels, quick menu and right-side actions still fit comfortably above it.
+ */
+const COMPOSER_FOOTER_COMPACT_WIDTH = 640;
+
 export function WorkspaceSessionComposer({
   value,
   valueRevision = 0,
@@ -852,6 +860,28 @@ export function WorkspaceSessionComposer({
       window.removeEventListener('resize', measure);
     };
   }, [floatingAboveComposer]);
+  // Controls-row responsive contract: when the composer card itself is narrow
+  // (side panels open, small window) the footer row is marked `data-compact`
+  // so controls inside it (ComposerControls) can drop text labels and keep
+  // icon-only triggers. The footer is the measurement anchor because its
+  // width tracks the composer card, not the controls' own content — measuring
+  // the controls themselves would oscillate once their text collapses.
+  const composerFooterRef = useRef<HTMLDivElement | null>(null);
+  const [composerFooterCompact, setComposerFooterCompact] = useState(false);
+  useEffect(() => {
+    const footer = composerFooterRef.current;
+    if (!footer) return;
+    const applyWidth = (width: number) => {
+      // 0 = not yet measurable (hidden or no layout yet); never compact on unknown width.
+      setComposerFooterCompact(width > 0 && width < COMPOSER_FOOTER_COMPACT_WIDTH);
+    };
+    applyWidth(footer.clientWidth);
+    const observer = new ResizeObserver((entries) => {
+      applyWidth(entries[entries.length - 1]?.contentRect.width ?? footer.clientWidth);
+    });
+    observer.observe(footer);
+    return () => observer.disconnect();
+  }, []);
   const attentionDockRef = useRef<HTMLDivElement | null>(null);
   const composerDropTargetRef = useRef<HTMLDivElement | null>(null);
   const attachmentStripRef = useRef<HTMLDivElement | null>(null);
@@ -2036,7 +2066,11 @@ export function WorkspaceSessionComposer({
             />
           </div>
 
-          <div className="mt-2 flex flex-wrap items-center gap-2.5 border-t border-border/40 pt-2">
+          <div
+            ref={composerFooterRef}
+            data-compact={composerFooterCompact || undefined}
+            className="group/composer-footer mt-2 flex flex-wrap items-center gap-2.5 border-t border-border/40 pt-2"
+          >
             <ComposerQuickMenu
               codexInstalled={codexInstalled}
               opencodeInstalled={opencodeInstalled}
