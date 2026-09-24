@@ -202,6 +202,11 @@ export function WorkspaceTranscriptSelection({
   const { t } = useLocale();
   const panelRef = useRef<HTMLDivElement | null>(null);
   const savedEditorRef = useRef<HTMLDivElement | null>(null);
+  // Live clone of the captured selection Range. DOM Ranges track boundary
+  // nodes through mutations, so re-deriving client rects from this Range
+  // re-anchors the candidate highlight to the text as the transcript
+  // scrolls or streams.
+  const candidateRangeRef = useRef<Range | null>(null);
   const [candidate, setCandidate] = useState<SelectionCandidate | null>(null);
   const [note, setNote] = useState('');
   const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null);
@@ -212,6 +217,7 @@ export function WorkspaceTranscriptSelection({
   const dismiss = useCallback(() => {
     setCandidate(null);
     setNote('');
+    candidateRangeRef.current = null;
   }, []);
 
   const dismissSavedEditor = useCallback(() => {
@@ -263,6 +269,7 @@ export function WorkspaceTranscriptSelection({
     if (!quote) {
       if (rawText.trim().length > MAX_WORKSPACE_SELECTION_CHARS && lastRect) {
         // Surface why the panel will not offer "add" instead of vanishing.
+        candidateRangeRef.current = range.cloneRange();
         setCandidate({
           quote: null,
           anchor: null,
@@ -282,6 +289,7 @@ export function WorkspaceTranscriptSelection({
     if (!lastRect) {
       return;
     }
+    candidateRangeRef.current = range.cloneRange();
     setCandidate({
       quote,
       anchor,
@@ -371,6 +379,99 @@ export function WorkspaceTranscriptSelection({
     }
     return () => {
       delete root.dataset.workspaceSelectionHighlightActive;
+    };
+  }, [hasSelectionCandidate, rootRef]);
+
+  // The candidate highlight renders viewport rects captured at mouseup while
+  // the native ::selection layer is transparented out. Without a refresh path
+  // those rects stay glued to the viewport and drift off the text as soon as
+  // the transcript scrolls. Re-derive them from the captured live Range so
+  // the highlight stays anchored to the content.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root || !hasSelectionCandidate) {
+      return;
+    }
+
+    let frame: number | null = null;
+    let fallbackTimer: number | null = null;
+
+    const refresh = () => {
+      frame = null;
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      const range = candidateRangeRef.current;
+      if (!range) {
+        return;
+      }
+      const rects = visibleTextRangeRects(range, root);
+      const lastRect = rects[rects.length - 1];
+      setCandidate((current) => {
+        if (!current) {
+          return current;
+        }
+        const rectsUnchanged = current.rects.length === rects.length
+          && current.rects.every((rect, index) => (
+            rect.left === rects[index].left
+            && rect.top === rects[index].top
+            && rect.width === rects[index].width
+            && rect.height === rects[index].height
+          ));
+        if (!lastRect) {
+          // The selection scrolled out of the visible root: hide the
+          // highlight but keep the action pill reachable where the user
+          // last saw it.
+          return rectsUnchanged && current.rects.length === 0
+            ? current
+            : { ...current, rects: [] };
+        }
+        if (current.editing) {
+          // Keep the editing panel stationary while the user types; only
+          // the highlight follows the text.
+          return rectsUnchanged ? current : { ...current, rects };
+        }
+        const left = Math.max(124, Math.min(window.innerWidth - 124, lastRect.left + lastRect.width / 2));
+        const top = Math.max(12, Math.min(window.innerHeight - 72, lastRect.bottom + 8));
+        if (rectsUnchanged && current.left === left && current.top === top) {
+          return current;
+        }
+        return { ...current, rects, left, top };
+      });
+    };
+
+    const scheduleRefresh = () => {
+      if (frame === null) {
+        frame = requestAnimationFrame(refresh);
+        // WKWebView suspends animation frames for occluded/background
+        // windows; the timeout fallback keeps the highlight anchored to the
+        // text in that state (same contract as annotation placements).
+        fallbackTimer = window.setTimeout(() => {
+          if (frame !== null) {
+            cancelAnimationFrame(frame);
+            refresh();
+          }
+        }, 250);
+      }
+    };
+
+    // `scroll` does not bubble; capture on the root also catches nested
+    // scrollers whose scrolling moves the selected text.
+    root.addEventListener('scroll', scheduleRefresh, { capture: true, passive: true });
+    window.addEventListener('resize', scheduleRefresh);
+    const mutationObserver = new MutationObserver(scheduleRefresh);
+    mutationObserver.observe(root, { childList: true, subtree: true, characterData: true });
+    return () => {
+      if (frame !== null) {
+        cancelAnimationFrame(frame);
+      }
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+      }
+      root.removeEventListener('scroll', scheduleRefresh, { capture: true });
+      window.removeEventListener('resize', scheduleRefresh);
+      mutationObserver.disconnect();
     };
   }, [hasSelectionCandidate, rootRef]);
 
