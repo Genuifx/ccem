@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import { Check, MessageSquareQuote, Pencil, Plus, Trash2, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
 import { cn } from '@/lib/utils';
 import {
@@ -796,7 +797,8 @@ export function WorkspaceComposerAnnotations({
               {t('workspace.composerAnnotationsClear')}
             </Button>
           </div>
-          <div className="max-h-[320px] space-y-1.5 overflow-y-auto">
+          <ScrollArea className="max-h-[320px] min-h-0">
+            <div className="space-y-1.5">
             {annotations.map((annotation, index) => (
               <div key={annotation.id} className="rounded-xl bg-surface px-3 py-2.5">
                 <div className="flex items-start gap-2">
@@ -862,7 +864,8 @@ export function WorkspaceComposerAnnotations({
                 </div>
               </div>
             ))}
-          </div>
+            </div>
+          </ScrollArea>
         </PopoverContent>
       </Popover>
       <button

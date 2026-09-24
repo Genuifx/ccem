@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { File, FileText, FileSpreadsheet, FileCode, Image as ImageIcon } from '@/lib/lucide-react'
 import { RemoveButton } from './remove-button'
 import type { PromptAreaFile } from './types'
@@ -165,10 +166,10 @@ export function FileStrip({ files, onRemove, onClick, className }: FileStripProp
       </div>
 
       {expanded && (
-        <div
+        <ScrollArea
           ref={popoverRef}
           className={cn(
-            'bg-popover border-border absolute bottom-full left-0 z-10 mb-2 max-h-48 overflow-y-auto rounded-lg border p-2 shadow-lg',
+            'bg-popover border-border absolute bottom-full left-0 z-10 mb-2 max-h-48 rounded-lg border p-2 shadow-lg',
           )}>
           <div className="flex flex-wrap gap-2" role="list" aria-label="More attached files">
             {files.slice(COLLAPSE_THRESHOLD).map((file) => (
@@ -181,7 +182,7 @@ export function FileStrip({ files, onRemove, onClick, className }: FileStripProp
               />
             ))}
           </div>
-        </div>
+        </ScrollArea>
       )}
     </div>
   )

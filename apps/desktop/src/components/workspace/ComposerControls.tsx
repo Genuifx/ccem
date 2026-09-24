@@ -459,7 +459,7 @@ export function ComposerControls({
           <ScrollArea
             type="always"
             data-ccem-composer-environment-scroll
-            className="min-h-0 max-h-[300px]"
+            className="ccem-overlay-scroll min-h-0 max-h-[300px]"
             viewportClassName="pr-1"
           >
             <div className="pb-1.5 pr-1">

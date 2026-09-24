@@ -33,6 +33,7 @@ import { enqueueSessionRouterMutation, resolveDisplayEnv, resolveEnvSwitchAction
 import { toast } from 'sonner';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import { resolveEnvironmentIconHint } from '@/components/workspace/sessionTreeIcons';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import { StreakUsagePopoverContent } from './StreakUsagePopover';
 import { WorkspaceRouteChip } from './WorkspaceRouter';
 import type { UsageStats } from '@/types/analytics';
@@ -317,7 +318,10 @@ export function WorkspaceStatusStrip({
           <div className="px-3 pt-2.5 pb-1 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
             {t('workspace.environmentLabel')}
           </div>
-          <div className={cn('p-1.5 pt-0', runtimeEnvironments.length > 6 && 'max-h-[200px] overflow-y-auto')}>
+          <ScrollArea
+            className={cn('min-h-0', runtimeEnvironments.length > 6 && 'max-h-[200px]')}
+          >
+            <div className="p-1.5 pt-0">
             {runtimeEnvironments.map((env) => {
               const isActive = env.name === displayEnv;
               return (
@@ -337,7 +341,8 @@ export function WorkspaceStatusStrip({
                 </DropdownMenuItem>
               );
             })}
-          </div>
+            </div>
+          </ScrollArea>
           {environments.length > 0 && <DropdownMenuSeparator className="mx-1.5" />}
           <DropdownMenuItem
             className="mx-1.5 mb-1.5 gap-2 rounded-lg px-3 py-2 text-muted-foreground glass-dropdown-item"

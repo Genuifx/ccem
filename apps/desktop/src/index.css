@@ -862,6 +862,19 @@
   max-width: 100% !important;
 }
 
+/* Always-mounted scrollbars (type="always") keep their discoverability but read
+   as quiet shadcn overlay thumbs: translucent at rest, full token strength when
+   the user points at the scroll area or the thumb itself. */
+.ccem-overlay-scroll .ccem-scroll-area-thumb {
+  background-color: hsl(var(--border) / 0.45);
+  transition: background-color 150ms ease;
+}
+
+.ccem-overlay-scroll:hover .ccem-scroll-area-thumb,
+.ccem-overlay-scroll .ccem-scroll-area-thumb:hover {
+  background-color: hsl(var(--border));
+}
+
 /* === Page Transition === */
 @keyframes page-enter {
   from { opacity: 0; transform: translateY(16px); }

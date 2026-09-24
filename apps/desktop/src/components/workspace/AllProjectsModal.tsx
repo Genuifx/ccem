@@ -10,6 +10,7 @@ import { copyBindCommand } from '@/lib/telegram-utils';
 import { useNativeSurfaceOcclusion } from '@/lib/nativeSurfaceOcclusion';
 import { getProjectName, truncatePath, formatRelativeTime } from '@/lib/utils';
 import { cn } from '@/lib/utils';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import { shallow } from 'zustand/shallow';
 
 interface AllProjectsModalProps {
@@ -147,8 +148,8 @@ export function AllProjectsModal({ open, onOpenChange, onLaunch }: AllProjectsMo
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-3">
-          <div className="space-y-0.5">
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="space-y-0.5 p-3">
             {activeTab === 'favorites' && favorites.map((project) => (
               <ProjectRow
                 key={project.path}
@@ -281,7 +282,7 @@ export function AllProjectsModal({ open, onOpenChange, onLaunch }: AllProjectsMo
               />
             ))}
           </div>
-        </div>
+        </ScrollArea>
       </div>
     </div>
   );
