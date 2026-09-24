@@ -116,6 +116,7 @@ impl NativeSessionCoordinator {
         coordination.query_generation = None;
         coordination.adapter = AdapterKind::Negotiating;
         coordination.capabilities.clear();
+        coordination.failed_foreground_adjudicated = None;
         coordination.bump();
         self.settings_signal.notify_all();
         self.interactive_signal.notify_all();
@@ -157,6 +158,7 @@ impl NativeSessionCoordinator {
         coordination.query_generation = None;
         coordination.adapter = AdapterKind::Negotiating;
         coordination.capabilities.clear();
+        coordination.failed_foreground_adjudicated = None;
         coordination.bump();
         self.settings_signal.notify_all();
         self.interactive_signal.notify_all();

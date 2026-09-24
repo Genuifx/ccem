@@ -892,3 +892,68 @@ fn control_ack_timeouts_leave_explicit_recovery_paths() {
         .begin_interactive_op(RT, INC, "reply-retry", "ask-1")
         .expect("single-consumer resolver makes retry safe");
 }
+
+#[test]
+fn helper_delivery_uncertain_failure_releases_the_exact_foreground() {
+    let coordinator = coordinator_with_incarnation();
+    negotiate_full(&coordinator);
+    let command_id = coordinator.admit_prompt(RT, INC).expect("admits");
+    coordinator.note_command_admitted(RT, INC, &command_id, GEN);
+
+    // Foreign or stale reports must not release the live foreground.
+    assert_eq!(
+        coordinator.release_failed_delivery_uncertain(RT, INC, "other-command"),
+        LifecycleDecision::Ignored
+    );
+    assert_eq!(
+        coordinator.release_failed_delivery_uncertain(RT, INC + 1, &command_id),
+        LifecycleDecision::Ignored
+    );
+    assert!(coordinator
+        .projection(RT)
+        .unwrap()
+        .active_command_id
+        .is_some());
+
+    let decision = coordinator.release_failed_delivery_uncertain(RT, INC, &command_id);
+    assert_eq!(
+        decision,
+        LifecycleDecision::Released {
+            command_id: command_id.clone()
+        }
+    );
+    let projection = coordinator.projection(RT).unwrap();
+    assert!(projection.active_command_id.is_none());
+    assert!(projection.protocol_error.is_none());
+    assert_eq!(projection.delivery_uncertain_count, 0);
+
+    // The next prompt owns the foreground immediately.
+    coordinator
+        .admit_prompt(RT, INC)
+        .expect("next prompt admits after failed turn");
+}
+
+#[test]
+fn adjudicated_failure_marker_is_single_shot_and_recovery_scoped() {
+    let coordinator = coordinator_with_incarnation();
+    negotiate_full(&coordinator);
+    let command_id = coordinator.admit_prompt(RT, INC).expect("admits");
+    coordinator.release_failed_delivery_uncertain(RT, INC, &command_id);
+    assert!(coordinator.consume_adjudicated_failure(RT));
+    assert!(
+        !coordinator.consume_adjudicated_failure(RT),
+        "marker is consumed exactly once"
+    );
+
+    let second = coordinator.admit_prompt(RT, INC).expect("readmits");
+    coordinator.release_failed_delivery_uncertain(RT, INC, &second);
+    assert!(coordinator.consume_adjudicated_failure(RT));
+
+    let third = coordinator.admit_prompt(RT, INC).expect("readmits");
+    coordinator.release_failed_delivery_uncertain(RT, INC, &third);
+    coordinator.note_incarnation(RT, INC + 1);
+    assert!(
+        !coordinator.consume_adjudicated_failure(RT),
+        "a new helper incarnation invalidates the stale marker"
+    );
+}

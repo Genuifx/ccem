@@ -8162,6 +8162,25 @@ impl NativeRuntimeManager {
                     },
                     "delivery_uncertain" => {
                         if let Some(command_id) = command_id.as_deref() {
+                            // The helper only emits this stage after its whole
+                            // SDK query died, so no terminal receipt can ever
+                            // follow for the exact foreground command. Release
+                            // it (without replaying the failed prompt) so the
+                            // next composer message can own the foreground;
+                            // otherwise every later prompt queues forever.
+                            let release = self
+                                .lifecycle
+                                .release_failed_delivery_uncertain(
+                                    runtime_id,
+                                    helper_incarnation,
+                                    command_id,
+                                );
+                            if release.released_command_id().is_some() {
+                                self.finalize_failed_delivery_uncertain(
+                                    runtime_id, command_id, detail,
+                                );
+                                return LifecycleDecision::Updated;
+                            }
                             self.lifecycle.mark_delivery_uncertain(
                                 runtime_id,
                                 helper_incarnation,
@@ -8289,6 +8308,50 @@ impl NativeRuntimeManager {
                 })
             }
             LifecycleDecision::Ignored | LifecycleDecision::Updated => Ok(()),
+        }
+    }
+
+    /// Bookkeeping after the coordinator released a foreground command the
+    /// helper reported as `delivery_uncertain`. The failed prompt is never
+    /// replayed: if it still owns the input-queue head (helper died before
+    /// admission), drop it with an explicit failure record; later queued
+    /// prompts stay and dispatch once the foreground is free. The session
+    /// lands in recoverable `interrupted` so the next composer message can be
+    /// sent, matching the existing SIGKILL/initial-prompt recovery contract.
+    fn finalize_failed_delivery_uncertain(&self, runtime_id: &str, command_id: &str, detail: &str) {
+        if self
+            .input_queue
+            .remove_dispatch(runtime_id, command_id)
+            .is_some()
+        {
+            self.lifecycle.note_queue_changed(runtime_id);
+            if let Err(error) = self.append_lifecycle_event(
+                runtime_id,
+                "prompt_delivery_failed",
+                format!(
+                    "Queued prompt {command_id} was not delivered after its turn failed: {detail}. Resend it to retry."
+                ),
+            ) {
+                eprintln!(
+                    "Failed to append delivery-failure event for {runtime_id}: {error}"
+                );
+            }
+        }
+        if let Err(error) = self.update_record(runtime_id, |record| {
+            if record.status == "stopped"
+                || record.status.starts_with("handoff_")
+                || record.permission_quarantined
+            {
+                return;
+            }
+            record.status = "interrupted".to_string();
+            record.is_active = true;
+            record.last_error = Some(format!("Model turn failed: {detail}"));
+            record.updated_at = Utc::now();
+        }) {
+            eprintln!(
+                "Failed to persist failed-turn interruption for {runtime_id}: {error}"
+            );
         }
     }
 
@@ -8541,9 +8604,19 @@ impl NativeRuntimeManager {
                     }
                     return Ok(());
                 }
+                // The helper's follow-up error status line after an already
+                // adjudicated failed turn must not terminalize the session to
+                // `error`: the foreground was released and the session stays
+                // resumable (`interrupted`), like the SIGKILL recovery path.
+                let adjudicated_failure =
+                    status == "error" && self.lifecycle.consume_adjudicated_failure(runtime_id);
                 self.update_record(runtime_id, |record| {
                     if status == "error"
-                        && is_recoverable_native_helper_error(record, normalized_detail.as_deref())
+                        && (adjudicated_failure
+                            || is_recoverable_native_helper_error(
+                                record,
+                                normalized_detail.as_deref(),
+                            ))
                     {
                         next_status = "interrupted".to_string();
                     }
@@ -19102,6 +19175,210 @@ wait"#,
             .lock()
             .expect("handles")
             .contains_key(runtime_id));
+    }
+
+    #[test]
+    fn failed_turn_delivery_uncertain_frees_foreground_for_next_prompt() {
+        let runtime_id = "coord-failed-turn-next-prompt";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"conv-failed","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#,
+            )
+            .expect("meta processes");
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("failed-client", "first", None, None, None),
+                None,
+            )
+            .expect("queue item");
+        let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command_id, dispatch_attempt)
+            .expect("coordinator admission");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"command_admitted","detail":"{command_id}","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("admission processes");
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+
+        // The model turn fails: the helper's query died after the command was
+        // dispatched, reported as delivery_uncertain followed by status error.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"delivery_uncertain","detail":"Claude query failed after command dispatch: provider 500","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("delivery uncertainty processes");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"status","status":"error","detail":"Claude query failed after command dispatch: provider 500"}"#,
+            )
+            .expect("failure status processes");
+
+        let projection = manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection");
+        assert!(
+            projection.active_command_id.is_none(),
+            "the failed turn must release foreground ownership"
+        );
+        let record = manager.current_record(runtime_id).expect("record");
+        assert_eq!(record.status, "interrupted");
+        assert!(record
+            .last_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("provider 500")));
+
+        // The user's next composer message must be sendable: the queue accepts
+        // it and the coordinator admits it as the new foreground command.
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("next-client", "second message", None, None, None),
+                None,
+            )
+            .expect("next message queues");
+        let (next_attempt, next_command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected next claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &next_command_id, next_attempt)
+            .expect("next prompt admits after the failed turn");
+    }
+
+    #[test]
+    fn failed_turn_delivery_uncertain_drops_unadmitted_head_and_keeps_fifo() {
+        let runtime_id = "coord-failed-turn-fifo";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"session_meta","provider_session_id":"conv-failed-fifo","capabilities":["msg_lifecycle_v1"],"query_generation":1}"#,
+            )
+            .expect("meta processes");
+        let incarnation = manager
+            .handles
+            .lock()
+            .unwrap()
+            .get(runtime_id)
+            .unwrap()
+            .generation;
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("lost-client", "lost prompt", None, None, None),
+                None,
+            )
+            .expect("head queues");
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("survivor-client", "later prompt", None, None, None),
+                None,
+            )
+            .expect("tail queues");
+        let (dispatch_attempt, command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                dispatch_attempt,
+                dispatch_command_id,
+                ..
+            } => (dispatch_attempt, dispatch_command_id),
+            other => panic!("expected queue claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &command_id, dispatch_attempt)
+            .expect("coordinator admission");
+
+        // The query dies before the helper proved admission for the head.
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                &format!(
+                    r#"{{"type":"event","payload":{{"type":"lifecycle","stage":"delivery_uncertain","detail":"Claude query ended before command delivery could be confirmed","command_id":"{command_id}","query_generation":1}}}}"#
+                ),
+            )
+            .expect("delivery uncertainty processes");
+        manager
+            .process_helper_stdout(
+                runtime_id,
+                r#"{"type":"status","status":"error","detail":"Claude query ended before command delivery could be confirmed"}"#,
+            )
+            .expect("failure status processes");
+
+        let projection = manager
+            .lifecycle
+            .projection(runtime_id)
+            .expect("projection");
+        assert!(projection.active_command_id.is_none());
+        let replayed = manager
+            .replay_events(runtime_id, None)
+            .expect("replay failure record");
+        assert!(replayed.events.iter().any(|event| matches!(
+            &event.payload,
+            SessionEventPayload::Lifecycle { stage, .. } if stage == "prompt_delivery_failed"
+        )));
+        assert!(
+            !manager
+                .input_queue
+                .snapshot(runtime_id)
+                .iter()
+                .any(|item| item.client_message_id == "lost-client"),
+            "the definitely-undelivered head is dropped instead of blocking FIFO"
+        );
+        assert_eq!(manager.input_queue.count(runtime_id), 1);
+
+        let (next_attempt, next_command_id) = match manager.input_queue.claim_next(runtime_id) {
+            NativeInputClaimOutcome::Claimed {
+                batch,
+                dispatch_attempt,
+                dispatch_command_id,
+            } => {
+                assert_eq!(batch.client_message_id(), "survivor-client");
+                (dispatch_attempt, dispatch_command_id)
+            }
+            other => panic!("expected survivor claim, got {other:?}"),
+        };
+        manager
+            .lifecycle
+            .admit_queued_prompt(runtime_id, incarnation, &next_command_id, next_attempt)
+            .expect("queued survivor admits after the failed turn");
     }
 
     fn assert_fifo_wakeup_survives_claimed_head(settings: bool, late_blocker: bool) {

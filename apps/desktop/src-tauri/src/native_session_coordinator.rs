@@ -235,6 +235,10 @@ struct SessionCoordination {
     pending_permission_settings: Option<PendingSettingsOp>,
     pending_interactive: Option<PendingInteractiveOp>,
     protocol_error: Option<String>,
+    /// The helper definitively reported a failed foreground command and that
+    /// failure was already adjudicated (ownership released, record shaped).
+    /// Consumed by the next correlated helper error status line.
+    failed_foreground_adjudicated: Option<String>,
 }
 
 impl SessionCoordination {
@@ -254,6 +258,7 @@ impl SessionCoordination {
             pending_permission_settings: None,
             pending_interactive: None,
             protocol_error: None,
+            failed_foreground_adjudicated: None,
         }
     }
 
@@ -452,6 +457,7 @@ impl NativeSessionCoordinator {
             query_generation: None,
             started_at: Instant::now(),
         });
+        coordination.failed_foreground_adjudicated = None;
         coordination.bump();
         Ok(command_id)
     }
@@ -606,6 +612,55 @@ impl NativeSessionCoordinator {
         coordination.protocol_error = Some(detail.into());
         coordination.bump();
         true
+    }
+
+    /// Release the foreground after the helper authoritatively reported the
+    /// whole query died with this command still unresolved
+    /// (`lifecycle stage = delivery_uncertain`). Unlike a pipe-write race,
+    /// that report can only arrive once the SDK query process has ended, so
+    /// no terminal receipt can ever follow for this command on this
+    /// generation. Releasing transfers the foreground to the next prompt
+    /// without replaying the failed one.
+    pub fn release_failed_delivery_uncertain(
+        &self,
+        runtime_id: &str,
+        helper_incarnation: u64,
+        command_id: &str,
+    ) -> LifecycleDecision {
+        let mut inner = self.lock_inner();
+        let Some(coordination) = inner.get_mut(runtime_id) else {
+            return LifecycleDecision::Ignored;
+        };
+        let matches = coordination.active.as_ref().is_some_and(|active| {
+            active.command_id == command_id && active.helper_incarnation == helper_incarnation
+        });
+        if !matches {
+            return LifecycleDecision::Ignored;
+        }
+        if let Some(active) = &mut coordination.active {
+            active.phase = CommandPhase::Uncertain;
+        }
+        let _ = coordination.release_active();
+        coordination.protocol_error = None;
+        coordination.failed_foreground_adjudicated = Some(command_id.to_string());
+        LifecycleDecision::Released {
+            command_id: command_id.to_string(),
+        }
+    }
+
+    /// One-shot marker for the status-line classifier: the helper's follow-up
+    /// `error` status line belongs to a foreground failure that was already
+    /// adjudicated, so it must land as `interrupted` (recoverable) instead of
+    /// terminal `error`.
+    pub fn consume_adjudicated_failure(&self, runtime_id: &str) -> bool {
+        let mut inner = self.lock_inner();
+        let Some(coordination) = inner.get_mut(runtime_id) else {
+            return false;
+        };
+        coordination
+            .failed_foreground_adjudicated
+            .take()
+            .is_some()
     }
 
     fn bind_active_generation(
