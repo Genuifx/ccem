@@ -1,7 +1,8 @@
+import { useState } from 'react';
 import { RotateCw } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
-import type { SessionUsageModelEntry, SessionUsageState } from './workspaceUsage';
+import type { SessionContextSnapshot, SessionUsageModelEntry, SessionUsageState } from './workspaceUsage';
 import { formatTokenCount } from './workspaceUsage';
 
 interface SessionUsagePopoverContentProps {
@@ -63,6 +64,164 @@ function routedRowLabel(t: (k: string) => string, logicalKey: string): string {
   return t('workspace.usagePanelSubRouteOther');
 }
 
+/** Upstream context-composition category that reports the unused window
+ * remainder — rendered muted, like upstream /context. */
+const FREE_SPACE_CATEGORY = 'Free space';
+
+/** Category names are open strings from upstream (new names ship ahead of
+ * locale updates); known ones map to localized labels, anything else renders
+ * verbatim. */
+const CATEGORY_LABEL_KEYS: Record<string, string> = {
+  'System prompt': 'workspace.contextCategorySystemPrompt',
+  'System tools': 'workspace.contextCategorySystemTools',
+  'MCP tools': 'workspace.contextCategoryMcpTools',
+  'Custom agents': 'workspace.contextCategoryCustomAgents',
+  'Memory files': 'workspace.contextCategoryMemoryFiles',
+  Skills: 'workspace.contextCategorySkills',
+  Messages: 'workspace.contextCategoryMessages',
+  Attachments: 'workspace.contextCategoryAttachments',
+  'Output style': 'workspace.contextCategoryOutputStyle',
+  'Compact summary': 'workspace.contextCategoryCompactSummary',
+  'Autocompact buffer': 'workspace.contextCategoryAutocompactBuffer',
+  'Free space': 'workspace.contextCategoryFreeSpace',
+  input: 'workspace.contextCategoryInput',
+  output: 'workspace.contextCategoryOutput',
+};
+
+const CHART_SEGMENT_CLASSES = [
+  'bg-chart-1',
+  'bg-chart-2',
+  'bg-chart-3',
+  'bg-chart-4',
+  'bg-chart-5',
+  'bg-chart-6',
+];
+
+interface CompositionRow {
+  name: string;
+  label: string;
+  tokens: number;
+  /** Share of the full context window (0–100, unrounded). */
+  percent: number;
+  colorClass: string;
+  isFreeSpace: boolean;
+}
+
+/** Build the composition rows: used categories in upstream order (stable
+ * chart colors) plus the muted free-space remainder when the provider reports
+ * it. Percentages are relative to the context window — the same base as the
+ * usage view's context bar and upstream /context, so the two views stay
+ * comparable. */
+function buildCompositionRows(
+  t: (k: string) => string,
+  context: SessionContextSnapshot,
+): { rows: CompositionRow[]; hasData: boolean } {
+  const categories = context.categories ?? [];
+  const denominator = context.maxTokens > 0 ? context.maxTokens : 0;
+  const percentOfWindow = (tokens: number) =>
+    denominator > 0 ? (tokens / denominator) * 100 : 0;
+
+  const rows: CompositionRow[] = [];
+  let colorIndex = 0;
+  for (const category of categories) {
+    if (category.tokens <= 0) continue;
+    const isFreeSpace = category.name === FREE_SPACE_CATEGORY;
+    rows.push({
+      name: category.name,
+      label: CATEGORY_LABEL_KEYS[category.name]
+        ? t(CATEGORY_LABEL_KEYS[category.name])
+        : category.name,
+      tokens: category.tokens,
+      percent: percentOfWindow(category.tokens),
+      colorClass: isFreeSpace
+        ? 'bg-muted'
+        : CHART_SEGMENT_CLASSES[colorIndex++ % CHART_SEGMENT_CLASSES.length],
+      isFreeSpace,
+    });
+  }
+  return { rows, hasData: rows.length > 0 };
+}
+
+/** Secondary panel view: current context composition breakdown (REQ-0028).
+ * Shares the usage view's overall used/total line idiom so the drill-down
+ * reads as another aperture of the same snapshot, never a second total. */
+export function ContextCompositionView({ context }: { context: SessionContextSnapshot }) {
+  const { t } = useLocale();
+  const { rows, hasData } = buildCompositionRows(t, context);
+  const contextPercent = clampPercent(context.percentage);
+
+  return (
+    <div className="space-y-2.5 px-4 py-2.5">
+      <SectionTitle>{t('workspace.contextCompositionTitle')}</SectionTitle>
+      {!hasData ? (
+        <div className="pb-1 text-xs leading-5 text-muted-foreground">
+          {t('workspace.contextCompositionEmpty')}
+        </div>
+      ) : (
+        <>
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-xs text-muted-foreground">
+              {t('workspace.contextUsageLine')
+                .replace('{used}', formatTokenCount(context.usedTokens).toLowerCase())
+                .replace('{total}', formatTokenCount(context.maxTokens).toLowerCase())}
+            </span>
+            <span className="text-xs font-semibold font-mono tabular-nums text-foreground">
+              {Math.round(contextPercent)}%
+            </span>
+          </div>
+          <div
+            className="flex h-1.5 overflow-hidden rounded-full bg-muted/60"
+            aria-label={t('workspace.contextCompositionTitle')}
+          >
+            {rows.map((row) => (
+              <div
+                key={`segment-${row.name}`}
+                className={cn('h-full', row.colorClass)}
+                style={{ width: `${row.percent}%` }}
+                title={`${row.label} · ${formatTokenCount(row.tokens)}`}
+              />
+            ))}
+          </div>
+          <div className="space-y-1">
+            {rows.map((row) => (
+              <div key={`row-${row.name}`} className="flex items-center gap-2">
+                <span
+                  className={cn('h-2 w-2 shrink-0 rounded-full', row.colorClass)}
+                  aria-hidden="true"
+                />
+                <span
+                  className={cn(
+                    'min-w-0 truncate text-xs',
+                    row.isFreeSpace ? 'text-muted-foreground/80' : 'text-muted-foreground',
+                  )}
+                >
+                  {row.label}
+                </span>
+                <span className="ml-auto flex shrink-0 items-baseline gap-1.5 font-mono tabular-nums">
+                  <span
+                    className={cn(
+                      'text-xs font-medium',
+                      row.isFreeSpace ? 'text-muted-foreground/80' : 'text-foreground',
+                    )}
+                  >
+                    {formatTokenCount(row.tokens)}
+                  </span>
+                  <span className="text-2xs text-muted-foreground/70">
+                    {row.percent.toFixed(1)}%
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="text-2xs leading-4 text-muted-foreground/70">
+            {t('workspace.contextCompositionFootnote')}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function buildModelRows(modelUsage: SessionUsageModelEntry[]) {
   const sorted = [...modelUsage].sort((a, b) => b.inputTokens - a.inputTokens);
   if (sorted.length <= MODEL_ROWS_LIMIT) {
@@ -97,6 +256,9 @@ export function SessionUsagePopoverContent({
   onRefresh,
 }: SessionUsagePopoverContentProps) {
   const { t } = useLocale();
+  // Secondary view state (REQ-0028). The popover content unmounts when the
+  // hover closes, so every open starts on the usage view — no stale drill-down.
+  const [view, setView] = useState<'usage' | 'composition'>('usage');
 
   const snapshot = usage.sessionUsage;
   // The SDK snapshot can lag one turn behind (transcript flush timing), while
@@ -162,11 +324,43 @@ export function SessionUsagePopoverContent({
         )}
       </div>
 
+      {hasContext && (
+        <div className="px-4 pb-2.5">
+          <div className="grid grid-cols-2 gap-0.5 rounded-lg bg-muted/60 p-0.5">
+            {([
+              ['usage', t('workspace.usagePanelViewUsage')],
+              ['composition', t('workspace.usagePanelViewComposition')],
+            ] as const).map(([nextView, label]) => (
+              <button
+                key={nextView}
+                type="button"
+                aria-pressed={view === nextView}
+                onClick={() => setView(nextView)}
+                className={cn(
+                  'rounded-md px-2 py-1 text-xs font-medium transition-colors',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30',
+                  view === nextView
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {isEmpty && (
         <div className="px-4 py-3 text-xs leading-5 text-muted-foreground">
           {t('workspace.usagePanelEmpty')}
         </div>
       )}
+
+      {view === 'composition' && hasContext ? (
+        <ContextCompositionView context={usage.context!} />
+      ) : (
+        <>
 
       {hasContext && (
         <div className="space-y-1.5 px-4 py-2.5">
@@ -296,6 +490,8 @@ export function SessionUsagePopoverContent({
             );
           })}
         </div>
+      )}
+        </>
       )}
     </div>
   );
