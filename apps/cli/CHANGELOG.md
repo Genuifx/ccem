@@ -1,5 +1,11 @@
 # ccem
 
+## 2.89.0
+
+### Minor Changes
+
+- Desktop: add context composition view to the session usage panel, unify dialog surfaces and scroll areas with theme tokens, and refine compact-mode composer controls.
+
 ## 2.88.0
 
 ### Minor Changes
