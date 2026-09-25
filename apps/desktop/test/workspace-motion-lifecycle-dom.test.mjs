@@ -91,11 +91,12 @@ async function loadEffect([, file, scope, index = 0]) {
   }).outputText;
 }
 
-async function mountEffect(motionCase, { reduced = false, windowSize = Infinity } = {}) {
+async function mountEffect(motionCase, { reduced = false, windowSize = Infinity, pageHidden = false } = {}) {
   const source = await loadEffect(motionCase);
   const container = document.createElement('div');
   document.body.append(container);
   dom.window.matchMedia = () => ({ matches: reduced });
+  Object.defineProperty(document, 'hidden', { configurable: true, value: pageHidden });
   let context;
   let execute;
 
@@ -171,6 +172,7 @@ async function mountEffect(motionCase, { reduced = false, windowSize = Infinity 
       return new Set(context.getTweens().flatMap((tween) => tween.targets()));
     },
     entryCount() { return context.data.length; },
+    pendingEntrances() { return context.getTweens().filter((tween) => tween.duration() > 0); },
     unmount() {
       React.act(() => root.unmount());
       assert.equal(context.data.length, 0, 'unmount releases the final animation context');
@@ -187,6 +189,29 @@ function assertVisible(element) {
   assert.notEqual(style.opacity, '0');
   assert.equal(element.style.transform, '', 'completed/interrupted entrance releases its transform');
 }
+
+test('background page navigation is fully visible without advancing the animation clock', async (t) => {
+  const mounted = await mountEffect(motionCases[1], { pageHidden: true });
+  t.after(() => mounted.unmount());
+  for (const revision of [1, 2]) {
+    mounted.render({ count: 1, revision });
+    assert.equal(mounted.pendingEntrances().length, 0, 'background navigation creates no suspended entrance');
+    assert.equal(mounted.container.firstChild.style.opacity, '');
+    assertVisible(mounted.container.firstChild);
+  }
+});
+
+test('background navigation clears an interrupted foreground page entrance', async (t) => {
+  const mounted = await mountEffect(motionCases[1]);
+  t.after(() => mounted.unmount());
+  mounted.advance(0.3);
+  assert.notEqual(mounted.container.firstChild.style.opacity, '');
+  Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  mounted.render({ count: 1, revision: 2 });
+  assert.equal(mounted.pendingEntrances().length, 0);
+  assert.equal(mounted.container.firstChild.style.opacity, '');
+  assertVisible(mounted.container.firstChild);
+});
 
 for (const motionCase of motionCases) {
   for (const reduced of [false, true]) {

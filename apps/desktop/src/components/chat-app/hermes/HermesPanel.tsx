@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, RefreshCw } from '@/lib/lucide-react';
+import { Activity, ArrowLeft, ArrowRight, KeyRound, Plus, QrCode, RefreshCw, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Progress } from '@/components/ui/progress';
 import { useLocale } from '@/locales';
 import { getHermesStatus, performHermesAction, type HermesAction, type HermesRunAction, type HermesStatus } from '@/lib/hermes-ipc';
+import { HermesRuntime } from './HermesRuntime';
+import { HermesSteps } from './HermesVisuals';
+import './hermes.css';
 import { HermesConnectionCard } from './HermesConnectionCard';
 import { HermesChannelForm, HermesChannelPicker, HermesQrSetup } from './HermesChannelSetup';
 import { errorText, INSTALLING, platformDisplayName, SETUP_CANCELLABLE, SETUP_WAIT_MS, setupErrorKey, timestamp, TRANSITIONING } from './hermes-presentation';
@@ -14,7 +15,7 @@ const PAIRING_ACTIONS = new Set<HermesAction>(['openPairing', 'approvePairing'])
 const RUNTIME_ACTIONS = new Set<HermesAction>(['install', 'removeRuntime', 'cancelInstall']);
 
 export function HermesPanel() {
-  const { t } = useLocale();
+  const { t, lang } = useLocale();
   const [status, setStatus] = useState<HermesStatus | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [setupRequestError, setSetupRequestError] = useState<string | null>(null);
@@ -24,6 +25,9 @@ export function HermesPanel() {
   const [cancelling, setCancelling] = useState(false);
   const [editor, setEditor] = useState<Editor | null>(null);
   const [now, setNow] = useState(Date.now());
+  const editorHeadingRef = useRef<HTMLHeadingElement>(null);
+  const addButtonRef = useRef<HTMLButtonElement>(null);
+  const previousEditorKey = useRef('closed');
   const mounted = useRef(false);
   const latestStatus = useRef<HermesStatus | null>(null);
   const pendingActions = useRef(new Map<string, { action: HermesAction; id: number }>());
@@ -136,7 +140,6 @@ export function HermesPanel() {
   const discoveryTransitioning = TRANSITIONING.has(status?.gateway.state ?? '');
   const activeConnection = connections.some((item) => item.state === 'running' || TRANSITIONING.has(item.state));
   const editorDisabled = disabled || installing || Boolean(editingConnection && busyActions[`account:${editingConnection.accountRef}`]);
-  const progress = status?.installer.state === 'downloading' && status.installer.totalBytes ? Math.min(100, status.installer.downloadedBytes / status.installer.totalBytes * 100) : null;
   const recentOperations = [...(status?.operations ?? [])].sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt)).slice(0, 8);
   const recentDeliveries = [...(status?.deliveries ?? [])].sort((a, b) => timestamp(b.createdAt) - timestamp(a.createdAt)).slice(0, 5);
 
@@ -153,6 +156,13 @@ export function HermesPanel() {
     if (status && editor?.kind === 'edit' && !connections.some((item) => item.accountRef === editor.accountRef)) setEditor(null);
   }, [status, connections, editor]);
 
+  const editorKey = editor?.kind === 'edit' ? editor.accountRef : editor?.platformId ?? (editor ? 'picker' : 'closed');
+  useEffect(() => {
+    if (editor) editorHeadingRef.current?.focus();
+    else if (previousEditorKey.current !== 'closed') addButtonRef.current?.focus();
+    previousEditorKey.current = editorKey;
+  }, [editorKey]);
+
   const changeEditor = async (next: Editor | null) => {
     if (disabled || setupConnecting) return;
     if (setupPending && setup) {
@@ -167,63 +177,68 @@ export function HermesPanel() {
     return translated === key ? value : translated;
   };
 
-  return <div className="space-y-5" data-hermes-panel>
-    <div className="flex items-center justify-between gap-4">
-      <div className="flex items-center gap-3"><div className="rounded-xl bg-primary/10 p-2.5 text-primary"><Bot className="h-5 w-5" /></div>
-        <div><h2 className="text-xl font-semibold">{t('hermes.title')}</h2><p className="text-sm text-muted-foreground">{t('hermes.subtitle')}</p></div>
+  return <div className="hermes-panel" data-hermes-panel>
+    <header className="hermes-page-header">
+      <div><h2>{t('hermes.title')}</h2><p>{t('hermes.subtitle')}</p></div>
+      <div className="hermes-header-actions">
+        <Button size="icon" variant="ghost" aria-label={t('hermes.refresh')} onClick={() => { setRequestError(null); setSetupRequestError(null); void refresh(); }}><RefreshCw className="h-4 w-4" /></Button>
+        {runtimeAvailable && <Button ref={addButtonRef} size="sm" disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor({ kind: 'add', manual: false })}><Plus className="h-4 w-4" aria-hidden="true" />{t('hermes.addChannel')}</Button>}
       </div>
-      <Button size="icon" variant="ghost" aria-label={t('hermes.refresh')} onClick={() => { setRequestError(null); setSetupRequestError(null); void refresh(); }}><RefreshCw className="h-4 w-4" /></Button>
-    </div>
-    {(requestError ?? readError) && <div role="alert" className="rounded-xl border border-destructive/20 bg-destructive/5 p-4 text-sm text-destructive">{requestError ?? readError}</div>}
-    {!status && <p role="status" className="py-8 text-center text-sm text-muted-foreground">{t(readError ? 'hermes.statusUnavailable' : 'hermes.loading')}</p>}
+    </header>
+    {(requestError ?? readError) && <div role="alert" className="hermes-alert">{requestError ?? readError}</div>}
+    {!status && <div className="hermes-loading" role="status"><span className="hermes-loading-line" aria-hidden="true" /><p>{t(readError ? 'hermes.statusUnavailable' : 'hermes.loading')}</p></div>}
     {status && <>
-      <Card><CardHeader className="pb-3"><CardTitle className="flex items-center justify-between gap-3 text-base"><span>{t('hermes.component')}</span><span className="text-xs font-normal text-muted-foreground" role="status">{stateLabel(status.installer.state)}</span></CardTitle></CardHeader>
-        <CardContent className="space-y-4">
-          {runtimeAvailable ? <div className="flex items-center justify-between gap-3 text-sm"><span className="text-muted-foreground">{t('hermes.version', { version: status.installer.version ?? '—' })}</span>
-            <div className="flex flex-wrap items-center justify-end gap-2">
-              {installed && !installing && <Button size="sm" variant="outline" disabled={hasActions || setupPending || setupConnecting} onClick={() => void run('install')}>{t('hermes.updateComponent')}</Button>}
-              <Button size="sm" variant="ghost" disabled={hasActions || installing || activeConnection || setupPending || setupConnecting} onClick={() => void run('removeRuntime')}>{t('hermes.removeComponent')}</Button>
-            </div>
-          </div> : <p className="text-sm text-muted-foreground">{t('hermes.installDescription')}</p>}
-          {installing && <div className="space-y-2"><Progress value={progress} aria-label={t('hermes.installProgress')} /><div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>{installAccepted ? status.installer.state === 'downloading' ? <>{(status.installer.downloadedBytes / 1024 / 1024).toFixed(1)} MB{status.installer.totalBytes ? ` / ${(status.installer.totalBytes / 1024 / 1024).toFixed(1)} MB` : ''}</> : stateLabel(status.installer.state) : t('hermes.installRequested')}</span>
-            <Button size="sm" variant="ghost" disabled={!installAccepted || cancelling || Boolean(busy && busy !== 'install')} onClick={() => void run('cancelInstall')}>{t('hermes.cancel')}</Button>
-          </div></div>}
-          {status.installer.error && <p role="alert" className="text-sm text-destructive">{errorText(status.installer.error)}</p>}
-          {!installed && !installing && <Button disabled={hasActions || (status.installer.state === 'error' && !status.installer.retryable)} onClick={() => void run('install')}>{t(status.installer.state === 'paused' ? 'hermes.resumeInstall' : status.installer.state === 'error' || status.installer.state === 'cancelled' ? 'hermes.retryInstall' : 'hermes.install')}</Button>}
-        </CardContent>
-      </Card>
       {runtimeAvailable && <>
-        <div className="flex items-center justify-between gap-3"><h3 className="text-base font-semibold">{t('hermes.connections')}</h3><Button size="sm" variant="outline" disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor({ kind: 'add', manual: false })}>{t('hermes.addChannel')}</Button></div>
-        {connections.map((connection) => {
-          const accountAction = busyActions[`account:${connection.accountRef}`];
-          const accountDisabled = runtimeDisabled || Boolean(accountAction);
-          const interruptDisabled = runtimeDisabled || Boolean(accountAction && !PAIRING_ACTIONS.has(accountAction));
-          return <HermesConnectionCard key={connection.accountRef} connection={connection} platform={platforms.find((item) => item.id === connection.platform)}
-            routes={status.routes.filter((route) => route.source.accountRef === connection.accountRef)} workspaces={status.workspaces} disabled={accountDisabled} stopDisabled={interruptDisabled} removeDisabled={interruptDisabled} editDisabled={disabled || Boolean(setupConnecting)}
-            requestError={connectionRequestErrors[connection.accountRef]} setupError={setup?.accountRef === connection.accountRef ? setupStatusError : null} run={run} onEdit={() => void changeEditor({ kind: 'edit', accountRef: connection.accountRef })} stateLabel={stateLabel} />;
-        })}
-        {showEditor && <Card data-hermes-editor><CardHeader className="pb-3"><CardTitle className="flex items-center justify-between gap-3 text-base">
-          <span>{editingConnection ? t('hermes.editConnection') : platform ? platformDisplayName(platform.id, platform.label, t) : t('hermes.choosePlatform')}</span>
-          {(platform || editingConnection) && <Button size="sm" variant="ghost" disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor(editingConnection ? null : { kind: 'add', manual: false })}>{t(editingConnection ? 'hermes.closeEditor' : 'hermes.changePlatform')}</Button>}
-        </CardTitle></CardHeader><CardContent className="space-y-4">
-          {setupRequestError && <p role="alert" className="text-sm text-destructive" data-hermes-setup-request-error>{t(setupRequestError)}</p>}
-          {editorSetup && setupStatusError && !manual && !setupRequestError && <p role="alert" className="text-sm text-destructive" data-hermes-setup-error>{t(setupStatusError)}</p>}
-          {platforms.length === 0 ? <div className="space-y-3"><p className="text-sm text-muted-foreground">{t(discoveryTransitioning ? 'hermes.loadingPlatforms' : 'hermes.noPlatforms')}</p>
-            {status.gateway.error && <p role="alert" className="text-sm text-destructive">{errorText(status.gateway.error)}</p>}
-            <Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button>
-          </div> : !platform && editingConnection ? <div className="space-y-3"><p role="status" className="text-sm text-muted-foreground">{t('hermes.connectionSchemaUnavailable')}</p><Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button></div>
-            : !platform ? <HermesChannelPicker platforms={platforms} disabled={disabled || Boolean(setupConnecting)} onSelect={(id) => setEditor({ kind: 'add', platformId: id, manual: false })} /> : <>
-            {manual ? <HermesChannelForm key={editingConnection?.accountRef ?? `new:${platform.id}`} platform={platform} connection={editingConnection} disabled={editorDisabled || Boolean(setupConnecting)} run={run} onSaved={() => setEditor((current) => current === editor ? null : current)} onCancel={() => void changeEditor(null)} />
-              : <HermesQrSetup platform={platform} setup={editorSetup} state={editorSetup ? setupState : undefined} disabled={disabled || discoveryTransitioning} onBegin={() => void run('beginSetup', { platform: platform.id })} onCancel={() => { if (editorSetup) void run('cancelSetup', { id: editorSetup.id }); }} />}
-            {!editingConnection && platform.qrSetup && <Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => void changeEditor({ kind: 'add', platformId: platform.id, manual: !manual })}>{t(manual ? 'hermes.useScan' : 'hermes.manualConnect')}</Button>}
-          </>}
-        </CardContent></Card>}
+        {showEditor && <section className="hermes-editor" data-hermes-editor>
+          <header className="hermes-editor-header">
+            <div className="hermes-editor-heading"><h3 ref={editorHeadingRef} tabIndex={-1}>{editingConnection ? t('hermes.editConnection') : platform ? platformDisplayName(platform.id, platform.label, t) : t('hermes.choosePlatform')}</h3>
+              {!platform && !editingConnection && <p>{t('hermes.choosePlatformHint')}</p>}
+            </div>
+            <div className="hermes-editor-navigation">
+              {platform && !editingConnection && <Button size="sm" variant="ghost" disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor({ kind: 'add', manual: false })}><ArrowLeft aria-hidden="true" />{t('hermes.changePlatform')}</Button>}
+              {(connections.length > 0 || editingConnection) && <Button size="icon" variant="ghost" aria-label={t('hermes.closeEditor')} disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor(null)}><X aria-hidden="true" /></Button>}
+            </div>
+          </header>
+          {!editingConnection && <HermesSteps current={platform ? 2 : 1} />}
+          <div className="hermes-editor-content">
+            {setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-request-error>{t(setupRequestError)}</p>}
+            {editorSetup && setupStatusError && !manual && !setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-error>{t(setupStatusError)}</p>}
+            {platforms.length === 0 ? <div className="hermes-discovery"><p>{t(discoveryTransitioning ? 'hermes.loadingPlatforms' : 'hermes.noPlatforms')}</p>
+              {status.gateway.error && <p role="alert" className="hermes-error">{errorText(status.gateway.error)}</p>}
+              <Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button>
+            </div> : !platform && editingConnection ? <div className="hermes-discovery"><p role="status">{t('hermes.connectionSchemaUnavailable')}</p><Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button></div>
+              : !platform ? <HermesChannelPicker platforms={platforms} disabled={disabled || Boolean(setupConnecting)} onSelect={(id) => void changeEditor({ kind: 'add', platformId: id, manual: false })} /> : <>
+              {manual ? <HermesChannelForm key={editingConnection?.accountRef ?? `new:${platform.id}`} platform={platform} connection={editingConnection} disabled={editorDisabled || Boolean(setupConnecting)} run={run} onSaved={() => setEditor((current) => current === editor ? null : current)} onCancel={() => void changeEditor(null)} />
+                : <HermesQrSetup platform={platform} setup={editorSetup} state={editorSetup ? setupState : undefined} disabled={disabled || discoveryTransitioning} onBegin={() => void run('beginSetup', { platform: platform.id })} onCancel={() => { if (editorSetup) void run('cancelSetup', { id: editorSetup.id }); }} />}
+              {!editingConnection && platform.qrSetup && <footer className="hermes-editor-footer"><Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => void changeEditor({ kind: 'add', platformId: platform.id, manual: !manual })}><span aria-hidden="true">{manual ? <QrCode /> : <KeyRound />}</span>{t(manual ? 'hermes.useScan' : 'hermes.manualConnect')}<ArrowRight aria-hidden="true" /></Button></footer>}
+            </>}
+          </div>
+        </section>}
+        {connections.length > 0 && <section className="hermes-connections" aria-labelledby="hermes-connections-title">
+          <div className="hermes-section-heading"><h3 id="hermes-connections-title">{t('hermes.connections')}<span className="hermes-count">{connections.length}</span></h3><span className="hermes-caption">{t('hermes.connectionsHint')}</span></div>
+          <div className="hermes-connection-list">{connections.map((connection) => {
+            const accountAction = busyActions[`account:${connection.accountRef}`];
+            const accountDisabled = runtimeDisabled || Boolean(accountAction);
+            const interruptDisabled = runtimeDisabled || Boolean(accountAction && !PAIRING_ACTIONS.has(accountAction));
+            return <HermesConnectionCard key={connection.accountRef} connection={connection} platform={platforms.find((item) => item.id === connection.platform)}
+              routes={status.routes.filter((route) => route.source.accountRef === connection.accountRef)} workspaces={status.workspaces} disabled={accountDisabled} stopDisabled={interruptDisabled} removeDisabled={interruptDisabled} editDisabled={disabled || Boolean(setupConnecting)}
+              requestError={connectionRequestErrors[connection.accountRef]} setupError={setup?.accountRef === connection.accountRef ? setupStatusError : null} run={run} onEdit={() => void changeEditor({ kind: 'edit', accountRef: connection.accountRef })} stateLabel={stateLabel} />;
+          })}</div>
+        </section>}
       </>}
-      {(status.operations.length > 0 || status.deliveries.length > 0) && <Card><CardHeader><CardTitle className="text-base">{t('hermes.activity')}</CardTitle></CardHeader><CardContent className="space-y-5">
-        {status.operations.length > 0 && <div className="space-y-3"><h4 className="text-xs font-medium text-muted-foreground">{t('hermes.operations')}</h4>{recentOperations.map((operation) => <div key={operation.id} className="flex items-start justify-between gap-4 text-sm"><div className="min-w-0"><p className="break-all font-mono text-xs text-muted-foreground">{operation.runtimeId}</p><p className="mt-1 line-clamp-3 break-words">{operation.detail}</p></div><span className="shrink-0 text-xs">{stateLabel(operation.state === 'running' ? 'started' : operation.state)}</span></div>)}</div>}
-        {status.deliveries.length > 0 && <div className="space-y-2"><h4 className="text-xs font-medium text-muted-foreground">{t('hermes.deliveries')}</h4>{recentDeliveries.map((delivery) => <div key={delivery.id} className="flex items-center justify-between gap-3 text-xs"><span className="truncate font-mono text-muted-foreground">{delivery.id}</span><span className="shrink-0">{stateLabel(delivery.status)}</span></div>)}</div>}
-      </CardContent></Card>}
+      {(status.operations.length > 0 || status.deliveries.length > 0) && <section className="hermes-activity" aria-labelledby="hermes-activity-title">
+        <div className="hermes-section-heading"><h3 id="hermes-activity-title">{t('hermes.activity')}</h3><Activity aria-hidden="true" /></div>
+        <div className="hermes-activity-columns">
+          {status.operations.length > 0 && <div><h4 className="hermes-caption">{t('hermes.operations')}</h4>{recentOperations.map((operation) => <div key={operation.id} className="hermes-activity-row"><div className="min-w-0"><p className="hermes-activity-detail">{operation.detail}</p><p className="hermes-activity-id" title={operation.runtimeId}>{operation.runtimeId}</p></div><span className="hermes-activity-state">{stateLabel(operation.state === 'running' ? 'started' : operation.state)}</span></div>)}</div>}
+          {status.deliveries.length > 0 && <div><h4 className="hermes-caption">{t('hermes.deliveries')}</h4>{recentDeliveries.map((delivery) => {
+            const date = new Date(timestamp(delivery.createdAt));
+            return <div key={delivery.id} className="hermes-activity-row"><div className="min-w-0"><p>{t('hermes.chatNotification')}{Number.isFinite(date.getTime()) && <> · <time dateTime={date.toISOString()}>{date.toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></>}</p><p className="hermes-activity-id" title={delivery.id}>{delivery.id.length > 16 ? `…${delivery.id.slice(-8)}` : delivery.id}</p></div><span className="hermes-activity-state">{stateLabel(delivery.status)}</span></div>;
+          })}</div>}
+        </div>
+      </section>}
+      <HermesRuntime installer={status.installer} runtimeAvailable={runtimeAvailable} installed={installed} installing={installing}
+        installAccepted={installAccepted} cancelling={cancelling} hasActions={hasActions} activeConnection={activeConnection}
+        setupActive={setupPending || Boolean(setupConnecting)} cancelDisabled={Boolean(busy && busy !== 'install')} run={run} stateLabel={stateLabel} />
     </>}
   </div>;
 }

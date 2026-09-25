@@ -10,6 +10,10 @@ import {
 } from 'react';
 import { HugeiconsIcon, type IconSvgElement } from '@hugeicons/react';
 import {
+  DiscordIcon,
+  SlackIcon,
+  TelegramIcon,
+  WechatIcon,
   Activity01Icon,
   Alert02Icon,
   AlertCircleIcon,
@@ -199,6 +203,10 @@ function createIcon(icon: IconSvgElement, displayName: string): LucideIcon {
 }
 
 export const Activity = createIcon(Activity01Icon, 'Activity');
+export const Discord = createIcon(DiscordIcon, 'Discord');
+export const Slack = createIcon(SlackIcon, 'Slack');
+export const Telegram = createIcon(TelegramIcon, 'Telegram');
+export const Wechat = createIcon(WechatIcon, 'Wechat');
 export const AlertCircle = createIcon(AlertCircleIcon, 'AlertCircle');
 export const AlertTriangle = createIcon(Alert02Icon, 'AlertTriangle');
 export const AppWindow = createIcon(AppWindowIcon, 'AppWindow');
