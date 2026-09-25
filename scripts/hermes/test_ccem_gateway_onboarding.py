@@ -255,6 +255,29 @@ class HostTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "^setup_platform_not_available$"):
             await host.request("beginSetup", {"id": "session", "platform": "wecom"})
 
+    async def test_feishu_dispatch_returns_credentials_only_on_private_poll(self):
+        host = self.new_host()
+        host.platforms = [{"id": "feishu", "available": True, "qrSetup": True}]
+        clock = [100.0]
+        async def fetch(url, **kwargs):
+            return {
+                "init": {"supported_auth_methods": ["client_secret"]},
+                "begin": {"device_code": "private-device-code", "verification_uri_complete": "https://open.feishu.cn/page/launcher?user_code=code", "interval": 5},
+                "poll": {"client_id": "cli_synthetic", "client_secret": "private-app-secret", "user_info": {"open_id": "untrusted-owner"}},
+            }[kwargs["form"]["action"]]
+        manager = host_module._setup_module.FeishuSetup(fetch_json=fetch, monotonic=lambda: clock[0])
+        self.addCleanup(manager.clear)
+        with patch.object(host_module._setup_module, "FeishuSetup", return_value=manager) as factory:
+            begun = await host.request("beginSetup", {"id": "session", "platform": "feishu"})
+        factory.assert_called_once()
+        self.assertEqual(begun["state"], "waiting")
+        clock[0] += 5
+        result = await host.request("pollSetup", {"id": "session"})
+        self.assertEqual(result["fields"]["FEISHU_APP_SECRET"], "private-app-secret")
+        public = json.dumps(await host.request("status", {}))
+        for sensitive in ("private-device-code", "private-app-secret", "untrusted-owner", "qrPayload"):
+            self.assertNotIn(sensitive, public)
+
     async def test_wire_cancel_preempts_generate_and_replacement_is_bounded(self):
         host = self.new_host()
         started = asyncio.Queue()
@@ -363,7 +386,7 @@ class HttpsTests(unittest.IsolatedAsyncioTestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix="ccem-qr-https-")
         directory = Path(cls.directory.name)
         config = directory / "openssl.cnf"
-        config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=work.weixin.qq.com\n[ext]\nsubjectAltName=DNS:work.weixin.qq.com,DNS:setup.hermes-agent.nousresearch.com\n")
+        config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=work.weixin.qq.com\n[ext]\nsubjectAltName=DNS:work.weixin.qq.com,DNS:setup.hermes-agent.nousresearch.com,DNS:accounts.feishu.cn,DNS:accounts.larksuite.com\n")
         cls.cert, cls.key = directory / "cert.pem", directory / "key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                         "-keyout", str(cls.key), "-out", str(cls.cert), "-config", str(config)],
@@ -393,7 +416,7 @@ class HttpsTests(unittest.IsolatedAsyncioTestCase):
         port = site._server.sockets[0].getsockname()[1]
         class LocalResolver(aiohttp.abc.AbstractResolver):
             async def resolve(self, host, target_port=0, family=socket.AF_INET):
-                if host not in ("work.weixin.qq.com", "setup.hermes-agent.nousresearch.com"):
+                if host not in ("work.weixin.qq.com", "setup.hermes-agent.nousresearch.com", "accounts.feishu.cn", "accounts.larksuite.com"):
                     raise AssertionError("external DNS is prohibited")
                 return [{"hostname": host, "host": "127.0.0.1", "port": port,
                          "family": socket.AF_INET, "proto": 0, "flags": 0}]
@@ -491,6 +514,34 @@ class HttpsTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "^setup_redirect_rejected$"):
             await qr._fetch_json(qr.TELEGRAM_URL + "/session", bearer="synthetic-private-token")
         self.assertEqual(self.requests, ["/v1/telegram/pairings/session"])
+
+    async def test_feishu_post_form_parses_pending_400_and_limits_rate(self):
+        form = {"action": "poll", "device_code": "synthetic-private-device-code", "tp": "ob_app"}
+        async def handler(request):
+            self.assertEqual(request.content_type, "application/x-www-form-urlencoded")
+            self.assertEqual(dict(await request.post()), form)
+            self.assertEqual(request.query_string, "")
+            self.assertNotIn("Authorization", request.headers)
+            return self.web.json_response({"error": "authorization_pending"}, status=400)
+        self.handler = handler
+        for url in qr.FEISHU_URLS.values():
+            self.assertEqual(await qr._fetch_json(url, method="POST", form=form), {"error": "authorization_pending"})
+        self.handler = lambda request: self.web.Response(status=429, text="private-provider-diagnostics")
+        self.assertEqual(await qr._fetch_json(qr.FEISHU_URLS["feishu"], method="POST", form=form), {"error": "slow_down"})
+        self.handler = lambda request: self.web.json_response({"client_secret": "private-secret"}, status=400)
+        with self.assertRaisesRegex(qr.SetupError, "setup_invalid_response"):
+            await qr._fetch_json(qr.FEISHU_URLS["feishu"], method="POST", form=form)
+
+    async def test_feishu_poll_capability_cannot_escape_or_follow_redirects(self):
+        form = {"action": "poll", "device_code": "synthetic-private-device-code", "tp": "ob_app"}
+        for url in ("https://evil.test/oauth/v1/app/registration", qr.FEISHU_URLS["feishu"] + "?redirect=x", qr.GENERATE_URL):
+            with self.assertRaisesRegex(qr.SetupError, "setup_invalid_endpoint"):
+                await qr._fetch_json(url, method="POST", form=form)
+        self.assertEqual(self.requests, [])
+        self.handler = lambda request: self.web.Response(status=302, headers={"Location": qr.FEISHU_URLS["lark"]})
+        with self.assertRaisesRegex(qr.SetupError, "setup_redirect_rejected"):
+            await qr._fetch_json(qr.FEISHU_URLS["feishu"], method="POST", form=form)
+        self.assertEqual(self.requests, ["/oauth/v1/app/registration"])
 
 
 if __name__ == "__main__":

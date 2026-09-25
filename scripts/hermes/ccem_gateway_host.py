@@ -48,6 +48,7 @@ FIELD_LABELS = {
     "WECOM_BOT_ID": "Bot ID", "WECOM_SECRET": "Bot secret",
     "TELEGRAM_BOT_TOKEN": "Bot token", "DISCORD_BOT_TOKEN": "Bot token",
     "FEISHU_APP_ID": "App ID", "FEISHU_APP_SECRET": "App secret",
+    "FEISHU_DOMAIN": "Region (feishu / lark)",
     "SLACK_BOT_TOKEN": "Bot token", "SLACK_APP_TOKEN": "App token",
 }
 
@@ -79,12 +80,14 @@ def platform_metadata(entry, strict_supported):
         fields.append({"key": key, "label": FIELD_LABELS.get(key, key.replace("_", " ")),
                        "secret": any(word in key for word in ("SECRET", "TOKEN", "PASSWORD", "KEY")),
                        "required": required.get("required", True) if isinstance(required, dict) else True})
+    if entry.name == "feishu" and not any(field["key"] == "FEISHU_DOMAIN" for field in fields):
+        fields.append({"key": "FEISHU_DOMAIN", "label": FIELD_LABELS["FEISHU_DOMAIN"], "secret": False, "required": False})
     try:
         available = bool(entry.check_fn())
     except Exception:
         available = False
     strict = strict_supported(entry.name)
-    qr = available and strict and entry.name in ("wecom", "telegram")
+    qr = available and strict and entry.name in ("wecom", "telegram", "feishu")
     if qr:
         try:
             _setup_module.tls_context()
@@ -230,6 +233,8 @@ class Host:
         allowed = {f["key"] for f in meta["fields"]}
         if set(fields) - allowed:
             raise ValueError("unknown_channel_field")
+        if platform == "feishu" and fields.get("FEISHU_DOMAIN", "feishu") not in ("feishu", "lark"):
+            raise ValueError("invalid_channel_field")
         for field in meta["fields"]:
             key = field["key"]
             value = fields.get(key, "")
@@ -392,7 +397,9 @@ class Host:
                 identifier, platform = self.validate_begin_setup(params)
                 if self.setup.platform != platform:
                     self.setup.clear("superseded")
-                    self.setup = _setup_module.TelegramSetup() if platform == "telegram" else _setup_module.WeComSetup()
+                    setup_type = {"wecom": _setup_module.WeComSetup, "telegram": _setup_module.TelegramSetup,
+                                  "feishu": _setup_module.FeishuSetup}[platform]
+                    self.setup = setup_type()
                 return await self.setup.begin(identifier, platform)
             if method == "pollSetup":
                 return await self.setup.poll(identifier)

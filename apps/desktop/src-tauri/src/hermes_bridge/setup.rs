@@ -114,6 +114,27 @@ impl Setup {
 fn allowed_qr_url(platform: &str, url: &reqwest::Url) -> bool {
     match platform {
         "wecom" => url.host_str() == Some("work.weixin.qq.com") && url.path() == "/ai/qc/c",
+        "feishu" => {
+            let query: Vec<_> = url.query_pairs().collect();
+            matches!(
+                url.host_str(),
+                Some("open.feishu.cn" | "open.larksuite.com")
+            ) && url.path() == "/page/launcher"
+                && query.iter().filter(|(key, _)| key == "user_code").count() == 1
+                && query.iter().all(|(key, value)| match key.as_ref() {
+                    "user_code" => {
+                        !value.is_empty()
+                            && value.len() <= 256
+                            && value.trim() == value
+                            && !value.chars().any(char::is_control)
+                    }
+                    "from" | "tp" => {
+                        value == "hermes"
+                            && query.iter().filter(|(other, _)| other == key).count() == 1
+                    }
+                    _ => false,
+                })
+        }
         "telegram" => {
             if url.host_str() != Some("t.me") {
                 return false;
@@ -168,6 +189,7 @@ fn complete_credentials(
     let expected: &[&str] = match platform {
         "wecom" => &["WECOM_BOT_ID", "WECOM_SECRET"],
         "telegram" => &["TELEGRAM_BOT_TOKEN"],
+        "feishu" => &["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOMAIN"],
         _ => return Err("setup_not_supported".into()),
     };
     if fields.len() != expected.len() {
@@ -181,6 +203,10 @@ fn complete_credentials(
         if value.trim().is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
             return Err("setup_invalid_credentials".into());
         }
+    }
+    if platform == "feishu" && !matches!(fields["FEISHU_DOMAIN"].as_str(), Some("feishu" | "lark"))
+    {
+        return Err("setup_invalid_credentials".into());
     }
     Ok(fields.clone())
 }
@@ -317,7 +343,7 @@ impl HermesBridgeManager {
             return Err("gateway_not_running".into());
         }
         let snapshot = host.snapshot();
-        if !["wecom", "telegram"].contains(&platform)
+        if !["wecom", "telegram", "feishu"].contains(&platform)
             || !snapshot["platforms"].as_array().is_some_and(|ps| {
                 ps.iter().any(|p| {
                     p["id"] == platform
@@ -484,6 +510,60 @@ mod tests {
 
     fn qr(id: &str, expires: i64) -> Value {
         json!({"id":id,"state":"waiting","qrPayload":"https://work.weixin.qq.com/ai/qc/c?s=scan-token","expiresAt":expires})
+    }
+
+    #[test]
+    fn feishu_qr_restricts_launcher_and_requires_complete_regional_credentials() {
+        let mut setup = Setup::new("feishu", 100);
+        let id = setup.id.clone();
+        let reply = |url| json!({"id":id,"state":"waiting","qrPayload":url,"expiresAt":300100});
+        for invalid in [
+            "https://open.feishu.cn.evil.test/page/launcher?user_code=code",
+            "http://open.feishu.cn/page/launcher?user_code=code",
+            "https://open.feishu.cn:443/page/launcher?user_code=code",
+            "https://user@open.feishu.cn/page/launcher?user_code=code",
+            "https://open.feishu.cn/page/other?user_code=code",
+            "https://open.feishu.cn/page/launcher?user_code=code#fragment",
+            "https://open.feishu.cn/page/launcher?user_code=code&user_code=other",
+            "https://open.feishu.cn/page/launcher?user_code=code&redirect_uri=https://evil.test",
+            "https://open.feishu.cn/page/launcher?user_code=code&from=other",
+            "https://open.feishu.cn/page/launcher?user_code=code&tp=hermes&tp=hermes",
+            "https://open.feishu.cn/page/launcher?user_code=%0A",
+            "https://open.feishu.cn/page/launcher?user_code=",
+        ] {
+            assert!(
+                setup.accept_qr(&id, &reply(invalid), 101).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(setup
+            .accept_qr(
+                &id,
+                &reply("https://open.feishu.cn/page/launcher?user_code=code&from=hermes&tp=hermes"),
+                101
+            )
+            .unwrap());
+        assert!(allowed_qr_url(
+            "feishu",
+            &reqwest::Url::parse("https://open.larksuite.com/page/launcher?user_code=code")
+                .unwrap()
+        ));
+        let complete = json!({"id":id,"platform":"feishu","state":"ready","fields":{
+            "FEISHU_APP_ID":"cli_synthetic","FEISHU_APP_SECRET":"private-app-secret","FEISHU_DOMAIN":"lark"},"open_id":"untrusted-owner"});
+        assert!(complete_credentials(&id, "feishu", &complete).is_ok());
+        for key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOMAIN"] {
+            let mut partial = complete.clone();
+            partial["fields"].as_object_mut().unwrap().remove(key);
+            assert!(complete_credentials(&id, "feishu", &partial).is_err());
+        }
+        let mut invalid = complete.clone();
+        invalid["fields"]["FEISHU_DOMAIN"] = json!("untrusted-domain");
+        assert!(complete_credentials(&id, "feishu", &invalid).is_err());
+        invalid = complete.clone();
+        invalid["fields"]["open_id"] = json!("untrusted-owner");
+        assert!(complete_credentials(&id, "feishu", &invalid).is_err());
+        setup.finish("connected", None);
+        assert!(!json!(setup).to_string().contains("private-app-secret"));
     }
     #[test]
     fn cancelled_replaced_and_expired_results_cannot_advance_setup() {

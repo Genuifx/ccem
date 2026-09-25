@@ -16,6 +16,10 @@ from datetime import datetime
 GENERATE_URL = "https://work.weixin.qq.com/ai/qc/generate?source=hermes"
 QUERY_URL = "https://work.weixin.qq.com/ai/qc/query_result"
 TELEGRAM_URL = "https://setup.hermes-agent.nousresearch.com/v1/telegram/pairings"
+FEISHU_URLS = {
+    "feishu": "https://accounts.feishu.cn/oauth/v1/app/registration",
+    "lark": "https://accounts.larksuite.com/oauth/v1/app/registration",
+}
 RESPONSE_LIMIT = 64 * 1024
 REQUEST_TIMEOUT = 8
 SESSION_TIMEOUT = 300
@@ -42,7 +46,7 @@ def _identifier(value):
 
 def validate_begin(identifier, platform):
     identifier = _identifier(identifier)
-    if platform not in ("wecom", "telegram"):
+    if platform not in ("wecom", "telegram", "feishu"):
         raise SetupError("setup_platform_not_supported")
     return identifier
 
@@ -95,23 +99,51 @@ def _telegram_qr_payload(value):
     return value
 
 
-async def _fetch_json(url, *, method="GET", payload=None, bearer=None):
+def _feishu_qr_payload(value):
+    value = _text(value, 4096)
+    try:
+        url = urllib.parse.urlsplit(value)
+        query = urllib.parse.parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
+        valid = (url.scheme == "https" and url.netloc in ("open.feishu.cn", "open.larksuite.com")
+                 and url.path == "/page/launcher" and not url.fragment
+                 and "user_code" in query and set(query) <= {"user_code", "from", "tp"}
+                 and all(len(values) == 1 for values in query.values())
+                 and bool(_text(query["user_code"][0], 256))
+                 and all(query[key] == ["hermes"] for key in ("from", "tp") if key in query))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SetupError("setup_invalid_qr_url")
+    return value
+
+
+async def _fetch_json(url, *, method="GET", payload=None, bearer=None, form=None):
     # Both URLs originate here. No renderer-provided URL, redirect, or proxy can
     # move a polling capability to another endpoint.
     parsed = urllib.parse.urlsplit(url)
-    wecom = method == "GET" and payload is None and bearer is None and (url == GENERATE_URL or (
+    wecom = method == "GET" and form is None and payload is None and bearer is None and (url == GENERATE_URL or (
         parsed.scheme == "https" and parsed.netloc == "work.weixin.qq.com"
         and parsed.path == "/ai/qc/query_result" and not parsed.fragment
         and list(urllib.parse.parse_qs(parsed.query)) == ["scode"]
     ))
-    telegram_create = method == "POST" and url == TELEGRAM_URL and payload == {"bot_name": "CCEM"} and bearer is None
-    telegram_poll = (method == "GET" and payload is None and isinstance(bearer, str)
+    telegram_create = method == "POST" and form is None and url == TELEGRAM_URL and payload == {"bot_name": "CCEM"} and bearer is None
+    telegram_poll = (method == "GET" and form is None and payload is None and isinstance(bearer, str)
                      and 1 <= len(bearer) <= 4096 and bearer == bearer.strip()
                      and all(32 <= ord(c) < 127 for c in bearer)
                      and parsed.scheme == "https" and parsed.netloc == "setup.hermes-agent.nousresearch.com"
                      and re.fullmatch(r"/v1/telegram/pairings/[A-Za-z0-9_-]{1,128}", parsed.path)
                      and not parsed.query and not parsed.fragment)
-    if not (wecom or telegram_create or telegram_poll):
+    feishu = (method == "POST" and url in FEISHU_URLS.values() and payload is None and bearer is None
+              and isinstance(form, dict) and (
+                  form == {"action": "init"}
+                  or form == {"action": "begin", "archetype": "PersonalAgent", "auth_method": "client_secret", "request_user_info": "open_id"}
+                  or (set(form) == {"action", "device_code", "tp"} and form["action"] == "poll" and form["tp"] == "ob_app"
+                      and isinstance(form["device_code"], str) and 1 <= len(form["device_code"]) <= 4096
+                      and form["device_code"] == form["device_code"].strip()
+                      and all(32 <= ord(c) < 127 for c in form["device_code"]))
+              ))
+    feishu_poll = feishu and form["action"] == "poll"
+    if not (wecom or telegram_create or telegram_poll or feishu):
         raise SetupError("setup_invalid_endpoint")
     try:
         import aiohttp
@@ -124,10 +156,13 @@ async def _fetch_json(url, *, method="GET", payload=None, bearer=None):
             headers = {"User-Agent": "HermesAgent/1.0"}
             if bearer:
                 headers["Authorization"] = "Bearer " + bearer
-            async with client.request(method, url, allow_redirects=False, headers=headers, json=payload) as response:
+            body = {"data": form} if feishu else {"json": payload}
+            async with client.request(method, url, allow_redirects=False, headers=headers, **body) as response:
                 if 300 <= response.status < 400:
                     raise SetupError("setup_redirect_rejected")
-                if response.status not in ((200, 201) if telegram_create else (200,)):
+                if response.status == 429 and feishu_poll:
+                    return {"error": "slow_down"}
+                if response.status not in ((200, 400) if feishu_poll else (200, 201) if telegram_create else (200,)):
                     raise SetupError("setup_request_failed")
                 if response.content_length is not None and response.content_length > RESPONSE_LIMIT:
                     raise SetupError("setup_response_too_large")
@@ -141,6 +176,8 @@ async def _fetch_json(url, *, method="GET", payload=None, bearer=None):
                 except (ValueError, UnicodeError):
                     raise SetupError("setup_invalid_response") from None
                 if not isinstance(value, dict):
+                    raise SetupError("setup_invalid_response")
+                if response.status == 400 and not isinstance(value.get("error"), str):
                     raise SetupError("setup_invalid_response")
                 return value
     except asyncio.TimeoutError:
@@ -324,6 +361,7 @@ class TelegramSetup(WeComSetup):
                 self.clear("failed")
             raise SetupError("setup_request_failed") from None
 
+
     async def poll(self, identifier):
         session = self._session(identifier)
         if not session["scode"]:
@@ -345,6 +383,115 @@ class TelegramSetup(WeComSetup):
             self.clear("consumed")
             return {"id": identifier, "state": "ready", "platform": "telegram", "fields": {"TELEGRAM_BOT_TOKEN": token}}
         except (asyncio.CancelledError, SetupError):
+            if self._current is session:
+                self.clear("failed")
+            raise
+        except Exception:
+            if self._current is session:
+                self.clear("failed")
+            raise SetupError("setup_request_failed") from None
+
+
+class FeishuSetup(WeComSetup):
+    """Official scan-to-create device flow; scanner identity grants no CCEM access."""
+
+    platform = "feishu"
+
+    async def begin(self, identifier, platform):
+        identifier = validate_begin(identifier, platform)
+        if platform != self.platform:
+            raise SetupError("setup_platform_not_supported")
+        self.clear("superseded")
+        session = {"id": identifier, "scode": None, "deadline": self._monotonic() + SESSION_TIMEOUT,
+                   "expiresAt": int((self._wall_clock() + SESSION_TIMEOUT) * 1000)}
+        self._current, self._terminal = session, None
+        self._expiry = asyncio.get_running_loop().call_later(SESSION_TIMEOUT, self._expire, session)
+        try:
+            init = await self._fetch_json(FEISHU_URLS["feishu"], method="POST", form={"action": "init"})
+            self._check(session)
+            if not isinstance(init, dict) or not isinstance(init.get("supported_auth_methods"), list) or "client_secret" not in init["supported_auth_methods"]:
+                raise SetupError("setup_unavailable")
+            data = await self._fetch_json(FEISHU_URLS["feishu"], method="POST", form={
+                "action": "begin", "archetype": "PersonalAgent", "auth_method": "client_secret", "request_user_info": "open_id"})
+            self._check(session)
+            if not isinstance(data, dict):
+                raise SetupError("setup_invalid_response")
+            code = _text(data.get("device_code"))
+            if not code.isascii():
+                raise SetupError("setup_invalid_response")
+            payload = _feishu_qr_payload(data.get("verification_uri_complete"))
+            parts = urllib.parse.urlsplit(payload)
+            query = dict(urllib.parse.parse_qsl(parts.query))
+            query.update({"from": "hermes", "tp": "hermes"})
+            payload = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+            interval = data.get("interval", 5)
+            expires = data.get("expires_in", data.get("expire_in", SESSION_TIMEOUT))
+            if type(interval) is not int or not 1 <= interval <= SESSION_TIMEOUT or type(expires) is not int or expires <= 0:
+                raise SetupError("setup_invalid_response")
+            remaining = min(expires, session["deadline"] - self._monotonic())
+            session.update(deadline=self._monotonic() + remaining, expiresAt=int((self._wall_clock() + remaining) * 1000))
+            self._expiry.cancel()
+            self._expiry = asyncio.get_running_loop().call_later(max(0, remaining), self._expire, session)
+            self._check(session)
+            session["scode"] = {"device_code": code, "domain": "feishu", "interval": interval,
+                                "next_poll": self._monotonic() + interval}
+            return {"id": identifier, "state": "waiting", "qrPayload": payload, "expiresAt": session["expiresAt"]}
+        except (asyncio.CancelledError, SetupError):
+            if self._current is session:
+                self.clear("failed")
+            raise
+        except Exception:
+            if self._current is session:
+                self.clear("failed")
+            raise SetupError("setup_request_failed") from None
+
+    async def poll(self, identifier):
+        session = self._session(identifier)
+        secret = session["scode"]
+        if not secret:
+            raise SetupError("setup_not_ready")
+        waiting = {"id": identifier, "state": "waiting"}
+        if self._monotonic() < secret["next_poll"]:
+            return waiting
+        # Host serializes poll requests. Throttle even transient failures and
+        # preserve the session so an ordinary network interruption is retryable.
+        secret["next_poll"] = self._monotonic() + secret["interval"]
+        try:
+            data = await self._fetch_json(FEISHU_URLS[secret["domain"]], method="POST", form={
+                "action": "poll", "device_code": secret["device_code"], "tp": "ob_app"})
+            self._check(session)
+            if not isinstance(data, dict):
+                raise SetupError("setup_invalid_response")
+            info = data.get("user_info") or {}
+            if not isinstance(info, dict):
+                raise SetupError("setup_invalid_response")
+            if info.get("tenant_brand") == "lark":
+                secret["domain"] = "lark"
+            error = data.get("error")
+            if error == "slow_down":
+                secret["interval"] = min(SESSION_TIMEOUT, secret["interval"] + 5)
+            secret["next_poll"] = self._monotonic() + secret["interval"]
+            if error in ("authorization_pending", "slow_down"):
+                return waiting
+            if error == "expired_token":
+                raise SetupError("setup_expired")
+            if error:
+                raise SetupError("setup_provider_error")
+            try:
+                fields = {"FEISHU_APP_ID": _text(data.get("client_id")),
+                          "FEISHU_APP_SECRET": _text(data.get("client_secret")),
+                          "FEISHU_DOMAIN": secret["domain"]}
+            except SetupError:
+                raise SetupError("setup_credentials_missing") from None
+            self.clear("consumed")
+            return {"id": identifier, "state": "ready", "platform": self.platform, "fields": fields}
+        except SetupError as error:
+            self._check(session)
+            if str(error) in ("setup_network_failed", "setup_request_timeout"):
+                return waiting
+            self.clear("failed")
+            raise
+        except asyncio.CancelledError:
             if self._current is session:
                 self.clear("failed")
             raise

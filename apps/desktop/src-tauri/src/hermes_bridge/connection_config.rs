@@ -142,6 +142,9 @@ impl HermesBridgeManager {
             if value.len() > 4096 || value.chars().any(char::is_control) {
                 return Err("invalid_channel_field".into());
             }
+            if key == "FEISHU_DOMAIN" && !value.is_empty() && !matches!(value, "feishu" | "lark") {
+                return Err("invalid_channel_field".into());
+            }
             if !value.is_empty() {
                 merged.insert(key.clone(), json!(value));
             }

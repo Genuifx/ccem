@@ -24,7 +24,7 @@
 
 上游 `wecom` extra 只增加 XML 依赖，单独导出它不能保证企业微信适配器可用。当前 `messaging` 闭包同时提供共享传输依赖 `aiohttp==3.14.3`，不再需要旧包为此导出的 `sms` extra。扫码 helper 与企业微信连接使用包内传输依赖，扫码 HTTPS 显式使用包内 certifi 根证书，避免依赖构建机的 OpenSSL 证书路径。
 
-包内 `ccem_gateway_onboarding.py` 提供扫码创建协议，由 `ccem_gateway_host.py` 从固定同目录路径加载；两个文件均进入签名文件清单。UI 只有收到平台可用且 `qrSetup=true` 时才显示默认扫码入口，当前为企业微信和 Telegram，手动配置继续保留。成功凭据经私有进程管道交给 CCEM 后端加密保存并连接，再进入私聊口令与桌面工作区授权；扫码不会直接授予任务访问权限。取消、过期及授权边界见 [用户路径](hermes-managed-integration.md#用户路径)。
+包内 `ccem_gateway_onboarding.py` 提供扫码创建协议，由 `ccem_gateway_host.py` 从固定同目录路径加载；两个文件均进入签名文件清单。UI 只有收到平台可用且 `qrSetup=true` 时才显示默认扫码入口，当前为企业微信、Telegram 和飞书，手动配置继续保留。飞书使用官方 device flow，按平台返回的间隔轮询并兼容 Lark 区域；凭据经私有进程管道交给 CCEM 后端加密保存并连接，再进入私聊口令与桌面工作区授权；扫码返回的用户标识不会直接授予任务访问权限。取消、过期及授权边界见 [用户路径](hermes-managed-integration.md#用户路径)。
 
 ## 安装与恢复契约
 

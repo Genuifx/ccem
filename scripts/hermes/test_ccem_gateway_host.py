@@ -20,6 +20,18 @@ from unittest.mock import patch
 
 
 class NativePairingProvenance(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_feishu_region_is_rejected_before_adapter_start(self):
+        with patch.dict(os.environ, {"HERMES_BUNDLED_PLUGINS": str(source / "plugins")}):
+            for region in ("unknown", "https://untrusted.test", ""):
+                host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+                    "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc", "platform": "feishu", "connect": True,
+                    "fields": {"FEISHU_APP_ID": "cli_synthetic", "FEISHU_APP_SECRET": "synthetic-secret", "FEISHU_DOMAIN": region}},
+                    Path(os.environ["HERMES_HOME"]) / "invalid-feishu-region")
+                host.publish = lambda: None
+                with self.assertRaisesRegex(ValueError, "^invalid_channel_field$"):
+                    await host.initialize()
+                self.assertIsNone(host.runner)
+
     async def test_running_status_requires_the_adapter_transport_readiness(self):
         host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
                                 "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc",

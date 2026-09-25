@@ -89,7 +89,10 @@ async def verify():
     wecom = next(item for item in host.platforms if item['id'] == 'wecom')
     assert wecom['available'] is True and wecom['qrSetup'] is True
     assert next(item for item in host.platforms if item['id'] == 'telegram')['qrSetup'] is True
-    assert all(item['qrSetup'] is False for item in host.platforms if item['id'] not in ('wecom', 'telegram'))
+    feishu = next(item for item in host.platforms if item['id'] == 'feishu')
+    assert feishu['qrSetup'] is True
+    assert next(field for field in feishu['fields'] if field['key'] == 'FEISHU_DOMAIN')['required'] is False
+    assert all(item['qrSetup'] is False for item in host.platforms if item['id'] not in ('wecom', 'telegram', 'feishu'))
     assert host.state == 'unconfigured'
     expected = {'wecom', 'telegram', 'feishu', 'discord', 'slack'}
     usable = {item['id'] for item in host.platforms if item['available'] and item['strictSend']}

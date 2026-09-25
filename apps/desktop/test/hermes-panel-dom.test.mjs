@@ -1135,6 +1135,45 @@ test('Telegram scan setup identifies the platform and service and keeps a manual
   assert.equal(actions('approvePairing').length, 0);
 });
 
+test('Feishu defaults to scanning, retries an expired code, and cancels before showing manual credentials', async () => {
+  const feishu = { ...platform, id: 'feishu', label: 'Feishu', qrSetup: true, fields: [
+    { key: 'FEISHU_APP_ID', label: 'App ID', secret: false, required: true },
+    { key: 'FEISHU_APP_SECRET', label: 'App secret', secret: true, required: true },
+    { key: 'FEISHU_DOMAIN', label: 'Region', secret: false, required: false },
+  ] };
+  let setup = { ...qrSetup, platform: 'feishu', qrPayload: 'https://open.feishu.cn/page/launcher?user_code=synthetic' };
+  current = snapshot({ gateway: { state: 'ready', platforms: [qrPlatform, feishu] } });
+  handler = async (name, args) => {
+    if (args?.action === 'beginSetup') return { ...current, setup };
+    if (args?.action === 'cancelSetup') return { ...current, setup: { ...setup, state: 'cancelled', qrPayload: undefined } };
+    return structuredClone(current);
+  };
+  await mount();
+  await selectPlatform('feishu');
+  assert.ok(container.querySelector('[data-hermes-setup]'));
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  await click(button('hermes.scanGenerate'));
+  assert.deepEqual(actions('beginSetup')[0].args.payload, { platform: 'feishu' });
+  assert.ok(container.querySelector('svg[data-hermes-qr]'));
+  assert.equal(container.querySelector('[data-hermes-setup-service]'), null);
+  current = { ...current, setup: { ...setup, state: 'expired', qrPayload: undefined } };
+  await poll();
+  assert.equal(container.querySelector('svg[data-hermes-qr]'), null);
+  assert.ok(button('hermes.scanRetry'));
+  setup = { ...setup, id: 'feishu-new-code', qrPayload: 'https://open.feishu.cn/page/launcher?user_code=refreshed' };
+  await click(button('hermes.scanRetry'));
+  assert.ok(container.querySelector('svg[data-hermes-qr]'));
+  await click(button('hermes.manualConnect'));
+  assert.deepEqual(actions('cancelSetup').at(-1).args.payload, { id: 'feishu-new-code' });
+  assert.equal(container.querySelector('svg[data-hermes-qr]'), null);
+  assert.ok(container.querySelector('#hermes-field-FEISHU_APP_ID'));
+  assert.equal(container.querySelector('#hermes-field-FEISHU_APP_SECRET').type, 'password');
+  await click(button('hermes.useScan'));
+  assert.ok(container.querySelector('[data-hermes-setup]'));
+  assert.equal(actions('configureChannel').length, 0);
+  assert.equal(actions('approvePairing').length, 0);
+});
+
 test('Telegram QR success adds a third connection without changing or authorizing the existing accounts', async () => {
   const telegram = { ...platform, id: 'telegram', label: 'Telegram', qrSetup: true, setupService: 'Hermes' };
   const one = connection();
