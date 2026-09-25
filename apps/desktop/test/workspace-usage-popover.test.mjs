@@ -333,6 +333,11 @@ test('composition view renders per-category tokens and window shares (real event
   assert.match(html, /bg-chart-2/);
   assert.match(html, /bg-chart-6/);
   assert.match(html, /bg-muted"/);
+  // Layout contract (REQ-0028 polish): legend values align into two fixed
+  // right-hand columns; the free-space row is separated by a hairline divider.
+  assert.match(html, /min-w-\[2\.75rem\] text-right/);
+  assert.match(html, /min-w-\[2\.5rem\] text-right/);
+  assert.match(html, /border-t border-border\/35 pt-1\.5/);
   // Estimate footnote (invisible boundary: upstream estimate basis).
   assert.match(html, /上游估算/);
 });

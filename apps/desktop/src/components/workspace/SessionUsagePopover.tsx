@@ -151,7 +151,7 @@ export function ContextCompositionView({ context }: { context: SessionContextSna
   const contextPercent = clampPercent(context.percentage);
 
   return (
-    <div className="space-y-2.5 px-4 py-2.5">
+    <div className="space-y-2 px-4 py-2.5">
       <SectionTitle>{t('workspace.contextCompositionTitle')}</SectionTitle>
       {!hasData ? (
         <div className="pb-1 text-xs leading-5 text-muted-foreground">
@@ -170,13 +170,13 @@ export function ContextCompositionView({ context }: { context: SessionContextSna
             </span>
           </div>
           <div
-            className="flex h-1.5 overflow-hidden rounded-full bg-muted/60"
+            className="flex h-2 items-stretch gap-[2px] overflow-hidden rounded-full bg-muted/60"
             aria-label={t('workspace.contextCompositionTitle')}
           >
             {rows.map((row) => (
               <div
                 key={`segment-${row.name}`}
-                className={cn('h-full', row.colorClass)}
+                className={cn('h-full rounded-[2px]', row.colorClass)}
                 style={{ width: `${row.percent}%` }}
                 title={`${row.label} · ${formatTokenCount(row.tokens)}`}
               />
@@ -184,7 +184,13 @@ export function ContextCompositionView({ context }: { context: SessionContextSna
           </div>
           <div className="space-y-1">
             {rows.map((row) => (
-              <div key={`row-${row.name}`} className="flex items-center gap-2">
+              <div
+                key={`row-${row.name}`}
+                className={cn(
+                  'flex items-center gap-2',
+                  row.isFreeSpace && 'mt-1.5 border-t border-border/35 pt-1.5',
+                )}
+              >
                 <span
                   className={cn('h-2 w-2 shrink-0 rounded-full', row.colorClass)}
                   aria-hidden="true"
@@ -197,23 +203,23 @@ export function ContextCompositionView({ context }: { context: SessionContextSna
                 >
                   {row.label}
                 </span>
-                <span className="ml-auto flex shrink-0 items-baseline gap-1.5 font-mono tabular-nums">
+                <span className="ml-auto flex shrink-0 items-baseline font-mono tabular-nums">
                   <span
                     className={cn(
-                      'text-xs font-medium',
+                      'min-w-[2.75rem] text-right text-xs font-medium',
                       row.isFreeSpace ? 'text-muted-foreground/80' : 'text-foreground',
                     )}
                   >
                     {formatTokenCount(row.tokens)}
                   </span>
-                  <span className="text-2xs text-muted-foreground/70">
+                  <span className="min-w-[2.5rem] text-right text-xs text-muted-foreground/75">
                     {row.percent.toFixed(1)}%
                   </span>
                 </span>
               </div>
             ))}
           </div>
-          <div className="text-2xs leading-4 text-muted-foreground/70">
+          <div className="pt-0.5 text-2xs leading-4 text-muted-foreground/70">
             {t('workspace.contextCompositionFootnote')}
           </div>
         </>
