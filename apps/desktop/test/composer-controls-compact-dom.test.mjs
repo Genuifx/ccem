@@ -276,7 +276,8 @@ test('composer controls collapse to icon-only when the footer goes narrow, and r
     assert.equal(container.querySelector('[data-compact]'), null, 'wide footer must not be compact');
 
     // Narrow footer: compact marker lands on the footer row and both label
-    // spans carry the compact-hidden variant. Icons stay rendered.
+    // spans carry the compact-hidden variant. Icons stay rendered, and the
+    // chevron affordances collapse with them (icon-only triggers).
     mounted.driveResize(500);
     const footer = container.querySelector('[data-compact]');
     assert.ok(footer, 'narrow footer should carry data-compact');
@@ -284,6 +285,17 @@ test('composer controls collapse to icon-only when the footer goes narrow, and r
     assert.ok(envLabel.className.includes(compactHidden), 'environment label must hide in compact mode');
     assert.ok(permLabel.className.includes(compactHidden), 'permission label must hide in compact mode');
     assert.equal(envLabel.textContent, 'DeepSeek-V4-Flash', 'label content is untouched — only presentation hides');
+    const envChevron = [...footer.querySelectorAll('svg')].find(
+      (svg) => svg.getAttribute('class')?.includes('group-data-[compact]/composer-footer:hidden')
+      && !svg.getAttribute('class')?.includes('[&>svg]'),
+    );
+    assert.ok(envChevron, 'environment trigger chevron must carry the compact-hidden variant');
+    const permTrigger = footer.querySelector('[role="combobox"]');
+    assert.match(
+      permTrigger.className,
+      /group-data-\[compact\]\/composer-footer:\[&>svg\]:hidden/,
+      'permission trigger must hide its direct-child chevron svg in compact mode',
+    );
 
     // Borderline: just at/above the 640px threshold stays expanded.
     mounted.driveResize(640);
@@ -318,5 +330,9 @@ test('composer footer compact threshold is wired through the shared footer row u
     'utf8',
   );
   const occurrences = controls.match(/group-data-\[compact\]\/composer-footer:hidden/g) ?? [];
-  assert.equal(occurrences.length, 5, 'env name, separator, gauge, effort text and permission label all collapse');
+  assert.equal(
+    occurrences.length,
+    6,
+    'env name, separator, gauge, effort text, permission label and env chevron all collapse',
+  );
 });

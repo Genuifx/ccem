@@ -389,7 +389,7 @@ export function ComposerControls({
               // when the state flips before the composer is first painted.
               'cursor-pointer outline-none transition-[background-color,box-shadow] duration-150',
               'hover:bg-white/[0.06] focus:ring-2 focus:ring-primary/30',
-              'max-[760px]:px-1.5 group-data-[compact]/composer-footer:px-1.5',
+              'max-[760px]:px-1.5 group-data-[compact]/composer-footer:px-2',
             )}
           >
             <span
@@ -418,7 +418,9 @@ export function ComposerControls({
             <span className="text-muted-foreground/60 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">·</span>
             <Gauge className="h-3 w-3 shrink-0 text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden" />
             <span className="shrink-0 whitespace-nowrap text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden">{t(EFFORT_I18N_KEYS[effort])}</span>
-            <ChevronDown className="h-3 w-3 shrink-0 opacity-50" />
+            {/* Compact mode keeps just the model glyph: the affordance moves
+                into the icon itself (whole trigger stays clickable). */}
+            <ChevronDown className="h-3 w-3 shrink-0 opacity-50 group-data-[compact]/composer-footer:hidden" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -573,7 +575,11 @@ export function ComposerControls({
           className={cn(
             'h-8 w-auto min-w-[112px] shrink-0 rounded-xl px-2.5 text-[12px] text-foreground',
             'max-[760px]:min-w-0 max-[760px]:px-1.5',
-            'group-data-[compact]/composer-footer:min-w-0 group-data-[compact]/composer-footer:px-1.5',
+            'group-data-[compact]/composer-footer:min-w-0 group-data-[compact]/composer-footer:px-2',
+            // Compact mode drops the trigger's chevron too (icon-only); the
+            // direct-child svg is the SelectTrigger's built-in ChevronDown —
+            // the mode icon lives inside the label span.
+            'group-data-[compact]/composer-footer:[&>svg]:hidden',
             // Narrow the shared SelectTrigger's transition-all to colors/shadow
             // so the compact min-width/padding swap applies instantly instead
             // of animating (and potentially sticking) layout properties.
