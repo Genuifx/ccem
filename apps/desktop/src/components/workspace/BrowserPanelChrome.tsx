@@ -4,7 +4,6 @@ import {
   ArrowRight,
   Bot,
   ExternalLink,
-  Globe,
   LoaderCircle,
   PanelTopClose,
   RefreshCw,
@@ -86,6 +85,9 @@ interface BrowserPanelNavigationProps {
   isLoading: boolean;
   navigationDisabled: boolean;
   stopLoadingDisabled: boolean;
+  spinnerActive: boolean;
+  isPopupCloseBusy: boolean;
+  isClosingSurface: boolean;
   t: (key: string) => string;
   onNavigationAction: (action: BrowserSurfaceNavigationAction) => void;
   onOpenExternal: () => void;
@@ -94,6 +96,8 @@ interface BrowserPanelNavigationProps {
   onUrlInputChange: (value: string) => void;
   onCancelUrlEditing: () => void;
   onStartUrlEditing: () => void;
+  onClosePopup: () => void;
+  onClose: () => void;
 }
 
 export function BrowserPanelNavigation({
@@ -113,6 +117,9 @@ export function BrowserPanelNavigation({
   isLoading,
   navigationDisabled,
   stopLoadingDisabled,
+  spinnerActive,
+  isPopupCloseBusy,
+  isClosingSurface,
   t,
   onNavigationAction,
   onOpenExternal,
@@ -121,6 +128,8 @@ export function BrowserPanelNavigation({
   onUrlInputChange,
   onCancelUrlEditing,
   onStartUrlEditing,
+  onClosePopup,
+  onClose,
 }: BrowserPanelNavigationProps) {
   const effectiveControl = control === 'agent'
     ? 'agent'
@@ -228,37 +237,47 @@ export function BrowserPanelNavigation({
         </TooltipTrigger>
         <TooltipContent side="bottom">{controlLabel}</TooltipContent>
       </Tooltip>
+      {spinnerActive ? (
+        <LoaderCircle
+          data-ccem-browser-busy="true"
+          className="ml-1 h-4 w-4 shrink-0 animate-spin text-muted-foreground"
+        />
+      ) : null}
+      {popupActive ? (
+        <BrowserToolButton
+          label={t('workspace.browserPopupClose')}
+          onClick={onClosePopup}
+          disabled={isPopupCloseBusy || sessionStatus !== 'running'}
+        >
+          <PanelTopClose className="h-4 w-4" />
+        </BrowserToolButton>
+      ) : null}
+      <BrowserToolButton
+        label={t('loginBrowserControl.closeBrowser')}
+        onClick={onClose}
+        disabled={isClosingSurface}
+      >
+        <X className="h-4 w-4" />
+      </BrowserToolButton>
     </div>
   );
 }
 
-interface BrowserPanelTabStripProps {
-  panelTitle: string;
+interface BrowserPanelStatusStripProps {
   sessionStatus: 'running' | 'closing' | 'cleanup_required';
   recoveryStates: BrowserSurfaceRecoveryState[];
   popupActive: boolean;
   lifecycle: BrowserPanelLifecycle;
-  spinnerActive: boolean;
-  isPopupCloseBusy: boolean;
-  isClosingSurface: boolean;
   t: (key: string) => string;
-  onClosePopup: () => void;
-  onClose: () => void;
 }
 
-export function BrowserPanelTabStrip({
-  panelTitle,
+export function BrowserPanelStatusStrip({
   sessionStatus,
   recoveryStates,
   popupActive,
   lifecycle,
-  spinnerActive,
-  isPopupCloseBusy,
-  isClosingSurface,
   t,
-  onClosePopup,
-  onClose,
-}: BrowserPanelTabStripProps) {
+}: BrowserPanelStatusStripProps) {
   const recoveryNeedsAttention = recoveryStates.some((state) => (
     state.startsWith('retained_') || state === 'renderer_process_terminated'
   ));
@@ -268,11 +287,6 @@ export function BrowserPanelTabStrip({
 
   return (
     <>
-      <div className="flex h-7 min-w-0 max-w-[220px] items-center gap-2 rounded-md bg-muted/45 px-2.5 text-xs font-medium text-foreground">
-        <Globe className="h-4 w-4" />
-        <span className="truncate">{panelTitle}</span>
-      </div>
-      <div className="min-w-0 flex-1" />
       {recoveryStates.length > 0 ? (
         <span
           data-ccem-browser-recovery-status={recoveryNeedsAttention ? 'attention' : 'recovered'}
@@ -299,25 +313,6 @@ export function BrowserPanelTabStrip({
           {t('workspace.browserCrashed')}
         </span>
       ) : null}
-      {spinnerActive ? (
-        <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
-      ) : null}
-      {popupActive ? (
-        <BrowserToolButton
-          label={t('workspace.browserPopupClose')}
-          onClick={onClosePopup}
-          disabled={isPopupCloseBusy || sessionStatus !== 'running'}
-        >
-          <PanelTopClose className="h-4 w-4" />
-        </BrowserToolButton>
-      ) : null}
-      <BrowserToolButton
-        label={t('loginBrowserControl.closeBrowser')}
-        onClick={onClose}
-        disabled={isClosingSurface}
-      >
-        <X className="h-4 w-4" />
-      </BrowserToolButton>
     </>
   );
 }

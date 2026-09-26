@@ -99,7 +99,11 @@ test('browser panel exposes only Mode 2 sidebar chrome and native surface IPC', 
   assert.match(browserPanelSource, /data-ccem-browser-backend="login"/);
   assert.match(browserPanelSource, /backend: 'login'/);
   assert.match(browserPanelSource, /data-ccem-browser-resize-handle="true"/);
-  assert.match(browserPanelSource, /data-ccem-browser-tab-strip="true"/);
+  // The workspace side panel already renders the tab header; the browser panel
+  // must not stack a second persistent strip under it.
+  assert.doesNotMatch(browserPanelSource, /data-ccem-browser-tab-strip|BrowserPanelTabStrip/);
+  assert.match(browserPanelSource, /data-ccem-browser-status-strip="true"/);
+  assert.match(browserPanelSource, /statusStripVisible = recoveryStates\.length > 0[\s\S]*?lifecycle === 'closed';/);
   assert.match(browserPanelSource, /<BrowserPanelNavigation/);
   assert.match(browserPanelChromeSource, /data-ccem-browser-navigation="true"/);
   assert.match(browserPanelChromeSource, /data-ccem-browser-url-display="true"/);
@@ -117,10 +121,18 @@ test('browser panel exposes only Mode 2 sidebar chrome and native surface IPC', 
     /backend:\s*'preview'|backend === 'preview'|browser_open|browser_set_visible|usePreviewSurfaceMutation/i,
   );
 
-  const tabStripIndex = browserPanelSource.indexOf('<BrowserPanelTabStrip');
+  // Surface-close and popup-close actions moved from the removed tab strip into
+  // the navigation toolbar; the recovery/cleanup/popup/crashed status texts live
+  // in the conditional status strip with unchanged predicates.
+  assert.match(browserPanelChromeSource, /workspace\.browserPopupClose/);
+  assert.match(browserPanelChromeSource, /loginBrowserControl\.closeBrowser/);
+  assert.match(browserPanelChromeSource, /data-ccem-browser-recovery-status=/);
+  assert.match(browserPanelChromeSource, /sessionStatus === 'cleanup_required'/);
+
   const navigationIndex = browserPanelSource.indexOf('<BrowserPanelNavigation');
-  assert.ok(tabStripIndex > 0);
-  assert.ok(navigationIndex > tabStripIndex);
+  const statusStripIndex = browserPanelSource.indexOf('<BrowserPanelStatusStrip');
+  assert.ok(navigationIndex > 0);
+  assert.ok(statusStripIndex > navigationIndex);
 
   const browserPanelCss = cssSource.match(/\.workspace-browser-panel \{[\s\S]*?\n\}/)?.[0] ?? '';
   assert.match(browserPanelCss, /border-left:/);
