@@ -309,7 +309,7 @@ export function SessionUsagePopoverContent({
   const contextPercent = hasContext ? clampPercent(usage.context!.percentage) : 0;
 
   return (
-    <div className="divide-y divide-border/35">
+    <div className="[&>*+*]:border-t [&>*+*]:border-border/35 [&>*:nth-child(2)]:border-t-0">
       <div className="flex items-center justify-between gap-2 px-4 pb-2.5 pt-3">
         <span className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
           {t('workspace.usagePanelTitle')}
