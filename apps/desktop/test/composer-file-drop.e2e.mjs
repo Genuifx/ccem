@@ -1,10 +1,22 @@
 // Real Composer browser smoke; native events are injected via Tauri's event API.
-// This does not prove Finder-to-WebView delivery. Run against a Vite dev server.
+// This does not prove Finder-to-WebView delivery. Run against a Vite dev server
+// (CCEM_TEST_URL, e.g. the port printed by `pnpm tauri:dev`), with Playwright
+// available directly or via PLAYWRIGHT_MODULE. Skips cleanly when Playwright
+// is not installed so `pnpm test:file-drop-e2e` stays runnable everywhere.
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import fs from 'node:fs/promises';
 const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+let chromium;
+try {
+  ({ chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright'));
+} catch {
+  console.log(JSON.stringify({
+    skipped: true,
+    reason: 'playwright not installed; install it (or set PLAYWRIGHT_MODULE) to run the composer file-drop browser smoke',
+  }));
+  process.exit(0);
+}
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1200, height: 900 }, deviceScaleFactor: 2 });
 const errors = [];
