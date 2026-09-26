@@ -1,12 +1,7 @@
-import { Check, Discord, MessageCircle, Slack, Telegram, Wechat } from '@/lib/lucide-react';
+import { Check } from '@/lib/lucide-react';
 import { useLocale } from '@/locales';
 
-export function HermesPlatformIcon({ platform, large = false }: { platform: string; large?: boolean }) {
-  const Icon = { wecom: Wechat, telegram: Telegram, discord: Discord, slack: Slack }[platform] ?? MessageCircle;
-  return <span className={`hermes-platform-icon${large ? ' hermes-platform-icon-large' : ''}`} data-platform-icon={platform} aria-hidden="true">
-    {platform === 'feishu' ? <span className="hermes-feishu-mark">飞</span> : <Icon />}
-  </span>;
-}
+export { HermesPlatformIcon } from './HermesPlatformIcon';
 
 export function HermesSteps({ current }: { current: 1 | 2 | 3 }) {
   const { t } = useLocale();

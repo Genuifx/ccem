@@ -71,6 +71,7 @@ test.before(async () => {
         act(()=>root.render(React.createElement(wholePage ? ChatApp : HermesPanel))); return root; }`,
       loader: 'tsx', resolveDir: desktop },
     outfile: output, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
+    loader: { '.svg': 'dataurl', '.png': 'dataurl' },
     plugins: [{ name: 'Hermes DOM boundary', setup(builder) {
       builder.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({ path: 'ipc', namespace: 'hermes-stub' }));
       builder.onResolve({ filter: /^@\/locales$/ }, () => ({ path: 'locale', namespace: 'hermes-stub' }));

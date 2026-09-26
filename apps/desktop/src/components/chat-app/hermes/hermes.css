@@ -48,11 +48,11 @@
 .hermes-platform-copy { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .hermes-platform-name { font-size: 14px; font-weight: 600; }
 .hermes-platform-icon { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 10px; background: hsl(var(--muted) / .65); color: hsl(var(--foreground)); }
-.hermes-platform-icon svg { width: 23px; height: 23px; }
-.hermes-platform-icon[data-platform-icon="wecom"], .hermes-platform-icon[data-platform-icon="telegram"], .hermes-platform-icon[data-platform-icon="feishu"] { background: hsl(var(--primary) / .08); color: hsl(var(--primary)); }
+.hermes-platform-icon svg, .hermes-platform-mark { width: 24px; height: 24px; }
+.hermes-platform-mark { display: block; object-fit: contain; user-select: none; }
+.dark .hermes-platform-mark-adaptive { filter: brightness(0) invert(1); }
 .hermes-platform-icon-large { width: 48px; height: 48px; border-radius: 12px; }
-.hermes-platform-icon-large svg { width: 28px; height: 28px; }
-.hermes-feishu-mark { font-size: 24px; font-weight: 650; line-height: 1; }
+.hermes-platform-icon-large svg, .hermes-platform-icon-large .hermes-platform-mark { width: 28px; height: 28px; }
 .hermes-option-arrow { width: 16px; height: 16px; color: hsl(var(--muted-foreground)); transition: transform 160ms ease-out; }
 .hermes-platform-button:hover:not(:disabled) .hermes-option-arrow { transform: translateX(3px); }
 .hermes-unavailable-guide { padding: 0 12px 10px 65px; }

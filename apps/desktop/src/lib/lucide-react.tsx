@@ -71,6 +71,7 @@ import {
   GitPullRequestIcon,
   Globe02Icon,
   GridViewIcon,
+  HashtagIcon,
   HeartCheckIcon,
   HelpCircleIcon,
   Home01Icon,
@@ -86,6 +87,7 @@ import {
   LinkSquare01Icon,
   LinkSquare02Icon,
   Loading03Icon,
+  Mail01Icon,
   Maximize01Icon,
   Message01Icon,
   Message02Icon,
@@ -269,6 +271,7 @@ export const GitFork = createIcon(GitForkIcon, 'GitFork');
 export const GitPullRequest = createIcon(GitPullRequestIcon, 'GitPullRequest');
 export const Globe = createIcon(Globe02Icon, 'Globe');
 export const Globe2 = createIcon(Globe02Icon, 'Globe2');
+export const Hash = createIcon(HashtagIcon, 'Hash');
 export const HeartPulse = createIcon(HeartCheckIcon, 'HeartPulse');
 export const History = createIcon(Clock04Icon, 'History');
 export const Home = createIcon(Home01Icon, 'Home');
@@ -289,6 +292,7 @@ export const Loader2 = createIcon(Loading03Icon, 'Loader2');
 export const LoaderCircle = createIcon(Loading03Icon, 'LoaderCircle');
 export const Lock = createIcon(SquareLock01Icon, 'Lock');
 export const Maximize2 = createIcon(Maximize01Icon, 'Maximize2');
+export const Mail = createIcon(Mail01Icon, 'Mail');
 export const MessageCircle = createIcon(Message01Icon, 'MessageCircle');
 export const MessageCircleMore = createIcon(MessageMultiple01Icon, 'MessageCircleMore');
 export const MessageSquare = createIcon(Message02Icon, 'MessageSquare');

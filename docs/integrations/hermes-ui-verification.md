@@ -121,3 +121,20 @@ Hermes 行为 70 项、真实 React/GSAP 生命周期 21 项、语言提供器 7
 证据位于忽略目录 `.artifacts/hermes-ui-redesign/`：`desktop-proof.json`、`final-tests.log`、`typecheck.log`、`build.log`、`file-size.log`，以及 `channels-light.png`、`feishu-light.png`、`feishu-dark.png`、`manual-light.png`、`connections-light.png`、`channels-narrow.png`。
 
 真实飞书机器人创建、私聊配对和任务收发仍未在本轮完成；二维码生成与 UI 验证不等同于账号端到端验收。交付为本地源码提交，未合入主线、未 push、未正式发行。
+
+## 渠道图标补齐（2026-09-26）
+
+行为契约：打开机器人列表和添加渠道页时，每个已知渠道有可识别的品牌或功能图标；进入扫码、凭据流程仍到达原有页面；图标不改变渠道的可连接状态。深浅主题及窄窗口均能显示，未知插件保留通用图标。
+
+当前真实运行组件目录共 23 个渠道：21 个条目使用品牌资产（企业微信的两种接入复用同一标识），Email 与 IRC 分别使用 Hugeicons 邮件和井号。共内置 19 个 SVG 和 1 个 PNG，不依赖远程图标服务。来源、改动与许可证见 `apps/desktop/src/assets/hermes-platforms/NOTICE.md`。
+
+在本任务独占的规范 `pnpm tauri:dev` 实例（MCP `57700`）执行真实 DOM 点击：
+
+- 列表 → 添加 → 展开其他渠道，23 个条目的图标全部渲染，所有品牌图片 `decode()` 成功；原有 18 个未开放的渠道仍不可连接。
+- 选择飞书进入扫码准备页，大图标为 28px；返回后选择 Discord，进入密码字段隐藏的手动凭据页；再次返回机器人列表。
+- 1240 × 960 与 540 × 980 窗口均无横向溢出；窄窗口图标保留 24px，列表转为单栏。
+- 临时切换根主题 class 检查深色；Buzz、Matrix、Raft、SimpleX 单色标识适配正常，彩色品牌保持原配色。完成后恢复浅色，未写共享主题设置。控制台未发现错误。
+
+验证：`node --test --test-reporter=tap apps/desktop/test/hermes-panel-dom.test.mjs` 81 项通过；`pnpm exec tsc --noEmit`、`pnpm exec vite build`、`pnpm check:file-size`、`git diff --check` 通过。仅修改前端展示，未重跑 Rust 测试或外部机器人收发验收。
+
+证据保存在 `.artifacts/hermes-navigation/`：`icons-proof.json`、`icons-{typecheck,build,dom,file-size}.log`，以及 `icons-channel-picker.png`、`icons-bot-list.png`、`icons-other-channels.png`、`icons-other-dark.png`、`icons-adaptive-dark.png`、`icons-feishu-setup-dark.png`、`icons-channels-narrow.png`。
