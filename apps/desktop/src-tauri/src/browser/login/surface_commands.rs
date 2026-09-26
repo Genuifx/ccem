@@ -985,10 +985,10 @@ impl LoginBrowserSurfaceManager {
         let _destructive = self.release_operation()?;
         match disposition {
             BrowserSurfaceReleaseArg::Hide => {
-                return Err(
+                Err(
                     "Browser surface release only closes a runtime; use epoch-fenced sync to hide it."
                         .to_string(),
-                );
+                )
             }
             BrowserSurfaceReleaseArg::Close => {
                 // Consume only the client revision before native cleanup. The
