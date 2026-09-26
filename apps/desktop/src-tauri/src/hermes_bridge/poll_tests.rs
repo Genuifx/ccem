@@ -7,6 +7,42 @@ struct Fixture {
     root: PathBuf,
     store: Option<Store>,
 }
+
+#[test]
+fn broken_cron_records_do_not_starve_workspace_notifications() {
+    let mut f = Fixture::new();
+    let route = f.route("subscriber");
+    let valid = make_delivery(&route, "workspace-good", "done".into());
+    let mut deliveries = vec![valid.clone()];
+    for index in 0..6 {
+        deliveries.push(make_delivery(
+            &route,
+            &format!("broken-{index}"),
+            "bad".into(),
+        ));
+    }
+    let sent = RefCell::new(Vec::new());
+    let result = drain_outbox(
+        deliveries,
+        |id| {
+            if id != valid.id {
+                return Err("cron_read_error".into());
+            }
+            Ok(Some(DeliveryReservation {
+                delivery: valid.clone(),
+                route: route.clone(),
+                transport: (),
+            }))
+        },
+        |reservation| {
+            sent.borrow_mut().push(reservation.delivery.id.clone());
+            Ok(json!({"status":"sent"}))
+        },
+        |_, _| Ok(()),
+    );
+    assert!(result.is_err());
+    assert_eq!(*sent.borrow(), vec![valid.id]);
+}
 impl Fixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("ccem-hermes-poll-{}", random_id()));

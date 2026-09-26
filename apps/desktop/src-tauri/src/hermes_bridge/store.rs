@@ -126,6 +126,8 @@ pub struct Operation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Delivery {
+    #[serde(default)]
+    pub cron: Option<crate::cron::CronDeliveryScope>,
     pub id: String,
     pub route_id: String,
     pub generation: i64,
@@ -618,6 +620,15 @@ impl Store {
             .map_err(err)?;
         raw.map(|raw| serde_json::from_str(&raw).map_err(err))
             .transpose()
+    }
+    pub fn enqueue_delivery(&self, d: &Delivery) -> Result<(), String> {
+        self.db
+            .execute(
+                "INSERT OR IGNORE INTO outbox VALUES(?1,?2,?3)",
+                params![d.id, d.route_id, serde_json::to_string(d).map_err(err)?],
+            )
+            .map_err(err)?;
+        Ok(())
     }
     pub fn save_delivery(&self, d: &Delivery) -> Result<(), String> {
         self.db

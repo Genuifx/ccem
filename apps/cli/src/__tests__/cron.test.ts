@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   createCronTask,
+  createCronTaskWithNotifications,
   deleteCronTask,
   parseCronCreateJson,
   readCronTasks,
@@ -145,5 +146,43 @@ describe('cron task store', () => {
       peerId: 'iveswen',
     });
     expect(readCronTasks(tasksPath)[0]?.wecomNotification).toEqual(task.wecomNotification);
+  });
+
+  it('creates and reads back a task only after validating its paired Hermes target', async () => {
+    const input = parseCronCreateJson(JSON.stringify({ name: 'Hermes report', cronExpression: '0 9 * * *', prompt: 'Report', hermesNotification: { routeId: 'route-one', generation: 3, subscriptionId: 'invented' } }));
+    const methods: string[] = [];
+    const task = await createCronTaskWithNotifications(input, tasksPath, async (method) => {
+      methods.push(method);
+      return [{ routeId: 'route-one', generation: 3, label: 'My bot', platform: 'wecom', chatId: 'paired-chat' }];
+    });
+    expect(methods).toEqual(['ccem.cron.notificationTargets']);
+    expect(task.hermesNotification).toMatchObject({ routeId: 'route-one', generation: 3 });
+    expect(task.hermesNotification?.subscriptionId).toBeTruthy();
+    expect(task.hermesNotification?.subscriptionId).not.toBe('invented');
+    expect(task.wecomNotification).toBeNull();
+    expect(readCronTasks(tasksPath)).toEqual([task]);
+  });
+
+  it('rejects unavailable or stale targets and RPC errors before any task write', async () => {
+    const input = { name: 'Report', cronExpression: '0 9 * * *', prompt: 'Report', hermesNotification: { routeId: 'paired', generation: 1 } };
+    for (const targets of [[], [{ routeId: 'paired', generation: 2 }], [{ routeId: 'another', generation: 1 }]]) {
+      await expect(createCronTaskWithNotifications(input, tasksPath, async () => targets)).rejects.toThrow(/unavailable or has changed/);
+      expect(fs.existsSync(tasksPath)).toBe(false);
+    }
+    await expect(createCronTaskWithNotifications(input, tasksPath, async () => { throw new Error('offline'); })).rejects.toThrow('offline');
+    expect(fs.existsSync(tasksPath)).toBe(false);
+  });
+
+  it('keeps legacy task creation offline and notification-free', async () => {
+    const task = await createCronTaskWithNotifications({ name: 'Local', cronExpression: '0 9 * * *', prompt: 'Local' }, tasksPath, async () => { throw new Error('must not call Desktop'); });
+    expect(task.hermesNotification).toBeNull();
+  });
+
+  it('rejects malformed targets and gives separate tasks separate subscription versions', () => {
+    for (const target of [{ routeId: 'guess' }, { routeId: 'paired', generation: 0 }, { routeId: '../path', generation: 1 }, 'paired']) {
+      expect(() => parseCronCreateJson(JSON.stringify({ hermesNotification: target }))).toThrow(/hermesNotification/);
+    }
+    const input = { name: 'Report', cronExpression: '0 9 * * *', prompt: 'Report', hermesNotification: { routeId: 'paired', generation: 1 } };
+    expect(createCronTask(input, tasksPath).hermesNotification?.subscriptionId).not.toBe(createCronTask(input, tasksPath).hermesNotification?.subscriptionId);
   });
 });

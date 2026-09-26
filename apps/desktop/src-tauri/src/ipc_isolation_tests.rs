@@ -47,7 +47,7 @@ fn trusted_app_acl_manifest_includes_environment_router_references() {
     assert!(allowed
         .iter()
         .any(|command| { command.as_str() == Some("browser_surface_navigation_action") }));
-    for command in ["hermes_status", "hermes_action"] {
+    for command in ["hermes_status", "hermes_action", "hermes_notification_targets"] {
         assert!(allowed.iter().any(|entry| entry.as_str() == Some(command)));
     }
 }
@@ -123,6 +123,7 @@ fn remote_browser_child_webview_cannot_invoke_app_or_plugin_commands() {
             "greet",
             "get_environment_router_references",
             "hermes_status",
+            "hermes_notification_targets",
             "hermes_action",
             "plugin:app|version",
         ] {

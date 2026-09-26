@@ -5902,6 +5902,7 @@ pub fn run_desktop_app() -> i32 {
         })
         .invoke_handler(tauri::generate_handler![
             hermes_bridge::hermes_status,
+            hermes_bridge::hermes_notification_targets,
             hermes_bridge::hermes_action,
             #[cfg(all(target_os = "macos", debug_assertions))]
             webcontent_recovery::webcontent_debug_main_process_id,

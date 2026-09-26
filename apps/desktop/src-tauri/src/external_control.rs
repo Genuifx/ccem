@@ -599,6 +599,11 @@ impl ExternalControlManager {
                 "version": env!("CARGO_PKG_VERSION"),
                 "capabilities": control_capabilities(),
             })),
+            "ccem.cron.notificationTargets" => {
+                let bridge = app.try_state::<Arc<crate::hermes_bridge::HermesBridgeManager>>()
+                    .ok_or("hermes_unavailable")?;
+                Ok(bridge.cron_notification_targets()?)
+            }
             "ccem.workspace.listSessions" => {
                 let _mutation_guard = self.environment_mutations.lock()?;
                 let params = deserialize_params::<ListSessionsParams>(rpc.params)?;
@@ -2254,6 +2259,7 @@ fn is_allowed_method_for_build(method: &str, _debug_assertions: bool) -> bool {
     matches!(
         method,
         "ccem.health"
+            | "ccem.cron.notificationTargets"
             | "ccem.workspace.listSessions"
             | "ccem.environment.references"
             | "ccem.environment.rename"

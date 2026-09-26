@@ -79,7 +79,8 @@ import { loadFromRemote, readAllStdin, resolveLoadCredentials } from './remote.j
 import { CCEM_BOT_BIND_SKILL_CONTENT } from './bot-bind-skill.js';
 import { CCEM_CRON_SKILL_CONTENT } from './cron-skill.js';
 import {
-  createCronTask,
+  createCronTaskWithNotifications,
+  getCronNotificationTargets,
   deleteCronTask,
   formatCronTaskTableRows,
   parseCronCreateJson,
@@ -1068,6 +1069,23 @@ cronCmd
   });
 
 cronCmd
+  .command('notification-targets')
+  .description('List paired Hermes recipients for task result notifications (Desktop must be running)')
+  .option('--json', 'Output as JSON')
+  .action(async (options) => {
+    try {
+      const targets = await getCronNotificationTargets();
+      if (options.json) { console.log(JSON.stringify(targets, null, 2)); return; }
+      const table = new Table({ head: ['Bot', 'Platform', 'Chat', 'Route ID', 'Generation'] });
+      table.push(...targets.map((target) => [target.label, target.platform, target.chatId, target.routeId, String(target.generation)]));
+      console.log(targets.length ? table.toString() : 'No paired Hermes notification targets. Pair a bot in CCEM Remote Control first.');
+    } catch (err) {
+      console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
+      process.exitCode = 1;
+    }
+  });
+
+cronCmd
   .command('create')
   .description('Create a CCEM cron task')
   .option('--from-json <json>', 'Read task input from inline JSON, @file, or - for stdin')
@@ -1088,7 +1106,7 @@ cronCmd
   .option('--wecom-peer-id <id>', 'WeCom peer id for cron result notifications')
   .option('--disabled', 'Create task disabled')
   .option('--json', 'Output as JSON')
-  .action((options) => {
+  .action(async (options) => {
     try {
       const input = options.fromJson
         ? parseCronCreateJson(options.fromJson)
@@ -1115,7 +1133,7 @@ cronCmd
                 : null,
           };
 
-      const task = createCronTask(input);
+      const task = await createCronTaskWithNotifications(input);
       if (options.json) {
         console.log(JSON.stringify(task, null, 2));
         return;

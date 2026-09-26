@@ -1,3 +1,4 @@
+import type { CronHermesNotification, CronHermesDelivery } from '@/lib/hermes-ipc';
 import { create } from 'zustand';
 import type { PermissionModeName, RouterConfig, RouterStatus, SessionRouterState } from '@ccem/core/browser';
 import type { UsageStats, Milestone } from '@/types/analytics';
@@ -123,6 +124,7 @@ export interface CronTask {
   timeoutSecs: number;
   templateId: string | null;
   wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
   triggerType: string;
   parentTaskId: string | null;
   createdAt: string;
@@ -136,6 +138,7 @@ export interface CronWecomNotification {
 }
 
 export interface CronTaskRun {
+  hermesNotification?: CronHermesDelivery | null;
   id: string;
   taskId: string;
   startedAt: string;

@@ -1,5 +1,30 @@
 import { invoke } from '@tauri-apps/api/core';
 
+export interface CronHermesNotification {
+  routeId: string;
+  generation: number;
+  subscriptionId?: string;
+}
+
+export interface CronHermesDelivery {
+  target: CronHermesNotification;
+  status: string;
+}
+
+export interface HermesNotificationTarget extends CronHermesNotification {
+  accountRef: string;
+  platform: string;
+  label: string;
+  chatId: string;
+  threadId?: string | null;
+  userId: string;
+  chatType: string;
+}
+
+export function getHermesNotificationTargets(): Promise<HermesNotificationTarget[]> {
+  return invoke('hermes_notification_targets');
+}
+
 export interface HermesSource {
   platform: string;
   profile: string;

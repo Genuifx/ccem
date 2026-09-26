@@ -1,5 +1,6 @@
 //! CCEM owns workspace policy, confirmations, operation state and the durable outbox.
 mod connection_config;
+mod cron_notifications;
 mod poll;
 mod process;
 mod setup;
@@ -790,6 +791,7 @@ fn make_delivery(route: &Route, event: &str, text: String) -> Delivery {
         status: "pending".into(),
         receipt: None,
         created_at: now(),
+        cron: None,
     }
 }
 fn bounded_chat_text(text: &str) -> String {
@@ -839,4 +841,11 @@ pub async fn hermes_action(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn hermes_notification_targets(
+    manager: tauri::State<'_, Arc<HermesBridgeManager>>,
+) -> Result<Value, String> {
+    manager.cron_notification_targets()
 }

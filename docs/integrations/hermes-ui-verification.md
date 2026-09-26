@@ -152,3 +152,34 @@ Hermes 行为 70 项、真实 React/GSAP 生命周期 21 项、语言提供器 7
 原生 invoke 属性不可改写，因此尝试注入 Hermes 状态失败未生效，没有将它记为桌面故障验证；故障与恢复由上述真实 React DOM 行为测试覆盖。后台 WebView 的 GSAP 过渡暂停，截图前完成对应三个有限过渡，未改写页面内容。
 
 类型检查、Vite 构建、文件大小检查和 diff 检查通过。证据为 `.artifacts/hermes-navigation/legacy-compat-{before,dom,typecheck,build,file-size}.log`、`legacy-config-unchanged.json`、`legacy-wecom-preserved.png`。本次验证旧入口与配置保留，不等同于真实聊天收发验收，也未合入或发布。
+
+## 定时任务与 Hermes 结果通知（2026-09-26）
+
+行为契约：用户在定时任务编辑器选择已配对的 Hermes 接收方，成功、失败或超时后发送本次任务的结果摘要。该选择仅订阅此任务，无需授权 workspace 或远程输入。默认不推送，旧企微通知仍保留在折叠区域。执行结果与通知送达状态分别显示。
+
+实际「AI 创建」入口通过 workspace 的 `/ccem-cron` 提示调用 CLI。新增 `ccem cron notification-targets --json`，AI 必须查询真实配对目标后把 `routeId` 和 `generation` 传给 `cron create --from-json`；多个候选需用户选择，查询失败不能自动换成旧企微目标。Desktop 在创建时校验目标，CLI 也通过经过认证的 Desktop RPC 校验。新 Tauri 命令仅加入可信主窗口 ACL，远程浏览器页不能调用。
+
+完成记录先原子写入任务历史，再幂等插入 Hermes SQLite outbox，后台扫描修复两次持久化之间的中断。每次订阅有独立版本：关闭后重新开启、切换接收方再切回都不会重发旧结果；未改变接收方的编辑保留订阅，旧客户端省略字段也保留。发送前复核配对与任务订阅，确认不明的发送保持 `unknown`，不自动重试。Cron 历史或单条授权读取失败不能阻断原 workspace 通知。没有声称跨平台 exactly-once。
+
+方案参考 [GitHub Actions 通知偏好](https://docs.github.com/en/subscriptions-and-notifications/how-tos/managing-github-actions-notifications) 的显式订阅、[AWS outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html) 的持久化与投递分离，以及 [Microsoft 重复发送说明](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-message-loss-and-duplicates) 的确认丢失边界；复用已有 outbox 和渠道回执，不增加消息队列。
+
+### 自动验证与审查
+
+- 真实 React/Radix DOM 套件 `cron-hermes-notification-dom`、`workspace-cron-command`、`hermes-panel-dom`：97 项通过，包括选择、关闭、失效目标保留、重选、查询失败和刷新。
+- CLI `cron` 与 `desktop-control`：55 项通过；真实临时文件读回、陈旧配对拒绝、RPC 失败不落盘、旧任务离线创建均覆盖。
+- Rust：`hermes_bridge` 69 项、`cron` 39 项、`ipc_isolation_tests` 3 项、`external_control::tests` 38 项通过，各筛选存在重叠，不累计为独立用例数。覆盖零 workspace 权限通知、真实 JSON 重启恢复、坏历史隔离、关闭/重开、移除连接、回执不明、旧 workspace 通知权限和失败记录不阻塞后续投递。
+- Desktop TypeScript、Vite 构建、CLI 构建、文件大小与 diff 检查通过；Cargo.lock 未变化。Vite 仍有原有 chunk 大小提示。
+- 独立审查提出订阅版本、首个终态持久化、恢复隔离和原子读改写问题，修复后复审无阻断项。
+
+### 真实桌面与企微验收
+
+使用本任务拥有的规范开发实例：`com.ccem.desktop.dev.idedbe6da`，MCP `57700`，隔离 Hermes 状态目录 `.artifacts/hermes-qr-live/state`，共享后台服务关闭。只手动启动本任务的 Hermes 企微连接；通过私有 control descriptor 验证 CLI。
+
+1. 真实任务编辑器创建「Hermes 定时通知验收 0926」，选择已配对企微接收方并保存。修改超时保留订阅，选择「不推送」清除，重新选择生成新订阅；旧形状 IPC 更新省略新字段时仍保留订阅。
+2. 点击任务的「立即执行」，运行 `run-1790427378476-7a84` 在 13.077 秒后成功，退出码 0，输出包含 `CCEM_HERMES_CRON_E2E_20260926 定时任务执行成功。`。其计划设为未来时间，本轮只手动触发一次，未以定时等待作为验收证据。
+3. Hermes outbox 仅有该次运行的一条记录，状态 `sent`，企微返回 `aibot_send_msg-9bc57fb3650041ce8c4421f31f44b70e` 回执。再次读回仍为 `sent`。实际打开企业微信中对应机器人聊天，消息正文包含任务名、`Status: success` 和相同验收标记。
+4. 点击执行历史的「查看输出」，实际渲染「结果推送到机器人 · 平台已确认发送」及相同结果，截图 `cron-hermes-delivered.png`；配置截图为 `cron-hermes-recipient.png`。
+5. 用实际构建 CLI 查询配对目标、创建一个禁用任务、列表读回确认订阅，然后移除该任务。此项验证 AI 所用 CLI 合约；本轮没有另开完整 AI 会话验证自然语言理解。
+6. 归档验收任务与运行记录后仅移除两条本轮测试任务。原 5 个任务的内容保持一致（忽略新增 null 默认字段和等值 JSON 数字 `10.0`/`10`）；旧企微配置 SHA-256 不变，原本不存在的 Telegram/微信配置仍不存在。停止本任务 launcher `69702`，原终端确认退出；未停止安装版或其他开发实例。
+
+证据保存在 `.artifacts/hermes-navigation/`：`cron-{before,self-test-state,delivery-proof,completed-test-backup,cleanup-proof,cli-live-readback,launcher-manifest}.json`、上述截图及 `cron-*.log`。真实账号验收仅覆盖企微；飞书、Telegram、Discord、Slack 沿用共享投递实现，但本轮没有逐渠道收发证明。新增代码仍在本地功能分支，未合入、未 push、未发行。

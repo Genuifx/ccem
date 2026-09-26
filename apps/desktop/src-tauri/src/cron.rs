@@ -1,3 +1,4 @@
+pub(crate) mod hermes_notifications;
 use crate::config;
 use crate::session_provenance::{
     register_launch, spawn_claude_source_binding, SessionProvenanceUpsert, DEFAULT_CONFIG_SOURCE,
@@ -7,6 +8,7 @@ use crate::terminal::resolve_claude_path;
 use crate::unified_runtime::UnifiedSessionManager;
 use crate::wecom::{read_wecom_settings, WecomBridgeManager, WecomTaskBindingTargetType};
 use chrono::{DateTime, Utc};
+pub use hermes_notifications::{CronDeliveryScope, CronHermesDelivery, CronHermesNotification};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -49,6 +51,8 @@ pub struct CronTask {
     pub template_id: Option<String>,
     #[serde(rename = "wecomNotification", alias = "wecom_notification", default)]
     pub wecom_notification: Option<CronWecomNotification>,
+    #[serde(rename = "hermesNotification", default)]
+    pub hermes_notification: Option<CronHermesNotification>,
     #[serde(rename = "triggerType", default = "default_trigger_type")]
     pub trigger_type: String,
     #[serde(rename = "parentTaskId", default)]
@@ -99,6 +103,8 @@ pub struct CronTaskRun {
     pub status: String, // "running" | "success" | "failed" | "timeout"
     #[serde(rename = "runtimeId", default)]
     pub runtime_id: Option<String>,
+    #[serde(rename = "hermesNotification", default)]
+    pub hermes_notification: Option<CronHermesDelivery>,
     #[serde(rename = "runtimeKind", default)]
     pub runtime_kind: Option<String>,
     #[serde(rename = "providerSessionId", default)]
@@ -167,7 +173,8 @@ fn write_tasks(tasks: &[CronTask]) -> Result<(), String> {
     };
     let content = serde_json::to_string_pretty(&file)
         .map_err(|e| format!("Failed to serialize cron tasks: {}", e))?;
-    fs::write(get_tasks_path(), content).map_err(|e| format!("Failed to write cron tasks: {}", e))
+    crate::secure_fs::write_private_atomic(&get_tasks_path(), content.as_bytes())
+        .map_err(|e| format!("Failed to write cron tasks: {}", e))
 }
 
 fn read_runs(task_id: &str) -> Result<Vec<CronTaskRun>, String> {
@@ -193,13 +200,18 @@ fn write_runs(task_id: &str, runs: &[CronTaskRun]) -> Result<(), String> {
     };
     let content = serde_json::to_string_pretty(&file)
         .map_err(|e| format!("Failed to serialize cron runs: {}", e))?;
-    fs::write(get_runs_path(task_id), content)
+    crate::secure_fs::write_private_atomic(&get_runs_path(task_id), content.as_bytes())
         .map_err(|e| format!("Failed to write cron runs: {}", e))
 }
 
 const MAX_RUNS_PER_TASK: usize = 50;
+// Completion, provenance and UI enrichment all perform read/modify/write.
+static RUN_MUTATIONS: Mutex<()> = Mutex::new(());
 
 fn append_run(task_id: &str, run: CronTaskRun) -> Result<(), String> {
+    let _guard = RUN_MUTATIONS
+        .lock()
+        .map_err(|_| "cron_runs_lock_poisoned")?;
     let mut runs = read_runs(task_id)?;
     runs.push(run);
     // Keep only the most recent MAX_RUNS_PER_TASK entries
@@ -215,10 +227,15 @@ fn update_run(
     run_id: &str,
     updater: impl FnOnce(&mut CronTaskRun),
 ) -> Result<(), String> {
+    let _guard = RUN_MUTATIONS
+        .lock()
+        .map_err(|_| "cron_runs_lock_poisoned")?;
     let mut runs = read_runs(task_id)?;
-    if let Some(r) = runs.iter_mut().find(|r| r.id == run_id) {
-        updater(r);
-    }
+    let run = runs
+        .iter_mut()
+        .find(|r| r.id == run_id)
+        .ok_or_else(|| format!("Run not found: {run_id}"))?;
+    updater(run);
     write_runs(task_id, &runs)
 }
 
@@ -595,7 +612,7 @@ fn register_cron_launch_provenance(
     });
 }
 
-fn format_cron_notification(task: &CronTask, run: &CronTaskRun) -> String {
+pub(crate) fn format_cron_notification(task: &CronTask, run: &CronTaskRun) -> String {
     let execution_profile = resolve_execution_profile(&task.execution_profile);
     let mut lines = vec![format!(
         "{} Cron: {}",
@@ -994,7 +1011,7 @@ fn execute_task(
     let started_at_instant = Utc::now();
     let started_at = started_at_instant.to_rfc3339();
 
-    let run = CronTaskRun {
+    let mut run = CronTaskRun {
         id: run_id.clone(),
         task_id: task.id.clone(),
         started_at: started_at.clone(),
@@ -1004,12 +1021,20 @@ fn execute_task(
         stderr: String::new(),
         duration_ms: None,
         status: "running".to_string(),
+        hermes_notification: None,
         runtime_id: None,
         runtime_kind: Some("headless".to_string()),
         provider_session_id: None,
         working_dir: None,
     };
 
+    run.hermes_notification = task
+        .hermes_notification
+        .clone()
+        .map(|target| CronHermesDelivery {
+            target,
+            status: "waiting".into(),
+        });
     let _ = append_run(&task.id, run.clone());
     let _ = app.emit("cron-task-started", &run);
 
@@ -1105,6 +1130,9 @@ fn execute_task(
         r.stderr = stderr.clone();
         r.duration_ms = Some(duration_ms);
         r.finished_at = Some(finished_at.clone());
+        if let Some(delivery) = r.hermes_notification.as_mut() {
+            delivery.status = "pending".into();
+        }
         if r.runtime_kind.is_none() {
             r.runtime_kind = Some("headless".to_string());
         }
@@ -1124,6 +1152,7 @@ fn execute_task(
             stderr: String::new(),
             duration_ms: None,
             status: "running".to_string(),
+            hermes_notification: None,
             runtime_id: None,
             runtime_kind: Some("headless".to_string()),
             provider_session_id: None,
@@ -1143,9 +1172,20 @@ fn execute_task(
         finished_run.working_dir = Some(working_dir.clone());
     }
     enrich_run_with_provenance(&mut finished_run);
-    let _ = update_run(&task.id, &run_id, |r| {
-        *r = finished_run.clone();
+    finished_run.hermes_notification = run.hermes_notification.clone().map(|mut delivery| {
+        delivery.status = "pending".into();
+        delivery
     });
+    // Persist the completion and recipient together before exposing a sendable result.
+    let persisted = update_run(&task.id, &run_id, |r| {
+        *r = finished_run.clone();
+    })
+    .is_ok();
+    if persisted {
+        hermes_notifications::complete(&app, &task, &mut finished_run);
+    } else if let Some(delivery) = finished_run.hermes_notification.as_mut() {
+        delivery.status = "not_sent".into();
+    }
 
     let event_name = if finished_run.status == "success" {
         "cron-task-completed"
@@ -1329,7 +1369,16 @@ pub fn add_cron_task(
     timeout_secs: Option<u64>,
     template_id: Option<String>,
     wecom_notification: Option<CronWecomNotification>,
+    hermes_notification: Option<CronHermesNotification>,
+    app: AppHandle,
 ) -> Result<CronTask, String> {
+    let hermes_notification = match hermes_notification {
+        Some(target) => {
+            hermes_notifications::bridge(&app)?.validate_cron_target(&target)?;
+            Some(hermes_notifications::version_subscription(target, None))
+        }
+        None => None,
+    };
     // Validate cron expression (5 fields + per-field token/range checks)
     validate_cron_expression(&cron_expression)?;
 
@@ -1352,6 +1401,7 @@ pub fn add_cron_task(
         timeout_secs: timeout_secs.unwrap_or(300),
         template_id,
         wecom_notification,
+        hermes_notification,
         trigger_type: "schedule".to_string(),
         parent_task_id: None,
         created_at: now.clone(),
@@ -1379,6 +1429,9 @@ pub fn update_cron_task(
     disallowed_tools: Option<Vec<String>>,
     timeout_secs: Option<u64>,
     wecom_notification: Option<CronWecomNotification>,
+    hermes_notification: Option<CronHermesNotification>,
+    clear_hermes_notification: Option<bool>,
+    app: AppHandle,
 ) -> Result<CronTask, String> {
     let mut tasks = read_tasks()?;
     let task = tasks
@@ -1411,6 +1464,22 @@ pub fn update_cron_task(
         task.timeout_secs = v;
     }
     task.wecom_notification = wecom_notification;
+    if clear_hermes_notification == Some(true) {
+        task.hermes_notification = None;
+    } else if let Some(target) = hermes_notification {
+        // Retain an unchanged stale selection on unrelated edits; sends still fail closed.
+        if !task
+            .hermes_notification
+            .as_ref()
+            .is_some_and(|old| hermes_notifications::same_target(old, &target))
+        {
+            hermes_notifications::bridge(&app)?.validate_cron_target(&target)?;
+        }
+        task.hermes_notification = Some(hermes_notifications::version_subscription(
+            target,
+            task.hermes_notification.as_ref(),
+        ));
+    }
     task.updated_at = chrono::Utc::now().to_rfc3339();
 
     let updated = task.clone();
@@ -1454,7 +1523,10 @@ pub fn toggle_cron_task(id: String) -> Result<CronTask, String> {
 }
 
 #[tauri::command]
-pub fn get_cron_task_runs(task_id: String) -> Result<Vec<CronTaskRun>, String> {
+pub fn get_cron_task_runs(app: AppHandle, task_id: String) -> Result<Vec<CronTaskRun>, String> {
+    let guard = RUN_MUTATIONS
+        .lock()
+        .map_err(|_| "cron_runs_lock_poisoned")?;
     let mut runs = read_runs(&task_id)?;
     let mut dirty = false;
     for run in &mut runs {
@@ -1467,6 +1539,10 @@ pub fn get_cron_task_runs(task_id: String) -> Result<Vec<CronTaskRun>, String> {
     }
     if dirty {
         let _ = write_runs(&task_id, &runs);
+    }
+    drop(guard);
+    for run in &mut runs {
+        hermes_notifications::hydrate(&app, run);
     }
     Ok(runs)
 }
@@ -1482,7 +1558,14 @@ pub fn retry_cron_task(
 }
 
 #[tauri::command]
-pub fn get_cron_run_detail(task_id: String, run_id: String) -> Result<CronTaskRun, String> {
+pub fn get_cron_run_detail(
+    app: AppHandle,
+    task_id: String,
+    run_id: String,
+) -> Result<CronTaskRun, String> {
+    let guard = RUN_MUTATIONS
+        .lock()
+        .map_err(|_| "cron_runs_lock_poisoned")?;
     let mut runs = read_runs(&task_id)?;
     let Some(index) = runs.iter().position(|r| r.id == run_id) else {
         return Err(format!("Run not found: {}", run_id));
@@ -1493,6 +1576,8 @@ pub fn get_cron_run_detail(task_id: String, run_id: String) -> Result<CronTaskRu
     if runs[index].provider_session_id != before_provider || runs[index].working_dir != before_dir {
         let _ = write_runs(&task_id, &runs);
     }
+    drop(guard);
+    hermes_notifications::hydrate(&app, &mut runs[index]);
     Ok(runs[index].clone())
 }
 
@@ -1813,6 +1898,7 @@ mod tests {
             timeout_secs: 300,
             template_id: None,
             wecom_notification: None,
+            hermes_notification: None,
             trigger_type: "schedule".to_string(),
             parent_task_id: None,
             created_at: "2026-03-08T00:00:00Z".to_string(),
@@ -1864,6 +1950,7 @@ mod tests {
             stderr: String::new(),
             duration_ms: None,
             status: "success".to_string(),
+            hermes_notification: None,
             runtime_id: None,
             runtime_kind: Some("headless".to_string()),
             provider_session_id: None,
@@ -1920,6 +2007,7 @@ mod tests {
             timeout_secs: 300,
             template_id: None,
             wecom_notification: None,
+            hermes_notification: None,
             trigger_type: "schedule".to_string(),
             parent_task_id: None,
             created_at: "2026-03-08T00:00:00Z".to_string(),
@@ -1953,6 +2041,7 @@ mod tests {
             timeout_secs: 300,
             template_id: None,
             wecom_notification: None,
+            hermes_notification: None,
             trigger_type: "schedule".to_string(),
             parent_task_id: None,
             created_at: "2026-03-08T00:00:00Z".to_string(),
@@ -2098,6 +2187,7 @@ mod tests {
             enabled: true,
             timeout_secs: 300,
             template_id: None,
+            hermes_notification: None,
             wecom_notification: Some(CronWecomNotification {
                 bot_id: Some("aibot-1".to_string()),
                 peer_id: Some("iveswen".to_string()),

@@ -60,6 +60,7 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
     {
         return Ok(());
     }
+    let recovery_error = manager.reconcile_cron_notifications(account).err();
     let routes: Vec<_> = manager
         .with_store(|store| store.routes())?
         .into_iter()
@@ -77,7 +78,7 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
             last_event_seq: s.last_event_seq,
         })
         .collect();
-    let issues = poll_cycle(
+    let mut issues = poll_cycle(
         &routes,
         &sessions,
         |route, session| {
@@ -163,6 +164,9 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
             )
         },
     )?;
+    if let Some(error) = recovery_error {
+        issues.push(error);
+    }
     if !issues.is_empty() {
         return Err(issues.join("; "));
     }
@@ -454,18 +458,54 @@ fn reserve_account_delivery(
 }
 
 fn reserve_delivery(store: &mut Store, id: &str) -> Result<Option<(Delivery, Route)>, String> {
+    reserve_delivery_with(store, id, cron_authorized)
+}
+
+fn cron_authorized(delivery: &Delivery) -> Result<bool, String> {
+    match &delivery.cron {
+        Some(scope) => crate::cron::hermes_notifications::delivery_authorized(
+            scope,
+            &delivery.route_id,
+            delivery.generation,
+        ),
+        None => Ok(false),
+    }
+}
+
+fn authorized_route(
+    store: &Store,
+    delivery: &Delivery,
+    check_cron: impl FnOnce(&Delivery) -> Result<bool, String>,
+) -> Result<Option<Route>, String> {
+    let cron_allowed = if delivery.cron.is_some() {
+        check_cron(delivery)?
+    } else {
+        false
+    };
+    Ok(store.routes()?.into_iter().find(|route| {
+        route.id == delivery.route_id
+            && route.generation == delivery.generation
+            && route.enabled
+            && if delivery.cron.is_some() {
+                cron_allowed
+            } else {
+                route.notifications
+            }
+    }))
+}
+
+pub(super) fn reserve_delivery_with(
+    store: &mut Store,
+    id: &str,
+    check_cron: impl FnOnce(&Delivery) -> Result<bool, String>,
+) -> Result<Option<(Delivery, Route)>, String> {
     let Some(mut delivery) = store.delivery(id)? else {
         return Ok(None);
     };
     if delivery.status != "pending" {
         return Ok(None);
     }
-    let route = store.routes()?.into_iter().find(|route| {
-        route.id == delivery.route_id
-            && route.generation == delivery.generation
-            && route.enabled
-            && route.notifications
-    });
+    let route = authorized_route(store, &delivery, check_cron)?;
     let Some(route) = route else {
         delivery.status = "revoked".into();
         store.save_delivery(&delivery)?;
@@ -482,19 +522,29 @@ fn finish_delivery(
     receipt: Result<Value, String>,
     same_host: bool,
 ) -> Result<(), String> {
+    finish_delivery_with(store, delivery, receipt, same_host, cron_authorized)
+}
+
+pub(super) fn finish_delivery_with(
+    store: &mut Store,
+    delivery: &Delivery,
+    receipt: Result<Value, String>,
+    same_host: bool,
+    check_cron: impl FnOnce(&Delivery) -> Result<bool, String>,
+) -> Result<(), String> {
     let Some(mut current) = store.delivery(&delivery.id)? else {
         return Ok(());
     };
     if current.status != "sending" {
         return Ok(());
     }
+    // A read failure after sending cannot prove delivery, and must not leave a
+    // permanently "sending" record or enable a retry.
     let authorized = same_host
-        && store.routes()?.iter().any(|route| {
-            route.id == current.route_id
-                && route.generation == current.generation
-                && route.enabled
-                && route.notifications
-        });
+        && authorized_route(store, &current, check_cron)
+            .ok()
+            .flatten()
+            .is_some();
     if !authorized {
         current.status = "unknown".into();
         current.receipt = Some(json!({"errorCode":"delivery_authority_changed"}));
@@ -524,20 +574,40 @@ fn drain_outbox<T>(
     mut send: impl FnMut(&DeliveryReservation<T>) -> Result<Value, String>,
     mut finish: impl FnMut(DeliveryReservation<T>, Result<Value, String>) -> Result<(), String>,
 ) -> Result<(), String> {
+    let mut issues = Vec::new();
+    let mut sent = 0;
     for delivery in deliveries
         .into_iter()
         .rev()
         .filter(|delivery| delivery.status == "pending")
-        .take(5)
     {
-        let Some(reserved) = reserve(&delivery.id)? else {
-            continue;
+        let reserved = match reserve(&delivery.id) {
+            Ok(Some(reserved)) => reserved,
+            Ok(None) => continue,
+            Err(error) => {
+                if issues.len() < 3 {
+                    issues.push(error);
+                }
+                continue;
+            }
         };
         // No policy, store, or gateway-owner lock crosses this network wait.
         let receipt = send(&reserved);
-        finish(reserved, receipt)?;
+        if let Err(error) = finish(reserved, receipt) {
+            if issues.len() < 3 {
+                issues.push(error);
+            }
+        }
+        sent += 1;
+        if sent == 5 {
+            break;
+        }
     }
-    Ok(())
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(issues.join("; "))
+    }
 }
 
 #[cfg(test)]
