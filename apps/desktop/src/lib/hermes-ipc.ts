@@ -63,6 +63,8 @@ export interface HermesRoute {
 }
 
 export interface HermesStatus {
+  // Receipt on configureChannel responses only; never infer it from list order.
+  configuredAccountRef?: string;
   installer: {
     state: string;
     version?: string | null;
@@ -103,7 +105,7 @@ export interface HermesActionPayloads {
 
 export type HermesAction = keyof HermesActionPayloads;
 
-export type HermesRunAction = <A extends HermesAction>(action: A, payload?: HermesActionPayloads[A], secrets?: string[]) => Promise<boolean>;
+export type HermesRunAction = <A extends HermesAction>(action: A, payload?: HermesActionPayloads[A], secrets?: string[]) => Promise<HermesStatus | false>;
 
 export function getHermesStatus(): Promise<HermesStatus> {
   return invoke<HermesStatus>('hermes_status');

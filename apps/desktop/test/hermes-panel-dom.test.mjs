@@ -15,6 +15,7 @@ let temp;
 let dom;
 let root;
 let container;
+let mountPoint;
 let intervalCallbacks;
 let invokeCalls;
 let current;
@@ -44,7 +45,7 @@ const deferred = () => { let resolve; let reject; const promise = new Promise((a
 test.before(async () => {
   temp = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-hermes-ui-'));
   dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
-  for (const key of ['window', 'document', 'navigator', 'HTMLElement', 'HTMLInputElement', 'Element', 'Node', 'DocumentFragment', 'MutationObserver', 'Event', 'MouseEvent', 'CustomEvent']) {
+  for (const key of ['window', 'document', 'navigator', 'HTMLElement', 'HTMLInputElement', 'HTMLButtonElement', 'NodeFilter', 'Element', 'Node', 'DocumentFragment', 'MutationObserver', 'Event', 'MouseEvent', 'CustomEvent']) {
     Object.defineProperty(globalThis, key, { value: dom.window[key], configurable: true, writable: true });
   }
   globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
@@ -102,22 +103,42 @@ test.beforeEach(() => {
   globalThis.__hermesInvoke = async (name, args) => { invokeCalls.push({ name, args }); return handler(name, args); };
   dom.window.setInterval = (callback) => { intervalCallbacks.push(callback); return intervalCallbacks.length; };
   dom.window.clearInterval = (id) => { intervalCallbacks[id - 1] = null; };
-  container = document.createElement('div');
-  document.body.appendChild(container);
+  container = document.body;
+  mountPoint = document.createElement('main');
+  document.body.appendChild(mountPoint);
 });
 test.afterEach(async () => {
   if (root) await harness.act(async () => root.unmount());
   root = null;
-  container.remove();
+  container.innerHTML = '';
 });
 test.after(async () => { dom.window.close(); await fs.rm(temp, { recursive: true, force: true }); stopEsbuild(); });
 
 async function settle() { await harness.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); }); }
-async function mount(wholePage = false) { root = harness.mount(container, wholePage); await settle(); }
+async function mount(wholePage = false) { root = harness.mount(mountPoint, wholePage); await settle(); }
 const button = (label, scope = container) => [...scope.querySelectorAll('button')].find((node) => node.textContent === label);
 const card = (accountRef = source.accountRef) => container.querySelector(`[data-hermes-connection="${accountRef}"]`);
-async function selectPlatform(id) { await click(container.querySelector(`[data-hermes-platform="${id}"] button`)); }
-async function mountQr() { await mount(); if (container.querySelector('[data-hermes-channel-picker]')) await selectPlatform(qrPlatform.id); }
+async function addBot() {
+  await closeDetails();
+  if (!container.querySelector('[data-hermes-editor]')) await click(button('hermes.addChannel'));
+}
+async function closeDetails() {
+  const close = container.querySelector('[aria-label="hermes.closeDetails"]');
+  if (close) await click(close);
+}
+async function openDetails(accountRef = source.accountRef) {
+  let drawer = container.querySelector(`[data-hermes-drawer="${accountRef}"]`);
+  if (drawer) return drawer;
+  await closeDetails();
+  const trigger = container.querySelector(`[data-hermes-open="${accountRef}"]`);
+  await click(trigger);
+  await settle();
+  drawer = container.querySelector(`[data-hermes-drawer="${accountRef}"]`);
+  assert.ok(drawer, 'managing a bot opens its drawer');
+  return drawer;
+}
+async function selectPlatform(id) { await addBot(); await click(container.querySelector(`[data-hermes-platform="${id}"] button`)); }
+async function mountQr() { await mount(); if (!container.querySelector('[data-hermes-editor]')) await addBot(); if (container.querySelector('[data-hermes-channel-picker]')) await selectPlatform(qrPlatform.id); }
 async function mountManual() { await mount(); await selectPlatform(platform.id); }
 const actions = (name) => invokeCalls.filter((call) => call.name === 'hermes_action' && (!name || call.args.action === name));
 async function click(node) {
@@ -217,7 +238,7 @@ test('an installed component updates explicitly and reuses install progress for 
   await harness.act(async () => installation.resolve(structuredClone(current)));
   assert.ok(container.textContent.includes('fixture-v2'));
   assert.equal(button('hermes.updateComponent').disabled, false);
-  assert.ok(button('hermes.stop', card()));
+  assert.ok(button('hermes.stop', await openDetails()));
 });
 
 test('post-download installation phases show indeterminate progress instead of a completed download', async () => {
@@ -238,13 +259,13 @@ test('cancelled and failed updates keep the activated runtime connections availa
   const launch = { runtimeRoot: '/fixture/old-runtime', python: '/fixture/python', source: '/fixture/source', host: '/fixture/host.py' };
   current = snapshot({ installer: { state: 'cancelled', version: 'fixture-v1', downloadedBytes: 0, retryable: true, launch }, connections: [connection()] });
   await mount();
-  assert.equal(button('hermes.stop', card()).disabled, false);
+  assert.equal(button('hermes.stop', await openDetails()).disabled, false);
   assert.ok(button('hermes.retryInstall'));
   current = snapshot({ installer: { ...current.installer, state: 'error', error: 'download failed' }, connections: [connection()] });
   await poll();
-  assert.equal(button('hermes.stop', card()).disabled, false);
+  assert.equal(button('hermes.stop', await openDetails()).disabled, false);
   assert.ok(container.textContent.includes('download failed'));
-  await click(button('hermes.stop', card()));
+  await click(button('hermes.stop', await openDetails()));
   assert.deepEqual(actions('stop')[0].args.payload, { accountRef: source.accountRef });
   current = snapshot({ installer: { ...current.installer, launch: null }, connections: [connection()] });
   await poll();
@@ -256,12 +277,12 @@ test('an update with a retained runtime disables discovery, channel creation and
     launch: { runtimeRoot: '/fixture/old-runtime', python: '/fixture/python', source: '/fixture/source', host: '/fixture/host.py' } };
   current = snapshot({ installer, gateway: { state: 'stopped', platforms: [] } });
   await mount();
-  assert.equal(button('hermes.loadPlatforms').disabled, true);
-  await click(button('hermes.loadPlatforms'));
+  assert.equal(button('hermes.addChannel').disabled, true);
+  await click(button('hermes.addChannel'));
   assert.equal(actions('refreshPlatforms').length, 0);
   current = qrSnapshot({ installer });
   await poll();
-  assert.equal(container.querySelector('[data-hermes-platform="wecom"] button').disabled, true);
+  assert.equal(button('hermes.addChannel').disabled, true);
   current = qrSnapshot();
   await poll();
   await selectPlatform('wecom');
@@ -273,80 +294,42 @@ test('an update with a retained runtime disables discovery, channel creation and
   assert.equal(actions('beginSetup').length, 0);
 });
 
-test('a pending new manual connection keeps peer pairing, stop and removal usable without restoring stale peers', async () => {
-  const peer = connection({ platform: 'wecom', label: 'WeCom' });
-  const telegram = { id: 'telegram', label: 'Telegram', available: true, strictSend: true, qrSetup: true,
-    fields: [{ key: 'TELEGRAM_BOT_TOKEN', label: 'Bot token', secret: true, required: true }] };
-  const added = connection({ accountRef: 'new-telegram', platform: 'telegram', label: 'Telegram', state: 'error', error: 'channel_connection_failed' });
-  current = snapshot({ gateway: { state: 'ready', platforms: [qrPlatform, telegram] }, connections: [peer] });
-  const createReply = deferred();
-  const staleCreation = { ...structuredClone(current), connections: [structuredClone(peer), added] };
-  handler = async (name, args) => {
-    if (args?.action === 'configureChannel') return createReply.promise;
-    if (args?.action === 'openPairing') current.connections = [{ ...peer, pairing: { code: 'peer-code', expiresAt: Date.now() + 600000 } }];
-    if (args?.action === 'stop') current.connections = [{ ...peer, state: 'stopped', enabled: false }];
-    if (args?.action === 'removeChannel') current.connections = [];
-    return structuredClone(current);
-  };
-  await mount();
-  await click(button('hermes.addChannel'));
-  await selectPlatform('telegram');
-  await click(button('hermes.manualConnect'));
-  await input('hermes-field-TELEGRAM_BOT_TOKEN', 'fixture-invalid-token');
+test('pending manual creation keeps the independent wizard locked and continues with its new account', async () => {
+  current = snapshot({ connections: [connection()] });
+  const result = deferred();
+  handler = async (name, args) => args?.action === 'configureChannel' ? result.promise : structuredClone(current);
+  await mountManual();
+  await input('hermes-field-DYNAMIC_ACCOUNT', 'new-account');
+  await input('hermes-field-DYNAMIC_SECRET', 'test-secret');
   await click(button('hermes.saveChannel'));
-  try {
-    assert.equal(actions('configureChannel')[0].args.payload.accountRef, undefined, 'this is a new connection');
-    assert.equal(button('hermes.saveChannel').disabled, true, 'creation remains serialized in the editor');
-    assert.equal(button('hermes.editConnection', card()).disabled, true, 'the busy editor does not advertise an ignored edit');
-    assert.equal(button('hermes.newPairing', card()).disabled, false);
-    assert.equal(button('hermes.stop', card()).disabled, false);
-    assert.equal(button('hermes.removeChannel', card()).disabled, false);
-    await click(button('hermes.newPairing', card()));
-    assert.deepEqual(actions('openPairing')[0].args.payload, { accountRef: peer.accountRef });
-    assert.ok(card().textContent.includes('peer-code'));
-    await click(button('hermes.stop', card()));
-    assert.deepEqual(actions('stop')[0].args.payload, { accountRef: peer.accountRef });
-    assert.ok(button('hermes.start', card()));
-    await click(button('hermes.removeChannel', card()));
-    await click(button('hermes.confirmRemoveChannel', card()));
-    assert.deepEqual(actions('removeChannel')[0].args.payload, { accountRef: peer.accountRef });
-    assert.equal(card(), null);
-    current.connections = [added];
-    await harness.act(async () => createReply.resolve(staleCreation));
-    await settle();
-    assert.equal(card(), null, 'late creation cannot restore a removed peer');
-    assert.ok(card(added.accountRef), 'a fresh read retains the newly saved connection');
-    assert.equal(actions('configureChannel').length, 1);
-  } finally {
-    await harness.act(async () => createReply.resolve(structuredClone(current)));
-  }
+  assert.equal(button('hermes.saveChannel').disabled, true);
+  assert.equal(button('hermes.backToConnections').disabled, true);
+  assert.equal(card(), null, 'peer controls are not embedded in the independent wizard');
+  current.connections = [connection({ state: 'stopped' }), connection({ accountRef: 'added-account', state: 'error' })];
+  await harness.act(async () => result.resolve({ ...structuredClone(current), configuredAccountRef: 'added-account' }));
+  assert.ok(container.querySelector('[data-hermes-connection-details="added-account"]'));
+  assert.equal(actions('approvePairing').length, 0);
+  await click(button('hermes.authorizeLater'));
+  assert.ok(card('added-account'));
+  assert.ok(card().textContent.includes('stopped'));
 });
 
 for (const action of ['beginSetup', 'refreshPlatforms']) {
-  test(`pending ${action} only locks the editor while a peer can stop`, async () => {
-    const peer = connection({ platform: 'wecom', label: 'WeCom' });
-    current = qrSnapshot({ connections: [peer], ...(action === 'refreshPlatforms' ? { gateway: { state: 'stopped', platforms: [] } } : {}) });
-    const reply = deferred();
-    handler = async (name, args) => {
-      if (args?.action === action) return reply.promise;
-      if (args?.action === 'stop') current.connections = [{ ...peer, state: 'stopped', enabled: false }];
-      return structuredClone(current);
-    };
+  test(`pending ${action} keeps the wizard stable while status reads continue`, async () => {
+    current = qrSnapshot({ connections: [connection()], ...(action === 'refreshPlatforms' ? { gateway: { state: 'stopped', platforms: [] } } : {}) });
+    const result = deferred();
+    handler = async (name, args) => args?.action === action ? result.promise : structuredClone(current);
     await mount();
-    await click(button('hermes.addChannel'));
+    await addBot();
     if (action === 'beginSetup') await selectPlatform('wecom');
     await click(button(action === 'beginSetup' ? 'hermes.scanGenerate' : 'hermes.loadPlatforms'));
-    try {
-      assert.equal(button('hermes.stop', card()).disabled, false);
-      assert.equal(button('hermes.removeChannel', card()).disabled, false);
-      assert.equal(button('hermes.newPairing', card()).disabled, false);
-      await click(button('hermes.stop', card()));
-      assert.deepEqual(actions('stop')[0].args.payload, { accountRef: peer.accountRef });
-      assert.ok(button('hermes.start', card()));
-    } finally {
-      await harness.act(async () => reply.resolve(structuredClone(current)));
-      await settle();
-    }
+    assert.equal(button('hermes.backToConnections').disabled, true);
+    assert.equal(card(), null);
+    current.connections = [connection({ state: 'stopped' })];
+    await poll();
+    await harness.act(async () => result.resolve(structuredClone(current)));
+    await click(button('hermes.backToConnections'));
+    assert.ok(card().textContent.includes('stopped'));
   });
 }
 
@@ -362,20 +345,20 @@ test('slow pairing leaves independent controls and status polling active without
     return structuredClone(current);
   };
   await mount();
-  await click(button('hermes.newPairing', card()));
-  assert.equal(button('hermes.newPairing', card()).disabled, true);
-  assert.equal(button('hermes.stop', card('account-two')).disabled, false);
-  await click(button('hermes.stop', card('account-two')));
+  await click(button('hermes.newPairing', await openDetails()));
+  assert.equal(button('hermes.newPairing', await openDetails()).disabled, true);
+  assert.equal(button('hermes.stop', await openDetails('account-two')).disabled, false);
+  await click(button('hermes.stop', await openDetails('account-two')));
   await settle();
   const reads = invokeCalls.filter((call) => call.name === 'hermes_status').length;
   current.connections[0].pairing = { code: 'fresh-poll-code', expiresAt: Date.now() + 600000 };
   await poll();
   assert.ok(invokeCalls.filter((call) => call.name === 'hermes_status').length > reads);
-  assert.ok(card().textContent.includes('fresh-poll-code'));
+  assert.ok((await openDetails()).textContent.includes('fresh-poll-code'));
   await harness.act(async () => pairingReply.resolve(stalePairingSnapshot));
   await settle();
-  assert.ok(button('hermes.start', card('account-two')), 'the late A response cannot undo B stop');
-  assert.ok(card().textContent.includes('fresh-poll-code'));
+  assert.ok(button('hermes.start', await openDetails('account-two')), 'the late A response cannot undo B stop');
+  assert.ok((await openDetails()).textContent.includes('fresh-poll-code'));
 });
 
 test('stop interrupts the same accounts pending pairing and its late rejection stays obsolete', async () => {
@@ -387,13 +370,13 @@ test('stop interrupts the same accounts pending pairing and its late rejection s
     return structuredClone(current);
   };
   await mount();
-  await click(button('hermes.newPairing', card()));
-  assert.equal(button('hermes.stop', card()).disabled, false);
-  await click(button('hermes.stop', card()));
+  await click(button('hermes.newPairing', await openDetails()));
+  assert.equal(button('hermes.stop', await openDetails()).disabled, false);
+  await click(button('hermes.stop', await openDetails()));
   assert.deepEqual(actions('stop')[0].args.payload, { accountRef: source.accountRef });
   await harness.act(async () => pairingReply.reject(new Error('obsolete pairing authority changed')));
   await settle();
-  assert.ok(button('hermes.start', card()));
+  assert.ok(button('hermes.start', await openDetails()));
   assert.equal(container.textContent.includes('obsolete pairing authority changed'), false);
 });
 
@@ -406,17 +389,17 @@ test('concurrent account replies never restore an older full snapshot after a fr
   handler = async (name, args) => args?.action === 'stop'
     ? (args.payload.accountRef === one.accountRef ? firstReply.promise : secondReply.promise) : structuredClone(current);
   await mount();
-  await click(button('hermes.stop', card()));
-  await click(button('hermes.stop', card(two.accountRef)));
+  await click(button('hermes.stop', await openDetails()));
+  await click(button('hermes.stop', await openDetails(two.accountRef)));
   const earlierSecondSnapshot = snapshot({ connections: [one, { ...two, enabled: false, state: 'stopped' }] });
   current = snapshot({ connections: [{ ...one, enabled: false, state: 'stopped' }, { ...two, enabled: false, state: 'stopped' }] });
   await harness.act(async () => firstReply.resolve(structuredClone(current)));
   await settle();
-  assert.ok(button('hermes.start', card()));
+  assert.ok(button('hermes.start', await openDetails()));
   await harness.act(async () => secondReply.resolve(earlierSecondSnapshot));
   await settle();
-  assert.ok(button('hermes.start', card()), 'B was requested later but its delayed response was captured before A stopped');
-  assert.ok(button('hermes.start', card(two.accountRef)));
+  assert.ok(button('hermes.start', await openDetails()), 'B was requested later but its delayed response was captured before A stopped');
+  assert.ok(button('hermes.start', await openDetails(two.accountRef)));
 });
 
 test('a poll started during a mutation cannot replace the completed action snapshot', async () => {
@@ -425,13 +408,13 @@ test('a poll started during a mutation cannot replace the completed action snaps
   const oldRead = deferred();
   handler = async (name, args) => args?.action === 'stop' ? stopReply.promise : structuredClone(current);
   await mount();
-  await click(button('hermes.stop', card()));
+  await click(button('hermes.stop', await openDetails()));
   handler = async (name) => name === 'hermes_status' ? oldRead.promise : structuredClone(current);
   await poll();
   await harness.act(async () => stopReply.resolve(snapshot({ connections: [connection({ enabled: false, state: 'stopped' })] })));
-  assert.ok(button('hermes.start', card()));
+  assert.ok(button('hermes.start', await openDetails()));
   await harness.act(async () => oldRead.resolve(structuredClone(current)));
-  assert.ok(button('hermes.start', card()), 'the read began before stop committed');
+  assert.ok(button('hermes.start', await openDetails()), 'the read began before stop committed');
 });
 
 test('a late save on another account does not close the current editor or clear its draft', async () => {
@@ -441,10 +424,10 @@ test('a late save on another account does not close the current editor or clear 
   const saveReply = deferred();
   handler = async (name, args) => args?.action === 'configureChannel' ? saveReply.promise : structuredClone(current);
   await mount();
-  await click(button('hermes.editConnection', card()));
+  await click(button('hermes.editConnection', await openDetails()));
   await input('hermes-connection-label', 'Renamed first');
   await click(button('hermes.saveChannel'));
-  await click(button('hermes.editConnection', card('account-two')));
+  await click(button('hermes.editConnection', await openDetails('account-two')));
   await input('hermes-connection-label', 'Unsaved second');
   current.connections[0].label = 'Renamed first';
   await harness.act(async () => saveReply.resolve(structuredClone(current)));
@@ -456,9 +439,10 @@ test('a successful connection retry clears its obsolete QR connection failure', 
   current = qrSnapshot({ connections: [connection({ platform: 'wecom', state: 'error', error: 'connection failed' })], setup: { ...qrSetup, state: 'error', accountRef: source.accountRef, error: 'setup_connection_failed', qrPayload: undefined } });
   handler = async (name, args) => args?.action === 'start' ? { ...structuredClone(current), connections: [connection({ platform: 'wecom' })] } : structuredClone(current);
   await mount();
+  await openDetails();
   assert.ok(container.querySelector('[data-hermes-setup-error]'));
-  await click(button('hermes.start', card()));
-  assert.ok(button('hermes.newPairing', card()));
+  await click(button('hermes.start', await openDetails()));
+  assert.ok(button('hermes.newPairing', await openDetails()));
   assert.equal(container.querySelector('[data-hermes-setup-error]'), null);
 });
 
@@ -467,6 +451,7 @@ test('QR-capable platforms default to scan setup without exposing credential fie
   const generation = deferred();
   handler = async (name, args) => args?.action === 'beginSetup' ? generation.promise : structuredClone(current);
   await mount();
+  await addBot();
   assert.ok(container.querySelector('[data-hermes-channel-picker]'));
   assert.equal(container.querySelector('[data-hermes-setup]'), null);
   await selectPlatform('wecom');
@@ -508,7 +493,7 @@ test('switching to manual connection cancels the pending QR setup before reveali
   await poll();
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, 'manual-secret', 'status polling preserves the manual draft');
   handler = async (name, args) => args?.action === 'configureChannel'
-    ? qrSnapshot({ connections: [connection({ platform: 'wecom' })] }) : structuredClone(current);
+    ? qrSnapshot({ configuredAccountRef: source.accountRef, connections: [connection({ platform: 'wecom' })] }) : structuredClone(current);
   await click(button('hermes.saveChannel'));
   assert.deepEqual(actions('configureChannel')[0].args.payload, { platform: 'wecom', fields: { DYNAMIC_ACCOUNT: 'manual-account', DYNAMIC_SECRET: 'manual-secret' } });
   assert.ok(button('hermes.newPairing'));
@@ -634,7 +619,8 @@ test('a connected bot with failed automatic pairing offers account linking witho
   handler = async (name, args) => args?.action === 'openPairing'
     ? { ...structuredClone(current), connections: [connection({ platform: 'wecom', pairing: { code: 'RETRY123', expiresAt: Date.now() + 120000 } })] }
     : structuredClone(current);
-  await mountQr();
+  await mount();
+  await openDetails();
   assert.equal(container.querySelector('[data-hermes-setup-error]').textContent, locale.hermes.scanPairingFailed);
   assert.ok(container.textContent.includes(locale.hermes.newPairing));
   assert.equal(container.querySelector('[data-hermes-setup]'), null);
@@ -730,8 +716,9 @@ test('QR connection advances to the backend pairing code without inventing a cha
   assert.equal(container.querySelector('[data-hermes-setup]'), null);
   assert.equal(container.querySelector('[data-hermes-manual]'), null);
   assert.equal(container.querySelector('code').textContent, '/ccem connect NATIVE987');
-  assert.ok(card());
-  assert.ok(card().textContent.includes('WeCom'));
+  assert.equal(card(), null);
+  assert.ok(container.querySelector('[data-hermes-connection-details]'));
+  assert.equal(container.querySelector('[aria-current="step"]').textContent, '3hermes.stepAuthorize');
   assert.equal(actions('openPairing').length, 0, 'backend already opened the nonce; rendering does not rotate it');
   assert.equal(actions('approvePairing').length, 0);
   assert.equal(container.querySelector('[data-hermes-pairing]'), null, 'scanning is not proof of a native chat sender');
@@ -742,7 +729,7 @@ test('QR connection advances to the backend pairing code without inventing a cha
 });
 
 test('dynamic configuration sends only known fields and clears entered secrets after successful save', async () => {
-  handler = async (name, args) => args?.action === 'configureChannel' ? snapshot({ connections: [connection({ configuredFields: ['DYNAMIC_ACCOUNT', 'DYNAMIC_SECRET'] })] }) : structuredClone(current);
+  handler = async (name, args) => args?.action === 'configureChannel' ? snapshot({ configuredAccountRef: source.accountRef, connections: [connection({ configuredFields: ['DYNAMIC_ACCOUNT', 'DYNAMIC_SECRET'] })] }) : structuredClone(current);
   await mountManual();
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').type, 'password');
   assert.equal(button('hermes.saveChannel').disabled, true);
@@ -754,11 +741,13 @@ test('dynamic configuration sends only known fields and clears entered secrets a
   current = snapshot({ connections: [connection({ state: 'stopped', enabled: false, configuredFields: ['DYNAMIC_ACCOUNT', 'DYNAMIC_SECRET'] })] });
   await poll();
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET'), null, 'saved connections offer restart before configuration');
+  if (button('hermes.authorizeLater')) await click(button('hermes.authorizeLater'));
+  await openDetails();
   await click(button('hermes.editConnection'));
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, '');
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').placeholder, 'hermes.alreadyConfigured');
   assert.equal(button('hermes.saveChannel').disabled, true, 'unchanged saved settings do not revoke pairings through a redundant save');
-  assert.equal(button('hermes.start').disabled, false, 'existing credentials can restart without entering secrets');
+  assert.equal(actions('start').length, 0, 'editing never reconnects with saved credentials automatically');
   await input('hermes-field-DYNAMIC_ACCOUNT', 'account-updated');
   assert.equal(button('hermes.saveChannel').disabled, false, 'partial changes keep the saved secret');
 });
@@ -781,11 +770,14 @@ test('stopping the channel reloads editable metadata without reconnecting or ent
   handler = async (name, args) => args?.action === 'stop'
     ? snapshot({ connections: [connection({ ...configured, state: 'stopping' })] }) : structuredClone(current);
   await mount();
+  await openDetails();
   await click(button('hermes.stop'));
   assert.equal(actions('stop').length, 1);
   assert.equal(button('hermes.start').disabled, true);
   current = snapshot({ connections: [connection({ ...configured, state: 'stopped', enabled: false })] });
   await poll();
+  if (button('hermes.authorizeLater')) await click(button('hermes.authorizeLater'));
+  await openDetails();
   await click(button('hermes.editConnection'));
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, '');
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').placeholder, 'hermes.alreadyConfigured');
@@ -799,6 +791,7 @@ test('stopping the channel reloads editable metadata without reconnecting or ent
 test('platform metadata with strictSend=false cannot start the new channel path', async () => {
   current = snapshot({ gateway: { state: 'ready', platforms: [{ ...platform, strictSend: false }] } });
   await mount();
+  await addBot();
   await click(button('hermes.otherChannels 1'));
   assert.equal(container.querySelector('[data-hermes-platform] button').disabled, true);
   assert.equal(container.querySelector('[data-hermes-manual]'), null);
@@ -811,6 +804,7 @@ test('pairing approval binds the displayed recipient and explicitly selected wor
   const approval = deferred();
   handler = async (name, args) => args?.action === 'approvePairing' ? approval.promise : structuredClone(current);
   await mount();
+  await openDetails();
   assert.ok(container.textContent.includes('actual-user'));
   assert.ok(container.textContent.includes('actual-chat'));
   assert.ok(container.textContent.includes('actual-thread'));
@@ -831,6 +825,7 @@ test('workspace search keeps hidden selections while confirming from a large wor
   current = snapshot({ connections: [connection({ pending: [pending] })],
     workspaces: Array.from({ length: 515 }, (_, index) => `/projects/workspace-${index}`) });
   await mount();
+  await openDetails();
   await click(container.querySelector('[aria-label="/projects/workspace-0"]'));
   await input(`hermes-workspace-search-${source.accountRef}-pair-one`, 'WORKSPACE-514');
   assert.equal(container.querySelector('[aria-label="/projects/workspace-0"]'), null);
@@ -849,6 +844,7 @@ test('workspace search keeps hidden selections while confirming from a large wor
 test('expired pending pairing cannot be approved', async () => {
   current = snapshot({ connections: [connection({ pending: [{ ...pending, expiresAt: Date.now() - 10000 }] })] });
   await mount();
+  await openDetails();
   assert.equal(button('hermes.pairingExpired').disabled, true);
   assert.equal(container.querySelector('[aria-label="/projects/one"]').disabled, true);
   assert.equal(actions('approvePairing').length, 0);
@@ -862,6 +858,7 @@ test('new pairing displays and copies the exact code without approving any recip
   let copied;
   Object.defineProperty(dom.window.navigator, 'clipboard', { configurable: true, value: { writeText: async (value) => { copied = value; } } });
   await mount();
+  await openDetails();
   await click(button('hermes.newPairing'));
   assert.equal(container.querySelector('code').textContent, '/ccem connect ABCD1234');
   await click(container.querySelector('[aria-label="hermes.copyCommand"]'));
@@ -875,6 +872,7 @@ test('disabling a route submits its exact ID and waits for the returned disabled
   const result = deferred();
   handler = async (name, args) => args?.action === 'disableRoute' ? result.promise : structuredClone(current);
   await mount();
+  await openDetails();
   await click(button('hermes.disableRoute'));
   assert.deepEqual(actions('disableRoute')[0].args.payload, { id: 'route-to-disable' });
   assert.equal(button('hermes.disableRoute').disabled, true);
@@ -890,13 +888,14 @@ test('a failed status read recovers on refresh without leaving a stale error vis
   handler = async () => structuredClone(current);
   await click(container.querySelector('[aria-label="hermes.refresh"]'));
   assert.equal(container.querySelector('[role="alert"]'), null);
-  assert.ok(container.querySelector('[data-hermes-channel-picker]'));
+  assert.ok(button('hermes.addChannel'));
 });
 
 test('installed component with no configured channel can restart metadata loading after failure', async () => {
   current = snapshot({ gateway: { state: 'stopped', platforms: [], error: 'metadata startup failed' } });
   handler = async (name, args) => args?.action === 'refreshPlatforms' ? snapshot({ gateway: { state: 'starting', platforms: [] } }) : structuredClone(current);
   await mount();
+  await addBot();
   assert.equal(button('hermes.loadPlatforms').disabled, false);
   await click(button('hermes.loadPlatforms'));
   assert.deepEqual(actions('refreshPlatforms')[0].args, { action: 'refreshPlatforms' });
@@ -928,7 +927,7 @@ test('a stale poll cannot overwrite a newer action response', async () => {
   // later action; here removeRuntime is available without a configured channel.
   await click(button('hermes.removeComponent'));
   await harness.act(async () => stale.resolve(snapshot({ installer: { state: 'not_installed', downloadedBytes: 0, retryable: false } })));
-  assert.ok(button('hermes.stop'), 'new action status survives the older read');
+  assert.ok(button('hermes.stop', await openDetails()), 'new action status survives the older read');
   assert.equal(button('hermes.install'), undefined);
 });
 
@@ -951,6 +950,7 @@ test('the runtime catalog shows supported channels first and keeps unavailable c
   const others = Array.from({ length: 30 }, (_, index) => ({ ...platform, id: `other-${index}`, label: `Other ${index}`, strictSend: false, unavailableReason: 'integration_unsupported' }));
   current = snapshot({ gateway: { state: 'ready', platforms: [qrPlatform, telegram, feishu, discord, slack, ...others] } });
   await mount();
+  await addBot();
   assert.equal(container.querySelectorAll('[data-hermes-platform]').length, 5);
   assert.ok(container.textContent.includes('Telegram'));
   const missing = container.querySelector('[data-hermes-platform="feishu"]');
@@ -980,7 +980,7 @@ test('adding a named manual connection preserves two existing accounts on the sa
   const two = connection({ accountRef: 'account-two', label: 'Transport two' });
   current = snapshot({ connections: [one, two] });
   handler = async (name, args) => args?.action === 'configureChannel'
-    ? snapshot({ connections: [one, two, connection({ accountRef: 'account-three', label: 'Third bot' })] }) : structuredClone(current);
+    ? snapshot({ configuredAccountRef: 'account-three', connections: [one, two, connection({ accountRef: 'account-three', label: 'Third bot' })] }) : structuredClone(current);
   await mount();
   assert.equal(container.querySelectorAll('[data-hermes-connection]').length, 2);
   await click(button('hermes.addChannel'));
@@ -990,9 +990,11 @@ test('adding a named manual connection preserves two existing accounts on the sa
   await input('hermes-field-DYNAMIC_SECRET', 'third-secret');
   await click(button('hermes.saveChannel'));
   assert.deepEqual(actions('configureChannel')[0].args.payload, { platform: platform.id, label: 'Third bot', fields: { DYNAMIC_ACCOUNT: 'third-account', DYNAMIC_SECRET: 'third-secret' } });
+  assert.ok(container.querySelector('[data-hermes-connection-details="account-three"]'));
+  await click(button('hermes.authorizeLater'));
   assert.equal(container.querySelectorAll('[data-hermes-connection]').length, 3);
-  assert.ok(button('hermes.stop', card(one.accountRef)));
-  assert.ok(button('hermes.stop', card(two.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(one.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(two.accountRef)));
   assert.equal(container.querySelector('[data-hermes-editor]'), null);
   assert.equal(actions('stop').length, 0);
 });
@@ -1007,13 +1009,13 @@ test('stopping and restarting one account leaves another account running', async
     return structuredClone(current);
   };
   await mount();
-  await click(button('hermes.stop', card(one.accountRef)));
+  await click(button('hermes.stop', await openDetails(one.accountRef)));
   assert.deepEqual(actions('stop')[0].args.payload, { accountRef: one.accountRef });
-  assert.ok(button('hermes.start', card(one.accountRef)));
-  assert.ok(button('hermes.stop', card(two.accountRef)));
-  await click(button('hermes.start', card(one.accountRef)));
+  assert.ok(button('hermes.start', await openDetails(one.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(two.accountRef)));
+  await click(button('hermes.start', await openDetails(one.accountRef)));
   assert.deepEqual(actions('start')[0].args.payload, { accountRef: one.accountRef });
-  assert.ok(button('hermes.stop', card(two.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(two.accountRef)));
 });
 
 test('editing one account preserves its draft across polling and never submits another account reference', async () => {
@@ -1024,7 +1026,7 @@ test('editing one account preserves its draft across polling and never submits a
   handler = async (name, args) => args?.action === 'configureChannel'
     ? snapshot({ connections: [connection({ ...one, accountRef: 'rotated-account-one' }), two] }) : structuredClone(current);
   await mount();
-  await click(button('hermes.editConnection', card(one.accountRef)));
+  await click(button('hermes.editConnection', await openDetails(one.accountRef)));
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').placeholder, 'hermes.alreadyConfigured');
   assert.equal(button('hermes.saveChannel').disabled, true);
   await input('hermes-field-DYNAMIC_ACCOUNT', 'edited-account');
@@ -1034,7 +1036,7 @@ test('editing one account preserves its draft across polling and never submits a
   assert.deepEqual(actions('configureChannel')[0].args.payload, { accountRef: one.accountRef, platform: platform.id, label: one.label, fields: { DYNAMIC_ACCOUNT: 'edited-account' } });
   assert.equal(card(one.accountRef), null);
   assert.ok(card('rotated-account-one'));
-  assert.ok(button('hermes.stop', card(two.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(two.accountRef)));
   assert.equal(actions('stop').length, 0);
 });
 
@@ -1042,9 +1044,10 @@ test('switching between account editors does not move credential drafts between 
   const configuredFields = ['DYNAMIC_ACCOUNT', 'DYNAMIC_SECRET'];
   current = snapshot({ connections: [connection({ configuredFields }), connection({ accountRef: 'account-two', label: 'Second', configuredFields })] });
   await mount();
-  await click(button('hermes.editConnection', card()));
+  await openDetails();
+  await click(button('hermes.editConnection', await openDetails()));
   await input('hermes-field-DYNAMIC_SECRET', 'first-account-secret-draft');
-  await click(button('hermes.editConnection', card('account-two')));
+  await click(button('hermes.editConnection', await openDetails('account-two')));
   assert.equal(container.querySelector('[data-hermes-manual]').dataset.accountRef, 'account-two');
   assert.equal(document.getElementById('hermes-field-DYNAMIC_SECRET').value, '');
   assert.equal(document.getElementById('hermes-connection-label').value, 'Second');
@@ -1059,17 +1062,17 @@ test('removal requires local confirmation and removes only the selected connecti
   const removal = deferred();
   handler = async (name, args) => args?.action === 'removeChannel' ? removal.promise : structuredClone(current);
   await mount();
-  await click(button('hermes.removeChannel', card(one.accountRef)));
+  await click(button('hermes.removeChannel', await openDetails(one.accountRef)));
   assert.equal(actions('removeChannel').length, 0);
-  await click(button('hermes.cancel', card(one.accountRef)));
+  await click(button('hermes.cancel', await openDetails(one.accountRef)));
   assert.equal(card(one.accountRef).querySelector('[data-hermes-remove-confirmation]'), null);
-  await click(button('hermes.removeChannel', card(one.accountRef)));
-  await click(button('hermes.confirmRemoveChannel', card(one.accountRef)));
+  await click(button('hermes.removeChannel', await openDetails(one.accountRef)));
+  await click(button('hermes.confirmRemoveChannel', await openDetails(one.accountRef)));
   assert.deepEqual(actions('removeChannel')[0].args.payload, { accountRef: one.accountRef });
   assert.equal(container.querySelectorAll('[data-hermes-connection]').length, 2, 'the pending request does not remove local evidence of the connection');
   await harness.act(async () => removal.resolve(snapshot({ connections: [two] })));
   assert.equal(card(one.accountRef), null);
-  assert.ok(button('hermes.stop', card(two.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(two.accountRef)));
   assert.equal(actions('stop').length, 0);
 });
 
@@ -1079,15 +1082,18 @@ test('pairing commands and pending requests stay scoped to their connection even
   const two = connection({ accountRef: 'account-two', label: 'Second', pending: [{ ...pending, source: secondSource }], pairing: { code: 'TWOCODE', expiresAt: Date.now() + 120000 } });
   current = snapshot({ connections: [one, two], pairing: { code: 'IGNORED-LEGACY', expiresAt: Date.now() + 120000 }, pending: [{ ...pending, id: 'ignored-legacy' }] });
   await mount();
-  assert.equal(card().querySelector('code').textContent, '/ccem connect ONECODE');
-  assert.equal(card('account-two').querySelector('code').textContent, '/ccem connect TWOCODE');
+  await openDetails();
+  assert.equal((await openDetails()).querySelector('code').textContent, '/ccem connect ONECODE');
+  assert.equal((await openDetails('account-two')).querySelector('code').textContent, '/ccem connect TWOCODE');
   assert.equal(container.textContent.includes('IGNORED-LEGACY'), false);
   assert.equal(container.querySelector('[data-hermes-pairing="ignored-legacy"]'), null);
+  await openDetails();
   assert.ok(document.getElementById(`hermes-workspace-search-${one.accountRef}-pair-one`));
+  assert.equal(button('hermes.approvePairing').disabled, true);
+  await openDetails('account-two');
   assert.ok(document.getElementById('hermes-workspace-search-account-two-pair-one'));
-  await click(card('account-two').querySelector('[aria-label="/projects/two"]'));
-  assert.equal(button('hermes.approvePairing', card()).disabled, true);
-  await click(button('hermes.approvePairing', card('account-two')));
+  await click((await openDetails('account-two')).querySelector('[aria-label="/projects/two"]'));
+  await click(button('hermes.approvePairing', await openDetails('account-two')));
   assert.deepEqual(actions('approvePairing')[0].args.payload, { accountRef: 'account-two', id: 'pair-one', workspaces: ['/projects/two'], allowInput: false, notifications: true });
 });
 
@@ -1098,10 +1104,11 @@ test('Slack pairing uses its runtime command prefix for both display and clipboa
   let copied;
   Object.defineProperty(dom.window.navigator, 'clipboard', { configurable: true, value: { writeText: async (value) => { copied = value; } } });
   await mount();
-  assert.equal(card().querySelector('code').textContent, '!ccem connect SLACK123');
-  await click(card().querySelector('[aria-label="hermes.copyCommand"]'));
+  await openDetails();
+  assert.equal((await openDetails()).querySelector('code').textContent, '!ccem connect SLACK123');
+  await click((await openDetails()).querySelector('[aria-label="hermes.copyCommand"]'));
   assert.equal(copied, '!ccem connect SLACK123');
-  await click(button('hermes.newPairing', card()));
+  await click(button('hermes.newPairing', await openDetails()));
   assert.deepEqual(actions('openPairing')[0].args.payload, { accountRef: source.accountRef });
 });
 
@@ -1200,10 +1207,13 @@ test('Telegram QR success adds a third connection without changing or authorizin
   const third = connection({ accountRef: 'telegram-third', platform: 'telegram', label: 'Personal Telegram', pairing: { code: 'TGPAIR', expiresAt: Date.now() + 120000 } });
   current = { ...current, connections: [one, two, third], setup: { ...setup, state: 'connected', accountRef: third.accountRef, qrPayload: undefined } };
   await poll();
+  assert.equal(container.querySelector('code').textContent, '/ccem connect TGPAIR');
+  assert.equal(card(), null);
+  await click(button('hermes.authorizeLater'));
   assert.equal(container.querySelectorAll('[data-hermes-connection]').length, 3);
-  assert.ok(button('hermes.stop', card(one.accountRef)));
-  assert.ok(button('hermes.stop', card(two.accountRef)));
-  assert.equal(card(third.accountRef).querySelector('code').textContent, '/ccem connect TGPAIR');
+  assert.ok(button('hermes.stop', await openDetails(one.accountRef)));
+  assert.ok(button('hermes.stop', await openDetails(two.accountRef)));
+  assert.equal((await openDetails(third.accountRef)).querySelector('code').textContent, '/ccem connect TGPAIR');
   assert.equal(container.querySelector('[data-hermes-editor]'), null);
   assert.equal(container.querySelector('[data-hermes-pairing]'), null);
   assert.equal(actions('approvePairing').length, 0);
@@ -1224,7 +1234,7 @@ test('optional schema fields do not block adding a channel and are sent only whe
 test('editing a connection whose schema is unavailable never turns into adding a different platform', async () => {
   current = snapshot({ connections: [connection({ platform: 'old-platform' })] });
   await mount();
-  await click(button('hermes.editConnection', card()));
+  await click(button('hermes.editConnection', await openDetails()));
   assert.ok(container.textContent.includes('hermes.connectionSchemaUnavailable'));
   assert.equal(container.querySelector('[data-hermes-channel-picker]'), null);
   assert.equal(container.querySelector('[data-hermes-manual]'), null);
@@ -1242,17 +1252,17 @@ test('connecting and reconnecting accounts remain individually stoppable and rem
   for (const state of ['starting', 'configuring', 'reconnecting']) {
     current = snapshot({ connections: [connection({ state }), two] });
     await poll();
-    assert.equal(button('hermes.stop', card()).disabled, false, `${state} can be stopped`);
-    assert.equal(button('hermes.editConnection', card()).disabled, true, `${state} cannot be edited`);
-    assert.equal(button('hermes.removeChannel', card()).disabled, false, `${state} can be removed`);
-    await click(button('hermes.stop', card()));
+    assert.equal(button('hermes.stop', await openDetails()).disabled, false, `${state} can be stopped`);
+    assert.equal(button('hermes.editConnection', await openDetails()).disabled, true, `${state} cannot be edited`);
+    assert.equal(button('hermes.removeChannel', await openDetails()).disabled, false, `${state} can be removed`);
+    await click(button('hermes.stop', await openDetails()));
     assert.deepEqual(actions('stop').at(-1).args.payload, { accountRef: source.accountRef });
-    assert.ok(button('hermes.stop', card('account-two')));
+    assert.ok(button('hermes.stop', await openDetails('account-two')));
   }
   current = snapshot({ connections: [connection({ state: 'reconnecting' }), two] });
   await poll();
-  await click(button('hermes.removeChannel', card()));
-  await click(button('hermes.confirmRemoveChannel', card()));
+  await click(button('hermes.removeChannel', await openDetails()));
+  await click(button('hermes.confirmRemoveChannel', await openDetails()));
   assert.deepEqual(actions('removeChannel')[0].args.payload, { accountRef: source.accountRef });
 });
 
@@ -1310,6 +1320,7 @@ test('unsafe setup guide URLs never become links or reach shell IPC', async () =
   const invalid = ['http://docs.example.com/setup', 'javascript:alert(1)', 'file:///tmp/guide', 'https://user:secret@docs.example.com/setup', 'not a URL'];
   current = snapshot({ gateway: { state: 'ready', platforms: invalid.map((setupUrl, index) => ({ ...platform, id: `unsafe-${index}`, setupUrl, available: false })) } });
   await mount();
+  await addBot();
   assert.equal(container.querySelectorAll('[data-hermes-platform] a').length, 0);
   assert.equal(invokeCalls.filter((call) => call.name === 'plugin:shell|open').length, 0);
 });
@@ -1334,33 +1345,34 @@ test('healthy runtime controls are disclosed on demand and installation failures
   assert.equal(button('hermes.retryInstall').disabled, false);
 });
 
-test('connection summaries retain account identity and reveal management without invoking mutations', async () => {
+test('connection management opens in a focused drawer and Escape restores its list entry', async () => {
   current = snapshot({ connections: [connection(), connection({ accountRef: 'second-account', label: 'Second account' })] });
   await mount();
-  const one = card();
-  const details = one.querySelector('[data-hermes-disclosure-content]');
-  const trigger = button('hermes.connectionDetails', one);
-  assert.equal(details.hidden, true);
-  assert.equal(trigger.getAttribute('aria-expanded'), 'false');
-  assert.ok(one.querySelector('header').textContent.includes(source.accountRef.slice(-8)));
-  await click(trigger);
-  assert.equal(details.hidden, false);
-  assert.equal(trigger.getAttribute('aria-expanded'), 'true');
-  assert.equal(card('second-account').querySelector('[data-hermes-disclosure-content]').hidden, true);
+  const row = card();
+  const trigger = button('hermes.connectionDetails', row);
+  assert.ok(row.textContent.includes(source.accountRef.slice(-8)));
+  const details = await openDetails();
+  assert.equal(document.activeElement, details.querySelector('h2'));
+  assert.equal(card(), row, 'opening details leaves the list DOM stable');
+  assert.equal(container.querySelectorAll('[data-hermes-drawer]').length, 1);
   assert.equal(actions().length, 0);
-  await click(trigger);
-  assert.equal(details.hidden, true);
+  await harness.act(async () => { document.activeElement.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+  await settle();
+  assert.equal(container.querySelector('[data-hermes-drawer]'), null);
+  assert.equal(document.activeElement, trigger);
 });
 
-test('new pairing requests automatically reveal their identity and explicit access choices', async () => {
+test('new pairing requests update the list cue without expanding or stealing focus', async () => {
   current = snapshot({ connections: [connection()] });
   await mount();
-  assert.equal(card().querySelector('[data-hermes-disclosure-content]').hidden, true);
+  button('hermes.addChannel').focus();
   current.connections[0].pending = [pending];
   await poll();
-  const details = card().querySelector('[data-hermes-disclosure-content]');
-  assert.equal(details.hidden, false);
-  const request = card().querySelector('[data-hermes-pairing]');
+  assert.ok(button('hermes.pendingPairings', card()));
+  assert.equal(container.querySelector('[data-hermes-pairing]'), null);
+  assert.equal(document.activeElement?.hasAttribute('data-hermes-add'), true);
+  const details = await openDetails();
+  const request = details.querySelector('[data-hermes-pairing]');
   assert.ok(request.textContent.includes(source.userId));
   assert.ok(request.textContent.includes(source.chatId));
   assert.equal(request.querySelector('[aria-label="/projects/one"]').getAttribute('aria-checked'), 'false');
@@ -1369,21 +1381,27 @@ test('new pairing requests automatically reveal their identity and explicit acce
   assert.equal(actions('approvePairing').length, 0);
 });
 
-test('the add flow precedes existing connections, focuses its heading, and returns focus when closed', async () => {
+test('Add replaces the list and legacy panels with a focused wizard, then restores list position', async () => {
   current = qrSnapshot({ connections: [connection()] });
-  await mount();
-  const add = button('hermes.addChannel');
-  await click(add);
+  await mount(true);
+  await click(button('hermes.existingConnections'));
+  assert.ok(container.querySelector('[data-legacy-panel]'));
+  mountPoint.scrollTop = 400;
+  await click(button('hermes.addChannel'));
   let editor = container.querySelector('[data-hermes-editor]');
-  assert.ok(editor.compareDocumentPosition(card()) & dom.window.Node.DOCUMENT_POSITION_FOLLOWING);
+  assert.equal(card(), null);
+  assert.equal(container.querySelector('[data-legacy-panel]'), null);
+  assert.equal(mountPoint.scrollTop, 0);
   assert.equal(document.activeElement, editor.querySelector('h3'));
   await selectPlatform('wecom');
   editor = container.querySelector('[data-hermes-editor]');
   assert.equal(document.activeElement, editor.querySelector('h3'));
   assert.ok(editor.querySelector('[aria-current="step"]').textContent.includes('hermes.stepConnect'));
-  await click(editor.querySelector('[aria-label="hermes.closeEditor"]'));
+  await click(button('hermes.backToConnections'));
   assert.equal(container.querySelector('[data-hermes-editor]'), null);
-  assert.equal(document.activeElement, add);
+  assert.equal(document.activeElement?.hasAttribute('data-hermes-add'), true);
+  assert.equal(mountPoint.scrollTop, 400);
+  assert.ok(container.querySelector('[data-legacy-panel]'));
   assert.equal(actions().length, 0);
 });
 
@@ -1398,27 +1416,168 @@ test('closing the add flow preserves a QR on failed cancellation and closes only
     return structuredClone(current);
   };
   await mount();
-  await click(container.querySelector('[data-hermes-editor] [aria-label="hermes.closeEditor"]'));
+  await click(button('hermes.backToConnections'));
   assert.ok(container.querySelector('[data-hermes-qr]'));
   assert.ok(container.querySelector('[data-hermes-setup-request-error]'));
   assert.equal(actions('cancelSetup').length, 1);
   cancelFails = false;
-  await click(container.querySelector('[data-hermes-editor] [aria-label="hermes.closeEditor"]'));
+  await click(button('hermes.backToConnections'));
   assert.equal(actions('cancelSetup').length, 2);
   assert.equal(container.querySelector('[data-hermes-editor]'), null);
   assert.ok(card());
 });
 
-test('successful manual connection returns focus to Add after the form unmounts', async () => {
+test('manual creation advances to authorization and returning locates the new bot', async () => {
   handler = async (name, args) => args?.action === 'configureChannel'
-    ? snapshot({ connections: [connection()] }) : structuredClone(current);
+    ? snapshot({ configuredAccountRef: source.accountRef, connections: [connection()] }) : structuredClone(current);
   await mountManual();
   await input('hermes-field-DYNAMIC_ACCOUNT', 'test-account');
   await input('hermes-field-DYNAMIC_SECRET', 'test-secret');
-  const save = button('hermes.saveChannel');
-  save.focus();
-  await click(save);
+  await click(button('hermes.saveChannel'));
   assert.equal(container.querySelector('[data-hermes-manual]'), null);
-  assert.equal(document.activeElement, button('hermes.addChannel'));
-  assert.ok(card());
+  assert.equal(document.activeElement?.tagName, 'H3');
+  assert.ok(container.textContent.includes('hermes.authorizeConnection'));
+  assert.equal(card(), null);
+  await click(button('hermes.authorizeLater'));
+  assert.ok(card().classList.contains('is-highlighted'));
+  assert.equal(document.activeElement?.getAttribute('data-hermes-open'), source.accountRef);
+});
+
+test('manual creation uses its explicit receipt even when a different new bot appears first', async () => {
+  const unrelated = connection({ accountRef: 'external-account', platform: 'slack' });
+  const added = connection({ accountRef: 'our-account' });
+  handler = async (name, args) => args?.action === 'configureChannel'
+    ? snapshot({ configuredAccountRef: added.accountRef, connections: [unrelated, added] }) : structuredClone(current);
+  await mountManual();
+  await input('hermes-field-DYNAMIC_ACCOUNT', 'our-bot');
+  await input('hermes-field-DYNAMIC_SECRET', 'test-secret');
+  await click(button('hermes.saveChannel'));
+  assert.ok(container.querySelector('[data-hermes-connection-details="our-account"]'));
+  assert.equal(container.querySelector('[data-hermes-connection-details="external-account"]'), null);
+});
+
+test('manual receipt advances while a concurrent account reply and status read remain pending', async () => {
+  current = snapshot({ connections: [connection()] });
+  const pairing = deferred();
+  const read = deferred();
+  let holdRead = false;
+  handler = async (name, args) => {
+    if (args?.action === 'openPairing') return pairing.promise;
+    if (args?.action === 'configureChannel') return snapshot({ configuredAccountRef: 'added-account', connections: [connection(), connection({ accountRef: 'added-account' })] });
+    if (name === 'hermes_status' && holdRead) return read.promise;
+    return structuredClone(current);
+  };
+  await mount();
+  await click(button('hermes.newPairing', await openDetails()));
+  await closeDetails();
+  await selectPlatform(platform.id);
+  holdRead = true;
+  await poll();
+  await input('hermes-field-DYNAMIC_ACCOUNT', 'new-account');
+  await input('hermes-field-DYNAMIC_SECRET', 'test-secret');
+  await click(button('hermes.saveChannel'));
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.equal(container.querySelector('[aria-current="step"]').textContent, '3hermes.stepAuthorize');
+  current.connections.push(connection({ accountRef: 'added-account' }));
+  holdRead = false;
+  await harness.act(async () => read.resolve(structuredClone(current)));
+  await poll();
+  assert.ok(container.querySelector('[data-hermes-connection-details="added-account"]'));
+  await harness.act(async () => { pairing.resolve(structuredClone(current)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  await settle();
+});
+
+test('a concurrent cancellation receipt cannot reveal manual credentials after scanning completes', async () => {
+  current = qrSnapshot({ connections: [connection()] });
+  const pairing = deferred();
+  const read = deferred();
+  let holdRead = false;
+  handler = async (name, args) => {
+    if (args?.action === 'openPairing') return pairing.promise;
+    if (args?.action === 'beginSetup') { current.setup = qrSetup; return structuredClone(current); }
+    if (args?.action === 'cancelSetup') return { ...structuredClone(current), setup: { ...qrSetup, state: 'connecting', qrPayload: undefined } };
+    if (name === 'hermes_status' && holdRead) return read.promise;
+    return structuredClone(current);
+  };
+  await mount();
+  await click(button('hermes.newPairing', await openDetails()));
+  await closeDetails();
+  await selectPlatform('wecom');
+  await click(button('hermes.scanGenerate'));
+  holdRead = true;
+  await poll();
+  await click(button('hermes.manualConnect'));
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'connecting');
+  assert.equal(button('hermes.backToConnections').disabled, true);
+  current = qrSnapshot({ setup: { ...qrSetup, state: 'connected', accountRef: 'scanned-account' }, connections: [connection(), connection({ accountRef: 'scanned-account', platform: 'wecom' })] });
+  holdRead = false;
+  await harness.act(async () => read.resolve(structuredClone(current)));
+  await poll();
+  assert.ok(container.querySelector('[data-hermes-connection-details="scanned-account"]'));
+  await harness.act(async () => { pairing.resolve(structuredClone(current)); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  await settle();
+});
+
+test('scan, native pairing and explicit authorization complete the wizard and highlight the exact bot', async () => {
+  current = qrSnapshot({ setup: qrSetup });
+  await mountQr();
+  current.setup = { ...qrSetup, state: 'connected', accountRef: source.accountRef };
+  current.connections = [connection({ platform: 'wecom', pairing: { code: 'PAIR123', expiresAt: Date.now() + 60000 } })];
+  await poll();
+  assert.equal(button('hermes.finishSetup'), undefined);
+  assert.equal(container.querySelector('[data-hermes-pairing]'), null);
+  current.connections[0].pending = [pending];
+  await poll();
+  assert.equal(button('hermes.approvePairing').disabled, true);
+  await click(container.querySelector('[aria-label="/projects/one"]'));
+  handler = async (name, args) => {
+    if (args?.action === 'approvePairing') {
+      current.routes = [{ id: 'new-route', generation: 1, source, enabled: true, workspaces: args.payload.workspaces, allowInput: args.payload.allowInput, notifications: args.payload.notifications }];
+      current.connections[0].pending = [];
+    }
+    return structuredClone(current);
+  };
+  await click(button('hermes.approvePairing'));
+  assert.equal(actions('approvePairing')[0].args.payload.allowInput, false);
+  assert.ok(button('hermes.finishSetup'));
+  assert.equal(card(), null);
+  await click(button('hermes.finishSetup'));
+  assert.ok(card().classList.contains('is-highlighted'));
+  assert.equal(document.activeElement?.getAttribute('data-hermes-open'), source.accountRef);
+  assert.ok(card().textContent.includes('hermes.accessSummary 1'));
+  await click(button('hermes.addChannel'));
+  assert.ok(container.querySelector('[data-hermes-channel-picker]'), 'a completed scan never reopens its prior authorization step');
+});
+
+test('an old cancellation finishing its refresh cannot replace a newer QR session with manual setup', async () => {
+  current = qrSnapshot({ connections: [connection()] });
+  const pairing = deferred();
+  const slowRead = deferred();
+  let holdRead = false;
+  let generations = 0;
+  handler = async (name, args) => {
+    if (args?.action === 'openPairing') return pairing.promise;
+    if (args?.action === 'beginSetup') { current.setup = { ...qrSetup, id: `qr-${++generations}` }; return structuredClone(current); }
+    if (args?.action === 'cancelSetup') { current.setup = { ...current.setup, state: 'cancelled' }; holdRead = true; return structuredClone(current); }
+    if (name === 'hermes_status' && holdRead) return slowRead.promise;
+    return structuredClone(current);
+  };
+  await mount();
+  await click(button('hermes.newPairing', await openDetails()));
+  await closeDetails();
+  await selectPlatform('wecom');
+  await click(button('hermes.scanGenerate'));
+  await click(button('hermes.manualConnect'));
+  assert.equal(button('hermes.scanRefresh').disabled, false);
+  await click(button('hermes.scanRefresh'));
+  assert.equal(current.setup.id, 'qr-2');
+  holdRead = false;
+  await harness.act(async () => slowRead.resolve(structuredClone(current)));
+  await settle();
+  await poll();
+  assert.equal(container.querySelector('[data-hermes-manual]'), null);
+  assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'waiting');
+  await harness.act(async () => pairing.resolve(structuredClone(current)));
+  await settle();
 });

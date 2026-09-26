@@ -98,7 +98,7 @@ impl HermesBridgeManager {
         self: &Arc<Self>,
         app: &AppHandle,
         payload: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let platform = payload["platform"].as_str().ok_or("platform_required")?;
         let fields = payload["fields"].as_object().ok_or("fields_required")?;
         let account = payload
@@ -183,7 +183,7 @@ impl HermesBridgeManager {
                 let _ = self.start_connection_locked(app, &connection.account_ref);
             }
         }
-        Ok(())
+        Ok(connection.account_ref)
     }
 
     pub(super) fn pairing_action(

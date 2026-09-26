@@ -71,7 +71,7 @@ export function HermesChannelPicker({ platforms, disabled, onSelect }: { platfor
 }
 
 export function HermesChannelForm({ platform, connection, disabled, run, onSaved, onCancel }: {
-  platform: HermesPlatform; connection?: HermesConnection; disabled: boolean; run: HermesRunAction; onSaved: () => void; onCancel: () => void;
+  platform: HermesPlatform; connection?: HermesConnection; disabled: boolean; run: HermesRunAction; onSaved: (accountRef?: string) => void; onCancel: () => void;
 }) {
   const { t } = useLocale();
   const [fields, setFields] = useState<Record<string, string>>({});
@@ -89,7 +89,7 @@ export function HermesChannelForm({ platform, connection, disabled, run, onSaved
       return value.trim() ? [value, value.trim()] : [];
     });
     void run('configureChannel', { platform: platform.id, fields: submitted, ...(connection ? { accountRef: connection.accountRef } : {}),
-      ...(label.trim() || connection ? { label: label.trim() } : {}) }, redact).then((ok) => { if (ok) { setFields({}); onSaved(); } });
+      ...(label.trim() || connection ? { label: label.trim() } : {}) }, redact).then((ok) => { if (ok) { setFields({}); onSaved(ok.configuredAccountRef); } });
   }}>
     <div className="hermes-form-fields">
       <div className="hermes-form-heading"><h3>{t('hermes.manualTitle')}</h3><p>{t('hermes.manualDescription', { platform: platformDisplayName(platform.id, platform.label, t) })}</p></div>

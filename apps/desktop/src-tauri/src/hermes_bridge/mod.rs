@@ -365,7 +365,10 @@ impl HermesBridgeManager {
                 });
             }
             "configureChannel" => {
-                self.configure_channel_locked(app, &payload)?;
+                let account_ref = self.configure_channel_locked(app, &payload)?;
+                let mut result = self.status();
+                result["configuredAccountRef"] = json!(account_ref);
+                return Ok(result);
             }
             "refreshPlatforms" => {
                 if self.setup_in_progress() {

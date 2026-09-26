@@ -1,4 +1,55 @@
-# Hermes 界面重设计验收
+# Hermes 界面与导航验收
+
+## 2026-09-26：列表、独立向导与详情侧栏
+
+基于 `7c1d6bf9`，继续隔离分支 `codex/hermes-integration-phase0`。用户批准以下交互，替代本文后半部分 9 月 25 日的行内展开方案。
+
+- 默认主页管理已添加的机器人：名称、平台、状态、工作区和输入权限摘要。待授权只更新入口提示，不自动挤开列表或抢焦点。
+- 添加进入独立三步向导：渠道 → 扫码/手动 → 私聊配对与工作区授权。列表、活动、组件和旧渠道面板从向导中移除。支持稍后授权；完成后定位并高亮准确的机器人。
+- 返回前等待二维码取消；失败保留页面；扫码已进入连接或已完成时继续授权。返回恢复列表滚动位置和焦点。
+- 管理打开 shadcn/Radix 详情侧栏，配置编辑、配对、权限和移除确认在侧栏内处理。关闭或 Escape 返回原入口，移除后返回添加入口。
+
+产品依据：[Home Assistant 添加集成](https://www.home-assistant.io/getting-started/integration/)、[Slack 添加应用](https://slack.com/help/articles/202035138-Add-apps-to-your-Slack-workspace)、[Atlassian Panel 使用边界](https://atlassian.design/components/panel/usage)、[Carbon 创建流程](https://carbondesignsystem.com/community/patterns/create-flows/)。技术采用既有 Radix Dialog 1.1.x 的 Portal、焦点、Escape 和受控生命周期；[官方文档](https://www.radix-ui.com/primitives/docs/components/dialog) 当前显示 1.1.20，本地依赖范围 ^1.1.15，未新增或升级依赖。
+
+### 状态与审查修正
+
+`configureChannel` 动作新增临时 `configuredAccountRef` 回执，直接来自后端保存结果，不入持久化状态；前端不再根据全量列表差集猜账号。单次动作结果与共享轮询快照分开处理，取消以本次 setup 回执决定导航，最终刷新结束后再次检查动作序号，防止旧取消把新二维码切到手动。
+
+真实后台 WebView 暴露了原弹窗遮挡队列仅等待 requestAnimationFrame 的问题，导致详情不出现。增加 100ms post-commit 等待兜底，仍等待所有原生 surface hide ACK，且恢复前检查活动弹层。独立审查确认未绕过遮挡保护。
+
+### 本轮自动验证
+
+```sh
+# 仓库根
+node --test apps/desktop/test/hermes-panel-dom.test.mjs
+node --test apps/desktop/test/workspace-motion-lifecycle-dom.test.mjs apps/desktop/test/locale-provider-dom.test.mjs
+node --test apps/desktop/test/native-surface-occlusion.test.mjs apps/desktop/test/delete-env-confirm-dialog-dom.test.mjs
+pnpm check:file-size
+git diff --check
+# apps/desktop
+pnpm build
+# apps/desktop/src-tauri
+cargo test --locked hermes_bridge::
+```
+
+Hermes DOM 75、动画与语言 28、原生遮挡与弹窗 18，共 121 项；Rust Hermes bridge 56 项通过。DOM 包含显式授权后完成、账号归属、同时创建、取消与扫码并发、旧取消不得覆盖新二维码、侧栏焦点/Escape、列表滚动和无抢焦点。独立复审通过，最终 DOM 无 act 警告。构建包含既有大 chunk 和 Tailwind 类名警告。最后补充连接名称与状态显示后，重跑 Hermes DOM、`pnpm exec tsc --noEmit` 和 `pnpm exec vite build`。
+
+### 本轮真实开发版证据
+
+证据保存在 `.artifacts/hermes-navigation/`；使用本任务规范 launcher、manifest 精确匹配的 `com.ccem.desktop.dev.idedbe6da` 与 MCP 57700。Hermes 状态复用隔离 `.artifacts/hermes-qr-live/state`，运行包 2026.9.25.1 使用已有本地测试签名信任源；共享后台服务关闭。启动参数修正后，仅停止了本任务创建、通过 PID/cwd 核对的旧开发进程。
+
+- 实际 WebView DOM 点击列表管理，侧栏出现并聚焦标题；关闭返回原入口。后台窗口仍能打开侧栏，没有替换 IPC 或伪造渲染状态。
+- 添加切到独立页面，列表行数为 0；回到列表恢复焦点。900 × 430 窗口中实测原滚动量 158 → 向导 0 → 返回 158。
+- 飞书通过真实服务生成二维码，状态 `waiting`；返回后后端 `cancelled`、二维码消失，原企微连接保持 `running`、原授权一条。
+- 使用明确无效的 Slack 测试凭据在隔离状态中新增临时机器人，真实 Rust 保存回执将向导推进到该账号的第三步。稍后授权返回后，新行高亮并获得焦点；随后通过详情确认移除测试记录。此测试没有证明 Slack 登录或收发。
+- 500 × 1000 实际窗口：向导改为单列；侧栏宽 500px，无横向溢出，焦点留在侧栏。Tauri MCP Escape 实测关闭侧栏并返回列表入口。修改配置时保存的密码保持空白，未修改时保存按钮禁用。
+- 截图含 `bots-list-light.png`、`bots-list-dark.png`、`add-channels-light.png`、`add-channels-narrow.png`、`details-light.png`、`details-narrow.png` 和 `feishu-qr-light.png`。仅临时切换根主题 class 检查深色，完成有限时长动画后截图，最终恢复浅色和 1120 × 900 窗口。测试二维码已取消，临时 Slack 记录已移除，最终仅原企微 `running`、无错误、原授权一条。
+
+具体 UI 结果见同目录 `desktop-proof.json` 与截图。真实外部平台扫码创建/私聊/收发与 UI 导航验收分开；自动配对授权全链路由行为测试夹具覆盖，不能算新一轮真实平台账号验收。本轮本地提交，未合并、未 push、未正式发行。
+
+---
+
+## 2026-09-25：前一版视觉重设计（历史记录）
 
 2026-09-25，基于 `b7b0242c`，隔离分支 `codex/hermes-integration-phase0`。本轮覆盖 CCEM 内 Hermes 的渠道选择、扫码与手动接入、连接管理、配对授权和运行组件管理；未改变渠道协议或持久化结构。
 

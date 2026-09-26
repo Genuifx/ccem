@@ -94,7 +94,7 @@ export function ChatApp() {
 
   return (
     <div ref={chatMotionRef} className="mx-auto w-full max-w-[1040px] space-y-4">
-      <HermesPanel />
+      <HermesPanel>
       <section className="border-t border-border-subtle pt-2">
         <Button variant="ghost" className="w-full justify-between px-1 text-xs text-muted-foreground" aria-expanded={legacyOpen}
           aria-controls="existing-chat-connections" onClick={() => setLegacyOpen((current) => !current)}>
@@ -155,6 +155,7 @@ export function ChatApp() {
       </div>
         </div>}
       </section>
+      </HermesPanel>
     </div>
   );
 }

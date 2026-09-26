@@ -213,3 +213,37 @@
 @media (prefers-reduced-motion: reduce) {
   .hermes-panel *, .hermes-panel *::before { animation: none !important; transition: none !important; }
 }
+
+/* Independent add flow and contextual management. */
+.hermes-wizard-navigation { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.hermes-wizard-navigation > button { margin-left: -12px; }
+.hermes-wizard-navigation svg { width: 16px; height: 16px; }
+.hermes-wizard { min-height: 400px; }
+.hermes-connection { transition: background-color 160ms ease-out; border-radius: 8px; }
+.hermes-connection.is-highlighted { background: hsl(var(--primary) / .07); outline: 1px solid hsl(var(--primary) / .2); outline-offset: 2px; }
+.hermes-empty { padding: 70px 20px 90px; text-align: center; }
+.hermes-empty > svg { width: 32px; height: 32px; color: hsl(var(--muted-foreground)); margin: 0 auto 18px; }
+.hermes-empty h3 { font-size: 16px; font-weight: 600; }
+.hermes-empty p { color: hsl(var(--muted-foreground)); font-size: 13px; margin-top: 8px; }
+.hermes-authorization-intro { color: hsl(var(--muted-foreground)); font-size: 13px; margin-bottom: 24px; }
+.hermes-detail-context { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.hermes-detail-context h4 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.hermes-complete { padding: 40px 20px 60px; text-align: center; }
+.hermes-complete > svg { width: 40px; height: 40px; color: hsl(var(--success)); margin: 0 auto 18px; }
+.hermes-complete h4 { font-size: 20px; font-weight: 600; }
+.hermes-complete p { font-size: 13px; color: hsl(var(--muted-foreground)); margin: 10px 0 26px; }
+.hermes-drawer-overlay { background: hsl(var(--foreground) / .16); animation: none !important; }
+.hermes-panel.hermes-drawer { position: fixed; inset: 0 0 0 auto; z-index: 50; width: min(560px, 100vw); max-width: none; margin: 0; background: hsl(var(--surface-raised)); border-left: 1px solid hsl(var(--border)); box-shadow: -12px 0 40px hsl(var(--foreground) / .08); display: flex; flex-direction: column; outline: none; }
+.hermes-drawer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 28px 28px 22px; border-bottom: 1px solid hsl(var(--border-subtle)); }
+.hermes-drawer-header h2 { font-size: 20px; font-weight: 600; outline: none; overflow-wrap: anywhere; }
+.hermes-drawer-header p { margin-top: 8px; font-size: 13px; }
+.hermes-drawer-header > button { flex-shrink: 0; margin-top: -6px; }
+.hermes-drawer-header svg { width: 18px; height: 18px; }
+.hermes-drawer-body { padding: 24px 28px; overflow-y: auto; min-height: 0; overscroll-behavior: contain; }
+.hermes-drawer .hermes-manual-layout { grid-template-columns: 1fr; }
+.hermes-drawer .hermes-account-id { flex-basis: 100%; margin-left: 0; margin-top: 8px; }
+.hermes-drawer .hermes-form-aside { padding: 18px; }
+@media (max-width: 500px) {
+  .hermes-drawer-header { padding: 22px 20px 18px; }
+  .hermes-drawer-body { padding: 22px 20px; }
+}

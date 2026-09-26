@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import { Bell, ChevronDown, Copy, FolderOpen, MessageCircle, Play, ShieldCheck, Square } from '@/lib/lucide-react';
+import { Bell, ArrowRight, Copy, FolderOpen, MessageCircle, Play, ShieldCheck, Square } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { useLocale } from '@/locales';
 import type { HermesConnection, HermesPendingPairing, HermesPlatform, HermesRoute, HermesRunAction, HermesSource } from '@/lib/hermes-ipc';
 import { errorText, platformDisplayName, timestamp, TRANSITIONING } from './hermes-presentation';
-import { HermesPlatformIcon, HermesSteps, workspaceName } from './HermesVisuals';
+import { HermesPlatformIcon, workspaceName } from './HermesVisuals';
 
 function SourceIdentity({ source }: { source: HermesSource }) {
   const { t } = useLocale();
@@ -56,12 +56,35 @@ function PendingPairing({ pairing, accountRef, workspaces, disabled, run }: {
   </div>;
 }
 
-export function HermesConnectionCard({ connection, platform, routes, workspaces, disabled, stopDisabled, removeDisabled, editDisabled, setupError, requestError, run, onEdit, stateLabel }: {
+export function HermesConnectionCard({ connection, platform, routes, stateLabel, onOpen, highlighted, requestError, setupError }: {
+  connection: HermesConnection; platform?: HermesPlatform; routes: HermesRoute[]; stateLabel: (value: string) => string;
+  onOpen: () => void; highlighted: boolean; requestError?: string | null; setupError?: string | null;
+}) {
+  const { t } = useLocale();
+  const platformLabel = platformDisplayName(connection.platform, platform?.label, t);
+  const label = !connection.label || connection.label === connection.platform || connection.label === platform?.label ? platformLabel : connection.label;
+  const active = routes.filter((route) => route.enabled);
+  const workspaceCount = new Set(active.flatMap((route) => route.workspaces)).size;
+  const attention = Boolean(connection.error || requestError || setupError);
+  return <article className={`hermes-connection${highlighted ? ' is-highlighted' : ''}`} data-hermes-connection={connection.accountRef}>
+    <header className="hermes-connection-header">
+      <HermesPlatformIcon platform={connection.platform} />
+      <div className="hermes-connection-title"><h4>{label}</h4><p>{platformLabel} · <span className="font-mono" title={connection.accountRef}>{connection.accountRef.slice(-8)}</span></p>
+        <p>{active.length ? t('hermes.accessSummary', { count: workspaceCount }) : t('hermes.needsPairing')}{active.length > 0 && <> · {t(active.some((route) => route.allowInput) ? 'hermes.allowInput' : 'hermes.queryOnly')}</>}</p>
+      </div>
+      <span className="hermes-connection-state" role="status"><span className={`hermes-status-dot${connection.state === 'running' && !attention ? ' is-running' : ''}`} aria-hidden="true" />{attention ? t('hermes.needsAttention') : stateLabel(connection.state)}</span>
+      <Button size="sm" variant="ghost" aria-haspopup="dialog" data-hermes-open={connection.accountRef} onClick={(event) => { event.currentTarget.focus({ preventScroll: true }); onOpen(); }}>
+        {t(connection.pending.length ? 'hermes.pendingPairings' : 'hermes.connectionDetails')}<ArrowRight className="h-4 w-4" aria-hidden="true" />
+      </Button>
+    </header>
+  </article>;
+}
+
+export function HermesConnectionDetails({ connection, platform, routes, workspaces, disabled, stopDisabled, removeDisabled, editDisabled, setupError, requestError, run, onEdit, stateLabel, authorizationOnly = false }: {
   connection: HermesConnection; platform?: HermesPlatform; routes: HermesRoute[]; workspaces: string[];
-  disabled: boolean; stopDisabled: boolean; removeDisabled: boolean; editDisabled: boolean; setupError?: string | null; requestError?: string | null; run: HermesRunAction; onEdit: () => void; stateLabel: (value: string) => string;
+  disabled: boolean; stopDisabled: boolean; removeDisabled: boolean; editDisabled: boolean; setupError?: string | null; requestError?: string | null; run: HermesRunAction; onEdit: () => void; stateLabel: (value: string) => string; authorizationOnly?: boolean;
 }) {
   const { t, lang } = useLocale();
-  const [expanded, setExpanded] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [copyError, setCopyError] = useState<string | null>(null);
@@ -73,31 +96,21 @@ export function HermesConnectionCard({ connection, platform, routes, workspaces,
   const platformLabel = platformDisplayName(connection.platform, platform?.label, t);
   const label = !connection.label || connection.label === connection.platform || connection.label === platform?.label ? platformLabel : connection.label;
   const activeRoutes = routes.filter((route) => route.enabled);
-  const attention = Boolean(connection.error || requestError || setupError || connection.pairing || connection.pending.length > 0 || confirmRemove);
-  const open = expanded || attention;
-  const detailsId = `hermes-connection-details-${connection.accountRef}`;
-  return <article className="hermes-connection" data-hermes-connection={connection.accountRef}>
-    <header className="hermes-connection-header">
-      <HermesPlatformIcon platform={connection.platform} />
-      <div className="hermes-connection-title"><h4>{label}</h4><p>{platformLabel} · <span className="font-mono" title={connection.accountRef}>{connection.accountRef.slice(-8)}</span> · {t(activeRoutes.length ? 'hermes.pairedChatsCount' : 'hermes.needsPairing', { count: activeRoutes.length })}</p></div>
-      <span className="hermes-connection-state" role="status"><span className={`hermes-status-dot${running ? ' is-running' : ''}`} aria-hidden="true" />{stateLabel(connection.state)}</span>
-      <div className="hermes-connection-actions">
-        {running && <Button size="sm" variant={activeRoutes.length ? 'ghost' : 'default'} disabled={disabled} onClick={() => { setCopiedCode(null); setCopyError(null); void run('openPairing', { accountRef: connection.accountRef }); }}>{t('hermes.newPairing')}</Button>}
-        <Button size="sm" variant="ghost" aria-expanded={open} aria-controls={detailsId} disabled={attention} onClick={() => setExpanded((value) => !value)}>
-          {t('hermes.connectionDetails')}<ChevronDown className={`hermes-chevron ${open ? 'is-open' : ''}`} aria-hidden="true" />
-        </Button>
+  return <div className="hermes-connection-details" data-hermes-connection-details={connection.accountRef}>
+      <div className="hermes-detail-context">
+        {authorizationOnly && <HermesPlatformIcon platform={connection.platform} />}
+        <div>{authorizationOnly && <h4>{label}</h4>}<p className="hermes-connection-state" role="status"><span className={`hermes-status-dot${running ? ' is-running' : ''}`} aria-hidden="true" />{stateLabel(connection.state)}</p></div>
       </div>
-    </header>
-    <div id={detailsId} className="hermes-connection-details" hidden={!open} data-hermes-disclosure-content>
       {connection.error && <p role="alert" className="hermes-alert">{errorText(connection.error)}</p>}
       {requestError && <p role="alert" className="hermes-alert">{requestError}</p>}
       {setupError && <p role="alert" className="hermes-alert" data-hermes-setup-error>{t(setupError)}</p>}
       <div className="hermes-connection-toolbar">
+        {running && <Button size="sm" variant={activeRoutes.length ? 'outline' : 'default'} disabled={disabled} onClick={() => { setCopiedCode(null); setCopyError(null); void run('openPairing', { accountRef: connection.accountRef }); }}>{t('hermes.newPairing')}</Button>}
         <Button size="sm" variant={canStop ? 'outline' : 'default'} disabled={(canStop ? stopDisabled : disabled) || connection.state === 'stopping'} onClick={() => void run(canStop ? 'stop' : 'start', { accountRef: connection.accountRef })}>
           {canStop ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}{t(canStop ? 'hermes.stop' : 'hermes.start')}
         </Button>
-        <Button size="sm" variant="ghost" disabled={disabled || editDisabled || transitioning} onClick={onEdit}>{t('hermes.editConnection')}</Button>
-        <Button size="sm" variant="ghost" disabled={removeDisabled} onClick={() => setConfirmRemove(true)}>{t('hermes.removeChannel')}</Button>
+        {!authorizationOnly && <><Button size="sm" variant="ghost" disabled={disabled || editDisabled || transitioning} onClick={onEdit}>{t('hermes.editConnection')}</Button>
+        <Button size="sm" variant="ghost" disabled={removeDisabled} onClick={() => setConfirmRemove(true)}>{t('hermes.removeChannel')}</Button></>}
         <span className="hermes-account-id" title={connection.accountRef}>{connection.accountRef.slice(-12)}</span>
       </div>
       {confirmRemove && <div className="hermes-remove-confirmation" data-hermes-remove-confirmation>
@@ -106,7 +119,6 @@ export function HermesConnectionCard({ connection, platform, routes, workspaces,
           <Button size="sm" variant="ghost" disabled={removeDisabled} onClick={() => setConfirmRemove(false)}>{t('hermes.cancel')}</Button></div>
       </div>}
       {connection.pairing && <div className="hermes-pairing-command" data-hermes-pairing-command>
-        <HermesSteps current={3} />
         <p className="text-sm">{pairingActive ? t('hermes.pairingInstruction') : t('hermes.pairingExpired')}</p>
         {pairingActive && <>
           <div className="hermes-command-line"><code>{pairingCommand}</code>
@@ -129,6 +141,5 @@ export function HermesConnectionCard({ connection, platform, routes, workspaces,
           <div className="space-y-1">{route.workspaces.map((workspace) => <p key={workspace} className="break-all font-mono text-xs text-muted-foreground">{workspace}</p>)}</div>
         </details>
       </div>)}</div>}
-    </div>
-  </article>;
+  </div>;
 }

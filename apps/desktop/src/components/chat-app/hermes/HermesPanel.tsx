@@ -1,20 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, ArrowLeft, ArrowRight, KeyRound, Plus, QrCode, RefreshCw, X } from '@/lib/lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { Activity, ArrowLeft, ArrowRight, CheckCircle2, KeyRound, MessageCircle, Plus, QrCode, RefreshCw } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/locales';
 import { getHermesStatus, performHermesAction, type HermesAction, type HermesRunAction, type HermesStatus } from '@/lib/hermes-ipc';
 import { HermesRuntime } from './HermesRuntime';
 import { HermesSteps } from './HermesVisuals';
 import './hermes.css';
-import { HermesConnectionCard } from './HermesConnectionCard';
+import { HermesConnectionDrawer } from './HermesConnectionDrawer';
+import { HermesConnectionCard, HermesConnectionDetails } from './HermesConnectionCard';
 import { HermesChannelForm, HermesChannelPicker, HermesQrSetup } from './HermesChannelSetup';
 import { errorText, INSTALLING, platformDisplayName, SETUP_CANCELLABLE, SETUP_WAIT_MS, setupErrorKey, timestamp, TRANSITIONING } from './hermes-presentation';
 
-type Editor = { kind: 'add'; platformId?: string; manual: boolean } | { kind: 'edit'; accountRef: string };
+type Wizard = { kind: 'add'; platformId?: string; manual: boolean } | { kind: 'authorize'; accountRef: string };
+type Details = { accountRef: string; editing: boolean };
 const PAIRING_ACTIONS = new Set<HermesAction>(['openPairing', 'approvePairing']);
 const RUNTIME_ACTIONS = new Set<HermesAction>(['install', 'removeRuntime', 'cancelInstall']);
 
-export function HermesPanel() {
+export function HermesPanel({ children }: { children?: ReactNode }) {
   const { t, lang } = useLocale();
   const [status, setStatus] = useState<HermesStatus | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -23,11 +25,17 @@ export function HermesPanel() {
   const [busyActions, setBusyActions] = useState<Record<string, HermesAction>>({});
   const [connectionRequestErrors, setConnectionRequestErrors] = useState<Record<string, string | null>>({});
   const [cancelling, setCancelling] = useState(false);
-  const [editor, setEditor] = useState<Editor | null>(null);
+  const [wizard, setWizard] = useState<Wizard | null>(null);
+  const [details, setDetails] = useState<Details | null>(null);
+  const [highlighted, setHighlighted] = useState<string | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const listScroll = useRef(0);
+  const returnAccount = useRef<string | null>(null);
+  const observedAuthorization = useRef<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const editorHeadingRef = useRef<HTMLHeadingElement>(null);
   const addButtonRef = useRef<HTMLButtonElement>(null);
-  const previousEditorKey = useRef('closed');
+  const previousViewKey = useRef('closed');
   const mounted = useRef(false);
   const latestStatus = useRef<HermesStatus | null>(null);
   const pendingActions = useRef(new Map<string, { action: HermesAction; id: number }>());
@@ -86,10 +94,14 @@ export function HermesPanel() {
     else { pendingActions.current.set(scope, { action, id }); setBusyActions((current) => ({ ...current, [scope]: action })); }
     if (accountRef) setConnectionRequestErrors((current) => ({ ...current, [accountRef]: null }));
     else { setRequestError(null); setSetupRequestError(null); }
+    let result: HermesStatus | false = false;
     try {
       const next = await performHermesAction(action, payload);
+      if (action === 'configureChannel' && scopeSequences.current.get(scope) === id) {
+        if (!accountRef && !next.configuredAccountRef) throw new Error(t('hermes.configurationResultMissing'));
+      }
       if (mounted.current && id === actionSequence.current && !concurrentActions.current.has(id)) { latestStatus.current = next; setStatus(next); setReadError(null); }
-      return scopeSequences.current.get(scope) === id;
+      result = next;
     } catch (error) {
       if (mounted.current && scopeSequences.current.get(scope) === id) {
         if (accountRef) setConnectionRequestErrors((current) => ({ ...current, [accountRef]: errorText(error, secrets) }));
@@ -110,6 +122,9 @@ export function HermesPanel() {
       const concurrent = concurrentActions.current.delete(id);
       if (mounted.current && (concurrent || (accountRef && id !== actionSequence.current))) await refresh();
     }
+    // A newer same-scope action can start while the final refresh is in flight.
+    // Validate after that await before a caller uses this receipt to navigate.
+    return mounted.current && scopeSequences.current.get(scope) === id ? result : false;
   };
 
   const platforms = status?.gateway.platforms ?? [];
@@ -124,11 +139,11 @@ export function HermesPanel() {
   const setupConnection = connections.find((item) => item.accountRef === setup?.accountRef);
   const setupRecovered = (setup?.error === 'setup_pairing_failed' && Boolean(setupConnection?.pairing)) || (setup?.error === 'setup_connection_failed' && setupConnection?.state === 'running');
   const setupStatusError = setupState === 'error' && !setupRecovered ? setupErrorKey(setup?.error) : null;
-  const editingConnection = editor?.kind === 'edit' ? connections.find((item) => item.accountRef === editor.accountRef) : undefined;
-  const platform = platforms.find((item) => item.id === (editingConnection?.platform ?? (editor?.kind === 'add' ? editor.platformId : undefined)));
-  const showEditor = editor !== null || connections.length === 0;
+  const detailConnection = connections.find((item) => item.accountRef === details?.accountRef);
+  const authorizationConnection = wizard?.kind === 'authorize' ? connections.find((item) => item.accountRef === wizard.accountRef) : undefined;
+  const platform = platforms.find((item) => item.id === (wizard?.kind === 'add' ? wizard.platformId : authorizationConnection?.platform));
   const editorSetup = setup && setup.platform === platform?.id && (!setup.accountRef || setupPending || setupConnecting) && setup.state !== 'connected' ? setup : undefined;
-  const manual = editor?.kind === 'edit' || (editor?.kind === 'add' && editor.manual) || !platform?.qrSetup;
+  const manual = (wizard?.kind === 'add' && wizard.manual) || !platform?.qrSetup;
   const busy = busyActions.global;
   const hasActions = Object.keys(busyActions).length > 0 || cancelling;
   const installed = status?.installer.state === 'installed';
@@ -139,37 +154,86 @@ export function HermesPanel() {
   const disabled = Boolean(busy) || runtimeDisabled;
   const discoveryTransitioning = TRANSITIONING.has(status?.gateway.state ?? '');
   const activeConnection = connections.some((item) => item.state === 'running' || TRANSITIONING.has(item.state));
-  const editorDisabled = disabled || installing || Boolean(editingConnection && busyActions[`account:${editingConnection.accountRef}`]);
   const recentOperations = [...(status?.operations ?? [])].sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt)).slice(0, 8);
   const recentDeliveries = [...(status?.deliveries ?? [])].sort((a, b) => timestamp(b.createdAt) - timestamp(a.createdAt)).slice(0, 5);
 
   useEffect(() => {
     if (!setup) return;
     if (setup.accountRef && (setup.state === 'connected' || setup.state === 'error')) {
-      setEditor((current) => current?.kind === 'add' ? null : current);
+      // Only the active scan may advance this wizard. Historical setup results
+      // must not hijack a later manual draft or reopen a completed flow.
+      setWizard((current) => current?.kind === 'add' && !current.manual && current.platformId === setup.platform
+        ? { kind: 'authorize', accountRef: setup.accountRef! } : current);
     } else if (SETUP_CANCELLABLE.has(setup.state) || setup.state === 'connecting') {
-      setEditor((current) => current ?? { kind: 'add', platformId: setup.platform, manual: false });
+      setWizard((current) => {
+        if (current) return current;
+        listScroll.current = panelRef.current?.closest('main')?.scrollTop ?? 0;
+        return { kind: 'add', platformId: setup.platform, manual: false };
+      });
     }
   }, [setup?.id, setup?.state, setup?.accountRef]);
 
   useEffect(() => {
-    if (status && editor?.kind === 'edit' && !connections.some((item) => item.accountRef === editor.accountRef)) setEditor(null);
-  }, [status, connections, editor]);
+    if (!status) return;
+    if (details && !detailConnection) setDetails(null);
+    if (wizard?.kind === 'authorize') {
+      if (authorizationConnection) observedAuthorization.current = wizard.accountRef;
+      else if (observedAuthorization.current === wizard.accountRef) setWizard(null);
+    } else observedAuthorization.current = null;
+  }, [status, details, detailConnection, wizard, authorizationConnection]);
 
-  const editorKey = editor?.kind === 'edit' ? editor.accountRef : editor?.platformId ?? (editor ? 'picker' : 'closed');
-  useEffect(() => {
-    if (editor) editorHeadingRef.current?.focus();
-    else if (previousEditorKey.current !== 'closed') addButtonRef.current?.focus();
-    previousEditorKey.current = editorKey;
-  }, [editorKey]);
+  const viewKey = wizard?.kind === 'authorize' ? `authorize:${wizard.accountRef}` : wizard ? `${wizard.platformId ?? 'picker'}:${wizard.manual}` : 'closed';
+  useLayoutEffect(() => {
+    const scroller = panelRef.current?.closest('main');
+    if (wizard) {
+      if (scroller) scroller.scrollTop = 0;
+      editorHeadingRef.current?.focus({ preventScroll: true });
+    } else if (previousViewKey.current !== 'closed') {
+      if (scroller) scroller.scrollTop = listScroll.current;
+      const target = returnAccount.current && [...(panelRef.current?.querySelectorAll<HTMLButtonElement>('[data-hermes-open]') ?? [])]
+        .find((item) => item.dataset.hermesOpen === returnAccount.current);
+      if (target) { target.focus({ preventScroll: true }); target.scrollIntoView?.({ block: 'nearest' }); }
+      else addButtonRef.current?.focus({ preventScroll: true });
+      returnAccount.current = null;
+    }
+    previousViewKey.current = viewKey;
+  }, [viewKey]);
 
-  const changeEditor = async (next: Editor | null) => {
+  const changeWizard = async (next: Wizard | null, accountRef?: string) => {
     if (disabled || setupConnecting) return;
     if (setupPending && setup) {
-      if (!await run('cancelSetup', { id: setup.id })) return;
-      if (latestStatus.current?.setup?.state === 'connecting') return;
+      const result = await run('cancelSetup', { id: setup.id });
+      if (!result) return;
+      const latest = result.setup;
+      // This action's receipt decides navigation even when its full snapshot was
+      // discarded because a different account changed concurrently.
+      if (latest && latestStatus.current?.setup?.id === latest.id && SETUP_CANCELLABLE.has(latestStatus.current.setup.state)
+        && (latest.state === 'connecting' || latest.accountRef)) {
+        latestStatus.current = { ...latestStatus.current, setup: latest };
+        setStatus(latestStatus.current);
+      }
+      if (latest?.state === 'connecting') return;
+      if (latest?.accountRef && (latest.state === 'connected' || latest.state === 'error')) {
+        setWizard({ kind: 'authorize', accountRef: latest.accountRef });
+        return;
+      }
     }
-    if (mounted.current) { setSetupRequestError(null); setRequestError(null); setEditor(next); }
+    if (mounted.current) {
+      setSetupRequestError(null); setRequestError(null);
+      if (!next) { returnAccount.current = accountRef ?? null; setHighlighted(accountRef ?? null); }
+      else if (!wizard) { setHighlighted(null); listScroll.current = panelRef.current?.closest('main')?.scrollTop ?? 0; }
+      setWizard(next);
+    }
+  };
+  const connectionProps = (connection: NonNullable<typeof detailConnection>) => {
+    const action = busyActions[`account:${connection.accountRef}`];
+    const interruptDisabled = runtimeDisabled || Boolean(action && !PAIRING_ACTIONS.has(action));
+    return { connection, platform: platforms.find((item) => item.id === connection.platform),
+      routes: status?.routes.filter((route) => route.source.accountRef === connection.accountRef) ?? [], workspaces: status?.workspaces ?? [],
+      disabled: runtimeDisabled || Boolean(action), stopDisabled: interruptDisabled, removeDisabled: interruptDisabled,
+      editDisabled: disabled || Boolean(setupConnecting), requestError: connectionRequestErrors[connection.accountRef],
+      setupError: setup?.accountRef === connection.accountRef ? setupStatusError : null, run, stateLabel,
+      onEdit: () => setDetails({ accountRef: connection.accountRef, editing: true }) };
   };
   const stateLabel = (value: string) => {
     const key = `hermes.state_${value}`;
@@ -177,55 +241,62 @@ export function HermesPanel() {
     return translated === key ? value : translated;
   };
 
-  return <div className="hermes-panel" data-hermes-panel>
-    <header className="hermes-page-header">
-      <div><h2>{t('hermes.title')}</h2><p>{t('hermes.subtitle')}</p></div>
-      <div className="hermes-header-actions">
-        <Button size="icon" variant="ghost" aria-label={t('hermes.refresh')} onClick={() => { setRequestError(null); setSetupRequestError(null); void refresh(); }}><RefreshCw className="h-4 w-4" /></Button>
-        {runtimeAvailable && <Button ref={addButtonRef} size="sm" disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor({ kind: 'add', manual: false })}><Plus className="h-4 w-4" aria-hidden="true" />{t('hermes.addChannel')}</Button>}
-      </div>
-    </header>
-    {(requestError ?? readError) && <div role="alert" className="hermes-alert">{requestError ?? readError}</div>}
-    {!status && <div className="hermes-loading" role="status"><span className="hermes-loading-line" aria-hidden="true" /><p>{t(readError ? 'hermes.statusUnavailable' : 'hermes.loading')}</p></div>}
-    {status && <>
-      {runtimeAvailable && <>
-        {showEditor && <section className="hermes-editor" data-hermes-editor>
-          <header className="hermes-editor-header">
-            <div className="hermes-editor-heading"><h3 ref={editorHeadingRef} tabIndex={-1}>{editingConnection ? t('hermes.editConnection') : platform ? platformDisplayName(platform.id, platform.label, t) : t('hermes.choosePlatform')}</h3>
-              {!platform && !editingConnection && <p>{t('hermes.choosePlatformHint')}</p>}
-            </div>
-            <div className="hermes-editor-navigation">
-              {platform && !editingConnection && <Button size="sm" variant="ghost" disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor({ kind: 'add', manual: false })}><ArrowLeft aria-hidden="true" />{t('hermes.changePlatform')}</Button>}
-              {(connections.length > 0 || editingConnection) && <Button size="icon" variant="ghost" aria-label={t('hermes.closeEditor')} disabled={disabled || installing || setupConnecting} onClick={() => void changeEditor(null)}><X aria-hidden="true" /></Button>}
-            </div>
-          </header>
-          {!editingConnection && <HermesSteps current={platform ? 2 : 1} />}
-          <div className="hermes-editor-content">
-            {setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-request-error>{t(setupRequestError)}</p>}
+  const authorized = Boolean(authorizationConnection && status?.routes.some((route) => route.source.accountRef === authorizationConnection.accountRef && route.enabled));
+  return <div ref={panelRef} className="hermes-panel" data-hermes-panel data-hermes-view={wizard ? 'add' : 'list'}>
+    {wizard ? <>
+      <header className="hermes-wizard-navigation">
+        <Button variant="ghost" size="sm" disabled={disabled || setupConnecting} onClick={() => void changeWizard(null)}><ArrowLeft aria-hidden="true" />{t('hermes.backToConnections')}</Button>
+        <span className="hermes-caption">{t('hermes.addChannel')}</span>
+      </header>
+      <section className="hermes-editor hermes-wizard" data-hermes-editor>
+        <header className="hermes-editor-header">
+          <div className="hermes-editor-heading"><h3 ref={editorHeadingRef} tabIndex={-1}>{wizard.kind === 'authorize' ? t(authorized ? 'hermes.connectionReady' : 'hermes.authorizeConnection') : platform ? platformDisplayName(platform.id, platform.label, t) : t('hermes.choosePlatform')}</h3>
+            {!platform && <p>{t('hermes.choosePlatformHint')}</p>}
+          </div>
+          {wizard.kind === 'add' && platform && <Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => void changeWizard({ kind: 'add', manual: false })}><ArrowLeft className="h-4 w-4" aria-hidden="true" />{t('hermes.changePlatform')}</Button>}
+        </header>
+        <HermesSteps current={wizard.kind === 'authorize' ? 3 : platform ? 2 : 1} />
+        <div className="hermes-editor-content">
+          {(requestError ?? readError) && <p role="alert" className="hermes-alert">{requestError ?? readError}</p>}
+          {setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-request-error>{t(setupRequestError)}</p>}
+          {wizard.kind === 'authorize' ? authorizationConnection ? <>
+            {authorized ? <div className="hermes-complete" role="status"><CheckCircle2 aria-hidden="true" /><h4>{t('hermes.connectionReady')}</h4><p>{t('hermes.connectionReadyHint')}</p>
+              <Button onClick={() => void changeWizard(null, authorizationConnection.accountRef)}>{t('hermes.finishSetup')}</Button>
+            </div> : <><p className="hermes-authorization-intro">{t('hermes.authorizeHint')}</p>
+              <HermesConnectionDetails key={authorizationConnection.accountRef} {...connectionProps(authorizationConnection)} authorizationOnly />
+              <footer className="hermes-editor-footer"><Button variant="ghost" size="sm" disabled={disabled} onClick={() => void changeWizard(null, authorizationConnection.accountRef)}>{t('hermes.authorizeLater')}</Button></footer>
+            </>}
+          </> : <p className="hermes-loading" role="status">{t('hermes.loading')}</p> : <>
             {editorSetup && setupStatusError && !manual && !setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-error>{t(setupStatusError)}</p>}
             {platforms.length === 0 ? <div className="hermes-discovery"><p>{t(discoveryTransitioning ? 'hermes.loadingPlatforms' : 'hermes.noPlatforms')}</p>
-              {status.gateway.error && <p role="alert" className="hermes-error">{errorText(status.gateway.error)}</p>}
+              {status?.gateway.error && <p role="alert" className="hermes-error">{errorText(status.gateway.error)}</p>}
               <Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button>
-            </div> : !platform && editingConnection ? <div className="hermes-discovery"><p role="status">{t('hermes.connectionSchemaUnavailable')}</p><Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button></div>
-              : !platform ? <HermesChannelPicker platforms={platforms} disabled={disabled || Boolean(setupConnecting)} onSelect={(id) => void changeEditor({ kind: 'add', platformId: id, manual: false })} /> : <>
-              {manual ? <HermesChannelForm key={editingConnection?.accountRef ?? `new:${platform.id}`} platform={platform} connection={editingConnection} disabled={editorDisabled || Boolean(setupConnecting)} run={run} onSaved={() => setEditor((current) => current === editor ? null : current)} onCancel={() => void changeEditor(null)} />
+            </div> : !platform ? <HermesChannelPicker platforms={platforms} disabled={disabled || Boolean(setupConnecting)} onSelect={(id) => void changeWizard({ kind: 'add', platformId: id, manual: false })} /> : <>
+              {manual ? <HermesChannelForm key={`new:${platform.id}`} platform={platform} disabled={disabled || Boolean(setupConnecting)} run={run} onSaved={(accountRef) => {
+                setWizard((current) => current === wizard && accountRef ? { kind: 'authorize', accountRef } : current);
+              }} onCancel={() => void changeWizard(null)} />
                 : <HermesQrSetup platform={platform} setup={editorSetup} state={editorSetup ? setupState : undefined} disabled={disabled || discoveryTransitioning} onBegin={() => void run('beginSetup', { platform: platform.id })} onCancel={() => { if (editorSetup) void run('cancelSetup', { id: editorSetup.id }); }} />}
-              {!editingConnection && platform.qrSetup && <footer className="hermes-editor-footer"><Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => void changeEditor({ kind: 'add', platformId: platform.id, manual: !manual })}><span aria-hidden="true">{manual ? <QrCode /> : <KeyRound />}</span>{t(manual ? 'hermes.useScan' : 'hermes.manualConnect')}<ArrowRight aria-hidden="true" /></Button></footer>}
+              {platform.qrSetup && <footer className="hermes-editor-footer"><Button size="sm" variant="ghost" disabled={disabled || setupConnecting} onClick={() => void changeWizard({ kind: 'add', platformId: platform.id, manual: !manual })}><span aria-hidden="true">{manual ? <QrCode /> : <KeyRound />}</span>{t(manual ? 'hermes.useScan' : 'hermes.manualConnect')}<ArrowRight aria-hidden="true" /></Button></footer>}
             </>}
-          </div>
-        </section>}
-        {connections.length > 0 && <section className="hermes-connections" aria-labelledby="hermes-connections-title">
+          </>}
+        </div>
+      </section>
+    </> : <>
+      <header className="hermes-page-header">
+        <div><h2>{t('hermes.title')}</h2><p>{t('hermes.subtitle')}</p></div>
+        <div className="hermes-header-actions">
+          <Button size="icon" variant="ghost" aria-label={t('hermes.refresh')} onClick={() => { setRequestError(null); setSetupRequestError(null); void refresh(); }}><RefreshCw className="h-4 w-4" /></Button>
+          {runtimeAvailable && <Button ref={addButtonRef} data-hermes-add size="sm" disabled={disabled || installing || setupConnecting} onClick={() => void changeWizard({ kind: 'add', manual: false })}><Plus className="h-4 w-4" aria-hidden="true" />{t('hermes.addChannel')}</Button>}
+        </div>
+      </header>
+      {(requestError ?? readError) && <div role="alert" className="hermes-alert">{requestError ?? readError}</div>}
+      {!status && <div className="hermes-loading" role="status"><span className="hermes-loading-line" aria-hidden="true" /><p>{t(readError ? 'hermes.statusUnavailable' : 'hermes.loading')}</p></div>}
+      {status && <>
+        {runtimeAvailable && (connections.length > 0 ? <section className="hermes-connections" aria-labelledby="hermes-connections-title">
           <div className="hermes-section-heading"><h3 id="hermes-connections-title">{t('hermes.connections')}<span className="hermes-count">{connections.length}</span></h3><span className="hermes-caption">{t('hermes.connectionsHint')}</span></div>
-          <div className="hermes-connection-list">{connections.map((connection) => {
-            const accountAction = busyActions[`account:${connection.accountRef}`];
-            const accountDisabled = runtimeDisabled || Boolean(accountAction);
-            const interruptDisabled = runtimeDisabled || Boolean(accountAction && !PAIRING_ACTIONS.has(accountAction));
-            return <HermesConnectionCard key={connection.accountRef} connection={connection} platform={platforms.find((item) => item.id === connection.platform)}
-              routes={status.routes.filter((route) => route.source.accountRef === connection.accountRef)} workspaces={status.workspaces} disabled={accountDisabled} stopDisabled={interruptDisabled} removeDisabled={interruptDisabled} editDisabled={disabled || Boolean(setupConnecting)}
-              requestError={connectionRequestErrors[connection.accountRef]} setupError={setup?.accountRef === connection.accountRef ? setupStatusError : null} run={run} onEdit={() => void changeEditor({ kind: 'edit', accountRef: connection.accountRef })} stateLabel={stateLabel} />;
-          })}</div>
-        </section>}
-      </>}
+          <div className="hermes-connection-list">{connections.map((connection) => <HermesConnectionCard key={connection.accountRef}
+            {...connectionProps(connection)} highlighted={highlighted === connection.accountRef} onOpen={() => setDetails({ accountRef: connection.accountRef, editing: false })} />)}</div>
+        </section> : <div className="hermes-empty"><MessageCircle aria-hidden="true" /><h3>{t('hermes.noConnections')}</h3><p>{t('hermes.noConnectionsHint')}</p></div>)}
       {(status.operations.length > 0 || status.deliveries.length > 0) && <section className="hermes-activity" aria-labelledby="hermes-activity-title">
         <div className="hermes-section-heading"><h3 id="hermes-activity-title">{t('hermes.activity')}</h3><Activity aria-hidden="true" /></div>
         <div className="hermes-activity-columns">
@@ -239,6 +310,21 @@ export function HermesPanel() {
       <HermesRuntime installer={status.installer} runtimeAvailable={runtimeAvailable} installed={installed} installing={installing}
         installAccepted={installAccepted} cancelling={cancelling} hasActions={hasActions} activeConnection={activeConnection}
         setupActive={setupPending || Boolean(setupConnecting)} cancelDisabled={Boolean(busy && busy !== 'install')} run={run} stateLabel={stateLabel} />
+        {children}
+      </>}
     </>}
+    {details && detailConnection && !wizard && <HermesConnectionDrawer key={detailConnection.accountRef} accountRef={detailConnection.accountRef}
+      title={detailConnection.label && detailConnection.label !== detailConnection.platform ? detailConnection.label : platformDisplayName(detailConnection.platform, platforms.find((item) => item.id === detailConnection.platform)?.label, t)}
+      description={t(details.editing ? 'hermes.editConnection' : 'hermes.connectionDetails')} onClose={() => setDetails(null)}>
+      {details.editing ? <>
+        {connectionRequestErrors[detailConnection.accountRef] && <p role="alert" className="hermes-alert">{connectionRequestErrors[detailConnection.accountRef]}</p>}
+        {platforms.find((item) => item.id === detailConnection.platform) ? <HermesChannelForm key={detailConnection.accountRef}
+          platform={platforms.find((item) => item.id === detailConnection.platform)!} connection={detailConnection}
+          disabled={disabled || Boolean(busyActions[`account:${detailConnection.accountRef}`])} run={run}
+          onSaved={() => setDetails((current) => current === details ? { ...current, editing: false } : current)}
+          onCancel={() => setDetails((current) => current ? { ...current, editing: false } : current)} />
+          : <div className="hermes-discovery"><p role="status">{t('hermes.connectionSchemaUnavailable')}</p><Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button></div>}
+      </> : <HermesConnectionDetails {...connectionProps(detailConnection)} />}
+    </HermesConnectionDrawer>}
   </div>;
 }
