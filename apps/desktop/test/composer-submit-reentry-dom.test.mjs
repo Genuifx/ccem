@@ -33,6 +33,12 @@ async function resolveDesktopSource(importPath) {
 const stubsPlugin = {
   name: 'ccem-composer-submit-reentry-stubs',
   setup(builder) {
+    builder.onResolve({ filter: /^@\/hooks\/useZoom$/ }, () => ({
+      path: 'zoom-stub', namespace: 'composer-submit-stubs',
+    }));
+    builder.onLoad({ filter: /^zoom-stub$/, namespace: 'composer-submit-stubs' }, () => ({
+      loader: 'js', contents: 'export function readAppZoom() { return window.__appliedZoomTest ?? 1; }',
+    }));
     builder.onResolve({ filter: /^@\/lib\/webcontentRecovery$/ }, () => ({
       path: 'recovery-stub', namespace: 'composer-submit-stubs',
     }));
@@ -705,3 +711,29 @@ test('disabled composer ignores native file drag and drop', async (t) => {
   assert.doesNotMatch(container.textContent, /workspace.composerAttachmentDropHint/);
   assert.equal(mounted.getCallCount(), 0);
 });
+
+for (const zoom of [0.8, 1, 1.3]) {
+test(`macOS Retina native logical positions highlight and submit at ${zoom} page zoom`, async (t) => {
+  const { container, restore } = installDom();
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const mounted = harness.mount(container, { workingDir: '/project' });
+  t.after(() => { mounted.unmount(); restore(); });
+  Object.defineProperty(window.navigator, 'platform', { value: 'MacIntel', configurable: true });
+  Object.defineProperty(window, 'devicePixelRatio', { value: 2, configurable: true });
+  window.__appliedZoomTest = zoom;
+  const card = container.querySelector('[data-composer-shell-card]');
+  card.getBoundingClientRect = () => ({ left: 100, top: 500, right: 700, bottom: 700, width: 600, height: 200 });
+  const paths = ['/project/拖放 smoke.txt'];
+  // Wry 0.55.1 forwards AppKit points without multiplying by the Retina scale.
+  const position = { x: 400 * zoom, y: 600 * zoom };
+  mounted.drag({ type: 'enter', paths, position });
+  assert.match(card.textContent, /workspace.composerAttachmentDropHint/);
+  mounted.drag({ type: 'drop', paths, position });
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 1);
+  mounted.pressEnter();
+  assert.equal(mounted.getCallCount(), 1);
+  assert.equal(mounted.getPayloads()[0].attachments[0].absolutePath, paths[0]);
+  await mounted.resolveAll(true);
+  assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 0);
+});
+}

@@ -20,7 +20,8 @@ async function emit(type, inside = true, droppedPaths = paths) {
   const box = await card.boundingBox();
   await page.evaluate(async ({ type, inside, paths, box }) => {
     const { emit } = await import('/node_modules/@tauri-apps/api/event.js');
-    const scale = window.devicePixelRatio;
+    // Match the native backend: Wry's macOS payload is in AppKit points.
+    const scale = /Mac/i.test(navigator.platform) ? 1 : window.devicePixelRatio;
     await emit(`tauri://drag-${type}`, type === 'leave' ? {} : {
       paths, position: { x: (box.x + box.width / 2) * scale, y: (inside ? box.y + box.height / 2 : box.y - 20) * scale },
     });

@@ -12,6 +12,8 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
+import { readAppZoom } from '@/hooks/useZoom';
+import { isComposerFileDropInside } from './composerFileDrop';
 import { isRecoveringWebcontent } from '@/lib/webcontentRecovery';
 import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, type ComposerSubmitResult } from './composerSubmissionResult';
 import { toRecoveredComposerDraft } from './composerRecovery';
@@ -1363,12 +1365,11 @@ export function WorkspaceSessionComposer({
           if (payload.type === 'leave') {
             return false;
           }
-          const rect = shell.getBoundingClientRect();
-          const scale = window.devicePixelRatio || 1;
-          const x = payload.position.x / scale;
-          const y = payload.position.y / scale;
-          return rect.width > 0 && rect.height > 0
-            && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+          return isComposerFileDropInside(shell.getBoundingClientRect(), payload.position, {
+            platform: navigator.platform,
+            devicePixelRatio: window.devicePixelRatio,
+            appZoom: readAppZoom(),
+          });
         })();
 
         if (payload.type === 'enter') {

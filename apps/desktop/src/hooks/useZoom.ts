@@ -20,6 +20,13 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 1.3;
 const STEP = 0.1;
 const DEFAULT_ZOOM = 1.0;
+let appliedZoom = DEFAULT_ZOOM;
+
+// Geometry must use the zoom acknowledged by the native WebView, even if
+// saving the preference fails or a later setZoom request is rejected.
+export function readAppZoom(): number {
+  return appliedZoom;
+}
 
 function isMacPlatform(): boolean {
   const platform = navigator.platform || '';
@@ -57,6 +64,7 @@ function readStoredZoom(): number {
 async function applyZoom(value: number): Promise<void> {
   try {
     await getCurrentWebview().setZoom(value);
+    appliedZoom = value;
   } catch (err) {
     // The webview API can fail outside of a Tauri shell (e.g. browser preview)
     // or if the permission is missing. Don't crash the UI in that case.
