@@ -138,3 +138,17 @@ Hermes 行为 70 项、真实 React/GSAP 生命周期 21 项、语言提供器 7
 验证：`node --test --test-reporter=tap apps/desktop/test/hermes-panel-dom.test.mjs` 81 项通过；`pnpm exec tsc --noEmit`、`pnpm exec vite build`、`pnpm check:file-size`、`git diff --check` 通过。仅修改前端展示，未重跑 Rust 测试或外部机器人收发验收。
 
 证据保存在 `.artifacts/hermes-navigation/`：`icons-proof.json`、`icons-{typecheck,build,dom,file-size}.log`，以及 `icons-channel-picker.png`、`icons-bot-list.png`、`icons-other-channels.png`、`icons-other-dark.png`、`icons-adaptive-dark.png`、`icons-feishu-setup-dark.png`、`icons-channels-narrow.png`。
+
+## 原有 Remote Control 兼容检查（2026-09-26）
+
+行为契约：Hermes 状态仍在加载、读取失败或尚未安装时，用户仍能展开“其他连接方式”，在原 Telegram / 微信 / 企微页面之间切换；Hermes 状态恢复后保留原来选中的平台。进入旧页面不安装 Hermes、不迁移或重写旧配置。
+
+发现旧入口作为 `HermesPanel` 的 children 位于 `status && …` 内，首轮状态未返回或失败会隐藏旧入口。将入口移出该状态条件，保留添加向导期间的原有页面切换行为。新增行为回归先复现加载中、失败两项不通过，再验证修复后三种情况均可展开并切换三个旧平台；完整 Hermes DOM 套件 84 项通过。
+
+代码比对确认此分支未修改原 Telegram / 微信 / 企微面板、桥接模块、配置接口或启动条件。旧配置路径仍是 `~/.ccem/{telegram,weixin,wecom}.json`，Hermes 使用单独的 `~/.ccem/hermes/`。Hermes 的重复身份检查只覆盖自身连接库，尚无跨新旧桥接服务的机器人身份互斥；同一机器人同时启用新旧服务不在本次兼容保证范围。
+
+规范开发实例 MCP `57700` 的真实 UI 操作：展开旧入口，分别点击 Telegram、微信、企微，页面均加载，企微原有两个机器人及设置可见，控制台无配置加载错误。没有点击保存、启动、停止或发送消息。检查前后旧企微配置文件 SHA-256 相同，原先不存在的 Telegram / 微信配置文件仍不存在。开发实例自动后台服务关闭，截图“未运行”不代表安装版服务状态。
+
+原生 invoke 属性不可改写，因此尝试注入 Hermes 状态失败未生效，没有将它记为桌面故障验证；故障与恢复由上述真实 React DOM 行为测试覆盖。后台 WebView 的 GSAP 过渡暂停，截图前完成对应三个有限过渡，未改写页面内容。
+
+类型检查、Vite 构建、文件大小检查和 diff 检查通过。证据为 `.artifacts/hermes-navigation/legacy-compat-{before,dom,typecheck,build,file-size}.log`、`legacy-config-unchanged.json`、`legacy-wecom-preserved.png`。本次验证旧入口与配置保留，不等同于真实聊天收发验收，也未合入或发布。

@@ -310,8 +310,8 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
       <HermesRuntime installer={status.installer} runtimeAvailable={runtimeAvailable} installed={installed} installing={installing}
         installAccepted={installAccepted} cancelling={cancelling} hasActions={hasActions} activeConnection={activeConnection}
         setupActive={setupPending || Boolean(setupConnecting)} cancelDisabled={Boolean(busy && busy !== 'install')} run={run} stateLabel={stateLabel} />
-        {children}
       </>}
+      {children}
     </>}
     {details && detailConnection && !wizard && <HermesConnectionDrawer key={detailConnection.accountRef} accountRef={detailConnection.accountRef}
       title={detailConnection.label && detailConnection.label !== detailConnection.platform ? detailConnection.label : platformDisplayName(detailConnection.platform, platforms.find((item) => item.id === detailConnection.platform)?.label, t)}

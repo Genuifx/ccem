@@ -83,7 +83,7 @@ test.before(async () => {
         if (args.path === 'locale') return { contents: `export function useLocale(){return {lang:'en',t:(key,params={})=>globalThis.__hermesTranslate?.(key,params)??({'hermes.platformWecom':'WeCom','hermes.platformFeishu':'Feishu'}[key]??key)+Object.values(params).map(value=>' '+value).join('')}}`, loader: 'js' };
         if (args.path === 'hooks') return { contents: `const methods={getPlatformCapabilities:async()=>({tmuxSupported:false,tmuxInstalled:false})}; export function useTauriCommands(){return methods}`, loader: 'js' };
         if (args.path === 'motion') return { contents: `export const ccemMotion={};export const clearMotionProps=()=>{};export const getMotionTargets=()=>[];export const gsap={};export const shouldReduceMotion=()=>true;export const useGSAP=()=>{};`, loader: 'js' };
-        return { contents: `import React from 'react'; export function ${args.path}(){return React.createElement('div',{'data-legacy-panel':true},'Existing platform')}`, loader: 'js', resolveDir: desktop };
+        return { contents: `import React from 'react'; export function ${args.path}(){return React.createElement('div',{'data-legacy-panel':true,'data-legacy-platform':'${args.path}'},'Existing platform')}`, loader: 'js', resolveDir: desktop };
       });
       builder.onResolve({ filter: /^@\// }, async (args) => {
         const base = path.join(desktop, 'src', args.path.slice(2));
@@ -177,6 +177,31 @@ test('Hermes is the default page and existing panels mount only after expanding'
   await click(button('hermes.existingConnections'));
   assert.equal(container.querySelector('[data-legacy-panel]'), null);
 });
+
+for (const state of ['loading', 'failed', 'not_installed']) {
+  test(`existing remote control stays usable while Hermes is ${state}`, async () => {
+    const statusRead = deferred();
+    handler = async () => {
+      if (state === 'loading') return statusRead.promise;
+      if (state === 'failed') throw new Error('status transport unavailable');
+      return snapshot({ installer: { state: 'not_installed', downloadedBytes: 0, retryable: false }, gateway: { state: 'stopped', platforms: [] } });
+    };
+    await mount(true);
+    await click(button('hermes.existingConnections'));
+    for (const [id, panel] of [['wecom', 'WecomPanel'], ['telegram', 'TelegramPanel'], ['weixin', 'WeixinPanel']]) {
+      const tab = container.querySelector(`[data-chat-platform-tab="${id}"]`);
+      await click(tab);
+      assert.equal(tab.getAttribute('aria-pressed'), 'true');
+      assert.equal(container.querySelector('[data-legacy-panel]')?.dataset.legacyPlatform, panel);
+    }
+    assert.equal(actions().length, 0, 'using existing connections does not install or configure Hermes');
+    if (state === 'loading') {
+      await harness.act(async () => { statusRead.resolve(snapshot()); });
+      await settle();
+      assert.equal(container.querySelector('[data-legacy-panel]')?.dataset.legacyPlatform, 'WeixinPanel', 'Hermes recovery preserves the active old connection');
+    }
+  });
+}
 
 test('install double-click starts once and cancellation waits for backend acceptance', async () => {
   current = snapshot({ installer: { state: 'not_installed', downloadedBytes: 0, retryable: false }, gateway: { state: 'stopped', platforms: [] } });
