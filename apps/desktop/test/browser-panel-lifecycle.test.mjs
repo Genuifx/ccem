@@ -810,17 +810,17 @@ test('a fresh snapshot clears omitted recovery state and its derived inline erro
   assert.equal(panel.getAttribute('data-ccem-browser-recovery'), 'renderer_process_terminated');
   assert.match(container.textContent, /zh:workspace\.browserRecoveryRendererStopped/);
   const recoveryStatus = container.querySelector('[data-ccem-browser-recovery-status="attention"]');
-  assert.ok(recoveryStatus, 'a retained recovery state must surface through the conditional status strip');
-  assert.ok(recoveryStatus.closest('[data-ccem-browser-status-strip="true"]'),
-    'the recovery hint lives in the status strip that replaced the removed tab strip');
+  assert.ok(recoveryStatus, 'a retained recovery state must surface through the address bar');
+  assert.ok(recoveryStatus.closest('[data-ccem-browser-navigation="true"]'),
+    'the recovery hint is an on-demand element inside the navigation toolbar');
 
   harness.emitBrowserState(bridge, 'lease-1', 1, { lifecycle: 'ready' });
   await harness.flushEffects();
 
   assert.equal(panel.getAttribute('data-ccem-browser-recovery'), 'none');
   assert.doesNotMatch(container.textContent, /zh:workspace\.browserRecoveryRendererStopped/);
-  assert.equal(container.querySelector('[data-ccem-browser-status-strip="true"]'), null,
-    'the status strip must disappear once no state needs reporting');
+  assert.equal(container.querySelector('[data-ccem-browser-recovery-status]'), null,
+    'the recovery hint must disappear once no state needs reporting');
 });
 
 test('address bar navigation actions use exact lease state and authoritative capabilities', async (t) => {
@@ -1450,9 +1450,9 @@ test('Agent control is one address-bar toggle and takeover does not re-handoff t
     'the browser panel must not stack a second persistent strip under the workspace side panel tabs',
   );
   assert.equal(
-    container.querySelector('[data-ccem-browser-status-strip="true"]'),
+    container.querySelector('[data-ccem-browser-recovery-status]'),
     null,
-    'the status strip renders only when a surface state needs reporting',
+    'surface status elements occupy no space while no state needs reporting',
   );
   const takeover = navigation.querySelector(
     'button[aria-label="zh:loginBrowserControl.takeover"]',

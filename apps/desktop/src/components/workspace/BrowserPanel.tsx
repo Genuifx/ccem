@@ -37,7 +37,7 @@ import { nativeSurfaceOcclusionStore } from '@/lib/nativeSurfaceOcclusionStore';
 import { useNativeBrowserSurfaceGeometrySync } from '@/hooks/useNativeBrowserSurfaceGeometrySync';
 import { CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
 import { buildNativeBrowserBounds, normalizeBrowserBoundsZoom } from './browserPanelGeometry';
-import { BrowserPanelNavigation, BrowserPanelStatusStrip } from './BrowserPanelChrome';
+import { BrowserPanelNavigation } from './BrowserPanelChrome';
 import type { BrowserAgentStatus } from './browserActivation';
 import { invokeBrowserCommand } from '@/lib/webcontentRecovery';
 
@@ -1000,13 +1000,6 @@ export function BrowserPanel({
     && lifecycle === 'ready'
     && !isLoading
     && !isBusy;
-  // The old tab strip rendered these hints unconditionally inside a persistent
-  // header bar; they now appear only when a surface state actually needs reporting.
-  const statusStripVisible = recoveryStates.length > 0
-    || sessionStatus === 'cleanup_required'
-    || popupActive
-    || lifecycle === 'failed'
-    || lifecycle === 'closed';
 
   return (
     <aside
@@ -1054,6 +1047,8 @@ export function BrowserPanel({
           || isLoginControlBusy || isPopupCloseBusy}
         isPopupCloseBusy={isPopupCloseBusy}
         isClosingSurface={isClosingSurface}
+        recoveryStates={recoveryStates}
+        lifecycle={lifecycle}
         t={t}
         onNavigationAction={(action) => void handleNavigationAction(action)}
         onOpenExternal={handleOpenExternal}
@@ -1065,18 +1060,6 @@ export function BrowserPanel({
         onClosePopup={() => void handleClosePopup()}
         onClose={() => void handleClose()}
       />
-
-      {statusStripVisible ? (
-        <div data-ccem-browser-status-strip="true" className="flex h-7 shrink-0 items-center gap-2 border-b border-border/45 px-3">
-          <BrowserPanelStatusStrip
-            sessionStatus={sessionStatus}
-            recoveryStates={recoveryStates}
-            popupActive={popupActive}
-            lifecycle={lifecycle}
-            t={t}
-          />
-        </div>
-      ) : null}
 
       {error || popupError ? (
         <div className="flex items-center gap-2 border-b border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">

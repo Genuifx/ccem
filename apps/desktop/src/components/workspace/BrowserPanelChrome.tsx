@@ -88,6 +88,8 @@ interface BrowserPanelNavigationProps {
   spinnerActive: boolean;
   isPopupCloseBusy: boolean;
   isClosingSurface: boolean;
+  recoveryStates: BrowserSurfaceRecoveryState[];
+  lifecycle: BrowserPanelLifecycle;
   t: (key: string) => string;
   onNavigationAction: (action: BrowserSurfaceNavigationAction) => void;
   onOpenExternal: () => void;
@@ -120,6 +122,8 @@ export function BrowserPanelNavigation({
   spinnerActive,
   isPopupCloseBusy,
   isClosingSurface,
+  recoveryStates,
+  lifecycle,
   t,
   onNavigationAction,
   onOpenExternal,
@@ -147,6 +151,12 @@ export function BrowserPanelNavigation({
   const reloadOrStopLabel = t(isLoading
     ? 'workspace.browserStopLoading'
     : 'workspace.browserReload');
+  const recoveryNeedsAttention = recoveryStates.some((state) => (
+    state.startsWith('retained_') || state === 'renderer_process_terminated'
+  ));
+  const recoveryLabel = recoveryStates
+    .map((state) => t(recoveryStateTranslationKeys[state]))
+    .join(', ');
 
   return (
     <div data-ccem-browser-navigation="true" className="flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
@@ -212,6 +222,32 @@ export function BrowserPanelNavigation({
           </button>
         )}
       </form>
+      {recoveryStates.length > 0 ? (
+        <span
+          data-ccem-browser-recovery-status={recoveryNeedsAttention ? 'attention' : 'recovered'}
+          className={recoveryNeedsAttention
+            ? 'min-w-0 max-w-56 shrink truncate text-[11px] font-medium text-destructive'
+            : 'min-w-0 max-w-56 shrink truncate text-[11px] font-medium text-primary'}
+          title={recoveryLabel}
+        >
+          {t(recoveryNeedsAttention
+            ? 'workspace.browserRecoveryAttention'
+            : 'workspace.browserRecoveryRecovered').replace('{state}', recoveryLabel)}
+        </span>
+      ) : null}
+      {sessionStatus === 'cleanup_required' ? (
+        <span className="shrink-0 text-[11px] font-medium text-destructive">
+          {t('loginBrowserControl.owner_danger')}
+        </span>
+      ) : popupActive ? (
+        <span className="shrink-0 text-[11px] font-medium text-primary">
+          {t('workspace.browserPopupActive')}
+        </span>
+      ) : lifecycle === 'failed' || lifecycle === 'closed' ? (
+        <span className="shrink-0 text-[11px] font-medium text-destructive">
+          {t('workspace.browserCrashed')}
+        </span>
+      ) : null}
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="inline-flex">
@@ -260,59 +296,5 @@ export function BrowserPanelNavigation({
         <X className="h-4 w-4" />
       </BrowserToolButton>
     </div>
-  );
-}
-
-interface BrowserPanelStatusStripProps {
-  sessionStatus: 'running' | 'closing' | 'cleanup_required';
-  recoveryStates: BrowserSurfaceRecoveryState[];
-  popupActive: boolean;
-  lifecycle: BrowserPanelLifecycle;
-  t: (key: string) => string;
-}
-
-export function BrowserPanelStatusStrip({
-  sessionStatus,
-  recoveryStates,
-  popupActive,
-  lifecycle,
-  t,
-}: BrowserPanelStatusStripProps) {
-  const recoveryNeedsAttention = recoveryStates.some((state) => (
-    state.startsWith('retained_') || state === 'renderer_process_terminated'
-  ));
-  const recoveryLabel = recoveryStates
-    .map((state) => t(recoveryStateTranslationKeys[state]))
-    .join(', ');
-
-  return (
-    <>
-      {recoveryStates.length > 0 ? (
-        <span
-          data-ccem-browser-recovery-status={recoveryNeedsAttention ? 'attention' : 'recovered'}
-          className={recoveryNeedsAttention
-            ? 'max-w-56 truncate text-[11px] font-medium text-destructive'
-            : 'max-w-56 truncate text-[11px] font-medium text-primary'}
-          title={recoveryLabel}
-        >
-          {t(recoveryNeedsAttention
-            ? 'workspace.browserRecoveryAttention'
-            : 'workspace.browserRecoveryRecovered').replace('{state}', recoveryLabel)}
-        </span>
-      ) : null}
-      {sessionStatus === 'cleanup_required' ? (
-        <span className="text-[11px] font-medium text-destructive">
-          {t('loginBrowserControl.owner_danger')}
-        </span>
-      ) : popupActive ? (
-        <span className="text-[11px] font-medium text-primary">
-          {t('workspace.browserPopupActive')}
-        </span>
-      ) : lifecycle === 'failed' || lifecycle === 'closed' ? (
-        <span className="text-[11px] font-medium text-destructive">
-          {t('workspace.browserCrashed')}
-        </span>
-      ) : null}
-    </>
   );
 }
