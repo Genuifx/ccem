@@ -1,5 +1,11 @@
 # ccem
 
+## 2.90.0
+
+### Minor Changes
+
+- Desktop: fix macOS composer file drop hit testing with AppKit logical coordinates and the acknowledged WebView zoom, make tab navigation urgent so transcript polling cannot starve tab switches on long sessions, remove a redundant browser release return, and refine the context composition panel rhythm with the usage panel title divider dropped.
+
 ## 2.89.0
 
 ### Minor Changes
