@@ -142,6 +142,42 @@ fn input(invocation: &str, ids: &[&str], stage: &str) -> SessionEventPayload {
 }
 
 #[test]
+fn removing_all_workspace_access_stops_projection_and_revokes_pending_delivery() {
+    let mut f = Fixture::new();
+    let route = f.route("one");
+    let session = f.session("runtime-a");
+    let delivery = make_delivery(&route, "old-notice", "old completion".into());
+    f.store()
+        .enqueue_page("old-cursor", 1, &[delivery.clone()])
+        .unwrap();
+    let unbound = f
+        .store()
+        .approve_route(route.source.clone(), vec![], true, true)
+        .unwrap();
+    let mut visits = 0;
+    poll_cycle(
+        &[unbound],
+        &[session],
+        |_, _| {
+            visits += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        visits, 0,
+        "no session events can be read for an unbound account"
+    );
+    assert!(reserve_delivery(f.store(), &delivery.id).unwrap().is_none());
+    assert_eq!(
+        f.store().delivery(&delivery.id).unwrap().unwrap().status,
+        "revoked"
+    );
+    assert_eq!(f.store().deliveries().unwrap().len(), 1);
+}
+
+#[test]
 fn local_remote_confirm_local_notifies_once_each_across_pages_and_restart() {
     let mut f = Fixture::new();
     let route = f.route("one");

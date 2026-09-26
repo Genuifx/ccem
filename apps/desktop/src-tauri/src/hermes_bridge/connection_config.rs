@@ -199,12 +199,7 @@ impl HermesBridgeManager {
             let id = payload["id"].as_str().ok_or("pairing_id_required")?;
             let workspaces: Vec<String> = serde_json::from_value(payload["workspaces"].clone())
                 .map_err(|_| "workspace_scope_required")?;
-            if workspaces.is_empty() {
-                return Err("workspace_scope_required".into());
-            }
-            if workspaces.iter().any(|p| !std::path::Path::new(p).is_dir()) {
-                return Err("workspace_not_found".into());
-            }
+            let workspaces = Store::canonical_workspaces(workspaces)?;
             (json!({"id":id}), workspaces)
         } else {
             (json!({}), vec![])

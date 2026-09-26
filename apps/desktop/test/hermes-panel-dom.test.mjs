@@ -51,6 +51,8 @@ test.before(async () => {
   globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
   globalThis.requestAnimationFrame = (cb) => setTimeout(cb, 0);
   globalThis.cancelAnimationFrame = clearTimeout;
+  // Radix Switch observes its hidden form input; JSDOM has no layout observer.
+  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   // Match the repo's DOM harness: Node MessageChannel keeps React's scheduler
   // alive after unmount, whereas a browser channel belongs to the page lifetime.
@@ -725,7 +727,7 @@ test('QR connection advances to the backend pairing code without inventing a cha
   current = { ...current, connections: [{ ...current.connections[0], pending: [{ ...pending, source: { ...source, platform: 'wecom' } }] }] };
   await poll();
   assert.ok(container.querySelector('[data-hermes-pairing="pair-one"]'));
-  assert.equal(button('hermes.approvePairing').disabled, true, 'workspace authorization remains an explicit step');
+  assert.equal(button('hermes.approvePairing').disabled, false, 'pairing does not require workspace access');
 });
 
 test('dynamic configuration sends only known fields and clears entered secrets after successful save', async () => {
@@ -809,7 +811,7 @@ test('pairing approval binds the displayed recipient and explicitly selected wor
   assert.ok(container.textContent.includes('actual-chat'));
   assert.ok(container.textContent.includes('actual-thread'));
   assert.ok(container.querySelector('[title="bot-account-reference-one"]'), 'the displayed recipient keeps its bot account reference available');
-  assert.equal(button('hermes.approvePairing').disabled, true);
+  assert.equal(button('hermes.approvePairing').disabled, false, 'workspace access is optional');
   assert.equal(container.querySelector('[aria-label="hermes.allowInput"]').getAttribute('aria-checked'), 'false');
   await click(container.querySelector('[aria-label="/projects/one"]'));
   const approve = button('hermes.approvePairing');
@@ -1089,7 +1091,7 @@ test('pairing commands and pending requests stay scoped to their connection even
   assert.equal(container.querySelector('[data-hermes-pairing="ignored-legacy"]'), null);
   await openDetails();
   assert.ok(document.getElementById(`hermes-workspace-search-${one.accountRef}-pair-one`));
-  assert.equal(button('hermes.approvePairing').disabled, true);
+  assert.equal(button('hermes.approvePairing').disabled, false, 'workspace access is optional');
   await openDetails('account-two');
   assert.ok(document.getElementById('hermes-workspace-search-account-two-pair-one'));
   await click((await openDetails('account-two')).querySelector('[aria-label="/projects/two"]'));
@@ -1377,7 +1379,7 @@ test('new pairing requests update the list cue without expanding or stealing foc
   assert.ok(request.textContent.includes(source.chatId));
   assert.equal(request.querySelector('[aria-label="/projects/one"]').getAttribute('aria-checked'), 'false');
   assert.equal(request.querySelector('[aria-label="hermes.allowInput"]').getAttribute('aria-checked'), 'false');
-  assert.equal(button('hermes.approvePairing', request).disabled, true);
+  assert.equal(button('hermes.approvePairing', request).disabled, false);
   assert.equal(actions('approvePairing').length, 0);
 });
 
@@ -1529,7 +1531,7 @@ test('scan, native pairing and explicit authorization complete the wizard and hi
   assert.equal(container.querySelector('[data-hermes-pairing]'), null);
   current.connections[0].pending = [pending];
   await poll();
-  assert.equal(button('hermes.approvePairing').disabled, true);
+  assert.equal(button('hermes.approvePairing').disabled, false, 'workspace access is optional');
   await click(container.querySelector('[aria-label="/projects/one"]'));
   handler = async (name, args) => {
     if (args?.action === 'approvePairing') {
@@ -1580,4 +1582,112 @@ test('an old cancellation finishing its refresh cannot replace a newer QR sessio
   assert.equal(container.querySelector('[data-hermes-setup]').dataset.setupState, 'waiting');
   await harness.act(async () => pairing.resolve(structuredClone(current)));
   await settle();
+});
+
+for (const available of [[], ['/projects/one']]) test(`pairing completes without workspace access with ${available.length} available projects`, async () => {
+  current = qrSnapshot({ setup: qrSetup, workspaces: available });
+  await mountQr();
+  current.setup = { ...qrSetup, state: 'connected', accountRef: source.accountRef };
+  current.connections = [connection({ platform: 'wecom', pending: [pending] })];
+  await poll();
+  handler = async (name, args) => {
+    if (args?.action === 'approvePairing') {
+      current.routes = [{ id: 'unbound', generation: 1, source, enabled: true,
+        workspaces: args.payload.workspaces, allowInput: args.payload.allowInput, notifications: args.payload.notifications }];
+      current.connections[0].pending = [];
+    }
+    return structuredClone(current);
+  };
+  assert.equal(button('hermes.approvePairing').disabled, false);
+  assert.equal(container.querySelector('[data-hermes-pairing] [data-hermes-disclosure-content]').hidden, true);
+  assert.equal(container.querySelector('[aria-label="hermes.allowInput"]').disabled, true);
+  assert.equal(container.querySelector('[aria-label="hermes.notifications"]').disabled, true);
+  await click(button('hermes.approvePairing'));
+  assert.deepEqual(actions('approvePairing')[0].args.payload, { accountRef: source.accountRef, id: pending.id, workspaces: [], allowInput: false, notifications: false });
+  assert.ok(button('hermes.finishSetup'));
+  await click(button('hermes.finishSetup'));
+  assert.ok(card().textContent.includes('hermes.pairedWithoutWorkspace'));
+  assert.equal(card().textContent.includes('hermes.queryOnly'), false);
+  await openDetails();
+  assert.ok(button('hermes.manageWorkspaceAccess'));
+});
+
+test('a paired bot can gain then remove all workspace access without losing its identity', async () => {
+  const route = { id: 'route-one', generation: 3, source, enabled: true, workspaces: [], allowInput: false, notifications: false };
+  current = snapshot({ connections: [connection()], routes: [route] });
+  handler = async (name, args) => {
+    if (args?.action === 'updateRoute') current.routes = [{ ...current.routes[0], ...args.payload, generation: args.payload.generation + 1 }];
+    return structuredClone(current);
+  };
+  await mount();
+  await openDetails();
+  await click(button('hermes.manageWorkspaceAccess'));
+  assert.equal(document.activeElement, container.querySelector('[data-hermes-route-editor]'));
+  assert.equal(button('hermes.saveWorkspaceAccess').disabled, true);
+  await click(container.querySelector('[aria-label="/projects/one"]'));
+  await click(button('hermes.saveWorkspaceAccess'));
+  assert.deepEqual(actions('updateRoute')[0].args.payload, { accountRef: source.accountRef, id: route.id, generation: 3,
+    workspaces: ['/projects/one'], allowInput: false, notifications: true });
+  assert.equal(container.querySelector('[data-hermes-route-editor]'), null);
+  assert.equal(document.activeElement, button('hermes.manageWorkspaceAccess'));
+  await click(button('hermes.manageWorkspaceAccess'));
+  await click(container.querySelector('[aria-label="/projects/one"]'));
+  await click(button('hermes.saveWorkspaceAccess'));
+  assert.deepEqual(actions('updateRoute')[1].args.payload, { accountRef: source.accountRef, id: route.id, generation: 4,
+    workspaces: [], allowInput: false, notifications: false });
+  assert.ok(container.querySelector('[data-hermes-route="route-one"]'));
+  assert.ok(card().textContent.includes('hermes.pairedWithoutWorkspace'));
+  assert.equal(document.activeElement, button('hermes.manageWorkspaceAccess'));
+});
+
+test('editing grants preserves existing workspaces outside the current catalogue and cancel writes nothing', async () => {
+  current = snapshot({ connections: [connection()], routes: [{ id: 'route-one', generation: 1, source, enabled: true,
+    workspaces: ['/projects/older'], allowInput: true, notifications: false }] });
+  await mount();
+  await openDetails();
+  await click(button('hermes.manageWorkspaceAccess'));
+  assert.equal(container.querySelector('[aria-label="/projects/older"]').getAttribute('aria-checked'), 'true');
+  await click(container.querySelector('[aria-label="/projects/one"]'));
+  await click(button('hermes.cancel'));
+  assert.equal(actions('updateRoute').length, 0);
+  assert.equal(document.activeElement, button('hermes.manageWorkspaceAccess'));
+  await click(button('hermes.manageWorkspaceAccess'));
+  assert.equal(container.querySelector('[aria-label="/projects/one"]').getAttribute('aria-checked'), 'false');
+  await click(container.querySelector('[aria-label="hermes.notifications"]'));
+  await click(button('hermes.saveWorkspaceAccess'));
+  assert.deepEqual(actions('updateRoute')[0].args.payload.workspaces, ['/projects/older']);
+});
+
+test('failed permission saves keep the draft, and a newer policy discards its stale generation', async () => {
+  current = snapshot({ connections: [connection()], routes: [{ id: 'route-one', generation: 1, source, enabled: true,
+    workspaces: [], allowInput: false, notifications: false }] });
+  handler = async (name, args) => { if (args?.action === 'updateRoute') throw new Error('route_authority_changed'); return structuredClone(current); };
+  await mount();
+  await openDetails();
+  await click(button('hermes.manageWorkspaceAccess'));
+  await click(container.querySelector('[aria-label="/projects/one"]'));
+  await click(button('hermes.saveWorkspaceAccess'));
+  assert.ok(container.querySelector('[data-hermes-route-editor]'));
+  assert.equal(container.querySelector('[aria-label="/projects/one"]').getAttribute('aria-checked'), 'true');
+  assert.ok(container.querySelector('[role="alert"]').textContent.includes('route_authority_changed'));
+  current.routes[0] = { ...current.routes[0], generation: 2, workspaces: ['/projects/two'] };
+  await poll();
+  assert.equal(container.querySelector('[data-hermes-route-editor]'), null);
+  await click(button('hermes.manageWorkspaceAccess'));
+  assert.equal(container.querySelector('[aria-label="/projects/one"]').getAttribute('aria-checked'), 'false');
+  assert.equal(container.querySelector('[aria-label="/projects/two"]').getAttribute('aria-checked'), 'true');
+  assert.equal(actions('updateRoute').length, 1);
+});
+
+test('paused connections and revoked identities cannot edit grants', async () => {
+  current = snapshot({ connections: [connection({ enabled: false, state: 'stopped' })], routes: [{ id: 'route-one', generation: 1, source,
+    enabled: true, workspaces: [], allowInput: false, notifications: false }] });
+  await mount();
+  await openDetails();
+  assert.equal(button('hermes.manageWorkspaceAccess').disabled, true);
+  assert.equal(button('hermes.disableRoute').disabled, false, 'access can still be revoked while stopped');
+  current.routes[0] = { ...current.routes[0], enabled: false, generation: 2 };
+  await poll();
+  assert.equal(button('hermes.manageWorkspaceAccess'), undefined);
+  assert.equal(actions('updateRoute').length, 0);
 });

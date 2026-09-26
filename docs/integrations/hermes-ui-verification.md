@@ -1,5 +1,24 @@
 # Hermes 界面与导航验收
 
+## 2026-09-26：工作区授权改为可选
+
+基于 `e260d1a4`。用户明确提出机器人不应强制绑定 workspace；本节更新下文原先将配对与工作区授权绑定的行为。原生 Hermes 的 [Channels 与 Pairing](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard) 也是分别管理渠道连接与聊天身份，不要求 CCEM 项目。
+
+- 第三步改为“关联账号”。工作区选项默认收起；没有任何项目或不选择工作区，都可确认配对并完成向导。
+- 已配对的聊天可在详情中“设置工作区权限”，添加或撤回授权，撤回全部权限仍保留配对身份。已有但不在当前会话目录列表中的授权保留在编辑器中，不会被隐式丢弃。
+- 空工作区不会成为全局授权：持久化输入、通知标志均为 false，现有任务范围过滤继续拒绝访问。更新权限须匹配账号、启用状态与 generation；更新后旧 challenge 撤销，新 generation 从当前事件序号开始。旧 pending 通知在预留发送时撤销，已发送中的通知仍沿用 unknown 语义，不能声称撤回。
+- 使用既有 Route 数据结构，无 schema 迁移。托管 host 仍为 `integration_only`，普通 Hermes AI 对话未接入。
+
+验证命令为 `node --test --test-reporter=tap apps/desktop/test/hermes-panel-dom.test.mjs`（81/81）、`cargo test --locked hermes_bridge::`（59/59）、桌面目录 `pnpm exec tsc --noEmit` 与 `pnpm exec vite build`、`pnpm check:file-size`、`git diff --check`。独立审查无阻断项，独立重跑相关 DOM 测试 8/8。新增覆盖零授权配对完成、持久化与访问拒绝、后续增加/全部移除、通知与 challenge 失效、跨账号/过期 generation/暂停/撤销拒绝、已有目录保留、保存失败与焦点恢复。
+
+真实开发实例沿用隔离 Hermes 状态，本轮由规范 launcher 启动，manifest `com.ccem.desktop.dev.idedbe6da`、MCP 57700、launcher PID 37510；未操作安装版或其他任务实例。通过实际界面打开原企微测试连接，撤回唯一测试目录并保存，后端 generation 1 → 2、workspace 数量 1 → 0、enabled 保持 true、输入和通知关闭，列表显示“已配对 · 未授权工作区”，保存后焦点回到“设置工作区权限”。截图与证明位于 `.artifacts/hermes-navigation/optional-unbound-details.png` 和 `optional-desktop-proof.json`。
+
+原测试目录已不在当前会话目录列表中，因此使用真实 `updateRoute` IPC 按记录的原值恢复该唯一目录及原输入/通知权限（generation 3），随后通过真实界面验证目录保留、修改草稿后取消、不写入且恢复焦点。最终原企微为 running、无错误，授权范围及权限恢复原值，WebView console 无错误。没有为了测试授权其他项目。
+
+新一轮真实企微私聊配对未完成：定位历史测试机器人时 Computer Use 连续返回 ScreenCaptureKit -3811，未发送配对指令。零工作区的新配对路径由真实 React 行为测试与 Rust 持久化测试覆盖，不记为真实平台收发验收。仅本地开发分支交付，未合入、push 或发布。
+
+---
+
 ## 2026-09-26：列表、独立向导与详情侧栏
 
 基于 `7c1d6bf9`，继续隔离分支 `codex/hermes-integration-phase0`。用户批准以下交互，替代本文后半部分 9 月 25 日的行内展开方案。

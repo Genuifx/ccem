@@ -252,6 +252,28 @@ impl Store {
         baselines: &[(String, String, u64)],
     ) -> Result<Route, String> {
         source.validate()?;
+        let scopes = Self::canonical_workspaces(workspaces)?;
+        let has_access = !scopes.is_empty();
+        let old = self.routes()?.into_iter().find(|r| r.source == source);
+        let route = Route {
+            id: old.as_ref().map(|r| r.id.clone()).unwrap_or_else(random_id),
+            generation: old.as_ref().map_or(1, |r| r.generation + 1),
+            identity_ref: digest(&format!(
+                "{}:{}:{}:{}",
+                source.account_ref, source.profile, source.platform, source.user_id
+            )),
+            target_ref: digest(&format!("{}:{}", source.account_ref, source.target())),
+            source,
+            workspaces: scopes,
+            allow_input: has_access && allow_input,
+            notifications: has_access && notifications,
+            enabled: true,
+            created_at: now(),
+        };
+        self.write_route_with_baselines(&route, baselines)?;
+        Ok(route)
+    }
+    pub fn canonical_workspaces(workspaces: Vec<String>) -> Result<Vec<String>, String> {
         let mut scopes = Vec::new();
         for value in workspaces {
             let path = Path::new(&value)
@@ -264,27 +286,44 @@ impl Store {
         }
         scopes.sort();
         scopes.dedup();
-        if scopes.is_empty() || scopes.len() > 32 {
-            return Err("workspace_scope_required".into());
+        if scopes.len() > 32 {
+            return Err("too_many_workspace_scopes".into());
         }
-        let old = self.routes()?.into_iter().find(|r| r.source == source);
-        let route = Route {
-            id: old.as_ref().map(|r| r.id.clone()).unwrap_or_else(random_id),
-            generation: old.as_ref().map_or(1, |r| r.generation + 1),
-            identity_ref: digest(&format!(
-                "{}:{}:{}:{}",
-                source.account_ref, source.profile, source.platform, source.user_id
-            )),
-            target_ref: digest(&format!("{}:{}", source.account_ref, source.target())),
-            source,
-            workspaces: scopes,
+        // An empty scope records a paired identity, never unrestricted access.
+        Ok(scopes)
+    }
+    pub fn update_route_access(
+        &mut self,
+        account: &str,
+        id: &str,
+        generation: i64,
+        workspaces: Vec<String>,
+        allow_input: bool,
+        notifications: bool,
+        baselines: &[(String, String, u64)],
+    ) -> Result<Route, String> {
+        let connection = self.connection(account)?;
+        let route = self
+            .routes()?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or("route_not_found")?;
+        if !connection.enabled
+            || route.source.account_ref != account
+            || route.source.platform != connection.platform
+        {
+            return Err("account_not_authorized".into());
+        }
+        if !route.enabled || route.generation != generation {
+            return Err("route_authority_changed".into());
+        }
+        self.approve_route_with_baselines(
+            route.source,
+            workspaces,
             allow_input,
             notifications,
-            enabled: true,
-            created_at: now(),
-        };
-        self.write_route_with_baselines(&route, baselines)?;
-        Ok(route)
+            baselines,
+        )
     }
     fn write_route(&mut self, route: &Route) -> Result<(), String> {
         self.write_route_with_baselines(route, &[])

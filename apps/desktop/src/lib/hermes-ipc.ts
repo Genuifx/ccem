@@ -100,6 +100,7 @@ export interface HermesActionPayloads {
   removeChannel: { accountRef: string };
   openPairing: { accountRef: string };
   approvePairing: { accountRef: string; id: string; workspaces: string[]; allowInput: boolean; notifications: boolean };
+  updateRoute: { accountRef: string; id: string; generation: number; workspaces: string[]; allowInput: boolean; notifications: boolean };
   disableRoute: { id: string };
 }
 

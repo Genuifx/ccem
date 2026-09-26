@@ -305,6 +305,151 @@ fn workspace_scope_is_canonical_and_not_string_prefix() {
         .is_err());
 }
 #[test]
+fn pairing_without_workspaces_persists_identity_with_no_task_access() {
+    let mut f = Fixture::new();
+    let workspace = f.root.join("workspace");
+    let r = f
+        .store()
+        .approve_route(source(), vec![], true, true)
+        .unwrap();
+    assert!(r.enabled);
+    assert!(!r.allow_input && !r.notifications);
+    assert!(!r.permits(workspace.to_str().unwrap()));
+    assert_eq!(
+        f.store()
+            .prepare(&r, "message", "runtime-a", "continue")
+            .unwrap_err(),
+        "input_not_allowed"
+    );
+    f.restart();
+    let saved = f.store().route(&source()).unwrap();
+    assert_eq!(saved.id, r.id);
+    assert!(saved.workspaces.is_empty());
+    assert!(!saved.permits(workspace.to_str().unwrap()));
+}
+
+#[test]
+fn paired_identity_can_gain_and_remove_all_access_without_pairing_again() {
+    let mut f = Fixture::new();
+    let account = f
+        .store()
+        .save_connection(None, "test", None, "cipher", &[], true)
+        .unwrap()
+        .account_ref;
+    let other = f
+        .store()
+        .save_connection(None, "test", None, "other", &[], true)
+        .unwrap()
+        .account_ref;
+    let mut identity = source();
+    identity.account_ref = account.clone();
+    let empty = f
+        .store()
+        .approve_route(identity.clone(), vec![], false, false)
+        .unwrap();
+    let path = f.root.join("workspace").to_string_lossy().into_owned();
+    assert!(f
+        .store()
+        .update_route_access(
+            &other,
+            &empty.id,
+            empty.generation,
+            vec![path.clone()],
+            true,
+            true,
+            &[]
+        )
+        .is_err());
+    let granted = f
+        .store()
+        .update_route_access(
+            &account,
+            &empty.id,
+            empty.generation,
+            vec![path.clone()],
+            true,
+            true,
+            &[("runtime-a".into(), path.clone(), 42)],
+        )
+        .unwrap();
+    assert_eq!(empty.id, granted.id);
+    assert_eq!(granted.source, identity);
+    assert!(granted.permits(&path));
+    assert_eq!(
+        f.store()
+            .cursor(&format!("{}:{}:runtime-a", granted.id, granted.generation))
+            .unwrap(),
+        Some(42)
+    );
+    assert!(f
+        .store()
+        .update_route_access(
+            &account,
+            &empty.id,
+            empty.generation,
+            vec![],
+            false,
+            false,
+            &[]
+        )
+        .is_err());
+    let c = challenge(&mut f, &granted);
+    f.store().set_connection_enabled(&account, false).unwrap();
+    assert!(f
+        .store()
+        .update_route_access(
+            &account,
+            &granted.id,
+            granted.generation,
+            vec![],
+            false,
+            false,
+            &[]
+        )
+        .is_err());
+    f.store().set_connection_enabled(&account, true).unwrap();
+    let unbound = f
+        .store()
+        .update_route_access(
+            &account,
+            &granted.id,
+            granted.generation,
+            vec![],
+            true,
+            true,
+            &[],
+        )
+        .unwrap();
+    assert!(unbound.enabled && unbound.workspaces.is_empty());
+    assert!(!unbound.allow_input && !unbound.notifications && !unbound.permits(&path));
+    assert!(f
+        .store()
+        .confirm(&unbound, "confirm", &c, "runtime-a")
+        .is_err());
+    assert!(
+        f.store()
+            .confirm(&granted, "old-confirm", &c, "runtime-a")
+            .is_err(),
+        "pending challenge was revoked durably"
+    );
+    f.store().disable_route(&unbound.id).unwrap();
+    let generation = f.store().routes().unwrap()[0].generation;
+    assert!(f
+        .store()
+        .update_route_access(
+            &account,
+            &unbound.id,
+            generation,
+            vec![path],
+            true,
+            true,
+            &[]
+        )
+        .is_err());
+    assert!(f.store().connection(&other).unwrap().enabled);
+}
+
+#[test]
 fn source_deserialization_rejects_model_asserted_extra_fields() {
     let mut value = json!(source());
     value["authorized"] = json!(true);

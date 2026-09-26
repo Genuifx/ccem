@@ -1,12 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Bell, ArrowRight, Copy, FolderOpen, MessageCircle, Play, ShieldCheck, Square } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Switch } from '@/components/ui/switch';
 import { useLocale } from '@/locales';
 import type { HermesConnection, HermesPendingPairing, HermesPlatform, HermesRoute, HermesRunAction, HermesSource } from '@/lib/hermes-ipc';
 import { errorText, platformDisplayName, timestamp, TRANSITIONING } from './hermes-presentation';
 import { HermesPlatformIcon, workspaceName } from './HermesVisuals';
+import { effectiveAccess, RouteAccessEditor, WorkspaceAccessFields, type WorkspaceAccess } from './HermesWorkspaceAccess';
 
 function SourceIdentity({ source }: { source: HermesSource }) {
   const { t } = useLocale();
@@ -22,35 +21,22 @@ function PendingPairing({ pairing, accountRef, workspaces, disabled, run }: {
   pairing: HermesPendingPairing; accountRef: string; workspaces: string[]; disabled: boolean; run: HermesRunAction;
 }) {
   const { t } = useLocale();
-  const [selected, setSelected] = useState<string[]>([]);
-  const [query, setQuery] = useState('');
-  const [allowInput, setAllowInput] = useState(false);
-  const [notifications, setNotifications] = useState(true);
+  const [access, setAccess] = useState<WorkspaceAccess>({ workspaces: [], allowInput: false, notifications: true });
+  const [showAccess, setShowAccess] = useState(false);
   const expired = !(timestamp(pairing.expiresAt) > Date.now());
-  const validSelection = selected.filter((workspace) => workspaces.includes(workspace));
-  const visibleWorkspaces = workspaces.filter((workspace) => workspace.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
+  const value = { ...access, workspaces: access.workspaces.filter((workspace) => workspaces.includes(workspace)) };
   const locked = disabled || expired || pairing.source.accountRef !== accountRef;
+  const accessId = `hermes-pairing-access-${accountRef}-${pairing.id}`;
   return <div className="hermes-pairing" data-hermes-pairing={pairing.id}>
     <h4>{t('hermes.pendingPairings')}</h4>
     <SourceIdentity source={pairing.source} />
-    <fieldset disabled={locked} className="hermes-workspaces">
-      <legend>{t('hermes.authorizedWorkspaces')}</legend>
-      {workspaces.length === 0 ? <p className="hermes-caption">{t('hermes.noWorkspaces')}</p> : <>
-        <Input id={`hermes-workspace-search-${accountRef}-${pairing.id}`} type="search" value={query}
-          placeholder={t('hermes.searchWorkspaces')} aria-label={t('hermes.searchWorkspaces')}
-          onChange={(event) => setQuery(event.target.value)} />
-        <p className="hermes-caption" aria-live="polite">{t('hermes.selectedWorkspaces', { count: validSelection.length })}</p>
-      </>}
-      <div className="hermes-workspace-list">{visibleWorkspaces.map((workspace) => <label key={workspace} className="hermes-workspace-option">
-        <FolderOpen aria-hidden="true" /><span><strong>{workspaceName(workspace)}</strong><small>{workspace}</small></span>
-        <Switch aria-label={workspace} checked={validSelection.includes(workspace)} disabled={locked}
-          onCheckedChange={(checked) => setSelected((current) => checked ? [...new Set([...current, workspace])] : current.filter((item) => item !== workspace))} />
-      </label>)}</div>
-      {workspaces.length > 0 && visibleWorkspaces.length === 0 && <p className="hermes-caption">{t('hermes.noMatchingWorkspaces')}</p>}
-      <label className="hermes-permission-option"><span>{t('hermes.allowInput')}</span><Switch checked={allowInput} onCheckedChange={setAllowInput} disabled={locked} aria-label={t('hermes.allowInput')} /></label>
-      <label className="hermes-permission-option"><span>{t('hermes.notifications')}</span><Switch checked={notifications} onCheckedChange={setNotifications} disabled={locked} aria-label={t('hermes.notifications')} /></label>
-    </fieldset>
-    <Button size="sm" disabled={locked || validSelection.length === 0} onClick={() => void run('approvePairing', { accountRef, id: pairing.id, workspaces: validSelection, allowInput, notifications })}>
+    <Button type="button" size="sm" variant="ghost" aria-expanded={showAccess} aria-controls={accessId} onClick={() => setShowAccess(!showAccess)}>
+      <FolderOpen aria-hidden="true" />{t('hermes.optionalWorkspaceAccess')}{value.workspaces.length > 0 && <span> · {value.workspaces.length}</span>}
+    </Button>
+    <div id={accessId} hidden={!showAccess} data-hermes-disclosure-content>
+      <WorkspaceAccessFields id={`${accountRef}-${pairing.id}`} workspaces={workspaces} value={value} onChange={setAccess} disabled={locked} />
+    </div>
+    <Button size="sm" disabled={locked} onClick={() => void run('approvePairing', { accountRef, id: pairing.id, ...effectiveAccess(value) })}>
       {expired ? t('hermes.pairingExpired') : t('hermes.approvePairing')}
     </Button>
   </div>;
@@ -70,7 +56,7 @@ export function HermesConnectionCard({ connection, platform, routes, stateLabel,
     <header className="hermes-connection-header">
       <HermesPlatformIcon platform={connection.platform} />
       <div className="hermes-connection-title"><h4>{label}</h4><p>{platformLabel} · <span className="font-mono" title={connection.accountRef}>{connection.accountRef.slice(-8)}</span></p>
-        <p>{active.length ? t('hermes.accessSummary', { count: workspaceCount }) : t('hermes.needsPairing')}{active.length > 0 && <> · {t(active.some((route) => route.allowInput) ? 'hermes.allowInput' : 'hermes.queryOnly')}</>}</p>
+        <p>{active.length ? workspaceCount ? t('hermes.accessSummary', { count: workspaceCount }) : t('hermes.pairedWithoutWorkspace') : t('hermes.needsPairing')}{workspaceCount > 0 && <> · {t(active.some((route) => route.allowInput) ? 'hermes.allowInput' : 'hermes.queryOnly')}</>}</p>
       </div>
       <span className="hermes-connection-state" role="status"><span className={`hermes-status-dot${connection.state === 'running' && !attention ? ' is-running' : ''}`} aria-hidden="true" />{attention ? t('hermes.needsAttention') : stateLabel(connection.state)}</span>
       <Button size="sm" variant="ghost" aria-haspopup="dialog" data-hermes-open={connection.accountRef} onClick={(event) => { event.currentTarget.focus({ preventScroll: true }); onOpen(); }}>
@@ -132,14 +118,32 @@ export function HermesConnectionDetails({ connection, platform, routes, workspac
         {copyError && <p role="alert" className="hermes-error">{copyError}</p>}
       </div>}
       {connection.pending.map((pairing) => <PendingPairing key={pairing.id} pairing={pairing} accountRef={connection.accountRef} workspaces={workspaces} disabled={disabled || !running} run={run} />)}
-      {routes.length > 0 && <div className="hermes-routes"><h4>{t('hermes.routes')}</h4>{routes.map((route) => <div key={route.id} className="hermes-route" data-hermes-route={route.id}>
+      {routes.length > 0 && <div className="hermes-routes"><h4>{t('hermes.routes')}</h4>{routes.map((route) => <PairedChat key={route.id} route={route} workspaces={workspaces} disabled={disabled} accessDisabled={disabled || !connection.enabled} run={run} />)}</div>}
+  </div>;
+}
+
+function PairedChat({ route, workspaces, disabled, accessDisabled, run }: { route: HermesRoute; workspaces: string[]; disabled: boolean; accessDisabled: boolean; run: HermesRunAction }) {
+  const { t } = useLocale();
+  const [editingAccess, setEditingAccess] = useState(false);
+  const elementRef = useRef<HTMLDivElement>(null);
+  const accessButtonRef = useRef<HTMLButtonElement>(null);
+  const wasEditing = useRef(false);
+  useEffect(() => { setEditingAccess(false); }, [route.generation, route.enabled]);
+  useLayoutEffect(() => {
+    if (editingAccess) elementRef.current?.querySelector<HTMLElement>('[data-hermes-route-editor]')?.focus();
+    else if (wasEditing.current) (accessButtonRef.current ?? elementRef.current)?.focus();
+    wasEditing.current = editingAccess;
+  }, [editingAccess]);
+  return <div ref={elementRef} tabIndex={-1} className="hermes-route" data-hermes-route={route.id}>
         <div className="hermes-route-top"><div className="hermes-route-title"><MessageCircle aria-hidden="true" /><span>{t(route.source.chatType === 'dm' ? 'hermes.directChat' : 'hermes.chat')} · {route.source.userId.length > 18 ? `${route.source.userId.slice(0, 8)}…${route.source.userId.slice(-4)}` : route.source.userId}</span></div>
           <Button size="sm" variant="ghost" disabled={disabled || !route.enabled} onClick={() => void run('disableRoute', { id: route.id })}>{t(route.enabled ? 'hermes.disableRoute' : 'hermes.routeDisabled')}</Button></div>
-        <div className="hermes-permissions"><span><ShieldCheck aria-hidden="true" />{t(route.allowInput ? 'hermes.allowInput' : 'hermes.queryOnly')}</span><span><Bell aria-hidden="true" />{t(route.notifications ? 'hermes.notifications' : 'hermes.notificationsOff')}</span></div>
+        {route.workspaces.length > 0 ? <div className="hermes-permissions"><span><ShieldCheck aria-hidden="true" />{t(route.allowInput ? 'hermes.allowInput' : 'hermes.queryOnly')}</span><span><Bell aria-hidden="true" />{t(route.notifications ? 'hermes.notifications' : 'hermes.notificationsOff')}</span></div>
+          : <p className="hermes-caption">{t('hermes.noWorkspaceAccess')}</p>}
         <div className="hermes-route-workspaces">{route.workspaces.map((workspace) => <span key={workspace} className="hermes-workspace-tag" title={workspace}><FolderOpen aria-hidden="true" />{workspaceName(workspace)}</span>)}</div>
+        {route.enabled && (editingAccess ? <RouteAccessEditor key={route.generation} route={route} workspaces={workspaces} disabled={accessDisabled} run={run} onClose={() => setEditingAccess(false)} />
+          : <Button ref={accessButtonRef} size="sm" variant="outline" disabled={accessDisabled} onClick={() => setEditingAccess(true)}>{t('hermes.manageWorkspaceAccess')}</Button>)}
         <details className="hermes-identity-disclosure"><summary>{t('hermes.identityDetails')}</summary><SourceIdentity source={route.source} />
           <div className="space-y-1">{route.workspaces.map((workspace) => <p key={workspace} className="break-all font-mono text-xs text-muted-foreground">{workspace}</p>)}</div>
         </details>
-      </div>)}</div>}
-  </div>;
+      </div>;
 }

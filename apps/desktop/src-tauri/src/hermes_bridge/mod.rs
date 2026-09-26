@@ -402,6 +402,31 @@ impl HermesBridgeManager {
                 self.connection_errors.lock().unwrap().remove(account);
                 self.failures.lock().unwrap().remove(account);
             }
+            "updateRoute" => {
+                let baselines: Vec<_> = self
+                    .native
+                    .list_sessions()
+                    .into_iter()
+                    .map(|s| (s.runtime_id, s.project_dir, s.last_event_seq.unwrap_or(0)))
+                    .collect();
+                self.with_store(|s| {
+                    s.update_route_access(
+                        payload["accountRef"]
+                            .as_str()
+                            .ok_or("account_ref_required")?,
+                        payload["id"].as_str().ok_or("route_id_required")?,
+                        payload["generation"]
+                            .as_i64()
+                            .ok_or("route_generation_required")?,
+                        serde_json::from_value(payload["workspaces"].clone())
+                            .map_err(|_| "workspace_scope_required")?,
+                        payload["allowInput"] == true,
+                        payload["notifications"] != false,
+                        &baselines,
+                    )
+                    .map(|_| ())
+                })?;
+            }
             "disableRoute" => {
                 self.with_store(|s| {
                     s.disable_route(payload["id"].as_str().ok_or("route_id_required")?)
