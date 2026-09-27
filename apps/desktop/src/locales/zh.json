@@ -1567,6 +1567,13 @@
     "tmuxOptionalNotice": "当前仍可完成基础桥接配置，但如果要拿到更完整的远程控制、续接和多终端协同体验，建议先安装 tmux。"
   },
   "hermes": {
+    "conversationModel": "对话模型",
+    "chooseConversationModel": "选择模型",
+    "saveConversationModel": "保存",
+    "conversationModelHint": "用于 Hermes 聊天和任务判断，无需绑定工作区。",
+    "conversationModelSaved": "已保存，下一条消息开始使用。",
+    "noConversationModels": "先在环境配置中添加一个可用的 API 模型。",
+    "conversationModelUnavailable": "原模型环境不可用，请重新选择。",
     "configurationResultMissing": "配置已保存，但未收到账号回执。请返回机器人列表查看。",
     "noConnectionsHint": "从右上角添加一个机器人，连接你的聊天渠道。",
     "noConnections": "还没有添加机器人",

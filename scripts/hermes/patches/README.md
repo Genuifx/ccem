@@ -85,3 +85,9 @@ scripts/run_tests.sh tests/gateway/test_wecom.py -k TestSend
 这些是本地代码与传输边界证据，不能代替打包、安装、真实账号发收或跨重启幂等验收。
 接口也不提供持久 outbox 或 exactly-once 保证。任意已安装的 Python 插件仍是可信代码，
 integration-only 模式不是针对恶意插件的系统沙箱。
+
+## 原生对话扩展
+
+`0002-native-managed-conversations.patch` 顺序应用在第一份补丁之后。构建器将两份补丁一起校验和记录。托管 conversation runner 设置 `managed_transport=true`，允许原生 Agent 对话，同时保持平台身份、逐条原生消息、禁用自动恢复/后台服务和严格配送边界。企微与飞书的文本批处理均在进入对话前跳过；同一授权范围的对话由 host 串行处理，确认命令可独立到达。可信消息入口和严格发送回执使用同一网关的单调时钟，短确认必须晚于已送达的冻结预览；同一原生消息的排队或重复投递不会刷新其最早接收时间。Rust 保留拒绝与成功选择的幂等记录。
+
+`test-conversation.py --package <runtime>` 使用私有 Python、真实 Gateway/AIAgent/SDK、仅 loopback 模型服务，覆盖原生对话、工具选择、重启历史和记忆、范围隔离及企微忙时确认。它不代表真实账号收发验收。

@@ -259,6 +259,7 @@ fn outbox_cursor_is_atomic_and_ambiguous_send_is_not_requeued() {
     let mut f = Fixture::new();
     let r = f.route();
     let d = Delivery {
+        conversation_scope: None, confirmation_preview: None,
         session_binding_id: None,
         cron: None,
         id: "event-a".into(),

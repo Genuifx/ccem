@@ -10,7 +10,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 
-fn model_config(env: &str) -> Result<Value, String> {
+pub(super) fn model_config(env: &str) -> Result<Value, String> {
     if env == "official" || env.trim().is_empty() {
         return Err("hermes_api_environment_required".into());
     }
@@ -50,6 +50,14 @@ fn model_config(env: &str) -> Result<Value, String> {
     Ok(
         json!({"provider":"custom","apiMode":"anthropic_messages","baseUrl":base,"apiKey":key,"model":selected,"authStyle":"bearer"}),
     )
+}
+
+pub(super) fn available_models() -> Vec<Value> {
+    let mut models = config::read_config().map(|c| c.registries.keys().filter_map(|name| {
+        model_config(name).ok().map(|m| json!({"envName":name,"model":m["model"]}))
+    }).collect::<Vec<_>>()).unwrap_or_default();
+    models.sort_by_key(|m| m["envName"].as_str().unwrap_or("").to_owned());
+    models
 }
 
 impl HermesBridgeManager {
@@ -103,8 +111,9 @@ impl HermesBridgeManager {
                     input_context: None, created_at: now(), last_decision_at: None, last_decision: None, error: None,
                 }, &route)?;
                 s.enqueue_delivery(&Delivery {
+                    conversation_scope: None, confirmation_preview: None,
                     id: digest(&format!("handoff:{}", binding.id)), route_id: route.id.clone(), generation: route.generation,
-                    text: bounded_chat_text(&format!("已接管 CCEM 会话：{}\nHermes 会按需汇总进展。可在这里回复继续当前会话，执行前仍需确认；桌面也可继续操作或解除接管。\n/ccem status {}", binding.title, runtime)),
+                    text: bounded_chat_text(&format!("已接手「{}」。有重要进展我会告诉你，也可以直接问我进度或让我继续。需要执行时，我会先给你看具体内容，回复“确认”后再开始。", binding.title)),
                     status: "pending".into(), receipt: None, created_at: now(), cron: None, session_binding_id: Some(binding.id),
                 })
             })?;
@@ -160,24 +169,7 @@ impl HermesBridgeManager {
         paired: &Route,
         challenge: &str,
     ) -> Result<(Route, String), String> {
-        self.with_store(|s| {
-            if let Ok(runtime) = s.challenge_runtime(paired, challenge) {
-                return Ok((paired.clone(), runtime));
-            }
-            for binding in s
-                .session_bindings()?
-                .iter()
-                .filter(|b| b.route_id == paired.id && b.generation == paired.generation)
-            {
-                let scoped = binding.scoped_route(paired);
-                if let Ok(runtime) = s.challenge_runtime(&scoped, challenge) {
-                    if runtime == binding.runtime_id {
-                        return Ok((scoped, runtime));
-                    }
-                }
-            }
-            Err("challenge_not_found".into())
-        })
+        self.with_store(|s| s.confirmation_route(paired, challenge))
     }
 
     pub(super) fn poll_session_handoffs(&self, account: &str) -> Result<(), String> {
@@ -249,12 +241,13 @@ impl HermesBridgeManager {
                     return Err("hermes_invalid_decision".into());
                 }
                 Ok(notify.then(|| Delivery {
+                    conversation_scope: None, confirmation_preview: None,
                     id: digest(&format!("session-notice:{}", decision.id)),
                     route_id: route.id.clone(),
                     generation: route.generation,
                     text: bounded_chat_text(&format!(
-                        "CCEM · {}\n{}\n/ccem status {}",
-                        binding.title, text, binding.runtime_id
+                        "「{}」\n{}",
+                        binding.title, text
                     )),
                     status: "pending".into(),
                     receipt: None,

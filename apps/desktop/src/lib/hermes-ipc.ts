@@ -92,6 +92,7 @@ export interface HermesConnection {
   label: string;
   configuredFields: string[];
   enabled: boolean;
+  conversationModel?: { envName: string; model: string } | null;
   state: string;
   error?: string | null;
   pending: HermesPendingPairing[];
@@ -115,6 +116,7 @@ export interface HermesRoute {
 }
 
 export interface HermesStatus {
+  conversationModels?: { envName: string; model: string }[];
   // Receipt on configureChannel responses only; never infer it from list order.
   configuredAccountRef?: string;
   installer: {
@@ -144,6 +146,7 @@ export interface HermesActionPayloads {
   cancelInstall: undefined;
   removeRuntime: undefined;
   configureChannel: { platform: string; fields: Record<string, string>; accountRef?: string; label?: string };
+  configureConversation: { accountRef: string; modelEnv: string };
   refreshPlatforms: undefined;
   beginSetup: { platform: string };
   cancelSetup: { id: string };

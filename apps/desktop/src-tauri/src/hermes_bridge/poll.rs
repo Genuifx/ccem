@@ -144,8 +144,19 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
                     if process.snapshot()["state"] != "running" {
                         return Ok(None);
                     }
+                    let owner = manager.gateways.lock().map_err(|_| "bridge_lock_poisoned")?.get(account)
+                        .map(|g| super::store::digest(&format!("Bearer {}", g.token)));
                     manager
-                        .with_store(|store| reserve_account_delivery(store, account, id))
+                        .with_store(|store| {
+                            if let Some(mut delivery) = store.delivery(id)? {
+                                if delivery.confirmation_preview.as_ref().is_some_and(|p| Some(&p.owner) != owner.as_ref()) {
+                                    delivery.status = "revoked".into();
+                                    store.save_delivery(&delivery)?;
+                                    return Ok(None);
+                                }
+                            }
+                            reserve_account_delivery(store, account, id)
+                        })
                         .map(|reserved| {
                             reserved.map(|(delivery, route)| DeliveryReservation {
                                 delivery,
@@ -168,7 +179,11 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
                     manager.with_store(|store| {
                         let enabled = store.connection(account).is_ok_and(|c| c.enabled);
                         finish_delivery(store, &reserved.delivery, receipt, same_host && enabled)
-                    })
+                    })?;
+                    if reserved.delivery.confirmation_preview.is_some() {
+                        manager.mark_presented_input(&reserved.delivery.id)?;
+                    }
+                    Ok(())
                 },
             )
         },
@@ -489,6 +504,14 @@ fn authorized_route(
     delivery: &Delivery,
     check_cron: impl FnOnce(&Delivery) -> Result<bool, String>,
 ) -> Result<Option<Route>, String> {
+    if let Some(scope) = &delivery.conversation_scope {
+        let route = store.routes()?.into_iter().find(|route| route.id == delivery.route_id
+            && route.generation == delivery.generation && route.enabled && super::conversation::scope(route) == *scope);
+        if let (Some(route), Some(preview)) = (&route, &delivery.confirmation_preview) {
+            if !store.pending_chat_inputs(route)?.contains(&preview.challenge) { return Ok(None); }
+        }
+        return Ok(route);
+    }
     if let Some(binding) = &delivery.session_binding_id {
         let route = store.routes()?.into_iter().find(|r| {
             r.id == delivery.route_id && r.generation == delivery.generation && r.enabled

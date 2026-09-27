@@ -53,6 +53,8 @@ test.before(async () => {
   globalThis.cancelAnimationFrame = clearTimeout;
   // Radix Switch observes its hidden form input; JSDOM has no layout observer.
   globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  dom.window.HTMLElement.prototype.scrollIntoView = function () {};
+  dom.window.HTMLElement.prototype.hasPointerCapture = function () { return false; };
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   // Match the repo's DOM harness: Node MessageChannel keeps React's scheduler
   // alive after unmount, whereas a browser channel belongs to the page lifetime.
@@ -167,6 +169,29 @@ async function input(id, value) {
   });
 }
 async function poll() { await harness.act(async () => { for (const callback of intervalCallbacks) callback?.(); }); await settle(); }
+
+test('a paired bot chooses its own conversation model without granting a workspace', async () => {
+  current = snapshot({ connections: [connection()], conversationModels: [{ envName: 'api-chat', model: 'chat-model' }] });
+  handler = async (name, args) => {
+    if (args?.action === 'configureConversation') {
+      current.connections[0].conversationModel = { envName: args.payload.modelEnv, model: 'chat-model' };
+    }
+    return structuredClone(current);
+  };
+  await mount(); const drawer = await openDetails();
+  const trigger = drawer.querySelector('[data-hermes-conversation-model] [role=combobox]');
+  await harness.act(async () => { trigger.focus(); trigger.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); });
+  await settle();
+  const option = [...document.querySelectorAll('[role=option]')].find((node) => node.textContent.includes('api-chat'));
+  assert.ok(option);
+  await harness.act(async () => { option.focus(); option.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); });
+  await settle();
+  await click(button('hermes.saveConversationModel', drawer));
+  assert.deepEqual(actions('configureConversation')[0].args.payload, { accountRef: source.accountRef, modelEnv: 'api-chat' });
+  assert.equal(actions('approvePairing').length + actions('updateRoute').length, 0);
+  await closeDetails(); await openDetails();
+  assert.match(document.querySelector('[data-hermes-conversation-model]').textContent, /api-chat/);
+});
 
 test('Hermes is the default page and existing panels mount only after expanding', async () => {
   await mount(true);

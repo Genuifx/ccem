@@ -1567,6 +1567,13 @@
     "tmuxOptionalNotice": "Basic bridge setup still works without tmux, but install it for the fuller remote control, resume, and multi-terminal experience."
   },
   "hermes": {
+    "conversationModel": "Conversation model",
+    "chooseConversationModel": "Choose a model",
+    "saveConversationModel": "Save",
+    "conversationModelHint": "Used for Hermes chat and task decisions. No workspace required.",
+    "conversationModelSaved": "Saved. Applies to the next message.",
+    "noConversationModels": "Add an available API model in Environments first.",
+    "conversationModelUnavailable": "The previous model environment is unavailable. Choose another.",
     "configurationResultMissing": "Configuration was saved, but the account receipt is missing. Return to the bot list to check it.",
     "noConnectionsHint": "Add a bot from the top right to connect your chat channel.",
     "noConnections": "No bots yet",

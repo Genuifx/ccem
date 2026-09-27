@@ -229,6 +229,9 @@ def finalize(args: argparse.Namespace) -> dict:
     source = package / "source"
     patch = args.patch.resolve()
     host = args.host.resolve()
+    combined = output / "build-cache/combined-gateway.patch"
+    combined.write_bytes(patch.read_bytes() + b"\n" + host.with_name("patches").joinpath("0002-native-managed-conversations.patch").read_bytes())
+    patch = combined
     if not patch.is_file() or not host.is_file():
         raise ValueError("Reviewed gateway patch and host must both exist before finalization")
     patch_env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(source.parent)}
@@ -247,6 +250,7 @@ def finalize(args: argparse.Namespace) -> dict:
     shutil.copy2(host, package / "ccem_gateway_host.py")
     shutil.copy2(host.with_name("ccem_gateway_onboarding.py"), package / "ccem_gateway_onboarding.py")
     shutil.copy2(host.with_name("ccem_session_advisor.py"), package / "ccem_session_advisor.py")
+    shutil.copy2(host.with_name("ccem_gateway_conversation.py"), package / "ccem_gateway_conversation.py")
     regularize_links(package)
     for path in package.rglob("__pycache__"):
         shutil.rmtree(path)

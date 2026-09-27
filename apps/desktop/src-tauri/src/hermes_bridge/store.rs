@@ -130,6 +130,10 @@ pub struct Operation {
 #[serde(rename_all = "camelCase")]
 pub struct Delivery {
     #[serde(default)]
+    pub confirmation_preview: Option<ConfirmationPreview>,
+    #[serde(default)]
+    pub conversation_scope: Option<String>,
+    #[serde(default)]
     pub session_binding_id: Option<String>,
     #[serde(default)]
     pub cron: Option<crate::cron::CronDeliveryScope>,
@@ -140,6 +144,12 @@ pub struct Delivery {
     pub status: String,
     pub receipt: Option<Value>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmationPreview {
+    pub challenge: String,
+    pub owner: String,
 }
 
 struct StoreOwner(File);
@@ -508,6 +518,66 @@ impl Store {
             .map_err(err)?
             .ok_or_else(|| "challenge_not_found".into())
     }
+    pub fn confirmation_route(&self, paired: &Route, challenge: &str) -> Result<(Route, String), String> {
+            if let Ok(runtime) = self.challenge_runtime(paired, challenge) {
+                return Ok((paired.clone(), runtime));
+            }
+            for binding in self
+                .session_bindings()?
+                .iter()
+                .filter(|b| b.route_id == paired.id && b.generation == paired.generation)
+            {
+                let scoped = binding.scoped_route(paired);
+                if let Ok(runtime) = self.challenge_runtime(&scoped, challenge) {
+                    if runtime == binding.runtime_id {
+                        return Ok((scoped, runtime));
+                    }
+                }
+            }
+            Err("challenge_not_found".into())
+    }
+    pub fn challenge_state(&self, route: &Route, id: &str) -> Result<(i64, String), String> {
+        self.db.query_row("SELECT expires,state FROM challenges WHERE id=?1 AND route_id=?2 AND generation=?3",
+            params![id,route.id,route.generation], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?
+            .ok_or_else(|| "challenge_not_found".into())
+    }
+    /// Bind one native short reply to one input before attempting submission.
+    /// This key spans session grants so redelivery cannot select a newer request.
+    pub fn short_reply_choice(&self, route: &Route, message: &str, action: &str, choice: Option<&str>) -> Result<Option<String>, String> {
+        validate_message_id(message)?;
+        let key = digest(&format!("short-reply:{}:{message}",route.source.key()));
+        let hash = digest(action);
+        let old: Option<(String,String)> = self.db.query_row("SELECT hash,response FROM requests WHERE id=?1", [&key], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
+        if let Some((previous, response)) = old {
+            if previous != hash { return Err("idempotency_conflict".into()); }
+            let value: Value = serde_json::from_str(&response).map_err(err)?;
+            if value["routeId"] != route.id || value["generation"] != route.generation { return Err("conversation_scope_changed".into()); }
+            if let Some(error) = value["error"].as_str() { return Err(error.into()); }
+            return Ok(value["challenge"].as_str().map(str::to_owned));
+        }
+        if let Some(challenge) = choice {
+            self.db.execute("INSERT INTO requests VALUES(?1,?2,?3)", params![key,hash,json!({"challenge":challenge,"routeId":route.id,"generation":route.generation}).to_string()]).map_err(err)?;
+        }
+        Ok(choice.map(str::to_owned))
+    }
+    pub fn reject_short_reply(&self, route: &Route, message: &str, action: &str, reason: &str) -> Result<(), String> {
+        validate_message_id(message)?;
+        let key = digest(&format!("short-reply:{}:{message}",route.source.key()));
+        self.db.execute("INSERT OR IGNORE INTO requests VALUES(?1,?2,?3)", params![key,digest(action),
+            json!({"error":reason,"routeId":route.id,"generation":route.generation}).to_string()]).map_err(err)?;
+        Ok(())
+    }
+    pub fn pending_chat_inputs(&self, paired: &Route) -> Result<Vec<String>, String> {
+        let mut routes = vec![paired.id.clone()];
+        routes.extend(self.session_bindings()?.into_iter().filter(|b| b.route_id == paired.id && b.generation == paired.generation).map(|b| b.id));
+        let mut pending = Vec::new();
+        for route in routes {
+            let mut query = self.db.prepare("SELECT id FROM challenges WHERE route_id=?1 AND generation=?2 AND state='pending' AND expires>?3").map_err(err)?;
+            let ids = query.query_map(params![route,paired.generation,now()], |r| r.get::<_,String>(0)).map_err(err)?;
+            for id in ids { pending.push(id.map_err(err)?); }
+        }
+        Ok(pending)
+    }
     pub fn cancel(&self, route: &Route, id: &str) -> Result<(), String> {
         let n=self.db.execute("UPDATE challenges SET state='cancelled' WHERE id=?1 AND route_id=?2 AND generation=?3 AND state='pending'",params![id,route.id,route.generation]).map_err(err)?;
         if n == 0 {
@@ -647,7 +717,7 @@ impl Store {
         Ok(())
     }
 }
-fn validate_message_id(id: &str) -> Result<(), String> {
+pub(super) fn validate_message_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
         Err("source_message_id_required".into())
     } else {

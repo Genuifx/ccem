@@ -1,5 +1,6 @@
 //! CCEM owns workspace policy, confirmations, operation state and the durable outbox.
 mod connection_config;
+mod conversation;
 mod cron_notifications;
 mod poll;
 mod process;
@@ -65,6 +66,7 @@ pub struct HermesBridgeManager {
     last_error: Mutex<Option<String>>,
     setup: Mutex<Option<setup::Setup>>,
     setup_workers: AtomicUsize,
+    presented_inputs: Mutex<HashMap<String, conversation::PresentedInput>>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -82,6 +84,10 @@ struct BridgeParams {
     operation_id: Option<String>,
     #[serde(default)]
     cursor: Option<u64>,
+    #[serde(default)]
+    conversation_scope: Option<String>,
+    #[serde(default)]
+    received_at_ns: Option<u64>,
 }
 
 impl HermesBridgeManager {
@@ -115,6 +121,7 @@ impl HermesBridgeManager {
             last_error: Mutex::new(None),
             setup: Mutex::new(None),
             setup_workers: AtomicUsize::new(0),
+            presented_inputs: Mutex::new(HashMap::new()),
         }
     }
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
@@ -178,6 +185,7 @@ impl HermesBridgeManager {
                         .iter()
                         .map(|record| {
                             let mut public = record.public_status();
+                            public["conversationModel"] = self.conversation_model(&record.account_ref).unwrap_or(Value::Null);
                             if let Ok(process) = self.connection_process(&record.account_ref) {
                                 let snapshot = process.snapshot();
                                 public["state"] = snapshot["state"].clone();
@@ -217,6 +225,7 @@ impl HermesBridgeManager {
         workspaces.sort();
         workspaces.dedup();
         result["workspaces"] = json!(workspaces);
+        result["conversationModels"] = json!(session_handoff::available_models());
         result
     }
     // Discovery has no registered bridge capability and never owns a connection.
@@ -315,6 +324,7 @@ impl HermesBridgeManager {
                 idle_lifecycle(&self.lifecycle, &self.install_requested)?
             };
         match action {
+            "configureConversation" => self.save_conversation_model(&payload)?,
             "beginSetup" => {
                 self.begin_setup_locked(
                     app,
@@ -500,15 +510,45 @@ impl HermesBridgeManager {
             "ccem.bridge.confirm",
             "ccem.bridge.cancel",
             "ccem.bridge.operation",
+            "ccem.bridge.conversation",
+            "ccem.bridge.validateConversation",
+            "ccem.bridge.shortReply",
+            "ccem.bridge.replyConversation",
         ]
         .contains(&method)
         {
             return Err("method_not_allowed".into());
         }
-        let p: BridgeParams =
+        let mut p: BridgeParams =
             serde_json::from_value(params).map_err(|_| "invalid_bridge_request")?;
         let route = self.with_store(|s| s.route_for_account(&account, &p.source))?;
+        if ["ccem.bridge.conversation", "ccem.bridge.validateConversation", "ccem.bridge.replyConversation", "ccem.bridge.shortReply"].contains(&method) {
+            store::validate_message_id(p.source_message_id.as_deref().unwrap_or(""))?;
+        }
+        if p.conversation_scope.as_ref().is_some_and(|s| s != &conversation::scope(&route)) {
+            if method == "ccem.bridge.shortReply" {
+                let action = match p.text.as_deref() {
+                    Some("confirm") => "ccem.bridge.confirm",
+                    Some("cancel") => "ccem.bridge.cancel",
+                    _ => return Err("invalid_confirmation_reply".into()),
+                };
+                self.with_store(|s| s.reject_short_reply(&route, p.source_message_id.as_deref().unwrap_or(""), action, "conversation_scope_changed"))?;
+            }
+            return Err("conversation_scope_changed".into());
+        }
+        if ["ccem.bridge.validateConversation", "ccem.bridge.replyConversation", "ccem.bridge.shortReply"].contains(&method) && p.conversation_scope.is_none() {
+            return Err("conversation_scope_required".into());
+        }
+        let short_action;
+        let method = if method == "ccem.bridge.shortReply" {
+            short_action = match p.text.as_deref() { Some("confirm") => "ccem.bridge.confirm", Some("cancel") => "ccem.bridge.cancel", _ => return Err("invalid_confirmation_reply".into()) };
+            p.challenge = Some(self.short_confirmation(&route, authorization, p.source_message_id.as_deref().unwrap_or(""), short_action, p.received_at_ns)?);
+            short_action
+        } else { method };
         match method {
+            "ccem.bridge.conversation" => self.conversation_snapshot(&route),
+            "ccem.bridge.validateConversation" => Ok(json!({"ok":true})),
+            "ccem.bridge.replyConversation" => self.enqueue_conversation_reply(&route, p.source_message_id.as_deref().unwrap_or(""), p.text.as_deref().unwrap_or("")),
             "ccem.bridge.list" => {
                 let attached: HashSet<_> = self
                     .with_store(|s| s.session_bindings())?
@@ -567,14 +607,21 @@ impl HermesBridgeManager {
                     p.runtime_id.as_deref().ok_or("runtime_id_required")?
                 };
                 let input_route = self.input_route(&route, id)?;
-                self.with_store(|s| {
+                if p.conversation_scope.is_some() && p.text.as_deref().unwrap_or("").len() > 1400 {
+                    return Err("invalid_input_size".into());
+                }
+                let prepared = self.with_store(|s| {
                     s.prepare(
                         &input_route,
                         p.source_message_id.as_deref().unwrap_or(""),
                         id,
                         p.text.as_deref().unwrap_or(""),
                     )
-                })
+                })?;
+                if p.conversation_scope.is_some() {
+                    self.enqueue_confirmation_preview(&route, authorization, &prepared)?;
+                }
+                Ok(prepared)
             }
             "ccem.bridge.confirm" => {
                 let challenge = p.challenge.as_deref().ok_or("challenge_required")?;
@@ -827,6 +874,7 @@ fn decode_fields(cipher: &str) -> Result<serde_json::Map<String, Value>, String>
 }
 fn make_delivery(route: &Route, event: &str, text: String) -> Delivery {
     Delivery {
+        conversation_scope: None, confirmation_preview: None,
         session_binding_id: None,
         id: digest(&format!("{}:{}:{event}", route.id, route.generation)),
         route_id: route.id.clone(),

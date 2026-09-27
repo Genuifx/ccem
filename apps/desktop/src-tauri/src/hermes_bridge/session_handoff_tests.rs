@@ -85,6 +85,7 @@ impl Fixture {
     }
     fn delivery(&self) -> Delivery {
         Delivery {
+            conversation_scope: None, confirmation_preview: None,
             id: random_id(),
             route_id: self.route.id.clone(),
             generation: self.route.generation,

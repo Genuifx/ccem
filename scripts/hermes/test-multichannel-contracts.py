@@ -356,17 +356,22 @@ class MultiChannelContracts(unittest.IsolatedAsyncioTestCase):
             runner._run_agent = AsyncMock(side_effect=AssertionError("must not start an agent"))
             challenge = "c" * 48
             prefix = host_module.command_prefix(platform)
-            for text, expected in (("continue the attached session", "chat continue the attached session"),
+            for text, expected in (("continue the attached session", None),
+                                   ("确认", "shortReply confirm"),
                                    (f"两分钟内发送：\n{prefix} confirm\n{challenge}", f"confirm {challenge}"),
                                    (f"/ccem confirm {challenge}", f"confirm {challenge}"),
                                    (f"{prefix} confirm {challenge}", f"confirm {challenge}")):
                 event = MessageEvent(text=text, message_id="native-message",
                     source=SessionSource(platform=Platform(platform), chat_id=self.chat(platform), user_id="unapproved", chat_type="dm"))
                 rewrite = host.pairing_hook(event=event)
-                self.assertEqual(rewrite, {"action":"rewrite", "text":"/ccem " + expected})
-                rewritten = MessageEvent(text=rewrite["text"], message_id=event.message_id, source=event.source)
-                self.assertEqual(rewritten.get_command(), "ccem")
-                self.assertEqual(rewritten.get_command_args(), expected)
+                if expected is None:
+                    self.assertIsNone(rewrite)
+                    rewritten = event
+                else:
+                    self.assertEqual(rewrite, {"action":"rewrite", "text":"/ccem " + expected})
+                    rewritten = MessageEvent(text=rewrite["text"], message_id=event.message_id, source=event.source)
+                    self.assertEqual(rewritten.get_command(), "ccem")
+                    self.assertEqual(rewritten.get_command_args(), expected)
                 runner.hooks = NS(emit=AsyncMock(), emit_collect=AsyncMock(return_value=[]))
                 def invoke_pre_dispatch(name, **kwargs):
                     return [host.pairing_hook(event=kwargs["event"])]

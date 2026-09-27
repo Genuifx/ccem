@@ -45,6 +45,7 @@ fn enqueue(store: &mut Store, task: &CronTask, run: &CronTaskRun) -> Result<Stri
         snapshot.target.generation,
     ) && target_route(store, &snapshot.target)?.is_some();
     let delivery = Delivery {
+        conversation_scope: None, confirmation_preview: None,
         session_binding_id: None,
         id,
         route_id: snapshot.target.route_id.clone(),

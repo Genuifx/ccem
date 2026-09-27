@@ -30,6 +30,10 @@ import urllib.request
 _setup_spec = importlib.util.spec_from_file_location("ccem_gateway_onboarding", Path(__file__).with_name("ccem_gateway_onboarding.py"))
 _setup_module = importlib.util.module_from_spec(_setup_spec)
 _setup_spec.loader.exec_module(_setup_module)
+_conversation_spec = importlib.util.spec_from_file_location("ccem_gateway_conversation", Path(__file__).with_name("ccem_gateway_conversation.py"))
+_conversation_module = importlib.util.module_from_spec(_conversation_spec)
+sys.modules[_conversation_spec.name] = _conversation_module
+_conversation_spec.loader.exec_module(_conversation_module)
 
 PROTOCOL = 1
 FRAME_LIMIT = 64 * 1024
@@ -85,6 +89,12 @@ def confirmation_reply(text, prefix):
 
 
 def command_error(code, prefix):
+    if code == "no_presented_confirmation":
+        return "当前没有待确认的操作。可以直接告诉我你想做什么。"
+    if code == "ambiguous_confirmation":
+        return "现在有多条待确认操作，不能确定你指哪条。请等待它们过期后重新提出需要执行的任务。"
+    if code == "conversation_scope_changed":
+        return "这段对话的授权已更新，请重新发送你的消息。"
     if code in {"challenge_expired_or_revoked", "challenge_not_found", "challenge_scope_mismatch"}:
         return "这条确认已过期或失效，没有提交新的执行。请重新发送原任务内容，收到新预览后再确认。"
     if code in {"session_not_found", "session_not_active"}:
@@ -223,7 +233,7 @@ class Host:
             if state == "running" and self.runner:
                 connected = self.transport_ready and any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
                 state = "running" if connected else "reconnecting"
-            return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1,
+            return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1, "nativeConversation": 1,
                     "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeSource")} for p in self.pending.values()],
                     "pairing": self.pairing}
 
@@ -251,9 +261,7 @@ class Host:
         # Only this private profile is visible to the child; no project plugins,
         # shared dotenv, model keys or automatic skills are imported from user paths.
         self.profile.mkdir(parents=True, exist_ok=True, mode=0o700)
-        config = {"gateway": {"integration_only": True, "unauthorized_dm_behavior": "ignore", "stt_enabled": False,
-                              "multiplex_profiles": False, "loop_watchdog": False},
-                  "plugins": {"enabled": [], "entries": {}}, "mcp_servers": {}}
+        config = _conversation_module.configuration()
         (self.profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
         from hermes_cli.plugins import discover_plugins, get_plugin_manager, PluginContext, PluginManifest
         from gateway.platform_registry import platform_registry
@@ -285,16 +293,15 @@ class Host:
                 os.environ[key] = value
         # The capability is never copied into environment, profile config or adapter metadata.
         from gateway.config import load_gateway_config
-        from gateway.run import GatewayRunner
         gateway_config = load_gateway_config()
-        gateway_config.integration_only = True
+        gateway_config.integration_only = False
         gateway_config.unauthorized_dm_behavior = "ignore"
         gateway_config.stt_enabled = False
         gateway_config.multiplex_profiles = False
         gateway_config.loop_watchdog = False
         for key, channel in gateway_config.platforms.items():
             channel.enabled = str(key.value) == platform
-        self.runner = GatewayRunner(gateway_config)
+        self.runner = _conversation_module.create_runner(self, gateway_config)
         context = PluginContext(PluginManifest(name="ccem-managed-bridge", source="bundled", kind="standalone"), get_plugin_manager())
         context.register_command("ccem", self.command, description="CCEM task commands", with_context=True)
         context.register_hook("pre_gateway_dispatch", self.pairing_hook)
@@ -325,10 +332,10 @@ class Host:
                 if reply is not None:
                     return {"action": "rewrite", "text": "/ccem " + reply}
         if not event.is_command():
-            # Rewrite only. Admission still authenticates the original native
-            # sender/message after this hook; no RPC or grant happens here.
-            if event.source and isinstance(event.text, str) and event.text.strip():
-                return {"action": "rewrite", "text": "/ccem chat " + event.text}
+            # Exact control replies are authenticated by normal native admission.
+            # All other messages stay intact for Hermes's conversation loop.
+            if event.text.strip() in ("确认", "取消"):
+                return {"action": "rewrite", "text": "/ccem shortReply " + ("confirm" if event.text.strip() == "确认" else "cancel")}
             return None
         if event.get_command() != "ccem":
             return None
@@ -382,8 +389,20 @@ class Host:
             raise ValueError(message[:160])
         return value.get("result")
 
+    def authenticated_source(self, context):
+        return source_value(context, self.boot["accountRef"])
+
+    async def conversation_unavailable(self, context, error):
+        # Do not return an exception string to a platform adapter or the user.
+        self.error = "conversation_unavailable"
+        self.publish()
+
     async def command(self, raw_args, context):
-        from gateway.managed_contracts import send_strict, StrictTarget
+        from gateway.managed_contracts import send_strict, StrictTarget, retain_managed_control_ingress
+        # Pin before waiting for a command slot or resolving scope. A timeout
+        # must not let a later transport retry acquire a post-preview timestamp.
+        if raw_args.strip().split() in (["shortReply", "confirm"], ["shortReply", "cancel"]):
+            retain_managed_control_ingress(self.runner, context)
         target = StrictTarget(profile=context.transport_profile, platform=context.platform,
                               chat_id=context.chat_id, thread_id=context.thread_id)
         maximum = next((p.get("maxMessageLength") for p in self.platforms if p["id"] == context.platform), 0)
@@ -398,6 +417,13 @@ class Host:
                 if method == "confirmation-help":
                     await send_strict(self.runner, target, f"请单独发送一条确认或取消指令，例如：\n{prefix} confirm <确认码>\n请只复制预览中的确认指令，不要连同任务正文或取消指令一起发送。")
                     return None
+                elif method == "shortReply" and len(args) == 2 and args[1] in ("confirm", "cancel"):
+                    params["text"] = args[1]
+                    scope = await asyncio.to_thread(self.rpc, "conversation", {k: v for k, v in params.items() if k != "text"})
+                    params["conversationScope"] = scope["scope"]
+                    # This frozen transport timestamp predates command-slot waits.
+                    # Missing timing stays missing so the authority can fail closed.
+                    params["receivedAtNs"] = context.received_at_ns
                 elif method in ("list",):
                     pass
                 elif method == "chat":
@@ -424,7 +450,10 @@ class Host:
                     await send_strict(self.runner, target, "\n".join(prefix + " " + line for line in ("list", "status <runtime>", "events <runtime> [cursor]", "input <runtime> <text>", "confirm <challenge>", "cancel <challenge>", "operation <operation>")))
                     return None
                 result = await asyncio.to_thread(self.rpc, method, params)
-                text = render_result(result, maximum, prefix)
+                if method == "shortReply":
+                    text = "已取消这次操作。" if result.get("state") == "cancelled" else ("任务是否收到还不能确认，请先让我查询状态。" if result.get("state") == "unknown" else "已交给任务继续处理，有结果时会告诉你。")
+                else:
+                    text = render_result(result, maximum, prefix)
             except ValueError as error:
                 text = command_error(str(error), prefix)
             except (urllib.error.URLError, TimeoutError):
@@ -432,6 +461,13 @@ class Host:
                 text = command_error("transport_error", prefix)
             except Exception:
                 text = "CCEM 请求失败；请在桌面检查连接状态。"
+            if method == "shortReply" and params.get("conversationScope"):
+                try:
+                    await asyncio.to_thread(self.rpc, "replyConversation", {**params, "text": text})
+                except Exception:
+                    self.error = "command_reply_unverified"
+                    self.publish()
+                return None
             receipt = await send_strict(self.runner, target, text)
             if receipt.get("status") != "sent":
                 self.error = "command_reply_" + str(receipt.get("status", "unknown"))
@@ -498,7 +534,10 @@ class Host:
             target = StrictTarget(**params["target"])
             if target.platform != self.boot.get("platform"):
                 return {"status": "not_sent", "error_code": "platform_mismatch"}
-            return await send_strict(self.runner, target, notification_text(str(params["text"]), target.platform), timeout=30.0)
+            receipt = await send_strict(self.runner, target, notification_text(str(params["text"]), target.platform), timeout=30.0)
+            if receipt.get("status") == "sent":
+                receipt["confirmedAtNs"] = time.monotonic_ns()
+            return receipt
         raise ValueError("unknown_host_method")
 
     async def decide_session_notification(self, params):

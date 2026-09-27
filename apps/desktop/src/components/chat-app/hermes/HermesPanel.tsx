@@ -229,6 +229,7 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
     const action = busyActions[`account:${connection.accountRef}`];
     const interruptDisabled = runtimeDisabled || Boolean(action && !PAIRING_ACTIONS.has(action));
     return { connection, platform: platforms.find((item) => item.id === connection.platform),
+      conversationModels: status?.conversationModels ?? [],
       routes: status?.routes.filter((route) => route.source.accountRef === connection.accountRef) ?? [], workspaces: status?.workspaces ?? [],
       disabled: runtimeDisabled || Boolean(action), stopDisabled: interruptDisabled, removeDisabled: interruptDisabled,
       editDisabled: disabled || Boolean(setupConnecting), requestError: connectionRequestErrors[connection.accountRef],

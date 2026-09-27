@@ -6,6 +6,7 @@ import type { HermesConnection, HermesPendingPairing, HermesPlatform, HermesRout
 import { errorText, platformDisplayName, timestamp, TRANSITIONING } from './hermes-presentation';
 import { HermesPlatformIcon, workspaceName } from './HermesVisuals';
 import { effectiveAccess, RouteAccessEditor, WorkspaceAccessFields, type WorkspaceAccess } from './HermesWorkspaceAccess';
+import { HermesConversationModel } from './HermesConversationModel';
 
 function SourceIdentity({ source }: { source: HermesSource }) {
   const { t } = useLocale();
@@ -66,8 +67,9 @@ export function HermesConnectionCard({ connection, platform, routes, stateLabel,
   </article>;
 }
 
-export function HermesConnectionDetails({ connection, platform, routes, workspaces, disabled, stopDisabled, removeDisabled, editDisabled, setupError, requestError, run, onEdit, stateLabel, authorizationOnly = false }: {
+export function HermesConnectionDetails({ connection, platform, routes, workspaces, conversationModels = [], disabled, stopDisabled, removeDisabled, editDisabled, setupError, requestError, run, onEdit, stateLabel, authorizationOnly = false }: {
   connection: HermesConnection; platform?: HermesPlatform; routes: HermesRoute[]; workspaces: string[];
+  conversationModels?: { envName: string; model: string }[];
   disabled: boolean; stopDisabled: boolean; removeDisabled: boolean; editDisabled: boolean; setupError?: string | null; requestError?: string | null; run: HermesRunAction; onEdit: () => void; stateLabel: (value: string) => string; authorizationOnly?: boolean;
 }) {
   const { t, lang } = useLocale();
@@ -118,6 +120,7 @@ export function HermesConnectionDetails({ connection, platform, routes, workspac
         {copyError && <p role="alert" className="hermes-error">{copyError}</p>}
       </div>}
       {connection.pending.map((pairing) => <PendingPairing key={pairing.id} pairing={pairing} accountRef={connection.accountRef} workspaces={workspaces} disabled={disabled || !running} run={run} />)}
+      <HermesConversationModel connection={connection} models={conversationModels} disabled={disabled} run={run} />
       {routes.length > 0 && <div className="hermes-routes"><h4>{t('hermes.routes')}</h4>{routes.map((route) => <PairedChat key={route.id} route={route} workspaces={workspaces} disabled={disabled} accessDisabled={disabled || !connection.enabled} run={run} />)}</div>}
   </div>;
 }
