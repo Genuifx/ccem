@@ -108,6 +108,10 @@ function deriveInstance(worktreeRoot, environment = process.env) {
   )
     ? '1'
     : '0';
+  const explicitHermesStateRoot = environment.CCEM_HERMES_STATE_DIR?.trim();
+  const hermesStateRoot = explicitHermesStateRoot ? path.resolve(normalizedRoot, explicitHermesStateRoot) : (backgroundServices === '0'
+    ? path.join(normalizedRoot, '.artifacts', 'hermes-managed')
+    : null);
 
   return {
     instanceId,
@@ -131,6 +135,7 @@ function deriveInstance(worktreeRoot, environment = process.env) {
       CCEM_TAURI_MCP_PORT: String(mcpPort),
       CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: backgroundServices,
       CCEM_BROWSER_DATA_ROOT: browserDataRoot,
+      ...(hermesStateRoot ? { CCEM_HERMES_STATE_DIR: hermesStateRoot } : {}),
     },
   };
 }

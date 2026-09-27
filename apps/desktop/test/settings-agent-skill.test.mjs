@@ -47,9 +47,10 @@ test('bundled CCEM agent skill matches the supported cron CLI contract', async (
   const cronCommands = [...cronCliSource.matchAll(/cronCmd\s*\n\s*\.command\('([^']+)'\)/g)]
     .map((match) => match[1].split(' ')[0]);
 
-  assert.deepEqual(cronCommands, ['list', 'create', 'delete']);
-  assert.match(skillSource, /supports `list`, `create`, and `delete`/);
+  assert.deepEqual(cronCommands, ['list', 'notification-targets', 'create', 'delete']);
+  assert.match(skillSource, /supports `list`, `notification-targets`, `create`, and `delete`/);
   assert.match(skillSource, /ccem cron list --json/);
+  assert.match(skillSource, /ccem cron notification-targets --json/);
   assert.match(skillSource, /ccem cron create --from-json/);
   assert.match(skillSource, /ccem cron delete "<taskId>" --json/);
   assert.match(skillSource, /does not expose an `update`, `edit`, or `runs` command/);

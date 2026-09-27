@@ -86,3 +86,8 @@ updater-replacement-smoke-harness = []
 [dev-dependencies]
 tauri = { version = "=2.11.5", features = ["test"] }
 tempfile = "3"
+
+# The managed runtime verifies hundreds of MB before every launch. Keep the
+# cryptographic implementation optimized in dev, without weakening any checks.
+[profile.dev.package.sha2]
+opt-level = 3

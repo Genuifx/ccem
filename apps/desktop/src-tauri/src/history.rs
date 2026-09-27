@@ -2481,10 +2481,11 @@ fn append_claude_meta_images_to_parent(messages: &mut [ConversationMessage], par
 
 fn strip_internal_tips_from_user_content(content: &mut serde_json::Value) {
     match content {
-        serde_json::Value::String(text) => {
-            if crate::user_prompt_display::strip_internal_system_tips(text) != text.as_str() {
-                *text = crate::user_prompt_display::normalize_user_visible_prompt(text).unwrap_or_default();
-            }
+        serde_json::Value::String(text)
+            if crate::user_prompt_display::strip_internal_system_tips(text) != text.as_str() =>
+        {
+            *text = crate::user_prompt_display::normalize_user_visible_prompt(text)
+                .unwrap_or_default();
         }
         serde_json::Value::Array(blocks) => {
             for block in blocks {

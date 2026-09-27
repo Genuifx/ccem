@@ -1,0 +1,2024 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index f75324d..a7a09ff 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -545,6 +545,7 @@ class GatewayConfig:
+     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
+     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
+     quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
++    integration_only: bool = False  # authenticated plugin commands + diagnostic native commands; no agents
+     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
+     # Legacy sessions.json mirror of the routing index (primary: state.db) for external tooling / downgrades.
+     # The primary copy lives in state.db (gateway_routing table, #9006). Default True for backward
+@@ -590,7 +591,7 @@ class GatewayConfig:
+ 
+     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
+     _SCALAR_DICT_FIELDS = (
+-        "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
++        "integration_only", "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
+         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
+         "max_concurrent_sessions", "multiplex_profiles", "multiplex_profile_allowlist",
+         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
+@@ -749,6 +750,7 @@ class GatewayConfig:
+             reset_by_platform=by_platform("reset_by_platform", SessionResetPolicy.from_dict),
+             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
+             quick_commands=_coerce_dict(data.get("quick_commands", {})),
++            integration_only=_coerce_bool(pick("integration_only"), False),
+             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
+             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
+             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
+diff --git a/gateway/managed_contracts.py b/gateway/managed_contracts.py
+new file mode 100644
+index 0000000..e04183c
+--- /dev/null
++++ b/gateway/managed_contracts.py
+@@ -0,0 +1,167 @@
++"""Authenticated command provenance and single-attempt delivery for gateway consumers.
++
++This API does not authorize arbitrary Python plugins or provide an outbox. Callers
++persist unknown outcomes and must not automatically retry them.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import math
++from dataclasses import asdict, dataclass
++from typing import Optional
++
++from gateway.config import Platform
++from gateway.platforms.base import SendResult
++
++
++INTEGRATION_NATIVE_COMMANDS = frozenset({"help", "status", "whoami", "platforms", "version", "start"})
++STRICT_SEND_PLATFORMS = frozenset({"telegram", "wecom", "feishu", "discord", "slack"})
++
++
++def strict_send_supported(platform: str) -> bool:
++    """Adapter capability implemented here; not proof that any account is connected."""
++    return isinstance(platform, str) and platform in STRICT_SEND_PLATFORMS
++
++
++@dataclass(frozen=True)
++class TrustedCommandContext:
++    platform: str
++    profile: str
++    transport_profile: str
++    user_id: Optional[str]
++    chat_id: str
++    thread_id: Optional[str]
++    source_message_id: Optional[str]
++    chat_type: str
++
++
++@dataclass(frozen=True)
++class StrictTarget:
++    profile: str
++    platform: str
++    chat_id: str
++    thread_id: Optional[str] = None
++
++
++def integration_only(runner) -> bool:
++    return getattr(getattr(runner, "config", None), "integration_only", False) is True
++
++
++def native_source_message_id(event) -> Optional[str]:
++    """Return transport message identity, excluding adapter bookkeeping fallbacks.
++
++    Adapters must mark generated IDs and non-message request IDs as synthetic.
++    Call before untrusted pre-dispatch hooks; this function does not authorize
++    its caller or turn hook-provided data into authenticated context.
++    """
++    if getattr(event, "message_id_is_synthetic", False) is not False:
++        return None
++    value = event.message_id or getattr(event.source, "message_id", None)
++    if isinstance(value, bool) or not isinstance(value, (str, int)) or not value:
++        return None
++    return str(value)
++
++
++def command_context(runner, source, source_message_id) -> TrustedCommandContext:
++    """Called only after ingress authorization, using the pre-hook source snapshot."""
++    primary = getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
++    owner = runner._transport_owner(source)
++    transport_profile = (owner[1] or primary) if owner is not None else (source.profile or primary)
++    return TrustedCommandContext(
++        platform=source.platform.value, profile=source.profile or primary,
++        transport_profile=transport_profile, user_id=source.user_id,
++        chat_id=source.chat_id, thread_id=source.thread_id,
++        source_message_id=str(source_message_id) if source_message_id else None,
++        chat_type=source.chat_type,
++    )
++
++
++def strict_result(status: str, error: Optional[str] = None, *, target=None,
++                  message_id=None, receipt_id=None) -> SendResult:
++    """Adapter result: target contains only platform-confirmed chat/thread identifiers."""
++    return SendResult(
++        success=status == "sent", message_id=message_id, error=error,
++        delivery_status=status, delivery_target=target, receipt_id=receipt_id,
++    )
++
++
++def _observe_task(task) -> None:
++    if not task.cancelled():
++        task.exception()
++
++
++async def send_strict(runner, target: StrictTarget, text: str, *, timeout: float = 30.0) -> dict:
++    """Use exactly one currently connected adapter; never connect, redirect or retry.
++
++    ``target`` in the receipt is the actual confirmed target (None if unconfirmed).
++    ``requested_target`` is always the explicit request. WeCom may acknowledge a
++    request without supplying a message ID; its ACK ID is then ``receipt_id``.
++    """
++    requested = asdict(target) if isinstance(target, StrictTarget) else None
++
++    def receipt(status, error=None, *, actual=None, message_id=None, receipt_id=None):
++        return {"status": status, "message_id": message_id, "receipt_id": receipt_id,
++                "requested_target": requested, "target": actual, "error_code": error}
++
++    if not isinstance(target, StrictTarget) or any(
++        not isinstance(value, str) or not value or value != value.strip()
++        for value in (target.profile, target.platform, target.chat_id)
++    ) or (target.thread_id is not None and (
++        not isinstance(target.thread_id, str) or not target.thread_id or target.thread_id != target.thread_id.strip()
++    )):
++        return receipt("not_sent", "invalid_target")
++    if not isinstance(text, str) or not text.strip():
++        return receipt("not_sent", "invalid_text")
++    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
++        return receipt("not_sent", "invalid_timeout")
++    try:
++        platform = Platform(target.platform)
++    except ValueError:
++        return receipt("not_sent", "unsupported_platform")
++    if not strict_send_supported(target.platform):
++        return receipt("not_sent", "strict_delivery_unsupported")
++    # No ambient active-profile or "default" fallback: a named primary owns its
++    # own adapters, while secondary profiles have explicit maps.
++    primary = getattr(runner, "_primary_profile_name", None)
++    profiles = getattr(runner, "_profile_adapters", None) or {}
++    adapters = (getattr(runner, "adapters", None) or {}) if target.profile == primary else profiles.get(target.profile, {})
++    adapter = adapters.get(platform)
++    if adapter is None or getattr(adapter, "is_connected", False) is not True:
++        return receipt("not_sent", "live_adapter_unavailable")
++    if getattr(adapter, "STRICT_DELIVERY_CAPABLE", False) is not True:
++        return receipt("not_sent", "strict_delivery_unsupported")
++    try:
++        task = asyncio.create_task(adapter.send_strict(target.chat_id, text, thread_id=target.thread_id))
++    except Exception:
++        return receipt("unknown", "adapter_exception")
++    try:
++        done, _ = await asyncio.wait({task}, timeout=timeout)
++        if task not in done:
++            task.cancel()
++            task.add_done_callback(_observe_task)
++            return receipt("unknown", "delivery_timeout")
++        result = task.result()
++    except asyncio.CancelledError:
++        task.cancel()
++        task.add_done_callback(_observe_task)
++        return receipt("unknown", "delivery_cancelled")
++    except Exception:
++        return receipt("unknown", "adapter_exception")
++    if not isinstance(result, SendResult) or result.delivery_status not in {"sent", "not_sent", "unknown"}:
++        return receipt("unknown", "invalid_adapter_receipt")
++    actual = None
++    if isinstance(result.delivery_target, dict):
++        actual = {"profile": target.profile, "platform": target.platform,
++                  "chat_id": result.delivery_target.get("chat_id"),
++                  "thread_id": result.delivery_target.get("thread_id")}
++    if result.continuation_message_ids or (result.delivery_status == "not_sent" and (
++        result.success is not False or result.message_id is not None
++    )) or (result.delivery_status == "sent" and (
++        result.success is not True or actual != requested or result.error is not None
++        or not (result.message_id or result.receipt_id)
++    )):
++        return receipt("unknown", "unconfirmed_delivery", actual=actual,
++                       message_id=result.message_id, receipt_id=result.receipt_id)
++    return receipt(result.delivery_status, result.error, actual=actual,
++                   message_id=result.message_id, receipt_id=result.receipt_id)
+diff --git a/gateway/managed_http.py b/gateway/managed_http.py
+new file mode 100644
+index 0000000..e829ad4
+--- /dev/null
++++ b/gateway/managed_http.py
+@@ -0,0 +1,92 @@
++"""Bounded one-attempt HTTP transport for managed adapter delivery.
++
++The adapters own authentication. This module never discovers credentials,
++retries a request, follows redirects, or accepts a caller-supplied endpoint.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import re
++import ssl
++
++import aiohttp
++import certifi
++
++
++_ENDPOINTS = {
++    ("feishu", "token"): "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
++    ("feishu", "message"): "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
++    ("lark", "token"): "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
++    ("lark", "message"): "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id",
++    ("slack", "message"): "https://slack.com/api/chat.postMessage",
++    ("discord", "message"): "https://discord.com/api/v10/channels/{chat_id}/messages",
++}
++MAX_RESPONSE_BYTES = 65536
++
++
++class StrictHTTPError(Exception):
++    """Fixed error codes only: never retain provider bodies, tokens or URLs."""
++
++
++async def post_json(platform, operation, payload, *, token=None, chat_id=None, proxy=None, proxy_auth=None):
++    url = _ENDPOINTS.get((platform, operation))
++    if url is None:
++        raise StrictHTTPError("invalid_endpoint")
++    if platform == "discord":
++        if not isinstance(chat_id, str) or not re.fullmatch(r"[1-9][0-9]{0,24}", chat_id):
++            raise StrictHTTPError("invalid_target")
++        url = url.format(chat_id=chat_id)
++    headers = {"Accept": "application/json"}
++    if token is not None:
++        if not isinstance(token, str) or not token or any(c.isspace() for c in token):
++            raise StrictHTTPError("invalid_authentication")
++        headers["Authorization"] = ("Bot " if platform == "discord" else "Bearer ") + token
++    context = ssl.create_default_context(cafile=certifi.where())
++    try:
++        # aiohttp 3.14 retries only idempotent methods; POST is not in that set.
++        # A fresh session also prevents ambient cookies/auth or redirect state.
++        async with aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=10), trust_env=False,
++        ) as session:
++            async with session.post(url, json=payload, headers=headers, ssl=context,
++                                    allow_redirects=False, proxy=proxy, proxy_auth=proxy_auth) as response:
++                if 300 <= response.status < 400:
++                    raise StrictHTTPError("redirect_refused")
++                chunks, size = [], 0
++                async for chunk in response.content.iter_chunked(16384):
++                    size += len(chunk)
++                    if size > MAX_RESPONSE_BYTES:
++                        raise StrictHTTPError("response_too_large")
++                    chunks.append(chunk)
++                try:
++                    body = json.loads(b"".join(chunks).decode("utf-8"))
++                except (UnicodeError, ValueError):
++                    raise StrictHTTPError("invalid_response") from None
++                if not isinstance(body, dict):
++                    raise StrictHTTPError("invalid_response")
++                return response.status, body
++    except asyncio.CancelledError:
++        raise
++    except StrictHTTPError:
++        raise
++    except Exception:
++        raise StrictHTTPError("transport_exception") from None
++
++
++def valid_text(text, maximum):
++    if not isinstance(text, str) or not text.strip():
++        return False
++    try:
++        return len(text.encode("utf-16-le")) // 2 <= maximum
++    except UnicodeError:
++        return False
++
++
++def identifier(value):
++    return value if isinstance(value, str) and value and value == value.strip() else None
++
++
++def native_identifier(value, pattern):
++    return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index d7eb6da..d3b1041 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -1567,6 +1567,9 @@ class MessageEvent:
+     # May this event resolve gateway commands / control prompts? Proactive plugin events set False
+     # so untrusted payload text stays conversational. Kept last for positional compat.
+     allow_gateway_control: bool = True
++    # Some adapters need a local ID for dedup/reply bookkeeping even when the
++    # platform omitted its native message ID. Such IDs cannot authorize writes.
++    message_id_is_synthetic: bool = False
+ 
+     def is_command(self) -> bool:
+         """Check if this is a command message (e.g., /new, /reset)."""
+@@ -1658,6 +1661,10 @@ class SendResult:
+     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
+     # branch without substring-matching ``error``.
+     error_kind: Optional[str] = None
++    # Optional single-attempt contract; legacy send() results do not assert this.
++    delivery_status: Optional[str] = None  # sent | not_sent | unknown
++    delivery_target: Optional[Dict[str, Any]] = None
++    receipt_id: Optional[str] = None  # platform ACK ID, distinct from message_id
+ 
+ 
+ # Platform-neutral send-failure kinds for ``SendResult.error_kind``: too_long (size cap),
+@@ -2366,6 +2373,8 @@ class BasePlatformAdapter(ABC):
+ 
+     def _enqueue_text_event(self, event: "MessageEvent") -> None:
+         """Buffer a text event (merging into a pending one) and restart the flush timer."""
++        if self._start_integration_processing(event):
++            return
+         key = self._text_batch_key(event)
+         existing = self._pending_text_batches.get(key)
+         if existing is None:
+@@ -2481,6 +2490,12 @@ class BasePlatformAdapter(ABC):
+                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send ``content`` (may be markdown) to a chat; returns SendResult with message id."""
+ 
++    STRICT_DELIVERY_CAPABLE: bool = False
++
++    async def send_strict(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
++        """Optional exact-target, single-attempt text delivery; never falls back to send()."""
++        return SendResult(success=False, error="strict_delivery_unsupported", delivery_status="not_sent")
++
+     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
+     REQUIRES_EDIT_FINALIZE: bool = False
+ 
+@@ -3497,11 +3512,41 @@ class BasePlatformAdapter(ABC):
+             raise
+         await self._drain_pending_after_session_command(session_key, command_guard)
+ 
++    def _start_integration_processing(self, event: MessageEvent) -> bool:
++        """Integration commands retain one payload/identity per transport event.
++
++        Agent session guards and text batching merge follow-ups; that would turn
++        a second command into text in the first command, losing its message ID.
++        Run independently of the transport reader so reply ACKs can still arrive.
++        """
++        from gateway.managed_contracts import integration_only
++        if not self._message_handler or not integration_only(self.gateway_runner):
++            return False
++
++        async def dispatch():
++            try:
++                if event.allow_gateway_control:
++                    coerce_plaintext_gateway_command(event)
++                await self._dispatch_inline_reply(event)
++            except asyncio.CancelledError:
++                raise
++            except Exception:
++                # A callback may already have sent. Never produce an extra reply.
++                logger.exception("[%s] Integration command dispatch failed", self.name)
++
++        task = asyncio.create_task(dispatch())
++        self._background_tasks.add(task)
++        task.add_done_callback(self._background_tasks.discard)
++        task.add_done_callback(self._expected_cancelled_tasks.discard)
++        return True
++
+     async def handle_message(self, event: MessageEvent) -> None:
+         """Process an incoming message; returns quickly by spawning a background
+         task so new messages (and interrupts) can arrive while an agent runs."""
+         if not self._message_handler:
+             return
++        if self._start_integration_processing(event):
++            return
+         if event.allow_gateway_control:
+             coerce_plaintext_gateway_command(event)
+         # Topic recovery is Telegram-DM-only; skip the executor hop for group traffic.
+diff --git a/gateway/run.py b/gateway/run.py
+index 0a62103..206fc3c 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1719,6 +1719,8 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
+     carry the scope into the executor thread with ``copy_context()`` (the same shape as
+     ``_run_in_executor_with_context``). See #95518.
+     """
++    if getattr(config, "integration_only", False) is True:
++        return
+     from tools.mcp_tool_discovery import discover_mcp_tools
+     loop = asyncio.get_running_loop()
+     if not getattr(config, "multiplex_profiles", False):
+@@ -3491,6 +3493,8 @@ class GatewayRunner(
+ 
+     def _init_startup_checks(self) -> None:
+         """Ensure tirith is installed and warn when manual approvals have no automated assessor."""
++        if getattr(self.config, "integration_only", False) is True:
++            return
+         def _ensure_tirith() -> None:
+             from tools.tirith_security import ensure_installed
+             ensure_installed(log_failures=False)  # downloads if needed; fail-open at scan time
+@@ -5023,6 +5027,8 @@ async def _start_gateway_start_control_socket(runner):
+ def _start_gateway_start_cron_and_housekeeping(runner):
+     """Start the cron scheduler thread + gateway housekeeping thread; returns
+     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
++    if getattr(runner.config, "integration_only", False) is True:
++        return threading.Event(), None, None, None
+     # The event loop is passed so cron delivery can use live adapters (E2EE support).
+     from cron.scheduler_provider import (
+         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
+@@ -5125,7 +5131,8 @@ async def _start_gateway_shutdown_tail(
+     # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
+     # finishes before we tear down.
+     cron_stop.set()
+-    _stop_cron_provider(cron_provider)
++    if cron_provider is not None:
++        _stop_cron_provider(cron_provider)
+     if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+                        "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
+@@ -5253,7 +5260,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+         start_nous_auth_keepalive()
+ 
+     _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+-    _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
++    if getattr(runner.config, "integration_only", False) is not True:
++        _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
+     _ensure_windows_gateway_venv_imports()
+ 
+     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 989ccf7..eaea0b8 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -11,13 +11,16 @@ import logging
+ from typing import TYPE_CHECKING
+ import asyncio
+ import concurrent.futures
++import copy
+ import dataclasses
+ import json
++import inspect
+ import os
+ import re
+ import time
+ from contextlib import suppress
+ from gateway.config import Platform
++from gateway.managed_contracts import INTEGRATION_NATIVE_COMMANDS, command_context, integration_only, native_source_message_id
+ from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+ from gateway.run_common import _UNSET
+ from gateway.session import (
+@@ -115,6 +118,8 @@ class GatewayInboundMixin:
+         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+         from gateway.run import _is_slack_ignored_channel
+         source = event.source
++        # A transport event can be replayed; admission must never reuse an old stamp.
++        event._hermes_trusted_command_context = None
+         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
+         _config = getattr(self, "config", None)
+ 
+@@ -150,6 +155,8 @@ class GatewayInboundMixin:
+             return None
+ 
+         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
++        if is_internal and integration_only(self):
++            return None
+ 
+         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
+         # and session setup — so an ignored channel can never reach pairing/auth/session state.
+@@ -177,10 +184,24 @@ class GatewayInboundMixin:
+         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
+         # counting internal/system events would keep a genuinely idle gateway awake.
+         self._scale_to_zero_note_real_inbound()
++        # Hooks may rewrite text or stage an unapproved pairing request, but cannot
++        # replace transport identity, promote a synthetic event, or mint message IDs.
++        # copy.copy preserves private adapter/profile provenance absent from to_dict.
++        ingress_source = copy.copy(source)
++        ingress_message_id = event.message_id or source.message_id
++        ingress_native_message_id = native_source_message_id(event)
++        ingress_synthetic_message_id = getattr(event, "message_id_is_synthetic", False)
++        ingress_control = event.allow_gateway_control
+         event = self._hm_pre_gateway_dispatch_hook(event, source)
+         if event is None:
+             return None
+-        source = event.source
++        source = ingress_source
++        event.source = source
++        event.message_id = ingress_message_id
++        event.message_id_is_synthetic = ingress_synthetic_message_id
++        event.internal = False
++        event.allow_gateway_control = ingress_control
++        event._hermes_trusted_command_context = None
+ 
+         if not self._is_user_authorized_for_source(source):
+             if source.user_id is None:
+@@ -196,6 +217,7 @@ class GatewayInboundMixin:
+             ):
+                 await self._hm_offer_pairing_code(source)
+             return None
++        event._hermes_trusted_command_context = command_context(self, source, ingress_native_message_id)
+         return event, source, False
+ 
+     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
+@@ -741,6 +763,9 @@ class GatewayInboundMixin:
+         if not (command and canonical and is_gateway_known_command(canonical)):
+             return False, None, command, canonical
+ 
++        if integration_only(self) and _cmd_def is not None and canonical not in INTEGRATION_NATIVE_COMMANDS:
++            return True, "This native command is disabled in integration-only mode.", command, canonical
++
+         # Per-platform slash access control: only active when the operator set ``allow_admin_from``
+         # for the source's scope; then non-admins get ``user_allowed_commands`` plus the
+         # /help, /whoami floor. Plain chat is never gated.
+@@ -916,6 +941,9 @@ class GatewayInboundMixin:
+             self._gateway_plain_command_handlers().get(canonical)
+             or self._gateway_idle_command_handlers().get(canonical)
+         )
++        if integration_only(self) and (plain_handler is not None or canonical in self._HM_CANONICAL_COMMANDS):
++            if canonical not in INTEGRATION_NATIVE_COMMANDS:
++                return True, "This native command is disabled in integration-only mode."
+         if plain_handler is not None:
+             return True, await plain_handler(event)
+         if canonical in self._HM_CANONICAL_COMMANDS:
+@@ -963,6 +991,8 @@ class GatewayInboundMixin:
+                 return True, _denied, command
+             qtype = qcmd.get("type")
+             if qtype == "exec":
++                if integration_only(self):
++                    return True, "Exec quick commands are disabled in integration-only mode.", command
+                 exec_cmd = qcmd.get("command", "")
+                 if not exec_cmd:
+                     return True, f"Quick command '/{command}' has no command defined.", command
+@@ -979,14 +1009,24 @@ class GatewayInboundMixin:
+         if command:
+             try:
+                 from hermes_cli.plugins import get_plugin_command_handler
+-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
++                plugin_name = command.replace("_", "-")
++                plugin_handler = get_plugin_command_handler(plugin_name)
+                 if plugin_handler:
+-                    result = plugin_handler(event.get_command_args().strip())
+-                    if asyncio.iscoroutine(result):
++                    denied = self._check_slash_access(source, plugin_name)
++                    if denied is not None:
++                        return True, denied, command
++                    raw_args = event.get_command_args().strip()
++                    if getattr(plugin_handler, "_hermes_with_context", False) is True:
++                        context = getattr(event, "_hermes_trusted_command_context", None)
++                        result = plugin_handler(raw_args, context)
++                    else:
++                        result = plugin_handler(raw_args)
++                    if inspect.isawaitable(result):
+                         result = await result
+                     return True, str(result) if result else None, command
+             except Exception as e:
+-                logger.warning("Plugin command dispatch failed: %s", e)
++                logger.warning("Plugin command dispatch failed (%s)", type(e).__name__)
++                return True, "Plugin command failed; no agent turn was started.", command
+         return False, None, command
+ 
+     def _hm_bundle_slash_rewrite(
+@@ -1135,7 +1175,7 @@ class GatewayInboundMixin:
+             _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
+         if not _handled:
+             _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
+-        if not _handled:
++        if not _handled and not integration_only(self):
+             _result = self._hm_skill_slash_rewrite(event, source, _quick_key, command)
+             _handled = _result is not None
+         return _handled, _result
+@@ -1182,6 +1222,10 @@ class GatewayInboundMixin:
+             return None
+         event, source, is_internal = _admitted
+ 
++        if integration_only(self):
++            handled, result = await self._hm_dispatch_idle_commands(event, source, self._session_key_for_source(source))
++            return result if handled else "This gateway accepts native and plugin commands only."
++
+         _paused_notice = self._hm_estop_gate(event, source, is_internal)
+         if _paused_notice is not None:
+             return _paused_notice
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index b20d49e..72e8286 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -17,6 +17,7 @@ import time
+ from contextlib import suppress
+ from datetime import datetime
+ from gateway.config import Platform
++from gateway.managed_contracts import integration_only
+ from gateway.delivery import looks_like_telegram_private_chat_id
+ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+ from gateway.session import SessionSource, build_session_key
+@@ -93,7 +94,7 @@ class GatewayStartupMixin:
+         """Kick off the boot turn-machinery warm-up so it overlaps the network-bound platform
+         connects; ``_finish_startup_restore`` awaits it (bounded)."""
+         from gateway.run import _startup_warmup_timeout_secs
+-        if _startup_warmup_timeout_secs() <= 0:
++        if integration_only(self) or _startup_warmup_timeout_secs() <= 0:
+             self._startup_warmup_task = None
+             return
+         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
+@@ -369,6 +370,8 @@ class GatewayStartupMixin:
+         """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
+         claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
+         the next restart. Best-effort; reuses the startup redelivery contract."""
++        if integration_only(self):
++            return 0
+         try:
+             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
+             if not await asyncio.to_thread(ledger_enabled):
+@@ -441,6 +444,8 @@ class GatewayStartupMixin:
+         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
+         sessions with a running agent are skipped so none is resumed twice."""
+         from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
++        if integration_only(self):
++            return 0
+         window = _auto_continue_freshness_window()
+         candidates = self._resume_pending_candidates(platform)
+         if candidates is None:
+@@ -610,6 +615,8 @@ class GatewayStartupMixin:
+ 
+     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
+         """Pause room execution durably without interrupting accepted turns."""
++        if integration_only(self):
++            return True
+         from tui_gateway import methods_groups
+         return await asyncio.to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
+ 
+@@ -838,6 +845,8 @@ class GatewayStartupMixin:
+         from gateway.run import _hermes_home
+         self._start_register_plugins_relay_hooks()
+         self.hooks.discover_and_load()
++        if integration_only(self):
++            return
+         # Recover background processes from checkpoint (crash recovery)
+         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
+             from tools.process_registry import process_registry
+@@ -1127,6 +1136,11 @@ class GatewayStartupMixin:
+     async def _start_post_connect_services(self, connected_count: int) -> None:
+         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
+         from gateway.run import _hermes_home
++        if integration_only(self):
++            self._start_loop_heartbeat_task()
++            await self.hooks.emit("gateway:startup", {"platforms": [p.value for p in self.adapters]})
++            logger.info("Integration-only gateway running with %s platform(s)", connected_count)
++            return
+         try:
+             await self._ensure_hosted_room_worker()
+         except Exception:
+@@ -1160,6 +1174,9 @@ class GatewayStartupMixin:
+         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
+         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
+         await self._start_post_connect_services(connected_count)
++        if integration_only(self):
++            await self._finish_startup_restore()
++            return
+         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
+         if connected_count > 0:
+             await asyncio.sleep(1.0)
+@@ -1206,6 +1223,10 @@ class GatewayStartupMixin:
+ 
+     def _start_spawn_background_watchers(self) -> None:
+         """Spawn the long-lived supervised background watchers."""
++        if integration_only(self):
++            self._spawn_reconnect_watcher()
++            self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
++            return
+         for method in self._PRE_RECONNECT_WATCHERS:
+             self._spawn_supervised(getattr(self, method), method[1:])
+         if self._failed_platforms:
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 3b7ee87..6a40d95 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -3783,6 +3783,11 @@ class GatewayTurnMixin:
+         """Run the agent; returns the full run_conversation result dict.
+ 
+         Keys: "final_response", "messages", "api_calls", "completed"."""
++        from gateway.managed_contracts import integration_only
++        if integration_only(self):
++            return {"final_response": "Agent execution is disabled in integration-only mode.",
++                    "messages": [], "api_calls": 0, "completed": False,
++                    "error": "integration_only"}
+         if self._get_proxy_url():
+             return await self._run_agent_via_proxy(
+                 message=message, context_prompt=context_prompt, history=history, source=source,
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 1f98ab6..cfb4351 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1864,6 +1864,8 @@ DEFAULT_CONFIG = {
+         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
+     },
+     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
++        # Opt-in command host: auth/plugin dispatch + diagnostics, no models or automatic agents.
++        "integration_only": False,
+         # Named-profile allowlist for multiplex mode. None = serve all; [] = default only.
+         "multiplex_profile_allowlist": None,
+         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index e6c3956..f83ca68 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -652,10 +652,15 @@ class PluginContext:
+     def register_command(
+         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
+         argument_mode: str | None = None,
++        *, with_context: bool = False,
+     ) -> Optional[PluginRegistration]:
+         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
+         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
+-        field; without it the command registers parameterless there but still accepts trailing text."""
++        field; without it the command registers parameterless there but still accepts trailing text.
++        ``with_context=True`` opts into ``fn(raw_args, TrustedCommandContext)`` on the
++        authenticated gateway path. CLI and internal events cannot supply that context."""
++        if not isinstance(with_context, bool):
++            raise TypeError("with_context must be a boolean")
+         clean = name.lower().strip().lstrip("/").replace(" ", "-")
+         if not clean:
+             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
+@@ -670,6 +675,7 @@ class PluginContext:
+         entry = {
+             "handler": handler, "description": description or "Plugin command",
+             "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
++            "with_context": with_context,
+             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
+             else ("text" if hint else None),
+         }
+@@ -1972,7 +1978,17 @@ def get_plugin_context_engine():
+ def get_plugin_command_handler(name: str) -> Optional[Callable]:
+     """Return the handler for a plugin-registered slash command, or ``None``."""
+     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+-    return entry["handler"] if entry else None
++    if not entry or not entry.get("with_context", False):
++        return entry["handler"] if entry else None
++
++    def contextual_handler(raw_args, context=None):
++        from gateway.managed_contracts import TrustedCommandContext
++        if not isinstance(context, TrustedCommandContext):
++            raise RuntimeError("This command requires authenticated gateway context")
++        return entry["handler"](raw_args, context)
++
++    contextual_handler._hermes_with_context = True
++    return contextual_handler
+ 
+ 
+ _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index f97bfae..86441f5 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -1007,6 +1007,16 @@ class DiscordAdapter(BasePlatformAdapter):
+             return preview.text
+         return _format_discord_markdown_link(preview.text, preview.url)
+ 
++    STRICT_DELIVERY_CAPABLE = True
++
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id, content, *, thread_id=None, metadata=None):
++        from .strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.DISCORD)
+         self._client: Optional[commands.Bot] = None
+@@ -1364,6 +1374,12 @@ class DiscordAdapter(BasePlatformAdapter):
+         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+             return False, False
+         role_authorized = False
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner):
++            # Let the gateway's Desktop-nonce hook see native private messages.
++            # This is transport admission only; command authorization stays there.
++            return (isinstance(message.channel, discord.DMChannel)
++                    and not getattr(message.author, "bot", False)), False
+         if getattr(message.author, "bot", False):
+             allow_bots = self._get_allow_bots()
+             if allow_bots == "none":
+@@ -4743,6 +4759,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         channel_id = str(interaction.channel_id)
+         return MessageEvent(
+             text=text, message_type=msg_type, source=source, raw_message=interaction,
++            message_id_is_synthetic=True, allow_gateway_control=False,
+             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+         )
+ 
+@@ -5928,6 +5945,9 @@ class DiscordAdapter(BasePlatformAdapter):
+         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
+     ) -> bool:
+         """Handle one Discord message and report whether it reached dispatch."""
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner) and not isinstance(message.channel, discord.DMChannel):
++            return False
+         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
+         #
+         # Config (discord.* in config.yaml or DISCORD_* env vars):
+diff --git a/plugins/platforms/discord/strict_delivery.py b/plugins/platforms/discord/strict_delivery.py
+new file mode 100644
+index 0000000..04dbb82
+--- /dev/null
++++ b/plugins/platforms/discord/strict_delivery.py
+@@ -0,0 +1,40 @@
++"""One Discord REST delivery, bypassing discord.py's built-in HTTP retry loop."""
++
++import re
++
++from gateway.managed_contracts import strict_result
++from gateway.managed_http import StrictHTTPError, native_identifier, post_json, valid_text
++
++
++async def ready(adapter):
++    client = getattr(adapter, "_client", None)
++    return bool(adapter.is_connected and client and client.is_ready())
++
++
++async def send_strict(adapter, chat_id, content, *, thread_id=None):
++    if not isinstance(chat_id, str) or not re.fullmatch(r"[1-9][0-9]{0,24}", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if not valid_text(content, 2000):
++        return strict_result("not_sent", "invalid_text")
++    client = getattr(adapter, "_client", None)
++    token = getattr(getattr(client, "http", None), "token", None)
++    if not await ready(adapter) or not token:
++        return strict_result("not_sent", "live_adapter_unavailable")
++    try:
++        status, body = await post_json("discord", "message", {
++            "content": content, "allowed_mentions": {"parse": []}, "tts": False,
++        }, token=token, chat_id=chat_id, proxy=getattr(client.http, "proxy", None),
++           proxy_auth=getattr(client.http, "proxy_auth", None))
++    except StrictHTTPError as error:
++        return strict_result("unknown", str(error))
++    if 400 <= status < 500:
++        return strict_result("not_sent", "platform_rejected")
++    if not 200 <= status < 300:
++        return strict_result("unknown", "unconfirmed_response")
++    actual = {"chat_id": native_identifier(body.get("channel_id"), r"[1-9][0-9]{0,24}"), "thread_id": None}
++    message_id = native_identifier(body.get("id"), r"[1-9][0-9]{0,24}")
++    if actual["chat_id"] != chat_id or not message_id or body.get("message_reference"):
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual, message_id=message_id)
++    return strict_result("sent", target=actual, message_id=message_id)
+diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
+index 7614366..85460c0 100644
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -1202,6 +1202,16 @@ class FeishuAdapter(BasePlatformAdapter):
+     _SPLIT_THRESHOLD = 4000  # chunk near Feishu's ~4096-char client split → continuation almost certain
+ 
+     # --- Lifecycle — init / settings / connect / disconnect ---
++    STRICT_DELIVERY_CAPABLE = True
++
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id, content, *, thread_id=None, metadata=None):
++        from .strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.FEISHU)
+         self._settings = self._load_settings(config.extra or {})
+@@ -1985,6 +1995,9 @@ class FeishuAdapter(BasePlatformAdapter):
+         if not message or not sender or not getattr(sender, "sender_id", None):
+             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
+             return
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner) and getattr(message, "chat_type", None) != "p2p":
++            return
+         message_id = getattr(message, "message_id", None)
+         if not message_id or await self._is_duplicate(message_id):
+             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
+@@ -2366,8 +2379,8 @@ class FeishuAdapter(BasePlatformAdapter):
+         )
+         synthetic_event = MessageEvent(
+             text=text, message_type=message_type, source=source, raw_message=raw_message,
+-            message_id=message_id, channel_prompt=self._resolve_channel_prompt(chat_id),
+-            timestamp=datetime.now(),
++            message_id=message_id, message_id_is_synthetic=True, allow_gateway_control=False,
++            channel_prompt=self._resolve_channel_prompt(chat_id), timestamp=datetime.now(),
+         )
+         await self._handle_message_with_guards(synthetic_event)
+ 
+diff --git a/plugins/platforms/feishu/strict_delivery.py b/plugins/platforms/feishu/strict_delivery.py
+new file mode 100644
+index 0000000..b21e37d
+--- /dev/null
++++ b/plugins/platforms/feishu/strict_delivery.py
+@@ -0,0 +1,77 @@
++"""One text create request to the explicit native Feishu/Lark chat ID."""
++
++import asyncio
++import json
++import re
++import time
++
++from gateway.managed_contracts import strict_result
++from gateway.managed_http import StrictHTTPError, identifier, native_identifier, post_json, valid_text
++
++
++async def ready(adapter):
++    connection = getattr(getattr(adapter, "_ws_client", None), "_conn", None)
++    state = getattr(getattr(connection, "state", None), "name", None)
++    return bool(adapter.is_connected and getattr(adapter, "_client", None)
++                and getattr(adapter, "_connection_mode", None) == "websocket"
++                and connection is not None and state == "OPEN")
++
++
++async def tenant_token(adapter, domain):
++    # The token belongs to this live adapter, never an ambient profile. Token
++    # acquisition is separate from delivery: failure here sends no message.
++    lock = getattr(adapter, "_ccem_token_lock", None)
++    if lock is None:
++        lock = adapter._ccem_token_lock = asyncio.Lock()
++    async with lock:
++        identity = (domain, adapter._app_id, adapter._app_secret)
++        cached = getattr(adapter, "_ccem_tenant_token", None)
++        if cached and cached[1] > time.monotonic() and cached[2] == identity:
++            return cached[0]
++        status, body = await post_json(domain, "token", {
++            "app_id": adapter._app_id, "app_secret": adapter._app_secret,
++        })
++        token, expires = identifier(body.get("tenant_access_token")), body.get("expire")
++        if (status != 200 or type(body.get("code")) is not int or body["code"] != 0
++                or not token or type(expires) is not int or expires <= 60):
++            raise StrictHTTPError("authentication_unavailable")
++        adapter._ccem_tenant_token = (token, time.monotonic() + min(expires - 60, 7200), identity)
++        return token
++
++
++async def send_strict(adapter, chat_id, content, *, thread_id=None):
++    if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9]+", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if not valid_text(content, 4000):
++        return strict_result("not_sent", "invalid_text")
++    domain = getattr(adapter, "_domain_name", None)
++    if domain not in {"feishu", "lark"}:
++        return strict_result("not_sent", "invalid_domain")
++    if not await ready(adapter):
++        return strict_result("not_sent", "live_adapter_unavailable")
++    try:
++        token = await tenant_token(adapter, domain)
++    except StrictHTTPError:
++        return strict_result("not_sent", "authentication_unavailable")
++    try:
++        status, body = await post_json(domain, "message", {
++            "receive_id": chat_id, "msg_type": "text",
++            "content": json.dumps({"text": content}, ensure_ascii=False),
++        }, token=token)
++    except StrictHTTPError as error:
++        return strict_result("unknown", str(error))
++    if 400 <= status < 500 or (status == 200 and type(body.get("code")) is int and body["code"] != 0):
++        return strict_result("not_sent", "platform_rejected")
++    if status != 200 or type(body.get("code")) is not int or body["code"] != 0:
++        return strict_result("unknown", "unconfirmed_response")
++    data = body.get("data")
++    data = data if isinstance(data, dict) else {}
++    actual = {"chat_id": native_identifier(data.get("chat_id"), r"oc_[A-Za-z0-9]+"),
++              "thread_id": native_identifier(data.get("thread_id"), r"omt_[A-Za-z0-9]+")}
++    message_id = native_identifier(data.get("message_id"), r"om_[A-Za-z0-9]+")
++    if (actual != {"chat_id": chat_id, "thread_id": None} or not message_id
++            or data.get("thread_id") not in (None, "")):
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual, message_id=message_id)
++    return strict_result("sent", target=actual, message_id=message_id)
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 0bc4b94..71a96a1 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -883,6 +883,16 @@ class SlackAdapter(BasePlatformAdapter):
+     _socket_ping_stale_factor = 4
+     _socket_first_ping_grace_s = 60.0
+ 
++    STRICT_DELIVERY_CAPABLE = True
++
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id, content, *, thread_id=None, metadata=None):
++        from .strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.SLACK)
+         self._app: Optional[Any] = None
+@@ -1625,7 +1635,15 @@ class SlackAdapter(BasePlatformAdapter):
+         proxy_url = _resolve_slack_proxy_url()
+         if proxy_url:
+             logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
+-        bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner):
++            from .strict_delivery import single_bot_token
++            if not single_bot_token(raw_token):
++                self._set_fatal_error("managed_single_account_required", "One Slack bot token is required", retryable=False)
++                return False
++            bot_tokens = [raw_token]
++        else:
++            bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
+         lock_acquired = False
+         try:
+             if not self._acquire_platform_lock("slack-app-token", app_token, "Slack app token"):
+@@ -3962,6 +3980,11 @@ class SlackAdapter(BasePlatformAdapter):
+         the synthetic reaction ts. Channels: real reply → per-thread; top-level with
+         ``reply_in_thread`` → ts as synthetic root; else None (``thread_ts == ts`` is no reply)."""
+         if is_dm:
++            from gateway.managed_contracts import integration_only
++            if integration_only(self.gateway_runner):
++                # A top-level DM stays top-level. Real threaded input retains its
++                # native thread and is rejected by managed DM pairing/strict send.
++                return event.get("thread_ts") or None
+             thread_ts = event.get("thread_ts") or assistant_meta.get("thread_ts")
+             if not thread_ts and self._dm_top_level_threads_as_sessions():
+                 thread_ts = ts
+@@ -4249,6 +4272,13 @@ class SlackAdapter(BasePlatformAdapter):
+             self._remember_channel_team(channel_id, team_id)
+         channel_type = event.get("channel_type", "") or ("im" if channel_id.startswith("D") else "")
+         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
++        from gateway.managed_contracts import integration_only
++        if integration_only(self.gateway_runner) and (
++            channel_type != "im" or event.get("type") != "message"
++            or event.get("_hermes_force_process") or len(self._team_clients) != 1
++            or team_id not in self._team_clients
++        ):
++            return
+         if is_dm and self._slack_disable_dms():
+             logger.info(
+                 "[Slack] Ignoring DM because Slack DMs are disabled: channel=%s user=%s",
+@@ -4259,7 +4289,9 @@ class SlackAdapter(BasePlatformAdapter):
+         is_one_to_one_dm = channel_type == "im"
+         # Reject unauthorized users before the expensive lookups/downloads;
+         # the runner's own auth check only runs after MessageEvent is built.
+-        if self._early_reject_unauthorized(user_id, channel_id, is_dm):
++        # Managed DM pairing runs in the gateway pre-dispatch hook. Keep its
++        # nonce challenge reachable; the gateway still authorizes every command.
++        if not integration_only(self.gateway_runner) and self._early_reject_unauthorized(user_id, channel_id, is_dm):
+             return
+         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
+         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+@@ -4344,7 +4376,7 @@ class SlackAdapter(BasePlatformAdapter):
+         source = self.build_source(
+             chat_id=channel_id,
+             chat_name=channel_name,
+-            chat_type="dm" if is_dm else "group",
++            chat_type="dm" if is_dm and event.get("channel_type") != "mpim" else "group",
+             user_id=user_id,
+             user_name=user_name,
+             thread_id=thread_ts,
+@@ -5656,7 +5688,8 @@ class SlackAdapter(BasePlatformAdapter):
+         event = MessageEvent(
+             text=text,
+             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
+-            source=source, raw_message=command)
++            source=source, raw_message=command,
++            message_id_is_synthetic=True, allow_gateway_control=False)
+         # Stash response_url so the first reply for this channel+user goes ephemeral. COMMAND
+         # events only: free-form "/hermes <question>" replies must stay public.
+         response_url = command.get("response_url", "")
+diff --git a/plugins/platforms/slack/strict_delivery.py b/plugins/platforms/slack/strict_delivery.py
+new file mode 100644
+index 0000000..0b1d33b
+--- /dev/null
++++ b/plugins/platforms/slack/strict_delivery.py
+@@ -0,0 +1,52 @@
++"""One authenticated workspace, one exact DM, one chat.postMessage attempt."""
++
++import re
++
++from gateway.managed_contracts import strict_result
++from gateway.managed_http import StrictHTTPError, native_identifier, post_json, valid_text
++
++
++def single_bot_token(value):
++    # Managed accounts never load upstream's saved multi-workspace token file.
++    return isinstance(value, str) and re.fullmatch(r"xoxb-[A-Za-z0-9-]+", value) is not None
++
++
++async def ready(adapter):
++    return (adapter.is_connected and len(getattr(adapter, "_team_clients", {})) == 1
++            and await adapter._socket_transport_connected() is True)
++
++
++async def send_strict(adapter, chat_id, content, *, thread_id=None):
++    if not isinstance(chat_id, str) or not re.fullmatch(r"D[A-Z0-9]+", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if not valid_text(content, 4000):
++        return strict_result("not_sent", "invalid_text")
++    clients = getattr(adapter, "_team_clients", {})
++    if not await ready(adapter):
++        return strict_result("not_sent", "live_adapter_unavailable")
++    client = next(iter(clients.values()))
++    token = getattr(client, "token", None)
++    if not single_bot_token(token):
++        return strict_result("not_sent", "invalid_authentication")
++    try:
++        status, body = await post_json("slack", "message", {
++            "channel": chat_id, "text": content, "mrkdwn": False, "parse": "none",
++            "unfurl_links": False, "unfurl_media": False, "reply_broadcast": False,
++        }, token=token, proxy=getattr(adapter, "_proxy_url", None))
++    except StrictHTTPError as error:
++        return strict_result("unknown", str(error))
++    if 400 <= status < 500 or (status == 200 and body.get("ok") is False):
++        return strict_result("not_sent", "platform_rejected")
++    if status != 200 or body.get("ok") is not True:
++        return strict_result("unknown", "unconfirmed_response")
++    message = body.get("message")
++    message = message if isinstance(message, dict) else {}
++    actual = {"chat_id": native_identifier(body.get("channel"), r"D[A-Z0-9]+"),
++              "thread_id": native_identifier(message.get("thread_ts"), r"[0-9]{10,16}\.[0-9]{6}")}
++    message_id = native_identifier(body.get("ts"), r"[0-9]{10,16}\.[0-9]{6}")
++    if (actual != {"chat_id": chat_id, "thread_id": None} or not message_id
++            or message.get("ts") != message_id or message.get("thread_ts") not in (None, "")):
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual, message_id=message_id)
++    return strict_result("sent", target=actual, message_id=message_id)
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index 73afb13..7542326 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -369,6 +369,7 @@ class TelegramAdapter(BasePlatformAdapter):
+     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
+ 
+     MAX_MESSAGE_LENGTH = 4096
++    STRICT_DELIVERY_CAPABLE = True
+     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
+     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
+@@ -3315,6 +3316,10 @@ class TelegramAdapter(BasePlatformAdapter):
+     async def send(
+         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send a message to a Telegram chat."""
++        if (metadata or {}).get("strict_target") is True:
++            if self._metadata_direct_messages_topic_id(metadata) is not None:
++                return SendResult(success=False, error="direct_messages_topic_unsupported", delivery_status="not_sent")
++            return await self.send_strict(chat_id, content, thread_id=self._metadata_thread_id(metadata))
+         if not self._bot:
+             live = self._replacement_telegram_adapter()
+             if live is not None:
+@@ -3383,6 +3388,14 @@ class TelegramAdapter(BasePlatformAdapter):
+                 retryable=(self._looks_like_connect_timeout(e) or self._looks_like_pool_timeout(e) or not is_timeout),
+                 error_kind=error_kind)
+ 
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
++        from plugins.platforms.telegram.strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     async def send_or_update_status(
+         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
+diff --git a/plugins/platforms/telegram/strict_delivery.py b/plugins/platforms/telegram/strict_delivery.py
+new file mode 100644
+index 0000000..76d9233
+--- /dev/null
++++ b/plugins/platforms/telegram/strict_delivery.py
+@@ -0,0 +1,55 @@
++"""Single plain-text Bot API request, preserving the explicit Telegram target."""
++
++from __future__ import annotations
++
++import asyncio
++import re
++
++from gateway.managed_contracts import strict_result
++
++
++async def ready(adapter):
++    return bool(adapter.is_connected and adapter._bot
++                and not getattr(adapter, "_send_path_degraded", False))
++
++
++async def send_strict(adapter, chat_id: str, content: str, *, thread_id=None):
++    # Usernames resolve to another ID; strict callers bind the numeric identity
++    # seen on ingress instead of asking Telegram to choose an account at send time.
++    if not isinstance(chat_id, str) or not re.fullmatch(r"-?[1-9][0-9]*", chat_id):
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None and (not isinstance(thread_id, str) or not re.fullmatch(r"[1-9][0-9]*", thread_id)):
++        return strict_result("not_sent", "invalid_thread_id")
++    if not isinstance(content, str) or not content.strip():
++        return strict_result("not_sent", "invalid_text")
++    try:
++        utf16_length = len(content.encode("utf-16-le")) // 2
++    except UnicodeError:
++        return strict_result("not_sent", "invalid_text")
++    if utf16_length > adapter.MAX_MESSAGE_LENGTH:
++        return strict_result("not_sent", "text_too_long")
++    if not await ready(adapter):
++        return strict_result("not_sent", "live_adapter_unavailable")
++    kwargs = {"chat_id": int(chat_id), "text": content, "parse_mode": None}
++    if thread_id is not None and thread_id != adapter._GENERAL_TOPIC_THREAD_ID:
++        kwargs["message_thread_id"] = int(thread_id)
++    try:
++        message = await adapter._bot.send_message(**kwargs)
++    except asyncio.CancelledError:
++        raise
++    except Exception as exc:
++        # Positive server rejection proves no message was accepted. Network errors
++        # and ACK timeouts are ambiguous; no reconnect, retry or thread downgrade.
++        from telegram.error import BadRequest, Forbidden, RetryAfter
++        if isinstance(exc, (BadRequest, Forbidden, RetryAfter)):
++            return strict_result("not_sent", "platform_rejected")
++        return strict_result("unknown", "transport_exception")
++    actual_chat = getattr(getattr(message, "chat", None), "id", None)
++    actual_thread = adapter._effective_message_thread_id(message)
++    actual = {"chat_id": str(actual_chat) if actual_chat is not None else None,
++              "thread_id": actual_thread}
++    message_id = getattr(message, "message_id", None)
++    if actual != {"chat_id": chat_id, "thread_id": thread_id} or not message_id:
++        return strict_result("unknown", "target_or_receipt_mismatch", target=actual,
++                             message_id=str(message_id) if message_id else None)
++    return strict_result("sent", target=actual, message_id=str(message_id))
+diff --git a/plugins/platforms/wecom/adapter.py b/plugins/platforms/wecom/adapter.py
+index 383d42a..e417345 100644
+--- a/plugins/platforms/wecom/adapter.py
++++ b/plugins/platforms/wecom/adapter.py
+@@ -112,6 +112,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
+     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
+ 
+     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
++    STRICT_DELIVERY_CAPABLE = True
+     SUPPORTS_MESSAGE_EDITING = False
+     SUPPORTS_NATIVE_STREAMING = True  # msgtype "stream" via aibot_respond_msg, not edit-based
+     MAX_STREAM_CONTENT_LENGTH = MAX_STREAM_CONTENT_LENGTH
+@@ -432,7 +433,9 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
+         if not isinstance(body, dict):
+             return
+         req_id = self._payload_req_id(payload)
+-        msg_id = str(body.get("msgid") or req_id or uuid.uuid4().hex)
++        native_msg_id = body.get("msgid")
++        native_msg_id = native_msg_id if isinstance(native_msg_id, str) and native_msg_id.strip() else None
++        msg_id = native_msg_id or req_id or uuid.uuid4().hex
+         sender = _dict_or_empty(body, "from")
+         sender_id = str(sender.get("userid") or "").strip()
+         if self._dedup.is_duplicate(msg_id):
+@@ -464,6 +467,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
+         source = self.build_source(chat_id=chat_id, chat_type="group" if is_group else "dm", user_id=sender_id or None, user_name=sender_id or None)
+         event = MessageEvent(
+             text=text, message_type=message_type, source=source, raw_message=payload, message_id=msg_id, media_urls=media_urls, media_types=media_types,
++            message_id_is_synthetic=native_msg_id is None,
+             reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None, reply_to_text=reply_text if has_reply_context else None, timestamp=datetime.now(tz=timezone.utc),
+         )
+         # Only plain text is batched, EXCEPT attachment-only messages, which are held so the
+@@ -631,6 +635,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
+     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         """Send standalone markdown (never touches active streams); serialized per chat for the 30 msgs/min
+         limit (846607). ``metadata["is_approval_prompt"]`` uses the control lane."""
++        if (metadata or {}).get("strict_target") is True:
++            return await self.send_strict(chat_id, content, thread_id=metadata.get("thread_id"))
+         if not chat_id:
+             return SendResult(success=False, error="chat_id is required")
+         metadata = metadata or {}  # pops mutate the caller's dict on purpose (consumed flags)
+@@ -639,6 +645,14 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, BasePl
+         force_proactive = bool(metadata.pop("force_proactive_send", False))
+         return await self._enqueue_chat_send(chat_id, lambda: self._send_inner(chat_id, content, reply_to, force_proactive=force_proactive), is_control=is_control)
+ 
++    async def strict_delivery_ready(self):
++        from .strict_delivery import ready
++        return await ready(self)
++
++    async def send_strict(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
++        from plugins.platforms.wecom.strict_delivery import send_strict
++        return await send_strict(self, chat_id, content, thread_id=thread_id)
++
+     async def _send_inner(self, chat_id: str, content: str, reply_to: Optional[str] = None, *, force_proactive: bool = False) -> SendResult:
+         """Send under the per-chat queue; force_proactive skips passive reply except in groups."""
+         try:
+diff --git a/plugins/platforms/wecom/strict_delivery.py b/plugins/platforms/wecom/strict_delivery.py
+new file mode 100644
+index 0000000..b5df058
+--- /dev/null
++++ b/plugins/platforms/wecom/strict_delivery.py
+@@ -0,0 +1,87 @@
++"""One uniquely correlated WeCom DM request on the existing socket; no retries."""
++
++from __future__ import annotations
++
++import asyncio
++
++from gateway.managed_contracts import strict_result
++
++
++async def ready(adapter):
++    return bool(adapter.is_connected and adapter._ws and not adapter._ws.closed)
++
++
++async def send_strict(adapter, chat_id: str, content: str, *, thread_id=None):
++    if not isinstance(chat_id, str) or not chat_id or chat_id != chat_id.strip():
++        return strict_result("not_sent", "invalid_chat_id")
++    if thread_id is not None:
++        return strict_result("not_sent", "thread_unsupported")
++    if chat_id in adapter._group_chat_ids:
++        return strict_result("not_sent", "strict_group_unsupported")
++    if not isinstance(content, str) or not content.strip():
++        return strict_result("not_sent", "invalid_text")
++    try:
++        byte_length = len(content.encode("utf-8"))
++    except UnicodeError:
++        return strict_result("not_sent", "invalid_text")
++    # The legacy helper truncates by characters. A strict request is one complete
++    # payload, conservatively bounded by UTF-8 bytes before that helper is used.
++    if byte_length > adapter.MAX_MESSAGE_LENGTH:
++        return strict_result("not_sent", "text_too_long")
++    if not await ready(adapter):
++        return strict_result("not_sent", "live_adapter_unavailable")
++
++    cancelled = False
++
++    async def attempt():
++        if cancelled:
++            return strict_result("not_sent", "cancelled_before_send")
++        return await _attempt(adapter, chat_id, content)
++
++    try:
++        return await adapter._enqueue_chat_send(chat_id, attempt)
++    except asyncio.CancelledError:
++        # A queued request must not start after its caller gives up. If already
++        # sending, the queue owns that one attempt and the caller records unknown.
++        cancelled = True
++        raise
++
++
++async def _attempt(adapter, chat_id, content):
++    from plugins.platforms.wecom.adapter import APP_CMD_SEND, REQUEST_TIMEOUT_SECONDS
++
++    # Passive replies reuse inbound req_id (also used by stream/control replies).
++    # A late ACK could confirm a different send. Strict DM delivery selects the
++    # proactive path BEFORE attempting any send and mints one correlation ID.
++    # Groups require passive replies and do not yet have this strict capability.
++    if chat_id in adapter._group_chat_ids:
++        return strict_result("not_sent", "strict_group_unsupported")
++    req_id = adapter._new_req_id(APP_CMD_SEND)
++    body = {"chatid": chat_id, **adapter._markdown_body(content)}
++    try:
++        response = await adapter._request(APP_CMD_SEND, req_id, body, REQUEST_TIMEOUT_SECONDS)
++    except asyncio.CancelledError:
++        raise
++    except asyncio.TimeoutError:
++        return strict_result("unknown", "ack_timeout")
++    except Exception:
++        return strict_result("unknown", "transport_exception")
++    # Missing errcode is not an ACK. A req_id is a request receipt, not a
++    # fabricated message identifier; only an explicitly returned msgid is one.
++    if not isinstance(response, dict) or adapter._payload_req_id(response) != req_id:
++        return strict_result("unknown", "invalid_ack")
++    code = response.get("errcode")
++    if isinstance(code, bool) or not isinstance(code, int):
++        return strict_result("unknown", "invalid_ack")
++    if code != 0:
++        return strict_result("not_sent", "platform_rejected", receipt_id=req_id)
++    response_body = response.get("body")
++    response_body = response_body if isinstance(response_body, dict) else {}
++    actual_chat = response_body.get("chatid", chat_id)
++    if actual_chat != chat_id:
++        return strict_result("unknown", "target_mismatch", receipt_id=req_id)
++    message_id = response_body.get("msgid")
++    return strict_result(
++        "sent", target={"chat_id": chat_id, "thread_id": None},
++        message_id=str(message_id) if message_id else None, receipt_id=req_id,
++    )
+diff --git a/tests/gateway/test_managed_contracts.py b/tests/gateway/test_managed_contracts.py
+new file mode 100644
+index 0000000..544a9e3
+--- /dev/null
++++ b/tests/gateway/test_managed_contracts.py
+@@ -0,0 +1,465 @@
++"""Real plugin dispatch and adapter functions; only transport boundaries are synthetic."""
++
++import asyncio
++import dataclasses
++import inspect
++import json
++import socket
++import weakref
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.managed_contracts import StrictTarget, TrustedCommandContext, send_strict, strict_result, native_source_message_id
++from gateway.platforms.base import MessageEvent
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++
++@pytest.fixture(autouse=True)
++def no_external_io(monkeypatch, tmp_path):
++    def denied(*args, **kwargs):
++        raise AssertionError("This contract test must not access a network")
++
++    monkeypatch.setattr(socket.socket, "connect", denied)
++    monkeypatch.setattr(socket.socket, "connect_ex", denied)
++    monkeypatch.setattr(socket.socket, "sendto", denied)
++    monkeypatch.setattr(socket, "getaddrinfo", denied)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++
++
++@pytest.fixture
++def command_host(monkeypatch, tmp_path):
++    # Real on-disk plugin discovery and registration; no test-owned command dispatcher.
++    home = tmp_path / "profile"
++    plugin = home / "plugins" / "contract-test"
++    plugin.mkdir(parents=True)
++    (plugin / "plugin.yaml").write_text("name: contract-test\nversion: 0.1.0\n")
++    (plugin / "__init__.py").write_text(
++        "import json\nfrom dataclasses import asdict\n"
++        "def contextual(raw_args, context):\n"
++        "    if raw_args == 'explode': raise ValueError('synthetic failure')\n"
++        "    if raw_args == 'silent-none': return None\n"
++        "    if raw_args == 'silent-empty': return ''\n"
++        "    return json.dumps({'args': raw_args, 'context': asdict(context)})\n"
++        "def register(ctx):\n"
++        "    ctx.register_command('contract-test', contextual, with_context=True)\n"
++        "    ctx.register_command('legacy-test', lambda raw_args: 'legacy:' + raw_args)\n"
++    )
++    (home / "config.yaml").write_text("plugins:\n  enabled: [contract-test]\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "alice,bob")
++    import hermes_cli.plugins as plugins
++    plugins.discover_plugins(force=True)
++    assert plugins.get_plugin_command_handler("contract-test") is not None
++
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(
++        integration_only=True, unauthorized_dm_behavior="ignore",
++        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
++    )
++    runner._primary_profile_name = "managed"
++    runner._profile_adapters = {}
++    runner.adapters = {}
++    runner._draining = False
++    runner._running_agents = {}
++    runner.hooks = SimpleNamespace(emit=AsyncMock(), emit_collect=AsyncMock(return_value=[]))
++    runner._run_agent = AsyncMock(side_effect=AssertionError("agent must not start"))
++    return runner
++
++
++def event(user="alice", chat="10", text="/contract-test hello", *, internal=False, message_id="m1"):
++    return MessageEvent(
++        text=text, internal=internal, message_id=message_id,
++        source=SessionSource(platform=Platform.TELEGRAM, user_id=user, chat_id=chat,
++                             chat_type="dm", thread_id="7"),
++    )
++
++
++@pytest.mark.asyncio
++async def test_dispatch_uses_frozen_ingress_identity_and_real_authorization(command_host, monkeypatch):
++    runner = command_host
++    real_hook = runner._hm_pre_gateway_dispatch_hook
++
++    def mutating_hook(inbound, source):
++        inbound.source.user_id = "alice"
++        inbound.source.chat_id = "forged-chat"
++        inbound.source.profile = "forged-profile"
++        inbound.message_id = "forged-id"
++        inbound.internal = True
++        return real_hook(inbound, source)
++
++    monkeypatch.setattr(runner, "_hm_pre_gateway_dispatch_hook", mutating_hook)
++    # Unknown users remain unknown even when the pre hook changes them to an allowlisted user.
++    assert await runner._handle_message(event("mallory")) is None
++    for user, chat, message_id in (("alice", "10", "m-a"), ("bob", "20", "m-b")):
++        inbound = event(user, chat, " /contract-test user_id=admin chat_id=other", message_id=message_id)
++        result = json.loads(await runner._handle_message(inbound))
++        context = result["context"]
++        assert (context["user_id"], context["chat_id"], context["source_message_id"]) == (user, chat, message_id)
++        assert context["profile"] == context["transport_profile"] == "managed"
++        assert context["thread_id"] == "7"
++        with pytest.raises(dataclasses.FrozenInstanceError):
++            inbound._hermes_trusted_command_context.user_id = "other"
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_context_absence_errors_and_command_policy_are_handled(command_host):
++    runner = command_host
++    missing = json.loads(await runner._handle_message(event(message_id=None)))
++    assert missing["context"]["source_message_id"] is None
++    assert await runner._handle_message(event(internal=True)) is None
++    assert await runner._handle_message(event(text="/legacy-test old callback")) == "legacy:old callback"
++    for silent in ("silent-none", "silent-empty"):
++        inbound = event(text="/contract-test " + silent)
++        admitted = await runner._hm_admit_event(inbound)
++        assert admitted is not None
++        handled, response, _ = await runner._hm_dispatch_quick_and_plugin_commands(inbound, inbound.source, "contract-test")
++        assert handled is True and response is None
++        assert await runner._handle_message(event(text="/contract-test " + silent)) is None
++    assert "Plugin command failed" in await runner._handle_message(event(text="/contract-test explode"))
++    import hermes_cli.plugins as plugins
++    with pytest.raises(RuntimeError, match="authenticated gateway context"):
++        plugins.get_plugin_command_handler("contract-test")("cli-args")
++    runner.config.platforms[Platform.TELEGRAM].extra["allow_admin_from"] = ["alice"]
++    denied = await runner._handle_message(event("bob"))
++    assert denied == runner._check_slash_access(event("bob").source, "contract-test")
++    runner.config.platforms[Platform.TELEGRAM].extra["user_allowed_commands"] = ["contract-test"]
++    allowed = json.loads(await runner._handle_message(event("bob", text="/contract_test allowed alias")))
++    assert allowed["context"]["user_id"] == "bob"
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_internal_context_rejected_even_outside_integration_mode(command_host):
++    runner = command_host
++    runner.config.integration_only = False
++    inbound = event(internal=True)
++    inbound._hermes_trusted_command_context = TrustedCommandContext("telegram", "forged", "forged", "alice", "10", None, "m", "dm")
++    admitted = await runner._hm_admit_event(inbound)
++    assert admitted is not None
++    handled, result, _ = await runner._hm_dispatch_quick_and_plugin_commands(inbound, inbound.source, "contract-test")
++    assert handled and "Plugin command failed" in result
++    assert inbound._hermes_trusted_command_context is None
++
++
++@pytest.mark.asyncio
++async def test_integration_only_keeps_native_diagnostics_but_no_model_or_exec(command_host):
++    runner = command_host
++    runner.config.quick_commands = {"shell-test": {"type": "exec", "command": "must-not-run"}}
++    runner._hm_run_exec_quick_command = AsyncMock(side_effect=AssertionError("no exec"))
++    for text in ("ordinary chat", "/compress", "/cron add test", "/plan test", "/shell-test"):
++        response = await runner._handle_message(event(text=text))
++        assert "disabled" in response or "commands only" in response
++    assert "admin" in (await runner._handle_message(event(text="/whoami"))).lower()
++    assert await runner._handle_message(event(text="/start")) == ""
++    runner._hm_run_exec_quick_command.assert_not_awaited()
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_profile_transport_provenance_survives_snapshot(command_host):
++    runner = command_host
++    from plugins.platforms.telegram.adapter import TelegramAdapter
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="synthetic"))
++    runner.adapters = {Platform.TELEGRAM: adapter}
++    inbound = event()
++    inbound.source.profile = "routed-runtime"
++    inbound.source._transport_adapter_ref = weakref.ref(adapter)
++    result = json.loads(await runner._handle_message(inbound))
++    assert result["context"]["profile"] == "routed-runtime"
++    assert result["context"]["transport_profile"] == "managed"
++
++
++def strict_runner(adapter, platform=Platform.TELEGRAM):
++    return SimpleNamespace(_primary_profile_name="managed", adapters={platform: adapter}, _profile_adapters={})
++
++
++def telegram_adapter():
++    from plugins.platforms.telegram.adapter import TelegramAdapter
++    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="synthetic"))
++    adapter._running = True
++    adapter._send_path_degraded = False
++    adapter._bot = SimpleNamespace(send_message=AsyncMock())
++    return adapter
++
++
++@pytest.mark.asyncio
++async def test_telegram_target_rejection_timeout_and_ack_are_single_attempts():
++    from telegram.error import BadRequest, TimedOut
++    adapter = telegram_adapter()
++    runner = strict_runner(adapter)
++    target = StrictTarget("managed", "telegram", "-100", "7")
++    for error, expected in ((BadRequest("Message thread not found"), "not_sent"), (TimedOut("ACK lost"), "unknown")):
++        adapter._bot.send_message.reset_mock(side_effect=True)
++        adapter._bot.send_message.side_effect = error
++        result = await send_strict(runner, target, "whole text")
++        assert result["status"] == expected
++        adapter._bot.send_message.assert_awaited_once_with(chat_id=-100, text="whole text", parse_mode=None, message_thread_id=7)
++    adapter._bot.send_message.reset_mock(side_effect=True)
++    adapter._bot.send_message.return_value = SimpleNamespace(
++        message_id=42, message_thread_id=7, is_topic_message=True,
++        chat=SimpleNamespace(id=-100, type="supergroup", is_forum=True),
++    )
++    result = await send_strict(runner, target, "whole text")
++    assert result["status"] == "sent" and result["message_id"] == "42"
++    assert result["target"] == dataclasses.asdict(target)
++    adapter._bot.send_message.return_value.message_thread_id = 8
++    assert (await send_strict(runner, target, "whole text"))["status"] == "unknown"
++
++
++@pytest.mark.asyncio
++async def test_wecom_ack_loss_never_falls_back_and_req_id_is_not_a_message_id():
++    from plugins.platforms.wecom.adapter import WeComAdapter, APP_CMD_SEND
++    adapter = WeComAdapter(PlatformConfig(enabled=True))
++    adapter._running = True
++    adapter._ws = SimpleNamespace(closed=False, send_json=AsyncMock())
++    adapter._last_chat_req_ids["chat-a"] = "inbound-req-a"
++    runner = strict_runner(adapter, Platform.WECOM)
++    target = StrictTarget("managed", "wecom", "chat-a")
++    frames = []
++
++    async def lose_ack(payload):
++        frames.append(payload)
++        adapter._pending_responses[payload["headers"]["req_id"]].set_exception(asyncio.TimeoutError())
++
++    adapter._ws.send_json.side_effect = lose_ack
++    try:
++        result = await send_strict(runner, target, "whole text")
++        assert result["status"] == "unknown"
++        assert len(frames) == 1 and frames[0]["cmd"] == APP_CMD_SEND
++        assert frames[0]["headers"]["req_id"] != "inbound-req-a"
++
++        async def acknowledge(payload):
++            frames.append(payload)
++            adapter._pending_responses[payload["headers"]["req_id"]].set_result({
++                "headers": {"req_id": payload["headers"]["req_id"]}, "errcode": 0,
++            })
++
++        adapter._ws.send_json.side_effect = acknowledge
++        result = await send_strict(runner, target, "whole text")
++        assert result["status"] == "sent" and result["message_id"] is None
++        assert result["receipt_id"] == frames[1]["headers"]["req_id"]
++        assert result["receipt_id"] != frames[0]["headers"]["req_id"]
++        assert result["target"] == dataclasses.asdict(target)
++        assert len(frames) == 2
++        adapter._group_chat_ids.add("chat-a")
++        assert (await send_strict(runner, target, "whole text"))["status"] == "not_sent"
++        assert len(frames) == 2
++    finally:
++        for task in adapter._chat_workers.values():
++            task.cancel()
++        await asyncio.gather(*adapter._chat_workers.values(), return_exceptions=True)
++
++
++@pytest.mark.asyncio
++async def test_wecom_adapter_does_not_auto_reply_after_context_handler_sends(command_host, monkeypatch):
++    from hermes_cli.plugins import PluginContext, get_plugin_manager
++    from hermes_cli.plugins_manifest import PluginManifest
++    from plugins.platforms.wecom.adapter import WeComAdapter, APP_CMD_SEND
++    monkeypatch.setenv("WECOM_ALLOWED_USERS", "alice")
++    runner = command_host
++    adapter = WeComAdapter(PlatformConfig(enabled=True))
++    adapter._running = True
++    frames = []
++
++    async def ack(payload):
++        frames.append(payload)
++        adapter._pending_responses[payload["headers"]["req_id"]].set_result({
++            "headers": payload["headers"], "errcode": 0,
++        })
++
++    adapter._ws = SimpleNamespace(closed=False, send_json=ack)
++    runner.adapters = {Platform.WECOM: adapter}
++    runner.config.platforms = {Platform.WECOM: adapter.config}
++    adapter.set_message_handler(runner._handle_message)
++    receipts = []
++
++    async def command(raw_args, context):
++        receipts.append(await send_strict(runner, StrictTarget(
++            context.transport_profile, context.platform, context.chat_id, context.thread_id,
++        ), "explicit response"))
++        return None if raw_args == "none" else ""
++
++    PluginContext(PluginManifest(name="contract-test", source="user"), get_plugin_manager()).register_command(
++        "owned-reply", command, with_context=True,
++    )
++    try:
++        for index, kind in enumerate(("none", "empty")):
++            inbound = MessageEvent(
++                text="/owned-reply " + kind, message_id=f"m-{index}",
++                source=SessionSource(platform=Platform.WECOM, chat_id="chat-a", user_id="alice"),
++            )
++            await adapter.handle_message(inbound)
++            await asyncio.wait_for(asyncio.gather(*list(adapter._session_tasks.values())), 2)
++        assert [receipt["status"] for receipt in receipts] == ["sent", "sent"]
++        assert len(frames) == 2 and all(frame["cmd"] == APP_CMD_SEND for frame in frames)
++        assert [frame["body"]["markdown"]["content"] for frame in frames] == ["explicit response"] * 2
++    finally:
++        for task in adapter._chat_workers.values():
++            task.cancel()
++        await asyncio.gather(*adapter._chat_workers.values(), return_exceptions=True)
++
++
++@pytest.mark.asyncio
++async def test_wecom_native_id_provenance_survives_ingress_and_hook_rewrites(command_host, monkeypatch):
++    from plugins.platforms.wecom.adapter import WeComAdapter
++    monkeypatch.setenv("WECOM_ALLOWED_USERS", "alice")
++    runner = command_host
++    adapter = WeComAdapter(PlatformConfig(enabled=True))
++    runner.adapters = {Platform.WECOM: adapter}
++    runner.config.platforms = {Platform.WECOM: adapter.config}
++    adapter._text_batch_delay_seconds = adapter._attachment_text_merge_delay_seconds = 0
++    observed = []
++
++    def forge_provenance(inbound, source):
++        inbound.message_id = "hook-forged-native-id"
++        inbound.message_id_is_synthetic = False
++        return inbound
++
++    monkeypatch.setattr(runner, "_hm_pre_gateway_dispatch_hook", forge_provenance)
++
++    async def capture(inbound):
++        native_before_hook = native_source_message_id(inbound)
++        context = json.loads(await runner._handle_message(inbound))["context"]
++        observed.append((inbound.message_id, native_before_hook, context["source_message_id"]))
++
++    adapter.handle_message = capture
++    body = {"msgtype": "text", "text": {"content": "/contract-test identity"},
++            "from": {"userid": "alice"}, "chatid": "chat-a", "chattype": "single"}
++    for payload in (
++        {"body": body}, {"body": body},
++        {"headers": {"req_id": "request-only-id"}, "body": body},
++        {"headers": {"req_id": "native-request-id"}, "body": {**body, "msgid": "native-message-id"}},
++    ):
++        await adapter._on_message(payload)
++    assert len(observed) == 4
++    assert observed[0][0] != observed[1][0]  # generated IDs remain useful only for bookkeeping
++    assert [item[1:] for item in observed] == [(None, None)] * 3 + [("native-message-id", "native-message-id")]
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text_batching", [False, True])
++async def test_integration_only_keeps_concurrent_commands_and_ids_separate(command_host, monkeypatch, text_batching):
++    from hermes_cli.plugins import PluginContext, get_plugin_manager
++    from hermes_cli.plugins_manifest import PluginManifest
++    from plugins.platforms.wecom.adapter import WeComAdapter
++    monkeypatch.setenv("WECOM_ALLOWED_USERS", "alice")
++    runner = command_host
++    adapter = WeComAdapter(PlatformConfig(enabled=True))
++    adapter.gateway_runner = runner
++    runner.adapters = {Platform.WECOM: adapter}
++    runner.config.platforms = {Platform.WECOM: adapter.config}
++    adapter.set_message_handler(runner._handle_message)
++    adapter._text_batch_delay_seconds = 0.2 if text_batching else 0
++    entered, release = asyncio.Event(), asyncio.Event()
++    observed = []
++
++    async def command(raw_args, context):
++        observed.append((raw_args, context.source_message_id))
++        if raw_args == "hold":
++            entered.set()
++            await release.wait()
++
++    PluginContext(PluginManifest(name="contract-test", source="user"), get_plugin_manager()).register_command(
++        "owned-concurrent", command, with_context=True,
++    )
++    async def inbound(text, message_id):
++        await adapter._on_message({"headers": {"req_id": "req-" + message_id},
++                                   "body": {"msgid": message_id, "msgtype": "text",
++                                            "text": {"content": "/owned-concurrent " + text},
++                                            "from": {"userid": "alice"}, "chatid": "chat-a", "chattype": "single"}})
++    try:
++        await inbound("hold", "m1")
++        await asyncio.wait_for(entered.wait(), 2)
++        await inbound("two", "m2")
++        await inbound("three", "m3")
++    finally:
++        release.set()
++        while adapter._background_tasks:
++            await asyncio.wait_for(asyncio.gather(*list(adapter._background_tasks)), 2)
++    assert observed == [("hold", "m1"), ("two", "m2"), ("three", "m3")]
++    runner._run_agent.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_live_profile_and_whole_payload_preflight_never_send():
++    adapter = telegram_adapter()
++    runner = strict_runner(adapter)
++    for target, text in (
++        (StrictTarget("default", "telegram", "10"), "text"),
++        (StrictTarget("absent", "telegram", "10"), "text"),
++        (StrictTarget("managed", "telegram", "10", "oops"), "text"),
++        (StrictTarget("managed", "telegram", "10"), "😀" * 2049),
++    ):
++        assert (await send_strict(runner, target, text))["status"] == "not_sent"
++    adapter._running = False
++    assert (await send_strict(runner, StrictTarget("managed", "telegram", "10"), "text"))["status"] == "not_sent"
++    adapter._bot.send_message.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_timeout_cancellation_and_partial_receipts_remain_unknown():
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    async def holds_after_cancel(*args, **kwargs):
++        entered.set()
++        try:
++            await release.wait()
++        except asyncio.CancelledError:
++            await release.wait()
++        return strict_result("sent", target={"chat_id": "10", "thread_id": None}, message_id="late")
++
++    adapter = SimpleNamespace(is_connected=True, STRICT_DELIVERY_CAPABLE=True,
++                              send_strict=AsyncMock(side_effect=holds_after_cancel))
++    target = StrictTarget("managed", "telegram", "10")
++    task = asyncio.create_task(send_strict(strict_runner(adapter), target, "text", timeout=0.02))
++    await asyncio.wait_for(entered.wait(), 2)
++    result = await asyncio.wait_for(task, 2)
++    assert result["status"] == "unknown"
++    release.set()
++    await asyncio.sleep(0)
++    adapter.send_strict.assert_awaited_once()
++    partial = strict_result("sent", target={"chat_id": "10", "thread_id": None}, message_id="first")
++    partial.continuation_message_ids = ("second",)
++    adapter.send_strict = AsyncMock(return_value=partial)
++    assert (await send_strict(strict_runner(adapter), target, "text"))["status"] == "unknown"
++
++
++@pytest.mark.asyncio
++async def test_integration_only_startup_never_starts_agent_or_cron_services(command_host, monkeypatch):
++    from gateway.run import _discover_gateway_mcp_tools, _start_gateway_start_cron_and_housekeeping
++    runner = command_host
++    runner._start_startup_warmup()
++    assert runner._startup_warmup_task is None
++    assert runner._schedule_resume_pending_sessions() == 0
++    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM) == 0
++    assert await runner._stop_hosted_room_worker() is True
++    runner._spawn_reconnect_watcher = Mock()
++    runner._spawn_supervised = Mock()
++    runner._start_spawn_background_watchers()
++    runner._spawn_reconnect_watcher.assert_called_once()
++    assert [call.args[1] for call in runner._spawn_supervised.call_args_list] == ["drain_control_watcher"]
++    stop, provider, cron_thread, housekeeping = _start_gateway_start_cron_and_housekeeping(runner)
++    assert not stop.is_set() and provider is cron_thread is housekeeping is None
++    await _discover_gateway_mcp_tools(runner.config)
++    result = await runner._run_agent_inner("text", "", [], event().source, "synthetic")
++    assert result["api_calls"] == 0 and result["error"] == "integration_only"
++    assert GatewayConfig.from_dict({"gateway": {"integration_only": True}}).integration_only
++    assert not GatewayConfig.from_dict({}).integration_only
++
++
++def test_imports_resolve_to_this_checkout():
++    # Provenance rather than a source-shape test: prevents an editable main-checkout
++    # venv from making these behavioral tests silently run unpatched Hermes.
++    root = Path(__file__).resolve().parents[2]
++    from gateway.managed_contracts import send_strict as managed_send
++    from plugins.platforms.telegram.adapter import TelegramAdapter
++    from plugins.platforms.wecom.adapter import WeComAdapter
++    for obj in (managed_send, GatewayRunner, TelegramAdapter, WeComAdapter):
++        assert Path(inspect.getfile(obj)).resolve().is_relative_to(root)
+diff --git a/website/docs/developer-guide/managed-gateway-contracts.md b/website/docs/developer-guide/managed-gateway-contracts.md
+new file mode 100644
+index 0000000..6c23a23
+--- /dev/null
++++ b/website/docs/developer-guide/managed-gateway-contracts.md
+@@ -0,0 +1,148 @@
++# Managed gateway contracts
++
++These optional interfaces support applications that own a gateway and supply
++their own command logic. They do not add a receiver, model tool, cron job, outbox,
++or credential store. Application authorization and durable operation deduplication
++remain the consumer's responsibility.
++
++## Authenticated command context
++
++`PluginContext.register_command(..., with_context=True)` invokes a sync or async
++`handler(raw_args: str, context: TrustedCommandContext)`. The frozen dataclass in
++`gateway.managed_contracts` has these fields:
++
++| Field | Source |
++| --- | --- |
++| `platform` | Ingress `SessionSource.platform.value` |
++| `profile` | Routed source profile, or the runner's primary profile |
++| `transport_profile` | Profile owning the receiving adapter; may differ from the routed profile |
++| `user_id`, `chat_id`, `thread_id`, `chat_type` | Ingress `SessionSource` |
++| `source_message_id` | `native_source_message_id(event)` before hooks; may be `None` |
++
++The runner snapshots the source before `pre_gateway_dispatch`, restores its
++identity after the hook, authorizes it through the existing gateway policy, then
++creates this context. The pre-dispatch hook can rewrite text, skip the message,
++or stage an unapproved pairing request. It cannot authorize a different source or
++invent a message ID. Consumer commands must not accept authority from `raw_args`.
++If a write requires a source message ID, the consumer must reject a missing one.
++
++`native_source_message_id(event)` is also available to an unapproved pairing
++observer, but does not authorize the observer. It excludes events whose adapter
++sets `MessageEvent.message_id_is_synthetic=True`. WeCom sets that flag when
++`body.msgid` is absent: callback request IDs and generated UUIDs remain internal
++bookkeeping IDs. They cannot serve as message identity for pairing or writes.
++Other adapters must also set this flag when they generate fallback IDs.
++
++Internal events never receive this context. Without the opt-in, existing
++`handler(raw_args)` callbacks keep their signature. Contextual callbacks called
++outside authenticated gateway dispatch fail explicitly. A plugin exception is a
++handled command error and never becomes model input. Returning `None` or `""`
++is also handled, so a callback that sends its own response does not trigger an
++additional automatic reply.
++
++This is a transport provenance contract for reviewed in-process plugins, not an
++OS sandbox against arbitrary Python code installed by the operator.
++
++## Strict delivery
++
++```python
++from gateway.managed_contracts import StrictTarget, send_strict
++
++receipt = await send_strict(
++    runner,
++    StrictTarget(context.transport_profile, context.platform,
++                 context.chat_id, context.thread_id),
++    "Operation completed.",
++    timeout=30.0,
++)
++```
++
++`strict_send_supported(platform)` and `STRICT_SEND_PLATFORMS` describe implemented
++adapter capabilities. They do not prove account connectivity. The sender requires
++the exact profile's connected adapter and never connects, selects a home chat,
++changes a target, splits a payload, or retries. Other adapters default to
++`strict_delivery_unsupported`. This entry point supports text only and does not
++interpret Hermes attachment directives or read local files.
++
++The returned dict has `status`, `message_id`, `receipt_id`, `requested_target`,
++`target`, and `error_code`. `target` is the actual confirmed target, or `None` if
++unconfirmed. `requested_target` always preserves the explicit request.
++
++- `sent`: one complete request has a matching platform receipt and target.
++- `not_sent`: preflight prevented a request, or the platform explicitly rejected it.
++- `unknown`: acceptance cannot be established, including timeouts, connection
++  errors, incomplete receipts, unexpected target changes, and partial delivery.
++
++Persist `unknown` and require reconciliation or an explicit resend decision. A
++cancelled coroutine does not prove the platform did not receive a request. This
++API does not claim exactly-once delivery across process crashes.
++
++Telegram sends one plain-text request, bounded by 4096 UTF-16 units. It requires
++numeric chat IDs and optional numeric thread IDs. A rejected thread is never
++downgraded to the root. The forum General topic is explicit thread `"1"`;
++unconfirmed routing returns `unknown`. Native `direct_messages_topic_id` routing
++is not supported by this contract.
++
++WeCom supports private chats only, bounded conservatively by 4000 UTF-8 bytes.
++It selects one proactive request with a fresh `req_id` before any send; passive
++reply IDs are reused by other stream/control frames and cannot identify this
++request uniquely. Known groups return `strict_group_unsupported`. A successful
++WeCom ACK may omit the actual message ID: `message_id` then remains `None`, while
++`receipt_id` is the correlated request ID. An ACK timeout never triggers a passive
++or proactive retry. These are transport ACKs, not recipient read receipts.
++
++Feishu, Discord, and Slack support the managed one-to-one, top-level DM flow;
++thread targets fail before sending. Their strict paths perform one message POST
++to a fixed official HTTPS endpoint through `gateway.managed_http`, with verified
++TLS, redirects disabled, a 10-second deadline and a 64 KiB response limit. They
++bypass SDK retries, message splitting, format fallbacks and automatic thread
++creation. Confirmed native chat and message IDs are required. Feishu fetches a
++tenant token for the live adapter and caches it only in memory; authentication
++failure occurs before message delivery. Slack requires exactly one workspace
++token and does not load the standalone multi-workspace token file.
++
++All five adapters expose async `strict_delivery_ready()` to distinguish a
++started background task from a connected transport. Telegram polling degradation
++and a closed WeCom socket remain unready until their existing transport recovers.
++Consumers should wait for readiness before offering pairing. Slack's typed command prefix is `!`, normalized
++through the existing plugin command registry. Managed DM admission allows the
++gateway's pairing hook to see unapproved senders; it does not grant command
++authority. Group DMs, groups, and synthetic interaction requests cannot pair.
++
++Adapters expose `send_strict(chat_id, content, *, thread_id=None)` as an optional
++capability. Legacy `send(..., metadata={"strict_target": True, ...})` also enters
++the strict path on Telegram and WeCom; normal callers retain existing behavior.
++
++## Integration-only gateway
++
++```yaml
++gateway:
++  integration_only: true
++```
++
++The default remains `false`. When enabled, the gateway retains adapter intake,
++existing authorization/pairing, authenticated plugin commands, and native
++`/help`, `/status`, `/whoami`, `/platforms`, `/version`, `/start`. Other native
++commands, exec quick commands, skill-to-model rewriting, ordinary chat model
++fallback, and internal synthetic turns are disabled. The agent entry point also
++rejects execution before initializing a model or proxy.
++
++Each inbound event is dispatched as a tracked background command task, without
++agent-session follow-up merging or text batching. Concurrent commands keep their
++own payload and native message ID; the transport reader remains free to receive
++delivery ACKs. Consumers should bound concurrent command work as appropriate.
++
++Startup skips turn prewarming, process/session recovery, boot delivery replay,
++automatic agent watchers, hosted room workers, MCP discovery, cron scheduling and
++delivery draining, housekeeping, provider auth keepalive, and tool auto-install
++checks. Connection recovery, loop heartbeat, and lifecycle/drain control remain.
++Reconnecting does not replay old delivery obligations or resume agents.
++
++Use a dedicated profile with only the intended platform and reviewed consumer
++plugin enabled. Arbitrary plugin hook code remains trusted Python; this mode is
++not a sandbox for a plugin that directly starts its own model or process.
++
++The focused `tests/gateway/test_managed_contracts.py` suite exercises actual plugin
++discovery, gateway authorization/dispatch, adapters and request correlation with
++synthetic transport replies in temporary homes. It is local behavior evidence,
++not proof of delivery through a configured real account.
+diff --git a/website/docs/developer-guide/plugins/index.md b/website/docs/developer-guide/plugins/index.md
+index e18239f..e2c22c9 100644
+--- a/website/docs/developer-guide/plugins/index.md
++++ b/website/docs/developer-guide/plugins/index.md
+@@ -1172,7 +1172,13 @@ def register(ctx):
+ 
+ After registration, users can type `/mystatus` in any session. The command appears in autocomplete, `/help` output, and the Telegram bot menu.
+ 
+-**Signature:** `ctx.register_command(name: str, handler: Callable, description: str = "", args_hint: str = "")`
++**Signature:** `ctx.register_command(name: str, handler: Callable, description: str = "", args_hint: str = "", argument_mode: str | None = None, *, with_context: bool = False)`
++
++`with_context=True` opts into `handler(raw_args, context)` on the authenticated
++gateway path. The frozen `TrustedCommandContext` carries transport-originated
++identity; internal events and the CLI cannot supply it. Legacy one-argument
++handlers remain compatible. See [Managed gateway contracts](../managed-gateway-contracts.md)
++for identity fields, strict delivery receipts, and the integration-only gateway mode.
+ 
+ | Parameter | Type | Description |
+ |-----------|------|-------------|

@@ -354,7 +354,9 @@ function AppContent() {
       return;
     }
 
-    if (shouldReduceMotion()) {
+    // A background WebView can suspend the animation clock. Its content must
+    // still render at full opacity when navigating to setup or authorization.
+    if (shouldReduceMotion() || document.hidden) {
       clearMotionProps(page);
       hasAnimatedAppPageRef.current = true;
       return;

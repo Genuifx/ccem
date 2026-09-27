@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""Private JSONL host for a pinned Hermes runtime.
+
+Run only from a verified runtime bundle. Credentials arrive once on stdin. The host
+uses Hermes's registry, authentication and live adapters; it has no platform SDKs
+or delivery fallback of its own.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import dataclasses
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# -I deliberately omits the script directory from sys.path. Load only this
+# verified bundle's companion module, never a project/user module of that name.
+_setup_spec = importlib.util.spec_from_file_location("ccem_gateway_onboarding", Path(__file__).with_name("ccem_gateway_onboarding.py"))
+_setup_module = importlib.util.module_from_spec(_setup_spec)
+_setup_spec.loader.exec_module(_setup_module)
+_conversation_spec = importlib.util.spec_from_file_location("ccem_gateway_conversation", Path(__file__).with_name("ccem_gateway_conversation.py"))
+_conversation_module = importlib.util.module_from_spec(_conversation_spec)
+sys.modules[_conversation_spec.name] = _conversation_module
+_conversation_spec.loader.exec_module(_conversation_module)
+
+PROTOCOL = 1
+FRAME_LIMIT = 64 * 1024
+_wire = sys.stdout
+_wire_lock = threading.Lock()
+
+# Capability metadata ships with the reviewed Hermes runtime, not with the
+# Desktop channel picker. New adapters do not require a CCEM platform enum.
+MANAGED_CHANNELS = ("wecom", "telegram", "feishu", "discord", "slack")
+PLATFORM_IDENTITY_FIELDS = {
+    "wecom": ["WECOM_BOT_ID"],
+    "telegram": ["TELEGRAM_BOT_TOKEN"],
+    "feishu": ["FEISHU_APP_ID"],
+    "discord": ["DISCORD_BOT_TOKEN"],
+    "slack": ["SLACK_BOT_TOKEN"],
+}
+FIELD_LABELS = {
+    "WECOM_BOT_ID": "Bot ID", "WECOM_SECRET": "Bot secret",
+    "TELEGRAM_BOT_TOKEN": "Bot token", "DISCORD_BOT_TOKEN": "Bot token",
+    "FEISHU_APP_ID": "App ID", "FEISHU_APP_SECRET": "App secret",
+    "FEISHU_DOMAIN": "Region (feishu / lark)",
+    "SLACK_BOT_TOKEN": "Bot token", "SLACK_APP_TOKEN": "App token",
+}
+
+
+def command_prefix(platform):
+    return "!ccem" if platform == "slack" else "/ccem"
+
+
+def confirmation_reply(text, prefix):
+    """Normalize only an entire control reply, never a command inside task prose.
+
+    Mobile clients can copy the nearby hint or insert whitespace in a long ID.
+    The normal gateway admission and Rust challenge checks still run afterward.
+    """
+    value = text.strip()
+    hint = re.match(r"^(两分钟内发送|取消)\s*[:：]\s*", value)
+    if hint:
+        value = value[hint.end():]
+    # Slack translates a leading !ccem to /ccem before gateway dispatch.
+    accepted_prefix = r"(?:!ccem|/ccem)" if prefix == "!ccem" else re.escape(prefix)
+    match = re.fullmatch(accepted_prefix + r"\s+(confirm|cancel)\s+([0-9a-fA-F\s]+)", value)
+    if match:
+        action, wrapped = match.groups()
+        challenge = "".join(wrapped.split())
+        expected = "cancel" if hint and hint[1] == "取消" else "confirm"
+        if len(challenge) == 48 and (not hint or action == expected):
+            return f"{action} {challenge.lower()}"
+    # A pasted preview or malformed control reply must not become a fresh task.
+    if re.search(r"[!/]+ccem\s+(?:confirm|cancel)\b", text):
+        return "confirmation-help"
+    return None
+
+
+def command_error(code, prefix):
+    if code == "no_presented_confirmation":
+        return "当前没有待确认的操作。可以直接告诉我你想做什么。"
+    if code == "ambiguous_confirmation":
+        return "现在有多条待确认操作，不能确定你指哪条。请等待它们过期后重新提出需要执行的任务。"
+    if code == "conversation_scope_changed":
+        return "这段对话的授权已更新，请重新发送你的消息。"
+    if code in {"challenge_expired_or_revoked", "challenge_not_found", "challenge_scope_mismatch"}:
+        return "这条确认已过期或失效，没有提交新的执行。请重新发送原任务内容，收到新预览后再确认。"
+    if code in {"session_not_found", "session_not_active"}:
+        return "原会话当前不可用，没有提交新的执行。连接恢复后，请重新发送原任务内容。"
+    if code == "separate_confirmation_message_required":
+        return "请将确认指令作为一条新消息单独发送。"
+    if code == "challenge_not_pending":
+        return "这条请求已处理，不能再取消；如果任务已提交，取消确认不会停止正在执行的任务。"
+    if code in {"input_not_allowed", "workspace_not_authorized"}:
+        return "当前会话尚未允许机器人继续执行。请先在 CCEM 授权后再试。"
+    return f"CCEM 请求未完成。请稍后重试；已提交任务可用 {prefix} operation 查询。"
+
+
+def notification_text(text, platform):
+    # The bridge owns this final line. Keep user/task text verbatim, including
+    # any slash-command examples inside the notification body.
+    body, separator, last = text.rpartition("\n")
+    if separator and last.startswith(("/ccem operation ", "/ccem status ")):
+        return body + separator + command_prefix(platform) + last[len("/ccem"):]
+    return text
+
+
+def platform_metadata(entry, strict_supported):
+    """Passive registry probe: unsupported platforms stay discoverable.
+
+    Never invoke ensure_deps_fn or setup_fn here; an ordinary status read must
+    neither install packages nor create/login to an external account.
+    """
+    fields = []
+    for required in entry.required_env:
+        key = required if isinstance(required, str) else required.get("name", "")
+        if not key or not key.replace("_", "").isalnum() or not key.isupper():
+            continue
+        fields.append({"key": key, "label": FIELD_LABELS.get(key, key.replace("_", " ")),
+                       "secret": any(word in key for word in ("SECRET", "TOKEN", "PASSWORD", "KEY")),
+                       "required": required.get("required", True) if isinstance(required, dict) else True})
+    if entry.name == "feishu" and not any(field["key"] == "FEISHU_DOMAIN" for field in fields):
+        fields.append({"key": "FEISHU_DOMAIN", "label": FIELD_LABELS["FEISHU_DOMAIN"], "secret": False, "required": False})
+    try:
+        available = bool(entry.check_fn())
+    except Exception:
+        available = False
+    strict = strict_supported(entry.name)
+    qr = available and strict and entry.name in ("wecom", "telegram", "feishu")
+    if qr:
+        try:
+            _setup_module.tls_context()
+        except _setup_module.SetupError:
+            qr = False
+    result = {"id": entry.name, "label": entry.label, "available": available,
+              "strictSend": strict, "fields": fields, "qrSetup": qr,
+              "maxMessageLength": getattr(entry, "max_message_length", 0),
+              "commandPrefix": command_prefix(entry.name),
+              "identityFields": PLATFORM_IDENTITY_FIELDS.get(entry.name, []),
+              "unavailableReason": "integration_unsupported" if not strict else "dependency_missing" if not available else None}
+    if entry.name in MANAGED_CHANNELS:
+        result["setupUrl"] = "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/" + entry.name
+    if entry.name == "telegram":
+        result["setupService"] = "Hermes"
+    return result
+
+
+def emit(value):
+    data = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(data.encode("utf-8")) >= FRAME_LIMIT:
+        raise ValueError("response_too_large")
+    with _wire_lock:
+        _wire.write(data + "\n")
+        _wire.flush()
+
+
+def read_frame():
+    raw = sys.stdin.buffer.readline(FRAME_LIMIT + 1)
+    if not raw:
+        return None
+    if len(raw) > FRAME_LIMIT or not raw.endswith(b"\n"):
+        raise ValueError("invalid_frame")
+    value = json.loads(raw.decode("utf-8", errors="strict"))
+    if not isinstance(value, dict):
+        raise ValueError("invalid_frame")
+    return value
+
+
+def validate_endpoint(endpoint):
+    url = urllib.parse.urlsplit(endpoint)
+    if url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port or url.path != "/rpc" or url.username or url.password or url.query or url.fragment:
+        raise ValueError("invalid_bridge_endpoint")
+
+
+def source_value(context, account_ref):
+    if not all(isinstance(value, str) and value for value in (context.platform, context.profile, context.transport_profile, context.user_id, context.chat_id, context.chat_type)):
+        raise ValueError("incomplete_authenticated_source")
+    return {
+        "accountRef": account_ref,
+        "platform": str(context.platform), "profile": str(context.profile),
+        "transportProfile": str(context.transport_profile), "userId": str(context.user_id),
+        "chatId": str(context.chat_id), "threadId": context.thread_id,
+        "chatType": str(context.chat_type),
+    }
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        raise ValueError("bridge_redirect_rejected")
+
+
+class Host:
+    def __init__(self, boot, profile):
+        if boot.get("protocolVersion") != PROTOCOL:
+            raise ValueError("protocol_mismatch")
+        validate_endpoint(boot.get("endpoint", ""))
+        token = boot.get("token", "")
+        if not isinstance(token, str) or len(token) < 32 or len(token) > 256:
+            raise ValueError("invalid_bridge_capability")
+        self.boot, self.profile = boot, profile
+        self.runner = None
+        self.transport_ready = False
+        self.state = "configuring"
+        self.error = None
+        self.platforms = []
+        self.pending = {}
+        self.pairing = None
+        self.lock = threading.RLock()
+        self.stopped = asyncio.Event()
+        self.loop = asyncio.get_running_loop()
+        self.command_slots = asyncio.Semaphore(4)
+        self.setup = _setup_module.WeComSetup()
+
+    def snapshot(self):
+        with self.lock:
+            current = int(time.time() * 1000)
+            self.pending = {k: v for k, v in self.pending.items() if v["expiresAt"] > current}
+            if self.pairing and self.pairing["expiresAt"] <= current:
+                self.pairing = None
+            state = self.state
+            if state == "running" and self.runner:
+                connected = self.transport_ready and any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
+                state = "running" if connected else "reconnecting"
+            return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1, "nativeConversation": 1,
+                    "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeSource")} for p in self.pending.values()],
+                    "pairing": self.pairing}
+
+    def publish(self):
+        emit({"event": "status", "payload": self.snapshot()})
+
+    async def refresh_transport_status(self):
+        self.transport_ready = False
+        if not self.runner:
+            return False
+        for key, adapter in self.runner.adapters.items():
+            if str(getattr(key, "value", key)) != self.boot.get("platform") or getattr(adapter, "is_connected", False) is not True:
+                continue
+            ready = getattr(adapter, "strict_delivery_ready", None)
+            try:
+                if ready is not None and await asyncio.wait_for(ready(), timeout=1.0) is not True:
+                    continue
+            except Exception:
+                continue
+            self.transport_ready = True
+            break
+        return self.transport_ready
+
+    async def initialize(self):
+        # Only this private profile is visible to the child; no project plugins,
+        # shared dotenv, model keys or automatic skills are imported from user paths.
+        self.profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+        config = _conversation_module.configuration()
+        (self.profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager, PluginContext, PluginManifest
+        from gateway.platform_registry import platform_registry
+        from gateway.managed_contracts import strict_send_supported
+        discover_plugins()
+        for entry in platform_registry.all_entries():
+            self.platforms.append(platform_metadata(entry, strict_send_supported))
+        self.platforms.sort(key=lambda p: (not (p["available"] and p["strictSend"]), p["id"]))
+        self.state = "configured" if self.boot.get("platform") else "unconfigured"
+        self.publish()
+        if not self.boot.get("connect"):
+            return
+        platform = self.boot.get("platform")
+        meta = next((p for p in self.platforms if p["id"] == platform and p["available"] and p["strictSend"]), None)
+        if not meta:
+            raise ValueError("platform_not_available")
+        fields = self.boot.get("fields", {})
+        allowed = {f["key"] for f in meta["fields"]}
+        if set(fields) - allowed:
+            raise ValueError("unknown_channel_field")
+        if platform == "feishu" and fields.get("FEISHU_DOMAIN", "feishu") not in ("feishu", "lark"):
+            raise ValueError("invalid_channel_field")
+        for field in meta["fields"]:
+            key = field["key"]
+            value = fields.get(key, "")
+            if not isinstance(value, str) or len(value) > 4096 or "\0" in value or (field["required"] and not value):
+                raise ValueError("required_channel_field_missing")
+            if value:
+                os.environ[key] = value
+        # The capability is never copied into environment, profile config or adapter metadata.
+        from gateway.config import load_gateway_config
+        gateway_config = load_gateway_config()
+        gateway_config.integration_only = False
+        gateway_config.unauthorized_dm_behavior = "ignore"
+        gateway_config.stt_enabled = False
+        gateway_config.multiplex_profiles = False
+        gateway_config.loop_watchdog = False
+        for key, channel in gateway_config.platforms.items():
+            channel.enabled = str(key.value) == platform
+        self.runner = _conversation_module.create_runner(self, gateway_config)
+        context = PluginContext(PluginManifest(name="ccem-managed-bridge", source="bundled", kind="standalone"), get_plugin_manager())
+        context.register_command("ccem", self.command, description="CCEM task commands", with_context=True)
+        context.register_hook("pre_gateway_dispatch", self.pairing_hook)
+        self.state = "starting"
+        self.publish()
+        await self.runner.start()
+        adapters = getattr(self.runner, "adapters", {})
+        deadline = time.monotonic() + 30
+        while adapters and time.monotonic() < deadline:
+            if await self.refresh_transport_status():
+                break
+            await asyncio.sleep(0.2)
+        if not self.transport_ready:
+            raise ValueError("channel_connection_failed")
+        self.state = "running"
+        self.publish()
+
+    def pairing_hook(self, *args, **kwargs):
+        event = kwargs.get("event")
+        if not event or getattr(event, "internal", True) or not getattr(event, "allow_gateway_control", False):
+            return None
+        if event.source and isinstance(event.text, str):
+            prefix = command_prefix(str(event.source.platform.value))
+            # Explicit input/chat commands keep their task text verbatim.
+            if not event.is_command() or (event.get_command() == "ccem" and
+                    event.get_command_args().split()[:1] in (["confirm"], ["cancel"])):
+                reply = confirmation_reply(event.text, prefix)
+                if reply is not None:
+                    return {"action": "rewrite", "text": "/ccem " + reply}
+        if not event.is_command():
+            # Exact control replies are authenticated by normal native admission.
+            # All other messages stay intact for Hermes's conversation loop.
+            if event.text.strip() in ("确认", "取消"):
+                return {"action": "rewrite", "text": "/ccem shortReply " + ("confirm" if event.text.strip() == "确认" else "cancel")}
+            return None
+        if event.get_command() != "ccem":
+            return None
+        pieces = event.get_command_args().split()
+        if not pieces or pieces[0] != "connect":
+            return None
+        source = event.source
+        # Pairing is an observation only. It cannot read a task or authorize input.
+        from gateway.managed_contracts import native_source_message_id
+        if not source or not source.user_id or not source.chat_id or source.chat_type != "dm" or source.thread_id or not native_source_message_id(event):
+            return {"action": "skip", "reason": "invalid_pairing_source"}
+        with self.lock:
+            self.snapshot()
+            if len(pieces) != 2 or not self.pairing or not secrets.compare_digest(pieces[1], self.pairing["code"]):
+                return {"action": "skip", "reason": "pairing_window_not_open"}
+            platform = str(source.platform.value)
+            if platform != self.boot.get("platform"):
+                return {"action": "skip", "reason": "pairing_platform_mismatch"}
+            native_source = dataclasses.replace(source)
+            store = self.runner._pairing_store_for(native_source)
+            code = store.generate_code(platform, source.user_id, source.user_name or "") if store else None
+            if not code:
+                return {"action": "skip", "reason": "pairing_rate_limited"}
+            from hermes_cli.profiles import get_active_profile_name
+            profile = source.profile or get_active_profile_name()
+            target_profile = getattr(self.runner, "_primary_profile_name", None) or get_active_profile_name()
+            identity = {"accountRef": self.boot["accountRef"], "platform": platform, "profile": profile, "transportProfile": target_profile,
+                        "userId": source.user_id, "chatId": source.chat_id,
+                        "threadId": source.thread_id, "chatType": source.chat_type}
+            identifier = secrets.token_hex(24)
+            self.pending[identifier] = {"id": identifier, "source": identity, "expiresAt": int(time.time()*1000)+120_000,
+                                        "nativeCode": code, "nativeSource": native_source}
+            self.pairing = None  # one native sender per desktop pairing window
+            self.publish()
+        return {"action": "skip", "reason": "awaiting_desktop_approval"}
+
+    def rpc(self, method, params):
+        # Disable proxy inheritance and redirects; the bearer is valid for this exact loopback endpoint only.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        body = json.dumps({"id": secrets.token_hex(16), "method": "ccem.bridge."+method, "params": params}).encode()
+        if len(body) > FRAME_LIMIT:
+            raise ValueError("request_too_large")
+        request = urllib.request.Request(self.boot["endpoint"], body, {"Content-Type": "application/json", "Authorization": "Bearer "+self.boot["token"]}, method="POST")
+        with opener.open(request, timeout=8) as response:
+            raw = response.read(FRAME_LIMIT+1)
+        if len(raw) > FRAME_LIMIT:
+            raise ValueError("response_too_large")
+        value = json.loads(raw)
+        if "error" in value:
+            message = value["error"].get("message", "bridge_error")
+            raise ValueError(message[:160])
+        return value.get("result")
+
+    def authenticated_source(self, context):
+        return source_value(context, self.boot["accountRef"])
+
+    async def conversation_unavailable(self, context, error):
+        # Do not return an exception string to a platform adapter or the user.
+        self.error = "conversation_unavailable"
+        self.publish()
+
+    async def command(self, raw_args, context):
+        from gateway.managed_contracts import send_strict, StrictTarget, retain_managed_control_ingress
+        # Pin before waiting for a command slot or resolving scope. A timeout
+        # must not let a later transport retry acquire a post-preview timestamp.
+        if raw_args.strip().split() in (["shortReply", "confirm"], ["shortReply", "cancel"]):
+            retain_managed_control_ingress(self.runner, context)
+        target = StrictTarget(profile=context.transport_profile, platform=context.platform,
+                              chat_id=context.chat_id, thread_id=context.thread_id)
+        maximum = next((p.get("maxMessageLength") for p in self.platforms if p["id"] == context.platform), 0)
+        maximum = min(3500, maximum) if isinstance(maximum, int) and maximum > 0 else 3500
+        input_limit = min(2000, max(0, maximum - 600))
+        prefix = command_prefix(context.platform)
+        async with self.command_slots:
+            try:
+                args = raw_args.strip().split(maxsplit=2)
+                method = args[0] if args else "help"
+                params = {"source": source_value(context, self.boot["accountRef"]), "sourceMessageId": context.source_message_id}
+                if method == "confirmation-help":
+                    await send_strict(self.runner, target, f"请单独发送一条确认或取消指令，例如：\n{prefix} confirm <确认码>\n请只复制预览中的确认指令，不要连同任务正文或取消指令一起发送。")
+                    return None
+                elif method == "shortReply" and len(args) == 2 and args[1] in ("confirm", "cancel"):
+                    params["text"] = args[1]
+                    scope = await asyncio.to_thread(self.rpc, "conversation", {k: v for k, v in params.items() if k != "text"})
+                    params["conversationScope"] = scope["scope"]
+                    # This frozen transport timestamp predates command-slot waits.
+                    # Missing timing stays missing so the authority can fail closed.
+                    params["receivedAtNs"] = context.received_at_ns
+                elif method in ("list",):
+                    pass
+                elif method == "chat":
+                    text = raw_args.strip().partition(" ")[2]
+                    if not text.strip() or len(text.encode("utf-8")) > input_limit:
+                        raise ValueError("input_text_required")
+                    params["text"] = text
+                elif method in ("status", "events", "input") and len(args) >= 2:
+                    params["runtimeId"] = args[1]
+                    if method == "input":
+                        if len(args) != 3:
+                            raise ValueError("input_text_required")
+                        if len(args[2].encode("utf-8")) > input_limit:
+                            await send_strict(self.runner, target, f"继续任务的指令太长，请缩短到 {input_limit} UTF-8 字节以内后重试。")
+                            return None
+                        params["text"] = args[2]
+                    elif method == "events" and len(args) == 3:
+                        params["cursor"] = int(args[2])
+                elif method in ("confirm", "cancel") and len(args) == 2:
+                    params["challenge"] = args[1]
+                elif method == "operation" and len(args) == 2:
+                    params["operationId"] = args[1]
+                else:
+                    await send_strict(self.runner, target, "\n".join(prefix + " " + line for line in ("list", "status <runtime>", "events <runtime> [cursor]", "input <runtime> <text>", "confirm <challenge>", "cancel <challenge>", "operation <operation>")))
+                    return None
+                result = await asyncio.to_thread(self.rpc, method, params)
+                if method == "shortReply":
+                    text = "已取消这次操作。" if result.get("state") == "cancelled" else ("任务是否收到还不能确认，请先让我查询状态。" if result.get("state") == "unknown" else "已交给任务继续处理，有结果时会告诉你。")
+                else:
+                    text = render_result(result, maximum, prefix)
+            except ValueError as error:
+                text = command_error(str(error), prefix)
+            except (urllib.error.URLError, TimeoutError):
+                # Avoid echoing credentials, arbitrary exception strings or task content on transport errors.
+                text = command_error("transport_error", prefix)
+            except Exception:
+                text = "CCEM 请求失败；请在桌面检查连接状态。"
+            if method == "shortReply" and params.get("conversationScope"):
+                try:
+                    await asyncio.to_thread(self.rpc, "replyConversation", {**params, "text": text})
+                except Exception:
+                    self.error = "command_reply_unverified"
+                    self.publish()
+                return None
+            receipt = await send_strict(self.runner, target, text)
+            if receipt.get("status") != "sent":
+                self.error = "command_reply_" + str(receipt.get("status", "unknown"))
+                self.publish()
+            return None  # handled; never let Hermes send a second ordinary reply
+
+    def validate_begin_setup(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("setup_invalid_request")
+        platform = params.get("platform")
+        identifier = _setup_module.validate_begin(params.get("id"), platform)
+        if not any(p["id"] == platform and p.get("qrSetup") is True for p in self.platforms):
+            raise ValueError("setup_platform_not_available")
+        return identifier, platform
+
+    async def request(self, method, params):
+        if method == "status":
+            return self.snapshot()
+        if method == "stop":
+            self.setup.clear()
+            self.stopped.set()
+            return {"ok": True}
+        if method == "decideSessionNotification":
+            return await self.decide_session_notification(params)
+        if method in ("beginSetup", "pollSetup", "cancelSetup"):
+            if not isinstance(params, dict):
+                raise ValueError("setup_invalid_request")
+            identifier = params.get("id")
+            if method == "beginSetup":
+                identifier, platform = self.validate_begin_setup(params)
+                if self.setup.platform != platform:
+                    self.setup.clear("superseded")
+                    setup_type = {"wecom": _setup_module.WeComSetup, "telegram": _setup_module.TelegramSetup,
+                                  "feishu": _setup_module.FeishuSetup}[platform]
+                    self.setup = setup_type()
+                return await self.setup.begin(identifier, platform)
+            if method == "pollSetup":
+                return await self.setup.poll(identifier)
+            return self.setup.cancel(identifier)
+        if method == "openPairing":
+            if self.snapshot()["state"] != "running":
+                raise ValueError("gateway_not_running")
+            with self.lock:
+                self.pending.clear()
+                self.pairing = {"code": secrets.token_hex(12), "expiresAt": int(time.time()*1000)+120_000}
+            self.publish()
+            return self.pairing
+        if method == "approvePairing":
+            with self.lock:
+                self.snapshot()
+                pending = self.pending.pop(params.get("id", ""), None)
+            if not pending:
+                raise ValueError("pairing_expired")
+            store = self.runner._pairing_store_for(pending["nativeSource"])
+            approved = store.approve_code(pending["source"]["platform"], pending["nativeCode"])
+            if not approved or str(approved["user_id"]) != pending["source"]["userId"]:
+                raise ValueError("pairing_approval_failed")
+            self.publish()
+            return {"source": pending["source"]}
+        if method == "sendStrict":
+            from gateway.managed_contracts import send_strict, StrictTarget
+            if self.state != "running":
+                return {"status": "not_sent", "error_code": "gateway_not_running"}
+            target = StrictTarget(**params["target"])
+            if target.platform != self.boot.get("platform"):
+                return {"status": "not_sent", "error_code": "platform_mismatch"}
+            receipt = await send_strict(self.runner, target, notification_text(str(params["text"]), target.platform), timeout=30.0)
+            if receipt.get("status") == "sent":
+                receipt["confirmedAtNs"] = time.monotonic_ns()
+            return receipt
+        raise ValueError("unknown_host_method")
+
+    async def decide_session_notification(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("invalid_decision_request")
+        data = json.dumps(params, ensure_ascii=False).encode()
+        if len(data) > 60_000:
+            raise ValueError("decision_context_too_large")
+        with tempfile.TemporaryDirectory(prefix="ccem-hermes-judge-") as temporary:
+            env = {"PATH": "/usr/bin:/bin", "HOME": temporary, "HERMES_HOME": temporary,
+                   "LANG": "en_US.UTF-8", "HERMES_SAFE_MODE": "1", "HERMES_DISABLE_LAZY_INSTALLS": "1"}
+            worker = await asyncio.create_subprocess_exec(
+                sys.executable, "-I", "-B", str(Path(__file__).with_name("ccem_session_advisor.py")),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                env=env, cwd=temporary)
+            try:
+                output, _ = await asyncio.wait_for(worker.communicate(data), timeout=30)
+                if worker.returncode != 0 or len(output) > 16_000:
+                    raise ValueError("hermes_notification_decision_failed")
+                result = json.loads(output)
+                if not isinstance(result, dict) or set(result) != {"notify", "text"} or type(result["notify"]) is not bool or not isinstance(result["text"], str):
+                    raise ValueError("hermes_notification_decision_failed")
+                if len(result["text"]) > 1600 or (result["notify"] and not result["text"].strip()) or (not result["notify"] and result["text"]):
+                    raise ValueError("hermes_notification_decision_failed")
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise ValueError("hermes_notification_decision_failed") from None
+            finally:
+                if worker.returncode is None:
+                    worker.kill()
+                    await worker.wait()
+
+    async def serve(self):
+        async def initialize():
+            try:
+                await self.initialize()
+            except Exception as exc:
+                self.state, self.error = "error", "gateway_start_failed:" + type(exc).__name__
+                self.publish()
+        initialization = asyncio.create_task(initialize())
+        async def heartbeat():
+            while not self.stopped.is_set():
+                await asyncio.sleep(5)
+                if self.state == "running":
+                    await self.refresh_transport_status()
+                self.publish()
+        heartbeat_task = asyncio.create_task(heartbeat())
+        setup_jobs = {}
+        decision_job = None
+        async def respond(frame):
+            identifier = frame.get("id")
+            try:
+                result = await self.request(frame.get("method"), frame.get("params", {}))
+                emit({"id": identifier, "result": result})
+                # Setup task handles remain bounded in setup_jobs. Do not keep
+                # a QR URL or credentials in a completed task's return value.
+                return result if frame.get("method") == "cancelSetup" else None
+            except asyncio.CancelledError:
+                emit({"id": identifier, "error": "setup_cancelled"})
+            except Exception as exc:
+                emit({"id": identifier, "error": str(exc)[:160] if isinstance(exc, ValueError) else "host_request_failed"})
+        async def cancel_jobs(identifier=None):
+            jobs = [job for job, owner in setup_jobs.values() if identifier is None or owner == identifier]
+            for job in jobs:
+                job.cancel()
+            if jobs:
+                await asyncio.gather(*jobs, return_exceptions=True)
+        try:
+            while not self.stopped.is_set():
+                frame = await asyncio.to_thread(read_frame)
+                if frame is None:
+                    break
+                identifier = frame.get("id")
+                if not isinstance(identifier, str) or len(identifier) > 256:
+                    raise ValueError("invalid_request_id")
+                method = frame.get("method")
+                params = frame.get("params", {})
+                if method == "decideSessionNotification":
+                    if decision_job is not None and not decision_job.done():
+                        emit({"id": identifier, "error": "decision_in_progress"})
+                    else:
+                        decision_job = asyncio.create_task(respond(frame))
+                elif method in ("beginSetup", "pollSetup") and isinstance(params, dict):
+                    if method == "beginSetup":
+                        try:
+                            self.validate_begin_setup(params)
+                        except ValueError as exc:
+                            emit({"id": identifier, "error": str(exc)})
+                            continue
+                        self.setup.clear("superseded")
+                        await cancel_jobs()
+                    elif method in setup_jobs and not setup_jobs[method][0].done():
+                        emit({"id": identifier, "error": "setup_poll_in_progress"})
+                        continue
+                    setup_jobs[method] = (asyncio.create_task(respond(frame)), params.get("id"))
+                else:
+                    result = await respond(frame)
+                    if method == "cancelSetup" and result and result.get("state") == "cancelled":
+                        await cancel_jobs(result["id"])
+        finally:
+            if decision_job is not None:
+                decision_job.cancel()
+                await asyncio.gather(decision_job, return_exceptions=True)
+            self.setup.clear()
+            await cancel_jobs()
+            initialization.cancel()
+            heartbeat_task.cancel()
+            await asyncio.gather(initialization, heartbeat_task, return_exceptions=True)
+            if self.runner:
+                await asyncio.wait_for(self.runner.stop(), timeout=2)
+
+
+def render_result(result, maximum=3500, prefix="/ccem"):
+    if not isinstance(result, dict):
+        return "CCEM：请求已处理。"
+    if "challenge" in result:
+        preview = f"继续任务 {result['runtimeId']}\n\n{result['text']}\n\n两分钟内发送：\n{prefix} confirm {result['challenge']}\n\n取消：\n{prefix} cancel {result['challenge']}"
+        if len(preview.encode("utf-8")) > maximum:
+            # Never ask a user to approve a truncated instruction.
+            raise ValueError("confirmation_preview_too_large")
+        return preview
+    if "sessions" in result:
+        rows = "\n\n".join(f"{limit_utf8(s.get('title') or 'Task', 60)} · {s.get('status', '')}\n{s['runtimeId']}" for s in result["sessions"])
+        if result.get("notice"):
+            rows = result["notice"] + "\n" + rows
+            if result["sessions"]:
+                rows += f"\n{prefix} input <runtime> <text>"
+        return limit_utf8(rows, maximum) or "授权工作区暂无任务。"
+    if "events" in result:
+        if not result.get("sourceAvailable") or result.get("gapDetected") or result.get("decodeFailureCount", 0) or result.get("oversizedEventCount", 0):
+            return "事件记录不完整，请在 CCEM 查看任务。"
+        events = "\n\n".join(f"{limit_utf8(e['title'], 120)}\n{limit_utf8(e['text'], 360)}" for e in result["events"])
+        return (limit_utf8(events, maximum - 300) or "暂无新事件。") + f"\n游标：{result.get('nextCursor')}"
+    if "operationId" in result:
+        return f"操作 {result['operationId']}\n{result['state']}\n{limit_utf8(result.get('detail', ''), min(2500, maximum - 350))}\n{prefix} operation {result['operationId']}"
+    return limit_utf8("\n".join(str(result[k]) for k in ("title", "runtimeId", "status", "state", "updatedAt") if result.get(k) is not None), maximum)
+
+
+def limit_utf8(value, maximum):
+    encoded = str(value).encode("utf-8")
+    return str(value) if len(encoded) <= maximum else encoded[:maximum-3].decode("utf-8", errors="ignore") + "…"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--profile", type=Path)
+    args = parser.parse_args()
+    if args.self_test:
+        source = Path(__file__).resolve().parent / "source"
+        sys.path.insert(0, str(source))
+        # Some Hermes import-time modules initialize a home. Confine those effects
+        # to a disposable directory, outside both user data and the immutable bundle.
+        sys.stdout = sys.stderr
+        with tempfile.TemporaryDirectory(prefix="ccem-hermes-health-") as temporary:
+            os.environ["HOME"] = temporary
+            os.environ["HERMES_HOME"] = temporary
+            from gateway.managed_contracts import StrictTarget, strict_send_supported
+            assert strict_send_supported("wecom") and StrictTarget
+            from plugins.platforms.wecom.adapter import WeComAdapter, check_wecom_requirements
+            assert WeComAdapter and check_wecom_requirements(), "WeCom transport dependencies are unavailable"
+            assert _setup_module.WeComSetup and _setup_module.TelegramSetup and _setup_module.tls_context()
+            os.environ["HERMES_BUNDLED_PLUGINS"] = str(source / "plugins")
+            from hermes_cli.plugins import discover_plugins
+            from gateway.platform_registry import platform_registry
+            discover_plugins()
+            for name in MANAGED_CHANNELS:
+                entry = platform_registry.get(name)
+                assert entry and entry.check_fn(), f"{name} transport dependencies are unavailable"
+                assert strict_send_supported(name), f"{name} managed delivery is unavailable"
+            worker = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).with_name("ccem_session_advisor.py")), "--self-test"],
+                                    cwd=temporary, env={"PATH":"/usr/bin:/bin", "HOME":temporary,"HERMES_HOME":temporary,"LANG":"en_US.UTF-8"},
+                                    capture_output=True, timeout=30)
+            assert worker.returncode == 0 and json.loads(worker.stdout).get("ok") is True, "Hermes notification evaluator dependencies unavailable"
+        emit({"ok": True, "protocolVersion": PROTOCOL, "channels": list(MANAGED_CHANNELS)})
+        return
+    if not args.source or not args.profile or not args.source.is_absolute() or not args.profile.is_absolute():
+        parser.error("private absolute source/profile paths required")
+    sys.stdout = sys.stderr
+    sys.path.insert(0, str(args.source))
+    os.environ["HERMES_HOME"] = str(args.profile)
+    os.environ["HERMES_BUNDLED_PLUGINS"] = str(args.source / "plugins")
+    boot = read_frame()
+    if boot is None:
+        return
+    async def run():
+        await Host(boot, args.profile).serve()
+    asyncio.run(run())
+
+
+if __name__ == "__main__":
+    main()

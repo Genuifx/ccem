@@ -88,7 +88,7 @@ ccem cron --help
 ccem cron list --json
 ```
 
-The current agent-facing CLI supports `list`, `create`, and `delete`. It does not expose an `update`, `edit`, or `runs` command.
+The current agent-facing CLI supports `list`, `notification-targets`, `create`, and `delete`. It does not expose an `update`, `edit`, or `runs` command.
 
 Read task IDs and complete task configuration from the array returned by `ccem cron list --json`. Resolve an exact task ID before changing an existing task.
 
@@ -97,6 +97,8 @@ For creation, run `ccem cron create --help`, resolve natural-language schedules 
 ```bash
 ccem cron create --from-json @task.json --json
 ```
+
+When the user asks to send task results to a Hermes bot, run `ccem cron notification-targets --json` and select the paired recipient matching the request. Ask when multiple recipients match; never invent recipient IDs or silently select another channel after a lookup failure.
 
 For deletion, confirm the exact task and use its ID:
 

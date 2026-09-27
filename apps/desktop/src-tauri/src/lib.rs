@@ -21,6 +21,8 @@ mod dsh_history;
 mod event_bus;
 mod event_dispatcher;
 mod external_control;
+mod hermes_bridge;
+mod hermes_installer;
 mod history;
 mod interactive_runtime;
 #[cfg(test)]
@@ -42,6 +44,7 @@ mod pet_window;
 mod prompt_image_store;
 mod proxy_debug;
 mod remote;
+mod remote_bridge;
 mod router;
 mod runtime;
 mod secure_fs;
@@ -5495,6 +5498,9 @@ pub fn run_desktop_app() -> i32 {
         native_runtime_manager.clone(),
         environment_mutation_coordinator.clone(),
     ));
+    let hermes_bridge_manager = Arc::new(hermes_bridge::HermesBridgeManager::new(
+        native_runtime_manager.clone(), environment_mutation_coordinator.clone(),
+    ));
     let event_dispatcher = Arc::new(EventDispatcher::default());
     let unified_session_manager = Arc::new(UnifiedSessionManager::new(
         headless_runtime_manager.clone(),
@@ -5528,6 +5534,7 @@ pub fn run_desktop_app() -> i32 {
     let proxy_manager_for_run = proxy_debug_manager.clone();
     let external_control_manager_for_setup = external_control_manager.clone();
     let external_control_manager_for_run = external_control_manager.clone();
+    let hermes_bridge_manager_for_run = hermes_bridge_manager.clone();
     let interactive_manager_for_setup = interactive_runtime_manager.clone();
     let interactive_manager_for_run = interactive_runtime_manager.clone();
     let headless_manager_for_run = headless_runtime_manager.clone();
@@ -5599,6 +5606,7 @@ pub fn run_desktop_app() -> i32 {
         .manage(login_browser_session_manager.clone())
         .manage(login_browser_surface_manager.clone())
         .manage(external_control_manager.clone())
+        .manage(hermes_bridge_manager.clone())
         .manage(event_dispatcher.clone())
         .manage(unified_session_manager.clone())
         .manage(telegram_bridge_manager.clone())
@@ -5916,6 +5924,9 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            hermes_bridge::hermes_status,
+            hermes_bridge::hermes_notification_targets,
+            hermes_bridge::hermes_action,
             #[cfg(all(target_os = "macos", debug_assertions))]
             webcontent_recovery::webcontent_debug_main_process_id,
             webcontent_recovery::webcontent_frontend_boot,
@@ -6302,6 +6313,8 @@ pub fn run_desktop_app() -> i32 {
                 if let Err(error) = external_control_manager_for_setup.start(startup_app.clone()) {
                     eprintln!("External control startup warning: {}", error);
                 }
+                startup_app.state::<Arc<hermes_bridge::HermesBridgeManager>>()
+                    .activate(&startup_app, automatic_background_services_enabled);
 
                 // Sync autostart state from settings only for a single-owner run.
                 if automatic_background_services_enabled {
@@ -6525,6 +6538,7 @@ pub fn run_desktop_app() -> i32 {
                 proxy_for_shutdown.shutdown().await;
             });
             external_control_manager_for_run.shutdown();
+            hermes_bridge_manager_for_run.shutdown();
         }
     });
 

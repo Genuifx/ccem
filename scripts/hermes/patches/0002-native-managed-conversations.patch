@@ -1,0 +1,411 @@
+diff --git a/gateway/managed_contracts.py b/gateway/managed_contracts.py
+index e04183c..5852459 100644
+--- a/gateway/managed_contracts.py
++++ b/gateway/managed_contracts.py
+@@ -8,6 +8,8 @@ from __future__ import annotations
+ 
+ import asyncio
+ import math
++import time
++from collections import OrderedDict
+ from dataclasses import asdict, dataclass
+ from typing import Optional
+ 
+@@ -34,6 +36,7 @@ class TrustedCommandContext:
+     thread_id: Optional[str]
+     source_message_id: Optional[str]
+     chat_type: str
++    received_at_ns: Optional[int] = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -48,6 +51,11 @@ def integration_only(runner) -> bool:
+     return getattr(getattr(runner, "config", None), "integration_only", False) is True
+ 
+ 
++def managed_gateway(runner) -> bool:
++    """A host owns transport identity, policy and delivery, with optional native dialogue."""
++    return integration_only(runner) or getattr(getattr(runner, "config", None), "managed_transport", False) is True
++
++
+ def native_source_message_id(event) -> Optional[str]:
+     """Return transport message identity, excluding adapter bookkeeping fallbacks.
+ 
+@@ -63,7 +71,72 @@ def native_source_message_id(event) -> Optional[str]:
+     return str(value)
+ 
+ 
+-def command_context(runner, source, source_message_id) -> TrustedCommandContext:
++_INGRESS_CLOCK_RETENTION_NS = 600 * 1_000_000_000
++_INGRESS_CLOCK_CAPACITY = 4096
++
++
++def stamp_managed_ingress(runner, event, *, pending=False):
++    """Freeze earliest native arrival before tasks, hooks or command queues.
++
++    This is transport provenance, not authorization. The runner authenticates
++    the original source before it may expose the value in a command context.
++    Never evict an unexpired ID to admit an unknown one: missing time fails closed.
++    """
++    now = time.monotonic_ns()
++    source = event.source
++    native_id = native_source_message_id(event) if source is not None else None
++    if source is None or native_id is None:
++        event._hermes_received_at_ns = None
++        return
++    cache = getattr(runner, "_managed_ingress_clock", None)
++    if cache is None:
++        cache = runner._managed_ingress_clock = OrderedDict()
++    for key, (_, active, expires) in list(cache.items()):
++        if not active and expires is not None and expires <= now:
++            del cache[key]
++    profile = source.profile or getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
++    key = (getattr(source.platform, "value", source.platform), profile,
++           source.user_id, source.chat_id, source.thread_id, source.chat_type, native_id)
++    previously_stamped = hasattr(event, "_hermes_received_at_ns")
++    prior = getattr(event, "_hermes_received_at_ns", now)
++    entry = cache.get(key)
++    if prior is None:
++        return None  # an unclocked event never gains authority on internal replay
++    if entry is None:
++        if len(cache) >= _INGRESS_CLOCK_CAPACITY or getattr(runner, "_managed_ingress_clock_overflowed", False):
++            # We cannot remember an unlimited set of rejected IDs. Keep unknown
++            # IDs unclocked for this owner rather than later upgrading a retry.
++            runner._managed_ingress_clock_overflowed = True
++            event._hermes_received_at_ns = prior if previously_stamped else None
++            return None
++        entry = cache[key] = [min(prior, now), 0, now + _INGRESS_CLOCK_RETENTION_NS]
++    else:
++        entry[0] = min(entry[0], prior)
++    if pending:
++        entry[1] += 1
++    event._hermes_received_at_ns = entry[0]
++    return key if pending else None
++
++
++def retain_managed_control_ingress(runner, context) -> None:
++    """A short control never gains a fresh arrival if its RPC outcome is unknown."""
++    key = (context.platform, context.profile, context.user_id, context.chat_id,
++           context.thread_id, context.chat_type, context.source_message_id)
++    entry = getattr(runner, "_managed_ingress_clock", {}).get(key)
++    if entry is not None:
++        entry[2] = None  # bounded owner-lifetime tombstone, including failed RPCs
++
++
++def release_managed_ingress(runner, key) -> None:
++    """A queued/processing ID cannot expire before its handler completes."""
++    entry = getattr(runner, "_managed_ingress_clock", {}).get(key)
++    if entry is not None:
++        entry[1] -= 1
++        if entry[2] is not None:
++            entry[2] = time.monotonic_ns() + _INGRESS_CLOCK_RETENTION_NS
++
++
++def command_context(runner, source, source_message_id, received_at_ns=None) -> TrustedCommandContext:
+     """Called only after ingress authorization, using the pre-hook source snapshot."""
+     primary = getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
+     owner = runner._transport_owner(source)
+@@ -74,6 +147,7 @@ def command_context(runner, source, source_message_id) -> TrustedCommandContext:
+         chat_id=source.chat_id, thread_id=source.thread_id,
+         source_message_id=str(source_message_id) if source_message_id else None,
+         chat_type=source.chat_type,
++        received_at_ns=received_at_ns,
+     )
+ 
+ 
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index d3b1041..c06775b 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3519,9 +3519,10 @@ class BasePlatformAdapter(ABC):
+         a second command into text in the first command, losing its message ID.
+         Run independently of the transport reader so reply ACKs can still arrive.
+         """
+-        from gateway.managed_contracts import integration_only
+-        if not self._message_handler or not integration_only(self.gateway_runner):
++        from gateway.managed_contracts import managed_gateway, stamp_managed_ingress, release_managed_ingress
++        if not self._message_handler or not managed_gateway(self.gateway_runner):
+             return False
++        clock_key = stamp_managed_ingress(self.gateway_runner, event, pending=True)
+ 
+         async def dispatch():
+             try:
+@@ -3534,7 +3535,14 @@ class BasePlatformAdapter(ABC):
+                 # A callback may already have sent. Never produce an extra reply.
+                 logger.exception("[%s] Integration command dispatch failed", self.name)
+ 
+-        task = asyncio.create_task(dispatch())
++        try:
++            task = asyncio.create_task(dispatch())
++        except BaseException:
++            release_managed_ingress(self.gateway_runner, clock_key)
++            raise
++        # A done callback also runs if cancellation precedes the coroutine's
++        # first instruction; a coroutine-local finally cannot cover that case.
++        task.add_done_callback(lambda _: release_managed_ingress(self.gateway_runner, clock_key))
+         self._background_tasks.add(task)
+         task.add_done_callback(self._background_tasks.discard)
+         task.add_done_callback(self._expected_cancelled_tasks.discard)
+diff --git a/gateway/run.py b/gateway/run.py
+index 206fc3c..500e474 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1719,7 +1719,7 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
+     carry the scope into the executor thread with ``copy_context()`` (the same shape as
+     ``_run_in_executor_with_context``). See #95518.
+     """
+-    if getattr(config, "integration_only", False) is True:
++    if (getattr(config, "integration_only", False) is True or getattr(config, "managed_transport", False) is True):
+         return
+     from tools.mcp_tool_discovery import discover_mcp_tools
+     loop = asyncio.get_running_loop()
+@@ -3493,7 +3493,7 @@ class GatewayRunner(
+ 
+     def _init_startup_checks(self) -> None:
+         """Ensure tirith is installed and warn when manual approvals have no automated assessor."""
+-        if getattr(self.config, "integration_only", False) is True:
++        if (getattr(self.config, "integration_only", False) is True or getattr(self.config, "managed_transport", False) is True):
+             return
+         def _ensure_tirith() -> None:
+             from tools.tirith_security import ensure_installed
+@@ -5027,7 +5027,7 @@ async def _start_gateway_start_control_socket(runner):
+ def _start_gateway_start_cron_and_housekeeping(runner):
+     """Start the cron scheduler thread + gateway housekeeping thread; returns
+     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+-    if getattr(runner.config, "integration_only", False) is True:
++    if (getattr(runner.config, "integration_only", False) is True or getattr(runner.config, "managed_transport", False) is True):
+         return threading.Event(), None, None, None
+     # The event loop is passed so cron delivery can use live adapters (E2EE support).
+     from cron.scheduler_provider import (
+@@ -5260,7 +5260,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+         start_nous_auth_keepalive()
+ 
+     _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+-    if getattr(runner.config, "integration_only", False) is not True:
++    if not (getattr(runner.config, "integration_only", False) is True or getattr(runner.config, "managed_transport", False) is True):
+         _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
+     _ensure_windows_gateway_venv_imports()
+ 
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index eaea0b8..215f48f 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -20,7 +20,7 @@ import re
+ import time
+ from contextlib import suppress
+ from gateway.config import Platform
+-from gateway.managed_contracts import INTEGRATION_NATIVE_COMMANDS, command_context, integration_only, native_source_message_id
++from gateway.managed_contracts import INTEGRATION_NATIVE_COMMANDS, command_context, integration_only, native_source_message_id, stamp_managed_ingress
+ from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+ from gateway.run_common import _UNSET
+ from gateway.session import (
+@@ -116,6 +116,11 @@ class GatewayInboundMixin:
+     ) -> Optional[Tuple["MessageEvent", SessionSource, bool]]:
+         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
+         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
++        # Capture before any await or hook. Direct runner callers still get an
++        # entry stamp; a saturated transport clock must remain missing.
++        if not hasattr(event, "_hermes_received_at_ns"):
++            stamp_managed_ingress(self, event)
++        ingress_received_at_ns = event._hermes_received_at_ns
+         from gateway.run import _is_slack_ignored_channel
+         source = event.source
+         # A transport event can be replayed; admission must never reuse an old stamp.
+@@ -202,6 +207,7 @@ class GatewayInboundMixin:
+         event.internal = False
+         event.allow_gateway_control = ingress_control
+         event._hermes_trusted_command_context = None
++        event._hermes_received_at_ns = ingress_received_at_ns
+ 
+         if not self._is_user_authorized_for_source(source):
+             if source.user_id is None:
+@@ -217,7 +223,7 @@ class GatewayInboundMixin:
+             ):
+                 await self._hm_offer_pairing_code(source)
+             return None
+-        event._hermes_trusted_command_context = command_context(self, source, ingress_native_message_id)
++        event._hermes_trusted_command_context = command_context(self, source, ingress_native_message_id, ingress_received_at_ns)
+         return event, source, False
+ 
+     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 72e8286..0603245 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -17,7 +17,7 @@ import time
+ from contextlib import suppress
+ from datetime import datetime
+ from gateway.config import Platform
+-from gateway.managed_contracts import integration_only
++from gateway.managed_contracts import managed_gateway
+ from gateway.delivery import looks_like_telegram_private_chat_id
+ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+ from gateway.session import SessionSource, build_session_key
+@@ -94,7 +94,7 @@ class GatewayStartupMixin:
+         """Kick off the boot turn-machinery warm-up so it overlaps the network-bound platform
+         connects; ``_finish_startup_restore`` awaits it (bounded)."""
+         from gateway.run import _startup_warmup_timeout_secs
+-        if integration_only(self) or _startup_warmup_timeout_secs() <= 0:
++        if managed_gateway(self) or _startup_warmup_timeout_secs() <= 0:
+             self._startup_warmup_task = None
+             return
+         self._startup_warmup_task = asyncio.ensure_future(self._warm_turn_prerequisites())
+@@ -370,7 +370,7 @@ class GatewayStartupMixin:
+         """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
+         claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
+         the next restart. Best-effort; reuses the startup redelivery contract."""
+-        if integration_only(self):
++        if managed_gateway(self):
+             return 0
+         try:
+             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
+@@ -444,7 +444,7 @@ class GatewayStartupMixin:
+         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
+         sessions with a running agent are skipped so none is resumed twice."""
+         from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
+-        if integration_only(self):
++        if managed_gateway(self):
+             return 0
+         window = _auto_continue_freshness_window()
+         candidates = self._resume_pending_candidates(platform)
+@@ -615,7 +615,7 @@ class GatewayStartupMixin:
+ 
+     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
+         """Pause room execution durably without interrupting accepted turns."""
+-        if integration_only(self):
++        if managed_gateway(self):
+             return True
+         from tui_gateway import methods_groups
+         return await asyncio.to_thread(methods_groups.stop_hosted_room_service, timeout=timeout)
+@@ -845,7 +845,7 @@ class GatewayStartupMixin:
+         from gateway.run import _hermes_home
+         self._start_register_plugins_relay_hooks()
+         self.hooks.discover_and_load()
+-        if integration_only(self):
++        if managed_gateway(self):
+             return
+         # Recover background processes from checkpoint (crash recovery)
+         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
+@@ -1136,7 +1136,7 @@ class GatewayStartupMixin:
+     async def _start_post_connect_services(self, connected_count: int) -> None:
+         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
+         from gateway.run import _hermes_home
+-        if integration_only(self):
++        if managed_gateway(self):
+             self._start_loop_heartbeat_task()
+             await self.hooks.emit("gateway:startup", {"platforms": [p.value for p in self.adapters]})
+             logger.info("Integration-only gateway running with %s platform(s)", connected_count)
+@@ -1174,7 +1174,7 @@ class GatewayStartupMixin:
+         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
+         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
+         await self._start_post_connect_services(connected_count)
+-        if integration_only(self):
++        if managed_gateway(self):
+             await self._finish_startup_restore()
+             return
+         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
+@@ -1223,7 +1223,7 @@ class GatewayStartupMixin:
+ 
+     def _start_spawn_background_watchers(self) -> None:
+         """Spawn the long-lived supervised background watchers."""
+-        if integration_only(self):
++        if managed_gateway(self):
+             self._spawn_reconnect_watcher()
+             self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+             return
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 86441f5..70b088e 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -1374,8 +1374,8 @@ class DiscordAdapter(BasePlatformAdapter):
+         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+             return False, False
+         role_authorized = False
+-        from gateway.managed_contracts import integration_only
+-        if integration_only(self.gateway_runner):
++        from gateway.managed_contracts import managed_gateway
++        if managed_gateway(self.gateway_runner):
+             # Let the gateway's Desktop-nonce hook see native private messages.
+             # This is transport admission only; command authorization stays there.
+             return (isinstance(message.channel, discord.DMChannel)
+@@ -5945,8 +5945,8 @@ class DiscordAdapter(BasePlatformAdapter):
+         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
+     ) -> bool:
+         """Handle one Discord message and report whether it reached dispatch."""
+-        from gateway.managed_contracts import integration_only
+-        if integration_only(self.gateway_runner) and not isinstance(message.channel, discord.DMChannel):
++        from gateway.managed_contracts import managed_gateway
++        if managed_gateway(self.gateway_runner) and not isinstance(message.channel, discord.DMChannel):
+             return False
+         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
+         #
+diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
+index 85460c0..8233897 100644
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -1995,8 +1995,8 @@ class FeishuAdapter(BasePlatformAdapter):
+         if not message or not sender or not getattr(sender, "sender_id", None):
+             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
+             return
+-        from gateway.managed_contracts import integration_only
+-        if integration_only(self.gateway_runner) and getattr(message, "chat_type", None) != "p2p":
++        from gateway.managed_contracts import managed_gateway
++        if managed_gateway(self.gateway_runner) and getattr(message, "chat_type", None) != "p2p":
+             return
+         message_id = getattr(message, "message_id", None)
+         if not message_id or await self._is_duplicate(message_id):
+@@ -2556,6 +2556,8 @@ class FeishuAdapter(BasePlatformAdapter):
+ 
+     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
+         """Apply Feishu-specific burst protection before entering the base adapter."""
++        if self._start_integration_processing(event):
++            return
+         if event.message_type == MessageType.TEXT and not event.is_command():
+             await self._enqueue_text_event(event)
+             return
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 71a96a1..eaf7500 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -1635,8 +1635,8 @@ class SlackAdapter(BasePlatformAdapter):
+         proxy_url = _resolve_slack_proxy_url()
+         if proxy_url:
+             logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
+-        from gateway.managed_contracts import integration_only
+-        if integration_only(self.gateway_runner):
++        from gateway.managed_contracts import managed_gateway
++        if managed_gateway(self.gateway_runner):
+             from .strict_delivery import single_bot_token
+             if not single_bot_token(raw_token):
+                 self._set_fatal_error("managed_single_account_required", "One Slack bot token is required", retryable=False)
+@@ -3980,8 +3980,8 @@ class SlackAdapter(BasePlatformAdapter):
+         the synthetic reaction ts. Channels: real reply → per-thread; top-level with
+         ``reply_in_thread`` → ts as synthetic root; else None (``thread_ts == ts`` is no reply)."""
+         if is_dm:
+-            from gateway.managed_contracts import integration_only
+-            if integration_only(self.gateway_runner):
++            from gateway.managed_contracts import managed_gateway
++            if managed_gateway(self.gateway_runner):
+                 # A top-level DM stays top-level. Real threaded input retains its
+                 # native thread and is rejected by managed DM pairing/strict send.
+                 return event.get("thread_ts") or None
+@@ -4272,8 +4272,8 @@ class SlackAdapter(BasePlatformAdapter):
+             self._remember_channel_team(channel_id, team_id)
+         channel_type = event.get("channel_type", "") or ("im" if channel_id.startswith("D") else "")
+         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+-        from gateway.managed_contracts import integration_only
+-        if integration_only(self.gateway_runner) and (
++        from gateway.managed_contracts import managed_gateway
++        if managed_gateway(self.gateway_runner) and (
+             channel_type != "im" or event.get("type") != "message"
+             or event.get("_hermes_force_process") or len(self._team_clients) != 1
+             or team_id not in self._team_clients
+@@ -4291,7 +4291,7 @@ class SlackAdapter(BasePlatformAdapter):
+         # the runner's own auth check only runs after MessageEvent is built.
+         # Managed DM pairing runs in the gateway pre-dispatch hook. Keep its
+         # nonce challenge reachable; the gateway still authorizes every command.
+-        if not integration_only(self.gateway_runner) and self._early_reject_unauthorized(user_id, channel_id, is_dm):
++        if not managed_gateway(self.gateway_runner) and self._early_reject_unauthorized(user_id, channel_id, is_dm):
+             return
+         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
+         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)

@@ -20,10 +20,13 @@ If the request is specific enough, create the task directly. Ask a follow-up onl
 - Working directory: default to the current directory via `pwd`.
 - Timeout: default to 300 seconds unless the task clearly needs longer.
 - Execution profile: use `conservative`, `standard`, or `autonomous` based on risk.
-- WeCom result delivery: when the user asks to push/send cron results to 企微/企业微信/WeCom, add `wecomNotification`.
+- Legacy WeCom result delivery: only when the user explicitly selects the old WeCom connection, add `wecomNotification`. For Hermes-managed bots use the paired target below; never fall back automatically.
   - Use `{ "enabled": true, "botId": null, "peerId": null }` to send to the ChatApp/WeCom default target configured in CCEM.
   - If the user gives an explicit bot or peer target, fill `botId` and `peerId`.
   - If the user asks for WeCom delivery but neither a default target nor an explicit target is available, ask for confirmation instead of guessing.
+
+- Hermes result delivery: when the user asks to send results to a bot, run `ccem cron notification-targets --json`. Select the paired recipient matching the user's request; ask when multiple recipients match. Never invent chat IDs or silently fall back to another channel on lookup failure.
+- Set `hermesNotification: { routeId, generation }` using that exact returned target. This grants only this task's completion notifications and does not require workspace access. Without an explicit notification request leave it null. Do not supply subscriptionId.
 
 Common cron patterns:
 

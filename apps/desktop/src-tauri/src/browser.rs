@@ -8,7 +8,7 @@ pub(crate) mod login;
 mod logs;
 mod policy;
 mod registry;
-mod runtime;
+pub(crate) mod runtime;
 #[cfg(test)]
 pub(crate) mod runtime_commands;
 mod surface_coordinator;

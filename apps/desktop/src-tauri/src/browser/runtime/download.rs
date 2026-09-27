@@ -170,7 +170,7 @@ pub fn download_archive_blocking_with_reporter(
     download_archive_with_options(spec, control, reporter, CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
 }
 
-fn download_archive_with_options(
+pub(crate) fn download_archive_with_options(
     spec: &DownloadSpec,
     control: &DownloadControl,
     reporter: &dyn DownloadProgressReporter,

@@ -1,3 +1,4 @@
+import type { CronHermesNotification, CronHermesDelivery } from '@/lib/hermes-ipc';
 /**
  * Tauri IPC 类型映射
  *
@@ -552,6 +553,7 @@ export interface TauriCommands {
       timeoutSecs?: number;
       templateId?: string | null;
       wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
     },
     CronTask
   ];
@@ -569,6 +571,8 @@ export interface TauriCommands {
       disallowedTools?: string[] | null;
       timeoutSecs?: number;
       wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
+      clearHermesNotification?: boolean;
     },
     CronTask
   ];
@@ -1684,6 +1688,7 @@ export interface CronTask {
   timeoutSecs: number;
   templateId?: string | null;
   wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
   triggerType: string;
   parentTaskId?: string | null;
   createdAt: string;
@@ -1713,6 +1718,7 @@ export interface TrayRuntimeSnapshot {
 }
 
 export interface CronTaskRun {
+  hermesNotification?: CronHermesDelivery | null;
   id: string;
   taskId: string;
   startedAt: string;

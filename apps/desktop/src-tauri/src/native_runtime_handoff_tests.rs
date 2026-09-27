@@ -147,6 +147,7 @@ for line in sys.stdin:
                 &HelperInputCommand::Prompt {
                     text: "after failed handoff",
                     command_id: None,
+                    client_message_ids: None,
                     images: None,
                 },
             )

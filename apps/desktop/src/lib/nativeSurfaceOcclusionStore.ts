@@ -35,7 +35,17 @@ export interface NativeSurfaceOcclusionStoreOptions {
 function defaultDeferRestore(): Promise<void> {
   return new Promise((resolve) => {
     if (typeof requestAnimationFrame === 'function') {
-      requestAnimationFrame(() => resolve());
+      // Background WebViews can suspend animation frames indefinitely. Keep
+      // the post-commit deferral bounded so a closing overlay cannot block the
+      // next overlay's hide acknowledgement behind transitionTail.
+      let frame: number | undefined;
+      const finish = () => {
+        clearTimeout(timer);
+        if (frame !== undefined && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame);
+        resolve();
+      };
+      const timer = setTimeout(finish, 100);
+      frame = requestAnimationFrame(finish);
       return;
     }
     queueMicrotask(resolve);

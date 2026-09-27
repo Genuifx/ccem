@@ -60,6 +60,7 @@ import {
   type ClaudeBackgroundTask,
 } from './claudeBackgroundTasks';
 import { createStreamEventCoalescer } from './streamEventCoalescer';
+import { InputOperation } from './inputOperation';
 
 type NativeProvider = 'claude' | 'codex';
 
@@ -94,6 +95,7 @@ type PromptCommand = {
   text: string;
   images?: PromptImage[] | null;
   command_id?: string;
+  client_message_ids?: string[];
 };
 
 type InteractivePromptResponseCommand = {
@@ -299,6 +301,9 @@ let claudeTurnCompletionEmitted = false;
 let claudeLastAssistantMessageUuid: string | null = null;
 let claudeTurnAwaitingResult = false;
 let claudeForegroundPromptUuid: string | null = null;
+let claudeInputOperation: InputOperation | null = null;
+let claudeInputResultCorrelated = false;
+const promptInputOperations = new WeakMap<PromptCommand, InputOperation>();
 let claudeForegroundPromptAccepted = false;
 let claudeForegroundCommand: 'compact' | null = null;
 let claudeIngressOriginKind: string | null = null;
@@ -358,7 +363,7 @@ let codexClient: Codex | null = null;
 let codexThread: any = null;
 let codexLastContextUsageKey: string | null = null;
 let pendingSettings: RuntimeSettingsPatch | null = null;
-const promptQueue: Array<{ text: string; images?: PromptImage[] | null }> = [];
+const promptQueue: Array<{ text: string; images?: PromptImage[] | null; operation?: InputOperation }> = [];
 const pendingPermissions = new Map<string, PermissionResolver>();
 const pendingClaudeInteractivePrompts = new Map<string, ClaudeInteractivePromptResolver>();
 const startedToolNames = new Map<string, string>();
@@ -538,6 +543,7 @@ function emitClaudeLifecycleProtocolError(reason: string, commandId = claudeFore
   claudeLifecycleMode = 'poisoned';
   clearClaudeLifecycleTerminalTimer();
   pendingClaudePromptReplay = null;
+  if (commandId === claudeForegroundPromptUuid) claudeInputOperation?.observe('unknown', reason);
   emitEvent({
     type: 'lifecycle',
     stage: 'lifecycle_protocol_error',
@@ -691,6 +697,7 @@ function processNegotiatedClaudeSdkCommandLifecycle(frame: ClaudeSdkCommandLifec
   if (state === 'queued' || state === 'started') {
     claudeForegroundPromptAccepted = true;
     pendingClaudePromptReplay = null;
+    if (state === 'started') claudeInputOperation?.observe('started', 'Claude SDK started the command.');
     return;
   }
   if (CLAUDE_SDK_TERMINAL_STATES.has(state)) {
@@ -1111,6 +1118,8 @@ function closeClaudeQueryForRecovery(
   }
 
   if (isCurrentClaudeQuerySnapshot(snapshot)) {
+    claudeInputOperation?.observe('unknown', options.reason ?? 'Claude query closed before a matching terminal.');
+    claudeInputOperation = null;
     claudeTurnAwaitingResult = false;
     claudeForegroundPromptUuid = null;
     claudeForegroundPromptAccepted = false;
@@ -1434,6 +1443,8 @@ function clearClaudeForegroundOwnership() {
   pendingClaudePromptReplay = null;
   claudeForegroundPromptAccepted = false;
   claudeForegroundPromptUuid = null;
+  claudeInputOperation = null;
+  claudeInputResultCorrelated = false;
   claudeForegroundCommand = null;
   claudeForegroundCoordinatorStamped = false;
   claudeDeferredForegroundResult = null;
@@ -1522,6 +1533,12 @@ function emitClaudeLegacyTurnTerminal(detail: string) {
 
   claudeTurnCompletionEmitted = true;
   const completedCommandId = claudeForegroundPromptUuid;
+  claudeInputOperation?.observe(
+    claudeInputResultCorrelated
+      ? (claudeTurnResultObservation?.failed ? 'failed' : 'completed')
+      : 'unknown',
+    claudeInputResultCorrelated ? detail : 'Legacy Claude terminal has no matching result user_message_uuid.',
+  );
   clearClaudeForegroundOwnership();
   emitEvent({
     type: 'lifecycle',
@@ -1570,6 +1587,10 @@ function finishClaudeFullLifecycleTurn(state: ClaudeSdkCommandState, commandId: 
   claudeTurnCompletionEmitted = true;
   claudeAuthoritativeTerminalCommandId = commandId;
   rememberClaudeCommandId(claudeTerminalCommandIds, commandId);
+  claudeInputOperation?.observe(
+    state === 'completed' && !(claudeInputResultCorrelated && observation?.failed) ? 'completed' : 'failed',
+    (claudeInputResultCorrelated && observation?.detail) || `Claude SDK command ${state}.`,
+  );
   clearClaudeForegroundOwnership();
   claudeInterruptRequested = false;
 
@@ -1679,6 +1700,7 @@ function finishClaudeLegacyTurnAfterIdle() {
 
 function emitClaudeTurnInterrupted(detail = 'Claude turn interrupted by desktop workspace.') {
   const interruptedCommandId = claudeForegroundPromptUuid;
+  claudeInputOperation?.observe('failed', detail);
   clearClaudeForegroundOwnership();
   claudeLastSessionState = 'idle';
   claudeInterruptRequested = false;
@@ -1733,6 +1755,7 @@ function emitClaudeDeliveryUncertain(reason: string) {
   claudeLifecycleMode = 'poisoned';
   clearClaudeLifecycleTerminalTimer();
   pendingClaudePromptReplay = null;
+  claudeInputOperation?.observe('unknown', reason);
   emitEvent({
     type: 'lifecycle',
     stage: 'delivery_uncertain',
@@ -1755,6 +1778,8 @@ function emitClaudeIncompleteResponse() {
 
   claudeTurnAwaitingResult = false;
   const incompleteCommandId = claudeForegroundPromptUuid;
+  claudeInputOperation?.observe('unknown', CLAUDE_INCOMPLETE_RESPONSE_REASON);
+  claudeInputOperation = null;
   claudeForegroundPromptUuid = null;
   claudeForegroundPromptAccepted = false;
   claudeForegroundCommand = null;
@@ -3411,6 +3436,9 @@ async function consumeClaudeMessages() {
         if (currentHumanEcho) {
           claudeForegroundPromptAccepted = true;
           pendingClaudePromptReplay = null;
+          if (claudeLifecycleMode === 'legacy' && message.uuid === claudeForegroundPromptUuid) {
+            claudeInputOperation?.observe('started', 'Claude SDK accepted the matching human input.');
+          }
         }
         const checkpoint = backgroundOwned
           ? null
@@ -3756,6 +3784,7 @@ async function consumeClaudeMessages() {
         claudeForegroundPromptAccepted = true;
 
         emitClaudeResultUsage(message);
+        claudeInputResultCorrelated = correlatedCommandId === claudeForegroundPromptUuid;
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
         finishClaudeLegacyTurnAfterIdle();
         if (!resultObservation.failed) {
@@ -3926,6 +3955,7 @@ function enqueueClaudePrompt(
   images?: PromptImage[] | null,
   commandId?: string,
   legacyReplayMessageId?: string,
+  operation?: InputOperation,
 ) {
   if (!claudeInputQueue) {
     throw new Error('Claude streaming input queue is not ready');
@@ -3942,6 +3972,8 @@ function enqueueClaudePrompt(
   claudeInterruptRequested = false;
   claudeInterruptCompletionEmitted = false;
   claudeForegroundPromptUuid = messageUuid;
+  claudeInputOperation = operation ?? null;
+  claudeInputResultCorrelated = false;
   claudeAuthoritativeTerminalCommandId = null;
   claudeForegroundCoordinatorStamped = coordinatorStamped;
   claudeForegroundPromptAccepted = false;
@@ -4284,7 +4316,7 @@ async function ensureCodexThread() {
   return codexThread;
 }
 
-async function runCodexTurn(text: string, images: PromptImage[] | null | undefined, abortController: AbortController) {
+async function runCodexTurn(text: string, images: PromptImage[] | null | undefined, abortController: AbortController, operation?: InputOperation) {
   const thread = await ensureCodexThread();
   abortController.signal.throwIfAborted();
 
@@ -4333,6 +4365,7 @@ async function runCodexTurn(text: string, images: PromptImage[] | null | undefin
     }
 
     if (event.type === 'turn.started') {
+      operation?.observe('started', 'Codex SDK started the turn.');
       emitEvent({
         type: 'lifecycle',
         stage: 'turn_started',
@@ -4343,6 +4376,7 @@ async function runCodexTurn(text: string, images: PromptImage[] | null | undefin
 
     if (event.type === 'turn.completed') {
       const outputTokens = event.usage.output_tokens ?? 0;
+      operation?.observe('completed', `Codex SDK completed the turn · output ${outputTokens} tokens`);
       emitEvent({
         type: 'lifecycle',
         stage: 'turn_completed',
@@ -4361,6 +4395,7 @@ async function runCodexTurn(text: string, images: PromptImage[] | null | undefin
     }
 
     if (event.type === 'turn.failed') {
+      operation?.observe('failed', event.error.message);
       // Explicit model selection must not look successful when the provider
       // rejects it. Preserve the legacy status behavior for omitted models.
       if (initCommand?.model != null) throw new Error(event.error.message);
@@ -4491,12 +4526,14 @@ async function runQueuedTurns() {
   currentAbortController = abortController;
   emitStatus('processing', 'Codex is processing a turn.');
   try {
-    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController);
+    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
+    nextPrompt.operation?.observe('unknown', 'Codex stream ended without a turn terminal.');
     if (!stopped) {
       emitStatus('ready', 'Ready for the next prompt.');
     }
   } catch (error) {
     const isAbort = error instanceof Error && error.name === 'AbortError';
+    nextPrompt.operation?.observe('unknown', error instanceof Error ? error.message : String(error));
     if (isAbort && !stopped) {
       emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
     }
@@ -5141,6 +5178,13 @@ async function handleCommand(command: InputCommand) {
     if (!command.text.trim() && !hasImages) {
       return;
     }
+    // Correlated Claude inputs also need the existing admission fence when a
+    // helper-only caller did not provide a backend command ID.
+    if (initCommand?.provider === 'claude' && command.client_message_ids?.length && !command.command_id) {
+      command.command_id = randomUUID();
+    }
+    const operation = new InputOperation(initCommand?.provider ?? 'codex', command.client_message_ids, emitEvent, command.command_id);
+    promptInputOperations.set(command, operation);
     if (runtimeTeardownPreparationId) {
       throw new Error('Native runtime is preparing to close and cannot accept a new prompt.');
     }
@@ -5149,9 +5193,11 @@ async function handleCommand(command: InputCommand) {
       // turn: reject it explicitly instead of silently queueing it behind the
       // active command (which would clobber the active turn's identity).
       if (!reserveClaudeCoordinatorAdmission(command.command_id)) {
+        operation.observe('failed', 'Claude rejected the input before dispatch: foreground busy.');
         return;
       }
       if (!await waitForClaudeInitializationForCommand(command.command_id)) {
+        operation.observe('failed', 'Claude initialization rejected the input before dispatch.');
         return;
       }
       await waitForClaudeInterruptToSettle();
@@ -5169,11 +5215,12 @@ async function handleCommand(command: InputCommand) {
         if (command.command_id) {
           cancelledClaudeCoordinatorAdmissions.delete(command.command_id);
         }
+        operation.observe('failed', 'Claude input was cancelled before dispatch.');
         return;
       }
-      enqueueClaudePrompt(command.text.trim(), command.images, command.command_id);
+      enqueueClaudePrompt(command.text.trim(), command.images, command.command_id, undefined, operation);
     } else {
-      promptQueue.push({ text: command.text.trim(), images: command.images });
+      promptQueue.push({ text: command.text.trim(), images: command.images, operation });
       await runQueuedTurns();
     }
     return;
@@ -5236,6 +5283,9 @@ async function handleCommand(command: InputCommand) {
     stopped = runtimeTeardown;
     if (runtimeTeardown) {
       runtimeTeardownPreparationId = null;
+      for (const queued of promptQueue.splice(0)) {
+        queued.operation?.observe('failed', 'Runtime stopped before this queued input was dispatched.');
+      }
     }
     clearClaudeIdleCloseTimer();
     pendingClaudePromptReplay = null;
@@ -5574,6 +5624,8 @@ rl.on('line', (line) => {
     }
     if (command.type === 'prompt') {
       releaseClaudeCoordinatorAdmission(command.command_id);
+      const operation = promptInputOperations.get(command);
+      operation?.observe(operation === claudeInputOperation ? 'unknown' : 'failed', message);
     }
     if (
       command.type === 'init'
