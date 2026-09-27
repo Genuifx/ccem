@@ -10,6 +10,45 @@ host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
 
 class GatewayHostTest(unittest.TestCase):
+    def test_mobile_confirmation_copy_normalizes_only_a_whole_control_reply(self):
+        challenge = "0123456789abcdef" * 3
+        for prefix in ("/ccem", "!ccem"):
+            for text in (f"{prefix} confirm {challenge}",
+                         f"两分钟内发送：\n{prefix} confirm\n{challenge[:32]}\n{challenge[32:]}",
+                         f" 两分钟内发送:\n{prefix} confirm {challenge.upper()}\n"):
+                with self.subTest(text=text):
+                    self.assertEqual(host.confirmation_reply(text, prefix), f"confirm {challenge}")
+            self.assertEqual(host.confirmation_reply(f"取消：\n{prefix} cancel\n{challenge}", prefix), f"cancel {challenge}")
+
+    def test_preview_and_ambiguous_control_copies_never_become_confirmation(self):
+        challenge = "c" * 48
+        examples = [host.render_result({"runtimeId": "native-one", "text": "hello", "challenge": challenge}),
+            f"/ccem confirm {challenge}\n/ccem cancel {challenge}",
+            f"/ccem confirm {challenge}\n/ccem confirm {challenge}",
+            f"请分析这条命令\n/ccem confirm {challenge}",
+            f"> /ccem confirm {challenge}",
+            f"两分钟内发送：\n/ccem cancel {challenge}",
+            f"取消：/ccem confirm {challenge}",
+            f"/ccem confirm {challenge} extra",
+            "/ccem confirm " + "c" * 47,
+            "/ccem confirm " + "c" * 49,
+            "/ccem confirm <确认码>"]
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual(host.confirmation_reply(text, "/ccem"), "confirmation-help")
+        self.assertEqual(host.confirmation_reply(f"/ccem confirm {challenge}", "!ccem"), f"confirm {challenge}")
+        self.assertEqual(host.confirmation_reply(f"!ccem confirm {challenge}", "/ccem"), "confirmation-help")
+        self.assertIsNone(host.confirmation_reply("继续", "/ccem"))
+
+    def test_confirmation_errors_are_specific_without_echoing_arbitrary_details(self):
+        for code in ("challenge_expired_or_revoked", "challenge_not_found", "challenge_scope_mismatch"):
+            message = host.command_error(code, "/ccem")
+            self.assertIn("失效", message)
+            self.assertIn("重新发送原任务", message)
+            self.assertNotIn("桌面", message)
+        self.assertIn("原会话当前不可用", host.command_error("session_not_found", "/ccem"))
+        self.assertNotIn("sensitive-details", host.command_error("sensitive-details", "/ccem"))
+
     def test_only_exact_loopback_rpc_endpoint_is_accepted(self):
         host.validate_endpoint("http://127.0.0.1:8123/rpc")
         for url in ["https://127.0.0.1:10/rpc", "http://localhost:10/rpc", "http://127.0.0.1:10/rpc?token=x", "http://127.0.0.1:10/else", "http://example.com:10/rpc", "http://x@127.0.0.1:10/rpc"]:

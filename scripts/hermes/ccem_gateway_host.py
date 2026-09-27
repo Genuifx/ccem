@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
@@ -56,6 +57,45 @@ FIELD_LABELS = {
 
 def command_prefix(platform):
     return "!ccem" if platform == "slack" else "/ccem"
+
+
+def confirmation_reply(text, prefix):
+    """Normalize only an entire control reply, never a command inside task prose.
+
+    Mobile clients can copy the nearby hint or insert whitespace in a long ID.
+    The normal gateway admission and Rust challenge checks still run afterward.
+    """
+    value = text.strip()
+    hint = re.match(r"^(两分钟内发送|取消)\s*[:：]\s*", value)
+    if hint:
+        value = value[hint.end():]
+    # Slack translates a leading !ccem to /ccem before gateway dispatch.
+    accepted_prefix = r"(?:!ccem|/ccem)" if prefix == "!ccem" else re.escape(prefix)
+    match = re.fullmatch(accepted_prefix + r"\s+(confirm|cancel)\s+([0-9a-fA-F\s]+)", value)
+    if match:
+        action, wrapped = match.groups()
+        challenge = "".join(wrapped.split())
+        expected = "cancel" if hint and hint[1] == "取消" else "confirm"
+        if len(challenge) == 48 and (not hint or action == expected):
+            return f"{action} {challenge.lower()}"
+    # A pasted preview or malformed control reply must not become a fresh task.
+    if re.search(r"[!/]+ccem\s+(?:confirm|cancel)\b", text):
+        return "confirmation-help"
+    return None
+
+
+def command_error(code, prefix):
+    if code in {"challenge_expired_or_revoked", "challenge_not_found", "challenge_scope_mismatch"}:
+        return "这条确认已过期或失效，没有提交新的执行。请重新发送原任务内容，收到新预览后再确认。"
+    if code in {"session_not_found", "session_not_active"}:
+        return "原会话当前不可用，没有提交新的执行。连接恢复后，请重新发送原任务内容。"
+    if code == "separate_confirmation_message_required":
+        return "请将确认指令作为一条新消息单独发送。"
+    if code == "challenge_not_pending":
+        return "这条请求已处理，不能再取消；如果任务已提交，取消确认不会停止正在执行的任务。"
+    if code in {"input_not_allowed", "workspace_not_authorized"}:
+        return "当前会话尚未允许机器人继续执行。请先在 CCEM 授权后再试。"
+    return f"CCEM 请求未完成。请稍后重试；已提交任务可用 {prefix} operation 查询。"
 
 
 def notification_text(text, platform):
@@ -276,11 +316,19 @@ class Host:
         event = kwargs.get("event")
         if not event or getattr(event, "internal", True) or not getattr(event, "allow_gateway_control", False):
             return None
+        if event.source and isinstance(event.text, str):
+            prefix = command_prefix(str(event.source.platform.value))
+            # Explicit input/chat commands keep their task text verbatim.
+            if not event.is_command() or (event.get_command() == "ccem" and
+                    event.get_command_args().split()[:1] in (["confirm"], ["cancel"])):
+                reply = confirmation_reply(event.text, prefix)
+                if reply is not None:
+                    return {"action": "rewrite", "text": "/ccem " + reply}
         if not event.is_command():
             # Rewrite only. Admission still authenticates the original native
             # sender/message after this hook; no RPC or grant happens here.
             if event.source and isinstance(event.text, str) and event.text.strip():
-                return {"action": "rewrite", "text": command_prefix(str(event.source.platform.value)) + " chat " + event.text}
+                return {"action": "rewrite", "text": "/ccem chat " + event.text}
             return None
         if event.get_command() != "ccem":
             return None
@@ -347,7 +395,10 @@ class Host:
                 args = raw_args.strip().split(maxsplit=2)
                 method = args[0] if args else "help"
                 params = {"source": source_value(context, self.boot["accountRef"]), "sourceMessageId": context.source_message_id}
-                if method in ("list",):
+                if method == "confirmation-help":
+                    await send_strict(self.runner, target, f"请单独发送一条确认或取消指令，例如：\n{prefix} confirm <确认码>\n请只复制预览中的确认指令，不要连同任务正文或取消指令一起发送。")
+                    return None
+                elif method in ("list",):
                     pass
                 elif method == "chat":
                     text = raw_args.strip().partition(" ")[2]
@@ -374,9 +425,11 @@ class Host:
                     return None
                 result = await asyncio.to_thread(self.rpc, method, params)
                 text = render_result(result, maximum, prefix)
-            except (ValueError, urllib.error.URLError, TimeoutError):
+            except ValueError as error:
+                text = command_error(str(error), prefix)
+            except (urllib.error.URLError, TimeoutError):
                 # Avoid echoing credentials, arbitrary exception strings or task content on transport errors.
-                text = f"CCEM 请求未完成。请在桌面检查连接、工作区授权或确认有效期；已提交任务可用 {prefix} operation 查询。"
+                text = command_error("transport_error", prefix)
             except Exception:
                 text = "CCEM 请求失败；请在桌面检查连接状态。"
             receipt = await send_strict(self.runner, target, text)
@@ -564,7 +617,7 @@ def render_result(result, maximum=3500, prefix="/ccem"):
     if not isinstance(result, dict):
         return "CCEM：请求已处理。"
     if "challenge" in result:
-        preview = f"继续任务 {result['runtimeId']}\n\n{result['text']}\n\n两分钟内发送：\n{prefix} confirm {result['challenge']}\n取消：{prefix} cancel {result['challenge']}"
+        preview = f"继续任务 {result['runtimeId']}\n\n{result['text']}\n\n两分钟内发送：\n{prefix} confirm {result['challenge']}\n\n取消：\n{prefix} cancel {result['challenge']}"
         if len(preview.encode("utf-8")) > maximum:
             # Never ask a user to approve a truncated instruction.
             raise ValueError("confirmation_preview_too_large")

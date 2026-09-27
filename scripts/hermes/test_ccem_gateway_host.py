@@ -20,6 +20,75 @@ from unittest.mock import patch
 
 
 class NativePairingProvenance(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmation_rewrite_keeps_gateway_admission_and_explicit_task_text(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+        host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+            "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc", "platform": "wecom"},
+            Path(os.environ["HERMES_HOME"]))
+        host.rpc = lambda *args: self.fail("A pre-dispatch rewrite cannot issue RPC")
+        source = SessionSource(platform=Platform("wecom"), chat_id="chat", user_id="user", chat_type="dm")
+        text = "两分钟内发送：\n/ccem confirm " + "c" * 48
+        for flags in ({"internal": True}, {"allow_gateway_control": False}):
+            event = MessageEvent(text=text, message_id="native-message", source=source, **flags)
+            self.assertIsNone(host.pairing_hook(event=event))
+        for command in ("chat", "input native-one"):
+            text = f"/ccem {command} explain this example:\n/ccem confirm " + "c" * 48
+            event = MessageEvent(text=text, message_id="native-message", source=source)
+            self.assertIsNone(host.pairing_hook(event=event))
+            self.assertEqual(event.text, text)
+
+    async def test_wecom_copied_confirmation_dispatches_once_without_creating_a_new_task(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.wecom.adapter import WeComAdapter
+        from gateway.managed_contracts import native_source_message_id
+
+        host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+            "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc", "platform": "wecom"},
+            Path(os.environ["HERMES_HOME"]))
+        challenge = "0123456789abcdef" * 3
+        calls, replies = [], []
+        def rpc(method, params):
+            calls.append((method, params))
+            if method == "confirm":
+                return {"operationId": "hermes:test", "state": "submitting"}
+            self.fail("A copied control reply must never create another chat preview")
+        async def send(runner, target, text):
+            replies.append(text)
+            return {"status": "sent"}
+        host.rpc = rpc
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._is_dm_intake_allowed = lambda sender: True
+        adapter._text_batch_delay_seconds = adapter._attachment_text_merge_delay_seconds = 0
+        async def receive(event):
+            rewrite = host.pairing_hook(event=event)
+            self.assertEqual(rewrite["action"], "rewrite")
+            context = types.SimpleNamespace(platform="wecom", profile="managed", transport_profile="managed",
+                user_id=event.source.user_id, chat_id=event.source.chat_id, thread_id=None,
+                chat_type="dm", source_message_id=native_source_message_id(event))
+            await host.command(rewrite["text"].removeprefix("/ccem "), context)
+        adapter.handle_message = receive
+        async def packet(text, message_id):
+            await adapter._on_message({"headers": {"req_id": "native-request"}, "body": {
+                "msgtype": "text", "text": {"content": text}, "msgid": message_id,
+                "from": {"userid": "native-user"}, "chatid": "native-chat", "chattype": "single"}})
+        with patch("gateway.managed_contracts.send_strict", send):
+            await packet(f"两分钟内发送：\n/ccem confirm\n{challenge[:30]}\n{challenge[30:]}", "native-confirm")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], "confirm")
+            self.assertEqual(calls[0][1]["challenge"], challenge)
+            self.assertEqual(calls[0][1]["sourceMessageId"], "native-confirm")
+            self.assertEqual(calls[0][1]["source"]["userId"], "native-user")
+            self.assertIn("hermes:test", replies[-1])
+            await packet(host_module.render_result({"runtimeId": "native-one", "text": "hello", "challenge": challenge}), "native-preview-copy")
+            self.assertEqual(len(calls), 1)
+            self.assertIn("单独发送一条", replies[-1])
+            host.rpc = lambda *args: (_ for _ in ()).throw(ValueError("challenge_expired_or_revoked"))
+            await packet(f"/ccem confirm {challenge}", "native-expired")
+            self.assertIn("失效", replies[-1])
+            self.assertIn("重新发送原任务", replies[-1])
+
     async def test_invalid_feishu_region_is_rejected_before_adapter_start(self):
         with patch.dict(os.environ, {"HERMES_BUNDLED_PLUGINS": str(source / "plugins")}):
             for region in ("unknown", "https://untrusted.test", ""):
