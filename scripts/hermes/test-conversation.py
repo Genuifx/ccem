@@ -192,6 +192,27 @@ class NativeConversation(unittest.IsolatedAsyncioTestCase):
         self.assertFalse({"terminal", "write_file", "execute_code", "delegate_task", "send_message", "ccem_confirm"} & tools)
         self.assertNotIn("synthetic-only-model-secret", json.dumps(body))
 
+    async def test_first_contact_keeps_ccem_identity_without_native_setup_prompts(self):
+        await self.send("你好", "native-first-contact")
+        body = json.dumps(self.requests[0][2], ensure_ascii=False)
+        self.assertIn("running inside CCEM Desktop", body)
+        self.assertIn("Keep your Hermes identity", body)
+        self.assertNotIn("mention that /help shows available commands", body)
+        self.assertNotIn("/sethome", body)
+        self.assertNotIn("profile-build", body)
+        self.assertEqual(self.previews, [])
+
+    async def test_help_describes_only_the_managed_conversation_capabilities(self):
+        await self.send("/help", "native-help")
+        self.assertEqual(len(self.replies), 1)
+        self.assertIn("CCEM 里的 Hermes", self.replies[0])
+        self.assertIn("确认", self.replies[0])
+        self.assertIn("/new", self.replies[0])
+        for unsupported in ("/approve", "/rollback", "/bg", "/goal", "/sethome", "/stop"):
+            self.assertNotIn(unsupported, self.replies[0])
+        self.assertEqual(self.requests, [], "help should not consume a model call")
+        self.assertEqual(self.previews, [], "help stays in the scoped reply outbox")
+
     async def test_missing_model_and_unauthorized_sender_do_not_invoke_model(self):
         self.model_available = False
         await self.send("你好", "native-no-model")
