@@ -4,6 +4,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { cn } from "@/lib/utils"
 import { X } from "@/lib/lucide-react"
 import { useNativeSurfaceOcclusion } from "@/lib/nativeSurfaceOcclusion"
+import { useNativeBrowserOverlayRef } from "@/lib/nativeBrowserOverlay"
 
 const Dialog = ({
   open,
@@ -42,7 +43,7 @@ const DialogOverlay = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
-    ref={ref}
+    ref={useNativeBrowserOverlayRef(ref)}
     className={cn(
       "fixed inset-0 z-50 bg-black/60 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
       className
@@ -63,7 +64,7 @@ const DialogContent = React.forwardRef<
     <DialogOverlay />
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none sm:p-6">
       <DialogPrimitive.Content
-        ref={ref}
+        ref={useNativeBrowserOverlayRef(ref)}
         className={cn(
           "pointer-events-auto relative grid w-full max-w-lg gap-4 border bg-popover p-6 text-popover-foreground shadow-xl duration-200 max-h-[calc(100vh-2rem)] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 sm:max-h-[calc(100vh-3rem)] sm:rounded-2xl",
           className

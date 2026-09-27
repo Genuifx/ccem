@@ -75,7 +75,7 @@ export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectB
       style={{ flex: `0 0 ${width}%`, maxWidth: '60%', minWidth: 360 }}
     >
       <div data-ccem-side-panel-resize-handle className="absolute inset-y-0 left-0 z-20 w-1.5 cursor-col-resize touch-none" onPointerDown={onResizeStart} />
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/45 px-3">
+      <div className="workspace-browser-chrome flex h-11 shrink-0 items-center gap-2 border-b border-border/45 px-3">
         <Tabs value={controller.tab ?? 'browser'} onValueChange={(tab) => {
           if (tab === 'browser') onSelectBrowser();
           else controller.open(tab as WorkspaceSideTab);

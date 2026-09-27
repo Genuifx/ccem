@@ -8,6 +8,7 @@ import { initPerformanceMode } from './lib/performance';
 import { initPerfLog } from './lib/perf-log';
 import { resolveDesktopWindowRoot } from './lib/windowRootRouting';
 import { initializeWebcontentRecovery } from './lib/webcontentRecovery';
+import { initializeNativeBrowserOverlays } from './lib/nativeBrowserOverlay';
 import './index.css';
 
 initPerformanceMode();
@@ -41,7 +42,7 @@ const mount = () => ReactDOM.createRoot(document.getElementById('root')!).render
   <React.StrictMode><Root /></React.StrictMode>,
 );
 if (Root === App) {
-  void initializeWebcontentRecovery().then(mount);
+  void initializeWebcontentRecovery().then(initializeNativeBrowserOverlays).then(mount);
 } else {
   mount();
 }

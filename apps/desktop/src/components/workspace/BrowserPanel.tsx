@@ -34,9 +34,10 @@ import {
 import { createBrowserPanelNativeSurfaceParticipant } from '@/lib/browserPanelNativeSurfaceParticipant';
 import { useNativeSurfaceOcclusionParticipant } from '@/lib/nativeSurfaceOcclusion';
 import { nativeSurfaceOcclusionStore } from '@/lib/nativeSurfaceOcclusionStore';
+import { isNativeBrowserCompositionEnabled, useNativeBrowserViewport, waitForNativeBrowserModalSync } from '@/lib/nativeBrowserOverlay';
 import { useNativeBrowserSurfaceGeometrySync } from '@/hooks/useNativeBrowserSurfaceGeometrySync';
-import { CCEM_ZOOM_STORAGE_KEY } from '@/hooks/useZoom';
-import { buildNativeBrowserBounds, normalizeBrowserBoundsZoom } from './browserPanelGeometry';
+import { readAppZoom } from '@/hooks/useZoom';
+import { buildNativeBrowserBounds } from './browserPanelGeometry';
 import { BrowserPanelNavigation, BrowserPanelTabStrip } from './BrowserPanelChrome';
 import type { BrowserAgentStatus } from './browserActivation';
 import { invokeBrowserCommand } from '@/lib/webcontentRecovery';
@@ -53,6 +54,8 @@ interface BrowserPanelSharedProps {
   /** The one conversation whose native child surface may currently be visible. */
   isActiveSurface?: boolean;
   surfaceOccluded?: boolean;
+  /** Non-modal absence: another page, side-panel tab, or inactive conversation. */
+  surfaceHidden?: boolean;
   /** Active native runtime whose opaque actor lineage owns Agent control. */
   agentSessionId?: string;
   onAgentStatus?: (status: BrowserAgentStatus) => void;
@@ -71,15 +74,6 @@ class BrowserNavigationSupersededError extends Error {}
 const browserSurfaceClient = createBrowserSurfaceClient({
   invoke: invokeBrowserCommand,
 });
-
-function readCurrentAppZoom(): number {
-  try {
-    const raw = window.localStorage.getItem(CCEM_ZOOM_STORAGE_KEY);
-    return normalizeBrowserBoundsZoom(raw ?? 1);
-  } catch {
-    return 1;
-  }
-}
 
 function normalizeBrowserInput(value: string): string {
   const trimmed = value.trim();
@@ -106,6 +100,7 @@ export function BrowserPanel({
   style,
   isActiveSurface = true,
   surfaceOccluded = false,
+  surfaceHidden = false,
   agentSessionId,
   onAgentStatus,
   onResizeStart,
@@ -139,6 +134,8 @@ export function BrowserPanel({
   isActiveSurfaceRef.current = isActiveSurface;
   const surfaceOccludedRef = useRef(surfaceOccluded);
   surfaceOccludedRef.current = surfaceOccluded;
+  const surfaceHiddenRef = useRef(surfaceHidden);
+  surfaceHiddenRef.current = surfaceHidden;
 
   const loginAgentSessionId = agentSessionId?.trim() || undefined;
   const loginAgentSessionIdRef = useRef(loginAgentSessionId);
@@ -169,6 +166,7 @@ export function BrowserPanel({
   const [isPopupCloseBusy, setIsPopupCloseBusy] = useState(false);
   const [isClosingSurface, setIsClosingSurface] = useState(false);
   const [isSurfaceReady, setIsSurfaceReady] = useState(false);
+  useNativeBrowserViewport(frameRef, isActiveSurface && isSurfaceReady && !surfaceHidden);
   const [acquireViewport, setAcquireViewport] = useState<ReturnType<typeof buildNativeBrowserBounds> | null>(null);
   const [acquireRevision, setAcquireRevision] = useState(0);
   const controlRef = useRef(control);
@@ -263,7 +261,7 @@ export function BrowserPanel({
   const readViewport = useCallback(() => {
     const frame = frameRef.current;
     if (!frame) return null;
-    const viewport = buildNativeBrowserBounds(frame.getBoundingClientRect(), readCurrentAppZoom());
+    const viewport = buildNativeBrowserBounds(frame.getBoundingClientRect(), readAppZoom());
     return viewport.width > 0 && viewport.height > 0 ? viewport : null;
   }, []);
 
@@ -275,8 +273,9 @@ export function BrowserPanel({
     const lease = surfaceLeaseRef.current;
     const visible = requestedVisible
       && isActiveSurfaceRef.current
-      && !surfaceOccludedRef.current
-      && !nativeSurfaceOcclusionStore.isOccluded();
+      && !surfaceHiddenRef.current
+      && (isNativeBrowserCompositionEnabled()
+        || (!surfaceOccludedRef.current && !nativeSurfaceOcclusionStore.isOccluded()));
     const viewport = visible ? readViewport() : undefined;
     if (!lease || (visible && !viewport)) return;
     await browserSurfaceClient.sync({
@@ -294,6 +293,8 @@ export function BrowserPanel({
   ), [presentationRevision, syncSurface]);
 
   const occludeSurface = useCallback(async () => {
+    if (!isActiveSurfaceRef.current || surfaceClosingRef.current) return;
+    await waitForNativeBrowserModalSync();
     if (!isActiveSurfaceRef.current || surfaceClosingRef.current) return;
     const lease = surfaceLeaseRef.current;
     if (!lease) return;
@@ -341,7 +342,7 @@ export function BrowserPanel({
     isActive: () => isActiveSurfaceRef.current,
     occlude: occludeSurface,
     restore: async () => {
-      await setNativeSurfaceVisible(!surfaceOccludedRef.current);
+      await setNativeSurfaceVisible(true);
       await resumeAgentAfterOcclusionRef.current();
     },
   }), isActiveSurface);
@@ -570,8 +571,8 @@ export function BrowserPanel({
 
   useEffect(() => {
     if (!isSurfaceReady) return;
-    void setNativeSurfaceVisible(isActiveSurface && !surfaceOccluded).catch(() => {});
-  }, [isActiveSurface, isSurfaceReady, setNativeSurfaceVisible, surfaceOccluded]);
+    void setNativeSurfaceVisible(isActiveSurface).catch(() => {});
+  }, [isActiveSurface, isSurfaceReady, setNativeSurfaceVisible, surfaceHidden, surfaceOccluded]);
 
   useEffect(() => {
     isUrlEditingRef.current = isUrlEditing;
@@ -1014,6 +1015,7 @@ export function BrowserPanel({
       data-ccem-browser-popup={popupActive ? 'active' : 'none'}
       data-ccem-browser-active={isActiveSurface ? 'true' : 'false'}
       data-ccem-browser-occluded={surfaceOccluded ? 'true' : 'false'}
+      data-ccem-browser-hidden={surfaceHidden ? 'true' : 'false'}
       style={style}
       className={cn(
         'workspace-browser-panel relative flex h-full min-w-0 flex-col overflow-hidden',
@@ -1026,7 +1028,7 @@ export function BrowserPanel({
         onPointerDown={onResizeStart}
       />
 
-      <div data-ccem-browser-tab-strip="true" className="flex h-10 shrink-0 items-center gap-2 border-b border-border/45 pl-3 pr-2">
+      <div data-ccem-browser-tab-strip="true" className="workspace-browser-chrome flex h-10 shrink-0 items-center gap-2 border-b border-border/45 pl-3 pr-2">
         <BrowserPanelTabStrip
           panelTitle={panelTitle}
           sessionStatus={sessionStatus}
@@ -1087,7 +1089,7 @@ export function BrowserPanel({
         </div>
       ) : null}
 
-      <div className="relative min-h-0 flex-1 bg-white">
+      <div data-ccem-native-browser-viewport className="relative min-h-0 flex-1 bg-white">
         <div ref={frameRef} data-ccem-browser-frame="true" className="absolute inset-y-0 right-0 left-1.5" />
       </div>
     </aside>

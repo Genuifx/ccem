@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>CCEM React overlay smoke</title></head>
+<body><div id="root"></div><script>
+// Explicit headless harness only: macOS locks suspend WK animation frames.
+// This can verify native routing/state, never physical gestures or compositor pixels.
+if (new URLSearchParams(location.search).has('timers')) {
+  window.requestAnimationFrame = (callback) => setTimeout(() => callback(performance.now()), 16);
+  window.cancelAnimationFrame = clearTimeout;
+  document.head.insertAdjacentHTML('beforeend', '<style>*,*::before,*::after { animation: none !important; transition: none !important; }</style>');
+}
+</script><script type="module" src="/src/dev/NativeBrowserOverlaySmoke.tsx"></script></body></html>

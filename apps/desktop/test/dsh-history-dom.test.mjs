@@ -65,7 +65,11 @@ const externalStubPlugin = {
     }));
     builder.onLoad({ filter: /^tauri-stub$/, namespace: 'dsh-test-stubs' }, () => ({
       loader: 'js',
-      contents: `export function invoke() { return Promise.resolve(null); }`,
+      contents: `
+        export function invoke() { return Promise.resolve(null); }
+        export function listen() { return Promise.resolve(() => {}); }
+        export function getCurrentWebview() { return { setZoom() { return Promise.resolve(); } }; }
+      `,
     }));
     builder.onResolve({ filter: /^sonner$/ }, () => ({
       path: 'sonner-stub', namespace: 'dsh-test-stubs',

@@ -339,7 +339,7 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
   );
   assert.match(
     browserPanel,
-    /if \(!isSurfaceReady\) return;[\s\S]*setNativeSurfaceVisible\(isActiveSurface && !surfaceOccluded\)/,
+    /if \(!isSurfaceReady\) return;[\s\S]*setNativeSurfaceVisible\(isActiveSurface\)/,
   );
   assert.match(browserPanel, /occlude: occludeSurface/);
   assert.match(browserPanel, /action: 'occlude'/);

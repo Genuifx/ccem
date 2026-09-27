@@ -2,6 +2,7 @@ import * as React from 'react';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { Check, ChevronDown, ChevronUp } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
+import { useNativeBrowserOverlayRef } from '@/lib/nativeBrowserOverlay';
 
 const Select = SelectPrimitive.Root;
 
@@ -84,7 +85,7 @@ const SelectContent = React.forwardRef<
 >(({ className, children, position = 'popper', viewportClassName, ...props }, ref) => (
   <SelectPrimitive.Portal>
     <SelectPrimitive.Content
-      ref={ref}
+      ref={useNativeBrowserOverlayRef(ref)}
       className={cn(
         'relative z-50 max-h-96 min-w-[8rem] overflow-hidden rounded-xl',
         'border border-border/40 bg-popover text-popover-foreground',

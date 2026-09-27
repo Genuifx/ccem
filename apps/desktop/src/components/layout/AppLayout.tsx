@@ -13,6 +13,7 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar';
 import { useLocale } from '@/locales';
+import { useNativeBrowserBackdropRef } from '@/lib/nativeBrowserOverlay';
 
 interface AppLayoutProps {
   children: ReactNode;
@@ -60,6 +61,8 @@ function AppLayoutBody({
   fullBleed = false,
 }: AppLayoutProps) {
   const { t } = useLocale();
+  const backdropRef = useNativeBrowserBackdropRef<HTMLDivElement>();
+  const ambientRef = useNativeBrowserBackdropRef<HTMLDivElement>();
   const { open, state } = useSidebar();
   const isWorkspace = activeTab === 'workspace';
   const sidebarToggleLabel = state === 'collapsed' ? t('sideRail.expand') : t('sideRail.collapse');
@@ -109,9 +112,9 @@ function AppLayoutBody({
       )}
 
       {/* Main content area — semi-transparent so ambient orbs bleed through glass panels */}
-      <SidebarInset className="app-content-shell flex-1 flex flex-col min-w-0 relative z-10 overflow-hidden">
+      <SidebarInset ref={backdropRef} className="app-content-shell flex-1 flex flex-col min-w-0 relative z-10 overflow-hidden">
         {/* Ambient background — lives inside content area only */}
-        <div className="ambient-bg" aria-hidden="true">
+        <div ref={ambientRef} className="ambient-bg" aria-hidden="true">
           <div className="ambient-orb-3" />
           <div className="ambient-orb-4" />
         </div>

@@ -56,8 +56,10 @@ async function recoveryHarness({ native = true, invoke, heap, uuid, draftCounts 
   };
 }
 
-test('actual main bootstrap waits for the native document fence before mounting App', async () => {
+test('actual main bootstrap waits for the native document fence and overlay setup before mounting App', async () => {
   const gate = deferred();
+  const overlayGate = deferred();
+  let overlayInitializations = 0;
   const harness = await recoveryHarness({ invoke: () => gate.promise });
   const mounts = [];
   function App() {}
@@ -73,6 +75,10 @@ test('actual main bootstrap waits for the native document fence before mounting 
     './lib/perf-log': { initPerfLog() {} },
     './lib/windowRootRouting': { resolveDesktopWindowRoot: () => 'main' },
     './lib/webcontentRecovery': harness.module,
+    './lib/nativeBrowserOverlay': { initializeNativeBrowserOverlays() {
+      overlayInitializations += 1;
+      return overlayGate.promise;
+    } },
     './index.css': {},
   };
   new Function('require', 'exports', 'window', 'document', await compile('main.tsx'))(
@@ -80,10 +86,15 @@ test('actual main bootstrap waits for the native document fence before mounting 
     { location: { search: '' } }, document,
   );
   assert.equal(mounts.length, 0);
+  assert.equal(overlayInitializations, 0, 'overlay initialization must wait for the document fence');
   assert.equal(harness.module.isRecoveringWebcontent(), true, 'unresolved boot cannot authorize replay');
   gate.resolve({ documentId: 'renderer-document-1', generation: 7, recovered: true });
   await harness.module.initializeWebcontentRecovery();
   await Promise.resolve();
+  assert.equal(overlayInitializations, 1);
+  assert.equal(mounts.length, 0, 'React must wait for native composition setup');
+  overlayGate.resolve(true);
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(mounts.length, 1);
   assert.equal(document.documentElement.dataset.window, 'main');
   assert.equal(harness.calls.length, 1, 'boot requests are single-flight');
