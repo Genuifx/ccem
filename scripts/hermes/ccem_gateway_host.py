@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -222,6 +223,7 @@ class Host:
         self.loop = asyncio.get_running_loop()
         self.command_slots = asyncio.Semaphore(4)
         self.setup = _setup_module.WeComSetup()
+        self._prepared_conversation_homes = set()
 
     def snapshot(self):
         with self.lock:
@@ -233,7 +235,7 @@ class Host:
             if state == "running" and self.runner:
                 connected = self.transport_ready and any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
                 state = "running" if connected else "reconnecting"
-            return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1, "nativeConversation": 1,
+            return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1, "nativeConversation": 1, "nativeTools": 1,
                     "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeSource")} for p in self.pending.values()],
                     "pairing": self.pairing}
 
@@ -261,7 +263,10 @@ class Host:
         # Only this private profile is visible to the child; no project plugins,
         # shared dotenv, model keys or automatic skills are imported from user paths.
         self.profile.mkdir(parents=True, exist_ok=True, mode=0o700)
-        config = _conversation_module.configuration()
+        tools_mode = self.boot.get("toolsMode", "ccem")
+        if tools_mode not in ("ccem", "native"):
+            raise ValueError("invalid_tools_mode")
+        config = _conversation_module.configuration(tools_mode)
         (self.profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
         from hermes_cli.plugins import discover_plugins, get_plugin_manager, PluginContext, PluginManifest
         from gateway.platform_registry import platform_registry
@@ -318,6 +323,44 @@ class Host:
             raise ValueError("channel_connection_failed")
         self.state = "running"
         self.publish()
+
+    def prepare_conversation_home(self, home, tools_mode):
+        """Initialize native Hermes resources once per scoped profile.
+
+        Keep the selected CCEM model and old bot histories independent. Full
+        mode uses the local user's CLI tools and existing Hermes skills; it is
+        a trusted-owner mode, not an OS filesystem sandbox.
+        """
+        if tools_mode != "native" or home in self._prepared_conversation_homes:
+            return
+        import yaml
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        config_path = home / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        workspace = home / "workspace"
+        workspace.mkdir(mode=0o700, exist_ok=True)
+        terminal = config.setdefault("terminal", {})
+        terminal.setdefault("backend", "local")
+        terminal.setdefault("home_mode", "real")
+        terminal.setdefault("cwd", str(workspace))
+        skills = config.setdefault("skills", {})
+        external = skills.setdefault("external_dirs", [])
+        installed = Path(os.environ.get("HERMES_REAL_HOME", str(Path.home()))) / ".hermes/skills"
+        if installed.is_dir() and str(installed) not in external:
+            external.append(str(installed))
+        config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        token = set_hermes_home_override(home)
+        try:
+            from tools.skills_sync import sync_skills
+            sync_skills(quiet=True)
+        finally:
+            reset_hermes_home_override(token)
+        bundled = Path(__file__).with_name("bundled-skills") / "ccem"
+        target = home / "skills/ccem"
+        if bundled.is_dir() and not target.exists():
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copytree(bundled, target)
+        self._prepared_conversation_homes.add(home)
 
     def pairing_hook(self, *args, **kwargs):
         event = kwargs.get("event")

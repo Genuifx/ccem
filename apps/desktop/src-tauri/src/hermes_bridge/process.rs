@@ -56,6 +56,17 @@ impl GatewayProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if boot["toolsMode"] == "native" {
+            // Full Hermes is an explicit local, trusted-owner capability. Keep
+            // its profile private, but let normal CLI tools find the real user
+            // home and executable PATH without inheriting model/channel secrets.
+            let home = dirs::home_dir().ok_or("user_home_unavailable")?;
+            let mut paths = vec![python.parent().unwrap_or(Path::new("/usr/bin")).to_path_buf()];
+            paths.extend(std::env::split_paths(&crate::terminal::get_user_path()));
+            let path = std::env::join_paths(paths).map_err(|_| "user_path_unavailable")?;
+            command.env("HOME", &home).env("HERMES_REAL_HOME", &home)
+                .env("PATH", path).env("LANG", "en_US.UTF-8");
+        }
         // No model credentials, user Python paths or shared Hermes profile are inherited.
         let mut child = command
             .spawn()

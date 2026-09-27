@@ -93,6 +93,8 @@ export interface HermesConnection {
   configuredFields: string[];
   enabled: boolean;
   conversationModel?: { envName: string; model: string } | null;
+  toolsMode?: 'native' | 'ccem';
+  nativeToolsAvailable?: boolean;
   state: string;
   error?: string | null;
   pending: HermesPendingPairing[];
@@ -147,6 +149,7 @@ export interface HermesActionPayloads {
   removeRuntime: undefined;
   configureChannel: { platform: string; fields: Record<string, string>; accountRef?: string; label?: string };
   configureConversation: { accountRef: string; modelEnv: string };
+  configureTools: { accountRef: string; toolsMode: 'native' | 'ccem' };
   refreshPlatforms: undefined;
   beginSetup: { platform: string };
   cancelSetup: { id: string };

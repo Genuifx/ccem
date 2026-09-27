@@ -104,7 +104,11 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
       result = next;
     } catch (error) {
       if (mounted.current && scopeSequences.current.get(scope) === id) {
-        if (accountRef) setConnectionRequestErrors((current) => ({ ...current, [accountRef]: errorText(error, secrets) }));
+        if (accountRef) {
+          const message = errorText(error, secrets);
+          setConnectionRequestErrors((current) => ({ ...current, [accountRef]: action === 'configureTools' && message.trim() === 'hermes_native_tools_update_required'
+            ? t('hermes.nativeToolsUpdateRequired') : message }));
+        }
         else if (action === 'beginSetup' || action === 'cancelSetup') setSetupRequestError(setupErrorKey(error));
         else setRequestError(errorText(error, secrets));
       }

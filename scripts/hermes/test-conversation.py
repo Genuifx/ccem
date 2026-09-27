@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import sys
 import tempfile
@@ -70,8 +71,24 @@ class NativeConversation(unittest.IsolatedAsyncioTestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+            def do_GET(self):
+                if self.path == "/README.md":
+                    raw = b"# Fixture project\nArchitecture: a native research agent reads documentation itself.\n"
+                elif "/models" in self.path:
+                    model = {"id": "claude-fixture", "context_length": 65536}
+                    raw = json.dumps({"data": [model]} if self.path.endswith("/models") else model).encode()
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if not self.path.endswith("/messages"):
+                    self.send_error(404)
+                    return
                 owner.requests.append((self.path, dict(self.headers), body))
                 owner.model_entered.set()
                 if not owner.hold_model.wait(10):
@@ -135,10 +152,15 @@ class NativeConversation(unittest.IsolatedAsyncioTestCase):
         if method == "conversation":
             return {"scope": self.scope, "model": {"model": "claude-fixture", "baseUrl": f"http://127.0.0.1:{self.server.server_port}",
                 "apiKey": "synthetic-only-model-secret", "apiMode": "anthropic_messages", "authStyle": "bearer"} if self.model_available else None,
-                "bindings": [{"runtimeId": "native-fixture", "title": "Test task"}], "recentNotifications": []}
+                "bindings": [{"runtimeId": "native-fixture", "title": "Test task"}], "recentNotifications": [],
+                "hasPendingCcemInput": getattr(self, "pending_ccem", False)}
         if method == "replyConversation":
-            self.replies.append(params["text"])
-            return {"deliveryId": "fixture", "status": "pending"}
+            key = (params["sourceMessageId"], params.get("deliveryKey"))
+            self.delivery_keys = getattr(self, "delivery_keys", set())
+            if key not in self.delivery_keys:
+                self.replies.append(params["text"])
+                self.delivery_keys.add(key)
+            return {"deliveryId": "fixture", "status": getattr(self, "delivery_status", "pending")}
         if method == "list":
             return {"sessions": [{"runtimeId": "native-fixture", "title": "Test task", "status": "ready"}]}
         if method == "validateConversation":
@@ -177,6 +199,297 @@ class NativeConversation(unittest.IsolatedAsyncioTestCase):
         self.server.shutdown()
         self.server.server_close()
         self.server_thread.join()
+
+    async def enable_native(self):
+        await self.runner.stop()
+        self.host.boot["toolsMode"] = "native"
+        self.delivery_status = "sent"
+        root_config = conversation.configuration("native")
+        root_config["model"] = {"context_length": 65536}
+        (self.home / "config.yaml").write_text(json.dumps(root_config))
+        self.work = self.home / "native-work"
+        self.work.mkdir()
+        def prepare(home, mode):
+            import yaml
+            saved = yaml.safe_load((home / "config.yaml").read_text())
+            saved["model"] = {"context_length": 65536}
+            saved["terminal"] = {"backend": "local", "cwd": str(self.work), "home_mode": "isolated"}
+            saved["approvals"] = {"mode": "manual", "timeout": 20}
+            saved["security"]["tirith_enabled"] = False
+            (home / "config.yaml").write_text(json.dumps(saved))
+            skill = home / "skills" / "fixture-research"
+            skill.mkdir(parents=True, exist_ok=True)
+            (skill / "SKILL.md").write_text("---\nname: fixture-research\ndescription: Fixture research skill.\n---\nNative skill token sapphire.\n")
+        self.host.prepare_conversation_home = prepare
+        self.runner = self.new_runner()
+
+    async def wait_for(self, condition):
+        try:
+            async with asyncio.timeout(15):
+                while not condition():
+                    await asyncio.sleep(0.01)
+        except TimeoutError:
+            self.fail("Expected native event did not arrive. Replies: " + repr(self.replies)
+                + "\n" + getattr(self, "turn_log", "")[-10000:])
+
+    async def wait_for_approval_ack(self):
+        from tools import approval
+        scoped = dataclasses.replace(self.source, profile="ccem-" + self.scope)
+        key = self.runner._session_key_for_source(scoped)
+        def acknowledged():
+            with approval._lock:
+                return any(entry.acknowledged for entry in approval._gateway_queues.get(key, []))
+        await self.wait_for(acknowledged)
+
+    async def test_native_mode_runs_its_own_research_terminal_files_and_skill(self):
+        await self.enable_native()
+        fixture = self.work / "fixture.txt"
+        fixture.write_text("native file token emerald")
+        research = f"import urllib.request\nprint(urllib.request.urlopen('http://127.0.0.1:{self.server.server_port}/README.md').read().decode())"
+        self.model_replies = [
+            [{"type": "tool_use", "id": "terminal-native", "name": "terminal", "input": {"command": "printf native-terminal-token"}}],
+            [{"type": "tool_use", "id": "read-native", "name": "read_file", "input": {"path": str(fixture)}}],
+            [{"type": "tool_use", "id": "skill-native", "name": "skill_view", "input": {"name": "fixture-research"}}],
+            [{"type": "tool_use", "id": "code-native", "name": "execute_code", "input": {"code": research}}],
+            [{"type": "tool_use", "id": "write-native", "name": "write_file", "input": {"path": str(self.work / "result.txt"), "content": "research complete"}}],
+            [{"type": "text", "text": "研究与本机验证完成。"}],
+        ]
+        running = asyncio.create_task(self.send("研究这个项目并读写测试文件，使用已有技能。", "full-native-tools"))
+        try:
+            await self.wait_for(lambda: any("execute_code" in text and "/approve" in text for text in self.replies))
+            await self.wait_for_approval_ack()
+            await asyncio.wait_for(self.send("/approve", "native-research-approval"), 5)
+            await asyncio.wait_for(running, 30)
+        finally:
+            if not running.done():
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await running
+        self.assertEqual(self.replies[-1], "研究与本机验证完成。", self.turn_log)
+        body = json.dumps(self.requests[-1][2], ensure_ascii=False)
+        for token in ("native-terminal-token", "native file token emerald", "Native skill token sapphire", "Architecture: a native research agent"):
+            self.assertIn(token, body, self.turn_log)
+        self.assertEqual((self.work / "result.txt").read_text(), "research complete")
+        tools = {tool["name"] for tool in self.requests[0][2]["tools"]}
+        self.assertTrue({"terminal", "read_file", "write_file", "execute_code", "skill_view", "skill_manage", "clarify", "ccem_list"} <= tools, tools)
+        self.assertNotIn("cronjob_manage", tools)
+        self.assertNotIn("ccem_confirm", tools)
+        self.assertFalse(any(method in ("input", "confirm") for method, _ in self.calls))
+        self.assertNotIn("synthetic-only-model-secret", body)
+        self.assertNotIn("You have no local terminal", body)
+
+    async def test_native_configuration_and_long_answer_survive_followup(self):
+        await self.enable_native()
+        expected = "完整回答。" * 1600
+        self.model_replies = [[{"type": "text", "text": expected}]]
+        await self.send("详细回答", "native-long")
+        self.assertEqual("".join(self.replies), expected, self.turn_log)
+        deliveries = [p for m, p in self.calls if m == "replyConversation"]
+        self.assertGreater(len(deliveries), 1)
+        self.assertEqual(len({p["deliveryKey"] for p in deliveries}), len(deliveries))
+        self.assertTrue(all(len(p["text"].encode()) <= 3500 for p in deliveries))
+        home = self.home / "conversations" / self.scope
+        saved = json.loads((home / "config.yaml").read_text())
+        saved["display"]["personality"] = "concise"
+        saved["agent"]["max_turns"] = 19
+        (home / "config.yaml").write_text(json.dumps(saved))
+        await self.send("继续", "native-config-kept")
+        restored = json.loads((home / "config.yaml").read_text())
+        self.assertEqual(restored["agent"]["max_turns"], 19)
+        self.assertEqual(restored["display"]["personality"], "concise")
+        self.assertGreater(self.requests[0][2]["max_tokens"], 2048)
+
+    async def test_native_clarify_reply_unblocks_agent_without_a_ccem_proposal(self):
+        await self.enable_native()
+        self.model_replies = [[{"type": "tool_use", "id": "clarify-native", "name": "clarify",
+            "input": {"questions": [{"question": "选择哪种测试颜色？", "choices": ["翡翠", "蓝宝石"]}]}}],
+            [{"type": "text", "text": "已采用蓝宝石。"}]]
+        running = asyncio.create_task(self.send("请让我选择测试颜色", "native-clarify-start"))
+        try:
+            await self.wait_for(lambda: any("选择哪种测试颜色" in text for text in self.replies))
+            await asyncio.wait_for(self.send("2", "native-clarify-answer"), 5)
+            await asyncio.wait_for(running, 15)
+        finally:
+            if not running.done():
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await running
+        self.assertIn("已采用蓝宝石。", self.replies, self.turn_log)
+        self.assertIn("蓝宝石", json.dumps(self.requests[-1][2], ensure_ascii=False))
+        self.assertFalse(any(method in ("input", "confirm") for method, _ in self.calls))
+
+    async def test_native_terminal_approval_uses_actual_user_reply(self):
+        await self.enable_native()
+        for reply in ("/deny", "/approve"):
+            marker = self.work / ("delete-" + reply[1:])
+            marker.write_text("fixture only")
+            command = "rm -rf " + shlex.quote(str(marker))
+            self.model_replies = [[{"type": "tool_use", "id": "terminal-approval-" + reply[1:], "name": "terminal", "input": {"command": command}}],
+                [{"type": "text", "text": "本轮已结束。"}]]
+            before = len(self.replies)
+            running = asyncio.create_task(self.send("执行已指定的测试命令", "native-approval-" + reply[1:]))
+            try:
+                await self.wait_for(lambda: any("/approve" in text and command in text for text in self.replies[before:]))
+                await self.wait_for_approval_ack()
+                self.assertTrue(marker.exists(), "native guard must block until a real user reply")
+                self.assertFalse(any("/approve always" in text for text in self.replies[before:]))
+                from tools.approval import _permanent_approved
+                previous_allowlist = set(_permanent_approved)
+                await asyncio.wait_for(self.send("/approve always", "native-disallowed-always-" + reply[1:]), 5)
+                self.assertTrue(marker.exists(), "always must not authorize this or other route scopes")
+                self.assertEqual(_permanent_approved, previous_allowlist)
+                await asyncio.wait_for(self.send(reply, "native-control-" + reply[1:]), 5)
+                await asyncio.wait_for(running, 15)
+            finally:
+                if not running.done():
+                    from tools.approval import resolve_gateway_approval
+                    scoped = dataclasses.replace(self.source, profile="ccem-" + self.scope)
+                    resolve_gateway_approval(self.runner._session_key_for_source(scoped), "deny")
+                    running.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await running
+            self.assertEqual(marker.exists(), reply == "/deny", self.turn_log)
+        self.assertFalse(any(method in ("input", "confirm") for method, _ in self.calls))
+
+    async def test_native_session_approval_does_not_cross_route_generation(self):
+        await self.enable_native()
+        self.scope = "c" * 64
+        for number, reply in enumerate(("/approve session", "/deny")):
+            marker = self.work / ("scoped-approval-" + str(number))
+            marker.write_text("fixture only")
+            command = "rm -rf " + shlex.quote(str(marker))
+            self.model_replies = [[{"type": "tool_use", "id": "terminal-scoped-" + str(number), "name": "terminal", "input": {"command": command}}],
+                [{"type": "text", "text": "本轮已结束。"}]]
+            before = len(self.replies)
+            running = asyncio.create_task(self.send("执行这个测试命令", "scope-approval-" + str(number)))
+            try:
+                await self.wait_for(lambda: any(command in text and "/approve" in text for text in self.replies[before:]))
+                await self.wait_for_approval_ack()
+                self.assertTrue(marker.exists())
+                await asyncio.wait_for(self.send(reply, "scope-control-" + str(number)), 5)
+                await asyncio.wait_for(running, 15)
+            finally:
+                if not running.done():
+                    running.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await running
+            self.assertEqual(marker.exists(), number == 1)
+            self.scope = "d" * 64
+
+    async def test_native_scoped_adapter_drops_revoked_prompt_and_final(self):
+        await self.enable_native()
+        original = self.rpc
+        def changing(method, params):
+            if method == "replyConversation":
+                self.scope = "b" * 64
+            return original(method, params)
+        self.host.rpc = changing
+        self.model_replies = [[{"type": "tool_use", "id": "clarify-revoked", "name": "clarify",
+            "input": {"questions": [{"question": "这个过期问题不得发送"}]}}],
+            [{"type": "text", "text": "这个过期回答不得发送"}]]
+        await asyncio.wait_for(self.send("测试撤销", "native-revoke-prompt"), 15)
+        self.assertGreaterEqual(len(self.requests), 2, self.turn_log)
+        self.assertEqual(self.replies, [], self.turn_log)
+        self.assertEqual(self.previews, [])
+
+    async def test_native_pending_preview_cannot_be_approved_by_an_early_or_replayed_reply(self):
+        await self.enable_native()
+        self.delivery_status = "pending"
+        marker = self.work / "ack-marker"
+        marker.write_text("fixture only")
+        command = "rm -rf " + shlex.quote(str(marker))
+        self.model_replies = [[{"type": "tool_use", "id": "terminal-wait-ack", "name": "terminal", "input": {"command": command}}],
+            [{"type": "text", "text": "本轮已结束。"}]]
+        running = asyncio.create_task(self.send("执行测试命令", "native-wait-ack"))
+        try:
+            await self.wait_for(lambda: any(command in text for text in self.replies))
+            await asyncio.wait_for(self.send("/approve", "early-native-approval"), 5)
+            self.assertTrue(marker.exists())
+            self.assertTrue(any("尚未确认送达" in text for text in self.replies))
+            self.delivery_status = "sending"
+            attempts = sum(m == "replyConversation" and p["sourceMessageId"] == "native-wait-ack" for m, p in self.calls)
+            await self.wait_for(lambda: sum(m == "replyConversation" and p["sourceMessageId"] == "native-wait-ack" for m, p in self.calls) > attempts)
+            self.assertTrue(marker.exists(), "sending is an intermediate state, not an ACK")
+            self.delivery_status = "sent"
+            await self.wait_for_approval_ack()
+            await asyncio.wait_for(self.send("/approve", "early-native-approval"), 5)
+            self.assertTrue(marker.exists(), "duplicate original ingress retains its pre-ACK time")
+            await asyncio.wait_for(self.send("/approve", "fresh-native-approval"), 5)
+            await asyncio.wait_for(running, 15)
+        finally:
+            if not running.done():
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await running
+        self.assertFalse(marker.exists(), self.turn_log)
+        prompt_attempts = [p for m, p in self.calls if m == "replyConversation" and p["sourceMessageId"] == "native-wait-ack" and command in p["text"]]
+        self.assertGreater(len(prompt_attempts), 1)
+        self.assertEqual(len({p["deliveryKey"] for p in prompt_attempts}), 1)
+
+    async def test_native_unknown_preview_fails_closed_without_running_command(self):
+        await self.enable_native()
+        self.delivery_status = "unknown"
+        marker = self.work / "unknown-marker"
+        marker.write_text("fixture only")
+        command = "rm -rf " + shlex.quote(str(marker))
+        self.model_replies = [[{"type": "tool_use", "id": "terminal-unknown", "name": "terminal", "input": {"command": command}}],
+            [{"type": "text", "text": "命令没有执行。"}]]
+        await asyncio.wait_for(self.send("执行测试命令", "native-unknown-ack"), 15)
+        await asyncio.wait_for(self.send("/approve", "native-after-unknown"), 5)
+        self.assertTrue(marker.exists(), self.turn_log)
+        self.assertGreaterEqual(len(self.requests), 2)
+        self.assertIn("BLOCKED", json.dumps(self.requests[-1][2]))
+        attempts = [p for m, p in self.calls if m == "replyConversation" and command in p["text"]]
+        self.assertEqual(len({p["deliveryKey"] for p in attempts}), 1)
+
+    async def test_native_delegate_inherits_memory_only_credentials_and_returns_in_turn(self):
+        await self.enable_native()
+        self.model_replies = [
+            [{"type": "tool_use", "id": "delegate-native", "name": "delegate_task", "input": {"tasks": [{"goal": "只回复 child-sapphire"}]}}],
+            [{"type": "text", "text": "child-sapphire"}],
+            [{"type": "text", "text": "子任务已完成。"}],
+        ]
+        await asyncio.wait_for(self.send("分配一个测试子任务并总结结果", "native-delegate"), 30)
+        self.assertEqual(self.replies[-1], "子任务已完成。", self.turn_log)
+        self.assertEqual(len(self.requests), 3, self.turn_log)
+        self.assertIn("child-sapphire", json.dumps(self.requests[-1][2]))
+        for path, headers, body in self.requests:
+            self.assertTrue(path.endswith("/messages"), path)
+            normalized = {k.lower(): v for k, v in headers.items()}
+            self.assertEqual(normalized.get("authorization"), "Bearer synthetic-only-model-secret")
+            self.assertNotIn("x-api-key", normalized)
+            self.assertNotIn("synthetic-only-model-secret", json.dumps(body))
+        for file in (self.home / "conversations").rglob("config.yaml"):
+            self.assertNotIn("synthetic-only-model-secret", file.read_text())
+
+    async def test_native_chinese_clarify_and_ccem_confirmation_remain_distinct(self):
+        await self.enable_native()
+        self.model_replies = [[{"type": "tool_use", "id": "clarify-chinese", "name": "clarify",
+            "input": {"questions": [{"question": "是否采用这个测试名称？请回复确认或取消。"}]}}],
+            [{"type": "text", "text": "收到你的确认。"}]]
+        running = asyncio.create_task(self.send("请我确认测试名称", "native-chinese-question"))
+        try:
+            await self.wait_for(lambda: any("是否采用这个测试名称" in text for text in self.replies))
+            self.pending_ccem = True
+            await asyncio.wait_for(self.send("确认", "native-chinese-ambiguous"), 5)
+            self.assertTrue(any("当前同时有" in text for text in self.replies))
+            self.assertFalse(any(m == "shortReply" for m, _ in self.calls))
+            self.assertFalse(running.done())
+            await asyncio.wait_for(self.send("/ccem shortReply confirm", "explicit-ccem-short"), 5)
+            self.assertEqual(sum(m == "shortReply" for m, _ in self.calls), 1)
+            self.assertFalse(running.done())
+            self.pending_ccem = False
+            await asyncio.wait_for(self.send("确认", "native-chinese-answer"), 5)
+            await asyncio.wait_for(running, 15)
+            self.assertEqual(sum(m == "shortReply" for m, _ in self.calls), 1)
+            self.assertIn("收到你的确认。", self.replies)
+            await asyncio.wait_for(self.send("确认", "ccem-only-short"), 5)
+            self.assertEqual(sum(m == "shortReply" for m, _ in self.calls), 2)
+        finally:
+            if not running.done():
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await running
 
     async def test_native_chat_replies_without_preparing_a_ccem_task(self):
         await self.send("你好", "native-hello")

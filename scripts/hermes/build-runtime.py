@@ -251,6 +251,7 @@ def finalize(args: argparse.Namespace) -> dict:
     shutil.copy2(host.with_name("ccem_gateway_onboarding.py"), package / "ccem_gateway_onboarding.py")
     shutil.copy2(host.with_name("ccem_session_advisor.py"), package / "ccem_session_advisor.py")
     shutil.copy2(host.with_name("ccem_gateway_conversation.py"), package / "ccem_gateway_conversation.py")
+    shutil.copytree(REPO / "packages/agent-skills/ccem", package / "bundled-skills/ccem", dirs_exist_ok=True)
     regularize_links(package)
     for path in package.rglob("__pycache__"):
         shutil.rmtree(path)

@@ -16,6 +16,28 @@ pub(super) struct PresentedInput {
 }
 
 impl HermesBridgeManager {
+    pub(super) fn conversation_tools_mode(&self, account: &str) -> Result<String, String> {
+        self.with_store(|s| s.conversation_tools_mode(account))
+    }
+
+    pub(super) fn native_tools_available(&self, account: &str) -> bool {
+        self.connection_process(account).or_else(|_| self.host_process())
+            .is_ok_and(|process| process.snapshot()["nativeTools"].as_u64() == Some(1))
+    }
+
+    pub(super) fn save_conversation_tools(&self, payload: &Value) -> Result<bool, String> {
+        let account = payload["accountRef"].as_str().ok_or("account_ref_required")?;
+        let mode = payload["toolsMode"].as_str().ok_or("invalid_tools_mode")?;
+        if !["ccem", "native"].contains(&mode) { return Err("invalid_tools_mode".into()); }
+        self.with_store(|s| s.connection(account))?;
+        if self.conversation_tools_mode(account)? == mode { return Ok(false); }
+        if mode == "native" && !self.native_tools_available(account) {
+            return Err("hermes_native_tools_update_required".into());
+        }
+        self.with_store(|s| s.set_setting(&format!("conversation_tools:{account}"), mode))?;
+        Ok(true)
+    }
+
     pub(super) fn conversation_model(&self, account: &str) -> Result<Value, String> {
         self.with_store(|s| {
             if let Some(saved) = s.setting(&format!("conversation_model:{account}"))? {
@@ -49,7 +71,8 @@ impl HermesBridgeManager {
                 .map(|b| json!({"runtimeId":b.runtime_id,"title":b.title})).collect::<Vec<_>>();
             let notifications = s.deliveries()?.into_iter().filter(|d| d.route_id == route.id && d.generation == route.generation && d.status == "sent" && d.conversation_scope.is_none())
                 .take(5).map(|d| json!({"id":d.id,"text":d.text,"createdAt":d.created_at})).collect::<Vec<_>>();
-            Ok(json!({"scope":scope(route),"model":model,"modelError":model_error,"bindings":bindings,"recentNotifications":notifications}))
+            Ok(json!({"scope":scope(route),"model":model,"modelError":model_error,"bindings":bindings,"recentNotifications":notifications,
+                "hasPendingCcemInput":!s.pending_chat_inputs(route)?.is_empty()}))
         })
     }
 
@@ -100,23 +123,49 @@ impl HermesBridgeManager {
         self.with_store(|s| select_confirmation(s, route, owner, message, action, received_at_ns, &presented))
     }
 
-    pub(super) fn enqueue_conversation_reply(&self, route: &Route, message: &str, text: &str) -> Result<Value, String> {
+    pub(super) fn enqueue_conversation_reply(&self, route: &Route, message: &str, text: &str, delivery_key: Option<&str>) -> Result<Value, String> {
+        self.with_store(|s| enqueue_reply(s, route, message, text, delivery_key))
+    }
+}
+
+fn enqueue_reply(s: &mut super::store::Store, route: &Route, message: &str, text: &str, delivery_key: Option<&str>) -> Result<Value, String> {
         if message.trim().is_empty() || message.len() > 512 { return Err("source_message_id_required".into()); }
         if text.trim().is_empty() || text.len() > 32_000 { return Err("invalid_conversation_reply".into()); }
+        let delivered_text = if delivery_key.is_some() {
+            if text.len() > 3500 { return Err("invalid_conversation_reply".into()); }
+            text.to_owned()
+        } else { super::bounded_chat_text(text) };
         let scope = scope(route);
-        let id = digest(&format!("conversation-reply:{scope}:{message}"));
-        self.with_store(|s| {
+        let id = conversation_delivery_id(&scope, message, delivery_key)?;
             if let Some(existing) = s.delivery(&id)? {
-                if existing.text != super::bounded_chat_text(text) { return Err("source_message_payload_conflict".into()); }
+                if existing.text != delivered_text { return Err("source_message_payload_conflict".into()); }
                 return Ok(json!({"deliveryId":id,"status":existing.status}));
             }
             s.enqueue_delivery(&super::store::Delivery {
                 id:id.clone(), route_id:route.id.clone(), generation:route.generation,
-                text:super::bounded_chat_text(text), status:"pending".into(), receipt:None,
+                text:delivered_text, status:"pending".into(), receipt:None,
                 created_at:now(), cron:None, session_binding_id:None, conversation_scope:Some(scope), confirmation_preview: None,
             })?;
             Ok(json!({"deliveryId":id,"status":s.delivery(&id)?.map(|d| d.status)}))
-        })
+}
+
+impl super::store::Store {
+    pub(super) fn conversation_tools_mode(&self, account: &str) -> Result<String, String> {
+        // Existing paired bots retain their granted capabilities until the owner opts in.
+        Ok(match self.setting(&format!("conversation_tools:{account}"))?.as_deref() {
+            Some("native") => "native",
+            _ => "ccem",
+        }.into())
+    }
+}
+
+fn conversation_delivery_id(scope: &str, message: &str, key: Option<&str>) -> Result<String, String> {
+    match key {
+        None => Ok(digest(&format!("conversation-reply:{scope}:{message}"))),
+        Some(key) if !key.is_empty() && key.len() <= 160 && key.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_:".contains(&c)) => {
+            Ok(digest(&format!("conversation-part:{}", json!([scope, message, key]))))
+        }
+        _ => Err("invalid_delivery_key".into()),
     }
 }
 

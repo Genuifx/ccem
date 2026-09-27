@@ -87,6 +87,8 @@ struct BridgeParams {
     #[serde(default)]
     conversation_scope: Option<String>,
     #[serde(default)]
+    delivery_key: Option<String>,
+    #[serde(default)]
     received_at_ns: Option<u64>,
 }
 
@@ -186,6 +188,8 @@ impl HermesBridgeManager {
                         .map(|record| {
                             let mut public = record.public_status();
                             public["conversationModel"] = self.conversation_model(&record.account_ref).unwrap_or(Value::Null);
+                            public["toolsMode"] = json!(self.conversation_tools_mode(&record.account_ref).unwrap_or_else(|_| "ccem".into()));
+                            public["nativeToolsAvailable"] = json!(self.native_tools_available(&record.account_ref));
                             if let Ok(process) = self.connection_process(&record.account_ref) {
                                 let snapshot = process.snapshot();
                                 public["state"] = snapshot["state"].clone();
@@ -281,7 +285,8 @@ impl HermesBridgeManager {
             .map(|c| c.account_ref.as_str())
             .unwrap_or("discovery");
         let token = random_id();
-        let boot = json!({"protocolVersion":1,"instanceId":instance,"accountRef":account,"endpoint":format!("http://127.0.0.1:{port}/rpc"),"token":token,"platform":connection.map(|c| &c.platform),"fields":fields,"connect":connection.is_some()});
+        let tools_mode = self.conversation_tools_mode(account)?;
+        let boot = json!({"protocolVersion":1,"instanceId":instance,"accountRef":account,"endpoint":format!("http://127.0.0.1:{port}/rpc"),"token":token,"platform":connection.map(|c| &c.platform),"fields":fields,"connect":connection.is_some(),"toolsMode":tools_mode});
         let launch = &lease.launch;
         let process = GatewayProcess::spawn(
             &launch.python,
@@ -325,6 +330,12 @@ impl HermesBridgeManager {
             };
         match action {
             "configureConversation" => self.save_conversation_model(&payload)?,
+            "configureTools" => {
+                let account = payload["accountRef"].as_str().ok_or("account_ref_required")?;
+                if self.save_conversation_tools(&payload)? && self.with_store(|s| s.connection(account))?.enabled {
+                    self.start_connection_locked(app, account)?;
+                }
+            }
             "beginSetup" => {
                 self.begin_setup_locked(
                     app,
@@ -521,6 +532,9 @@ impl HermesBridgeManager {
         }
         let mut p: BridgeParams =
             serde_json::from_value(params).map_err(|_| "invalid_bridge_request")?;
+        if p.delivery_key.is_some() && method != "ccem.bridge.replyConversation" {
+            return Err("invalid_bridge_request".into());
+        }
         let route = self.with_store(|s| s.route_for_account(&account, &p.source))?;
         if ["ccem.bridge.conversation", "ccem.bridge.validateConversation", "ccem.bridge.replyConversation", "ccem.bridge.shortReply"].contains(&method) {
             store::validate_message_id(p.source_message_id.as_deref().unwrap_or(""))?;
@@ -548,7 +562,7 @@ impl HermesBridgeManager {
         match method {
             "ccem.bridge.conversation" => self.conversation_snapshot(&route),
             "ccem.bridge.validateConversation" => Ok(json!({"ok":true})),
-            "ccem.bridge.replyConversation" => self.enqueue_conversation_reply(&route, p.source_message_id.as_deref().unwrap_or(""), p.text.as_deref().unwrap_or("")),
+            "ccem.bridge.replyConversation" => self.enqueue_conversation_reply(&route, p.source_message_id.as_deref().unwrap_or(""), p.text.as_deref().unwrap_or(""), p.delivery_key.as_deref()),
             "ccem.bridge.list" => {
                 let attached: HashSet<_> = self
                     .with_store(|s| s.session_bindings())?

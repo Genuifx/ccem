@@ -1613,6 +1613,15 @@
     "tmuxOptionalNotice": "当前仍可完成基础桥接配置，但如果要拿到更完整的远程控制、续接和多终端协同体验，建议先安装 tmux。"
   },
   "hermes": {
+    "toolsMode": "能力范围",
+    "toolsModeNative": "完整 Hermes",
+    "toolsModeCcem": "仅 CCEM 会话",
+    "saveToolsMode": "保存并重连",
+    "toolsModeNativeHint": "可访问网页、Skills 和记忆，读写本机文件、运行命令；危险操作沿用 Hermes 原生确认。",
+    "toolsModeCcemHint": "仅使用 CCEM 会话工具，按已授权的工作区访问任务。",
+    "toolsModeWorkspaceBoundary": "工作区授权仅限制 CCEM 会话工具，不限制 Hermes 本机工具。",
+    "nativeToolsUpdateRequired": "请更新聊天组件后再启用完整 Hermes。",
+    "toolsModeSaved": "能力范围已保存。",
     "conversationModel": "对话模型",
     "chooseConversationModel": "选择模型",
     "saveConversationModel": "保存",

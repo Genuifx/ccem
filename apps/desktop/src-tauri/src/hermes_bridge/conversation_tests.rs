@@ -2,6 +2,46 @@ use super::*;
 use super::super::{poll::{finish_delivery_with, reserve_delivery_with}, store::*};
 use std::{collections::HashMap, fs, path::PathBuf};
 
+#[test]
+fn native_tools_are_explicit_per_connection_and_survive_restart() {
+    let mut f = Fixture::new();
+    assert_eq!(f.s().conversation_tools_mode("old-bot").unwrap(), "ccem");
+    f.s().set_setting("conversation_tools:my-bot", "native").unwrap();
+    f.store.take();
+    f.store = Some(Store::open(&f.root.join("state")).unwrap());
+    assert_eq!(f.s().conversation_tools_mode("my-bot").unwrap(), "native");
+    assert_eq!(f.s().conversation_tools_mode("old-bot").unwrap(), "ccem");
+    f.s().set_setting("conversation_tools:my-bot", "corrupt").unwrap();
+    assert_eq!(f.s().conversation_tools_mode("my-bot").unwrap(), "ccem");
+}
+
+#[test]
+fn native_prompts_and_final_parts_have_independent_scoped_outbox_entries() {
+    let mut f = Fixture::new();
+    let route = f.route.clone();
+    let prompt = enqueue_reply(f.s(), &route, "message", "Approve this command?", Some("approval:1")).unwrap();
+    let first = enqueue_reply(f.s(), &route, "message", "Research part one", Some("final:1")).unwrap();
+    let second = enqueue_reply(f.s(), &route, "message", "Research part two", Some("final:2")).unwrap();
+    assert_ne!(prompt["deliveryId"], first["deliveryId"]);
+    assert_ne!(first["deliveryId"], second["deliveryId"]);
+    assert_eq!(first, enqueue_reply(f.s(), &route, "message", "Research part one", Some("final:1")).unwrap());
+    assert_eq!(f.s().deliveries().unwrap().len(), 3);
+    assert_eq!(enqueue_reply(f.s(), &route, "message", "Changed payload", Some("final:1")).unwrap_err(), "source_message_payload_conflict");
+    let mut replacement = route.clone();
+    replacement.generation += 1;
+    let next = enqueue_reply(f.s(), &replacement, "message", "Research part one", Some("final:1")).unwrap();
+    assert_ne!(next["deliveryId"], first["deliveryId"]);
+    for key in ["", "a/b", "a\nb"] {
+        assert!(enqueue_reply(f.s(), &route, "message", "text", Some(key)).is_err());
+    }
+    let legacy = enqueue_reply(f.s(), &route, "message", "legacy final", None).unwrap();
+    assert_eq!(legacy["deliveryId"], digest(&format!("conversation-reply:{}:message", scope(&route))));
+    let long = "汉".repeat(1000);
+    let saved = enqueue_reply(f.s(), &route, "message", &long, Some("long:1")).unwrap();
+    assert_eq!(f.s().delivery(saved["deliveryId"].as_str().unwrap()).unwrap().unwrap().text, long);
+    assert!(enqueue_reply(f.s(), &route, "message", &"汉".repeat(1200), Some("long:2")).is_err());
+}
+
 struct Fixture { root: PathBuf, store: Option<Store>, route: Route, shown: HashMap<String, PresentedInput> }
 impl Fixture {
     fn new() -> Self {

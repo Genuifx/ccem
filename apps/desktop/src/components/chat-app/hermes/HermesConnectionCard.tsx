@@ -7,6 +7,7 @@ import { errorText, platformDisplayName, timestamp, TRANSITIONING } from './herm
 import { HermesPlatformIcon, workspaceName } from './HermesVisuals';
 import { effectiveAccess, RouteAccessEditor, WorkspaceAccessFields, type WorkspaceAccess } from './HermesWorkspaceAccess';
 import { HermesConversationModel } from './HermesConversationModel';
+import { HermesToolsMode } from './HermesToolsMode';
 
 function SourceIdentity({ source }: { source: HermesSource }) {
   const { t } = useLocale();
@@ -121,6 +122,7 @@ export function HermesConnectionDetails({ connection, platform, routes, workspac
       </div>}
       {connection.pending.map((pairing) => <PendingPairing key={pairing.id} pairing={pairing} accountRef={connection.accountRef} workspaces={workspaces} disabled={disabled || !running} run={run} />)}
       <HermesConversationModel connection={connection} models={conversationModels} disabled={disabled} run={run} />
+      <HermesToolsMode key={connection.accountRef} connection={connection} disabled={disabled} run={run} />
       {routes.length > 0 && <div className="hermes-routes"><h4>{t('hermes.routes')}</h4>{routes.map((route) => <PairedChat key={route.id} route={route} workspaces={workspaces} disabled={disabled} accessDisabled={disabled || !connection.enabled} run={run} />)}</div>}
   </div>;
 }

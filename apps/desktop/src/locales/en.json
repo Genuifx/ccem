@@ -1613,6 +1613,15 @@
     "tmuxOptionalNotice": "Basic bridge setup still works without tmux, but install it for the fuller remote control, resume, and multi-terminal experience."
   },
   "hermes": {
+    "toolsMode": "Capabilities",
+    "toolsModeNative": "Full Hermes",
+    "toolsModeCcem": "CCEM sessions only",
+    "saveToolsMode": "Save and reconnect",
+    "toolsModeNativeHint": "Access the web, Skills and memory, read and write local files, and run commands. Risky operations use Hermes' native confirmation.",
+    "toolsModeCcemHint": "Use only CCEM session tools, with task access limited to authorized workspaces.",
+    "toolsModeWorkspaceBoundary": "Workspace grants apply only to CCEM session tools, not Hermes' local tools.",
+    "nativeToolsUpdateRequired": "Update the chat component before enabling Full Hermes.",
+    "toolsModeSaved": "Capabilities saved.",
     "conversationModel": "Conversation model",
     "chooseConversationModel": "Choose a model",
     "saveConversationModel": "Save",

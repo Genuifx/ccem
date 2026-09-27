@@ -170,6 +170,125 @@ async function input(id, value) {
 }
 async function poll() { await harness.act(async () => { for (const callback of intervalCallbacks) callback?.(); }); await settle(); }
 
+async function chooseSelect(section, label) {
+  const trigger = section.querySelector('[role=combobox]');
+  assert.ok(trigger);
+  await harness.act(async () => { trigger.focus(); trigger.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); });
+  await settle();
+  const option = [...document.querySelectorAll('[role=option]')].find((node) => node.textContent === label);
+  assert.ok(option, label);
+  await harness.act(async () => { option.focus(); option.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); });
+  await settle();
+}
+
+test('tools mode defaults existing bots to CCEM and saves each explicit change independently of the model', async () => {
+  current = snapshot({ connections: [connection({ nativeToolsAvailable: true, conversationModel: { envName: 'chat', model: 'model-one' } })] });
+  handler = async (name, args) => {
+    if (args?.action === 'configureTools') current.connections[0].toolsMode = args.payload.toolsMode;
+    return structuredClone(current);
+  };
+  await mount(); await openDetails();
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  assert.equal(section.querySelector('[role=combobox]').textContent, 'hermes.toolsModeCcem');
+  assert.equal(button('hermes.saveToolsMode').disabled, true);
+  assert.equal(actions('configureTools').length, 0);
+  await chooseSelect(section, 'hermes.toolsModeNative');
+  assert.ok(section.textContent.includes('hermes.toolsModeNativeHint'));
+  assert.ok(section.textContent.includes('hermes.toolsModeWorkspaceBoundary'));
+  await click(button('hermes.saveToolsMode'));
+  assert.deepEqual(actions('configureTools')[0].args.payload, { accountRef: source.accountRef, toolsMode: 'native' });
+  assert.equal(button('hermes.saveToolsMode').disabled, true);
+  assert.ok(section.querySelector('[role=status]').textContent.includes('hermes.toolsModeSaved'));
+  await chooseSelect(section, 'hermes.toolsModeCcem');
+  await click(button('hermes.saveToolsMode'));
+  assert.deepEqual(actions('configureTools')[1].args.payload, { accountRef: source.accountRef, toolsMode: 'ccem' });
+  assert.deepEqual(current.connections[0].conversationModel, { envName: 'chat', model: 'model-one' });
+  assert.equal(actions('configureConversation').length + actions('approvePairing').length + actions('updateRoute').length, 0);
+});
+
+for (const capability of [undefined, false]) test(`tools mode blocks native activation when capability is ${capability}`, async () => {
+  current = snapshot({ connections: [connection({ nativeToolsAvailable: capability })] });
+  await mount(); await openDetails();
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  await chooseSelect(section, 'hermes.toolsModeNative');
+  assert.equal(button('hermes.saveToolsMode').disabled, true);
+  assert.ok(section.querySelector('[role=status]').textContent.includes('hermes.nativeToolsUpdateRequired'));
+  await click(button('hermes.saveToolsMode'));
+  assert.equal(actions('configureTools').length, 0);
+  await chooseSelect(section, 'hermes.toolsModeCcem');
+  assert.equal(section.querySelector('[role=status]'), null);
+  assert.equal(button('hermes.saveToolsMode').disabled, true, 'returning to the saved mode needs no mutation');
+});
+
+test('tools mode can narrow a native connection even when the new runtime capability is missing', async () => {
+  current = snapshot({ connections: [connection({ toolsMode: 'native' })] });
+  handler = async (name, args) => {
+    if (args?.action === 'configureTools') current.connections[0].toolsMode = args.payload.toolsMode;
+    return structuredClone(current);
+  };
+  await mount(); await openDetails();
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  assert.ok(section.textContent.includes('hermes.nativeToolsUpdateRequired'));
+  await chooseSelect(section, 'hermes.toolsModeCcem');
+  assert.equal(button('hermes.saveToolsMode').disabled, false);
+  await click(button('hermes.saveToolsMode'));
+  assert.deepEqual(actions('configureTools')[0].args.payload, { accountRef: source.accountRef, toolsMode: 'ccem' });
+});
+
+test('tools mode draft survives polling, capability changes and a separate model save', async () => {
+  current = snapshot({ connections: [connection({ nativeToolsAvailable: true })], conversationModels: [{ envName: 'api-chat', model: 'chat-model' }] });
+  handler = async (name, args) => {
+    if (args?.action === 'configureConversation') current.connections[0].conversationModel = { envName: args.payload.modelEnv, model: 'chat-model' };
+    return structuredClone(current);
+  };
+  await mount(); await openDetails();
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  await chooseSelect(section, 'hermes.toolsModeNative');
+  await chooseSelect(container.querySelector('[data-hermes-conversation-model]'), 'api-chat · chat-model');
+  await click(button('hermes.saveConversationModel'));
+  await poll();
+  assert.equal(section.querySelector('[role=combobox]').textContent, 'hermes.toolsModeNative');
+  assert.equal(button('hermes.saveToolsMode').disabled, false);
+  current.connections[0] = { ...current.connections[0], nativeToolsAvailable: false };
+  await poll();
+  assert.equal(section.querySelector('[role=combobox]').textContent, 'hermes.toolsModeNative');
+  assert.equal(button('hermes.saveToolsMode').disabled, true);
+  assert.ok(section.textContent.includes('hermes.nativeToolsUpdateRequired'));
+  current.connections[0].nativeToolsAvailable = true;
+  await poll();
+  assert.equal(button('hermes.saveToolsMode').disabled, false);
+  assert.equal(actions('configureTools').length, 0);
+  assert.deepEqual(actions('configureConversation')[0].args.payload, { accountRef: source.accountRef, modelEnv: 'api-chat' });
+});
+
+for (const error of ['hermes_native_tools_update_required', 'connection restart failed']) test(`tools mode save retains its draft and exposes ${error}`, async () => {
+  current = snapshot({ connections: [connection({ nativeToolsAvailable: true })] });
+  handler = async (name, args) => { if (args?.action === 'configureTools') throw new Error(error); return structuredClone(current); };
+  await mount(); await openDetails();
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  await chooseSelect(section, 'hermes.toolsModeNative');
+  await click(button('hermes.saveToolsMode'));
+  assert.equal(section.querySelector('[role=combobox]').textContent, 'hermes.toolsModeNative');
+  assert.equal(section.textContent.includes('hermes.toolsModeSaved'), false);
+  assert.equal(button('hermes.saveToolsMode').disabled, false);
+  const expected = error === 'hermes_native_tools_update_required' ? 'hermes.nativeToolsUpdateRequired' : error;
+  assert.ok(container.querySelector('[role=alert]').textContent.includes(expected));
+});
+
+test('tools mode drafts and writes stay with their bot account', async () => {
+  const other = connection({ accountRef: 'account-two', nativeToolsAvailable: true });
+  current = snapshot({ connections: [connection({ nativeToolsAvailable: true }), other] });
+  await mount(); await openDetails();
+  await chooseSelect(container.querySelector('[data-hermes-tools-mode]'), 'hermes.toolsModeNative');
+  await openDetails(other.accountRef);
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  assert.equal(section.querySelector('[role=combobox]').textContent, 'hermes.toolsModeCcem');
+  await chooseSelect(section, 'hermes.toolsModeNative');
+  await click(button('hermes.saveToolsMode'));
+  assert.deepEqual(actions('configureTools')[0].args.payload, { accountRef: other.accountRef, toolsMode: 'native' });
+  assert.equal(actions('configureTools').length, 1);
+});
+
 test('a paired bot chooses its own conversation model without granting a workspace', async () => {
   current = snapshot({ connections: [connection()], conversationModels: [{ envName: 'api-chat', model: 'chat-model' }] });
   handler = async (name, args) => {
