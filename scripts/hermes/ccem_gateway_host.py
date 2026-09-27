@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private JSONL host for a pinned Hermes runtime. No model configuration is required.
+"""Private JSONL host for a pinned Hermes runtime.
 
 Run only from a verified runtime bundle. Credentials arrive once on stdin. The host
 uses Hermes's registry, authentication and live adapters; it has no platform SDKs
@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import subprocess
 import sys
 import threading
 import tempfile
@@ -182,7 +183,7 @@ class Host:
             if state == "running" and self.runner:
                 connected = self.transport_ready and any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
                 state = "running" if connected else "reconnecting"
-            return {"state": state, "error": self.error, "platforms": self.platforms,
+            return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1,
                     "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeSource")} for p in self.pending.values()],
                     "pairing": self.pairing}
 
@@ -275,7 +276,13 @@ class Host:
         event = kwargs.get("event")
         if not event or getattr(event, "internal", True) or not getattr(event, "allow_gateway_control", False):
             return None
-        if not event.is_command() or event.get_command() != "ccem":
+        if not event.is_command():
+            # Rewrite only. Admission still authenticates the original native
+            # sender/message after this hook; no RPC or grant happens here.
+            if event.source and isinstance(event.text, str) and event.text.strip():
+                return {"action": "rewrite", "text": command_prefix(str(event.source.platform.value)) + " chat " + event.text}
+            return None
+        if event.get_command() != "ccem":
             return None
         pieces = event.get_command_args().split()
         if not pieces or pieces[0] != "connect":
@@ -342,6 +349,11 @@ class Host:
                 params = {"source": source_value(context, self.boot["accountRef"]), "sourceMessageId": context.source_message_id}
                 if method in ("list",):
                     pass
+                elif method == "chat":
+                    text = raw_args.strip().partition(" ")[2]
+                    if not text.strip() or len(text.encode("utf-8")) > input_limit:
+                        raise ValueError("input_text_required")
+                    params["text"] = text
                 elif method in ("status", "events", "input") and len(args) >= 2:
                     params["runtimeId"] = args[1]
                     if method == "input":
@@ -389,6 +401,8 @@ class Host:
             self.setup.clear()
             self.stopped.set()
             return {"ok": True}
+        if method == "decideSessionNotification":
+            return await self.decide_session_notification(params)
         if method in ("beginSetup", "pollSetup", "cancelSetup"):
             if not isinstance(params, dict):
                 raise ValueError("setup_invalid_request")
@@ -434,6 +448,38 @@ class Host:
             return await send_strict(self.runner, target, notification_text(str(params["text"]), target.platform), timeout=30.0)
         raise ValueError("unknown_host_method")
 
+    async def decide_session_notification(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("invalid_decision_request")
+        data = json.dumps(params, ensure_ascii=False).encode()
+        if len(data) > 60_000:
+            raise ValueError("decision_context_too_large")
+        with tempfile.TemporaryDirectory(prefix="ccem-hermes-judge-") as temporary:
+            env = {"PATH": "/usr/bin:/bin", "HOME": temporary, "HERMES_HOME": temporary,
+                   "LANG": "en_US.UTF-8", "HERMES_SAFE_MODE": "1", "HERMES_DISABLE_LAZY_INSTALLS": "1"}
+            worker = await asyncio.create_subprocess_exec(
+                sys.executable, "-I", "-B", str(Path(__file__).with_name("ccem_session_advisor.py")),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                env=env, cwd=temporary)
+            try:
+                output, _ = await asyncio.wait_for(worker.communicate(data), timeout=30)
+                if worker.returncode != 0 or len(output) > 16_000:
+                    raise ValueError("hermes_notification_decision_failed")
+                result = json.loads(output)
+                if not isinstance(result, dict) or set(result) != {"notify", "text"} or type(result["notify"]) is not bool or not isinstance(result["text"], str):
+                    raise ValueError("hermes_notification_decision_failed")
+                if len(result["text"]) > 1600 or (result["notify"] and not result["text"].strip()) or (not result["notify"] and result["text"]):
+                    raise ValueError("hermes_notification_decision_failed")
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise ValueError("hermes_notification_decision_failed") from None
+            finally:
+                if worker.returncode is None:
+                    worker.kill()
+                    await worker.wait()
+
     async def serve(self):
         async def initialize():
             try:
@@ -450,6 +496,7 @@ class Host:
                 self.publish()
         heartbeat_task = asyncio.create_task(heartbeat())
         setup_jobs = {}
+        decision_job = None
         async def respond(frame):
             identifier = frame.get("id")
             try:
@@ -478,7 +525,12 @@ class Host:
                     raise ValueError("invalid_request_id")
                 method = frame.get("method")
                 params = frame.get("params", {})
-                if method in ("beginSetup", "pollSetup") and isinstance(params, dict):
+                if method == "decideSessionNotification":
+                    if decision_job is not None and not decision_job.done():
+                        emit({"id": identifier, "error": "decision_in_progress"})
+                    else:
+                        decision_job = asyncio.create_task(respond(frame))
+                elif method in ("beginSetup", "pollSetup") and isinstance(params, dict):
                     if method == "beginSetup":
                         try:
                             self.validate_begin_setup(params)
@@ -496,6 +548,9 @@ class Host:
                     if method == "cancelSetup" and result and result.get("state") == "cancelled":
                         await cancel_jobs(result["id"])
         finally:
+            if decision_job is not None:
+                decision_job.cancel()
+                await asyncio.gather(decision_job, return_exceptions=True)
             self.setup.clear()
             await cancel_jobs()
             initialization.cancel()
@@ -515,7 +570,12 @@ def render_result(result, maximum=3500, prefix="/ccem"):
             raise ValueError("confirmation_preview_too_large")
         return preview
     if "sessions" in result:
-        return limit_utf8("\n\n".join(f"{limit_utf8(s.get('title') or 'Task', 60)} · {s['status']}\n{s['runtimeId']}" for s in result["sessions"]), maximum) or "授权工作区暂无任务。"
+        rows = "\n\n".join(f"{limit_utf8(s.get('title') or 'Task', 60)} · {s.get('status', '')}\n{s['runtimeId']}" for s in result["sessions"])
+        if result.get("notice"):
+            rows = result["notice"] + "\n" + rows
+            if result["sessions"]:
+                rows += f"\n{prefix} input <runtime> <text>"
+        return limit_utf8(rows, maximum) or "授权工作区暂无任务。"
     if "events" in result:
         if not result.get("sourceAvailable") or result.get("gapDetected") or result.get("decodeFailureCount", 0) or result.get("oversizedEventCount", 0):
             return "事件记录不完整，请在 CCEM 查看任务。"
@@ -559,6 +619,10 @@ def main():
                 entry = platform_registry.get(name)
                 assert entry and entry.check_fn(), f"{name} transport dependencies are unavailable"
                 assert strict_send_supported(name), f"{name} managed delivery is unavailable"
+            worker = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).with_name("ccem_session_advisor.py")), "--self-test"],
+                                    cwd=temporary, env={"PATH":"/usr/bin:/bin", "HOME":temporary,"HERMES_HOME":temporary,"LANG":"en_US.UTF-8"},
+                                    capture_output=True, timeout=30)
+            assert worker.returncode == 0 and json.loads(worker.stdout).get("ok") is True, "Hermes notification evaluator dependencies unavailable"
         emit({"ok": True, "protocolVersion": PROTOCOL, "channels": list(MANAGED_CHANNELS)})
         return
     if not args.source or not args.profile or not args.source.is_absolute() or not args.profile.is_absolute():

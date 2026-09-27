@@ -111,7 +111,16 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
                 {
                     return Ok(());
                 }
-                project_page(store, route, session, &page)
+                // The explicit handoff owns this session's delivery policy.
+                // Still project operation state, but avoid the older broad-route notices.
+                let mut projected_route = route.clone();
+                if store
+                    .binding_for_route(route, &session.runtime_id)?
+                    .is_some()
+                {
+                    projected_route.notifications = false;
+                }
+                project_page(store, &projected_route, session, &page)
             })
         },
         || {
@@ -165,6 +174,9 @@ pub(super) fn poll(manager: &HermesBridgeManager, account: &str) -> Result<(), S
         },
     )?;
     if let Some(error) = recovery_error {
+        issues.push(error);
+    }
+    if let Err(error) = manager.poll_session_handoffs(account) {
         issues.push(error);
     }
     if !issues.is_empty() {
@@ -477,6 +489,15 @@ fn authorized_route(
     delivery: &Delivery,
     check_cron: impl FnOnce(&Delivery) -> Result<bool, String>,
 ) -> Result<Option<Route>, String> {
+    if let Some(binding) = &delivery.session_binding_id {
+        let route = store.routes()?.into_iter().find(|r| {
+            r.id == delivery.route_id && r.generation == delivery.generation && r.enabled
+        });
+        return match route {
+            Some(route) if store.session_delivery_authorized(binding, &route)? => Ok(Some(route)),
+            _ => Ok(None),
+        };
+    }
     let cron_allowed = if delivery.cron.is_some() {
         check_cron(delivery)?
     } else {

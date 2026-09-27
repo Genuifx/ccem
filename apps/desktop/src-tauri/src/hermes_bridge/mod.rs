@@ -3,6 +3,7 @@ mod connection_config;
 mod cron_notifications;
 mod poll;
 mod process;
+mod session_handoff;
 mod setup;
 mod startup;
 mod store;
@@ -292,6 +293,9 @@ impl HermesBridgeManager {
         action: &str,
         payload: Value,
     ) -> Result<Value, String> {
+        if ["sessionBinding", "bindSession", "detachSession"].contains(&action) {
+            return self.session_handoff_action(action, &payload);
+        }
         if action == "cancelInstall" {
             self.installer.cancel();
             self.install_cancelled.store(true, Ordering::Release);
@@ -466,7 +470,11 @@ impl HermesBridgeManager {
             .native
             .get_session_summary(id)?
             .ok_or("session_not_found")?;
-        if !route.permits(&session.project_dir) {
+        if !route.permits(&session.project_dir)
+            && self
+                .with_store(|s| s.binding_for_route(route, id))?
+                .is_none()
+        {
             return Err("workspace_not_authorized".into());
         }
         Ok(session)
@@ -485,6 +493,7 @@ impl HermesBridgeManager {
             .ok_or("bridge_token_revoked")?;
         if ![
             "ccem.bridge.list",
+            "ccem.bridge.chat",
             "ccem.bridge.status",
             "ccem.bridge.events",
             "ccem.bridge.input",
@@ -501,11 +510,17 @@ impl HermesBridgeManager {
         let route = self.with_store(|s| s.route_for_account(&account, &p.source))?;
         match method {
             "ccem.bridge.list" => {
+                let attached: HashSet<_> = self
+                    .with_store(|s| s.session_bindings())?
+                    .into_iter()
+                    .filter(|b| b.route_id == route.id && b.generation == route.generation)
+                    .map(|b| b.runtime_id)
+                    .collect();
                 let mut sessions: Vec<_> = self
                     .native
                     .list_sessions()
                     .into_iter()
-                    .filter(|s| route.permits(&s.project_dir))
+                    .filter(|s| route.permits(&s.project_dir) || attached.contains(&s.runtime_id))
                     .collect();
                 sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
                 Ok(
@@ -526,12 +541,35 @@ impl HermesBridgeManager {
                     ))
                 }
             }
-            "ccem.bridge.input" => {
-                let id = p.runtime_id.as_deref().ok_or("runtime_id_required")?;
-                self.scoped_session(&route, id)?;
+            "ccem.bridge.input" | "ccem.bridge.chat" => {
+                let chosen;
+                let id = if method.ends_with("chat") {
+                    let bindings: Vec<_> = self
+                        .with_store(|s| s.session_bindings())?
+                        .into_iter()
+                        .filter(|b| b.route_id == route.id && b.generation == route.generation)
+                        .filter(|b| {
+                            self.native
+                                .get_session_summary(&b.runtime_id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|s| s.is_active)
+                        })
+                        .collect();
+                    if bindings.len() != 1 {
+                        return Ok(
+                            json!({"notice":if bindings.is_empty() {"当前没有接管的会话，请先在 CCEM 输入框右下角选择「交给机器人」。"} else {"当前接管了多个会话，请使用 input 命令指定会话；不会猜测你的目标。"},"sessions":bindings.iter().map(|b|json!({"runtimeId":b.runtime_id,"title":b.title})).collect::<Vec<_>>()}),
+                        );
+                    }
+                    chosen = bindings[0].runtime_id.clone();
+                    chosen.as_str()
+                } else {
+                    p.runtime_id.as_deref().ok_or("runtime_id_required")?
+                };
+                let input_route = self.input_route(&route, id)?;
                 self.with_store(|s| {
                     s.prepare(
-                        &route,
+                        &input_route,
                         p.source_message_id.as_deref().unwrap_or(""),
                         id,
                         p.text.as_deref().unwrap_or(""),
@@ -540,11 +578,11 @@ impl HermesBridgeManager {
             }
             "ccem.bridge.confirm" => {
                 let challenge = p.challenge.as_deref().ok_or("challenge_required")?;
-                let id = self.with_store(|s| s.challenge_runtime(&route, challenge))?;
+                let (confirmed_route, id) = self.confirmation_route(&route, challenge)?;
                 self.scoped_session(&route, &id)?;
                 let (mut op, submit) = self.with_store(|s| {
                     s.confirm(
-                        &route,
+                        &confirmed_route,
                         p.source_message_id.as_deref().unwrap_or(""),
                         challenge,
                         &id,
@@ -574,16 +612,21 @@ impl HermesBridgeManager {
                 )
             }
             "ccem.bridge.cancel" => {
-                self.with_store(|s| {
-                    s.cancel(&route, p.challenge.as_deref().ok_or("challenge_required")?)
-                })?;
+                let challenge = p.challenge.as_deref().ok_or("challenge_required")?;
+                let (confirmed_route, _) = self.confirmation_route(&route, challenge)?;
+                self.with_store(|s| s.cancel(&confirmed_route, challenge))?;
                 Ok(json!({"state":"cancelled"}))
             }
             "ccem.bridge.operation" => {
                 let op = self.with_store(|s| {
                     s.operation(p.operation_id.as_deref().ok_or("operation_id_required")?)
                 })?;
-                if op.route_id != route.id || op.generation != route.generation {
+                let scoped_id = self
+                    .with_store(|s| s.binding_for_route(&route, &op.runtime_id))?
+                    .map(|b| b.id);
+                if (op.route_id != route.id && scoped_id.as_deref() != Some(&op.route_id))
+                    || op.generation != route.generation
+                {
                     return Err("operation_not_authorized".into());
                 }
                 self.scoped_session(&route, &op.runtime_id)?;
@@ -784,6 +827,7 @@ fn decode_fields(cipher: &str) -> Result<serde_json::Map<String, Value>, String>
 }
 fn make_delivery(route: &Route, event: &str, text: String) -> Delivery {
     Delivery {
+        session_binding_id: None,
         id: digest(&format!("{}:{}:{event}", route.id, route.generation)),
         route_id: route.id.clone(),
         generation: route.generation,

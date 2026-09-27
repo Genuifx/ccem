@@ -13,6 +13,9 @@ use std::{
 #[path = "connections.rs"]
 mod connections;
 pub use connections::ConnectionRecord;
+#[path = "session_store.rs"]
+mod session_store;
+pub use session_store::{SessionBinding, SessionDecision};
 
 pub fn now() -> i64 {
     SystemTime::now()
@@ -127,6 +130,8 @@ pub struct Operation {
 #[serde(rename_all = "camelCase")]
 pub struct Delivery {
     #[serde(default)]
+    pub session_binding_id: Option<String>,
+    #[serde(default)]
     pub cron: Option<crate::cron::CronDeliveryScope>,
     pub id: String,
     pub route_id: String,
@@ -179,6 +184,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, route_id TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS cursors(id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_bindings(runtime_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_decisions(id TEXT PRIMARY KEY, binding_id TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS connections(account_ref TEXT PRIMARY KEY, platform TEXT NOT NULL, label TEXT NOT NULL, cipher TEXT NOT NULL, configured_fields TEXT NOT NULL, enabled INTEGER NOT NULL);").map_err(err)?;
         let mut store = Self { db, _owner: owner };
         store.migrate_connections()?;

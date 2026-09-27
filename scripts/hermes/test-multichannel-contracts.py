@@ -341,6 +341,27 @@ class MultiChannelContracts(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await runner._handle_message(event))
             runner._run_agent.assert_not_awaited()
 
+    async def test_plain_text_rewrite_still_requires_native_sender_admission(self):
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+        for platform in self.adapters:
+            host = host_module.Host({"protocolVersion": 1, "token": "x"*48,
+                "accountRef": "a"*48, "endpoint": "http://127.0.0.1:1/rpc", "platform": platform}, Path(os.environ["HERMES_HOME"]))
+            host.rpc = lambda *args: self.fail("unapproved text must not call CCEM")
+            event = MessageEvent(text="continue the attached session", message_id="native-message",
+                source=SessionSource(platform=Platform(platform), chat_id=self.chat(platform), user_id="unapproved", chat_type="dm"))
+            rewrite = host.pairing_hook(event=event)
+            self.assertEqual(rewrite, {"action":"rewrite", "text":host_module.command_prefix(platform)+" chat continue the attached session"})
+            runner = object.__new__(GatewayRunner)
+            runner.config = GatewayConfig(integration_only=True, unauthorized_dm_behavior="ignore", platforms={Platform(platform):PlatformConfig(enabled=True)})
+            runner._primary_profile_name = "managed"
+            runner._profile_adapters, runner.adapters, runner._running_agents = {}, {}, {}
+            runner._draining = False
+            runner.hooks = NS(emit=AsyncMock(), emit_collect=AsyncMock(return_value=[rewrite]))
+            runner._run_agent = AsyncMock(side_effect=AssertionError("must not start an agent"))
+            self.assertIsNone(await runner._handle_message(event))
+            runner._run_agent.assert_not_awaited()
+
     async def test_connected_adapter_proxy_is_used_without_inheriting_environment_auth(self):
         for platform in ("discord", "slack"):
             adapter = self.adapters[platform]

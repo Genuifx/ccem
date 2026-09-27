@@ -25,6 +25,33 @@ export function getHermesNotificationTargets(): Promise<HermesNotificationTarget
   return invoke('hermes_notification_targets');
 }
 
+export interface HermesSessionBinding {
+  id: string;
+  runtimeId: string;
+  routeId: string;
+  generation: number;
+  title: string;
+  modelEnv: string;
+  model: string;
+  lastDecision: string | null;
+  error: string | null;
+}
+
+export interface HermesSessionHandoff {
+  binding: HermesSessionBinding | null;
+  bindingValid: boolean;
+  deliveryStatus: string | null;
+  targets: (HermesNotificationTarget & { handoffReady: boolean })[];
+  models: { envName: string; model: string }[];
+  defaultModelEnv: string;
+}
+
+export function sessionHermesAction(action: 'sessionBinding' | 'bindSession' | 'detachSession', payload: {
+  runtimeId: string; routeId?: string; generation?: number; modelEnv?: string; bindingId?: string;
+}): Promise<HermesSessionHandoff> {
+  return invoke('hermes_action', { action, payload });
+}
+
 export interface HermesSource {
   platform: string;
   profile: string;

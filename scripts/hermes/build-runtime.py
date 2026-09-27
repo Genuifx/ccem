@@ -195,7 +195,7 @@ def prepare(args: argparse.Namespace) -> dict:
     # their shared transport. Keep the original lock, including wheel hashes.
     requirements = cache / "requirements.lock.txt"
     requirements.write_text(run([args.uv, "export", "--frozen", "--no-dev", "--no-emit-project",
-        "--extra", "wecom", "--extra", "feishu", "--extra", "messaging", "--format", "requirements-txt"], cwd=source))
+        "--extra", "wecom", "--extra", "feishu", "--extra", "messaging", "--extra", "anthropic", "--format", "requirements-txt"], cwd=source))
     site = package / "python/lib/python3.11/site-packages"
     print("Installing the locked wheel closure in the build artifact", flush=True)
     subprocess.run([args.uv, "pip", "install", "--python", str(python), "--target", str(site),
@@ -246,6 +246,7 @@ def finalize(args: argparse.Namespace) -> dict:
         write_json(stamp, {"sha256": sha256(patch)})
     shutil.copy2(host, package / "ccem_gateway_host.py")
     shutil.copy2(host.with_name("ccem_gateway_onboarding.py"), package / "ccem_gateway_onboarding.py")
+    shutil.copy2(host.with_name("ccem_session_advisor.py"), package / "ccem_session_advisor.py")
     regularize_links(package)
     for path in package.rglob("__pycache__"):
         shutil.rmtree(path)
