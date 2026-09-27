@@ -48,6 +48,7 @@ test('builds a non-interactive Claude query environment for desktop sessions', a
   assert.equal(env.CLAUDE_CONFIG_DIR, '/tmp/ccem-claude-config');
   assert.equal(env.CLAUDE_AGENT_SDK_CLIENT_APP, 'ccem-desktop');
   assert.equal(env.CLAUDE_CODE_SANDBOXED, '1');
+  assert.equal(env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1');
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, 'high');
 });
 

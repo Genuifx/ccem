@@ -87,12 +87,14 @@ static NATIVE_RUNTIME_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const BROWSER_ACTOR_ID_PREFIX: &str = "browser-actor-";
 const BROWSER_ACTOR_ID_RANDOM_BYTES: usize = 16;
 const MAX_PROVIDER_SESSION_ID_BYTES: usize = 512;
+const CLAUDE_STALLED_END_TURN_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueDispatchTrigger {
     VisibleUserAction,
     AuthoritativeLifecycle,
     InitializationSettled,
+    RetiredQuery,
 }
 
 fn is_background_task_shutdown_safety_error(message: &str) -> bool {
@@ -1475,6 +1477,37 @@ fn helper_output_defers_queue_autodrain(line: &str) -> bool {
     })
 }
 
+#[derive(Clone)]
+struct ClaudeEndTurnObservation {
+    command_id: String,
+    query_generation: u64,
+    assistant_message_uuid: Option<String>,
+}
+
+fn helper_output_claude_end_turn(line: &str) -> Option<ClaudeEndTurnObservation> {
+    line.lines().filter_map(|entry| serde_json::from_str::<Value>(entry).ok()).find_map(|value| {
+        let payload = value.get("payload")?;
+        if value.get("type")?.as_str()? != "event"
+            || payload.get("type")?.as_str()? != "lifecycle"
+            || payload.get("stage")?.as_str()? != "assistant_end_turn_observed"
+        {
+            return None;
+        }
+        let command_id = payload.get("command_id")?.as_str()?.trim();
+        if command_id.is_empty() {
+            return None;
+        }
+        Some(ClaudeEndTurnObservation {
+            command_id: command_id.to_string(),
+            query_generation: payload.get("query_generation")?.as_u64()?,
+            assistant_message_uuid: payload
+                .get("assistant_message_uuid")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    })
+}
+
 fn helper_output_requests_queue_autodrain(line: &str) -> bool {
     line.lines().map(str::trim).any(|entry| {
         let Ok(value) = serde_json::from_str::<Value>(entry) else {
@@ -1975,6 +2008,7 @@ struct NativeSessionHandle {
     settings_update_acks: SettingsUpdateAckRegistry,
     child: Mutex<Option<NativeHelperChild>>,
     events: Mutex<SessionStore>,
+    last_helper_output_at: Mutex<Instant>,
     background_tasks: Mutex<HashMap<String, NativeBackgroundTask>>,
     has_background_task_snapshot: AtomicBool,
     terminal_background_task_ids: Mutex<HashSet<String>>,
@@ -2496,6 +2530,7 @@ impl NativeRuntimeManager {
             settings_update_acks: SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(runtime_id.clone())),
+            last_helper_output_at: Mutex::new(Instant::now()),
             background_tasks: Mutex::new(HashMap::new()),
             has_background_task_snapshot: AtomicBool::new(false),
             terminal_background_task_ids: Mutex::new(HashSet::new()),
@@ -3623,7 +3658,10 @@ impl NativeRuntimeManager {
             return Ok(());
         }
         if trigger == QueueDispatchTrigger::AuthoritativeLifecycle
-            && self.lifecycle.adapter_kind(runtime_id) != Some(AdapterKind::FullLifecycle)
+            && !matches!(
+                self.lifecycle.adapter_kind(runtime_id),
+                Some(AdapterKind::FullLifecycle | AdapterKind::LegacySerial)
+            )
         {
             return Ok(());
         }
@@ -3816,6 +3854,179 @@ impl NativeRuntimeManager {
                 eprintln!("{detail}");
             }
         });
+    }
+
+    fn schedule_stalled_claude_turn_recovery(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        observation: ClaudeEndTurnObservation,
+    ) {
+        let manager = Arc::clone(self);
+        let app = app.clone();
+        let runtime_id = runtime_id.to_string();
+        let handle = Arc::clone(handle);
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut background_deferral_reported = false;
+            loop {
+                let quiet_for = match handle.last_helper_output_at.lock() {
+                    Ok(last) => last.elapsed(),
+                    Err(_) => return,
+                };
+                if quiet_for < CLAUDE_STALLED_END_TURN_GRACE {
+                    thread::sleep(CLAUDE_STALLED_END_TURN_GRACE - quiet_for);
+                }
+                let still_active = manager.lifecycle.projection(&runtime_id).is_some_and(|state| {
+                    state.active_command_id.as_deref() == Some(observation.command_id.as_str())
+                        && state.active_helper_incarnation == Some(handle.generation)
+                        && state.query_generation == observation.query_generation
+                });
+                if !still_active || !manager.is_current_handle(&runtime_id, &handle).unwrap_or(false) {
+                    return;
+                }
+                if handle.last_helper_output_at.lock().is_ok_and(|last| {
+                    last.elapsed() < CLAUDE_STALLED_END_TURN_GRACE
+                }) {
+                    continue;
+                }
+                let recovery = match manager.active_background_tasks(&runtime_id) {
+                    Ok(tasks) if !tasks.is_empty() => {
+                        if !background_deferral_reported {
+                            let _ = manager.append_lifecycle_event(
+                                &runtime_id,
+                                "stalled_turn_recovery_deferred",
+                                "Claude background tasks remain active after the final assistant message."
+                                    .to_string(),
+                            );
+                            background_deferral_reported = true;
+                        }
+                        Ok(false)
+                    }
+                    Ok(_) => manager.recover_stalled_claude_turn(
+                        Some(&app),
+                        &runtime_id,
+                        &handle,
+                        &observation,
+                    ),
+                    Err(error) => Err(error),
+                };
+                match recovery {
+                    Ok(true) => return,
+                    Ok(false) => thread::sleep(Duration::from_secs(1)),
+                    Err(error) => {
+                        let _ = manager.set_last_error(&runtime_id, error.clone());
+                        let _ = manager.append_lifecycle_event(
+                            &runtime_id,
+                            "stalled_turn_recovery_failed",
+                            error,
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    fn recover_stalled_claude_turn(
+        self: &Arc<Self>,
+        app: Option<&AppHandle>,
+        runtime_id: &str,
+        handle: &Arc<NativeSessionHandle>,
+        observation: &ClaudeEndTurnObservation,
+    ) -> Result<bool, String> {
+        let _transition_guard = self
+            .app_termination_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime transition".to_string())?;
+        let _reconnect_guard = self
+            .reconnect_lock
+            .lock()
+            .map_err(|_| "Failed to lock native runtime reconnect coordinator".to_string())?;
+        let current = self
+            .handles
+            .lock()
+            .map_err(|_| "Failed to lock native runtime handles".to_string())?
+            .get(runtime_id)
+            .is_some_and(|current| Self::same_handle(current, handle));
+        let active = self.lifecycle.projection(runtime_id).is_some_and(|state| {
+            state.adapter == AdapterKind::LegacySerial.as_str()
+                && state.active_command_id.as_deref() == Some(observation.command_id.as_str())
+                && state.active_helper_incarnation == Some(handle.generation)
+                && state.query_generation == observation.query_generation
+                && state.protocol_error.is_none()
+        });
+        if !current || !active || !handle.alive.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if handle
+            .last_helper_output_at
+            .lock()
+            .map_err(|_| "Failed to lock native helper output time".to_string())?
+            .elapsed()
+            < CLAUDE_STALLED_END_TURN_GRACE
+        {
+            return Ok(false);
+        }
+        if !self.active_background_tasks(runtime_id)?.is_empty() {
+            return Ok(false);
+        }
+
+        let _ = self.append_lifecycle_event(
+            runtime_id,
+            "stalled_turn_recovery_started",
+            format!(
+                "Retiring helper generation {} after Claude's final answer lacked a turn terminal. command_id={}",
+                handle.generation, observation.command_id
+            ),
+        );
+        if !self.retire_handle_if_current(runtime_id, handle)? {
+            return Ok(false);
+        }
+        let decision = self
+            .lifecycle
+            .abandon_retired_command(runtime_id, &observation.command_id);
+        if !matches!(decision, LifecycleDecision::Released { .. }) {
+            return Err(format!(
+                "Retired Claude helper generation {} but command {} was not released",
+                handle.generation, observation.command_id
+            ));
+        }
+        let transcript_result = self.append_retired_handle_event(
+            handle,
+            SessionEventPayload::Lifecycle {
+                stage: "turn_completed".to_string(),
+                detail: "Claude's final answer was delivered; its stalled query was retired."
+                    .to_string(),
+                assistant_message_uuid: observation.assistant_message_uuid.clone(),
+                command_id: Some(observation.command_id.clone()),
+                query_generation: Some(observation.query_generation),
+                user_message_uuid: Some(observation.command_id.clone()),
+            },
+        );
+        self.apply_lifecycle_decision(runtime_id, &decision)?;
+        let ready_result = self.append_retired_handle_event(
+            handle,
+            SessionEventPayload::Lifecycle {
+                stage: "ready".to_string(),
+                detail: format!(
+                    "Coordinator released terminal command {} after retiring its stalled query.",
+                    observation.command_id
+                ),
+                assistant_message_uuid: None,
+                command_id: Some(observation.command_id.clone()),
+                query_generation: Some(observation.query_generation),
+                user_message_uuid: None,
+            },
+        );
+        drop(_reconnect_guard);
+        drop(_transition_guard);
+        if let Some(app) = app {
+            self.schedule_queued_dispatch(app, runtime_id, QueueDispatchTrigger::RetiredQuery);
+        }
+        transcript_result?;
+        ready_result?;
+        Ok(true)
     }
 
     pub fn respond_to_permission(
@@ -7618,6 +7829,7 @@ impl NativeRuntimeManager {
                 runtime_id.to_string(),
                 start_seq,
             )),
+            last_helper_output_at: Mutex::new(Instant::now()),
             background_tasks: Mutex::new(HashMap::new()),
             has_background_task_snapshot: AtomicBool::new(false),
             terminal_background_task_ids: Mutex::new(HashSet::new()),
@@ -8389,6 +8601,11 @@ impl NativeRuntimeManager {
         if !self.is_current_handle(runtime_id, handle)? {
             return Ok(());
         }
+        *handle
+            .last_helper_output_at
+            .lock()
+            .map_err(|_| "Failed to lock native helper output time".to_string())? = Instant::now();
+        let end_turn_observation = helper_output_claude_end_turn(line);
         let defer_queue_autodrain = helper_output_defers_queue_autodrain(line);
         let request_queue_autodrain = helper_output_requests_queue_autodrain(line);
         let initialization_failed = helper_output_reports_initialization_failure(line);
@@ -8419,6 +8636,11 @@ impl NativeRuntimeManager {
             None
         };
         drop(_reconnect_guard);
+        if result.is_ok() {
+            if let (Some(app), Some(observation)) = (app, end_turn_observation) {
+                self.schedule_stalled_claude_turn_recovery(app, runtime_id, handle, observation);
+            }
+        }
         if let Some(preparation) = pending_handoff {
             let manager = Arc::clone(self);
             let app = app.cloned();
@@ -10131,6 +10353,21 @@ impl NativeRuntimeManager {
         Ok(())
     }
 
+    fn append_retired_handle_event(
+        &self,
+        handle: &Arc<NativeSessionHandle>,
+        payload: SessionEventPayload,
+    ) -> Result<(), String> {
+        let record = handle
+            .events
+            .lock()
+            .map_err(|_| "Failed to lock retired native session store".to_string())?
+            .append(payload);
+        self.event_log
+            .append(&record)
+            .map_err(|error| format!("Failed to persist retired native event: {error}"))
+    }
+
     fn append_event_if_current(
         &self,
         runtime_id: &str,
@@ -11494,6 +11731,7 @@ mod tests {
             settings_update_acks: super::SettingsUpdateAckRegistry::default(),
             child: Mutex::new(None),
             events: Mutex::new(SessionStore::new(&runtime_id)),
+            last_helper_output_at: Mutex::new(Instant::now()),
             background_tasks: Mutex::new(HashMap::new()),
             has_background_task_snapshot: AtomicBool::new(false),
             terminal_background_task_ids: Mutex::new(HashSet::new()),
@@ -19550,6 +19788,136 @@ wait"#,
     #[test]
     fn fifo_terminal_wakeup_racing_busy_release_dispatches_tail_once() {
         assert_fifo_wakeup_survives_claimed_head(false, false);
+    }
+
+    #[test]
+    fn legacy_terminal_releases_and_dispatches_queued_prompt() {
+        let runtime_id = "legacy-terminal-queued-followup";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let generation = manager.handles.lock().unwrap()[runtime_id].generation;
+        manager.lifecycle.note_incarnation(runtime_id, generation);
+        manager.lifecycle.note_session_meta(
+            runtime_id,
+            generation,
+            Some("legacy-conversation"),
+            Some(&[]),
+            Some(1),
+        );
+        manager
+            .lifecycle
+            .admit_prompt_with_id(runtime_id, generation, "first-command")
+            .unwrap();
+        manager
+            .lifecycle
+            .note_command_admitted(runtime_id, generation, "first-command", 1);
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("queued-followup", "follow up", None, None, None),
+                Some("first-command"),
+            )
+            .unwrap();
+        let decision = manager
+            .lifecycle
+            .note_legacy_terminal(runtime_id, generation, "first-command", 1);
+        assert!(matches!(decision, crate::native_session_coordinator::LifecycleDecision::Released { .. }));
+        manager.apply_lifecycle_decision(runtime_id, &decision).unwrap();
+
+        let mut dispatched = 0;
+        manager
+            .dispatch_queued_with(
+                runtime_id,
+                super::QueueDispatchTrigger::AuthoritativeLifecycle,
+                |text, _, _, _, command_id, attempt, _| {
+                    assert_eq!(text, "follow up");
+                    manager
+                        .lifecycle
+                        .admit_queued_prompt(runtime_id, generation, command_id, attempt)
+                        .unwrap();
+                    manager.process_helper_stdout(runtime_id, &serde_json::json!({
+                        "type": "event", "payload": {
+                            "type": "lifecycle", "stage": "command_admitted",
+                            "command_id": command_id, "query_generation": 1,
+                            "detail": "received"
+                        }
+                    }).to_string()).unwrap();
+                    dispatched += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(dispatched, 1);
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+    }
+
+    #[test]
+    fn stalled_legacy_answer_retires_exact_generation_before_releasing_queue() {
+        let runtime_id = "legacy-answer-without-result";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let handle = manager.handles.lock().unwrap()[runtime_id].clone();
+        manager.lifecycle.note_incarnation(runtime_id, handle.generation);
+        manager.lifecycle.note_session_meta(
+            runtime_id,
+            handle.generation,
+            Some("legacy-conversation"),
+            Some(&[]),
+            Some(1),
+        );
+        manager
+            .lifecycle
+            .admit_prompt_with_id(runtime_id, handle.generation, "first-command")
+            .unwrap();
+        manager.lifecycle.note_command_admitted(
+            runtime_id,
+            handle.generation,
+            "first-command",
+            1,
+        );
+        manager
+            .input_queue
+            .enqueue(
+                runtime_id,
+                FrozenNativeInputBatch::new("queued-followup", "follow up", None, None, None),
+                Some("first-command"),
+            )
+            .unwrap();
+        *handle.last_helper_output_at.lock().unwrap() =
+            Instant::now() - super::CLAUDE_STALLED_END_TURN_GRACE - Duration::from_secs(1);
+        let observation = super::ClaudeEndTurnObservation {
+            command_id: "first-command".to_string(),
+            query_generation: 1,
+            assistant_message_uuid: Some("final-answer".to_string()),
+        };
+        assert!(!manager.recover_stalled_claude_turn(
+            None,
+            runtime_id,
+            &handle,
+            &super::ClaudeEndTurnObservation {
+                command_id: "other-command".to_string(),
+                ..observation.clone()
+            },
+        ).unwrap());
+        assert!(manager.handles.lock().unwrap().contains_key(runtime_id));
+        handle.background_tasks.lock().unwrap().insert(
+            "still-running".to_string(),
+            background_task("still-running", NativeBackgroundTaskStatus::Running),
+        );
+        assert!(!manager.recover_stalled_claude_turn(None, runtime_id, &handle, &observation).unwrap());
+        assert!(manager.handles.lock().unwrap().contains_key(runtime_id));
+        handle.background_tasks.lock().unwrap().clear();
+        assert!(manager.recover_stalled_claude_turn(None, runtime_id, &handle, &observation).unwrap());
+        assert!(!manager.handles.lock().unwrap().contains_key(runtime_id));
+        assert!(manager.lifecycle.projection(runtime_id).unwrap().active_command_id.is_none());
+        assert_eq!(manager.input_queue.count(runtime_id), 1);
+        assert_eq!(manager.records.lock().unwrap()[runtime_id].status, "ready");
+        assert!(manager.replay_events(runtime_id, None).unwrap().events.iter().any(|event| {
+            matches!(&event.payload, SessionEventPayload::Lifecycle {
+                stage, command_id, assistant_message_uuid, ..
+            } if stage == "turn_completed"
+                && command_id.as_deref() == Some("first-command")
+                && assistant_message_uuid.as_deref() == Some("final-answer"))
+        }));
     }
 
     #[test]

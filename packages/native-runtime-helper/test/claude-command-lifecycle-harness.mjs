@@ -108,10 +108,16 @@ async function buildHelperWithWireMock(options = {}) {
               let localTurn = 0;
               let signalInterrupt;
               const interruptSignal = new Promise((resolve) => { signalInterrupt = resolve; });
+              let signalClose;
+              const closeSignal = new Promise((resolve) => { signalClose = resolve; });
               return {
                 close() {
                   probe({stage:'close',query:thisQuery});
+                  if (scenario === 'legacy_stalled_end_turn' || scenario === 'legacy_stalled_stream_end_turn') {
+                    process.stdout.write(JSON.stringify({type:'query_close_probe',query:thisQuery})+'\\n');
+                  }
                   closed = true;
+                  signalClose();
                 },
                 async interrupt() { signalInterrupt(); },
                 async setModel() {},
@@ -157,9 +163,18 @@ async function buildHelperWithWireMock(options = {}) {
                   const iterator = prompt[Symbol.asyncIterator]();
                   const session_id = 'mock-session';
                   const preInit = scenario === 'preinit_full' || scenario === 'preinit_legacy';
-                  const legacy = scenario === 'legacy' || scenario === 'preinit_legacy';
+                  const legacy = scenario === 'legacy'
+                    || scenario === 'preinit_legacy'
+                    || scenario === 'legacy_missing_capabilities'
+                    || scenario === 'legacy_missing_idle'
+                    || scenario === 'legacy_stalled_end_turn'
+                    || scenario === 'legacy_stalled_stream_end_turn';
                   if (!preInit) {
-                    if (scenario === 'missing_capabilities') {
+                    if (scenario === 'missing_capabilities'
+                      || scenario === 'legacy_missing_capabilities'
+                      || scenario === 'legacy_missing_idle'
+                      || scenario === 'legacy_stalled_end_turn'
+                      || scenario === 'legacy_stalled_stream_end_turn') {
                       yield { type: 'system', subtype: 'init', session_id };
                     } else {
                       yield initFrame(session_id, legacy ? [] : fullCapabilities);
@@ -208,8 +223,86 @@ async function buildHelperWithWireMock(options = {}) {
                       yield initFrame(session_id, fullCapabilities);
                     }
 
-                    yield { ...userMessage, session_id };
+                    if (${JSON.stringify(options.peerBeforeUserEcho ?? false)}) {
+                      yield {
+                        type: 'user', uuid: 'peer-before-echo', session_id,
+                        origin: { kind: 'peer' }, shouldQuery: false,
+                        message: { role: 'user', content: 'peer context' },
+                      };
+                    }
+                    const userEcho = { ...userMessage, session_id };
+                    if (${JSON.stringify(options.omitUserEchoOrigin ?? false)}) {
+                      delete userEcho.origin;
+                    }
+                    yield userEcho;
+                    if (${JSON.stringify(options.staleOriginlessEchoBeforeResult ?? false)}) {
+                      yield {
+                        type: 'user', uuid: 'stale-originless-echo', session_id,
+                        message: { role: 'user', content: 'stale input' },
+                      };
+                      if (${JSON.stringify(options.staleOriginlessEchoBeforeResult ?? false)} === 'before') {
+                        yield {
+                          type: 'result', subtype: 'success', result: 'stale result',
+                          session_id,
+                        };
+                      }
+                    }
                     yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
+                    if (scenario === 'legacy_stalled_stream_end_turn' && thisQuery === 1) {
+                      if (${JSON.stringify(options.priorAssistantUuid ?? null)}) {
+                        yield {
+                          type: 'assistant', uuid: ${JSON.stringify(options.priorAssistantUuid ?? null)},
+                          session_id, parent_tool_use_id: null,
+                          message: { role: 'assistant', stop_reason: 'tool_use', content: [] },
+                        };
+                      }
+                      const base = {
+                        type: 'stream_event',
+                        uuid: 'stream-final-assistant',
+                        session_id,
+                        parent_tool_use_id: null,
+                      };
+                      yield { ...base, event: { type: 'message_start', message: { id: 'stream-final-message' } } };
+                      yield { ...base, event: {
+                        type: 'content_block_delta',
+                        delta: { type: 'text_delta', text: 'streamed final answer' },
+                      } };
+                      yield { ...base, event: {
+                        type: 'message_delta',
+                        delta: { stop_reason: 'end_turn' },
+                      } };
+                      await closeSignal;
+                      yield resultFrame(userMessage, localTurn, session_id);
+                      continue;
+                    }
+                    if (scenario === 'legacy_missing_idle'
+                      || (scenario === 'legacy_stalled_end_turn' && thisQuery === 1)) {
+                      yield {
+                        type: 'assistant',
+                        uuid: scenario === 'legacy_missing_idle'
+                          ? 'missing-idle-assistant'
+                          : 'stalled-assistant',
+                        session_id,
+                        parent_tool_use_id: null,
+                        message: {
+                          role: 'assistant',
+                          stop_reason: 'end_turn',
+                          content: [{
+                            type: 'text',
+                            text: scenario === 'legacy_missing_idle'
+                              ? 'result without idle'
+                              : 'stalled final answer',
+                          }],
+                        },
+                      };
+                    }
+                    if (scenario === 'legacy_stalled_end_turn' && thisQuery === 1) {
+                      // The old query never reports Result or idle. A late
+                      // Result after close exercises the generation fence.
+                      await closeSignal;
+                      yield resultFrame(userMessage, localTurn, session_id);
+                      continue;
+                    }
                     if (assistantUuidPrefix) {
                       yield {
                         type: 'assistant',
@@ -343,6 +436,18 @@ async function buildHelperWithWireMock(options = {}) {
 
                     if (resultDelayMs > 0) await sleep(resultDelayMs);
                     yield resultFrame(userMessage, localTurn, session_id);
+                    if (${JSON.stringify(options.staleOriginlessEchoBeforeResult ?? false)} === 'after') {
+                      yield {
+                        type: 'result', subtype: 'success', result: 'stale result',
+                        session_id,
+                      };
+                    }
+
+                    if (scenario === 'legacy_missing_idle') {
+                      // Result alone is not the serial turn terminal.
+                      await closeSignal;
+                      continue;
+                    }
 
                     if (scenario === 'missing_terminal') {
                       await new Promise(() => {});

@@ -331,6 +331,8 @@ let claudeSdkCapabilities: string[] | undefined;
 let claudePreInitLifecycleFrames: ClaudeSdkCommandLifecycleFrame[] = [];
 let claudeTurnResultObservation: ClaudeTurnResultObservation | null = null;
 let claudeLegacyIdleCommandId: string | null = null;
+let claudeEndTurnObservedCommandId: string | null = null;
+const claudeStaleOriginlessEchoUuids = new Set<string>();
 let claudeLifecycleTerminalTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeLifecycleProtocolErrorKey: string | null = null;
 let claudeAuthoritativeTerminalCommandId: string | null = null;
@@ -588,6 +590,7 @@ function beginClaudeLifecycleGeneration() {
   }
   clearClaudeLifecycleTerminalTimer();
   claudeLifecycleMode = 'negotiating';
+  claudeEndTurnObservedCommandId = null;
   claudeSdkCapabilities = undefined;
   claudePreInitLifecycleFrames = [];
   claudeLifecycleProtocolErrorKey = null;
@@ -624,12 +627,13 @@ function configureClaudeLifecycleFromInit(message: unknown) {
     capabilities?: unknown;
     session_id?: unknown;
   };
-  if (!Array.isArray(record.capabilities)) {
-    // An absent capability field is not an explicit LegacySerial handshake.
-    // Keep this query negotiating until the SDK provides an actual list.
+  if (record.capabilities !== undefined && !Array.isArray(record.capabilities)) {
+    emitClaudeLifecycleProtocolError('malformed_capabilities: Claude init capabilities must be an array');
     return;
   }
-  const capabilities = record.capabilities.filter(
+  // The SDK declares capabilities optional; older Claude CLIs omit the field.
+  // Their init is an explicit LegacySerial handshake.
+  const capabilities = (record.capabilities ?? []).filter(
     (capability): capability is string => typeof capability === 'string',
   );
   const nextMode: ClaudeLifecycleMode = capabilities.includes('msg_lifecycle_v1')
@@ -735,6 +739,13 @@ function handleClaudeSdkCommandLifecycle(message: unknown) {
       return;
     }
     claudePreInitLifecycleFrames.push(frame);
+    return;
+  }
+  if (claudeLifecycleMode === 'legacy' && record.command_uuid === claudeForegroundPromptUuid) {
+    emitClaudeLifecycleProtocolError(
+      'lifecycle_frames_without_capability: Claude emitted a command lifecycle frame without advertising it',
+      record.command_uuid,
+    );
     return;
   }
   processNegotiatedClaudeSdkCommandLifecycle(frame);
@@ -945,14 +956,20 @@ function resolveClaudeBackgroundTaskId(toolUseId?: string, agentId?: string) {
 }
 
 function isCurrentClaudeHumanPromptEcho(message: unknown) {
-  if (claudeMessageOriginKind(message) !== 'human' || !claudeTurnAwaitingResult) {
+  if (!claudeTurnAwaitingResult) {
+    return false;
+  }
+  const originKind = claudeMessageOriginKind(message);
+  if (originKind && originKind !== 'human') {
     return false;
   }
   const messageUuid = (message as { uuid?: unknown } | undefined)?.uuid;
   if (typeof messageUuid === 'string' && claudeForegroundPromptUuid) {
     return messageUuid === claudeForegroundPromptUuid;
   }
-  return true;
+  // Older SDK/CLI pairs omit origin on the echoed user frame. Without an
+  // exact UUID match, only an explicitly human frame can own the foreground.
+  return originKind === 'human';
 }
 
 function claudeUserMessageHasToolResult(message: unknown) {
@@ -1435,6 +1452,40 @@ function resetClaudeTurnTracking() {
   claudeDeferredForegroundResult = null;
   claudeTurnResultObservation = null;
   claudeLegacyIdleCommandId = null;
+  claudeEndTurnObservedCommandId = null;
+  claudeStaleOriginlessEchoUuids.clear();
+}
+
+function observeClaudeAssistantEndTurn(messageUuid: unknown) {
+  const commandId = claudeForegroundPromptUuid;
+  if (
+    claudeLifecycleMode !== 'legacy'
+    || !claudeTurnAwaitingResult
+    || !claudeForegroundPromptAccepted
+    || !commandId
+    || claudeEndTurnObservedCommandId === commandId
+  ) {
+    return;
+  }
+  const finalAssistantUuid = typeof messageUuid === 'string' && messageUuid.trim()
+    ? messageUuid.trim()
+    : null;
+  if (finalAssistantUuid) {
+    claudeLastAssistantMessageUuid = finalAssistantUuid;
+  }
+  claudeEndTurnObservedCommandId = commandId;
+  // A streamed end_turn can precede the full assistant frame. It is only a
+  // hint for the desktop's exact-generation retirement, never a terminal.
+  emitEvent({
+    type: 'lifecycle',
+    stage: 'assistant_end_turn_observed',
+    detail: 'Claude delivered a final assistant message; awaiting the turn terminal.',
+    command_id: commandId,
+    query_generation: claudeQueryGeneration,
+    ...(finalAssistantUuid
+      ? { assistant_message_uuid: finalAssistantUuid }
+      : {}),
+  });
 }
 
 function clearClaudeForegroundOwnership() {
@@ -3319,7 +3370,18 @@ async function consumeClaudeMessages() {
       if (message.type === 'stream_event') {
         const event = (message as { event?: Record<string, unknown> }).event;
         if (event) {
-          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
+          const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+          if (
+            !backgroundOwned
+            && !claudeMessageParentToolUseId(message)
+            && event.type === 'message_delta'
+            && (event.delta as { stop_reason?: unknown } | undefined)?.stop_reason === 'end_turn'
+          ) {
+            // SDK partial-frame UUIDs can change between stream events. The
+            // complete assistant frame, when present, supplies the fork UUID.
+            observeClaudeAssistantEndTurn(undefined);
+          }
+          handleClaudePartialEvent(event, backgroundOwned);
         }
         continue;
       }
@@ -3402,6 +3464,12 @@ async function consumeClaudeMessages() {
             });
           }
         });
+        if (
+          !claudeMessageParentToolUseId(message)
+          && (message as { message?: { stop_reason?: unknown } }).message?.stop_reason === 'end_turn'
+        ) {
+          observeClaudeAssistantEndTurn(assistantMessageUuid);
+        }
         continue;
       }
 
@@ -3410,10 +3478,31 @@ async function consumeClaudeMessages() {
         const shouldQuery = (message as { shouldQuery?: unknown }).shouldQuery !== false;
         const hasToolResult = claudeUserMessageHasToolResult(message);
         const currentHumanEcho = !hasToolResult && isCurrentClaudeHumanPromptEcho(message);
+        const echoUuid = (message as { uuid?: unknown }).uuid;
+        const staleOriginlessEcho = !originKind
+          && !hasToolResult
+          && claudeTurnAwaitingResult
+          && typeof echoUuid === 'string'
+          && Boolean(claudeForegroundPromptUuid)
+          && echoUuid !== claudeForegroundPromptUuid;
+        if (staleOriginlessEcho) {
+          claudeStaleOriginlessEchoUuids.add(echoUuid);
+          // Replay-user-messages can expose a separate file checkpoint UUID
+          // for this prompt. Preserve its checkpoint without giving it turn
+          // ownership or letting an uncorrelated Result end the foreground.
+          const checkpoint = buildClaudeFileCheckpointEvent(message, currentProviderSessionId);
+          if (checkpoint) {
+            emitEvent(checkpoint);
+          }
+          continue;
+        }
         if (originKind === 'human' && !hasToolResult && !currentHumanEcho) {
           // A stale human echo from an earlier prompt must not take ownership
           // of the current turn, create a checkpoint, or expose peer output.
           continue;
+        }
+        if (currentHumanEcho) {
+          claudeIngressOriginKind = 'human';
         }
         const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
         if (originKind === 'human') {
@@ -3711,6 +3800,18 @@ async function consumeClaudeMessages() {
         const correlatedCommandId = typeof resultPromptUuid === 'string' && resultPromptUuid.trim()
           ? resultPromptUuid.trim()
           : null;
+        if (correlatedCommandId && claudeStaleOriginlessEchoUuids.delete(correlatedCommandId)) {
+          continue;
+        }
+        if (
+          !correlatedCommandId
+          && claudeStaleOriginlessEchoUuids.size > 0
+        ) {
+          // No SDK field can distinguish this Result from one for the stale
+          // echo. Arrival order is not proof of ownership, so leave the
+          // foreground to its exact terminal or desktop retirement fence.
+          continue;
+        }
         const resultObservation = claudeResultObservation(message);
         if (
           claudeLifecycleMode === 'full'

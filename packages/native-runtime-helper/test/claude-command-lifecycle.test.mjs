@@ -102,27 +102,170 @@ test('LegacySerial is explicit and releases only after Result plus idle', async 
   ), 'legacy Result plus idle terminal');
 });
 
-test('capability negotiation requires an explicit list and rejects contradictory pre-init frames', async (t) => {
-  await t.test('absent capabilities stay negotiating', async (t) => {
+test('an older Claude init without capabilities settles on matching Result plus idle', async (t) => {
+  const session = await startHelper(t, {
+    scenario: 'legacy_missing_capabilities',
+    resultDelayMs: 200,
+    omitUserEchoOrigin: true,
+    omitResultCorrelation: true,
+  });
+  const initialReadyCount = readyCount(session);
+  send(session, { type: 'prompt', text: 'older CLI turn', command_id: 'older-cli-one' });
+  await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'command_admitted',
+    'older-cli-one',
+  ), 'older CLI command admission');
+  await sleep(40);
+  assert.equal(lifecycleCount(session, 'legacy_turn_terminal', 'older-cli-one'), 0);
+  assert.equal(readyCount(session), initialReadyCount,
+    'an old CLI init and human echo must not complete the foreground');
+  await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'turn_result_observed',
+    'older-cli-one',
+  ), 'older CLI Result observation');
+  await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'legacy_turn_terminal',
+    'older-cli-one',
+  ), 'older CLI Result plus idle terminal');
+  assert.equal(lifecycleCount(session, 'sdk_command_state', 'older-cli-one'), 0);
+  assert.ok(session.outputs.some((output) => output.type === 'session_meta'
+    && output.query_generation === 1
+    && Array.isArray(output.capabilities)
+    && output.capabilities.length === 0),
+  'missing capabilities must resolve to the serial adapter after matching evidence');
+  assert.ok(session.outputs.some((output) => output.type === 'status'
+    && output.status === 'ready'
+    && output.detail === 'Ready for the next prompt.'),
+  'the completed turn must become ready');
+  send(session, { type: 'prompt', text: 'follow-up', command_id: 'older-cli-two' });
+  await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'command_admitted',
+    'older-cli-two',
+  ), 'follow-up admission');
+});
+
+test('originless stale echoes make uncorrelated Results non-authoritative in either order', async (t) => {
+  for (const order of ['before', 'after']) {
+    await t.test(`stale Result ${order} current Result`, async (t) => {
+      const session = await startHelper(t, {
+        scenario: 'legacy_missing_capabilities',
+        omitUserEchoOrigin: true,
+        omitResultCorrelation: true,
+        staleOriginlessEchoBeforeResult: order,
+      });
+      send(session, { type: 'prompt', text: 'current command', command_id: `current-${order}` });
+      await waitForOutput(session, (output) => output.type === 'event'
+        && output.payload?.type === 'checkpoint_created', 'matching foreground checkpoint');
+      await sleep(150);
+      assert.equal(session.outputs.filter((output) => output.type === 'event'
+        && output.payload?.type === 'checkpoint_created').length, 2,
+      'foreign replay checkpoints remain available without taking turn ownership');
+      assert.equal(lifecycleCount(session, 'turn_result_observed', `current-${order}`), 0);
+      assert.equal(lifecycleCount(session, 'legacy_turn_terminal', `current-${order}`), 0);
+    });
+  }
+});
+
+test('old-CLI end_turn without Result or idle is observation only', async (t) => {
+  const session = await startHelper(t, { scenario: 'legacy_stalled_end_turn' });
+  const initialReadyCount = readyCount(session);
+  send(session, { type: 'prompt', text: 'answer and stall', command_id: 'stalled-one' });
+  await waitForOutput(session, (output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk'
+    && output.payload.text === 'stalled final answer', 'visible final answer');
+  const observation = await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'assistant_end_turn_observed',
+    'stalled-one',
+  ), 'fenced final-answer observation');
+  assert.equal(observation.payload.query_generation, 1);
+  assert.equal(observation.payload.assistant_message_uuid, 'stalled-assistant');
+
+  await sleep(180);
+  assert.equal(lifecycleCount(session, 'turn_result_observed', 'stalled-one'), 0);
+  assert.equal(lifecycleCount(session, 'legacy_turn_terminal', 'stalled-one'), 0);
+  assert.equal(lifecycleCount(session, 'command_abandoned', 'stalled-one'), 0);
+  assert.equal(lifecycleCount(session, 'turn_completed', 'stalled-one'), 0);
+  assert.equal(readyCount(session), initialReadyCount,
+    'helper observation cannot release Rust-owned foreground');
+  assert.equal(session.outputs.some((output) => output.type === 'query_close_probe'), false,
+    'helper must leave process retirement to the desktop owner');
+});
+
+test('old-CLI streamed end_turn observes the final turn without a full assistant frame', async (t) => {
+  const session = await startHelper(t, {
+    scenario: 'legacy_stalled_stream_end_turn',
+    omitUserEchoOrigin: true,
+    peerBeforeUserEcho: true,
+    priorAssistantUuid: 'earlier-tool-use-assistant',
+  });
+  const initialReadyCount = readyCount(session);
+  send(session, { type: 'prompt', text: 'stream and stall', command_id: 'stream-stalled-one' });
+  await waitForOutput(session, (output) => output.type === 'event'
+    && output.payload?.type === 'assistant_chunk'
+    && output.payload.text === 'streamed final answer', 'streamed visible answer');
+  const observation = await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'assistant_end_turn_observed',
+    'stream-stalled-one',
+  ), 'streamed final-answer observation');
+  assert.equal(observation.payload.query_generation, 1);
+  assert.equal(Object.hasOwn(observation.payload, 'assistant_message_uuid'), false,
+    'neither partial-frame nor prior tool-use UUIDs are final answer fork anchors');
+  await sleep(100);
+  assert.equal(lifecycleCount(session, 'turn_result_observed', 'stream-stalled-one'), 0);
+  assert.equal(lifecycleCount(session, 'legacy_turn_terminal', 'stream-stalled-one'), 0);
+  assert.equal(readyCount(session), initialReadyCount);
+});
+
+test('old-CLI Result without idle remains an observation', async (t) => {
+  const session = await startHelper(t, { scenario: 'legacy_missing_idle' });
+  const initialReadyCount = readyCount(session);
+  send(session, { type: 'prompt', text: 'answer without idle', command_id: 'missing-idle-one' });
+  const finalAnswer = await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'assistant_end_turn_observed',
+    'missing-idle-one',
+  ), 'final-answer observation before Result');
+  assert.equal(finalAnswer.payload.assistant_message_uuid, 'missing-idle-assistant');
+  await waitForOutput(session, (output) => isLifecycle(
+    output,
+    'turn_result_observed',
+    'missing-idle-one',
+  ), 'Result without idle');
+
+  await sleep(100);
+  assert.equal(lifecycleCount(session, 'legacy_turn_terminal', 'missing-idle-one'), 0);
+  assert.equal(lifecycleCount(session, 'turn_completed', 'missing-idle-one'), 0);
+  assert.equal(readyCount(session), initialReadyCount,
+    'Result and end_turn do not replace the missing SDK idle receipt');
+});
+
+test('legacy capability inference rejects contradictory raw lifecycle frames', async (t) => {
+  await t.test('absent capabilities with raw lifecycle is a protocol conflict', async (t) => {
     const session = await startHelper(t, { scenario: 'missing_capabilities' });
     send(session, { type: 'prompt', text: 'no capability list', command_id: 'negotiating-one' });
     await waitForOutput(session, (output) => isLifecycle(
       output,
-      'turn_result_observed',
+      'lifecycle_protocol_error',
       'negotiating-one',
-    ), 'Result while capability negotiation remains open');
-    await sleep(100);
+    ), 'raw lifecycle contradicts the legacy init');
     const metas = session.outputs.filter((output) => output.type === 'session_meta'
       && output.query_generation === 1);
     assert.ok(metas.length > 0);
-    assert.equal(metas.some((output) => Object.hasOwn(output, 'capabilities')), false);
+    assert.equal(metas.some((output) => Array.isArray(output.capabilities)
+      && output.capabilities.length === 0), true);
     assert.equal(lifecycleCount(session, 'legacy_turn_terminal', 'negotiating-one'), 0);
     send(session, { type: 'prompt', text: 'still blocked', command_id: 'negotiating-two' });
     await waitForOutput(session, (output) => isLifecycle(
       output,
       'command_rejected',
       'negotiating-two',
-    ), 'negotiating foreground remains owned');
+    ), 'conflicted foreground remains owned');
   });
 
   await t.test('explicit legacy conflicts with pre-init lifecycle evidence', async (t) => {

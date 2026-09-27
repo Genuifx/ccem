@@ -27748,6 +27748,7 @@ import process5 from "node:process";
 import process2 from "node:process";
 var CLAUDE_DESKTOP_CLIENT_APP = "ccem-desktop";
 var CLAUDE_NON_INTERACTIVE_SANDBOX = "1";
+var CLAUDE_SESSION_STATE_EVENTS = "1";
 var MANAGED_CLAUDE_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
@@ -27785,7 +27786,8 @@ function buildClaudeQueryEnv({
     ...cleanBaseEnv,
     ...envVars,
     CLAUDE_AGENT_SDK_CLIENT_APP: CLAUDE_DESKTOP_CLIENT_APP,
-    CLAUDE_CODE_SANDBOXED: CLAUDE_NON_INTERACTIVE_SANDBOX
+    CLAUDE_CODE_SANDBOXED: CLAUDE_NON_INTERACTIVE_SANDBOX,
+    CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: CLAUDE_SESSION_STATE_EVENTS
   };
   if (env.ANTHROPIC_AUTH_TOKEN) {
     delete env.ANTHROPIC_API_KEY;
@@ -43612,6 +43614,8 @@ var claudeSdkCapabilities;
 var claudePreInitLifecycleFrames = [];
 var claudeTurnResultObservation = null;
 var claudeLegacyIdleCommandId = null;
+var claudeEndTurnObservedCommandId = null;
+var claudeStaleOriginlessEchoUuids = /* @__PURE__ */ new Set();
 var claudeLifecycleTerminalTimer = null;
 var claudeLifecycleProtocolErrorKey = null;
 var claudeAuthoritativeTerminalCommandId = null;
@@ -43815,6 +43819,7 @@ function beginClaudeLifecycleGeneration() {
   }
   clearClaudeLifecycleTerminalTimer();
   claudeLifecycleMode = "negotiating";
+  claudeEndTurnObservedCommandId = null;
   claudeSdkCapabilities = void 0;
   claudePreInitLifecycleFrames = [];
   claudeLifecycleProtocolErrorKey = null;
@@ -43841,10 +43846,11 @@ function armClaudeLifecycleTerminalTimer(commandId, reason) {
 }
 function configureClaudeLifecycleFromInit(message) {
   const record2 = message;
-  if (!Array.isArray(record2.capabilities)) {
+  if (record2.capabilities !== void 0 && !Array.isArray(record2.capabilities)) {
+    emitClaudeLifecycleProtocolError("malformed_capabilities: Claude init capabilities must be an array");
     return;
   }
-  const capabilities = record2.capabilities.filter(
+  const capabilities = (record2.capabilities ?? []).filter(
     (capability) => typeof capability === "string"
   );
   const nextMode = capabilities.includes("msg_lifecycle_v1") ? "full" : "legacy";
@@ -43933,6 +43939,13 @@ function handleClaudeSdkCommandLifecycle(message) {
       return;
     }
     claudePreInitLifecycleFrames.push(frame);
+    return;
+  }
+  if (claudeLifecycleMode === "legacy" && record2.command_uuid === claudeForegroundPromptUuid) {
+    emitClaudeLifecycleProtocolError(
+      "lifecycle_frames_without_capability: Claude emitted a command lifecycle frame without advertising it",
+      record2.command_uuid
+    );
     return;
   }
   processNegotiatedClaudeSdkCommandLifecycle(frame);
@@ -44080,14 +44093,18 @@ function resolveClaudeBackgroundTaskId(toolUseId, agentId) {
   return taskId;
 }
 function isCurrentClaudeHumanPromptEcho(message) {
-  if (claudeMessageOriginKind(message) !== "human" || !claudeTurnAwaitingResult) {
+  if (!claudeTurnAwaitingResult) {
+    return false;
+  }
+  const originKind = claudeMessageOriginKind(message);
+  if (originKind && originKind !== "human") {
     return false;
   }
   const messageUuid = message?.uuid;
   if (typeof messageUuid === "string" && claudeForegroundPromptUuid) {
     return messageUuid === claudeForegroundPromptUuid;
   }
-  return true;
+  return originKind === "human";
 }
 function claudeUserMessageHasToolResult(message) {
   const record2 = message;
@@ -44431,6 +44448,27 @@ function resetClaudeTurnTracking() {
   claudeDeferredForegroundResult = null;
   claudeTurnResultObservation = null;
   claudeLegacyIdleCommandId = null;
+  claudeEndTurnObservedCommandId = null;
+  claudeStaleOriginlessEchoUuids.clear();
+}
+function observeClaudeAssistantEndTurn(messageUuid) {
+  const commandId = claudeForegroundPromptUuid;
+  if (claudeLifecycleMode !== "legacy" || !claudeTurnAwaitingResult || !claudeForegroundPromptAccepted || !commandId || claudeEndTurnObservedCommandId === commandId) {
+    return;
+  }
+  const finalAssistantUuid = typeof messageUuid === "string" && messageUuid.trim() ? messageUuid.trim() : null;
+  if (finalAssistantUuid) {
+    claudeLastAssistantMessageUuid = finalAssistantUuid;
+  }
+  claudeEndTurnObservedCommandId = commandId;
+  emitEvent({
+    type: "lifecycle",
+    stage: "assistant_end_turn_observed",
+    detail: "Claude delivered a final assistant message; awaiting the turn terminal.",
+    command_id: commandId,
+    query_generation: claudeQueryGeneration,
+    ...finalAssistantUuid ? { assistant_message_uuid: finalAssistantUuid } : {}
+  });
 }
 function clearClaudeForegroundOwnership() {
   clearClaudeLifecycleTerminalTimer();
@@ -45855,7 +45893,11 @@ async function consumeClaudeMessages() {
       if (message.type === "stream_event") {
         const event = message.event;
         if (event) {
-          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
+          const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+          if (!backgroundOwned && !claudeMessageParentToolUseId(message) && event.type === "message_delta" && event.delta?.stop_reason === "end_turn") {
+            observeClaudeAssistantEndTurn(void 0);
+          }
+          handleClaudePartialEvent(event, backgroundOwned);
         }
         continue;
       }
@@ -45919,6 +45961,9 @@ async function consumeClaudeMessages() {
             });
           }
         });
+        if (!claudeMessageParentToolUseId(message) && message.message?.stop_reason === "end_turn") {
+          observeClaudeAssistantEndTurn(assistantMessageUuid);
+        }
         continue;
       }
       if (message.type === "user") {
@@ -45926,8 +45971,21 @@ async function consumeClaudeMessages() {
         const shouldQuery = message.shouldQuery !== false;
         const hasToolResult = claudeUserMessageHasToolResult(message);
         const currentHumanEcho = !hasToolResult && isCurrentClaudeHumanPromptEcho(message);
+        const echoUuid = message.uuid;
+        const staleOriginlessEcho = !originKind && !hasToolResult && claudeTurnAwaitingResult && typeof echoUuid === "string" && Boolean(claudeForegroundPromptUuid) && echoUuid !== claudeForegroundPromptUuid;
+        if (staleOriginlessEcho) {
+          claudeStaleOriginlessEchoUuids.add(echoUuid);
+          const checkpoint2 = buildClaudeFileCheckpointEvent(message, currentProviderSessionId);
+          if (checkpoint2) {
+            emitEvent(checkpoint2);
+          }
+          continue;
+        }
         if (originKind === "human" && !hasToolResult && !currentHumanEcho) {
           continue;
+        }
+        if (currentHumanEcho) {
+          claudeIngressOriginKind = "human";
         }
         const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
         if (originKind === "human") {
@@ -46170,6 +46228,12 @@ async function consumeClaudeMessages() {
         const resultOriginKind = claudeMessageOriginKind(message);
         const resultPromptUuid = message.user_message_uuid;
         const correlatedCommandId = typeof resultPromptUuid === "string" && resultPromptUuid.trim() ? resultPromptUuid.trim() : null;
+        if (correlatedCommandId && claudeStaleOriginlessEchoUuids.delete(correlatedCommandId)) {
+          continue;
+        }
+        if (!correlatedCommandId && claudeStaleOriginlessEchoUuids.size > 0) {
+          continue;
+        }
         const resultObservation = claudeResultObservation(message);
         if (claudeLifecycleMode === "full" && correlatedCommandId && claudeTerminalCommandIds.has(correlatedCommandId)) {
           emitClaudeResultUsage(message);
