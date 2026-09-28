@@ -1,5 +1,11 @@
 # ccem
 
+## 2.91.0
+
+### Minor Changes
+
+- Integrate managed Hermes bots and native conversations into the desktop app: multi-channel QR onboarding for WeCom and Feishu, native workspace session handoff and scheduled task delivery, a redesigned connection experience with channel brand icons, and a hardened remote bridge with scoped approvals and unsafe-path gating.
+
 ## 2.90.0
 
 ### Minor Changes
