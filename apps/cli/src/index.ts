@@ -83,9 +83,10 @@ import {
   getCronNotificationTargets,
   deleteCronTask,
   formatCronTaskTableRows,
+  listCronTasksViaDesktop,
   parseCronCreateJson,
   parseStringList,
-  readCronTasks,
+  triggerCronTask,
 } from './cron.js';
 import {
   getOrUpdateDesktopRoutes,
@@ -1044,9 +1045,9 @@ cronCmd
   .command('list')
   .description('List CCEM cron tasks')
   .option('--json', 'Output as JSON')
-  .action((options) => {
+  .action(async (options) => {
     try {
-      const tasks = readCronTasks();
+      const tasks = await listCronTasksViaDesktop();
       if (options.json) {
         console.log(JSON.stringify(tasks, null, 2));
         return;
@@ -1163,6 +1164,26 @@ cronCmd
       }
       console.log(chalk.green(`✓ Deleted cron task: ${task.name}`));
       console.log(chalk.gray(`  id: ${task.id}`));
+    } catch (err) {
+      console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
+      process.exitCode = 1;
+    }
+  });
+
+cronCmd
+  .command('trigger <selector>')
+  .description('Trigger a cron task to run immediately in CCEM Desktop (exact id or exact name; Desktop must be running)')
+  .option('--json', 'Output triggered task as JSON')
+  .action(async (selector, options) => {
+    try {
+      const task = await triggerCronTask(selector);
+      if (options.json) {
+        console.log(JSON.stringify(task, null, 2));
+        return;
+      }
+      console.log(chalk.green(`✓ Triggered cron task: ${task.name}`));
+      console.log(chalk.gray(`  id: ${task.id}`));
+      console.log(chalk.gray('  Runs in the background; run history is in CCEM Desktop → Cron.'));
     } catch (err) {
       console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
       process.exitCode = 1;

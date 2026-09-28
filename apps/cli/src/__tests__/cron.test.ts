@@ -6,8 +6,11 @@ import {
   createCronTask,
   createCronTaskWithNotifications,
   deleteCronTask,
+  listCronTasksViaDesktop,
   parseCronCreateJson,
   readCronTasks,
+  resolveCronTaskSelector,
+  triggerCronTask,
   writeCronTasks,
 } from '../cron.js';
 
@@ -184,5 +187,80 @@ describe('cron task store', () => {
     }
     const input = { name: 'Report', cronExpression: '0 9 * * *', prompt: 'Report', hermesNotification: { routeId: 'paired', generation: 1 } };
     expect(createCronTask(input, tasksPath).hermesNotification?.subscriptionId).not.toBe(createCronTask(input, tasksPath).hermesNotification?.subscriptionId);
+  });
+});
+
+describe('cron trigger via Desktop control plane', () => {
+  let tempDir: string;
+  let tasksPath: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-cron-trigger-test-'));
+    tasksPath = path.join(tempDir, 'cron-tasks.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function seedTasks() {
+    const first = createCronTask({ name: 'Daily Review', cronExpression: '0 9 * * *', prompt: 'First', workingDir: '/repo' }, tasksPath);
+    const second = createCronTask({ name: 'Nightly Report', cronExpression: '0 22 * * *', prompt: 'Second', workingDir: '/repo' }, tasksPath);
+    return { first, second };
+  }
+
+  it('resolves selectors by exact id or exact name and rejects ambiguity', () => {
+    const { first, second } = seedTasks();
+
+    expect(resolveCronTaskSelector([first, second], first.id)).toBe(first);
+    expect(resolveCronTaskSelector([first, second], '  Nightly Report ')).toBe(second);
+    expect(() => resolveCronTaskSelector([first, second], 'missing')).toThrow(/not found: missing/);
+    expect(() => resolveCronTaskSelector([first, second], '   ')).toThrow(/id or name is required/);
+
+    const twin = { ...first, id: 'cron-twin' };
+    expect(() => resolveCronTaskSelector([first, twin], first.name)).toThrow(/ambiguous/);
+  });
+
+  it('lists tasks through the RPC channel and falls back to the shared store offline', async () => {
+    const { first } = seedTasks();
+
+    const calls: string[] = [];
+    const online = async (method: string) => {
+      calls.push(method);
+      return [{ ...first, prompt: 'served by Desktop' }];
+    };
+    await expect(listCronTasksViaDesktop(online, tasksPath)).resolves.toHaveLength(1);
+    expect(calls).toEqual(['ccem.cron.list']);
+
+    const offline = async () => {
+      throw new Error('CCEM Desktop control endpoint not found');
+    };
+    await expect(listCronTasksViaDesktop(offline, tasksPath)).resolves.toEqual(readCronTasks(tasksPath));
+
+    const malformed = async () => 'not-an-array';
+    await expect(listCronTasksViaDesktop(malformed, tasksPath)).resolves.toEqual(readCronTasks(tasksPath));
+  });
+
+  it('triggers by id or name through ccem.cron.trigger and validates the response', async () => {
+    const { first } = seedTasks();
+    const calls: { method: string; params?: unknown }[] = [];
+    const request = async (method: string, params?: unknown) => {
+      calls.push({ method, params });
+      if (method === 'ccem.cron.list') return readCronTasks(tasksPath);
+      return first;
+    };
+
+    await expect(triggerCronTask(first.id, request)).resolves.toBe(first);
+    await expect(triggerCronTask('Daily Review', request)).resolves.toBe(first);
+    expect(calls).toEqual([
+      { method: 'ccem.cron.list' },
+      { method: 'ccem.cron.trigger', params: { id: first.id } },
+      { method: 'ccem.cron.list' },
+      { method: 'ccem.cron.trigger', params: { id: first.id } },
+    ]);
+
+    await expect(triggerCronTask('missing', request)).rejects.toThrow(/not found: missing/);
+    const invalid = async (method: string) => (method === 'ccem.cron.list' ? readCronTasks(tasksPath) : 'garbage');
+    await expect(triggerCronTask(first.id, invalid)).rejects.toThrow(/Invalid cron trigger response/);
   });
 });

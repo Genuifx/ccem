@@ -85,6 +85,56 @@ export async function getCronNotificationTargets(
   return result as CronNotificationTarget[];
 }
 
+/**
+ * List cron tasks through the Desktop control plane. Falls back to the shared
+ * task store when Desktop is not running or predates `ccem.cron.list`, so
+ * `ccem cron list` keeps working offline.
+ */
+export async function listCronTasksViaDesktop(
+  request: DesktopControlRequester = requestDesktopControl,
+  tasksPath = getCronTasksPath(),
+): Promise<CronTask[]> {
+  try {
+    const tasks = await request('ccem.cron.list');
+    if (!Array.isArray(tasks)) {
+      throw new Error('Invalid cron tasks response from CCEM Desktop.');
+    }
+    return tasks as CronTask[];
+  } catch {
+    return readCronTasks(tasksPath);
+  }
+}
+
+export function resolveCronTaskSelector(tasks: CronTask[], selector: string): CronTask {
+  const normalized = selector.trim();
+  if (!normalized) {
+    throw new Error('Task id or name is required');
+  }
+
+  const matches = tasks.filter((task) => task.id === normalized || task.name === normalized);
+  if (matches.length === 0) {
+    throw new Error(`Cron task not found: ${normalized}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Cron task selector is ambiguous: ${normalized}`);
+  }
+
+  return matches[0]!;
+}
+
+export async function triggerCronTask(
+  selector: string,
+  request: DesktopControlRequester = requestDesktopControl,
+): Promise<CronTask> {
+  const task = resolveCronTaskSelector(await listCronTasksViaDesktop(request), selector);
+  const triggered = await request('ccem.cron.trigger', { id: task.id });
+  if (!triggered || typeof triggered !== 'object' || Array.isArray(triggered)
+    || typeof (triggered as CronTask).id !== 'string') {
+    throw new Error('Invalid cron trigger response from CCEM Desktop.');
+  }
+  return triggered as CronTask;
+}
+
 export async function createCronTaskWithNotifications(
   input: CronCreateInput,
   tasksPath = getCronTasksPath(),

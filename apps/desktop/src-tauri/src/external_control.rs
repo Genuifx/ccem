@@ -340,6 +340,11 @@ struct EnvironmentNameParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct CronTriggerParams {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RenameEnvironmentParams {
     old_name: String,
@@ -603,6 +608,29 @@ impl ExternalControlManager {
                 let bridge = app.try_state::<Arc<crate::hermes_bridge::HermesBridgeManager>>()
                     .ok_or("hermes_unavailable")?;
                 Ok(bridge.cron_notification_targets()?)
+            }
+            "ccem.cron.list" => {
+                let tasks = crate::cron::list_cron_tasks()?;
+                Ok(serde_json::to_value(tasks).map_err(|error| error.to_string())?)
+            }
+            "ccem.cron.trigger" => {
+                let params = deserialize_params::<CronTriggerParams>(rpc.params)?;
+                let id = params.id.trim();
+                if id.is_empty() {
+                    return Err("Task id cannot be empty".into());
+                }
+                // Same execution path as the UI "run now" button: resolve the
+                // unified runtime manager from managed state and let
+                // run_cron_task_now spawn the background execution thread.
+                let unified_runtime_manager = app
+                    .try_state::<Arc<crate::unified_runtime::UnifiedSessionManager>>()
+                    .ok_or("unified_runtime_unavailable")?;
+                let task = crate::cron::run_cron_task_now(
+                    app.clone(),
+                    unified_runtime_manager.inner().clone(),
+                    id,
+                )?;
+                Ok(serde_json::to_value(task).map_err(|error| error.to_string())?)
             }
             "ccem.workspace.listSessions" => {
                 let _mutation_guard = self.environment_mutations.lock()?;
@@ -2044,7 +2072,10 @@ fn build_runtime_link(summary: &NativeSessionSummary) -> String {
 }
 
 fn control_capabilities() -> Value {
-    json!({ "taskModelSelection": { "version": 1, "providers": ["codex"] } })
+    json!({
+        "taskModelSelection": { "version": 1, "providers": ["codex"] },
+        "cron": { "version": 1, "actions": ["list", "trigger"] }
+    })
 }
 
 fn control_descriptor_path() -> Result<PathBuf, String> {
@@ -2260,6 +2291,8 @@ fn is_allowed_method_for_build(method: &str, _debug_assertions: bool) -> bool {
         method,
         "ccem.health"
             | "ccem.cron.notificationTargets"
+            | "ccem.cron.list"
+            | "ccem.cron.trigger"
             | "ccem.workspace.listSessions"
             | "ccem.environment.references"
             | "ccem.environment.rename"
@@ -2569,6 +2602,9 @@ mod tests {
     fn test_allowed_methods() {
         for method in [
             "ccem.health",
+            "ccem.cron.notificationTargets",
+            "ccem.cron.list",
+            "ccem.cron.trigger",
             "ccem.workspace.listSessions",
             "ccem.environment.references",
             "ccem.environment.rename",
@@ -2601,6 +2637,19 @@ mod tests {
         assert!(!is_allowed_method(""));
         assert!(!is_allowed_method("admin.shutdown"));
         assert!(!is_allowed_method("system.execute"));
+    }
+
+    #[test]
+    fn cron_trigger_params_require_a_string_id() {
+        let params: CronTriggerParams =
+            serde_json::from_value(json!({ "id": "cron-1234-abcd" })).expect("valid params");
+        assert_eq!(params.id, "cron-1234-abcd");
+        for invalid in [json!({}), json!({ "id": 42 }), json!({ "taskId": "cron-1" })] {
+            assert!(
+                serde_json::from_value::<CronTriggerParams>(invalid).is_err(),
+                "params without a string id must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2736,7 +2785,8 @@ mod tests {
     #[test]
     fn task_model_capability_and_create_params_contract() {
         assert_eq!(control_capabilities(), json!({
-            "taskModelSelection": { "version": 1, "providers": ["codex"] }
+            "taskModelSelection": { "version": 1, "providers": ["codex"] },
+            "cron": { "version": 1, "actions": ["list", "trigger"] }
         }));
         let legacy = create_session_params(json!({ "provider": "codex", "prompt": "start" }));
         assert!(legacy.model.is_none());
