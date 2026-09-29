@@ -220,6 +220,7 @@ commands.allow = [
   "get_proxy_traffic_detail",
   "clear_proxy_traffic",
   "get_workspace_git_snapshot",
+  "get_workspace_recent_files",
   "get_workspace_file_diff",
   "get_workspace_file_preview",
   "get_workspace_media_preview",

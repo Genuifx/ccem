@@ -263,7 +263,7 @@
     "filesSession": "会话写入",
     "filesBrowse": "浏览文件",
     "filesGitHint": "当前工作目录的未提交改动，可能包含其他会话或手动修改。",
-    "filesSessionHint": "已记录的写文件工具操作；排除已知失败，不包含所有命令行改动。",
+    "filesSessionHint": "会话期间写入的文件：写文件工具操作与文件系统检测合并；已知失败的操作已排除，也可能包含同期其他修改。",
     "filesBrowseHint": "搜索当前工作目录中的文件，点击即可预览。",
     "filesSearch": "搜索文件",
     "filesEmpty": "没有匹配的文件",

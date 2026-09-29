@@ -1225,6 +1225,14 @@ export interface WorkspaceGitSnapshot {
   error?: string | null;
 }
 
+/** Workspace file detected as written/modified at or after a point in time. */
+export interface WorkspaceRecentFile {
+  /** Path relative to the scanned working dir, forward slashes. */
+  path: string;
+  modified_ms: number;
+  byte_size: number;
+}
+
 export type WorkspaceDiffLineKind = 'context' | 'addition' | 'deletion' | 'hunk' | 'meta';
 
 export interface WorkspaceDiffLine {

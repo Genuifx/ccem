@@ -263,7 +263,7 @@
     "filesSession": "Session writes",
     "filesBrowse": "Browse files",
     "filesGitHint": "Uncommitted changes in this working directory, including other sessions and manual edits.",
-    "filesSessionHint": "Recorded file-writing operations, excluding known failures. Shell changes may be missing.",
+    "filesSessionHint": "Files written during this session: file-tool operations merged with filesystem detection. Known failures are excluded; concurrent edits by others may appear.",
     "filesBrowseHint": "Search files in this working directory and click to preview.",
     "filesSearch": "Search files",
     "filesEmpty": "No matching files",

@@ -57,6 +57,7 @@ import type {
   SessionPromptImage,
   WorkspaceCommand,
   WorkspaceGitSnapshot,
+  WorkspaceRecentFile,
   ToolQuestionPrompt,
 } from '@/lib/tauri-ipc';
 import { cn } from '@/lib/utils';
@@ -1498,6 +1499,7 @@ export function WorkspaceNativeSessionView({
     setNativeSessionRuntimePermMode,
     handoffNativeSessionToTerminal,
     getWorkspaceGitSnapshot,
+    getWorkspaceRecentFiles,
     getWorkspaceFileDiff,
     getWorkspaceMediaPreview,
     getSessionSubagents,
@@ -1589,6 +1591,8 @@ export function WorkspaceNativeSessionView({
   const sidePanel = useWorkspaceSidePanel();
   const isReviewDetailOpen = isVisible && (sidePanel?.tab === 'files' || sidePanel?.tab === 'agents');
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
+  const [recentFiles, setRecentFiles] = useState<WorkspaceRecentFile[] | null>(null);
+  const recentFilesRequestSeqRef = useRef(0);
   const [isRefreshingGitSnapshot, setIsRefreshingGitSnapshot] = useState(false);
   const [respondingRequestId, setRespondingRequestId] = useState<string | null>(null);
   const [queuedState, setQueuedState] = useState<QueuedGuidanceState>(() => ({
@@ -2134,6 +2138,32 @@ export function WorkspaceNativeSessionView({
     }
   }, [getWorkspaceGitSnapshot, session.project_dir]);
 
+  // Filesystem truth for the 会话写入 list: files modified at/after session
+  // start, regardless of which tool (Write, bash redirection, script) produced
+  // them. Errors degrade to event-derived detection only.
+  const refreshRecentFiles = useCallback(async () => {
+    const requestSeq = recentFilesRequestSeqRef.current + 1;
+    recentFilesRequestSeqRef.current = requestSeq;
+    const projectDir = session.project_dir;
+    const sinceMs = Date.parse(session.created_at);
+
+    if (!projectDir || !Number.isFinite(sinceMs) || sinceMs <= 0) {
+      setRecentFiles(null);
+      return;
+    }
+
+    try {
+      const files = await getWorkspaceRecentFiles(projectDir, sinceMs);
+      if (recentFilesRequestSeqRef.current === requestSeq) {
+        setRecentFiles(files);
+      }
+    } catch {
+      if (recentFilesRequestSeqRef.current === requestSeq) {
+        setRecentFiles(null);
+      }
+    }
+  }, [getWorkspaceRecentFiles, session.created_at, session.project_dir]);
+
   useEffect(() => {
     // Flush the outgoing runtime's mirror immediately on session switch
     // (under its own runtime id — latestEventsRef still holds its events).
@@ -2200,6 +2230,8 @@ export function WorkspaceNativeSessionView({
     gitSnapshotRequestSeqRef.current += 1;
     setGitSnapshot(null);
     setIsRefreshingGitSnapshot(false);
+    recentFilesRequestSeqRef.current += 1;
+    setRecentFiles(null);
   }, [
     clearComposerDraft,
     handleComposerTextChange,
@@ -2220,6 +2252,8 @@ export function WorkspaceNativeSessionView({
     gitSnapshotRequestSeqRef.current += 1;
     setGitSnapshot(null);
     setIsRefreshingGitSnapshot(false);
+    recentFilesRequestSeqRef.current += 1;
+    setRecentFiles(null);
   }, [session.project_dir]);
 
   useEffect(() => {
@@ -2415,7 +2449,7 @@ export function WorkspaceNativeSessionView({
         consumedCount: events.length,
         fold,
       };
-      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir);
+      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir, recentFiles);
     }
     const selection = selectEventAppendRange(
       events,
@@ -2442,9 +2476,10 @@ export function WorkspaceNativeSessionView({
       };
     }
     // Idle: reuse the fold (pruned head is already accounted for). The git
-    // snapshot only participates in assembly, so git refreshes never refold.
-    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir);
-  }, [events, gitSnapshot, session.project_dir]);
+    // snapshot and recent-file scan only participate in assembly, so their
+    // refreshes never refold.
+    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir, recentFiles);
+  }, [events, gitSnapshot, recentFiles, session.project_dir]);
   const reviewModel = useMemo(
     () => {
       if (!isReviewPopoverOpen && !isReviewDetailOpen) {
@@ -2457,9 +2492,10 @@ export function WorkspaceNativeSessionView({
         messages,
         gitSnapshot,
         eventFold: reviewFoldRef.current?.fold,
+        recentFiles,
       });
     },
-    [events, gitSnapshot, isReviewPopoverOpen, isReviewDetailOpen, messages, session],
+    [events, gitSnapshot, recentFiles, isReviewPopoverOpen, isReviewDetailOpen, messages, session],
   );
 
   // Publish review summary to the status-strip entry pill while this live session owns the view.
@@ -2587,6 +2623,7 @@ export function WorkspaceNativeSessionView({
     const delay = isReviewPopoverOpen || isReviewDetailOpen ? 250 : 1200;
     const timeoutId = window.setTimeout(() => {
       void refreshGitSnapshot();
+      void refreshRecentFiles();
     }, delay);
 
     return () => {
@@ -2598,6 +2635,7 @@ export function WorkspaceNativeSessionView({
     isReviewDetailOpen,
     isVisible,
     refreshGitSnapshot,
+    refreshRecentFiles,
     session.status,
   ]);
 
@@ -4343,6 +4381,7 @@ export function WorkspaceNativeSessionView({
       setSelectedFileCheckpoint(null);
       toast.success(t('workspace.nativeRestoreSuccess'));
       void refreshGitSnapshot();
+      void refreshRecentFiles();
       void refreshSummary({ force: true });
       return;
     }
@@ -4352,7 +4391,7 @@ export function WorkspaceNativeSessionView({
         t('workspace.nativeRestoreFailed').replace('{error}', resultEvent.payload.error),
       );
     }
-  }, [clearFileRewindTimeout, events, refreshGitSnapshot, refreshSummary, t]);
+  }, [clearFileRewindTimeout, events, refreshGitSnapshot, refreshRecentFiles, refreshSummary, t]);
 
   useEffect(() => {
     if (
@@ -4402,7 +4441,7 @@ export function WorkspaceNativeSessionView({
             isOpen={isReviewPopoverOpen}
             isRefreshingGit={isRefreshingGitSnapshot}
             onOpenChange={setReviewPanelOpen}
-            onRefreshGit={() => void refreshGitSnapshot()}
+            onRefreshGit={() => { void refreshGitSnapshot(); void refreshRecentFiles(); }}
             onLoadDiff={(filePath) => getWorkspaceFileDiff(session.project_dir, filePath)}
             onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(session.project_dir, filePath)}
             isLive

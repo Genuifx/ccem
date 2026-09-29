@@ -58,6 +58,7 @@ import type {
   UnifiedSessionInfo,
   WorkspaceFileSuggestion,
   WorkspaceGitSnapshot,
+  WorkspaceRecentFile,
   WorkspaceFileDiff,
   WorkspaceMediaPreview,
   WorkspaceCommand,
@@ -1195,6 +1196,13 @@ export function useTauriCommands() {
     return invoke<WorkspaceGitSnapshot>('get_workspace_git_snapshot', { workingDir });
   }, []);
 
+  const getWorkspaceRecentFiles = useCallback(async (
+    workingDir: string,
+    sinceMs: number,
+  ): Promise<WorkspaceRecentFile[]> => {
+    return invoke<WorkspaceRecentFile[]>('get_workspace_recent_files', { workingDir, sinceMs });
+  }, []);
+
   const getWorkspaceFileDiff = useCallback(async (
     workingDir: string,
     filePath: string,
@@ -1856,6 +1864,7 @@ export function useTauriCommands() {
     setNativeSessionRuntimePermMode,
     handoffNativeSessionToTerminal,
     getWorkspaceGitSnapshot,
+    getWorkspaceRecentFiles,
     getWorkspaceFileDiff,
     getWorkspaceMediaPreview,
     getSessionSubagents,

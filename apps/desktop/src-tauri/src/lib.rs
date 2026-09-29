@@ -155,7 +155,7 @@ use workspace_decorations::{
     native_runtime_descriptor, should_replay_decoration_events, unified_runtime_descriptor,
     WorkspaceDecorationSessionInput, WorkspaceSessionDecoration,
 };
-use workspace_search::search_workspace_files;
+use workspace_search::{get_workspace_recent_files, search_workspace_files};
 
 /// Global flag: when true, CloseRequested should NOT be intercepted.
 static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
@@ -6096,6 +6096,7 @@ pub fn run_desktop_app() -> i32 {
             skills::install_skill,
             skills::uninstall_skill,
             search_workspace_files,
+            get_workspace_recent_files,
             cron::list_cron_tasks,
             cron::add_cron_task,
             cron::update_cron_task,

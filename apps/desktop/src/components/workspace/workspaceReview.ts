@@ -1,5 +1,5 @@
 import type { ConversationContentBlock, ConversationMessageData } from '@/features/conversations/types';
-import type { NativeSessionSummary, SessionEventRecord, WorkspaceGitSnapshot } from '@/lib/tauri-ipc';
+import type { NativeSessionSummary, SessionEventRecord, WorkspaceGitSnapshot, WorkspaceRecentFile } from '@/lib/tauri-ipc';
 import {
   buildWorkspaceTodos,
   type WorkspaceTodoItem,
@@ -263,6 +263,104 @@ function isWritingTool(name: string) {
   return /^(?:write|edit|multiedit|notebookedit|apply_patch|file_change)$/i.test(name);
 }
 
+const EXEC_TOOL_NAME = /^(?:bash|sh|zsh|shell|command_execution|run_command|exec|execute_command|powershell|pwsh|terminal)$/i;
+
+/** Bash-family tools: input summary carries the command line itself. */
+function isExecutionTool(name: string, category: string) {
+  return category === 'execution' || EXEC_TOOL_NAME.test(name);
+}
+
+/** Tokens that can never be a real file written by a shell command. */
+function plausibleWriteTarget(token: string | undefined): token is string {
+  if (!token || token === '.' || token === '..') return false;
+  if (/["'`\\$*?{}\[\]()<>;|&=!]/.test(token)) return false;
+  if (token.startsWith('-') || token.startsWith('~')) return false;
+  // Pseudo/devices: `> /dev/null` must not enter the list.
+  if (/^\/(?:dev|proc|sys)\//i.test(token)) return false;
+  return true;
+}
+
+function unquote(token: string): string {
+  return (/^"[^"]*"$/.test(token) || /^'[^']*'$/.test(token)) ? token.slice(1, -1) : token;
+}
+
+function isSegmentBoundaryToken(token: string) {
+  return /^(?:[;&|]+|\(|\)|&&|\|\|)$/.test(token);
+}
+
+function isRedirectToken(token: string) {
+  return /^(?:\d*&?)>{1,2}/.test(token);
+}
+
+function addWriteTarget(targets: Set<string>, token: string | undefined) {
+  if (!token) return;
+  const candidate = unquote(token);
+  if (plausibleWriteTarget(candidate)) {
+    targets.add(candidate);
+  }
+}
+
+/**
+ * Conservative extraction of file paths a shell command line plausibly wrote:
+ * redirection targets (`>f`, `>>f`, `2>f`, `&>f`, spaced variants), `tee`/`touch`
+ * operands, and `cp`/`mv`/`install`/`rsync` destinations. Script-internal writes
+ * are covered by the filesystem scan instead, not by this parser.
+ */
+export function execWriteTargets(command: string): string[] {
+  const targets = new Set<string>();
+  const segments = command.split(/(?:\s*&&\s*|\s*\|\|\s*|\s*;\s*|\s*\|\s*|\n+)/);
+  for (const segment of segments) {
+    const tokens = segment.match(/\S+/g) ?? [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index]!;
+
+      // Attached redirect (`>f`, `>>f`, `2>f`, `&>f`): the rest of the token is the target.
+      const attached = token.match(/^(?:\d*&?)>{1,2}(.+)$/);
+      if (attached) {
+        addWriteTarget(targets, attached[1]);
+        continue;
+      }
+      // Standalone redirect operator: the next token is the target.
+      if (/^(?:\d*&?)>{1,2}$/.test(token)) {
+        addWriteTarget(targets, tokens[index + 1]);
+        index += 1;
+        continue;
+      }
+
+      const commandWord = unquote(token).toLowerCase();
+      const collectOperands = (stopAtFlags: boolean): string[] => {
+        const operands: string[] = [];
+        for (let next = index + 1; next < tokens.length; next += 1) {
+          const operand = tokens[next]!;
+          if (isRedirectToken(operand) || isSegmentBoundaryToken(operand)) break;
+          if (stopAtFlags && operand.startsWith('-')) continue;
+          operands.push(operand);
+        }
+        return operands;
+      };
+
+      if (commandWord === 'tee' || commandWord === 'touch') {
+        // Every non-flag operand of tee/touch is a file the command writes.
+        for (const operand of collectOperands(true)) {
+          addWriteTarget(targets, operand);
+        }
+        continue;
+      }
+      if (commandWord === 'cp' || commandWord === 'mv' || commandWord === 'install' || commandWord === 'rsync') {
+        // Last operand is the destination; directory destinations are left to
+        // the filesystem scan (their children are not nameable here).
+        const operands = collectOperands(true);
+        const destination = operands[operands.length - 1];
+        if (destination && !destination.endsWith('/') && unquote(destination) !== '.') {
+          addWriteTarget(targets, destination);
+        }
+        continue;
+      }
+    }
+  }
+  return Array.from(targets);
+}
+
 function normalizeReviewPath(path: string, workingDir?: string | null): string {
   const normalize = (value: string) => {
     const absolute = value.startsWith('/');
@@ -337,6 +435,17 @@ export function foldWorkspaceReviewEvents(
             addSdkFile(path, 'sdk', payload.tool_use_id, event.seq);
           }
         }
+      } else if (
+        payload.type === 'tool_use_started'
+        && isExecutionTool(payload.raw_name, categoryName(payload.category))
+      ) {
+        // Shell-family tools: mine the command line for write targets
+        // (redirections, tee/touch, cp/mv destinations). Entries survive only
+        // when the tool_use later completes successfully (assembly filters by
+        // successful toolUseIds), so failed commands never pollute the list.
+        for (const target of execWriteTargets(payload.input_summary)) {
+          addSdkFile(target, 'sdk', payload.tool_use_id, event.seq);
+        }
       }
     }
 
@@ -382,6 +491,7 @@ function reviewFilesFromFold(
   fold: WorkspaceReviewEventFold | null,
   gitSnapshot?: WorkspaceGitSnapshot | null,
   workingDir?: string | null,
+  recentFiles?: WorkspaceRecentFile[] | null,
 ): ReviewChangedFile[] {
   const files = new Map<string, ReviewChangedFile>();
   for (const file of gitSnapshot?.files ?? []) {
@@ -426,6 +536,28 @@ function reviewFilesFromFold(
     });
   }
 
+  // Filesystem truth (files modified at/after session start): catches writes the
+  // event stream cannot see — bash redirection the summary truncated away,
+  // script-generated files, gitignored outputs, non-git working dirs.
+  for (const file of recentFiles ?? []) {
+    if (!file?.path) continue;
+    const path = normalizeReviewPath(file.path, workingDir ?? gitSnapshot?.root);
+    const current = files.get(path);
+    if (current) {
+      if (current.source === 'git') current.source = 'matched';
+      continue;
+    }
+    files.set(path, {
+      path,
+      status: 'fs',
+      source: 'sdk',
+      additions: null,
+      deletions: null,
+      toolUseIds: [],
+      sourceSeqs: [],
+    });
+  }
+
   return Array.from(files.values()).sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -433,8 +565,9 @@ export function buildWorkspaceReviewSummaryFromFold(
   fold: WorkspaceReviewEventFold | null,
   gitSnapshot?: WorkspaceGitSnapshot | null,
   workingDir?: string | null,
+  recentFiles?: WorkspaceRecentFile[] | null,
 ): WorkspaceReviewSummary {
-  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, workingDir);
+  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, workingDir, recentFiles);
   return {
     failedTools: Array.from(fold?.tools.values() ?? []).filter((tool) => tool.success === false).length,
     changedFiles: changedFiles.length,
@@ -464,17 +597,19 @@ export function buildWorkspaceReviewModel({
   messages,
   gitSnapshot,
   eventFold,
+  recentFiles,
 }: {
   session: NativeSessionSummary;
   events: SessionEventRecord[];
   messages: ConversationMessageData[];
   gitSnapshot?: WorkspaceGitSnapshot | null;
   eventFold?: WorkspaceReviewEventFold | null;
+  recentFiles?: WorkspaceRecentFile[] | null;
 }): WorkspaceReviewModel {
   const todoState = buildWorkspaceTodos(events, messages);
   const todos = todoState.items;
   const fold = eventFold ?? foldWorkspaceReviewEvents(null, events);
-  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, session.project_dir);
+  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, session.project_dir, recentFiles);
   const tools = Array.from(fold.tools.values()).sort((left, right) => left.seq - right.seq);
   const failedTools = tools.filter((tool) => tool.success === false);
 

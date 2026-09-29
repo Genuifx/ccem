@@ -599,3 +599,123 @@ test('file evidence excludes reads and failed writes, deduplicates paths, and ig
   assert.equal(earlier.tools.get('bad').success, undefined, 'append does not mutate an earlier fold');
   assert.equal(later.tools.get('bad').success, false);
 });
+
+test('execWriteTargets extracts shell write targets conservatively', async () => {
+  const { execWriteTargets } = await importWorkspaceReview();
+  const sorted = (command) => execWriteTargets(command).sort();
+
+  // Redirections: spaced, attached, appending, fd and both-stream forms.
+  assert.deepEqual(sorted('echo hi > out.txt'), ['out.txt']);
+  assert.deepEqual(sorted('echo hi >>out.txt'), ['out.txt']);
+  assert.deepEqual(sorted('python gen.py 2> err.log'), ['err.log']);
+  assert.deepEqual(sorted('npm run build &> all.log'), ['all.log']);
+  assert.deepEqual(sorted('cat a b > c 2>/dev/null'), ['c'], '/dev/null must be excluded');
+
+  // tee / touch / cp / mv.
+  assert.deepEqual(sorted('npm run build 2>&1 | tee build.log'), ['build.log']);
+  assert.deepEqual(sorted('tee -a append.log'), ['append.log']);
+  assert.deepEqual(sorted('touch a.txt b.txt'), ['a.txt', 'b.txt']);
+  assert.deepEqual(sorted('cp -r src dst'), ['dst']);
+  assert.deepEqual(sorted('mv old.md new.md && mv x.md y.md'), ['new.md', 'y.md']);
+  assert.deepEqual(sorted('cp -r src dst/'), [], 'directory destinations are left to the filesystem scan');
+
+  // False-positive guards: fd duplication, quoted strings, flags, tilde.
+  assert.deepEqual(sorted('diff a b 2>&1 | less'), []);
+  assert.deepEqual(sorted('echo "a>b" > real.txt'), ['real.txt']);
+  assert.deepEqual(sorted('test -f --out'), []);
+  assert.deepEqual(sorted('echo hi > ~/notes.txt'), []);
+});
+
+test('bash-written files join the session list, failed commands do not', async () => {
+  const { buildWorkspaceReviewModel } = await importWorkspaceReview();
+  const bashStart = (seq, id, command) => event(seq, {
+    type: 'tool_use_started',
+    tool_use_id: id,
+    raw_name: 'Bash',
+    input_summary: command,
+    needs_response: false,
+    category: { category: 'execution', raw_name: 'Bash' },
+  });
+  const end = (seq, id, name, success) => event(seq, {
+    type: 'tool_use_completed', tool_use_id: id, raw_name: name, result_summary: 'ok', success,
+  });
+  const events = [
+    bashStart(1, 'bash-1', 'echo hi > redirect.txt'),
+    end(2, 'bash-1', 'Bash', true),
+    bashStart(3, 'bash-2', 'node gen.js > /tmp/missing-gen-out.txt'),
+    end(4, 'bash-2', 'Bash', false),
+    event(5, {
+      type: 'tool_use_started',
+      tool_use_id: 'codex-1',
+      raw_name: 'command_execution',
+      input_summary: 'pytest -q 2> pytest-err.log',
+      needs_response: false,
+      category: { category: 'execution', raw_name: 'command_execution' },
+    }),
+    event(6, {
+      type: 'tool_use_completed', tool_use_id: 'codex-1', raw_name: 'command_execution',
+      result_summary: 'done', success: true,
+    }),
+  ];
+
+  const model = buildWorkspaceReviewModel({ session: session(), events, messages: [] });
+
+  assert.deepEqual(
+    model.changedFiles.map((file) => [file.path, file.source, file.status]),
+    [
+      ['pytest-err.log', 'sdk', 'sdk'],
+      ['redirect.txt', 'sdk', 'sdk'],
+    ],
+    'successful redirect targets are listed; the failed command target is excluded',
+  );
+  assert.ok(model.changedFiles.every((file) => file.toolUseIds.length > 0));
+});
+
+test('filesystem-detected recent files complete the session list', async () => {
+  const { buildWorkspaceReviewModel, buildWorkspaceReviewSummaryFromFold, foldWorkspaceReviewEvents } = await importWorkspaceReview();
+  const events = [
+    event(1, {
+      type: 'tool_use_started', tool_use_id: 'write-1', raw_name: 'Write',
+      input_summary: 'docs/report.md', needs_response: false,
+      category: { category: 'file_op', raw_name: 'Write' },
+    }),
+    event(2, { type: 'tool_use_completed', tool_use_id: 'write-1', raw_name: 'Write', result_summary: 'ok', success: true }),
+    event(3, {
+      type: 'tool_use_started', tool_use_id: 'bash-1', raw_name: 'Bash',
+      input_summary: 'node scripts/gen.js', needs_response: false,
+      category: { category: 'execution', raw_name: 'Bash' },
+    }),
+    event(4, { type: 'tool_use_completed', tool_use_id: 'bash-1', raw_name: 'Bash', result_summary: 'ok', success: true }),
+  ];
+  // Script-internal writes are invisible to the event stream; the filesystem
+  // scan (mtime >= session start) is what surfaces them.
+  const recentFiles = [
+    { path: '.artifacts/gen-report.html', modified_ms: 2, byte_size: 10 },
+    { path: 'out/generated.json', modified_ms: 3, byte_size: 10 },
+    { path: 'docs/report.md', modified_ms: 4, byte_size: 10 },
+    { path: 'tracked.md', modified_ms: 5, byte_size: 10 },
+  ];
+  const gitSnapshot = {
+    is_repo: true, root: '/repo', branch: 'main', sha: 'abc', upstream: null, dirty_count: 1,
+    files: [{ path: 'tracked.md', status: 'M', additions: 1, deletions: 0 }],
+  };
+
+  const model = buildWorkspaceReviewModel({ session: session(), events, messages: [], gitSnapshot, recentFiles });
+
+  assert.deepEqual(
+    model.changedFiles.map((file) => [file.path, file.source, file.status]),
+    [
+      ['.artifacts/gen-report.html', 'sdk', 'fs'],
+      ['docs/report.md', 'sdk', 'sdk'],
+      ['out/generated.json', 'sdk', 'fs'],
+      ['tracked.md', 'matched', 'modified'],
+    ],
+    'fs scan fills gaps, event evidence wins dedup, git overlap becomes matched',
+  );
+  assert.deepEqual(model.changedFiles[1].toolUseIds, ['write-1'], 'event-detected file keeps its tool attribution');
+
+  const fold = foldWorkspaceReviewEvents(null, events);
+  const summary = buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, '/repo', recentFiles);
+  assert.equal(summary.changedFiles, model.changedFiles.length, 'summary and list agree');
+  assert.equal(summary.artifacts >= 1, true, 'fs-detected html artifact is counted');
+});

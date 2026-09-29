@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const INDEX_TTL: Duration = Duration::from_secs(45);
 const DEFAULT_LIMIT: usize = 12;
@@ -322,6 +322,135 @@ pub fn search_workspace_files(
         .collect())
 }
 
+/// A workspace file detected as written/modified at or after a point in time
+/// (the owning session's start), regardless of which tool produced it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceRecentFile {
+    /// Path relative to the scanned working dir, forward slashes.
+    pub path: String,
+    pub modified_ms: u64,
+    pub byte_size: u64,
+}
+
+const RECENT_SCAN_MAX_ENTRIES: usize = 60_000;
+const RECENT_SCAN_MAX_RESULTS: usize = 500;
+
+/// Heavy/VCS directories skipped by the recent-file scan. Unlike the suggestion
+/// index, dot directories are NOT skipped wholesale: sessions legitimately
+/// write into places like `.artifacts/` or `.claude/`.
+const RECENT_SCAN_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".cache",
+    "__pycache__",
+    ".venv",
+];
+
+fn collect_recent_files(
+    root: &Path,
+    dir: &Path,
+    since: SystemTime,
+    walked: &mut usize,
+    files: &mut Vec<WorkspaceRecentFile>,
+) {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for child in read_dir.flatten() {
+        if *walked >= RECENT_SCAN_MAX_ENTRIES {
+            return;
+        }
+        *walked += 1;
+        let Ok(file_type) = child.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let name = child.file_name().to_string_lossy().to_string();
+            if RECENT_SCAN_SKIP_DIRS
+                .iter()
+                .any(|skipped| skipped.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            collect_recent_files(root, &child.path(), since, walked, files);
+            continue;
+        }
+        // Regular files only; symlinks are skipped (no follows, no broken links).
+        if !file_type.is_file() {
+            continue;
+        }
+        let Ok(metadata) = child.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < since {
+            continue;
+        }
+        let absolute = child.path();
+        let relative = absolute.strip_prefix(root).unwrap_or(&absolute);
+        files.push(WorkspaceRecentFile {
+            path: normalize_path(relative),
+            modified_ms: modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|value| value.as_millis() as u64)
+                .unwrap_or(0),
+            byte_size: metadata.len(),
+        });
+    }
+}
+
+/// Lists files under `working_dir` whose mtime is at or after `since_ms`
+/// (epoch milliseconds), newest first, bounded to keep large trees cheap.
+#[tauri::command]
+pub async fn get_workspace_recent_files(
+    working_dir: String,
+    since_ms: u64,
+) -> Result<Vec<WorkspaceRecentFile>, String> {
+    let root = fs::canonicalize(PathBuf::from(&working_dir)).map_err(|error| {
+        format!(
+            "Failed to resolve workspace path {}: {}",
+            working_dir, error
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Workspace path {} is not a directory",
+            root.display()
+        ));
+    }
+
+    let since = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_millis(since_ms))
+        .ok_or_else(|| format!("Invalid since timestamp: {since_ms}"))?;
+    let mut walked = 0usize;
+    let mut files = Vec::new();
+    collect_recent_files(&root, &root, since, &mut walked, &mut files);
+    Ok(rank_recent_files(files))
+}
+
+/// Newest first (stable path tiebreak), bounded for UI consumption.
+fn rank_recent_files(mut files: Vec<WorkspaceRecentFile>) -> Vec<WorkspaceRecentFile> {
+    files.sort_by(|left, right| {
+        right
+            .modified_ms
+            .cmp(&left.modified_ms)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    files.truncate(RECENT_SCAN_MAX_RESULTS);
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::{score_entry, FileIndexEntry};
@@ -376,5 +505,131 @@ mod tests {
             make_entry("apps/desktop/src/components/workspace/WorkspaceSessionComposer.tsx");
         let score = score_entry(&entry, "wsc").expect("fuzzy score");
         assert!(score > 0);
+    }
+
+    mod recent_files {
+        use super::super::{collect_recent_files, rank_recent_files, WorkspaceRecentFile};
+        use std::fs;
+        use std::path::Path;
+        use std::process::Command;
+        use std::time::{Duration, SystemTime};
+
+        fn write_file(root: &Path, relative: &str) {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent");
+            }
+            fs::write(&path, "content").expect("write file");
+        }
+
+        /// Backdates a file's mtime via `touch -t` (unix-only helper for tests).
+        fn backdate(path: &Path, stamp: &str) {
+            let status = Command::new("touch")
+                .arg("-t")
+                .arg(stamp)
+                .arg(path)
+                .status()
+                .expect("run touch");
+            assert!(status.success(), "touch -t {stamp} failed");
+        }
+
+        fn paths(files: &[WorkspaceRecentFile]) -> Vec<String> {
+            files.iter().map(|file| file.path.clone()).collect()
+        }
+
+        #[test]
+        fn returns_only_files_modified_at_or_after_since() {
+            let root = std::env::temp_dir().join(format!(
+                "ccem-recent-{}",
+                std::time::SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).expect("create root");
+            write_file(&root, "fresh.txt");
+            write_file(&root, "nested/out.json");
+            write_file(&root, "stale.txt");
+            backdate(&root.join("stale.txt"), "202001010000");
+
+            let since = SystemTime::now() - Duration::from_secs(5);
+            let mut walked = 0usize;
+            let mut files = Vec::new();
+            collect_recent_files(&root, &root, since, &mut walked, &mut files);
+
+            let mut listed = paths(&files);
+            listed.sort();
+            assert_eq!(listed, vec!["fresh.txt".to_string(), "nested/out.json".to_string()]);
+            assert!(files.iter().all(|file| file.byte_size > 0));
+            assert!(files.iter().all(|file| file.modified_ms > 0));
+            fs::remove_dir_all(&root).ok();
+        }
+
+        #[test]
+        fn skips_heavy_dirs_but_keeps_dot_dirs_like_artifacts() {
+            let root = std::env::temp_dir().join(format!(
+                "ccem-recent-{}",
+                std::time::SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).expect("create root");
+            write_file(&root, ".artifacts/shot.png");
+            write_file(&root, ".claude/settings.json");
+            write_file(&root, "node_modules/pkg/index.js");
+            write_file(&root, ".git/HEAD");
+            write_file(&root, "target/debug/skip.bin");
+
+            let mut walked = 0usize;
+            let mut files = Vec::new();
+            collect_recent_files(
+                &root,
+                &root,
+                SystemTime::UNIX_EPOCH,
+                &mut walked,
+                &mut files,
+            );
+
+            let mut listed = paths(&files);
+            listed.sort();
+            assert_eq!(
+                listed,
+                vec![
+                    ".artifacts/shot.png".to_string(),
+                    ".claude/settings.json".to_string(),
+                ]
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+
+        #[test]
+        fn newest_files_sort_first_with_stable_tiebreak() {
+            let root = std::env::temp_dir().join(format!(
+                "ccem-recent-{}",
+                std::time::SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).expect("create root");
+            write_file(&root, "older.txt");
+            std::thread::sleep(Duration::from_millis(20));
+            write_file(&root, "newer.txt");
+
+            let mut walked = 0usize;
+            let mut files = Vec::new();
+            collect_recent_files(
+                &root,
+                &root,
+                SystemTime::UNIX_EPOCH,
+                &mut walked,
+                &mut files,
+            );
+            let ranked = rank_recent_files(files);
+
+            assert_eq!(paths(&ranked), vec!["newer.txt".to_string(), "older.txt".to_string()]);
+            fs::remove_dir_all(&root).ok();
+        }
     }
 }
