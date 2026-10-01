@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">CCEM</h1>
-<p align="center"><strong>The Control Center for Your AI Coding Assistants</strong></p>
+<p align="center"><strong>One control center for Claude Code, Codex, OpenCode and every model behind them.</strong></p>
 
 <p align="center">
   <a href="./README.md">English</a> | <a href="./README_zh.md">中文</a>
@@ -15,23 +15,29 @@
   <a href="https://github.com/Genuifx/ccem/releases"><img src="https://img.shields.io/github/v/release/Genuifx/ccem" alt="GitHub release" /></a>
   <a href="https://github.com/Genuifx/ccem/actions/workflows/release-desktop.yml"><img src="https://github.com/Genuifx/ccem/actions/workflows/release-desktop.yml/badge.svg" alt="Release Desktop" /></a>
   <a href="https://deepwiki.com/Genuifx/ccem"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <a href="https://github.com/Genuifx/ccem/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/ccem.svg" alt="license" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="license: Apache 2.0" /></a>
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-![Shot](./screenshots/shots.webp)
+> **🖼️ IMAGE PLACEHOLDER 1 — Hero shot** (replaces `screenshots/shots.webp`)
+>
+> **Suggested file:** `screenshots/hero.webp` · 2400×1500 · light theme on a soft macOS wallpaper
+>
+> **Shows:** The CCEM Desktop main window, front and center, on the **Workspace** page. Glass sidebar on the left (Workspace, Sessions, Environments, Skills, History, Cron, Chat Apps, Analytics, Proxy Debug, Settings). The center shows a live Claude session with a short streamed transcript: a user prompt, an assistant reply with a tool call card (for example an `Edit` on `src/app.ts`) and a todo checklist. The composer at the bottom shows the **Claude / Codex / OpenCode** agent switcher, an environment chip (for example `KIMI`), a permission chip (`dev`), an effort selector and a **Dynamic routing** chip. The **side panel** on the right is open on the **Browser** tab and shows a localhost page. In the lower-right corner of the desktop, outside the window, the **Desktop Cat** sits with two small session bubbles stacked beside it.
+>
+> **Caption:** *Pick a model, pick an agent, ship. CCEM Desktop in action.*
 
 ---
 
 ## Table of Contents
 
 - [Why ccem](#why-ccem)
-- [What ccem Does](#what-ccem-does)
-- [Competitive Landscape](#competitive-landscape)
+- [Highlights](#highlights)
 - [Quick Start](#quick-start)
 - [CLI](#cli)
 - [Desktop App](#desktop-app)
-- [Coming Soon](#coming-soon)
+- [External Control: JSON-RPC, Deeplinks & CLI](#external-control-json-rpc-deeplinks--cli)
+- [How ccem Compares](#how-ccem-compares)
 - [Data Storage](#data-storage)
 - [Tech Stack](#tech-stack)
 - [Contributing](#contributing)
@@ -41,109 +47,75 @@
 
 ## Why ccem
 
-After using Claude Code for a while, some things just get annoying.
+Claude Code is great. Using it seriously every day is where things get messy.
 
-You want KIMI for frontend, Opus for architecture, DeepSeek for scripts — but every time you switch models you're manually `export`-ing env vars. Eight terminal tabs later, no idea which is connected to what.
+- **Model sprawl.** KIMI for frontend, DeepSeek for scripts, GLM for refactors, a local Ollama model on the plane. Each switch means hand-`export`ing env vars, and eight terminal tabs later nobody knows which tab talks to which provider.
+- **Permission fatigue.** Clicking *Approve* 200 times a day wears you out. `--dangerously-skip-permissions` feels like a bad idea next to your `.env`.
+- **No idea what you spent.** Claude Code, Codex and OpenCode each keep their own logs. Nothing adds them up.
+- **You're away from your desk.** You're out getting coffee, a test is red, and your laptop is at home.
+- **The work that should run itself.** Nightly test runs, a Monday PR sweep, a changelog every Friday, with the results sent to your phone.
 
-Permissions too. Approving every command gets old. But `--dangerously-skip-permissions` feels reckless — what if it deletes your `.env`?
-
-Then there's the money question. How much have you spent this month? Claude Code won't tell you. Codex won't either. The combined bill across both? Nobody knows.
-
-And the real kicker — you're out getting coffee, need Claude to fix something, but your computer's at home. You're stuck.
-
-Or maybe you want Claude to run tests every night, review PRs, push results to your phone. Not a crazy ask, right?
-
-**So I built ccem.** Environment switching, permission modes, multi-model sessions, usage analytics, cron automation, remote control from your phone — one tool, all covered.
+**ccem handles all of it.** It's a free, open-source CLI plus a native Tauri desktop app that switches models in one keystroke, sets permissions with one word, routes subagents to cheaper models, tracks every token, runs cron jobs, and lets you continue a session from Telegram, WeChat, WeCom or Feishu.
 
 ---
 
-## What ccem Does
+## Highlights
 
-Two flavors. Pick whichever fits.
+| | CLI | Desktop |
+|---|:---:|:---:|
+| **11 provider presets** (GLM, KIMI, DeepSeek, Qwen/Bailian, MiniMax, MiMo, OpenRouter, Ollama, …) with Opus / Sonnet / Haiku tier mapping | ✅ | ✅ |
+| **6 permission modes**: `yolo` · `dev` · `readonly` · `safe` · `ci` · `audit` | ✅ | ✅ |
+| **Usage & cost analytics** with a calendar heatmap | ✅ | ✅ Claude + Codex + OpenCode |
+| **Skill installer**: 20 curated presets + any GitHub URL | ✅ | ✅ Streaming search |
+| **Encrypted team config sharing** (`ccem load`) | ✅ | ✅ |
+| **DeepSeek Harness (`dsh`)**: run a ccem environment through DeepSeek's agent harness | ✅ `ccem dsh` | ✅ History source |
+| **tmux-backed sessions**: list and attach from any terminal | ✅ `ccem sessions` / `attach` | ✅ |
+| **Cron automation**: create, list, delete, trigger | ✅ | ✅ Scheduler, templates, AI generation, run history |
+| **Drive Desktop from scripts**: sessions, input, events, routing | ✅ `ccem desktop …` | ✅ 20-method JSON-RPC |
+| **Three agents in one workspace**: Claude Code, Codex, OpenCode | — | ✅ |
+| **Per-subagent model routing** through a local routing proxy | — | ✅ |
+| **Built-in browser side panel** the agent can drive, with you able to pause it | — | ✅ |
+| **Fork a session from any turn** and **rewind to file checkpoints** | — | ✅ |
+| **Session Review**: diffs, todos, artifacts, subagent traces | — | ✅ |
+| **Chat bots**: Hermes-powered WeCom & Feishu, plus Telegram / WeChat / WeCom bridges | — | ✅ |
+| **Desktop Cat**: an always-on-top companion that stacks your running and finished sessions | — | ✅ |
+| **Tray cockpit**, **Proxy Debug**, **share posters**, **auto-update** | — | ✅ |
 
-The feature descriptions below refer to the current source tree. For a downloaded version, check its release notes and available platform assets.
-
-| Feature | CLI | Desktop |
-|---|---|---|
-| Multi-model environment switching | ✅ | ✅ |
-| Permission mode presets (6 modes) | ✅ | ✅ |
-| Usage analytics & cost tracking | ✅ | ✅ |
-| Skill management (discover + install) | ✅ | ✅ Streaming search |
-| Remote config sharing (team) | ✅ | ✅ |
-| Claude Code + Codex dual engine | — | ✅ |
-| Workspace dashboard | — | ✅ |
-| Multi-session management | — | ✅ |
-| Telegram remote control | — | ✅ |
-| WeChat remote control | — | ✅ |
-| WeCom (企业微信) bot bridge | — | ✅ |
-| Cron scheduled tasks | ✅ Create, list, delete | ✅ Manage and execute schedules |
-| Desktop session queries | ✅ Requires running Desktop | ✅ |
-| System tray mini-dashboard | — | ✅ |
-| Conversation history browser | — | ✅ |
-| API proxy debugging | — | ✅ |
-| Session review (todos, artifacts, subagents) | — | ✅ |
-| Checkpoint rewind | — | ✅ |
-| Global search across history | — | ✅ |
-| ccem:// deeplinks & JSON-RPC API | — | ✅ |
-| Auto-update | — | ✅ |
-| Share poster (AI coding weekly report) | — | ✅ |
-
-Both share the environment config file (`~/.ccem/config.json`). Switching configurations does not update environment variables in an existing shell. Use `ccem run <cmd>` to apply the current configuration to a new command, or follow the Shell Integration instructions below to update your current shell.
-
----
-
-## Competitive Landscape
-
-| | ccem | ccswitch | OpenClaw | Vanilla Claude Code |
-|---|---|---|---|---|
-| **Multi-model switching** | CLI + GUI | CLI only | — | Manual `export` |
-| **Permission presets** | 6 modes | — | — | 3 built-in |
-| **Dual engine** (Claude + Codex) | Yes | — | — | — |
-| **Desktop app** | Tauri native | — | — | — |
-| **Remote control** | Telegram / WeChat / WeCom | — | Self-hosted | — |
-| **Cron automation** | Templates + AI gen | — | — | — |
-| **Usage analytics** | Claude + Codex unified | — | — | — |
-| **Tray dashboard** | Yes | — | — | — |
-| **Conversation history** | Unified browser | — | Web UI | — |
-| **API proxy debug** | Built-in | — | — | — |
-| **External API** | JSON-RPC + deeplinks | — | — | — |
-| **Session review** | Todos, artifacts, subagents | — | — | — |
-| **Team config sharing** | Encrypted remote load | — | — | — |
-| **Price** | Free & open source | Free & open source | Free & open source | Free |
+The CLI and Desktop read the same config file (`~/.ccem/config.json`), so an environment you add in one shows up in the other immediately.
 
 ---
 
 ## Quick Start
 
-### CLI (Terminal)
+### CLI: 30 seconds, no install
 
 ```bash
-npx ccem              # Interactive menu — no install needed
+npx ccem              # Interactive menu
 ```
 
-Or install globally:
+Or install it globally:
 
 ```bash
 npm install -g ccem
-ccem add kimi         # Name an environment, then choose a preset or enter settings
+ccem add kimi         # Name it, pick the KIMI preset, paste your key
 ccem use kimi         # Switch to it
-ccem dev              # Launch Claude Code in dev permission mode
+ccem dev              # Launch Claude Code in "dev" permission mode
 ```
 
 ### Desktop
 
 Download from [GitHub Releases](https://github.com/Genuifx/ccem/releases):
 
-- **macOS**: `.dmg` (Apple Silicon / Intel)
+- **macOS**: `.dmg` for Apple Silicon (`aarch64`) and Intel (`x86_64`)
 - **Windows**: `.exe` installer (x64)
 
-Launch, add an environment, pick Claude or Codex, hit go.
+Open it, add an environment, pick **Claude**, **Codex** or **OpenCode**, describe your task, and press <kbd>Cmd</kbd>+<kbd>Enter</kbd>.
 
 ---
 
 # CLI
 
-Manage environments, permissions, usage, skills, and scheduled task records from your terminal, and query sessions in a running Desktop app.
+Everything you need from the terminal: environments, permissions, usage, skills, cron, DeepSeek Harness, tmux sessions, and remote control of a running Desktop app.
 
 ## Install
 
@@ -153,6 +125,14 @@ npm install -g ccem
 # or just: npx ccem
 ```
 
+> **🖼️ IMAGE PLACEHOLDER 2 — CLI interactive menu** (replaces `screenshots/cli-index.webp`)
+>
+> **Suggested file:** `screenshots/cli-menu.webp` · terminal at ~120×36, dark theme, a readable monospace font
+>
+> **Shows:** Running `ccem` with no arguments. At the top, the ASCII/pixel CCEM logo. Under it, a status line with the current environment (for example `KIMI`) and the permission mode (`dev`). Then the Ink-rendered interactive menu with the cursor on an item such as *Switch environment*, and other items visible (add environment, permission modes, usage, skills, etc.). Optionally, a second pane or inset shows `ccem ls` output: a cli-table3 table listing 4–5 environments with names, base URLs and models, the active one highlighted.
+>
+> **Caption:** *`npx ccem`: everything one keystroke away.*
+
 ## Environment Management
 
 ```bash
@@ -161,35 +141,37 @@ ccem add kimi     # Name an environment, then choose a preset or enter settings
 ccem use kimi     # Switch environment
 ccem ls           # List all environments
 ccem current      # Show active environment
-ccem env          # Output export commands (pipe-friendly)
-ccem env --json   # JSON format
-ccem run <cmd>    # Run command with env vars injected
-ccem del <name>   # Delete environment
+ccem env          # Print export commands (pipe-friendly)
+ccem env --json   # Same, as JSON
+ccem run <cmd>    # Run any command with the env vars injected
+ccem del <name>   # Delete
 ccem rename <a> <b>
 ccem cp <src> <dst>
 ```
 
 ### Built-in Presets
 
-| Preset | Base URL | Main Model | Fast Model |
-|---|---|---|---|
-| GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3-flash |
-| KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k2.7-code |
-| Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding |
-| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] |
-| DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-v4-pro[1m] | deepseek-v4-flash |
-| Bailian (Aliyun) | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.6-flash |
-| Bailian Code Plan | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-plus | qwen3.7-plus |
-| OpenRouter | `https://openrouter.ai/api` | anthropic/claude-opus-5 | anthropic/claude-haiku-4.5 |
-| Ollama | `http://localhost:11434` | gemma4:31b | gemma4:e4b |
-| MiMo (Xiaomi) | `https://api.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5 |
-| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro |
+Each preset fills in the base URL and maps Claude Code's **Opus / Sonnet / Haiku** tiers to that provider's models (`ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL`), with `ANTHROPIC_MODEL=opus`. Claude Code's `/model` picker and its subagents then use the right model for each tier.
 
-> Official environment defaults to `claude-sonnet-4-5-20250929` + `claude-haiku-4-5-20251001`.
+| Preset | Base URL | Opus tier | Sonnet tier | Haiku tier |
+|---|---|---|---|---|
+| GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3[1m] | glm-5.3-flash |
+| KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k3[1m] | kimi-k2.7-code |
+| Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding | kimi-for-coding |
+| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] | MiniMax-M3[1m] |
+| DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-v4-pro[1m] | deepseek-v4-pro[1m] | deepseek-v4-flash |
+| Bailian (Aliyun) | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.7-max | qwen3.6-flash |
+| Bailian Coding Plan | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-plus | qwen3.7-plus | qwen3.7-plus |
+| OpenRouter | `https://openrouter.ai/api` | anthropic/claude-opus-5 | anthropic/claude-sonnet-5 | anthropic/claude-haiku-4.5 |
+| Ollama (local) | `http://localhost:11434` | gemma4:31b | gemma4:26b | gemma4:e4b |
+| MiMo (Xiaomi) | `https://api.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro | mimo-v2.5 |
+| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro | mimo-v2.5-pro |
+
+Any other Anthropic-compatible endpoint works too: just enter the base URL, key and models yourself. API keys are encrypted at rest.
 
 ### Shell Integration
 
-After `ccem use`, env vars won't update in your current shell. Add this to `~/.zshrc`:
+`ccem use` can't change the env vars of the shell you're already in. Either prefix commands with `ccem run`, or add this to `~/.zshrc`:
 
 ```bash
 ccem() {
@@ -208,121 +190,145 @@ Then `source ~/.zshrc`.
 
 ## Permission Modes
 
-Six presets between "approve everything" and "approve nothing."
+Six presets that sit between "approve everything" and "approve nothing".
 
-| Mode | Description | When to use |
+| Mode | What it allows | Use it for |
 |---|---|---|
-| **yolo** | Allow everything | Your own project, full trust |
-| **dev** | Dev permissions, block sensitive files | Daily development |
-| **readonly** | Read-only | Code review, learning |
-| **safe** | Restrict network + writes | Unfamiliar codebases |
-| **ci** | CI/CD suitable | Automation pipelines |
-| **audit** | Read + search only | Security audits |
+| **yolo** | Everything | Your own project, full trust |
+| **dev** | Normal development, sensitive files blocked | Daily work |
+| **readonly** | Reading only | Code review, learning a codebase |
+| **safe** | Restricted network and writes | Unfamiliar or untrusted repos |
+| **ci** | A CI-friendly tool set | Automation pipelines |
+| **audit** | Read and search only | Security audits |
 
 ```bash
-ccem yolo / dev / readonly / safe / ci / audit   # Temporary (reverts on exit)
-ccem setup perms --dev                            # Permanent
-ccem setup default-mode --dev                     # Set default
-ccem --mode                                       # Show current
+ccem yolo | dev | readonly | safe | ci | audit   # Apply temporarily; reverted when Claude Code exits
+ccem setup perms --dev                            # Write it into the project's .claude/settings.json
+ccem setup default-mode --dev                     # Make it the default
+ccem --mode                                       # Show the current mode
+ccem --list-modes                                 # Show all modes
 ```
 
 ## Usage Analytics
 
 ```bash
-ccem usage          # Interactive with calendar heatmap
+ccem usage          # Interactive view with a calendar heatmap
 ccem usage --json   # Machine-readable
 ```
 
-Parses JSONL logs from `~/.claude/projects/` to calculate token usage and costs. Price data fetched from LiteLLM and cached locally.
+ccem parses Claude Code's JSONL logs under `~/.claude/projects/` and calculates tokens and cost from cached LiteLLM model prices.
 
 ## Skill Management
 
 ```bash
-ccem skill add              # Interactive picker (Tab to switch groups)
-ccem skill add <name>       # Install preset
-ccem skill add <github-url> # Install from GitHub
-ccem skill ls               # List installed
+ccem skill add              # Interactive picker (Tab switches groups)
+ccem skill add <name>       # Install a preset
+ccem skill add <github-url> # Install from any GitHub repo or subfolder
+ccem skill ls               # List installed skills
 ccem skill rm <name>        # Remove
 ```
 
-**Official presets:** frontend-design, skill-creator, web-artifacts-builder, canvas-design, algorithmic-art, theme-factory, mcp-builder, webapp-testing, pdf/docx/pptx/xlsx, brand-guidelines, doc-coauthoring
+**Official presets (16):** frontend-design, skill-creator, web-artifacts-builder, canvas-design, algorithmic-art, theme-factory, mcp-builder, webapp-testing, pdf, docx, pptx, xlsx, brand-guidelines, doc-coauthoring, internal-comms, slack-gif-creator
 
-**Curated:** superpowers, ui-ux-pro-max, Humanizer-zh
+**Curated community skills:** superpowers, ui-ux-pro-max, Humanizer-zh, skill-writer
 
-## Remote Config
+ccem also ships skills that teach Claude Code to use ccem itself:
 
-Share API configurations across your team with encrypted transport.
+```bash
+ccem setup cron       # Installs the ccem-cron skill: Claude can schedule tasks for you
+ccem setup bot-bind   # Installs the ccem-bot-bind skill: Claude can attach a session to a chat bot
+```
+
+## DeepSeek Harness (`dsh`)
+
+Run a ccem environment through **DeepSeek Harness**, a separate agent runtime. ccem converts your environment into a dsh provider config, mapping the Opus/Sonnet/Haiku tiers to models, so the same keys work in both runtimes.
+
+```bash
+ccem dsh doctor                       # Offline readiness check: binary, versions, config
+ccem dsh inspect --env deepseek       # Preview the dsh provider config (secrets redacted)
+ccem dsh run --tier sonnet "fix the flaky test in auth.spec.ts"
+```
+
+`run` accepts `--env`, `--tier opus|sonnet|haiku`, `--model`, `--cwd` and `--permission read-only|workspace-write|danger-full-access`. Desktop release builds bundle dsh, and its sessions appear in the History page under **DeepSeek**.
+
+## tmux Sessions
+
+When tmux is installed, interactive sessions run inside tmux, so you can pick them up from any terminal:
+
+```bash
+ccem sessions         # List tmux-backed interactive sessions
+ccem attach [id]      # Attach to one in your terminal
+```
+
+## Team Config Sharing
+
+Distribute API configurations to your team over an encrypted channel:
 
 ```bash
 ccem load https://your-server.com/api/env --key YOUR_KEY --secret YOUR_SECRET
+# or keep secrets out of shell history:
+echo '{"key":"…","secret":"…"}' | ccem load https://your-server.com/api/env --credentials-stdin
 ```
 
-Server code lives in `server/`. AES-256-GCM encryption with authenticated envelope (v2), rate limiting, and hot-reload. See `server/` in the repo for full deployment instructions.
+A ready-to-deploy server lives in [`server/`](./server). It uses AES-256-GCM authenticated envelopes and rate limiting, and ships with an example config and a PM2 ecosystem file.
 
-## Manage Scheduled Tasks from the CLI
-
-Create a disabled weekday review task in the current directory, then review and enable it on Desktop's scheduled tasks page:
+## Scheduled Tasks from the CLI
 
 ```bash
 ccem cron create --name weekday-review --schedule '0 9 * * 1-5' \
-  --prompt 'Inspect the current project and summarize issues that need attention' \
-  --disabled --json
+  --prompt 'Inspect this project and summarize issues that need attention' \
+  --execution-profile conservative --disabled --json
 ccem cron list --json
+ccem cron trigger weekday-review      # Run it now via the running Desktop app
+ccem cron delete weekday-review
+ccem cron notification-targets        # Show where results can be delivered
 ```
 
-Use `--working-dir <path>` to choose another directory. To delete a task, run `ccem cron delete <selector>`, where selector is its exact ID or name.
+Other options: `--working-dir`, `--env-name`, `--max-budget-usd`, `--allowed-tools`, `--disallowed-tools`, `--timeout-secs`, `--template-id`, `--from-json`, and `--wecom-result` / `--wecom-bot-id` / `--wecom-peer-id` to send results to WeCom. Scheduled runs fire from the Desktop scheduler. The CLI writes the task record, and `trigger` asks the running Desktop to run it.
 
-## Query Desktop from the CLI
+## Drive Desktop from the CLI
 
-Start Desktop, then check its local control endpoint and list workspace sessions:
+With the Desktop app running:
 
 ```bash
 ccem desktop health --json
-ccem desktop sessions --json
-```
-
-Use a runtime ID from the list to query a session's status and events:
-
-```bash
+ccem desktop create --env kimi --perm dev --json      # Start a workspace session
+ccem desktop sessions --cwd . --status running --json
 ccem desktop status <runtimeId> --json
 ccem desktop events <runtimeId> --since 0 --limit 50 --json
+ccem desktop send <runtimeId> --text "now add tests"   # Send input, idempotent with --message-id
+ccem desktop routes <runtimeId> --set Explore=glm      # Re-bind a routing key mid-session
+ccem desktop open 'ccem://workspace/session?…'         # Focus a session in Desktop
 ```
-
-These commands connect to a running Desktop app. Installing the CLI alone does not start the Desktop session service.
 
 ## CLI Command Reference
 
 <details>
-<summary><b>Common commands</b></summary>
+<summary><b>All commands</b></summary>
 
 | Command | Description |
 |---|---|
 | `ccem` | Interactive menu |
-| `ccem ls` | List environments |
-| `ccem use <name>` | Switch |
-| `ccem add <name>` | Add |
-| `ccem del <name>` | Delete |
-| `ccem rename <a> <b>` | Rename |
-| `ccem cp <src> <dst>` | Copy |
-| `ccem current` | Current environment |
-| `ccem env [--json]` | Output env vars |
-| `ccem run <cmd>` | Run with env |
-| `ccem load <url>` | Load remote config |
-| `ccem yolo/dev/readonly/safe/ci/audit` | Temporary permission mode |
-| `ccem --mode` | Current mode |
-| `ccem --list-modes` | All modes |
-| `ccem setup perms --<mode>` | Permanent permissions |
-| `ccem setup default-mode --<mode>` | Default mode |
-| `ccem setup init` | Initialize (skip onboarding, disable telemetry) |
+| `ccem ls` / `use <name>` / `add <name>` / `del <name>` | List, switch, add, delete environments |
+| `ccem rename <a> <b>` / `cp <src> <dst>` | Rename / copy an environment |
+| `ccem current` | Show active environment |
+| `ccem env [--json]` | Print env vars |
+| `ccem run <cmd>` | Run a command with env vars injected |
+| `ccem load <url>` | Load encrypted remote config |
+| `ccem yolo/dev/readonly/safe/ci/audit` | Launch Claude Code with a permission mode |
+| `ccem --mode` / `--list-modes` | Current mode / all modes |
+| `ccem setup perms --<mode>` / `--reset` | Write project permissions |
+| `ccem setup default-mode --<mode>` | Set the default mode |
+| `ccem setup init [--chrome]` | Initialize Claude Code (skip onboarding, disable telemetry; optionally add chrome-devtools MCP) |
+| `ccem setup migrate [--clean] [--force]` | Migrate legacy config |
+| `ccem setup cron` / `setup bot-bind` | Install the ccem-cron / ccem-bot-bind skills |
 | `ccem usage [--json]` | Usage stats |
 | `ccem skill add/ls/rm` | Skill management |
-| `ccem cron create [options]` | Create a scheduled task record |
-| `ccem cron list [--json]` | List scheduled tasks |
-| `ccem cron delete <selector> [--json]` | Delete a task by exact ID or name |
-| `ccem desktop health [--json]` | Check the Desktop control endpoint |
-| `ccem desktop sessions [--json]` | List workspace sessions |
-| `ccem desktop status <runtimeId> [--json]` | Query session status |
-| `ccem desktop events <runtimeId> [--since <seq>] [--limit <count>] [--json]` | Read session events |
+| `ccem dsh run/inspect/doctor` | DeepSeek Harness integration |
+| `ccem sessions` / `attach [id]` | tmux-backed interactive sessions |
+| `ccem bot-bind` | Bind the current session to a chat-bot target |
+| `ccem cron create/list/delete/trigger/notification-targets` | Scheduled tasks |
+| `ccem desktop health/create/sessions/status/events/send/routes/open` | Control a running Desktop app |
 
 </details>
 
@@ -330,174 +336,194 @@ These commands connect to a running Desktop app. Installing the CLI alone does n
 
 # Desktop App
 
-A native desktop app built with **Tauri 2.0** — real Rust + React, not an Electron wrapper. Runs on macOS and Windows.
+A native app built on **Tauri 2** (a Rust backend and a React frontend, not an Electron wrapper) for **macOS** and **Windows**. Everything the CLI does, plus a full workspace for running agents.
 
-On top of everything the CLI offers, Desktop brings an integrated workspace, dual-engine support, remote control, cron automation, and a tray mini-dashboard.
+## Workspace: Claude Code, Codex & OpenCode in One Place
 
-## Install
+> **🖼️ IMAGE PLACEHOLDER 3 — Workspace with composer & side panel** (replaces `screenshots/sessions.webp`)
+>
+> **Suggested file:** `screenshots/workspace.webp` · 2400×1500 · dark theme
+>
+> **Shows:** The Workspace page with a project list on the left and several sessions grouped under one project, with status dots for running, waiting for approval and done. In the center, an active Claude session's transcript with a hover menu on one turn showing **"Fork a session from this turn"**. The composer at the bottom has a `$skill` token, an `@src/auth.ts` file chip, a pasted image thumbnail, the **Claude / Codex / OpenCode** switcher, an environment chip, a permission chip and the **Effort** dropdown open (Minimal → Max). The side panel on the right is open on the **Browser** tab with a URL bar, back/forward/reload, and an amber **"Agent controlling"** pill with a **Pause Agent control** button.
+>
+> **Caption:** *Three agents, one composer, a browser the agent can drive.*
 
-Download from [GitHub Releases](https://github.com/Genuifx/ccem/releases):
+The Workspace isn't just a launcher. It's where you start, steer and review agent runs.
 
-- **Windows x64**: `CCEM Desktop_*_x64-setup.exe`
-- **macOS (Apple Silicon / Intel)**: `.dmg` — macOS 10.15+
+- **Three agents**: start a **Claude Code**, **Codex** or **OpenCode** session from the same composer. Claude and Codex run in the native GUI. OpenCode sessions open in OpenCode Web.
+- **A detailed composer**: `$skill` tokens, `/slash` commands (scanned from your installed Claude Code commands and `.claude/commands/`), `@file` mentions, image and file drops, and model, provider and effort selectors.
+- **Fork from any turn**: branch a new Claude session that keeps the full context up to that turn, leaving the original unchanged.
+- **File checkpoints & rewind**: restore the working tree to any Claude file checkpoint from the transcript.
+- **Built-in browser side panel**: an embedded browser with **isolated login profiles**, so your own Chrome data stays untouched. The agent can drive it. You can pause it, take over, and review its screenshots, console logs and an action audit trail.
+- **Global search (<kbd>Cmd</kbd>+<kbd>K</kbd>)**: search every project and past conversation.
+- **Hand off to a bot**: attach a running session to a paired chat bot. Hermes decides which updates are worth sending, and replies from chat continue the session.
 
-## Workspace — Your Command Center
+## Per-Subagent Model Routing
 
-![Sessions](./screenshots/sessions.webp)
+> **🖼️ IMAGE PLACEHOLDER 4 — Model routing popover**
+>
+> **Suggested file:** `screenshots/routing.webp` · 1600×1000 · light theme, cropped to the composer area
+>
+> **Shows:** The **Dynamic routing** popover open above the composer. At the top, a **Route profile** selector showing "Budget chores". Below it, **Bindings by type**: *Main thread → KIMI*, *Explore → GLM*, *Background tasks → DeepSeek*, *Other agents → Follow default*. Under that, an **Allow agent self re-routing** toggle and an **Agent may reroute to** list with 3 envs checked. Footer buttons: **Apply changes** and **Save as my default**. Optionally, an inset of the session's usage panel with the **Sub-route usage (Router-observed)** breakdown.
+>
+> **Caption:** *Keep the main thread on your best model and send busywork to cheaper ones.*
 
-The Workspace is where sessions live. It's not just a launcher — it's a full control surface.
+Why pay top-model prices for `grep`? Turn on **Dynamic routing** for a Claude session and ccem runs it through a local routing proxy (bound to `127.0.0.1`) that splits the work across environments:
 
-**Prompt Composer —** Launch sessions with a rich input: `$skill` tokens, `/commands`, `@file` references, image attachments, model/provider/effort selectors. Everything you need before hitting enter.
+- Bind **subagent types** (for example `Explore`) and **background tasks** to different environments. The main thread follows the composer's environment.
+- Save reusable **route profiles**, or generate them from templates: **Budget chores** (send Explore and the background model to a cheaper environment) or **Specialty split** (bind one subagent type to a specialist).
+- Optionally let the agent **re-route itself** to an allow-listed environment.
+- Change bindings mid-session. Changes apply from the next request.
+- See which environment handled what in the session's **routed usage** breakdown.
 
-**Slash Commands —** ccem scans your installed Claude Code commands and `.claude/commands/` directories, parsing YAML frontmatter. Available directly in the composer.
+Routing is opt-in for each session, and sessions that don't use it run direct.
 
-**Global Search (Cmd+K) —** Search across all past conversations and projects in real time. Find that thing Claude said three days ago.
+## Sessions & Session Review
 
-**Multi-Session Management —** Run Claude Code in one window, Codex in another, DeepSeek in a third — simultaneously, each with its own environment and permission mode.
+> **🖼️ IMAGE PLACEHOLDER 5 — Session Review drawer**
+>
+> **Suggested file:** `screenshots/session-review.webp` · 2400×1500 · dark theme
+>
+> **Shows:** The **Session Review** drawer open over a finished session. The header shows a **Task progress · 5/6** bar, the environment and the Git branch. The left column has sections **Changed files** (4 files with +/- counts), **Subagents** (two entries) and **Artifacts** (an HTML report and a PNG). The right pane shows the selected file's diff with green and red lines and an **Open in editor** button. A **Failed tools** chip shows one failure.
+>
+> **Caption:** *Know exactly what the agent did before you merge.*
 
-- Grid / list view toggle
-- Per-session: project dir, environment, permission mode, PID, source (Desktop / CLI / Telegram / WeChat / WeCom / Cron)
-- Per-session actions: focus, minimize, stop, close
-- Orphan recovery: detect and take over unmanaged Claude processes
+- Grid or list view of every session, showing project, environment, permission mode, agent and where it was started (Desktop, CLI, chat bot or cron).
+- **Session Review**: a todo progress snapshot, changed files from Git and the SDK with inline diffs, generated artifacts (HTML, images, reports), failed tool calls, and a trace of each subagent.
+- **Interactive events** for tmux sessions: structured tool prompts, plan reviews and terminal approvals.
+- Desktop notifications when a task completes or fails, or when a plan, question or permission prompt needs you.
 
-**Session Review Drawer —** Open any session to see a structured review: final assistant reply, changed files (git + SDK), extracted todos, tool evidence, generated artifacts (HTML/images/reports), subagent tracking.
+## Remote Control: Chat Bots
 
-**Checkpoints & Rewind —** Claude's file checkpoint system exposed in the UI. Create checkpoints, rewind to them, track rewind failures.
+> **🖼️ IMAGE PLACEHOLDER 6 — Chat Apps / Hermes bots** (replaces `screenshots/telegram.webp`)
+>
+> **Suggested file:** `screenshots/chat-bots.webp` · composite: desktop window on the left (60%), phone frame on the right (40%)
+>
+> **Shows:** *Left:* the **Chat Apps** page with the **Bots** panel showing the **Hermes chat component** with its version and **Your bots**: a **WeCom** bot ("Account paired · Access to 2 workspaces") and a **Feishu** bot. A collapsed **Other connection methods** row is visible below. *Right:* a phone showing a Feishu or WeCom chat in which the user asks "run the tests in ccem-web and fix failures", and the bot replies with a task card showing the session status, then a short summary of the result.
+>
+> **Caption:** *Your agents, reachable from the chat app you already use.*
 
-**Subagent Tracking —** ccem tracks subagent lifecycle with named scientific personas (Turing, Curie, Feynman, Hopper, etc.), each with unique symbols and accent colors.
+Continue workspace tasks from your phone, using **any API key you've configured** rather than only an Anthropic subscription.
 
-## Claude Code + Codex Dual Engine
+**Hermes bots (WeCom & Feishu).** Desktop installs and manages the **Hermes** chat component for you. Scan a QR code to create a bot (or connect an existing one), pair your chat account, then choose which workspaces each bot can reach. Bots can run in **CCEM sessions only** mode, which limits them to ccem session tools in authorized workspaces, or **Full Hermes** mode with web access, skills, memory, local files and commands. Pick the API environment Hermes uses for conversation, and have cron results sent to your chat.
 
-![History](./screenshots/history.webp)
+**Other connection methods.** The original bridges are still available:
 
-Desktop supports both **Claude Code** and **OpenAI Codex CLI** as runtimes. In Workspace, choose a working directory and provider, enter your task, and submit to create a session.
+- **Telegram**: Forum Topics, with each topic bound to a project directory, environment and permission mode. One topic, one long-lived session.
+- **WeChat (Weixin)**: private-chat bridge with QR login, a user allowlist, and `/approve` / `/deny` for permission prompts.
+- **WeCom**: multi-bot bridge with admin/user separation, group chats and `@mention` triggering.
 
-Each provider resolves its own runtime configuration and requires the corresponding runtime and authentication to be available. Launch options differ: dynamic routing, for example, currently applies only to Claude sessions.
+Remote control works best with tmux installed (resume and multi-terminal workflows).
 
-Both session types appear in a unified view, with proper icons and status indicators. Proxy Debug captures traffic from both engines.
+## Cron: Scheduled Automation
 
-ccem Desktop isn't just a Claude Code manager — it's a control center for your local AI coding assistants.
+> **🖼️ IMAGE PLACEHOLDER 7 — Cron Tasks page** (replaces `screenshots/cron.webp`)
+>
+> **Suggested file:** `screenshots/cron.webp` · 2400×1500 · light theme
+>
+> **Shows:** The **Cron Tasks** page. Left: a list of 4 tasks (for example "Nightly tests · `0 2 * * *`", "Weekday PR review · `0 9 * * 1-5`") with enable toggles and **next run** times. Right: the create/edit form with the **Quick Templates** row (PR Review, Test Runner, Doc Generation, Security Audit, Changelog), a natural-language **AI generate** input, the cron expression, the working directory, the **Execution Profile** segmented control (Conservative / Standard / Autonomous) with its description, and a **Budget Cap** field. Bottom: **Run history** with ✓/✗ status, duration and a **Retry** button on a failed run.
+>
+> **Caption:** *Set it once and wake up to finished work.*
 
-## Remote Control — Telegram, WeChat & WeCom
+- **Five-field cron** expressions on local time, with a preview of upcoming runs.
+- **Quick templates**: PR Review, Test Runner, Doc Generation, Security Audit, Changelog.
+- **AI generation**: describe the job in plain language and get a cron expression and prompt back.
+- **Execution profiles**:
+  - **Conservative**: read, search, edit and write only, with a lower budget and no shell or web.
+  - **Standard**: adds Bash and web tools.
+  - **Autonomous**: a higher budget and bypassed permissions, for trusted tasks only.
+- A per-task **budget cap**, tool allow/deny lists and a timeout.
+- **Run history** with status, duration and logs, plus one-click retry.
+- **Result notifications** to Telegram, WeCom or Hermes bots.
 
-![Telegram](./screenshots/telegram.webp)
+Scheduled runs need the Desktop app running.
 
-Control Claude Code sessions on your computer from your phone. Unlike the official Claude mobile app (Anthropic subscription required), ccem works with any API key you've configured.
+## Analytics: Claude + Codex + OpenCode
 
-### Telegram
+> **🖼️ IMAGE PLACEHOLDER 8 — Analytics & share poster** (replaces `screenshots/analytics.webp`)
+>
+> **Suggested file:** `screenshots/analytics.webp` · 2400×1500 · dark theme
+>
+> **Shows:** The **Analytics** page with a source switcher at the top (All / Claude / Codex / OpenCode) and stat cards for tokens, cost, **Streak** and week-over-week trend arrows. Below them, a GitHub-style **Activity Heatmap (Calendar)** and a stacked token/cost trend chart by model. Overlaid on the right, the **Share Poster** dialog showing a poster preview in the **Terminal** style with a "Gold Coder" rank badge, and style tabs Classic / Terminal / Data Ink.
+>
+> **Caption:** *Every token across every agent in one view, ready to share.*
 
-Uses Forum Topics — each Topic maps to a project directory on your machine. One Topic, one project, one persistent session. Clean separation, no cross-talk.
+- A daily activity heatmap, token and cost trends by model, and streaks and week-over-week trends.
+- Switch between **All, Claude, Codex or OpenCode** in one click.
+- **Share posters** in three styles (Classic, Terminal, Data Ink), with ranks from Bronze to Legendary Coder.
 
-1. Configure your Bot Token + allowed users in ChatApp
-2. Bind each Forum Topic to a project directory, environment, and permission mode
-3. Send messages from your phone — ccem spawns/reuses a local Claude session
-4. Results stream back in real time, with optional tool call visibility
+Costs come from the usage records ccem can read and known model prices. Where a price is missing, ccem shows the known cost and a count of unpriced tokens instead of guessing. Treat these figures as an estimate, not a provider bill.
 
-### WeChat (微信)
+## Desktop Cat & Tray Cockpit
 
-Direct private chat mode — send a message, ccem spawns a headless Claude session, results stream back. QR code login, user allowlist, permission approval via `/approve` / `/deny` in chat.
+> **🖼️ IMAGE PLACEHOLDER 9 — Desktop Cat + Tray Cockpit**
+>
+> **Suggested file:** `screenshots/cat-and-tray.webp` · 1800×1100 · macOS desktop with a plain wallpaper and no main window
+>
+> **Shows:** *Top right:* the menu-bar **Tray Cockpit** dropped down, showing Env and Perm chips, **Tokens Today** and **Cost Today**, a **Token Trend** chart with Hour/Day tabs, a **Model Type Split** bar, **Active Projects** with status dots, **Scheduled Tasks**, a health row (tmux ok · bridge online · cron ok · version) and launch buttons (Workspace, Sessions, Diagnostics). *Bottom right:* the always-on-top **Desktop Cat** with three stacked session bubbles beside it: two running sessions (spinner) and one with an unread "completed" badge.
+>
+> **Caption:** *Glance at the menu bar or the cat to see what your agents are doing.*
 
-### WeCom (企业微信)
+- **Desktop Cat** (Settings → Desktop Cat): an always-on-top companion with your running sessions and unread finished sessions stacked beside it. Click one to jump straight to it.
+- **Tray Cockpit**: a menu-bar mini dashboard showing the current env and permission mode, today's tokens and cost, an hourly or daily trend, the split by model type, active projects, upcoming cron tasks, health checks (tmux, bridge, cron, version) and quick-launch buttons.
 
-Full enterprise WeChat bot bridge with multi-bot management, WebSocket connectivity, admin/user permission separation, group chat support, `@mention` triggering, and cron-to-WeCom push notifications.
+## Also in the Box
 
-> Feishu (Lark) integration — coming soon.
+- **Conversation History**: one place to browse Claude, Codex, OpenCode and DeepSeek Harness conversations, grouped by project, with `/compact` boundaries respected and continue-from-history support.
+- **Proxy Debug**: a live request list (method, URL, status, size) with a JSON and SSE-aware detail viewer, and separate upstream URLs for Claude and Codex.
+- **Environments & Skills**: visual versions of the CLI features, with one-click presets, remote config sync and streaming skill search.
+- **Auto-update**: background downloads on **stable** or **beta** channels, then restart when it's ready.
+- **Settings**: light, dark or system theme. Chinese or English. Default permission mode and working directory. Terminal choice: Terminal.app, iTerm2 or Ghostty. Launch at login. Notifications. An AI-enhancement environment. Dependency checks for the ccem CLI, `claude`, `codex`, OpenCode and tmux.
 
-## Cron Tasks — Scheduled Automation
-
-![Cron Tasks](./screenshots/cron.webp)
-
-Set a five-field cron expression, working directory, and prompt, then save and enable the task. Automatic execution requires a running Desktop scheduler with background services enabled and uses local machine time. Creating a task record through the CLI does not start the scheduler.
-
-- **Templates**: PR Review, Test Runner, Doc Generation, Security Audit, Changelog
-- **AI generation**: Describe what you want in natural language, get a cron expression + prompt generated
-- **Result notifications**: After a run ends, ccem attempts to send a summary to configured Telegram notifications. WeCom also requires task notifications to be enabled and a target configured. Confirm delivery through the destination channel
-- **Run history**: Status, duration, logs for every execution
-- **Next run preview**: See when upcoming runs will fire
-- **Retry on failure**: One-click re-run
-
-## Analytics — Claude + Codex, One View
-
-![Analytics](./screenshots/analytics.webp)
-
-GitHub-style usage statistics for both Claude Code and Codex, unified.
-
-- Daily activity heatmap + token/cost trends by model
-- Switch between Claude, Codex, or combined with one click
-- Consecutive active days streak + trend arrows (up/down vs. last week)
-- **Share poster**: generate your AI Coding weekly report
-
-Costs are calculated from readable usage records and model prices. When pricing does not cover all tokens, the UI shows the known cost and the unpriced token count. These amounts are not a complete provider bill.
-
-## Tray Cockpit — System Tray Mini-Dashboard
-
-A persistent mini-dashboard in your system tray, independent of the main window:
-
-- Current environment and permission mode at a glance
-- Today's token usage and cost
-- 12-hour activity chart with interactive cursor tracking
-- Provider breakdown: Claude / Codex / OpenCode
-- Active sessions with status dots
-- Upcoming cron tasks with expressions
-- Quick-launch dock: Workspace, Sessions, Proxy Debug
-
-## Conversation History
-
-Browse all past Claude Code and Codex conversations in one place. Filter by source (All / Claude / Codex), grouped by project directory. `/compact` segmentation boundaries supported.
-
-## Proxy Debug
-
-Built-in API request debugging:
-
-- Live traffic list: timestamp, method, URL, status code, size
-- Request/response detail viewer with JSON formatting + SSE stream detection
-- Separate upstream URL configuration for Claude and Codex
-
-## Environments & Skills
-
-Same functionality as CLI, visual interface:
-
-- **Environments**: Card-based list, one-click preset filling, remote config sync
-- **Skills**: Streaming search as you type, one-click install/uninstall
-
-## App Auto-Update
-
-Built-in Tauri updater — check, download, install updates from within the app. Progress tracking with status indicator.
-
-## External Control API
-
-A local JSON-RPC server for programmatic control:
-
-- `ccem://` URI scheme deeplinks to sessions, events, and history
-- Token-authenticated localhost endpoint
-- `create_session`, `list_sessions`, `send_input`, `open_session` methods
-- Enables bot-to-session binding and external tool integration
-
-## Settings
-
-- Theme: light / dark / system
-- Language: Chinese / English
-- Default permission mode / working directory
-- Terminal preference (iTerm2 / Terminal.app)
-- AI-enhanced mode: use a selected environment for AI features
-- Dependency check: auto-detect CLI / claude / codex / tmux
-
-## Keyboard Shortcuts
+### Keyboard Shortcuts
 
 | Shortcut | Action |
 |---|---|
-| Cmd+1~9 | Switch pages |
-| Cmd+Enter / Cmd+N | Launch session |
-| Cmd+K | Global search |
-| Cmd+, | Settings |
-| Cmd+Q | Quit |
+| <kbd>Cmd</kbd>+<kbd>1</kbd>…<kbd>9</kbd> | Workspace, Sessions, Environments, Skills, History, Cron, Chat Apps, Analytics, Proxy Debug |
+| <kbd>Cmd</kbd>+<kbd>Enter</kbd> / <kbd>Cmd</kbd>+<kbd>N</kbd> | Launch session |
+| <kbd>Cmd</kbd>+<kbd>K</kbd> | Global search |
+| <kbd>Cmd</kbd>+<kbd>,</kbd> | Settings |
+| <kbd>Cmd</kbd>+<kbd>Q</kbd> | Quit |
 
 ---
 
-## Coming Soon
+## External Control: JSON-RPC, Deeplinks & CLI
 
-- **Feishu (Lark)** — bot bridge integration
-- **Pet/Companion** — pixel-art desktop companion that reacts to your session activity
+While Desktop is running, it serves a **token-authenticated JSON-RPC endpoint on `127.0.0.1`**. Its address and token are written to a local control descriptor (`~/.ccem/control.json`; override with `CCEM_CONTROL_FILE`). Scripts, bots and other tools can start and steer sessions through it. The `ccem desktop …` and `ccem cron trigger` commands use the same endpoint.
+
+<details>
+<summary><b>All 20 methods</b></summary>
+
+| Area | Methods |
+|---|---|
+| Health | `ccem.health` |
+| Workspace sessions | `ccem.workspace.createSession`, `listSessions`, `getSession`, `getEvents`, `sendInput`, `openSession`, `restartDirect` |
+| Session routing | `ccem.workspace.getRouter`, `ccem.workspace.updateRouter` |
+| Router | `ccem.router.status`, `ccem.router.getSettings`, `ccem.router.updateSettings` |
+| Remote | `ccem.remote.getEvents` |
+| Cron | `ccem.cron.list`, `ccem.cron.trigger`, `ccem.cron.notificationTargets` |
+| Environments | `ccem.environment.references`, `ccem.environment.rename`, `ccem.environment.delete` |
+
+</details>
+
+**Deeplinks.** `ccem://workspace/session?…` links open and focus a specific session in Desktop, from a chat message, a notification or `ccem desktop open`.
+
+---
+
+## How ccem Compares
+
+| | ccem | Vanilla Claude Code |
+|---|---|---|
+| Multi-provider switching | 11 presets with tier mapping, CLI + GUI | Manual `export` |
+| Permission presets | 6 modes | Built-in modes, configured manually |
+| Agents | Claude Code, Codex, OpenCode (+ DeepSeek Harness via CLI) | Claude Code |
+| Per-subagent model routing | Local routing proxy, profiles, templates | — |
+| Remote control | Hermes WeCom/Feishu, Telegram, WeChat, WeCom | — |
+| Scheduled automation | Cron with templates, profiles and budgets | — |
+| Unified usage analytics | Claude + Codex + OpenCode | — |
+| Session review, fork & rewind | Diffs, todos, artifacts, subagent traces | Partial (CLI rewind) |
+| External API | 20-method JSON-RPC + `ccem://` deeplinks | — |
+| Price | Free & open source | Free CLI |
 
 ---
 
@@ -505,31 +531,44 @@ A local JSON-RPC server for programmatic control:
 
 | Path | Contents |
 |---|---|
-| `~/.ccem/config.json` | Environment config (API keys encrypted) |
+| `~/.ccem/config.json` | Environments (API keys encrypted) and settings, shared by CLI and Desktop |
+| `~/.ccem/cron-tasks.json` | Scheduled tasks |
 | `~/.ccem/usage-cache.json` | Usage cache |
-| `~/.ccem/model-prices.json` | Price cache |
+| `~/.ccem/model-prices.json` | Model price cache |
+| `~/.ccem/control.json` | Local JSON-RPC endpoint descriptor (while Desktop runs) |
 | `.claude/settings.json` | Project permission config |
-| `.claude/skills/` | Installed skills |
+| `~/.claude/skills/`, `.claude/skills/` | Installed skills |
 
 ---
 
 ## Tech Stack
 
 ```
-apps/cli/          CLI — Commander.js + Inquirer.js + Ink (React for CLI)
-apps/desktop/      Desktop — Tauri 2.0 + React 18 + Rust
-packages/core/     Shared logic — presets, types, encryption
-server/            Remote config server
+apps/cli/          CLI: Commander + Inquirer + Ink (React for the terminal)
+apps/desktop/      Desktop: Tauri 2 + Rust backend + React 18 frontend
+packages/core/     Shared presets, types, encryption, routing (Node + browser builds)
+server/            Remote config server (Express)
 ```
 
-pnpm workspaces monorepo. **Frontend**: Vite, Tailwind CSS, Zustand, shadcn/ui, Recharts, GSAP. **Backend**: Rust + Tauri 2.0, window-vibrancy (macOS glassmorphism). **i18n**: Chinese / English.
+A pnpm workspaces monorepo. **Frontend**: Vite, Tailwind CSS, Zustand, shadcn/ui, Recharts, GSAP. **Backend**: Rust on Tauri 2, with macOS window vibrancy. **i18n**: Chinese and English.
+
+Architecture notes for contributors: [Desktop Backend](docs/architecture/desktop-backend.md) · [Desktop Frontend](docs/architecture/desktop-frontend.md) · [Design System](docs/architecture/design-system.md)
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome!
+Issues and PRs are welcome!
+
+```bash
+pnpm install
+pnpm --filter @ccem/core build   # Build core first
+pnpm run dev                     # Dev mode for all packages
+pnpm verify                      # Full local CI gate
+```
+
+For Desktop, run `cd apps/desktop && pnpm tauri:dev`. See [CLAUDE.md](./CLAUDE.md) for the dev-instance rules.
 
 ## License
 
-MIT
+Apache License 2.0. See [LICENSE](./LICENSE) for the full text.
