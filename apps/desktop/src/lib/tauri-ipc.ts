@@ -136,7 +136,7 @@ export interface TauriCommands {
   get_session_router: [{ runtimeId: string }, SessionRouterState];
   update_session_router: [{ request: UpdateSessionRouterRequest }, SessionRouterState];
   restart_native_session_direct: [{ runtimeId: string }, SessionRouterState];
-  generate_workspace_session_title: [{ titleInput: string }, string | null];
+  generate_workspace_session_title: [{ titleInput: string; envName?: string; workingDir?: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
   browser_surface_acquire: [BrowserSurfaceAcquireRequest, BrowserSurfaceLease];
   browser_surface_sync: [BrowserSurfaceSyncRequest, void];

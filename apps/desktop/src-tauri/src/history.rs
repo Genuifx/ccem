@@ -2124,6 +2124,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
 
     let mut session_id = path.file_stem()?.to_str()?.to_string();
     let mut display: Option<String> = None;
+    let mut display_priority = 0;
     let mut timestamp = 0;
     let mut project = String::new();
 
@@ -2155,9 +2156,22 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
         }
 
         if let Some(candidate) = extract_claude_project_display_candidate(&value) {
-            let candidate = normalize_history_display(Some(candidate));
-            if !candidate.is_empty() {
+            let priority = match value.get("type").and_then(|v| v.as_str()) {
+                Some("custom-title") => 4,
+                Some("summary") => 3,
+                Some("user") => 2,
+                _ => 1, // last-prompt is only a fallback if no real request exists.
+            };
+            let candidate = if priority == 4 {
+                clean_display_title(&candidate)
+            } else {
+                normalize_history_display(Some(candidate))
+            };
+            if !candidate.is_empty()
+                && (priority > display_priority || (priority >= 3 && priority == display_priority))
+            {
                 display = Some(candidate);
+                display_priority = priority;
             }
         }
     }
@@ -2171,7 +2185,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
     Some(HistorySession {
         id: session_id,
         source: SOURCE_CLAUDE.to_string(),
-        display: normalize_history_display(display),
+        display: if display_priority == 4 { display.unwrap_or_default() } else { normalize_history_display(display) },
         timestamp,
         project,
         project_name,
@@ -2185,6 +2199,10 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
 
 fn extract_claude_project_display_candidate(value: &serde_json::Value) -> Option<String> {
     match value.get("type").and_then(|v| v.as_str()) {
+        Some("custom-title") => value
+            .get("customTitle")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
         Some("last-prompt") => value
             .get("lastPrompt")
             .and_then(|v| v.as_str())
@@ -4680,7 +4698,9 @@ fn normalize_history_display(display: Option<String>) -> String {
 /// Non-destructive cleanup: strip noise artifacts but do NOT truncate.
 /// Search and export rely on the raw string; truncation is handled by frontend CSS.
 fn clean_display_title(raw: &str) -> String {
-    let s = raw.trim();
+    let visible = crate::user_prompt_display::normalize_user_visible_prompt(raw)
+        .unwrap_or_default();
+    let s = visible.trim();
     if s.is_empty() {
         return String::new();
     }
@@ -4944,12 +4964,13 @@ fn is_noise_display(display: &str) -> bool {
 fn is_low_signal_followup(display: &str) -> bool {
     let trimmed = display
         .trim()
-        .trim_start_matches(|c: char| {
+        .trim_matches(|c: char| {
             matches!(c, '?' | '？' | '!' | '！' | '.' | '。' | ',' | '，')
         })
-        .trim_start();
+        .trim()
+        .to_ascii_lowercase();
 
-    matches!(trimmed, "继续" | "继续呢" | "继续啊" | "怎么样了")
+    matches!(trimmed.as_str(), "继续" | "继续呢" | "继续啊" | "继续呗" | "怎么样了" | "好的" | "ok" | "hi" | "hello" | "你好")
 }
 
 /// Heuristic: slash command token such as /clear, /superpowers:executing-plans.
@@ -5055,7 +5076,7 @@ mod tests {
         load_claude_history_from_paths_limited_with_provenance_records,
         load_codex_history_from_config, merge_opencode_history_session,
         merge_tool_results_into_messages, normalize_history_display, normalize_history_limit,
-        normalize_history_source, parse_claude_conversation_file, parse_codex_history_timestamp,
+        normalize_history_source, parse_claude_conversation_file, parse_claude_project_session_index, parse_codex_history_timestamp,
         parse_opencode_conversation_export, parse_opencode_history_session,
         resolve_codex_path_config_from, score_history_search_match,
         supplement_history_from_provenance_records, upsert_codex_history_session, CodexHistoryLine,
@@ -6304,6 +6325,52 @@ mod tests {
         assert_eq!(session.display, "");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_claude_project_title_keeps_first_visible_task_through_followups() {
+        let root = temp_history_dir("stable-visible-title");
+        let path = root.join("session-1.jsonl");
+        let prompt = format!("<system_tip>{}</system_tip>\n\n<selected_skills>hidden</selected_skills>\n<user_request>修复 ProjectTree 标题生成</user_request>", crate::user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP);
+        let lines = [
+            serde_json::json!({"type":"user","cwd":"/tmp/ccem","message":{"content":"hi"}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"text","text":prompt}]}}),
+            serde_json::json!({"type":"user","message":{"content":"继续呗"}}),
+            serde_json::json!({"type":"user","message":{"content":"给这个改动补测试"}}),
+            serde_json::json!({"type":"last-prompt","lastPrompt":"给这个改动补测试"}),
+        ];
+        fs::write(&path, lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let session = parse_claude_project_session_index(&path).unwrap();
+        assert_eq!(session.display, "修复 ProjectTree 标题生成");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_claude_project_manual_title_wins_over_summaries_and_user_requests() {
+        let root = temp_history_dir("explicit-provider-title");
+        let path = root.join("session-1.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","message":{"content":"原始用户请求"}}),
+            serde_json::json!({"type":"summary","summary":"自动摘要"}),
+            serde_json::json!({"type":"custom-title","customTitle":"手动命名 ProjectTree"}),
+            serde_json::json!({"type":"summary","summary":"后续摘要"}),
+            serde_json::json!({"type":"user","message":{"content":"后续请求"}}),
+        ];
+        fs::write(&path, lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        assert_eq!(parse_claude_project_session_index(&path).unwrap().display, "手动命名 ProjectTree");
+        fs::write(&path, "{\"type\":\"custom-title\",\"customTitle\":\"Hi\"}\n{\"type\":\"summary\",\"summary\":\"后续摘要\"}\n").unwrap();
+        assert_eq!(parse_claude_project_session_index(&path).unwrap().display, "Hi");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_history_display_recovers_owned_wrappers_but_preserves_user_xml() {
+        let prompt = format!("<system_tip>{}</system_tip>\n\n请生成报告\n并提供预览", crate::user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP);
+        assert_eq!(normalize_history_display(Some(prompt)), "请生成报告 并提供预览");
+        assert_eq!(normalize_history_display(Some("<workspace_annotations>hidden</workspace_annotations>".into())), "");
+        assert_eq!(normalize_history_display(Some("<system_tip>用户自己写的 XML</system_tip>保留全文".into())), "<system_tip>用户自己写的 XML</system_tip>保留全文");
+        assert_eq!(normalize_history_display(Some("继续呗！".into())), "");
+        assert_eq!(normalize_history_display(Some("继续优化标题生成".into())), "继续优化标题生成");
     }
 
     #[test]

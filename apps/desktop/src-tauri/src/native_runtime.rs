@@ -1538,18 +1538,18 @@ fn spawn_queue_autodrain(dispatch: impl FnOnce() + Send + 'static) {
 }
 
 #[derive(Debug)]
-struct NativeHelperChild {
+pub(crate) struct NativeHelperChild {
     inner: Arc<SharedChild>,
     writer: Option<NativeHelperWriter>,
     process_tree: Arc<NativeProcessTree>,
 }
 
 impl NativeHelperChild {
-    fn pid(&self) -> u32 {
+    pub(crate) fn pid(&self) -> u32 {
         self.inner.id()
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.write_until(bytes.to_vec(), Instant::now() + NATIVE_HELPER_WRITE_TIMEOUT)
     }
 
@@ -1560,7 +1560,7 @@ impl NativeHelperChild {
             .write_until(bytes, deadline)
     }
 
-    fn kill(mut self) -> Result<(), String> {
+    pub(crate) fn kill(mut self) -> Result<(), String> {
         self.writer.take();
         let tree_result = self.process_tree.kill();
         let _ = self.inner.kill();
@@ -1771,7 +1771,7 @@ impl NativeProcessTree {
     }
 }
 
-fn spawn_native_helper_process(
+pub(crate) fn spawn_native_helper_process(
     mut command: StdCommand,
 ) -> Result<(Receiver<CommandEvent>, NativeHelperChild), String> {
     command
