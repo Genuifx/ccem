@@ -306,11 +306,17 @@ def finalize(args: argparse.Namespace) -> dict:
                 "bundle_identifier": None, "publisher": "CCEM"}}}
     manifest_path = output / "manifest.json"
     write_json(manifest_path, manifest)
-    signature, public = sign(manifest_path.read_bytes(), args.signing_seed.resolve())
-    (output / "manifest.json.sig").write_text(signature)
-    (output / "public-key.pub").write_text(public)
+    if args.external_signature:
+        # A publisher signs these exact bytes with the existing CI-only Tauri key.
+        # Never leave a stale signature from a previous version next to the new manifest.
+        (output / "manifest.json.sig").unlink(missing_ok=True)
+        (output / "public-key.pub").unlink(missing_ok=True)
+    else:
+        signature, public = sign(manifest_path.read_bytes(), args.signing_seed.resolve())
+        (output / "manifest.json.sig").write_text(signature)
+        (output / "public-key.pub").write_text(public)
     receipt = json.loads((output / "build-receipt.json").read_text())
-    receipt.update({"buildState": "complete", "version": args.version, "sequence": args.sequence, "artifactBytes": archive_size,
+    receipt.update({"buildState": "awaiting_signature" if args.external_signature else "complete", "version": args.version, "sequence": args.sequence, "artifactBytes": archive_size,
         "unpackedBytes": unpacked, "fileCount": len(files), "archiveSha256": manifest["artifact"]["archive"]["sha256"],
         "patchSha256": sha256(patch), "hostSha256": sha256(host), "relocatedSelfTest": result,
         "nativeAudit": audit,
@@ -334,9 +340,10 @@ def main() -> None:
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--source-base-url", default="https://127.0.0.1:57890")
     parser.add_argument("--signing-seed", type=Path)
+    parser.add_argument("--external-signature", action="store_true", help="Emit exact manifest bytes for CI Tauri signing; verification is required before publishing")
     args = parser.parse_args()
-    if args.stage != "prepare" and (args.signing_seed is None or args.sequence < 1):
-        parser.error("finalization requires --signing-seed and a positive sequence")
+    if args.stage != "prepare" and (bool(args.signing_seed) == args.external_signature or args.sequence < 1):
+        parser.error("finalization requires exactly one of --signing-seed or --external-signature and a positive sequence")
     if args.stage in {"prepare", "all"}:
         print(json.dumps(prepare(args), indent=2))
     if args.stage in {"finalize", "all"}:

@@ -4,6 +4,8 @@
 
 #[path = "hermes_installer/package.rs"]
 mod package;
+#[path = "hermes_installer/release_source.rs"]
+mod release_source;
 #[cfg(test)]
 #[path = "hermes_installer/tests.rs"]
 mod tests;
@@ -11,7 +13,7 @@ mod tests;
 use crate::browser::runtime::{
     activation::{ActivationFault, ActivationStore, ActiveRuntimeLease, VerifiedRuntimeReceipt},
     download::{
-        download_archive_with_options, DownloadControl, DownloadErrorCode,
+        download_archive_with_redirect_policy, DownloadControl, DownloadErrorCode,
         DownloadProgressReporter, DownloadSpec,
     },
     extract::{extract_runtime_archive_with_cancel, ExtractionErrorCode},
@@ -271,6 +273,13 @@ impl HermesInstaller {
     }
 
     pub fn lease_runtime(&self) -> Result<HermesRuntimeLease, HermesInstallError> {
+        self.lease_runtime_with_source(&Source::configured()?)
+    }
+
+    fn lease_runtime_with_source(
+        &self,
+        source: &Source,
+    ) -> Result<HermesRuntimeLease, HermesInstallError> {
         let paths = self.paths()?;
         if !paths.active_pointer.exists() {
             return Err(failure("not_installed", "聊天组件尚未安装。", true));
@@ -281,7 +290,6 @@ impl HermesInstaller {
             .ok_or_else(|| failure("not_installed", "聊天组件尚未安装。", true))?;
         let receipt = &lease.pointer().active;
         let launch = launch_for(&paths, receipt);
-        let source = Source::configured()?;
         let manifest_bytes = read_regular(
             &launch.runtime_root.join("manifest.json"),
             MAX_MANIFEST_BYTES,
@@ -291,7 +299,7 @@ impl HermesInstaller {
             MAX_SIGNATURE_BYTES,
         )?;
         let verified =
-            self.verify_manifest(&source, &manifest_bytes, &signature, receipt.sequence)?;
+            self.verify_manifest(source, &manifest_bytes, &signature, receipt.sequence)?;
         if verified.exact_bytes_sha256 != receipt.manifest_sha256 {
             return Err(failure(
                 "manifest_mismatch",
@@ -331,6 +339,7 @@ impl HermesInstaller {
             fetch_bounded(&format!("{}.sig", source.manifest_url), MAX_SIGNATURE_BYTES)?;
         let verified = self.verify_manifest(&source, &manifest, &signature, sequence)?;
         let artifact = &verified.manifest.artifact;
+        let artifact_url = source.artifact_url(&artifact.source_url)?;
         if let Some(active) = current
             .as_ref()
             .filter(|p| p.active.manifest_sha256 == verified.exact_bytes_sha256)
@@ -375,7 +384,7 @@ impl HermesInstaller {
         self.check_cancel()?;
         self.set_phase("downloading");
         let spec = DownloadSpec {
-            source_url: source.artifact_url(&artifact.source_url)?,
+            source_url: artifact_url,
             expected_size: artifact.archive.byte_size,
             expected_sha256: artifact.archive.sha256.clone(),
             completed_path: archive_path(&paths, &verified),
@@ -383,12 +392,13 @@ impl HermesInstaller {
         // The shared downloader keeps an ETag/Range journal and verifies the entire final hash.
         let mut attempts = 0;
         loop {
-            match download_archive_with_options(
+            match download_archive_with_redirect_policy(
                 &spec,
                 &self.download,
                 self,
                 Duration::from_secs(10),
                 Duration::from_secs(30),
+                release_source::redirect_policy(&spec.source_url),
             ) {
                 Ok(_) => break,
                 Err(error) => {
@@ -541,7 +551,9 @@ impl HermesInstaller {
                 false,
             ));
         }
-        source.artifact_url(&artifact.source_url)?;
+        // Launch leases verify the pinned publisher, saved receipt and local package.
+        // Only a new download is bound to the current compiled Release URL: advancing
+        // that URL must not disable an existing compatible, authenticated runtime.
         Ok(verified)
     }
 
@@ -626,6 +638,14 @@ impl Source {
         }
         let url = option_env!("CCEM_HERMES_RUNTIME_MANIFEST_URL").filter(|s| !s.is_empty());
         let key = option_env!("CCEM_HERMES_RUNTIME_PUBLIC_KEY").filter(|s| !s.is_empty());
+        let defaults;
+        let (url, key) = match (url, key) {
+            (None, None) => {
+                defaults = release_source::pinned_source()?;
+                (Some(defaults.0.as_str()), Some(defaults.1.as_str()))
+            }
+            values => values,
+        };
         match (url, key) {
             (Some(url), Some(key)) => {
                 let parsed = reqwest::Url::parse(url).map_err(|_| source_failure())?;
@@ -646,6 +666,20 @@ impl Source {
         let mut artifact = reqwest::Url::parse(value).map_err(|_| source_failure())?;
         let manifest = reqwest::Url::parse(&self.manifest_url).map_err(|_| source_failure())?;
         validate_url(&artifact)?;
+        if manifest.host_str() == Some("github.com")
+            && (!release_source::is_release_asset(&manifest)
+                || artifact.path()
+                    != format!(
+                        "{}/hermes-macos-aarch64.zip",
+                        manifest.path().trim_end_matches("/manifest.json")
+                    ))
+        {
+            return Err(failure(
+                "source_rejected",
+                "聊天组件下载源不在受信发布源内。",
+                false,
+            ));
+        }
         if artifact.scheme() != "https"
             || artifact.host_str() != manifest.host_str()
             || artifact.port_or_known_default()
@@ -689,7 +723,7 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 }
 fn fetch_bounded(url: &str, maximum: u64) -> Result<Vec<u8>, HermesInstallError> {
     let response = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(release_source::redirect_policy(url))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build()
@@ -697,6 +731,13 @@ fn fetch_bounded(url: &str, maximum: u64) -> Result<Vec<u8>, HermesInstallError>
         .get(url)
         .send()
         .map_err(|_| failure("network", "无法连接聊天组件发布源。", true))?;
+    if response.status().is_redirection() {
+        return Err(failure(
+            "source_rejected",
+            "聊天组件发布源发生不受信的跳转。",
+            false,
+        ));
+    }
     if response.status() != reqwest::StatusCode::OK
         || response.content_length().is_some_and(|n| n > maximum)
     {

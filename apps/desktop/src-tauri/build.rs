@@ -1,4 +1,7 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=CCEM_HERMES_RUNTIME_MANIFEST_URL");
+    println!("cargo:rerun-if-env-changed=CCEM_HERMES_RUNTIME_PUBLIC_KEY");
+    println!("cargo:rerun-if-changed=hermes-runtime-source.json");
     println!("cargo:rerun-if-env-changed=CCEM_OFFICIAL_APPLE_TEAM_ID");
     println!("cargo:rerun-if-env-changed=APPLE_SIGNING_IDENTITY");
     if let Ok(team_identifier) = std::env::var("CCEM_OFFICIAL_APPLE_TEAM_ID") {

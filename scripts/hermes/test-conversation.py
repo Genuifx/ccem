@@ -27,7 +27,8 @@ package = args.package.resolve(strict=True)
 temporary = tempfile.TemporaryDirectory(prefix="ccem-native-chat-test-")
 os.environ.clear()
 os.environ.update(HOME=temporary.name, HERMES_HOME=temporary.name, PATH="/usr/bin:/bin",
-    HERMES_SAFE_MODE="1", HERMES_DISABLE_LAZY_INSTALLS="1", HERMES_BUNDLED_PLUGINS=str(package / "source/plugins"))
+    HERMES_SAFE_MODE="1", HERMES_DISABLE_LAZY_INSTALLS="1", HERMES_BUNDLED_PLUGINS=str(package / "source/plugins"),
+    NO_PROXY="127.0.0.1,localhost,::1")
 sys.path.insert(0, str(package / "source"))
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("conversation_host_test", Path(__file__).with_name("ccem_gateway_host.py"))

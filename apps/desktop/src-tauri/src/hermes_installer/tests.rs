@@ -165,6 +165,34 @@ fn authenticated_manifest_tampering_and_downgrade_are_rejected() {
     assert!(!temp.path().join("runtime").exists());
 }
 
+#[test]
+fn advancing_release_source_preserves_cached_manifest_trust_but_rejects_old_downloads() {
+    let temp = tempfile::tempdir().unwrap();
+    let installer = HermesInstaller::new(temp.path().join("runtime"));
+    let next_source = Source {
+        manifest_url: "https://github.com/Genuifx/ccem/releases/download/2026.10.3.1/manifest.json"
+            .into(),
+        public_key: include_str!("fixtures/public-key.pub").into(),
+        development_loopback: false,
+    };
+    let verified = installer
+        .verify_manifest(
+            &next_source,
+            include_bytes!("fixtures/manifest.json"),
+            include_bytes!("fixtures/manifest.json.sig"),
+            7,
+        )
+        .unwrap();
+    assert!(next_source
+        .artifact_url(&verified.manifest.artifact.source_url)
+        .is_err());
+    let old_release =
+        "https://github.com/Genuifx/ccem/releases/download/2026.10.2.1/hermes-macos-aarch64.zip";
+    assert!(next_source.artifact_url(old_release).is_err());
+    assert!(next_source.artifact_url("https://github.com/Genuifx/ccem/releases/download/2026.10.3.1/hermes-macos-aarch64.zip").is_ok());
+    assert!(!temp.path().join("runtime").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_runtime_root_or_parent_is_rejected_without_writes() {
@@ -248,6 +276,20 @@ fn signed_package_install_relocation_lease_and_remove() {
     installer
         .install()
         .expect("an identical verified package is already installed");
+    assert_eq!(fs::read(root.join("active.json")).unwrap(), pointer_before);
+    // A newer Desktop points downloads at a newer component. Its existing local
+    // runtime must still obtain a fully verified lease without visiting that source.
+    let next_source = Source {
+        manifest_url: "https://github.com/Genuifx/ccem/releases/download/2026.10.3.1/manifest.json"
+            .into(),
+        public_key: Source::configured().unwrap().public_key,
+        development_loopback: false,
+    };
+    drop(
+        installer
+            .lease_runtime_with_source(&next_source)
+            .expect("cached runtime survives the next Release URL"),
+    );
     assert_eq!(fs::read(root.join("active.json")).unwrap(), pointer_before);
     assert!(fs::read_dir(root.join("candidates"))
         .unwrap()
