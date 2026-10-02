@@ -1,5 +1,11 @@
 # ccem
 
+## 2.91.1
+
+### Patch Changes
+
+- Repair Hermes installation in published Desktop builds by pinning an independently signed GitHub Release component and validating its availability before producing Desktop release packages.
+
 ## 2.91.0
 
 ### Minor Changes

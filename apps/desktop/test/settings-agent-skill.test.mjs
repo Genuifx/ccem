@@ -36,14 +36,12 @@ test('bundled CCEM agent skill teaches agents to use the JSON desktop CLI wrappe
 test('bundled CCEM agent skill matches the supported cron CLI contract', async () => {
   const [skillSource, cliSource] = await Promise.all([
     fs.readFile(path.join(repoRoot, 'packages/agent-skills/ccem/SKILL.md'), 'utf8'),
-    fs.readFile(path.join(repoRoot, 'apps/cli/src/index.ts'), 'utf8'),
+    fs.readFile(path.join(repoRoot, 'apps/cli/src/cronCommands.ts'), 'utf8'),
   ]);
   const cronStart = cliSource.indexOf('const cronCmd = program');
-  const cronEnd = cliSource.indexOf('const setupCmd = program');
   assert.notEqual(cronStart, -1);
-  assert.notEqual(cronEnd, -1);
 
-  const cronCliSource = cliSource.slice(cronStart, cronEnd);
+  const cronCliSource = cliSource.slice(cronStart);
   const cronCommands = [...cronCliSource.matchAll(/cronCmd\s*\n\s*\.command\('([^']+)'\)/g)]
     .map((match) => match[1].split(' ')[0]);
 
