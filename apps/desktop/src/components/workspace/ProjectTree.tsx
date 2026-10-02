@@ -17,6 +17,7 @@ import { useLocale } from '@/locales';
 import type { Environment } from '@/store';
 import type { HistorySessionItem, SessionStickerId, SessionTaskStage } from '@/features/conversations/types';
 import { SessionTreeItemIcon, resolveSessionClient } from './sessionTreeIcons';
+import { WorkspaceSessionTitle } from './WorkspaceSessionTitle';
 import { buildCcemSessionLinkForHistorySession } from './sessionLinks';
 import type { WorkspaceSessionDecoration } from './useWorkspaceSessionDecorations';
 import {
@@ -782,14 +783,16 @@ export const ProjectTree = memo(function ProjectTree({
       const seenSessionKeys = new Set<string>();
 
       for (const node of precomputedProjectNodes) {
-        const unpinnedNodeSessions = node.sessions.filter((session) => {
-          const key = canonicalizeSessionKey(toKey(session));
-          if (pinnedSessionKeySet.has(key) || seenSessionKeys.has(key)) {
-            return false;
-          }
-          seenSessionKeys.add(key);
-          return true;
-        });
+        const unpinnedNodeSessions = node.sessions
+          .map((session) => sessionByKey.get(canonicalizeSessionKey(toKey(session))) ?? session)
+          .filter((session) => {
+            const key = canonicalizeSessionKey(toKey(session));
+            if (pinnedSessionKeySet.has(key) || seenSessionKeys.has(key)) {
+              return false;
+            }
+            seenSessionKeys.add(key);
+            return true;
+          });
 
         if (unpinnedNodeSessions.length === 0) {
           continue;
@@ -836,7 +839,7 @@ export const ProjectTree = memo(function ProjectTree({
     }
 
     return buildProjectNodes(unpinnedSessions);
-  }, [canonicalizeSessionKey, pinnedSessionKeySet, precomputedProjectNodes, unpinnedSessions]);
+  }, [canonicalizeSessionKey, pinnedSessionKeySet, precomputedProjectNodes, sessionByKey, unpinnedSessions]);
 
   const activityProjectOrder = useMemo(
     () => activitySortedProjectNodes.map((node) => node.project),
@@ -1474,9 +1477,10 @@ export const ProjectTree = memo(function ProjectTree({
               className="flex min-w-0 flex-1 flex-col"
               title={`${getHistorySessionDisplay(session, t('history.untitledSession'))}\n${session.project}`}
             >
-              <span className="min-w-0 truncate text-sm font-medium leading-tight">
-                {getHistorySessionDisplay(session, t('history.untitledSession'))}
-              </span>
+              <WorkspaceSessionTitle
+                className="text-sm font-medium leading-tight"
+                title={getHistorySessionDisplay(session, t('history.untitledSession'))}
+              />
               <span className="mt-0.5 flex min-w-0 items-center gap-1">
                 <span
                   className={cn(
@@ -1500,9 +1504,10 @@ export const ProjectTree = memo(function ProjectTree({
               >
                 {iconContent}
               </span>
-              <span className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
-                {getHistorySessionDisplay(session, t('history.untitledSession'))}
-              </span>
+              <WorkspaceSessionTitle
+                className="flex-1 text-sm font-medium leading-tight"
+                title={getHistorySessionDisplay(session, t('history.untitledSession'))}
+              />
             </>
           )}
           <span className="inline-flex w-10 shrink-0 items-center justify-end gap-1.5 whitespace-nowrap text-[10px] tabular-nums transition-opacity duration-150 group-hover/session:opacity-0">

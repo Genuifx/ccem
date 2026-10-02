@@ -1711,8 +1711,12 @@ export function useTauriCommands() {
     return router;
   }, [setSessionRouter]);
 
-  const generateWorkspaceSessionTitle = useCallback(async (titleInput: string): Promise<string | null> => {
-    return invoke<string | null>('generate_workspace_session_title', { titleInput });
+  const generateWorkspaceSessionTitle = useCallback(async (
+    titleInput: string,
+    envName?: string,
+    workingDir?: string,
+  ): Promise<string | null> => {
+    return invoke<string | null>('generate_workspace_session_title', { titleInput, envName, workingDir });
   }, []);
 
   const openTextInVSCode = useCallback(async (

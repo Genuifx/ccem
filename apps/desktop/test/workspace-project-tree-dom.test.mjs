@@ -86,6 +86,7 @@ const motionStubPlugin = {
           };
           export function shouldReduceMotion() { return true; }
           export function clearMotionProps() {}
+          export function useGSAP() {}
         `,
       }),
     );
@@ -507,6 +508,27 @@ test('ProjectTree moves an existing session to its new recency position when act
     'claude:scheduled',
     'claude:middle',
   ]);
+});
+
+test('ProjectTree applies a generated live title while its precomputed history nodes stay stale', async (t) => {
+  const { dom } = installDom();
+  const { harness, tempDir } = await importProjectTreeHarness();
+  const container = document.querySelector('#root');
+  const selected = [];
+  const historySessions = [historySession({ id: 'title-provider', timestamp: Date.now(), display: '原始用户请求' })];
+  const entry = liveEntry({ runtimeId: 'title-runtime', providerSessionId: 'title-provider', updatedAt: new Date().toISOString() });
+  const props = { historySessions, liveEntries: [entry], onSelect: (session) => selected.push(session) };
+  const mounted = harness.mountProjectTree(container, props);
+  t.after(async () => { mounted.unmount(); dom.window.close(); await fs.rm(tempDir, { recursive: true, force: true }); });
+  const before = rowsWithKey(container, 'claude:title-provider')[0];
+  assert.equal(before.querySelector('[data-title-current]').textContent, '原始用户请求');
+  mounted.render({ ...props, liveEntries: [{ ...entry, session: { ...entry.session, display_title: '生成的短标题', display_title_revision: 2 } }] });
+  const after = rowsWithKey(container, 'claude:title-provider')[0];
+  assert.equal(after, before, 'title changes must preserve the existing row DOM');
+  assert.equal(after.querySelector('[data-title-current]').textContent, '生成的短标题');
+  mounted.click(after);
+  assert.equal(selected.at(-1).display, '生成的短标题');
+  assert.equal(historySessions[0].display, '原始用户请求', 'cached snapshots remain immutable');
 });
 
 test('ProjectTree toggles between project groups and a time-sorted flat session list', async (t) => {

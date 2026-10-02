@@ -2757,7 +2757,7 @@ export function Workspace({
       session.runtime_id,
     );
 
-    void generateWorkspaceSessionTitle(normalizedInput)
+    void generateWorkspaceSessionTitle(normalizedInput, session.env_name, session.project_dir)
       .then(async (generatedTitle) => {
         const title = generatedTitle?.trim();
         if (

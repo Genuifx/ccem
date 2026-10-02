@@ -12,7 +12,7 @@ use std::{
 };
 
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +176,26 @@ mod tests {
         fs::write(&cache, "broken json").unwrap();
         assert_eq!(load(&[path.clone()], Some(&cache), parse).len(), 1);
         assert_eq!(load(&[path], Some(dir.path()), parse).len(), 1);
+    }
+
+    #[test]
+    fn parser_version_change_rebuilds_unchanged_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let cache = dir.path().join("index.json");
+        fs::write(&path, "visible request").unwrap();
+        load(&[path.clone()], Some(&cache), parse);
+        let mut old_cache: serde_json::Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+        old_cache["version"] = serde_json::json!(VERSION - 1);
+        fs::write(&cache, old_cache.to_string()).unwrap();
+        let mut reads = 0;
+        let result = load(&[path], Some(&cache), |path| {
+            reads += 1;
+            parse(path)
+        });
+        assert_eq!(reads, 1);
+        assert_eq!(result[0].display, "visible request");
+        assert_eq!(read_index(&cache).version, VERSION);
     }
 
     #[test]

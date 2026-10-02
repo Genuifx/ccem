@@ -49,7 +49,7 @@ export function buildClaudeQueryEnv({
     delete cleanBaseEnv[key];
   }
 
-  const env = {
+  const env: Record<string, string | undefined> = {
     ...cleanBaseEnv,
     ...envVars,
     CLAUDE_AGENT_SDK_CLIENT_APP: CLAUDE_DESKTOP_CLIENT_APP,

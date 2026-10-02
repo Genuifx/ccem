@@ -320,6 +320,38 @@ test('resolves review provider session id from a native wrapper history session'
   assert.equal(providerSessionId, 'd4465693-907c-4499-840a-106c33f6a967');
 });
 
+test('a persisted live title immediately replaces stale provider history without losing annotations', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+  const previous = historySession({ id: 'provider-1', display: '旧历史提示', taskStage: 'validation', taskLabel: '人工标签' });
+  const sessions = buildWorkspaceSidebarSessions([previous], [{
+    session: nativeSession({ provider_session_id: 'provider-1', display_title: '可靠的会话标题', display_title_revision: 2 }),
+    initialPrompt: '原始请求',
+  }]);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].display, '可靠的会话标题');
+  assert.equal(sessions[0].taskStage, 'validation');
+  assert.equal(sessions[0].taskLabel, '人工标签');
+  assert.equal(sessions[0].timestamp, previous.timestamp);
+  assert.equal(previous.display, '旧历史提示');
+});
+
+test('a live authoritative clear replaces stale history with the original request', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+  const sessions = buildWorkspaceSidebarSessions([historySession({ id: 'provider-1', display: '刚被清除的标题' })], [{
+    session: nativeSession({ provider_session_id: 'provider-1', display_title: null, display_title_revision: 3, initial_user_prompt: '最初的有效请求' }),
+    initialPrompt: '继续呗',
+    generatedTitle: '过期生成标题',
+  }]);
+  assert.equal(sessions[0].display, '最初的有效请求');
+});
+
+test('an empty history title can use the visible live request without replacing a named history title', async () => {
+  const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
+  const entry = { session: nativeSession({ provider_session_id: 'provider-1', initial_user_prompt: '最初的有效请求' }), initialPrompt: 'hi' };
+  assert.equal(buildWorkspaceSidebarSessions([historySession({ id: 'provider-1', display: '' })], [entry])[0].display, '最初的有效请求');
+  assert.equal(buildWorkspaceSidebarSessions([historySession({ id: 'provider-1', display: '手动历史标题' })], [entry])[0].display, '手动历史标题');
+});
+
 test('uses the history id itself for provider history sessions', async () => {
   const { resolveWorkspaceReviewProviderSessionId } = await importWorkspaceSidebarSessions();
 
