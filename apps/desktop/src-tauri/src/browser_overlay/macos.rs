@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 #[derive(Default)]
 struct NativeOverlayState {
+    enabled: bool,
     policy: OverlayPolicy,
     main_view: Option<Retained<NSView>>,
     app: Option<AppHandle>,
@@ -25,10 +26,40 @@ thread_local! {
 }
 
 pub(crate) fn enabled() -> bool {
-    STATE.with(|state| state.borrow().main_view.is_some())
+    STATE.with(|state| state.borrow().enabled)
 }
 pub(crate) fn modal() -> bool {
     STATE.with(|state| state.borrow().policy.modal)
+}
+
+fn main_view(window: &WebviewWindow) -> Result<Retained<NSView>, String> {
+    let pointer = window.ns_view().map_err(|error| error.to_string())?;
+    let parent = unsafe { pointer.cast::<NSView>().as_ref() }
+        .ok_or("Main content view is unavailable")?;
+    parent.subviews().into_iter()
+        .find(|view| unsafe { msg_send![view, isKindOfClass: class!(WKWebView)] })
+        .ok_or_else(|| "Main WKWebView is unavailable".into())
+}
+
+/** A new document starts in legacy mode, including when its boot ACK is late. */
+pub(crate) fn reset_for_frontend_boot(app: &AppHandle) -> Result<(), String> {
+    let reset_app = app.clone();
+    run_cancellable_on_main(app, MainThreadMarker::new().is_some(), Duration::from_secs(5),
+        "reset React browser composition", move || {
+            // Hide before releasing the old policy. Retained CEF stays under
+            // the same wrapper across reload and either presentation mode.
+            crate::browser::login::cef::surface::macos::configure_overlay_composition(false)?;
+            let window = reset_app.get_webview_window("main").ok_or("Main window is unavailable")?;
+            let view = main_view(&window)?;
+            unsafe {
+                let _: () = msg_send![&*view, setValue: &*NSNumber::new_bool(true), forKey: ns_string!("drawsBackground")];
+            }
+            STATE.with(|state| *state.borrow_mut() = NativeOverlayState {
+                main_view: Some(view), ..Default::default()
+            });
+            focus_main_view();
+            Ok(())
+        })
 }
 
 pub(crate) fn initialize(window: &WebviewWindow) -> Result<bool, String> {
@@ -43,22 +74,18 @@ pub(crate) fn initialize(window: &WebviewWindow) -> Result<bool, String> {
         Duration::from_secs(5),
         "initialize React browser composition",
         move || {
-            let pointer = window.ns_view().map_err(|error| error.to_string())?;
-            let parent = unsafe { pointer.cast::<NSView>().as_ref() }
-                .ok_or("Main content view is unavailable")?;
-            let main_view = parent
-                .subviews()
-                .into_iter()
-                .find(|view| unsafe { msg_send![view, isKindOfClass: class!(WKWebView)] })
-                .ok_or("Main WKWebView is unavailable")?;
+            let main_view = main_view(&window)?;
+            let parent = unsafe { main_view.superview() }.ok_or("Main content view is unavailable")?;
             // The same KVC key is used by this checkout's Wry 0.55 transparency
             // implementation. Never change the view's position in the hierarchy.
             unsafe {
                 let _: () = msg_send![&*main_view, setValue: &*NSNumber::new_bool(false), forKey: ns_string!("drawsBackground")];
             }
             parent.setWantsLayer(true);
+            crate::browser::login::cef::surface::macos::configure_overlay_composition(true)?;
             STATE.with(|state| {
                 *state.borrow_mut() = NativeOverlayState {
+                    enabled: true,
                     main_view: Some(main_view),
                     app: Some(app),
                     ..Default::default()
@@ -83,7 +110,7 @@ pub(crate) fn sync(
         move || {
             let changed = STATE.with(|state| {
                 let mut state = state.borrow_mut();
-                if state.main_view.is_none() {
+                if !state.enabled {
                     return Err("Native browser composition is unavailable".to_string());
                 }
                 let previous_revision = state.policy.revision;
@@ -126,20 +153,25 @@ define_class! {
         #[unsafe(method(hitTest:))]
         fn hit_test(&self, point: NSPoint) -> *mut NSView {
             if self.ivars().suspended.get() { return std::ptr::null_mut(); }
-            let main_view = STATE.with(|state| state.borrow().main_view.clone());
-            let Some(main_view) = main_view else { return std::ptr::null_mut(); };
-            let parent = unsafe { self.superview() };
-            let converted = main_view.convertPoint_fromView(point, parent.as_deref());
-            let x = converted.x;
-            let y = if main_view.isFlipped() { converted.y } else { main_view.bounds().size.height - converted.y };
-            if STATE.with(|state| state.borrow().policy.blocks(x, y)) { return std::ptr::null_mut(); }
+            let converted = if enabled() {
+                let main_view = STATE.with(|state| state.borrow().main_view.clone());
+                let Some(main_view) = main_view else { return std::ptr::null_mut(); };
+                let parent = unsafe { self.superview() };
+                let converted = main_view.convertPoint_fromView(point, parent.as_deref());
+                let x = converted.x;
+                let y = if main_view.isFlipped() { converted.y } else { main_view.bounds().size.height - converted.y };
+                if STATE.with(|state| state.borrow().policy.blocks(x, y)) { return std::ptr::null_mut(); }
+                Some((x, y))
+            } else { None };
             let target: *mut NSView = unsafe { msg_send![super(self), hitTest: point] };
             // During asynchronous CEF close/creation the wrapper may be empty.
             // Its own transparent background must never swallow React input.
             if std::ptr::eq(target, self as *const Self as *const NSView) {
                 return std::ptr::null_mut();
             }
-            if !target.is_null() { notify_pointer_down(self.mtm(), x, y); }
+            if !target.is_null() {
+                if let Some((x, y)) = converted { notify_pointer_down(self.mtm(), x, y); }
+            }
             target
         }
     }
@@ -160,7 +192,7 @@ impl BrowserHostView {
             if layer.is_null() {
                 return Err("CEF wrapper backing layer is unavailable".into());
             }
-            let _: () = msg_send![layer, setZPosition: -1.0_f64];
+            let _: () = msg_send![layer, setZPosition: if enabled() { -1.0_f64 } else { 0.0_f64 }];
             let _: () = msg_send![layer, setMasksToBounds: true];
             // Visual order comes from CALayer, input order from hitTest above.
             parent.addSubview(&this);
@@ -176,6 +208,12 @@ impl BrowserHostView {
     }
     pub(crate) fn resize(&self, bounds: NativeChildBounds) {
         self.setFrame(frame(bounds));
+    }
+    pub(crate) fn set_composition(&self, enabled: bool) {
+        unsafe {
+            let layer: *mut AnyObject = msg_send![self, layer];
+            let _: () = msg_send![layer, setZPosition: if enabled { -1.0_f64 } else { 0.0_f64 }];
+        }
     }
 }
 
@@ -252,6 +290,7 @@ pub(crate) fn probe_point(x: f64, y: f64) -> Result<serde_json::Value, String> {
         class.name().to_string_lossy().into_owned()
     };
     Ok(serde_json::json!({
+        "composition": enabled(),
         "hitMain": hit_main,
         "hitClass": hit.as_deref().map(name),
         "mainFrame": [main.frame().origin.x, main.frame().origin.y, main.frame().size.width, main.frame().size.height],

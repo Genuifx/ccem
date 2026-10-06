@@ -7,6 +7,7 @@ Manage scheduled tasks for Claude Code/Codex through the structured \`ccem cron\
 Determine the user's intent from their message:
 
 - **List/view**: user says "list", "show", "view", "查看", "列出"
+- **Run now**: user says "run now", "trigger", "立即运行", "马上跑", "手动触发"
 - **Delete/remove**: user says "delete", "remove", "删除", "移除"
 - **Create**: default for anything else
 
@@ -20,6 +21,9 @@ If the request is specific enough, create the task directly. Ask a follow-up onl
 - Working directory: default to the current directory via \`pwd\`.
 - Timeout: default to 300 seconds unless the task clearly needs longer.
 - Execution profile: use \`conservative\`, \`standard\`, or \`autonomous\` based on risk.
+
+- Hermes result delivery: when the user asks to send results to a bot, run \`ccem cron notification-targets --json\`. Select the paired recipient matching the user's request; ask when multiple recipients match. Never invent chat IDs or silently fall back to another channel on lookup failure.
+- Set \`hermesNotification: { routeId, generation }\` using that exact returned target. This grants only this task's completion notifications and does not require workspace access. Without an explicit notification request leave it null. Do not supply subscriptionId.
 
 Common cron patterns:
 
@@ -71,6 +75,18 @@ ccem cron list
 
 Use \`ccem cron list --json\` when you need exact fields.
 
+## Running A Task Now
+
+When the user wants an existing task to run immediately (instead of waiting for its schedule), trigger it through the CLI:
+
+\`\`\`bash
+ccem cron trigger "TASK_ID_OR_EXACT_NAME"
+\`\`\`
+
+- CCEM Desktop must be running; the task executes in the desktop's background and its run history appears there.
+- Triggering is not destructive and does not modify the task or its schedule, so no confirmation is needed beyond identifying the right task.
+- Report the task name/id from the command output. Run status is not available in the CLI.
+
 ## Deleting A Task
 
 1. List all tasks first so the user can identify which one to delete.
@@ -84,7 +100,7 @@ ccem cron delete "TASK_ID_OR_EXACT_NAME"
 ## Safety Rules
 
 - Do not directly read, write, or hand-edit \`~/.ccem/cron-tasks.json\`.
-- Use \`ccem cron create/list/delete\` as the stable contract.
+- Use \`ccem cron create/list/trigger/delete\` as the stable contract.
 - Never construct JSON by string concatenation; pass valid JSON to \`--from-json\`.
 - After creating or deleting a task, read back with \`ccem cron list --json\` and report the actual stored task.
 - Ask for confirmation first only when the request is ambiguous or destructive.

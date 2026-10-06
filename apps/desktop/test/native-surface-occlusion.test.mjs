@@ -164,7 +164,7 @@ test('overlay readiness waits for native hide ACK and overlapping leases restore
   assert.equal(store.isOccluded(), false);
   await drawer.release();
   assert.deepEqual(events, ['hide:start', 'hide:ack', 'restore']);
-  assert.deepEqual(states, [true, false]);
+  assert.deepEqual(states, [true, true, false]);
 });
 
 test('a new overlay waits for a fresh hide when restore is already running', async () => {
@@ -427,4 +427,30 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
   assert.match(projectPicker, /if \(!gatedOpen\)/);
   assert.match(reviewPopover, /const gatedOpen = useNativeSurfaceOcclusion\(isOpen\)/);
   assert.match(reviewPopover, /open=\{gatedOpen\}/);
+});
+
+test('suspended background animation frames cannot block the next overlay or restore through it', async (context) => {
+  const { createNativeSurfaceOcclusionStore } = await importOcclusionStore();
+  const originalFrame = globalThis.requestAnimationFrame;
+  const originalCancel = globalThis.cancelAnimationFrame;
+  globalThis.requestAnimationFrame = () => 1; // A real hidden WebView may never call it.
+  globalThis.cancelAnimationFrame = () => {};
+  context.after(() => {
+    globalThis.requestAnimationFrame = originalFrame;
+    globalThis.cancelAnimationFrame = originalCancel;
+  });
+  const events = [];
+  const store = createNativeSurfaceOcclusionStore();
+  store.registerParticipant({ hide: async () => events.push('hide'), restore: async () => events.push('restore') });
+  const first = store.acquire();
+  await first.ready;
+  const closing = first.release();
+  const second = store.acquire();
+  await second.ready;
+  await closing;
+  assert.equal(store.isOccluded(), true);
+  assert.equal(events.includes('restore'), false, 'the old close cannot reveal surfaces under a new overlay');
+  await second.release();
+  assert.equal(store.isOccluded(), false);
+  assert.deepEqual(events, ['hide', 'hide', 'restore']);
 });

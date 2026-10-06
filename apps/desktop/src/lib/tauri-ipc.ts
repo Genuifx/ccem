@@ -1,3 +1,4 @@
+import type { CronHermesNotification, CronHermesDelivery } from '@/lib/hermes-ipc';
 /**
  * Tauri IPC 类型映射
  *
@@ -135,7 +136,7 @@ export interface TauriCommands {
   get_session_router: [{ runtimeId: string }, SessionRouterState];
   update_session_router: [{ request: UpdateSessionRouterRequest }, SessionRouterState];
   restart_native_session_direct: [{ runtimeId: string }, SessionRouterState];
-  generate_workspace_session_title: [{ titleInput: string }, string | null];
+  generate_workspace_session_title: [{ titleInput: string; envName?: string; workingDir?: string }, string | null];
   open_text_in_vscode: [{ content: string; suggestedName?: string | null }, string];
   browser_surface_acquire: [BrowserSurfaceAcquireRequest, BrowserSurfaceLease];
   browser_surface_sync: [BrowserSurfaceSyncRequest, void];
@@ -552,6 +553,7 @@ export interface TauriCommands {
       timeoutSecs?: number;
       templateId?: string | null;
       wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
     },
     CronTask
   ];
@@ -569,6 +571,8 @@ export interface TauriCommands {
       disallowedTools?: string[] | null;
       timeoutSecs?: number;
       wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
+      clearHermesNotification?: boolean;
     },
     CronTask
   ];
@@ -1684,6 +1688,7 @@ export interface CronTask {
   timeoutSecs: number;
   templateId?: string | null;
   wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
   triggerType: string;
   parentTaskId?: string | null;
   createdAt: string;
@@ -1713,6 +1718,7 @@ export interface TrayRuntimeSnapshot {
 }
 
 export interface CronTaskRun {
+  hermesNotification?: CronHermesDelivery | null;
   id: string;
   taskId: string;
   startedAt: string;

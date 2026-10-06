@@ -28,7 +28,7 @@ use tauri::{AppHandle, Manager};
 mod mutation;
 mod popup;
 
-pub(crate) use mutation::{occlude, set_bounds, set_visible, sync_overlay_input};
+pub(crate) use mutation::{configure_overlay_composition, occlude, set_bounds, set_visible, sync_overlay_input};
 #[cfg(debug_assertions)]
 pub(crate) use mutation::debug_focus;
 
@@ -641,7 +641,7 @@ wrap_request_context_handler! {
 
             // Create CEF inside its final parent. CALayer controls visual order;
             // hitTest on this wrapper independently controls native input.
-            let (parent_view, child_bounds) = if crate::browser_overlay::macos::enabled() {
+            let (parent_view, child_bounds) = {
                 let wrapper = match BrowserHostView::attach(parent, bounds) {
                     Ok(wrapper) => wrapper,
                     Err(error) => { record_creation_failure(&self.shared, error); return; }
@@ -654,8 +654,6 @@ wrap_request_context_handler! {
                     }
                 });
                 (pointer, NativeChildBounds { x: 0, y: 0, ..bounds })
-            } else {
-                (parent_view, bounds)
             };
             let rect = Rect {
                 x: child_bounds.x,

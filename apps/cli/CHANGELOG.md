@@ -1,5 +1,23 @@
 # ccem
 
+## 2.91.1
+
+### Patch Changes
+
+- Repair Hermes installation in published Desktop builds by pinning an independently signed GitHub Release component and validating its availability before producing Desktop release packages.
+
+## 2.91.0
+
+### Minor Changes
+
+- Integrate managed Hermes bots and native conversations into the desktop app: multi-channel QR onboarding for WeCom and Feishu, native workspace session handoff and scheduled task delivery, a redesigned connection experience with channel brand icons, and a hardened remote bridge with scoped approvals and unsafe-path gating.
+
+## 2.90.0
+
+### Minor Changes
+
+- Desktop: fix macOS composer file drop hit testing with AppKit logical coordinates and the acknowledged WebView zoom, make tab navigation urgent so transcript polling cannot starve tab switches on long sessions, remove a redundant browser release return, and refine the context composition panel rhythm with the usage panel title divider dropped.
+
 ## 2.89.0
 
 ### Minor Changes

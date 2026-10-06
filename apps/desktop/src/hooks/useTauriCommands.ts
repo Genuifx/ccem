@@ -1,3 +1,4 @@
+import type { CronHermesNotification } from '@/lib/hermes-ipc';
 import { invoke } from '@tauri-apps/api/core';
 import { resolveEnvConfigForRuntime } from '@ccem/core/browser';
 import type {
@@ -1424,6 +1425,7 @@ export function useTauriCommands() {
     timeoutSecs?: number;
     templateId?: string;
     wecomNotification?: CronWecomNotification | null;
+    hermesNotification?: CronHermesNotification | null;
   }) => {
     const task = await invoke<CronTask>('add_cron_task', {
       name: data.name,
@@ -1438,6 +1440,7 @@ export function useTauriCommands() {
       timeoutSecs: data.timeoutSecs || 300,
       templateId: data.templateId || null,
       wecomNotification: data.wecomNotification ?? null,
+      hermesNotification: data.hermesNotification ?? null,
     });
     const tasks = await invoke<CronTask[]>('list_cron_tasks');
     setCronTasks(tasks);
@@ -1457,8 +1460,9 @@ export function useTauriCommands() {
     disallowedTools?: string[];
     timeoutSecs?: number;
     wecomNotification?: CronWecomNotification | null;
+    hermesNotification?: CronHermesNotification | null;
   }) => {
-    const task = await invoke<CronTask>('update_cron_task', data);
+    const task = await invoke<CronTask>('update_cron_task', { ...data, clearHermesNotification: data.hermesNotification === null });
     const tasks = await invoke<CronTask[]>('list_cron_tasks');
     setCronTasks(tasks);
     return task;
@@ -1707,8 +1711,12 @@ export function useTauriCommands() {
     return router;
   }, [setSessionRouter]);
 
-  const generateWorkspaceSessionTitle = useCallback(async (titleInput: string): Promise<string | null> => {
-    return invoke<string | null>('generate_workspace_session_title', { titleInput });
+  const generateWorkspaceSessionTitle = useCallback(async (
+    titleInput: string,
+    envName?: string,
+    workingDir?: string,
+  ): Promise<string | null> => {
+    return invoke<string | null>('generate_workspace_session_title', { titleInput, envName, workingDir });
   }, []);
 
   const openTextInVSCode = useCallback(async (

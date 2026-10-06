@@ -50,12 +50,14 @@ pub(crate) async fn browser_overlay_debug(
                         initial_url: url.into(), viewport: viewport()?, visible: true,
                     })?;
                     opened.wait_until_ready(Duration::from_secs(25))?;
+                    opened.state_handle().allow_user_popups().map_err(|error| format!("Enable fixture popups: {error:?}"))?;
                     *connection = Some(opened);
                 }
                 "resize" => host.set_surface_viewport(&app, SURFACE.into(), viewport()?)?,
                 "occlude" => host.occlude_surface(&app, SURFACE.into())?,
                 "show" => host.set_surface_visible(&app, SURFACE.into(), true)?,
                 "hide" => host.set_surface_visible(&app, SURFACE.into(), false)?,
+                "close_popup" => host.close_popup(&app, SURFACE.into())?,
                 "focus" => run_cancellable_on_main(&app, false, Duration::from_secs(5), "focus smoke browser", || {
                     crate::browser::login::cef::surface::macos::debug_focus(SURFACE)
                 })?,
@@ -73,7 +75,8 @@ pub(crate) async fn browser_overlay_debug(
             }
             let snapshot = host.surface_snapshot(&app, SURFACE.into())?;
             Ok(json!({"surfaceId": snapshot.surface_id, "visible": snapshot.visible,
-                "title": snapshot.title, "lifecycle": format!("{:?}", snapshot.lifecycle), "error": snapshot.error}))
+                "title": snapshot.title, "lifecycle": format!("{:?}", snapshot.lifecycle), "error": snapshot.error,
+                "popup": snapshot.popup.map(|popup| json!({"id": popup.popup_id, "title": popup.title, "lifecycle": format!("{:?}", popup.lifecycle)}))}))
         })
     }).await.map_err(|error| error.to_string())?
 }

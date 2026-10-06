@@ -1022,6 +1022,8 @@ pub async fn webcontent_debug_main_process_id(webview: Webview) -> Result<i32, S
 /// view can never outlive the UI document that used to own it. The rebuilt UI
 /// re-acquires and syncs whatever panel it actually shows again.
 fn reset_embedded_surfaces_for_frontend_boot(app: &tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    crate::browser_overlay::macos::reset_for_frontend_boot(app)?;
     #[cfg(any(target_os = "macos", windows))]
     {
         let Some(surfaces) = app.try_state::<std::sync::Arc<

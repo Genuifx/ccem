@@ -682,6 +682,8 @@ enum HelperInputCommand<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         command_id: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        client_message_ids: Option<&'a [String]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<&'a [PromptImage]>,
     },
     PermissionResponse {
@@ -1536,18 +1538,18 @@ fn spawn_queue_autodrain(dispatch: impl FnOnce() + Send + 'static) {
 }
 
 #[derive(Debug)]
-struct NativeHelperChild {
+pub(crate) struct NativeHelperChild {
     inner: Arc<SharedChild>,
     writer: Option<NativeHelperWriter>,
     process_tree: Arc<NativeProcessTree>,
 }
 
 impl NativeHelperChild {
-    fn pid(&self) -> u32 {
+    pub(crate) fn pid(&self) -> u32 {
         self.inner.id()
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.write_until(bytes.to_vec(), Instant::now() + NATIVE_HELPER_WRITE_TIMEOUT)
     }
 
@@ -1558,7 +1560,7 @@ impl NativeHelperChild {
             .write_until(bytes, deadline)
     }
 
-    fn kill(mut self) -> Result<(), String> {
+    pub(crate) fn kill(mut self) -> Result<(), String> {
         self.writer.take();
         let tree_result = self.process_tree.kill();
         let _ = self.inner.kill();
@@ -1769,7 +1771,7 @@ impl NativeProcessTree {
     }
 }
 
-fn spawn_native_helper_process(
+pub(crate) fn spawn_native_helper_process(
     mut command: StdCommand,
 ) -> Result<(Receiver<CommandEvent>, NativeHelperChild), String> {
     command
@@ -3205,6 +3207,7 @@ impl NativeRuntimeManager {
             None,
             None,
             true,
+            None,
         )
     }
 
@@ -3224,6 +3227,7 @@ impl NativeRuntimeManager {
         command_id_override: Option<&str>,
         admission_attempt: Option<u64>,
         append_user_prompt_event_after_write: bool,
+        batch_client_message_ids: Option<&[String]>,
     ) -> Result<(), String> {
         let _termination_guard = self
             .app_termination_lock
@@ -3292,9 +3296,17 @@ impl NativeRuntimeManager {
         let images_ref = images
             .filter(|imgs| !imgs.is_empty())
             .map(|imgs| imgs.as_slice());
+        let direct_client_ids: Vec<String> = client_message_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        let client_message_ids = batch_client_message_ids.unwrap_or(&direct_client_ids);
         let prompt_command = HelperInputCommand::Prompt {
             text,
             command_id: command_id.as_deref(),
+            client_message_ids: (!client_message_ids.is_empty()).then_some(client_message_ids),
             images: images_ref,
         };
         if let Some(command_id) = command_id.as_deref() {
@@ -3558,7 +3570,7 @@ impl NativeRuntimeManager {
         self.dispatch_queued_with(
             runtime_id,
             trigger,
-            |text, display_text, images, annotations, command_id, attempt| {
+            |text, display_text, images, annotations, command_id, attempt, client_message_ids| {
                 self.send_user_message_admitted(
                     app,
                     runtime_id,
@@ -3571,6 +3583,7 @@ impl NativeRuntimeManager {
                     Some(command_id),
                     Some(attempt),
                     false,
+                    Some(client_message_ids),
                 )
             },
         )
@@ -3588,6 +3601,7 @@ impl NativeRuntimeManager {
             Option<&Vec<SessionPromptAnnotation>>,
             &str,
             u64,
+            &[String],
         ) -> Result<(), String>,
     ) -> Result<(), String> {
         if trigger != QueueDispatchTrigger::InitializationSettled
@@ -3625,6 +3639,11 @@ impl NativeRuntimeManager {
                     | NativeInputClaimOutcome::BlockedByDeliveryUncertain { .. }
                     | NativeInputClaimOutcome::Empty => return Ok(()),
                 };
+            let client_message_ids: Vec<String> = batch
+                .messages()
+                .iter()
+                .map(|message| message.client_message_id().to_owned())
+                .collect();
             let dispatch_parts = batch.into_dispatch_parts();
             let client_message_id = dispatch_parts.client_message_id.clone();
             let decoded_images: Result<Option<Vec<PromptImage>>, String> = dispatch_parts
@@ -3667,6 +3686,7 @@ impl NativeRuntimeManager {
                 annotations.as_ref(),
                 &dispatch_command_id,
                 dispatch_attempt,
+                &client_message_ids,
             );
             match dispatch {
                 Ok(()) => {
@@ -14754,6 +14774,69 @@ mod tests {
     }
 
     #[test]
+    fn input_operation_helper_events_are_replayable_and_ready_cannot_complete_an_input() {
+        let runtime_id = "input-operation-replay";
+        let manager = manager_with_handle(runtime_id);
+        for stage in ["started", "unknown"] {
+            manager.process_helper_stdout(runtime_id, &serde_json::json!({
+                "type": "event", "payload": {
+                    "type": "input_operation", "operation_id": "invocation-a",
+                    "client_message_ids": ["client-a", "client-b"],
+                    "provider": "codex", "stage": stage, "detail": "observed"
+                }
+            }).to_string()).unwrap();
+        }
+        manager.process_helper_stdout(runtime_id,
+            r#"{"type":"status","status":"ready","detail":"Ready for the next prompt."}"#).unwrap();
+        let batch = manager.replay_events(runtime_id, None).unwrap();
+        let operations: Vec<_> = batch.events.iter().filter_map(|event| match &event.payload {
+            SessionEventPayload::InputOperation {
+                operation_id, client_message_ids, provider, stage, provider_turn_id, ..
+            } => {
+                assert_eq!(operation_id, "invocation-a");
+                assert_eq!(client_message_ids, &["client-a", "client-b"]);
+                assert_eq!(provider, "codex");
+                assert!(provider_turn_id.is_none());
+                Some(stage.as_str())
+            }
+            _ => None,
+        }).collect();
+        assert_eq!(operations, ["started", "unknown"]);
+    }
+
+    #[test]
+    fn input_operation_fifo_transport_contains_every_original_merged_client_id() {
+        let runtime_id = "input-operation-merged-batch";
+        let manager = Arc::new(manager_with_handle(runtime_id));
+        let generation = manager.handles.lock().unwrap()[runtime_id].generation;
+        manager.lifecycle.note_incarnation(runtime_id, generation);
+        manager.lifecycle.note_session_meta(runtime_id, generation, Some("conversation"),
+            Some(&["msg_lifecycle_v1".to_owned()]), Some(1));
+        let mut batch = FrozenNativeInputBatch::new("client-a", "first", None, None, None);
+        batch.merge_pending(FrozenNativeInputBatch::new("client-b", "second", None, None, None));
+        manager.input_queue.enqueue(runtime_id, batch, None).unwrap();
+        let mut writes = Vec::new();
+        manager.dispatch_queued_with(runtime_id, super::QueueDispatchTrigger::VisibleUserAction,
+            |text, _, images, _, command, attempt, client_ids| {
+                manager.lifecycle.admit_queued_prompt(runtime_id, generation, command, attempt).unwrap();
+                let wire = serde_json::to_value(super::HelperInputCommand::Prompt {
+                    text, command_id: Some(command), client_message_ids: Some(client_ids),
+                    images: images.map(Vec::as_slice),
+                }).unwrap();
+                assert_eq!(wire["client_message_ids"], serde_json::json!(["client-a", "client-b"]));
+                assert!(text.contains("first") && text.contains("second"));
+                writes.push(wire);
+                manager.process_helper_stdout(runtime_id, &serde_json::json!({
+                    "type": "event", "payload": { "type": "lifecycle", "stage": "command_admitted",
+                        "detail": "admitted", "command_id": command, "query_generation": 1 }
+                }).to_string()).unwrap();
+                Ok(())
+            }).unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(manager.input_queue.count(runtime_id), 0);
+    }
+
+    #[test]
     fn native_user_prompt_events_are_replayable() {
         let runtime_id = format!(
             "native-user-prompt-{}",
@@ -19427,7 +19510,8 @@ wait"#,
         let mut attempts = 0;
         let mut writes = 0;
         manager.dispatch_queued_with(runtime_id, super::QueueDispatchTrigger::VisibleUserAction,
-            |text, _, _, _, command, attempt| {
+            |text, _, _, _, command, attempt, client_message_ids| {
+                assert_eq!(client_message_ids, ["pending-b"]);
                 attempts += 1;
                 assert!(attempts <= 2, "retry must be driven by progress, never a busy loop");
                 assert_eq!(text, "B");
@@ -19445,7 +19529,7 @@ wait"#,
                     // Deterministically run the authoritative drain at the lost-
                     // wakeup boundary, before the original driver releases B.
                     manager.dispatch_queued_with(runtime_id, super::QueueDispatchTrigger::AuthoritativeLifecycle,
-                        |_, _, _, _, _, _| panic!("B remains claimed by the first driver")).unwrap();
+                        |_, _, _, _, _, _, _| panic!("B remains claimed by the first driver")).unwrap();
                     return Err(blocked.to_message());
                 }
                 manager.lifecycle.admit_queued_prompt(runtime_id, generation, command, attempt).unwrap();
@@ -19525,7 +19609,7 @@ wait"#,
                 .dispatch_queued_with(
                     &runtime_id,
                     super::QueueDispatchTrigger::VisibleUserAction,
-                    |_, _, _, _, command, attempt| {
+                    |_, _, _, _, command, attempt, _| {
                         attempts += 1;
                         assert_eq!(attempts, 1, "unchanged or uncertain blockers must not loop");
                         Err(manager
@@ -19574,7 +19658,7 @@ wait"#,
             .dispatch_queued_with(
                 runtime_id,
                 super::QueueDispatchTrigger::VisibleUserAction,
-                |_, _, _, _, command, attempt| {
+                |_, _, _, _, command, attempt, _| {
                     writes += 1;
                     assert_eq!(writes, 1, "possibly-written command must never replay");
                     manager
@@ -19665,7 +19749,7 @@ wait"#,
             .dispatch_queued_with(
                 runtime_id,
                 super::QueueDispatchTrigger::VisibleUserAction,
-                |text, _, images, _, command_id, attempt| {
+                |text, _, images, _, command_id, attempt, client_message_ids| {
                     assert_eq!(text, "B");
                     assert!(manager.app_termination_lock.try_lock().is_ok());
                     assert!(manager.reconnect_lock.try_lock().is_ok());
@@ -19690,6 +19774,7 @@ wait"#,
                         &super::HelperInputCommand::Prompt {
                             text,
                             command_id: Some(command_id),
+                            client_message_ids: Some(client_message_ids),
                             images: images.map(Vec::as_slice),
                         },
                     );

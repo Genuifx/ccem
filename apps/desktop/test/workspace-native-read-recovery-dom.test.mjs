@@ -67,6 +67,7 @@ test('the real native view recovers finals, exposes persistent failure, and supp
     entryPoints: [path.join(desktop, 'test/fixtures/transcript-read-recovery.tsx')],
     outfile: output, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic',
     target: 'node20', logLevel: 'silent', alias: { '@': path.join(desktop, 'src') },
+    loader: { '.svg': 'dataurl', '.png': 'dataurl' },
     define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env': '{}' },
     plugins: [recoveryIpcPlugin(desktop), { name: 'fast-test-clock', setup(builder) {
       // Accelerate only deadlines/intervals. Use the actual view, commands,

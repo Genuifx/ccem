@@ -161,3 +161,32 @@ test('composer usage indicator keeps no data-gated early return', async () => {
   assert.doesNotMatch(component, /return null;\s*\n\s*const hasContext/);
   assert.doesNotMatch(component, /turnCount === 0 && !usage\.context && !usage\.sessionUsage/);
 });
+
+test('composer usage ring exposes expanded state for the pin interaction', async () => {
+  const { EMPTY_USAGE, renderIndicator } = await importUsageIndicatorRenderer();
+
+  // REQ-0035: the ring is a hover surface AND a click-pin toggle, so its
+  // expanded state must be exposed to semantics/automation.
+  const html = renderIndicator(EMPTY_USAGE);
+  assert.match(html, /aria-expanded="false"/);
+});
+
+test('composer usage panel wiring keeps the pinned close contract (REQ-0035)', async () => {
+  const component = await fs.readFile(
+    path.join(desktopDir, 'src', 'components', 'workspace', 'ContextWindowIndicator.tsx'),
+    'utf8',
+  );
+
+  // Controlled open with a pinned veto: hover/focus leave close requests are
+  // ignored while pinned, so a view-switch resize cannot auto-close the panel.
+  assert.match(component, /<HoverCard open=\{open\}/);
+  assert.match(component, /pinnedRef\.current/);
+  assert.match(component, /else if \(!pinnedRef\.current\)/);
+  // Explicit dismissal paths: Escape and pointerdown outside close a pinned
+  // panel; a pointerdown on the ring itself is prevented so the same click can
+  // toggle the pin instead of dismissing the panel mid-gesture.
+  assert.match(component, /onEscapeKeyDown=\{dismiss\}/);
+  assert.match(component, /onPointerDownOutside=\{handlePointerDownOutside\}/);
+  assert.match(component, /triggerRef\.current\?\.contains\(target\)/);
+  assert.match(component, /event\.preventDefault\(\);/);
+});

@@ -66,6 +66,11 @@ jobs:
       - name: Verify pinned browser runtime manifests
         run: pnpm check:browser-runtime-manifests
 
+      - name: Verify Hermes release configuration and transport contracts
+        run: |
+          node scripts/hermes/check-release.mjs
+          node --test scripts/hermes/release-contract.test.mjs
+
       - name: Run tests
         run: pnpm -r test:run
 

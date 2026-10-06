@@ -39,7 +39,8 @@ function setup(t, options = {}) {
   const manager = api.createNativeBrowserOverlayManager({
     document: view.document,
     readZoom: () => zoom,
-    isModal: () => modal,
+    isModal: options.isModal ?? (() => modal),
+    isModalRequested: options.isModalRequested,
     send: async (state) => { sent.push(state); await options.send?.(state); },
     onError: options.onError,
   });
@@ -124,17 +125,42 @@ test('modal ACK fences an older delayed unlock before the surface occlude transa
   assert.equal(surfaceOccluded, true, 'late unlock cannot clear the acknowledged occlusion');
 });
 
-test('modal geometry rejection keeps the barrier closed and is handled for fire-and-forget observers', async (t) => {
+test('a modal barrier stays closed through a rejected ACK and follows its successful retry without a viewport', async (t) => {
   const errors = [];
+  const retry = [];
+  let sends = 0;
+  let ready = false;
   const h = setup(t, {
-    send: async () => { throw new Error('geometry rejected'); },
+    send: async () => { if (++sends === 1) throw new Error('geometry rejected'); },
     onError: (error) => errors.push(error.message),
   });
+  h.view.setTimeout = (fn) => { retry.push(fn); return retry.length; };
+  h.view.clearTimeout = () => {};
   h.setModal(true);
   h.manager.flush();
-  await assert.rejects(h.manager.waitForModalSync(), /geometry rejected/);
+  const barrier = h.manager.waitForModalSync().then(() => { ready = true; });
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ready, false, 'failure must not authorize the overlay to mount');
   assert.deepEqual(errors, ['geometry rejected']);
+  assert.equal(retry.length, 1);
+  retry.shift()();
+  await barrier;
+  assert.equal(ready, true);
+  assert.equal(sends, 2);
+});
+
+test('closing the requested modal cancels its failed ACK waiter and disposal also releases pending waiters', async (t) => {
+  const h = setup(t, { send: async () => { throw new Error('bridge unavailable'); } });
+  h.setModal(true);
+  const closed = assert.rejects(h.manager.waitForModalSync(), /modal was closed/);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.setModal(false);
+  h.manager.flush();
+  await closed;
+  h.setModal(true);
+  const disposed = assert.rejects(h.manager.waitForModalSync(), /manager is disposed/);
+  h.manager.dispose();
+  await disposed;
 });
 
 test('a failed unchanged snapshot retries with capped backoff until the live viewport can recover', async (t) => {
@@ -321,11 +347,11 @@ test('StrictMode ref registration survives effect replay and unmount retires it'
     react: React,
     '@tauri-apps/api/event': { listen: async () => () => {} },
     '@/hooks/useZoom': { readAppZoom: () => 1 },
-    './webcontentRecovery': { invokeBrowserCommand: async (command, args) => {
+    './webcontentRecovery': { currentWebcontentDocumentIdentity: () => ({ documentId: 'test', generation: 1 }), invokeBrowserCommand: async (command, args) => {
       if (command === 'browser_overlay_initialize') return true;
       sent.push(args);
     } },
-    './nativeSurfaceOcclusionStore': { nativeSurfaceOcclusionStore: { isOccluded: () => false, subscribe: () => () => {} } },
+    './nativeSurfaceOcclusionStore': { nativeSurfaceOcclusionStore: { isOccluded: () => false, hasActiveOverlays: () => false, subscribe: () => () => {} } },
     './nativeBrowserOverlayManager': { createNativeBrowserOverlayManager(options) {
       const manager = api.createNativeBrowserOverlayManager(options); activeManagers.push(manager); return manager;
     } },
@@ -410,4 +436,129 @@ test('a CEF click dismisses a real non-modal Radix popover and leaves its viewpo
   // Radix restores focus in a deferred unmount event; keep this DOM's event
   // constructors installed until that cleanup has completed.
   await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+});
+
+async function searchHarness(t) {
+  const storeApi = {};
+  new Function('exports', compile(await fs.readFile(new URL('../src/lib/nativeSurfaceOcclusionStore.ts', import.meta.url), 'utf8')))(storeApi);
+  const store = storeApi.createNativeSurfaceOcclusionStore({ deferRestore: () => Promise.resolve() });
+  const retries = new Map();
+  let timerId = 0;
+  let attempts = 0;
+  const h = setup(t, {
+    isModal: store.isOccluded,
+    isModalRequested: () => store.hasActiveOverlays(),
+    send: async (snapshot) => { if (snapshot.modal && ++attempts === 1) throw new Error('temporary IPC failure'); },
+  });
+  h.view.setTimeout = (fn) => { retries.set(++timerId, fn); return timerId; };
+  h.view.clearTimeout = (id) => retries.delete(id);
+  const globals = new Map();
+  const values = {
+    window: h.view, document: h.view.document, navigator: h.view.navigator,
+    getComputedStyle: h.view.getComputedStyle.bind(h.view), IS_REACT_ACT_ENVIRONMENT: true,
+  };
+  for (const key of ['HTMLElement', 'HTMLInputElement', 'Node', 'NodeFilter', 'Element', 'CustomEvent', 'MutationObserver', 'ResizeObserver', 'Event', 'DOMRect']) values[key] = h.view[key];
+  for (const [key, value] of Object.entries(values)) {
+    globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
+  }
+  let root;
+  const React = require('react');
+  t.after(async () => {
+    if (root) await React.act(async () => root.unmount());
+    await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    for (const [key, descriptor] of globals) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  });
+  const { createRoot } = require('react-dom/client');
+  const Dialog = require('@radix-ui/react-dialog');
+  const hooks = {};
+  new Function('require', 'exports', compile(await fs.readFile(new URL('../src/lib/nativeSurfaceOcclusion.ts', import.meta.url), 'utf8')))(
+    (name) => name === 'react' ? React : { nativeSurfaceOcclusionStore: store }, hooks,
+  );
+  const releaseViewport = h.manager.register(h.element([400, 100, 500, 600]), 'viewport');
+  const unsubscribe = store.subscribe(h.manager.flush);
+  const transitions = [];
+  const unregister = store.registerParticipant({
+    hide: () => { transitions.push('hide'); return h.manager.waitForModalSync(); },
+    restore: () => { transitions.push('restore'); },
+  });
+  t.after(unsubscribe);
+  root = createRoot(h.view.document.querySelector('main'));
+  function Search() {
+    const [open, setOpen] = React.useState(false);
+    const ready = hooks.useNativeSurfaceOcclusion(open);
+    return React.createElement(React.Fragment, null,
+      React.createElement('button', { id: 'request-search', onClick: () => setOpen(true) }, '搜索'),
+      React.createElement('button', { id: 'cancel-search', onClick: () => setOpen(false) }, '取消搜索'),
+      React.createElement(Dialog.Root, { open: ready, onOpenChange: setOpen },
+        React.createElement(Dialog.Portal, null, React.createElement(Dialog.Content, { 'data-search-overlay': '', 'aria-describedby': undefined },
+          React.createElement(Dialog.Title, null, '搜索'),
+          React.createElement(Dialog.Close, { id: 'close-search' }, '关闭')))));
+  }
+  await React.act(async () => root.render(React.createElement(Search)));
+  return {
+    ...h, store, retries, transitions, unregister, releaseViewport,
+    click: (selector) => React.act(async () => h.view.document.querySelector(selector).click()),
+    retry: () => React.act(async () => {
+      const [id, fn] = retries.entries().next().value;
+      retries.delete(id);
+      fn();
+    }),
+  };
+}
+
+test('one search-open request mounts its real dialog after a transient modal ACK failure, even if the panel unmounts', async (t) => {
+  const h = await searchHarness(t);
+  const { store } = h;
+  await h.click('#request-search');
+  assert.equal(store.isOccluded(), true);
+  assert.equal(h.view.document.querySelector('[data-search-overlay]'), null, 'failed ACK must keep the dialog unmounted');
+  assert.equal(h.retries.size, 1);
+  h.unregister();
+  h.releaseViewport();
+  await h.retry();
+  assert.ok(h.view.document.querySelector('[data-search-overlay]'), 'the same open request completes without another click');
+  await h.click('#close-search');
+  assert.equal(h.view.document.querySelector('[data-search-overlay]'), null);
+  assert.equal(store.isOccluded(), false, 'unmounted panel must not strand the transition queue');
+});
+
+test('canceling a search before its failed modal ACK recovers drains the real store and allows another request', async (t) => {
+  const h = await searchHarness(t);
+  await h.click('#request-search');
+  assert.equal(h.view.document.querySelector('[data-search-overlay]'), null);
+  assert.equal(h.retries.size, 1);
+  await h.click('#cancel-search');
+  assert.equal(h.store.isOccluded(), false, 'cancel must release the effective guard without waiting for IPC recovery');
+  assert.deepEqual(h.transitions, ['hide', 'restore']);
+  await h.click('#request-search');
+  assert.ok(h.view.document.querySelector('[data-search-overlay]'));
+  await h.click('#close-search');
+  assert.equal(h.store.isOccluded(), false);
+  assert.deepEqual(h.transitions, ['hide', 'restore', 'hide', 'restore']);
+});
+
+test('an immediate search reopen gets a fresh ACK barrier while its previous cancellation is still restoring', async (t) => {
+  const h = await searchHarness(t);
+  const states = [];
+  const unsubscribe = h.store.subscribe(() => states.push(h.store.isOccluded()));
+  t.after(unsubscribe);
+  await h.click('#request-search');
+  const React = require('react');
+  const { flushSync } = require('react-dom');
+  await React.act(async () => {
+    // Separate commits emulate two gestures in the same event-loop turn. The
+    // first restore is still queued when the next open acquires its lease.
+    flushSync(() => h.view.document.querySelector('#cancel-search').click());
+    flushSync(() => h.view.document.querySelector('#request-search').click());
+  });
+  assert.ok(h.view.document.querySelector('[data-search-overlay]'), 'the newer open must not reuse or strand the canceled waiter');
+  assert.ok(states.every(Boolean), 'effective input blocking must stay on across an immediate reopen');
+  assert.deepEqual(h.transitions, ['hide', 'hide']);
+  await h.click('#close-search');
+  assert.equal(h.store.isOccluded(), false);
+  assert.deepEqual(h.transitions, ['hide', 'hide', 'restore']);
 });

@@ -562,10 +562,10 @@ mod tests {
     fn wait_until_idle(manager: &BrowserRuntimeManager) -> BrowserRuntimeReadiness {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let readiness = manager.readiness().unwrap();
             let running = manager.operation.lock().unwrap().running;
             if !running {
-                return readiness;
+                // The worker publishes readiness before clearing its running flag.
+                return manager.readiness().unwrap();
             }
             assert!(Instant::now() < deadline, "worker did not finish");
             thread::sleep(Duration::from_millis(5));

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ensureCcemDir, getCcemConfigDir } from '@ccem/core';
+import { requestDesktopControl, type DesktopControlRequester } from './desktopControl.js';
 
 export type CronExecutionProfile = 'conservative' | 'standard' | 'autonomous';
 
@@ -21,6 +22,7 @@ export interface CronTask {
   timeoutSecs: number;
   templateId: string | null;
   wecomNotification: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
   triggerType: 'schedule';
   parentTaskId: string | null;
   createdAt: string;
@@ -31,6 +33,21 @@ export interface CronWecomNotification {
   botId?: string | null;
   peerId?: string | null;
   enabled?: boolean | null;
+}
+
+export interface CronHermesNotification {
+  routeId: string;
+  generation: number;
+  subscriptionId?: string;
+}
+
+export interface CronNotificationTarget extends CronHermesNotification {
+  label: string;
+  platform: string;
+  chatId: string;
+  threadId?: string | null;
+  userId: string;
+  chatType: string;
 }
 
 export interface CronCreateInput {
@@ -47,6 +64,90 @@ export interface CronCreateInput {
   timeoutSecs?: number | null;
   templateId?: string | null;
   wecomNotification?: CronWecomNotification | null;
+  hermesNotification?: CronHermesNotification | null;
+}
+
+export function parseHermesNotification(value: unknown): CronHermesNotification | null {
+  if (value == null) return null;
+  const target = value as Partial<CronHermesNotification>;
+  if (typeof target.routeId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(target.routeId)
+    || !Number.isSafeInteger(target.generation) || Number(target.generation) <= 0) {
+    throw new Error('hermesNotification requires a paired routeId and its current positive generation');
+  }
+  return { routeId: target.routeId, generation: target.generation! };
+}
+
+export async function getCronNotificationTargets(
+  request: DesktopControlRequester = requestDesktopControl,
+): Promise<CronNotificationTarget[]> {
+  const result = await request('ccem.cron.notificationTargets');
+  if (!Array.isArray(result)) throw new Error('Invalid notification targets response');
+  return result as CronNotificationTarget[];
+}
+
+/**
+ * List cron tasks through the Desktop control plane. Falls back to the shared
+ * task store when Desktop is not running or predates `ccem.cron.list`, so
+ * `ccem cron list` keeps working offline.
+ */
+export async function listCronTasksViaDesktop(
+  request: DesktopControlRequester = requestDesktopControl,
+  tasksPath = getCronTasksPath(),
+): Promise<CronTask[]> {
+  try {
+    const tasks = await request('ccem.cron.list');
+    if (!Array.isArray(tasks)) {
+      throw new Error('Invalid cron tasks response from CCEM Desktop.');
+    }
+    return tasks as CronTask[];
+  } catch {
+    return readCronTasks(tasksPath);
+  }
+}
+
+export function resolveCronTaskSelector(tasks: CronTask[], selector: string): CronTask {
+  const normalized = selector.trim();
+  if (!normalized) {
+    throw new Error('Task id or name is required');
+  }
+
+  const matches = tasks.filter((task) => task.id === normalized || task.name === normalized);
+  if (matches.length === 0) {
+    throw new Error(`Cron task not found: ${normalized}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Cron task selector is ambiguous: ${normalized}`);
+  }
+
+  return matches[0]!;
+}
+
+export async function triggerCronTask(
+  selector: string,
+  request: DesktopControlRequester = requestDesktopControl,
+): Promise<CronTask> {
+  const task = resolveCronTaskSelector(await listCronTasksViaDesktop(request), selector);
+  const triggered = await request('ccem.cron.trigger', { id: task.id });
+  if (!triggered || typeof triggered !== 'object' || Array.isArray(triggered)
+    || typeof (triggered as CronTask).id !== 'string') {
+    throw new Error('Invalid cron trigger response from CCEM Desktop.');
+  }
+  return triggered as CronTask;
+}
+
+export async function createCronTaskWithNotifications(
+  input: CronCreateInput,
+  tasksPath = getCronTasksPath(),
+  request: DesktopControlRequester = requestDesktopControl,
+): Promise<CronTask> {
+  const target = parseHermesNotification(input.hermesNotification);
+  if (target) {
+    const targets = await getCronNotificationTargets(request);
+    if (!targets.some((entry) => entry.routeId === target.routeId && entry.generation === target.generation)) {
+      throw new Error('Hermes notification target is unavailable or has changed. Run ccem cron notification-targets --json and choose again.');
+    }
+  }
+  return createCronTask({ ...input, hermesNotification: target }, tasksPath);
 }
 
 interface CronTasksFile {
@@ -178,6 +279,7 @@ function parseWecomNotification(value: unknown): CronWecomNotification | null {
 }
 
 export function createCronTask(input: CronCreateInput, tasksPath = getCronTasksPath()): CronTask {
+  const hermesTarget = parseHermesNotification(input.hermesNotification);
   const name = input.name?.trim();
   if (!name) {
     throw new Error('Task name is required');
@@ -220,6 +322,7 @@ export function createCronTask(input: CronCreateInput, tasksPath = getCronTasksP
     timeoutSecs,
     templateId: input.templateId?.trim() || null,
     wecomNotification: normalizeWecomNotification(input.wecomNotification),
+    hermesNotification: hermesTarget ? { ...hermesTarget, subscriptionId: crypto.randomUUID() } : null,
     triggerType: 'schedule',
     parentTaskId: null,
     createdAt: now,
@@ -286,6 +389,7 @@ export function parseCronCreateJson(raw: string): CronCreateInput {
     timeoutSecs: typeof parsed.timeoutSecs === 'number' ? parsed.timeoutSecs : null,
     templateId: typeof parsed.templateId === 'string' ? parsed.templateId : null,
     wecomNotification: parseWecomNotification(wecomNotification),
+    hermesNotification: parseHermesNotification(parsed.hermesNotification),
   };
 }
 

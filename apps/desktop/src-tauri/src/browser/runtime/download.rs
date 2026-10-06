@@ -170,12 +170,32 @@ pub fn download_archive_blocking_with_reporter(
     download_archive_with_options(spec, control, reporter, CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
 }
 
-fn download_archive_with_options(
+pub(crate) fn download_archive_with_options(
     spec: &DownloadSpec,
     control: &DownloadControl,
     reporter: &dyn DownloadProgressReporter,
     connect_timeout: Duration,
     download_timeout: Duration,
+) -> Result<DownloadOutcome, DownloadError> {
+    download_archive_with_redirect_policy(
+        spec,
+        control,
+        reporter,
+        connect_timeout,
+        download_timeout,
+        reqwest::redirect::Policy::none(),
+    )
+}
+
+/// Redirect permission belongs to the caller. Browser runtime downloads keep their
+/// existing no-redirect policy; Hermes permits only its pinned GitHub asset transport.
+pub(crate) fn download_archive_with_redirect_policy(
+    spec: &DownloadSpec,
+    control: &DownloadControl,
+    reporter: &dyn DownloadProgressReporter,
+    connect_timeout: Duration,
+    download_timeout: Duration,
+    redirect_policy: reqwest::redirect::Policy,
 ) -> Result<DownloadOutcome, DownloadError> {
     validate_spec(spec)?;
     let paths = DownloadPaths::new(&spec.completed_path)?;
@@ -191,7 +211,7 @@ fn download_archive_with_options(
         .unwrap_or(0);
     let _ = reporter.try_report(resume_offset, spec.expected_size);
     let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(redirect_policy)
         .connect_timeout(connect_timeout)
         .timeout(download_timeout)
         .build()

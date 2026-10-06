@@ -1,0 +1,187 @@
+name: Release Hermes Runtime
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-hermes-runtime
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build and sign the reviewed Hermes component
+    runs-on: macos-15
+    environment: mode2-signing
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require protected main and the exact selected source
+        shell: bash
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$REF_PROTECTED" == true ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" == "$GITHUB_SHA" ]]
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Setup build-side Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Require the publisher signing identity
+        env:
+          PUBLISHER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: test -n "$PUBLISHER_KEY"
+
+      - name: Install locked build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          python3 -m venv "$RUNNER_TEMP/hermes-build-tools"
+          "$RUNNER_TEMP/hermes-build-tools/bin/python" -m pip install uv==0.12.12
+
+      - name: Resolve immutable component configuration
+        id: config
+        shell: bash
+        run: node scripts/hermes/check-release.mjs --github-output "$GITHUB_OUTPUT"
+
+      - name: Check out the reviewed upstream revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: NousResearch/hermes-agent
+          ref: bc1330eebc0aa8a443501b5f62586eb7361353a5
+          path: .artifacts/hermes-upstream
+          persist-credentials: false
+
+      - name: Build the locked relocatable Python and Hermes package
+        shell: bash
+        env:
+          VERSION: ${{ steps.config.outputs.version }}
+          SEQUENCE: ${{ steps.config.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python3 scripts/hermes/build-runtime.py \
+            --hermes-source .artifacts/hermes-upstream \
+            --output .artifacts/hermes-build \
+            --uv "$RUNNER_TEMP/hermes-build-tools/bin/uv" \
+            --version "$VERSION" --sequence "$SEQUENCE" \
+            --source-base-url https://github.com/Genuifx/ccem/releases/download \
+            --external-signature
+
+      - name: Verify the pinned agent and managed gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime=.artifacts/hermes-build/hermes-runtime
+          "$runtime/python/bin/python3.11" -I -B scripts/hermes/test-runtime-package.py --package "$runtime"
+          "$runtime/python/bin/python3.11" -I -B scripts/hermes/test-conversation.py --package "$runtime"
+          "$runtime/python/bin/python3.11" -I -B scripts/hermes/test-native-profile.py --package "$runtime"
+          python3 -B scripts/hermes/test-gateway-host.py
+
+      - name: Sign the exact manifest with the existing publisher identity
+        working-directory: apps/desktop
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm exec tauri signer sign ../../.artifacts/hermes-build/manifest.json
+
+      - name: Verify and stage only the signed release payload
+        shell: bash
+        env:
+          VERSION: ${{ steps.config.outputs.version }}
+        run: |
+          set -euo pipefail
+          source=.artifacts/hermes-build
+          payload=.artifacts/hermes-release-payload
+          mkdir -p "$payload"
+          cp "$source/manifest.json" "$source/manifest.json.sig" "$source/build-receipt.json" "$payload/"
+          cp "$source/$VERSION/hermes-macos-aarch64.zip" "$payload/"
+          node scripts/hermes/check-release.mjs --local-root "$payload" --record-verification
+
+      - name: Retain the exact current-run payload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: hermes-release-payload
+          path: .artifacts/hermes-release-payload/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish immutable Hermes assets without changing Desktop latest
+    needs: build
+    runs-on: ubuntu-latest
+    environment: mode2-signing
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: hermes-release-payload
+          path: .artifacts/hermes-release-payload
+
+      - name: Reverify the payload and reject an existing component tag
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" == "$GITHUB_SHA" ]]
+          node scripts/hermes/check-release.mjs --local-root .artifacts/hermes-release-payload
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$VERSION" > "$RUNNER_TEMP/hermes-existing-tag"
+          status=$?
+          set -e
+          [[ "$status" == 2 ]] || { echo 'Existing or unverifiable component tag; refusing to replace it.' >&2; exit 1; }
+
+      - name: Create the component draft and verify uploaded bytes before publishing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          payload=.artifacts/hermes-release-payload
+          notes="$RUNNER_TEMP/hermes-release-notes.md"
+          node -e 'const fs=require("fs"); fs.writeFileSync(process.argv[1], `Managed Hermes component from CCEM source ${process.env.GITHUB_SHA}.\n\nThe manifest is signed with the pinned CCEM publisher key. This release is independent of Desktop latest.\n`)' "$notes"
+          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Hermes Runtime $VERSION" \
+            --notes-file "$notes" --draft --prerelease --latest=false \
+            "$payload/manifest.json" "$payload/manifest.json.sig" \
+            "$payload/hermes-macos-aarch64.zip" "$payload/build-receipt.json"
+          remote="$RUNNER_TEMP/hermes-upload-verification"
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir "$remote"
+          node scripts/hermes/check-release.mjs --local-root "$remote"
+          [[ "$(git ls-remote origin refs/heads/main | awk '{print $1}')" == "$GITHUB_SHA" ]]
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+          node scripts/hermes/check-release.mjs --published

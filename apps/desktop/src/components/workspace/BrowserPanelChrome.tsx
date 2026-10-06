@@ -4,7 +4,6 @@ import {
   ArrowRight,
   Bot,
   ExternalLink,
-  Globe,
   LoaderCircle,
   PanelTopClose,
   RefreshCw,
@@ -86,6 +85,11 @@ interface BrowserPanelNavigationProps {
   isLoading: boolean;
   navigationDisabled: boolean;
   stopLoadingDisabled: boolean;
+  spinnerActive: boolean;
+  isPopupCloseBusy: boolean;
+  isClosingSurface: boolean;
+  recoveryStates: BrowserSurfaceRecoveryState[];
+  lifecycle: BrowserPanelLifecycle;
   t: (key: string) => string;
   onNavigationAction: (action: BrowserSurfaceNavigationAction) => void;
   onOpenExternal: () => void;
@@ -94,6 +98,8 @@ interface BrowserPanelNavigationProps {
   onUrlInputChange: (value: string) => void;
   onCancelUrlEditing: () => void;
   onStartUrlEditing: () => void;
+  onClosePopup: () => void;
+  onClose: () => void;
 }
 
 export function BrowserPanelNavigation({
@@ -113,6 +119,11 @@ export function BrowserPanelNavigation({
   isLoading,
   navigationDisabled,
   stopLoadingDisabled,
+  spinnerActive,
+  isPopupCloseBusy,
+  isClosingSurface,
+  recoveryStates,
+  lifecycle,
   t,
   onNavigationAction,
   onOpenExternal,
@@ -121,6 +132,8 @@ export function BrowserPanelNavigation({
   onUrlInputChange,
   onCancelUrlEditing,
   onStartUrlEditing,
+  onClosePopup,
+  onClose,
 }: BrowserPanelNavigationProps) {
   const effectiveControl = control === 'agent'
     ? 'agent'
@@ -138,6 +151,12 @@ export function BrowserPanelNavigation({
   const reloadOrStopLabel = t(isLoading
     ? 'workspace.browserStopLoading'
     : 'workspace.browserReload');
+  const recoveryNeedsAttention = recoveryStates.some((state) => (
+    state.startsWith('retained_') || state === 'renderer_process_terminated'
+  ));
+  const recoveryLabel = recoveryStates
+    .map((state) => t(recoveryStateTranslationKeys[state]))
+    .join(', ');
 
   return (
     <div data-ccem-browser-navigation="true" className="workspace-browser-chrome flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
@@ -203,6 +222,32 @@ export function BrowserPanelNavigation({
           </button>
         )}
       </form>
+      {recoveryStates.length > 0 ? (
+        <span
+          data-ccem-browser-recovery-status={recoveryNeedsAttention ? 'attention' : 'recovered'}
+          className={recoveryNeedsAttention
+            ? 'min-w-0 max-w-56 shrink truncate text-[11px] font-medium text-destructive'
+            : 'min-w-0 max-w-56 shrink truncate text-[11px] font-medium text-primary'}
+          title={recoveryLabel}
+        >
+          {t(recoveryNeedsAttention
+            ? 'workspace.browserRecoveryAttention'
+            : 'workspace.browserRecoveryRecovered').replace('{state}', recoveryLabel)}
+        </span>
+      ) : null}
+      {sessionStatus === 'cleanup_required' ? (
+        <span className="shrink-0 text-[11px] font-medium text-destructive">
+          {t('loginBrowserControl.owner_danger')}
+        </span>
+      ) : popupActive ? (
+        <span className="shrink-0 text-[11px] font-medium text-primary">
+          {t('workspace.browserPopupActive')}
+        </span>
+      ) : lifecycle === 'failed' || lifecycle === 'closed' ? (
+        <span className="shrink-0 text-[11px] font-medium text-destructive">
+          {t('workspace.browserCrashed')}
+        </span>
+      ) : null}
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="inline-flex">
@@ -228,79 +273,11 @@ export function BrowserPanelNavigation({
         </TooltipTrigger>
         <TooltipContent side="bottom">{controlLabel}</TooltipContent>
       </Tooltip>
-    </div>
-  );
-}
-
-interface BrowserPanelTabStripProps {
-  panelTitle: string;
-  sessionStatus: 'running' | 'closing' | 'cleanup_required';
-  recoveryStates: BrowserSurfaceRecoveryState[];
-  popupActive: boolean;
-  lifecycle: BrowserPanelLifecycle;
-  spinnerActive: boolean;
-  isPopupCloseBusy: boolean;
-  isClosingSurface: boolean;
-  t: (key: string) => string;
-  onClosePopup: () => void;
-  onClose: () => void;
-}
-
-export function BrowserPanelTabStrip({
-  panelTitle,
-  sessionStatus,
-  recoveryStates,
-  popupActive,
-  lifecycle,
-  spinnerActive,
-  isPopupCloseBusy,
-  isClosingSurface,
-  t,
-  onClosePopup,
-  onClose,
-}: BrowserPanelTabStripProps) {
-  const recoveryNeedsAttention = recoveryStates.some((state) => (
-    state.startsWith('retained_') || state === 'renderer_process_terminated'
-  ));
-  const recoveryLabel = recoveryStates
-    .map((state) => t(recoveryStateTranslationKeys[state]))
-    .join(', ');
-
-  return (
-    <>
-      <div className="flex h-7 min-w-0 max-w-[220px] items-center gap-2 rounded-md bg-muted/45 px-2.5 text-xs font-medium text-foreground">
-        <Globe className="h-4 w-4" />
-        <span className="truncate">{panelTitle}</span>
-      </div>
-      <div className="min-w-0 flex-1" />
-      {recoveryStates.length > 0 ? (
-        <span
-          data-ccem-browser-recovery-status={recoveryNeedsAttention ? 'attention' : 'recovered'}
-          className={recoveryNeedsAttention
-            ? 'max-w-56 truncate text-[11px] font-medium text-destructive'
-            : 'max-w-56 truncate text-[11px] font-medium text-primary'}
-          title={recoveryLabel}
-        >
-          {t(recoveryNeedsAttention
-            ? 'workspace.browserRecoveryAttention'
-            : 'workspace.browserRecoveryRecovered').replace('{state}', recoveryLabel)}
-        </span>
-      ) : null}
-      {sessionStatus === 'cleanup_required' ? (
-        <span className="text-[11px] font-medium text-destructive">
-          {t('loginBrowserControl.owner_danger')}
-        </span>
-      ) : popupActive ? (
-        <span className="text-[11px] font-medium text-primary">
-          {t('workspace.browserPopupActive')}
-        </span>
-      ) : lifecycle === 'failed' || lifecycle === 'closed' ? (
-        <span className="text-[11px] font-medium text-destructive">
-          {t('workspace.browserCrashed')}
-        </span>
-      ) : null}
       {spinnerActive ? (
-        <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+        <LoaderCircle
+          data-ccem-browser-busy="true"
+          className="ml-1 h-4 w-4 shrink-0 animate-spin text-muted-foreground"
+        />
       ) : null}
       {popupActive ? (
         <BrowserToolButton
@@ -318,6 +295,6 @@ export function BrowserPanelTabStrip({
       >
         <X className="h-4 w-4" />
       </BrowserToolButton>
-    </>
+    </div>
   );
 }

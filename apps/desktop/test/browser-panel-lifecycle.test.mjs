@@ -818,12 +818,18 @@ test('a fresh snapshot clears omitted recovery state and its derived inline erro
   assert.ok(panel);
   assert.equal(panel.getAttribute('data-ccem-browser-recovery'), 'renderer_process_terminated');
   assert.match(container.textContent, /zh:workspace\.browserRecoveryRendererStopped/);
+  const recoveryStatus = container.querySelector('[data-ccem-browser-recovery-status="attention"]');
+  assert.ok(recoveryStatus, 'a retained recovery state must surface through the address bar');
+  assert.ok(recoveryStatus.closest('[data-ccem-browser-navigation="true"]'),
+    'the recovery hint is an on-demand element inside the navigation toolbar');
 
   harness.emitBrowserState(bridge, 'lease-1', 1, { lifecycle: 'ready' });
   await harness.flushEffects();
 
   assert.equal(panel.getAttribute('data-ccem-browser-recovery'), 'none');
   assert.doesNotMatch(container.textContent, /zh:workspace\.browserRecoveryRendererStopped/);
+  assert.equal(container.querySelector('[data-ccem-browser-recovery-status]'), null,
+    'the recovery hint must disappear once no state needs reporting');
 });
 
 test('address bar navigation actions use exact lease state and authoritative capabilities', async (t) => {
@@ -890,8 +896,9 @@ test('address bar navigation actions use exact lease state and authoritative cap
       'zh:workspace.browserOpenExternal',
       'zh:workspace.browserUrl',
       'zh:loginBrowserControl.handoffAgent',
+      'zh:loginBrowserControl.closeBrowser',
     ],
-    'browser navigation controls must precede External, URL, and the single Agent toggle',
+    'browser navigation controls must precede External, URL, the single Agent toggle, and the surface close',
   );
 
   const button = (key) => navigation.querySelector(`button[aria-label="zh:workspace.${key}"]`);
@@ -1402,9 +1409,9 @@ test('Login A and B default to their exact Agent once per lease, retain leases a
     '[data-ccem-browser-navigation="true"] button[aria-label="zh:loginBrowserControl.takeover"]',
   ));
   assert.equal(
-    containerB.querySelector('[data-ccem-browser-tab-strip="true"] [data-ccem-browser-control-toggle="true"]'),
-    null,
-    'handoff, pause, and takeover controls must not remain in the tab strip',
+    containerB.querySelectorAll('[data-ccem-browser-control-toggle="true"]').length,
+    1,
+    'handoff, pause, and takeover controls must stay a single address-bar toggle',
   );
 });
 
@@ -1445,9 +1452,17 @@ test('Agent control is one address-bar toggle and takeover does not re-handoff t
     ['handoff'],
   );
   const navigation = container.querySelector('[data-ccem-browser-navigation="true"]');
-  const tabStrip = container.querySelector('[data-ccem-browser-tab-strip="true"]');
   assert.ok(navigation);
-  assert.ok(tabStrip);
+  assert.equal(
+    container.querySelector('[data-ccem-browser-tab-strip="true"]'),
+    null,
+    'the browser panel must not stack a second persistent strip under the workspace side panel tabs',
+  );
+  assert.equal(
+    container.querySelector('[data-ccem-browser-recovery-status]'),
+    null,
+    'surface status elements occupy no space while no state needs reporting',
+  );
   const takeover = navigation.querySelector(
     'button[aria-label="zh:loginBrowserControl.takeover"]',
   );
@@ -1457,11 +1472,13 @@ test('Agent control is one address-bar toggle and takeover does not re-handoff t
     1,
     'the address bar exposes one control toggle',
   );
-  assert.equal(tabStrip.querySelector(
+  assert.equal(
+    container.querySelectorAll('[data-ccem-browser-control-toggle="true"]').length,
+    1,
+    'no control toggle may exist outside the address bar',
+  );
+  assert.equal(container.querySelector(
     'button[aria-label="zh:loginBrowserControl.pauseAgent"]',
-  ), null);
-  assert.equal(tabStrip.querySelector(
-    'button[aria-label="zh:loginBrowserControl.takeover"]',
   ), null);
 
   harness.click(takeover);
@@ -2449,6 +2466,8 @@ test('closing during cold startup unmounts immediately and closes only its late 
 
   const close = container.querySelector('button[aria-label="zh:loginBrowserControl.closeBrowser"]');
   assert.ok(close);
+  assert.ok(close.closest('[data-ccem-browser-navigation="true"]'),
+    'the surface-close action lives in the address bar after the tab strip removal');
   harness.click(close);
   assert.equal(closeCount, 1, 'X must notify the Workspace while startup is still pending');
   assert.equal(container.querySelector('[data-ccem-browser-panel="true"]'), null);

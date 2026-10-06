@@ -89,3 +89,44 @@ export async function run() {
   return { status: 'passed', harness: location.search.includes('timers') ? 'timer-driven-hidden-WK' : 'normal-animation-frames',
     physicalGesturesVerified: false, compositorVerified: false, receipts };
 }
+
+// Navigate between normal and ?fallback=1 documents, then run this stage.
+// Pass the previous stage's page to verify a retained or deliberately new CEF.
+export async function runModeRecovery({ composition, reuse = false, before = null }) {
+  const api = window.__overlaySmoke;
+  if (!api) throw new Error('Open the overlay smoke document first');
+  const receipts = [];
+  const wait = async (predicate, label) => {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const result = await predicate();
+      if (result) return result;
+      await new Promise(resolve => setTimeout(resolve, 35));
+    }
+    throw new Error(`Timed out: ${label}`);
+  };
+  const check = (ok, label, evidence) => {
+    if (!ok) throw new Error(`${label}: ${JSON.stringify(evidence)}`);
+    receipts.push({ label, evidence });
+  };
+  const state = async () => { const value = await api.call('status'); return { ...value, page: JSON.parse(value.title) }; };
+  const probe = () => { const b = api.bounds(); return api.call('probe', { point: [b.x + b.width * .75, b.y + b.height * .75] }); };
+  document.querySelector(reuse ? '#smoke-restore' : '#smoke-start').click();
+  await wait(() => document.querySelector('#smoke-start').disabled, 'surface presented');
+  const baseline = await state();
+  const native = await wait(async () => { const p = await probe(); return !p.hitMain && p; }, 'CEF receives input');
+  check(native.composition === composition, 'native presentation matches this document', native);
+  if (before) check(reuse ? baseline.page.boot === before.boot : baseline.page.boot !== before.boot,
+    reuse ? 'reload retains the original CEF page' : 'fallback creates a fresh CEF page', { before, after: baseline.page });
+  await api.call('focus');
+  document.querySelector('#smoke-dialog').click();
+  await wait(() => document.querySelector('#smoke-dialog-content'), 'real dialog opens');
+  const opened = await state();
+  const hit = await probe();
+  check(opened.visible === composition && hit.hitMain, 'dialog uses the chosen composition or hide barrier', { opened, hit });
+  document.querySelector('#smoke-dialog-close').click();
+  await wait(async () => (await state()).visible && !(await probe()).hitMain, 'CEF restored after dialog');
+  const final = await state();
+  check(final.page.boot === baseline.page.boot && final.page.ticks >= baseline.page.ticks, 'dialog retains CEF state', { before: baseline.page, after: final.page });
+  return { status: 'passed', composition, physicalGesturesVerified: false, compositorVerified: false, page: final.page, receipts };
+}

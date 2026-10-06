@@ -200,6 +200,9 @@ jobs:
       - name: Verify pinned browser runtime manifests
         run: node scripts/ci/check-browser-runtime-manifests.mjs
 
+      - name: Require the signed Hermes component before producing Desktop
+        run: node scripts/hermes/check-release.mjs --published
+
       - name: Detect complete cross-platform production signing
         id: release-mode
         env:
@@ -268,6 +271,10 @@ jobs:
         with:
           node-version: '22'
           cache: 'pnpm'
+
+      - name: Pin Hermes source and publisher key in this build
+        shell: bash
+        run: node scripts/hermes/check-release.mjs --github-env "$GITHUB_ENV"
 
       - name: Require a fresh current-attempt Desktop build
         id: release-payload

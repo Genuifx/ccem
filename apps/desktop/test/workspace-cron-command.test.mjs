@@ -86,7 +86,7 @@ test('preserves the full user cron request for the launched agent', async () => 
   assert.match(agentPrompt?.prompt ?? '', /不要强制覆盖任何现有任务/);
 });
 
-test('instructs the agent to use WeCom result notification when requested', async () => {
+test('instructs the agent to resolve a paired recipient before creating a notified task', async () => {
   const { buildWorkspaceCronAgentPrompt } = await importWorkspaceCronCommand();
   const agentPrompt = buildWorkspaceCronAgentPrompt(
     '/ccem-cron 每天下午 6 点总结今天的 git 变更并把结果推送到企微',
@@ -94,9 +94,13 @@ test('instructs the agent to use WeCom result notification when requested', asyn
   );
 
   assert.match(agentPrompt?.prompt ?? '', /wecomNotification/);
-  assert.match(agentPrompt?.prompt ?? '', /ChatApp\/WeCom/);
+  assert.match(agentPrompt?.prompt ?? '', /ccem cron notification-targets --json/);
+  assert.match(agentPrompt?.prompt ?? '', /hermesNotification/);
+  assert.match(agentPrompt?.prompt ?? '', /存在多个候选时请用户选择/);
+  assert.match(agentPrompt?.prompt ?? '', /只有用户明确选择旧企微连接/);
+  assert.match(agentPrompt?.prompt ?? '', /Hermes 查询失败不能自动改用旧目标/);
   assert.match(agentPrompt?.prompt ?? '', /\{ enabled: true, botId: null, peerId: null \}/);
-  assert.match(agentPrompt?.prompt ?? '', /不要猜测联系人或群/);
+  assert.match(agentPrompt?.prompt ?? '', /不猜测联系人或群/);
 });
 
 test('workspace cron submit launches a native agent session instead of creating a task directly', async () => {
@@ -131,11 +135,11 @@ test('cron AI Create opens workspace composer seeded with /ccem-cron', async () 
   assert.doesNotMatch(cronSource, /AiCronPanel/);
 });
 
-test('cron Add Task form exposes WeCom result notification fields', async () => {
+test('cron Add Task form retains the legacy WeCom result notification fields', async () => {
   const cronSource = await fs.readFile(cronPagePath, 'utf8');
 
   assert.match(cronSource, /getWecomTaskBindingOptions/);
-  assert.match(cronSource, /resultNotification/);
+  assert.match(cronSource, /legacyNotification/);
   assert.match(cronSource, /wecomNotification: notifyWecom/);
   assert.match(cronSource, /wecomDefaultTarget/);
   assert.match(cronSource, /wecomManualTarget/);

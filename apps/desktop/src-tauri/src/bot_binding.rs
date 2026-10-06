@@ -92,17 +92,7 @@ pub struct BotBindingInfo {
     pub connected_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BotBindingOutboxFrameKind {
-    TaskCard,
-    EventUpdate,
-    InteractiveOutput,
-    InboundCommand,
-    PermissionPrompt,
-    SessionCompleted,
-    Error,
-}
+pub use crate::remote_bridge::RemoteEventKind as BotBindingOutboxFrameKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotBindingOutboxFrame {

@@ -204,8 +204,8 @@ export function toLiveHistorySessionItem(
   const hasAuthoritativeTitleState = (entry.session.display_title_revision ?? 0) > 0;
   const display = entry.session.display_title?.trim()
     || (!hasAuthoritativeTitleState ? entry.generatedTitle?.trim() : '')
-    || entry.initialPrompt?.trim()
     || entry.session.initial_user_prompt?.trim()
+    || entry.initialPrompt?.trim()
     || `${entry.session.provider === 'codex' ? 'Codex' : 'Claude'} workspace session`;
 
   return {
@@ -234,7 +234,7 @@ export function buildWorkspaceSidebarSessions(
   }
 
   const nextSessions = [...historySessions];
-  const existingKeys = new Set(historySessions.map(historySessionKey));
+  const indexByKey = new Map(historySessions.map((session, index) => [historySessionKey(session), index]));
 
   for (const entry of liveEntries) {
     const liveItem = toLiveHistorySessionItem(entry);
@@ -243,11 +243,19 @@ export function buildWorkspaceSidebarSessions(
     }
 
     const key = historySessionKey(liveItem);
-    if (existingKeys.has(key)) {
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex !== undefined) {
+      const historyItem = nextSessions[existingIndex];
+      // Persisted native revisions include manual clears. Their latest title
+      // must render immediately, even while the history snapshot is stale.
+      if (((entry.session.display_title_revision ?? 0) > 0 || !historyItem.display.trim())
+        && historyItem.display !== liveItem.display) {
+        nextSessions[existingIndex] = { ...historyItem, display: liveItem.display };
+      }
       continue;
     }
 
-    existingKeys.add(key);
+    indexByKey.set(key, nextSessions.length);
     nextSessions.push(liveItem);
   }
 

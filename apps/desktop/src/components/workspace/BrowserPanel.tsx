@@ -38,7 +38,7 @@ import { isNativeBrowserCompositionEnabled, useNativeBrowserViewport, waitForNat
 import { useNativeBrowserSurfaceGeometrySync } from '@/hooks/useNativeBrowserSurfaceGeometrySync';
 import { readAppZoom } from '@/hooks/useZoom';
 import { buildNativeBrowserBounds } from './browserPanelGeometry';
-import { BrowserPanelNavigation, BrowserPanelTabStrip } from './BrowserPanelChrome';
+import { BrowserPanelNavigation } from './BrowserPanelChrome';
 import type { BrowserAgentStatus } from './browserActivation';
 import { invokeBrowserCommand } from '@/lib/webcontentRecovery';
 
@@ -1028,23 +1028,6 @@ export function BrowserPanel({
         onPointerDown={onResizeStart}
       />
 
-      <div data-ccem-browser-tab-strip="true" className="workspace-browser-chrome flex h-10 shrink-0 items-center gap-2 border-b border-border/45 pl-3 pr-2">
-        <BrowserPanelTabStrip
-          panelTitle={panelTitle}
-          sessionStatus={sessionStatus}
-          recoveryStates={recoveryStates}
-          popupActive={popupActive}
-          lifecycle={lifecycle}
-          spinnerActive={isBusy || isLoading || popupLoading || isClosingSurface
-            || isLoginControlBusy || isPopupCloseBusy}
-          isPopupCloseBusy={isPopupCloseBusy}
-          isClosingSurface={isClosingSurface}
-          t={t}
-          onClosePopup={() => void handleClosePopup()}
-          onClose={() => void handleClose()}
-        />
-      </div>
-
       <BrowserPanelNavigation
         effectiveUrl={effectiveUrl}
         popupActive={popupActive}
@@ -1062,6 +1045,12 @@ export function BrowserPanel({
         isLoading={isLoading}
         navigationDisabled={navigationDisabled}
         stopLoadingDisabled={stopLoadingDisabled}
+        spinnerActive={isBusy || isLoading || popupLoading || isClosingSurface
+          || isLoginControlBusy || isPopupCloseBusy}
+        isPopupCloseBusy={isPopupCloseBusy}
+        isClosingSurface={isClosingSurface}
+        recoveryStates={recoveryStates}
+        lifecycle={lifecycle}
         t={t}
         onNavigationAction={(action) => void handleNavigationAction(action)}
         onOpenExternal={handleOpenExternal}
@@ -1070,6 +1059,8 @@ export function BrowserPanel({
         onUrlInputChange={setUrlInput}
         onCancelUrlEditing={cancelUrlEditing}
         onStartUrlEditing={handleStartUrlEditing}
+        onClosePopup={() => void handleClosePopup()}
+        onClose={() => void handleClose()}
       />
 
       {error || popupError ? (

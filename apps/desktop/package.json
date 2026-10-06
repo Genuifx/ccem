@@ -1,6 +1,6 @@
 {
   "name": "@ccem/desktop",
-  "version": "2.89.0",
+  "version": "2.91.1",
   "type": "module",
   "scripts": {
     "predev": "node scripts/prepare-native-runtime-sidecar.mjs",
@@ -11,6 +11,7 @@
     "test:run": "pnpm --filter @ccem/core build && node --test test/*.test.mjs",
     "test:dsh-bundle-smoke": "node scripts/verify-dsh-bundle-smoke.mjs",
     "test:e2e": "node test/opencode.mcp.e2e.mjs",
+    "test:file-drop-e2e": "node test/composer-file-drop.e2e.mjs",
     "perf:smoke": "node scripts/perf-smoke.mjs",
     "preview": "vite preview",
     "tauri": "tauri",

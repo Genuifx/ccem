@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useDeferredValue, useState } from 'react';
 import { RotateCw } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
@@ -265,6 +265,11 @@ export function SessionUsagePopoverContent({
   // Secondary view state (REQ-0028). The popover content unmounts when the
   // hover closes, so every open starts on the usage view — no stale drill-down.
   const [view, setView] = useState<'usage' | 'composition'>('usage');
+  // The segmented control highlights from the urgent `view` state so the press
+  // lands immediately; the panel body swaps via the deferred value so the
+  // full-content re-render (rows + reposition) never blocks the click/hover
+  // event stream (REQ-0035 lag complaint on rapid 用量/组成 switching).
+  const deferredView = useDeferredValue(view);
 
   const snapshot = usage.sessionUsage;
   // The SDK snapshot can lag one turn behind (transcript flush timing), while
@@ -363,7 +368,7 @@ export function SessionUsagePopoverContent({
         </div>
       )}
 
-      {view === 'composition' && hasContext ? (
+      {deferredView === 'composition' && hasContext ? (
         <ContextCompositionView context={usage.context!} />
       ) : (
         <>

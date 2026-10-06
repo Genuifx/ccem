@@ -88,7 +88,7 @@ ccem cron --help
 ccem cron list --json
 ```
 
-The current agent-facing CLI supports `list`, `create`, and `delete`. It does not expose an `update`, `edit`, or `runs` command.
+The current agent-facing CLI supports `list`, `notification-targets`, `create`, `trigger`, and `delete`. It does not expose an `update`, `edit`, or `runs` command.
 
 Read task IDs and complete task configuration from the array returned by `ccem cron list --json`. Resolve an exact task ID before changing an existing task.
 
@@ -98,11 +98,21 @@ For creation, run `ccem cron create --help`, resolve natural-language schedules 
 ccem cron create --from-json @task.json --json
 ```
 
+When the user asks to send task results to a Hermes bot, run `ccem cron notification-targets --json` and select the paired recipient matching the request. Ask when multiple recipients match; never invent recipient IDs or silently select another channel after a lookup failure.
+
 For deletion, confirm the exact task and use its ID:
 
 ```bash
 ccem cron delete "<taskId>" --json
 ```
+
+When the user wants an existing task to run immediately instead of waiting for its schedule, trigger it by exact ID or exact name:
+
+```bash
+ccem cron trigger "<taskIdOrName>" --json
+```
+
+`ccem cron trigger` requires CCEM Desktop to be running; the task executes in the desktop's background and run history appears on its Cron page. Triggering does not modify the task or its schedule. The response confirms the triggered task; run status is not available through the CLI.
 
 For an update request, first read the task with `ccem cron list --json`. If desktop UI control is available, use CCEM Desktop's Cron page to edit the exact task in place, then read the task list again to verify the stored result. Otherwise explain the CLI limitation and ask whether the user wants to update it in Desktop or replace it. Replacement creates a new task ID and does not preserve the old task's run-history association.
 

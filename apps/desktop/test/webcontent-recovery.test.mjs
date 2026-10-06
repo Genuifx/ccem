@@ -46,7 +46,7 @@ async function recoveryHarness({ native = true, invoke, heap, uuid, draftCounts 
     { warn() {} },
   );
   return {
-    module, calls, timers, document,
+    module, calls, timers, document, window,
     timeout() {
       for (const [id, timer] of [...timers]) {
         timers.delete(id);
@@ -98,6 +98,62 @@ test('actual main bootstrap waits for the native document fence and overlay setu
   assert.equal(mounts.length, 1);
   assert.equal(document.documentElement.dataset.window, 'main');
   assert.equal(harness.calls.length, 1, 'boot requests are single-flight');
+});
+
+test('actual main mounts after the recovery deadline and a late identity cannot enable composition', async () => {
+  const gate = deferred();
+  const harness = await recoveryHarness({ invoke: (command) => (
+    command === 'webcontent_frontend_boot' ? gate.promise : Promise.resolve(true)
+  ) });
+  const mounts = [];
+  const document = { documentElement: { dataset: {} }, getElementById: () => ({ id: 'root' }) };
+  const window = { ...harness.window, location: { search: '' }, addEventListener() {} };
+  const overlay = {};
+  const overlayImports = {
+    react: {},
+    '@tauri-apps/api/event': { listen: async () => () => {} },
+    '@/hooks/useZoom': { readAppZoom: () => 1 },
+    './webcontentRecovery': harness.module,
+    './nativeSurfaceOcclusionStore': { nativeSurfaceOcclusionStore: {
+      subscribe: () => () => {}, isOccluded: () => false, hasActiveOverlays: () => false,
+    } },
+    './nativeBrowserOverlayManager': { createNativeBrowserOverlayManager: () => ({ flush() {} }) },
+  };
+  new Function('require', 'exports', 'window', 'document', 'CSS', await compile('lib/nativeBrowserOverlay.ts'))(
+    (name) => { assert.ok(name in overlayImports, name); return overlayImports[name]; },
+    overlay, window, document, { supports: () => true },
+  );
+  const imports = {
+    react: { default: { createElement: (...args) => args, StrictMode: 'strict' } },
+    'react-dom/client': { default: { createRoot: () => ({ render: (tree) => mounts.push(tree) }) } },
+    '@tauri-apps/api/window': { getCurrentWindow: () => ({ label: 'main' }) },
+    './App': { default: function App() {} },
+    './pages/PetOverlay': { PetOverlay() {} },
+    './pages/TrayCockpit': { TrayCockpit() {} },
+    './lib/performance': { initPerformanceMode() {} },
+    './lib/perf-log': { initPerfLog() {} },
+    './lib/windowRootRouting': { resolveDesktopWindowRoot: () => 'main' },
+    './lib/webcontentRecovery': harness.module,
+    './lib/nativeBrowserOverlay': overlay,
+    './index.css': {},
+  };
+  new Function('require', 'exports', 'window', 'document', await compile('main.tsx'))(
+    (name) => { assert.ok(name in imports, name); return imports[name]; }, {}, window, document,
+  );
+  assert.equal(mounts.length, 0);
+  harness.timeout();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mounts.length, 1, 'the original recovery timeout must still release the UI');
+  assert.equal(overlay.isNativeBrowserCompositionEnabled(), false);
+  assert.deepEqual(harness.calls.map(({ command }) => command), ['webcontent_frontend_boot']);
+
+  gate.resolve({ documentId: 'renderer-document-1', generation: 0, recovered: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await overlay.initializeNativeBrowserOverlays(), false, 'this document must keep its chosen fallback');
+  assert.equal(mounts.length, 1);
+  assert.equal(await harness.module.acknowledgeWebcontentReady(), true, 'late identity still enables the existing ready ACK');
+  assert.equal(harness.module.isRecoveringWebcontent(), true, 'late identity must not authorize replay');
+  assert.deepEqual(harness.calls.map(({ command }) => command), ['webcontent_frontend_boot', 'webcontent_frontend_ready']);
 });
 
 test('fresh/recovered document identity and generation are forwarded to ready and samples', async () => {

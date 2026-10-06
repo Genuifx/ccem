@@ -295,6 +295,9 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
     if (!Object.hasOwn(environment, 'CCEM_BROWSER_DATA_ROOT')) {
       delete childEnvironment.CCEM_BROWSER_DATA_ROOT;
     }
+    if (!Object.hasOwn(environment, 'CCEM_HERMES_STATE_DIR')) {
+      delete childEnvironment.CCEM_HERMES_STATE_DIR;
+    }
     const result = spawnSync(
       process.execPath,
       [launcherPath, '--describe', '--worktree-root', worktreeRoot],
@@ -329,6 +332,8 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
   assert.equal(alpha.environment.CCEM_DESKTOP_DEV_INSTANCE_ID, alpha.instanceId);
   assert.equal(alpha.environment.CCEM_TAURI_MCP_PORT, String(alpha.mcpPort));
   assert.equal(alpha.environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES, '0');
+  assert.equal(alpha.environment.CCEM_HERMES_STATE_DIR, path.join(alphaRoot, '.artifacts', 'hermes-managed'));
+  assert.notEqual(alpha.environment.CCEM_HERMES_STATE_DIR, beta.environment.CCEM_HERMES_STATE_DIR);
   assert.equal(alpha.browserDataRootSource, 'worktree default');
   assert.equal(
     alpha.environment.CCEM_BROWSER_DATA_ROOT,
@@ -351,6 +356,22 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
     }).environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES,
     '1',
   );
+  assert.equal(
+    describe(alphaRoot, { CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: '1' }).environment.CCEM_HERMES_STATE_DIR,
+    undefined,
+    'explicit background services retain the existing shared Hermes behavior',
+  );
+  for (const background of ['0', '1']) {
+    assert.equal(describe(alphaRoot, {
+      CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: background,
+      CCEM_HERMES_STATE_DIR: '/private/tmp/explicit-hermes-state',
+    }).environment.CCEM_HERMES_STATE_DIR, '/private/tmp/explicit-hermes-state');
+    assert.equal(describe(alphaRoot, {
+      CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: background,
+      CCEM_HERMES_STATE_DIR: '.artifacts/synthetic-hermes',
+    }).environment.CCEM_HERMES_STATE_DIR, path.join(alphaRoot, '.artifacts', 'synthetic-hermes'),
+    'relative overrides must be absolute before the Rust debug root validation');
+  }
   assert.equal(
     describe('/tmp/ccem-worktree-alpha', {
       CCEM_BROWSER_DATA_ROOT: '/private/tmp/ccem-explicit-browser-root',

@@ -340,6 +340,11 @@ struct EnvironmentNameParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct CronTriggerParams {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RenameEnvironmentParams {
     old_name: String,
@@ -497,13 +502,17 @@ impl ExternalControlManager {
     }
 
     fn handle_connection(self: &Arc<Self>, app: &AppHandle, mut stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+        if let Err(error) = configure_control_stream(&stream) {
+            eprintln!("External control stream configuration failed: {}", error);
+            return;
+        }
         let response = match read_http_request(&mut stream) {
             Ok(request) => self.handle_http_request(app, request),
             Err(error) => HttpResponse::json_error(400, None, -32700, &error),
         };
-        let _ = stream.write_all(&response.to_bytes());
+        if let Err(error) = stream.write_all(&response.to_bytes()) {
+            eprintln!("External control response write failed: {}", error);
+        }
     }
 
     fn handle_http_request(&self, app: &AppHandle, request: HttpRequest) -> HttpResponse {
@@ -538,9 +547,14 @@ impl ExternalControlManager {
         }
 
         let expected_auth = format!("Bearer {}", self.token);
-        if request.headers.get("authorization").map(String::as_str) != Some(expected_auth.as_str())
-        {
+        let authorization = request.headers.get("authorization").map(String::as_str).unwrap_or("");
+        let bridge = app.try_state::<Arc<crate::hermes_bridge::HermesBridgeManager>>();
+        let bridge_authorized = bridge.as_ref().is_some_and(|b| b.authorized_token(authorization));
+        if authorization != expected_auth && !bridge_authorized {
             return HttpResponse::json_error(401, None, -32001, "Unauthorized");
+        }
+        if bridge_authorized && request.body.len() > 64 * 1024 {
+            return HttpResponse::json_error(413, None, -32600, "Bridge request too large");
         }
 
         let rpc = match serde_json::from_slice::<JsonRpcRequest>(&request.body) {
@@ -555,6 +569,13 @@ impl ExternalControlManager {
             }
         };
         let id = rpc.id.clone();
+
+        if bridge_authorized {
+            return match bridge.expect("authorized bridge exists").handle_rpc(app, authorization, &rpc.method, rpc.params) {
+                Ok(result) => HttpResponse::json_result(id, result),
+                Err(error) => HttpResponse::json_error(200, id, -32000, &error),
+            };
+        }
 
         // Method allowlist: reject unknown JSON-RPC methods with -32601.
         if !is_allowed_method(&rpc.method) {
@@ -583,6 +604,34 @@ impl ExternalControlManager {
                 "version": env!("CARGO_PKG_VERSION"),
                 "capabilities": control_capabilities(),
             })),
+            "ccem.cron.notificationTargets" => {
+                let bridge = app.try_state::<Arc<crate::hermes_bridge::HermesBridgeManager>>()
+                    .ok_or("hermes_unavailable")?;
+                Ok(bridge.cron_notification_targets()?)
+            }
+            "ccem.cron.list" => {
+                let tasks = crate::cron::list_cron_tasks()?;
+                Ok(serde_json::to_value(tasks).map_err(|error| error.to_string())?)
+            }
+            "ccem.cron.trigger" => {
+                let params = deserialize_params::<CronTriggerParams>(rpc.params)?;
+                let id = params.id.trim();
+                if id.is_empty() {
+                    return Err("Task id cannot be empty".into());
+                }
+                // Same execution path as the UI "run now" button: resolve the
+                // unified runtime manager from managed state and let
+                // run_cron_task_now spawn the background execution thread.
+                let unified_runtime_manager = app
+                    .try_state::<Arc<crate::unified_runtime::UnifiedSessionManager>>()
+                    .ok_or("unified_runtime_unavailable")?;
+                let task = crate::cron::run_cron_task_now(
+                    app.clone(),
+                    unified_runtime_manager.inner().clone(),
+                    id,
+                )?;
+                Ok(serde_json::to_value(task).map_err(|error| error.to_string())?)
+            }
             "ccem.workspace.listSessions" => {
                 let _mutation_guard = self.environment_mutations.lock()?;
                 let params = deserialize_params::<ListSessionsParams>(rpc.params)?;
@@ -624,6 +673,17 @@ impl ExternalControlManager {
                     .map(ControlSessionSummary::from)
                     .ok_or_else(|| format!("Native runtime {} not found", params.runtime_id))?;
                 Ok(serde_json::to_value(session).map_err(|error| error.to_string())?)
+            }
+            "ccem.remote.getEvents" => {
+                let params = deserialize_params::<EventsParams>(rpc.params)?;
+                let since = Some(params.since_seq.unwrap_or(0));
+                let batch = self.native_runtime.replay_event_page(
+                    &params.runtime_id,
+                    since,
+                    None,
+                    params.limit.unwrap_or(100),
+                )?;
+                Ok(crate::remote_bridge::project_batch(batch, since))
             }
             "ccem.workspace.getEvents" => {
                 let params = deserialize_params::<EventsParams>(rpc.params)?;
@@ -1750,6 +1810,14 @@ impl HttpResponse {
     }
 }
 
+fn configure_control_stream(stream: &TcpStream) -> std::io::Result<()> {
+    // Accepted sockets inherit the listener's O_NONBLOCK on macOS. Timeouts
+    // alone do not make write_all wait, so large replies would be truncated.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))
+}
+
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     read_http_request_with_deadline(stream, SOCKET_IO_TIMEOUT)
 }
@@ -2004,7 +2072,10 @@ fn build_runtime_link(summary: &NativeSessionSummary) -> String {
 }
 
 fn control_capabilities() -> Value {
-    json!({ "taskModelSelection": { "version": 1, "providers": ["codex"] } })
+    json!({
+        "taskModelSelection": { "version": 1, "providers": ["codex"] },
+        "cron": { "version": 1, "actions": ["list", "trigger"] }
+    })
 }
 
 fn control_descriptor_path() -> Result<PathBuf, String> {
@@ -2219,12 +2290,16 @@ fn is_allowed_method_for_build(method: &str, _debug_assertions: bool) -> bool {
     matches!(
         method,
         "ccem.health"
+            | "ccem.cron.notificationTargets"
+            | "ccem.cron.list"
+            | "ccem.cron.trigger"
             | "ccem.workspace.listSessions"
             | "ccem.environment.references"
             | "ccem.environment.rename"
             | "ccem.environment.delete"
             | "ccem.workspace.getSession"
             | "ccem.workspace.getEvents"
+            | "ccem.remote.getEvents"
             | "ccem.workspace.sendInput"
             | "ccem.workspace.openSession"
             | "ccem.workspace.createSession"
@@ -2349,6 +2424,37 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    #[test]
+    fn accepted_nonblocking_listener_delivers_large_response_to_slow_reader() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let deadline = Instant::now() + SOCKET_IO_TIMEOUT;
+        let (mut server, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept synthetic client: {error}"),
+            }
+        };
+        // Linux does not inherit O_NONBLOCK from accept; force the macOS state
+        // as well so this behavior regression runs on both platforms.
+        server.set_nonblocking(true).unwrap();
+        configure_control_stream(&server).unwrap();
+        let response = HttpResponse::json(200, json!({ "synthetic": "x".repeat(8 * 1024 * 1024) }));
+        let expected = response.to_bytes();
+        let writer = thread::spawn(move || server.write_all(&response.to_bytes()));
+        client.set_read_timeout(Some(SOCKET_IO_TIMEOUT)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        writer.join().unwrap().expect("complete response write");
+        assert_eq!(received.len(), expected.len());
+        assert!(received == expected, "response bytes must be complete and unchanged");
     }
 
     #[test]
@@ -2496,12 +2602,16 @@ mod tests {
     fn test_allowed_methods() {
         for method in [
             "ccem.health",
+            "ccem.cron.notificationTargets",
+            "ccem.cron.list",
+            "ccem.cron.trigger",
             "ccem.workspace.listSessions",
             "ccem.environment.references",
             "ccem.environment.rename",
             "ccem.environment.delete",
             "ccem.workspace.getSession",
             "ccem.workspace.getEvents",
+            "ccem.remote.getEvents",
             "ccem.workspace.sendInput",
             "ccem.workspace.openSession",
             "ccem.workspace.createSession",
@@ -2527,6 +2637,19 @@ mod tests {
         assert!(!is_allowed_method(""));
         assert!(!is_allowed_method("admin.shutdown"));
         assert!(!is_allowed_method("system.execute"));
+    }
+
+    #[test]
+    fn cron_trigger_params_require_a_string_id() {
+        let params: CronTriggerParams =
+            serde_json::from_value(json!({ "id": "cron-1234-abcd" })).expect("valid params");
+        assert_eq!(params.id, "cron-1234-abcd");
+        for invalid in [json!({}), json!({ "id": 42 }), json!({ "taskId": "cron-1" })] {
+            assert!(
+                serde_json::from_value::<CronTriggerParams>(invalid).is_err(),
+                "params without a string id must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2662,7 +2785,8 @@ mod tests {
     #[test]
     fn task_model_capability_and_create_params_contract() {
         assert_eq!(control_capabilities(), json!({
-            "taskModelSelection": { "version": 1, "providers": ["codex"] }
+            "taskModelSelection": { "version": 1, "providers": ["codex"] },
+            "cron": { "version": 1, "actions": ["list", "trigger"] }
         }));
         let legacy = create_session_params(json!({ "provider": "codex", "prompt": "start" }));
         assert!(legacy.model.is_none());

@@ -60,6 +60,7 @@ function Smoke() {
     try {
       const value = await call(action, { bounds: bounds() });
       if (action === 'start') setStarted(true);
+      if (action === 'show') { setStarted(true); setVisible(true); }
       if (action === 'close') setStarted(false);
       setResult(JSON.stringify(value, null, 2));
     } catch (error) { setResult(String(error)); }
@@ -67,6 +68,7 @@ function Smoke() {
   return <div ref={backdrop} className="app-content-shell relative h-screen overflow-hidden p-10">
     <div className="relative z-10 flex flex-wrap gap-3">
       <Button id="smoke-start" onClick={() => void run('start')} disabled={started}>启动 CEF</Button>
+      <Button id="smoke-restore" onClick={() => void run('show')} disabled={started}>复用保留页面</Button>
       <Button id="smoke-dialog" onClick={() => setDialog(true)}>全局弹框</Button>
       <Button id="smoke-review" ref={workspaceReviewTriggerRef} onClick={() => setReview(true)}>审查</Button>
       <Popover><PopoverTrigger asChild><Button id="smoke-popover">局部浮层</Button></PopoverTrigger>
@@ -79,6 +81,7 @@ function Smoke() {
       <Button id="smoke-hide" onClick={async () => { await call(visible ? 'hide' : 'show'); setVisible(!visible); }}>切换浏览器</Button>
       <Button id="smoke-status" onClick={() => void run('status')}>读取状态</Button>
       <Button id="smoke-close" onClick={() => void run('close')}>关闭 CEF</Button>
+      <Button id="smoke-close-popup" onClick={() => void run('close_popup')}>关闭网页弹窗</Button>
     </div>
     <pre id="smoke-result" className="relative z-10 mt-6 max-w-[38%] overflow-auto whitespace-pre-wrap text-xs">{result}</pre>
     <section className="workspace-browser-panel absolute bottom-5 right-5 top-36 w-[58%] border border-border bg-card">
@@ -99,7 +102,9 @@ function Smoke() {
 }
 
 if (import.meta.env.DEV) {
-  void initializeWebcontentRecovery().then(initializeNativeBrowserOverlays).then(() => {
+  // Explicit fallback document exercises retention after a timed-out boot.
+  void initializeWebcontentRecovery().then(() => new URLSearchParams(location.search).has('fallback')
+    ? false : initializeNativeBrowserOverlays()).then(() => {
     createRoot(document.getElementById('root')!).render(<React.StrictMode><LocaleProvider><Smoke /></LocaleProvider></React.StrictMode>);
   });
 }

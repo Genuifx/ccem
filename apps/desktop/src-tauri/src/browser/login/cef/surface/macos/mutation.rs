@@ -45,7 +45,7 @@ pub(crate) fn set_bounds(surface_id: &str, bounds: NativeChildBounds) -> Result<
 
 pub(crate) fn occlude(surface_id: &str) -> Result<(), String> {
     require_main_thread()?;
-    if has_wrapper(surface_id) {
+    if crate::browser_overlay::macos::enabled() && has_wrapper(surface_id) {
         return suspend_input(surface_id);
     }
     let (visible, shared, primary, popup) = surface_focus_children(surface_id)?;
@@ -156,6 +156,31 @@ pub(crate) fn sync_overlay_input(modal: bool) -> Result<(), String> {
             if visible { set_visible(&id, true)?; }
             else { shared.clear_focus_restore_intent(); }
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn configure_overlay_composition(enabled: bool) -> Result<(), String> {
+    require_main_thread()?;
+    let wrappers = SURFACES.with(|surfaces| {
+        surfaces.borrow().iter().filter_map(|(id, surface)| {
+            surface.wrapper.as_ref().map(|wrapper| (
+                id.clone(), wrapper.clone(), surface.close_requested, Arc::clone(&surface.shared),
+            ))
+        }).collect::<Vec<_>>()
+    });
+    for (id, wrapper, closing, shared) in wrappers {
+        if !enabled {
+            wrapper.suspend_input(true);
+            wrapper.setHidden(true);
+            SURFACES.with(|surfaces| {
+                if let Some(surface) = surfaces.borrow_mut().get_mut(&id) { surface.visible = false; }
+            });
+            shared.clear_focus_restore_intent();
+            shared.update(|state| state.visible = false);
+            wrapper.suspend_input(closing);
+        }
+        wrapper.set_composition(enabled);
     }
     Ok(())
 }

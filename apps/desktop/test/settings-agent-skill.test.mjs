@@ -36,22 +36,22 @@ test('bundled CCEM agent skill teaches agents to use the JSON desktop CLI wrappe
 test('bundled CCEM agent skill matches the supported cron CLI contract', async () => {
   const [skillSource, cliSource] = await Promise.all([
     fs.readFile(path.join(repoRoot, 'packages/agent-skills/ccem/SKILL.md'), 'utf8'),
-    fs.readFile(path.join(repoRoot, 'apps/cli/src/index.ts'), 'utf8'),
+    fs.readFile(path.join(repoRoot, 'apps/cli/src/cronCommands.ts'), 'utf8'),
   ]);
   const cronStart = cliSource.indexOf('const cronCmd = program');
-  const cronEnd = cliSource.indexOf('const setupCmd = program');
   assert.notEqual(cronStart, -1);
-  assert.notEqual(cronEnd, -1);
 
-  const cronCliSource = cliSource.slice(cronStart, cronEnd);
+  const cronCliSource = cliSource.slice(cronStart);
   const cronCommands = [...cronCliSource.matchAll(/cronCmd\s*\n\s*\.command\('([^']+)'\)/g)]
     .map((match) => match[1].split(' ')[0]);
 
-  assert.deepEqual(cronCommands, ['list', 'create', 'delete']);
-  assert.match(skillSource, /supports `list`, `create`, and `delete`/);
+  assert.deepEqual(cronCommands, ['list', 'notification-targets', 'create', 'delete', 'trigger']);
+  assert.match(skillSource, /supports `list`, `notification-targets`, `create`, `trigger`, and `delete`/);
   assert.match(skillSource, /ccem cron list --json/);
+  assert.match(skillSource, /ccem cron notification-targets --json/);
   assert.match(skillSource, /ccem cron create --from-json/);
   assert.match(skillSource, /ccem cron delete "<taskId>" --json/);
+  assert.match(skillSource, /ccem cron trigger "<taskIdOrName>" --json/);
   assert.match(skillSource, /does not expose an `update`, `edit`, or `runs` command/);
   assert.match(skillSource, /use CCEM Desktop's Cron page to edit the exact task in place/);
   assert.doesNotMatch(skillSource, /ccem cron runs <taskId> --json/);

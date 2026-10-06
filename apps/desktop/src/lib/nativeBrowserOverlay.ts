@@ -1,7 +1,7 @@
 import { useCallback, useLayoutEffect, useRef, type ForwardedRef, type RefObject } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { readAppZoom } from '@/hooks/useZoom';
-import { invokeBrowserCommand } from './webcontentRecovery';
+import { currentWebcontentDocumentIdentity, invokeBrowserCommand } from './webcontentRecovery';
 import { nativeSurfaceOcclusionStore } from './nativeSurfaceOcclusionStore';
 import { createNativeBrowserOverlayManager } from './nativeBrowserOverlayManager';
 
@@ -24,6 +24,9 @@ export function initializeNativeBrowserOverlays(): Promise<boolean> {
   if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return Promise.resolve(false);
   initialization = (async () => {
     try {
+      // Recovery already bounded its handshake. Keep this document in legacy
+      // mode if that deadline expired; a late identity must not change layers.
+      if (!currentWebcontentDocumentIdentity()) return false;
       if (!CSS.supports('clip-path', 'polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0)')) return false;
       if (!await invokeBrowserCommand<boolean>('browser_overlay_initialize')) return false;
       enabled = true;
@@ -32,6 +35,7 @@ export function initializeNativeBrowserOverlays(): Promise<boolean> {
         document,
         readZoom: readAppZoom,
         isModal: nativeSurfaceOcclusionStore.isOccluded,
+        isModalRequested: nativeSurfaceOcclusionStore.hasActiveOverlays,
         send: (snapshot) => invokeBrowserCommand('browser_overlay_sync', { ...snapshot }),
         onError: (error) => console.error('Native browser overlay geometry sync failed:', error),
       });

@@ -15,6 +15,8 @@ interface ManagerOptions {
   document: Document;
   readZoom: () => number;
   isModal: () => boolean;
+  /** Only controls waiter cancellation; native input uses the effective guard. */
+  isModalRequested?: () => boolean;
   send: (snapshot: NativeBrowserOverlaySnapshot) => Promise<void>;
   onError?: (error: unknown) => void;
 }
@@ -59,7 +61,9 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
   let trackUntil = 0;
   let revision = 0;
   let lastSnapshot = '';
-  let latestSend: { modal: boolean; promise: Promise<void> } | null = null;
+  let latestModal = false;
+  let acknowledgedRevision = 0;
+  const modalWaiters = new Set<{ resolve: () => void; reject: (error: unknown) => void }>();
   let retryTimer: number | null = null;
   let failedSends = 0;
   let microtaskPending = false;
@@ -73,6 +77,16 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
   };
   const isModal = () => options.isModal()
     || view.getComputedStyle(document.body).pointerEvents === 'none';
+  const isModalRequested = () => options.isModalRequested?.() ?? isModal();
+
+  const settleModalWaiters = (error?: Error) => {
+    for (const waiter of modalWaiters) {
+      if (error) waiter.reject(error);
+      else waiter.resolve();
+    }
+    modalWaiters.clear();
+  };
+  const needsRetry = () => registries.viewport.size > 0 || modalWaiters.size > 0;
 
   const flush = () => {
     if (disposed) return;
@@ -103,6 +117,7 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
     }
     // Never leave an unreported overlay clickable through to CEF when bounded.
     const modal = isModal() || regions.length > MAX_REGIONS;
+    if (!isModalRequested()) settleModalWaiters(new Error('Native browser modal was closed before its acknowledgement'));
     const state = { modal, regions: regions.length > MAX_REGIONS ? [] : regions };
     const fingerprint = JSON.stringify(state);
     if (fingerprint === lastSnapshot) return;
@@ -111,11 +126,13 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
     let promise: Promise<void>;
     try { promise = options.send({ revision: currentRevision, ...state }); }
     catch (error) { promise = Promise.reject(error); }
-    latestSend = { modal, promise };
-    // flush stays fire-and-forget. A participant can separately await the same
-    // transport promise without creating an unhandled rejection for observers.
+    latestModal = modal;
+    // Handle transport failures here; modal participants remain behind their
+    // barrier until a retry acknowledges the latest revision.
     void promise.then(() => {
       if (currentRevision === revision) {
+        acknowledgedRevision = currentRevision;
+        if (modal) settleModalWaiters();
         failedSends = 0;
         if (retryTimer !== null) view.clearTimeout(retryTimer);
         retryTimer = null;
@@ -125,13 +142,13 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
       lastSnapshot = '';
       options.onError?.(error);
       failedSends += 1;
-      // Retry only a failed transport while a native viewport still exists. The
-      // delay is capped, so an unchanged snapshot can recover after a bridge gap.
-      if (registries.viewport.size > 0) {
+      // An opening modal follows recovery of the same ACK. Keep retrying if its
+      // viewport unmounts so the occlusion store's transition queue can drain.
+      if (needsRetry()) {
         if (retryTimer !== null) view.clearTimeout(retryTimer);
         retryTimer = view.setTimeout(() => {
           retryTimer = null;
-          if (registries.viewport.size > 0) flush();
+          if (needsRetry()) flush();
         }, Math.min(2000, 100 * (2 ** Math.min(failedSends - 1, 5))));
       }
     });
@@ -240,13 +257,14 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
     register,
     flush,
     schedule,
-    async waitForModalSync(): Promise<void> {
-      if (disposed) throw new Error('Native browser overlay manager is disposed');
+    waitForModalSync(): Promise<void> {
+      if (disposed) return Promise.reject(new Error('Native browser overlay manager is disposed'));
       flush();
-      if (!latestSend?.modal) throw new Error('Native browser modal barrier requires an active modal');
+      if (!latestModal || !isModalRequested()) return Promise.reject(new Error('Native browser modal barrier requires an active modal'));
       // This ACK precedes the surface occlude transaction. Consequently any old
       // modal=false IPC is fenced by a newer native revision before React opens.
-      await latestSend.promise;
+      if (acknowledgedRevision === revision) return Promise.resolve();
+      return new Promise((resolve, reject) => modalWaiters.add({ resolve, reject }));
     },
     /** CEF clicks need a DOM outside event for non-modal Radix dismiss layers. */
     pointerDown({ x, y, button }: { x: number; y: number; button: number }): void {
@@ -275,6 +293,7 @@ export function createNativeBrowserOverlayManager(options: ManagerOptions) {
     dispose() {
       if (disposed) return;
       disposed = true;
+      settleModalWaiters(new Error('Native browser overlay manager is disposed'));
       if (frame !== null) view.cancelAnimationFrame(frame);
       if (retryTimer !== null) view.clearTimeout(retryTimer);
       mutations.disconnect();

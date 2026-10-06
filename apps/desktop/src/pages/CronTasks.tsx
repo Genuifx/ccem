@@ -1,3 +1,5 @@
+import { HermesNotificationPicker } from '@/components/cron/HermesNotificationPicker';
+import type { CronHermesNotification } from '@/lib/hermes-ipc';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { listen } from '@tauri-apps/api/event';
@@ -535,6 +537,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
     disallowedTools?: string[];
     timeoutSecs?: number;
     wecomNotification?: CronWecomNotification | null;
+    hermesNotification?: CronHermesNotification | null;
   }) => Promise<void>;
   editTask?: CronTask;
   environments: { name: string }[];
@@ -552,6 +555,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
   const [disallowedToolsInput, setDisallowedToolsInput] = useState('');
   const [timeoutSecs, setTimeoutSecs] = useState(300);
   const [notifyWecom, setNotifyWecom] = useState(false);
+  const [hermesNotification, setHermesNotification] = useState<CronHermesNotification | null>(null);
   const [wecomBotId, setWecomBotId] = useState('');
   const [wecomPeerId, setWecomPeerId] = useState('');
   const [useManualWecomTarget, setUseManualWecomTarget] = useState(false);
@@ -594,6 +598,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
       setDisallowedToolsInput(formatToolListInput(editTask.disallowedTools));
       setTimeoutSecs(editTask.timeoutSecs);
       setNotifyWecom(Boolean(editTask.wecomNotification?.enabled));
+      setHermesNotification(editTask.hermesNotification ?? null);
       setWecomBotId(editTask.wecomNotification?.botId || '');
       setWecomPeerId(editTask.wecomNotification?.peerId || '');
       setUseManualWecomTarget(false);
@@ -609,6 +614,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
       setDisallowedToolsInput('');
       setTimeoutSecs(300);
       setNotifyWecom(false);
+      setHermesNotification(null);
       setWecomBotId('');
       setWecomPeerId('');
       setUseManualWecomTarget(false);
@@ -646,6 +652,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
         allowedTools: parseToolListInput(allowedToolsInput),
         disallowedTools: parseToolListInput(disallowedToolsInput),
         timeoutSecs,
+        hermesNotification,
         wecomNotification: notifyWecom ? {
           enabled: true,
           botId: wecomBotId.trim() || null,
@@ -750,89 +757,95 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
               </p>
             </div>
           </div>
-          <div className="rounded-xl border border-black/[0.08] dark:border-white/[0.08] bg-black/[0.02] dark:bg-white/[0.03] p-3 space-y-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <Bell className="h-3.5 w-3.5 text-primary" />
-                  <p className="text-xs font-medium text-foreground">{t('cron.resultNotification')}</p>
-                </div>
-                <p className="mt-1 text-2xs text-muted-foreground">{t('cron.wecomNotificationDesc')}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setNotifyWecom((value) => !value)}
-                className={cn(
-                  'shrink-0 rounded-full px-3 py-1 text-xs font-medium transition-all active:scale-[0.97]',
-                  notifyWecom
-                    ? 'bg-primary text-primary-foreground shadow-sm'
-                    : 'border border-black/[0.08] dark:border-white/[0.12] text-muted-foreground hover:text-foreground',
-                )}
-              >
-                {notifyWecom ? t('cron.wecomNotifyOn') : t('cron.wecomNotifyOff')}
-              </button>
-            </div>
-            {notifyWecom && (
-              <div className="space-y-3">
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium text-muted-foreground">{t('cron.wecomTarget')}</label>
-                  <Select
-                    value={selectedWecomTargetValue}
-                    onValueChange={(value) => {
-                      if (value === '__default__') {
-                        setWecomBotId('');
-                        setWecomPeerId('');
-                        setUseManualWecomTarget(false);
-                        return;
-                      }
-                      if (value === '__manual__') {
-                        setUseManualWecomTarget(true);
-                        return;
-                      }
-                      const target = wecomTargetOptions.find((item) => item.id === value);
-                      if (target) {
-                        setWecomBotId(target.botId);
-                        setWecomPeerId(target.peerId);
-                        setUseManualWecomTarget(false);
-                      }
-                    }}
-                  >
-                    <SelectTrigger className="w-full h-auto px-3 py-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.06] border border-black/[0.08] dark:border-white/[0.08] text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className={MODAL_SELECT_CONTENT_CLS}>
-                      <SelectItem value="__default__">{t('cron.wecomDefaultTarget')}</SelectItem>
-                      {wecomTargetOptions.map((target) => (
-                        <SelectItem key={target.id} value={target.id}>{target.label}</SelectItem>
-                      ))}
-                      <SelectItem value="__manual__">{t('cron.wecomManualTarget')}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                {selectedWecomTargetValue === '__manual__' && (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-medium text-muted-foreground">{t('cron.wecomBotId')}</label>
-                      <input
-                        className={cn(INPUT_CLS, 'font-mono')}
-                        value={wecomBotId}
-                        onChange={(e) => { setUseManualWecomTarget(true); setWecomBotId(e.target.value); }}
-                        placeholder="aibot..."
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-medium text-muted-foreground">{t('cron.wecomPeerId')}</label>
-                      <input
-                        className={cn(INPUT_CLS, 'font-mono')}
-                        value={wecomPeerId}
-                        onChange={(e) => { setUseManualWecomTarget(true); setWecomPeerId(e.target.value); }}
-                        placeholder="iveswen or group:chatid"
-                      />
-                    </div>
+          <div className="rounded-xl border border-border/60 bg-foreground/[0.02] p-4 space-y-3">
+            <HermesNotificationPicker value={hermesNotification} onChange={setHermesNotification} />
+            <details open={notifyWecom || undefined} className="border-t border-border/50 pt-3">
+              <summary className="cursor-pointer text-xs text-muted-foreground">{t('cron.legacyNotification')}</summary>
+              <div className="space-y-3 pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <Bell className="h-3.5 w-3.5 text-primary" />
+                    <p className="text-xs font-medium text-foreground">{t('cron.wecomTarget')}</p>
                   </div>
-                )}
+                  <p className="mt-1 text-2xs text-muted-foreground">{t('cron.wecomNotificationDesc')}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setNotifyWecom((value) => !value)}
+                  className={cn(
+                    'shrink-0 rounded-full px-3 py-1 text-xs font-medium transition-all active:scale-[0.97]',
+                    notifyWecom
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'border border-black/[0.08] dark:border-white/[0.12] text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {notifyWecom ? t('cron.wecomNotifyOn') : t('cron.wecomNotifyOff')}
+                </button>
               </div>
-            )}
+              {notifyWecom && (
+                <div className="space-y-3">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-medium text-muted-foreground">{t('cron.wecomTarget')}</label>
+                    <Select
+                      value={selectedWecomTargetValue}
+                      onValueChange={(value) => {
+                        if (value === '__default__') {
+                          setWecomBotId('');
+                          setWecomPeerId('');
+                          setUseManualWecomTarget(false);
+                          return;
+                        }
+                        if (value === '__manual__') {
+                          setUseManualWecomTarget(true);
+                          return;
+                        }
+                        const target = wecomTargetOptions.find((item) => item.id === value);
+                        if (target) {
+                          setWecomBotId(target.botId);
+                          setWecomPeerId(target.peerId);
+                          setUseManualWecomTarget(false);
+                        }
+                      }}
+                    >
+                      <SelectTrigger className="w-full h-auto px-3 py-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.06] border border-black/[0.08] dark:border-white/[0.08] text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className={MODAL_SELECT_CONTENT_CLS}>
+                        <SelectItem value="__default__">{t('cron.wecomDefaultTarget')}</SelectItem>
+                        {wecomTargetOptions.map((target) => (
+                          <SelectItem key={target.id} value={target.id}>{target.label}</SelectItem>
+                        ))}
+                        <SelectItem value="__manual__">{t('cron.wecomManualTarget')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {selectedWecomTargetValue === '__manual__' && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">{t('cron.wecomBotId')}</label>
+                        <input
+                          className={cn(INPUT_CLS, 'font-mono')}
+                          value={wecomBotId}
+                          onChange={(e) => { setUseManualWecomTarget(true); setWecomBotId(e.target.value); }}
+                          placeholder="aibot..."
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-muted-foreground">{t('cron.wecomPeerId')}</label>
+                        <input
+                          className={cn(INPUT_CLS, 'font-mono')}
+                          value={wecomPeerId}
+                          onChange={(e) => { setUseManualWecomTarget(true); setWecomPeerId(e.target.value); }}
+                          placeholder="iveswen or group:chatid"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            </details>
           </div>
           <div className="rounded-xl border border-black/[0.08] dark:border-white/[0.08] bg-black/[0.02] dark:bg-white/[0.03] p-3 space-y-3">
             <div className="space-y-1">
@@ -948,6 +961,15 @@ export function CronTasks({
       setDrawerLoading(false);
     }
   }, [cronTasks, getCronRunDetail]);
+
+  useEffect(() => {
+    if (!drawerRun?.hermesNotification || !['waiting', 'pending', 'sending', 'unavailable'].includes(drawerRun.hermesNotification.status)) return;
+    let active = true;
+    const timer = window.setInterval(() => {
+      getCronRunDetail(drawerRun.taskId, drawerRun.id).then((run) => { if (active) setDrawerRun(run); }).catch(() => {});
+    }, 2500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [drawerRun?.id, drawerRun?.hermesNotification?.status, getCronRunDetail]);
 
   const openRunSession = useCallback((task: CronTask | null | undefined, run: CronTaskRun) => {
     const link = buildCronRunSessionLink({
@@ -1237,6 +1259,7 @@ export function CronTasks({
     disallowedTools?: string[];
     timeoutSecs?: number;
     wecomNotification?: CronWecomNotification | null;
+    hermesNotification?: CronHermesNotification | null;
   }) => {
     if (editingTask) {
       await updateCronTask({ id: editingTask.id, ...data });
@@ -1625,6 +1648,11 @@ function RunDetailDrawer({ run, task, loading, onClose, onOpenSession, t }: {
                   <span>{t('cron.exitCode')}: {run.exitCode}</span>
                 )}
               </div>
+
+              {run.hermesNotification && <div className="flex items-center gap-2 rounded-xl border border-border/50 px-3 py-2 text-xs" role="status" data-cron-delivery-status={run.hermesNotification.status}>
+                <Bell className="h-4 w-4 text-primary" />
+                <span>{t('cron.hermesRecipient')} · {t(`cron.hermesDelivery_${run.hermesNotification.status}`)}</span>
+              </div>}
 
               {/* Session CTA */}
               <div className="rounded-xl border border-[hsl(var(--glass-border-light)/0.18)] bg-foreground/[0.03] px-3 py-3 space-y-2">

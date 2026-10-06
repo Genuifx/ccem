@@ -10,6 +10,10 @@ import {
 } from 'react';
 import { HugeiconsIcon, type IconSvgElement } from '@hugeicons/react';
 import {
+  DiscordIcon,
+  SlackIcon,
+  TelegramIcon,
+  WechatIcon,
   Activity01Icon,
   Alert02Icon,
   AlertCircleIcon,
@@ -68,6 +72,7 @@ import {
   GitPullRequestIcon,
   Globe02Icon,
   GridViewIcon,
+  HashtagIcon,
   HeartCheckIcon,
   HelpCircleIcon,
   Home01Icon,
@@ -83,6 +88,7 @@ import {
   LinkSquare01Icon,
   LinkSquare02Icon,
   Loading03Icon,
+  Mail01Icon,
   Maximize01Icon,
   Message01Icon,
   Message02Icon,
@@ -200,6 +206,10 @@ function createIcon(icon: IconSvgElement, displayName: string): LucideIcon {
 }
 
 export const Activity = createIcon(Activity01Icon, 'Activity');
+export const Discord = createIcon(DiscordIcon, 'Discord');
+export const Slack = createIcon(SlackIcon, 'Slack');
+export const Telegram = createIcon(TelegramIcon, 'Telegram');
+export const Wechat = createIcon(WechatIcon, 'Wechat');
 export const AlertCircle = createIcon(AlertCircleIcon, 'AlertCircle');
 export const AlertTriangle = createIcon(Alert02Icon, 'AlertTriangle');
 export const AppWindow = createIcon(AppWindowIcon, 'AppWindow');
@@ -263,6 +273,7 @@ export const GitFork = createIcon(GitForkIcon, 'GitFork');
 export const GitPullRequest = createIcon(GitPullRequestIcon, 'GitPullRequest');
 export const Globe = createIcon(Globe02Icon, 'Globe');
 export const Globe2 = createIcon(Globe02Icon, 'Globe2');
+export const Hash = createIcon(HashtagIcon, 'Hash');
 export const HeartPulse = createIcon(HeartCheckIcon, 'HeartPulse');
 export const History = createIcon(Clock04Icon, 'History');
 export const Home = createIcon(Home01Icon, 'Home');
@@ -283,6 +294,7 @@ export const Loader2 = createIcon(Loading03Icon, 'Loader2');
 export const LoaderCircle = createIcon(Loading03Icon, 'LoaderCircle');
 export const Lock = createIcon(SquareLock01Icon, 'Lock');
 export const Maximize2 = createIcon(Maximize01Icon, 'Maximize2');
+export const Mail = createIcon(Mail01Icon, 'Mail');
 export const MessageCircle = createIcon(Message01Icon, 'MessageCircle');
 export const MessageCircleMore = createIcon(MessageMultiple01Icon, 'MessageCircleMore');
 export const MessageSquare = createIcon(Message02Icon, 'MessageSquare');

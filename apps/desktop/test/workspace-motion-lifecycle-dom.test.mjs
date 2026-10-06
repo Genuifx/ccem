@@ -91,18 +91,20 @@ async function loadEffect([, file, scope, index = 0]) {
   }).outputText;
 }
 
-async function mountEffect(motionCase, { reduced = false, windowSize = Infinity } = {}) {
+async function mountEffect(motionCase, { reduced = false, windowSize = Infinity, pageHidden = false } = {}) {
   const source = await loadEffect(motionCase);
   const container = document.createElement('div');
   document.body.append(container);
   dom.window.matchMedia = () => ({ matches: reduced });
+  Object.defineProperty(document, 'hidden', { configurable: true, value: pageHidden });
   let context;
   let execute;
 
-  function Harness({ count, revision = count, open = true, prefix = [], hidden = false }) {
+  function Harness({ count, revision = count, open = true, prefix = [], hidden = false, legacyOpen = false }) {
     const rootRef = React.useRef(null);
     const previousMotionKeysRef = React.useRef([]);
     const hasHydratedMotionRef = React.useRef(false);
+    const hasHydratedChatMotionRef = React.useRef(false);
     const hasAnimatedAppPageRef = React.useRef(false);
     const previousAttachmentIdsRef = React.useRef([]);
     const displayItems = [...prefix, ...Array.from({ length: count }, (_, index) => `row-${index}`)]
@@ -117,6 +119,7 @@ async function mountEffect(motionCase, { reduced = false, windowSize = Infinity 
       },
       listRef: rootRef,
       appPageMotionRef: rootRef,
+      chatMotionRef: rootRef,
       attentionPanelRef: rootRef,
       composerShellRef: rootRef,
       attentionDockRef: rootRef,
@@ -126,12 +129,15 @@ async function mountEffect(motionCase, { reduced = false, windowSize = Infinity 
       digestBodyRef: rootRef,
       previousMotionKeysRef,
       hasHydratedMotionRef,
+      hasHydratedChatMotionRef,
       hasAnimatedAppPageRef,
       previousAttachmentIdsRef,
       displayItems,
       displayItemTailSignal: `${displayItems.length}:${displayItems.at(-1)?.key}`,
       startupReady: true,
       activeTab: `page-${revision}`,
+      showTmuxNotice: false,
+      legacyOpen,
       attentionMotionKey: String(revision),
       attachments,
       attachmentMotionKey: attachments.map(({ id }) => id).join('|'),
@@ -151,6 +157,10 @@ async function mountEffect(motionCase, { reduced = false, windowSize = Infinity 
         'data-composer-attachment-chip': true,
         'data-attachment-id': key,
       }, key)),
+      ...(legacyOpen ? [
+        React.createElement('button', { key: 'chat-tab', 'data-chat-platform-active': 'true' }, `Channel ${revision}`),
+        React.createElement('div', { key: 'chat-panel', 'data-chat-platform-panel': true }, `Channel panel ${revision}`),
+      ] : []),
     );
   }
 
@@ -171,6 +181,7 @@ async function mountEffect(motionCase, { reduced = false, windowSize = Infinity 
       return new Set(context.getTweens().flatMap((tween) => tween.targets()));
     },
     entryCount() { return context.data.length; },
+    pendingEntrances() { return context.getTweens().filter((tween) => tween.duration() > 0); },
     unmount() {
       React.act(() => root.unmount());
       assert.equal(context.data.length, 0, 'unmount releases the final animation context');
@@ -187,6 +198,52 @@ function assertVisible(element) {
   assert.notEqual(style.opacity, '0');
   assert.equal(element.style.transform, '', 'completed/interrupted entrance releases its transform');
 }
+
+test('background legacy channel controls are visible on first expansion without advancing the animation clock', async (t) => {
+  const mounted = await mountEffect(['chat channels', 'pages/ChatApp.tsx', 'chatMotionRef'], { pageHidden: true });
+  t.after(() => mounted.unmount());
+  assert.equal(mounted.container.querySelector('[data-chat-platform-panel]'), null);
+  mounted.render({ count: 1, legacyOpen: true });
+  assert.equal(mounted.pendingEntrances().length, 0, 'background expansion creates no suspended entrance');
+  assertVisible(mounted.container.querySelector('[data-chat-platform-active]'));
+  assertVisible(mounted.container.querySelector('[data-chat-platform-panel]'));
+});
+
+test('background legacy channel switches clear an interrupted foreground entrance', async (t) => {
+  const mounted = await mountEffect(['chat channels', 'pages/ChatApp.tsx', 'chatMotionRef']);
+  t.after(() => mounted.unmount());
+  mounted.render({ count: 1, legacyOpen: true });
+  mounted.advance(0.3);
+  assert.notEqual(mounted.container.querySelector('[data-chat-platform-panel]').style.opacity, '');
+  Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  mounted.render({ count: 1, revision: 2, legacyOpen: true });
+  assert.equal(mounted.pendingEntrances().length, 0, 'the old channel animation cannot resume after the switch');
+  assertVisible(mounted.container.querySelector('[data-chat-platform-active]'));
+  assertVisible(mounted.container.querySelector('[data-chat-platform-panel]'));
+});
+
+test('background page navigation is fully visible without advancing the animation clock', async (t) => {
+  const mounted = await mountEffect(motionCases[1], { pageHidden: true });
+  t.after(() => mounted.unmount());
+  for (const revision of [1, 2]) {
+    mounted.render({ count: 1, revision });
+    assert.equal(mounted.pendingEntrances().length, 0, 'background navigation creates no suspended entrance');
+    assert.equal(mounted.container.firstChild.style.opacity, '');
+    assertVisible(mounted.container.firstChild);
+  }
+});
+
+test('background navigation clears an interrupted foreground page entrance', async (t) => {
+  const mounted = await mountEffect(motionCases[1]);
+  t.after(() => mounted.unmount());
+  mounted.advance(0.3);
+  assert.notEqual(mounted.container.firstChild.style.opacity, '');
+  Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  mounted.render({ count: 1, revision: 2 });
+  assert.equal(mounted.pendingEntrances().length, 0);
+  assert.equal(mounted.container.firstChild.style.opacity, '');
+  assertVisible(mounted.container.firstChild);
+});
 
 for (const motionCase of motionCases) {
   for (const reduced of [false, true]) {
