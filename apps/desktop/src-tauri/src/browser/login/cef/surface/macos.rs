@@ -10,7 +10,8 @@ use crate::browser::login::cef::{
     pump::CefExternalPump,
 };
 use cef::*;
-use cef_objc2::MainThreadMarker;
+use cef_objc2::{rc::Retained, MainThreadMarker};
+use crate::browser_overlay::macos::BrowserHostView;
 use cef_objc2_app_kit::NSView;
 use std::{
     cell::RefCell,
@@ -27,7 +28,9 @@ use tauri::{AppHandle, Manager};
 mod mutation;
 mod popup;
 
-pub(crate) use mutation::{occlude, set_bounds, set_visible};
+pub(crate) use mutation::{configure_overlay_composition, occlude, set_bounds, set_visible, sync_overlay_input};
+#[cfg(debug_assertions)]
+pub(crate) use mutation::debug_focus;
 
 const DEVTOOLS_DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 const SURFACE_CLOSE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -58,6 +61,17 @@ struct NativeCefSurface {
     close_requested: bool,
     primary_closed: bool,
     popup: Option<popup::NativeCefPopup>,
+    wrapper: Option<Retained<BrowserHostView>>,
+}
+
+impl NativeCefSurface {
+    fn child_bounds(&self) -> NativeChildBounds {
+        if self.wrapper.is_some() {
+            NativeChildBounds { x: 0, y: 0, ..self.bounds }
+        } else {
+            self.bounds
+        }
+    }
 }
 
 fn release_profile_context_member(profile_id: &str, surface_id: &str) {
@@ -81,6 +95,9 @@ fn retire_surface(mut surface: NativeCefSurface) {
     surface.registration.take();
     surface.browser.take();
     surface.context.take();
+    if let Some(wrapper) = surface.wrapper.take() {
+        wrapper.removeFromSuperview();
+    }
     drop(surface);
     release_profile_context_member(&profile_id, &surface_id);
 }
@@ -410,6 +427,10 @@ wrap_life_span_handler! {
                 return;
             }
             child.setHidden(!visible);
+            if mutation::input_suspended(&self.surface_id) {
+                host.set_focus(0);
+                crate::browser_overlay::macos::focus_main_view();
+            }
             self.shared.update(|state| {
                 state.lifecycle = CefSurfaceLifecycle::Loading;
                 state.devtools_attached = true;
@@ -508,6 +529,10 @@ wrap_client! {
 
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
             Some(HostShortcutKeyboardHandler::new(self.app.clone(), self.surface_id.clone()))
+        }
+
+        fn focus_handler(&self) -> Option<FocusHandler> {
+            Some(mutation::SurfaceFocusHandler::new(self.surface_id.clone()))
         }
 
         fn request_handler(&self) -> Option<RequestHandler> {
@@ -614,9 +639,25 @@ wrap_request_context_handler! {
                 return;
             }
 
+            // Create CEF inside its final parent. CALayer controls visual order;
+            // hitTest on this wrapper independently controls native input.
+            let (parent_view, child_bounds) = {
+                let wrapper = match BrowserHostView::attach(parent, bounds) {
+                    Ok(wrapper) => wrapper,
+                    Err(error) => { record_creation_failure(&self.shared, error); return; }
+                };
+                let pointer = Retained::as_ptr(&wrapper) as *mut std::ffi::c_void;
+                SURFACES.with(|surfaces| {
+                    if let Some(surface) = surfaces.borrow_mut().get_mut(&self.surface_id) {
+                        wrapper.setHidden(!surface.visible);
+                        surface.wrapper = Some(wrapper);
+                    }
+                });
+                (pointer, NativeChildBounds { x: 0, y: 0, ..bounds })
+            };
             let rect = Rect {
-                x: bounds.x,
-                y: bounds.y,
+                x: child_bounds.x,
+                y: child_bounds.y,
                 width: bounds.width,
                 height: bounds.height,
             };
@@ -708,6 +749,7 @@ pub(crate) fn create_surface(
                 close_requested: false,
                 primary_closed: false,
                 popup: None,
+                wrapper: None,
             },
         );
     });
@@ -856,7 +898,7 @@ pub(crate) fn snapshot(surface_id: &str) -> Result<super::CefSurfaceSnapshot, St
 
 pub(crate) fn close(surface_id: &str) -> Result<(), String> {
     require_main_thread()?;
-    let (browser, popup_browser, shared, remove_without_browser) = SURFACES.with(|surfaces| {
+    let (browser, popup_browser, shared, remove_without_browser, wrapper) = SURFACES.with(|surfaces| {
         let mut surfaces = surfaces.borrow_mut();
         let surface = surfaces
             .get_mut(surface_id)
@@ -884,10 +926,15 @@ pub(crate) fn close(surface_id: &str) -> Result<(), String> {
                 .and_then(|popup| popup.browser.clone()),
             Arc::clone(&surface.shared),
             remove_without_browser,
+            surface.wrapper.clone(),
         ))
     })?;
     shared.clear_focus_restore_intent();
     shared.deny_popups();
+    if let Some(wrapper) = wrapper {
+        wrapper.suspend_input(true);
+        wrapper.setHidden(true);
+    }
 
     if remove_without_browser {
         // A pending or failed RequestContext has no BrowserHost and therefore can never emit

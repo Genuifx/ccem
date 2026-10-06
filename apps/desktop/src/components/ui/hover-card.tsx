@@ -2,6 +2,7 @@ import * as React from "react"
 import * as HoverCardPrimitive from "@radix-ui/react-hover-card"
 
 import { cn } from "@/lib/utils"
+import { useNativeBrowserOverlayRef } from "@/lib/nativeBrowserOverlay"
 
 const HoverCard = HoverCardPrimitive.Root
 
@@ -13,7 +14,7 @@ const HoverCardContent = React.forwardRef<
 >(({ className, align = "center", sideOffset = 4, ...props }, ref) => (
   <HoverCardPrimitive.Portal>
     <HoverCardPrimitive.Content
-      ref={ref}
+      ref={useNativeBrowserOverlayRef(ref)}
       align={align}
       sideOffset={sideOffset}
       className={cn(

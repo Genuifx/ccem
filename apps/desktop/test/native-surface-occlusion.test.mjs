@@ -164,7 +164,7 @@ test('overlay readiness waits for native hide ACK and overlapping leases restore
   assert.equal(store.isOccluded(), false);
   await drawer.release();
   assert.deepEqual(events, ['hide:start', 'hide:ack', 'restore']);
-  assert.deepEqual(states, [true, false]);
+  assert.deepEqual(states, [true, true, false]);
 });
 
 test('a new overlay waits for a fresh hide when restore is already running', async () => {
@@ -339,7 +339,7 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
   );
   assert.match(
     browserPanel,
-    /if \(!isSurfaceReady\) return;[\s\S]*setNativeSurfaceVisible\(isActiveSurface && !surfaceOccluded\)/,
+    /if \(!isSurfaceReady\) return;[\s\S]*setNativeSurfaceVisible\(isActiveSurface\)/,
   );
   assert.match(browserPanel, /occlude: occludeSurface/);
   assert.match(browserPanel, /action: 'occlude'/);

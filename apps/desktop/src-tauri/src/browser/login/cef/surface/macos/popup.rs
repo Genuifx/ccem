@@ -67,7 +67,7 @@ pub(super) fn configure_user_popup(
             browser: None,
             close_requested: false,
         });
-        Ok(surface.bounds)
+        Ok(surface.child_bounds())
     });
     let bounds = match reservation {
         Ok(bounds) => bounds,
@@ -401,7 +401,7 @@ wrap_life_span_handler! {
                     (
                         surface.context.clone(),
                         surface.browser.clone(),
-                        surface.bounds,
+                        surface.child_bounds(),
                         surface.visible,
                         surface.close_requested || popup.close_requested || surface.primary_closed,
                     )
@@ -473,6 +473,10 @@ wrap_life_span_handler! {
                 }
             }
             child.setHidden(!visible || close_now);
+            if super::mutation::input_suspended(&self.surface_id) {
+                host.set_focus(0);
+                crate::browser_overlay::macos::focus_main_view();
+            }
             self.shared.update_popup(self.popup_id, |popup| {
                 popup.lifecycle = if close_now {
                     CefSurfaceLifecycle::Closing
@@ -525,10 +529,12 @@ wrap_life_span_handler! {
                 let child = host.window_handle().cast::<NSView>();
                 if let Some(child) = unsafe { child.as_ref() } {
                     child.setHidden(false);
-                    if let Some(window) = child.window() {
-                        let _ = window.makeFirstResponder(Some(child));
+                    if !super::mutation::input_suspended(&self.surface_id) {
+                        if let Some(window) = child.window() {
+                            let _ = window.makeFirstResponder(Some(child));
+                        }
+                        host.set_focus(1);
                     }
-                    host.set_focus(1);
                 }
             }
             finalize_surface_if_terminal(&self.surface_id, &self.shared);
@@ -546,6 +552,10 @@ wrap_client! {
     }
 
     impl Client {
+        fn focus_handler(&self) -> Option<FocusHandler> {
+            Some(super::mutation::SurfaceFocusHandler::new(self.surface_id.clone()))
+        }
+
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(PopupDisplayHandler::new(self.popup_id, Arc::clone(&self.shared)))
         }

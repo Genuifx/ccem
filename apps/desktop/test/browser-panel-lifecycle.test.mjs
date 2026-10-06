@@ -52,6 +52,7 @@ const browserPanelTestStubs = {
     virtual(/^@\/hooks\/useNativeBrowserSurfaceGeometrySync$/, 'geometry-sync');
     virtual(/^@\/hooks\/useZoom$/, 'zoom');
     virtual(/^@\/lib\/webcontentRecovery$/, 'webcontent-recovery');
+    virtual(/^@\/lib\/nativeBrowserOverlay$/, 'native-browser-overlay');
     virtual(/^@\/lib\/lucide-react$/, 'icons');
     virtual(/^@\/components\/ui\/button$/, 'button');
     virtual(/^@\/components\/ui\/input$/, 'input');
@@ -106,8 +107,16 @@ const browserPanelTestStubs = {
               return globalThis.${bridgeKey}.invoke(command, args);
             }
           `,
+          'native-browser-overlay': `
+            export function isNativeBrowserCompositionEnabled() { return globalThis.${bridgeKey}.compositionEnabled === true; }
+            export function useNativeBrowserViewport() {}
+            export async function waitForNativeBrowserModalSync() {
+              if (isNativeBrowserCompositionEnabled()) await globalThis.${bridgeKey}.overlayModalGate?.();
+            }
+          `,
           zoom: `
             export const CCEM_ZOOM_STORAGE_KEY = 'ccem.test.zoom';
+            export function readAppZoom() { return Number(window.localStorage.getItem(CCEM_ZOOM_STORAGE_KEY) || 1); }
           `,
           icons: `
             const icon = (name) => function TestIcon(props) {
@@ -2610,4 +2619,95 @@ test('Login opens in user control when no exact runtime exists and close uses cl
     container.querySelector('button[aria-label="zh:workspace.browserClose"]'),
     null,
   );
+});
+
+test('composition waits for geometry ACK before control IPC and still waits for Agent pause ACK', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({ acquireSnapshot: { control: 'agent', auto_handoff: true } });
+  bridge.compositionEnabled = true;
+  let allowGeometry;
+  let allowPause;
+  const geometryGate = new Promise((resolve) => { allowGeometry = resolve; });
+  const pauseGate = new Promise((resolve) => { allowPause = resolve; });
+  bridge.overlayModalGate = () => geometryGate;
+  const invoke = bridge.invoke.bind(bridge);
+  bridge.invoke = async (command, args) => {
+    const result = await invoke(command, args);
+    if (command === 'browser_surface_control' && args.action === 'occlude') await pauseGate;
+    return result;
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  let mounted;
+  let overlay;
+  t.after(async () => {
+    allowGeometry(); allowPause();
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+  mounted = harness.mountBrowserPanel(document.querySelector('#root'), {
+    locale: 'zh', backend: 'login', sessionId: 'composition-ack-browser', workingDir: '/workspace',
+    profileMode: 'default', defaultUrl: 'https://example.test', presentationRevision: 1,
+    isActiveSurface: true, surfaceOccluded: false, surfaceHidden: false,
+    agentSessionId: 'composition-agent', onClose() {},
+  });
+  await harness.flushEffects();
+  let ready = false;
+  const acquiring = harness.acquireNativeSurfaceOcclusion().then((lease) => { ready = true; return lease; });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(callsFor(bridge, 'browser_surface_control').length, 0, 'no occlude before geometry ACK');
+  assert.equal(ready, false);
+  allowGeometry();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action), ['occlude']);
+  assert.equal(ready, false, 'geometry ACK does not replace the Agent-pause ACK');
+  allowPause();
+  overlay = await acquiring;
+  assert.equal(ready, true);
+});
+
+test('composition keeps the same live surface through modal pause and restore but hides inactive pages', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge({ acquireSnapshot: { control: 'agent', auto_handoff: true } });
+  bridge.compositionEnabled = true;
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  let mounted;
+  let overlay;
+  t.after(async () => {
+    await overlay?.release();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+  const props = {
+    locale: 'zh', backend: 'login', sessionId: 'composition-browser', workingDir: '/workspace',
+    profileMode: 'default', defaultUrl: 'https://example.test', presentationRevision: 1,
+    isActiveSurface: true, surfaceOccluded: false, surfaceHidden: false,
+    agentSessionId: 'composition-agent', onClose() {},
+  };
+  mounted = harness.mountBrowserPanel(document.querySelector('#root'), props);
+  await harness.flushEffects();
+  overlay = await harness.acquireNativeSurfaceOcclusion();
+  mounted.render({ ...props, surfaceOccluded: true, presentationRevision: 2 });
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_sync').at(-1).args.visible, true);
+  assert.deepEqual(callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action), ['occlude']);
+  mounted.render({ ...props, presentationRevision: 3 });
+  await overlay.release();
+  overlay = null;
+  await harness.flushEffects();
+  assert.deepEqual(callsFor(bridge, 'browser_surface_control').map(({ args }) => args.action), ['occlude', 'handoff']);
+  assert.ok(callsFor(bridge, 'browser_surface_sync').every(({ args }) => args.visible));
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 1);
+  assert.equal(callsFor(bridge, 'browser_surface_release').length, 0);
+
+  // Workspace remains mounted when its page becomes inactive. That absence
+  // must still hide CEF even while the selected side-panel tab is unchanged.
+  mounted.render({ ...props, surfaceHidden: true, surfaceOccluded: true, presentationRevision: 4 });
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_sync').at(-1).args.visible, false);
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 1);
 });

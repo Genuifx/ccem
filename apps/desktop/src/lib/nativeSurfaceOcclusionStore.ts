@@ -19,6 +19,8 @@ export interface NativeSurfaceOcclusionStore {
   acquire: () => NativeSurfaceOcclusionLease;
   registerParticipant: (participant: NativeSurfaceOcclusionParticipant) => () => void;
   isOccluded: () => boolean;
+  /** Requested overlays may close before the serialized native guard releases. */
+  hasActiveOverlays: () => boolean;
   subscribe: (listener: () => void) => () => void;
 }
 
@@ -148,10 +150,10 @@ export function createNativeSurfaceOcclusionStore(
 
       if (!wasOccluded) {
         // Keep this synchronous as the defensive surfaceOccluded fallback.
-        if (!occluded) {
-          occluded = true;
-          notify();
-        }
+        occluded = true;
+        // A reopen can acquire while the previous restore still holds the
+        // effective guard. Subscribers also need that new requested state.
+        notify();
         hiddenBarrier = beginHideBarrier();
       }
 
@@ -166,6 +168,9 @@ export function createNativeSurfaceOcclusionStore(
           if (!activeSources.delete(source) || activeSources.size > 0) return;
 
           hiddenBarrier = null;
+          // Cancel any pending geometry barrier before enqueueing restore;
+          // otherwise that barrier and transitionTail would wait on each other.
+          notify();
 
           await enqueue(async () => {
             // The overlay renders closed before its layout-effect cleanup calls
@@ -218,6 +223,9 @@ export function createNativeSurfaceOcclusionStore(
     },
     isOccluded() {
       return occluded;
+    },
+    hasActiveOverlays() {
+      return activeSources.size > 0;
     },
     subscribe(listener) {
       listeners.add(listener);

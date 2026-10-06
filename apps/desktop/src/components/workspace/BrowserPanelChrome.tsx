@@ -159,7 +159,7 @@ export function BrowserPanelNavigation({
     .join(', ');
 
   return (
-    <div data-ccem-browser-navigation="true" className="flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
+    <div data-ccem-browser-navigation="true" className="workspace-browser-chrome flex h-11 shrink-0 items-center gap-1 border-b border-border/45 px-3">
       <BrowserToolButton
         label={t('workspace.browserBack')}
         onClick={() => onNavigationAction('back')}

@@ -1551,8 +1551,8 @@ export function Workspace({
   const sidePanelOpen = sidePanel.tab !== null;
   const sidePanelDetailOpen = isActive && (sidePanel.tab === 'files' || sidePanel.tab === 'agents');
   const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
-  const browserSurfaceOccluded = !isActive
-    || sidePanel.tab !== 'browser'
+  const browserSurfaceHidden = !isActive || sidePanel.tab !== 'browser';
+  const browserSurfaceOccluded = browserSurfaceHidden
     || isGlobalSearchOpen
     || nativeSurfaceModalOccluded;
   const presentationSurfaceSessionId = activeBrowserTarget?.surfaceSessionId
@@ -4002,6 +4002,7 @@ export function Workspace({
             presentationRevision: browserPresentationRevision,
             isActiveSurface: isPanelActive,
             surfaceOccluded: browserSurfaceOccluded || !isPanelActive,
+            surfaceHidden: browserSurfaceHidden || !isPanelActive,
             className: 'h-full w-full',
             onResizeStart: handleBrowserPanelResizeStart,
             onHostShortcut: handleBrowserSurfaceHostShortcut,

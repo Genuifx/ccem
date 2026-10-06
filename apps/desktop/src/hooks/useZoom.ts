@@ -65,6 +65,7 @@ async function applyZoom(value: number): Promise<void> {
   try {
     await getCurrentWebview().setZoom(value);
     appliedZoom = value;
+    emitZoomChange(value);
   } catch (err) {
     // The webview API can fail outside of a Tauri shell (e.g. browser preview)
     // or if the permission is missing. Don't crash the UI in that case.
@@ -104,7 +105,6 @@ export function useZoom(): void {
     const initial = readStoredZoom();
     void applyZoom(initial);
     persistZoom(initial);
-    emitZoomChange(initial);
 
     let current = initial;
     const isMac = isMacPlatform();
@@ -115,7 +115,6 @@ export function useZoom(): void {
       current = clamped;
       void applyZoom(clamped);
       persistZoom(clamped);
-      emitZoomChange(clamped);
     };
 
     const applyZoomCommand = (command: AppZoomCommand) => {

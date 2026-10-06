@@ -66,7 +66,7 @@ test('overlay occlusion round-trips native focus intent without ordinary-show fo
   assert.doesNotMatch(focusRestore, /self\.target\.take\(\)/);
   assert.match(
     browserPanel,
-    /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
+    /const visible = requestedVisible[\s\S]*&& !surfaceHiddenRef\.current[\s\S]*isNativeBrowserCompositionEnabled\(\)[\s\S]*\|\| \(!surfaceOccludedRef\.current && !nativeSurfaceOcclusionStore\.isOccluded\(\)\)/,
   );
   assert.match(browserPanel, /nextRecoveryStates\.includes\('renderer_process_terminated'\)/);
   assert.match(browserPanel, /setError\(t\('workspace\.browserRecoveryRendererStopped'\)\)/);
@@ -459,7 +459,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
   assert.match(panelSource, /browserSurfaceClient\.navigationAction/);
   assert.match(
     panelSource,
-    /const visible = requestedVisible[\s\S]*&& !surfaceOccludedRef\.current[\s\S]*&& !nativeSurfaceOcclusionStore\.isOccluded\(\)/,
+    /const visible = requestedVisible[\s\S]*&& !surfaceHiddenRef\.current[\s\S]*isNativeBrowserCompositionEnabled\(\)[\s\S]*\|\| \(!surfaceOccludedRef\.current && !nativeSurfaceOcclusionStore\.isOccluded\(\)\)/,
   );
   assert.doesNotMatch(panelSource, /focused:/);
   assert.doesNotMatch(panelSource, /document\.hasFocus\(\)/);
@@ -488,7 +488,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
   assert.match(workspaceSource, /browserTargetBySessionId/);
   assert.match(
     workspaceSource,
-    /browserSurfaceOccluded = !isActive[\s\S]*\|\| isGlobalSearchOpen[\s\S]*\|\| nativeSurfaceModalOccluded/,
+    /browserSurfaceHidden = !isActive \|\| sidePanel\.tab !== 'browser'[\s\S]*browserSurfaceOccluded = browserSurfaceHidden[\s\S]*\|\| isGlobalSearchOpen[\s\S]*\|\| nativeSurfaceModalOccluded/,
   );
   assert.match(workspaceSource, /surfaceOccluded: browserSurfaceOccluded \|\| !isPanelActive/);
   assert.match(workspaceSource, /onHostShortcut: handleBrowserSurfaceHostShortcut/);

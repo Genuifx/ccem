@@ -558,6 +558,7 @@ export function WorkspaceTranscriptSelection({
             key={placement.annotation.id}
             data-workspace-selection-action
             data-workspace-annotation-marker
+            data-ccem-native-overlay
             className="group fixed z-[90]"
             style={{ left: placement.markerLeft, top: placement.markerTop }}
           >
@@ -590,6 +591,7 @@ export function WorkspaceTranscriptSelection({
       {editingPlacement ? (
         <div
           ref={savedEditorRef}
+          data-ccem-native-overlay
           data-workspace-selection-action
           className="fixed z-[100] w-[min(340px,calc(100vw-24px))] rounded-2xl border border-border/45 bg-popover p-3 shadow-xl"
           style={{
@@ -664,6 +666,7 @@ export function WorkspaceTranscriptSelection({
       {candidate ? (
         <div
           ref={panelRef}
+          data-ccem-native-overlay
           data-workspace-selection-action
           className={cn(
             'fixed z-[100] -translate-x-1/2 rounded-2xl border border-border/45 bg-popover shadow-xl',

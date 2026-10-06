@@ -2,6 +2,7 @@ import * as React from "react"
 import * as PopoverPrimitive from "@radix-ui/react-popover"
 
 import { cn } from "@/lib/utils"
+import { useNativeBrowserOverlayRef } from "@/lib/nativeBrowserOverlay"
 
 const Popover = PopoverPrimitive.Root
 
@@ -15,7 +16,7 @@ const PopoverContent = React.forwardRef<
 >(({ className, align = "center", sideOffset = 4, ...props }, ref) => (
   <PopoverPrimitive.Portal>
     <PopoverPrimitive.Content
-      ref={ref}
+      ref={useNativeBrowserOverlayRef(ref)}
       align={align}
       sideOffset={sideOffset}
       className={cn(

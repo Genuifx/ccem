@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh"><meta charset="utf-8"><title>Native overlay probe</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#154d65;color:#fff;font:16px system-ui;padding:28px;min-height:100vh}
+h1{font-size:25px;margin:0 0 12px}p{opacity:.85;line-height:1.7}input,button{font:inherit;padding:12px;border:0;border-radius:8px;width:100%;margin:12px 0}
+button{background:#a8efc4;color:#07382a;cursor:pointer}.meter{height:7px;background:#87ecd9;border-radius:8px;width:50%;animation:move 2s infinite alternate}
+@keyframes move{to{transform:translateX(100%)}}pre{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8;background:#ffffff15;padding:16px;border-radius:12px}
+</style>
+<h1>CEF 浏览器 · 实时页面</h1><p>弹框打开期间，计时持续推进。输入内容和加载标识应保持不变。</p>
+<div class="meter"></div><label for="browser-input">浏览器输入</label>
+<input id="browser-input" placeholder="输入 before，关闭弹框后继续输入 after">
+<button id="browser-counter">浏览器点击计数：0</button>
+<button id="browser-popup">打开本地网页弹窗</button><pre id="state"></pre>
+<script>
+const boot = crypto.randomUUID();
+const started = performance.now();
+let clicks = 0;
+let popupWindow = null;
+const popupPage = location.hash === '#popup';
+if (popupPage) {
+  document.querySelector('h1').textContent = 'CEF 本地网页弹窗';
+  document.querySelector('#browser-popup').textContent = '关闭网页弹窗';
+}
+const input = document.querySelector('input');
+const button = document.querySelector('button');
+function render() {
+  const state = {boot, ticks: Math.floor((performance.now()-started)/500), clicks, value:input.value.slice(0,100), focused:document.activeElement.id,
+    popupClosed: popupWindow?.closed ?? null};
+  document.querySelector('#state').textContent = JSON.stringify(state,null,2);
+  document.title = JSON.stringify(state);
+}
+button.onclick = () => { button.textContent = `浏览器点击计数：${++clicks}`;render(); };
+document.querySelector('#browser-popup').onclick = () => {
+  if (popupPage) window.close();
+  else popupWindow = window.open(location.origin + location.pathname + '#popup', 'overlay-smoke-popup', 'width=480,height=480');
+  render();
+};
+input.oninput = render;
+setInterval(render,500); render();
+</script></html>

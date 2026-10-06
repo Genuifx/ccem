@@ -105,8 +105,14 @@ export function initializeWebcontentRecovery(): Promise<void> {
   return bootPromise;
 }
 
+/** Read only an acknowledged identity; startup fallbacks must not wait for a late boot. */
+export function currentWebcontentDocumentIdentity(): WebcontentDocumentIdentity | null {
+  return activeDocument ? { documentId: activeDocument.documentId, generation: activeDocument.generation } : null;
+}
+
 export function awaitWebcontentDocumentIdentity(): Promise<WebcontentDocumentIdentity | null> {
-  if (activeDocument) return Promise.resolve({ documentId: activeDocument.documentId, generation: activeDocument.generation });
+  const identity = currentWebcontentDocumentIdentity();
+  if (identity) return Promise.resolve(identity);
   return identityPromise ?? Promise.resolve(null);
 }
 

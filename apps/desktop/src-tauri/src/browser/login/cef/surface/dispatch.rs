@@ -12,7 +12,7 @@ const DISPATCH_RUNNING: u8 = 1;
 const DISPATCH_CANCELLED: u8 = 2;
 const DISPATCH_COMPLETED: u8 = 3;
 
-pub(super) fn run_cancellable_on_main<T, F>(
+pub(crate) fn run_cancellable_on_main<T, F>(
     app: &AppHandle,
     already_on_main: bool,
     timeout: Duration,

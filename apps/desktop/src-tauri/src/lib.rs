@@ -6,6 +6,7 @@ mod app_update_engine;
 mod app_updates;
 mod bot_binding;
 mod browser;
+mod browser_overlay;
 mod channel;
 mod codex_migration;
 mod companion;
@@ -5621,6 +5622,8 @@ pub fn run_desktop_app() -> i32 {
 
     #[cfg(any(target_os = "macos", windows))]
     let builder = builder.manage(cef_host_controller.clone());
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    let builder = builder.manage(browser_overlay::debug::SmokeState::default());
 
     #[cfg(target_os = "macos")]
     let builder = builder.on_web_content_process_terminate(webcontent_recovery::handle_termination);
@@ -5939,6 +5942,10 @@ pub fn run_desktop_app() -> i32 {
             pet_notifications::open_pet_notification,
             pet_window::resize_pet_window,
             pet_window::set_pet_window_content_visible,
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            browser_overlay::debug::browser_overlay_debug,
+            browser_overlay::browser_overlay_initialize,
+            browser_overlay::browser_overlay_sync,
             browser::login::surface_commands::ipc::browser_surface_acquire,
             browser::login::surface_commands::ipc::browser_surface_sync,
             browser::login::surface_commands::ipc::browser_surface_release,

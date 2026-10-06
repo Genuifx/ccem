@@ -1,6 +1,7 @@
 import * as React from "react";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import { cn } from "@/lib/utils";
+import { useNativeBrowserOverlayRef } from "@/lib/nativeBrowserOverlay";
 
 const DEFAULT_TOOLTIP_DELAY = 300;
 
@@ -21,7 +22,7 @@ const TooltipContent = React.forwardRef<
 >(({ className, sideOffset = 8, ...props }, ref) => (
   <TooltipPrimitive.Portal>
     <TooltipPrimitive.Content
-      ref={ref}
+      ref={useNativeBrowserOverlayRef(ref)}
       sideOffset={sideOffset}
       className={cn(
         "z-50 overflow-hidden rounded-lg px-2.5 py-1.5 text-[11px] text-foreground",

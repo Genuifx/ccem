@@ -15,6 +15,7 @@ function mountZoom({ stored = null, storageFails = false } = {}) {
   const pending = [];
   const effects = [];
   const listeners = new Map();
+  const zoomEvents = [];
   const sandbox = {
     exports: {},
     require: (name) => {
@@ -35,14 +36,17 @@ function mountZoom({ stored = null, storageFails = false } = {}) {
     window: {
       addEventListener: (name, handler) => listeners.set(name, handler),
       removeEventListener: (name) => listeners.delete(name),
-      dispatchEvent: (event) => listeners.get(event.type)?.(event),
+      dispatchEvent: (event) => {
+        if (event.type === 'ccem-zoom-change') zoomEvents.push(event.detail.zoom);
+        listeners.get(event.type)?.(event);
+      },
     },
   };
   vm.runInNewContext(outputText, sandbox);
   const api = sandbox.exports;
   api.useZoom();
   const dispose = effects[0]();
-  return { api, pending, dispose };
+  return { api, pending, dispose, zoomEvents };
 }
 
 test('drag geometry uses native acknowledged zoom instead of a pending saved preference', async () => {
@@ -78,5 +82,19 @@ test('a rejected native zoom keeps the last successfully applied geometry', asyn
   pending.shift().reject(Error('native zoom unavailable'));
   await settleNativeZoom();
   assert.equal(api.readAppZoom(), 0.8);
+  dispose();
+});
+
+test('overlay geometry refresh waits for the native zoom acknowledgement', async () => {
+  const { api, pending, dispose, zoomEvents } = mountZoom({ stored: '0.8' });
+  assert.deepEqual(zoomEvents, []);
+  pending.shift().resolve();
+  await settleNativeZoom();
+  assert.deepEqual(zoomEvents, [0.8]);
+  api.dispatchAppZoomCommand('zoom_in');
+  assert.deepEqual(zoomEvents, [0.8]);
+  pending.shift().resolve();
+  await settleNativeZoom();
+  assert.deepEqual(zoomEvents, [0.8, 0.9]);
   dispose();
 });

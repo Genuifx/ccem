@@ -21,8 +21,12 @@ pub(crate) fn set_bounds(surface_id: &str, bounds: NativeChildBounds) -> Result<
                 .popup
                 .as_ref()
                 .and_then(|popup| popup.browser.clone()),
+            surface.wrapper.clone(),
+            surface.child_bounds(),
         ))
     })?;
+    if let Some(wrapper) = &browsers.2 { wrapper.resize(bounds); }
+    let bounds = browsers.3;
     for browser in [browsers.0, browsers.1].into_iter().flatten() {
         let host = browser
             .host()
@@ -41,6 +45,9 @@ pub(crate) fn set_bounds(surface_id: &str, bounds: NativeChildBounds) -> Result<
 
 pub(crate) fn occlude(surface_id: &str) -> Result<(), String> {
     require_main_thread()?;
+    if crate::browser_overlay::macos::enabled() && has_wrapper(surface_id) {
+        return suspend_input(surface_id);
+    }
     let (visible, shared, primary, popup) = surface_focus_children(surface_id)?;
     if visible {
         let target = current_focus_target(primary.as_ref(), popup.as_ref())?;
@@ -55,6 +62,8 @@ pub(crate) fn set_visible(surface_id: &str, visible: bool) -> Result<(), String>
     let popup_browser = popup.as_ref().and_then(|(_, browser)| browser.as_ref());
 
     let apply_visibility = || -> Result<(), String> {
+        let wrapper = SURFACES.with(|surfaces| surfaces.borrow().get(surface_id).and_then(|surface| surface.wrapper.clone()));
+        if let Some(wrapper) = wrapper { wrapper.setHidden(!visible); }
         if let Some(browser) = primary.as_ref() {
             browser_child(browser, "primary")?.setHidden(!visible || popup_browser.is_some());
         }
@@ -76,7 +85,7 @@ pub(crate) fn set_visible(surface_id: &str, visible: bool) -> Result<(), String>
         return Err(error);
     }
 
-    if visible {
+    if visible && !input_suspended(surface_id) {
         // Only a live popup browser counts as the current focus target. A
         // captured popup whose browser has closed is stale and must be dropped.
         let current_popup = popup
@@ -104,6 +113,84 @@ pub(crate) fn set_visible(surface_id: &str, visible: bool) -> Result<(), String>
         })?;
     }
     Ok(())
+}
+
+fn has_wrapper(surface_id: &str) -> bool {
+    SURFACES.with(|surfaces| surfaces.borrow().get(surface_id).is_some_and(|surface| surface.wrapper.is_some()))
+}
+
+pub(super) fn input_suspended(surface_id: &str) -> bool {
+    SURFACES.with(|surfaces| surfaces.borrow().get(surface_id).is_some_and(|surface| {
+        surface.wrapper.as_ref().is_some_and(|wrapper| wrapper.input_suspended())
+    }))
+}
+
+fn suspend_input(surface_id: &str) -> Result<(), String> {
+    let wrapper = SURFACES.with(|surfaces| surfaces.borrow().get(surface_id).and_then(|surface| surface.wrapper.clone()));
+    let Some(wrapper) = wrapper else { return Ok(()); };
+    // Global React sync and the Agent pause barrier may both arrive. Capture
+    // the original focus only once; a second capture would erase it after blur.
+    if wrapper.suspend_input(true) { return Ok(()); }
+    let (visible, shared, primary, popup) = surface_focus_children(surface_id)?;
+    if !visible { return Ok(()); }
+    let target = current_focus_target(primary.as_ref(), popup.as_ref())?;
+    shared.capture_focus_restore_intent(target);
+    if target.is_some() {
+        for browser in [primary.as_ref(), popup.as_ref().and_then(|(_, browser)| browser.as_ref())].into_iter().flatten() {
+            if let Some(host) = browser.host() { host.set_focus(0); }
+        }
+        crate::browser_overlay::macos::focus_main_view();
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_overlay_input(modal: bool) -> Result<(), String> {
+    require_main_thread()?;
+    let surfaces = SURFACES.with(|surfaces| surfaces.borrow().iter().filter_map(|(id, surface)| {
+        surface.wrapper.as_ref().map(|wrapper| (id.clone(), wrapper.clone(), surface.visible, Arc::clone(&surface.shared)))
+    }).collect::<Vec<_>>());
+    for (id, wrapper, visible, shared) in surfaces {
+        if modal {
+            suspend_input(&id)?;
+        } else if wrapper.suspend_input(false) {
+            if visible { set_visible(&id, true)?; }
+            else { shared.clear_focus_restore_intent(); }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn configure_overlay_composition(enabled: bool) -> Result<(), String> {
+    require_main_thread()?;
+    let wrappers = SURFACES.with(|surfaces| {
+        surfaces.borrow().iter().filter_map(|(id, surface)| {
+            surface.wrapper.as_ref().map(|wrapper| (
+                id.clone(), wrapper.clone(), surface.close_requested, Arc::clone(&surface.shared),
+            ))
+        }).collect::<Vec<_>>()
+    });
+    for (id, wrapper, closing, shared) in wrappers {
+        if !enabled {
+            wrapper.suspend_input(true);
+            wrapper.setHidden(true);
+            SURFACES.with(|surfaces| {
+                if let Some(surface) = surfaces.borrow_mut().get_mut(&id) { surface.visible = false; }
+            });
+            shared.clear_focus_restore_intent();
+            shared.update(|state| state.visible = false);
+            wrapper.suspend_input(closing);
+        }
+    }
+    Ok(())
+}
+
+wrap_focus_handler! {
+    pub(super) struct SurfaceFocusHandler { surface_id: String }
+    impl FocusHandler {
+        fn on_set_focus(&self, _browser: Option<&mut Browser>, _source: FocusSource) -> i32 {
+            i32::from(input_suspended(&self.surface_id))
+        }
+    }
 }
 
 type PopupFocusChild = Option<(i32, Option<Browser>)>;
@@ -189,4 +276,16 @@ fn focus_browser(browser: &Browser, label: &str) -> Result<(), String> {
     }
     host.set_focus(1);
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn debug_focus(surface_id: &str) -> Result<(), String> {
+    require_main_thread()?;
+    if input_suspended(surface_id) { return Err("Surface input is suspended".into()); }
+    let (_, _, primary, popup) = surface_focus_children(surface_id)?;
+    if let Some(browser) = popup.as_ref().and_then(|(_, browser)| browser.as_ref()) {
+        focus_browser(browser, "popup")
+    } else if let Some(browser) = primary.as_ref() {
+        focus_browser(browser, "primary")
+    } else { Err("Surface is not ready".into()) }
 }

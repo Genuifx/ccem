@@ -605,7 +605,8 @@
   mix-blend-mode: overlay;
 }
 
-.app-content-shell {
+.app-content-shell,
+.app-content-shell::before {
   background:
     linear-gradient(
       180deg,
@@ -626,7 +627,8 @@
     hsl(var(--background) / var(--content-bg-opacity, 1));
 }
 
-.light .app-content-shell {
+.light .app-content-shell,
+.light .app-content-shell::before {
   background:
     linear-gradient(
       180deg,
@@ -1730,15 +1732,52 @@
 }
 
 .workspace-browser-panel {
-  background: hsl(var(--background) / 0.96);
+  --browser-chrome-background: hsl(var(--background) / 0.96);
+  background: var(--browser-chrome-background);
   border-left: 1px solid hsl(var(--border) / 0.72);
   box-shadow: none;
 }
 
 .light .workspace-browser-panel {
-  background: hsl(40 25% 99% / 0.99);
+  --browser-chrome-background: hsl(40 25% 99% / 0.99);
+  background: var(--browser-chrome-background);
   border-left: 1px solid hsl(40 15% 82% / 0.78);
   box-shadow: none;
+}
+
+/* The WKWebView remains one React tree above CEF. Only its decorative
+   backgrounds are cut out; clipping an ancestor would erase inline overlays. */
+html[data-native-browser-composition='true'][data-native-browser-hole='true'] body {
+  background: transparent;
+}
+html[data-native-browser-hole='true'] .app-content-shell {
+  background: transparent;
+}
+html[data-native-browser-hole='true'] .app-content-shell::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  clip-path: var(--ccem-browser-backdrop-clip, none);
+}
+html[data-native-browser-hole='true'] .ambient-bg {
+  clip-path: var(--ccem-browser-backdrop-clip, none);
+}
+html[data-native-browser-hole='true'] .workspace-browser-panel,
+html[data-native-browser-hole='true'] [data-ccem-native-browser-viewport] {
+  background: transparent;
+}
+html[data-native-browser-hole='true'] .workspace-browser-chrome {
+  background: var(--browser-chrome-background);
+}
+html[data-native-browser-hole='true'] [data-ccem-native-browser-viewport]::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0.375rem;
+  background: var(--browser-chrome-background);
+  pointer-events: none;
 }
 
 /* --- Status chip liquid glass --- */

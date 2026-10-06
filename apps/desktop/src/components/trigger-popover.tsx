@@ -97,6 +97,7 @@ export function TriggerPopover({
   return (
     <ScrollArea
       ref={popoverRef}
+      data-ccem-native-overlay={placement === 'anchored' ? '' : undefined}
       className={cn(
         'max-h-[240px] min-w-[200px]',
         placement === 'anchored'
