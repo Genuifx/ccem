@@ -1619,6 +1619,7 @@
     "saveToolsMode": "保存并重连",
     "toolsModeNativeHint": "可访问网页、Skills 和记忆，读写本机文件、运行命令；危险操作沿用 Hermes 原生确认。",
     "toolsModeCcemHint": "仅使用 CCEM 会话工具，按已授权的工作区访问任务。",
+    "toolsModeCcemBoundary": "保留对话、记忆和技能查阅；不开放独立网页浏览、本机文件读写或终端命令。",
     "toolsModeWorkspaceBoundary": "工作区授权仅限制 CCEM 会话工具，不限制 Hermes 本机工具。",
     "nativeToolsUpdateRequired": "请更新聊天组件后再启用完整 Hermes。",
     "toolsModeSaved": "能力范围已保存。",

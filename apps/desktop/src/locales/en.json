@@ -1619,6 +1619,7 @@
     "saveToolsMode": "Save and reconnect",
     "toolsModeNativeHint": "Access the web, Skills and memory, read and write local files, and run commands. Risky operations use Hermes' native confirmation.",
     "toolsModeCcemHint": "Use only CCEM session tools, with task access limited to authorized workspaces.",
+    "toolsModeCcemBoundary": "Chat, memory and skill browsing remain available. Standalone web browsing, local file access and terminal commands are disabled.",
     "toolsModeWorkspaceBoundary": "Workspace grants apply only to CCEM session tools, not Hermes' local tools.",
     "nativeToolsUpdateRequired": "Update the chat component before enabling Full Hermes.",
     "toolsModeSaved": "Capabilities saved.",

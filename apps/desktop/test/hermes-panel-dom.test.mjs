@@ -206,6 +206,87 @@ test('tools mode defaults existing bots to CCEM and saves each explicit change i
   assert.equal(actions('configureConversation').length + actions('approvePairing').length + actions('updateRoute').length, 0);
 });
 
+test('tools mode options explain their scope on hover and keyboard focus without changing or saving the choice', async () => {
+  current = snapshot({ connections: [connection({ nativeToolsAvailable: true })] });
+  await mount(); await openDetails();
+  const section = container.querySelector('[data-hermes-tools-mode]');
+  const trigger = section.querySelector('[role=combobox]');
+  await harness.act(async () => {
+    trigger.focus();
+    trigger.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  });
+  await settle();
+  const native = document.querySelector('[data-hermes-tools-option="native"]');
+  const ccem = document.querySelector('[data-hermes-tools-option="ccem"]');
+  const hover = async (node) => {
+    await harness.act(async () => {
+      const event = new dom.window.MouseEvent('pointerover', { bubbles: true });
+      Object.defineProperty(event, 'pointerType', { value: 'mouse' });
+      node.dispatchEvent(event);
+      node.focus();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+  };
+  await hover(native);
+  let explanation = document.querySelector('[data-hermes-tools-explanation="native"]');
+  assert.ok(explanation.textContent.includes('hermes.toolsModeNativeHint'));
+  assert.ok(explanation.textContent.includes('hermes.toolsModeWorkspaceBoundary'));
+  assert.ok(document.getElementById(native.getAttribute('aria-describedby')).textContent.includes('hermes.toolsModeWorkspaceBoundary'));
+  assert.equal(trigger.textContent, 'hermes.toolsModeCcem');
+  await harness.act(async () => {
+    native.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  });
+  assert.equal(document.activeElement, ccem);
+  explanation = document.querySelector('[data-hermes-tools-explanation="ccem"]');
+  assert.ok(explanation.textContent.includes('hermes.toolsModeCcemHint'));
+  assert.ok(explanation.textContent.includes('hermes.toolsModeCcemBoundary'));
+  assert.equal(actions('configureTools').length, 0);
+  await harness.act(async () => {
+    ccem.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  });
+  await settle();
+  assert.equal(document.querySelector('[role=listbox]'), null);
+  assert.equal(document.querySelector('[data-hermes-tools-explanation]'), null);
+  assert.equal(document.activeElement, trigger);
+
+  await harness.act(async () => {
+    trigger.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  });
+  await settle();
+  const nativeChoice = document.querySelector('[data-hermes-tools-option="native"]');
+  await hover(nativeChoice);
+  await harness.act(async () => {
+    for (const type of ['pointerdown', 'pointerup']) {
+      const event = new dom.window.MouseEvent(type, { bubbles: true, button: 0 });
+      Object.defineProperty(event, 'pointerType', { value: 'mouse' });
+      nativeChoice.dispatchEvent(event);
+    }
+  });
+  await settle();
+  assert.equal(trigger.textContent, 'hermes.toolsModeNative', 'a mouse selection still works after opening its explanation');
+  assert.equal(document.querySelector('[role=listbox]'), null);
+  assert.equal(document.querySelector('[data-hermes-tools-explanation]'), null);
+  assert.equal(button('hermes.saveToolsMode').disabled, false);
+  assert.equal(actions('configureTools').length, 0, 'selecting only changes the draft');
+
+  await harness.act(async () => {
+    trigger.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  });
+  await settle();
+  await harness.act(async () => {
+    document.activeElement.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+  });
+  await settle();
+  await harness.act(async () => {
+    document.activeElement.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  });
+  await settle();
+  assert.equal(trigger.textContent, 'hermes.toolsModeCcem');
+  assert.equal(button('hermes.saveToolsMode').disabled, true);
+  assert.equal(actions('configureTools').length, 0);
+});
+
 for (const capability of [undefined, false]) test(`tools mode blocks native activation when capability is ${capability}`, async () => {
   current = snapshot({ connections: [connection({ nativeToolsAvailable: capability })] });
   await mount(); await openDetails();
