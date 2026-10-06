@@ -180,7 +180,6 @@ pub(crate) fn configure_overlay_composition(enabled: bool) -> Result<(), String>
             shared.update(|state| state.visible = false);
             wrapper.suspend_input(closing);
         }
-        wrapper.set_composition(enabled);
     }
     Ok(())
 }

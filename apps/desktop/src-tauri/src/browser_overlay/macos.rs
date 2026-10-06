@@ -41,6 +41,18 @@ fn main_view(window: &WebviewWindow) -> Result<Retained<NSView>, String> {
         .ok_or_else(|| "Main WKWebView is unavailable".into())
 }
 
+fn set_main_layer_position(view: &NSView, position: f64) -> Result<(), String> {
+    view.setWantsLayer(true);
+    unsafe {
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if layer.is_null() {
+            return Err("Main WKWebView backing layer is unavailable".into());
+        }
+        let _: () = msg_send![layer, setZPosition: position];
+    }
+    Ok(())
+}
+
 /** A new document starts in legacy mode, including when its boot ACK is late. */
 pub(crate) fn reset_for_frontend_boot(app: &AppHandle) -> Result<(), String> {
     let reset_app = app.clone();
@@ -51,6 +63,7 @@ pub(crate) fn reset_for_frontend_boot(app: &AppHandle) -> Result<(), String> {
             crate::browser::login::cef::surface::macos::configure_overlay_composition(false)?;
             let window = reset_app.get_webview_window("main").ok_or("Main window is unavailable")?;
             let view = main_view(&window)?;
+            set_main_layer_position(&view, 0.0)?;
             unsafe {
                 let _: () = msg_send![&*view, setValue: &*NSNumber::new_bool(true), forKey: ns_string!("drawsBackground")];
             }
@@ -76,13 +89,17 @@ pub(crate) fn initialize(window: &WebviewWindow) -> Result<bool, String> {
         move || {
             let main_view = main_view(&window)?;
             let parent = unsafe { main_view.superview() }.ok_or("Main content view is unavailable")?;
+            parent.setWantsLayer(true);
+            crate::browser::login::cef::surface::macos::configure_overlay_composition(true)?;
+            // Keep CEF at the parent's content plane. A negative wrapper z
+            // puts Chromium behind the opaque parent backing in this Wry host.
+            // Raise WK instead, without changing AppKit's input/subview order.
+            set_main_layer_position(&main_view, 1.0)?;
             // The same KVC key is used by this checkout's Wry 0.55 transparency
             // implementation. Never change the view's position in the hierarchy.
             unsafe {
                 let _: () = msg_send![&*main_view, setValue: &*NSNumber::new_bool(false), forKey: ns_string!("drawsBackground")];
             }
-            parent.setWantsLayer(true);
-            crate::browser::login::cef::surface::macos::configure_overlay_composition(true)?;
             STATE.with(|state| {
                 *state.borrow_mut() = NativeOverlayState {
                     enabled: true,
@@ -192,7 +209,7 @@ impl BrowserHostView {
             if layer.is_null() {
                 return Err("CEF wrapper backing layer is unavailable".into());
             }
-            let _: () = msg_send![layer, setZPosition: if enabled() { -1.0_f64 } else { 0.0_f64 }];
+            let _: () = msg_send![layer, setZPosition: 0.0_f64];
             let _: () = msg_send![layer, setMasksToBounds: true];
             // Visual order comes from CALayer, input order from hitTest above.
             parent.addSubview(&this);
@@ -208,12 +225,6 @@ impl BrowserHostView {
     }
     pub(crate) fn resize(&self, bounds: NativeChildBounds) {
         self.setFrame(frame(bounds));
-    }
-    pub(crate) fn set_composition(&self, enabled: bool) {
-        unsafe {
-            let layer: *mut AnyObject = msg_send![self, layer];
-            let _: () = msg_send![layer, setZPosition: if enabled { -1.0_f64 } else { 0.0_f64 }];
-        }
     }
 }
 
