@@ -90,7 +90,7 @@ export function HermesConnectionDetails({ connection, platform, routes, workspac
         {authorizationOnly && <HermesPlatformIcon platform={connection.platform} />}
         <div>{authorizationOnly && <h4>{label}</h4>}<p className="hermes-connection-state" role="status"><span className={`hermes-status-dot${running ? ' is-running' : ''}`} aria-hidden="true" />{stateLabel(connection.state)}</p></div>
       </div>
-      {connection.error && <p role="alert" className="hermes-alert">{errorText(connection.error)}</p>}
+      {connection.error && <p role="alert" className="hermes-alert">{connection.error === 'pairing_rate_limited' ? t('hermes.pairingRateLimited') : errorText(connection.error)}</p>}
       {requestError && <p role="alert" className="hermes-alert">{requestError}</p>}
       {setupError && <p role="alert" className="hermes-alert" data-hermes-setup-error>{t(setupError)}</p>}
       <div className="hermes-connection-toolbar">

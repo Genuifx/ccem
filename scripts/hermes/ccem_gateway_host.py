@@ -236,7 +236,7 @@ class Host:
                 connected = self.transport_ready and any(getattr(adapter, "is_connected", False) is True for adapter in self.runner.adapters.values())
                 state = "running" if connected else "reconnecting"
             return {"state": state, "error": self.error, "platforms": self.platforms, "sessionHandoff": 1, "nativeConversation": 1, "nativeTools": 1,
-                    "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeSource")} for p in self.pending.values()],
+                    "pending": [{k: v for k, v in p.items() if k not in ("nativeCode", "nativeRequestId", "nativeApproved", "nativeSource")} for p in self.pending.values()],
                     "pairing": self.pairing}
 
     def publish(self):
@@ -399,8 +399,19 @@ class Host:
                 return {"action": "skip", "reason": "pairing_platform_mismatch"}
             native_source = dataclasses.replace(source)
             store = self.runner._pairing_store_for(native_source)
-            code = store.generate_code(platform, source.user_id, source.user_name or "") if store else None
-            if not code:
+            # Desktop nonce renewal must not mint another native code: Hermes
+            # rate-limits generation even after a successful approval. Reuse a
+            # live native request, or recheck an existing grant at approval time.
+            approved = bool(store and store.is_approved(platform, source.user_id))
+            request_id, code = None, None
+            if store and not approved:
+                request_id = next((p["request_id"] for p in store.list_pending(platform)
+                                   if p["user_id"] == source.user_id and p.get("request_id")), None)
+                if not request_id:
+                    code = store.generate_code(platform, source.user_id, source.user_name or "")
+            if not approved and not request_id and not code:
+                self.error = "pairing_rate_limited"
+                self.publish()
                 return {"action": "skip", "reason": "pairing_rate_limited"}
             from hermes_cli.profiles import get_active_profile_name
             profile = source.profile or get_active_profile_name()
@@ -410,7 +421,10 @@ class Host:
                         "threadId": source.thread_id, "chatType": source.chat_type}
             identifier = secrets.token_hex(24)
             self.pending[identifier] = {"id": identifier, "source": identity, "expiresAt": int(time.time()*1000)+120_000,
-                                        "nativeCode": code, "nativeSource": native_source}
+                                        "nativeCode": code, "nativeRequestId": request_id, "nativeApproved": approved,
+                                        "nativeSource": native_source}
+            if self.error == "pairing_rate_limited":
+                self.error = None
             self.pairing = None  # one native sender per desktop pairing window
             self.publish()
         return {"action": "skip", "reason": "awaiting_desktop_approval"}
@@ -565,7 +579,13 @@ class Host:
             if not pending:
                 raise ValueError("pairing_expired")
             store = self.runner._pairing_store_for(pending["nativeSource"])
-            approved = store.approve_code(pending["source"]["platform"], pending["nativeCode"])
+            platform, user_id = pending["source"]["platform"], pending["source"]["userId"]
+            if pending.get("nativeApproved"):
+                approved = {"user_id": user_id} if store.is_approved(platform, user_id) else None
+            elif pending.get("nativeRequestId"):
+                approved = store.approve_request(platform, pending["nativeRequestId"])
+            else:
+                approved = store.approve_code(platform, pending["nativeCode"])
             if not approved or str(approved["user_id"]) != pending["source"]["userId"]:
                 raise ValueError("pairing_approval_failed")
             self.publish()

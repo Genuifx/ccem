@@ -1714,6 +1714,7 @@
     "start": "Start connection",
     "stop": "Stop connection",
     "newPairing": "Pair account",
+    "pairingRateLimited": "Unable to submit the pairing request right now. Please try again later.",
     "pairingInstruction": "Send this command in the chat you want to connect:",
     "pairingExpires": "Valid until {time}",
     "pairingExpired": "Pairing expired. Generate a new code.",

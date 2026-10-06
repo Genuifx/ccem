@@ -1553,6 +1553,34 @@ test('new pairing requests update the list cue without expanding or stealing foc
   assert.equal(actions('approvePairing').length, 0);
 });
 
+test('reopening pairing replaces the nonce and shows retries or renewed approval without silently authorizing', async () => {
+  const paired = { id: 'paired-route', source, enabled: true, generation: 1, workspaces: [], allowInput: false, notifications: false };
+  current = snapshot({ connections: [connection({ pairing: { code: 'OLD', expiresAt: Date.now() + 120000 } })], routes: [paired] });
+  await mount();
+  const details = await openDetails();
+  handler = async (name, args) => {
+    if (args?.action === 'openPairing') {
+      current.connections[0].pairing = { code: 'NEW', expiresAt: Date.now() + 120000 };
+      current.connections[0].pending = [];
+    }
+    return structuredClone(current);
+  };
+  await click(button('hermes.newPairing', details));
+  assert.ok(details.querySelector('code').textContent.endsWith('connect NEW'));
+  assert.equal(details.textContent.includes('connect OLD'), false);
+  current.connections[0].error = 'pairing_rate_limited';
+  await poll();
+  assert.ok(details.querySelector('[role="alert"]').textContent.includes('hermes.pairingRateLimited'));
+  current.connections[0].error = null;
+  current.connections[0].pairing = null;
+  current.connections[0].pending = [{ ...pending, id: 'renewed-pairing' }];
+  await poll();
+  assert.equal(details.querySelector('[role="alert"]'), null);
+  assert.ok(details.querySelector('[data-hermes-pairing="renewed-pairing"]'));
+  assert.equal(button('hermes.approvePairing', details).disabled, false);
+  assert.equal(actions('approvePairing').length, 0);
+});
+
 test('Add replaces the list and legacy panels with a focused wizard, then restores list position', async () => {
   current = qrSnapshot({ connections: [connection()] });
   await mount(true);

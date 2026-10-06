@@ -1714,6 +1714,7 @@
     "start": "启动连接",
     "stop": "停止连接",
     "newPairing": "关联账号",
+    "pairingRateLimited": "暂时无法提交关联请求，请稍后重试。",
     "pairingInstruction": "在要连接的聊天中发送这条指令：",
     "pairingExpires": "有效至 {time}",
     "pairingExpired": "配对已过期，请重新生成",

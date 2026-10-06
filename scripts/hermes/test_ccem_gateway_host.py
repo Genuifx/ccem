@@ -2,7 +2,7 @@
 """Isolated host pairing regression against an explicitly supplied patched Hermes tree.
 
 Run with the runtime Python: python -I test_ccem_gateway_host.py --source PATH.
-Only synthetic callbacks and an in-memory pairing store are used; no connection
+Only synthetic callbacks and temporary native pairing stores are used; no connection
 is created and import-time profile writes are confined to a temporary home.
 """
 import argparse
@@ -20,6 +20,116 @@ from unittest.mock import patch
 
 
 class NativePairingProvenance(unittest.IsolatedAsyncioTestCase):
+    async def test_wecom_repairing_reuses_native_request_then_existing_approval(self):
+        from gateway.config import PlatformConfig
+        from gateway.pairing import PairingStore
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        with tempfile.TemporaryDirectory() as directory, patch("gateway.pairing.PAIRING_DIR", Path(directory)):
+            store = PairingStore()
+            host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+                "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc", "platform": "wecom"}, Path(directory))
+            adapter = WeComAdapter(PlatformConfig(enabled=True))
+            adapter._is_dm_intake_allowed = lambda sender: True
+            adapter._text_batch_delay_seconds = adapter._attachment_text_merge_delay_seconds = 0
+            host.runner = types.SimpleNamespace(_pairing_store_for=lambda source: store,
+                _primary_profile_name="default", adapters={"wecom": types.SimpleNamespace(is_connected=True)})
+            host.state, host.transport_ready = "running", True
+            published, decisions = [], []
+            host.publish = lambda: published.append(host.snapshot())
+            host.rpc = lambda *args: self.fail("Pairing observation must not authorize a task")
+            async def receive(event):
+                decisions.append(host.pairing_hook(event=event))
+            adapter.handle_message = receive
+            async def packet(code, message_id, user="native-user"):
+                await adapter._on_message({"headers": {"req_id": "native-request"}, "body": {
+                    "msgtype": "text", "text": {"content": "/ccem connect " + code}, "msgid": message_id,
+                    "from": {"userid": user}, "chatid": "native-chat", "chattype": "single"}})
+
+            first = (await host.request("openPairing", {}))["code"]
+            await packet(first, "first-message")
+            self.assertEqual(decisions[-1]["reason"], "awaiting_desktop_approval")
+            stale_id = next(iter(host.pending))
+            native_pending = store.list_pending("wecom")
+            self.assertEqual(len(native_pending), 1)
+            self.assertFalse(store.is_approved("wecom", "native-user"))
+            self.assertIsNone(store.generate_code("wecom", "native-user"), "real native limiter is active")
+
+            second = (await host.request("openPairing", {}))["code"]
+            await packet(first, "stale-nonce")
+            self.assertEqual(decisions[-1]["reason"], "pairing_window_not_open")
+            with patch.object(store, "generate_code", side_effect=AssertionError("Must reuse the native request")):
+                await packet(second, "second-message")
+            self.assertEqual(decisions[-1]["reason"], "awaiting_desktop_approval")
+            self.assertEqual(store.list_pending("wecom"), native_pending)
+            new_id = next(iter(host.pending))
+            self.assertNotEqual(new_id, stale_id)
+            with self.assertRaisesRegex(ValueError, "pairing_expired"):
+                await host.request("approvePairing", {"id": stale_id})
+            public = host.snapshot()["pending"][0]
+            self.assertFalse(any(key.startswith("native") for key in public))
+            self.assertFalse(store.is_approved("wecom", "native-user"), "resending never approves")
+            approved = await host.request("approvePairing", {"id": new_id})
+            self.assertEqual(approved["source"]["userId"], "native-user")
+            self.assertTrue(store.is_approved("wecom", "native-user"))
+
+            third = (await host.request("openPairing", {}))["code"]
+            with patch.object(store, "generate_code", side_effect=AssertionError("Approved users need no new grant")):
+                await packet(third, "third-message")
+            self.assertEqual(decisions[-1]["reason"], "awaiting_desktop_approval")
+            self.assertEqual(store.list_pending("wecom"), [])
+            self.assertEqual((await host.request("approvePairing", {"id": next(iter(host.pending))}))["source"], approved["source"])
+
+            fourth = (await host.request("openPairing", {}))["code"]
+            await packet(fourth, "revoked-before-approval")
+            store.revoke("wecom", "native-user")
+            with self.assertRaisesRegex(ValueError, "pairing_approval_failed"):
+                await host.request("approvePairing", {"id": next(iter(host.pending))})
+            self.assertFalse(store.is_approved("wecom", "native-user"))
+
+            retry = (await host.request("openPairing", {}))["code"]
+            await packet(retry, "rate-limited-no-native-request")
+            self.assertEqual(decisions[-1]["reason"], "pairing_rate_limited")
+            self.assertEqual(published[-1]["error"], "pairing_rate_limited")
+            self.assertEqual(host.pending, {})
+            self.assertIsNotNone(host.pairing, "failure leaves a retryable nonce")
+            await packet(retry, "another-user", user="second-user")
+            self.assertEqual(decisions[-1]["reason"], "awaiting_desktop_approval")
+            self.assertIsNone(host.error)
+            self.assertEqual(next(iter(host.pending.values()))["source"]["userId"], "second-user")
+            self.assertFalse(store.is_approved("wecom", "second-user"))
+
+    async def test_native_pending_request_survives_host_restart_but_not_native_expiry(self):
+        from gateway.config import Platform
+        from gateway.pairing import PairingStore, CODE_TTL_SECONDS
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+
+        with tempfile.TemporaryDirectory() as directory, patch("gateway.pairing.PAIRING_DIR", Path(directory)):
+            store = PairingStore()
+            self.assertIsNotNone(store.generate_code("wecom", "other-user"))
+            self.assertIsNotNone(store.generate_code("wecom", "restart-user"))
+            native_id = next(p["request_id"] for p in store.list_pending("wecom") if p["user_id"] == "restart-user")
+            host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+                "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc", "platform": "wecom"}, Path(directory))
+            host.runner = types.SimpleNamespace(_pairing_store_for=lambda source: store,
+                _primary_profile_name="default", adapters={"wecom": types.SimpleNamespace(is_connected=True)})
+            host.state, host.transport_ready = "running", True
+            host.publish = lambda: None
+            nonce = (await host.request("openPairing", {}))["code"]
+            event = MessageEvent(text="/ccem connect " + nonce, message_id="restart-message",
+                source=SessionSource(platform=Platform("wecom"), chat_id="restart-chat", user_id="restart-user", chat_type="dm"))
+            self.assertEqual(host.pairing_hook(event=event)["reason"], "awaiting_desktop_approval")
+            pending = next(iter(host.pending.values()))
+            self.assertEqual(pending["nativeRequestId"], native_id)
+            # The Desktop window is still valid, but its native request expires.
+            expired = store._load_json(store._pending_path("wecom"))
+            expired[native_id]["created_at"] -= CODE_TTL_SECONDS + 1
+            store._save_json(store._pending_path("wecom"), expired)
+            with self.assertRaisesRegex(ValueError, "pairing_approval_failed"):
+                await host.request("approvePairing", {"id": pending["id"]})
+            self.assertFalse(store.is_approved("wecom", "restart-user"))
+
     async def test_confirmation_rewrite_keeps_gateway_admission_and_explicit_task_text(self):
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent
@@ -155,7 +265,7 @@ class NativePairingProvenance(unittest.IsolatedAsyncioTestCase):
         def generate_code(platform, user, name):
             native_requests.append((platform, user))
             return "synthetic-native-pairing-code"
-        store = types.SimpleNamespace(generate_code=generate_code)
+        store = types.SimpleNamespace(generate_code=generate_code, is_approved=lambda *args: False, list_pending=lambda *args: [])
         host.runner = types.SimpleNamespace(_pairing_store_for=lambda source: store,
                                             _primary_profile_name="custom")
         host.publish = lambda: None
