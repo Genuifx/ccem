@@ -17,7 +17,7 @@ const diff = { path: 'docs/report.md', is_repo: true, is_binary: false, lines: [
 const file = (content) => ({ content, is_binary: false, truncated: false, byte_size: content.length });
 const tick = () => new Promise((resolve) => setTimeout(resolve, 15));
 
-async function setup(t, invoke) {
+async function setup(t, invoke, content = '[Open report](ccem-file://preview?path=docs%2Freport.md) [Unsafe](javascript:alert(1))') {
   const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', { url: 'http://localhost/', pretendToBeVisual: true });
   for (const key of ['window', 'document', 'navigator', 'HTMLElement', 'HTMLInputElement', 'Element', 'Node', 'Event', 'MouseEvent', 'CustomEvent', 'MutationObserver', 'getComputedStyle']) {
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value: dom.window[key] });
@@ -58,7 +58,7 @@ async function setup(t, invoke) {
         const [review, setReview] = useState(true);
         return <LocaleProvider><TooltipProvider><WorkspaceSidePanelContext.Provider value={panel}><WorkspaceFileLinkContext.Provider value={{ workingDir: props.session.project_dir, openFile: path => panel.open('files', path) }}>
           <button ref={workspaceReviewTriggerRef} onClick={() => setReview(true)}>Review</button>
-          <MarkdownRenderer content={'[Open report](ccem-file://preview?path=docs%2Freport.md) [Unsafe](javascript:alert(1))'} />
+          <MarkdownRenderer content={props.content} />
           <WorkspaceReviewPopover {...props} isOpen={review} onOpenChange={setReview} isRefreshingGit={false} onRefreshGit={() => {}} />
           <WorkspaceSidePanel controller={panel} width={50} onResizeStart={() => {}} onSelectBrowser={() => panel.open('browser')}><div id="retained-browser" hidden={panel.tab !== 'browser'}>Retained browser</div></WorkspaceSidePanel>
         </WorkspaceFileLinkContext.Provider></WorkspaceSidePanelContext.Provider></TooltipProvider></LocaleProvider>;
@@ -85,7 +85,7 @@ async function setup(t, invoke) {
   });
   const { act, mount, createBrowserActivationController } = await import(pathToFileURL(output).href);
   const root = mount(document.getElementById('root'));
-  const props = { session, model, onLoadDiff: async () => diff, onLoadSubagents: async () => ({ subagents: [] }) };
+  const props = { session, model, content, onLoadDiff: async () => diff, onLoadSubagents: async () => ({ subagents: [] }) };
   await root.render(props);
   const settle = () => act(async () => { await tick(); });
   const click = async (element) => {
@@ -128,6 +128,24 @@ test('review details move into the side panel; Markdown, source, diff and local 
   await h.click([...document.querySelectorAll('[data-ccem-markdown-preview] a')].find(a => a.textContent === 'Next'));
   assert.equal(calls.at(-1).filePath, 'docs/next.md');
   assert.equal(document.querySelector('a[href^="javascript:"]'), null);
+});
+
+test('agent-drift preview links still open the files tab with the full untruncated path', async (t) => {
+  const calls = [];
+  const h = await setup(t, async (command, args) => {
+    calls.push({ command, ...args });
+    return file('# Drift report');
+  }, '[Capitalized](ccem-file://Preview?path=design-demos%2Fnatgeo-p1.html) [Hash](ccem-file://preview?path=docs/a#b.md) [Foreign](ccem-file://download?path=docs/x.md)');
+  const links = [...document.querySelectorAll('[data-ccem-file-link]')];
+  assert.equal(links.length, 2, 'only preview-action links are clickable');
+  await h.click(links[0]);
+  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'files');
+  assert.equal(calls.find((call) => call.command === 'get_workspace_file_preview').filePath, 'design-demos/natgeo-p1.html');
+  await h.settle();
+  // .html previews open in source mode; the file still loads end to end.
+  assert.match(document.querySelector('[data-ccem-file-source]')?.textContent ?? '', /Drift report/);
+  await h.click(links[1]);
+  assert.equal(calls.filter((call) => call.command === 'get_workspace_file_preview').at(-1).filePath, 'docs/a#b.md');
 });
 
 test('browser rollback preserves later manual choices and closing fences pending activation', async (t) => {

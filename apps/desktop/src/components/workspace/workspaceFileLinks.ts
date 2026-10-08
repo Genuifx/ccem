@@ -1,11 +1,31 @@
+/**
+ * The reserved ccem-file scheme carries a single `path` query value. Agents
+ * drift from the canonical form — capitalized host, empty authority, raw
+ * '#', '&' or '+' in the value — and URLSearchParams would silently truncate
+ * or mis-decode those. Recognize the preview action case-insensitively and
+ * read the value verbatim from the raw href; the backend still enforces
+ * working-dir containment after resolution.
+ */
+function ccemFilePreviewPath(href: string): string | null {
+  const url = new URL(href);
+  const host = url.hostname.toLowerCase();
+  const isPreviewAction = (host === 'preview' && (!url.pathname || url.pathname === '/'))
+    || (host === '' && url.pathname.replace(/^\//, '').toLowerCase() === 'preview');
+  if (!isPreviewAction || url.username || url.password) return null;
+  const rest = href.slice(href.indexOf(':') + 1);
+  const start = rest.search(/[?&]path=/);
+  if (start < 0) return null;
+  const value = rest.slice(rest.indexOf('=', start) + 1);
+  if (!value) return null;
+  const path = value.replace(/(?:%[0-9a-fA-F]{2})+/g, decodeURIComponent);
+  return /[\x00-\x1f]/.test(path) ? null : path;
+}
+
 /** Local links are handled inside the owning workspace, never by the OS. */
 export function workspaceFileLinkPath(href: string): string | null {
   try {
     if (/^ccem-file:/i.test(href)) {
-      const url = new URL(href);
-      if (url.hostname !== 'preview' || (url.pathname && url.pathname !== '/') || url.username || url.password) return null;
-      const path = url.searchParams.get('path');
-      return path && !/[\x00-\x1f]/.test(path) ? path : null;
+      return ccemFilePreviewPath(href);
     }
     if (/^file:/i.test(href)) {
       const url = new URL(href);

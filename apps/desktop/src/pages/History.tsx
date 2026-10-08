@@ -15,6 +15,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
+import { WorkspaceFileLinkContext } from '@/components/workspace/WorkspaceFileLinkContext';
 import {
   formatInteractiveSessionLaunchError,
   isInteractiveSessionTerminalOpenError,
@@ -153,6 +154,22 @@ export function History() {
   }, [sourceFilter, syncSessionState]);
 
   const selectedSession = sessions.find((session) => toSessionKey(session) === selectedKey);
+
+  // Preview links inside history transcripts stay clickable here: the History
+  // tab has no side panel, so a click opens the resolved file through the
+  // guarded workspace command (same affordance as the files tab's editor
+  // button). Without this target, ccem-file:/file: links render as dead text.
+  const historyFileLinkTarget = useMemo(() => {
+    const workingDir = selectedSession?.project || '';
+    if (!workingDir) return null;
+    return {
+      workingDir,
+      openFile: (path: string) => {
+        void invoke<boolean>('open_file_in_workspace', { workingDir, filePath: path })
+          .catch((err) => { toast.error(String(err)); });
+      },
+    };
+  }, [selectedSession?.project]);
 
   const handleResume = useCallback(async () => {
     if (!selectedSession) return;
@@ -493,29 +510,31 @@ export function History() {
             />
           </div>
         ) : selectedSession ? (
-          <Suspense fallback={<HistoryDetailFallback />}>
-            <LazyHistoryDetail
-              key={selectedSession ? toSessionKey(selectedSession) : undefined}
-              selectedSession={selectedSession}
-              messages={messages}
-              segments={segments}
-              activeSegment={activeSegment}
-              onActiveSegmentChange={setActiveSegment}
-              isLoadingMessages={isLoadingMessages}
-              detailError={detailError}
-              detailWarnings={detailWarnings}
-              onRetryDetail={() => selectedSession && handleSelect(selectedSession)}
-              onExport={handleExport}
-              onResume={handleResume}
-              launched={launched}
-              onSessionTitleChange={async (source, sessionId, newTitle) => {
-                await setSessionTitle(source, sessionId, newTitle);
-                invalidateHistoryCache();
-                const refreshed = await fetchHistorySessions(sourceFilter, true);
-                syncSessionState(refreshed);
-              }}
-            />
-          </Suspense>
+          <WorkspaceFileLinkContext.Provider value={historyFileLinkTarget}>
+            <Suspense fallback={<HistoryDetailFallback />}>
+              <LazyHistoryDetail
+                key={selectedSession ? toSessionKey(selectedSession) : undefined}
+                selectedSession={selectedSession}
+                messages={messages}
+                segments={segments}
+                activeSegment={activeSegment}
+                onActiveSegmentChange={setActiveSegment}
+                isLoadingMessages={isLoadingMessages}
+                detailError={detailError}
+                detailWarnings={detailWarnings}
+                onRetryDetail={() => selectedSession && handleSelect(selectedSession)}
+                onExport={handleExport}
+                onResume={handleResume}
+                launched={launched}
+                onSessionTitleChange={async (source, sessionId, newTitle) => {
+                  await setSessionTitle(source, sessionId, newTitle);
+                  invalidateHistoryCache();
+                  const refreshed = await fetchHistorySessions(sourceFilter, true);
+                  syncSessionState(refreshed);
+                }}
+              />
+            </Suspense>
+          </WorkspaceFileLinkContext.Provider>
         ) : (
           <div className="flex-1 flex items-center justify-center">
             <p className="text-xs text-muted-foreground">{t('history.noResults')}</p>
