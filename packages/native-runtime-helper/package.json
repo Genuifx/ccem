@@ -16,6 +16,7 @@
     "@deepseek-ai/dsh-session-persistence": "0.1.1-rc.2",
     "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.1-rc.2",
     "@deepseek-ai/dsh-session-title": "0.1.1-rc.2",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@openai/codex-sdk": "^0.139.0",
     "koffi": "3.1.0",
     "zod": "^4.1.12"

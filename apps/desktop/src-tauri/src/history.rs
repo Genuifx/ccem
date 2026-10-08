@@ -961,6 +961,10 @@ struct SubagentSidecarMeta {
     description: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    /// Claude Code sets this when the user stopped the agent; it is terminal
+    /// (the agent will not produce further events or a task notification).
+    #[serde(default, rename = "stoppedByUser", alias = "stopped_by_user")]
+    stopped_by_user: Option<bool>,
 }
 
 /// Enumerate `agent-<agentId>.jsonl` files in `subagents_dir`, returning base
@@ -988,7 +992,19 @@ fn discover_subagent_records(subagents_dir: &Path) -> Vec<SubagentRecord> {
         let sidecar = read_subagent_sidecar_meta(subagents_dir, agent_id);
         let status =
             normalize_subagent_status(sidecar.as_ref().and_then(|meta| meta.status.as_deref()))
-                .unwrap_or_else(|| "running".to_string());
+                .unwrap_or_else(|| {
+                    // No explicit sidecar status: an agent stopped by the user is
+                    // terminal, everything else is presumed still running.
+                    if sidecar
+                        .as_ref()
+                        .and_then(|meta| meta.stopped_by_user)
+                        .unwrap_or(false)
+                    {
+                        "failed".to_string()
+                    } else {
+                        "running".to_string()
+                    }
+                });
         let completed_at = if status == "running" {
             None
         } else {
@@ -1153,6 +1169,40 @@ fn scan_subagent_file_stats(path: &Path) -> Option<SubagentFileStats> {
     })
 }
 
+/// Apply an async agent's terminal lifecycle status to its metadata. Terminal
+/// notifications are keyed by exact `agentId`, so they win over the correlated
+/// call projection (which stays `running` for async launches) and also cover
+/// nested agents that have no `Agent` tool_use in the main transcript.
+fn apply_agent_terminal_to_meta(
+    meta: &mut SubagentMeta,
+    terminal: &AgentTerminalStatus,
+    last_event_at: Option<u64>,
+) {
+    match terminal.status.as_str() {
+        "completed" => {
+            meta.status = "completed".to_string();
+            meta.completed_at = terminal.completed_at.or(last_event_at);
+            if terminal.result_summary.is_some() {
+                meta.result_summary = terminal.result_summary.clone();
+            }
+        }
+        "failed" | "stopped" => {
+            meta.status = "failed".to_string();
+            meta.completed_at = terminal.completed_at.or(last_event_at);
+            if terminal.result_summary.is_some() {
+                meta.result_summary = terminal.result_summary.clone();
+            }
+        }
+        "running" => {
+            // An in-flight TaskOutput poll after an earlier stop: the agent was
+            // resumed, so it is running again.
+            meta.status = "running".to_string();
+            meta.completed_at = None;
+        }
+        _ => {}
+    }
+}
+
 /// Enrich sub-agent metadata from the main session transcript: correlate each
 /// sub-agent to the `Agent`/`Task` tool_use that spawned it. Prefer stable
 /// `agentId` values parsed from the tool_result, then fall back to prompt text
@@ -1171,6 +1221,9 @@ fn enrich_subagent_records(records: &mut [SubagentRecord], main_path: &Path) {
             used_calls.insert(index);
             let call = &agent_index.calls[index];
             apply_agent_call_to_meta(&mut record.meta, call, record.last_event_at);
+        }
+        if let Some(terminal) = agent_index.agent_terminal.get(&record.meta.agent_id) {
+            apply_agent_terminal_to_meta(&mut record.meta, terminal, record.last_event_at);
         }
     }
 }
@@ -1247,11 +1300,24 @@ struct MainAgentCall {
     result_text: Option<String>,
 }
 
+/// Terminal lifecycle status for an async sub-agent, projected from
+/// `<task-notification>` blocks or `TaskOutput` results in the main transcript.
+/// `status` keeps the raw value (`completed` | `failed` | `stopped` |
+/// `running` for an in-flight TaskOutput poll).
+#[derive(Debug, Clone)]
+struct AgentTerminalStatus {
+    status: String,
+    completed_at: Option<u64>,
+    result_summary: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct AgentCallIndex {
     calls: Vec<MainAgentCall>,
     prompt_to_indices: HashMap<String, Vec<usize>>,
     agent_id_to_index: HashMap<String, usize>,
+    /// agentId -> latest terminal status (file order, last write wins).
+    agent_terminal: HashMap<String, AgentTerminalStatus>,
 }
 
 fn find_agent_call_for_record(
@@ -1277,9 +1343,166 @@ fn find_agent_call_for_record(
         })
 }
 
+/// Marker text of the async `Agent` launch result. Newer Claude Code returns
+/// this tool_result immediately at spawn time; completion is later signalled by
+/// a `<task-notification>` block or a `TaskOutput` result, so the launch result
+/// must NOT be projected as completion.
+const ASYNC_AGENT_LAUNCH_MARKER: &str = "Async agent launched successfully";
+
+/// Detect whether a main-transcript line is an async agent launch result
+/// (structured `toolUseResult.status == "async_launched"` / `isAsync: true`,
+/// with a text fallback).
+fn is_async_agent_launch_result(tool_use_result: Option<&serde_json::Value>, text: &str) -> bool {
+    if let Some(tur) = tool_use_result.and_then(|v| v.as_object()) {
+        let status = tur.get("status").and_then(|x| x.as_str());
+        if status == Some("async_launched") {
+            return true;
+        }
+        if tur.get("isAsync").and_then(|x| x.as_bool()) == Some(true) {
+            return true;
+        }
+    }
+    text.contains(ASYNC_AGENT_LAUNCH_MARKER)
+}
+
+/// Extract the inner value of the first `<tag>…</tag>` pair in `text`.
+fn extract_xml_tag_value<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim())
+}
+
+/// Record a terminal lifecycle update for `agent_id` (file order: last wins).
+fn record_agent_terminal(
+    index: &mut AgentCallIndex,
+    agent_id: &str,
+    status: &str,
+    completed_at: Option<u64>,
+    result_summary: Option<String>,
+) {
+    if agent_id.is_empty() || status.is_empty() {
+        return;
+    }
+    index.agent_terminal.insert(
+        agent_id.to_string(),
+        AgentTerminalStatus {
+            status: status.to_string(),
+            completed_at,
+            result_summary: result_summary.and_then(|text| truncate_subagent_result_summary(&text)),
+        },
+    );
+}
+
+/// Collect async-agent terminal status updates from one parsed main-transcript
+/// line: structured `toolUseResult.task` (TaskOutput), `<task-notification>`
+/// blocks (queue-operation content, attachment prompts, tool_result text) and
+/// the text-form `<task_id>…<status>…<output>` TaskOutput fallback.
+fn collect_agent_terminal_from_line(index: &mut AgentCallIndex, v: &serde_json::Value, line_ts: u64) {
+    let completed_at = (line_ts > 0).then_some(line_ts);
+
+    // Structured TaskOutput result: {retrieval_status, task: {task_id, task_type, status, output, result}}.
+    if let Some(task) = v
+        .get("toolUseResult")
+        .and_then(|tur| tur.get("task"))
+        .and_then(|task| task.as_object())
+    {
+        let task_type = task.get("task_type").and_then(|x| x.as_str()).unwrap_or("");
+        if task_type == "local_agent" {
+            if let (Some(task_id), Some(status)) = (
+                task.get("task_id").and_then(|x| x.as_str()),
+                task.get("status").and_then(|x| x.as_str()),
+            ) {
+                let summary = task
+                    .get("result")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| task.get("output").and_then(|x| x.as_str()))
+                    .map(ToString::to_string);
+                record_agent_terminal(
+                    index,
+                    task_id,
+                    status,
+                    if status == "running" { None } else { completed_at },
+                    summary,
+                );
+                return;
+            }
+        }
+    }
+
+    // Text-bearing fields that may carry a `<task-notification>` block or the
+    // text-form TaskOutput result.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(content) = v.get("content").and_then(|x| x.as_str()) {
+        candidates.push(content.to_string());
+    }
+    if let Some(prompt) = v
+        .get("attachment")
+        .and_then(|a| a.get("prompt"))
+        .and_then(|x| x.as_str())
+    {
+        candidates.push(prompt.to_string());
+    }
+    if let Some(blocks) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in blocks {
+            if block.get("type").and_then(|x| x.as_str()) != Some("tool_result") {
+                continue;
+            }
+            if let Some(text) = extract_plain_text_content(
+                block.get("content").unwrap_or(&serde_json::Value::Null),
+            ) {
+                candidates.push(text);
+            }
+        }
+    }
+
+    for text in &candidates {
+        if text.contains("<task-notification>") {
+            if let (Some(task_id), Some(status)) = (
+                extract_xml_tag_value(text, "task-id"),
+                extract_xml_tag_value(text, "status"),
+            ) {
+                let summary = extract_xml_tag_value(text, "result").map(ToString::to_string);
+                record_agent_terminal(
+                    index,
+                    task_id,
+                    status,
+                    if status == "running" { None } else { completed_at },
+                    summary,
+                );
+            }
+        } else if text.contains("<task_id>") {
+            // Text-form TaskOutput result.
+            if let (Some(task_id), Some(status)) = (
+                extract_xml_tag_value(text, "task_id"),
+                extract_xml_tag_value(text, "status"),
+            ) {
+                let summary = extract_xml_tag_value(text, "output").map(ToString::to_string);
+                record_agent_terminal(
+                    index,
+                    task_id,
+                    status,
+                    if status == "running" { None } else { completed_at },
+                    summary,
+                );
+            }
+        }
+    }
+}
+
 /// Scan the main transcript for all `Agent`/`Task` tool_use blocks and their
 /// matching tool_results. Returns indexes by stable `agentId` and by normalized
 /// prompt text for older/built-in agents that do not expose an id in the result.
+///
+/// Async agent launches (tool_result arrives at spawn time with
+/// `toolUseResult.status == "async_launched"`) keep the call `Running`;
+/// their terminal status comes from task notifications / TaskOutput results
+/// collected into `agent_terminal` instead.
 fn scan_main_transcript_agent_calls(main_path: &Path) -> Option<AgentCallIndex> {
     let file = fs::File::open(main_path).ok()?;
     let reader = BufReader::new(file);
@@ -1297,6 +1520,7 @@ fn scan_main_transcript_agent_calls(main_path: &Path) -> Option<AgentCallIndex> 
             continue;
         };
         let line_ts = parse_timestamp_value(&v.get("timestamp").cloned());
+        collect_agent_terminal_from_line(&mut index, &v, line_ts);
         let Some(blocks) = v
             .get("message")
             .and_then(|m| m.get("content"))
@@ -1304,6 +1528,7 @@ fn scan_main_transcript_agent_calls(main_path: &Path) -> Option<AgentCallIndex> 
         else {
             continue;
         };
+        let tool_use_result = v.get("toolUseResult");
         for block in blocks {
             let Some(btype) = block.get("type").and_then(|x| x.as_str()) else {
                 continue;
@@ -1360,14 +1585,31 @@ fn scan_main_transcript_agent_calls(main_path: &Path) -> Option<AgentCallIndex> 
                 let result_text = extract_plain_text_content(
                     block.get("content").unwrap_or(&serde_json::Value::Null),
                 );
-                if let Some(agent_id) = result_text
-                    .as_deref()
-                    .and_then(extract_agent_id_from_result_text)
-                {
+                // The launch tool_result of an async agent carries the agentId
+                // correlation but is NOT a completion: keep the call Running.
+                let is_async_launch = is_async_agent_launch_result(
+                    tool_use_result,
+                    result_text.as_deref().unwrap_or(""),
+                );
+                // Prefer the structured agentId from toolUseResult, then the text marker.
+                let structured_agent_id = tool_use_result
+                    .and_then(|tur| tur.get("agentId"))
+                    .and_then(|x| x.as_str());
+                let agent_id = structured_agent_id
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        result_text
+                            .as_deref()
+                            .and_then(extract_agent_id_from_result_text)
+                    });
+                if let Some(agent_id) = agent_id {
                     index
                         .agent_id_to_index
                         .entry(agent_id)
                         .or_insert(call_index);
+                }
+                if is_async_launch {
+                    continue;
                 }
                 let call = &mut index.calls[call_index];
                 call.status = if is_error {
@@ -6089,6 +6331,200 @@ mod tests {
         assert_eq!(meta.status, "completed");
         assert_eq!(meta.completed_at, Some(1_781_431_203_000));
         assert_eq!(meta.result_summary.as_deref(), Some("Done\nagentId: a123"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Main transcript with the async agent lifecycle used by current Claude
+    /// Code: `Agent` tool_use -> immediate launch tool_result (structured
+    /// `toolUseResult.status = "async_launched"` + `agentId: …` text), then a
+    /// `<task-notification>` in a queue-operation line when the agent stops.
+    fn write_async_agent_main_transcript(main_path: &Path, notification_status: &str) {
+        fs::write(
+            main_path,
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-10-08T01:02:07.000Z\",\"message\":{\"content\":\"review please\"}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2026-10-08T01:02:08.025Z\",\"message\":{\"content\":[",
+                "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Agent\",\"input\":{\"subagent_type\":\"general-purpose\",\"description\":\"Review cluster\",\"prompt\":\"Review the recent commits\"}}",
+                "],\"model\":\"claude-test\"}}\n",
+                "{\"type\":\"user\",\"uuid\":\"u2\",\"timestamp\":\"2026-10-08T01:02:08.032Z\",\"toolUseResult\":{\"isAsync\":true,\"status\":\"async_launched\",\"agentId\":\"a1b2c3\"},\"message\":{\"content\":[",
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"Async agent launched successfully. (This tool result is internal metadata.)\\nagentId: a1b2c3 (internal ID - do not mention to user.)\\nThe agent is working in the background. You will be notified automatically when it completes.\"}]}",
+                "]}}\n",
+            )
+            .to_string()
+                + &format!(
+                    "{{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"2026-10-08T01:04:07.034Z\",\"sessionId\":\"session-async\",\"content\":\"<task-notification>\\n<task-id>a1b2c3</task-id>\\n<tool-use-id>call_1</tool-use-id>\\n<output-file>/tmp/x.output</output-file>\\n<status>{notification_status}</status>\\n<summary>Agent \\\"Review cluster\\\" finished</summary>\\n<result>Found 2 issues</result>\\n</task-notification>\"}}\n"
+                ),
+        )
+        .expect("write main transcript");
+    }
+
+    fn write_subagent_file(subagents_dir: &Path, agent_id: &str, prompt: &str) {
+        fs::create_dir_all(subagents_dir).expect("create subagents dir");
+        fs::write(
+            subagents_dir.join(format!("agent-{agent_id}.jsonl")),
+            format!(
+                concat!(
+                    "{{\"type\":\"user\",\"uuid\":\"s1\",\"timestamp\":\"2026-10-08T01:02:08.500Z\",\"agentId\":\"{agent_id}\",\"isSidechain\":true,\"message\":{{\"content\":\"{prompt}\"}}}}\n",
+                    "{{\"type\":\"assistant\",\"uuid\":\"s2\",\"timestamp\":\"2026-10-08T01:02:40.000Z\",\"agentId\":\"{agent_id}\",\"isSidechain\":true,\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"working…\"}}],\"model\":\"claude-test\"}}}}\n"
+                ),
+                agent_id = agent_id,
+                prompt = prompt
+            ),
+        )
+        .expect("write subagent file");
+    }
+
+    #[test]
+    fn test_async_agent_launch_keeps_subagent_running_until_notification() {
+        let root = temp_history_dir("subagents-async-launch");
+        let main_path = root.join("session-async.jsonl");
+        // Launch result only — the agent is still executing.
+        fs::write(
+            &main_path,
+            concat!(
+                "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2026-10-08T01:02:08.025Z\",\"message\":{\"content\":[",
+                "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Agent\",\"input\":{\"subagent_type\":\"general-purpose\",\"description\":\"Review cluster\",\"prompt\":\"Review the recent commits\"}}",
+                "],\"model\":\"claude-test\"}}\n",
+                "{\"type\":\"user\",\"uuid\":\"u2\",\"timestamp\":\"2026-10-08T01:02:08.032Z\",\"toolUseResult\":{\"isAsync\":true,\"status\":\"async_launched\",\"agentId\":\"a1b2c3\"},\"message\":{\"content\":[",
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"Async agent launched successfully.\\nagentId: a1b2c3 (internal ID - do not mention to user.)\\nThe agent is working in the background.\"}]}",
+                "]}}\n"
+            ),
+        )
+        .expect("write main transcript");
+        write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+
+        let mut records = discover_subagent_records(&root.join("subagents"));
+        assert_eq!(records.len(), 1);
+        enrich_subagent_records(&mut records, &main_path);
+        let meta = &records[0].meta;
+        assert_eq!(meta.agent_id, "a1b2c3");
+        // The async launch result must NOT be projected as completion.
+        assert_eq!(meta.status, "running", "agent still executing stays running");
+        assert_eq!(meta.completed_at, None);
+        // Correlation still enriches type/description from the Agent call.
+        assert_eq!(meta.subagent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(meta.description.as_deref(), Some("Review cluster"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_task_notification_flips_async_subagent_to_completed() {
+        let root = temp_history_dir("subagents-async-completed");
+        let main_path = root.join("session-async.jsonl");
+        write_async_agent_main_transcript(&main_path, "completed");
+        write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+
+        let mut records = discover_subagent_records(&root.join("subagents"));
+        enrich_subagent_records(&mut records, &main_path);
+        let meta = &records[0].meta;
+        assert_eq!(meta.status, "completed");
+        assert_eq!(meta.completed_at, Some(1_791_421_447_034));
+        assert_eq!(meta.result_summary.as_deref(), Some("Found 2 issues"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_task_notification_failed_and_stopped_map_to_failed() {
+        for status in ["failed", "stopped"] {
+            let root = temp_history_dir(&format!("subagents-async-{status}"));
+            let main_path = root.join("session-async.jsonl");
+            write_async_agent_main_transcript(&main_path, status);
+            write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+
+            let mut records = discover_subagent_records(&root.join("subagents"));
+            enrich_subagent_records(&mut records, &main_path);
+            assert_eq!(
+                records[0].meta.status, "failed",
+                "notification status {status} maps to failed"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn test_taskoutput_poll_then_notification_last_write_wins() {
+        let root = temp_history_dir("subagents-async-last-wins");
+        let main_path = root.join("session-async.jsonl");
+        // Launch + a TaskOutput poll reporting `running`, then a completion
+        // notification. File order decides: the later notification wins.
+        fs::write(
+            &main_path,
+            concat!(
+                "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2026-10-08T01:02:08.025Z\",\"message\":{\"content\":[",
+                "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Agent\",\"input\":{\"subagent_type\":\"general-purpose\",\"description\":\"Review cluster\",\"prompt\":\"Review the recent commits\"}}",
+                "],\"model\":\"claude-test\"}}\n",
+                "{\"type\":\"user\",\"uuid\":\"u2\",\"timestamp\":\"2026-10-08T01:02:08.032Z\",\"toolUseResult\":{\"isAsync\":true,\"status\":\"async_launched\",\"agentId\":\"a1b2c3\"},\"message\":{\"content\":[",
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"Async agent launched successfully.\\nagentId: a1b2c3\"}]}",
+                "]}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"a2\",\"timestamp\":\"2026-10-08T01:03:00.000Z\",\"message\":{\"content\":[",
+                "{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"TaskOutput\",\"input\":{\"task_id\":\"a1b2c3\",\"block\":true}}",
+                "],\"model\":\"claude-test\"}}\n",
+                "{\"type\":\"user\",\"uuid\":\"u3\",\"timestamp\":\"2026-10-08T01:03:01.000Z\",\"toolUseResult\":{\"retrieval_status\":\"success\",\"task\":{\"task_id\":\"a1b2c3\",\"task_type\":\"local_agent\",\"status\":\"running\",\"output\":\"partial…\"}},\"message\":{\"content\":[",
+                "{\"type\":\"tool_result\",\"tool_use_id\":\"call_2\",\"content\":\"<retrieval_status>success</retrieval_status>\\n\\n<task_id>a1b2c3</task_id>\\n\\n<task_type>local_agent</task_type>\\n\\n<status>running</status>\\n\\n<output>partial…</output>\"}",
+                "]}}\n"
+            )
+            .to_string()
+                + "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"2026-10-08T01:04:07.034Z\",\"sessionId\":\"session-async\",\"content\":\"<task-notification>\\n<task-id>a1b2c3</task-id>\\n<status>completed</status>\\n<result>Final report</result>\\n</task-notification>\"}\n",
+        )
+        .expect("write main transcript");
+        write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+
+        let mut records = discover_subagent_records(&root.join("subagents"));
+        enrich_subagent_records(&mut records, &main_path);
+        let meta = &records[0].meta;
+        assert_eq!(meta.status, "completed", "later notification beats earlier running poll");
+        assert_eq!(meta.result_summary.as_deref(), Some("Final report"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_notification_applies_to_nested_agent_without_main_transcript_call() {
+        let root = temp_history_dir("subagents-async-nested");
+        let main_path = root.join("session-async.jsonl");
+        // Nested agents (spawnDepth >= 2) have no Agent tool_use in the main
+        // transcript; the notification's task-id is the only correlation.
+        fs::write(
+            &main_path,
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-10-08T01:02:07.000Z\",\"message\":{\"content\":\"go\"}}\n",
+                "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"2026-10-08T01:04:07.034Z\",\"sessionId\":\"session-async\",\"content\":\"<task-notification>\\n<task-id>nested9</task-id>\\n<status>completed</status>\\n<result>Nested done</result>\\n</task-notification>\"}\n"
+            ),
+        )
+        .expect("write main transcript");
+        write_subagent_file(&root.join("subagents"), "nested9", "Nested task prompt");
+
+        let mut records = discover_subagent_records(&root.join("subagents"));
+        enrich_subagent_records(&mut records, &main_path);
+        let meta = &records[0].meta;
+        assert_eq!(meta.status, "completed");
+        assert_eq!(meta.result_summary.as_deref(), Some("Nested done"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_sidecar_stopped_by_user_maps_to_failed() {
+        let root = temp_history_dir("subagents-stopped-by-user");
+        let subagents_dir = root.join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+        fs::write(
+            subagents_dir.join("agent-stopped1.meta.json"),
+            "{\"agentType\":\"Explore\",\"description\":\"Stopped agent\",\"toolUseId\":\"call_9\",\"spawnDepth\":1,\"stoppedByUser\":true}",
+        )
+        .expect("write sidecar");
+        write_subagent_file(&subagents_dir, "stopped1", "Stopped task prompt");
+
+        let records = discover_subagent_records(&subagents_dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].meta.status, "failed",
+            "stoppedByUser sidecar marks the agent terminal"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
