@@ -1555,7 +1555,17 @@ export function deriveTranscriptAppend(
   if (!appendedEvents.length) {
     return state;
   }
-  return foldTranscriptEvents({ ...state }, appendedEvents, suppressGapBeforeSeqs);
+  return foldTranscriptEvents({
+    ...state,
+    messages: [...state.messages],
+    pendingTurn: state.pendingTurn
+      ? { ...state.pendingTurn, contentBlocks: [...state.pendingTurn.contentBlocks] }
+      : null,
+    hiddenInteractiveToolUseIds: new Set(state.hiddenInteractiveToolUseIds),
+    backgroundToolUseIds: new Set(state.backgroundToolUseIds),
+    emittedErrorTexts: new Set(state.emittedErrorTexts),
+    promptQueue: [...state.promptQueue],
+  }, appendedEvents, suppressGapBeforeSeqs);
 }
 
 /**

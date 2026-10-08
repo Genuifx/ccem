@@ -6,6 +6,19 @@ import path from 'node:path';
 import ts from 'typescript';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+test('incremental integrity follows the paged continuity result even when gap metadata is absent', async () => {
+  const mod = await importBackfillModule();
+  const batch = {
+    source_available: true, truncated: false, gap_detected: false,
+    oldest_available_seq: 1, newest_available_seq: 8,
+    events: [{ runtime_id: 'integrity', seq: 7 }, { runtime_id: 'integrity', seq: 8 }],
+  };
+  assert.equal(mod.replayBatchCoversSequenceAfter(batch, 3), false);
+  assert.equal(mod.inspectIncrementalTranscriptReplay(batch, true).state, 'partial');
+  assert.equal(mod.inspectIncrementalTranscriptReplay(batch, true).acknowledgedSeq, 8,
+    'readable live tail advances separately from the retained unresolved range');
+});
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(__dirname, '..');
 

@@ -20,7 +20,7 @@ async function loadRender() {
   let memo;
   let effect;
   function visit(node) {
-    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'rawMessages') {
+    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'transcriptDerivation') {
       memo = node.initializer.getText(ast);
     }
     if (ts.isCallExpression(node) && node.expression.getText(ast) === 'useLayoutEffect'
@@ -32,7 +32,12 @@ async function loadRender() {
   }
   visit(ast);
   assert.ok(memo && effect);
-  const compiled = ts.transpileModule(`${effect}; return ${memo};`, {
+  const compiled = ts.transpileModule(`${effect}; const transcriptDerivation = ${memo};
+    useLayoutEffect(() => {
+      transcriptDerivationRef.current = transcriptDerivation;
+      transcriptDerivationBackfillMarkerRef.current = transcriptBackfillCommitMarker;
+    }, [transcriptDerivation, transcriptBackfillCommitMarker]);
+    return finalizeTranscriptMessages(transcriptDerivation);`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-gap-render-'));
@@ -51,6 +56,7 @@ async function loadRender() {
 for (const scenario of [
   { name: 'empty mount', cached: false, stale: false },
   { name: 'cached head', cached: true, stale: false },
+  { name: 'authoritative partial corrects a cached seam', cached: true, stale: false, seam: true },
   { name: 'stale generation cannot suppress real gaps', cached: false, stale: true },
   { name: 'fast backfill refs cannot outrun the committed events', cached: false, stale: false, fast: true },
 ]) test(`initial replay gap rendering: ${scenario.name}`, async () => {
@@ -73,6 +79,7 @@ for (const scenario of [
   const ev = (seq, text) => ({ runtime_id: session.runtime_id, seq,
     occurred_at: '2026-09-07T00:00:00Z', payload: { type: 'assistant_chunk', text } });
   let execute;
+  let applyPruneSeams;
   function Harness({ events, marker, backfillMarker = null }) {
     const bindings = {
       ...helpers,
@@ -82,14 +89,17 @@ for (const scenario of [
       transcriptBackfillCommitMarker: backfillMarker,
       runtimeRequestScopeRef: React.useRef(scope),
       transcriptDerivationRef: React.useRef(null),
+      transcriptDerivationBackfillMarkerRef: React.useRef(null),
+      transcriptCommitRecovery: { acknowledge() {} },
       initialReplayRuntimeRef: React.useRef(null),
-      rawTailSeamsRef: React.useRef([]),
+      rawTailSeamsRef: React.useRef(scenario.seam ? [5] : []),
       rawTailSettledRef: React.useRef(scenario.fast === true),
       initialReplayUnloadedGapStartsRef: React.useRef([]),
       lastSeenSeqRef: React.useRef(null),
       pendingTranscriptPartialObservationRef: React.useRef(null),
       readCachedNativeEvents: () => ({ events: [], seams: [] }),
     };
+    applyPruneSeams = (seams) => { bindings.rawTailSeamsRef.current = seams; };
     execute ??= new Function(...Object.keys(bindings), compiled);
     const messages = execute(...Object.values(bindings));
     return React.createElement('div', null, ...messages.map((message, index) =>
@@ -105,12 +115,18 @@ for (const scenario of [
     await render(scenario.cached ? [ev(1, 'first')] : [], null);
     // 1 -> 5 is a real hole; 5 -> 20 is an intentionally unloaded range.
     await render([ev(1, 'first'), ev(5, 'anchor'), ev(20, 'tail')], marker);
-    const expectedGaps = scenario.stale ? 2 : 1;
+    const expectedGaps = scenario.stale ? 2 : scenario.seam ? 0 : 1;
     assert.equal(container.textContent.split(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN).length - 1, expectedGaps,
       'only the real hole may render a gap in the first committed replay');
     assert.match(container.textContent, /tail/);
     await render([ev(1, 'first'), ev(5, 'anchor'), ev(20, 'tail'), ev(21, 'new tail')], marker);
     assert.equal(container.textContent.split(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN).length - 1, expectedGaps);
+    if (scenario.seam) {
+      await render([ev(1, 'first'), ev(5, 'anchor'), ev(20, 'tail'), ev(21, 'new tail')], marker,
+        { ...scope, commitId: 3, clearProvisionalGaps: true });
+      assert.equal(container.textContent.split(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN).length - 1, 2,
+        'authoritative partial removes cache/unloaded seam suppression in the same render');
+    }
     await render(Array.from({ length: 21 }, (_, i) => ev(i + 1, `entry ${i + 1}`)),
       { ...marker, commitId: 2, rawTailSettled: true, initialUnloadedGapStarts: [] });
     assert.ok(!container.textContent.includes(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN));
@@ -118,8 +134,16 @@ for (const scenario of [
     // An authoritative backfill confirming a hole supersedes the initial
     // unloaded marker, even when it lands before another poll does.
     await render([ev(1, 'first'), ev(20, 'confirmed missing range')], marker,
-      { ...scope, commitId: 3 });
+      { ...scope, commitId: 3, clearProvisionalGaps: true });
     assert.ok(container.textContent.includes(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN));
+    const settledFullMarker = { ...scope, commitId: 4, clearProvisionalGaps: true };
+    await render(Array.from({ length: 21 }, (_, i) => ev(i + 1, `complete ${i + 1}`)), marker, settledFullMarker);
+    assert.ok(!container.textContent.includes(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN));
+    applyPruneSeams([20, 22]);
+    await render([ev(1, 'first'), ev(20, 'prune anchor'), ev(22, 'tail after pruning')], marker,
+      settledFullMarker);
+    assert.ok(!container.textContent.includes(helpers.TRANSCRIPT_GAP_SUMMARY_TOKEN),
+      'a consumed authoritative marker must honor subsequently created prune seams');
   } finally {
     await React.act(() => root.unmount());
     await cleanup();

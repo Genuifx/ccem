@@ -55,6 +55,26 @@ function ev(seq, payload) {
   };
 }
 
+test('an interrupted append cannot mutate the committed transcript fold', async () => {
+  const mod = await importTranscriptModule();
+  const committed = mod.deriveTranscriptReset([], [], [
+    ev(1, { type: 'assistant_chunk', text: 'committed ' }),
+    ev(2, { type: 'tool_use_started', tool_use_id: 'approval', raw_name: 'Write', needs_response: true }),
+  ]);
+  const before = mod.finalizeTranscriptMessages(committed);
+  const aborted = mod.deriveTranscriptAppend(committed, [
+    ev(3, { type: 'assistant_chunk', text: 'aborted' }),
+    ev(4, { type: 'tool_use_completed', tool_use_id: 'approval', raw_name: 'Write', success: true, result_summary: 'ok' }),
+    ev(5, { type: 'lifecycle', stage: 'turn_completed', detail: '' }),
+  ]);
+  assert.deepEqual(mod.finalizeTranscriptMessages(committed), before);
+  assert.ok(committed.hiddenInteractiveToolUseIds.has('approval'));
+  const retried = mod.deriveTranscriptAppend(committed, [ev(3, { type: 'assistant_chunk', text: 'accepted' })]);
+  assert.ok(JSON.stringify(mod.finalizeTranscriptMessages(retried)).includes('committed accepted'));
+  assert.ok(!JSON.stringify(mod.finalizeTranscriptMessages(retried)).includes('aborted'));
+  assert.ok(JSON.stringify(mod.finalizeTranscriptMessages(aborted)).includes('aborted'));
+});
+
 /**
  * Deterministic conversational fixture: turns of ten events each.
  * 1 user_prompt, 2 lifecycle(turn_started), 3-5 assistant_chunk,

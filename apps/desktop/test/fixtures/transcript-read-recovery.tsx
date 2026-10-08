@@ -36,6 +36,10 @@ export function mountRecoveryFixture(container: HTMLElement, options: { stallIni
     pending: [] as Array<() => void>,
     requests: [] as Array<{ runtimeId: string; afterSeq: number | null }>,
     sends: 0,
+    sparseSeqs: new Set<number>(),
+    sourceAvailable: true,
+    deferBackfill: false,
+    backfillReleases: [] as Array<() => void>,
     events: [
       record(1, { type: 'lifecycle', stage: 'turn_started', detail: '' }),
       record(2, { type: 'assistant_chunk', text: '正在整理清单。' }),
@@ -50,9 +54,10 @@ export function mountRecoveryFixture(container: HTMLElement, options: { stallIni
   const originalInvoke = internals.invoke;
   const page = (id: string, after: number | null, snapshot: number | null) => {
     const end = snapshot ?? (id === runtimeId ? state.events.length : 0);
-    const events = id === runtimeId ? state.events.filter((event) => event.seq > (after ?? 0) && event.seq <= end) : [];
+    const readable = id === runtimeId ? state.events.filter((event) => event.seq > (after ?? 0) && event.seq <= end) : [];
+    const events = readable.filter((event) => !state.sparseSeqs.has(event.seq));
     return {
-      events, source_available: true, gap_detected: false, decode_failure_count: 0,
+      events, source_available: state.sourceAvailable, gap_detected: readable.length !== events.length, decode_failure_count: 0,
       oversized_event_count: 0, oldest_available_seq: end ? 1 : null,
       snapshot_newest_seq: end || null, next_cursor: events.at(-1)?.seq ?? after, has_more: false,
     };
@@ -83,6 +88,10 @@ export function mountRecoveryFixture(container: HTMLElement, options: { stallIni
       state.pageCalls++;
       state.requests.push({ runtimeId: id, afterSeq: args.afterSeq });
       const result = page(id, args.afterSeq, args.snapshotNewestSeq);
+      if (id === runtimeId && args.afterSeq == null && state.deferBackfill) {
+        state.deferBackfill = false;
+        return new Promise((resolve) => state.backfillReleases.push(() => resolve(result)));
+      }
       return id === runtimeId ? maybeStall(result) : Promise.resolve(result);
     }
     if (command === 'get_native_session_summary') {
@@ -120,7 +129,7 @@ export function mountRecoveryFixture(container: HTMLElement, options: { stallIni
             initialPrompt={null} initialImages={null} initialAnnotations={null}
             onSessionUpdate={setSession} onStartNew={noop} />
         </div>
-        <div className="min-h-0 flex-1" style={{ display: active === runtimeId ? 'none' : undefined }}>
+        <div className="min-h-0 flex-1" data-testid="other-pane" style={{ display: active === runtimeId ? 'none' : undefined }}>
           <WorkspaceNativeSessionView session={{ ...initial, runtime_id: 'other-fixture' }} isVisible={active !== runtimeId}
             seedMessages={empty} installedSkills={empty} workspaceCommands={empty}
             initialPrompt={null} initialImages={null} initialAnnotations={null}
@@ -133,12 +142,16 @@ export function mountRecoveryFixture(container: HTMLElement, options: { stallIni
   flushSync(() => root.render(<Fixture />));
   return {
     state, publish,
+    append: (payloads: SessionEventRecord['payload'][]) => {
+      payloads.forEach((payload) => state.events.push(record(state.events.length + 1, payload)));
+    },
     switchTo: (id: string) => flushSync(() => setVisibleRuntime(id)),
     diagnostics: () => getPerfEvents().filter((event) => event.name.startsWith('nativeTranscript.')),
     unmount: () => {
       flushSync(() => root.unmount());
       state.mode = 'healthy';
       for (const release of [...state.pending]) release();
+      for (const release of state.backfillReleases) release();
       (globalThis as any).__transcriptRecoveryInvoke = previousFixtureInvoke;
     },
   };

@@ -17,7 +17,6 @@ import {
 } from '@/lib/lucide-react';
 import {
   Suspense,
-  startTransition,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -150,6 +149,7 @@ import {
   type LocalUserPrompt,
   type TranscriptDerivationState,
 } from './workspaceEventTranscript';
+import { createTranscriptCommitRecovery } from './workspaceTranscriptCommitRecovery';
 import {
   createTranscriptBackfillEventUpdate,
   deriveTranscriptBackfillHideDisposition,
@@ -308,6 +308,8 @@ interface WorkspaceNativeSessionViewProps {
   onNavigateEnvironments?: () => void;
 }
 
+const PARTIAL_REPLAY_RETRY_BASE_MS = 2_000;
+const PARTIAL_REPLAY_RETRY_MAX_MS = 60_000;
 const ACTIVE_POLL_INTERVAL_MS = 140;
 const IDLE_POLL_INTERVAL_MS = 700;
 const TERMINAL_POLL_INTERVAL_MS = 1100;
@@ -1546,6 +1548,10 @@ export function WorkspaceNativeSessionView({
     acknowledgedSeq: number | null;
     resetLastSeen: boolean;
     startedWithSeq: number | null;
+    resultStatus: 'success' | 'partial';
+    partialVersionAtStart: number;
+    clearProvisionalGaps: boolean;
+    rawTailSettled: boolean;
   } | null>(null);
   const [pollReplayCommitMarker, setPollReplayCommitMarker] = useState<(
     TranscriptBackfillCommitIdentity & {
@@ -1631,6 +1637,7 @@ export function WorkspaceNativeSessionView({
   // and review evidence fold only appended events; a reset refolds from
   // scratch when the event list is not a suffix extension of what was folded.
   const transcriptDerivationRef = useRef<TranscriptDerivationState | null>(null);
+  const transcriptDerivationBackfillMarkerRef = useRef<TranscriptBackfillCommitIdentity | null>(null);
   const sessionUsageDerivationRef = useRef<{
     runtimeId: string | null;
     consumedSeq: number | null;
@@ -1689,6 +1696,19 @@ export function WorkspaceNativeSessionView({
     runtimeId: session.runtime_id,
     generation: 0,
   });
+  const partialReplayRetryRef = useRef({ attempts: 0, nextAt: 0 });
+  const transcriptCommitRecoveryRef = useRef<ReturnType<typeof createTranscriptCommitRecovery> | null>(null);
+  if (!transcriptCommitRecoveryRef.current) {
+    transcriptCommitRecoveryRef.current = createTranscriptCommitRecovery({
+      isCurrent: (identity) => {
+        const scope = runtimeRequestScopeRef.current;
+        return identity.runtimeId === scope.runtimeId && identity.generation === scope.generation;
+      },
+      isSameRuntime: (identity) => runtimeRequestScopeRef.current.runtimeId === identity.runtimeId,
+      onRecover: (identity, kind) => recordPerfMark('nativeTranscript.commit-recovery', { ...identity, kind }),
+    });
+  }
+  const transcriptCommitRecovery = transcriptCommitRecoveryRef.current;
   const transcriptBackfillRequestRef = useRef<{
     runtimeId: string;
     generation: number;
@@ -1722,6 +1742,7 @@ export function WorkspaceNativeSessionView({
       runtimeId: session.runtime_id,
       generation: previousScope.generation + 1,
     };
+    transcriptCommitRecovery.cancel();
     transcriptBackfillRequestRef.current?.controller.abort();
     transcriptBackfillRequestRef.current = null;
     incrementalReplayAbortRef.current?.abort();
@@ -1736,6 +1757,7 @@ export function WorkspaceNativeSessionView({
       runtimeId: previousScope.runtimeId,
       generation: previousScope.generation + 1,
     };
+    transcriptCommitRecovery.cancel();
     transcriptBackfillRequestRef.current?.controller.abort();
     transcriptBackfillRequestRef.current = null;
     incrementalReplayAbortRef.current?.abort();
@@ -1760,6 +1782,7 @@ export function WorkspaceNativeSessionView({
         generation: previousScope.generation + 1,
       };
     }
+    transcriptCommitRecovery.cancel();
     const activeRequest = transcriptBackfillRequestRef.current;
     if (activeRequest?.runtimeId === session.runtime_id) {
       activeRequest.controller.abort();
@@ -1803,6 +1826,25 @@ export function WorkspaceNativeSessionView({
     const pendingCommit = transcriptBackfillCommitPendingRef.current;
     if (transcriptBackfillCommitMarker
       && transcriptBackfillCommitMatches(pendingCommit, transcriptBackfillCommitMarker)) {
+      const marker = transcriptBackfillCommitMarker;
+      transcriptCommitRecovery.acknowledge('backfill', marker);
+      const presentation = resolveTranscriptBackfillPresentation(
+        marker.resultStatus, marker.acknowledgedSeq, marker.partialVersionAtStart,
+        includePendingTranscriptPartialObservation(
+          transcriptPartialObservationRef.current, pendingTranscriptPartialObservationRef.current, marker,
+        ),
+      );
+      transcriptPartialObservationRef.current = presentation.partialObservation;
+      if (presentation.state === 'idle') {
+        pendingTranscriptPartialObservationRef.current = null;
+        partialReplayRetryRef.current = { attempts: 0, nextAt: 0 };
+      }
+      if (marker.clearProvisionalGaps) {
+        rawTailSeamsRef.current = [];
+        initialReplayUnloadedGapStartsRef.current = [];
+      }
+      rawTailSettledRef.current = marker.rawTailSettled;
+      setTranscriptBackfillView({ runtimeId: marker.runtimeId, state: presentation.state });
       transcriptBackfillCommitPendingRef.current = null;
       initialReplayRuntimeRef.current = session.runtime_id;
       lastSeenSeqRef.current = resolveCommittedReplayCursor(
@@ -1825,6 +1867,7 @@ export function WorkspaceNativeSessionView({
       return;
     }
 
+    transcriptCommitRecovery.acknowledge('poll', marker);
     if (marker.isInitialReplay) {
       initialReplayRuntimeRef.current = marker.runtimeId;
       if (!rawTailSettledRef.current) {
@@ -2125,6 +2168,7 @@ export function WorkspaceNativeSessionView({
     rawTailSeamsRef.current = cached.seams;
     initialReplayUnloadedGapStartsRef.current = [];
     rawTailSettledRef.current = false;
+    partialReplayRetryRef.current = { attempts: 0, nextAt: 0 };
     transcriptPartialObservationRef.current = {
       version: 0,
       throughSeq: null,
@@ -2224,15 +2268,21 @@ export function WorkspaceNativeSessionView({
     ? session.last_error ?? null
     : null;
 
-  const rawMessages = useMemo(() => {
+  const transcriptDerivation = useMemo(() => {
     const baseMessages = buildBaseMessages(seedMessages, replayLocalPrompts.initialPrompt);
     const tokens = { seedMessages, prompts: replayLocalPrompts };
+    const scope = runtimeRequestScopeRef.current;
+    const authoritativeReplay = transcriptBackfillCommitMarker?.runtimeId === scope.runtimeId
+      && transcriptBackfillCommitMarker.generation === scope.generation
+      && transcriptBackfillCommitMarker.clearProvisionalGaps
+      && !transcriptBackfillCommitMatches(transcriptDerivationBackfillMarkerRef.current, transcriptBackfillCommitMarker)
+      ? transcriptBackfillCommitMarker : null;
     // Cache/prune seams are proven presentation-only boundaries. While the
     // initial limited replay is still being recovered, its sparse anchors are
     // presentation-only too: show one recovery status instead of inserting a
     // transcript message for every temporary sequence jump.
     const suppressedGapStarts = (isMount: boolean) => {
-      const knownSeams = rawTailSeamsRef.current.length > 0
+      const knownSeams = authoritativeReplay ? [] : rawTailSeamsRef.current.length > 0
         ? rawTailSeamsRef.current
         : (isMount ? readCachedNativeEvents(session.runtime_id).seams : []);
       // The poll marker and events render together, before the layout effect
@@ -2247,7 +2297,7 @@ export function WorkspaceNativeSessionView({
           && transcriptBackfillCommitMarker.commitId > pollReplayCommitMarker.commitId)
         ? pollReplayCommitMarker
         : null;
-      const unloadedGapStarts = initialReplayMarker
+      const unloadedGapStarts = authoritativeReplay ? [] : initialReplayMarker
         ? initialReplayMarker.initialUnloadedGapStarts
         : (!rawTailSettledRef.current ? initialReplayUnloadedGapStartsRef.current : []);
       const suppressed = new Set([
@@ -2268,6 +2318,11 @@ export function WorkspaceNativeSessionView({
     let state: TranscriptDerivationState;
     if (!previousState) {
       state = resetState(true);
+    } else if (authoritativeReplay
+      && !transcriptBackfillCommitMatches(transcriptDerivationBackfillMarkerRef.current, authoritativeReplay)) {
+      // A full snapshot can confirm that a cached seam is a real hole, even
+      // when its last seq/count match the cache. Refold with its own metadata.
+      state = resetState(false);
     } else if (
       previousState.seedMessages !== seedMessages
       || previousState.prompts !== replayLocalPrompts
@@ -2300,9 +2355,14 @@ export function WorkspaceNativeSessionView({
     if (state.terminalError !== transcriptTerminalError) {
       state = { ...state, terminalError: transcriptTerminalError };
     }
-    transcriptDerivationRef.current = state;
-    return finalizeTranscriptMessages(state);
+    return state;
   }, [events, pollReplayCommitMarker, replayLocalPrompts, seedMessages, transcriptBackfillCommitMarker, transcriptTerminalError]);
+
+  useLayoutEffect(() => {
+    transcriptDerivationRef.current = transcriptDerivation;
+    transcriptDerivationBackfillMarkerRef.current = transcriptBackfillCommitMarker;
+  }, [transcriptDerivation, transcriptBackfillCommitMarker]);
+  const rawMessages = useMemo(() => finalizeTranscriptMessages(transcriptDerivation), [transcriptDerivation]);
 
   const messages = useMemo(
     () => stabilizeMessageRefs(rawMessages, previousMessagesRef.current),
@@ -2557,7 +2617,7 @@ export function WorkspaceNativeSessionView({
     }
   }, [getNativeSessionSummary, isRuntimeRequestCurrent, onSessionUpdate, session.runtime_id]);
 
-  const backfillInitialReplay = useCallback(async () => {
+  const backfillInitialReplay = useCallback(async (automatic = false) => {
     const requestScope = {
       runtimeId: session.runtime_id,
       generation: runtimeRequestScopeRef.current.generation,
@@ -2565,6 +2625,7 @@ export function WorkspaceNativeSessionView({
     if (!isVisible || !isRuntimeRequestCurrent(requestScope)) {
       return;
     }
+    if (transcriptCommitRecovery.hasPending('backfill')) return;
     const activeRequest = transcriptBackfillRequestRef.current;
     if (activeRequest?.runtimeId === requestScope.runtimeId) {
       return;
@@ -2579,7 +2640,7 @@ export function WorkspaceNativeSessionView({
     };
     transcriptBackfillRequestRef.current = request;
     rawTailSettledRef.current = false;
-    setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'loading' });
+    if (!automatic) setTranscriptBackfillView({ runtimeId: requestScope.runtimeId, state: 'loading' });
 
     const result = await runTranscriptPagedBackfill({
       loadPage: (afterSeq, snapshotNewestSeq) => getNativeSessionEventPage(
@@ -2601,6 +2662,11 @@ export function WorkspaceNativeSessionView({
     }
     transcriptBackfillRequestRef.current = null;
 
+    const retry = partialReplayRetryRef.current;
+    retry.nextAt = performance.now() + Math.min(
+      PARTIAL_REPLAY_RETRY_MAX_MS, PARTIAL_REPLAY_RETRY_BASE_MS * 2 ** Math.min(retry.attempts, 5),
+    );
+    retry.attempts += 1;
     if (result.status === 'cancelled') {
       return;
     }
@@ -2618,34 +2684,12 @@ export function WorkspaceNativeSessionView({
     );
     const replayCursor = fullBatch.newest_available_seq ?? latestEventSeq(fullBatch.events);
 
-    if (resolution.clearProvisionalGaps) {
-      rawTailSeamsRef.current = [];
-      initialReplayUnloadedGapStartsRef.current = [];
-    }
-    rawTailSettledRef.current = resolution.rawTailSettled;
-    const partialObservationAtResolution = includePendingTranscriptPartialObservation(
-      transcriptPartialObservationRef.current,
-      pendingTranscriptPartialObservationRef.current,
-      requestScope,
+    const presentationAtCommit = () => resolveTranscriptBackfillPresentation(
+      result.status, replayCursor, request.partialVersionAtStart,
+      includePendingTranscriptPartialObservation(
+        transcriptPartialObservationRef.current, pendingTranscriptPartialObservationRef.current, requestScope,
+      ),
     );
-    const presentation = resolveTranscriptBackfillPresentation(
-      result.status,
-      replayCursor,
-      request.partialVersionAtStart,
-      partialObservationAtResolution,
-    );
-    transcriptPartialObservationRef.current = presentation.partialObservation;
-    const pendingPartial = pendingTranscriptPartialObservationRef.current;
-    if (
-      result.status === 'success'
-      && presentation.state === 'idle'
-      && pendingPartial?.runtimeId === requestScope.runtimeId
-      && pendingPartial.generation === requestScope.generation
-    ) {
-      // This authoritative snapshot covered every known partial range. Drop
-      // its queued marker too, so that marker cannot revive a cleared warning.
-      pendingTranscriptPartialObservationRef.current = null;
-    }
     const updateEvents = createTranscriptBackfillEventUpdate(
       result.status,
       fullBatch,
@@ -2655,6 +2699,10 @@ export function WorkspaceNativeSessionView({
       ...requestScope,
       commitId: transcriptBackfillCommitSequenceRef.current + 1,
       acknowledgedSeq: replayCursor,
+      resultStatus: result.status,
+      partialVersionAtStart: request.partialVersionAtStart,
+      clearProvisionalGaps: resolution.clearProvisionalGaps,
+      rawTailSettled: resolution.rawTailSettled,
       startedWithSeq: request.startedWithSeq,
       resetLastSeen: replayCursor == null
         && result.status === 'success'
@@ -2663,17 +2711,17 @@ export function WorkspaceNativeSessionView({
     transcriptBackfillCommitSequenceRef.current = commitMarker.commitId;
     transcriptBackfillCommitPendingRef.current = commitMarker;
     captureBackfillReadingAnchor(commitMarker);
-    startTransition(() => {
+    transcriptCommitRecovery.enqueue('backfill', commitMarker, (isOwned, canReplayEvents) => {
       setEvents((previous) => (
-        isRuntimeRequestCurrent(requestScope) ? updateEvents(previous) : previous
+        canReplayEvents() ? updateEvents(previous) : previous
       ));
       setTranscriptBackfillView((current) => (
-        isRuntimeRequestCurrent(requestScope)
-          ? { runtimeId: requestScope.runtimeId, state: presentation.state }
+        isOwned()
+          ? { runtimeId: requestScope.runtimeId, state: presentationAtCommit().state }
           : current
       ));
       setTranscriptBackfillCommitMarker((current) => (
-        isRuntimeRequestCurrent(requestScope) ? commitMarker : current
+        isOwned() ? commitMarker : current
       ));
     });
 
@@ -2699,12 +2747,19 @@ export function WorkspaceNativeSessionView({
     if (!isVisible || !isRuntimeRequestCurrent(requestScope)) {
       return false;
     }
+    const partial = transcriptPartialObservationRef.current;
+    if ((partial.throughSeq != null || partial.unknownRange)
+      && performance.now() >= partialReplayRetryRef.current.nextAt) {
+      void backfillInitialReplay(true);
+    }
+    if (transcriptCommitRecovery.hasPending('poll')) return false;
     const attemptId = ++transcriptPollAttemptRef.current;
     const startedAt = Date.now();
     const controller = new AbortController();
     incrementalReplayAbortRef.current?.abort();
     incrementalReplayAbortRef.current = controller;
     let batch: ReplayBatch;
+    let replayPartial = false;
     try {
       const result = isInitialReplay
         ? await runTranscriptBackfillWithRetry({
@@ -2748,6 +2803,7 @@ export function WorkspaceNativeSessionView({
         throw result.error;
       }
       batch = result.value;
+      replayPartial = result.status === 'partial';
     } finally {
       if (incrementalReplayAbortRef.current === controller) {
         incrementalReplayAbortRef.current = null;
@@ -2758,7 +2814,7 @@ export function WorkspaceNativeSessionView({
     }
     const incrementalReplay = isInitialReplay
       ? null
-      : inspectIncrementalTranscriptReplay(batch);
+      : inspectIncrementalTranscriptReplay(batch, replayPartial);
     addObservedUserPromptClientMessageIds(
       observedUserPromptClientMessageIdsRef.current,
       batch.events,
@@ -2795,6 +2851,10 @@ export function WorkspaceNativeSessionView({
       };
       transcriptBackfillCommitSequenceRef.current = commitMarker.commitId;
       if (commitMarker.partial) {
+        const previousPartial = transcriptPartialObservationRef.current;
+        if (previousPartial.throughSeq == null && !previousPartial.unknownRange) {
+          partialReplayRetryRef.current = { attempts: 0, nextAt: performance.now() + PARTIAL_REPLAY_RETRY_BASE_MS };
+        }
         const partialObservation = includePendingTranscriptPartialObservation(
           transcriptPartialObservationRef.current,
           pendingTranscriptPartialObservationRef.current,
@@ -2815,10 +2875,10 @@ export function WorkspaceNativeSessionView({
           pendingTranscriptPartialObservationRef.current.observation;
       }
 
-      const commitPollReplay = () => {
+      const commitPollReplay = (isOwned: () => boolean, canReplayEvents: () => boolean) => {
         if (batch.events.length > 0 || (isInitialReplay && initialReplayComplete)) {
           setEvents((previous) => {
-            if (!isRuntimeRequestCurrent(requestScope)) {
+            if (!canReplayEvents()) {
               return previous;
             }
             if (isInitialReplay && batch.events.length === 0) {
@@ -2831,7 +2891,7 @@ export function WorkspaceNativeSessionView({
         }
         if (initialReplayComplete || incrementalReplay?.state === 'partial') {
           setTranscriptBackfillView((current) => {
-            if (!isRuntimeRequestCurrent(requestScope)) {
+            if (!isOwned()) {
               return current;
             }
             if (
@@ -2850,15 +2910,11 @@ export function WorkspaceNativeSessionView({
           });
         }
         setPollReplayCommitMarker((current) => (
-          isRuntimeRequestCurrent(requestScope) ? commitMarker : current
+          isOwned() ? commitMarker : current
         ));
       };
 
-      if (hasImmediateAttentionEvent(batch.events)) {
-        commitPollReplay();
-      } else {
-        startTransition(commitPollReplay);
-      }
+      transcriptCommitRecovery.enqueue('poll', commitMarker, commitPollReplay, hasImmediateAttentionEvent(batch.events));
     } else if (!transcriptBackfillCommitPendingRef.current) {
       // A successful empty page also confirms the live cursor is caught up.
       setTranscriptPollFailure((current) => (

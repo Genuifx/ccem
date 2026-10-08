@@ -591,8 +591,8 @@ export function createTranscriptBackfillEventUpdate(
   );
 }
 
-export function inspectIncrementalTranscriptReplay(replayBatch: ReplayBatch) {
-  const partial = replayBatch.source_available === false
+export function inspectIncrementalTranscriptReplay(replayBatch: ReplayBatch, incompleteRange = false) {
+  const partial = incompleteRange || replayBatch.source_available === false
     || replayBatch.truncated
     || replayBatch.gap_detected;
   const newestDecodedSeq = replayBatch.events.reduce<number | null>(
