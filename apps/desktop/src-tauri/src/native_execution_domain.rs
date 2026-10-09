@@ -17,8 +17,9 @@ struct Process {
     status: u32,
 }
 
-// Apple XNU proc_info.h PROC_PIDUNIQIDENTIFIERINFO. Unlike PPID, the
-// original parent's unique ID remains unchanged when a process is reparented.
+// Apple XNU proc_info.h PROC_PIDUNIQIDENTIFIERINFO. The parent's unique ID
+// survives reparenting, but a later exec can refresh it to the new parent.
+// observe_lineage retains ownership already proven before that transition.
 #[repr(C)]
 struct UniqueInfo {
     uuid: [u8; 16],
@@ -547,13 +548,12 @@ sys.stdin.readline()
                 "-u",
                 "-c",
                 r#"
-import os, sys
+import subprocess, sys
 sys.stdin.readline()
-pid = os.fork()
-if pid == 0:
-    os.setsid()
-    os.execl('/bin/sleep', 'sleep', '30')
-print(pid, flush=True)
+# Popen waits for exec via its error pipe before the parent can exit.
+# Otherwise exec after reparenting can replace the original parent identity.
+tool = subprocess.Popen(['/bin/sleep', '30'], start_new_session=True)
+print(tool.pid, flush=True)
 "#,
             ])
             .stdin(Stdio::piped())
@@ -567,8 +567,9 @@ print(pid, flush=True)
             .read_line(&mut line)
             .unwrap();
         let pid = line.trim().parse::<i32>().unwrap();
-        let tool = inspect(pid).unwrap().unwrap();
         root.wait().unwrap();
+        // Discover the tool only after the root exits, without caching lineage.
+        let tool = inspect(pid).unwrap().unwrap();
         let result = domain.kill();
         let alive = inspect(pid)
             .unwrap()
@@ -577,7 +578,9 @@ print(pid, flush=True)
             let _ = signal(&tool, libc::SIGKILL);
         }
         result.unwrap();
-        assert!(!alive);
+        assert_eq!(tool.parent_unique, domain.root.unique,
+            "the exec-ready orphan must retain the exited root's identity");
+        assert!(!alive, "owned orphan must exit before kill returns: {tool:?}");
     }
 
     #[test]
