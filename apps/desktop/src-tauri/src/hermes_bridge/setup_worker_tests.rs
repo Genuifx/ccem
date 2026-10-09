@@ -1,5 +1,6 @@
 use super::*;
-use std::{fs, path::Path, sync::mpsc};
+use crate::hermes_bridge::test_support::python;
+use std::{fs, sync::mpsc};
 
 // Exercise the production completion function and real child-process protocol
 // without loading the user's NativeRuntimeManager state or a signed runtime.
@@ -43,7 +44,7 @@ for line in sys.stdin:
         .unwrap();
         let process = Arc::new(
             GatewayProcess::spawn(
-                Path::new("/usr/bin/python3"),
+                python(),
                 &host,
                 root.path(),
                 &root.path().join("profile"),
@@ -96,7 +97,13 @@ for line in sys.stdin:
         while !started.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(started.exists(), "the real host must receive openPairing");
+        assert!(
+            started.exists(),
+            "the real host must receive openPairing: python={}, alive={}, snapshot={}",
+            python().display(),
+            self.process.alive(),
+            self.process.snapshot()
+        );
         (worker, rx)
     }
 

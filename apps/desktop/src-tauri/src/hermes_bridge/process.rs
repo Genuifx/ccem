@@ -271,6 +271,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn slow_host_reply_does_not_block_snapshot_and_stop_interrupts_owned_request() {
+        let python = crate::hermes_bridge::test_support::python();
         let root = std::env::temp_dir().join(format!("ccem-hermes-slow-host-{}", random_id()));
         std::fs::create_dir_all(&root).unwrap();
         let host = root.join("host.py");
@@ -289,16 +290,8 @@ for line in sys.stdin:
 "#,
         )
         .unwrap();
-        let process = Arc::new(
-            GatewayProcess::spawn(
-                Path::new("/usr/bin/python3"),
-                &host,
-                &root,
-                &root,
-                json!({}),
-            )
-            .unwrap(),
-        );
+        let process =
+            Arc::new(GatewayProcess::spawn(python, &host, &root, &root, json!({})).unwrap());
         let pending = process.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let worker =
@@ -307,7 +300,13 @@ for line in sys.stdin:
         while !root.join("request-started").exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(root.join("request-started").exists());
+        assert!(
+            root.join("request-started").exists(),
+            "the real host must receive slow: python={}, alive={}, snapshot={}",
+            python.display(),
+            process.alive(),
+            process.snapshot()
+        );
         let read_started = Instant::now();
         assert_eq!(process.snapshot()["state"], "running");
         assert!(read_started.elapsed() < Duration::from_millis(250));

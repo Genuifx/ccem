@@ -87,13 +87,7 @@ fn connection(account: &str, cipher: &str) -> ConnectionRecord {
 
 #[test]
 fn blocked_connection_and_discovery_verification_leave_peer_policy_and_rpc_available() {
-    let python = std::process::Command::new(if cfg!(windows) { "python.exe" } else { "python3" })
-        .args(["-I", "-c", "import sys; print(sys.executable)"])
-        .output()
-        .expect("the gateway fixture requires Python 3 on PATH");
-    assert!(python.status.success(), "Python fixture lookup failed");
-    let python = std::path::PathBuf::from(String::from_utf8(python.stdout).unwrap().trim());
-    assert!(python.is_absolute(), "Python fixture path must be absolute");
+    let python = crate::hermes_bridge::test_support::python();
     for discovery in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::open(&root.path().join("store")).unwrap();
@@ -137,7 +131,7 @@ for line in sys.stdin:
         .unwrap();
         let process = Arc::new(
             GatewayProcess::spawn(
-                &python,
+                python,
                 &host,
                 root.path(),
                 &root.path().join("profile"),
