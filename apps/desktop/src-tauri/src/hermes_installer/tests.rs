@@ -103,6 +103,20 @@ fn private_atomic_record_replacement_leaves_no_partial_file() {
 }
 
 #[test]
+fn failed_private_record_replacement_preserves_target_and_cleans_temp_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("keep"), b"original").unwrap();
+    assert_eq!(
+        write_private(&path, b"replacement").unwrap_err().code,
+        "filesystem"
+    );
+    assert_eq!(fs::read(path.join("keep")).unwrap(), b"original");
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn source_rejects_credentials_redirect_origins_and_unapproved_protocol() {
     let source = Source {
         manifest_url: "https://releases.ccem.invalid/manifest.json".into(),
@@ -135,6 +149,16 @@ fn source_rejects_credentials_redirect_origins_and_unapproved_protocol() {
     assert!(dev.artifact_url("https://127.0.0.1:57891/pkg.zip").is_err());
 }
 
+fn fixture_manifest_environment(minimum_sequence: u64) -> ManifestEnvironment {
+    ManifestEnvironment {
+        platform: RuntimePlatform::Macos,
+        architecture: RuntimeArchitecture::Aarch64,
+        os_version: "14.0".into(),
+        protocol_version: HERMES_PROTOCOL_VERSION,
+        minimum_sequence,
+    }
+}
+
 #[test]
 fn authenticated_manifest_tampering_and_downgrade_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
@@ -147,21 +171,43 @@ fn authenticated_manifest_tampering_and_downgrade_are_rejected() {
     let bytes = include_bytes!("fixtures/manifest.json");
     let signature = include_bytes!("fixtures/manifest.json.sig");
     let valid = installer
-        .verify_manifest(&source, bytes, signature, 1)
+        .verify_manifest_for_environment(
+            &source,
+            bytes,
+            signature,
+            &fixture_manifest_environment(1),
+        )
         .unwrap();
     assert_eq!(valid.manifest.sequence, 7);
     let mut tampered = bytes.to_vec();
     let index = tampered.iter().position(|b| *b == b'7').unwrap();
     tampered[index] = b'8';
-    assert!(installer
-        .verify_manifest(&source, &tampered, signature, 1)
-        .is_err());
-    assert!(installer
-        .verify_manifest(&source, bytes, signature, 8)
-        .is_err());
-    assert!(installer
-        .verify_manifest(&source, bytes, b"not a signature", 1)
-        .is_err());
+    for (manifest, signature, minimum_sequence, reason) in [
+        (
+            tampered.as_slice(),
+            signature.as_slice(),
+            1,
+            "InvalidSignature",
+        ),
+        (bytes.as_slice(), signature.as_slice(), 8, "RollbackRejected"),
+        (
+            bytes.as_slice(),
+            b"not a signature".as_slice(),
+            1,
+            "InvalidSignature",
+        ),
+    ] {
+        let error = installer
+            .verify_manifest_for_environment(
+                &source,
+                manifest,
+                signature,
+                &fixture_manifest_environment(minimum_sequence),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "manifest_rejected");
+        assert!(error.message.contains(reason), "{error:?}");
+    }
     assert!(!temp.path().join("runtime").exists());
 }
 
@@ -176,11 +222,11 @@ fn advancing_release_source_preserves_cached_manifest_trust_but_rejects_old_down
         development_loopback: false,
     };
     let verified = installer
-        .verify_manifest(
+        .verify_manifest_for_environment(
             &next_source,
             include_bytes!("fixtures/manifest.json"),
             include_bytes!("fixtures/manifest.json.sig"),
-            7,
+            &fixture_manifest_environment(7),
         )
         .unwrap();
     assert!(next_source
@@ -190,6 +236,31 @@ fn advancing_release_source_preserves_cached_manifest_trust_but_rejects_old_down
         "https://github.com/Genuifx/ccem/releases/download/2026.10.2.1/hermes-macos-aarch64.zip";
     assert!(next_source.artifact_url(old_release).is_err());
     assert!(next_source.artifact_url("https://github.com/Genuifx/ccem/releases/download/2026.10.3.1/hermes-macos-aarch64.zip").is_ok());
+    assert!(!temp.path().join("runtime").exists());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn production_manifest_verification_still_rejects_unsupported_hosts() {
+    let temp = tempfile::tempdir().unwrap();
+    let installer = HermesInstaller::new(temp.path().join("runtime"));
+    let source = Source {
+        manifest_url: "http://127.0.0.1:57890/manifest.json".into(),
+        public_key: include_str!("fixtures/public-key.pub").into(),
+        development_loopback: true,
+    };
+    assert_eq!(
+        installer
+            .verify_manifest(
+                &source,
+                include_bytes!("fixtures/manifest.json"),
+                include_bytes!("fixtures/manifest.json.sig"),
+                1,
+            )
+            .unwrap_err()
+            .code,
+        "unsupported_platform"
+    );
     assert!(!temp.path().join("runtime").exists());
 }
 

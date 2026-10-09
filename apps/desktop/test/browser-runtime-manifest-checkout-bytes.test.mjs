@@ -8,7 +8,7 @@ const desktopDir = path.resolve(import.meta.dirname, '..');
 const repoDir = path.resolve(desktopDir, '..', '..');
 const manifestDir = path.join(desktopDir, 'src-tauri', 'runtime-manifests');
 
-test('signed browser runtime assets keep their exact repository bytes on Windows checkout', async () => {
+async function assertWindowsCheckoutBytes(manifestDir) {
   const assetNames = (await fs.readdir(manifestDir)).filter((name) =>
     /\.(?:json|pub|sig)$/u.test(name),
   );
@@ -41,4 +41,10 @@ test('signed browser runtime assets keep their exact repository bytes on Windows
         `(repository=${repositoryBytes.length}, checkout=${windowsCheckoutBytes.length})`,
     );
   }
-});
+}
+
+test('signed browser runtime assets keep their exact repository bytes on Windows checkout', () =>
+  assertWindowsCheckoutBytes(manifestDir));
+
+test('signed Hermes fixture assets keep their exact repository bytes on Windows checkout', () =>
+  assertWindowsCheckoutBytes(path.join(desktopDir, 'src-tauri', 'src', 'hermes_installer', 'fixtures')));

@@ -510,10 +510,6 @@ impl HermesInstaller {
         signature: &[u8],
         minimum_sequence: u64,
     ) -> Result<VerifiedRuntimeManifest, HermesInstallError> {
-        let mut trust = ManifestTrustStore::new();
-        trust
-            .add_minisign_key(KEY_ID, &source.public_key)
-            .map_err(|_| failure("invalid_trust_root", "聊天组件签名公钥配置无效。", false))?;
         let environment = ManifestEnvironment {
             platform: RuntimePlatform::Macos,
             architecture: RuntimeArchitecture::Aarch64,
@@ -521,13 +517,27 @@ impl HermesInstaller {
             protocol_version: HERMES_PROTOCOL_VERSION,
             minimum_sequence,
         };
+        self.verify_manifest_for_environment(source, bytes, signature, &environment)
+    }
+
+    fn verify_manifest_for_environment(
+        &self,
+        source: &Source,
+        bytes: &[u8],
+        signature: &[u8],
+        environment: &ManifestEnvironment,
+    ) -> Result<VerifiedRuntimeManifest, HermesInstallError> {
+        let mut trust = ManifestTrustStore::new();
+        trust
+            .add_minisign_key(KEY_ID, &source.public_key)
+            .map_err(|_| failure("invalid_trust_root", "聊天组件签名公钥配置无效。", false))?;
         let verified = trust
             .verify_exact_bytes(
                 KEY_ID,
                 bytes,
                 std::str::from_utf8(signature)
                     .map_err(|_| failure("invalid_signature", "聊天组件签名无效。", false))?,
-                &environment,
+                environment,
             )
             .map_err(|e| {
                 failure(
@@ -922,7 +932,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), HermesInstallError> {
         let mut file = options.open(&temp).map_err(|_| io_failure())?;
         file.write_all(bytes).map_err(|_| io_failure())?;
         file.sync_all().map_err(|_| io_failure())?;
+        drop(file);
+        // Replace in one rename, including on Windows; never remove the previous record first.
         fs::rename(&temp, path).map_err(|_| io_failure())?;
+        // Windows cannot open a directory with File::open for this Unix durability step.
+        #[cfg(unix)]
         fs::File::open(path.parent().ok_or_else(io_failure)?)
             .and_then(|d| d.sync_all())
             .map_err(|_| io_failure())?;

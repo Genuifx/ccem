@@ -135,7 +135,14 @@ mod tests {
         fs::write(root.join("docs/报告.md"), "# After\n").unwrap();
         fs::create_dir(root.join("outputs")).unwrap();
         fs::write(root.join("outputs/my report.md"), "# New report\n").unwrap();
-        fs::write(root.join("outputs/new\nline.md"), "newline filename\n").unwrap();
+        // Windows forbids control characters in filenames. Keep the newline
+        // coverage on Unix and exercise a literal space on Windows instead.
+        let unusual_path = if cfg!(windows) {
+            "outputs/new line.md"
+        } else {
+            "outputs/new\nline.md"
+        };
+        fs::write(root.join(unusual_path), "unusual filename\n").unwrap();
         let snapshot = crate::get_workspace_git_snapshot(root.to_string_lossy().into()).unwrap();
         let paths: Vec<_> = snapshot
             .files
@@ -148,7 +155,7 @@ mod tests {
                 "alpha.txt",
                 "docs/报告.md",
                 "outputs/my report.md",
-                "outputs/new\nline.md"
+                unusual_path
             ]
         );
         assert_eq!(snapshot.dirty_count, 4);
