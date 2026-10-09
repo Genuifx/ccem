@@ -5,8 +5,8 @@ use std::{
 };
 
 // Resolve the CI-selected interpreter before GatewayProcess clears the child
-// environment. Every real host fixture must use this same absolute executable.
-pub(super) fn python() -> &'static Path {
+// environment. Real gateway and native handoff fixtures share this executable.
+pub(crate) fn python() -> &'static Path {
     static PYTHON: OnceLock<PathBuf> = OnceLock::new();
     PYTHON
         .get_or_init(|| {

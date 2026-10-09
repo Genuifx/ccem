@@ -21,12 +21,14 @@ impl HandoffFixture {
             })
             .unwrap();
         let handle = manager.handles.lock().unwrap()[name].clone();
-        let mut command = StdCommand::new("/usr/bin/python3");
+        let python = crate::hermes_bridge::test_support::python();
+        let mut command = StdCommand::new(python);
         command.args(["-u", "-c", r#"
 import json, sys, time
 mode = sys.argv[1]
 def output(detail):
     print(json.dumps({'type': 'status', 'status': 'ready', 'detail': detail}), flush=True)
+output('handoff fixture ready')
 for line in sys.stdin:
     cmd = json.loads(line)
     kind = cmd['type']
@@ -64,6 +66,7 @@ for line in sys.stdin:
         let continuations = Arc::new(AtomicU64::new(0));
         let pump_continuations = Arc::clone(&continuations);
         let (done, pump_done) = mpsc::channel();
+        let (ready, fixture_ready) = mpsc::channel();
         std::thread::spawn(move || {
             tauri::async_runtime::block_on(async {
                 let mut stdout = Vec::new();
@@ -83,6 +86,15 @@ for line in sys.stdin:
                                         &pump_handle,
                                     )
                                     .unwrap();
+                                if serde_json::from_str::<serde_json::Value>(&line).is_ok_and(
+                                    |event| {
+                                        event["type"] == "status"
+                                            && event["status"] == "ready"
+                                            && event["detail"] == "handoff fixture ready"
+                                    },
+                                ) {
+                                    let _ = ready.send(());
+                                }
                                 if line.contains("continued:") {
                                     pump_continuations.fetch_add(1, Ordering::SeqCst);
                                 }
@@ -119,14 +131,26 @@ for line in sys.stdin:
             });
             let _ = done.send(());
         });
-        Self {
+        let fixture = Self {
             manager,
             handle,
             runtime_id,
             pump_done,
             preparations,
             continuations,
-        }
+        };
+        // Exclude interpreter startup from handoff/grace timing, but require the
+        // ready frame to pass through the real output pump and production handler.
+        // Construct first so Drop also cleans up a startup timeout or pump failure.
+        fixture_ready
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "handoff fixture {name} did not become ready (python={}): {error}",
+                    python.display()
+                )
+            });
+        fixture
     }
 
     fn assert_can_continue(&self) {
