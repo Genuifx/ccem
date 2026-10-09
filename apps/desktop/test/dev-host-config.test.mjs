@@ -332,7 +332,7 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
   assert.equal(alpha.environment.CCEM_DESKTOP_DEV_INSTANCE_ID, alpha.instanceId);
   assert.equal(alpha.environment.CCEM_TAURI_MCP_PORT, String(alpha.mcpPort));
   assert.equal(alpha.environment.CCEM_DESKTOP_DEV_BACKGROUND_SERVICES, '0');
-  assert.equal(alpha.environment.CCEM_HERMES_STATE_DIR, path.join(alphaRoot, '.artifacts', 'hermes-managed'));
+  assert.equal(alpha.environment.CCEM_HERMES_STATE_DIR, path.resolve(alphaRoot, '.artifacts', 'hermes-managed'));
   assert.notEqual(alpha.environment.CCEM_HERMES_STATE_DIR, beta.environment.CCEM_HERMES_STATE_DIR);
   assert.equal(alpha.browserDataRootSource, 'worktree default');
   assert.equal(
@@ -365,11 +365,11 @@ test('Tauri dev launcher derives distinct complete instance namespaces from work
     assert.equal(describe(alphaRoot, {
       CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: background,
       CCEM_HERMES_STATE_DIR: '/private/tmp/explicit-hermes-state',
-    }).environment.CCEM_HERMES_STATE_DIR, '/private/tmp/explicit-hermes-state');
+    }).environment.CCEM_HERMES_STATE_DIR, path.resolve(alphaRoot, '/private/tmp/explicit-hermes-state'));
     assert.equal(describe(alphaRoot, {
       CCEM_DESKTOP_DEV_BACKGROUND_SERVICES: background,
       CCEM_HERMES_STATE_DIR: '.artifacts/synthetic-hermes',
-    }).environment.CCEM_HERMES_STATE_DIR, path.join(alphaRoot, '.artifacts', 'synthetic-hermes'),
+    }).environment.CCEM_HERMES_STATE_DIR, path.resolve(alphaRoot, '.artifacts', 'synthetic-hermes'),
     'relative overrides must be absolute before the Rust debug root validation');
   }
   assert.equal(

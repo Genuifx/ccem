@@ -12,10 +12,19 @@ const { createRoot } = require('react-dom/client');
 const sourceDir = path.resolve(import.meta.dirname, '../src');
 
 function effectContaining(source, marker) {
+  source = source.replace(/\r\n?/g, '\n');
   const markerAt = source.indexOf(marker);
   assert.notEqual(markerAt, -1, `Workspace effect fixture: ${marker}`);
   return source.slice(source.lastIndexOf('  useEffect(() => {', markerAt), source.indexOf('\n\n', markerAt));
 }
+
+test('Workspace effect fixtures preserve boundaries across checkout line endings', () => {
+  const effect = '  useEffect(() => {\n    marker();\n  }, []);';
+  const source = `before\n${effect}\n\n  const unrelated: string = 'typescript';\n`;
+  for (const newline of ['\n', '\r\n', '\r']) {
+    assert.equal(effectContaining(source.replace(/\n/g, newline), 'marker();'), effect);
+  }
+});
 
 async function recoveryModules(restored) {
   const modules = new Map();
