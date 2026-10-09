@@ -1,5 +1,11 @@
 # ccem
 
+## 2.92.0
+
+### Minor Changes
+
+- Integrate live React overlays above native browsers; improve session transcript recovery, asynchronous subagent updates, file detection and preview links; refine Hermes pairing and capability guidance; update production dependency security pins; and restore cross-platform release verification.
+
 ## 2.91.1
 
 ### Patch Changes
