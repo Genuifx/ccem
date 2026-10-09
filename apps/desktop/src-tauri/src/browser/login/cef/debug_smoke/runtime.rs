@@ -792,7 +792,7 @@ fn expected_canonical_smoke_host_identity(instance_id: &str) -> Result<SmokeHost
             "macOS Mode 2 smoke requires {DEV_INSTANCE_ENV} as <worktree-slug>-<8 lowercase hex>"
         )
     };
-    let (slug, hash) = instance_id.rsplit_once('-').ok_or_else(&invalid)?;
+    let (slug, hash) = instance_id.rsplit_once('-').ok_or_else(invalid)?;
     let slug_bytes = slug.as_bytes();
     let slug_is_valid = !slug_bytes.is_empty()
         && slug_bytes.len() <= 32

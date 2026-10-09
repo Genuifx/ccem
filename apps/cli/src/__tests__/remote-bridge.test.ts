@@ -3,11 +3,27 @@ import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
+import type { SpawnOptions } from 'node:child_process';
 import { Command } from 'commander';
 import {
   parseRemoteCursor, registerRemoteBridge, relayRemoteBatch, renderRemoteEvent,
   sendHermesMessage, type RemoteEventBatch,
 } from '../remoteBridge.js';
+
+const fixtureScripts = vi.hoisted(() => new Set<string>());
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn(command: string, args: readonly string[], options: SpawnOptions) {
+      if (!fixtureScripts.has(command)) return actual.spawn(command, args, options);
+      // Windows cannot execute a POSIX shebang. Adapt only our fixture's launch;
+      // keep real child processes, literal argv, pipes, and production kill logic.
+      expect(options.shell).toBe(false);
+      return actual.spawn(process.execPath, [command, ...args], options);
+    },
+  };
+});
 
 const event = (seq: number) => ({ version: 1 as const, event_id: `run:${seq}`, runtime_id: 'run', seq,
   occurred_at: '2026-09-09T00:00:00Z', kind: 'session_completed', title: 'Session completed', text: 'completed' });
@@ -17,13 +33,15 @@ const temporary: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  fixtureScripts.clear();
   await Promise.all(temporary.splice(0).map(path => rm(path, { recursive: true, force: true })));
 });
 async function fixture(script: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'ccem-hermes-test-'));
   temporary.push(dir);
-  const file = join(dir, 'hermes');
-  await writeFile(file, `#!${process.execPath}\n${script}`, { mode: 0o700 });
+  const file = join(dir, 'hermes fixture.cjs');
+  await writeFile(file, script);
+  fixtureScripts.add(file);
   return file;
 }
 

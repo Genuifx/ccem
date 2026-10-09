@@ -345,7 +345,7 @@ fn matches_active_lease(current: &BrowserSurfaceSnapshot, lease_id: &str, genera
 
 fn mint_lease_id() -> Result<String, BrowserSurfaceCoordinatorError> {
     let serial = NEXT_LEASE_SERIAL
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map_err(|_| BrowserSurfaceCoordinatorError::LeaseIdExhausted)?;
