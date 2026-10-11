@@ -126,21 +126,27 @@ export const PromptArea = forwardRef<PromptAreaHandle, PromptAreaProps>(function
   const syncHeight = useCallback(() => {
     const el = editorRef.current
     if (!el) return
+    const requestedHeight = Number.parseFloat(el.style.height)
+    // At either size limit, scrollHeight already tells us whether a resize is
+    // needed. Avoid invalidating layout with height='auto' on every keystroke
+    // while a short draft still fits, or a long draft still exceeds the cap.
+    if (requestedHeight <= minHeight && el.scrollHeight <= minHeight) return
+    if (maxHeight && requestedHeight >= maxHeight && el.scrollHeight > Math.ceil(maxHeight)) return
     // Temporarily set height to auto so scrollHeight reflects true content height
     el.style.height = 'auto'
     const contentHeight = el.scrollHeight
     el.style.height = `${contentHeight}px`
     setEditorHeight(contentHeight)
-  }, [editorRef])
+  }, [editorRef, minHeight, maxHeight])
 
+  const pendingHeightSyncRef = useRef(syncHeight)
   const scheduleHeightSync = useCallback(() => {
-    if (heightFrameRef.current !== null) {
-      cancelAnimationFrame(heightFrameRef.current)
-    }
+    pendingHeightSyncRef.current = syncHeight
+    if (heightFrameRef.current !== null) return
     heightFrameRef.current = requestAnimationFrame(() => {
       heightFrameRef.current = null
       if (eventHandlers.isComposing.current) return
-      syncHeight()
+      pendingHeightSyncRef.current()
     })
   }, [eventHandlers.isComposing, syncHeight])
 

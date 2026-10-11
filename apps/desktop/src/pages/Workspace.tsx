@@ -2149,30 +2149,20 @@ export function Workspace({
     workspaceMode,
   ]);
 
-  const skillsContext = useMemo(() => {
-    if (workspaceMode === 'history' && selectedSession) {
-      return {
-        workingDir: selectedSession.project || null,
-        provider: selectedSession.source === 'codex' ? 'codex' : 'claude',
-      };
-    }
-    if (workspaceMode === 'live' && activeLiveEntry) {
-      return {
-        workingDir: activeLiveEntry.session.project_dir || null,
-        provider: activeLiveEntry.session.provider,
-      };
-    }
-    return {
-      workingDir: effectiveComposeDir,
-      provider: composeProvider,
-    };
-  }, [
-    activeLiveEntry,
-    composeProvider,
-    effectiveComposeDir,
-    selectedSession,
-    workspaceMode,
-  ]);
+  const skillsWorkingDir = workspaceMode === 'history' && selectedSession
+    ? selectedSession.project || null
+    : workspaceMode === 'live' && activeLiveEntry
+      ? activeLiveEntry.session.project_dir || null
+      : effectiveComposeDir;
+  const skillsProvider = workspaceMode === 'history' && selectedSession
+    ? selectedSession.source === 'codex' ? 'codex' : 'claude'
+    : workspaceMode === 'live' && activeLiveEntry
+      ? activeLiveEntry.session.provider
+      : composeProvider;
+  const skillsContext = useMemo(() => ({
+    workingDir: skillsWorkingDir,
+    provider: skillsProvider,
+  }), [skillsWorkingDir, skillsProvider]);
 
   useEffect(() => {
     if (!browserWorkspaceReady) return;
@@ -3327,6 +3317,17 @@ export function Workspace({
     upsertLiveSessionEntry(session);
   }, [upsertLiveSessionEntry]);
 
+  const handleLiveStartNew = useCallback(() => {
+    setWorkspaceMode('compose');
+    setActiveLiveRuntimeId(null);
+    // A fresh Composer must not inherit an unsent session's routing opt-in.
+    updateComposeRouteDraftState(createComposerRouteDraft());
+  }, [updateComposeRouteDraftState]);
+
+  const handleNavigateEnvironments = useCallback(() => {
+    onNavigate('environments');
+  }, [onNavigate]);
+
   const selectedHistorySupportsInline = selectedSession?.source !== 'opencode';
 
   useEffect(() => {
@@ -3962,15 +3963,8 @@ export function Workspace({
                           opencodeInstalled={opencodeInstalled}
                           onLaunchNewSession={handleNewSession}
                           onForkTurnRequest={openForkTurn}
-                          onNavigateEnvironments={() => onNavigate('environments')}
-                          onStartNew={() => {
-                            setWorkspaceMode('compose');
-                            setActiveLiveRuntimeId(null);
-                            // "Start New" opens a fresh Composer: reset the
-                            // routing opt-in so a prior unsent draft never
-                            // leaks into the next launch.
-                            updateComposeRouteDraftState(createComposerRouteDraft());
-                          }}
+                          onNavigateEnvironments={handleNavigateEnvironments}
+                          onStartNew={handleLiveStartNew}
                       />
                       </div>
                     );

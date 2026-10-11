@@ -85,8 +85,8 @@ export function mergeToolResults(msgs: ConversationMessageData[]): ConversationM
           const match = resultByToolUseId.get(block.id);
           return cachedBlock.type === 'tool_use'
             && cachedBlock.id === block.id
-            && cachedBlock._result === (match ? match.content : undefined)
-            && cachedBlock._resultError === (match ? match.isError : undefined);
+            && cachedBlock._result === (match ? match.content : block._result)
+            && cachedBlock._resultError === (match ? match.isError : block._resultError);
         });
         if (upToDate) {
           for (const block of cachedBlocks) {

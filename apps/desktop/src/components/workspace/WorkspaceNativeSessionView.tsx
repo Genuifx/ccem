@@ -21,6 +21,7 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  memo,
   useRef,
   useState,
   type ReactNode,
@@ -182,7 +183,8 @@ import {
   foldSessionUsageEvents,
   type SessionUsageFold,
 } from './workspaceUsage';
-import { useWorkspaceSidePanel } from './WorkspaceSidePanel';
+import { WorkspaceSidePanelContext, useWorkspaceSidePanel } from './WorkspaceSidePanel';
+import { WorkspaceFileLinkContext, useWorkspaceFileLinks } from './WorkspaceFileLinkContext';
 import { LazyWorkspaceReviewPopover } from './LazyWorkspaceReviewPopover';
 import {
   buildWorkspaceReviewModel,
@@ -1460,7 +1462,23 @@ function WorkspaceAttentionPanel({
   );
 }
 
-export function WorkspaceNativeSessionView({
+export const WorkspaceNativeSessionView = memo(function WorkspaceNativeSessionView({ session, ...props }: WorkspaceNativeSessionViewProps) {
+  const sidePanel = useWorkspaceSidePanel();
+  const fileLinks = useWorkspaceFileLinks();
+  // Workspace's contexts follow the selected owner. Keep those updates outside
+  // hidden transcripts; memo alone cannot stop a context subscription. Revealing
+  // a session supplies the current owner and callbacks in the same render.
+  const isVisible = props.isVisible !== false;
+  return (
+    <WorkspaceSidePanelContext.Provider value={isVisible ? sidePanel : null}>
+      <WorkspaceFileLinkContext.Provider value={isVisible ? fileLinks : null}>
+        <WorkspaceNativeSessionViewContent {...props} session={session} />
+      </WorkspaceFileLinkContext.Provider>
+    </WorkspaceSidePanelContext.Provider>
+  );
+});
+
+const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionViewContent({
   session,
   initialPrompt,
   initialImages,
@@ -4975,4 +4993,4 @@ export function WorkspaceNativeSessionView({
     />
     </>
   );
-}
+});

@@ -254,8 +254,9 @@ test('source regression: every fresh-Composer entry point resets the routing dra
   );
 
   // 5. WorkspaceNativeSessionView onStartNew resets the compose draft.
-  const startNewIndex = source.indexOf('onStartNew={() => {');
-  const startNewBlock = source.slice(startNewIndex, source.indexOf('})}', startNewIndex));
+  const startNewIndex = source.indexOf('const handleLiveStartNew = useCallback');
+  const startNewBlock = source.slice(startNewIndex, source.indexOf('  }, [', startNewIndex));
+  assert.ok(source.includes('onStartNew={handleLiveStartNew}'));
   assert.ok(
     startNewBlock.includes('updateComposeRouteDraftState(createComposerRouteDraft())'),
     'onStartNew must reset the draft',

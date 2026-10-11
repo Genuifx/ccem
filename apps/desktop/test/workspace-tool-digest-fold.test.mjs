@@ -48,15 +48,21 @@ async function importHarness() {
         import React, { act } from 'react';
         import { createRoot } from 'react-dom/client';
         import { WorkspaceToolDigest } from '@/components/workspace/WorkspaceMessageBubble';
+        export { buildWorkspaceTranscriptItems } from '@/components/workspace/WorkspaceTranscriptList';
 
         export function mount(container, initialProps) {
           const root = createRoot(container);
-          const state = { props: initialProps };
+          const state = { props: initialProps, renders: 0 };
+          const ObservedDigest = React.memo((props) => {
+            state.renders++;
+            return React.createElement(WorkspaceToolDigest.type, props);
+          }, WorkspaceToolDigest.compare);
           const render = () => act(() => {
-            root.render(React.createElement(WorkspaceToolDigest, state.props));
+            root.render(React.createElement(ObservedDigest, state.props));
           });
           render();
           return {
+            renders: () => state.renders,
             setProps(nextProps) { state.props = nextProps; render(); },
             click(element) { act(() => element.click()); },
             unmount() { act(() => root.unmount()); },
@@ -144,6 +150,40 @@ test('programmatic digest expand/collapse skips the size transition; manual togg
 
     mounted.unmount();
   } finally {
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    stopEsbuild();
+  }
+});
+
+test('appending transcript text skips unchanged tool digests but still renders changed entries', async () => {
+  const dom = installDom();
+  const { harness, tempDir } = await importHarness();
+  const container = document.getElementById('root');
+  let mounted;
+  try {
+    const messages = [{
+      msgType: 'assistant', uuid: 'completed-tool', segmentIndex: 0,
+      content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: '/tmp/a.ts' } }],
+    }];
+    const first = harness.buildWorkspaceTranscriptItems(messages).find(item => item.type === 'tool-digest');
+    mounted = harness.mount(container, { entries: first.entries, autoExpanded: false, isActive: false });
+    const second = harness.buildWorkspaceTranscriptItems([
+      ...messages,
+      { msgType: 'assistant', uuid: 'next-text', segmentIndex: 0, content: 'New streamed answer.' },
+    ]).find(item => item.key === first.key);
+    const initialRenders = mounted.renders();
+    mounted.setProps({ entries: second.entries, autoExpanded: false, isActive: false });
+    assert.equal(mounted.renders(), initialRenders, 'unchanged historical digest should bail out');
+    mounted.setProps({ entries: [...second.entries, ENTRIES[0]], autoExpanded: false, isActive: false });
+    assert.equal(mounted.renders(), initialRenders + 1, 'appended tool must update the digest');
+    const changedEntry = { ...second.entries[0], block: { ...second.entries[0].block, _result: 'late result' } };
+    mounted.setProps({ entries: [changedEntry, ENTRIES[0]], autoExpanded: false, isActive: false });
+    assert.equal(mounted.renders(), initialRenders + 2, 'late tool result must invalidate the digest');
+    mounted.click(container.querySelector('button[aria-expanded]'));
+    assert.match(gridWrapper(container).className, /grid-rows-\[1fr\]/, 'manual expansion still works');
+  } finally {
+    mounted?.unmount();
     dom.window.close();
     await fs.rm(tempDir, { recursive: true, force: true });
     stopEsbuild();

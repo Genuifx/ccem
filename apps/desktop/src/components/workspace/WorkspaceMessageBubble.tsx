@@ -1129,7 +1129,12 @@ export const WorkspaceToolDigest = memo(
   WorkspaceToolDigestComponent,
   (prevProps, nextProps) => (
     prevProps.className === nextProps.className
-    && prevProps.entries === nextProps.entries
+    // The transcript builder can regroup an unchanged historical segment into
+    // a new array. Its immutable entries retain identity until a tool result
+    // or thinking block changes; compare those rather than the array wrapper.
+    && (prevProps.entries === nextProps.entries
+      || (prevProps.entries.length === nextProps.entries.length
+        && prevProps.entries.every((entry, index) => entry === nextProps.entries[index])))
     && prevProps.autoExpanded === nextProps.autoExpanded
     && prevProps.isActive === nextProps.isActive
   )
