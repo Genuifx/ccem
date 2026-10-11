@@ -61,6 +61,8 @@ interface PendingAssistantTurn {
   cacheReadTokens?: number;
   /** Provider message uuid of the turn's last main-chain assistant message (fork anchor). */
   providerMessageUuid?: string;
+  turnOperationId?: string;
+  turnMetrics?: ConversationMessageData['turnMetrics'];
 }
 
 function parseOccurredAt(occurredAt: string): number | undefined {
@@ -459,6 +461,8 @@ function createAssistantTextMessage(
     | 'outputTokens'
     | 'cacheCreationTokens'
     | 'cacheReadTokens'
+    | 'turnOperationId'
+    | 'turnMetrics'
   >> = {},
 ): ConversationMessageData {
   return {
@@ -562,6 +566,8 @@ function createAssistantTurnMessage(
         outputTokens: pendingTurn.outputTokens,
         cacheCreationTokens: pendingTurn.cacheCreationTokens,
         cacheReadTokens: pendingTurn.cacheReadTokens,
+        turnOperationId: pendingTurn.turnOperationId,
+        turnMetrics: pendingTurn.turnMetrics,
       },
     );
     if (textMessage && pendingTurn.providerMessageUuid) {
@@ -581,6 +587,8 @@ function createAssistantTurnMessage(
     outputTokens: pendingTurn.outputTokens,
     cacheCreationTokens: pendingTurn.cacheCreationTokens,
     cacheReadTokens: pendingTurn.cacheReadTokens,
+    turnOperationId: pendingTurn.turnOperationId,
+    turnMetrics: pendingTurn.turnMetrics,
   };
 }
 
@@ -870,6 +878,9 @@ function shallowEqualMessages(
     && previous.outputTokens === next.outputTokens
     && previous.cacheCreationTokens === next.cacheCreationTokens
     && previous.cacheReadTokens === next.cacheReadTokens
+    && previous.turnOperationId === next.turnOperationId
+    && previous.turnMetrics?.outputTokens === next.turnMetrics?.outputTokens
+    && previous.turnMetrics?.elapsedMs === next.turnMetrics?.elapsedMs
     && previous.annotations === next.annotations
     && shallowEqualContent(previous.content, next.content);
 }
@@ -994,6 +1005,7 @@ export interface TranscriptDerivationState {
   /** Leading messages that came from base/seed inputs (rebuildable). */
   headLength: number;
   pendingTurn: PendingAssistantTurn | null;
+  activeOperationId?: string;
   hiddenInteractiveToolUseIds: Set<string>;
   /** Tool uses owned by background tasks: their completions never render as
    *  standalone result/error rows (v2.70.0 background-task lifecycle). */
@@ -1088,6 +1100,8 @@ function foldAppendTranscriptGapSummary(
   occurredAt?: number,
 ) {
   foldFlushPendingTurn(state);
+  // The missing range may contain a terminal and another operation's start.
+  state.activeOperationId = undefined;
   const last = state.messages[state.messages.length - 1];
   if (last?.msgType === 'summary' && last.summary === TRANSCRIPT_GAP_SUMMARY_TOKEN) {
     return;
@@ -1201,7 +1215,7 @@ function foldApplyTokenUsageToLatestAssistant(
   payload: Extract<SessionEventRecord['payload'], { type: 'token_usage' }>,
 ) {
   const pendingTurn = state.pendingTurn;
-  if (pendingTurn) {
+  if (pendingTurn && (!payload.operation_id || pendingTurn.turnOperationId === payload.operation_id)) {
     pendingTurn.inputTokens = payload.input_tokens;
     pendingTurn.outputTokens = payload.output_tokens;
     pendingTurn.cacheReadTokens = payload.cache_read_tokens;
@@ -1215,6 +1229,7 @@ function foldApplyTokenUsageToLatestAssistant(
     if (message.msgType !== 'assistant' && message.msgType !== 'ai') {
       continue;
     }
+    if (payload.operation_id && message.turnOperationId !== payload.operation_id) continue;
     next[index] = {
       ...message,
       inputTokens: payload.input_tokens,
@@ -1236,6 +1251,7 @@ function foldEnsurePendingTurn(
       id: `assistant-turn-${event.seq}`,
       timestamp: occurredAt,
       contentBlocks: [],
+      turnOperationId: state.activeOperationId,
     };
     return state.pendingTurn;
   }
@@ -1407,6 +1423,34 @@ function foldTranscriptEvents(
               occurredAt,
             ),
           );
+        }
+        break;
+      }
+      case 'input_operation': {
+        if (event.payload.stage === 'started') {
+          if (state.activeOperationId !== event.payload.operation_id) foldFlushPendingTurn(state);
+          state.activeOperationId = event.payload.operation_id;
+        } else if (state.activeOperationId === event.payload.operation_id) {
+          state.activeOperationId = undefined;
+        }
+        break;
+      }
+      case 'turn_metrics': {
+        const { operation_id, output_tokens, elapsed_ms } = event.payload;
+        if (!Number.isSafeInteger(output_tokens) || output_tokens < 0
+          || !Number.isSafeInteger(elapsed_ms) || elapsed_ms <= 0) break;
+        const turnMetrics = { outputTokens: output_tokens, elapsedMs: elapsed_ms };
+        if (state.pendingTurn?.turnOperationId === operation_id) {
+          state.pendingTurn.turnMetrics ??= turnMetrics;
+        } else {
+          // A late Result belongs to its execution, never to the latest reply.
+          for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+            if (state.messages[index]!.turnOperationId !== operation_id) continue;
+            if (!state.messages[index]!.turnMetrics) {
+              state.messages[index] = { ...state.messages[index]!, turnMetrics };
+            }
+            break;
+          }
         }
         break;
       }

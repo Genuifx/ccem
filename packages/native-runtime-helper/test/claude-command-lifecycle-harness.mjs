@@ -329,6 +329,7 @@ async function buildHelperWithWireMock(options = {}) {
                     }
 
                     if (scenario === 'terminal_before_result') {
+                      if (resultDelayMs > 0) await sleep(resultDelayMs);
                       yield {
                         type: 'command_lifecycle',
                         command_uuid: userMessage.uuid,
@@ -336,6 +337,12 @@ async function buildHelperWithWireMock(options = {}) {
                         session_id,
                       };
                       if (terminalDelayMs > 0) await sleep(terminalDelayMs);
+                      if (${JSON.stringify(options.lateForeignResults ?? false)}) {
+                        const foreign = resultFrame(userMessage, localTurn, session_id);
+                        foreign.usage.output_tokens = 999;
+                        yield { ...foreign, origin: { kind: 'task-notification' } };
+                        yield { ...foreign, parent_tool_use_id: 'child-task' };
+                      }
                       yield resultFrame(userMessage, localTurn, session_id);
                       yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
                       continue;

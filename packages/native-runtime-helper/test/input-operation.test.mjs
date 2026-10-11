@@ -166,7 +166,8 @@ test('Claude LegacySerial waits for correlated Result and idle; uncorrelated inp
   await waitForOutput(session, isOperation('one', 'completed'), 'legacy terminal');
   send(session, { type: 'prompt', text: 'untracked', command_id: 'two' });
   await waitForOutput(session, (output) => isLifecycle(output, 'legacy_turn_terminal', 'two'), 'untracked terminal');
-  assert.equal(operations(session).length, 2, 'old client ID must not be borrowed');
+  assert.equal(operations(session, 'one').length, 2, 'old client ID must not be borrowed');
+  assert.deepEqual(operations(session).slice(2).map((event) => event.client_message_ids), [[], []]);
 });
 
 for (const state of ['cancelled', 'discarded', 'refused']) {

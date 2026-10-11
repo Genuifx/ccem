@@ -1201,6 +1201,7 @@ fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
         | SessionEventPayload::FilesRewound { .. }
         | SessionEventPayload::FileRewindFailed { .. }
         | SessionEventPayload::TokenUsage { .. }
+        | SessionEventPayload::TurnMetrics { .. }
         | SessionEventPayload::ContextUsage { .. }
         | SessionEventPayload::SessionUsage { .. } => true,
         SessionEventPayload::ToolUseStarted {
@@ -1228,6 +1229,30 @@ mod tests {
     use crate::user_prompt_display::WRITE_TOOL_LIMIT_SYSTEM_TIP;
     use chrono::Utc;
     use rusqlite::Connection;
+
+    #[test]
+    fn completed_turn_metrics_flush_and_replay_with_their_operation_identity() {
+        let db_path = std::env::temp_dir().join(format!(
+            "ccem-turn-metrics-{}-{}.sqlite", std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let log = NativeEventLog::new(db_path.clone());
+        let payload = serde_json::json!({
+            "type": "turn_metrics", "operation_id": "turn-a", "provider": "codex",
+            "output_tokens": 317, "elapsed_ms": 2500,
+        });
+        log.append(&SessionEventRecord {
+            runtime_id: "metrics-runtime".into(), seq: 1, occurred_at: Utc::now(),
+            payload: serde_json::from_value(payload.clone()).expect("helper metric wire format"),
+        }).expect("append metric");
+        // An independent reader sees the metric without waiting for buffer size/stop.
+        let observer = NativeEventLog::new(db_path.clone());
+        let page = observer.replay_page("metrics-runtime", None, None, 10).expect("replay");
+        assert_eq!(serde_json::to_value(&page.events[0].payload).unwrap(), payload);
+        drop(observer);
+        drop(log);
+        let _ = std::fs::remove_file(db_path);
+    }
 
     fn replay_page_test_record(runtime_id: &str, seq: u64) -> SessionEventRecord {
         SessionEventRecord {

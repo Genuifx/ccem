@@ -5859,7 +5859,7 @@ var sd = v(function(iB) {
     if (o.$async) r.throw(Ae._`new ${e.ValidationError}(${t})`);
     else r.assign(Ae._`${n}.errors`, t), r.return(false);
   }
-  var fs4 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
+  var fs5 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
   function oB(e, t, r) {
     let { createErrors: n } = e.it;
     if (n === false) return Ae._`{}`;
@@ -5876,13 +5876,13 @@ var sd = v(function(iB) {
   function XAe({ keyword: e, it: { errSchemaPath: t } }, { schemaPath: r, parentSchema: n }) {
     let o = n ? t : Ae.str`${t}/${e}`;
     if (r) o = Ae.str`${o}${(0, H_.getErrorPath)(r, H_.Type.Str)}`;
-    return [fs4.schemaPath, o];
+    return [fs5.schemaPath, o];
   }
   function QAe(e, { params: t, message: r }, n) {
     let { keyword: o, data: i, schemaValue: s, it: a } = e, { opts: c, propertyName: u, topSchemaRef: d, schemaPath: f } = a;
-    if (n.push([fs4.keyword, o], [fs4.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs4.message, typeof r == "function" ? r(e) : r]);
-    if (c.verbose) n.push([fs4.schema, s], [fs4.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
-    if (u) n.push([fs4.propertyName, u]);
+    if (n.push([fs5.keyword, o], [fs5.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs5.message, typeof r == "function" ? r(e) : r]);
+    if (c.verbose) n.push([fs5.schema, s], [fs5.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
+    if (u) n.push([fs5.propertyName, u]);
   }
 });
 var uB = v(function(cB) {
@@ -27313,7 +27313,7 @@ var Thread = class {
     const generator = this.runStreamedInternal(input, turnOptions);
     const items = [];
     let finalResponse = "";
-    let usage = null;
+    let usage2 = null;
     let turnFailure = null;
     for await (const event of generator) {
       if (event.type === "item.completed") {
@@ -27322,7 +27322,7 @@ var Thread = class {
         }
         items.push(event.item);
       } else if (event.type === "turn.completed") {
-        usage = event.usage;
+        usage2 = event.usage;
       } else if (event.type === "turn.failed") {
         turnFailure = event.error;
         break;
@@ -27331,7 +27331,7 @@ var Thread = class {
     if (turnFailure) {
       throw new Error(turnFailure.message);
     }
-    return { items, finalResponse, usage };
+    return { items, finalResponse, usage: usage2 };
   }
 };
 function normalizeInput(input) {
@@ -28974,10 +28974,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path6) {
-  if (!path6)
+function getElementAtPath(obj, path7) {
+  if (!path7)
     return obj;
-  return path6.reduce((acc, key) => acc?.[key], obj);
+  return path7.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -29360,11 +29360,11 @@ function aborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path6, issues) {
+function prefixIssues(path7, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path6);
+    iss.path.unshift(path7);
     return iss;
   });
 }
@@ -29547,7 +29547,7 @@ function formatError(error48, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error48, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error49, path6 = []) => {
+  const processError = (error49, path7 = []) => {
     var _a3, _b2;
     for (const issue2 of error49.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
@@ -29557,7 +29557,7 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
       } else if (issue2.code === "invalid_element") {
         processError({ issues: issue2.issues }, issue2.path);
       } else {
-        const fullpath = [...path6, ...issue2.path];
+        const fullpath = [...path7, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -29589,8 +29589,8 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path6 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path6) {
+  const path7 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path7) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -32691,8 +32691,8 @@ function az_default() {
 }
 
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/locales/be.js
-function getBelarusianPlural(count, one, few, many) {
-  const absCount = Math.abs(count);
+function getBelarusianPlural(count2, one, few, many) {
+  const absCount = Math.abs(count2);
   const lastDigit = absCount % 10;
   const lastTwoDigits = absCount % 100;
   if (lastTwoDigits >= 11 && lastTwoDigits <= 19) {
@@ -34516,8 +34516,8 @@ function hu_default() {
 }
 
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/locales/hy.js
-function getArmenianPlural(count, one, many) {
-  return Math.abs(count) === 1 ? one : many;
+function getArmenianPlural(count2, one, many) {
+  return Math.abs(count2) === 1 ? one : many;
 }
 function withDefiniteArticle(word) {
   if (!word)
@@ -36525,8 +36525,8 @@ function pt_default() {
 }
 
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/locales/ru.js
-function getRussianPlural(count, one, few, many) {
-  const absCount = Math.abs(count);
+function getRussianPlural(count2, one, few, many) {
+  const absCount = Math.abs(count2);
   const lastDigit = absCount % 10;
   const lastTwoDigits = absCount % 100;
   if (lastTwoDigits >= 11 && lastTwoDigits <= 19) {
@@ -41567,13 +41567,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path6 = ref.slice(1).split("/").filter(Boolean);
-  if (path6.length === 0) {
+  const path7 = ref.slice(1).split("/").filter(Boolean);
+  if (path7.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path6[0] === defsKey) {
-    const key = path6[1];
+  if (path7[0] === defsKey) {
+    const key = path7[1];
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -42496,20 +42496,20 @@ function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 function usageTotalTokens(value) {
-  const usage = asRecord3(value);
-  if (!usage) return null;
-  const total = finiteNumber(usage.total_tokens);
+  const usage2 = asRecord3(value);
+  if (!usage2) return null;
+  const total = finiteNumber(usage2.total_tokens);
   if (total !== null && total >= 0) {
     return total;
   }
-  const input = finiteNumber(usage.input_tokens) ?? 0;
-  const output = finiteNumber(usage.output_tokens) ?? 0;
+  const input = finiteNumber(usage2.input_tokens) ?? 0;
+  const output = finiteNumber(usage2.output_tokens) ?? 0;
   const totalFromParts = input + output;
   return totalFromParts > 0 ? totalFromParts : null;
 }
 function usageCategoryTokens(value, key) {
-  const usage = asRecord3(value);
-  return Math.max(0, finiteNumber(usage?.[key]) ?? 0);
+  const usage2 = asRecord3(value);
+  return Math.max(0, finiteNumber(usage2?.[key]) ?? 0);
 }
 function buildCodexContextUsageFromTokenCount(payload, fallbackModel = "codex") {
   if (payload.type !== "token_count") {
@@ -42584,18 +42584,18 @@ function recentSessionDirs(root, days = 7) {
   }
   return dirs;
 }
-function findCodexSessionFile(sessionId, sessionsRoot = resolveCodexSessionsRoot()) {
+function findCodexSessionFile(sessionId, sessionsRoot2 = resolveCodexSessionsRoot()) {
   const trimmed = sessionId.trim();
   if (!trimmed || !looksLikeUuid(trimmed)) {
     return null;
   }
-  for (const dir of recentSessionDirs(sessionsRoot)) {
+  for (const dir of recentSessionDirs(sessionsRoot2)) {
     const match = scanDirectoryForSessionFile(dir, trimmed, false);
     if (match) {
       return match;
     }
   }
-  return scanDirectoryForSessionFile(sessionsRoot, trimmed, true);
+  return scanDirectoryForSessionFile(sessionsRoot2, trimmed, true);
 }
 function readTailLines(filePath) {
   const stat = fs3.statSync(filePath);
@@ -42731,26 +42731,26 @@ function readObject2(value) {
   }
   return value;
 }
-function readString(record2, keys) {
-  if (!record2) {
+function readString(record3, keys) {
+  if (!record3) {
     return void 0;
   }
   for (const key of keys) {
-    const value = record2[key];
+    const value = record3[key];
     if (typeof value === "string" && value.trim()) {
       return value.trim();
     }
   }
   return void 0;
 }
-function readText(record2) {
-  return readString(record2, ["subject", "content", "text", "description"]);
+function readText(record3) {
+  return readString(record3, ["subject", "content", "text", "description"]);
 }
-function readActiveText(record2) {
-  return readString(record2, ["activeForm", "active_text"]);
+function readActiveText(record3) {
+  return readString(record3, ["activeForm", "active_text"]);
 }
-function readId(record2) {
-  return readString(record2, ["id", "taskId", "task_id"]);
+function readId(record3) {
+  return readString(record3, ["id", "taskId", "task_id"]);
 }
 function normalizeStatus(value, fallback = "pending") {
   if (value === "pending" || value === "in_progress" || value === "completed" || value === "failed") {
@@ -42779,8 +42779,8 @@ function parseResultObject(value) {
   }
   if (Array.isArray(value)) {
     for (const entry of value) {
-      const record2 = readObject2(entry);
-      const parsed = record2?.type === "text" ? parseResultObject(record2.text) : parseResultObject(entry);
+      const record3 = readObject2(entry);
+      const parsed = record3?.type === "text" ? parseResultObject(record3.text) : parseResultObject(entry);
       if (parsed) {
         return parsed;
       }
@@ -42792,39 +42792,39 @@ function cloneItem(item) {
   return { ...item };
 }
 function isTodoSnapshotItemV1(value) {
-  const record2 = readObject2(value);
+  const record3 = readObject2(value);
   return Boolean(
-    record2 && typeof record2.id === "string" && record2.id.trim() && typeof record2.text === "string" && record2.text.trim() && ["pending", "in_progress", "completed", "failed"].includes(String(record2.status)) && (record2.active_text === void 0 || typeof record2.active_text === "string")
+    record3 && typeof record3.id === "string" && record3.id.trim() && typeof record3.text === "string" && record3.text.trim() && ["pending", "in_progress", "completed", "failed"].includes(String(record3.status)) && (record3.active_text === void 0 || typeof record3.active_text === "string")
   );
 }
 function isTodoSnapshotV1(value) {
-  const record2 = readObject2(value);
-  if (!record2 || record2.version !== 1 || record2.provider !== "claude" && record2.provider !== "codex" || typeof record2.revision !== "number" || !Number.isSafeInteger(record2.revision) || record2.revision < 0 || !Array.isArray(record2.items) || !record2.items.every(isTodoSnapshotItemV1)) {
+  const record3 = readObject2(value);
+  if (!record3 || record3.version !== 1 || record3.provider !== "claude" && record3.provider !== "codex" || typeof record3.revision !== "number" || !Number.isSafeInteger(record3.revision) || record3.revision < 0 || !Array.isArray(record3.items) || !record3.items.every(isTodoSnapshotItemV1)) {
     return false;
   }
-  return record2.provider === "claude" ? ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(String(record2.source)) : record2.source === "todo_list";
+  return record3.provider === "claude" ? ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(String(record3.source)) : record3.source === "todo_list";
 }
 function itemFromRecord(value, fallbackId) {
-  const record2 = readObject2(value);
-  const text = readText(record2);
-  if (!record2 || !text) {
+  const record3 = readObject2(value);
+  const text = readText(record3);
+  if (!record3 || !text) {
     return null;
   }
-  const activeText = readActiveText(record2);
+  const activeText = readActiveText(record3);
   return {
-    id: readId(record2) ?? fallbackId,
+    id: readId(record3) ?? fallbackId,
     text,
-    status: typeof record2.completed === "boolean" ? record2.completed ? "completed" : "pending" : normalizeStatus(record2.status),
+    status: typeof record3.completed === "boolean" ? record3.completed ? "completed" : "pending" : normalizeStatus(record3.status),
     ...activeText ? { active_text: activeText } : {}
   };
 }
 function snapshotFromCodexTodoList(item, revision = 1) {
-  const record2 = readObject2(item);
-  if (record2?.type !== "todo_list" || !Array.isArray(record2.items)) {
+  const record3 = readObject2(item);
+  if (record3?.type !== "todo_list" || !Array.isArray(record3.items)) {
     return void 0;
   }
-  const listId = readId(record2) ?? "todo-list";
-  const items = record2.items.map((value, index) => itemFromRecord(value, `${listId}:${index}`)).filter((value) => Boolean(value));
+  const listId = readId(record3) ?? "todo-list";
+  const items = record3.items.map((value, index) => itemFromRecord(value, `${listId}:${index}`)).filter((value) => Boolean(value));
   return {
     version: 1,
     provider: "codex",
@@ -43622,22 +43622,32 @@ function createStreamEventCoalescer(writePayload, options = {}) {
 
 // src/inputOperation.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
+import { performance as performance2 } from "node:perf_hooks";
 var InputOperation = class {
-  constructor(provider, clientMessageIds, emit2, commandId) {
+  constructor(provider, clientMessageIds, emit2, commandId, now = () => performance2.now()) {
     this.provider = provider;
     this.emit = emit2;
     this.commandId = commandId;
+    this.now = now;
     this.clientMessageIds = Array.isArray(clientMessageIds) ? [...new Set(clientMessageIds.filter((id) => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))] : [];
   }
   id = randomUUID3();
   clientMessageIds;
   started = false;
   terminal = false;
+  startedAt;
+  completedAt;
+  outputTokens;
+  metricsEmitted = false;
   observe(stage, detail, providerTurnId) {
     if (this.terminal || stage === "started" && this.started) return;
-    if (stage === "started") this.started = true;
-    else this.terminal = true;
-    if (!this.clientMessageIds.length) return;
+    if (stage === "started") {
+      this.started = true;
+      this.startedAt = this.now();
+    } else {
+      this.terminal = true;
+      if (stage === "completed") this.completedAt = this.now();
+    }
     this.emit({
       type: "input_operation",
       operation_id: this.id,
@@ -43648,8 +43658,236 @@ var InputOperation = class {
       ...this.commandId ? { command_id: this.commandId } : {},
       ...providerTurnId ? { provider_turn_id: providerTurnId } : {}
     });
+    this.emitMetricsIfReady();
+  }
+  /** Only authoritative, successful, current-turn output counts belong here.
+   * Usage may arrive after the terminal; never include that transport delay. */
+  recordOutputTokens(tokens) {
+    if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0) return;
+    if (this.outputTokens !== void 0) return;
+    this.outputTokens = tokens;
+    this.emitMetricsIfReady();
+  }
+  emitMetricsIfReady() {
+    if (this.metricsEmitted || this.startedAt === void 0 || this.completedAt === void 0 || this.outputTokens === void 0) return;
+    const elapsedMs = Math.round(this.completedAt - this.startedAt);
+    if (elapsedMs <= 0) return;
+    this.metricsEmitted = true;
+    this.emit({
+      type: "turn_metrics",
+      operation_id: this.id,
+      provider: this.provider,
+      output_tokens: this.outputTokens,
+      elapsed_ms: elapsedMs
+    });
   }
 };
+
+// src/codexTurnUsage.ts
+import fs4 from "node:fs";
+import path6 from "node:path";
+var TAIL_BYTES2 = 1024 * 1024;
+var MAX_TURN_BYTES = 32 * 1024 * 1024;
+var RETRY_COUNT = 8;
+var RETRY_DELAY_MS = 50;
+var ZERO = { input: 0, output: 0, cached: 0, cacheWrite: 0, reasoning: 0, total: 0 };
+var KEYS = Object.keys(ZERO);
+function record2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+function count(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function usage(value) {
+  const obj = record2(value);
+  if (!obj) return null;
+  const input = count(obj.input_tokens);
+  const output = count(obj.output_tokens);
+  const cached2 = count(obj.cached_input_tokens);
+  const cacheWrite = count(obj.cache_write_input_tokens ?? 0);
+  const reasoning = count(obj.reasoning_output_tokens ?? 0);
+  const total = count(obj.total_tokens);
+  if (input === null || output === null || cached2 === null || cacheWrite === null || reasoning === null || total === null || cached2 + cacheWrite > input || reasoning > output) {
+    return null;
+  }
+  return { input, output, cached: cached2, cacheWrite, reasoning, total };
+}
+function equal(a, b) {
+  return KEYS.every((key) => a[key] === b[key]);
+}
+function normalize(raw) {
+  return {
+    inputTokens: raw.input - raw.cached - raw.cacheWrite,
+    outputTokens: raw.output,
+    cacheReadTokens: raw.cached,
+    cacheCreationTokens: raw.cacheWrite
+  };
+}
+function sessionsRoot(codexHome) {
+  return codexHome?.trim() ? path6.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
+}
+function readRange(fd, start, length) {
+  const buffer = Buffer.alloc(length);
+  let read = 0;
+  while (read < length) {
+    const next = fs4.readSync(fd, buffer, read, length - read, start + read);
+    if (next === 0) throw new Error("Codex rollout changed while reading");
+    read += next;
+  }
+  return buffer;
+}
+function readAnchor(fd, offset) {
+  const length = Math.min(64, offset);
+  return readRange(fd, offset - length, length).toString("base64");
+}
+function captureCodexUsageBaseline(sessionId, codexHome) {
+  const baseline = {
+    sessionId: sessionId?.trim() || null,
+    sessionsRoot: sessionsRoot(codexHome),
+    filePath: null,
+    offset: 0,
+    device: 0,
+    inode: 0,
+    anchor: "",
+    total: null,
+    valid: !sessionId?.trim()
+  };
+  if (!baseline.sessionId) return baseline;
+  const filePath = findCodexSessionFile(baseline.sessionId, baseline.sessionsRoot);
+  if (!filePath) return baseline;
+  let fd;
+  try {
+    fd = fs4.openSync(filePath, "r");
+    const stat = fs4.fstatSync(fd);
+    if (!stat.isFile() || stat.size === 0) return baseline;
+    const start = Math.max(0, stat.size - TAIL_BYTES2);
+    const tail = readRange(fd, start, stat.size - start);
+    if (tail[tail.length - 1] !== 10) return baseline;
+    const lines = tail.toString("utf8").split("\n");
+    if (start > 0) lines.shift();
+    for (let index = lines.length - 1; index >= 0; index--) {
+      try {
+        const row = record2(JSON.parse(lines[index]));
+        const payload = record2(row?.payload);
+        if (row?.type === "event_msg" && payload?.type === "token_count") {
+          baseline.total = usage(record2(payload.info)?.total_token_usage);
+          break;
+        }
+      } catch {
+      }
+    }
+    const anchor = readAnchor(fd, stat.size);
+    if (fs4.fstatSync(fd).size !== stat.size) return baseline;
+    return { ...baseline, filePath, offset: stat.size, device: stat.dev, inode: stat.ino, anchor, valid: true };
+  } catch {
+    return baseline;
+  } finally {
+    if (fd !== void 0) fs4.closeSync(fd);
+  }
+}
+var INVALID = { state: "invalid" };
+var PENDING = { state: "pending" };
+function parseTurn(text, sessionId, baseline) {
+  let turnId = null;
+  let completed = false;
+  let sawSessionMeta = baseline.sessionId !== null;
+  let lastTotal = baseline.sessionId ? baseline.total : { ...ZERO };
+  let cumulativeValid = lastTotal !== null;
+  let sawTotal = false;
+  let turnUsage = null;
+  let summedUsage = { ...ZERO };
+  const responses = /* @__PURE__ */ new Map();
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = record2(JSON.parse(line));
+    } catch {
+      return INVALID;
+    }
+    const payload = record2(row?.payload);
+    if (!row || !payload) return INVALID;
+    if (row.type === "session_meta") {
+      if ((payload.id ?? payload.session_id) !== sessionId) return INVALID;
+      if (!baseline.sessionId && (payload.forked_from_id || payload.history_base)) return INVALID;
+      sawSessionMeta = true;
+    } else if (row.type === "turn_context") {
+      if (!turnId || payload.turn_id !== turnId) return INVALID;
+    } else if (row.type === "token_usage_record") {
+      if (!turnId || completed || payload.thread_id !== sessionId || payload.turn_id !== turnId || typeof payload.response_id !== "string" || !payload.response_id) return INVALID;
+      const request = usage(payload.usage);
+      const turn = usage(payload.turn_token_usage);
+      if (!request || !turn) return INVALID;
+      const previous = responses.get(payload.response_id);
+      if (previous) {
+        if (!equal(previous.request, request) || !equal(previous.turn, turn)) return INVALID;
+        continue;
+      }
+      summedUsage = Object.fromEntries(KEYS.map((key) => [key, summedUsage[key] + request[key]]));
+      if (!KEYS.every((key) => Number.isSafeInteger(summedUsage[key])) || !equal(summedUsage, turn)) return INVALID;
+      responses.set(payload.response_id, { request, turn });
+      turnUsage = turn;
+    } else if (row.type === "event_msg") {
+      if (payload.type === "task_started" || payload.type === "turn_started") {
+        if (turnId || typeof payload.turn_id !== "string" || !payload.turn_id) return INVALID;
+        turnId = payload.turn_id;
+      } else if (payload.type === "task_complete" || payload.type === "turn_complete") {
+        if (!turnId || payload.turn_id !== turnId) return INVALID;
+        completed = true;
+      } else if (payload.type === "turn_aborted" || payload.type === "turn_failed" || payload.type === "thread_rolled_back") {
+        return INVALID;
+      } else if (payload.type === "token_count") {
+        const next = usage(record2(payload.info)?.total_token_usage);
+        if (!turnId || completed) {
+          if (!next || !lastTotal || !equal(next, lastTotal)) return INVALID;
+          continue;
+        }
+        sawTotal = true;
+        const previousTotal = lastTotal;
+        if (!next || !previousTotal || KEYS.some((key) => next[key] < previousTotal[key])) {
+          cumulativeValid = false;
+        }
+        lastTotal = next;
+      }
+    }
+  }
+  if (!sawSessionMeta || !turnId || !completed) return PENDING;
+  if (turnUsage) return { state: "ready", value: normalize(turnUsage) };
+  const initial = baseline.sessionId ? baseline.total : ZERO;
+  if (!cumulativeValid || !sawTotal || !lastTotal || !initial) return INVALID;
+  const delta = Object.fromEntries(KEYS.map((key) => [key, lastTotal[key] - initial[key]]));
+  if (delta.cached + delta.cacheWrite > delta.input || delta.reasoning > delta.output) return INVALID;
+  return { state: "ready", value: normalize(delta) };
+}
+function tryResolve(sessionId, baseline) {
+  const filePath = baseline.filePath ?? findCodexSessionFile(sessionId, baseline.sessionsRoot);
+  if (!filePath) return PENDING;
+  let fd;
+  try {
+    fd = fs4.openSync(filePath, "r");
+    const stat = fs4.fstatSync(fd);
+    if (!stat.isFile() || stat.size < baseline.offset || stat.size - baseline.offset > MAX_TURN_BYTES) return INVALID;
+    if (baseline.filePath && (stat.dev !== baseline.device || stat.ino !== baseline.inode || readAnchor(fd, baseline.offset) !== baseline.anchor)) return INVALID;
+    const bytes = readRange(fd, baseline.offset, stat.size - baseline.offset);
+    if (!bytes.length || bytes[bytes.length - 1] !== 10) return PENDING;
+    return parseTurn(bytes.toString("utf8"), sessionId, baseline);
+  } catch {
+    return PENDING;
+  } finally {
+    if (fd !== void 0) fs4.closeSync(fd);
+  }
+}
+async function resolveCodexTurnUsage(sessionId, baseline, codexHome) {
+  const id = sessionId.trim();
+  if (!baseline.valid || !id || baseline.sessionId && baseline.sessionId !== id || codexHome !== void 0 && sessionsRoot(codexHome) !== baseline.sessionsRoot) return null;
+  for (let attempt = 0; attempt <= RETRY_COUNT; attempt++) {
+    const result = tryResolve(id, baseline);
+    if (result.state === "ready") return result.value;
+    if (result.state === "invalid") return null;
+    if (attempt < RETRY_COUNT) await new Promise((resolve2) => setTimeout(resolve2, RETRY_DELAY_MS));
+  }
+  return null;
+}
 
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
@@ -43701,6 +43939,7 @@ var claudeInitializationError = null;
 var resolveClaudeInitialization = null;
 var claudeInitializationBarrier = Promise.resolve();
 var claudeTerminalCommandIds = /* @__PURE__ */ new Set();
+var claudeUsageOperations = /* @__PURE__ */ new Map();
 var claudeObservedResultCommandIds = /* @__PURE__ */ new Set();
 var claudeSeenNonHumanResultKeys = /* @__PURE__ */ new Set();
 var pendingClaudePromptReplay = null;
@@ -43897,6 +44136,7 @@ function beginClaudeLifecycleGeneration() {
   claudeLifecycleProtocolErrorKey = null;
   claudeAuthoritativeTerminalCommandId = null;
   claudeTerminalCommandIds.clear();
+  claudeUsageOperations.clear();
   claudeObservedResultCommandIds.clear();
   if (currentProviderSessionId) {
     emitSessionMeta(currentProviderSessionId);
@@ -43917,11 +44157,11 @@ function armClaudeLifecycleTerminalTimer(commandId, reason) {
   claudeLifecycleTerminalTimer.unref?.();
 }
 function configureClaudeLifecycleFromInit(message) {
-  const record2 = message;
-  if (!Array.isArray(record2.capabilities)) {
+  const record3 = message;
+  if (!Array.isArray(record3.capabilities)) {
     return;
   }
-  const capabilities = record2.capabilities.filter(
+  const capabilities = record3.capabilities.filter(
     (capability) => typeof capability === "string"
   );
   const nextMode = capabilities.includes("msg_lifecycle_v1") ? "full" : "legacy";
@@ -43936,7 +44176,7 @@ function configureClaudeLifecycleFromInit(message) {
   }
   claudeSdkCapabilities = capabilities;
   claudeLifecycleMode = nextMode;
-  const sessionId = typeof record2.session_id === "string" ? record2.session_id : null;
+  const sessionId = typeof record3.session_id === "string" ? record3.session_id : null;
   if (sessionId) {
     emitSessionMeta(sessionId);
   }
@@ -43985,27 +44225,27 @@ function processNegotiatedClaudeSdkCommandLifecycle(frame) {
   }
 }
 function handleClaudeSdkCommandLifecycle(message) {
-  const record2 = message;
-  if (typeof record2.command_uuid !== "string") {
+  const record3 = message;
+  if (typeof record3.command_uuid !== "string") {
     return;
   }
-  if (typeof record2.state !== "string") {
-    if (record2.command_uuid === claudeForegroundPromptUuid) {
+  if (typeof record3.state !== "string") {
+    if (record3.command_uuid === claudeForegroundPromptUuid) {
       emitClaudeLifecycleProtocolError(
         "malformed_sdk_command_state: matching lifecycle frame omitted a string state",
-        record2.command_uuid
+        record3.command_uuid
       );
     }
     return;
   }
-  if (typeof record2.session_id === "string") {
-    emitSessionMeta(record2.session_id);
+  if (typeof record3.session_id === "string") {
+    emitSessionMeta(record3.session_id);
   }
-  const frame = { commandId: record2.command_uuid, state: record2.state };
+  const frame = { commandId: record3.command_uuid, state: record3.state };
   if (claudeLifecycleMode === "negotiating") {
     if (claudePreInitLifecycleFrames.length >= MAX_PRE_INIT_LIFECYCLE_FRAMES) {
-      if (record2.command_uuid === claudeForegroundPromptUuid) {
-        emitClaudeLifecycleProtocolError("pre_init_lifecycle_buffer_overflow", record2.command_uuid);
+      if (record3.command_uuid === claudeForegroundPromptUuid) {
+        emitClaudeLifecycleProtocolError("pre_init_lifecycle_buffer_overflow", record3.command_uuid);
       }
       return;
     }
@@ -44082,11 +44322,11 @@ function claudeMessageOriginKind(message) {
   if (typeof origin?.kind === "string") {
     return origin.kind;
   }
-  const record2 = message;
-  if (record2?.type !== "user") {
+  const record3 = message;
+  if (record3?.type !== "user") {
     return null;
   }
-  const content = record2.message?.content;
+  const content = record3.message?.content;
   const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((block) => Boolean(
     block && typeof block === "object" && block.type === "text" && typeof block.text === "string"
   )).map((block) => block.text).join("") : "";
@@ -44117,23 +44357,23 @@ function taskNotificationSharesActiveForegroundTurn(originKind) {
   return originKind === "task-notification" && claudeTurnAwaitingResult && claudeForegroundPromptAccepted && (claudeIngressOriginKind === null || claudeIngressOriginKind === "human");
 }
 function propagateClaudeHiddenToolOwnership(message) {
-  const record2 = message;
+  const record3 = message;
   const parentToolUseId = claudeMessageParentToolUseId(message);
-  const explicitTaskId = typeof record2?.task_id === "string" ? claudeBackgroundTasks.backgroundTaskIdForOwner(record2.task_id) : null;
+  const explicitTaskId = typeof record3?.task_id === "string" ? claudeBackgroundTasks.backgroundTaskIdForOwner(record3.task_id) : null;
   const ownerTaskId = explicitTaskId ?? claudeBackgroundTasks.backgroundTaskIdForOwner(parentToolUseId);
   if (ownerTaskId) {
-    const messageAgentId = typeof record2?.agent_id === "string" ? record2.agent_id : typeof record2?.subagent_retry?.agent_id === "string" ? record2.subagent_retry.agent_id : null;
+    const messageAgentId = typeof record3?.agent_id === "string" ? record3.agent_id : typeof record3?.subagent_retry?.agent_id === "string" ? record3.subagent_retry.agent_id : null;
     claudeBackgroundTasks.associateOwnerWithTask(messageAgentId, ownerTaskId);
   }
-  if (record2?.type === "tool_progress" && typeof record2.tool_use_id === "string") {
-    claudeHiddenToolUseIds.add(record2.tool_use_id);
+  if (record3?.type === "tool_progress" && typeof record3.tool_use_id === "string") {
+    claudeHiddenToolUseIds.add(record3.tool_use_id);
     if (ownerTaskId) {
-      claudeBackgroundTasks.associateOwnerWithTask(record2.tool_use_id, ownerTaskId);
-      claudeBackgroundTasks.associateChildToolWithParent(record2.tool_use_id, parentToolUseId);
+      claudeBackgroundTasks.associateOwnerWithTask(record3.tool_use_id, ownerTaskId);
+      claudeBackgroundTasks.associateChildToolWithParent(record3.tool_use_id, parentToolUseId);
     }
     return;
   }
-  for (const block of getClaudeContentBlocks(record2?.message)) {
+  for (const block of getClaudeContentBlocks(record3?.message)) {
     if (block.type === "tool_use" && typeof block.id === "string") {
       claudeHiddenToolUseIds.add(block.id);
       if (ownerTaskId) {
@@ -44167,26 +44407,26 @@ function isCurrentClaudeHumanPromptEcho(message) {
   return true;
 }
 function claudeUserMessageHasToolResult(message) {
-  const record2 = message;
-  return getClaudeContentBlocks(record2?.message).some((block) => block.type === "tool_result");
+  const record3 = message;
+  return getClaudeContentBlocks(record3?.message).some((block) => block.type === "tool_result");
 }
 function claudeNonHumanResultKey(message, originKind) {
-  const record2 = message;
-  if (typeof record2?.uuid === "string" && record2.uuid.trim()) {
-    return `uuid:${record2.uuid.trim()}`;
+  const record3 = message;
+  if (typeof record3?.uuid === "string" && record3.uuid.trim()) {
+    return `uuid:${record3.uuid.trim()}`;
   }
   if (!originKind || originKind === "human") {
     return null;
   }
   return JSON.stringify([
     originKind,
-    record2?.subtype ?? null,
-    record2?.result ?? null,
-    record2?.errors ?? null
+    record3?.subtype ?? null,
+    record3?.result ?? null,
+    record3?.errors ?? null
   ]);
 }
 function isForegroundClaudeResult(message) {
-  if (!claudeTurnAwaitingResult) {
+  if (!claudeTurnAwaitingResult || claudeMessageParentToolUseId(message)) {
     return false;
   }
   const originKind = claudeMessageOriginKind(message);
@@ -44452,20 +44692,24 @@ function rememberClaudeCommandId(set2, commandId) {
     set2.delete(oldest);
   }
 }
-function emitClaudeResultUsage(message) {
-  const record2 = message;
-  if (!record2.usage) {
+function emitClaudeResultUsage(message, commandId) {
+  const record3 = message;
+  if (!record3.usage) {
     return;
   }
-  const outputTokens = typeof record2.usage.output_tokens === "number" ? record2.usage.output_tokens : 0;
+  if (commandId && record3.subtype === "success" && !record3.is_error) {
+    claudeUsageOperations.get(commandId)?.recordOutputTokens(record3.usage.output_tokens);
+  }
+  const outputTokens = typeof record3.usage.output_tokens === "number" ? record3.usage.output_tokens : 0;
   emitEvent({
     type: "token_usage",
     provider: "claude",
-    input_tokens: typeof record2.usage.input_tokens === "number" ? record2.usage.input_tokens : 0,
+    ...commandId && claudeUsageOperations.has(commandId) ? { operation_id: claudeUsageOperations.get(commandId).id } : {},
+    input_tokens: typeof record3.usage.input_tokens === "number" ? record3.usage.input_tokens : 0,
     output_tokens: outputTokens,
-    cache_read_tokens: typeof record2.usage.cache_read_input_tokens === "number" ? record2.usage.cache_read_input_tokens : 0,
-    cache_creation_tokens: typeof record2.usage.cache_creation_input_tokens === "number" ? record2.usage.cache_creation_input_tokens : 0,
-    total_cost_usd: typeof record2.total_cost_usd === "number" ? record2.total_cost_usd : null,
+    cache_read_tokens: typeof record3.usage.cache_read_input_tokens === "number" ? record3.usage.cache_read_input_tokens : 0,
+    cache_creation_tokens: typeof record3.usage.cache_creation_input_tokens === "number" ? record3.usage.cache_creation_input_tokens : 0,
+    total_cost_usd: typeof record3.total_cost_usd === "number" ? record3.total_cost_usd : null,
     scope: "turn_total"
   });
 }
@@ -45227,11 +45471,11 @@ function parseClaudeSessionUsagePayload(raw) {
   let cacheReadTokens = 0;
   let cacheCreationTokens = 0;
   let costUsd = null;
-  for (const [model, usage] of Object.entries(modelUsageMap)) {
-    if (!usage || typeof usage !== "object") {
+  for (const [model, usage2] of Object.entries(modelUsageMap)) {
+    if (!usage2 || typeof usage2 !== "object") {
       continue;
     }
-    const entry = usage;
+    const entry = usage2;
     const entryInput = asNumber(entry.inputTokens);
     const entryOutput = asNumber(entry.outputTokens);
     const entryCacheRead = asNumber(entry.cacheReadInputTokens);
@@ -45273,8 +45517,8 @@ function stableRateLimitsKey(rateLimits) {
     if (!raw || typeof raw !== "object") {
       return "null";
     }
-    const record2 = raw;
-    return [record2.utilization, record2.resets_at ?? ""].join(":");
+    const record3 = raw;
+    return [record3.utilization, record3.resets_at ?? ""].join(":");
   };
   return ["five_hour", "seven_day"].map((name) => `${name}=${windowKey(rateLimits[name])}`).join(",");
 }
@@ -46167,13 +46411,13 @@ async function consumeClaudeMessages() {
         const resultPromptUuid = message.user_message_uuid;
         const correlatedCommandId = typeof resultPromptUuid === "string" && resultPromptUuid.trim() ? resultPromptUuid.trim() : null;
         const resultObservation = claudeResultObservation(message);
-        if (claudeLifecycleMode === "full" && correlatedCommandId && claudeTerminalCommandIds.has(correlatedCommandId)) {
-          emitClaudeResultUsage(message);
-          observeLateClaudeTurnResult(
+        if (claudeLifecycleMode === "full" && correlatedCommandId && claudeTerminalCommandIds.has(correlatedCommandId) && (!resultOriginKind || resultOriginKind === "human") && !claudeMessageParentToolUseId(message)) {
+          const firstObservation = observeLateClaudeTurnResult(
             correlatedCommandId,
             resultObservation.detail,
             resultObservation.failed
           );
+          if (firstObservation) emitClaudeResultUsage(message, correlatedCommandId);
           continue;
         }
         if (claudeLifecycleMode === "full" && !correlatedCommandId && resultOriginKind === "human" && claudeTerminalCommandIds.size > 0) {
@@ -46213,7 +46457,9 @@ async function consumeClaudeMessages() {
         claudePendingNonHumanResultCount = 0;
         pendingClaudePromptReplay = null;
         claudeForegroundPromptAccepted = true;
-        emitClaudeResultUsage(message);
+        if (!correlatedCommandId || !claudeObservedResultCommandIds.has(correlatedCommandId)) {
+          emitClaudeResultUsage(message, correlatedCommandId);
+        }
         claudeInputResultCorrelated = correlatedCommandId === claudeForegroundPromptUuid;
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
         finishClaudeLegacyTurnAfterIdle();
@@ -46367,6 +46613,12 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, ope
   claudeInterruptCompletionEmitted = false;
   claudeForegroundPromptUuid = messageUuid;
   claudeInputOperation = operation ?? null;
+  if (operation) {
+    claudeUsageOperations.set(messageUuid, operation);
+    if (claudeUsageOperations.size > 64) {
+      claudeUsageOperations.delete(claudeUsageOperations.keys().next().value);
+    }
+  }
   claudeInputResultCorrelated = false;
   claudeAuthoritativeTerminalCommandId = null;
   claudeForegroundCoordinatorStamped = coordinatorStamped;
@@ -46668,6 +46920,8 @@ async function ensureCodexThread() {
 async function runCodexTurn(text, images, abortController, operation) {
   const thread = await ensureCodexThread();
   abortController.signal.throwIfAborted();
+  const codexHome = initCommand?.env_vars?.CODEX_HOME ?? process5.env.CODEX_HOME;
+  const usageBaseline = captureCodexUsageBaseline(currentProviderSessionId, codexHome);
   let input;
   const parts = buildPromptContentParts(text, images);
   const hasImages = parts.some((part) => part.type === "image");
@@ -46715,20 +46969,25 @@ async function runCodexTurn(text, images, abortController, operation) {
         continue;
       }
       if (event.type === "turn.completed") {
-        const outputTokens = event.usage.output_tokens ?? 0;
-        operation?.observe("completed", `Codex SDK completed the turn \xB7 output ${outputTokens} tokens`);
+        operation?.observe("completed", "Codex SDK completed the turn.");
+        const usage2 = currentProviderSessionId ? await resolveCodexTurnUsage(currentProviderSessionId, usageBaseline, codexHome) : null;
+        if (usage2) {
+          operation?.recordOutputTokens(usage2.outputTokens);
+          emitEvent({
+            type: "token_usage",
+            provider: "codex",
+            ...operation ? { operation_id: operation.id } : {},
+            input_tokens: usage2.inputTokens,
+            output_tokens: usage2.outputTokens,
+            cache_read_tokens: usage2.cacheReadTokens,
+            cache_creation_tokens: usage2.cacheCreationTokens,
+            scope: "turn_total"
+          });
+        }
         emitEvent({
           type: "lifecycle",
           stage: "turn_completed",
-          detail: `Turn completed \xB7 output ${outputTokens} tokens`
-        });
-        emitEvent({
-          type: "token_usage",
-          provider: "codex",
-          input_tokens: event.usage.input_tokens ?? 0,
-          output_tokens: outputTokens,
-          cache_read_tokens: event.usage.cached_input_tokens ?? 0,
-          cache_creation_tokens: 0
+          detail: usage2 ? `Turn completed \xB7 output ${usage2.outputTokens} tokens` : "Turn completed"
         });
         await emitCodexContextUsageFromSessionFile(currentProviderSessionId, 10);
         continue;
@@ -47070,12 +47329,17 @@ async function handleCommand(command) {
         }
         emitStatus("ready", "Native runtime helper initialized.");
         emitClaudeInitializationSettled();
-        enqueueClaudePrompt(initialText, initialImages, command.initial_command_id ?? void 0);
+        const operation = new InputOperation("claude", [], emitEvent, command.initial_command_id ?? void 0);
+        enqueueClaudePrompt(initialText, initialImages, command.initial_command_id ?? void 0, void 0, operation);
       } else {
         if (!activeTurn && !stopped) {
           emitStatus("ready", "Native runtime helper initialized.");
         }
-        promptQueue.push({ text: initialText, images: initialImages });
+        promptQueue.push({
+          text: initialText,
+          images: initialImages,
+          operation: new InputOperation("codex", [], emitEvent, command.initial_command_id ?? void 0)
+        });
         await runQueuedTurns();
       }
     } else if (command.provider === "claude") {

@@ -37,6 +37,69 @@ function eventAt(seq, payload, occurredAt) {
   };
 }
 
+test('turn speed belongs to its execution across late results, streaming append, and replay', async () => {
+  const { deriveTranscriptReset, deriveTranscriptAppend, finalizeTranscriptMessages,
+    stabilizeMessageRefs } = await importWorkspaceEventTranscript();
+  const operation = (id, stage) => ({ type: 'input_operation', operation_id: id,
+    client_message_ids: [id], provider: 'claude', stage, detail: '' });
+  const events = [
+    event(1, operation('a', 'started')),
+    event(2, { type: 'assistant_chunk', text: 'First reply' }),
+    event(3, operation('a', 'completed')),
+    event(4, { type: 'lifecycle', stage: 'turn_completed', detail: '' }),
+    event(5, operation('b', 'started')),
+    event(6, { type: 'assistant_chunk', text: 'Second reply' }),
+    event(7, { type: 'turn_metrics', provider: 'claude', operation_id: 'a', output_tokens: 120, elapsed_ms: 2000 }),
+    event(8, { type: 'token_usage', provider: 'claude', operation_id: 'a', output_tokens: 120,
+      input_tokens: 50, cache_read_tokens: 10, cache_creation_tokens: 0, scope: 'turn_total' }),
+    event(9, operation('b', 'completed')),
+    event(10, { type: 'turn_metrics', provider: 'claude', operation_id: 'b', output_tokens: 40, elapsed_ms: 1000 }),
+    event(11, { type: 'lifecycle', stage: 'turn_completed', detail: '' }),
+    // A duplicate must not change the already persisted value.
+    event(12, { type: 'turn_metrics', provider: 'claude', operation_id: 'a', output_tokens: 999, elapsed_ms: 1 }),
+  ];
+  const streaming = deriveTranscriptReset([], [], events.slice(0, 6));
+  const before = finalizeTranscriptMessages(streaming);
+  assert.ok(before.every((message) => !message.turnMetrics));
+  const incremental = finalizeTranscriptMessages(deriveTranscriptAppend(streaming, events.slice(6)));
+  assert.deepEqual(incremental.map((message) => message.turnMetrics), [
+    { outputTokens: 120, elapsedMs: 2000 }, { outputTokens: 40, elapsedMs: 1000 },
+  ]);
+  assert.equal(incremental[0].outputTokens, 120);
+  assert.equal(incremental[1].outputTokens, undefined, 'late usage must not overwrite the next turn');
+  assert.deepEqual(finalizeTranscriptMessages(deriveTranscriptReset([], [], events)), incremental);
+  assert.notEqual(stabilizeMessageRefs(incremental, before)[0], before[0], 'metric arrival rerenders the reply');
+  assert.ok(finalizeTranscriptMessages(streaming).every((message) => !message.turnMetrics), 'append preserves prior state');
+});
+
+test('legacy, interrupted, unmatched and invalid usage never invent turn speed', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const messages = buildMessagesFromEvents([], [], [
+    event(1, { type: 'assistant_chunk', text: 'Legacy reply' }),
+    event(2, { type: 'token_usage', provider: 'claude', input_tokens: 999, output_tokens: 50,
+      cache_read_tokens: 200, cache_creation_tokens: 10, scope: 'turn_total' }),
+    event(3, { type: 'turn_metrics', provider: 'claude', operation_id: 'unmatched', output_tokens: 50, elapsed_ms: 1000 }),
+    event(4, { type: 'lifecycle', stage: 'turn_interrupted', detail: '' }),
+    event(5, { type: 'input_operation', operation_id: 'next', client_message_ids: ['next'], provider: 'codex', stage: 'started', detail: '' }),
+    event(6, { type: 'assistant_chunk', text: 'Next reply' }),
+    event(7, { type: 'turn_metrics', provider: 'codex', operation_id: 'next', output_tokens: 50, elapsed_ms: 0 }),
+  ]);
+  assert.ok(messages.every((message) => !message.turnMetrics));
+});
+
+test('a transcript gap cannot lend an earlier execution identity to later replies', async () => {
+  const { buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const messages = buildMessagesFromEvents([], [], [
+    event(1, { type: 'input_operation', operation_id: 'a', client_message_ids: ['a'], provider: 'claude', stage: 'started', detail: '' }),
+    event(2, { type: 'assistant_chunk', text: 'First reply' }),
+    event(10, { type: 'assistant_chunk', text: 'Reply after a missing turn boundary' }),
+    event(11, { type: 'turn_metrics', provider: 'claude', operation_id: 'a', output_tokens: 120, elapsed_ms: 2000 }),
+  ]);
+  assert.deepEqual(messages[0].turnMetrics, { outputTokens: 120, elapsedMs: 2000 });
+  assert.equal(messages.at(-1).turnOperationId, undefined);
+  assert.equal(messages.at(-1).turnMetrics, undefined);
+});
+
 test('optimistic annotation prompts converge to the persisted replay snapshot', async () => {
   const {
     buildMessagesFromEvents,

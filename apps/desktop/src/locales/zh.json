@@ -118,6 +118,9 @@
     "diagnostics": "诊断"
   },
   "workspace": {
+    "turnAverageSpeed": "本轮平均 {speed} tok/s",
+    "turnSpeedCalculation": "{tokens} 输出 token ÷ {seconds} 秒",
+    "turnSpeedScope": "主会话输出，包含推理，不含输入和缓存；耗时包含工具执行和等待。",
     "sessionReferenceMentionLabel": "引用会话或文件",
     "sessionReferenceGroup": "会话 · 仅引用",
     "sessionReferenceFileGroup": "文件",

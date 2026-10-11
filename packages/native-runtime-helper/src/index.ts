@@ -62,6 +62,7 @@ import {
 } from './claudeBackgroundTasks';
 import { createStreamEventCoalescer } from './streamEventCoalescer';
 import { InputOperation } from './inputOperation';
+import { captureCodexUsageBaseline, resolveCodexTurnUsage } from './codexTurnUsage';
 
 type NativeProvider = 'claude' | 'codex';
 
@@ -346,6 +347,8 @@ let claudeInitializationError: string | null = null;
 let resolveClaudeInitialization: (() => void) | null = null;
 let claudeInitializationBarrier: Promise<void> = Promise.resolve();
 const claudeTerminalCommandIds = new Set<string>();
+// Keep bounded ownership for Results delivered after command terminal/next start.
+const claudeUsageOperations = new Map<string, InputOperation>();
 const claudeObservedResultCommandIds = new Set<string>();
 const claudeSeenNonHumanResultKeys = new Set<string>();
 let pendingClaudePromptReplay: {
@@ -594,6 +597,7 @@ function beginClaudeLifecycleGeneration() {
   claudeLifecycleProtocolErrorKey = null;
   claudeAuthoritativeTerminalCommandId = null;
   claudeTerminalCommandIds.clear();
+  claudeUsageOperations.clear();
   claudeObservedResultCommandIds.clear();
   if (currentProviderSessionId) {
     emitSessionMeta(currentProviderSessionId);
@@ -983,7 +987,7 @@ function claudeNonHumanResultKey(message: unknown, originKind: string | null) {
 }
 
 function isForegroundClaudeResult(message: unknown) {
-  if (!claudeTurnAwaitingResult) {
+  if (!claudeTurnAwaitingResult || claudeMessageParentToolUseId(message)) {
     return false;
   }
   const originKind = claudeMessageOriginKind(message);
@@ -1393,13 +1397,18 @@ function rememberClaudeCommandId(set: Set<string>, commandId: string) {
   }
 }
 
-function emitClaudeResultUsage(message: unknown) {
+function emitClaudeResultUsage(message: unknown, commandId: string | null) {
   const record = message as {
     usage?: Record<string, unknown>;
     total_cost_usd?: number;
+    subtype?: string;
+    is_error?: boolean;
   };
   if (!record.usage) {
     return;
+  }
+  if (commandId && record.subtype === 'success' && !record.is_error) {
+    claudeUsageOperations.get(commandId)?.recordOutputTokens(record.usage.output_tokens);
   }
   const outputTokens = typeof record.usage.output_tokens === 'number'
     ? record.usage.output_tokens
@@ -1407,6 +1416,8 @@ function emitClaudeResultUsage(message: unknown) {
   emitEvent({
     type: 'token_usage',
     provider: 'claude',
+    ...(commandId && claudeUsageOperations.has(commandId)
+      ? { operation_id: claudeUsageOperations.get(commandId)!.id } : {}),
     input_tokens: typeof record.usage.input_tokens === 'number' ? record.usage.input_tokens : 0,
     output_tokens: outputTokens,
     cache_read_tokens: typeof record.usage.cache_read_input_tokens === 'number'
@@ -3646,13 +3657,15 @@ async function consumeClaudeMessages() {
           claudeLifecycleMode === 'full'
           && correlatedCommandId
           && claudeTerminalCommandIds.has(correlatedCommandId)
+          && (!resultOriginKind || resultOriginKind === 'human')
+          && !claudeMessageParentToolUseId(message)
         ) {
-          emitClaudeResultUsage(message);
-          observeLateClaudeTurnResult(
+          const firstObservation = observeLateClaudeTurnResult(
             correlatedCommandId,
             resultObservation.detail,
             resultObservation.failed,
           );
+          if (firstObservation) emitClaudeResultUsage(message, correlatedCommandId);
           continue;
         }
         if (
@@ -3713,7 +3726,9 @@ async function consumeClaudeMessages() {
         pendingClaudePromptReplay = null;
         claudeForegroundPromptAccepted = true;
 
-        emitClaudeResultUsage(message);
+        if (!correlatedCommandId || !claudeObservedResultCommandIds.has(correlatedCommandId)) {
+          emitClaudeResultUsage(message, correlatedCommandId);
+        }
         claudeInputResultCorrelated = correlatedCommandId === claudeForegroundPromptUuid;
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
         finishClaudeLegacyTurnAfterIdle();
@@ -3903,6 +3918,12 @@ function enqueueClaudePrompt(
   claudeInterruptCompletionEmitted = false;
   claudeForegroundPromptUuid = messageUuid;
   claudeInputOperation = operation ?? null;
+  if (operation) {
+    claudeUsageOperations.set(messageUuid, operation);
+    if (claudeUsageOperations.size > 64) {
+      claudeUsageOperations.delete(claudeUsageOperations.keys().next().value!);
+    }
+  }
   claudeInputResultCorrelated = false;
   claudeAuthoritativeTerminalCommandId = null;
   claudeForegroundCoordinatorStamped = coordinatorStamped;
@@ -4249,6 +4270,8 @@ async function ensureCodexThread() {
 async function runCodexTurn(text: string, images: PromptImage[] | null | undefined, abortController: AbortController, operation?: InputOperation) {
   const thread = await ensureCodexThread();
   abortController.signal.throwIfAborted();
+  const codexHome = initCommand?.env_vars?.CODEX_HOME ?? process.env.CODEX_HOME;
+  const usageBaseline = captureCodexUsageBaseline(currentProviderSessionId, codexHome);
 
   let input: import('@openai/codex-sdk').Input;
   const parts = buildPromptContentParts(text, images);
@@ -4305,20 +4328,29 @@ async function runCodexTurn(text: string, images: PromptImage[] | null | undefin
     }
 
     if (event.type === 'turn.completed') {
-      const outputTokens = event.usage.output_tokens ?? 0;
-      operation?.observe('completed', `Codex SDK completed the turn · output ${outputTokens} tokens`);
+      // exec reports thread-cumulative usage (including resumed history). Freeze
+      // the terminal clock now, before waiting for the authoritative turn ledger.
+      operation?.observe('completed', 'Codex SDK completed the turn.');
+      const usage = currentProviderSessionId
+        ? await resolveCodexTurnUsage(currentProviderSessionId, usageBaseline, codexHome)
+        : null;
+      if (usage) {
+        operation?.recordOutputTokens(usage.outputTokens);
+        emitEvent({
+          type: 'token_usage',
+          provider: 'codex',
+          ...(operation ? { operation_id: operation.id } : {}),
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          cache_read_tokens: usage.cacheReadTokens,
+          cache_creation_tokens: usage.cacheCreationTokens,
+          scope: 'turn_total',
+        });
+      }
       emitEvent({
         type: 'lifecycle',
         stage: 'turn_completed',
-        detail: `Turn completed · output ${outputTokens} tokens`,
-      });
-      emitEvent({
-        type: 'token_usage',
-        provider: 'codex',
-        input_tokens: event.usage.input_tokens ?? 0,
-        output_tokens: outputTokens,
-        cache_read_tokens: event.usage.cached_input_tokens ?? 0,
-        cache_creation_tokens: 0,
+        detail: usage ? `Turn completed · output ${usage.outputTokens} tokens` : 'Turn completed',
       });
       await emitCodexContextUsageFromSessionFile(currentProviderSessionId, 10);
       continue;
@@ -4736,12 +4768,14 @@ async function handleCommand(command: InputCommand) {
         // the initial command as the active foreground owner.
         emitStatus('ready', 'Native runtime helper initialized.');
         emitClaudeInitializationSettled();
-        enqueueClaudePrompt(initialText, initialImages, command.initial_command_id ?? undefined);
+        const operation = new InputOperation('claude', [], emitEvent, command.initial_command_id ?? undefined);
+        enqueueClaudePrompt(initialText, initialImages, command.initial_command_id ?? undefined, undefined, operation);
       } else {
         if (!activeTurn && !stopped) {
           emitStatus('ready', 'Native runtime helper initialized.');
         }
-        promptQueue.push({ text: initialText, images: initialImages });
+        promptQueue.push({ text: initialText, images: initialImages,
+          operation: new InputOperation('codex', [], emitEvent, command.initial_command_id ?? undefined) });
         await runQueuedTurns();
       }
     } else if (command.provider === 'claude') {

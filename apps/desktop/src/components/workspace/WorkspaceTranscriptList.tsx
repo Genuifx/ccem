@@ -4,6 +4,7 @@ import type {
   ConversationMessageData,
 } from '@/features/conversations/types';
 import { cn } from '@/lib/utils';
+import { TurnSpeedBadge } from './TurnSpeedBadge';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import {
   processMessageBlocks,
@@ -26,6 +27,12 @@ import {
 const TOP_SPACER_DATASET = 'workspaceTranscriptTopSpacer';
 
 export type WorkspaceTranscriptItem =
+  | {
+    type: 'turn-metrics';
+    key: string;
+    role: 'assistant';
+    metrics: NonNullable<ConversationMessageData['turnMetrics']>;
+  }
   | {
     type: 'message';
     key: string;
@@ -241,6 +248,13 @@ export function buildWorkspaceTranscriptItems(
       ...segment,
       key: `${messageKey}-segment-${segmentIndex}`,
     })));
+    if (message.turnMetrics) {
+      // A single execution can render as text/tool/text segments. Its footer
+      // follows the entire reply, including turns that end with only tools.
+      flushSegments();
+      items.push({ type: 'turn-metrics', role: 'assistant',
+        key: uniqueItemKey(`${messageKey}-metrics`), metrics: message.turnMetrics });
+    }
   });
 
   flushSegments();
@@ -746,6 +760,15 @@ export function WorkspaceTranscriptList({
       {windowedItems.map((item, index) => {
         const absoluteIndex = windowStartIndex + index;
         const prevRole = absoluteIndex > 0 ? displayItems[absoluteIndex - 1].role : null;
+
+        if (item.type === 'turn-metrics') {
+          return (
+            <div key={item.key} data-transcript-item-key={item.key}
+              className="py-2">
+              <TurnSpeedBadge metrics={item.metrics} />
+            </div>
+          );
+        }
 
         if (item.type === 'tool-digest') {
           return (

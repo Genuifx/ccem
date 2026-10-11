@@ -95,6 +95,9 @@ export interface ConversationMessageData {
   outputTokens?: number;
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
+  /** Runtime-scoped execution identity; never inferred from message order. */
+  turnOperationId?: string;
+  turnMetrics?: { outputTokens: number; elapsedMs: number };
   segmentIndex: number;
   isCompactBoundary: boolean;
   planContent?: string;

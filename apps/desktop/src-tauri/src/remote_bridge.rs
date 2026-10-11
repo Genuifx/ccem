@@ -274,6 +274,7 @@ pub(crate) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         // forwarded per turn — don't spam bot outboxes with them. Interactive
         // receipts are consumed by the desktop attention layer (Slice C).
         SessionEventPayload::SessionUsage { .. }
+        | SessionEventPayload::TurnMetrics { .. }
         | SessionEventPayload::RuntimeSettingsChanged { .. }
         | SessionEventPayload::InteractiveResponseResult { .. }
         | SessionEventPayload::BackgroundTasksChanged { .. }

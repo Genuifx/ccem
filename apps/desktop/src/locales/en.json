@@ -118,6 +118,9 @@
     "diagnostics": "Diagnostics"
   },
   "workspace": {
+    "turnAverageSpeed": "Turn average {speed} tok/s",
+    "turnSpeedCalculation": "{tokens} output tokens ÷ {seconds} seconds",
+    "turnSpeedScope": "Main-agent output, including reasoning, excluding input and cache. Time includes tools and waiting.",
     "sessionReferenceMentionLabel": "Reference a session or file",
     "sessionReferenceGroup": "Sessions · reference only",
     "sessionReferenceFileGroup": "Files",

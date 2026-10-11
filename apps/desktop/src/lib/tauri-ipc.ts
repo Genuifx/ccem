@@ -1469,7 +1469,25 @@ export type SessionEventPayload =
     }
   | { type: 'gap_notification'; last_seen_seq: number; oldest_available_seq: number }
   | {
+      type: 'input_operation';
+      operation_id: string;
+      client_message_ids: string[];
+      provider: 'claude' | 'codex';
+      stage: 'started' | 'completed' | 'failed' | 'unknown';
+      detail: string;
+      command_id?: string;
+      provider_turn_id?: string;
+    }
+  | {
+      type: 'turn_metrics';
+      operation_id: string;
+      provider: 'claude' | 'codex';
+      output_tokens: number;
+      elapsed_ms: number;
+    }
+  | {
       type: 'token_usage';
+      operation_id?: string | null;
       provider: string;
       input_tokens: number;
       output_tokens: number;

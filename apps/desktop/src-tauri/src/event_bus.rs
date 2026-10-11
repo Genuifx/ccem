@@ -344,7 +344,17 @@ pub enum SessionEventPayload {
         last_seen_seq: u64,
         oldest_available_seq: u64,
     },
+    /// Completed main-agent turn. Duration is frozen at the helper's terminal
+    /// boundary using a monotonic clock, including tool execution and waiting.
+    TurnMetrics {
+        operation_id: String,
+        provider: String,
+        output_tokens: u64,
+        elapsed_ms: u64,
+    },
     TokenUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         provider: String,
         input_tokens: u64,
         output_tokens: u64,
