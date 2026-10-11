@@ -70,6 +70,11 @@ type BrowserPanelControl = NonNullable<BrowserSurfaceSnapshot['control']>;
 
 class BrowserControlSupersededError extends Error {}
 class BrowserNavigationSupersededError extends Error {}
+class BrowserAcquireCancelledError extends Error {}
+
+function isViewportNotReady(error: unknown): boolean {
+  return String(error).includes('CEF_VIEWPORT_NOT_READY:');
+}
 
 const browserSurfaceClient = createBrowserSurfaceClient({
   invoke: invokeBrowserCommand,
@@ -169,6 +174,7 @@ export function BrowserPanel({
   useNativeBrowserViewport(frameRef, isActiveSurface && isSurfaceReady && !surfaceHidden);
   const [acquireViewport, setAcquireViewport] = useState<ReturnType<typeof buildNativeBrowserBounds> | null>(null);
   const [acquireRevision, setAcquireRevision] = useState(0);
+  const acquireWaitingForLayoutRef = useRef(false);
   const controlRef = useRef(control);
   controlRef.current = control;
   const autoHandoffRef = useRef(autoHandoff);
@@ -351,6 +357,10 @@ export function BrowserPanel({
     if (!isActiveSurfaceRef.current) return;
     const initialViewport = readViewport();
     if (initialViewport) setAcquireViewport((previous) => previous ?? initialViewport);
+    if (initialViewport && acquireWaitingForLayoutRef.current) {
+      acquireWaitingForLayoutRef.current = false;
+      setAcquireRevision((revision) => revision + 1);
+    }
     if (syncFrameRef.current !== null) cancelAnimationFrame(syncFrameRef.current);
     syncFrameRef.current = requestAnimationFrame(() => {
       syncFrameRef.current = null;
@@ -389,6 +399,7 @@ export function BrowserPanel({
     // Recovered hidden panels have no layout yet. Reconnect on their first real
     // presentation; later hide/show transitions retain the same acquired lease.
     if (!acquireViewport) return;
+    acquireWaitingForLayoutRef.current = false;
     let disposed = false;
     let unlistenState: (() => void) | null = null;
     let unlistenHostShortcut: (() => void) | null = null;
@@ -490,15 +501,31 @@ export function BrowserPanel({
         }
         unlistenHostShortcut = nextHostShortcutUnlisten;
 
-        const lease = await surfaceOrdering.enqueue((clientRevision) => (
-          browserSurfaceClient.acquire({
-            ...acquireRequest,
-            clientRevision,
-            // Listener setup, queued work, or a retry can follow a resize/zoom.
-            // Keep the initial rectangle only as a fallback for a now-hidden panel.
-            viewport: lifecycleActionsRef.current.readViewport() ?? acquireViewport,
-          })
-        ));
+        const acquire = async () => {
+          for (let attempt = 0; ; attempt++) {
+            try {
+              return await surfaceOrdering.enqueue((clientRevision) => (
+                browserSurfaceClient.acquire({
+                  ...acquireRequest,
+                  clientRevision,
+                  viewport: acquireViewport,
+                }, () => {
+                  if (disposed) throw new BrowserAcquireCancelledError();
+                  const viewport = lifecycleActionsRef.current.readViewport();
+                  if (!viewport) throw new Error('CEF_VIEWPORT_NOT_READY: panel layout is hidden');
+                  return viewport;
+                })
+              ));
+            } catch (error) {
+              if (disposed || !isViewportNotReady(error) || attempt >= 2
+                || !lifecycleActionsRef.current.readViewport()) throw error;
+              // A resize can race the final IPC/native-main-thread handoff. Retry
+              // only this classified pre-creation failure, with fresh layout/revision.
+              await new Promise((resolve) => window.setTimeout(resolve, 50));
+            }
+          }
+        };
+        const lease = await acquire();
         if (disposed) {
           await surfaceOrdering.enqueue((clientRevision) => (
             browserSurfaceClient.release({
@@ -540,9 +567,15 @@ export function BrowserPanel({
           unlistenState = null;
           unlistenHostShortcut?.();
           unlistenHostShortcut = null;
-          setLifecycle('failed');
-          showLifecycleError(String(acquireError));
-        } else {
+          if (isViewportNotReady(acquireError) && !lifecycleActionsRef.current.readViewport()) {
+            // No polling while hidden. The existing geometry observer resumes us
+            // when the panel has an actual rectangle again.
+            acquireWaitingForLayoutRef.current = true;
+          } else {
+            setLifecycle('failed');
+            showLifecycleError(String(acquireError));
+          }
+        } else if (!(acquireError instanceof BrowserAcquireCancelledError)) {
           console.error('Failed to close a disposed browser surface:', acquireError);
         }
       } finally {

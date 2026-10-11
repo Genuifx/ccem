@@ -204,3 +204,33 @@ test('acquisition waits for the latest metadata ACK, forwards generation zero, a
   assert.deepEqual(calls.filter(call => call.command === 'webcontent_browser_workspace_save').map(call => call.args.revision), [1, 1, 1, 2]);
   assert.deepEqual(calls.at(-1).args, { panelSessionId: 'surface-a', frontendDocumentId: 'fresh-document', frontendGeneration: 0 });
 });
+
+test('acquisition prepares layout only after the final workspace ACK and can cancel before native IPC', async () => {
+  const calls = [];
+  const gate = deferred();
+  const modules = await documentModules('late-layout', async (command, args) => {
+    calls.push({ command, args });
+    if (command === 'webcontent_frontend_boot') return { documentId: args.documentId, generation: 0, recovered: false };
+    if (command === 'webcontent_browser_workspace_save') return gate.promise;
+    return 'acquired';
+  });
+  await modules.recovery.initializeWebcontentRecovery();
+  void modules.recovery.saveBrowserWorkspace({ version: 1, instanceSequence: 1, targets: {}, sessionKeys: { runtime: [], provider: [] } });
+  let width = 720, reads = 0;
+  const acquire = modules.recovery.invokeBrowserCommand('browser_surface_acquire', { viewport: { width } }, () => {
+    reads++;
+    return { viewport: { width } };
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads, 0, 'layout is not captured before the metadata acknowledgement');
+  width = 400;
+  gate.resolve();
+  await acquire;
+  assert.equal(reads, 1);
+  assert.equal(calls.at(-1).args.viewport.width, 400);
+  const before = calls.length;
+  await assert.rejects(modules.recovery.invokeBrowserCommand('browser_surface_acquire', {}, () => {
+    throw new Error('panel unmounted');
+  }), /panel unmounted/);
+  assert.equal(calls.length, before, 'cancelled panel must not allocate a native surface');
+});

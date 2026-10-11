@@ -115,79 +115,24 @@ fn snap_native_edge(value: f64) -> f64 {
     }
 }
 
-/// DOM geometry is measured from the top-left of the Wry viewport while AppKit child views use a
-/// bottom-left origin. Rounding outward ensures the native browser fills the reserved slot without
-/// leaving a one-pixel seam when the app zoom produces fractional logical coordinates.
-pub(crate) fn macos_child_bounds(
-    viewport: LogicalViewport,
-    parent_height: f64,
-) -> Result<NativeChildBounds, String> {
-    if ![
-        viewport.x,
-        viewport.y,
-        viewport.width,
-        viewport.height,
-        parent_height,
-    ]
-    .into_iter()
-    .all(f64::is_finite)
-    {
-        return Err("CEF viewport geometry must be finite".to_string());
-    }
-    if viewport.x < 0.0
-        || viewport.y < 0.0
-        || viewport.width <= 0.0
-        || viewport.height <= 0.0
-        || parent_height <= 0.0
-        || viewport.y + viewport.height > parent_height + NATIVE_EDGE_ROUNDOFF
-    {
-        return Err("CEF viewport geometry is outside its parent view".to_string());
-    }
-
-    let left = snap_native_edge(viewport.x).floor();
-    let top = snap_native_edge(viewport.y).floor();
-    let right = snap_native_edge(viewport.x + viewport.width).ceil();
-    let bottom = snap_native_edge((viewport.y + viewport.height).min(parent_height)).ceil();
-    let parent_bottom = parent_height.ceil();
-    let values = [left, top, right, bottom, parent_bottom];
-    if values
-        .into_iter()
-        .any(|value| value < i32::MIN as f64 || value > i32::MAX as f64)
-    {
-        return Err("CEF viewport geometry exceeds native coordinate limits".to_string());
-    }
-
-    let bounds = NativeChildBounds {
-        x: left as i32,
-        y: (parent_bottom - bottom) as i32,
-        width: (right - left) as i32,
-        height: (bottom - top) as i32,
-    };
-    if bounds.width <= 0 || bounds.height <= 0 || bounds.y < 0 {
-        return Err("CEF viewport geometry collapsed after native conversion".to_string());
-    }
-    Ok(bounds)
-}
-
-/// Windows child HWND coordinates use the parent client area's top-left origin and physical
-/// pixels. BrowserPanel has already applied app zoom to produce host-window logical coordinates,
-/// so convert only by the actual Tauri monitor scale factor and round outward to avoid seams.
-pub(crate) fn windows_child_bounds(
+/// Validate arithmetic before clipping: malformed/extreme requests must not become valid
+/// merely because their intersection with the window is small.
+fn clipped_child_bounds(
     viewport: LogicalViewport,
     scale_factor: f64,
-    parent_width: i32,
-    parent_height: i32,
+    parent_width: f64,
+    parent_height: f64,
 ) -> Result<NativeChildBounds, String> {
-    if ![
+    let values = [
         viewport.x,
         viewport.y,
         viewport.width,
         viewport.height,
         scale_factor,
-    ]
-    .into_iter()
-    .all(f64::is_finite)
-    {
+        parent_width,
+        parent_height,
+    ];
+    if !values.into_iter().all(f64::is_finite) {
         return Err("CEF viewport geometry must be finite".to_string());
     }
     if viewport.x < 0.0
@@ -195,31 +140,68 @@ pub(crate) fn windows_child_bounds(
         || viewport.width <= 0.0
         || viewport.height <= 0.0
         || scale_factor <= 0.0
-        || parent_width <= 0
-        || parent_height <= 0
+        || parent_width < 0.0
+        || parent_height < 0.0
     {
-        return Err("CEF viewport geometry is outside its parent window".to_string());
+        return Err("CEF viewport geometry has invalid dimensions".to_string());
     }
-
-    let left = snap_native_edge(viewport.x * scale_factor).floor();
-    let top = snap_native_edge(viewport.y * scale_factor).floor();
-    let right = snap_native_edge((viewport.x + viewport.width) * scale_factor).ceil();
-    let bottom = snap_native_edge((viewport.y + viewport.height) * scale_factor).ceil();
-    if [left, top, right, bottom]
+    let edges = [
+        viewport.x * scale_factor,
+        viewport.y * scale_factor,
+        (viewport.x + viewport.width) * scale_factor,
+        (viewport.y + viewport.height) * scale_factor,
+    ];
+    if edges
         .into_iter()
-        .any(|value| value < 0.0 || value > i32::MAX as f64)
-        || right > f64::from(parent_width)
-        || bottom > f64::from(parent_height)
-        || right <= left
-        || bottom <= top
+        .chain([parent_width, parent_height])
+        .any(|value| !value.is_finite() || value > i32::MAX as f64)
     {
-        return Err("CEF viewport geometry is outside its parent window".to_string());
+        return Err("CEF viewport geometry exceeds native coordinate limits".to_string());
     }
-
+    let [left, top, right, bottom] = edges.map(snap_native_edge);
+    // The native parent can shrink after the frontend measures, even with a fresh
+    // IPC request. Intersect on the main thread with its current client bounds.
+    let left = left.floor();
+    let top = top.floor();
+    let right = right.ceil().min(parent_width.floor());
+    let bottom = bottom.ceil().min(parent_height.floor());
+    if right <= left || bottom <= top {
+        return Err(
+            "CEF_VIEWPORT_NOT_READY: no visible area in the current parent window".to_string(),
+        );
+    }
     Ok(NativeChildBounds {
         x: left as i32,
         y: top as i32,
         width: (right - left) as i32,
         height: (bottom - top) as i32,
     })
+}
+
+/// AppKit child views use a bottom-left origin. Both parent dimensions are read
+/// on the main thread; only the part still inside the window may be displayed.
+pub(crate) fn macos_child_bounds(
+    viewport: LogicalViewport,
+    parent_width: f64,
+    parent_height: f64,
+) -> Result<NativeChildBounds, String> {
+    let mut bounds = clipped_child_bounds(viewport, 1.0, parent_width, parent_height)?;
+    bounds.y = parent_height.floor() as i32 - bounds.y - bounds.height;
+    Ok(bounds)
+}
+
+/// HWND client coordinates use a top-left origin and physical pixels. Apply only
+/// monitor DPI here: the frontend already applied app zoom to its logical rect.
+pub(crate) fn windows_child_bounds(
+    viewport: LogicalViewport,
+    scale_factor: f64,
+    parent_width: i32,
+    parent_height: i32,
+) -> Result<NativeChildBounds, String> {
+    clipped_child_bounds(
+        viewport,
+        scale_factor,
+        f64::from(parent_width),
+        f64::from(parent_height),
+    )
 }

@@ -275,13 +275,14 @@ export interface BrowserSurfaceClosePopupRequest {
 }
 
 interface BrowserSurfaceIpcDependencies {
-  invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+  invoke: <T>(command: string, args?: Record<string, unknown>, prepare?: () => Record<string, unknown>) => Promise<T>;
 }
 
 export function createBrowserSurfaceClient(dependencies: BrowserSurfaceIpcDependencies) {
   return {
-    acquire: (request: BrowserSurfaceAcquireRequest) =>
-      dependencies.invoke<BrowserSurfaceLease>('browser_surface_acquire', { ...request }),
+    acquire: (request: BrowserSurfaceAcquireRequest, readViewport?: () => NativeBrowserBounds) =>
+      dependencies.invoke<BrowserSurfaceLease>('browser_surface_acquire', { ...request },
+        readViewport ? () => ({ viewport: readViewport() }) : undefined),
     sync: (request: BrowserSurfaceSyncRequest) =>
       dependencies.invoke<void>('browser_surface_sync', { ...request }),
     release: (request: BrowserSurfaceReleaseRequest) =>

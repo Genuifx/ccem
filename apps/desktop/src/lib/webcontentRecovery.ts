@@ -160,7 +160,11 @@ export async function flushBrowserWorkspace(): Promise<void> {
 }
 
 /** Every UI mutation carries its originating document; stale windows cannot borrow the new fence. */
-export async function invokeBrowserCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+export async function invokeBrowserCommand<T>(
+  command: string,
+  args?: Record<string, unknown>,
+  prepare?: () => Record<string, unknown>,
+): Promise<T> {
   const identity = await awaitWebcontentDocumentIdentity();
   if (!identity) throw new Error('Browser document identity is unavailable.');
   if (command === 'browser_surface_acquire'
@@ -171,6 +175,9 @@ export async function invokeBrowserCommand<T>(command: string, args?: Record<str
   }
   return invoke<T>(command, {
     ...args,
+    // Layout and component lifetime may change while either acknowledgement waits.
+    // Run synchronously at the actual IPC boundary, after every asynchronous fence.
+    ...prepare?.(),
     frontendDocumentId: identity.documentId,
     frontendGeneration: identity.generation,
   });

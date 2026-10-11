@@ -166,6 +166,7 @@ fn browser_panel_top_left_coordinates_convert_to_outward_rounded_nsview_bounds()
             width: 580.2,
             height: 618.3,
         },
+        900.0,
         700.0,
     )
     .expect("valid BrowserPanel viewport");
@@ -191,7 +192,8 @@ fn zoomed_webview_roundoff_does_not_reject_a_flush_parent_edge() {
         width: 442.60938720703126,
         height: 573.046875,
     };
-    let macos = macos_child_bounds(viewport, 700.0).expect("subpixel roundoff is not overflow");
+    let macos =
+        macos_child_bounds(viewport, 900.0, 700.0).expect("subpixel roundoff is not overflow");
     assert_eq!(macos.y, 0);
     assert_eq!(macos.x + macos.width, 900);
     assert_eq!(macos.height, 574);
@@ -207,26 +209,102 @@ fn zoomed_webview_roundoff_does_not_reject_a_flush_parent_edge() {
 }
 
 #[test]
-fn viewport_roundoff_tolerance_does_not_admit_real_overflow() {
+fn native_geometry_clips_in_flight_resize_to_both_parent_axes() {
     let viewport = LogicalViewport {
         x: 100.0,
         y: 80.0,
-        width: 800.0,
-        height: 620.01,
+        width: 1000.0,
+        height: 800.0,
     };
-    assert!(macos_child_bounds(viewport, 700.0).is_err());
-    assert!(windows_child_bounds(viewport, 2.0, 1800, 1400).is_err());
-    assert!(windows_child_bounds(
-        LogicalViewport {
-            width: 800.01,
-            height: 620.0,
-            ..viewport
-        },
-        2.0,
-        1800,
-        1400
-    )
-    .is_err());
+    assert_eq!(
+        macos_child_bounds(viewport, 900.0, 700.0).unwrap(),
+        NativeChildBounds {
+            x: 100,
+            y: 0,
+            width: 800,
+            height: 620
+        }
+    );
+    assert_eq!(
+        windows_child_bounds(viewport, 1.5, 1350, 1050).unwrap(),
+        NativeChildBounds {
+            x: 150,
+            y: 120,
+            width: 1200,
+            height: 930
+        }
+    );
+    for (x, y, width, height) in [
+        (900.0, 0.0, 900.0, 700.0),
+        (0.0, 700.0, 900.0, 700.0),
+        (0.0, 0.0, 0.0, 0.0),
+    ] {
+        let rect = LogicalViewport { x, y, ..viewport };
+        assert!(macos_child_bounds(rect, width, height)
+            .unwrap_err()
+            .starts_with("CEF_VIEWPORT_NOT_READY:"));
+        assert!(windows_child_bounds(rect, 1.0, width as i32, height as i32)
+            .unwrap_err()
+            .starts_with("CEF_VIEWPORT_NOT_READY:"));
+    }
+}
+
+#[test]
+fn clipping_never_admits_non_finite_or_unrepresentable_geometry() {
+    let valid = LogicalViewport {
+        x: 10.0,
+        y: 20.0,
+        width: 400.0,
+        height: 300.0,
+    };
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+        for rect in [
+            LogicalViewport { x: value, ..valid },
+            LogicalViewport { y: value, ..valid },
+            LogicalViewport {
+                width: value,
+                ..valid
+            },
+            LogicalViewport {
+                height: value,
+                ..valid
+            },
+        ] {
+            assert!(macos_child_bounds(rect, 900.0, 700.0).is_err());
+            assert!(windows_child_bounds(rect, 2.0, 1800, 1400).is_err());
+        }
+        assert!(windows_child_bounds(valid, value, 1800, 1400).is_err());
+    }
+    assert!(macos_child_bounds(valid, f64::INFINITY, 700.0).is_err());
+    assert!(macos_child_bounds(valid, 900.0, f64::MAX).is_err());
+}
+
+#[test]
+fn clipped_geometry_stays_inside_parent_for_zoom_dpi_and_resize_matrix() {
+    for (width, height) in [(880.0, 640.0), (900.0, 700.0), (1234.0, 789.0)] {
+        for zoom_step in 5..=13 {
+            let zoom = f64::from(zoom_step) / 10.0;
+            for noise in [-0.0001, 0.0, 0.0001, 0.01, 150.0] {
+                let rect = LogicalViewport {
+                    x: width * 0.55,
+                    y: 100.0 * zoom,
+                    width: width * 0.45 + noise,
+                    height: height - 100.0 * zoom + noise,
+                };
+                let mac = macos_child_bounds(rect, width, height).unwrap();
+                assert!(mac.x >= 0 && mac.y >= 0 && mac.width > 0 && mac.height > 0);
+                assert!(f64::from(mac.x + mac.width) <= width);
+                assert!(f64::from(mac.y + mac.height) <= height);
+                for dpi in [1.0, 1.25, 1.5, 2.0, 3.0] {
+                    let pw = (width * dpi) as i32;
+                    let ph = (height * dpi) as i32;
+                    let win = windows_child_bounds(rect, dpi, pw, ph).unwrap();
+                    assert!(win.x >= 0 && win.y >= 0 && win.width > 0 && win.height > 0);
+                    assert!(win.x + win.width <= pw && win.y + win.height <= ph);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -238,7 +316,7 @@ fn viewport_snapping_does_not_produce_an_empty_native_child() {
             width,
             height,
         };
-        assert!(macos_child_bounds(viewport, 700.0).is_err());
+        assert!(macos_child_bounds(viewport, 900.0, 700.0).is_err());
         assert!(windows_child_bounds(viewport, 2.0, 1800, 1400).is_err());
     }
 }
@@ -251,12 +329,13 @@ fn native_viewport_rejects_non_finite_empty_and_out_of_parent_geometry() {
         width: 400.0,
         height: 300.0,
     };
-    assert!(macos_child_bounds(valid, 700.0).is_ok());
+    assert!(macos_child_bounds(valid, 900.0, 700.0).is_ok());
     assert!(macos_child_bounds(
         LogicalViewport {
             width: 0.0,
             ..valid
         },
+        900.0,
         700.0
     )
     .is_err());
@@ -265,16 +344,18 @@ fn native_viewport_rejects_non_finite_empty_and_out_of_parent_geometry() {
             x: f64::NAN,
             ..valid
         },
+        900.0,
         700.0
     )
     .is_err());
-    assert!(macos_child_bounds(valid, f64::INFINITY).is_err());
+    assert!(macos_child_bounds(valid, 900.0, f64::INFINITY).is_err());
     assert!(macos_child_bounds(
         LogicalViewport {
-            y: 500.0,
+            y: 800.0,
             height: 300.0,
             ..valid
         },
+        900.0,
         700.0,
     )
     .is_err());

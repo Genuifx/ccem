@@ -180,7 +180,11 @@ impl CefHostController {
                 .map_err(|error| format!("resolve CCEM content NSView: {error}"))?;
             let parent = unsafe { parent_view.cast::<NSView>().as_ref() }
                 .ok_or_else(|| "CCEM content NSView is null".to_string())?;
-            let bounds = macos_child_bounds(request.viewport, parent.bounds().size.height)?;
+            let bounds = macos_child_bounds(
+                request.viewport,
+                parent.bounds().size.width,
+                parent.bounds().size.height,
+            )?;
             super::surface::macos::create_surface(
                 &app_handle,
                 &profile_root,
@@ -217,7 +221,11 @@ impl CefHostController {
                 .map_err(|error| format!("resolve CCEM content NSView: {error}"))?;
             let parent = unsafe { parent_view.cast::<NSView>().as_ref() }
                 .ok_or_else(|| "CCEM content NSView is null".to_string())?;
-            let bounds = macos_child_bounds(viewport, parent.bounds().size.height)?;
+            let bounds = macos_child_bounds(
+                viewport,
+                parent.bounds().size.width,
+                parent.bounds().size.height,
+            )?;
             super::surface::macos::set_bounds(&surface_id, bounds)
         })
     }

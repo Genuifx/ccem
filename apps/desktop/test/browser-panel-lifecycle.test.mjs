@@ -96,15 +96,19 @@ const browserPanelTestStubs = {
           'geometry-sync': `
             export function useNativeBrowserSurfaceGeometrySync(_frameRef, syncBounds, enabled = true) {
               globalThis.${bridgeKey}.React.useEffect(() => {
-                if (enabled) syncBounds();
+                if (!enabled) return;
+                syncBounds();
+                window.addEventListener('resize', syncBounds);
+                return () => window.removeEventListener('resize', syncBounds);
               }, [enabled, syncBounds]);
             }
           `,
           'webcontent-recovery': `
             // This suite isolates the real Panel lifecycle. Recovery protocol and
             // metadata acknowledgement are exercised by the workspace recovery suite.
-            export function invokeBrowserCommand(command, args) {
-              return globalThis.${bridgeKey}.invoke(command, args);
+            export async function invokeBrowserCommand(command, args, prepare) {
+              await globalThis.${bridgeKey}.beforeInvoke?.(command);
+              return globalThis.${bridgeKey}.invoke(command, { ...args, ...prepare?.() });
             }
           `,
           'native-browser-overlay': `
@@ -678,6 +682,115 @@ test('cold acquire reads current bounds after asynchronous listener setup', asyn
     x: 300, y: 100, width: 500, height: 400,
   }, 'initial layout is only a readiness signal, not an immutable acquire rectangle');
   assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'ready');
+});
+
+async function mountGeometryPanel(t, bridge) {
+  const dom = installDom();
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  let closed = false;
+  const mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh', backend: 'login', sessionId: 'runtime:geometry-recovery:1',
+    workingDir: '/workspace', profileMode: 'default', presentationRevision: 1,
+    isActiveSurface: true, surfaceOccluded: false, onClose() {},
+  });
+  const close = () => { if (!closed) { mounted.unmount(); closed = true; } };
+  t.after(async () => {
+    close();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+  const settle = async (predicate) => {
+    for (let i = 0; i < 80; i++) {
+      await harness.flushEffects();
+      if (predicate()) return;
+    }
+    assert.fail('geometry state did not settle');
+  };
+  return { harness, container, close, settle };
+}
+
+test('geometry races retry with current dimensions and increasing revisions before becoming ready', async t => {
+  const bridge = createBridge();
+  const invoke = bridge.invoke;
+  const attempts = [];
+  bridge.invoke = async (command, args) => {
+    if (command === 'browser_surface_acquire') {
+      attempts.push(args);
+      if (attempts.length < 3) throw new Error('CEF_VIEWPORT_NOT_READY: parent is resizing');
+    }
+    return invoke(command, args);
+  };
+  const { container, settle } = await mountGeometryPanel(t, bridge);
+  Object.defineProperty(container.querySelector('[data-ccem-browser-frame]'), 'getBoundingClientRect', {
+    value: () => new window.DOMRect(100, 80, attempts.length ? 400 : 720, 300),
+  });
+  await settle(() => container.querySelector('aside').dataset.ccemBrowserLifecycle === 'ready');
+  assert.equal(attempts.length, 3);
+  assert.equal(attempts[0].viewport.width, 720);
+  assert.equal(attempts[2].viewport.width, 400);
+  assert.ok(attempts.every((args, i) => i === 0 || args.clientRevision > attempts[i - 1].clientRevision));
+  assert.equal(container.querySelector('[data-ccem-browser-retry]'), null);
+  assert.equal(callsFor(bridge, 'browser_surface_release').length, 0);
+});
+
+for (const [message, expectedAttempts] of [
+  ['CEF_VIEWPORT_NOT_READY: persistent layout failure', 3],
+  ['Login Browser profile is locked', 1],
+]) {
+  test(`acquisition stays bounded and actionable: ${message}`, async t => {
+    const bridge = createBridge();
+    const invoke = bridge.invoke;
+    let attempts = 0;
+    bridge.invoke = async (command, args) => {
+      if (command === 'browser_surface_acquire') { attempts++; throw new Error(message); }
+      return invoke(command, args);
+    };
+    const { container, harness, settle } = await mountGeometryPanel(t, bridge);
+    await settle(() => container.querySelector('aside').dataset.ccemBrowserLifecycle === 'failed');
+    window.dispatchEvent(new window.Event('resize'));
+    await harness.flushEffects();
+    assert.equal(attempts, expectedAttempts, 'resize must not turn a persistent failure into an infinite retry loop');
+    assert.ok(container.querySelector('[data-ccem-browser-retry]'));
+    assert.ok(container.textContent.includes(message));
+  });
+}
+
+test('a panel hidden during the metadata wait defers acquisition until real layout returns', async t => {
+  const bridge = createBridge();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  bridge.beforeInvoke = command => command === 'browser_surface_acquire' ? gate : undefined;
+  const { container, harness, settle } = await mountGeometryPanel(t, bridge);
+  await harness.flushEffects();
+  let hidden = true;
+  Object.defineProperty(container.querySelector('[data-ccem-browser-frame]'), 'getBoundingClientRect', {
+    value: () => new window.DOMRect(0, 0, hidden ? 0 : 400, hidden ? 0 : 300),
+  });
+  release();
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 0);
+  assert.equal(container.querySelector('[data-ccem-browser-retry]'), null);
+  hidden = false;
+  window.dispatchEvent(new window.Event('resize'));
+  await settle(() => container.querySelector('aside').dataset.ccemBrowserLifecycle === 'ready');
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 1);
+  assert.equal(callsFor(bridge, 'browser_surface_acquire')[0].args.viewport.width, 400);
+});
+
+test('unmount during the final acknowledgement cancels acquisition before allocating CEF', async t => {
+  const bridge = createBridge();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  bridge.beforeInvoke = command => command === 'browser_surface_acquire' ? gate : undefined;
+  const { harness, close } = await mountGeometryPanel(t, bridge);
+  await harness.flushEffects();
+  close();
+  release();
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 0);
+  assert.equal(callsFor(bridge, 'browser_surface_release').length, 0);
 });
 
 test('Login locale changes retain its lease until the panel actually unmounts', async (t) => {
