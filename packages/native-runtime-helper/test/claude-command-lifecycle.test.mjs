@@ -237,9 +237,10 @@ test('a terminal-before-Result keeps late usage detached from the next command',
     'late-result-one',
   ), 'late first Result observation');
   assert.equal(lifecycleCount(session, 'turn_result_observed', 'late-result-two'), 0);
-  assert.ok(session.outputs.some((output) => output.type === 'event'
+  // Late usage follows its Result observation as a separate stdout line.
+  await waitForOutput(session, (output) => output.type === 'event'
     && output.payload?.type === 'token_usage'
-    && output.payload.scope === 'turn_total'));
+    && output.payload.scope === 'turn_total', 'late first Result usage');
   await waitForOutput(session, (output) => isLifecycle(
     output,
     'sdk_command_state',

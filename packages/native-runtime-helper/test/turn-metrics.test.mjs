@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { startHelper, send, waitForOutput } from './claude-command-lifecycle-harness.mjs';
 
 const bundled = await build({
-  entryPoints: [new URL('../src/inputOperation.ts', import.meta.url).pathname],
+  entryPoints: [fileURLToPath(new URL('../src/inputOperation.ts', import.meta.url))],
   bundle: true, write: false, platform: 'node', format: 'esm', logLevel: 'silent',
 });
 const { InputOperation } = await import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
