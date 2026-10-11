@@ -448,7 +448,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
   );
   assert.match(
     panelSource,
-    /surfaceOrdering\.enqueue\(\(clientRevision\) => \([\s\S]*browserSurfaceClient\.acquire\(\{ \.\.\.acquireRequest, clientRevision \}\)/,
+    /surfaceOrdering\.enqueue\(\(clientRevision\) => \(\s*browserSurfaceClient\.acquire\(\{\s*\.\.\.acquireRequest,\s*clientRevision,/,
   );
   assert.doesNotMatch(panelSource, /disposition: 'hide'/);
   assert.match(
@@ -504,7 +504,7 @@ test('panel source exposes only Mode 2 lease commands through one ordering lane'
     listenerIndex,
   );
   const acquireIndex = panelSource.indexOf(
-    'browserSurfaceClient.acquire({ ...acquireRequest, clientRevision })',
+    'browserSurfaceClient.acquire({',
   );
   assert.ok(listenerIndex > 0);
   assert.ok(hostShortcutListenerIndex > listenerIndex);

@@ -182,6 +182,68 @@ fn browser_panel_top_left_coordinates_convert_to_outward_rounded_nsview_bounds()
 }
 
 #[test]
+fn zoomed_webview_roundoff_does_not_reject_a_flush_parent_edge() {
+    // Measured in WKWebView at 90% zoom in a 900x700 logical window. The DOM
+    // bottom maps to 700.0000076293945, and the right edge to 900.0000274658203.
+    let viewport = LogicalViewport {
+        x: 457.39064025878906,
+        y: 126.95313262939452,
+        width: 442.60938720703126,
+        height: 573.046875,
+    };
+    let macos = macos_child_bounds(viewport, 700.0).expect("subpixel roundoff is not overflow");
+    assert_eq!(macos.y, 0);
+    assert_eq!(macos.x + macos.width, 900);
+    assert_eq!(macos.height, 574);
+
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let width = (900.0 * scale) as i32;
+        let height = (700.0 * scale) as i32;
+        let windows = windows_child_bounds(viewport, scale, width, height)
+            .expect("DPI conversion must not amplify roundoff into an extra pixel");
+        assert_eq!(windows.x + windows.width, width);
+        assert_eq!(windows.y + windows.height, height);
+    }
+}
+
+#[test]
+fn viewport_roundoff_tolerance_does_not_admit_real_overflow() {
+    let viewport = LogicalViewport {
+        x: 100.0,
+        y: 80.0,
+        width: 800.0,
+        height: 620.01,
+    };
+    assert!(macos_child_bounds(viewport, 700.0).is_err());
+    assert!(windows_child_bounds(viewport, 2.0, 1800, 1400).is_err());
+    assert!(windows_child_bounds(
+        LogicalViewport {
+            width: 800.01,
+            height: 620.0,
+            ..viewport
+        },
+        2.0,
+        1800,
+        1400
+    )
+    .is_err());
+}
+
+#[test]
+fn viewport_snapping_does_not_produce_an_empty_native_child() {
+    for (width, height) in [(0.0001, 300.0), (400.0, 0.0001)] {
+        let viewport = LogicalViewport {
+            x: 10.0,
+            y: 20.0,
+            width,
+            height,
+        };
+        assert!(macos_child_bounds(viewport, 700.0).is_err());
+        assert!(windows_child_bounds(viewport, 2.0, 1800, 1400).is_err());
+    }
+}
+
+#[test]
 fn native_viewport_rejects_non_finite_empty_and_out_of_parent_geometry() {
     let valid = LogicalViewport {
         x: 10.0,

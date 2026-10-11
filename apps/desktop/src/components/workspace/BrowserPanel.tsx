@@ -436,7 +436,6 @@ export function BrowserPanel({
       workingDir: workingDir.trim(),
       ...profileSelection,
       initialUrl: initialUrlRef.current,
-      viewport: acquireViewport,
     };
 
     const applySurfaceState = (state: BrowserSurfaceStateChangedEvent) => {
@@ -492,7 +491,13 @@ export function BrowserPanel({
         unlistenHostShortcut = nextHostShortcutUnlisten;
 
         const lease = await surfaceOrdering.enqueue((clientRevision) => (
-          browserSurfaceClient.acquire({ ...acquireRequest, clientRevision })
+          browserSurfaceClient.acquire({
+            ...acquireRequest,
+            clientRevision,
+            // Listener setup, queued work, or a retry can follow a resize/zoom.
+            // Keep the initial rectangle only as a fallback for a now-hidden panel.
+            viewport: lifecycleActionsRef.current.readViewport() ?? acquireViewport,
+          })
         ));
         if (disposed) {
           await surfaceOrdering.enqueue((clientRevision) => (

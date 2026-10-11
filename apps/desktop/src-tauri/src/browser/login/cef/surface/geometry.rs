@@ -101,6 +101,20 @@ pub(crate) fn profile_cache_path(root: &Path, profile_id: &str) -> Result<PathBu
     Ok(path)
 }
 
+const NATIVE_EDGE_ROUNDOFF: f64 = 0.001;
+
+// WebView zoom uses floating-point layout coordinates. A flush edge can arrive as
+// 700.0000076 instead of 700; ceil would turn that noise into a whole extra pixel.
+// Preserve actual fractional edges, snapping only within 1/1000 of a native unit.
+fn snap_native_edge(value: f64) -> f64 {
+    let rounded = value.round();
+    if (value - rounded).abs() <= NATIVE_EDGE_ROUNDOFF {
+        rounded
+    } else {
+        value
+    }
+}
+
 /// DOM geometry is measured from the top-left of the Wry viewport while AppKit child views use a
 /// bottom-left origin. Rounding outward ensures the native browser fills the reserved slot without
 /// leaving a one-pixel seam when the app zoom produces fractional logical coordinates.
@@ -125,15 +139,15 @@ pub(crate) fn macos_child_bounds(
         || viewport.width <= 0.0
         || viewport.height <= 0.0
         || parent_height <= 0.0
-        || viewport.y + viewport.height > parent_height
+        || viewport.y + viewport.height > parent_height + NATIVE_EDGE_ROUNDOFF
     {
         return Err("CEF viewport geometry is outside its parent view".to_string());
     }
 
-    let left = viewport.x.floor();
-    let top = viewport.y.floor();
-    let right = (viewport.x + viewport.width).ceil();
-    let bottom = (viewport.y + viewport.height).ceil();
+    let left = snap_native_edge(viewport.x).floor();
+    let top = snap_native_edge(viewport.y).floor();
+    let right = snap_native_edge(viewport.x + viewport.width).ceil();
+    let bottom = snap_native_edge((viewport.y + viewport.height).min(parent_height)).ceil();
     let parent_bottom = parent_height.ceil();
     let values = [left, top, right, bottom, parent_bottom];
     if values
@@ -187,15 +201,17 @@ pub(crate) fn windows_child_bounds(
         return Err("CEF viewport geometry is outside its parent window".to_string());
     }
 
-    let left = (viewport.x * scale_factor).floor();
-    let top = (viewport.y * scale_factor).floor();
-    let right = ((viewport.x + viewport.width) * scale_factor).ceil();
-    let bottom = ((viewport.y + viewport.height) * scale_factor).ceil();
+    let left = snap_native_edge(viewport.x * scale_factor).floor();
+    let top = snap_native_edge(viewport.y * scale_factor).floor();
+    let right = snap_native_edge((viewport.x + viewport.width) * scale_factor).ceil();
+    let bottom = snap_native_edge((viewport.y + viewport.height) * scale_factor).ceil();
     if [left, top, right, bottom]
         .into_iter()
         .any(|value| value < 0.0 || value > i32::MAX as f64)
         || right > f64::from(parent_width)
         || bottom > f64::from(parent_height)
+        || right <= left
+        || bottom <= top
     {
         return Err("CEF viewport geometry is outside its parent window".to_string());
     }

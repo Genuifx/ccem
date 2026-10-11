@@ -346,7 +346,7 @@ test('BrowserPanel and every overlapping React surface use the acknowledgement g
   assert.match(browserPanel, /syncSurface\(requestedVisible, presentationRevision\)/);
   assert.match(
     browserPanel,
-    /browserSurfaceClient\.acquire\(\{ \.\.\.acquireRequest, clientRevision \}\)/,
+    /browserSurfaceClient\.acquire\(\{\s*\.\.\.acquireRequest,\s*clientRevision,/,
   );
   assert.doesNotMatch(browserPanel, /browser_open|browser_set_visible|browser_set_active_session/);
   assert.match(browserBackend, /pub fn open_with_visibility\(/);

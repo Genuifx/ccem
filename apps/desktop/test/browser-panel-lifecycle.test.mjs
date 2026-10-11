@@ -592,7 +592,7 @@ test('a restored hidden panel waits for positive bounds and reconnects without r
   assert.equal(callsFor(bridge, 'browser_surface_sync').at(-1).args.visible, true);
 });
 
-test('the acquire retry button reconnects the same panel identity after a transient failure', async (t) => {
+test('the acquire retry button remeasures resized bounds while reconnecting the same panel identity', async (t) => {
   const dom = installDom();
   const bridge = createBridge({ acquireSnapshot: { url: 'https://retained.example.test/' } });
   const invoke = bridge.invoke;
@@ -625,14 +625,59 @@ test('the acquire retry button reconnects the same panel identity after a transi
   assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'failed');
   const retry = container.querySelector('[data-ccem-browser-retry="true"]');
   assert.ok(retry, 'failed acquisition exposes a usable retry gesture');
+  const resizedBounds = { x: 300, y: 100, width: 500, height: 400 };
+  Object.defineProperty(container.querySelector('[data-ccem-browser-frame]'), 'getBoundingClientRect', {
+    value: () => new window.DOMRect(resizedBounds.x, resizedBounds.y, resizedBounds.width, resizedBounds.height),
+  });
   harness.click(retry);
   await harness.flushEffects();
   await harness.flushEffects();
   assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'ready');
   assert.equal(container.querySelector('[data-ccem-browser-retry="true"]'), null);
   assert.deepEqual(callsFor(bridge, 'browser_surface_acquire').map(call => call.args.panelSessionId), [sessionId, sessionId]);
+  assert.deepEqual(callsFor(bridge, 'browser_surface_acquire').at(-1).args.viewport, resizedBounds,
+    'retry must not reuse the dimensions captured before the failure');
   assert.equal(callsFor(bridge, 'browser_surface_release').length, 0,
     'retrying an unacquired panel must not close its retained runtime');
+});
+
+test('cold acquire reads current bounds after asynchronous listener setup', async (t) => {
+  const dom = installDom();
+  const bridge = createBridge();
+  const listen = bridge.listen;
+  let allowListener;
+  const listenerGate = new Promise(resolve => { allowListener = resolve; });
+  bridge.listen = async (...args) => {
+    await listenerGate;
+    return listen(...args);
+  };
+  const { harness, tempDir } = await importBrowserPanelHarness();
+  const container = document.querySelector('#root');
+  let mounted;
+  t.after(async () => {
+    allowListener();
+    mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+  mounted = harness.mountBrowserPanel(container, {
+    locale: 'zh', backend: 'login', sessionId: 'runtime:cold-geometry:1',
+    workingDir: '/workspace', profileMode: 'default', presentationRevision: 1,
+    isActiveSurface: true, surfaceOccluded: false, onClose() {},
+  });
+  await harness.flushEffects();
+  assert.equal(callsFor(bridge, 'browser_surface_acquire').length, 0);
+  Object.defineProperty(container.querySelector('[data-ccem-browser-frame]'), 'getBoundingClientRect', {
+    value: () => new window.DOMRect(300, 100, 500, 400),
+  });
+  allowListener();
+  await harness.flushEffects();
+  await harness.flushEffects();
+  assert.deepEqual(callsFor(bridge, 'browser_surface_acquire')[0].args.viewport, {
+    x: 300, y: 100, width: 500, height: 400,
+  }, 'initial layout is only a readiness signal, not an immutable acquire rectangle');
+  assert.equal(container.querySelector('aside').dataset.ccemBrowserLifecycle, 'ready');
 });
 
 test('Login locale changes retain its lease until the panel actually unmounts', async (t) => {
