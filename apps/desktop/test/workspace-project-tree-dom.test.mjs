@@ -768,3 +768,99 @@ test('ProjectTree scrolls a selected row into view only when it is outside the v
 
   dom.window.HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect;
 });
+
+test('ProjectTree folds worktrees into their repository and gathers other origins into fixed groups', async (t) => {
+  const { dom } = installDom();
+  const { harness, tempDir } = await importProjectTreeHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+
+  let mounted;
+  t.after(async () => {
+    await mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const WORKTREE = '/Users/wzt/G/Github/copilot-worktrees/claude-code-env-manager/genuifx-psychic-dollop';
+  const HERMES_RUN = '/Users/wzt/.hermes/demand-inbox/executor-state/worktrees/0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+  const sessions = [
+    // A scheduled run inside the repository still belongs to the scheduled group.
+    { ...historySession({ id: 'nightly-report', timestamp: BASE_TIMESTAMP - 500 }), launchMode: 'cron' },
+    historySession({ id: 'repo-main', timestamp: BASE_TIMESTAMP - 1_000 }),
+    historySession({ id: 'repo-worktree', timestamp: BASE_TIMESTAMP - 2_000, project: WORKTREE, projectName: 'genuifx-psychic-dollop' }),
+    historySession({ id: 'hermes-run', timestamp: BASE_TIMESTAMP - 3_000, project: HERMES_RUN, projectName: '0f1e2d3c4b5a69788796a5b4c3d2e1f0' }),
+    historySession({ id: 'home-chat', timestamp: BASE_TIMESTAMP - 4_000, project: '/Users/wzt', projectName: 'wzt' }),
+  ];
+
+  mounted = await harness.mountProjectTree(container, {
+    historySessions: sessions,
+    liveEntries: [],
+    onSelect: () => {},
+  });
+
+  const headerKeys = () => Array.from(container.querySelectorAll('[data-project-motion-key]'))
+    .map((element) => element.dataset.projectMotionKey)
+    .filter((key) => key.startsWith('project:'));
+  const rowKeysIn = (selector) => Array.from(container.querySelectorAll(`${selector} [data-workspace-session-key]`))
+    .map((element) => element.dataset.workspaceSessionKey);
+  const nodeSelector = (motionKey) => `[data-project-motion-key="${motionKey}"]`;
+  const groupToggle = (groupId) => container.querySelector(
+    `${nodeSelector(`project:group:ccem-group:${groupId}`)} button[aria-expanded]`,
+  );
+
+  // Five directories become one repository plus fixed groups below a divider.
+  assert.deepEqual(headerKeys(), [
+    `project:main:${PROJECT}`,
+    'project:group:ccem-group:chat',
+    'project:group:ccem-group:agent',
+    'project:group:ccem-group:scheduled',
+  ]);
+  const groupsBlock = container.querySelector('[data-sidebar-groups]');
+  assert.ok(groupsBlock);
+  assert.equal(groupsBlock.querySelectorAll('[data-project-motion-key^="project:main:"]').length, 0);
+
+  // The worktree run sits under its repository and names the worktree; the
+  // scheduled run does not, even though it used the same directory.
+  assert.deepEqual(rowKeysIn(nodeSelector(`project:main:${PROJECT}`)), ['claude:repo-main', 'claude:repo-worktree']);
+  assert.match(
+    container.querySelector('[data-workspace-session-key="claude:repo-worktree"]').textContent,
+    /genuifx-psychic-dollop/,
+  );
+  assert.doesNotMatch(
+    container.querySelector('[data-workspace-session-key="claude:repo-main"]').textContent,
+    /genuifx-psychic-dollop/,
+  );
+
+  // Groups start collapsed with a count and open on demand.
+  const scheduledToggle = groupToggle('scheduled');
+  assert.equal(scheduledToggle.getAttribute('aria-expanded'), 'false');
+  assert.match(scheduledToggle.textContent, /定时任务\s*1/);
+  assert.match(groupToggle('agent').textContent, /Agent 任务\s*1/);
+  assert.match(groupToggle('chat').textContent, /无项目会话\s*1/);
+  await mounted.click(scheduledToggle);
+  assert.equal(groupToggle('scheduled').getAttribute('aria-expanded'), 'true');
+  assert.deepEqual(rowKeysIn(nodeSelector('project:group:ccem-group:scheduled')), ['claude:nightly-report']);
+
+  // Recent mode keeps hand-run sessions on the timeline and moves finished
+  // automated runs into the groups below it.
+  await mounted.click(container.querySelector('button[aria-label="按时间排序"]'));
+  assert.deepEqual(rowKeysIn('[data-recent-bucket]'), [
+    'claude:repo-main',
+    'claude:repo-worktree',
+    'claude:home-chat',
+  ]);
+  assert.deepEqual(headerKeys(), [
+    'project:group:ccem-group:agent',
+    'project:group:ccem-group:scheduled',
+  ]);
+  assert.match(
+    container.querySelector('[data-recent-bucket] [data-workspace-session-key="claude:repo-worktree"]').textContent,
+    /claude-code-env-manager · genuifx-psychic-dollop/,
+  );
+  assert.match(
+    container.querySelector('[data-recent-bucket] [data-workspace-session-key="claude:home-chat"]').textContent,
+    /无项目会话/,
+  );
+});

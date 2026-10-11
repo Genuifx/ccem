@@ -46,6 +46,12 @@ pub struct HistorySession {
     pub task_sticker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_label: Option<String>,
+    /// Launch origin: provenance modes (`cron`, `external_control`,
+    /// `native_sdk`, ...) or `automation` / `subagent` for Codex Desktop
+    /// automation and sub-agent threads.
+    /// The workspace sidebar groups automated launches by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -229,6 +235,9 @@ struct CodexLine {
 struct CodexSessionMeta {
     cwd: Option<String>,
     subagent_parent_thread_id: Option<String>,
+    guardian_parent_thread_id: Option<String>,
+    thread_source: Option<String>,
+    agent_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,12 +255,16 @@ struct CodexSessionFileInfo {
     rollout_path: PathBuf,
     cwd: Option<String>,
     modified_at: u64,
+    thread_source: Option<String>,
+    agent_label: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct CodexSessionFileCollection {
     files: Vec<(String, CodexSessionFileInfo)>,
     subagent_parent_by_id: HashMap<String, String>,
+    /// Guardian approval reviews carry no conversation of their own.
+    guardian_parent_by_id: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +282,8 @@ struct CodexThreadRecord {
     updated_at: u64,
     cwd: Option<String>,
     title: Option<String>,
+    thread_source: Option<String>,
+    agent_label: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -284,6 +299,65 @@ struct CodexSessionRecord {
     rollout_path: Option<PathBuf>,
     rollout_priority: u8,
     rollout_timestamp: u64,
+    launch_mode: Option<String>,
+    /// Last-resort title for untitled sub-agent threads.
+    agent_label: Option<String>,
+}
+
+/// Codex Desktop records why a thread exists (`user`, `automation`,
+/// `subagent`, `guardian_review`, ...). Scheduled automations and
+/// machine-spawned sub-agent threads map onto launch modes.
+const CODEX_LAUNCH_MODE_AUTOMATION: &str = "automation";
+const CODEX_LAUNCH_MODE_SUBAGENT: &str = "subagent";
+
+fn codex_launch_mode_from_thread_source(thread_source: Option<&str>) -> Option<String> {
+    let thread_source = thread_source?.trim().to_ascii_lowercase();
+    let launch_mode = match thread_source.as_str() {
+        "automation" => CODEX_LAUNCH_MODE_AUTOMATION,
+        "subagent" | "guardian_review" => CODEX_LAUNCH_MODE_SUBAGENT,
+        _ => return None,
+    };
+    Some(launch_mode.to_string())
+}
+
+fn apply_codex_thread_source(record: &mut CodexSessionRecord, thread_source: Option<&str>) {
+    if let Some(launch_mode) = codex_launch_mode_from_thread_source(thread_source) {
+        record.launch_mode = Some(launch_mode);
+    }
+}
+
+/// Spawned sub-agents are usually untitled; their agent path names the task
+/// the parent delegated (`/root/token_scope_review`) and the nickname tells
+/// sibling workers apart (`token_scope_review · Cicero`).
+fn codex_subagent_label(nickname: Option<&str>, agent_path: Option<&str>) -> Option<String> {
+    let task = agent_path
+        .and_then(|path| path.trim().trim_end_matches('/').rsplit('/').next())
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && *segment != "root");
+    let nickname = nickname.map(str::trim).filter(|name| !name.is_empty());
+    match (task, nickname) {
+        (Some(task), Some(nickname)) => Some(format!("{task} · {nickname}")),
+        (Some(label), None) | (None, Some(label)) => Some(label.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn apply_codex_agent_label(record: &mut CodexSessionRecord, agent_label: Option<String>) {
+    if record.agent_label.is_none() {
+        record.agent_label = agent_label;
+    }
+}
+
+/// Runs after duplicate sub-agent collapsing, which must only compare the
+/// real titles a worker shares with its parent thread.
+fn apply_codex_agent_label_fallbacks(session_map: &mut HashMap<String, CodexSessionRecord>) {
+    for record in session_map.values_mut() {
+        if record.display.is_empty() {
+            if let Some(label) = record.agent_label.take() {
+                record.display = label;
+            }
+        }
+    }
 }
 
 const CODEX_TITLE_PRIORITY_HISTORY: u8 = 1;
@@ -1831,6 +1905,7 @@ fn merge_claude_history_line(session_map: &mut HashMap<String, HistorySession>, 
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         },
     );
 }
@@ -1924,6 +1999,14 @@ fn is_cron_provenance_record(record: &session_provenance::SessionProvenanceRecor
         || record.started_via.trim().eq_ignore_ascii_case("cron")
 }
 
+fn provenance_launch_mode(record: &session_provenance::SessionProvenanceRecord) -> Option<String> {
+    if is_cron_provenance_record(record) {
+        return Some("cron".to_string());
+    }
+    let launch_mode = record.launch_mode.trim();
+    (!launch_mode.is_empty()).then(|| launch_mode.to_ascii_lowercase())
+}
+
 fn supplement_history_list_from_provenance(sessions: &mut [HistorySession], source: &str) {
     let records = match session_provenance::list_records_by_client(source) {
         Ok(records) => records,
@@ -1963,6 +2046,10 @@ fn apply_provenance_to_history_session(
 
     if session.config_source.is_none() || session.config_source.as_deref() == Some("native") {
         session.config_source = Some(record_config_source);
+    }
+
+    if let Some(launch_mode) = provenance_launch_mode(record) {
+        session.launch_mode = Some(launch_mode);
     }
 
     if session.project.is_empty() && !record.working_dir.trim().is_empty() {
@@ -2038,6 +2125,7 @@ fn history_session_from_provenance_record(
         task_stage: None,
         task_sticker: None,
         task_label: None,
+        launch_mode: None,
     })
 }
 
@@ -2277,6 +2365,9 @@ fn merge_history_session_metadata(winner: &mut HistorySession, donor: &HistorySe
     if winner.task_label.is_none() {
         winner.task_label = donor.task_label.clone();
     }
+    if winner.launch_mode.is_none() {
+        winner.launch_mode = donor.launch_mode.clone();
+    }
 }
 
 fn merge_claude_history_session(
@@ -2292,6 +2383,9 @@ fn merge_claude_history_session(
         {
             existing.project = candidate.project.clone();
             existing.project_name = candidate.project_name.clone();
+        }
+        if existing.launch_mode.is_none() {
+            existing.launch_mode = candidate.launch_mode.clone();
         }
         if (is_noise_display(&existing.display) && !is_noise_display(&candidate.display))
             || (candidate.timestamp >= existing.timestamp && !is_noise_display(&candidate.display))
@@ -2436,6 +2530,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
         task_stage: None,
         task_sticker: None,
         task_label: None,
+        launch_mode: None,
     })
 }
 
@@ -2972,6 +3067,7 @@ fn upsert_codex_history_session(
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
         );
     }
@@ -3097,6 +3193,7 @@ fn load_codex_history_from_config_limited(
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: record.launch_mode,
             })
         })
         .collect::<Vec<_>>();
@@ -3105,17 +3202,36 @@ fn load_codex_history_from_config_limited(
     Ok(sessions)
 }
 
+/// Id lookups also resolve threads that the session list folds away.
 fn build_codex_session_records(
     config: &CodexPathConfig,
 ) -> Result<HashMap<String, CodexSessionRecord>, String> {
-    build_codex_session_records_limited(config, None)
+    Ok(merge_codex_session_records(config, None).0)
 }
 
 fn build_codex_session_records_limited(
     config: &CodexPathConfig,
     session_scan_limit: Option<usize>,
 ) -> Result<HashMap<String, CodexSessionRecord>, String> {
-    let session_files =
+    let (mut session_map, session_files) = merge_codex_session_records(config, session_scan_limit);
+    collapse_codex_duplicate_subagent_records(
+        &mut session_map,
+        &session_files.subagent_parent_by_id,
+        &session_files.guardian_parent_by_id,
+    );
+    apply_codex_agent_label_fallbacks(&mut session_map);
+
+    Ok(session_map)
+}
+
+fn merge_codex_session_records(
+    config: &CodexPathConfig,
+    session_scan_limit: Option<usize>,
+) -> (
+    HashMap<String, CodexSessionRecord>,
+    CodexSessionFileCollection,
+) {
+    let mut session_files =
         collect_codex_session_files_limited(&config.sessions_root, session_scan_limit);
     let history_entries = load_codex_history_index(&config.history_path);
     let session_index_entries = load_codex_session_index(&config.session_index_path);
@@ -3123,7 +3239,7 @@ fn build_codex_session_records_limited(
 
     let mut session_map: HashMap<String, CodexSessionRecord> = HashMap::new();
 
-    for (session_id, file_info) in session_files.files {
+    for (session_id, file_info) in std::mem::take(&mut session_files.files) {
         let record = codex_record(&mut session_map, &session_id);
         apply_codex_rollout_path(
             record,
@@ -3137,6 +3253,8 @@ fn build_codex_session_records_limited(
             CODEX_PROJECT_PRIORITY_SESSION_META,
             file_info.modified_at,
         );
+        apply_codex_thread_source(record, file_info.thread_source.as_deref());
+        apply_codex_agent_label(record, file_info.agent_label);
         record.timestamp = record.timestamp.max(file_info.modified_at);
     }
 
@@ -3191,15 +3309,12 @@ fn build_codex_session_records_limited(
         if let Some(path) = thread.rollout_path {
             apply_codex_rollout_path(record, path, CODEX_ROLLOUT_PRIORITY_SQLITE, timestamp);
         }
+        apply_codex_thread_source(record, thread.thread_source.as_deref());
+        apply_codex_agent_label(record, thread.agent_label);
         record.timestamp = record.timestamp.max(timestamp);
     }
 
-    collapse_codex_duplicate_subagent_records(
-        &mut session_map,
-        &session_files.subagent_parent_by_id,
-    );
-
-    Ok(session_map)
+    (session_map, session_files)
 }
 
 fn find_codex_session_file_with_config(
@@ -3251,15 +3366,31 @@ fn load_codex_threads_from_state_db(config: &CodexPathConfig) -> Vec<CodexThread
             Err(_) => continue,
         };
 
-        let mut stmt = match conn
-            .prepare("SELECT id, rollout_path, created_at, updated_at, cwd, title FROM threads")
-        {
+        // Codex added these columns over several releases; older state
+        // databases still list threads, just without the extra metadata.
+        let columns = codex_thread_table_columns(&conn);
+        let optional_column = |name: &'static str| {
+            if columns.contains(name) {
+                name
+            } else {
+                "NULL"
+            }
+        };
+        let query = format!(
+            "SELECT id, rollout_path, created_at, updated_at, cwd, title, {}, {}, {} FROM threads",
+            optional_column("thread_source"),
+            optional_column("agent_nickname"),
+            optional_column("agent_path"),
+        );
+        let mut stmt = match conn.prepare(&query) {
             Ok(stmt) => stmt,
             Err(_) => continue,
         };
 
         let rows = match stmt.query_map([], |row| {
             let rollout_path: Option<String> = row.get(1)?;
+            let agent_nickname: Option<String> = row.get(7)?;
+            let agent_path: Option<String> = row.get(8)?;
             Ok(CodexThreadRecord {
                 id: row.get(0)?,
                 rollout_path: rollout_path
@@ -3270,6 +3401,8 @@ fn load_codex_threads_from_state_db(config: &CodexPathConfig) -> Vec<CodexThread
                 updated_at: normalize_unix_timestamp_i64(row.get::<_, i64>(3)?),
                 cwd: row.get(4)?,
                 title: row.get(5)?,
+                thread_source: row.get(6)?,
+                agent_label: codex_subagent_label(agent_nickname.as_deref(), agent_path.as_deref()),
             })
         }) {
             Ok(rows) => rows,
@@ -3280,6 +3413,18 @@ fn load_codex_threads_from_state_db(config: &CodexPathConfig) -> Vec<CodexThread
     }
 
     vec![]
+}
+
+fn codex_thread_table_columns(conn: &Connection) -> HashSet<String> {
+    let mut stmt = match conn.prepare("PRAGMA table_info(threads)") {
+        Ok(stmt) => stmt,
+        Err(_) => return HashSet::new(),
+    };
+    let columns = match stmt.query_map([], |row| row.get::<_, String>(1)) {
+        Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+        Err(_) => HashSet::new(),
+    };
+    columns
 }
 
 fn list_codex_state_db_candidates(sqlite_home: &Path) -> Vec<PathBuf> {
@@ -3396,22 +3541,35 @@ fn apply_codex_rollout_path(
 fn collapse_codex_duplicate_subagent_records(
     session_map: &mut HashMap<String, CodexSessionRecord>,
     subagent_parent_by_id: &HashMap<String, String>,
+    guardian_parent_by_id: &HashMap<String, String>,
 ) {
-    if subagent_parent_by_id.is_empty() {
+    if subagent_parent_by_id.is_empty() && guardian_parent_by_id.is_empty() {
         return;
     }
 
-    let duplicate_ids = subagent_parent_by_id
+    let duplicate_subagents =
+        subagent_parent_by_id
+            .iter()
+            .filter_map(|(subagent_id, parent_id)| {
+                let subagent = session_map.get(subagent_id)?;
+                let parent = session_map.get(parent_id)?;
+                if is_duplicate_codex_subagent_record(subagent, parent) {
+                    Some((subagent_id.clone(), parent_id.clone()))
+                } else {
+                    None
+                }
+            });
+    // Guardian approval reviews only hold a compacted copy of the parent's
+    // context, so they always fold into an openable parent thread.
+    let guardian_reviews = guardian_parent_by_id
         .iter()
-        .filter_map(|(subagent_id, parent_id)| {
-            let subagent = session_map.get(subagent_id)?;
+        .filter_map(|(review_id, parent_id)| {
             let parent = session_map.get(parent_id)?;
-            if is_duplicate_codex_subagent_record(subagent, parent) {
-                Some((subagent_id.clone(), parent_id.clone()))
-            } else {
-                None
-            }
-        })
+            (session_map.contains_key(review_id) && parent.rollout_path.is_some())
+                .then(|| (review_id.clone(), parent_id.clone()))
+        });
+    let duplicate_ids = duplicate_subagents
+        .chain(guardian_reviews)
         .collect::<Vec<_>>();
 
     for (subagent_id, parent_id) in duplicate_ids {
@@ -3505,24 +3663,42 @@ fn collect_codex_session_files_limited(
 
     for (modified_at, _, path_session_id, path) in candidates {
         let meta = read_codex_session_meta(&path);
-        let subagent_parent_thread_id = meta
-            .as_ref()
-            .and_then(|meta| meta.subagent_parent_thread_id.as_deref())
-            .filter(|parent_id| *parent_id != path_session_id && looks_like_uuid(parent_id))
-            .map(|parent_id| parent_id.to_string());
+        let valid_parent = |parent_id: Option<&str>| {
+            parent_id
+                .filter(|parent_id| *parent_id != path_session_id && looks_like_uuid(parent_id))
+                .map(|parent_id| parent_id.to_string())
+        };
+        let subagent_parent_thread_id = valid_parent(
+            meta.as_ref()
+                .and_then(|meta| meta.subagent_parent_thread_id.as_deref()),
+        );
+        let guardian_parent_thread_id = valid_parent(
+            meta.as_ref()
+                .and_then(|meta| meta.guardian_parent_thread_id.as_deref()),
+        );
 
         if let Some(parent_thread_id) = subagent_parent_thread_id {
             collection
                 .subagent_parent_by_id
                 .insert(path_session_id.clone(), parent_thread_id);
         }
+        if let Some(parent_thread_id) = guardian_parent_thread_id {
+            collection
+                .guardian_parent_by_id
+                .insert(path_session_id.clone(), parent_thread_id);
+        }
 
+        let (cwd, thread_source, agent_label) = meta
+            .map(|meta| (meta.cwd, meta.thread_source, meta.agent_label))
+            .unwrap_or_default();
         collection.files.push((
             path_session_id,
             CodexSessionFileInfo {
-                cwd: meta.and_then(|meta| meta.cwd),
+                cwd,
                 modified_at,
                 rollout_path: path,
+                thread_source,
+                agent_label,
             },
         ));
     }
@@ -3589,10 +3765,48 @@ fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
             .pointer("/source/subagent/thread_spawn/parent_thread_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let thread_source = payload
+            .get("thread_source")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // Rollouts written before `thread_source` existed only mark
+                // sub-agents through their `source` object.
+                payload
+                    .pointer("/source/subagent")
+                    .map(|_| CODEX_LAUNCH_MODE_SUBAGENT.to_string())
+            });
+        let spawn_field = |field: &str| {
+            payload.get(field).and_then(|v| v.as_str()).or_else(|| {
+                payload
+                    .pointer(&format!("/source/subagent/thread_spawn/{field}"))
+                    .and_then(|v| v.as_str())
+            })
+        };
+        let agent_label =
+            codex_subagent_label(spawn_field("agent_nickname"), spawn_field("agent_path"));
+        let is_guardian_review = payload
+            .pointer("/source/subagent/other")
+            .and_then(|v| v.as_str())
+            .is_some_and(|other| other.eq_ignore_ascii_case("guardian"))
+            || thread_source
+                .as_deref()
+                .is_some_and(|source| source.eq_ignore_ascii_case("guardian_review"));
+        let guardian_parent_thread_id = if is_guardian_review {
+            payload
+                .get("parent_thread_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
 
         return Some(CodexSessionMeta {
             cwd,
             subagent_parent_thread_id,
+            guardian_parent_thread_id,
+            thread_source,
+            agent_label,
         });
     }
 
@@ -4178,6 +4392,7 @@ fn parse_opencode_history_session(value: &serde_json::Value) -> Option<HistorySe
         task_stage: None,
         task_sticker: None,
         task_label: None,
+        launch_mode: None,
     })
 }
 
@@ -4446,6 +4661,7 @@ fn local_opencode_session_to_history_session(
         task_stage: None,
         task_sticker: None,
         task_label: None,
+        launch_mode: None,
     }
 }
 
@@ -4592,6 +4808,7 @@ pub fn map_dsh_list_item(item: &dsh_history::DshSessionListItem) -> HistorySessi
         task_stage: None,
         task_sticker: None,
         task_label: None,
+        launch_mode: None,
     }
 }
 
@@ -5311,14 +5528,15 @@ fn extract_usage_fields(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_workspace_overview_snapshot, collect_codex_session_files_limited,
-        dedupe_history_sessions_with_provenance_records, dedupe_near_duplicate_history_sessions,
-        discover_subagent_metas, discover_subagent_records, enrich_subagent_metas,
-        enrich_subagent_records, find_codex_session_file_with_config, is_noise_display,
-        load_claude_history_from_paths_limited_with_provenance_records,
+        build_workspace_overview_snapshot, codex_subagent_label,
+        collect_codex_session_files_limited, dedupe_history_sessions_with_provenance_records,
+        dedupe_near_duplicate_history_sessions, discover_subagent_metas, discover_subagent_records,
+        enrich_subagent_metas, enrich_subagent_records, find_codex_session_file_with_config,
+        is_noise_display, load_claude_history_from_paths_limited_with_provenance_records,
         load_codex_history_from_config, merge_opencode_history_session,
         merge_tool_results_into_messages, normalize_history_display, normalize_history_limit,
-        normalize_history_source, parse_claude_conversation_file, parse_claude_project_session_index, parse_codex_history_timestamp,
+        normalize_history_source, parse_claude_conversation_file,
+        parse_claude_project_session_index, parse_codex_history_timestamp,
         parse_opencode_conversation_export, parse_opencode_history_session,
         resolve_codex_path_config_from, score_history_search_match,
         supplement_history_from_provenance_records, upsert_codex_history_session, CodexHistoryLine,
@@ -5594,6 +5812,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
             HistorySession {
                 id: "newer-beta".to_string(),
@@ -5607,6 +5826,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
             HistorySession {
                 id: "newer-alpha".to_string(),
@@ -5620,6 +5840,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
         ];
 
@@ -5660,6 +5881,7 @@ mod tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         };
         let title_match = session("Optimize workspace performance", "ccem");
         let project_match = session("Refactor UI", "workspace-performance");
@@ -5917,6 +6139,7 @@ mod tests {
         assert_eq!(session.project_name, "ccem");
         assert_eq!(session.env_name.as_deref(), Some("glm-official"));
         assert_eq!(session.config_source.as_deref(), Some("ccem"));
+        assert_eq!(session.launch_mode.as_deref(), Some("cron"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -5959,6 +6182,7 @@ mod tests {
         assert_eq!(session.project_name, "baymax");
         assert_eq!(session.env_name.as_deref(), Some("KimiCodePlan"));
         assert_eq!(session.config_source.as_deref(), Some("ccem"));
+        assert_eq!(session.launch_mode.as_deref(), Some("cron"));
         assert_eq!(session.timestamp, 1_783_137_629_000);
 
         let _ = fs::remove_dir_all(root);
@@ -6010,6 +6234,63 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_provenance_exposes_normalized_launch_mode_on_existing_sessions() {
+        let mut session_map = HashMap::new();
+        for id in ["agent-session", "cron-via-session"] {
+            session_map.insert(
+                id.to_string(),
+                HistorySession {
+                    id: id.to_string(),
+                    source: SOURCE_CLAUDE.to_string(),
+                    display: "task".to_string(),
+                    timestamp: 1,
+                    project: "/Users/g/ccem".to_string(),
+                    project_name: "ccem".to_string(),
+                    env_name: None,
+                    config_source: None,
+                    task_stage: None,
+                    task_sticker: None,
+                    task_label: None,
+                    launch_mode: None,
+                },
+            );
+        }
+        let record = |id: &str, launch_mode: &str, started_via: &str| SessionProvenanceRecord {
+            ccem_session_id: format!("run-{id}"),
+            client: SOURCE_CLAUDE.to_string(),
+            source_session_id: id.to_string(),
+            env_name: "glm-official".to_string(),
+            config_source: Some("ccem".to_string()),
+            working_dir: "/Users/g/ccem".to_string(),
+            perm_mode: Some("dev".to_string()),
+            launch_mode: launch_mode.to_string(),
+            started_via: started_via.to_string(),
+            created_at: "2026-07-04T04:00:26Z".to_string(),
+            updated_at: "2026-07-04T04:00:29Z".to_string(),
+        };
+        let mut records = HashMap::new();
+        records.insert(
+            "agent-session".to_string(),
+            record("agent-session", "External_Control", "desktop_control"),
+        );
+        records.insert(
+            "cron-via-session".to_string(),
+            record("cron-via-session", "", "cron"),
+        );
+
+        supplement_history_from_provenance_records(&mut session_map, SOURCE_CLAUDE, records, None);
+
+        assert_eq!(
+            session_map["agent-session"].launch_mode.as_deref(),
+            Some("external_control")
+        );
+        assert_eq!(
+            session_map["cron-via-session"].launch_mode.as_deref(),
+            Some("cron")
+        );
     }
 
     #[test]
@@ -6065,6 +6346,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
         );
 
@@ -6082,6 +6364,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
         );
 
@@ -6824,6 +7107,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
             HistorySession {
                 id: "session-plain".to_string(),
@@ -6837,6 +7121,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
             HistorySession {
                 id: "session-later".to_string(),
@@ -6850,6 +7135,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
         ];
 
@@ -6896,6 +7182,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
             HistorySession {
                 id: "provider-session-1".to_string(),
@@ -6909,6 +7196,7 @@ mod tests {
                 task_stage: None,
                 task_sticker: None,
                 task_label: None,
+                launch_mode: None,
             },
         ];
 
@@ -6949,6 +7237,7 @@ mod tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         }];
 
         let deduped = dedupe_history_sessions_with_provenance_records(sessions, &records);
@@ -6983,6 +7272,319 @@ mod tests {
         assert_eq!(session.project, "/Users/g/ccem");
         assert_eq!(session.project_name, "ccem");
         assert!(session.timestamp > 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_codex_session_file_with_meta(
+        root: &Path,
+        session_id: &str,
+        cwd: &str,
+        extra_meta: serde_json::Value,
+    ) -> PathBuf {
+        let session_dir = root.join("sessions").join("2026").join("04").join("16");
+        fs::create_dir_all(&session_dir).expect("create codex session dir");
+        let path = session_dir.join(format!("rollout-2026-04-16T09-00-00-{session_id}.jsonl"));
+        let mut payload = serde_json::json!({
+            "id": session_id,
+            "cwd": cwd,
+            "originator": "Codex Desktop",
+        });
+        if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra_meta.as_object()) {
+            payload.extend(extra.clone());
+        }
+        let meta = serde_json::json!({
+            "timestamp": "2026-04-16T09:00:00.000Z",
+            "type": "session_meta",
+            "payload": payload,
+        });
+        let message = serde_json::json!({
+            "timestamp": "2026-04-16T09:00:01.000Z",
+            "type": "event_msg",
+            "payload": { "type": "user_message", "message": "daily check" },
+        });
+        fs::write(&path, format!("{meta}\n{message}\n")).expect("write codex session file");
+        path
+    }
+
+    #[test]
+    fn test_codex_history_maps_rollout_thread_source_to_launch_mode() {
+        let root = temp_history_dir("codex-thread-source-meta");
+        let sqlite_home = root.join("sqlite");
+        let cases = [
+            (
+                "019d8ca8-cf4d-74e2-be37-5554a73ec5aa",
+                serde_json::json!({ "source": "vscode", "thread_source": "automation" }),
+                Some("automation"),
+            ),
+            (
+                "019d8ca8-cf4d-74e2-be37-5554a73ec5bb",
+                serde_json::json!({ "source": "vscode", "thread_source": "user" }),
+                None,
+            ),
+            (
+                "019d8ca8-cf4d-74e2-be37-5554a73ec5cc",
+                serde_json::json!({
+                    "source": { "subagent": { "other": "guardian" } },
+                    "thread_source": "guardian_review",
+                }),
+                Some("subagent"),
+            ),
+            (
+                "019d8ca8-cf4d-74e2-be37-5554a73ec5dd",
+                serde_json::json!({ "source": { "subagent": { "other": "guardian" } } }),
+                Some("subagent"),
+            ),
+            (
+                "019d8ca8-cf4d-74e2-be37-5554a73ec5ee",
+                serde_json::json!({ "source": "exec" }),
+                None,
+            ),
+        ];
+        for (session_id, extra_meta, _) in &cases {
+            write_codex_session_file_with_meta(
+                &root,
+                session_id,
+                "/Users/g/ccem",
+                extra_meta.clone(),
+            );
+        }
+
+        let config = temp_codex_config(&root, &sqlite_home);
+        let sessions = load_codex_history_from_config(&config).expect("load codex history");
+        for (session_id, _, expected) in cases {
+            let session = sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .expect("session should exist");
+            assert_eq!(
+                session.launch_mode.as_deref(),
+                expected,
+                "session {session_id}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_codex_history_marks_automation_threads_from_sqlite_thread_source() {
+        let root = temp_history_dir("codex-automation-sqlite");
+        let sqlite_home = root.join("sqlite");
+        let session_id = "019d8c8b-16d2-7c22-bb28-dfe820b219aa";
+        let rollout_path = write_codex_session_file(&root, session_id, "/Users/g/ccem");
+
+        create_state_db(
+            &sqlite_home,
+            "state_5.sqlite",
+            &[
+                "ALTER TABLE threads ADD COLUMN thread_source TEXT;",
+                &format!(
+                    concat!(
+                        "INSERT INTO threads (",
+                        "id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, thread_source",
+                        ") VALUES (",
+                        "'{}', '{}', 1776183186, 1776183187, 'vscode', 'openai', '/Users/g/ccem', 'CCEM 每日检查', 'workspace-write', 'never', 'automation'",
+                        ");"
+                    ),
+                    session_id,
+                    rollout_path.display()
+                ),
+            ],
+        );
+
+        let config = temp_codex_config(&root, &sqlite_home);
+        let sessions = load_codex_history_from_config(&config).expect("load codex history");
+        let session = sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .expect("session should exist");
+
+        assert_eq!(session.display, "CCEM 每日检查");
+        assert_eq!(session.launch_mode.as_deref(), Some("automation"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_codex_subagent_label_prefers_task_name_then_nickname() {
+        assert_eq!(
+            codex_subagent_label(Some("Cicero"), Some("/root/token_scope_review")).as_deref(),
+            Some("token_scope_review · Cicero")
+        );
+        assert_eq!(
+            codex_subagent_label(None, Some("/root/perf/harness/")).as_deref(),
+            Some("harness")
+        );
+        assert_eq!(
+            codex_subagent_label(Some(" Tesla "), None).as_deref(),
+            Some("Tesla")
+        );
+        assert_eq!(codex_subagent_label(Some("  "), Some("/root")), None);
+        assert_eq!(codex_subagent_label(None, None), None);
+    }
+
+    #[test]
+    fn test_codex_history_titles_untitled_subagents_from_agent_metadata() {
+        let root = temp_history_dir("codex-subagent-agent-label");
+        let sqlite_home = root.join("sqlite");
+        let cwd = "/Users/g/Github/AG";
+        let parent_id = "019dd43b-1460-7621-af7b-d05a495ee171";
+        let rollout_meta_id = "019dd510-a117-7a63-b574-9051b6f1ba01";
+        let legacy_spawn_id = "019dd510-a117-7a63-b574-9051b6f1ba02";
+        let sqlite_label_id = "019dd510-a117-7a63-b574-9051b6f1ba03";
+        let titled_id = "019dd510-a117-7a63-b574-9051b6f1ba04";
+        let duplicate_id = "019dd510-a117-7a63-b574-9051b6f1ba05";
+
+        let parent_path = write_codex_session_file(&root, parent_id, cwd);
+        write_codex_session_file_with_meta(
+            &root,
+            rollout_meta_id,
+            cwd,
+            serde_json::json!({
+                "thread_source": "subagent",
+                "agent_nickname": "Cicero",
+                "agent_path": "/root/token_scope_review",
+                "source": { "subagent": { "thread_spawn": { "parent_thread_id": parent_id } } },
+            }),
+        );
+        write_codex_session_file_with_meta(
+            &root,
+            legacy_spawn_id,
+            cwd,
+            serde_json::json!({
+                "agent_nickname": null,
+                "source": { "subagent": { "thread_spawn": {
+                    "parent_thread_id": parent_id,
+                    "agent_nickname": "Bernoulli",
+                    "agent_path": "/root/perf/harness",
+                } } },
+            }),
+        );
+        let sqlite_label_path =
+            write_codex_subagent_session_file(&root, sqlite_label_id, parent_id, cwd);
+        let titled_path = write_codex_subagent_session_file(&root, titled_id, parent_id, cwd);
+        let duplicate_path = write_codex_subagent_session_file(&root, duplicate_id, parent_id, cwd);
+
+        let db_path = create_state_db(&sqlite_home, "state_5.sqlite", &[]);
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        let rows = [
+            (parent_id, parent_path.as_path(), "Parent title", None, None),
+            (
+                sqlite_label_id,
+                sqlite_label_path.as_path(),
+                "",
+                Some("Tesla"),
+                Some("/root/food_trial_a"),
+            ),
+            (
+                titled_id,
+                titled_path.as_path(),
+                "Child task title",
+                Some("Plato"),
+                Some("/root/food_live_acceptance"),
+            ),
+            (
+                duplicate_id,
+                duplicate_path.as_path(),
+                "Parent title",
+                Some("Gibbs"),
+                Some("/root/arch_review"),
+            ),
+        ];
+        for (id, path, title, nickname, agent_path) in rows {
+            conn.execute(
+                concat!(
+                    "INSERT INTO threads (",
+                    "id, rollout_path, created_at, updated_at, cwd, title, agent_nickname, agent_path",
+                    ") VALUES (?1, ?2, 1776182000, 1776182001, ?3, ?4, ?5, ?6)"
+                ),
+                rusqlite::params![
+                    id,
+                    path.to_string_lossy().to_string(),
+                    cwd,
+                    title,
+                    nickname,
+                    agent_path
+                ],
+            )
+            .expect("insert thread row");
+        }
+        drop(conn);
+
+        let config = temp_codex_config(&root, &sqlite_home);
+        let sessions = load_codex_history_from_config(&config).expect("load codex history");
+        let display_of = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| session.display.as_str())
+        };
+
+        assert_eq!(display_of(parent_id), Some("Parent title"));
+        assert_eq!(
+            display_of(rollout_meta_id),
+            Some("token_scope_review · Cicero")
+        );
+        assert_eq!(display_of(legacy_spawn_id), Some("harness · Bernoulli"));
+        assert_eq!(display_of(sqlite_label_id), Some("food_trial_a · Tesla"));
+        assert_eq!(display_of(titled_id), Some("Child task title"));
+        assert_eq!(
+            display_of(duplicate_id),
+            None,
+            "duplicate-title workers still fold into the parent"
+        );
+        assert_eq!(sessions.len(), 5);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_codex_history_folds_guardian_reviews_into_parent_thread() {
+        let root = temp_history_dir("codex-guardian-fold");
+        let sqlite_home = root.join("sqlite");
+        let cwd = "/Users/g/Documents/Codex/2026-09-18/22-00-asia-taipei-n-1";
+        let parent_id = "01a0b4d2-8280-79f0-a111-62de8a4aa96f";
+        let review_id = "01a0b4d2-8280-79f0-a111-62de8a4aa9a1";
+        let legacy_review_id = "01a0b4d2-8280-79f0-a111-62de8a4aa9a2";
+        let orphan_review_id = "01a0b4d2-8280-79f0-a111-62de8a4aa9a3";
+        let missing_parent_id = "01a0b4d2-8280-79f0-a111-62de8a4aa9ff";
+
+        write_codex_session_file(&root, parent_id, cwd);
+        for (id, thread_source, parent) in [
+            (review_id, "guardian_review", parent_id),
+            (legacy_review_id, "subagent", parent_id),
+            (orphan_review_id, "guardian_review", missing_parent_id),
+        ] {
+            write_codex_session_file_with_meta(
+                &root,
+                id,
+                cwd,
+                serde_json::json!({
+                    "parent_thread_id": parent,
+                    "thread_source": thread_source,
+                    "source": { "subagent": { "other": "guardian" } },
+                }),
+            );
+        }
+
+        let config = temp_codex_config(&root, &sqlite_home);
+        let sessions = load_codex_history_from_config(&config).expect("load codex history");
+        let mut ids = sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        assert_eq!(ids, vec![parent_id, orphan_review_id]);
+        let orphan = sessions
+            .iter()
+            .find(|session| session.id == orphan_review_id)
+            .expect("orphaned review stays visible");
+        assert_eq!(orphan.launch_mode.as_deref(), Some("subagent"));
+        let folded_rollout = find_codex_session_file_with_config(review_id, &config)
+            .expect("folded review stays openable by id");
+        assert!(folded_rollout.to_string_lossy().contains(review_id));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7960,6 +8562,7 @@ mod dsh_integration_tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         };
         assert_eq!(history_dedupe_key(&session), None);
     }
@@ -7978,6 +8581,7 @@ mod dsh_integration_tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         };
         assert!(history_dedupe_key(&session).is_some());
     }
@@ -8016,6 +8620,7 @@ mod dsh_integration_tests {
                     task_stage: None,
                     task_sticker: None,
                     task_label: None,
+                    launch_mode: None,
                 },
                 HistorySession {
                     id: "s2".to_string(),
@@ -8029,6 +8634,7 @@ mod dsh_integration_tests {
                     task_stage: None,
                     task_sticker: None,
                     task_label: None,
+                    launch_mode: None,
                 },
             ])
         })
@@ -8063,6 +8669,7 @@ mod dsh_integration_tests {
                     task_stage: None,
                     task_sticker: None,
                     task_label: None,
+                    launch_mode: None,
                 },
                 HistorySession {
                     id: "abcdef0123456789:dsh-leak".to_string(),
@@ -8076,6 +8683,7 @@ mod dsh_integration_tests {
                     task_stage: None,
                     task_sticker: None,
                     task_label: None,
+                    launch_mode: None,
                 },
             ])
         })
@@ -8195,6 +8803,7 @@ mod dsh_integration_tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         }];
         let dsh = vec![HistorySession {
             id: "abcdef0123456789:s1".to_string(),
@@ -8208,6 +8817,7 @@ mod dsh_integration_tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         }];
 
         let result = orchestrate_history_list(
@@ -8241,6 +8851,7 @@ mod dsh_integration_tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         }];
 
         let result = orchestrate_history_list(

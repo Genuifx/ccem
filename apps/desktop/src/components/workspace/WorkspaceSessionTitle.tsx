@@ -6,9 +6,12 @@ import { cn } from '@/lib/utils';
 export const WorkspaceSessionTitle = memo(function WorkspaceSessionTitle({
   title,
   className,
+  hint,
 }: {
   title: string;
   className?: string;
+  /** Native hover text, e.g. the full title plus the session directory. */
+  hint?: string;
 }) {
   const rootRef = useRef<HTMLSpanElement>(null);
   const currentRef = useRef<HTMLSpanElement>(null);
@@ -47,6 +50,7 @@ export const WorkspaceSessionTitle = memo(function WorkspaceSessionTitle({
       className={cn('relative block min-w-0 overflow-hidden', className)}
       data-workspace-session-title="true"
       aria-label={title}
+      title={hint}
     >
       <span ref={currentRef} className="block truncate" data-title-current="true">{title}</span>
       <span

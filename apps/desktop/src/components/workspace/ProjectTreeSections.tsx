@@ -1,14 +1,18 @@
 import { memo } from 'react';
 import type { ReactNode } from 'react';
 import {
+  Bot,
   ChevronRight,
   ChevronsUp,
+  FlaskConical,
   FolderClosed,
   FolderOpen,
   MessageSquare,
   RefreshCw,
+  RotateCcw,
   SquarePen,
-  X,
+  Timer,
+  type LucideIcon,
 } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -21,7 +25,7 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu';
 import type { HistorySessionItem } from '@/features/conversations/types';
-import type { ProjectClassification, ProjectNode, RecentSessionBucket } from './workspaceProjectTreeModel';
+import type { ProjectNode, RecentSessionBucket, SidebarGroupId } from './workspaceProjectTreeModel';
 
 export const PROJECT_TREE_PAGE_SIZE = 6;
 export const RECENT_BUCKET_PAGE_SIZE = 15;
@@ -31,18 +35,23 @@ type RenderSessionRow = (
   options?: {
     pinnedSection?: boolean;
     recentSection?: boolean;
-    activeTemporarySection?: boolean;
   },
 ) => ReactNode;
 
 type ProjectActionCallbacks = {
   onMarkTemporary: (project: string) => void;
-  onKeepMain: (project: string) => void;
-  onResetProjectClassification: (project: string) => void;
+  onResetProjectClassification: (overrideKey: string) => void;
   onOrganizeSidebar: () => void;
 };
 
-type ProjectNodeSectionKind = 'main' | 'temporary' | 'activeTemporary';
+type ProjectNodeSectionKind = 'main' | 'group';
+
+const GROUP_ICONS: Readonly<Record<SidebarGroupId, LucideIcon>> = {
+  chat: MessageSquare,
+  agent: Bot,
+  scheduled: Timer,
+  temporary: FlaskConical,
+};
 
 export const PinnedSessionsSection = memo(function PinnedSessionsSection({
   pinnedSessions,
@@ -150,82 +159,71 @@ export const RecentSessionsSection = memo(function RecentSessionsSection({
 });
 
 export const ProjectTreeContent = memo(function ProjectTreeContent({
-  activeTemporaryProjectNodes,
-  classificationsByProject,
   effectiveExpanded,
+  getProjectOverrideKey,
   getVisibleCount,
   getVisibleSessions,
+  groupLabel,
+  groupNodes,
   isLoading,
-  mainProjectNodes,
   onCreateForProject,
-  onDismissActiveTemporaryProject,
   pinnedSessionsCount,
   projectActions,
+  projectNodes,
   recentBuckets,
   recentTotalCount,
   onLoadMoreRecentBucket,
   onCollapseRecentBucket,
   renderSessionRow,
-  temporaryProjectNodes,
   toggleProject,
   collapseList,
   loadMore,
   t,
 }: {
-  activeTemporaryProjectNodes: ProjectNode[];
-  classificationsByProject: Record<string, ProjectClassification | undefined>;
   effectiveExpanded: Set<string>;
+  getProjectOverrideKey: (project: string) => string | undefined;
   getVisibleCount: (project: string) => number;
   getVisibleSessions: (node: ProjectNode) => HistorySessionItem[];
+  groupLabel: (groupId: SidebarGroupId) => string;
+  /** Fixed groups (projectless, agent, scheduled, temporary) listed below the main content. */
+  groupNodes: ProjectNode[];
   isLoading: boolean;
-  mainProjectNodes: ProjectNode[];
   onCreateForProject?: (projectPath: string) => void;
-  onDismissActiveTemporaryProject: (project: string) => void;
   pinnedSessionsCount: number;
   projectActions: ProjectActionCallbacks;
+  projectNodes: ProjectNode[];
   /** When defined, the tree renders time-bucketed flat groups instead of project groups. */
   recentBuckets?: Array<RecentSessionBucket & { totalCount: number }>;
   recentTotalCount?: number;
   onLoadMoreRecentBucket?: (bucketId: RecentSessionBucket['id']) => void;
   onCollapseRecentBucket?: (bucketId: RecentSessionBucket['id']) => void;
   renderSessionRow: RenderSessionRow;
-  temporaryProjectNodes: ProjectNode[];
   toggleProject: (project: string) => void;
   collapseList: (project: string) => void;
   loadMore: (project: string) => void;
   t: (key: string) => string;
 }) {
   const isRecentMode = recentBuckets !== undefined;
-  const hasProjectNodes =
-    mainProjectNodes.length > 0
-    || temporaryProjectNodes.length > 0
-    || activeTemporaryProjectNodes.length > 0;
-  const hasContent = isRecentMode ? (recentTotalCount ?? 0) > 0 : hasProjectNodes;
+  const hasPrimaryContent = isRecentMode ? (recentTotalCount ?? 0) > 0 : projectNodes.length > 0;
+  const hasContent = hasPrimaryContent || groupNodes.length > 0;
 
   const renderProjectNode = (
     node: ProjectNode,
     section: ProjectNodeSectionKind,
   ) => {
-    const isActiveTemporary = section === 'activeTemporary';
     const isExpanded = effectiveExpanded.has(node.project);
     const visibleCount = getVisibleCount(node.project);
     const visible = getVisibleSessions(node);
     const hasMore = node.sessions.length > visible.length;
     const canCollapse = visibleCount > PROJECT_TREE_PAGE_SIZE;
-    const classification = classificationsByProject[node.project];
-    const isTemporary = classification?.bucket === 'temporary';
-    const parentName = classification?.parentProjectName;
-    const metaLabel = isTemporary
-      ? parentName
-        ? t('workspace.temporaryProjectParent').replace('{project}', parentName)
-        : t('workspace.temporaryProjectLabel')
-      : null;
-    const showDismiss = isActiveTemporary;
+    const groupId = node.kind === 'group' ? node.groupId : undefined;
+    const GroupIcon = groupId ? GROUP_ICONS[groupId] : null;
+    const overrideKey = groupId ? undefined : getProjectOverrideKey(node.project);
+    const createPath = groupId ? undefined : node.createPath;
 
-    // Unified row vocabulary across main / temporary / activeTemporary sections.
-    // Active-temporary carries no decorative glow, no border, no shadow — the
-    // section location IS the active signal. Side-stripe borders and ghost-cards
-    // are explicit bans; do not reintroduce them.
+    // Projects and groups share one header vocabulary; the icon and the
+    // divider above the groups carry the difference. Side-stripe borders and
+    // ghost-cards are explicit bans; do not reintroduce them.
     const header = (
       <div
         className={cn(
@@ -237,6 +235,8 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
         <button
           type="button"
           onClick={() => toggleProject(node.project)}
+          aria-expanded={isExpanded}
+          title={createPath}
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           <ChevronRight
@@ -245,54 +245,30 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
               isExpanded && 'rotate-90'
             )}
           />
-          {isExpanded ? (
-            <FolderOpen className={cn('h-4 w-4 shrink-0', isTemporary ? 'text-amber-500' : 'text-primary')} />
+          {GroupIcon ? (
+            <GroupIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+          ) : isExpanded ? (
+            <FolderOpen className="h-4 w-4 shrink-0 text-primary" />
           ) : (
-            <FolderClosed className={cn('h-4 w-4 shrink-0', isTemporary ? 'text-amber-500' : 'text-muted-foreground')} />
+            <FolderClosed className="h-4 w-4 shrink-0 text-muted-foreground" />
           )}
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
-            {node.projectName}
+            {groupId ? groupLabel(groupId) : node.projectName}
           </span>
-          {metaLabel && (
-            <span className="max-w-[82px] shrink-0 truncate text-[10px] text-muted-foreground">
-              {metaLabel}
+          {groupId && (
+            <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+              {node.sessions.length}
             </span>
           )}
         </button>
-        {showDismiss && (
+        {createPath && onCreateForProject && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
-                  onDismissActiveTemporaryProject(node.project);
-                }}
-                aria-label={t('workspace.dismissActiveTemporaryProject')}
-                className={cn(
-                  'absolute right-2 top-1/2 z-10 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md',
-                  'pointer-events-none text-muted-foreground opacity-0 transition-opacity duration-150',
-                  'hover:bg-muted/80 hover:text-foreground focus:text-foreground',
-                  'focus:pointer-events-auto focus:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/25',
-                  'group-hover/project:pointer-events-auto group-hover/project:opacity-100'
-                )}
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right" sideOffset={6} className="whitespace-nowrap">
-              {t('workspace.dismissActiveTemporaryProject')}
-            </TooltipContent>
-          </Tooltip>
-        )}
-        {!showDismiss && onCreateForProject && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onCreateForProject(node.project);
+                  onCreateForProject(createPath);
                 }}
                 aria-label={t('workspace.createInProject')}
                 className={cn(
@@ -323,24 +299,21 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
         <ContextMenu>
           <ContextMenuTrigger asChild>{header}</ContextMenuTrigger>
           <ContextMenuContent className="w-56">
-            {classification?.bucket === 'temporary' ? (
-              <ContextMenuItem onClick={() => projectActions.onKeepMain(node.project)}>
-                <FolderClosed className="mr-2 h-3.5 w-3.5" />
-                {t('workspace.keepProjectInMainList')}
-              </ContextMenuItem>
-            ) : (
-              <ContextMenuItem onClick={() => projectActions.onMarkTemporary(node.project)}>
-                <FolderClosed className="mr-2 h-3.5 w-3.5" />
-                {t('workspace.markProjectTemporary')}
-              </ContextMenuItem>
+            {!groupId && (
+              <>
+                <ContextMenuItem onClick={() => projectActions.onMarkTemporary(node.project)}>
+                  <FlaskConical className="mr-2 h-3.5 w-3.5" />
+                  {t('workspace.markProjectTemporary')}
+                </ContextMenuItem>
+                {overrideKey && (
+                  <ContextMenuItem onClick={() => projectActions.onResetProjectClassification(overrideKey)}>
+                    <RotateCcw className="mr-2 h-3.5 w-3.5" />
+                    {t('workspace.resetProjectClassification')}
+                  </ContextMenuItem>
+                )}
+                <ContextMenuSeparator />
+              </>
             )}
-            {classification?.source === 'manual' && (
-              <ContextMenuItem onClick={() => projectActions.onResetProjectClassification(node.project)}>
-                <RefreshCw className="mr-2 h-3.5 w-3.5" />
-                {t('workspace.resetProjectClassification')}
-              </ContextMenuItem>
-            )}
-            <ContextMenuSeparator />
             <ContextMenuItem onClick={projectActions.onOrganizeSidebar}>
               <RefreshCw className="mr-2 h-3.5 w-3.5" />
               {t('workspace.organizeSidebar')}
@@ -398,44 +371,30 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
               <p className="text-xs text-muted-foreground/70">{t('workspace.noHistoryHint')}</p>
             </div>
           )
-        ) : isRecentMode ? (
-          <RecentSessionsSection
-            buckets={recentBuckets ?? []}
-            onLoadMoreBucket={onLoadMoreRecentBucket ?? (() => {})}
-            onCollapseBucket={onCollapseRecentBucket ?? (() => {})}
-            renderSessionRow={renderSessionRow}
-            t={t}
-          />
         ) : (
           <>
-            {mainProjectNodes.map((node) => renderProjectNode(node, 'main'))}
-            {temporaryProjectNodes.length > 0 && (
-              <div className="mt-2 border-t border-border/45 pt-2">
-                <div className="mb-1 flex h-5 items-center justify-between px-3">
-                  <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-                    {t('workspace.temporaryProjects')}
-                  </span>
-                  <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
-                    {temporaryProjectNodes.length}
-                  </span>
-                </div>
-                {temporaryProjectNodes.map((node) => renderProjectNode(node, 'temporary'))}
+            {isRecentMode ? (
+              hasPrimaryContent && (
+                <RecentSessionsSection
+                  buckets={recentBuckets ?? []}
+                  onLoadMoreBucket={onLoadMoreRecentBucket ?? (() => {})}
+                  onCollapseBucket={onCollapseRecentBucket ?? (() => {})}
+                  renderSessionRow={renderSessionRow}
+                  t={t}
+                />
+              )
+            ) : (
+              projectNodes.map((node) => renderProjectNode(node, 'main'))
+            )}
+            {groupNodes.length > 0 && (
+              <div
+                data-sidebar-groups
+                className={cn(hasPrimaryContent && 'mt-2 border-t border-border/45 pt-2')}
+              >
+                {groupNodes.map((node) => renderProjectNode(node, 'group'))}
               </div>
             )}
           </>
-        )}
-        {!isRecentMode && activeTemporaryProjectNodes.length > 0 && (
-          <div className="mt-2 border-t border-border/60 px-0.5 pb-1 pt-1.5">
-            <div className="mb-0.5 flex h-5 items-center justify-between px-3">
-              <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-                {t('workspace.activeTemporaryProjects')}
-              </span>
-              <span className="rounded-full bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-muted-foreground">
-                {activeTemporaryProjectNodes.length}
-              </span>
-            </div>
-            {activeTemporaryProjectNodes.map((node) => renderProjectNode(node, 'activeTemporary'))}
-          </div>
         )}
       </ScrollArea>
     </>

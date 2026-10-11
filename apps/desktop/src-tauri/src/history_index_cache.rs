@@ -139,6 +139,7 @@ mod tests {
             task_stage: None,
             task_sticker: None,
             task_label: None,
+            launch_mode: None,
         })
     }
 

@@ -1,39 +1,19 @@
 import type { HistorySessionItem } from '@/features/conversations/types';
 
-export type ProjectBucket = 'main' | 'temporary';
-export type ProjectBucketOverride = ProjectBucket;
-export type ProjectClassificationSource = 'manual' | 'worktree' | 'name' | 'regular';
+/** Fixed sidebar groups for sessions that do not belong to a project. */
+export type SidebarGroupId = 'chat' | 'agent' | 'scheduled' | 'temporary';
 
 export interface ProjectNode {
   project: string;
   projectName: string;
   sessions: HistorySessionItem[];
   latestTimestamp: number;
+  /** Project directory or fixed group; plain path nodes leave this unset. */
+  kind?: 'project' | 'group';
+  groupId?: SidebarGroupId;
+  /** Directory for new sessions; unset for groups and repositories without a known checkout. */
+  createPath?: string;
 }
-
-export interface ProjectClassification {
-  project: string;
-  bucket: ProjectBucket;
-  source: ProjectClassificationSource;
-  parentProject?: string;
-  parentProjectName?: string;
-}
-
-export interface SidebarProjectSections {
-  mainProjectNodes: ProjectNode[];
-  temporaryProjectNodes: ProjectNode[];
-  activeTemporaryProjectNodes: ProjectNode[];
-}
-
-const TEMPORARY_PROJECT_NAME_PATTERNS = [
-  /^ui(?:-|$)/i,
-  /^e2e(?:-|$)/i,
-  /^handoff(?:-|$)/i,
-  /^improve-\d{8}(?:-|$)/i,
-  /(?:^|-)mainflow-\d+/i,
-  /(?:^|-)smoke(?:-|$)/i,
-  /(?:^|-)checkpoint(?:-|$)/i,
-];
 
 // Align overflow budget with the UI page size so auto-expansion for active
 // sessions feels like one extra "Load more" click rather than an unbounded list.
@@ -46,67 +26,6 @@ export function normalizeProjectPath(path: string): string {
 export function projectBasename(path: string): string {
   const normalized = normalizeProjectPath(path);
   return normalized.split('/').filter(Boolean).pop() || 'unknown';
-}
-
-function pathKey(path: string): string {
-  return normalizeProjectPath(path).toLowerCase();
-}
-
-function inferWorktreeParent(project: string): string | null {
-  const normalized = normalizeProjectPath(project);
-  const marker = '/.worktrees/';
-  const markerIndex = normalized.toLowerCase().indexOf(marker);
-  if (markerIndex <= 0) {
-    return null;
-  }
-  return normalized.slice(0, markerIndex);
-}
-
-function hasTemporaryName(projectName: string): boolean {
-  return TEMPORARY_PROJECT_NAME_PATTERNS.some((pattern) => pattern.test(projectName));
-}
-
-export function classifyProject(
-  project: string,
-  allProjects: string[],
-  overrides: Record<string, ProjectBucketOverride | undefined> = {},
-): ProjectClassification {
-  const override = overrides[project];
-  if (override) {
-    return {
-      project,
-      bucket: override,
-      source: 'manual',
-    };
-  }
-
-  const parentProject = inferWorktreeParent(project);
-  if (parentProject) {
-    const knownProjectByKey = new Map(allProjects.map((candidate) => [pathKey(candidate), candidate]));
-    const canonicalParent = knownProjectByKey.get(pathKey(parentProject)) ?? parentProject;
-    return {
-      project,
-      bucket: 'temporary',
-      source: 'worktree',
-      parentProject: canonicalParent,
-      parentProjectName: projectBasename(canonicalParent),
-    };
-  }
-
-  const projectName = projectBasename(project);
-  if (hasTemporaryName(projectName)) {
-    return {
-      project,
-      bucket: 'temporary',
-      source: 'name',
-    };
-  }
-
-  return {
-    project,
-    bucket: 'main',
-    source: 'regular',
-  };
 }
 
 export function buildProjectNodes(sessions: HistorySessionItem[]): ProjectNode[] {
@@ -418,35 +337,4 @@ export function sortProjectNodesByOrder(nodes: ProjectNode[], projectOrder: stri
     }
     return right.latestTimestamp - left.latestTimestamp;
   });
-}
-
-export function splitProjectNodesForSidebar(
-  projectNodes: ProjectNode[],
-  classificationsByProject: Record<string, ProjectClassification | undefined>,
-  activeTemporaryProjects: Set<string>,
-  dismissedActiveTemporaryProjects: Set<string>,
-): SidebarProjectSections {
-  const mainProjectNodes: ProjectNode[] = [];
-  const temporaryProjectNodes: ProjectNode[] = [];
-  const activeTemporaryProjectNodes: ProjectNode[] = [];
-
-  for (const node of projectNodes) {
-    const classification = classificationsByProject[node.project];
-    if (classification?.bucket !== 'temporary') {
-      mainProjectNodes.push(node);
-      continue;
-    }
-
-    if (activeTemporaryProjects.has(node.project) && !dismissedActiveTemporaryProjects.has(node.project)) {
-      activeTemporaryProjectNodes.push(node);
-    } else {
-      temporaryProjectNodes.push(node);
-    }
-  }
-
-  return {
-    mainProjectNodes,
-    temporaryProjectNodes,
-    activeTemporaryProjectNodes,
-  };
 }

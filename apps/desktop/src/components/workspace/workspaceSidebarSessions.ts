@@ -71,7 +71,8 @@ export function areHistorySessionItemsEqual(
     && previous.configSource === next.configSource
     && previous.taskStage === next.taskStage
     && previous.taskSticker === next.taskSticker
-    && previous.taskLabel === next.taskLabel;
+    && previous.taskLabel === next.taskLabel
+    && previous.launchMode === next.launchMode;
 }
 
 export function retainStableHistorySessions(

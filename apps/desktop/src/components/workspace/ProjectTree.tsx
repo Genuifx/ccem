@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Check, Clock, Copy, FolderTree, Link, Pin, RefreshCw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
+import { Check, Clock, Copy, FolderOpen, FolderTree, Link, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion } from '@/lib/gsapMotion';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -36,16 +36,28 @@ import {
   buildProjectNodes,
   buildProjectPrioritySessionKeys,
   bucketRecentSessions,
-  classifyProject,
   reconcileProjectOrder,
   selectVisibleProjectSessions,
   sortProjectNodesByOrder,
-  splitProjectNodesForSidebar,
   stabilizeProjectNodeSessions,
-  type ProjectBucketOverride,
-  type ProjectClassification,
   type ProjectNode,
+  type SidebarGroupId,
 } from './workspaceProjectTreeModel';
+import {
+  SIDEBAR_GROUP_LABEL_KEYS,
+  canPromoteSessionOrigin,
+  describeSessionOrigin,
+  describeSessionOriginInNode,
+  findProjectClassificationOverrideKey,
+  groupSidebarSessions,
+  partitionRecentSessions,
+  resolveProjectPathOrigin,
+  resolveProjectPathOrigins,
+  resolveSessionOrigin,
+  updateProjectClassificationOverride,
+  type ProjectClassificationOverride,
+  type SessionOrigin,
+} from './workspaceSidebarGrouping';
 
 interface ProjectTreeProps {
   sessions: HistorySessionItem[];
@@ -98,7 +110,6 @@ const MAX_LABEL_LENGTH = 24;
 const PINNED_SESSION_KEYS_STORAGE_KEY = 'ccem-workspace-pinned-sessions';
 const PROJECT_ORDER_STORAGE_KEY = 'ccem-workspace-project-order';
 const PROJECT_CLASSIFICATION_STORAGE_KEY = 'ccem-workspace-project-classification';
-const DISMISSED_ACTIVE_TEMP_PROJECTS_STORAGE_KEY = 'ccem-workspace-dismissed-active-temp-projects';
 const SORT_MODE_STORAGE_KEY = 'ccem-workspace-project-tree-sort';
 const EMPTY_CANONICAL_KEY_MAP: Readonly<Record<string, string | undefined>> = {};
 const EMPTY_SESSION_KEY_SET: ReadonlySet<string> = new Set();
@@ -169,11 +180,7 @@ function readProjectOrder(): string[] {
   return readStringArrayStorage(PROJECT_ORDER_STORAGE_KEY);
 }
 
-function readDismissedActiveTemporaryProjects(): string[] {
-  return readStringArrayStorage(DISMISSED_ACTIVE_TEMP_PROJECTS_STORAGE_KEY);
-}
-
-function readProjectClassificationOverrides(): Record<string, ProjectBucketOverride> {
+function readProjectClassificationOverrides(): Record<string, ProjectClassificationOverride> {
   try {
     const rawValue = localStorage.getItem(PROJECT_CLASSIFICATION_STORAGE_KEY);
     if (!rawValue) {
@@ -184,7 +191,7 @@ function readProjectClassificationOverrides(): Record<string, ProjectBucketOverr
       return {};
     }
 
-    const result: Record<string, ProjectBucketOverride> = {};
+    const result: Record<string, ProjectClassificationOverride> = {};
     for (const [project, bucket] of Object.entries(parsed)) {
       if (typeof project !== 'string') {
         continue;
@@ -524,9 +531,6 @@ export const ProjectTree = memo(function ProjectTree({
   const [projectClassificationOverrides, setProjectClassificationOverrides] = useState(
     readProjectClassificationOverrides
   );
-  const [dismissedActiveTemporaryProjects, setDismissedActiveTemporaryProjects] = useState(
-    readDismissedActiveTemporaryProjects
-  );
   const [sortMode, setSortMode] = useState<ProjectTreeSortMode>(readSortMode);
 
   const processingKeysRef = useRef<Set<string>>(new Set());
@@ -592,13 +596,6 @@ export const ProjectTree = memo(function ProjectTree({
       JSON.stringify(projectClassificationOverrides)
     );
   }, [projectClassificationOverrides]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      DISMISSED_ACTIVE_TEMP_PROJECTS_STORAGE_KEY,
-      JSON.stringify(dismissedActiveTemporaryProjects)
-    );
-  }, [dismissedActiveTemporaryProjects]);
 
   useEffect(() => {
     localStorage.setItem(SORT_MODE_STORAGE_KEY, sortMode);
@@ -841,20 +838,76 @@ export const ProjectTree = memo(function ProjectTree({
     return buildProjectNodes(unpinnedSessions);
   }, [canonicalizeSessionKey, pinnedSessionKeySet, precomputedProjectNodes, sessionByKey, unpinnedSessions]);
 
-  const activityProjectOrder = useMemo(
-    () => activitySortedProjectNodes.map((node) => node.project),
-    [activitySortedProjectNodes]
+  // Classification sees every known directory: a shared worktree finds its
+  // repository through the main checkout, a tool folder through its project.
+  // The joined key keeps the list identity stable across unrelated updates.
+  const sessionProjectPathsRef = useRef<{ key: string; paths: string[] }>({ key: '', paths: [] });
+  const sessionProjectPaths = useMemo(() => {
+    const unique = new Set<string>();
+    for (const session of sessions) {
+      unique.add(session.project);
+    }
+    for (const node of precomputedProjectNodes ?? []) {
+      for (const session of node.sessions) {
+        unique.add(session.project);
+      }
+    }
+    const paths = Array.from(unique).sort();
+    const key = paths.join('\u0000');
+    if (key !== sessionProjectPathsRef.current.key) {
+      sessionProjectPathsRef.current = { key, paths };
+    }
+    return sessionProjectPathsRef.current.paths;
+  }, [precomputedProjectNodes, sessions]);
+
+  const pathOrigins = useMemo(
+    () => resolveProjectPathOrigins(sessionProjectPaths, projectClassificationOverrides),
+    [projectClassificationOverrides, sessionProjectPaths]
   );
 
-  const stableActivityProjectNodes = useMemo(() => {
+  const originOfSession = useMemo(() => {
+    const cache = new Map<string, SessionOrigin>();
+    return (session: HistorySessionItem): SessionOrigin => {
+      const cacheKey = `${session.launchMode ?? ''}\u0000${session.project}`;
+      const cached = cache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+      const pathOrigin = pathOrigins.get(session.project)
+        ?? resolveProjectPathOrigin(session.project, projectClassificationOverrides);
+      const origin = resolveSessionOrigin(session, pathOrigin);
+      cache.set(cacheKey, origin);
+      return origin;
+    };
+  }, [pathOrigins, projectClassificationOverrides]);
+
+  const groupLabel = useCallback(
+    (groupId: SidebarGroupId) => t(SIDEBAR_GROUP_LABEL_KEYS[groupId]),
+    [t]
+  );
+
+  const sidebarNodes = useMemo(
+    () => groupSidebarSessions(
+      activitySortedProjectNodes.flatMap((node) => node.sessions),
+      originOfSession,
+    ),
+    [activitySortedProjectNodes, originOfSession]
+  );
+
+  const activityProjectOrder = useMemo(
+    () => sidebarNodes.filter((node) => node.kind !== 'group').map((node) => node.project),
+    [sidebarNodes]
+  );
+
+  const stableSidebarNodes = useMemo(() => {
     const stableNodes = stabilizeProjectNodeSessions(
       stableProjectNodesRef.current,
-      activitySortedProjectNodes,
+      sidebarNodes,
       { canonicalKeyBySessionKey },
     );
     stableProjectNodesRef.current = stableNodes;
     return stableNodes;
-  }, [activitySortedProjectNodes, canonicalKeyBySessionKey]);
+  }, [canonicalKeyBySessionKey, sidebarNodes]);
 
   const activityProjectOrderKey = activityProjectOrder.join('\u0000');
 
@@ -868,31 +921,18 @@ export const ProjectTree = memo(function ProjectTree({
     });
   }, [activityProjectOrder, activityProjectOrderKey]);
 
-  const classificationsByProject = useMemo(() => {
-    const result: Record<string, ProjectClassification> = {};
-    for (const node of stableActivityProjectNodes) {
-      result[node.project] = classifyProject(
-        node.project,
-        activityProjectOrder,
-        projectClassificationOverrides
-      );
-    }
-    return result;
-  }, [activityProjectOrder, stableActivityProjectNodes, projectClassificationOverrides]);
-
   const projectNodes = useMemo(
-    () => sortProjectNodesByOrder(stableActivityProjectNodes, projectOrder),
-    [projectOrder, stableActivityProjectNodes]
+    () => sortProjectNodesByOrder(
+      stableSidebarNodes.filter((node) => node.kind !== 'group'),
+      projectOrder,
+    ),
+    [projectOrder, stableSidebarNodes]
   );
 
-  const temporaryCandidateProjectNodes = useMemo(
-    () => projectNodes.filter((node) => classificationsByProject[node.project]?.bucket === 'temporary'),
-    [classificationsByProject, projectNodes]
-  );
-
-  const dismissedActiveTemporaryProjectSet = useMemo(
-    () => new Set(dismissedActiveTemporaryProjects),
-    [dismissedActiveTemporaryProjects]
+  // Fixed groups always follow the projects in their canonical order.
+  const groupNodes = useMemo(
+    () => stableSidebarNodes.filter((node) => node.kind === 'group'),
+    [stableSidebarNodes]
   );
 
   const activityPrioritySessionKeys = useMemo(
@@ -904,89 +944,60 @@ export const ProjectTree = memo(function ProjectTree({
     [activeSessionKeys, canonicalKeyBySessionKey, decorationsBySessionKey]
   );
 
-  const activeTemporaryProjectSet = useMemo(() => {
-    const active = new Set<string>();
-    for (const node of temporaryCandidateProjectNodes) {
-      if (node.sessions.some((session) => (
-        activityPrioritySessionKeys.has(canonicalizeSessionKey(toKey(session)))
-      ))) {
-        active.add(node.project);
-      }
-    }
-    return active;
-  }, [activityPrioritySessionKeys, canonicalizeSessionKey, temporaryCandidateProjectNodes]);
-
-  useEffect(() => {
-    setDismissedActiveTemporaryProjects((previous) => {
-      const next = previous.filter((project) => activeTemporaryProjectSet.has(project));
-      if (next.length === previous.length) {
-        return previous;
-      }
-      return next;
-    });
-  }, [activeTemporaryProjectSet]);
-
-  const {
-    mainProjectNodes,
-    temporaryProjectNodes,
-    activeTemporaryProjectNodes,
-  } = useMemo(
-    () => splitProjectNodesForSidebar(
-      projectNodes,
-      classificationsByProject,
-      activeTemporaryProjectSet,
-      dismissedActiveTemporaryProjectSet
-    ),
-    [
-      activeTemporaryProjectSet,
-      classificationsByProject,
-      dismissedActiveTemporaryProjectSet,
-      projectNodes,
-    ]
-  );
-
   const organizeSidebar = useCallback(() => {
     setProjectOrder(activityProjectOrder);
   }, [activityProjectOrder]);
 
-  const projectActions = useMemo(() => ({
-    onMarkTemporary: (project: string) => {
-      setProjectClassificationOverrides((previous) => ({
-        ...previous,
-        [project]: 'temporary',
-      }));
-    },
-    onKeepMain: (project: string) => {
-      setProjectClassificationOverrides((previous) => ({
-        ...previous,
-        [project]: 'main',
-      }));
-      setDismissedActiveTemporaryProjects((previous) =>
-        previous.filter((candidate) => candidate !== project)
-      );
-    },
-    onResetProjectClassification: (project: string) => {
-      setProjectClassificationOverrides((previous) => {
-        if (!previous[project]) {
-          return previous;
-        }
-        const next = { ...previous };
-        delete next[project];
-        return next;
-      });
-    },
-    onOrganizeSidebar: organizeSidebar,
-  }), [organizeSidebar]);
-
-  const dismissActiveTemporaryProject = useCallback((project: string) => {
-    setDismissedActiveTemporaryProjects((previous) => (
-      previous.includes(project) ? previous : [...previous, project]
+  const setProjectClassification = useCallback((
+    path: string,
+    value: ProjectClassificationOverride | null,
+  ) => {
+    setProjectClassificationOverrides((previous) => (
+      updateProjectClassificationOverride(previous, path, value)
     ));
   }, []);
 
+  const projectActions = useMemo(() => ({
+    onMarkTemporary: (project: string) => setProjectClassification(project, 'temporary'),
+    onResetProjectClassification: (overrideKey: string) => setProjectClassification(overrideKey, null),
+    onOrganizeSidebar: organizeSidebar,
+  }), [organizeSidebar, setProjectClassification]);
+
+  const getProjectOverrideKey = useCallback(
+    (project: string) => findProjectClassificationOverrideKey(projectClassificationOverrides, project),
+    [projectClassificationOverrides]
+  );
+
+  const recentSessionKeyOf = useCallback(
+    (session: HistorySessionItem) => canonicalizeSessionKey(toKey(session)),
+    [canonicalizeSessionKey]
+  );
+
+  // Finished automated runs leave the timeline for their groups below it;
+  // running ones stay on top with everything else that is active.
+  const recentPartition = useMemo(
+    () => partitionRecentSessions(
+      recentSessions,
+      originOfSession,
+      activityPrioritySessionKeys,
+      recentSessionKeyOf,
+    ),
+    [activityPrioritySessionKeys, originOfSession, recentSessionKeyOf, recentSessions]
+  );
+
+  const recentGroupNodes = useMemo(
+    () => groupSidebarSessions(recentPartition.automated, originOfSession),
+    [originOfSession, recentPartition]
+  );
+
+  const treeNodes = useMemo(
+    () => (sortMode === 'recent' ? recentGroupNodes : [...projectNodes, ...groupNodes]),
+    [groupNodes, projectNodes, recentGroupNodes, sortMode]
+  );
+
   const activeProjectSet = useMemo(() => {
     const projects = new Set<string>();
-    for (const node of projectNodes) {
+    for (const node of treeNodes) {
       if (node.sessions.some((session) => (
         activityPrioritySessionKeys.has(canonicalizeSessionKey(toKey(session)))
       ))) {
@@ -994,16 +1005,16 @@ export const ProjectTree = memo(function ProjectTree({
       }
     }
     return projects;
-  }, [activityPrioritySessionKeys, canonicalizeSessionKey, projectNodes]);
+  }, [activityPrioritySessionKeys, canonicalizeSessionKey, treeNodes]);
 
   const selectedProject = useMemo(() => {
     if (!canonicalSelectedKey) {
       return null;
     }
-    return projectNodes.find((node) => node.sessions.some((session) => (
+    return treeNodes.find((node) => node.sessions.some((session) => (
       canonicalizeSessionKey(toKey(session)) === canonicalSelectedKey
     )))?.project ?? null;
-  }, [canonicalSelectedKey, canonicalizeSessionKey, projectNodes]);
+  }, [canonicalSelectedKey, canonicalizeSessionKey, treeNodes]);
 
   const prioritySessionKeys = useMemo(() => {
     const keys = new Set(activityPrioritySessionKeys);
@@ -1014,10 +1025,10 @@ export const ProjectTree = memo(function ProjectTree({
   }, [activityPrioritySessionKeys, canonicalSelectedKey]);
 
   const recentBuckets = useMemo(
-    () => bucketRecentSessions(recentSessions, activityPrioritySessionKeys, {
-      keyOf: (session) => canonicalizeSessionKey(toKey(session)),
+    () => bucketRecentSessions(recentPartition.timeline, activityPrioritySessionKeys, {
+      keyOf: recentSessionKeyOf,
     }),
-    [activityPrioritySessionKeys, canonicalizeSessionKey, recentSessions]
+    [activityPrioritySessionKeys, recentPartition, recentSessionKeyOf]
   );
 
   // Per-bucket pagination keeps the flat view cheap to mount (and toggle into)
@@ -1059,10 +1070,31 @@ export const ProjectTree = memo(function ProjectTree({
     });
   }, []);
 
-  const defaultExpandedProjects = useMemo(() => new Set([
-    ...mainProjectNodes.slice(0, 3).map((node) => node.project),
-    ...activeTemporaryProjectNodes.map((node) => node.project),
-  ]), [activeTemporaryProjectNodes, mainProjectNodes]);
+  // Groups start collapsed; one with a running session opens until the user
+  // toggles the tree, like any active project.
+  const defaultExpandedProjects = useMemo(
+    () => new Set(projectNodes.slice(0, 3).map((node) => node.project)),
+    [projectNodes]
+  );
+
+  // A per-row origin line only helps when rows of one node ran in different
+  // places (worktrees of a project, several sources in a group).
+  const nodesWithMixedOrigins = useMemo(() => {
+    const keys = new Set<string>();
+    for (const node of treeNodes) {
+      const first = node.sessions[0];
+      if (!first) {
+        continue;
+      }
+      const firstOrigin = describeSessionOriginInNode(originOfSession(first)) ?? '';
+      if (node.sessions.some((session) => (
+        (describeSessionOriginInNode(originOfSession(session)) ?? '') !== firstOrigin
+      ))) {
+        keys.add(node.project);
+      }
+    }
+    return keys;
+  }, [originOfSession, treeNodes]);
 
   // Selecting a hidden row reveals its project once. A later explicit collapse
   // remains respected until the user selects another row.
@@ -1166,25 +1198,27 @@ export const ProjectTree = memo(function ProjectTree({
       `mode:${sortMode}`,
       `pinned:${pinnedSessions.map((session) => canonicalizeSessionKey(toKey(session))).join(',')}`,
       ...(sortMode === 'recent'
-        ? visibleRecentBuckets.map((bucket) => (
-            `recent:${bucket.id}:${bucket.sessions.map((session) => canonicalizeSessionKey(toKey(session))).join(',')}`
-          ))
+        ? [
+            ...visibleRecentBuckets.map((bucket) => (
+              `recent:${bucket.id}:${bucket.sessions.map((session) => canonicalizeSessionKey(toKey(session))).join(',')}`
+            )),
+            ...recentGroupNodes.map((node) => serializeProjectNode('group', node)),
+          ]
         : [
-            ...mainProjectNodes.map((node) => serializeProjectNode('main', node)),
-            ...temporaryProjectNodes.map((node) => serializeProjectNode('temporary', node)),
-            ...activeTemporaryProjectNodes.map((node) => serializeProjectNode('activeTemporary', node)),
+            ...projectNodes.map((node) => serializeProjectNode('main', node)),
+            ...groupNodes.map((node) => serializeProjectNode('group', node)),
           ]),
     ].join('\n');
   }, [
-    activeTemporaryProjectNodes,
     canonicalizeSessionKey,
     effectiveExpanded,
     getVisibleSessions,
+    groupNodes,
     isLoading,
-    mainProjectNodes,
     pinnedSessions,
+    projectNodes,
+    recentGroupNodes,
     sortMode,
-    temporaryProjectNodes,
     visibleRecentBuckets,
   ]);
 
@@ -1324,12 +1358,16 @@ export const ProjectTree = memo(function ProjectTree({
     return environment?.name || clientLabel;
   }, [decorationsBySessionKey, resolveEnvironment, t]);
 
+  const promoteSessionProject = useCallback(
+    (project: string) => setProjectClassification(project, 'main'),
+    [setProjectClassification]
+  );
+
   const renderSessionRow = useCallback((
     session: HistorySessionItem,
     options: {
       pinnedSection?: boolean;
       recentSection?: boolean;
-      activeTemporarySection?: boolean;
     } = {},
   ) => {
     const rawKey = toKey(session);
@@ -1340,10 +1378,6 @@ export const ProjectTree = memo(function ProjectTree({
     const pinLabel = isPinned ? t('workspace.unpinSession') : t('workspace.pinSession');
     const decoration = decorationsBySessionKey[rawKey];
     const approvalRequired = decoration?.attentionKind === 'permission_required';
-    // activeTemporarySection is intentionally a no-op visually: session rows
-    // share one vocabulary across sections. The option remains in the type so
-    // callers can mark intent without reintroducing a side-stripe / nested-card
-    // treatment. Do NOT branch on it for chrome, padding, or selected state.
     const rowChrome = options.pinnedSection || options.recentSection ? 'mx-0' : 'mx-1';
     const rowPadding = options.pinnedSection || options.recentSection ? 'pl-2 pr-2' : 'pl-9 pr-2';
     const editPadding = options.pinnedSection || options.recentSection ? 'pl-2 pr-2' : 'pl-9 pr-3';
@@ -1397,6 +1431,17 @@ export const ProjectTree = memo(function ProjectTree({
     }
 
     const sessionLink = buildCcemSessionLinkForHistorySession(session);
+    const sessionTitle = getHistorySessionDisplay(session, t('history.untitledSession'));
+    const titleHint = `${sessionTitle}\n${session.project}`;
+    const origin = originOfSession(session);
+    const originInNode = !options.pinnedSection && !options.recentSection
+      && nodesWithMixedOrigins.has(origin.nodeKey)
+      ? describeSessionOriginInNode(origin)
+      : undefined;
+    // Untitled sessions already fall back to the project name as their title.
+    const nodeOriginLabel = originInNode !== sessionTitle ? originInNode : undefined;
+    const canPromote = canPromoteSessionOrigin(origin);
+    const resetOverrideKey = origin.kind === 'group' && !origin.byLauncher ? origin.overrideKey : undefined;
     const iconContent = session.taskSticker ? (
       <SessionAnnotationPopover
         session={session}
@@ -1472,14 +1517,14 @@ export const ProjectTree = memo(function ProjectTree({
         <div className="flex min-w-0 items-center gap-1.5">
           {options.recentSection ? (
             // Recent rows lead with the title alone; the (shrunken) client icon
-            // sits on the second line next to the project name.
+            // sits on the second line next to where the session ran.
             <span
               className="flex min-w-0 flex-1 flex-col"
-              title={`${getHistorySessionDisplay(session, t('history.untitledSession'))}\n${session.project}`}
+              title={titleHint}
             >
               <WorkspaceSessionTitle
                 className="text-sm font-medium leading-tight"
-                title={getHistorySessionDisplay(session, t('history.untitledSession'))}
+                title={sessionTitle}
               />
               <span className="mt-0.5 flex min-w-0 items-center gap-1">
                 <span
@@ -1492,7 +1537,7 @@ export const ProjectTree = memo(function ProjectTree({
                   {iconContent}
                 </span>
                 <span className="min-w-0 truncate text-[10px] leading-none text-muted-foreground/70">
-                  {session.projectName}
+                  {describeSessionOrigin(origin, groupLabel)}
                 </span>
               </span>
             </span>
@@ -1504,10 +1549,24 @@ export const ProjectTree = memo(function ProjectTree({
               >
                 {iconContent}
               </span>
-              <WorkspaceSessionTitle
-                className="flex-1 text-sm font-medium leading-tight"
-                title={getHistorySessionDisplay(session, t('history.untitledSession'))}
-              />
+              {nodeOriginLabel ? (
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <WorkspaceSessionTitle
+                    className="text-sm font-medium leading-tight"
+                    title={sessionTitle}
+                    hint={titleHint}
+                  />
+                  <span className="mt-0.5 min-w-0 truncate text-[10px] leading-none text-muted-foreground/70">
+                    {nodeOriginLabel}
+                  </span>
+                </span>
+              ) : (
+                <WorkspaceSessionTitle
+                  className="flex-1 text-sm font-medium leading-tight"
+                  title={sessionTitle}
+                  hint={titleHint}
+                />
+              )}
             </>
           )}
           <span className="inline-flex w-10 shrink-0 items-center justify-end gap-1.5 whitespace-nowrap text-[10px] tabular-nums transition-opacity duration-150 group-hover/session:opacity-0">
@@ -1592,6 +1651,19 @@ export const ProjectTree = memo(function ProjectTree({
             {t('workspace.copySessionLink')}
           </ContextMenuItem>
           )}
+          {sessionLink && (canPromote || resetOverrideKey) && <ContextMenuSeparator />}
+          {canPromote && (
+            <ContextMenuItem onClick={() => promoteSessionProject(session.project)}>
+              <FolderOpen className="mr-2 h-3.5 w-3.5" />
+              {t('workspace.showAsSeparateProject')}
+            </ContextMenuItem>
+          )}
+          {resetOverrideKey && (
+            <ContextMenuItem onClick={() => projectActions.onResetProjectClassification(resetOverrideKey)}>
+              <RotateCcw className="mr-2 h-3.5 w-3.5" />
+              {t('workspace.resetProjectClassification')}
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
     );
@@ -1608,12 +1680,17 @@ export const ProjectTree = memo(function ProjectTree({
     editingKey,
     freshDotKeys,
     getIconTitle,
+    groupLabel,
     handlePinnedDragOver,
     handlePinnedDragStart,
     handlePinnedDrop,
+    nodesWithMixedOrigins,
     onSaveAnnotation,
     onSelect,
+    originOfSession,
     pinnedSessionKeySet,
+    projectActions,
+    promoteSessionProject,
     resolveEnvironment,
     saveEdit,
     t,
@@ -1710,23 +1787,22 @@ export const ProjectTree = memo(function ProjectTree({
 
       {/* Tree content */}
       <ProjectTreeContent
-        activeTemporaryProjectNodes={activeTemporaryProjectNodes}
-        classificationsByProject={classificationsByProject}
         effectiveExpanded={effectiveExpanded}
+        getProjectOverrideKey={getProjectOverrideKey}
         getVisibleCount={getVisibleCount}
         getVisibleSessions={getVisibleSessions}
+        groupLabel={groupLabel}
+        groupNodes={sortMode === 'recent' ? recentGroupNodes : groupNodes}
         isLoading={isLoading}
-        mainProjectNodes={mainProjectNodes}
         onCreateForProject={onCreateForProject}
-        onDismissActiveTemporaryProject={dismissActiveTemporaryProject}
         pinnedSessionsCount={pinnedSessions.length}
         projectActions={projectActions}
+        projectNodes={projectNodes}
         recentBuckets={sortMode === 'recent' ? visibleRecentBuckets : undefined}
-        recentTotalCount={sortMode === 'recent' ? recentSessions.length : undefined}
+        recentTotalCount={sortMode === 'recent' ? recentPartition.timeline.length : undefined}
         onLoadMoreRecentBucket={loadMoreRecentBucket}
         onCollapseRecentBucket={collapseRecentBucket}
         renderSessionRow={renderSessionRow}
-        temporaryProjectNodes={temporaryProjectNodes}
         toggleProject={toggleProject}
         collapseList={collapseList}
         loadMore={loadMore}

@@ -38,6 +38,8 @@ export interface HistorySessionItem {
   taskStage?: SessionTaskStage;
   taskSticker?: SessionStickerId;
   taskLabel?: string;
+  /** Launch origin, e.g. `cron`, `external_control`, or Codex `automation` / `subagent`. */
+  launchMode?: string;
 }
 
 export interface WorkspaceProjectNode {
