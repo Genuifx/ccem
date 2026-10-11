@@ -11,7 +11,7 @@ export function TurnSpeedBadge({ metrics }: { metrics: ConversationMessageData['
   const speed = rate > 0 && rate < 0.1 ? '<0.1' : rate.toFixed(1);
   const label = t('workspace.turnAverageSpeed', { speed });
   return (
-    <div className="text-xs text-muted-foreground/70" data-turn-speed={speed}>
+    <div className="mx-1 whitespace-nowrap text-[10px] text-muted-foreground/50" data-turn-speed={speed}>
       <Tooltip>
         <TooltipTrigger asChild>
           <span tabIndex={0} className="cursor-default tabular-nums" aria-label={label}>{label}</span>

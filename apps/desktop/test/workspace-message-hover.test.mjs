@@ -170,16 +170,22 @@ function extractBalancedDivByClass(html, classNamePart) {
   assert.fail(`could not find closing div for ${classNamePart}`);
 }
 
-test('completed turn renders exactly one speed footer after text/tool/text segments or tools alone', async () => {
-  const { renderTranscript, summarizeTranscriptItems } = await importWorkspaceMessageRenderer();
+test('completed turn renders speed once, immediately before its timestamp', async () => {
+  const { renderTranscript } = await importWorkspaceMessageRenderer();
+  const { JSDOM } = await import('jsdom');
   const tool = { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'probe.txt' }, _result: 'proof' };
-  for (const content of [[{ type: 'text', text: 'I will read it.' }, tool, { type: 'text', text: 'proof' }], [tool]]) {
+  const timestamp = Date.parse('2026-10-11T04:49:00.000Z');
+  for (const content of [[{ type: 'text', text: 'I will read it.' }, tool, { type: 'text', text: 'proof' }], [tool], [{ type: 'text', text: 'I will read it.' }, tool]]) {
     const messages = [{ msgType: 'assistant', uuid: 'turn', segmentIndex: 0,
-      isCompactBoundary: false, content, turnMetrics: { outputTokens: 72, elapsedMs: 13743 } }];
+      timestamp, isCompactBoundary: false, content, turnMetrics: { outputTokens: 72, elapsedMs: 13743 } }];
     const html = renderTranscript(messages);
-    assert.equal((html.match(/data-turn-speed=/g) || []).length, 1);
-    assert.match(html, /本轮平均 5.2 tok\/s/);
-    assert.equal(summarizeTranscriptItems(messages).at(-1).type, 'turn-metrics');
+    const dom = new JSDOM(html);
+    const badges = dom.window.document.querySelectorAll('[data-turn-speed]');
+    assert.equal(badges.length, 1);
+    assert.match(badges[0].textContent, /本轮平均 5.2 tok\/s/);
+    assert.equal(badges[0].nextElementSibling.textContent,
+      new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    dom.window.close();
   }
 });
 
@@ -222,7 +228,7 @@ test('workspace message actions are revealed by explicit transcript content hove
   );
   assert.match(
     component,
-    /<MessageMetaBar\s+message=\{message\}\s+isUser=\{false\}\s+visible=\{showMessageActions\}\s+t=\{t\}\s+onForkTurn=\{onForkTurn && hasProviderMessageUuid\(message\) \? onForkTurn : undefined\}\s+\/>/,
+    /<MessageMetaBar\s+message=\{message\}\s+isUser=\{false\}\s+visible=\{showMessageActions\}[\s\S]*?onForkTurn=\{onForkTurn && hasProviderMessageUuid\(message\) \? onForkTurn : undefined\}/,
   );
 });
 

@@ -8,6 +8,7 @@ import { TurnSpeedBadge } from './TurnSpeedBadge';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import {
   processMessageBlocks,
+  formatMessageTime,
   WorkspaceMessageBubble,
   WorkspacePendingResponse,
   WorkspaceToolDigest,
@@ -32,12 +33,14 @@ export type WorkspaceTranscriptItem =
     key: string;
     role: 'assistant';
     metrics: NonNullable<ConversationMessageData['turnMetrics']>;
+    timestamp?: number;
   }
   | {
     type: 'message';
     key: string;
     role: 'user' | 'assistant';
     message: ConversationMessageData;
+    turnMetrics?: ConversationMessageData['turnMetrics'];
   }
   | {
     type: 'tool-digest';
@@ -249,11 +252,21 @@ export function buildWorkspaceTranscriptItems(
       key: `${messageKey}-segment-${segmentIndex}`,
     })));
     if (message.turnMetrics) {
-      // A single execution can render as text/tool/text segments. Its footer
-      // follows the entire reply, including turns that end with only tools.
+      // Only the final segment owns the metric, even for text/tool/text turns.
       flushSegments();
-      items.push({ type: 'turn-metrics', role: 'assistant',
-        key: uniqueItemKey(`${messageKey}-metrics`), metrics: message.turnMetrics });
+      const last = segments.length > 0 ? items[items.length - 1] : undefined;
+      const content = last?.type === 'message' ? last.message.content : undefined;
+      const hasText = typeof content === 'string' ? Boolean(content.trim())
+        : (Array.isArray(content) ? content : [content]).some((block) => block?.type === 'text' && block.text?.trim());
+      if (last?.type === 'message' && last.role === 'assistant' && hasText
+        && !last.message.planContent && !last.message.isCompactBoundary && last.message.msgType !== 'summary') {
+        last.turnMetrics = message.turnMetrics;
+      } else {
+        // Tool-only / non-text endings have no message action bar.
+        items.push({ type: 'turn-metrics', role: 'assistant',
+          key: uniqueItemKey(`${messageKey}-metrics`), metrics: message.turnMetrics,
+          timestamp: message.timestamp });
+      }
     }
   });
 
@@ -764,8 +777,11 @@ export function WorkspaceTranscriptList({
         if (item.type === 'turn-metrics') {
           return (
             <div key={item.key} data-transcript-item-key={item.key}
-              className="py-2">
+              className="flex items-center gap-1 py-2">
               <TurnSpeedBadge metrics={item.metrics} />
+              <span className="text-[10px] tabular-nums text-muted-foreground/40">
+                {formatMessageTime(item.timestamp)}
+              </span>
             </div>
           );
         }
@@ -827,6 +843,7 @@ export function WorkspaceTranscriptList({
           >
             <WorkspaceMessageBubble
               message={message}
+              turnMetrics={item.turnMetrics}
               prevRole={prevRole}
               onForkTurn={onForkTurn}
               suppressSpacing={!selfMargined}

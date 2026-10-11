@@ -55,9 +55,11 @@ import {
 } from './transcriptIdentity';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { WorkspaceMessageAnnotationsPopover } from './WorkspaceMessageAnnotationsPopover';
+import { TurnSpeedBadge } from './TurnSpeedBadge';
 
 interface WorkspaceMessageBubbleProps {
   message: ConversationMessageData;
+  turnMetrics?: ConversationMessageData['turnMetrics'];
   prevRole?: string | null;
   /**
    * Offer "fork session from this turn" on model-output turns. Must be a
@@ -1216,7 +1218,7 @@ function PlanBlock({ content, label }: { content: string; label: string }) {
   );
 }
 
-function formatMessageTime(ts?: number): string | null {
+export function formatMessageTime(ts?: number): string | null {
   if (!ts || !Number.isFinite(ts) || ts <= 0) return null;
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
@@ -1227,12 +1229,14 @@ const MessageMetaBar = memo(function MessageMetaBar({
   visible,
   t,
   onForkTurn,
+  turnMetrics,
 }: {
   message: ConversationMessageData;
   isUser: boolean;
   visible: boolean;
   t: (key: string) => string;
   onForkTurn?: (message: ConversationMessageData) => void;
+  turnMetrics?: ConversationMessageData['turnMetrics'];
 }) {
   const [copied, setCopied] = useState(false);
   const [exportingImage, setExportingImage] = useState(false);
@@ -1372,6 +1376,7 @@ const MessageMetaBar = memo(function MessageMetaBar({
       {exportingImage ? (
         <TranscriptImageExportNode ref={exportNodeRef} content={copyText} />
       ) : null}
+      {!isUser && turnMetrics ? <TurnSpeedBadge metrics={turnMetrics} /> : null}
       {timeLabel ? (
         <span className="text-[10px] tabular-nums text-muted-foreground/40">
           {timeLabel}
@@ -1383,6 +1388,7 @@ const MessageMetaBar = memo(function MessageMetaBar({
   prev.message === next.message
   && prev.isUser === next.isUser
   && prev.visible === next.visible
+  && prev.turnMetrics === next.turnMetrics
   && prev.t === next.t
 ));
 
@@ -1905,7 +1911,7 @@ function renderContentBlocks(
   return { content: result, images: imageBlocks, summaries };
 }
 
-function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn, suppressSpacing = false }: WorkspaceMessageBubbleProps) {
+function WorkspaceMessageBubbleComponent({ message, turnMetrics, prevRole, onForkTurn, suppressSpacing = false }: WorkspaceMessageBubbleProps) {
   const { t } = useLocale();
   const [isActionHovering, setIsActionHovering] = useState(false);
   const [isActionFocusWithin, setIsActionFocusWithin] = useState(false);
@@ -2071,6 +2077,7 @@ function WorkspaceMessageBubbleComponent({ message, prevRole, onForkTurn, suppre
               message={message}
               isUser={false}
               visible={showMessageActions}
+              turnMetrics={turnMetrics}
               t={t}
               onForkTurn={onForkTurn && hasProviderMessageUuid(message) ? onForkTurn : undefined}
             />
@@ -2103,5 +2110,6 @@ export const WorkspaceMessageBubble = memo(
   WorkspaceMessageBubbleComponent,
   (prevProps, nextProps) => prevProps.prevRole === nextProps.prevRole
     && prevProps.message === nextProps.message
+    && prevProps.turnMetrics === nextProps.turnMetrics
     && prevProps.suppressSpacing === nextProps.suppressSpacing
 );
