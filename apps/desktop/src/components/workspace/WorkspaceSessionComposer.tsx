@@ -763,21 +763,23 @@ function ComposerTriggerSuggestionPanel({
 }: {
   state: PromptAreaTriggerPanelState;
 }) {
+  // The shared ScrollArea inside TriggerPopover owns the scrolling. Its cap matches the
+  // attention dock budget (max-h-[min(35vh,280px)]) exactly so the dock's native scroll
+  // never engages for this section alone — the previous cap mismatch stacked two native
+  // scrollbars around a disabled inner scroll area.
   return (
-    <div className="max-h-[min(42vh,320px)] overflow-y-auto pr-0.5">
-      <TriggerPopover
-        suggestions={state.suggestions}
-        loading={state.loading}
-        error={state.error}
-        emptyMessage={state.emptyMessage}
-        selectedIndex={state.selectedIndex}
-        onSelect={state.onSelect}
-        onDismiss={state.onDismiss}
-        triggerChar={state.triggerChar}
-        placement="static"
-        className="max-h-none"
-      />
-    </div>
+    <TriggerPopover
+      suggestions={state.suggestions}
+      loading={state.loading}
+      error={state.error}
+      emptyMessage={state.emptyMessage}
+      selectedIndex={state.selectedIndex}
+      onSelect={state.onSelect}
+      onDismiss={state.onDismiss}
+      triggerChar={state.triggerChar}
+      placement="static"
+      className="max-h-[min(35vh,280px)]"
+    />
   );
 }
 

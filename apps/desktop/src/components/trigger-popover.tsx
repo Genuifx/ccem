@@ -98,11 +98,16 @@ export function TriggerPopover({
     <ScrollArea
       ref={popoverRef}
       data-ccem-native-overlay={placement === 'anchored' ? '' : undefined}
+      // Radix hover-type scrollbars never mount in this app's webview, so the
+      // composer-embedded (static) list uses the repo's always-mounted overlay
+      // thumb pattern (ccem-overlay-scroll) to keep exactly one visible,
+      // shadcn-styled scrollbar.
+      type={placement === 'static' ? 'always' : undefined}
       className={cn(
         'max-h-[240px] min-w-[200px]',
         placement === 'anchored'
           ? 'bg-popover rounded-xl border p-2 shadow-md animate-in fade-in-0 zoom-in-95'
-          : 'w-full min-w-0 bg-transparent p-0 shadow-none',
+          : 'w-full min-w-0 bg-transparent p-0 shadow-none ccem-overlay-scroll',
         className,
       )}
       style={style}
