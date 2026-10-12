@@ -40,7 +40,9 @@ function getRingColor(percentage: number): string {
  * (用量/组成) resizes the content, which can drop a resting pointer outside
  * the hover surface and auto-close the panel mid-read. While pinned, hover/
  * focus leave can no longer close the panel; only an explicit dismissal
- * (click the ring again, click outside, or Escape) closes it.
+ * (click the ring again, click outside, or Escape) closes it. A 用量/组成
+ * segment click engages the same pinned mode (REQ-0043) so an unpinned
+ * hover panel cannot be auto-closed by its own view-swap resize.
  */
 export function ContextWindowIndicator({
   usage,
@@ -83,13 +85,22 @@ export function ContextWindowIndicator({
     }
   };
 
+  // A 用量/组成 switch (REQ-0043) engages the pinned reading mode too: the
+  // swap resizes the panel, which can drop a resting pointer outside the hover
+  // surface and auto-close an unpinned hover panel mid-switch. Pinning keeps
+  // the switched view readable; the existing dismissal paths (ring click,
+  // pointerdown outside, Escape) still close it.
+  const engagePin = () => {
+    pinnedRef.current = true;
+    setPinned(true);
+  };
+
   const handleTriggerClick = () => {
     if (pinnedRef.current) {
       dismiss();
       return;
     }
-    pinnedRef.current = true;
-    setPinned(true);
+    engagePin();
     setOpen(true);
     // Hover-open already refreshed; only a click that opened the panel needs one.
     if (!open) {
@@ -147,6 +158,7 @@ export function ContextWindowIndicator({
           usage={usage}
           provider={provider}
           onRefresh={onRefreshUsage}
+          onEngage={engagePin}
         />
       </HoverCardContent>
     </HoverCard>

@@ -1,4 +1,4 @@
-import { useDeferredValue, useState } from 'react';
+import { useState } from 'react';
 import { RotateCw } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
@@ -9,6 +9,11 @@ interface SessionUsagePopoverContentProps {
   usage: SessionUsageState;
   provider?: string;
   onRefresh?: () => void;
+  /** Fired when the user switches the 用量/组成 segment. The host engages its
+   * pinned reading mode: the view swap resizes the panel, which can drop a
+   * resting pointer outside the hover surface and auto-close an unpinned
+   * hover panel mid-switch (REQ-0043). */
+  onEngage?: () => void;
 }
 
 function barColor(percentage: number): string {
@@ -260,16 +265,24 @@ export function SessionUsagePopoverContent({
   usage,
   provider,
   onRefresh,
+  onEngage,
 }: SessionUsagePopoverContentProps) {
   const { t } = useLocale();
   // Secondary view state (REQ-0028). The popover content unmounts when the
   // hover closes, so every open starts on the usage view — no stale drill-down.
   const [view, setView] = useState<'usage' | 'composition'>('usage');
-  // The segmented control highlights from the urgent `view` state so the press
-  // lands immediately; the panel body swaps via the deferred value so the
-  // full-content re-render (rows + reposition) never blocks the click/hover
-  // event stream (REQ-0035 lag complaint on rapid 用量/组成 switching).
-  const deferredView = useDeferredValue(view);
+
+  // The body swaps in the same render as the segmented control (REQ-0043):
+  // `useDeferredValue` let the swap lag behind the control under busy
+  // re-render streams (workspace usage events), leaving the panel showing the
+  // usage view after a 组成 click. The panel is a small subtree (<1ms), so a
+  // synchronous swap restores next-frame switching with no measurable input
+  // cost; the pin the switch engages covers the resize-driven hover auto-close
+  // that motivated REQ-0035's deferral workaround.
+  const switchView = (nextView: 'usage' | 'composition') => {
+    setView(nextView);
+    onEngage?.();
+  };
 
   const snapshot = usage.sessionUsage;
   // The SDK snapshot can lag one turn behind (transcript flush timing), while
@@ -346,7 +359,7 @@ export function SessionUsagePopoverContent({
                 key={nextView}
                 type="button"
                 aria-pressed={view === nextView}
-                onClick={() => setView(nextView)}
+                onClick={() => switchView(nextView)}
                 className={cn(
                   'rounded-md px-2 py-1 text-xs font-medium transition-colors',
                   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30',
@@ -368,7 +381,7 @@ export function SessionUsagePopoverContent({
         </div>
       )}
 
-      {deferredView === 'composition' && hasContext ? (
+      {view === 'composition' && hasContext ? (
         <ContextCompositionView context={usage.context!} />
       ) : (
         <>
