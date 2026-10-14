@@ -1877,6 +1877,32 @@ fn retain_incomplete_source_entries(
     }
 }
 
+/// Retain cache entries for local-log files that this enumeration did not
+/// see, regardless of enumeration completeness.
+///
+/// Claude Code and Codex rotate their own session transcripts on a retention
+/// schedule (Claude Code's default `cleanupPeriodDays` is 30 days) and a
+/// source directory can also disappear transiently (sync pause, sleep/wake,
+/// mid-rotation). For these local-log sources a file leaving the disk is NOT
+/// evidence that its historical usage should leave the rollup: usage that
+/// has been observed once is archived so streaks and long-term history
+/// survive log retention. Retaining the whole entry (not just its rollup
+/// contribution) keeps the global-rollup diff stable, so a file that
+/// reappears later is diffed as existing rather than re-added (no double
+/// counting). Contrast with `retain_incomplete_source_entries`, which keeps
+/// the authoritative-deletion contract for virtual sources (dsh/opencode).
+fn retain_unseen_local_log_entries(
+    existing: &CacheFile,
+    source: &str,
+    next: &mut HashMap<String, CacheFileEntry>,
+) {
+    for (path, entry) in &existing.files {
+        if detect_source_from_path(path) == Some(source) {
+            next.entry(path.clone()).or_insert_with(|| entry.clone());
+        }
+    }
+}
+
 fn should_write_usage_cache(
     desktop_cache_exists: bool,
     existing: &CacheFile,
@@ -1920,8 +1946,6 @@ fn refresh_usage_cache() -> CacheFile {
 fn refresh_usage_cache_locked() -> CacheFile {
     let prices = load_model_prices();
     let discovery = discover_jsonl_files();
-    let mut claude_complete = discovery.claude_complete;
-    let mut codex_complete = discovery.codex_complete;
     let desktop_cache_exists = usage_cache_path().exists();
     let existing_cache = read_usage_cache();
 
@@ -1937,40 +1961,30 @@ fn refresh_usage_cache_locked() -> CacheFile {
 
         let meta = match get_file_meta(&discovered.path) {
             Some(m) => m,
-            None => {
-                match discovered.source {
-                    UsageSource::Claude => claude_complete = false,
-                    UsageSource::Codex => codex_complete = false,
-                }
-                continue;
-            }
+            None => continue,
         };
 
         let cached = existing_cache.files.get(&path_str);
         let entry = refresh_discovered_entry(cached, &discovered, meta, &prices);
         if entry.append_anchor.is_none() {
-            match discovered.source {
-                UsageSource::Claude => claude_complete = false,
-                UsageSource::Codex => codex_complete = false,
-            }
             continue;
         }
 
         new_cache.files.insert(path_str, entry);
     }
 
-    retain_incomplete_source_entries(
-        &existing_cache,
-        SOURCE_CLAUDE,
-        &mut new_cache.files,
-        claude_complete,
-    );
-    retain_incomplete_source_entries(
-        &existing_cache,
-        SOURCE_CODEX,
-        &mut new_cache.files,
-        codex_complete,
-    );
+    if !discovery.claude_complete || !discovery.codex_complete {
+        eprintln!(
+            "Usage source enumeration incomplete (claude={}, codex={}); unseen local-log entries retained",
+            discovery.claude_complete, discovery.codex_complete
+        );
+    }
+
+    // Local-log sources: retention cleanup by the source tool (or a
+    // transient directory miss) must not erase usage history. See
+    // retain_unseen_local_log_entries.
+    retain_unseen_local_log_entries(&existing_cache, SOURCE_CLAUDE, &mut new_cache.files);
+    retain_unseen_local_log_entries(&existing_cache, SOURCE_CODEX, &mut new_cache.files);
 
     let opencode_result = load_opencode_cache_entries(&prices, &existing_cache);
     for (path_key, entry) in opencode_result.entries {
@@ -3040,10 +3054,20 @@ fn aggregate_model_breakdown(
     breakdown
 }
 
+/// Count consecutive local-calendar usage days ending today — or, before the
+/// day's first usage, ending yesterday. The current day is still in progress,
+/// so an empty today must not break an otherwise intact streak (morning and
+/// just-after-midnight views keep yesterday's streak instead of collapsing
+/// to zero).
 fn calculate_streak(daily_history: &HashMap<String, TokenUsageWithCost>) -> u32 {
     let today = Local::now().date_naive();
     let mut streak: u32 = 0;
     let mut check_date = today;
+
+    let today_key = check_date.format("%Y-%m-%d").to_string();
+    if !daily_history.contains_key(&today_key) {
+        check_date -= chrono::Duration::days(1);
+    }
 
     loop {
         let date_str = check_date.format("%Y-%m-%d").to_string();
@@ -3191,6 +3215,7 @@ mod tests {
         parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
         parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
         refresh_discovered_entry, reset_model_price_lookup_count, retain_incomplete_source_entries,
+        retain_unseen_local_log_entries,
         shared_usage_cache, should_reuse_usage_stats, should_write_usage_cache, snapshot_is_fresh,
         update_global_rollup, usage_cache_path, write_json_atomic, write_usage_summary_to,
         CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheRollup, CacheRollupBucket,
@@ -3200,7 +3225,7 @@ mod tests {
         SOURCE_DSH, SOURCE_OPENCODE, TEST_SNAPSHOT_REFRESH, USAGE_CACHE_VERSION,
         USAGE_SUMMARY_VERSION,
     };
-    use chrono::{Local, TimeZone};
+    use chrono::{Datelike, Local, TimeZone};
     use std::collections::HashMap;
     use std::fs;
     use std::io::BufReader;
@@ -4729,6 +4754,306 @@ mod tests {
         assert!(
             authoritative_empty.is_empty(),
             "a successful empty enumeration must still delete stale sessions"
+        );
+    }
+
+    fn local_log_entry(path: &str, timestamp: &str, source: &str, tokens: u64) -> (String, CacheFileEntry) {
+        let stats = CacheStats {
+            entries: vec![CacheEntry {
+                timestamp: timestamp.to_string(),
+                model: "fixture-model".to_string(),
+                environment: None,
+                usage: CacheUsage {
+                    input_tokens: tokens,
+                    ..Default::default()
+                },
+            }],
+        };
+        (
+            path.to_string(),
+            CacheFileEntry {
+                rollup: CacheRollup::from_entries(source, &stats.entries),
+                stats: CacheStats::default(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn unseen_local_log_entries_are_retained_even_on_complete_enumeration() {
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: HashMap::from([
+                local_log_entry(
+                    "/home/u/.claude/projects/p/old.jsonl",
+                    "2026-09-01T12:00:00+08:00",
+                    SOURCE_CLAUDE,
+                    10,
+                ),
+                local_log_entry(
+                    "/home/u/.codex/sessions/2026/09/01/rollout.jsonl",
+                    "2026-09-01T12:00:00+08:00",
+                    SOURCE_CODEX,
+                    10,
+                ),
+                (
+                    "dsh://source/session-1".to_string(),
+                    CacheFileEntry::default(),
+                ),
+            ]),
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        let mut next = HashMap::new();
+        retain_unseen_local_log_entries(&existing, SOURCE_CLAUDE, &mut next);
+        retain_unseen_local_log_entries(&existing, SOURCE_CODEX, &mut next);
+        assert!(next.contains_key("/home/u/.claude/projects/p/old.jsonl"));
+        assert!(next.contains_key("/home/u/.codex/sessions/2026/09/01/rollout.jsonl"));
+        assert!(
+            !next.contains_key("dsh://source/session-1"),
+            "virtual sources keep the authoritative-deletion contract"
+        );
+    }
+
+    /// REQ-0044 reproduction: a 100-day streak collapses to exactly 31 days
+    /// when Claude Code's 30-day retention cleanup removes old transcripts in
+    /// the same refresh where the codex source directory is transiently
+    /// missed (reported as a complete enumeration). This documents the
+    /// pre-fix composition; the production refresh now archives unseen
+    /// local-log entries so this cliff cannot happen (see the test below).
+    #[test]
+    fn retention_cleanup_plus_transient_miss_reproduces_the_reported_streak_cliff() {
+        let today = Local::now().date_naive();
+        let ts = |days_back: i64| {
+            let date = today - chrono::Duration::days(days_back);
+            Local
+                .with_ymd_and_hms(date.year(), date.month(), date.day(), 12, 0, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+
+        let mut files = HashMap::new();
+        for days_back in 0..100 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.claude/projects/p/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CLAUDE,
+                10,
+            );
+            files.insert(path, entry);
+        }
+        for days_back in 0..6 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.codex/sessions/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CODEX,
+                7,
+            );
+            files.insert(path, entry);
+        }
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files: files.clone(),
+            last_updated: None,
+        };
+        assert_eq!(
+            calculate_streak(&aggregate_cache(&existing, None, &default_prices()).daily_history),
+            100,
+            "fixture: full history shows the reported 100-day streak"
+        );
+
+        // Retention cleanup keeps only the newest 31 claude files; the codex
+        // directory is transiently missing and enumerated as empty+complete.
+        let mut discovered = HashMap::new();
+        for days_back in 0..31 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.claude/projects/p/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CLAUDE,
+                10,
+            );
+            discovered.insert(path, entry);
+        }
+
+        // Pre-fix composition: unseen entries drop out and their rollups are
+        // subtracted, leaving only the 31 retention survivors.
+        let cliff = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: update_global_rollup(&existing, &discovered).0,
+            files: discovered,
+            last_updated: None,
+        };
+        assert_eq!(
+            calculate_streak(&aggregate_cache(&cliff, None, &default_prices()).daily_history),
+            31,
+            "reproduces the reported 100 -> 31 collapse"
+        );
+    }
+
+    /// Production composition after the fix: the same retention cleanup plus
+    /// transient codex miss must preserve the full streak and history, and a
+    /// later refresh that re-discovers codex must not double-count.
+    #[test]
+    fn streak_and_history_survive_retention_cleanup_and_transient_source_miss() {
+        let today = Local::now().date_naive();
+        let ts = |days_back: i64| {
+            let date = today - chrono::Duration::days(days_back);
+            Local
+                .with_ymd_and_hms(date.year(), date.month(), date.day(), 12, 0, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+
+        let mut files = HashMap::new();
+        for days_back in 0..100 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.claude/projects/p/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CLAUDE,
+                10,
+            );
+            files.insert(path, entry);
+        }
+        for days_back in 0..6 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.codex/sessions/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CODEX,
+                7,
+            );
+            files.insert(path, entry);
+        }
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files: files.clone(),
+            last_updated: None,
+        };
+
+        // Refresh 2: only 31 recent claude files discovered; codex missed.
+        let mut next_files = HashMap::new();
+        for days_back in 0..31 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.claude/projects/p/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CLAUDE,
+                10,
+            );
+            next_files.insert(path, entry);
+        }
+        retain_unseen_local_log_entries(&existing, SOURCE_CLAUDE, &mut next_files);
+        retain_unseen_local_log_entries(&existing, SOURCE_CODEX, &mut next_files);
+
+        let refreshed = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: update_global_rollup(&existing, &next_files).0,
+            files: next_files,
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&refreshed, None, &default_prices());
+        assert_eq!(
+            calculate_streak(&stats.daily_history),
+            100,
+            "the streak must survive source retention cleanup and a transient miss"
+        );
+        assert_eq!(stats.daily_history.len(), 100);
+        assert_eq!(stats.total.input_tokens, 100 * 10 + 6 * 7);
+
+        // Refresh 3: codex comes back and is fully re-discovered. The
+        // retained entries make the diff treat those paths as existing, so
+        // nothing is added twice.
+        let mut recovered_files = HashMap::new();
+        for days_back in 0..31 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.claude/projects/p/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CLAUDE,
+                10,
+            );
+            recovered_files.insert(path, entry);
+        }
+        for days_back in 0..6 {
+            let (path, entry) = local_log_entry(
+                &format!("/home/u/.codex/sessions/day-{days_back}.jsonl"),
+                &ts(days_back),
+                SOURCE_CODEX,
+                7,
+            );
+            recovered_files.insert(path, entry);
+        }
+        retain_unseen_local_log_entries(&refreshed, SOURCE_CLAUDE, &mut recovered_files);
+        retain_unseen_local_log_entries(&refreshed, SOURCE_CODEX, &mut recovered_files);
+
+        let recovered = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            global_rollup: update_global_rollup(&refreshed, &recovered_files).0,
+            files: recovered_files,
+            last_updated: None,
+        };
+        let stats = aggregate_cache(&recovered, None, &default_prices());
+        assert_eq!(
+            stats.total.input_tokens,
+            100 * 10 + 6 * 7,
+            "a source that comes back must not be double-counted"
+        );
+        assert_eq!(calculate_streak(&stats.daily_history), 100);
+    }
+
+    #[test]
+    fn calculate_streak_grants_grace_for_a_day_with_no_usage_yet() {
+        let today = Local::now().date_naive();
+        let key = |days_back: i64| {
+            (today - chrono::Duration::days(days_back))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let history = |days: &[i64]| {
+            days.iter()
+                .map(|d| (key(*d), TokenUsageWithCost::default()))
+                .collect::<HashMap<_, _>>()
+        };
+
+        // Nothing used yet today: the streak still counts the trailing days
+        // ending yesterday (morning / just-after-midnight view).
+        assert_eq!(calculate_streak(&history(&[1, 2, 3, 4])), 4);
+        // Today already has usage: it extends the streak.
+        assert_eq!(calculate_streak(&history(&[0, 1, 2, 3, 4])), 5);
+        // Neither today nor yesterday: the streak is genuinely broken.
+        assert_eq!(calculate_streak(&history(&[2, 3])), 0);
+        // No history at all.
+        assert_eq!(calculate_streak(&HashMap::new()), 0);
+    }
+
+    #[test]
+    fn usage_just_after_local_midnight_buckets_into_the_new_local_day() {
+        // Date keys must follow the LOCAL calendar day: usage half an hour
+        // after local midnight belongs to the new local day, and the streak
+        // walk uses the same local-day keys.
+        let today = Local::now().date_naive();
+        let just_after_midnight = today.and_hms_opt(0, 30, 0).expect("midnight timestamp");
+        let ts = Local
+            .from_local_datetime(&just_after_midnight)
+            .single()
+            .expect("unambiguous local midnight")
+            .to_rfc3339();
+
+        assert_eq!(
+            extract_date(&ts),
+            Some(today.format("%Y-%m-%d").to_string()),
+            "post-midnight usage must land on the new local calendar day"
+        );
+
+        let mut history = HashMap::new();
+        history.insert(
+            today.format("%Y-%m-%d").to_string(),
+            TokenUsageWithCost::default(),
+        );
+        assert_eq!(
+            calculate_streak(&history),
+            1,
+            "the streak walk must accept the same local-day key"
         );
     }
 

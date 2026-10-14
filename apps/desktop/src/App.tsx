@@ -20,6 +20,7 @@ import type { UsageStats } from '@/types/analytics';
 import { shallow } from 'zustand/shallow';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
+import { calculateContinuousUsageDays } from '@/lib/streak';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import { EnvironmentsSkeleton } from '@/components/ui/skeleton-states';
 import { StartupSplash } from '@/components/layout/StartupSplash';
@@ -82,21 +83,6 @@ function normalizeAppPermissionMode(value: unknown): PermissionModeName | null {
   return typeof value === 'string' && (PERMISSION_MODE_NAMES as string[]).includes(value)
     ? value as PermissionModeName
     : null;
-}
-
-function calculateContinuousUsageDays(dailyHistory: UsageStats['dailyHistory']): number {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-
-  let streak = 0;
-  while (true) {
-    const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    if (!dailyHistory[dateKey]) {
-      return streak;
-    }
-    streak += 1;
-    date.setDate(date.getDate() - 1);
-  }
 }
 
 function AppContent() {

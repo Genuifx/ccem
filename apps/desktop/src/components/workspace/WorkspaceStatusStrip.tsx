@@ -30,6 +30,7 @@ import {
 } from '@/components/ui/popover';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { enqueueSessionRouterMutation, resolveDisplayEnv, resolveEnvSwitchAction, resolveEnvSwitchCasPatch } from '@/lib/routerProfiles';
+import { calculateContinuousUsageDays } from '@/lib/streak';
 import { toast } from 'sonner';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import { resolveEnvironmentIconHint } from '@/components/workspace/sessionTreeIcons';
@@ -61,20 +62,8 @@ function EnvironmentLobeIcon({
   );
 }
 
-// Walks dailyHistory backwards from today counting consecutive days.
-// Matches the boot-time calculation in App.tsx.
-function calculateContinuousUsageDays(dailyHistory: UsageStats['dailyHistory']): number {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  let streak = 0;
-  while (true) {
-    const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    if (!dailyHistory[dateKey]) return streak;
-    streak += 1;
-    date.setDate(date.getDate() - 1);
-  }
-}
-
+// The streak metric uses the shared util in @/lib/streak — the same
+// calculation as the boot-time value in App.tsx and the Rust backend.
 interface WorkspaceStatusStripProps {
   onNavigate: (tab: string) => void;
   onOpenSearch: () => void;

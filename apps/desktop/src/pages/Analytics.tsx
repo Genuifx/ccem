@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils';
 import { HeatmapCalendar } from '@/components/analytics/HeatmapCalendar';
 import { useAppStore } from '@/store';
 import { generateMockMilestones, generateMockUsageStats } from '@/lib/mockAnalytics';
+import { calculateContinuousUsageDays } from '@/lib/streak';
 import { useLocale } from '@/locales';
 import { AnalyticsSkeleton } from '@/components/ui/skeleton-states';
 import { useCountUp } from '@/hooks/useCountUp';
@@ -35,25 +36,10 @@ function isMockUsageStats(stats: UsageStats | null | undefined): boolean {
   return typeof stats?.lastUpdated === 'string' && stats.lastUpdated.startsWith('mock:');
 }
 
-function calculateStreakDays(dailyHistory: UsageStats['dailyHistory']): number {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-
-  let streak = 0;
-  while (true) {
-    const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    if (!dailyHistory[dateKey]) {
-      return streak;
-    }
-    streak += 1;
-    date.setDate(date.getDate() - 1);
-  }
-}
-
 function primeAnalyticsSourceCache(source: UsageSourceFilter, stats: UsageStats, fetchedAt = Date.now()) {
   analyticsSourceCache.set(source, {
     stats,
-    streakDays: calculateStreakDays(stats.dailyHistory),
+    streakDays: calculateContinuousUsageDays(stats.dailyHistory),
     fetchedAt,
   });
 }
@@ -64,7 +50,7 @@ async function fetchAnalyticsSource(source: UsageSourceFilter, force = false): P
   if (!force && cached?.stats && Date.now() - cached.fetchedAt < ANALYTICS_CACHE_TTL_MS) {
     return {
       stats: cached.stats,
-      streakDays: cached.streakDays ?? calculateStreakDays(cached.stats.dailyHistory),
+      streakDays: cached.streakDays ?? calculateContinuousUsageDays(cached.stats.dailyHistory),
     };
   }
 
@@ -79,7 +65,7 @@ async function fetchAnalyticsSource(source: UsageSourceFilter, force = false): P
     .then((stats) => {
       const result = {
         stats,
-        streakDays: calculateStreakDays(stats.dailyHistory),
+        streakDays: calculateContinuousUsageDays(stats.dailyHistory),
       };
       analyticsSourceCache.set(source, {
         ...result,
@@ -274,7 +260,7 @@ export function Analytics() {
         const mockStats = generateMockUsageStats();
         setUsageStats(mockStats);
         setMilestones(generateMockMilestones());
-        setContinuousUsageDays(calculateStreakDays(mockStats.dailyHistory));
+        setContinuousUsageDays(calculateContinuousUsageDays(mockStats.dailyHistory));
         setIsUsingMockData(true);
       } else {
         setLoadError(true);
@@ -301,7 +287,7 @@ export function Analytics() {
         }
         const result = {
           stats: summary,
-          streakDays: calculateStreakDays(summary.dailyHistory),
+          streakDays: calculateContinuousUsageDays(summary.dailyHistory),
         };
         primeAnalyticsSourceCache('all', summary);
         applyAnalyticsData(result, 'all');
