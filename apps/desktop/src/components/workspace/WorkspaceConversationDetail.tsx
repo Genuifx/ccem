@@ -16,6 +16,7 @@ import type {
   HistorySegment,
   HistorySessionItem,
 } from '@/features/conversations/types';
+import { toSessionKey } from '@/features/conversations/types';
 import {
   getInitialTranscriptRenderCount,
   getLatestTranscriptWindow,
@@ -279,7 +280,7 @@ export function WorkspaceConversationDetail({
       {onAddAnnotation && onUpdateAnnotation && onRemoveAnnotation ? (
         <WorkspaceTranscriptSelection
           rootRef={messagesContainerRef}
-          scopeKey={`history:${selectedSession.source}:${selectedSession.id}:${activeSegment ?? 'all'}`}
+          scopeKey={`history:${toSessionKey(selectedSession)}:${activeSegment ?? 'all'}`}
           canAdd={canAddAnnotation}
           annotations={annotations}
           onAdd={onAddAnnotation}

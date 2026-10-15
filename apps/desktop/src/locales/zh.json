@@ -1,13 +1,18 @@
 {
   "agentProfiles": {
     "title": "Agent 数据与登录",
-    "description": "CCEM 独立保存配置、登录态、历史和记忆。已有历史和记忆在首次启动时复制，此后与官方应用分别保存。",
-    "preparing": "正在准备独立目录并迁入已有会话…",
+    "preparing": "正在读取 Agent 数据设置…",
     "retry": "重试",
-    "login": "为 CCEM 登录",
+    "loginClaude": "登录 Claude 账号",
+    "loginCodex": "登录 ChatGPT 账号",
+    "isolated": "配置、登录态、历史和记忆独立保存在 CCEM。",
+    "shared": "复用官方 Codex 的配置、登录态、历史和记忆。",
+    "isolateCodex": "隔离 Codex 数据",
+    "switchHint": "仅影响新建会话，已有会话继续使用原环境。首次开启会复制已有历史和记忆。",
+    "saving": "正在切换数据环境…",
     "opening": "正在打开…",
     "loginOpened": "已在终端打开 CCEM 专属登录流程",
-    "loginHint": "使用官方订阅需要在这里单独登录；API 环境继续使用已配置的密钥。项目内的指令、技能和文件仍随项目共享。"
+    "loginHint": "隔离环境使用官方订阅时需单独登录。API 密钥继续可用，项目内的文件、指令和技能仍然共享。"
   },
   "startup": {
     "preparing": "正在准备工作区…",

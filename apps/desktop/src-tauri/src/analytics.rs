@@ -704,9 +704,9 @@ struct JsonlDiscovery {
     codex_complete: bool,
 }
 
-fn discover_jsonl_files() -> JsonlDiscovery {
+fn discover_jsonl_files(codex_home: &Path) -> JsonlDiscovery {
     let (mut files, claude_complete) = discover_claude_jsonl_files();
-    let (codex_files, codex_complete) = discover_codex_jsonl_files();
+    let (codex_files, codex_complete) = discover_codex_jsonl_files(codex_home);
     files.extend(codex_files);
     JsonlDiscovery {
         files,
@@ -792,10 +792,10 @@ fn collect_claude_jsonl_dir(
     complete
 }
 
-/// Scan CCEM's independently persisted Codex transcripts.
-fn discover_codex_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
+/// Scan the Codex profile selected for this refresh.
+fn discover_codex_jsonl_files(codex_home: &Path) -> (Vec<DiscoveredFile>, bool) {
     let mut files = Vec::new();
-    let sessions_dir = agent_home::codex_home().join("sessions");
+    let sessions_dir = codex_home.join("sessions");
     if !sessions_dir.exists() {
         return (files, true);
     }
@@ -1936,9 +1936,16 @@ fn migrate_agent_cache_paths(
             codex_home.join("sessions"),
         ),
     ];
+    remap_agent_cache_paths(cache, &roots)
+}
+
+fn remap_agent_cache_paths(cache: &mut CacheFile, roots: &[(PathBuf, PathBuf)]) -> bool {
     let mut moves = Vec::new();
     for old_key in cache.files.keys() {
-        for (source_root, target_root) in &roots {
+        for (source_root, target_root) in roots {
+            if source_root == target_root {
+                continue;
+            }
             let Ok(relative) = Path::new(old_key).strip_prefix(source_root) else {
                 continue;
             };
@@ -1957,7 +1964,12 @@ fn migrate_agent_cache_paths(
     }
     let changed = !moves.is_empty();
     for (old_key, new_key) in moves {
-        if let Some(entry) = cache.files.remove(&old_key) {
+        if let Some(mut entry) = cache.files.remove(&old_key) {
+            // A profile switch can select a diverged snapshot with identical
+            // size and mtime. Retain totals until refresh, but reparse that
+            // destination instead of carrying another profile's cursor.
+            entry.meta.mtime = -1.0;
+            entry.append_anchor = None;
             cache.files.entry(new_key).or_insert(entry);
         }
     }
@@ -2003,15 +2015,27 @@ fn refresh_usage_cache_locked() -> CacheFile {
         return read_usage_cache();
     }
     let prices = load_model_prices();
-    let discovery = discover_jsonl_files();
+    let codex_isolated = agent_home::codex_isolated();
+    let discovery = discover_jsonl_files(&agent_home::codex_home_for_mode(codex_isolated));
     let desktop_cache_exists = usage_cache_path().exists();
     let mut existing_cache = read_usage_cache();
     let remapped = dirs::home_dir().is_some_and(|home| {
-        migrate_agent_cache_paths(
+        let shared = agent_home::codex_home_for_mode(false).join("sessions");
+        let isolated = agent_home::isolated_codex_home().join("sessions");
+        let (inactive, active) = if codex_isolated {
+            (shared, isolated)
+        } else {
+            (isolated, shared)
+        };
+        remap_agent_cache_paths(
             &mut existing_cache,
-            &home,
-            &agent_home::claude_home(),
-            &agent_home::codex_home(),
+            &[
+                (
+                    home.join(".claude/projects"),
+                    agent_home::claude_home().join("projects"),
+                ),
+                (inactive, active),
+            ],
         )
     });
 
@@ -2899,6 +2923,8 @@ fn detect_source_from_path(path: &str) -> Option<&'static str> {
         return Some(SOURCE_CLAUDE);
     }
     if Path::new(path).starts_with(agent_home::codex_home().join("sessions"))
+        || Path::new(path).starts_with(agent_home::codex_home_for_mode(false).join("sessions"))
+        || Path::new(path).starts_with(agent_home::isolated_codex_home().join("sessions"))
         || path.contains("/.codex/sessions/")
         || path.contains("\\.codex\\sessions\\")
     {
@@ -3949,6 +3975,72 @@ mod tests {
             150
         );
         assert_eq!(cache.files.len(), 1);
+    }
+
+    #[test]
+    fn codex_profile_switch_reparses_diverged_snapshot_without_double_counting() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared_root = temp.path().join("shared/sessions");
+        let isolated_root = temp.path().join("isolated/sessions");
+        let shared = shared_root.join("rollout.jsonl");
+        let isolated = isolated_root.join("rollout.jsonl");
+        fs::create_dir_all(&shared_root).unwrap();
+        fs::create_dir_all(&isolated_root).unwrap();
+        for (path, input) in [(&shared, 100), (&isolated, 900)] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    codex_context_line("gpt-5.3-codex"),
+                    codex_count_line("2026-03-01T10:00:00Z", input, 0, 10, 0)
+                ),
+            )
+            .unwrap();
+        }
+        let modified = fs::metadata(&shared).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&isolated)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let files = HashMap::from([(
+            shared.to_string_lossy().to_string(),
+            refresh_round(None, &discovered_at(&shared, UsageSource::Codex)),
+        )]);
+        let mut cache = CacheFile {
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files,
+            ..CacheFile::default()
+        };
+        for (source, target, path, expected) in [
+            (&shared_root, &isolated_root, &isolated, 900),
+            (&isolated_root, &shared_root, &shared, 100),
+            (&shared_root, &isolated_root, &isolated, 900),
+        ] {
+            assert!(super::remap_agent_cache_paths(
+                &mut cache,
+                &[(source.clone(), target.clone())]
+            ));
+            let key = path.to_string_lossy().to_string();
+            let entry = refresh_round(
+                cache.files.get(&key),
+                &discovered_at(path, UsageSource::Codex),
+            );
+            cache.files.insert(key, entry);
+            cache.global_rollup = CacheRollup::from_file_entries(&cache.files);
+            assert_eq!(cache.files.len(), 1);
+            assert_eq!(
+                aggregate_cache(&cache, Some(SOURCE_CODEX), &default_prices())
+                    .total
+                    .input_tokens,
+                expected
+            );
+        }
+        assert!(!super::remap_agent_cache_paths(
+            &mut cache,
+            &[(isolated_root.clone(), isolated_root)]
+        ));
     }
 
     /// Independent full-parse reference for shadow assertions.

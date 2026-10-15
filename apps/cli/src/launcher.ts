@@ -239,13 +239,14 @@ export async function launchClaude(options: LaunchOptions): Promise<void> {
   });
 }
 
-/** Authenticate only the CCEM-owned account, without an environment's API-token override. */
+/** Authenticate in the selected app profile; Codex shares its official profile by default. */
 export async function launchAgentAuth(provider: 'claude' | 'codex'): Promise<void> {
-  ensureCcemAgentHome(provider);
   const env = buildIsolatedAgentEnv();
+  ensureCcemAgentHome(provider, { ...process.env, CCEM_CODEX_ISOLATED: env.CCEM_CODEX_ISOLATED });
   const args = provider === 'claude'
     ? ['auth', 'login']
-    : ['--config', `sqlite_home=${JSON.stringify(env.CODEX_HOME)}`, 'login'];
+    : env.CCEM_CODEX_ISOLATED === '1'
+      ? ['--config', `sqlite_home=${JSON.stringify(env.CODEX_HOME)}`, 'login'] : ['login'];
   await new Promise<void>((resolve, reject) => {
     const child = spawn(provider, args, { env, stdio: 'inherit', shell: false });
     child.once('error', reject);

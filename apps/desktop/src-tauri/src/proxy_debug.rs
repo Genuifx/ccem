@@ -4331,6 +4331,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(crate::session::Session {
+                    codex_isolated: None,
                     id: "legacy-runtime".to_string(),
                     pid: None,
                     client: "claude".to_string(),

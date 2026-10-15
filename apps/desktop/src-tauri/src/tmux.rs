@@ -112,9 +112,11 @@ impl TmuxManager {
         env_vars: &HashMap<String, String>,
         working_dir: &Path,
     ) -> Result<TmuxWindowInfo, String> {
+        let mut prepared_env = env_vars.clone();
         if matches!(client, "claude" | "codex") {
-            crate::agent_home::ensure_agent_homes()?;
+            crate::agent_profile::prepare_env(client, &mut prepared_env)?;
         }
+        let env_vars = &prepared_env;
         Self::check_tmux_installed()?;
         let session_name = session_name_for_runtime(runtime_id, &self.session_prefix);
         let window_name = DEFAULT_TMUX_WINDOW.to_string();
@@ -1552,9 +1554,9 @@ fn build_tmux_launch_spec(
     }
 
     let mut command_parts = vec![shell_quote(&client_binary)];
-    if client == "codex" {
+    if client == "codex" && crate::agent_profile::codex_isolated_for_env(&env_vars) {
         command_parts.push("-c".to_string());
-        command_parts.push(shell_quote(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::codex_home().to_string_lossy()).unwrap())));
+        command_parts.push(shell_quote(&format!("sqlite_home={}", serde_json::to_string(&env_vars["CODEX_HOME"]).unwrap())));
     }
     command_parts.extend(client_args.iter().map(|arg| shell_quote(arg)));
 
@@ -2703,6 +2705,17 @@ mod tests {
         );
         assert!(command.contains("exec "));
         assert!(command.contains("'resume' 'session-123'"));
+    }
+
+    #[test]
+    fn codex_tmux_launch_keeps_the_pinned_profile() {
+        for isolated in [false, true] {
+            let env = HashMap::from([("CCEM_CODEX_ISOLATED".into(), if isolated { "1" } else { "0" }.into())]);
+            let spec = build_tmux_launch_spec("codex", &["resume".into(), "session-123".into()], &env, "test:main", "tmux");
+            assert_eq!(spec.command.contains("sqlite_home="), isolated);
+            assert!(spec.environment.contains(&format!("CODEX_HOME={}", crate::agent_home::codex_home_for_mode(isolated).display())));
+            assert!(spec.environment.contains(&format!("CCEM_CODEX_ISOLATED={}", if isolated { "1" } else { "0" })));
+        }
     }
 
     #[test]

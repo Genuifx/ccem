@@ -50,15 +50,15 @@ describe('migration with live legacy CCEM processes', () => {
     const relative = provider === 'claude' ? '.claude/projects/project/session.jsonl' : '.codex/sessions/old.jsonl';
     const source = write(relative, 'initial\n');
     const child = await start(provider, { CCEM_SESSION_ID: 'legacy-ccem' }, source);
-    expect(() => ensureCcemAgentHome(provider, { HOME: home })).toThrow(/live CCEM|still writing/);
-    const root = getCcemAgentHome(provider, { HOME: home });
+    expect(() => ensureCcemAgentHome(provider, { HOME: home, CCEM_CODEX_ISOLATED: '1' })).toThrow(/live CCEM|still writing/);
+    const root = getCcemAgentHome(provider, { HOME: home, CCEM_CODEX_ISOLATED: '1' });
     expect(fs.existsSync(path.join(root, AGENT_MIGRATION_MARKER))).toBe(false);
     expect(fs.existsSync(path.join(home, '.ccem/agents/.ccem-migration.lock'))).toBe(false);
     fs.appendFileSync(source, 'last-message\n');
     const stopped = once(child, 'exit');
     child.kill();
     await stopped;
-    ensureCcemAgentHome(provider, { HOME: home });
+    ensureCcemAgentHome(provider, { HOME: home, CCEM_CODEX_ISOLATED: '1' });
     const copied = path.join(root, relative.split('/').slice(1).join('/'));
     expect(fs.readFileSync(copied, 'utf8')).toBe('initial\nlast-message\n');
     expect(fs.readFileSync(source, 'utf8')).toBe('initial\nlast-message\n');
@@ -67,19 +67,33 @@ describe('migration with live legacy CCEM processes', () => {
   it('allows official and already isolated writers and writers using another source home', async () => {
     write('.claude/projects/project/session.jsonl', 'legacy\n');
     await start('claude', {});
-    const root = getCcemAgentHome('claude', { HOME: home });
+    const root = getCcemAgentHome('claude', { HOME: home, CCEM_CODEX_ISOLATED: '1' });
     await start('claude', { CCEM_SESSION_ID: 'isolated', CLAUDE_CONFIG_DIR: root }, path.join(root, 'projects/current.jsonl'));
     await start('claude', { CCEM_SESSION_ID: 'other-home', HOME: path.join(home, 'other user') });
-    expect(ensureCcemAgentHome('claude', { HOME: home })).toBe(root);
+    expect(ensureCcemAgentHome('claude', { HOME: home, CCEM_CODEX_ISOLATED: '1' })).toBe(root);
     expect(fs.readFileSync(path.join(root, 'projects/project/session.jsonl'), 'utf8')).toBe('legacy\n');
   });
 
   it('does not reopen a completed snapshot when a later official-directory writer starts', async () => {
     const source = write('.codex/sessions/old.jsonl', 'snapshot\n');
-    const root = ensureCcemAgentHome('codex', { HOME: home });
+    const root = ensureCcemAgentHome('codex', { HOME: home, CCEM_CODEX_ISOLATED: '1' });
     await start('codex', { CCEM_RUNTIME_ID: 'after-snapshot' }, source);
     fs.appendFileSync(source, 'later-official-message\n');
-    expect(ensureCcemAgentHome('codex', { HOME: home })).toBe(root);
+    expect(ensureCcemAgentHome('codex', { HOME: home, CCEM_CODEX_ISOLATED: '1' })).toBe(root);
     expect(fs.readFileSync(path.join(root, 'sessions/old.jsonl'), 'utf8')).toBe('snapshot\n');
+  });
+
+  it('defers a custom shared Codex source until its CCEM writer finishes', async () => {
+    const source = write('custom-codex/sessions/old.jsonl', 'initial\n');
+    const sharedRoot = path.join(home, 'custom-codex');
+    const child = await start('codex', { CCEM_RUNTIME_ID: 'custom-shared', CODEX_HOME: sharedRoot }, source);
+    const env = { HOME: home, CODEX_HOME: sharedRoot, CCEM_CODEX_ISOLATED: '1' };
+    expect(() => ensureCcemAgentHome('codex', env)).toThrow(/live CCEM|still writing/);
+    fs.appendFileSync(source, 'last-message\n');
+    const stopped = once(child, 'exit');
+    child.kill();
+    await stopped;
+    const root = ensureCcemAgentHome('codex', env);
+    expect(fs.readFileSync(path.join(root, 'sessions/old.jsonl'), 'utf8')).toBe('initial\nlast-message\n');
   });
 });

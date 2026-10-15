@@ -507,13 +507,17 @@ A local JSON-RPC server for programmatic control:
 |---|---|
 | `~/.ccem/config.json` | Environment config (API keys encrypted) |
 | `~/.ccem/agents/claude/` | CCEM Claude Code configuration, login, history, and memory |
-| `~/.ccem/agents/codex/` | CCEM Codex configuration, login, history, and memory |
+| `~/.codex/` (or `CODEX_HOME`) | Codex configuration, login, history, and memory shared with the official app by default |
+| `~/.ccem/agents/codex/` | Optional isolated Codex profile |
+| `~/.ccem/agents/profiles.json` | Codex isolation preference, shared by the desktop and CLI |
 | `~/.ccem/usage-cache.json` | Usage cache |
 | `~/.ccem/model-prices.json` | Price cache |
 | `.claude/settings.json` | Project permission config |
 | `.claude/skills/` | Installed skills |
 
-Providers within CCEM share the corresponding agent directory; official apps keep their own directories. First launch independently copies existing conversations and memories while preserving session IDs. Subsequent changes stay separate. Credentials, global settings, and plugin registries are not copied; configured CCEM API keys remain available. To use an official subscription, sign in under Settings → Agent data & sign-in, or run `ccem auth claude` / `ccem auth codex`.
+Claude Code uses a CCEM-owned profile. Codex defaults to reusing the official configuration, login, history, memory, and database location. Turn on **Settings → Agent data & sign-in → Isolate Codex data** to give Codex a separate CCEM profile. The setting applies to new sessions; existing native sessions keep their original profile through reconnects and terminal handoff. Providers within CCEM share the corresponding agent profile.
+
+First use of an isolated profile copies existing conversations and memories while preserving session IDs. Later changes stay separate; turning isolation off leaves the isolated copy available for reuse. Credentials, global settings, and plugin registries are not copied. Configured CCEM API keys remain available. Official subscriptions require a separate sign-in only in isolated profiles, through the settings page or `ccem auth claude` / `ccem auth codex` (which follows the selected Codex mode).
 
 Finish any running sessions from an older CCEM version before the first migration so their final turns can be included. Project files, project instructions, and shared `~/.agents/skills` remain available; app data isolation does not restrict filesystem access to the working directory. An absolute `CCEM_AGENT_HOME` can select a separate agent data root for a controlled deployment.
 

@@ -24,6 +24,8 @@ fn get_sessions_file_path() -> std::path::PathBuf {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Session {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_isolated: Option<bool>,
     pub id: String,
     pub pid: Option<u32>,
     #[serde(default = "default_client")]
@@ -330,8 +332,10 @@ impl SessionManager {
         }
 
         let running = self.get_running_sessions();
-        let active_iterm_sessions = query_needed_terminal(&running, "iterm2", terminal::list_iterm_sessions);
-        let active_terminal_windows = query_needed_terminal(&running, "terminalapp", terminal::list_terminal_app_windows);
+        let active_iterm_sessions =
+            query_needed_terminal(&running, "iterm2", terminal::list_iterm_sessions);
+        let active_terminal_windows =
+            query_needed_terminal(&running, "terminalapp", terminal::list_terminal_app_windows);
 
         {
             let mut sessions = self.lock_sessions();
@@ -349,7 +353,9 @@ impl SessionManager {
                     (Some(term_type), Some(wid)) => {
                         let is_alive = match term_type.as_str() {
                             "iterm2" => terminal_window_is_present(&active_iterm_sessions, wid),
-                            "terminalapp" => terminal_window_is_present(&active_terminal_windows, wid),
+                            "terminalapp" => {
+                                terminal_window_is_present(&active_terminal_windows, wid)
+                            }
                             _ => false,
                         };
 
@@ -374,10 +380,14 @@ impl SessionManager {
 }
 
 fn query_needed_terminal(
-    sessions: &[Session], kind: &str,
+    sessions: &[Session],
+    kind: &str,
     query: impl FnOnce() -> Result<Vec<String>, String>,
 ) -> Result<Vec<String>, String> {
-    if sessions.iter().any(|session| !session.is_tmux_backed() && session.terminal_type.as_deref() == Some(kind)) {
+    if sessions
+        .iter()
+        .any(|session| !session.is_tmux_backed() && session.terminal_type.as_deref() == Some(kind))
+    {
         query()
     } else {
         Ok(Vec::new())
@@ -387,7 +397,10 @@ fn query_needed_terminal(
 fn terminal_window_is_present(result: &Result<Vec<String>, String>, id: &str) -> bool {
     // Failure/timeout is unknown, so the next monitor pass can retry. It must
     // not turn a live user's session into an interrupted session.
-    result.as_ref().map(|ids| ids.iter().any(|value| value == id)).unwrap_or(true)
+    result
+        .as_ref()
+        .map(|ids| ids.iter().any(|value| value == id))
+        .unwrap_or(true)
 }
 
 /// Check if a process with the given PID is still running
@@ -500,8 +513,13 @@ pub fn start_session_monitor(app: AppHandle, manager: Arc<SessionManager>) {
 
             // 2. Batch query all active terminal windows (single AppleScript call each)
             let terminal_sessions = manager.get_running_terminal_sessions();
-            let active_iterm_sessions = query_needed_terminal(&terminal_sessions, "iterm2", terminal::list_iterm_sessions);
-            let active_terminal_app_windows = query_needed_terminal(&terminal_sessions, "terminalapp", terminal::list_terminal_app_windows);
+            let active_iterm_sessions =
+                query_needed_terminal(&terminal_sessions, "iterm2", terminal::list_iterm_sessions);
+            let active_terminal_app_windows = query_needed_terminal(
+                &terminal_sessions,
+                "terminalapp",
+                terminal::list_terminal_app_windows,
+            );
 
             // 3. Check terminal-based sessions
             for session in terminal_sessions {
@@ -544,7 +562,9 @@ pub fn start_session_monitor(app: AppHandle, manager: Arc<SessionManager>) {
                 if let (Some(term_type), Some(wid)) = (&session.terminal_type, &session.window_id) {
                     let is_alive = match term_type.as_str() {
                         "iterm2" => terminal_window_is_present(&active_iterm_sessions, wid),
-                        "terminalapp" => terminal_window_is_present(&active_terminal_app_windows, wid),
+                        "terminalapp" => {
+                            terminal_window_is_present(&active_terminal_app_windows, wid)
+                        }
                         _ => true,
                     };
 
@@ -585,6 +605,7 @@ mod tests {
 
     fn sample_session(id: &str) -> Session {
         Session {
+            codex_isolated: None,
             id: id.to_string(),
             pid: Some(42),
             client: "claude".to_string(),
@@ -602,6 +623,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_profile_pin_survives_persistence_and_legacy_records_remain_shared() {
+        let mut session = sample_session("codex-session");
+        session.client = "codex".into();
+        let legacy = serde_json::to_value(&session).unwrap();
+        assert!(legacy.get("codex_isolated").is_none());
+        let restored: Session = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.codex_isolated.unwrap_or(false));
+        session.codex_isolated = Some(true);
+        let restored: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(restored.codex_isolated, Some(true));
+    }
+
+    #[test]
     fn startup_skips_unneeded_terminal_queries_and_preserves_unknown_sessions() {
         let session = sample_session("tmux-fixture");
         let result = super::query_needed_terminal(&[session], "iterm2", || {
@@ -615,12 +650,16 @@ mod tests {
         let result = super::query_needed_terminal(&[session], "iterm2", || Err("timeout".into()));
         assert!(super::terminal_window_is_present(&result, "42"));
         assert!(!super::terminal_window_is_present(&Ok(vec![]), "42"));
-        assert!(super::terminal_window_is_present(&Ok(vec!["42".into()]), "42"));
+        assert!(super::terminal_window_is_present(
+            &Ok(vec!["42".into()]),
+            "42"
+        ));
     }
 
     #[test]
     fn tmux_backed_session_with_target_survives_pidless_startup_reconcile() {
         let session = Session {
+            codex_isolated: None,
             id: "session-1777215516640".to_string(),
             pid: None,
             client: "claude".to_string(),

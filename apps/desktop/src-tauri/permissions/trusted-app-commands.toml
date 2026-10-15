@@ -3,6 +3,7 @@ identifier = "trusted-app-commands"
 description = "Allows CCEM application commands only for explicitly trusted application webviews."
 commands.allow = [
   "get_agent_profiles",
+  "set_codex_isolation",
   "login_agent_profile",
   "webcontent_debug_main_process_id",
   "webcontent_frontend_boot",

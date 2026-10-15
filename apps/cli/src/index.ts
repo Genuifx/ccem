@@ -37,6 +37,7 @@ import {
   ensureCcemAgentHome,
   getCcemAgentEnv,
   INHERITED_AGENT_ENV_KEYS,
+  SHARED_CODEX_ENV_KEYS,
   isAgentIdentityEnvKey,
   getCcemConfigPath,
   getLegacyConfigPath,
@@ -148,7 +149,8 @@ const buildShellEnvCommands = (envName: string | undefined, env: EnvConfig): str
     ...Object.keys(process.env).filter(isAgentIdentityEnvKey),
     ...Object.keys(resolved),
   ])];
-  return keys.map((key) =>
+  return keys.filter((key) => resolved.CCEM_CODEX_ISOLATED === '1'
+    || !(SHARED_CODEX_ENV_KEYS as readonly string[]).includes(key)).map((key) =>
     resolved[key]
       ? `export ${key}=${shellQuote(resolved[key])}`
       : `unset ${key}`
@@ -1026,7 +1028,7 @@ program
 
 program
   .command('auth <provider>')
-  .description('Sign in to Claude Code or Codex for CCEM only')
+  .description('Sign in using the selected Claude Code or Codex profile')
   .action(async (provider: string) => {
     if (provider !== 'claude' && provider !== 'codex') {
       program.error('Provider must be claude or codex');

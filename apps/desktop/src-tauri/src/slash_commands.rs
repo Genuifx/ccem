@@ -288,9 +288,10 @@ fn scan_provider_commands(
 pub async fn list_workspace_commands(
     working_dir: Option<String>,
     provider: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Vec<WorkspaceCommand>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        list_workspace_commands_sync(working_dir, provider)
+        list_workspace_commands_sync(working_dir, provider, codex_isolated)
     })
     .await
     .map_err(|error| format!("Failed to scan workspace commands: {}", error))?
@@ -299,8 +300,11 @@ pub async fn list_workspace_commands(
 fn list_workspace_commands_sync(
     working_dir: Option<String>,
     provider: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Vec<WorkspaceCommand>, String> {
-    crate::agent_home::ensure_agent_homes()?;
+    let codex_isolated = match codex_isolated { Some(mode) => mode, None => crate::agent_home::codex_isolation_preference()? };
+    crate::agent_home::prepare_agent_homes_for_mode(codex_isolated)?;
+    let codex_home = crate::agent_home::codex_home_for_mode(codex_isolated);
     let home = dirs::home_dir();
     let working_dir = working_dir
         .as_deref()
@@ -315,7 +319,7 @@ fn list_workspace_commands_sync(
     match normalized_provider.as_deref() {
         Some("codex") => {
             commands.extend(scan_provider_commands(
-                Some(&crate::agent_home::codex_home()),
+                Some(&codex_home),
                 home.as_deref(),
                 working_dir.as_deref(),
                 "codex",
@@ -340,7 +344,7 @@ fn list_workspace_commands_sync(
                 ".claude",
             ));
             commands.extend(scan_provider_commands(
-                Some(&crate::agent_home::codex_home()),
+                Some(&codex_home),
                 home.as_deref(),
                 working_dir.as_deref(),
                 "codex",

@@ -30,6 +30,8 @@ const HISTORY_SCAN_LIMIT_MULTIPLIER: usize = 2;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct HistorySession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_isolated: Option<bool>,
     pub id: String,
     pub source: String,
     pub display: String,
@@ -242,6 +244,7 @@ struct CodexSessionMeta {
 
 #[derive(Debug, Clone)]
 struct CodexPathConfig {
+    isolated: bool,
     home_dir: PathBuf,
     codex_home: PathBuf,
     history_path: PathBuf,
@@ -651,7 +654,19 @@ fn build_workspace_project_nodes(sessions: &[HistorySession]) -> Vec<WorkspacePr
 }
 
 fn history_session_key(session: &HistorySession) -> String {
-    format!("{}:{}", session.source, session.id)
+    if session.source == SOURCE_CODEX && session.codex_isolated == Some(true) {
+        format!("codex:isolated:{}", session.id)
+    } else {
+        format!("{}:{}", session.source, session.id)
+    }
+}
+
+fn history_profile_source(session: &HistorySession) -> String {
+    if session.source == SOURCE_CODEX && session.codex_isolated == Some(true) {
+        "codex:isolated".to_string()
+    } else {
+        session.source.trim().to_lowercase()
+    }
 }
 
 fn normalize_history_search_text(value: &str) -> String {
@@ -719,6 +734,7 @@ pub async fn get_conversation_messages(
     app: tauri::AppHandle,
     session_id: String,
     source: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Vec<ConversationMessage>, String> {
     let source_hint = normalize_history_source(source.as_deref())?;
 
@@ -730,7 +746,8 @@ pub async fn get_conversation_messages(
     }
 
     run_blocking(move || {
-        let (messages, _) = load_legacy_conversation_detail(&session_id, source_hint)?;
+        let (messages, _) =
+            load_legacy_conversation_detail(&session_id, source_hint, codex_isolated)?;
         Ok(messages)
     })
     .await
@@ -741,6 +758,7 @@ pub async fn get_conversation_detail(
     app: tauri::AppHandle,
     session_id: String,
     source: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<ConversationDetailPayload, HistoryCommandError> {
     let source_hint =
         normalize_history_source(source.as_deref()).map_err(|e| HistoryCommandError {
@@ -758,7 +776,7 @@ pub async fn get_conversation_detail(
     let legacy_result = if source_hint != Some(SOURCE_DSH) {
         let sid = session_id.clone();
         let sh = source_hint;
-        Some(run_blocking(move || load_legacy_conversation_detail(&sid, sh)).await)
+        Some(run_blocking(move || load_legacy_conversation_detail(&sid, sh, codex_isolated)).await)
     } else {
         None
     };
@@ -770,15 +788,20 @@ pub async fn get_conversation_detail(
 fn load_legacy_conversation_detail(
     session_id: &str,
     source_hint: Option<&'static str>,
+    codex_isolated: Option<bool>,
 ) -> Result<(Vec<ConversationMessage>, Vec<CompactSegment>), String> {
     if source_hint.is_none() || matches!(source_hint, Some(SOURCE_CLAUDE | SOURCE_CODEX)) {
-        agent_home::ensure_agent_homes()?;
+        match codex_isolated {
+            Some(mode) => agent_home::prepare_agent_homes_for_mode(mode)?,
+            None => agent_home::ensure_agent_homes()?,
+        }
     }
     // Legacy: only resolve among claude/codex/opencode; never probe DSH.
-    let resolved_source = match resolve_history_source_for_session(session_id, source_hint) {
-        Some(s) => s,
-        None => return Ok((vec![], vec![])),
-    };
+    let resolved_source =
+        match resolve_history_source_for_session(session_id, source_hint, codex_isolated) {
+            Some(s) => s,
+            None => return Ok((vec![], vec![])),
+        };
 
     match resolved_source {
         SOURCE_CLAUDE => {
@@ -793,7 +816,8 @@ fn load_legacy_conversation_detail(
             parse_claude_conversation_file(&path)
         }
         SOURCE_CODEX => {
-            let path = match find_codex_session_file(session_id) {
+            let config = resolve_codex_path_config_for_mode(codex_isolated)?;
+            let path = match find_codex_session_file_with_config(session_id, &config) {
                 Some(p) => p,
                 None => return Ok((vec![], vec![])),
             };
@@ -951,6 +975,7 @@ pub async fn get_session_subagents(
     session_id: String,
     source: Option<String>,
     detail_agent_id: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<SessionSubagentsPayload, String> {
     run_blocking(move || {
         let empty = || SessionSubagentsPayload {
@@ -959,12 +984,16 @@ pub async fn get_session_subagents(
         };
         let source_hint = normalize_history_source(source.as_deref())?;
         if source_hint.is_none() || matches!(source_hint, Some(SOURCE_CLAUDE | SOURCE_CODEX)) {
-            agent_home::ensure_agent_homes()?;
+            match codex_isolated {
+                Some(mode) => agent_home::prepare_agent_homes_for_mode(mode)?,
+                None => agent_home::ensure_agent_homes()?,
+            }
         }
-        let resolved_source = match resolve_history_source_for_session(&session_id, source_hint) {
-            Some(s) => s,
-            None => return Ok(empty()),
-        };
+        let resolved_source =
+            match resolve_history_source_for_session(&session_id, source_hint, codex_isolated) {
+                Some(s) => s,
+                None => return Ok(empty()),
+            };
         // v1 supports Claude only — Codex/opencode have different sub-agent layouts.
         if resolved_source != SOURCE_CLAUDE {
             return Ok(empty());
@@ -1768,6 +1797,7 @@ pub async fn get_conversation_segments(
     app: tauri::AppHandle,
     session_id: String,
     source: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Vec<CompactSegment>, String> {
     let source_hint = normalize_history_source(source.as_deref())?;
 
@@ -1779,7 +1809,8 @@ pub async fn get_conversation_segments(
     }
 
     run_blocking(move || {
-        let (_, segments) = load_legacy_conversation_detail(&session_id, source_hint)?;
+        let (_, segments) =
+            load_legacy_conversation_detail(&session_id, source_hint, codex_isolated)?;
         Ok(segments)
     })
     .await
@@ -1913,6 +1944,7 @@ fn merge_claude_history_line(session_map: &mut HashMap<String, HistorySession>, 
     merge_claude_history_session(
         session_map,
         HistorySession {
+            codex_isolated: None,
             id,
             source: SOURCE_CLAUDE.to_string(),
             display,
@@ -2130,6 +2162,7 @@ fn history_session_from_provenance_record(
         .unwrap_or(0);
 
     Some(HistorySession {
+        codex_isolated: None,
         id: id.to_string(),
         source: source.to_string(),
         display: String::new(),
@@ -2211,7 +2244,7 @@ fn dedupe_provenance_alias_history_sessions(
         .iter()
         .map(|session| {
             (
-                session.source.trim().to_lowercase(),
+                history_profile_source(session),
                 session.id.trim().to_string(),
             )
         })
@@ -2221,15 +2254,16 @@ fn dedupe_provenance_alias_history_sessions(
 
     for mut session in sessions {
         let source = session.source.trim().to_lowercase();
+        let profile_source = history_profile_source(&session);
         let original_id = session.id.trim().to_string();
         let canonical_id = aliases
             .get(&(source.clone(), original_id.clone()))
             .filter(|source_session_id| {
-                present_keys.contains(&(source.clone(), (*source_session_id).clone()))
+                present_keys.contains(&(profile_source.clone(), (*source_session_id).clone()))
             })
             .cloned()
             .unwrap_or_else(|| original_id.clone());
-        let key = (source, canonical_id.clone());
+        let key = (profile_source, canonical_id.clone());
 
         if let Some(existing_index) = indexes_by_key.get(&key).copied() {
             let mut merged =
@@ -2294,7 +2328,7 @@ fn history_dedupe_key(session: &HistorySession) -> Option<(String, String, Strin
     }
 
     Some((
-        session.source.trim().to_lowercase(),
+        history_profile_source(session),
         project.replace('\\', "/").to_lowercase(),
         display.to_lowercase(),
     ))
@@ -2547,6 +2581,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
         .to_string();
 
     Some(HistorySession {
+        codex_isolated: None,
         id: session_id,
         source: SOURCE_CLAUDE.to_string(),
         display: if display_priority == 4 {
@@ -3094,6 +3129,7 @@ fn upsert_codex_history_session(
         session_map.insert(
             id.clone(),
             HistorySession {
+                codex_isolated: None,
                 id,
                 source: SOURCE_CODEX.to_string(),
                 display,
@@ -3117,21 +3153,72 @@ fn find_codex_session_file(session_id: &str) -> Option<PathBuf> {
 }
 
 fn resolve_codex_path_config() -> Result<CodexPathConfig, String> {
-    agent_home::ensure_agent_homes()?;
+    resolve_codex_path_config_for_mode(None)
+}
+
+fn resolve_codex_path_config_for_mode(mode: Option<bool>) -> Result<CodexPathConfig, String> {
+    match mode {
+        Some(mode) => agent_home::prepare_agent_homes_for_mode(mode)?,
+        None => agent_home::ensure_agent_homes()?,
+    }
+    let isolated = mode.unwrap_or_else(agent_home::codex_isolated);
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(codex_path_config_for(&home_dir, agent_home::codex_home()))
+    let codex_home = agent_home::codex_home_for_mode(isolated);
+    if isolated {
+        Ok(codex_path_config_for(&home_dir, codex_home))
+    } else {
+        Ok(shared_codex_path_config_for(
+            &home_dir,
+            codex_home,
+            std::env::var("CODEX_SQLITE_HOME").ok().as_deref(),
+            &std::env::current_dir().unwrap_or_else(|_| home_dir.clone()),
+        ))
+    }
 }
 
 fn codex_path_config_for(home_dir: &Path, codex_home: PathBuf) -> CodexPathConfig {
     // Both databases and transcripts belong to this application. An inherited
     // CODEX_SQLITE_HOME or sqlite_home in config cannot reconnect official state.
     CodexPathConfig {
+        isolated: true,
         home_dir: home_dir.to_path_buf(),
         history_path: codex_home.join("history.jsonl"),
         sessions_root: codex_home.join("sessions"),
         session_index_path: codex_home.join("session_index.jsonl"),
         sqlite_home: codex_home.clone(),
         codex_home,
+    }
+}
+
+fn shared_codex_path_config_for(
+    home_dir: &Path,
+    codex_home: PathBuf,
+    sqlite_env: Option<&str>,
+    cwd: &Path,
+) -> CodexPathConfig {
+    let config_sqlite = fs::read_to_string(codex_home.join("config.toml"))
+        .ok()
+        .and_then(|value| toml::from_str::<toml::Value>(&value).ok())
+        .and_then(|value| {
+            value
+                .get("sqlite_home")
+                .and_then(|path| path.as_str())
+                .map(str::to_string)
+        });
+    let sqlite_home = sqlite_env
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| resolve_path_value(value, home_dir, cwd))
+        .or_else(|| {
+            config_sqlite
+                .as_deref()
+                .map(|value| resolve_path_value(value, home_dir, &codex_home))
+        })
+        .unwrap_or_else(|| codex_home.clone());
+    CodexPathConfig {
+        isolated: false,
+        sqlite_home,
+        ..codex_path_config_for(home_dir, codex_home)
     }
 }
 
@@ -3164,7 +3251,7 @@ fn load_codex_history_from_config_limited(
         .into_values()
         .filter_map(|record| {
             let rollout_path = record.rollout_path?;
-            if !is_owned_codex_rollout(&rollout_path, &config.codex_home)
+            if !codex_rollout_allowed(&rollout_path, config)
                 || fs::File::open(&rollout_path).is_err()
             {
                 return None;
@@ -3178,6 +3265,7 @@ fn load_codex_history_from_config_limited(
                 .to_string();
 
             Some(HistorySession {
+                codex_isolated: Some(config.isolated),
                 id: record.id,
                 source: SOURCE_CODEX.to_string(),
                 display: record.display,
@@ -3342,9 +3430,7 @@ fn find_codex_session_file_with_config(
         .ok()?
         .get(session_id)
         .and_then(|record| record.rollout_path.clone())
-        .filter(|path| {
-            is_owned_codex_rollout(path, &config.codex_home) && fs::File::open(path).is_ok()
-        })
+        .filter(|path| codex_rollout_allowed(path, config) && fs::File::open(path).is_ok())
 }
 
 fn load_codex_history_index(path: &Path) -> Vec<CodexHistoryLine> {
@@ -3415,7 +3501,7 @@ fn load_codex_threads_from_state_db(config: &CodexPathConfig) -> Vec<CodexThread
                 rollout_path: rollout_path
                     .as_deref()
                     .map(|raw| resolve_path_value(raw, &config.home_dir, &config.codex_home))
-                    .filter(|path| is_owned_codex_rollout(path, &config.codex_home)),
+                    .filter(|path| codex_rollout_allowed(path, config)),
                 created_at: normalize_unix_timestamp_i64(row.get::<_, i64>(2)?),
                 updated_at: normalize_unix_timestamp_i64(row.get::<_, i64>(3)?),
                 cwd: row.get(4)?,
@@ -3446,6 +3532,10 @@ fn is_owned_codex_rollout(path: &Path, codex_home: &Path) -> bool {
     (resolved.starts_with(root.join("sessions"))
         || resolved.starts_with(root.join("archived_sessions")))
         && resolved.is_file()
+}
+
+fn codex_rollout_allowed(path: &Path, config: &CodexPathConfig) -> bool {
+    !config.isolated || is_owned_codex_rollout(path, &config.codex_home)
 }
 
 fn codex_thread_table_columns(conn: &Connection) -> HashSet<String> {
@@ -4408,6 +4498,7 @@ fn parse_opencode_history_session(value: &serde_json::Value) -> Option<HistorySe
     ));
 
     Some(HistorySession {
+        codex_isolated: None,
         id,
         source: SOURCE_OPENCODE.to_string(),
         display,
@@ -4689,6 +4780,7 @@ fn local_opencode_session_to_history_session(
         .to_string();
 
     HistorySession {
+        codex_isolated: None,
         id: session.id,
         source: SOURCE_OPENCODE.to_string(),
         display: normalize_history_display(Some(session.title)),
@@ -4832,6 +4924,7 @@ pub fn map_dsh_list_item(item: &dsh_history::DshSessionListItem) -> HistorySessi
     let title = item.title.clone().unwrap_or_default();
 
     HistorySession {
+        codex_isolated: None,
         id: composite_id,
         source: SOURCE_DSH.to_string(),
         display: if title.is_empty() {
@@ -5102,13 +5195,17 @@ fn normalize_history_source(source: Option<&str>) -> Result<Option<&'static str>
 fn resolve_history_source_for_session(
     session_id: &str,
     source_hint: Option<&'static str>,
+    codex_isolated: Option<bool>,
 ) -> Option<&'static str> {
     if let Some(source) = source_hint {
         return Some(source);
     }
 
     let has_claude = has_claude_session(session_id);
-    let has_codex = has_codex_session(session_id);
+    let has_codex = resolve_codex_path_config_for_mode(codex_isolated)
+        .ok()
+        .and_then(|config| find_codex_session_file_with_config(session_id, &config))
+        .is_some();
     let has_opencode = has_opencode_session(session_id);
 
     if has_claude {
@@ -5606,6 +5703,7 @@ mod tests {
 
     fn temp_codex_config(root: &Path, sqlite_home: &Path) -> CodexPathConfig {
         CodexPathConfig {
+            isolated: true,
             home_dir: root.to_path_buf(),
             codex_home: root.to_path_buf(),
             history_path: root.join("history.jsonl"),
@@ -5846,6 +5944,7 @@ mod tests {
     fn test_workspace_overview_snapshot_groups_projects_in_recency_order() {
         let sessions = vec![
             HistorySession {
+                codex_isolated: None,
                 id: "older-alpha".to_string(),
                 source: "claude".to_string(),
                 display: "Older alpha".to_string(),
@@ -5860,6 +5959,7 @@ mod tests {
                 launch_mode: None,
             },
             HistorySession {
+                codex_isolated: None,
                 id: "newer-beta".to_string(),
                 source: "codex".to_string(),
                 display: "Newer beta".to_string(),
@@ -5874,6 +5974,7 @@ mod tests {
                 launch_mode: None,
             },
             HistorySession {
+                codex_isolated: None,
                 id: "newer-alpha".to_string(),
                 source: "claude".to_string(),
                 display: "Newer alpha".to_string(),
@@ -5915,6 +6016,7 @@ mod tests {
     #[test]
     fn test_history_search_score_prefers_title_matches() {
         let session = |display: &str, project_name: &str| HistorySession {
+            codex_isolated: None,
             id: display.to_string(),
             source: SOURCE_CLAUDE.to_string(),
             display: display.to_string(),
@@ -6288,6 +6390,7 @@ mod tests {
             session_map.insert(
                 id.to_string(),
                 HistorySession {
+                    codex_isolated: None,
                     id: id.to_string(),
                     source: SOURCE_CLAUDE.to_string(),
                     display: "task".to_string(),
@@ -6380,6 +6483,7 @@ mod tests {
         map.insert(
             "opencode-session-1".to_string(),
             HistorySession {
+                codex_isolated: None,
                 id: "opencode-session-1".to_string(),
                 source: "opencode".to_string(),
                 display: "".to_string(),
@@ -6398,6 +6502,7 @@ mod tests {
         merge_opencode_history_session(
             &mut map,
             HistorySession {
+                codex_isolated: None,
                 id: "opencode-session-1".to_string(),
                 source: "opencode".to_string(),
                 display: "补齐元数据".to_string(),
@@ -7218,6 +7323,7 @@ mod tests {
     fn test_dedupe_near_duplicate_history_sessions_prefers_ccem_metadata() {
         let sessions = vec![
             HistorySession {
+                codex_isolated: None,
                 id: "session-ccem".to_string(),
                 source: SOURCE_CLAUDE.to_string(),
                 display: "9.9-9.11=？".to_string(),
@@ -7232,6 +7338,7 @@ mod tests {
                 launch_mode: None,
             },
             HistorySession {
+                codex_isolated: None,
                 id: "session-plain".to_string(),
                 source: SOURCE_CLAUDE.to_string(),
                 display: "9.9-9.11=？".to_string(),
@@ -7246,6 +7353,7 @@ mod tests {
                 launch_mode: None,
             },
             HistorySession {
+                codex_isolated: None,
                 id: "session-later".to_string(),
                 source: SOURCE_CLAUDE.to_string(),
                 display: "9.9-9.11=？".to_string(),
@@ -7293,6 +7401,7 @@ mod tests {
         }];
         let sessions = vec![
             HistorySession {
+                codex_isolated: None,
                 id: "native-1776489728117".to_string(),
                 source: SOURCE_CLAUDE.to_string(),
                 display: "整理工作间会话关系".to_string(),
@@ -7307,6 +7416,7 @@ mod tests {
                 launch_mode: None,
             },
             HistorySession {
+                codex_isolated: None,
                 id: "provider-session-1".to_string(),
                 source: SOURCE_CLAUDE.to_string(),
                 display: "整理工作间会话关系".to_string(),
@@ -7348,6 +7458,7 @@ mod tests {
             updated_at: "2026-04-17T12:00:02Z".to_string(),
         }];
         let sessions = vec![HistorySession {
+            codex_isolated: None,
             id: "native-1776489728117".to_string(),
             source: SOURCE_CLAUDE.to_string(),
             display: "整理工作间会话关系".to_string(),
@@ -7929,6 +8040,70 @@ mod tests {
         assert_eq!(resolved.codex_home, isolated);
         assert_eq!(resolved.sqlite_home, isolated);
         assert_eq!(resolved.sessions_root, isolated.join("sessions"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_codex_restores_sqlite_configuration_and_external_rollout_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let shared = home.join("custom-codex");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("config.toml"), "sqlite_home = 'database'\n").unwrap();
+        let config = super::shared_codex_path_config_for(&home, shared.clone(), None, temp.path());
+        assert_eq!(config.sqlite_home, shared.join("database"));
+        assert!(!config.isolated);
+        let env_config = super::shared_codex_path_config_for(
+            &home,
+            shared.clone(),
+            Some("~/other-database"),
+            temp.path(),
+        );
+        assert_eq!(env_config.sqlite_home, home.join("other-database"));
+        let relative = super::shared_codex_path_config_for(
+            &home,
+            shared,
+            Some("relative-database"),
+            temp.path(),
+        );
+        assert_eq!(relative.sqlite_home, temp.path().join("relative-database"));
+
+        let id = "019cbc5a-5720-7451-905e-84b96a508abb";
+        let outside =
+            write_codex_session_file(&home.join("external-rollouts"), id, "/fixture/official");
+        create_state_db(&config.sqlite_home, "state_5.sqlite", &[&format!(
+            "INSERT INTO threads (id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) VALUES ('{id}','{}',1776181000,1776181001,'vscode','openai','/fixture/official','official title','workspace-write','never');", outside.display()
+        )]);
+        assert_eq!(
+            find_codex_session_file_with_config(id, &config),
+            Some(outside)
+        );
+        let sessions = load_codex_history_from_config(&config).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].codex_isolated, Some(false));
+    }
+
+    #[test]
+    fn shared_and_isolated_codex_copies_keep_separate_history_identity() {
+        let root = temp_history_dir("codex-profile-identity");
+        let id = "019cbc5a-5720-7451-905e-84b96a508abb";
+        write_codex_session_file(&root, id, "/fixture/project");
+        let mut shared_config = codex_path_config_for(&root, root.clone());
+        shared_config.isolated = false;
+        let mut sessions = load_codex_history_from_config(&shared_config).unwrap();
+        let mut isolated = sessions[0].clone();
+        isolated.codex_isolated = Some(true);
+        sessions.push(isolated);
+        let sessions = dedupe_history_sessions_with_provenance_records(sessions, &[]);
+        assert_eq!(sessions.len(), 2);
+        let keys = sessions
+            .iter()
+            .map(super::history_session_key)
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&format!("codex:{id}")));
+        assert!(keys.contains(&format!("codex:isolated:{id}")));
+        let snapshot = build_workspace_overview_snapshot(sessions);
+        assert_eq!(snapshot.project_nodes[0].session_keys.len(), 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8737,6 +8912,7 @@ mod dsh_integration_tests {
     #[test]
     fn dsh_sessions_never_dedupe() {
         let session = HistorySession {
+            codex_isolated: None,
             id: "abcdef0123456789:session-1".to_string(),
             source: SOURCE_DSH.to_string(),
             display: "Fix bug".to_string(),
@@ -8756,6 +8932,7 @@ mod dsh_integration_tests {
     #[test]
     fn claude_sessions_still_dedupe() {
         let session = HistorySession {
+            codex_isolated: None,
             id: "uuid-123".to_string(),
             source: SOURCE_CLAUDE.to_string(),
             display: "Fix bug".to_string(),
@@ -8795,6 +8972,7 @@ mod dsh_integration_tests {
         let snapshot = orchestrate_workspace_overview(Some(10), |_limit| {
             Ok(vec![
                 HistorySession {
+                    codex_isolated: None,
                     id: "s1".to_string(),
                     source: SOURCE_CLAUDE.to_string(),
                     display: "Claude session".to_string(),
@@ -8809,6 +8987,7 @@ mod dsh_integration_tests {
                     launch_mode: None,
                 },
                 HistorySession {
+                    codex_isolated: None,
                     id: "s2".to_string(),
                     source: SOURCE_CODEX.to_string(),
                     display: "Codex session".to_string(),
@@ -8844,6 +9023,7 @@ mod dsh_integration_tests {
         let snapshot = orchestrate_workspace_overview(Some(10), |_limit| {
             Ok(vec![
                 HistorySession {
+                    codex_isolated: None,
                     id: "s1".to_string(),
                     source: SOURCE_CLAUDE.to_string(),
                     display: "Claude".to_string(),
@@ -8858,6 +9038,7 @@ mod dsh_integration_tests {
                     launch_mode: None,
                 },
                 HistorySession {
+                    codex_isolated: None,
                     id: "abcdef0123456789:dsh-leak".to_string(),
                     source: SOURCE_DSH.to_string(),
                     display: "DSH leak".to_string(),
@@ -8978,6 +9159,7 @@ mod dsh_integration_tests {
     #[test]
     fn orchestrate_list_combines_legacy_and_dsh() {
         let legacy = vec![HistorySession {
+            codex_isolated: None,
             id: "uuid-1".to_string(),
             source: SOURCE_CLAUDE.to_string(),
             display: "Legacy".to_string(),
@@ -8992,6 +9174,7 @@ mod dsh_integration_tests {
             launch_mode: None,
         }];
         let dsh = vec![HistorySession {
+            codex_isolated: None,
             id: "abcdef0123456789:s1".to_string(),
             source: SOURCE_DSH.to_string(),
             display: "DSH".to_string(),
@@ -9026,6 +9209,7 @@ mod dsh_integration_tests {
     #[test]
     fn orchestrate_list_dsh_error_source_all_soft_fail() {
         let legacy = vec![HistorySession {
+            codex_isolated: None,
             id: "uuid-1".to_string(),
             source: SOURCE_CLAUDE.to_string(),
             display: "Legacy".to_string(),

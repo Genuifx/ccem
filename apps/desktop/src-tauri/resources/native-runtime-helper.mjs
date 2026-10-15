@@ -5859,7 +5859,7 @@ var sd = v(function(iB) {
     if (o.$async) r.throw(Ae._`new ${e.ValidationError}(${t})`);
     else r.assign(Ae._`${n}.errors`, t), r.return(false);
   }
-  var fs5 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
+  var fs6 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
   function oB(e, t, r) {
     let { createErrors: n } = e.it;
     if (n === false) return Ae._`{}`;
@@ -5876,13 +5876,13 @@ var sd = v(function(iB) {
   function XAe({ keyword: e, it: { errSchemaPath: t } }, { schemaPath: r, parentSchema: n }) {
     let o = n ? t : Ae.str`${t}/${e}`;
     if (r) o = Ae.str`${o}${(0, H_.getErrorPath)(r, H_.Type.Str)}`;
-    return [fs5.schemaPath, o];
+    return [fs6.schemaPath, o];
   }
   function QAe(e, { params: t, message: r }, n) {
     let { keyword: o, data: i, schemaValue: s, it: a } = e, { opts: c, propertyName: u, topSchemaRef: d, schemaPath: f } = a;
-    if (n.push([fs5.keyword, o], [fs5.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs5.message, typeof r == "function" ? r(e) : r]);
-    if (c.verbose) n.push([fs5.schema, s], [fs5.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
-    if (u) n.push([fs5.propertyName, u]);
+    if (n.push([fs6.keyword, o], [fs6.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs6.message, typeof r == "function" ? r(e) : r]);
+    if (c.verbose) n.push([fs6.schema, s], [fs6.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
+    if (u) n.push([fs6.propertyName, u]);
   }
 });
 var uB = v(function(cB) {
@@ -27745,8 +27745,10 @@ import { createInterface } from "node:readline";
 import process5 from "node:process";
 
 // ../core/src/agent-home.ts
+import fs2 from "node:fs";
 import os2 from "node:os";
 import path3 from "node:path";
+var PROFILES_FILE = "profiles.json";
 var IDENTITY_ENV_KEYS = [
   "ANTHROPIC_PROFILE",
   "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
@@ -27815,6 +27817,13 @@ var INHERITED_AGENT_ENV_KEYS = [
   "ANTHROPIC_VERTEX_PROJECT_ID",
   "CLOUD_ML_REGION"
 ];
+var SHARED_CODEX_ENV_KEYS = [
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "CODEX_API_KEY",
+  "CODEX_ACCESS_TOKEN",
+  "CODEX_SQLITE_HOME"
+];
 function userHome(env) {
   return env.HOME || env.USERPROFILE || os2.homedir();
 }
@@ -27825,37 +27834,88 @@ function getCcemAgentBase(env = process.env) {
   }
   return path3.resolve(override || path3.join(userHome(env), ".ccem", "agents"));
 }
-function getCcemAgentHome(provider, env = process.env) {
+function readCodexIsolation(env) {
+  if (env.CCEM_CODEX_ISOLATED === "1") return true;
+  if (env.CCEM_CODEX_ISOLATED === "0") return false;
+  const file2 = path3.join(getCcemAgentBase(env), PROFILES_FILE);
+  let raw;
+  try {
+    raw = fs2.readFileSync(file2, "utf8");
+  } catch (error48) {
+    if (error48.code === "ENOENT") return false;
+    throw new Error("Cannot read CCEM agent profile preferences");
+  }
+  let profiles;
+  try {
+    profiles = JSON.parse(raw);
+  } catch {
+    throw new Error("CCEM agent profile preferences are invalid");
+  }
+  if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) {
+    throw new Error("CCEM agent profile preferences are invalid");
+  }
+  const value = profiles.codexIsolation;
+  if (value === void 0) return false;
+  if (typeof value !== "boolean") throw new Error("CCEM codexIsolation preference must be a boolean");
+  return value;
+}
+function isCodexIsolated(env = process.env) {
+  try {
+    return readCodexIsolation(env);
+  } catch {
+    return true;
+  }
+}
+function getCcemIsolatedAgentHome(provider, env = process.env) {
   return path3.join(getCcemAgentBase(env), provider);
 }
+function getOfficialCodexHome(env) {
+  const override = env.CODEX_HOME?.trim();
+  if (!override) return path3.resolve(userHome(env), ".codex");
+  if (override === "~") return path3.resolve(userHome(env));
+  if (/^~[\\/]/.test(override)) return path3.resolve(userHome(env), override.slice(2));
+  return path3.resolve(override);
+}
+function getCcemAgentHome(provider, env = process.env) {
+  return provider === "codex" && !isCodexIsolated(env) ? getOfficialCodexHome(env) : getCcemIsolatedAgentHome(provider, env);
+}
 function getCcemAgentEnv(env = process.env) {
-  const claude = getCcemAgentHome("claude", env);
-  const codex = getCcemAgentHome("codex", env);
+  const isolated = readCodexIsolation(env);
+  const claude = getCcemIsolatedAgentHome("claude", env);
+  const codex = isolated ? getCcemIsolatedAgentHome("codex", env) : getOfficialCodexHome(env);
   return {
     CLAUDE_CONFIG_DIR: claude,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: claude,
     CODEX_HOME: codex,
-    CODEX_SQLITE_HOME: codex
+    CCEM_CODEX_ISOLATED: isolated ? "1" : "0",
+    ...isolated ? { CODEX_SQLITE_HOME: codex } : {}
   };
 }
-function clearInheritedAgentEnv(env) {
+function clearInheritedAgentEnv(env, codexIsolated = isCodexIsolated(env)) {
   for (const key of Object.keys(env)) {
+    if (!codexIsolated && SHARED_CODEX_ENV_KEYS.includes(key)) continue;
     if (INHERITED_AGENT_ENV_KEYS.includes(key) || isAgentIdentityEnvKey(key)) {
       delete env[key];
     }
   }
 }
 function buildIsolatedAgentEnv(baseEnv = process.env, selectedEnv = {}) {
+  const profile = getCcemAgentEnv(baseEnv);
+  const codexIsolated = profile.CCEM_CODEX_ISOLATED === "1";
   const env = { ...baseEnv };
-  clearInheritedAgentEnv(env);
+  clearInheritedAgentEnv(env, codexIsolated);
   Object.assign(env, selectedEnv);
   for (const key of Object.keys(env)) {
-    if (isAgentIdentityEnvKey(key)) delete env[key];
+    if (isAgentIdentityEnvKey(key) && (codexIsolated || key !== "CODEX_ACCESS_TOKEN")) delete env[key];
   }
   delete env.CLAUDECODE;
   if (baseEnv.CCEM_AGENT_HOME === void 0) delete env.CCEM_AGENT_HOME;
   else env.CCEM_AGENT_HOME = baseEnv.CCEM_AGENT_HOME;
-  Object.assign(env, getCcemAgentEnv(baseEnv));
+  if (!codexIsolated) {
+    if (baseEnv.CODEX_SQLITE_HOME === void 0) delete env.CODEX_SQLITE_HOME;
+    else env.CODEX_SQLITE_HOME = baseEnv.CODEX_SQLITE_HOME;
+  }
+  Object.assign(env, profile);
   return Object.fromEntries(Object.entries(env).filter((entry) => entry[1] !== void 0));
 }
 
@@ -42535,14 +42595,14 @@ function createCcemSessionHandoffMcpServer(permissionMode, sendMessage) {
 }
 
 // src/imageInputs.ts
-import fs2 from "fs";
+import fs3 from "fs";
 import os3 from "os";
 import path5 from "path";
 var MAX_SINGLE_IMAGE_BYTES = 30 * 1024 * 1024;
 var MAX_TOTAL_IMAGE_BYTES = 300 * 1024 * 1024;
 function createLocalImageInputs(parts) {
   const tempDir = path5.join(os3.tmpdir(), "ccem-images");
-  fs2.mkdirSync(tempDir, { recursive: true });
+  fs3.mkdirSync(tempDir, { recursive: true });
   const inputs = [];
   const tempFiles = [];
   let totalSize = 0;
@@ -42563,7 +42623,7 @@ function createLocalImageInputs(parts) {
       const ext = part.image.mediaType.split("/")[1] || "png";
       const filename = `paste-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
       const filePath = path5.join(tempDir, filename);
-      fs2.writeFileSync(filePath, data);
+      fs3.writeFileSync(filePath, data);
       tempFiles.push(filePath);
       inputs.push({ type: "local_image", path: filePath });
     }
@@ -42576,14 +42636,14 @@ function createLocalImageInputs(parts) {
 function cleanupTempFiles(files) {
   for (const file2 of files) {
     try {
-      fs2.unlinkSync(file2);
+      fs3.unlinkSync(file2);
     } catch {
     }
   }
 }
 
 // src/codexContextUsage.ts
-import fs3 from "node:fs";
+import fs4 from "node:fs";
 import path6 from "node:path";
 var TAIL_BYTES = 512 * 1024;
 function asRecord3(value) {
@@ -42646,7 +42706,7 @@ function looksLikeUuid(value) {
 function scanDirectoryForSessionFile(dir, sessionId, recursive) {
   let entries;
   try {
-    entries = fs3.readdirSync(dir, { withFileTypes: true });
+    entries = fs4.readdirSync(dir, { withFileTypes: true });
   } catch {
     return null;
   }
@@ -42695,18 +42755,18 @@ function findCodexSessionFile(sessionId, sessionsRoot2 = resolveCodexSessionsRoo
   return scanDirectoryForSessionFile(sessionsRoot2, trimmed, true);
 }
 function readTailLines(filePath) {
-  const stat = fs3.statSync(filePath);
+  const stat = fs4.statSync(filePath);
   const length = Math.min(stat.size, TAIL_BYTES);
   const start = Math.max(0, stat.size - length);
-  const fd = fs3.openSync(filePath, "r");
+  const fd = fs4.openSync(filePath, "r");
   try {
     const buffer = Buffer.alloc(length);
-    fs3.readSync(fd, buffer, 0, length, start);
+    fs4.readSync(fd, buffer, 0, length, start);
     const text = buffer.toString("utf8");
     const lines = text.split(/\r?\n/).filter((line) => line.trim());
     return start > 0 ? lines.slice(1) : lines;
   } finally {
-    fs3.closeSync(fd);
+    fs4.closeSync(fd);
   }
 }
 function readLatestCodexContextUsageFromSessionFile(filePath) {
@@ -43781,7 +43841,7 @@ var InputOperation = class {
 };
 
 // src/codexTurnUsage.ts
-import fs4 from "node:fs";
+import fs5 from "node:fs";
 import path7 from "node:path";
 var TAIL_BYTES2 = 1024 * 1024;
 var MAX_TURN_BYTES = 32 * 1024 * 1024;
@@ -43827,7 +43887,7 @@ function readRange(fd, start, length) {
   const buffer = Buffer.alloc(length);
   let read = 0;
   while (read < length) {
-    const next = fs4.readSync(fd, buffer, read, length - read, start + read);
+    const next = fs5.readSync(fd, buffer, read, length - read, start + read);
     if (next === 0) throw new Error("Codex rollout changed while reading");
     read += next;
   }
@@ -43854,8 +43914,8 @@ function captureCodexUsageBaseline(sessionId, codexHome) {
   if (!filePath) return baseline;
   let fd;
   try {
-    fd = fs4.openSync(filePath, "r");
-    const stat = fs4.fstatSync(fd);
+    fd = fs5.openSync(filePath, "r");
+    const stat = fs5.fstatSync(fd);
     if (!stat.isFile() || stat.size === 0) return baseline;
     const start = Math.max(0, stat.size - TAIL_BYTES2);
     const tail = readRange(fd, start, stat.size - start);
@@ -43874,12 +43934,12 @@ function captureCodexUsageBaseline(sessionId, codexHome) {
       }
     }
     const anchor = readAnchor(fd, stat.size);
-    if (fs4.fstatSync(fd).size !== stat.size) return baseline;
+    if (fs5.fstatSync(fd).size !== stat.size) return baseline;
     return { ...baseline, filePath, offset: stat.size, device: stat.dev, inode: stat.ino, anchor, valid: true };
   } catch {
     return baseline;
   } finally {
-    if (fd !== void 0) fs4.closeSync(fd);
+    if (fd !== void 0) fs5.closeSync(fd);
   }
 }
 var INVALID = { state: "invalid" };
@@ -43961,8 +44021,8 @@ function tryResolve(sessionId, baseline) {
   if (!filePath) return PENDING;
   let fd;
   try {
-    fd = fs4.openSync(filePath, "r");
-    const stat = fs4.fstatSync(fd);
+    fd = fs5.openSync(filePath, "r");
+    const stat = fs5.fstatSync(fd);
     if (!stat.isFile() || stat.size < baseline.offset || stat.size - baseline.offset > MAX_TURN_BYTES) return INVALID;
     if (baseline.filePath && (stat.dev !== baseline.device || stat.ino !== baseline.inode || readAnchor(fd, baseline.offset) !== baseline.anchor)) return INVALID;
     const bytes = readRange(fd, baseline.offset, stat.size - baseline.offset);
@@ -43971,7 +44031,7 @@ function tryResolve(sessionId, baseline) {
   } catch {
     return PENDING;
   } finally {
-    if (fd !== void 0) fs4.closeSync(fd);
+    if (fd !== void 0) fs5.closeSync(fd);
   }
 }
 async function resolveCodexTurnUsage(sessionId, baseline, codexHome) {
@@ -46986,12 +47046,13 @@ async function ensureCodexThread() {
     throw new Error("Native runtime helper not initialized");
   }
   if (!codexClient) {
+    const env = buildIsolatedAgentEnv(process5.env, initCommand.env_vars);
     codexClient = new Codex({
       codexPathOverride: initCommand.codex_path ?? void 0,
       baseUrl: initCommand.codex_base_url ?? void 0,
       apiKey: initCommand.codex_api_key ?? void 0,
-      env: buildIsolatedAgentEnv(process5.env, initCommand.env_vars),
-      config: { sqlite_home: getCcemAgentHome("codex") }
+      env,
+      ...env.CCEM_CODEX_ISOLATED === "1" ? { config: { sqlite_home: env.CODEX_HOME } } : {}
     });
   }
   if (!codexThread) {
@@ -47347,6 +47408,7 @@ async function handleCommand(command) {
     return;
   }
   if (command.type === "init") {
+    Object.assign(process5.env, getCcemAgentEnv());
     if (command.model != null) {
       if (command.provider !== "codex") {
         throw new Error("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.");
@@ -47375,7 +47437,6 @@ async function handleCommand(command) {
     if (forkRequested) {
       const parentSessionId = command.provider_session_id.trim();
       try {
-        Object.assign(process5.env, getCcemAgentEnv());
         const forked = await Mkt(parentSessionId, {
           upToMessageId: command.fork_at_message_id?.trim() || void 0,
           dir: command.working_dir

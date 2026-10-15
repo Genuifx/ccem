@@ -46,6 +46,7 @@ export interface ReviewEntrySummary {
 export interface Session {
   id: string;
   client: LaunchClient;
+  codexIsolated?: boolean;
   envName: string;
   configSource?: 'ccem' | 'native';
   workingDir: string;

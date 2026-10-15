@@ -1540,8 +1540,9 @@ pub fn search_skills_stream(app: AppHandle, query: String) {
 pub async fn list_workspace_skills(
     working_dir: Option<String>,
     provider: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Vec<InstalledSkill>, String> {
-    tauri::async_runtime::spawn_blocking(move || list_workspace_skills_sync(working_dir, provider))
+    tauri::async_runtime::spawn_blocking(move || list_workspace_skills_sync(working_dir, provider, codex_isolated))
         .await
         .map_err(|error| format!("Failed to join workspace skill scan task: {}", error))?
 }
@@ -1549,8 +1550,11 @@ pub async fn list_workspace_skills(
 fn list_workspace_skills_sync(
     working_dir: Option<String>,
     provider: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Vec<InstalledSkill>, String> {
-    agent_home::ensure_agent_homes()?;
+    let codex_isolated = match codex_isolated { Some(mode) => mode, None => agent_home::codex_isolation_preference()? };
+    agent_home::prepare_agent_homes_for_mode(codex_isolated)?;
+    let codex_home = agent_home::codex_home_for_mode(codex_isolated);
     let home = dirs::home_dir();
     let working_dir = working_dir
         .as_deref()
@@ -1566,7 +1570,7 @@ fn list_workspace_skills_sync(
         Some("codex") => {
             skills.extend(scan_codex_skills_for_context(
                 home.as_deref(),
-                &agent_home::codex_home(),
+                &codex_home,
                 working_dir.as_deref(),
             ));
         }
@@ -1585,13 +1589,15 @@ fn list_workspace_skills_sync(
             ));
             skills.extend(scan_codex_skills_for_context(
                 home.as_deref(),
-                &agent_home::codex_home(),
+                &codex_home,
                 working_dir.as_deref(),
             ));
         }
     }
 
-    mark_managed_skills(&mut skills);
+    mark_managed_skills_for_roots(&mut skills, &[
+        agent_home::claude_home().join("skills"), codex_home.join("skills"),
+    ]);
     skills.sort_by(|left, right| {
         let left_disabled = left.disabled;
         let right_disabled = right.disabled;
@@ -1975,9 +1981,13 @@ fn is_owned_skill_path(path: &Path, roots: &[PathBuf]) -> bool {
 
 fn mark_managed_skills(skills: &mut [InstalledSkill]) {
     let roots = profile_skill_roots();
+    mark_managed_skills_for_roots(skills, &roots);
+}
+
+fn mark_managed_skills_for_roots(skills: &mut [InstalledSkill], roots: &[PathBuf]) {
     for skill in skills {
         skill.managed_by_ccem =
-            skill.scope == "global" && is_owned_skill_path(Path::new(&skill.path), &roots);
+            skill.scope == "global" && is_owned_skill_path(Path::new(&skill.path), roots);
     }
 }
 

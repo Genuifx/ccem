@@ -4234,12 +4234,13 @@ async function ensureCodexThread() {
   }
 
   if (!codexClient) {
+    const env = buildIsolatedAgentEnv(process.env, initCommand.env_vars);
     codexClient = new Codex({
       codexPathOverride: initCommand.codex_path ?? undefined,
       baseUrl: initCommand.codex_base_url ?? undefined,
       apiKey: initCommand.codex_api_key ?? undefined,
-      env: buildIsolatedAgentEnv(process.env, initCommand.env_vars),
-      config: { sqlite_home: getCcemAgentHome('codex') },
+      env,
+      ...(env.CCEM_CODEX_ISOLATED === '1' ? { config: { sqlite_home: env.CODEX_HOME } } : {}),
     });
   }
 
@@ -4668,6 +4669,8 @@ async function handleCommand(command: InputCommand) {
   }
 
   if (command.type === 'init') {
+    // Keep this helper's storage mode stable if preferences change while it is alive.
+    Object.assign(process.env, getCcemAgentEnv());
     if (command.model != null) {
       if (command.provider !== 'codex') {
         throw new Error('MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.');
@@ -4707,8 +4710,7 @@ async function handleCommand(command: InputCommand) {
     if (forkRequested) {
       const parentSessionId = command.provider_session_id!.trim();
       try {
-        // SDK filesystem helpers have no env option; enforce their global root too.
-        Object.assign(process.env, getCcemAgentEnv());
+        // SDK filesystem helpers use the process roots pinned during initialization.
         const forked = await forkSession(parentSessionId, {
           upToMessageId: command.fork_at_message_id?.trim() || undefined,
           dir: command.working_dir,

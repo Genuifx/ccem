@@ -1035,6 +1035,10 @@ fn build_launch_command(
 fn profile_shell_environment(client: &str) -> String {
     let mut env = HashMap::new();
     crate::agent_profile::apply_env(client, &mut env);
+    shell_environment(env)
+}
+
+fn shell_environment(env: HashMap<String, String>) -> String {
     let mut entries = env.into_iter().collect::<Vec<_>>();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries.into_iter().map(|(key, value)| {
@@ -1044,17 +1048,19 @@ fn profile_shell_environment(client: &str) -> String {
 
 /// Login uses the same directories and credential cleanup as an agent launch.
 /// The user completes the provider's normal login in their terminal.
-pub fn open_agent_login(client: &str) -> Result<(), String> {
+pub fn open_agent_login(client: &str, codex_isolated: bool) -> Result<(), String> {
     if !external_terminal_launch_supported() {
         return Err(format!("Use `ccem auth {client}` in a terminal on this platform."));
     }
+    let mut env = HashMap::from([("CCEM_CODEX_ISOLATED".into(), if codex_isolated { "1" } else { "0" }.into())]);
+    crate::agent_profile::apply_env(client, &mut env);
+    let codex_options = codex_sqlite_option(&env);
     let (binary, args) = match client {
         "claude" => (resolve_claude_path().ok_or("Claude Code is not installed")?, "auth login".to_string()),
-        "codex" => (resolve_codex_path().ok_or("Codex is not installed")?, format!("-c {} login",
-            quote_posix_shell_word(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::codex_home().to_string_lossy()).unwrap())))),
+        "codex" => (resolve_codex_path().ok_or("Codex is not installed")?, format!("{codex_options}login")),
         _ => return Err("Unsupported agent provider".into()),
     };
-    let command = format!("( {}; unset CLAUDECODE; {} {} )", profile_shell_environment(client), quote_posix_shell_word(&binary), args);
+    let command = format!("( {}; unset CLAUDECODE; {} {} )", shell_environment(env), quote_posix_shell_word(&binary), args);
     let terminal = get_preferred_terminal();
     let script = match terminal {
         TerminalType::TerminalApp => terminal_app_script(&command),
@@ -1167,6 +1173,15 @@ fn build_tmux_attach_command_with_binary(tmux: &str, target: &str) -> String {
 }
 
 /// Build the shell command to launch Codex and write exit code for session tracking.
+fn codex_sqlite_option(env: &HashMap<String, String>) -> String {
+    if crate::agent_profile::codex_isolated_for_env(env) {
+        let directory = env.get("CODEX_HOME").expect("Codex profile environment applied");
+        format!("-c {} ", quote_posix_shell_word(&format!("sqlite_home={}", serde_json::to_string(directory).unwrap())))
+    } else {
+        String::new()
+    }
+}
+
 fn build_codex_shell_command(
     env_vars: &HashMap<String, String>,
     working_dir: &str,
@@ -1175,6 +1190,7 @@ fn build_codex_shell_command(
 ) -> String {
     let mut env_vars = env_vars.clone();
     crate::agent_profile::apply_env("codex", &mut env_vars);
+    let sqlite_option = codex_sqlite_option(&env_vars);
     let mut parts = Vec::new();
     parts.push("mkdir -p ~/.ccem/sessions".to_string());
 
@@ -1190,12 +1206,11 @@ fn build_codex_shell_command(
     let codex_path = resolve_codex_path().unwrap_or_else(|| "codex".to_string());
     let escaped_codex = codex_path.replace("'", "'\\''");
     let escaped_session_id = session_id.replace("'", "'\\''");
-    let sqlite_override = quote_posix_shell_word(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::codex_home().to_string_lossy()).unwrap()));
     let codex_cmd = if let Some(resume_id) = resume_session_id {
         let escaped_resume = resume_id.replace("'", "'\\''");
-        format!("'{}' -c {} resume '{}'", escaped_codex, sqlite_override, escaped_resume)
+        format!("'{}' {}resume '{}'", escaped_codex, sqlite_option, escaped_resume)
     } else {
-        format!("'{}' -c {}", escaped_codex, sqlite_override)
+        format!("'{}' {}", escaped_codex, sqlite_option)
     };
     parts.push(format!(
         "{}; echo $? > ~/.ccem/sessions/'{}'.exit",
@@ -1494,7 +1509,7 @@ fn dispatch_iterm2_command(session_id: String, shell_command: String) {
 /// * `Err(String)` with error message on failure
 pub fn launch_in_terminal(
     terminal: TerminalType,
-    env_vars: HashMap<String, String>,
+    mut env_vars: HashMap<String, String>,
     working_dir: &str,
     session_id: &str,
     env_name: &str,
@@ -1503,7 +1518,7 @@ pub fn launch_in_terminal(
     client: &str,
 ) -> Result<(Option<String>, Option<String>), String> {
     if matches!(client, "claude" | "codex") {
-        crate::agent_home::ensure_agent_homes()?;
+        crate::agent_profile::prepare_env(client, &mut env_vars)?;
     }
     if !external_terminal_launch_supported() {
         return Err(
@@ -2591,6 +2606,22 @@ mod tests {
         assert!(cmd.contains("cd '/home/user'"));
         assert!(cmd.contains(" resume 'codex-session-456'"));
         assert!(cmd.contains("echo $? > ~/.ccem/sessions/'test-session-123'.exit"));
+    }
+
+    #[test]
+    fn codex_shell_database_override_follows_the_session_pin() {
+        let shared = build_codex_shell_command(
+            &HashMap::from([("CCEM_CODEX_ISOLATED".into(), "0".into())]),
+            "/fixture/project", "shared", Some("original-session"),
+        );
+        assert!(!shared.contains("sqlite_home="));
+        assert!(shared.contains("export CCEM_CODEX_ISOLATED='0'"));
+        let isolated = build_codex_shell_command(
+            &HashMap::from([("CCEM_CODEX_ISOLATED".into(), "1".into())]),
+            "/fixture/project", "isolated", Some("original-session"),
+        );
+        assert!(isolated.contains(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::isolated_codex_home().to_string_lossy()).unwrap())));
+        assert!(isolated.contains("export CCEM_CODEX_ISOLATED='1'"));
     }
 
     #[test]

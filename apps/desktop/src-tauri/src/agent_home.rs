@@ -44,15 +44,113 @@ pub fn claude_home() -> PathBuf {
     agent_base().join("claude")
 }
 pub fn codex_home() -> PathBuf {
+    codex_home_for_mode(codex_isolated())
+}
+pub fn isolated_codex_home() -> PathBuf {
     agent_base().join("codex")
 }
+pub fn codex_home_for_mode(isolated: bool) -> PathBuf {
+    if isolated {
+        return isolated_codex_home();
+    }
+    resolve_shared_codex_home(
+        &dirs::home_dir().unwrap_or_default(),
+        std::env::var("CODEX_HOME").ok().as_deref(),
+        &std::env::current_dir().unwrap_or_default(),
+    )
+}
+
+fn resolve_shared_codex_home(home: &Path, configured: Option<&str>, cwd: &Path) -> PathBuf {
+    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        None => home.join(".codex"),
+        Some("~") => home.to_path_buf(),
+        Some(value) if value.starts_with("~/") => home.join(&value[2..]),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        }
+    }
+}
+
+fn read_profile_preferences(base: &Path) -> Result<serde_json::Value, String> {
+    let path = base.join("profiles.json");
+    validate_no_symlinks(&path)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(serde_json::json!({})),
+        Err(error) => {
+            return Err(format!(
+                "Could not read CCEM agent profile preferences: {error}"
+            ))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Invalid CCEM agent profile preferences".to_string())?;
+    if !value.is_object()
+        || value
+            .get("codexIsolation")
+            .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("Invalid Codex isolation preference".into());
+    }
+    Ok(value)
+}
+
+pub fn codex_isolation_preference() -> Result<bool, String> {
+    read_codex_isolation_preference(&agent_base())
+}
+
+fn read_codex_isolation_preference(base: &Path) -> Result<bool, String> {
+    Ok(read_profile_preferences(base)?
+        .get("codexIsolation")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
+fn codex_isolation_from(pin: Option<&str>, base: &Path) -> Result<bool, String> {
+    match pin {
+        Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        _ => read_codex_isolation_preference(base),
+    }
+}
+
+fn configured_codex_isolation() -> Result<bool, String> {
+    codex_isolation_from(
+        std::env::var("CCEM_CODEX_ISOLATED").ok().as_deref(),
+        &agent_base(),
+    )
+}
+
+pub fn codex_isolated() -> bool {
+    // A broken preference must never silently reconnect an isolated profile
+    // to shared state. Launch preparation returns the underlying error.
+    configured_codex_isolation().unwrap_or(true)
+}
+
 pub fn claude_config_path() -> PathBuf {
     claude_home().join(".claude.json")
 }
 
-/// Validate before any launch. Ambient CLAUDE_CONFIG_DIR/CODEX_HOME never select
-/// CCEM state or the migration source, including when launched from another agent.
+/// Claude is always isolated. Codex keeps its official home unless the user
+/// selected isolation or this process carries a pinned session mode.
 pub fn ensure_agent_homes() -> Result<(), String> {
+    prepare_agent_homes_for_mode(configured_codex_isolation()?)
+}
+
+pub fn prepare_codex_isolation() -> Result<(), String> {
+    prepare_agent_homes_for_mode(true)
+}
+
+pub fn codex_isolation_needs_preparation() -> Result<bool, String> {
+    Ok(!migration_complete(&isolated_codex_home())?)
+}
+
+pub fn prepare_agent_homes_for_mode(isolated: bool) -> Result<(), String> {
     // Existing command tests use production entry points. A test must opt into
     // a fixture base before preparation may touch disk; migration tests below
     // call the explicit-home seam and never inspect a developer's real home.
@@ -64,9 +162,21 @@ pub fn ensure_agent_homes() -> Result<(), String> {
     #[cfg(not(test))]
     let home = dirs::home_dir().ok_or("Could not find home directory")?;
     #[cfg(test)]
-    return ensure_agent_homes_at(&home, &agent_base());
+    return ensure_agent_homes_for_mode_with_guard(
+        &home,
+        &agent_base(),
+        &home.join(".codex"),
+        isolated,
+        |_, _, _, _| Ok(()),
+    );
     #[cfg(not(test))]
-    ensure_agent_homes_with_guard(&home, &agent_base(), ensure_no_legacy_writers)
+    ensure_agent_homes_for_mode_with_guard(
+        &home,
+        &agent_base(),
+        &codex_home_for_mode(false),
+        isolated,
+        ensure_no_legacy_writers,
+    )
 }
 
 #[cfg(test)]
@@ -79,16 +189,44 @@ fn ensure_agent_homes_with_guard(
     base: &Path,
     guard: impl FnOnce(&Path, &Path, &[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
+    ensure_agent_homes_for_mode_with_guard(
+        home,
+        base,
+        &home.join(".codex"),
+        true,
+        |home, base, _, pending| guard(home, base, pending),
+    )
+}
+
+fn ensure_agent_homes_for_mode_with_guard(
+    home: &Path,
+    base: &Path,
+    codex_source: &Path,
+    isolated: bool,
+    guard: impl FnOnce(&Path, &Path, &Path, &[&str]) -> Result<(), String>,
+) -> Result<(), String> {
     let _guard = PREPARATION_LOCK
         .lock()
         .map_err(|_| "Agent home preparation lock poisoned")?;
     validate_agent_base(home, base)?;
+    if isolated && !migration_complete(&base.join("codex"))? {
+        let source = resolve_existing_parent(codex_source)?;
+        let target = resolve_existing_parent(base)?;
+        if source.starts_with(&target) || target.starts_with(&source) {
+            return Err("Shared Codex home must not overlap the CCEM isolated profile".into());
+        }
+    }
     create_private_dir(base)?;
-    for provider in ["claude", "codex"] {
+    let providers = if isolated {
+        &["claude", "codex"][..]
+    } else {
+        &["claude"][..]
+    };
+    for provider in providers {
         let root = base.join(provider);
         validate_no_symlinks(&root)?;
         create_private_dir(&root)?;
-        let paths = if provider == "claude" {
+        let paths = if *provider == "claude" {
             CLAUDE_SNAPSHOT_PATHS
         } else {
             CODEX_SNAPSHOT_PATHS
@@ -96,19 +234,22 @@ fn ensure_agent_homes_with_guard(
         for name in paths {
             validate_no_symlinks(&root.join(name))?;
         }
-        validate_no_symlinks(&root.join(if provider == "claude" {
+        validate_no_symlinks(&root.join(if *provider == "claude" {
             ".claude.json"
         } else {
             "config.toml"
         }))?;
     }
-    if migration_complete(&base.join("claude"))? && migration_complete(&base.join("codex"))? {
+    if migration_complete(&base.join("claude"))?
+        && (!isolated || migration_complete(&base.join("codex"))?)
+    {
         return Ok(());
     }
 
     let _process_lock = MigrationLock::acquire(base)?;
-    let pending = ["claude", "codex"]
-        .into_iter()
+    let pending = providers
+        .iter()
+        .copied()
         .filter_map(|provider| match migration_complete(&base.join(provider)) {
             Ok(false) => Some(Ok(provider)),
             Ok(true) => None,
@@ -116,7 +257,7 @@ fn ensure_agent_homes_with_guard(
         })
         .collect::<Result<Vec<_>, _>>()?;
     if !pending.is_empty() {
-        guard(home, base, &pending)?;
+        guard(home, base, codex_source, &pending)?;
     }
     snapshot_provider(
         &home.join(".claude"),
@@ -124,13 +265,76 @@ fn ensure_agent_homes_with_guard(
         CLAUDE_SNAPSHOT_PATHS,
         true,
     )?;
-    snapshot_provider(
-        &home.join(".codex"),
-        &base.join("codex"),
-        CODEX_SNAPSHOT_PATHS,
-        false,
-    )?;
+    if isolated {
+        snapshot_provider(
+            codex_source,
+            &base.join("codex"),
+            CODEX_SNAPSHOT_PATHS,
+            false,
+        )?;
+    }
     Ok(())
+}
+
+pub fn set_codex_isolation(isolated: bool) -> Result<(), String> {
+    #[cfg(test)]
+    let home = std::env::var_os("CCEM_AGENT_TEST_SOURCE_HOME")
+        .filter(|_| std::env::var_os("CCEM_AGENT_HOME").is_some())
+        .map(PathBuf::from)
+        .ok_or("Profile tests require an explicit fixture home")?;
+    #[cfg(not(test))]
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    set_codex_isolation_with_prepare(&home, &agent_base(), isolated, prepare_codex_isolation)
+}
+
+fn set_codex_isolation_with_prepare(
+    home: &Path,
+    base: &Path,
+    isolated: bool,
+    prepare: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if isolated {
+        prepare()?;
+    }
+    write_codex_isolation_preference(home, base, isolated)
+}
+
+fn write_codex_isolation_preference(
+    home: &Path,
+    base: &Path,
+    isolated: bool,
+) -> Result<(), String> {
+    let _guard = PREPARATION_LOCK
+        .lock()
+        .map_err(|_| "Agent home preparation lock poisoned")?;
+    validate_agent_base(home, base)?;
+    create_private_dir(base)?;
+    let _process_lock = MigrationLock::acquire(base)?;
+    let mut preferences = read_profile_preferences(base)?;
+    preferences["codexIsolation"] = serde_json::Value::Bool(isolated);
+    let bytes = serde_json::to_vec_pretty(&preferences).map_err(|error| error.to_string())?;
+    let path = base.join("profiles.json");
+    let temp = base.join(format!(
+        ".ccem-profile-{}-{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)
+    })();
+    let _ = fs::remove_file(temp);
+    result.map_err(|error| format!("Could not save Codex isolation preference: {error}"))?;
+    sync_directory(base)
 }
 
 fn process_provider(executable: &str, command: &str) -> Option<&'static str> {
@@ -195,6 +399,7 @@ fn legacy_writer_provider(
     provider: &str,
     env: &HashMap<String, String>,
     source_home: &Path,
+    codex_source: &Path,
     base: &Path,
     pending: &[&str],
 ) -> Option<&'static str> {
@@ -226,9 +431,12 @@ fn legacy_writer_provider(
                     .unwrap_or_else(|| PathBuf::from(value))
             })
             .unwrap_or_else(|| process_home.join(default));
-        if !path_matches(&effective, &base.join(candidate))
-            && path_matches(&effective, &source_home.join(default))
-        {
+        let source = if candidate == "codex" {
+            codex_source.to_path_buf()
+        } else {
+            source_home.join(default)
+        };
+        if !path_matches(&effective, &base.join(candidate)) && path_matches(&effective, &source) {
             return Some(candidate);
         }
     }
@@ -288,20 +496,26 @@ fn parse_process_rows(output: &str) -> HashMap<u32, String> {
         .collect()
 }
 
-fn record_uses_migration_source(row: &serde_json::Value, home: &Path) -> bool {
+fn record_uses_migration_source(row: &serde_json::Value, home: &Path, codex_source: &Path) -> bool {
     let Some(path) = row.get("jsonl_path").and_then(|value| value.as_str()) else {
         return true;
     };
     [
         home.join(".claude/projects"),
-        home.join(".codex/sessions"),
-        home.join(".codex/archived_sessions"),
+        codex_source.join("sessions"),
+        codex_source.join("archived_sessions"),
     ]
     .iter()
     .any(|root| Path::new(path).starts_with(root))
 }
 
-fn is_persisted_legacy_pid(home: &Path, pid: u32, provider: &str, pending: &[&str]) -> bool {
+fn is_persisted_legacy_pid(
+    home: &Path,
+    codex_source: &Path,
+    pid: u32,
+    provider: &str,
+    pending: &[&str],
+) -> bool {
     ["sessions.json", "runtime-state.json"].iter().any(|name| {
         let Ok(bytes) = fs::read(home.join(".ccem").join(name)) else {
             return false;
@@ -321,14 +535,19 @@ fn is_persisted_legacy_pid(home: &Path, pid: u32, provider: &str, pending: &[&st
                     row.get("pid").and_then(|value| value.as_u64()) == Some(u64::from(pid))
                         && pending.contains(&client)
                         && (provider == "native" || client == provider)
-                        && record_uses_migration_source(row, home)
+                        && record_uses_migration_source(row, home, codex_source)
                 })
             })
     })
 }
 
 #[cfg(unix)]
-fn ensure_no_legacy_writers(home: &Path, base: &Path, pending: &[&str]) -> Result<(), String> {
+fn ensure_no_legacy_writers(
+    home: &Path,
+    base: &Path,
+    codex_source: &Path,
+    pending: &[&str],
+) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let processes = Command::new("ps")
         .args(["-ax", "-o", "pid=,comm="])
@@ -387,7 +606,7 @@ fn ensure_no_legacy_writers(home: &Path, base: &Path, pending: &[&str]) -> Resul
             });
         let Some(environment) = environment else {
             if process_definitely_exited(pid)
-                || !is_persisted_legacy_pid(home, pid, provider, pending)
+                || !is_persisted_legacy_pid(home, codex_source, pid, provider, pending)
             {
                 continue;
             }
@@ -399,6 +618,7 @@ fn ensure_no_legacy_writers(home: &Path, base: &Path, pending: &[&str]) -> Resul
             provider,
             &environment,
             home,
+            codex_source,
             base,
             pending,
         ) {
@@ -409,7 +629,12 @@ fn ensure_no_legacy_writers(home: &Path, base: &Path, pending: &[&str]) -> Resul
 }
 
 #[cfg(not(unix))]
-fn ensure_no_legacy_writers(home: &Path, _base: &Path, pending: &[&str]) -> Result<(), String> {
+fn ensure_no_legacy_writers(
+    home: &Path,
+    _base: &Path,
+    codex_source: &Path,
+    pending: &[&str],
+) -> Result<(), String> {
     // Windows has no portable process-environment query. Do not infer ownership
     // from an arbitrary Claude/Codex PID; only persisted CCEM sessions qualify.
     for name in ["sessions.json", "runtime-state.json"] {
@@ -448,7 +673,7 @@ fn ensure_no_legacy_writers(home: &Path, _base: &Path, pending: &[&str]) -> Resu
                 && pending.contains(&provider)
                 && !process_definitely_exited(pid)
             {
-                if !record_uses_migration_source(row, home) {
+                if !record_uses_migration_source(row, home, codex_source) {
                     continue;
                 }
                 #[cfg(windows)]

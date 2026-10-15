@@ -6,7 +6,10 @@ import {
   AGENT_MIGRATION_MARKER,
   buildIsolatedAgentEnv,
   ensureCcemAgentHome,
+  getCcemAgentEnv,
   getCcemAgentHome,
+  getCcemIsolatedAgentHome,
+  isCodexIsolated,
 } from '../agent-home';
 
 describe('CCEM agent homes', () => {
@@ -23,7 +26,7 @@ describe('CCEM agent homes', () => {
 
   it('forces independent storage and removes inherited account overrides while preserving selected tokens', () => {
     const env = buildIsolatedAgentEnv({
-      HOME: home, PATH: '/usr/bin',
+      HOME: home, PATH: '/usr/bin', CCEM_CODEX_ISOLATED: '1',
       CLAUDE_CONFIG_DIR: '/official/claude', CLAUDE_SECURESTORAGE_CONFIG_DIR: '/official/keychain',
       CODEX_HOME: '/official/codex', CODEX_SQLITE_HOME: '/official/sqlite',
       CLAUDE_CODE_OAUTH_TOKEN: 'host-oauth', CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '4',
@@ -65,9 +68,88 @@ describe('CCEM agent homes', () => {
   });
 
   it('accepts only an absolute launcher-owned base override', () => {
-    expect(getCcemAgentHome('codex', { HOME: home, CCEM_AGENT_HOME: path.join(home, 'test-agents') }))
+    expect(getCcemAgentHome('codex', { HOME: home, CCEM_AGENT_HOME: path.join(home, 'test-agents'), CCEM_CODEX_ISOLATED: '1' }))
       .toBe(path.join(home, 'test-agents/codex'));
     expect(() => getCcemAgentHome('claude', { CCEM_AGENT_HOME: 'relative' })).toThrow(/absolute/);
+  });
+
+  it('shares official Codex by default without creating or changing its state', () => {
+    const auth = write('.codex/auth.json', 'official-login');
+    write('.codex/config.toml', 'sqlite_home = "/official/config-sqlite"');
+    const official = path.join(home, '.codex');
+    fs.chmodSync(official, 0o751);
+    expect(isCodexIsolated({ HOME: home })).toBe(false);
+    expect(ensureCcemAgentHome('codex', { HOME: home })).toBe(official);
+    expect(fs.readFileSync(auth, 'utf8')).toBe('official-login');
+    expect(fs.statSync(official).mode & 0o777).toBe(0o751);
+    expect(fs.existsSync(path.join(home, '.ccem'))).toBe(false);
+    expect(fs.existsSync(path.join(official, AGENT_MIGRATION_MARKER))).toBe(false);
+    expect(getCcemAgentEnv({ HOME: home })).not.toHaveProperty('CODEX_SQLITE_HOME');
+    const absent = path.join(home, 'missing-official');
+    expect(ensureCcemAgentHome('codex', { HOME: home, CODEX_HOME: absent })).toBe(absent);
+    expect(fs.existsSync(absent)).toBe(false);
+  });
+
+  it('keeps shared Codex credentials and SQLite settings while Claude remains isolated', () => {
+    const env = buildIsolatedAgentEnv({
+      HOME: home, CODEX_HOME: '~/official-codex', CODEX_SQLITE_HOME: '~/official-sqlite',
+      OPENAI_API_KEY: 'official-openai', OPENAI_BASE_URL: 'https://official.example',
+      CODEX_API_KEY: 'official-codex', CODEX_ACCESS_TOKEN: 'official-access',
+      CLAUDE_CODE_OAUTH_TOKEN: 'official-claude', CLAUDE_CONFIG_DIR: '/official/claude',
+    }, { CCEM_CODEX_ISOLATED: '1', CODEX_HOME: '/model/codex', CODEX_SQLITE_HOME: '/model/sqlite' });
+    expect(env).toMatchObject({
+      CCEM_CODEX_ISOLATED: '0', CODEX_HOME: path.join(home, 'official-codex'),
+      CODEX_SQLITE_HOME: '~/official-sqlite', OPENAI_API_KEY: 'official-openai',
+      OPENAI_BASE_URL: 'https://official.example', CODEX_API_KEY: 'official-codex', CODEX_ACCESS_TOKEN: 'official-access',
+      CLAUDE_CONFIG_DIR: path.join(home, '.ccem/agents/claude'),
+    });
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(buildIsolatedAgentEnv({ HOME: home }, { CODEX_SQLITE_HOME: '/model/sqlite' }))
+      .not.toHaveProperty('CODEX_SQLITE_HOME');
+    expect(getCcemAgentHome('codex', { HOME: home, CODEX_HOME: 'relative-codex' })).toBe(path.resolve('relative-codex'));
+  });
+
+  it('applies the preference to new launches while keeping existing process pins stable', () => {
+    const source = write('.codex/sessions/old.jsonl', 'old session');
+    const shared = buildIsolatedAgentEnv({ HOME: home });
+    write('.ccem/agents/profiles.json', JSON.stringify({ codexIsolation: true, future: 'retained' }));
+    expect(isCodexIsolated({ HOME: home })).toBe(true);
+    expect(getCcemAgentHome('codex', shared)).toBe(path.join(home, '.codex'));
+    const isolated = buildIsolatedAgentEnv({ HOME: home });
+    const root = ensureCcemAgentHome('codex', { HOME: home });
+    expect(root).toBe(getCcemIsolatedAgentHome('codex', { HOME: home }));
+    expect(fs.readFileSync(path.join(root, 'sessions/old.jsonl'), 'utf8')).toBe('old session');
+    write('.ccem/agents/profiles.json', JSON.stringify({ codexIsolation: false }));
+    expect(getCcemAgentHome('codex', { HOME: home })).toBe(path.join(home, '.codex'));
+    expect(getCcemAgentHome('codex', isolated)).toBe(root);
+    expect(ensureCcemAgentHome('codex', isolated)).toBe(root);
+    expect(fs.readFileSync(source, 'utf8')).toBe('old session');
+  });
+
+  it('snapshots a custom shared Codex home and rejects overlap before an unfinished migration', () => {
+    write('custom-codex/sessions/custom.jsonl', 'custom session');
+    write('.codex/sessions/default.jsonl', 'different session');
+    const env = { HOME: home, CODEX_HOME: '~/custom-codex', CCEM_CODEX_ISOLATED: '1' };
+    const root = ensureCcemAgentHome('codex', env);
+    expect(fs.readFileSync(path.join(root, 'sessions/custom.jsonl'), 'utf8')).toBe('custom session');
+    expect(fs.existsSync(path.join(root, 'sessions/default.jsonl'))).toBe(false);
+    expect(ensureCcemAgentHome('codex', { ...env, CODEX_HOME: root })).toBe(root);
+    const base = path.join(home, 'overlap-agents');
+    expect(() => ensureCcemAgentHome('codex', { ...env, CCEM_AGENT_HOME: base, CODEX_HOME: path.join(base, 'codex') }))
+      .toThrow(/overlap/);
+    expect(fs.existsSync(path.join(base, 'codex', AGENT_MIGRATION_MARKER))).toBe(false);
+  });
+
+  it('does not silently fall back to sharing when preferences are invalid', () => {
+    write('.ccem/agents/profiles.json', '{broken');
+    expect(isCodexIsolated({ HOME: home })).toBe(true);
+    expect(getCcemAgentHome('codex', { HOME: home })).toBe(path.join(home, '.ccem/agents/codex'));
+    expect(() => buildIsolatedAgentEnv({ HOME: home })).toThrow(/invalid/);
+    expect(() => ensureCcemAgentHome('codex', { HOME: home })).toThrow(/invalid/);
+    expect(isCodexIsolated({ HOME: home, CCEM_CODEX_ISOLATED: '0' })).toBe(false);
+    expect(isCodexIsolated({ HOME: home, CCEM_CODEX_ISOLATED: '1' })).toBe(true);
+    write('.ccem/agents/profiles.json', JSON.stringify({ codexIsolation: 'yes' }));
+    expect(() => getCcemAgentEnv({ HOME: home })).toThrow(/boolean/);
   });
 
   it('copies only legacy Claude sessions and memory once without overwriting either app', () => {
@@ -101,7 +183,7 @@ describe('CCEM agent homes', () => {
     for (const file of ['sessions/2026/old.jsonl', 'archived_sessions/old.jsonl', 'history.jsonl', 'session_index.jsonl', 'memories/summary.md', 'memories_v2/rollout_summaries/old.md', 'AGENTS.md', 'AGENTS.override.md']) write(`.codex/${file}`);
     for (const file of ['auth.json', 'config.toml', 'state_5.sqlite', 'skills/private/SKILL.md',
       'memories_v2/private.sqlite', 'memories_v2/private.sqlite-shm', 'memories_v2/state.db-wal']) write(`.codex/${file}`, 'secret');
-    const root = ensureCcemAgentHome('codex', { HOME: home });
+    const root = ensureCcemAgentHome('codex', { HOME: home, CCEM_CODEX_ISOLATED: '1' });
     expect(fs.readFileSync(path.join(root, 'sessions/2026/old.jsonl'), 'utf8')).toBe('.codex/sessions/2026/old.jsonl');
     expect(fs.existsSync(path.join(root, 'memories/summary.md'))).toBe(true);
     expect(fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8')).toBe('.codex/AGENTS.md');

@@ -1,13 +1,18 @@
 {
   "agentProfiles": {
     "title": "Agent data & sign-in",
-    "description": "CCEM stores its own configuration, sign-in, history, and memory. Existing history and memory are copied on first launch and stored separately from official apps afterward.",
-    "preparing": "Preparing separate directories and importing existing conversations…",
+    "preparing": "Loading agent data settings…",
     "retry": "Retry",
-    "login": "Sign in for CCEM",
+    "loginClaude": "Sign in to Claude",
+    "loginCodex": "Sign in to ChatGPT",
+    "isolated": "Configuration, sign-in, history, and memory are stored separately in CCEM.",
+    "shared": "Uses the official Codex configuration, sign-in, history, and memory.",
+    "isolateCodex": "Isolate Codex data",
+    "switchHint": "Applies to new sessions. Existing sessions keep their original profile. History and memory are copied when first enabled.",
+    "saving": "Switching data profile…",
     "opening": "Opening…",
     "loginOpened": "Opened the CCEM sign-in flow in your terminal",
-    "loginHint": "Official subscriptions require a separate sign-in here. API environments keep using their configured keys. Project instructions, skills, and files remain shared with the project."
+    "loginHint": "Isolated profiles require a separate sign-in for official subscriptions. API keys remain available. Project files, instructions, and skills remain shared."
   },
   "startup": {
     "preparing": "Preparing your workspace…",

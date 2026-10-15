@@ -32,6 +32,7 @@ describe('isolated agent authentication executable boundary', () => {
       fs.writeFileSync(path.join(bin, provider), script, { mode: 0o700 });
     }
     vi.stubEnv('HOME', home);
+    vi.stubEnv('CCEM_CODEX_ISOLATED', '1');
     vi.stubEnv('CCEM_AGENT_HOME', path.join(home, 'agents'));
     vi.stubEnv('PATH', `${bin}${path.delimiter}${process.env.PATH}`);
     vi.stubEnv('CCEM_AUTH_CAPTURE', path.join(home, 'capture.json'));
@@ -65,4 +66,19 @@ describe('isolated agent authentication executable boundary', () => {
       expect(fs.existsSync(path.join(root, 'auth-fixture.json'))).toBe(false);
     });
   }
+
+  it('uses the official Codex login and inherited environment by default', async () => {
+    vi.stubEnv('CCEM_CODEX_ISOLATED', undefined);
+    vi.stubEnv('CODEX_SQLITE_HOME', path.join(home, 'official-sqlite'));
+    await launchAgentAuth('codex');
+    const captured = JSON.parse(fs.readFileSync(path.join(home, 'capture.json'), 'utf8'));
+    expect(captured.args).toEqual(['login']);
+    expect(captured.root).toBe(path.join(home, '.codex'));
+    expect(captured.sqlite).toBe(path.join(home, 'official-sqlite'));
+    expect(captured.openai).toBe('official-api-key');
+    expect(captured.codex).toBe('official-codex-key');
+    expect(captured.oauth).toBeUndefined();
+    expect(fs.existsSync(path.join(home, 'agents'))).toBe(false);
+    expect(fs.readFileSync(path.join(home, '.codex/login-fixture.json'), 'utf8')).toBe('ccem-account');
+  });
 });

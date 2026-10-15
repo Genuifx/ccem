@@ -16,6 +16,142 @@ fn write(path: &Path, value: &str) {
 }
 
 #[test]
+fn codex_defaults_to_shared_and_pins_override_only_the_process() {
+    let (_temp, home, base) = fixture();
+    assert!(!codex_isolation_from(None, &base).unwrap());
+    assert!(codex_isolation_from(Some("1"), &base).unwrap());
+    assert!(!base.exists(), "reading defaults does not create a profile");
+    write(
+        &base.join("profiles.json"),
+        "{\"codexIsolation\":true,\"other\":7}",
+    );
+    assert!(codex_isolation_from(None, &base).unwrap());
+    assert!(!codex_isolation_from(Some("0"), &base).unwrap());
+    assert!(
+        read_codex_isolation_preference(&base).unwrap(),
+        "pin must not change saved selection"
+    );
+    write(
+        &base.join("profiles.json"),
+        "{\"codexIsolation\":\"false\"}",
+    );
+    assert!(codex_isolation_from(None, &base).is_err());
+    assert!(
+        !codex_isolation_from(Some("0"), &base).unwrap(),
+        "existing shared process remains pinned"
+    );
+    write(&base.join("profiles.json"), "broken");
+    assert!(read_codex_isolation_preference(&base).is_err());
+    assert_eq!(
+        resolve_shared_codex_home(&home, None, &home),
+        home.join(".codex")
+    );
+    assert_eq!(
+        resolve_shared_codex_home(&home, Some("~/custom"), &base),
+        home.join("custom")
+    );
+    assert_eq!(
+        resolve_shared_codex_home(&home, Some("relative"), &base),
+        base.join("relative")
+    );
+    assert_eq!(resolve_shared_codex_home(&home, Some("~"), &base), home);
+}
+
+#[test]
+fn shared_mode_prepares_only_claude_and_never_modifies_codex_home() {
+    let (_temp, home, base) = fixture();
+    let shared = home.join("custom official codex");
+    write(&shared.join("auth.json"), "fixture shared auth");
+    write(&shared.join("config.toml"), "model = 'shared-model'");
+    write(&shared.join("sessions/session.jsonl"), "shared transcript");
+    let before = fs::metadata(&shared).unwrap().modified().unwrap();
+    ensure_agent_homes_for_mode_with_guard(&home, &base, &shared, false, |_, _, _, pending| {
+        assert_eq!(pending, &["claude"]);
+        Ok(())
+    })
+    .unwrap();
+    assert!(base.join("claude").join(MIGRATION_MARKER).exists());
+    assert!(!base.join("codex").exists());
+    assert!(!shared.join(MIGRATION_MARKER).exists());
+    assert_eq!(fs::metadata(&shared).unwrap().modified().unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(shared.join("auth.json")).unwrap(),
+        "fixture shared auth"
+    );
+    assert_eq!(
+        fs::read_to_string(shared.join("config.toml")).unwrap(),
+        "model = 'shared-model'"
+    );
+}
+
+#[test]
+fn opt_in_snapshots_custom_shared_home_before_preference_and_toggle_preserves_it() {
+    let (_temp, home, base) = fixture();
+    let shared = home.join("custom-codex");
+    write(&shared.join("sessions/session.jsonl"), "shared first turn");
+    write(&shared.join("auth.json"), "fixture shared auth");
+    write(
+        &base.join("profiles.json"),
+        "{\"codexIsolation\":false,\"other\":7}",
+    );
+    let failure =
+        set_codex_isolation_with_prepare(&home, &base, true, || Err("still running".into()));
+    assert!(failure.is_err());
+    assert!(!read_codex_isolation_preference(&base).unwrap());
+    set_codex_isolation_with_prepare(&home, &base, true, || {
+        ensure_agent_homes_for_mode_with_guard(
+            &home,
+            &base,
+            &shared,
+            true,
+            |_, _, source, pending| {
+                assert_eq!(source, shared);
+                assert!(pending.contains(&"codex"));
+                Ok(())
+            },
+        )
+    })
+    .unwrap();
+    assert!(read_codex_isolation_preference(&base).unwrap());
+    assert_eq!(read_profile_preferences(&base).unwrap()["other"], 7);
+    assert_eq!(
+        fs::read_to_string(base.join("codex/sessions/session.jsonl")).unwrap(),
+        "shared first turn"
+    );
+    assert!(!base.join("codex/auth.json").exists());
+    set_codex_isolation_with_prepare(&home, &base, false, || panic!("disabling never prepares"))
+        .unwrap();
+    assert!(!read_codex_isolation_preference(&base).unwrap());
+    assert!(base.join("codex").join(MIGRATION_MARKER).exists());
+    write(&shared.join("sessions/session.jsonl"), "new shared turn");
+    // A prepared helper pins CODEX_HOME to its own root; completed markers
+    // bypass source overlap validation and never import a second snapshot.
+    ensure_agent_homes_for_mode_with_guard(
+        &home,
+        &base,
+        &base.join("codex"),
+        true,
+        |_, _, _, _| panic!("completed snapshot"),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(base.join("codex/sessions/session.jsonl")).unwrap(),
+        "shared first turn"
+    );
+}
+
+#[test]
+fn pending_codex_isolation_rejects_overlap_before_writing_directories() {
+    let (_temp, home, base) = fixture();
+    assert!(
+        ensure_agent_homes_for_mode_with_guard(&home, &base, &base, true, |_, _, _, _| Ok(()))
+            .unwrap_err()
+            .contains("overlap")
+    );
+    assert!(!base.exists());
+}
+
+#[test]
 fn snapshot_preserves_history_and_memory_without_credentials_or_config() {
     let (_temp, home, base) = fixture();
     let copied = [
@@ -223,7 +359,16 @@ fn legacy_writer_classifier_requires_ccem_ownership_and_source_home() {
     let (_temp, home, base) = fixture();
     let mut env = HashMap::from([("HOME".into(), home.to_string_lossy().to_string())]);
     let classify = |env: &HashMap<String, String>, provider, pending: &[&str]| {
-        legacy_writer_provider(12345, 999, provider, env, &home, &base, pending)
+        legacy_writer_provider(
+            12345,
+            999,
+            provider,
+            env,
+            &home,
+            &home.join(".codex"),
+            &base,
+            pending,
+        )
     };
     assert_eq!(
         classify(&env, "claude", &["claude", "codex"]),
@@ -242,7 +387,16 @@ fn legacy_writer_classifier_requires_ccem_ownership_and_source_home() {
         "completed provider"
     );
     assert_eq!(
-        legacy_writer_provider(12345, 12345, "claude", &env, &home, &base, &["claude"]),
+        legacy_writer_provider(
+            12345,
+            12345,
+            "claude",
+            &env,
+            &home,
+            &home.join(".codex"),
+            &base,
+            &["claude"]
+        ),
         None,
         "self"
     );
@@ -281,6 +435,7 @@ fn unavailable_environment_requires_persisted_source_ownership() {
     let (_temp, home, base) = fixture();
     assert!(!is_persisted_legacy_pid(
         &home,
+        &home.join(".codex"),
         12345,
         "claude",
         &["claude"]
@@ -293,10 +448,34 @@ fn unavailable_environment_requires_persisted_source_ownership() {
         ])
         .to_string(),
     );
-    assert!(is_persisted_legacy_pid(&home, 12345, "claude", &["claude"]));
-    assert!(!is_persisted_legacy_pid(&home, 12345, "codex", &["codex"]));
-    assert!(!is_persisted_legacy_pid(&home, 12346, "codex", &["codex"]));
-    assert!(!is_persisted_legacy_pid(&home, 999, "claude", &["claude"]));
+    assert!(is_persisted_legacy_pid(
+        &home,
+        &home.join(".codex"),
+        12345,
+        "claude",
+        &["claude"]
+    ));
+    assert!(!is_persisted_legacy_pid(
+        &home,
+        &home.join(".codex"),
+        12345,
+        "codex",
+        &["codex"]
+    ));
+    assert!(!is_persisted_legacy_pid(
+        &home,
+        &home.join(".codex"),
+        12346,
+        "codex",
+        &["codex"]
+    ));
+    assert!(!is_persisted_legacy_pid(
+        &home,
+        &home.join(".codex"),
+        999,
+        "claude",
+        &["claude"]
+    ));
 }
 
 #[test]

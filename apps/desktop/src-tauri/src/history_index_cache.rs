@@ -128,6 +128,7 @@ mod tests {
     use super::*;
     fn parse(path: &Path) -> Option<HistorySession> {
         Some(HistorySession {
+            codex_isolated: None,
             id: path.file_stem()?.to_str()?.into(),
             source: "claude".into(),
             display: fs::read_to_string(path).ok()?,
@@ -186,7 +187,8 @@ mod tests {
         let cache = dir.path().join("index.json");
         fs::write(&path, "visible request").unwrap();
         load(&[path.clone()], Some(&cache), parse);
-        let mut old_cache: serde_json::Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+        let mut old_cache: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
         old_cache["version"] = serde_json::json!(VERSION - 1);
         fs::write(&cache, old_cache.to_string()).unwrap();
         let mut reads = 0;

@@ -154,6 +154,7 @@ export interface BrowserPanelHistorySessionIdentity {
   source: string;
   id: string;
   project: string;
+  codexIsolated?: boolean;
 }
 
 function normalizeBrowserAgentProject(project: string): string {
@@ -164,13 +165,15 @@ export function matchesBrowserPanelHistorySession(
   historySession: BrowserPanelHistorySessionIdentity | null | undefined,
   nativeSession: Pick<
     NativeSessionSummary,
-    'provider' | 'provider_session_id' | 'project_dir' | 'runtime_id'
+    'provider' | 'provider_session_id' | 'project_dir' | 'runtime_id' | 'codex_isolated'
   > | null | undefined,
 ): boolean {
   return Boolean(
     historySession
     && nativeSession
     && nativeSession.provider === historySession.source
+    && (historySession.source !== 'codex'
+      || Boolean(nativeSession.codex_isolated) === Boolean(historySession.codexIsolated))
     && (
       nativeSession.provider_session_id === historySession.id
       || nativeSession.runtime_id === historySession.id

@@ -9,6 +9,7 @@ type AgentEnvironment = Record<string, string | undefined>;
 
 export const AGENT_MIGRATION_MARKER = '.ccem-migration-v1.json';
 const MIGRATION_LOCK = '.ccem-migration.lock';
+const PROFILES_FILE = 'profiles.json';
 const LEGACY_ENTRIES: Record<IsolatedAgentProvider, readonly string[]> = {
   claude: ['projects', 'history.jsonl', 'plans', 'file-history', 'CLAUDE.md'],
   codex: ['sessions', 'archived_sessions', 'history.jsonl', 'session_index.jsonl', 'memories', 'memories_v2', 'AGENTS.md', 'AGENTS.override.md'],
@@ -52,6 +53,11 @@ export const INHERITED_AGENT_ENV_KEYS = [
   'ANTHROPIC_VERTEX_PROJECT_ID', 'CLOUD_ML_REGION',
 ] as const;
 
+/** Official Codex credentials and SQLite settings remain available in shared mode. */
+export const SHARED_CODEX_ENV_KEYS = [
+  'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'CODEX_SQLITE_HOME',
+] as const;
+
 function userHome(env: AgentEnvironment): string {
   return env.HOME || env.USERPROFILE || os.homedir();
 }
@@ -64,23 +70,64 @@ export function getCcemAgentBase(env: AgentEnvironment = process.env): string {
   return path.resolve(override || path.join(userHome(env), '.ccem', 'agents'));
 }
 
-export function getCcemAgentHome(provider: IsolatedAgentProvider, env: AgentEnvironment = process.env): string {
+function readCodexIsolation(env: AgentEnvironment): boolean {
+  if (env.CCEM_CODEX_ISOLATED === '1') return true;
+  if (env.CCEM_CODEX_ISOLATED === '0') return false;
+  const file = path.join(getCcemAgentBase(env), PROFILES_FILE);
+  let raw: string;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw new Error('Cannot read CCEM agent profile preferences');
+  }
+  let profiles: unknown;
+  try { profiles = JSON.parse(raw); } catch { throw new Error('CCEM agent profile preferences are invalid'); }
+  if (!profiles || typeof profiles !== 'object' || Array.isArray(profiles)) {
+    throw new Error('CCEM agent profile preferences are invalid');
+  }
+  const value = (profiles as Record<string, unknown>).codexIsolation;
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') throw new Error('CCEM codexIsolation preference must be a boolean');
+  return value;
+}
+
+/** Read-only path lookups fail toward isolation; launch preparation reports invalid preferences. */
+export function isCodexIsolated(env: AgentEnvironment = process.env): boolean {
+  try { return readCodexIsolation(env); } catch { return true; }
+}
+
+export function getCcemIsolatedAgentHome(provider: IsolatedAgentProvider, env: AgentEnvironment = process.env): string {
   return path.join(getCcemAgentBase(env), provider);
 }
 
+function getOfficialCodexHome(env: AgentEnvironment): string {
+  const override = env.CODEX_HOME?.trim();
+  if (!override) return path.resolve(userHome(env), '.codex');
+  if (override === '~') return path.resolve(userHome(env));
+  if (/^~[\\/]/.test(override)) return path.resolve(userHome(env), override.slice(2));
+  return path.resolve(override);
+}
+
+export function getCcemAgentHome(provider: IsolatedAgentProvider, env: AgentEnvironment = process.env): string {
+  return provider === 'codex' && !isCodexIsolated(env)
+    ? getOfficialCodexHome(env) : getCcemIsolatedAgentHome(provider, env);
+}
+
 export function getCcemAgentEnv(env: AgentEnvironment = process.env): Record<string, string> {
-  const claude = getCcemAgentHome('claude', env);
-  const codex = getCcemAgentHome('codex', env);
+  const isolated = readCodexIsolation(env);
+  const claude = getCcemIsolatedAgentHome('claude', env);
+  const codex = isolated ? getCcemIsolatedAgentHome('codex', env) : getOfficialCodexHome(env);
   return {
     CLAUDE_CONFIG_DIR: claude,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: claude,
     CODEX_HOME: codex,
-    CODEX_SQLITE_HOME: codex,
+    CCEM_CODEX_ISOLATED: isolated ? '1' : '0',
+    ...(isolated ? { CODEX_SQLITE_HOME: codex } : {}),
   };
 }
 
-export function clearInheritedAgentEnv(env: AgentEnvironment): void {
+export function clearInheritedAgentEnv(env: AgentEnvironment, codexIsolated = isCodexIsolated(env)): void {
   for (const key of Object.keys(env)) {
+    if (!codexIsolated && (SHARED_CODEX_ENV_KEYS as readonly string[]).includes(key)) continue;
     if ((INHERITED_AGENT_ENV_KEYS as readonly string[]).includes(key)
       || isAgentIdentityEnvKey(key)) {
       delete env[key];
@@ -93,17 +140,23 @@ export function buildIsolatedAgentEnv(
   baseEnv: AgentEnvironment = process.env,
   selectedEnv: AgentEnvironment = {},
 ): Record<string, string> {
+  const profile = getCcemAgentEnv(baseEnv);
+  const codexIsolated = profile.CCEM_CODEX_ISOLATED === '1';
   const env = { ...baseEnv };
-  clearInheritedAgentEnv(env);
+  clearInheritedAgentEnv(env, codexIsolated);
   Object.assign(env, selectedEnv);
   for (const key of Object.keys(env)) {
-    if (isAgentIdentityEnvKey(key)) delete env[key];
+    if (isAgentIdentityEnvKey(key) && (codexIsolated || key !== 'CODEX_ACCESS_TOKEN')) delete env[key];
   }
   delete env.CLAUDECODE;
   // This is a launcher setting, never a per-model setting.
   if (baseEnv.CCEM_AGENT_HOME === undefined) delete env.CCEM_AGENT_HOME;
   else env.CCEM_AGENT_HOME = baseEnv.CCEM_AGENT_HOME;
-  Object.assign(env, getCcemAgentEnv(baseEnv));
+  if (!codexIsolated) {
+    if (baseEnv.CODEX_SQLITE_HOME === undefined) delete env.CODEX_SQLITE_HOME;
+    else env.CODEX_SQLITE_HOME = baseEnv.CODEX_SQLITE_HOME;
+  }
+  Object.assign(env, profile);
   return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
@@ -289,8 +342,9 @@ export function ensureCcemAgentHome(
   provider: IsolatedAgentProvider,
   env: AgentEnvironment = process.env,
 ): string {
+  if (provider === 'codex' && !readCodexIsolation(env)) return getOfficialCodexHome(env);
   const base = getCcemAgentBase(env);
-  const root = getCcemAgentHome(provider, env);
+  const root = getCcemIsolatedAgentHome(provider, env);
   validateAgentBase(base, env);
   ensureRealDirectory(base);
   ensureRealDirectory(root);
@@ -302,7 +356,15 @@ export function ensureCcemAgentHome(
   const unlock = acquireMigrationLock(base);
   try {
     if (migrationComplete(marker)) return root;
-    const source = path.join(userHome(env), provider === 'claude' ? '.claude' : '.codex');
+    const source = provider === 'codex' ? getOfficialCodexHome(env) : path.join(userHome(env), '.claude');
+    if (provider === 'codex') {
+      const resolvedBase = resolveExistingParent(base);
+      const resolvedSource = resolveExistingParent(source);
+      if (resolvedBase === resolvedSource || resolvedBase.startsWith(`${resolvedSource}${path.sep}`)
+        || resolvedSource.startsWith(`${resolvedBase}${path.sep}`)) {
+        throw new Error('CCEM Codex migration source must not overlap its isolated agent directory');
+      }
+    }
     assertNoLegacyAgentWriters(provider, userHome(env), source, root);
     const sourceStat = statIfPresent(source);
     if (sourceStat?.isDirectory() && !sourceStat.isSymbolicLink()) {

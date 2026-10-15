@@ -4466,7 +4466,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             onLoadSubagents={
               session.provider === 'claude' && session.provider_session_id
                 ? (detailAgentId) =>
-                    getSessionSubagents(session.provider_session_id!, session.provider, detailAgentId)
+                    getSessionSubagents(session.provider_session_id!, session.provider, detailAgentId, session.codex_isolated)
                 : undefined
             }
           />

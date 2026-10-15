@@ -971,6 +971,7 @@ impl ExternalControlManager {
                 let resolved = resolve_claude_env(&env_name)?;
                 NativeSessionOptions {
                     provider,
+                    codex_isolated: None,
                     env_name: resolved.env_name,
                     perm_mode,
                     runtime_perm_mode,
@@ -999,6 +1000,7 @@ impl ExternalControlManager {
                 let proxy_env_vars = system_proxy::resolve_codex_proxy_env();
                 NativeSessionOptions {
                     provider,
+                    codex_isolated: None,
                     env_name: if resolved.env_name.is_empty() {
                         env_name
                     } else {

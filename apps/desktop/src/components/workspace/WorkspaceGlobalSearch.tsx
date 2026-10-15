@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import type { HistorySessionItem } from '@/features/conversations/types';
+import { toSessionKey } from '@/features/conversations/types';
 
 interface WorkspaceGlobalSearchProps {
   sessions: HistorySessionItem[];
@@ -318,7 +319,7 @@ export const WorkspaceGlobalSearch = memo(function WorkspaceGlobalSearch({
     const isSelected = entry.flatIndex === selectedIndex;
     return (
       <button
-        key={`session:${session.source}:${session.id}`}
+        key={`session:${toSessionKey(session)}`}
         type="button"
         data-spotlight-result-item
         data-spotlight-result-active={isSelected ? 'true' : undefined}

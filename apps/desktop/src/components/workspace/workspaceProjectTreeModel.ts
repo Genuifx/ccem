@@ -55,14 +55,14 @@ export function buildProjectNodes(sessions: HistorySessionItem[]): ProjectNode[]
   return nodes;
 }
 
-function projectSessionKey(session: Pick<HistorySessionItem, 'id' | 'source'>): string {
-  return `${session.source}:${session.id}`;
+function projectSessionKey(session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>): string {
+  return `${session.source}:${session.source === 'codex' && session.codexIsolated ? 'isolated:' : ''}${session.id}`;
 }
 
 export type ProjectSessionCanonicalKeyMap = Readonly<Record<string, string | undefined>>;
 
 function canonicalProjectSessionKey(
-  session: Pick<HistorySessionItem, 'id' | 'source'>,
+  session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>,
   canonicalKeyBySessionKey: ProjectSessionCanonicalKeyMap,
 ): string {
   const key = projectSessionKey(session);
@@ -268,7 +268,7 @@ export function bucketRecentSessions(
   } = {},
 ): RecentSessionBucket[] {
   const now = options.now ?? Date.now();
-  const keyOf = options.keyOf ?? ((session: HistorySessionItem) => `${session.source}:${session.id}`);
+  const keyOf = options.keyOf ?? projectSessionKey;
   const day = 86_400_000;
   const startToday = startOfDay(now);
   const startYesterday = startOfDay(startToday - 1);

@@ -6,6 +6,7 @@ export interface WorkspaceSidebarLiveSessionEntry {
     NativeSessionSummary,
     | 'runtime_id'
     | 'provider'
+    | 'codex_isolated'
     | 'provider_session_id'
     | 'display_title'
     | 'display_title_revision'
@@ -46,15 +47,15 @@ function liveSessionSidebarId(entry: WorkspaceSidebarLiveSessionEntry): string {
 }
 
 export function liveSessionSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): string {
-  return `${toHistorySource(entry.session.provider)}:${liveSessionSidebarId(entry)}`;
+  return historySessionKey({ source: toHistorySource(entry.session.provider), id: liveSessionSidebarId(entry), codexIsolated: entry.session.codex_isolated ?? false });
 }
 
 function liveSessionRuntimeSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): string {
-  return `${toHistorySource(entry.session.provider)}:${entry.session.runtime_id}`;
+  return historySessionKey({ source: toHistorySource(entry.session.provider), id: entry.session.runtime_id, codexIsolated: entry.session.codex_isolated ?? false });
 }
 
-function historySessionKey(session: Pick<HistorySessionItem, 'id' | 'source'>): string {
-  return `${session.source}:${session.id}`;
+function historySessionKey(session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>): string {
+  return `${session.source}:${session.source === 'codex' && session.codexIsolated ? 'isolated:' : ''}${session.id}`;
 }
 
 export function areHistorySessionItemsEqual(
@@ -63,6 +64,7 @@ export function areHistorySessionItemsEqual(
 ) {
   return previous.id === next.id
     && previous.source === next.source
+    && previous.codexIsolated === next.codexIsolated
     && previous.display === next.display
     && previous.timestamp === next.timestamp
     && previous.project === next.project
@@ -212,6 +214,7 @@ export function toLiveHistorySessionItem(
   return {
     id: liveSessionSidebarId(entry),
     source: toHistorySource(entry.session.provider),
+    codexIsolated: entry.session.provider === 'codex' ? entry.session.codex_isolated ?? false : undefined,
     display,
     timestamp: parseTimestamp(entry.session.updated_at || entry.session.created_at),
     project,
@@ -265,11 +268,14 @@ export function buildWorkspaceSidebarSessions(
 
 export function findLiveEntryForSidebarSession<T extends WorkspaceSidebarLiveSessionEntry>(
   liveEntries: T[],
-  session: Pick<HistorySessionItem, 'id' | 'source'>,
+  session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>,
 ): T | undefined {
   return liveEntries.find((entry) => {
     const source = toHistorySource(entry.session.provider);
     if (source !== session.source) {
+      return false;
+    }
+    if (source === 'codex' && Boolean(entry.session.codex_isolated) !== Boolean(session.codexIsolated)) {
       return false;
     }
 
