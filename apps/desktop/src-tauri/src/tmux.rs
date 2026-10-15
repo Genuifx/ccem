@@ -112,6 +112,9 @@ impl TmuxManager {
         env_vars: &HashMap<String, String>,
         working_dir: &Path,
     ) -> Result<TmuxWindowInfo, String> {
+        if matches!(client, "claude" | "codex") {
+            crate::agent_home::ensure_agent_homes()?;
+        }
         Self::check_tmux_installed()?;
         let session_name = session_name_for_runtime(runtime_id, &self.session_prefix);
         let window_name = DEFAULT_TMUX_WINDOW.to_string();
@@ -1526,6 +1529,8 @@ fn build_tmux_launch_spec(
     target: &str,
     tmux_binary: &str,
 ) -> TmuxLaunchSpec {
+    let mut env_vars = env_vars.clone();
+    crate::agent_profile::apply_env(client, &mut env_vars);
     let client_binary = match client {
         "codex" => resolve_codex_path().unwrap_or_else(|| "codex".to_string()),
         "opencode" => resolve_opencode_path().unwrap_or_else(|| "opencode".to_string()),
@@ -1533,19 +1538,32 @@ fn build_tmux_launch_spec(
     };
     let mut environment = vec![format!("PATH={}", get_user_path())];
     let mut environment_keys = vec!["PATH".to_string()];
+    let mut cleared_keys = Vec::new();
 
     let mut env_entries = env_vars.iter().collect::<Vec<_>>();
     env_entries.sort_by(|left, right| left.0.cmp(right.0));
     for (key, value) in env_entries {
+        if value.is_empty() {
+            cleared_keys.push(shell_quote(key));
+            continue;
+        }
         environment.push(format!("{}={}", key, value));
         environment_keys.push(key.clone());
     }
 
     let mut command_parts = vec![shell_quote(&client_binary)];
+    if client == "codex" {
+        command_parts.push("-c".to_string());
+        command_parts.push(shell_quote(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::codex_home().to_string_lossy()).unwrap())));
+    }
     command_parts.extend(client_args.iter().map(|arg| shell_quote(arg)));
 
     let environment_loader = build_tmux_environment_loader(&environment_keys, target, tmux_binary);
-    let managed_env_keys = MANAGED_CLAUDE_ENV_KEYS.join(" ");
+    let mut managed_env_keys = MANAGED_CLAUDE_ENV_KEYS.join(" ");
+    if !cleared_keys.is_empty() {
+        managed_env_keys.push(' ');
+        managed_env_keys.push_str(&cleared_keys.join(" "));
+    }
 
     TmuxLaunchSpec {
         command: format!(

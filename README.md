@@ -233,7 +233,7 @@ ccem usage          # Interactive with calendar heatmap
 ccem usage --json   # Machine-readable
 ```
 
-Parses JSONL logs from `~/.claude/projects/` to calculate token usage and costs. Price data fetched from LiteLLM and cached locally.
+Parses JSONL logs from `~/.ccem/agents/claude/projects/` to calculate token usage and costs. Price data fetched from LiteLLM and cached locally.
 
 ## Skill Management
 
@@ -506,10 +506,16 @@ A local JSON-RPC server for programmatic control:
 | Path | Contents |
 |---|---|
 | `~/.ccem/config.json` | Environment config (API keys encrypted) |
+| `~/.ccem/agents/claude/` | CCEM Claude Code configuration, login, history, and memory |
+| `~/.ccem/agents/codex/` | CCEM Codex configuration, login, history, and memory |
 | `~/.ccem/usage-cache.json` | Usage cache |
 | `~/.ccem/model-prices.json` | Price cache |
 | `.claude/settings.json` | Project permission config |
 | `.claude/skills/` | Installed skills |
+
+Providers within CCEM share the corresponding agent directory; official apps keep their own directories. First launch independently copies existing conversations and memories while preserving session IDs. Subsequent changes stay separate. Credentials, global settings, and plugin registries are not copied; configured CCEM API keys remain available. To use an official subscription, sign in under Settings → Agent data & sign-in, or run `ccem auth claude` / `ccem auth codex`.
+
+Finish any running sessions from an older CCEM version before the first migration so their final turns can be included. Project files, project instructions, and shared `~/.agents/skills` remain available; app data isolation does not restrict filesystem access to the working directory. An absolute `CCEM_AGENT_HOME` can select a separate agent data root for a controlled deployment.
 
 ---
 

@@ -34,6 +34,8 @@ import type {
 // ============================================
 
 export interface TauriCommands {
+  get_agent_profiles: [void, AgentProfileStatus[]];
+  login_agent_profile: [{ provider: 'claude' | 'codex' }, void];
   // 环境管理
   get_environments: [void, Record<string, Environment>];
   get_current_env: [void, string | null];
@@ -535,7 +537,7 @@ export interface TauriCommands {
   get_ccem_agent_skill_status: [void, CcemAgentSkillStatus];
   install_ccem_agent_skill: [void, CcemAgentSkillStatus];
   install_skill: [{ packageId: string; global: boolean }, void];  // 修正：后端参数是 package_id + global
-  uninstall_skill: [{ name: string }, void];
+  uninstall_skill: [{ name: string; global: boolean; path?: string }, void];
 
   // Cron 任务
   list_cron_tasks: [void, CronTask[]];
@@ -1635,7 +1637,14 @@ export interface ConversationSegment {
   messageCount: number;
 }
 
+export interface AgentProfileStatus {
+  provider: 'claude' | 'codex';
+  directory: string;
+  initialized: boolean;
+}
+
 export interface InstalledSkill {
+  managedByCcem?: boolean;
   id?: string;
   name: string;
   description: string;

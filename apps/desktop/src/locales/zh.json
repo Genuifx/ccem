@@ -1,4 +1,14 @@
 {
+  "agentProfiles": {
+    "title": "Agent 数据与登录",
+    "description": "CCEM 独立保存配置、登录态、历史和记忆。已有历史和记忆在首次启动时复制，此后与官方应用分别保存。",
+    "preparing": "正在准备独立目录并迁入已有会话…",
+    "retry": "重试",
+    "login": "为 CCEM 登录",
+    "opening": "正在打开…",
+    "loginOpened": "已在终端打开 CCEM 专属登录流程",
+    "loginHint": "使用官方订阅需要在这里单独登录；API 环境继续使用已配置的密钥。项目内的指令、技能和文件仍随项目共享。"
+  },
   "startup": {
     "preparing": "正在准备工作区…",
     "configuration": "正在读取配置…",
@@ -1231,9 +1241,9 @@
     "defaultPermissionHint": "启动 Claude 时默认使用此权限，可在 Home 页临时覆盖",
     "agentSkill": "Agent Skill",
     "agentSkillTitle": "CCEM Agent Skill",
-    "agentSkillDesc": "安装随 CCEM 发布的全局 skill，让 Codex 和 Claude Code 都知道如何通过结构化 CLI 调用 CCEM。",
-    "agentSkillInstall": "安装到全局",
-    "agentSkillUpdate": "更新全局 skill",
+    "agentSkillDesc": "安装 CCEM skill，让 CCEM 中的 Codex 和 Claude Code 能通过结构化 CLI 调用 CCEM。",
+    "agentSkillInstall": "安装到 CCEM",
+    "agentSkillUpdate": "更新 CCEM skill",
     "agentSkillReinstall": "重新安装",
     "agentSkillInstalling": "安装中",
     "agentSkillCurrent": "已是最新",

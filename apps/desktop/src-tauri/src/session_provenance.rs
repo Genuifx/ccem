@@ -477,7 +477,13 @@ fn discover_codex_session_id(project_dir: &str, earliest_modified_at: u64) -> Op
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
@@ -513,30 +519,7 @@ fn discover_codex_session_id(project_dir: &str, earliest_modified_at: u64) -> Op
 }
 
 fn codex_sessions_root() -> Option<PathBuf> {
-    let home_dir = dirs::home_dir()?;
-    let env_base = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
-    let codex_home = std::env::var("CODEX_HOME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|raw| resolve_path_value(&raw, &home_dir, &env_base))
-        .unwrap_or_else(|| home_dir.join(".codex"));
-    Some(codex_home.join("sessions"))
-}
-
-fn resolve_path_value(raw: &str, home_dir: &Path, relative_base: &Path) -> PathBuf {
-    if raw == "~" {
-        return home_dir.to_path_buf();
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return home_dir.join(rest);
-    }
-
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        path
-    } else {
-        relative_base.join(path)
-    }
+    Some(crate::agent_home::codex_home().join("sessions"))
 }
 
 fn file_modified_at_millis(path: &Path) -> u64 {
@@ -692,7 +675,8 @@ mod tests {
         let _guard = env_guard().lock().expect("lock env guard");
         let root = temp_root("codex-scan");
         let db_path = root.join("state.sqlite");
-        let codex_home = root.join(".codex");
+        let agent_base = root.join("agents");
+        let codex_home = agent_base.join("codex");
         let sessions_root = codex_home
             .join("sessions")
             .join("2026")
@@ -702,7 +686,7 @@ mod tests {
             .join("rollout-2026-04-17T12-00-00-019d7d58-6c57-76d3-8712-d9126006a5cb.jsonl");
 
         std::env::set_var("CCEM_STATE_DB_PATH", &db_path);
-        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CCEM_AGENT_HOME", &agent_base);
         fs::create_dir_all(&sessions_root).expect("create codex sessions root");
         fs::write(
             &rollout_path,
@@ -737,7 +721,7 @@ mod tests {
         assert_eq!(state_db_path(), db_path);
 
         std::env::remove_var("CCEM_STATE_DB_PATH");
-        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("CCEM_AGENT_HOME");
         let _ = fs::remove_dir_all(root);
     }
 }

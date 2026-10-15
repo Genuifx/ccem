@@ -1,19 +1,8 @@
 import process from 'node:process';
+import { buildIsolatedAgentEnv } from '../../core/src/agent-home';
 
 const CLAUDE_DESKTOP_CLIENT_APP = 'ccem-desktop';
 const CLAUDE_NON_INTERACTIVE_SANDBOX = '1';
-const MANAGED_CLAUDE_ENV_KEYS = [
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_MODEL',
-  'CLAUDE_CODE_SUBAGENT_MODEL',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_SMALL_FAST_MODEL',
-] as const;
-
 type ClaudeQueryEnvInput = {
   envVars?: Record<string, string>;
   effort?: string | null;
@@ -44,14 +33,8 @@ export function buildClaudeQueryEnv({
   baseEnv = process.env,
   routerMode = false,
 }: ClaudeQueryEnvInput = {}) {
-  const cleanBaseEnv = { ...baseEnv };
-  for (const key of MANAGED_CLAUDE_ENV_KEYS) {
-    delete cleanBaseEnv[key];
-  }
-
   const env: Record<string, string | undefined> = {
-    ...cleanBaseEnv,
-    ...envVars,
+    ...buildIsolatedAgentEnv(baseEnv, envVars),
     CLAUDE_AGENT_SDK_CLIENT_APP: CLAUDE_DESKTOP_CLIENT_APP,
     CLAUDE_CODE_SANDBOXED: CLAUDE_NON_INTERACTIVE_SANDBOX,
   };

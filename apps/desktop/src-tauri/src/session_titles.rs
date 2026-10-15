@@ -98,6 +98,8 @@ async fn run_title_query_helper(
     app: AppHandle,
     request: TitleQueryRequest,
 ) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(crate::agent_home::ensure_agent_homes)
+        .await.map_err(|error| format!("Failed to prepare agent profile: {error}"))??;
     let helper_command = TitleQueryCommand {
         command_type: "title_query",
         title_input: &request.title_input,
@@ -109,11 +111,14 @@ async fn run_title_query_helper(
     let line = serde_json::to_string(&helper_command)
         .map_err(|error| format!("Failed to encode title query command: {}", error))?;
     let helper_path = native_helper_script_path(&app)?;
+    let mut profile_env = HashMap::new();
+    crate::agent_profile::apply_env("claude", &mut profile_env);
     let command = app
         .shell()
         .sidecar("ccem-node")
         .map_err(|error| format!("Failed to resolve Node sidecar: {}", error))?
         .arg(helper_path.to_string_lossy().to_string())
+        .envs(profile_env)
         .current_dir(&request.working_dir);
 
     let (rx, mut child) = spawn_native_helper_process(command.into())?;

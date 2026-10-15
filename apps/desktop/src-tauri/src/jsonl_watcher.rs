@@ -98,8 +98,17 @@ pub fn discover_jsonl_path(
     started_at: DateTime<Utc>,
     preferred_session_id: Option<&str>,
 ) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let projects_dir = home.join(".claude").join("projects");
+    let projects_dir = crate::agent_home::claude_home().join("projects");
+    discover_jsonl_path_in(&projects_dir, project_dir, started_at, preferred_session_id)
+}
+
+fn discover_jsonl_path_in(
+    projects_dir: &std::path::Path,
+    project_dir: &str,
+    started_at: DateTime<Utc>,
+    preferred_session_id: Option<&str>,
+) -> Option<PathBuf> {
+    let canonical_root = fs::canonicalize(projects_dir).ok()?;
     let earliest_modified_at = if preferred_session_id.is_some() {
         started_at - chrono::Duration::minutes(10)
     } else {
@@ -108,13 +117,16 @@ pub fn discover_jsonl_path(
 
     for key in project_dir_keys(project_dir) {
         let base_dir = projects_dir.join(key);
-        if !base_dir.exists() {
+        if !fs::canonicalize(&base_dir).is_ok_and(|path| path.starts_with(&canonical_root)) {
             continue;
         }
 
         if let Some(session_id) = preferred_session_id {
+            if session_id.contains(['/', '\\']) {
+                return None;
+            }
             let preferred = base_dir.join(format!("{}.jsonl", session_id));
-            if preferred.exists() {
+            if fs::symlink_metadata(&preferred).is_ok_and(|meta| meta.is_file()) {
                 return Some(preferred);
             }
         }
@@ -122,6 +134,7 @@ pub fn discover_jsonl_path(
         let mut candidates = fs::read_dir(&base_dir)
             .ok()?
             .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .map(|entry| entry.path())
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
             .filter_map(|path| {
@@ -673,6 +686,36 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn watcher_binds_migrated_session_without_observing_new_official_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap().join("user");
+        let base = home.join(".ccem/agents");
+        let key = project_dir_key("/fixture/project");
+        let legacy = home.join(".claude/projects").join(&key);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("previous.jsonl"), "old session\n").unwrap();
+        crate::agent_home::ensure_agent_homes_at(&home, &base).unwrap();
+        std::fs::write(legacy.join("official-new.jsonl"), "new official session\n").unwrap();
+        let isolated_projects = base.join("claude/projects");
+        let found = super::discover_jsonl_path_in(
+            &isolated_projects,
+            "/fixture/project",
+            chrono::Utc::now(),
+            Some("previous"),
+        )
+        .unwrap();
+        assert_eq!(found, isolated_projects.join(&key).join("previous.jsonl"));
+        let latest = super::discover_jsonl_path_in(
+            &isolated_projects,
+            "/fixture/project",
+            chrono::Utc::now(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(latest, found);
+    }
 
     #[test]
     fn project_dir_key_matches_claude_layout() {

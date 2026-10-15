@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { fileURLToPath } from 'url';
 import type { TokenUsage, TokenUsageWithCost, UsageStats, ModelPrice, UsageCache, FileMeta, FileStats, FileStatsEntry } from '@ccem/core';
+import { ensureCcemAgentHome, getCcemAgentHome } from '@ccem/core';
 
 // ESM 兼容：获取 __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -13,13 +14,13 @@ const __dirname = path.dirname(__filename);
 // ... (保持前面的 import 和常量定义不变) ...
 
 // Claude 项目数据目录
-const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const CLAUDE_PROJECTS_DIR = path.join(getCcemAgentHome('claude'), 'projects');
 
 // ccem 数据目录
 const CCEM_DIR = path.join(os.homedir(), '.ccem');
 
 // 缓存版本号（修改缓存结构或统计口径时递增）
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 // 缓存文件路径
 const getCachePath = () => path.join(CCEM_DIR, 'usage-cache.json');
@@ -429,13 +430,14 @@ async function getAllJSONLFilesAsync(): Promise<string[]> {
     for (const project of projects) {
       const projectPath = path.join(CLAUDE_PROJECTS_DIR, project);
       try {
-        const stat = await fsPromises.stat(projectPath);
+        const stat = await fsPromises.lstat(projectPath);
 
         if (stat.isDirectory()) {
           const projectFiles = await fsPromises.readdir(projectPath);
           for (const file of projectFiles) {
-            if (file.endsWith('.jsonl')) {
-              files.push(path.join(projectPath, file));
+            const filePath = path.join(projectPath, file);
+            if (file.endsWith('.jsonl') && (await fsPromises.lstat(filePath)).isFile()) {
+              files.push(filePath);
             }
           }
         }
@@ -453,6 +455,7 @@ async function getAllJSONLFilesAsync(): Promise<string[]> {
 // 获取使用统计（带增量缓存）- 完全 Async
 export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
   if (signal?.aborted) throw new Error('Aborted');
+  ensureCcemAgentHome('claude');
 
   const prices = await loadPrices();
   if (signal?.aborted) throw new Error('Aborted');

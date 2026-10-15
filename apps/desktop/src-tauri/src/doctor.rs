@@ -239,8 +239,8 @@ fn collect_path_statuses() -> Vec<DoctorPathStatus> {
             "ccemNativeRuntimeState",
             home.join(".ccem").join("native-runtime-state.json"),
         ));
-        paths.push(path_status("claudeHome", home.join(".claude")));
-        paths.push(path_status("codexHome", home.join(".codex")));
+        paths.push(path_status("claudeHome", crate::agent_home::claude_home()));
+        paths.push(path_status("codexHome", crate::agent_home::codex_home()));
     }
 
     for (label, key) in [

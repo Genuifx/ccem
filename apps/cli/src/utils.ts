@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { ensureCcemAgentHome, getCcemAgentHome } from '@ccem/core';
 
 // Encryption setup
 const ALGORITHM = 'aes-256-cbc';
@@ -83,26 +84,22 @@ export const getHomeDir = (): string => {
 };
 
 /**
- * 获取全局 Claude 配置文件路径 (~/.claude.json)
+ * 获取 CCEM 专属 Claude 配置文件路径
  */
 export const getGlobalClaudeConfigPath = (): string => {
-  return path.join(getHomeDir(), '.claude.json');
+  return path.join(getCcemAgentHome('claude'), '.claude.json');
 };
 
 /**
- * 获取全局 Claude settings 文件路径 (~/.claude/settings.json)
+ * 获取 CCEM 专属 Claude settings 文件路径
  */
 export const getGlobalClaudeSettingsPath = (): string => {
-  return path.join(getHomeDir(), '.claude', 'settings.json');
+  return path.join(getCcemAgentHome('claude'), 'settings.json');
 };
 
 /**
- * 确保全局 ~/.claude 目录存在
+ * 确保 CCEM 专属 Claude 目录存在
  */
 export const ensureGlobalClaudeDir = (): string => {
-  const claudeDir = path.join(getHomeDir(), '.claude');
-  if (!fs.existsSync(claudeDir)) {
-    fs.mkdirSync(claudeDir, { recursive: true });
-  }
-  return claudeDir;
+  return ensureCcemAgentHome('claude');
 };

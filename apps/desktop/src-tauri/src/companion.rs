@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ── Claude config structs (read from ~/.claude.json) ──────────────────────────
+// ── Claude config structs (read from CCEM agent state) ──────────────────────────
 
 #[derive(Deserialize)]
 struct OauthAccount {
@@ -159,17 +159,20 @@ fn roll_bones(user_id: &str) -> (String, String, String, String, bool, HashMap<S
 
 #[tauri::command]
 pub fn get_companion() -> Result<Option<Companion>, String> {
-    let path = dirs::home_dir()
-        .ok_or("cannot resolve home dir")?
-        .join(".claude.json");
+    let path = crate::agent_home::claude_config_path();
 
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return Ok(None), // file missing → no companion
     };
 
-    let cfg: ClaudeConfig = serde_json::from_str(&text)
-        .map_err(|e| format!("parse ~/.claude.json: line {} col {}", e.line(), e.column()))?;
+    let cfg: ClaudeConfig = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "parse CCEM Claude config: line {} col {}",
+            e.line(),
+            e.column()
+        )
+    })?;
 
     let stored = match cfg.companion {
         Some(c) => c,

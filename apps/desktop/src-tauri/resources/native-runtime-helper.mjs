@@ -3903,8 +3903,8 @@ var qU = v(function(BU) {
   BU._globalThis = void 0;
   BU._globalThis = typeof globalThis === "object" ? globalThis : global;
 });
-var GU = v(function(os5) {
-  var Axe = os5 && os5.__createBinding || (Object.create ? function(e, t, r, n) {
+var GU = v(function(os4) {
+  var Axe = os4 && os4.__createBinding || (Object.create ? function(e, t, r, n) {
     if (n === void 0) n = r;
     Object.defineProperty(e, n, { enumerable: true, get: function() {
       return t[r];
@@ -3912,11 +3912,11 @@ var GU = v(function(os5) {
   } : function(e, t, r, n) {
     if (n === void 0) n = r;
     e[n] = t[r];
-  }), kxe = os5 && os5.__exportStar || function(e, t) {
+  }), kxe = os4 && os4.__exportStar || function(e, t) {
     for (var r in e) if (r !== "default" && !Object.prototype.hasOwnProperty.call(t, r)) Axe(t, e, r);
   };
-  Object.defineProperty(os5, "__esModule", { value: true });
-  kxe(qU(), os5);
+  Object.defineProperty(os4, "__esModule", { value: true });
+  kxe(qU(), os4);
 });
 var WU = v(function(is) {
   var Oxe = is && is.__createBinding || (Object.create ? function(e, t, r, n) {
@@ -27744,21 +27744,125 @@ import { randomUUID as randomUUID4 } from "node:crypto";
 import { createInterface } from "node:readline";
 import process5 from "node:process";
 
+// ../core/src/agent-home.ts
+import os2 from "node:os";
+import path3 from "node:path";
+var IDENTITY_ENV_KEYS = [
+  "ANTHROPIC_PROFILE",
+  "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+  "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_ORGANIZATION_UUID",
+  "CLAUDE_CODE_USER_EMAIL",
+  "CLAUDE_CODE_HFI_BEARER_TOKEN",
+  "CLAUDE_CODE_ENABLE_PROXY_AUTH_HELPER",
+  "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+  "CLAUDE_CODE_DESIGN_OAUTH_CLIENT_ID",
+  "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+  "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
+  "USE_LOCAL_OAUTH",
+  "USE_STAGING_OAUTH",
+  "CLAUDE_LOCAL_OAUTH_API_BASE",
+  "CODEX_ACCESS_TOKEN"
+];
+function isAgentIdentityEnvKey(key) {
+  return IDENTITY_ENV_KEYS.includes(key) || ["CLAUDE_CODE_OAUTH_", "CLAUDE_CODE_HOST_", "CLAUDE_CODE_ACCOUNT_", "CLAUDE_COWORK_MEMORY_"].some((prefix) => key.startsWith(prefix));
+}
+var INHERITED_AGENT_ENV_KEYS = [
+  ...IDENTITY_ENV_KEYS,
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_PROFILE",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+  "CLAUDE_CODE_OAUTH_CLIENT_ID",
+  "CLAUDE_CODE_OAUTH_SCOPES",
+  "CLAUDE_CODE_HOST_CREDS_FILE",
+  "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+  "CLAUDE_CODE_ACCOUNT_UUID",
+  "CLAUDE_CODE_ACCOUNT_TAGGED_ID",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_MANTLE",
+  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+  "CLAUDE_CODE_USE_GATEWAY",
+  "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "CODEX_API_KEY",
+  "CODEX_HOME",
+  "CODEX_SQLITE_HOME",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "ANTHROPIC_AWS_API_KEY",
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+  "ANTHROPIC_FOUNDRY_RESOURCE",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "CLOUD_ML_REGION"
+];
+function userHome(env) {
+  return env.HOME || env.USERPROFILE || os2.homedir();
+}
+function getCcemAgentBase(env = process.env) {
+  const override = env.CCEM_AGENT_HOME?.trim();
+  if (override && (!path3.isAbsolute(override) || override.split(/[\\/]/).includes(".."))) {
+    throw new Error("CCEM_AGENT_HOME must be an absolute path without '..'");
+  }
+  return path3.resolve(override || path3.join(userHome(env), ".ccem", "agents"));
+}
+function getCcemAgentHome(provider, env = process.env) {
+  return path3.join(getCcemAgentBase(env), provider);
+}
+function getCcemAgentEnv(env = process.env) {
+  const claude = getCcemAgentHome("claude", env);
+  const codex = getCcemAgentHome("codex", env);
+  return {
+    CLAUDE_CONFIG_DIR: claude,
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: claude,
+    CODEX_HOME: codex,
+    CODEX_SQLITE_HOME: codex
+  };
+}
+function clearInheritedAgentEnv(env) {
+  for (const key of Object.keys(env)) {
+    if (INHERITED_AGENT_ENV_KEYS.includes(key) || isAgentIdentityEnvKey(key)) {
+      delete env[key];
+    }
+  }
+}
+function buildIsolatedAgentEnv(baseEnv = process.env, selectedEnv = {}) {
+  const env = { ...baseEnv };
+  clearInheritedAgentEnv(env);
+  Object.assign(env, selectedEnv);
+  for (const key of Object.keys(env)) {
+    if (isAgentIdentityEnvKey(key)) delete env[key];
+  }
+  delete env.CLAUDECODE;
+  if (baseEnv.CCEM_AGENT_HOME === void 0) delete env.CCEM_AGENT_HOME;
+  else env.CCEM_AGENT_HOME = baseEnv.CCEM_AGENT_HOME;
+  Object.assign(env, getCcemAgentEnv(baseEnv));
+  return Object.fromEntries(Object.entries(env).filter((entry) => entry[1] !== void 0));
+}
+
 // src/claudeEnv.ts
 import process2 from "node:process";
 var CLAUDE_DESKTOP_CLIENT_APP = "ccem-desktop";
 var CLAUDE_NON_INTERACTIVE_SANDBOX = "1";
-var MANAGED_CLAUDE_ENV_KEYS = [
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_DEFAULT_OPUS_MODEL",
-  "ANTHROPIC_DEFAULT_SONNET_MODEL",
-  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-  "ANTHROPIC_MODEL",
-  "CLAUDE_CODE_SUBAGENT_MODEL",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_SMALL_FAST_MODEL"
-];
 var ROUTER_BYPASS_HOSTS = ["127.0.0.1", "localhost", "::1"];
 function mergeNoProxyHosts(value) {
   const hosts = (value ?? "").split(",").map((host) => host.trim()).filter(Boolean);
@@ -27777,13 +27881,8 @@ function buildClaudeQueryEnv({
   baseEnv = process2.env,
   routerMode = false
 } = {}) {
-  const cleanBaseEnv = { ...baseEnv };
-  for (const key of MANAGED_CLAUDE_ENV_KEYS) {
-    delete cleanBaseEnv[key];
-  }
   const env = {
-    ...cleanBaseEnv,
-    ...envVars,
+    ...buildIsolatedAgentEnv(baseEnv, envVars),
     CLAUDE_AGENT_SDK_CLIENT_APP: CLAUDE_DESKTOP_CLIENT_APP,
     CLAUDE_CODE_SANDBOXED: CLAUDE_NON_INTERACTIVE_SANDBOX
   };
@@ -28029,8 +28128,7 @@ var QuerySnapshotSlot = class {
 };
 
 // src/claudePlanGuard.ts
-import os2 from "node:os";
-import path3 from "node:path";
+import path4 from "node:path";
 var PLAN_MODE_BLOCKED_TOOLS = /* @__PURE__ */ new Set([
   "Write",
   "Edit",
@@ -28049,7 +28147,7 @@ function extractPathLikeValue(input) {
   }
   return null;
 }
-function isClaudeInternalPlanFile(toolName, input) {
+function isClaudeInternalPlanFile(toolName, input, claudeHome = getCcemAgentHome("claude")) {
   if (!["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(toolName)) {
     return false;
   }
@@ -28057,24 +28155,24 @@ function isClaudeInternalPlanFile(toolName, input) {
   if (!pathLikeValue) {
     return false;
   }
-  const resolvedTarget = path3.resolve(pathLikeValue);
-  const planDir = path3.resolve(os2.homedir(), ".claude", "plans");
-  return resolvedTarget === planDir || resolvedTarget.startsWith(`${planDir}${path3.sep}`);
+  const resolvedTarget = path4.resolve(pathLikeValue);
+  const planDir = path4.resolve(claudeHome, "plans");
+  return resolvedTarget === planDir || resolvedTarget.startsWith(`${planDir}${path4.sep}`);
 }
-function shouldBlockClaudeToolInPlanMode(toolName, input) {
+function shouldBlockClaudeToolInPlanMode(toolName, input, claudeHome = getCcemAgentHome("claude")) {
   if (!PLAN_MODE_BLOCKED_TOOLS.has(toolName)) {
     return false;
   }
-  return !isClaudeInternalPlanFile(toolName, input);
+  return !isClaudeInternalPlanFile(toolName, input, claudeHome);
 }
-function buildClaudePlanModePreToolUseHook(isPlanMode) {
+function buildClaudePlanModePreToolUseHook(isPlanMode, claudeHome = getCcemAgentHome("claude")) {
   return async function claudePlanModePreToolUseHook(input) {
     if (!isPlanMode() || input.hook_event_name !== "PreToolUse") {
       return { continue: true };
     }
     const toolName = input.tool_name ?? "";
     const toolInput = asRecord(input.tool_input);
-    if (!shouldBlockClaudeToolInPlanMode(toolName, toolInput)) {
+    if (!shouldBlockClaudeToolInPlanMode(toolName, toolInput, claudeHome)) {
       return { continue: true };
     }
     const reason = `Plan mode is active. Confirm the plan before running ${toolName}.`;
@@ -28088,10 +28186,10 @@ function buildClaudePlanModePreToolUseHook(isPlanMode) {
     };
   };
 }
-function buildClaudePlanModeHooks(isPlanMode) {
+function buildClaudePlanModeHooks(isPlanMode, claudeHome = getCcemAgentHome("claude")) {
   return {
     PreToolUse: [{
-      hooks: [buildClaudePlanModePreToolUseHook(isPlanMode)]
+      hooks: [buildClaudePlanModePreToolUseHook(isPlanMode, claudeHome)]
     }]
   };
 }
@@ -28974,10 +29072,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path7) {
-  if (!path7)
+function getElementAtPath(obj, path8) {
+  if (!path8)
     return obj;
-  return path7.reduce((acc, key) => acc?.[key], obj);
+  return path8.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -29360,11 +29458,11 @@ function aborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path7, issues) {
+function prefixIssues(path8, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path7);
+    iss.path.unshift(path8);
     return iss;
   });
 }
@@ -29547,7 +29645,7 @@ function formatError(error48, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error48, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error49, path7 = []) => {
+  const processError = (error49, path8 = []) => {
     var _a3, _b2;
     for (const issue2 of error49.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
@@ -29557,7 +29655,7 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
       } else if (issue2.code === "invalid_element") {
         processError({ issues: issue2.issues }, issue2.path);
       } else {
-        const fullpath = [...path7, ...issue2.path];
+        const fullpath = [...path8, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -29589,8 +29687,8 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path7 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path7) {
+  const path8 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path8) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -41567,13 +41665,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path7 = ref.slice(1).split("/").filter(Boolean);
-  if (path7.length === 0) {
+  const path8 = ref.slice(1).split("/").filter(Boolean);
+  if (path8.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path7[0] === defsKey) {
-    const key = path7[1];
+  if (path8[0] === defsKey) {
+    const key = path8[1];
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -42439,11 +42537,11 @@ function createCcemSessionHandoffMcpServer(permissionMode, sendMessage) {
 // src/imageInputs.ts
 import fs2 from "fs";
 import os3 from "os";
-import path4 from "path";
+import path5 from "path";
 var MAX_SINGLE_IMAGE_BYTES = 30 * 1024 * 1024;
 var MAX_TOTAL_IMAGE_BYTES = 300 * 1024 * 1024;
 function createLocalImageInputs(parts) {
-  const tempDir = path4.join(os3.tmpdir(), "ccem-images");
+  const tempDir = path5.join(os3.tmpdir(), "ccem-images");
   fs2.mkdirSync(tempDir, { recursive: true });
   const inputs = [];
   const tempFiles = [];
@@ -42464,7 +42562,7 @@ function createLocalImageInputs(parts) {
       }
       const ext = part.image.mediaType.split("/")[1] || "png";
       const filename = `paste-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
-      const filePath = path4.join(tempDir, filename);
+      const filePath = path5.join(tempDir, filename);
       fs2.writeFileSync(filePath, data);
       tempFiles.push(filePath);
       inputs.push({ type: "local_image", path: filePath });
@@ -42486,8 +42584,7 @@ function cleanupTempFiles(files) {
 
 // src/codexContextUsage.ts
 import fs3 from "node:fs";
-import os4 from "node:os";
-import path5 from "node:path";
+import path6 from "node:path";
 var TAIL_BYTES = 512 * 1024;
 function asRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
@@ -42540,8 +42637,8 @@ function buildCodexContextUsageFromTokenCount(payload, fallbackModel = "codex") 
   };
 }
 function resolveCodexSessionsRoot(env = process.env) {
-  const codexHome = env.CODEX_HOME?.trim() || path5.join(os4.homedir(), ".codex");
-  return path5.join(codexHome, "sessions");
+  const codexHome = getCcemAgentHome("codex", env);
+  return path6.join(codexHome, "sessions");
 }
 function looksLikeUuid(value) {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
@@ -42554,7 +42651,7 @@ function scanDirectoryForSessionFile(dir, sessionId, recursive) {
     return null;
   }
   for (const entry of entries) {
-    const entryPath = path5.join(dir, entry.name);
+    const entryPath = path6.join(dir, entry.name);
     if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(sessionId)) {
       return entryPath;
     }
@@ -42566,7 +42663,7 @@ function scanDirectoryForSessionFile(dir, sessionId, recursive) {
     if (!entry.isDirectory()) {
       continue;
     }
-    const match = scanDirectoryForSessionFile(path5.join(dir, entry.name), sessionId, true);
+    const match = scanDirectoryForSessionFile(path6.join(dir, entry.name), sessionId, true);
     if (match) {
       return match;
     }
@@ -42580,7 +42677,7 @@ function recentSessionDirs(root, days = 7) {
     const yyyy = String(date5.getFullYear());
     const mm2 = String(date5.getMonth() + 1).padStart(2, "0");
     const dd2 = String(date5.getDate()).padStart(2, "0");
-    dirs.push(path5.join(root, yyyy, mm2, dd2));
+    dirs.push(path6.join(root, yyyy, mm2, dd2));
   }
   return dirs;
 }
@@ -43685,7 +43782,7 @@ var InputOperation = class {
 
 // src/codexTurnUsage.ts
 import fs4 from "node:fs";
-import path6 from "node:path";
+import path7 from "node:path";
 var TAIL_BYTES2 = 1024 * 1024;
 var MAX_TURN_BYTES = 32 * 1024 * 1024;
 var RETRY_COUNT = 8;
@@ -43724,7 +43821,7 @@ function normalize(raw) {
   };
 }
 function sessionsRoot(codexHome) {
-  return codexHome?.trim() ? path6.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
+  return codexHome?.trim() ? path7.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
 }
 function readRange(fd, start, length) {
   const buffer = Buffer.alloc(length);
@@ -45887,7 +45984,8 @@ function buildClaudeQueryOptions(handoffOwner) {
     ...routerSystemPrompt ? { systemPrompt: routerSystemPrompt } : {},
     hooks: mergeClaudeRouteHooks(
       buildClaudePlanModeHooks(
-        () => initCommand?.provider === "claude" && initCommand.perm_mode === "plan"
+        () => initCommand?.provider === "claude" && initCommand.perm_mode === "plan",
+        env.CLAUDE_CONFIG_DIR
       ),
       initCommand.router
     ),
@@ -46892,10 +46990,8 @@ async function ensureCodexThread() {
       codexPathOverride: initCommand.codex_path ?? void 0,
       baseUrl: initCommand.codex_base_url ?? void 0,
       apiKey: initCommand.codex_api_key ?? void 0,
-      env: {
-        ...process5.env,
-        ...initCommand.env_vars
-      }
+      env: buildIsolatedAgentEnv(process5.env, initCommand.env_vars),
+      config: { sqlite_home: getCcemAgentHome("codex") }
     });
   }
   if (!codexThread) {
@@ -46920,7 +47016,7 @@ async function ensureCodexThread() {
 async function runCodexTurn(text, images, abortController, operation) {
   const thread = await ensureCodexThread();
   abortController.signal.throwIfAborted();
-  const codexHome = initCommand?.env_vars?.CODEX_HOME ?? process5.env.CODEX_HOME;
+  const codexHome = getCcemAgentHome("codex");
   const usageBaseline = captureCodexUsageBaseline(currentProviderSessionId, codexHome);
   let input;
   const parts = buildPromptContentParts(text, images);
@@ -47279,6 +47375,7 @@ async function handleCommand(command) {
     if (forkRequested) {
       const parentSessionId = command.provider_session_id.trim();
       try {
+        Object.assign(process5.env, getCcemAgentEnv());
         const forked = await Mkt(parentSessionId, {
           upToMessageId: command.fork_at_message_id?.trim() || void 0,
           dir: command.working_dir

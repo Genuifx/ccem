@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter};
 
-use crate::config;
+use crate::{agent_home, config};
 
 /// Cached user PATH — login shell is expensive on macOS (1-3s),
 /// only resolve once per process lifetime.
@@ -49,6 +49,8 @@ pub struct InstalledSkill {
     pub implicit_allowed: bool,
     pub ui_metadata: Option<SkillUiMetadata>,
     pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub managed_by_ccem: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -458,6 +460,7 @@ fn build_installed_skill_from_dir(
         implicit_allowed: options.implicit_allowed,
         ui_metadata,
         diagnostics,
+        managed_by_ccem: false,
     })
 }
 
@@ -549,8 +552,8 @@ fn is_path_disabled(path: &Path, disabled_paths: &HashSet<PathBuf>) -> bool {
     })
 }
 
-fn read_codex_config(home: &Path) -> CodexConfig {
-    let config_path = home.join(".codex").join("config.toml");
+fn read_codex_config(home: &Path, codex_home: &Path) -> CodexConfig {
+    let config_path = codex_home.join("config.toml");
     let content = match std::fs::read_to_string(config_path) {
         Ok(content) => content,
         Err(_) => {
@@ -736,7 +739,11 @@ fn add_skills_unique_by_file(
     }
 }
 
-fn collect_workspace_skill_dirs(working_dir: Option<&Path>, folder_name: &str) -> Vec<PathBuf> {
+fn collect_workspace_skill_dirs(
+    working_dir: Option<&Path>,
+    folder_name: &str,
+    user_home: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let Some(working_dir) = working_dir else {
         return dirs;
@@ -748,6 +755,11 @@ fn collect_workspace_skill_dirs(working_dir: Option<&Path>, folder_name: &str) -
     };
 
     while let Some(dir) = current {
+        // A user home is not a project root: its agent directories belong to
+        // the official apps, even when the workspace has no Git boundary.
+        if user_home == Some(dir.as_path()) {
+            break;
+        }
         let skills_dir = dir.join(folder_name).join("skills");
         if skills_dir.exists() {
             dirs.push(skills_dir);
@@ -763,6 +775,7 @@ fn collect_workspace_skill_dirs(working_dir: Option<&Path>, folder_name: &str) -
 
 fn scan_codex_skills_for_context(
     home: Option<&Path>,
+    codex_home: &Path,
     working_dir: Option<&Path>,
 ) -> Vec<InstalledSkill> {
     let mut skills = Vec::new();
@@ -772,9 +785,9 @@ fn scan_codex_skills_for_context(
     let Some(home) = home else {
         return skills;
     };
-    let codex_config = read_codex_config(home);
+    let codex_config = read_codex_config(home, codex_home);
 
-    for dir in collect_workspace_skill_dirs(working_dir, ".agents") {
+    for dir in collect_workspace_skill_dirs(working_dir, ".agents", Some(home)) {
         let mut options = SkillScanOptions {
             scope: "project".to_string(),
             agents: codex_agents.clone(),
@@ -827,12 +840,12 @@ fn scan_codex_skills_for_context(
         );
     }
 
-    let codex_skills_dir = home.join(".codex").join("skills");
+    let codex_skills_dir = codex_home.join("skills");
     if codex_skills_dir.exists() {
         let mut options = SkillScanOptions {
             scope: "global".to_string(),
             agents: codex_agents.clone(),
-            source: Some("~/.codex/skills".to_string()),
+            source: Some("CCEM Codex skills".to_string()),
             version: None,
             provider: Some("codex".to_string()),
             plugin_name: None,
@@ -858,7 +871,7 @@ fn scan_codex_skills_for_context(
             let system_options = SkillScanOptions {
                 scope: "system".to_string(),
                 agents: codex_agents.clone(),
-                source: Some("~/.codex/skills/.system".to_string()),
+                source: Some("CCEM Codex system skills".to_string()),
                 version: None,
                 provider: Some("codex".to_string()),
                 plugin_name: None,
@@ -906,18 +919,18 @@ fn scan_codex_skills_for_context(
         );
     }
 
-    scan_codex_plugin_cache_skills(home, &codex_config, &mut skills, &mut seen_files);
+    scan_codex_plugin_cache_skills(codex_home, &codex_config, &mut skills, &mut seen_files);
 
     skills
 }
 
 fn scan_codex_plugin_cache_skills(
-    home: &Path,
+    codex_home: &Path,
     codex_config: &CodexConfig,
     all_skills: &mut Vec<InstalledSkill>,
     seen_files: &mut HashSet<String>,
 ) {
-    let cache_dir = home.join(".codex").join("plugins").join("cache");
+    let cache_dir = codex_home.join("plugins").join("cache");
     let marketplace_entries = match std::fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -1023,11 +1036,12 @@ fn parse_claude_skill_overrides_from_value(
     }
 }
 
-fn collect_claude_settings_paths(home: Option<&Path>, working_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(home) = home {
-        paths.push(home.join(".claude").join("settings.json"));
-    }
+fn collect_claude_settings_paths(
+    home: Option<&Path>,
+    claude_home: &Path,
+    working_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![claude_home.join("settings.json")];
     if let Some(working_dir) = working_dir {
         let mut current = if working_dir.is_file() {
             working_dir.parent().map(Path::to_path_buf)
@@ -1035,6 +1049,9 @@ fn collect_claude_settings_paths(home: Option<&Path>, working_dir: Option<&Path>
             Some(working_dir.to_path_buf())
         };
         while let Some(dir) = current {
+            if home == Some(dir.as_path()) {
+                break;
+            }
             paths.push(dir.join(".claude").join("settings.json"));
             if dir.join(".git").exists() {
                 break;
@@ -1047,10 +1064,11 @@ fn collect_claude_settings_paths(home: Option<&Path>, working_dir: Option<&Path>
 
 fn read_claude_skill_overrides(
     home: Option<&Path>,
+    claude_home: &Path,
     working_dir: Option<&Path>,
 ) -> HashMap<String, String> {
     let mut overrides = HashMap::new();
-    for settings_path in collect_claude_settings_paths(home, working_dir) {
+    for settings_path in collect_claude_settings_paths(home, claude_home, working_dir) {
         let Ok(content) = std::fs::read_to_string(settings_path) else {
             continue;
         };
@@ -1155,6 +1173,7 @@ fn apply_claude_native_priority(skills: Vec<InstalledSkill>) -> Vec<InstalledSki
 
 fn scan_claude_skills_for_context(
     home: Option<&Path>,
+    claude_home: &Path,
     working_dir: Option<&Path>,
 ) -> Vec<InstalledSkill> {
     let claude_agents = vec!["Claude Code".to_string()];
@@ -1178,13 +1197,13 @@ fn scan_claude_skills_for_context(
         skills.extend(scan_skills_dir_with_options(&enterprise_dir, &options));
     }
 
-    if let Some(home) = home {
-        let personal_dir = home.join(".claude").join("skills");
+    {
+        let personal_dir = claude_home.join("skills");
         if personal_dir.exists() {
             let options = SkillScanOptions {
                 scope: "global".to_string(),
                 agents: claude_agents.clone(),
-                source: Some("~/.claude/skills".to_string()),
+                source: Some("CCEM Claude skills".to_string()),
                 version: None,
                 provider: Some("claude".to_string()),
                 plugin_name: None,
@@ -1198,7 +1217,7 @@ fn scan_claude_skills_for_context(
         }
     }
 
-    for project_dir in collect_workspace_skill_dirs(working_dir, ".claude") {
+    for project_dir in collect_workspace_skill_dirs(working_dir, ".claude", home) {
         let options = SkillScanOptions {
             scope: "project".to_string(),
             agents: claude_agents.clone(),
@@ -1215,9 +1234,8 @@ fn scan_claude_skills_for_context(
         skills.extend(scan_skills_dir_with_options(&project_dir, &options));
     }
 
+    skills.extend(scan_claude_plugin_skills(claude_home));
     if let Some(home) = home {
-        skills.extend(scan_claude_plugin_skills(home));
-
         let shared_agents_dir = home.join(".agents").join("skills");
         if shared_agents_dir.exists() {
             let options = SkillScanOptions {
@@ -1239,7 +1257,7 @@ fn scan_claude_skills_for_context(
         }
     }
 
-    for project_agents_dir in collect_workspace_skill_dirs(working_dir, ".agents") {
+    for project_agents_dir in collect_workspace_skill_dirs(working_dir, ".agents", home) {
         let options = SkillScanOptions {
             scope: "project".to_string(),
             agents: claude_agents.clone(),
@@ -1259,7 +1277,7 @@ fn scan_claude_skills_for_context(
         skills.extend(scan_skills_dir_with_options(&project_agents_dir, &options));
     }
 
-    let overrides = read_claude_skill_overrides(home, working_dir);
+    let overrides = read_claude_skill_overrides(home, claude_home, working_dir);
     for skill in &mut skills {
         apply_claude_overrides(skill, &overrides);
     }
@@ -1267,14 +1285,11 @@ fn scan_claude_skills_for_context(
     apply_claude_native_priority(skills)
 }
 
-/// Scan plugin skills from ~/.claude/plugins/
-fn scan_claude_plugin_skills(home: &Path) -> Vec<InstalledSkill> {
+/// Scan plugin skills from the CCEM Claude profile.
+fn scan_claude_plugin_skills(claude_home: &Path) -> Vec<InstalledSkill> {
     let mut skills = Vec::new();
     // Read installed_plugins.json
-    let plugins_json = home
-        .join(".claude")
-        .join("plugins")
-        .join("installed_plugins.json");
+    let plugins_json = claude_home.join("plugins").join("installed_plugins.json");
     let content = match std::fs::read_to_string(&plugins_json) {
         Ok(c) => c,
         Err(_) => return skills,
@@ -1339,23 +1354,21 @@ fn scan_claude_plugin_skills(home: &Path) -> Vec<InstalledSkill> {
 
 /// Backward-compatible wrapper for the installed skills settings view.
 fn scan_plugin_skills() -> Vec<InstalledSkill> {
-    dirs::home_dir()
-        .map(|home| scan_claude_plugin_skills(&home))
-        .unwrap_or_default()
+    scan_claude_plugin_skills(&agent_home::claude_home())
 }
 
-fn ccem_agent_skill_file_targets(home: &Path) -> Vec<(String, PathBuf)> {
+fn ccem_agent_skill_file_targets(claude_home: &Path, codex_home: &Path) -> Vec<(String, PathBuf)> {
     vec![
         (
             "Codex".to_string(),
-            home.join(".codex")
+            codex_home
                 .join("skills")
                 .join(CCEM_AGENT_SKILL_NAME)
                 .join("SKILL.md"),
         ),
         (
             "Claude Code".to_string(),
-            home.join(".claude")
+            claude_home
                 .join("skills")
                 .join(CCEM_AGENT_SKILL_NAME)
                 .join("SKILL.md"),
@@ -1363,8 +1376,11 @@ fn ccem_agent_skill_file_targets(home: &Path) -> Vec<(String, PathBuf)> {
     ]
 }
 
-fn get_ccem_agent_skill_status_for_home(home: &Path) -> Result<CcemAgentSkillStatus, String> {
-    let targets: Vec<CcemAgentSkillTarget> = ccem_agent_skill_file_targets(home)
+fn get_ccem_agent_skill_status_for_homes(
+    claude_home: &Path,
+    codex_home: &Path,
+) -> Result<CcemAgentSkillStatus, String> {
+    let targets: Vec<CcemAgentSkillTarget> = ccem_agent_skill_file_targets(claude_home, codex_home)
         .into_iter()
         .map(|(agent, path)| {
             let content = std::fs::read_to_string(&path).ok();
@@ -1389,8 +1405,12 @@ fn get_ccem_agent_skill_status_for_home(home: &Path) -> Result<CcemAgentSkillSta
     })
 }
 
-fn install_ccem_agent_skill_for_home(home: &Path) -> Result<CcemAgentSkillStatus, String> {
-    for (_, path) in ccem_agent_skill_file_targets(home) {
+fn install_ccem_agent_skill_for_homes(
+    claude_home: &Path,
+    codex_home: &Path,
+) -> Result<CcemAgentSkillStatus, String> {
+    for (_, path) in ccem_agent_skill_file_targets(claude_home, codex_home) {
+        reject_symlink_path(&path)?;
         let Some(parent) = path.parent() else {
             return Err(format!(
                 "Invalid CCEM agent skill target: {}",
@@ -1403,7 +1423,7 @@ fn install_ccem_agent_skill_for_home(home: &Path) -> Result<CcemAgentSkillStatus
             .map_err(|error| format!("Failed to write {}: {}", path.display(), error))?;
     }
 
-    get_ccem_agent_skill_status_for_home(home)
+    get_ccem_agent_skill_status_for_homes(claude_home, codex_home)
 }
 
 // ============================================
@@ -1411,17 +1431,23 @@ fn install_ccem_agent_skill_for_home(home: &Path) -> Result<CcemAgentSkillStatus
 // ============================================
 
 #[tauri::command]
-pub fn get_ccem_agent_skill_status() -> Result<CcemAgentSkillStatus, String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
-    get_ccem_agent_skill_status_for_home(&home)
+pub async fn get_ccem_agent_skill_status() -> Result<CcemAgentSkillStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        agent_home::ensure_agent_homes()?;
+        get_ccem_agent_skill_status_for_homes(&agent_home::claude_home(), &agent_home::codex_home())
+    })
+    .await
+    .map_err(|error| format!("Failed to read CCEM agent skill status: {}", error))?
 }
 
 #[tauri::command]
-pub fn install_ccem_agent_skill() -> Result<CcemAgentSkillStatus, String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
-    install_ccem_agent_skill_for_home(&home)
+pub async fn install_ccem_agent_skill() -> Result<CcemAgentSkillStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        agent_home::ensure_agent_homes()?;
+        install_ccem_agent_skill_for_homes(&agent_home::claude_home(), &agent_home::codex_home())
+    })
+    .await
+    .map_err(|error| format!("Failed to install CCEM agent skill: {}", error))?
 }
 
 /// Stream skill search results via Claude CLI subprocess.
@@ -1429,6 +1455,17 @@ pub fn install_ccem_agent_skill() -> Result<CcemAgentSkillStatus, String> {
 #[tauri::command]
 pub fn search_skills_stream(app: AppHandle, query: String) {
     std::thread::spawn(move || {
+        if let Err(error) = agent_home::ensure_agent_homes() {
+            let _ = app.emit(
+                "skill-search-stream",
+                serde_json::json!({
+                    "type": "error", "error": error,
+                })
+                .to_string(),
+            );
+            let _ = app.emit("skill-search-done", ());
+            return;
+        }
         let prompt = format!(
             "用户想找: {}，请用 npx skills find 搜索并以 JSON 返回推荐，JSON 格式为 [{{\"name\": \"...\", \"package_id\": \"...\", \"description\": \"...\", \"source\": \"skills.sh\"}}]",
             query
@@ -1458,7 +1495,8 @@ pub fn search_skills_stream(app: AppHandle, query: String) {
             cmd.current_dir(home);
         }
 
-        // Inject AI environment's API config (respects ai_enhanced setting)
+        // Apply the application profile before its selected model connection.
+        crate::agent_profile::configure_command("claude", &mut cmd);
         config::inject_ai_env(&mut cmd);
 
         let child = cmd.spawn();
@@ -1495,8 +1533,8 @@ pub fn search_skills_stream(app: AppHandle, query: String) {
 }
 
 /// List all installed skills from three sources:
-/// 1. Filesystem skills: ~/.claude/skills/, ~/.agents/skills/, ~/.codex/skills/
-/// 2. Plugin skills: ~/.claude/plugins/installed_plugins.json
+/// 1. CCEM profile skills and shared ~/.agents/skills/
+/// 2. Plugin skills from the CCEM Claude profile
 /// 3. Project skills: <defaultWorkingDir>/.claude/skills/ (optional)
 #[tauri::command]
 pub async fn list_workspace_skills(
@@ -1512,6 +1550,7 @@ fn list_workspace_skills_sync(
     working_dir: Option<String>,
     provider: Option<String>,
 ) -> Result<Vec<InstalledSkill>, String> {
+    agent_home::ensure_agent_homes()?;
     let home = dirs::home_dir();
     let working_dir = working_dir
         .as_deref()
@@ -1527,27 +1566,32 @@ fn list_workspace_skills_sync(
         Some("codex") => {
             skills.extend(scan_codex_skills_for_context(
                 home.as_deref(),
+                &agent_home::codex_home(),
                 working_dir.as_deref(),
             ));
         }
         Some("claude") | Some("claude-code") => {
             skills.extend(scan_claude_skills_for_context(
                 home.as_deref(),
+                &agent_home::claude_home(),
                 working_dir.as_deref(),
             ));
         }
         _ => {
             skills.extend(scan_claude_skills_for_context(
                 home.as_deref(),
+                &agent_home::claude_home(),
                 working_dir.as_deref(),
             ));
             skills.extend(scan_codex_skills_for_context(
                 home.as_deref(),
+                &agent_home::codex_home(),
                 working_dir.as_deref(),
             ));
         }
     }
 
+    mark_managed_skills(&mut skills);
     skills.sort_by(|left, right| {
         let left_disabled = left.disabled;
         let right_disabled = right.disabled;
@@ -1658,6 +1702,7 @@ pub async fn list_installed_skills() -> Result<Vec<InstalledSkill>, String> {
 }
 
 fn list_installed_skills_sync() -> Result<Vec<InstalledSkill>, String> {
+    agent_home::ensure_agent_homes()?;
     let mut all_skills = Vec::new();
 
     if let Some(home) = dirs::home_dir() {
@@ -1665,8 +1710,8 @@ fn list_installed_skills_sync() -> Result<Vec<InstalledSkill>, String> {
         let claude_agents = ["Claude Code"];
         let codex_agents = ["Codex"];
 
-        // ~/.claude/skills/ → Claude Code
-        let claude_skills_dir = home.join(".claude").join("skills");
+        // CCEM Claude profile → Claude Code
+        let claude_skills_dir = agent_home::claude_home().join("skills");
         if claude_skills_dir.exists() {
             all_skills.extend(scan_skills_dir(
                 &claude_skills_dir,
@@ -1691,8 +1736,8 @@ fn list_installed_skills_sync() -> Result<Vec<InstalledSkill>, String> {
             ));
         }
 
-        // ~/.codex/skills/ → Codex
-        let codex_skills_dir = home.join(".codex").join("skills");
+        // CCEM Codex profile → Codex
+        let codex_skills_dir = agent_home::codex_home().join("skills");
         if codex_skills_dir.exists() {
             all_skills.extend(scan_skills_dir(
                 &codex_skills_dir,
@@ -1711,8 +1756,11 @@ fn list_installed_skills_sync() -> Result<Vec<InstalledSkill>, String> {
 
     // Source 3: Project skills (if defaultWorkingDir is configured)
     if let Some(working_dir) = config::get_default_working_dir() {
-        let project_skills_dir = PathBuf::from(&working_dir).join(".claude").join("skills");
-        if project_skills_dir.exists() {
+        for project_skills_dir in collect_workspace_skill_dirs(
+            Some(Path::new(&working_dir)),
+            ".claude",
+            dirs::home_dir().as_deref(),
+        ) {
             all_skills.extend(scan_skills_dir(
                 &project_skills_dir,
                 "project",
@@ -1722,6 +1770,7 @@ fn list_installed_skills_sync() -> Result<Vec<InstalledSkill>, String> {
         }
     }
 
+    mark_managed_skills(&mut all_skills);
     Ok(all_skills)
 }
 
@@ -1879,8 +1928,292 @@ pub fn get_curated_skills() -> Vec<CuratedSkill> {
     ]
 }
 
-/// Install a skill via npx skills add (async, event-driven).
-/// Emits "skill-install-done" with { package_id, success, message }.
+fn profile_skill_roots() -> Vec<PathBuf> {
+    vec![
+        agent_home::claude_home().join("skills"),
+        agent_home::codex_home().join("skills"),
+    ]
+}
+
+/// Never follow an installed skill or profile symlink while modifying files.
+fn reject_symlink_path(path: &Path) -> Result<(), String> {
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("Skill paths must not contain parent-directory traversal".to_string());
+    }
+    for ancestor in path.ancestors() {
+        if std::fs::symlink_metadata(ancestor)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "Refusing to modify a symlinked skill path: {}",
+                ancestor.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_owned_skill_path(path: &Path, roots: &[PathBuf]) -> bool {
+    if reject_symlink_path(path).is_err() {
+        return false;
+    }
+    let Ok(canonical_path) = path.canonicalize() else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        path != root
+            && path.starts_with(root)
+            && root.canonicalize().is_ok_and(|canonical_root| {
+                canonical_path != canonical_root && canonical_path.starts_with(canonical_root)
+            })
+    })
+}
+
+fn mark_managed_skills(skills: &mut [InstalledSkill]) {
+    let roots = profile_skill_roots();
+    for skill in skills {
+        skill.managed_by_ccem =
+            skill.scope == "global" && is_owned_skill_path(Path::new(&skill.path), &roots);
+    }
+}
+
+fn validate_project_skill_directory(working_dir: &Path, user_home: &Path) -> Result<(), String> {
+    let working_dir = normalized_existing_or_raw(working_dir);
+    let user_home = normalized_existing_or_raw(user_home);
+    if working_dir == user_home
+        || working_dir.starts_with(user_home.join(".claude"))
+        || working_dir.starts_with(user_home.join(".codex"))
+        || working_dir.starts_with(user_home.join(".agents"))
+    {
+        return Err(
+            "Select a project outside the official agent and shared user directories".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn skill_install_roots(
+    global: bool,
+    agents: Option<&[String]>,
+    claude_home: &Path,
+    codex_home: &Path,
+    working_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    if !global {
+        let working_dir =
+            working_dir.ok_or("Select a project directory before installing project skills")?;
+        if let Some(user_home) = dirs::home_dir() {
+            validate_project_skill_directory(working_dir, &user_home)?;
+        }
+    }
+    let default_agents = vec!["Claude Code".to_string(), "Codex".to_string()];
+    let agents = agents
+        .filter(|agents| !agents.is_empty())
+        .unwrap_or(&default_agents);
+    let mut roots = Vec::new();
+    for agent in agents {
+        let root = match agent.as_str() {
+            "Claude Code" | "claude-code" | "claude" => {
+                if global {
+                    claude_home.join("skills")
+                } else {
+                    working_dir
+                        .ok_or("Select a project directory before installing project skills")?
+                        .join(".claude/skills")
+                }
+            }
+            "Codex" | "codex" => {
+                if global {
+                    codex_home.join("skills")
+                } else {
+                    working_dir
+                        .ok_or("Select a project directory before installing project skills")?
+                        .join(".agents/skills")
+                }
+            }
+            other => return Err(format!("Unsupported CCEM skill agent: {}", other)),
+        };
+        reject_symlink_path(&root)?;
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+fn copy_skill_tree(source: &Path, target: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Skill packages cannot contain symlinks: {}",
+            source.display()
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(target).map_err(|error| error.to_string())?;
+        for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            copy_skill_tree(&entry.path(), &target.join(entry.file_name()))?;
+        }
+    } else if metadata.is_file() {
+        std::fs::copy(source, target).map_err(|error| error.to_string())?;
+    } else {
+        return Err(format!(
+            "Unsupported file in skill package: {}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+fn promote_staged_skills(staging: &Path, roots: &[PathBuf]) -> Result<usize, String> {
+    let staged_root = staging.join(".claude/skills");
+    let entries = std::fs::read_dir(&staged_root)
+        .map_err(|_| "The package did not install any skills".to_string())?;
+    let mut sources = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.path().join("SKILL.md").is_file() {
+            sources.push(entry.path());
+        }
+    }
+    if sources.is_empty() {
+        return Err("The package did not install any skills".to_string());
+    }
+    for root in roots {
+        reject_symlink_path(root)?;
+        std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+        for source in &sources {
+            let name = source
+                .file_name()
+                .ok_or("Invalid skill package directory")?;
+            let target = root.join(name);
+            reject_symlink_path(&target)?;
+            let prepared = root.join(format!(".ccem-skill-install-{}", rand::random::<u64>()));
+            if let Err(error) = copy_skill_tree(source, &prepared) {
+                let _ = std::fs::remove_dir_all(&prepared);
+                return Err(error);
+            }
+            let backup = root.join(format!(".ccem-skill-backup-{}", rand::random::<u64>()));
+            let had_target = target.exists();
+            if had_target {
+                if let Err(error) = std::fs::rename(&target, &backup) {
+                    let _ = std::fs::remove_dir_all(&prepared);
+                    return Err(error.to_string());
+                }
+            }
+            if let Err(error) = std::fs::rename(&prepared, &target) {
+                if had_target {
+                    let _ = std::fs::rename(&backup, &target);
+                }
+                let _ = std::fs::remove_dir_all(&prepared);
+                return Err(error.to_string());
+            }
+            if had_target {
+                std::fs::remove_dir_all(backup).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(sources.len())
+}
+
+fn staged_skill_install_command(
+    staging: &Path,
+    package_id: &str,
+    skill_name: Option<&str>,
+) -> Command {
+    let mut command = Command::new("npx");
+    // skills' global Codex target is ~/.agents/skills, regardless of CODEX_HOME.
+    // Project copy mode writes only in staging; CCEM promotes physical files.
+    command.args([
+        "--yes",
+        "skills",
+        "add",
+        package_id,
+        "-y",
+        "--copy",
+        "--agent",
+        "claude-code",
+    ]);
+    if let Some(skill_name) = skill_name {
+        command.args(["--skill", skill_name]);
+    }
+    command.current_dir(staging).env("PATH", get_user_path());
+    command
+}
+
+fn install_skill_sync(
+    package_id: &str,
+    skill_name: Option<&str>,
+    global: bool,
+    agents: Option<&[String]>,
+) -> Result<String, String> {
+    if package_id.trim().is_empty()
+        || package_id.starts_with('-')
+        || skill_name.is_some_and(|name| name.trim().is_empty() || name.starts_with('-'))
+    {
+        return Err("A valid skill package and skill name are required".to_string());
+    }
+    agent_home::ensure_agent_homes()?;
+    let working_dir = config::get_default_working_dir().map(PathBuf::from);
+    let roots = skill_install_roots(
+        global,
+        agents,
+        &agent_home::claude_home(),
+        &agent_home::codex_home(),
+        working_dir.as_deref(),
+    )?;
+    let staging_parent = agent_home::claude_home().join(".skill-staging");
+    reject_symlink_path(&staging_parent)?;
+    std::fs::create_dir_all(&staging_parent).map_err(|error| error.to_string())?;
+    let staging = staging_parent.join(format!("{}-{}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir(&staging).map_err(|error| error.to_string())?;
+    let result = (|| {
+        let output = staged_skill_install_command(&staging, package_id, skill_name)
+            .output()
+            .map_err(|error| format!("Failed to run npx: {}", error))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(if stderr.trim().is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            });
+        }
+        let count = promote_staged_skills(&staging, &roots)?;
+        Ok(format!(
+            "Installed {} skill(s) in the selected CCEM profiles",
+            count
+        ))
+    })();
+    let _ = std::fs::remove_dir_all(staging);
+    result
+}
+
+fn uninstall_skill_from_roots(
+    name: &str,
+    path: Option<&Path>,
+    roots: &[PathBuf],
+) -> Result<String, String> {
+    let matches: Vec<_> = roots
+        .iter()
+        .flat_map(|root| scan_skills_dir(root, "global", &[], None))
+        .filter(|skill| skill.name == name && is_owned_skill_path(Path::new(&skill.path), roots))
+        .filter(|skill| path.is_none_or(|path| path == Path::new(&skill.path)))
+        .collect();
+    if matches.len() != 1 {
+        return Err("Select an exact CCEM-owned skill; shared, plugin and official-app skills are managed at their source".to_string());
+    }
+    std::fs::remove_dir_all(&matches[0].path).map_err(|error| error.to_string())?;
+    Ok(format!("Removed {} from the selected CCEM profile", name))
+}
+
+/// Install into a temporary project, then copy only into the selected CCEM profiles.
 #[tauri::command]
 pub fn install_skill(
     app: AppHandle,
@@ -1890,126 +2223,44 @@ pub fn install_skill(
     agents: Option<Vec<String>>,
 ) {
     std::thread::spawn(move || {
-        let mut args = vec![
-            "skills".to_string(),
-            "add".to_string(),
-            package_id.clone(),
-            "-y".to_string(),
-        ];
-
-        // Add --skill if provided
-        if let Some(ref sn) = skill_name {
-            args.push("--skill".to_string());
-            args.push(sn.clone());
-        }
-
-        if global {
-            args.push("-g".to_string());
-        }
-
-        // Add --agent flags if agents are specified
-        if let Some(ref agent_list) = agents {
-            if !agent_list.is_empty() {
-                args.push("--agent".to_string());
-                for agent in agent_list {
-                    // Map display names to CLI names
-                    let cli_name = match agent.as_str() {
-                        "Claude Code" => "claude-code",
-                        "Codex" => "codex",
-                        other => other,
-                    };
-                    args.push(cli_name.to_string());
-                }
-            }
-        }
-
-        let user_path = get_user_path();
-        let result = Command::new("npx")
-            .args(&args)
-            .env("PATH", user_path)
-            .output();
-
-        let payload = match result {
-            Ok(output) => {
-                // npx skills add writes progress/spinners to stderr even on success,
-                // so only check exit code — ignore stderr warnings.
-                if output.status.success() {
-                    serde_json::json!({
-                        "package_id": package_id,
-                        "success": true,
-                        "message": String::from_utf8_lossy(&output.stdout).to_string()
-                    })
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    serde_json::json!({
-                        "package_id": package_id,
-                        "success": false,
-                        "message": if stderr.is_empty() { stdout } else { stderr }
-                    })
-                }
-            }
-            Err(e) => {
-                serde_json::json!({
-                    "package_id": package_id,
-                    "success": false,
-                    "message": format!("Failed to run npx: {}", e)
-                })
-            }
-        };
-
+        let result = install_skill_sync(
+            &package_id,
+            skill_name.as_deref(),
+            global,
+            agents.as_deref(),
+        );
+        let payload = serde_json::json!({
+            "package_id": package_id,
+            "success": result.is_ok(),
+            "message": result.unwrap_or_else(|error| error),
+        });
         let _ = app.emit("skill-install-done", payload.to_string());
     });
 }
 
-/// Uninstall a skill via npx skills remove (async, event-driven).
-/// Emits "skill-uninstall-done" with { name, success, message }.
+/// Remove only the selected physical skill directory; never run a global CLI removal.
 #[tauri::command]
-pub fn uninstall_skill(app: AppHandle, name: String, global: bool) {
+pub fn uninstall_skill(app: AppHandle, name: String, global: bool, path: Option<String>) {
     std::thread::spawn(move || {
-        let mut args = vec![
-            "skills".to_string(),
-            "remove".to_string(),
-            name.clone(),
-            "-y".to_string(),
-        ];
-        if global {
-            args.push("-g".to_string());
-        }
-
-        let user_path = get_user_path();
-        let result = Command::new("npx")
-            .args(&args)
-            .env("PATH", user_path)
-            .output();
-
-        let payload = match result {
-            Ok(output) => {
-                if output.status.success() {
-                    serde_json::json!({
-                        "name": name,
-                        "success": true,
-                        "message": String::from_utf8_lossy(&output.stdout).to_string()
-                    })
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    serde_json::json!({
-                        "name": name,
-                        "success": false,
-                        "message": if stderr.is_empty() { stdout } else { stderr }
-                    })
-                }
-            }
-            Err(e) => {
-                serde_json::json!({
-                    "name": name,
-                    "success": false,
-                    "message": format!("Failed to run npx: {}", e)
-                })
-            }
-        };
-
+        let working_dir = config::get_default_working_dir().map(PathBuf::from);
+        let result = agent_home::ensure_agent_homes()
+            .and_then(|_| {
+                skill_install_roots(
+                    global,
+                    None,
+                    &agent_home::claude_home(),
+                    &agent_home::codex_home(),
+                    working_dir.as_deref(),
+                )
+            })
+            .and_then(|roots| {
+                uninstall_skill_from_roots(&name, path.as_deref().map(Path::new), &roots)
+            });
+        let payload = serde_json::json!({
+            "name": name,
+            "success": result.is_ok(),
+            "message": result.unwrap_or_else(|error| error),
+        });
         let _ = app.emit("skill-uninstall-done", payload.to_string());
     });
 }
@@ -2020,6 +2271,221 @@ pub fn uninstall_skill(app: AppHandle, name: String, global: bool) {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn write_test_skill(path: &Path, name: &str) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("SKILL.md"), format!("---\nname: {}\n---\n", name)).unwrap();
+    }
+
+    #[test]
+    fn profile_skill_scans_ignore_official_settings_plugins_and_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let claude_home = home.join(".ccem/agents/claude");
+        let codex_home = home.join(".ccem/agents/codex");
+        let project = home.join("project/non-git");
+        write_test_skill(&home.join(".claude/skills/official"), "official-claude");
+        write_test_skill(&home.join(".codex/skills/official"), "official-codex");
+        write_test_skill(&home.join(".agents/skills/shared"), "shared");
+        write_test_skill(&claude_home.join("skills/private"), "private-claude");
+        write_test_skill(&codex_home.join("skills/private"), "private-codex");
+        write_test_skill(&project.join(".claude/skills/project"), "project-claude");
+        write_test_skill(&project.join(".agents/skills/project"), "project-codex");
+        fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"skillOverrides":{"private-claude":"off"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            format!(
+                "[[skills.config]]\npath = {:?}\nenabled = false\n",
+                codex_home.join("skills").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let official_plugin = home.join(".claude/plugins/cache/market/plugin/1");
+        write_test_skill(&official_plugin.join("skills/hidden"), "official-plugin");
+        fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            serde_json::json!({"plugins":{"plugin@market":[{"installPath":official_plugin}]}})
+                .to_string(),
+        )
+        .unwrap();
+        write_test_skill(
+            &home.join(".codex/plugins/cache/market/plugin/skills/hidden"),
+            "official-codex-plugin",
+        );
+
+        let claude = scan_claude_skills_for_context(Some(&home), &claude_home, Some(&project));
+        let codex = scan_codex_skills_for_context(Some(&home), &codex_home, Some(&project));
+        let claude_names: HashSet<_> = claude.iter().map(|skill| skill.name.as_str()).collect();
+        let codex_names: HashSet<_> = codex.iter().map(|skill| skill.name.as_str()).collect();
+        assert!(claude_names.is_superset(&HashSet::from([
+            "private-claude",
+            "project-claude",
+            "shared"
+        ])));
+        assert!(codex_names.is_superset(&HashSet::from([
+            "private-codex",
+            "project-codex",
+            "shared"
+        ])));
+        assert!(!claude
+            .iter()
+            .chain(codex.iter())
+            .any(|skill| skill.name.starts_with("official")));
+        assert!(
+            !claude
+                .iter()
+                .find(|skill| skill.name == "private-claude")
+                .unwrap()
+                .disabled
+        );
+        assert!(
+            !codex
+                .iter()
+                .find(|skill| skill.name == "private-codex")
+                .unwrap()
+                .disabled
+        );
+
+        fs::write(
+            claude_home.join("settings.json"),
+            r#"{"skillOverrides":{"private-claude":"off"}}"#,
+        )
+        .unwrap();
+        let claude = scan_claude_skills_for_context(Some(&home), &claude_home, Some(&project));
+        assert!(
+            claude
+                .iter()
+                .find(|skill| skill.name == "private-claude")
+                .unwrap()
+                .disabled
+        );
+    }
+
+    #[test]
+    fn staged_skill_install_copies_selected_profiles_without_global_cli_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let claude_home = home.join(".ccem/agents/claude");
+        let codex_home = home.join(".ccem/agents/codex");
+        let staging = home.join("staging");
+        let source = staging.join(".claude/skills/example");
+        write_test_skill(&source, "Example Skill");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(source.join("scripts/run.sh"), "echo example").unwrap();
+        let official = home.join(".claude/skills/example");
+        let shared = home.join(".agents/skills/example");
+        write_test_skill(&official, "official untouched");
+        write_test_skill(&shared, "shared untouched");
+        let roots = skill_install_roots(true, None, &claude_home, &codex_home, None).unwrap();
+        assert_eq!(
+            roots,
+            vec![claude_home.join("skills"), codex_home.join("skills")]
+        );
+        assert_eq!(
+            skill_install_roots(
+                true,
+                Some(&["Codex".into()]),
+                &claude_home,
+                &codex_home,
+                None
+            )
+            .unwrap(),
+            vec![codex_home.join("skills")]
+        );
+        assert_eq!(promote_staged_skills(&staging, &roots).unwrap(), 1);
+        fs::remove_dir_all(staging).unwrap();
+        for root in &roots {
+            assert_eq!(
+                fs::read_to_string(root.join("example/scripts/run.sh")).unwrap(),
+                "echo example"
+            );
+            assert!(is_owned_skill_path(&root.join("example"), &roots));
+        }
+        assert!(fs::read_to_string(official.join("SKILL.md"))
+            .unwrap()
+            .contains("official untouched"));
+        assert!(fs::read_to_string(shared.join("SKILL.md"))
+            .unwrap()
+            .contains("shared untouched"));
+        assert!(!is_owned_skill_path(&official, &roots));
+        assert!(!is_owned_skill_path(&shared, &roots));
+
+        let command = staged_skill_install_command(&home, "example/skills", Some("example"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"--copy".to_string()));
+        assert!(!args.iter().any(|arg| arg == "--global" || arg == "-g"));
+        assert_eq!(command.get_current_dir(), Some(home.as_path()));
+    }
+
+    #[test]
+    fn project_skill_mutations_cannot_select_an_official_or_shared_user_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        for path in [
+            &home,
+            &home.join(".claude"),
+            &home.join(".codex/projects"),
+            &home.join(".agents"),
+        ] {
+            assert!(validate_project_skill_directory(path, &home).is_err());
+        }
+        assert!(validate_project_skill_directory(&home.join("projects/repo"), &home).is_ok());
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_exact_owned_profile_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let roots = vec![
+            home.join("profiles/claude/skills"),
+            home.join("profiles/codex/skills"),
+        ];
+        let official = home.join(".claude/skills/same");
+        let shared = home.join(".agents/skills/same");
+        for path in [
+            &official,
+            &shared,
+            &roots[0].join("same"),
+            &roots[1].join("same"),
+        ] {
+            write_test_skill(path, "same");
+        }
+        assert!(uninstall_skill_from_roots("same", Some(&official), &roots).is_err());
+        assert!(uninstall_skill_from_roots("same", Some(&shared), &roots).is_err());
+        assert!(uninstall_skill_from_roots("same", None, &roots).is_err());
+        uninstall_skill_from_roots("same", Some(&roots[0].join("same")), &roots).unwrap();
+        assert!(!roots[0].join("same").exists());
+        assert!(roots[1].join("same/SKILL.md").exists());
+        assert!(official.join("SKILL.md").exists());
+        assert!(shared.join("SKILL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_mutations_reject_symlinks_to_external_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let external = home.join("official/skills/same");
+        let root = home.join("ccem/skills");
+        write_test_skill(&external, "same");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&external, root.join("same")).unwrap();
+        assert!(!is_owned_skill_path(&root.join("same"), &[root.clone()]));
+        assert!(
+            uninstall_skill_from_roots("same", Some(&root.join("same")), &[root.clone()]).is_err()
+        );
+        let staging = home.join("staging");
+        write_test_skill(&staging.join(".claude/skills/same"), "same");
+        assert!(promote_staged_skills(&staging, &[root]).is_err());
+        assert!(external.join("SKILL.md").exists());
+    }
 
     #[test]
     fn test_parse_skill_frontmatter_with_data() {
@@ -2245,6 +2711,7 @@ Some content here.
             implicit_allowed: true,
             ui_metadata: None,
             diagnostics: Vec::new(),
+            managed_by_ccem: false,
         }
     }
 
@@ -2347,7 +2814,7 @@ Some content here.
         )
         .unwrap();
 
-        let config = read_codex_config(&home);
+        let config = read_codex_config(&home, &home.join(".codex"));
         assert!(is_path_disabled(
             &home.join("blocked").join("SKILL.md"),
             &config.disabled_skill_paths
@@ -2368,7 +2835,7 @@ Some content here.
         fs::create_dir_all(&nested).unwrap();
         fs::write(repo.join(".git"), "gitdir: somewhere").unwrap();
 
-        let dirs = collect_workspace_skill_dirs(Some(&nested), ".agents");
+        let dirs = collect_workspace_skill_dirs(Some(&nested), ".agents", None);
         assert_eq!(dirs, vec![repo.join(".agents").join("skills")]);
 
         let _ = fs::remove_dir_all(&root);
@@ -2385,7 +2852,7 @@ Some content here.
         let options = SkillScanOptions {
             scope: "system".to_string(),
             agents: vec!["Codex".to_string()],
-            source: Some("~/.codex/skills/.system".to_string()),
+            source: Some("CCEM Codex system skills".to_string()),
             version: None,
             provider: Some("codex".to_string()),
             plugin_name: None,
@@ -2409,7 +2876,11 @@ Some content here.
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
 
-        let status = get_ccem_agent_skill_status_for_home(&home).unwrap();
+        let status = get_ccem_agent_skill_status_for_homes(
+            &home.join("ccem/claude"),
+            &home.join("ccem/codex"),
+        )
+        .unwrap();
 
         assert_eq!(status.name, "ccem");
         assert!(!status.installed);
@@ -2417,7 +2888,7 @@ Some content here.
         assert_eq!(status.targets.len(), 2);
         assert!(status.targets.iter().any(|target| target.agent == "Codex"
             && Path::new(&target.path).ends_with(
-                Path::new(".codex")
+                Path::new("ccem/codex")
                     .join("skills")
                     .join("ccem")
                     .join("SKILL.md")
@@ -2429,7 +2900,7 @@ Some content here.
             .iter()
             .any(|target| target.agent == "Claude Code"
                 && Path::new(&target.path).ends_with(
-                    Path::new(".claude")
+                    Path::new("ccem/claude")
                         .join("skills")
                         .join("ccem")
                         .join("SKILL.md")
@@ -2445,8 +2916,13 @@ Some content here.
         let home = std::env::temp_dir().join("ccem-test-agent-skill-install");
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        write_test_skill(&home.join(".claude/skills/ccem"), "official-claude");
+        write_test_skill(&home.join(".codex/skills/ccem"), "official-codex");
 
-        let status = install_ccem_agent_skill_for_home(&home).unwrap();
+        let status =
+            install_ccem_agent_skill_for_homes(&home.join("ccem/claude"), &home.join("ccem/codex"))
+                .unwrap();
 
         assert!(status.installed);
         assert!(status.up_to_date);
@@ -2454,12 +2930,12 @@ Some content here.
         assert!(status.targets.iter().all(|target| target.up_to_date));
 
         let codex_skill = home
-            .join(".codex")
+            .join("ccem/codex")
             .join("skills")
             .join("ccem")
             .join("SKILL.md");
         let claude_skill = home
-            .join(".claude")
+            .join("ccem/claude")
             .join("skills")
             .join("ccem")
             .join("SKILL.md");
@@ -2470,6 +2946,14 @@ Some content here.
         assert_eq!(claude_content, CCEM_AGENT_SKILL_CONTENT);
         assert!(codex_content.contains("ccem desktop health --json"));
         assert!(codex_content.contains("ccem desktop create"));
+        assert!(
+            fs::read_to_string(home.join(".claude/skills/ccem/SKILL.md"))
+                .unwrap()
+                .contains("official-claude")
+        );
+        assert!(fs::read_to_string(home.join(".codex/skills/ccem/SKILL.md"))
+            .unwrap()
+            .contains("official-codex"));
 
         let _ = fs::remove_dir_all(&home);
     }

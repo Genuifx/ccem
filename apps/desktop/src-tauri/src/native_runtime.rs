@@ -2420,6 +2420,10 @@ impl NativeRuntimeManager {
             );
         }
         let mut options = options;
+        crate::agent_home::ensure_agent_homes()?;
+        let client = match options.provider { NativeProvider::Claude => "claude", NativeProvider::Codex => "codex" };
+        crate::agent_profile::apply_env(client, &mut options.helper_env_vars);
+        crate::agent_profile::apply_env(client, &mut options.terminal_env_vars);
         validate_task_model(options.provider, options.model.as_deref())?;
         self.prepare_router_launch(&mut options, false)?;
         options.initial_annotations =
@@ -7740,11 +7744,14 @@ impl NativeRuntimeManager {
             .filter(|router| router.launch_transport == LaunchTransport::Routed)
             .map(build_helper_router_init);
         let helper_path = native_helper_script_path(&app)?;
+        let mut profile_env = HashMap::new();
+        crate::agent_profile::apply_env(options.provider.as_str(), &mut profile_env);
         let command = app
             .shell()
             .sidecar("ccem-node")
             .map_err(|error| format!("Failed to resolve Node sidecar: {error}"))?
             .arg(helper_path.to_string_lossy().to_string())
+            .envs(profile_env)
             .current_dir(&options.working_dir);
 
         let (mut rx, child) = spawn_native_helper_process(command.into())?;
@@ -11221,6 +11228,10 @@ fn build_runtime_bootstrap_options(
             }
         };
     merge_helper_env_path(&mut helper_env_vars, &terminal::get_user_path());
+    let client = match record.provider { NativeProvider::Claude => "claude", NativeProvider::Codex => "codex" };
+    crate::agent_home::ensure_agent_homes()?;
+    crate::agent_profile::apply_env(client, &mut helper_env_vars);
+    crate::agent_profile::apply_env(client, &mut terminal_env_vars);
     inject_ccem_runtime_env(&mut helper_env_vars, &record.runtime_id);
     inject_ccem_runtime_env(&mut terminal_env_vars, &record.runtime_id);
 

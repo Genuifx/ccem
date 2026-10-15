@@ -233,7 +233,7 @@ ccem usage          # 交互式，带日历热力图
 ccem usage --json   # 机器可读格式
 ```
 
-解析 `~/.claude/projects/` 下的 JSONL 日志，计算 token 用量和费用。价格数据从 LiteLLM 拉取并缓存本地。
+解析 `~/.ccem/agents/claude/projects/` 下的 JSONL 日志，计算 token 用量和费用。价格数据从 LiteLLM 拉取并缓存本地。
 
 ## Skill 管理
 
@@ -506,10 +506,16 @@ GitHub 风格的使用统计，Claude Code 和 Codex 数据统一展示。
 | 路径 | 内容 |
 |---|---|
 | `~/.ccem/config.json` | 环境配置（API Key 加密存储） |
+| `~/.ccem/agents/claude/` | CCEM 的 Claude Code 配置、登录态、历史和记忆 |
+| `~/.ccem/agents/codex/` | CCEM 的 Codex 配置、登录态、历史和记忆 |
 | `~/.ccem/usage-cache.json` | 用量缓存 |
 | `~/.ccem/model-prices.json` | 价格缓存 |
 | `.claude/settings.json` | 项目权限配置 |
 | `.claude/skills/` | 已安装的 Skills |
+
+CCEM 内的不同供应商共用对应的 Agent 目录；官方应用继续使用自己的目录。首次启动会独立复制已有会话和记忆，保留会话 ID，此后分别保存。官方应用的凭证、全局设置和插件注册表不会复制；CCEM 已配置的 API 密钥继续可用。使用官方订阅时，在设置的「Agent 数据与登录」中登录，或运行 `ccem auth claude` / `ccem auth codex`。
+
+首次切换前请结束仍在运行的旧版 CCEM 会话，以便完整迁入最后一轮记录。项目文件、项目指令和 `~/.agents/skills` 仍按项目或共享技能使用；应用数据隔离不限制 Agent 对工作目录的文件访问。独立部署可通过绝对路径 `CCEM_AGENT_HOME` 指定 Agent 数据根目录。
 
 ---
 

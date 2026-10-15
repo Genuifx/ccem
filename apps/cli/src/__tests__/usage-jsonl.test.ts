@@ -1,5 +1,5 @@
 import * as fsPromises from 'fs/promises';
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -25,11 +25,13 @@ describe('JSONL usage accounting', () => {
   let usage: typeof import('../usage.js');
 
   beforeEach(async () => {
-    home = await mkdtemp(join(tmpdir(), 'ccem-usage-test-'));
-    project = join(home, '.claude', 'projects', 'synthetic');
+    home = await realpath(await mkdtemp(join(tmpdir(), 'ccem-usage-test-')));
+    project = join(home, '.ccem', 'agents', 'claude', 'projects', 'synthetic');
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('CCEM_AGENT_HOME', join(home, '.ccem', 'agents'));
     cachePath = join(home, '.ccem', 'usage-cache.json');
     await mkdir(project, { recursive: true });
-    await mkdir(join(home, '.ccem'));
+    await mkdir(join(home, '.ccem'), { recursive: true });
     vi.resetModules();
     vi.doMock('os', () => ({ homedir: () => home }));
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
@@ -45,6 +47,7 @@ describe('JSONL usage accounting', () => {
   afterEach(async () => {
     vi.doUnmock('os');
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     await rm(home, { recursive: true, force: true });
   });
 
@@ -135,6 +138,6 @@ describe('JSONL usage accounting', () => {
     const stats = await readStats();
     expect(initial).toBeNull();
     expect(stats.total.inputTokens).toBe(100);
-    expect(JSON.parse(await readFile(cachePath, 'utf8')).version).toBe(2);
+    expect(JSON.parse(await readFile(cachePath, 'utf8')).version).toBe(3);
   });
 });

@@ -3,6 +3,7 @@
  * 支持从 GitHub 仓库下载 skills 到当前目录的 .claude/skills/
  */
 import { execFileSync } from 'node:child_process';
+import { buildIsolatedAgentEnv, ensureCcemAgentHome } from '@ccem/core';
 import * as fs from 'fs';
 import * as path from 'path';
 import chalk from 'chalk';
@@ -603,14 +604,18 @@ export function installFromPluginMarketplace(
       throw new Error(`Invalid package name: ${packageName}`);
     }
 
+    ensureCcemAgentHome('claude');
+    const env = buildIsolatedAgentEnv();
     console.log(chalk.cyan(`Adding marketplace: ${marketplace}...`));
     execFileSync('claude', ['plugin', 'marketplace', 'add', marketplace], {
       stdio: 'inherit',
+      env,
     });
 
     console.log(chalk.cyan(`Installing package: ${packageName}...`));
     execFileSync('claude', ['plugin', 'install', packageName], {
       stdio: 'inherit',
+      env,
     });
 
     console.log(chalk.green(`Successfully installed ${packageName}`));

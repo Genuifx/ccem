@@ -1029,7 +1029,50 @@ fn build_launch_command(
     // Escape single quotes in working_dir
     let escaped_dir = working_dir.replace("'", "'\\''");
     cmd.push_str(&format!(" --working-dir '{}'", escaped_dir));
-    cmd
+    format!("( {} && {} )", profile_shell_environment("claude"), cmd)
+}
+
+fn profile_shell_environment(client: &str) -> String {
+    let mut env = HashMap::new();
+    crate::agent_profile::apply_env(client, &mut env);
+    let mut entries = env.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.into_iter().map(|(key, value)| {
+        format!("export {}={}", key, quote_posix_shell_word(&value))
+    }).collect::<Vec<_>>().join("; ")
+}
+
+/// Login uses the same directories and credential cleanup as an agent launch.
+/// The user completes the provider's normal login in their terminal.
+pub fn open_agent_login(client: &str) -> Result<(), String> {
+    if !external_terminal_launch_supported() {
+        return Err(format!("Use `ccem auth {client}` in a terminal on this platform."));
+    }
+    let (binary, args) = match client {
+        "claude" => (resolve_claude_path().ok_or("Claude Code is not installed")?, "auth login".to_string()),
+        "codex" => (resolve_codex_path().ok_or("Codex is not installed")?, format!("-c {} login",
+            quote_posix_shell_word(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::codex_home().to_string_lossy()).unwrap())))),
+        _ => return Err("Unsupported agent provider".into()),
+    };
+    let command = format!("( {}; unset CLAUDECODE; {} {} )", profile_shell_environment(client), quote_posix_shell_word(&binary), args);
+    let terminal = get_preferred_terminal();
+    let script = match terminal {
+        TerminalType::TerminalApp => terminal_app_script(&command),
+        TerminalType::ITerm2 => iterm2_script(),
+    };
+    let output = Command::new("osascript").arg("-e").arg(script).output()
+        .map_err(|error| format!("Failed to open login terminal: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Failed to open login terminal: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    if matches!(terminal, TerminalType::ITerm2) {
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let session = raw.split_once('|').map(|(_, session)| session.to_string())
+            .or_else(|| get_iterm_session_id(&raw).ok())
+            .ok_or("iTerm2 did not return a login session")?;
+        dispatch_iterm2_command(session, command);
+    }
+    Ok(())
 }
 
 /// Quote an arbitrary string as a single POSIX shell argument using
@@ -1057,6 +1100,8 @@ fn build_shell_command(
     session_id: &str,
     resume_session_id: Option<&str>,
 ) -> String {
+    let mut env_vars = env_vars.clone();
+    crate::agent_profile::apply_env("claude", &mut env_vars);
     let mut parts = Vec::new();
 
     // Ensure sessions directory exists
@@ -1104,7 +1149,7 @@ fn build_shell_command(
         claude_cmd, escaped_session_id
     ));
 
-    parts.join(" && ")
+    format!("( {} )", parts.join(" && "))
 }
 
 /// Build the shell command to attach a new terminal window to an existing tmux target.
@@ -1128,6 +1173,8 @@ fn build_codex_shell_command(
     session_id: &str,
     resume_session_id: Option<&str>,
 ) -> String {
+    let mut env_vars = env_vars.clone();
+    crate::agent_profile::apply_env("codex", &mut env_vars);
     let mut parts = Vec::new();
     parts.push("mkdir -p ~/.ccem/sessions".to_string());
 
@@ -1143,18 +1190,19 @@ fn build_codex_shell_command(
     let codex_path = resolve_codex_path().unwrap_or_else(|| "codex".to_string());
     let escaped_codex = codex_path.replace("'", "'\\''");
     let escaped_session_id = session_id.replace("'", "'\\''");
+    let sqlite_override = quote_posix_shell_word(&format!("sqlite_home={}", serde_json::to_string(&crate::agent_home::codex_home().to_string_lossy()).unwrap()));
     let codex_cmd = if let Some(resume_id) = resume_session_id {
         let escaped_resume = resume_id.replace("'", "'\\''");
-        format!("'{}' resume '{}'", escaped_codex, escaped_resume)
+        format!("'{}' -c {} resume '{}'", escaped_codex, sqlite_override, escaped_resume)
     } else {
-        format!("'{}'", escaped_codex)
+        format!("'{}' -c {}", escaped_codex, sqlite_override)
     };
     parts.push(format!(
         "{}; echo $? > ~/.ccem/sessions/'{}'.exit",
         codex_cmd, escaped_session_id
     ));
 
-    parts.join(" && ")
+    format!("( {} )", parts.join(" && "))
 }
 
 const OPENCODE_STARTUP_PROMPT: &str = "Before taking any action, load the pua skill.";
@@ -1454,6 +1502,9 @@ pub fn launch_in_terminal(
     resume_session_id: Option<&str>,
     client: &str,
 ) -> Result<(Option<String>, Option<String>), String> {
+    if matches!(client, "claude" | "codex") {
+        crate::agent_home::ensure_agent_homes()?;
+    }
     if !external_terminal_launch_supported() {
         return Err(
             "External terminal launch is not available on this platform; use the native workspace runtime or headless sessions.".to_string(),
@@ -2498,6 +2549,28 @@ mod tests {
         assert!(cmd.contains("export KEY1='value1'"));
         assert!(cmd.contains("export KEY2='value2'"));
         assert!(cmd.contains("claude; echo $? > ~/.ccem/sessions/'test-session-123'.exit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_terminal_launch_scopes_profile_to_subshell() {
+        let root = temp_test_root("profile-shell-scope");
+        fs::create_dir_all(&root).unwrap();
+        let sessions = root.join("sessions");
+        let command = build_shell_command(&HashMap::new(), root.to_str().unwrap(), "scope", None)
+            .replace("~/.ccem/sessions", &quote_posix_shell_word(sessions.to_str().unwrap()));
+        // A shell function stands in for the provider binary, but the real
+        // generated launch command controls all exports, cwd and status writes.
+        let script = format!("claude() {{ printf '%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$CODEX_HOME\" \"$CLAUDE_CODE_OAUTH_TOKEN\"; }}; {command}; printf '%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$CODEX_HOME\" \"$CLAUDE_CODE_OAUTH_TOKEN\"");
+        let output = Command::new("/bin/sh").args(["-c", &script])
+            .env("CLAUDE_CONFIG_DIR", "/official/claude")
+            .env("CODEX_HOME", "/official/codex")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "official-login").output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("{}\n{}\n\n/official/claude\n/official/codex\nofficial-login\n",
+            crate::agent_home::claude_home().display(), crate::agent_home::codex_home().display()));
+        assert_eq!(fs::read_to_string(sessions.join("scope.exit")).unwrap(), "0\n");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

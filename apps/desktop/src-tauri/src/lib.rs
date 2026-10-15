@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
+mod agent_home;
+mod agent_profile;
 mod analytics;
 mod app_update_engine;
 mod app_updates;
@@ -5927,6 +5929,8 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            agent_profile::get_agent_profiles,
+            agent_profile::login_agent_profile,
             hermes_bridge::hermes_status,
             hermes_bridge::hermes_notification_targets,
             hermes_bridge::hermes_action,
@@ -6201,6 +6205,11 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .setup(move |app| {
+            tauri::async_runtime::spawn_blocking(|| {
+                if let Err(error) = agent_home::ensure_agent_homes() {
+                    eprintln!("CCEM agent profile preparation failed: {error}");
+                }
+            });
             webcontent_recovery::initialize(app.handle());
             // Load desktop settings once for startup logic
             let startup_settings = config::read_settings().unwrap_or_default();

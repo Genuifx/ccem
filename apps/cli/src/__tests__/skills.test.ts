@@ -27,13 +27,16 @@ describe('skills', () => {
   const execFileSyncMock = execFileSync as unknown as Mock;
 
   beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-skills-test-'));
+    tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-skills-test-')));
+    vi.stubEnv('HOME', tempDir);
+    vi.stubEnv('CCEM_AGENT_HOME', path.join(tempDir, 'agents'));
     vi.spyOn(process, 'cwd').mockReturnValue(tempDir);
     execFileSyncMock.mockReset();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     if (fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true });
     }
@@ -364,6 +367,7 @@ describe('skills', () => {
 
   describe('installFromPluginMarketplace', () => {
     it('should call claude with argv arrays for marketplace installation', () => {
+      execFileSyncMock.mockReturnValue(''); // Empty process inventory during first-use migration.
       const result = installFromPluginMarketplace(
         'obra/superpowers-marketplace',
         'superpowers@superpowers-marketplace'
@@ -373,14 +377,14 @@ describe('skills', () => {
       expect(execFileSyncMock).toHaveBeenCalledWith(
         'claude',
         ['plugin', 'marketplace', 'add', 'obra/superpowers-marketplace'],
-        { stdio: 'inherit' }
+        expect.objectContaining({ stdio: 'inherit', env: expect.objectContaining({ CLAUDE_CONFIG_DIR: path.join(tempDir, 'agents', 'claude') }) })
       );
       expect(execFileSyncMock).toHaveBeenCalledWith(
         'claude',
         ['plugin', 'install', 'superpowers@superpowers-marketplace'],
-        { stdio: 'inherit' }
+        expect.objectContaining({ stdio: 'inherit', env: expect.objectContaining({ CLAUDE_CONFIG_DIR: path.join(tempDir, 'agents', 'claude') }) })
       );
-      for (const call of execFileSyncMock.mock.calls) {
+      for (const call of execFileSyncMock.mock.calls.filter((call) => call[0] !== 'ps')) {
         expect(call[0]).toBe('claude');
         expect(Array.isArray(call[1])).toBe(true);
       }

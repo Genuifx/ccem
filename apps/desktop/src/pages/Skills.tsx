@@ -273,9 +273,17 @@ export function Skills() {
     }
   };
 
-  const handleUninstall = (name: string) => {
-    setUninstallingNames((prev) => new Set(prev).add(name));
-    invoke('uninstall_skill', { name, global: true }).catch(() => {});
+  const handleUninstall = (skill: { name: string; path: string; managedByCcem?: boolean }) => {
+    if (!skill.managedByCcem) return;
+    setUninstallingNames((prev) => new Set(prev).add(skill.name));
+    invoke('uninstall_skill', { name: skill.name, global: true, path: skill.path }).catch((error) => {
+      setUninstallingNames((prev) => {
+        const next = new Set(prev);
+        next.delete(skill.name);
+        return next;
+      });
+      toast.error(t('skills.uninstallError').replace('{error}', String(error)));
+    });
   };
 
   const openInstallDialog = (skill: DiscoverSkillInfo) => {
@@ -631,7 +639,7 @@ function InstalledView({
   expandedSkill: string | null;
   setExpandedSkill: (id: string | null) => void;
   uninstallingNames: Set<string>;
-  onUninstall: (name: string) => void;
+  onUninstall: (skill: { name: string; path: string; managedByCcem?: boolean }) => void;
   t: (key: string) => string;
 }) {
   const allEmpty =
@@ -659,7 +667,7 @@ function InstalledView({
                 setExpandedSkill(expandedSkill === skill.name ? null : skill.name)
               }
               isUninstalling={uninstallingNames.has(skill.name)}
-              onUninstall={() => onUninstall(skill.name)}
+              onUninstall={() => onUninstall(skill)}
             />
           ))}
         </div>

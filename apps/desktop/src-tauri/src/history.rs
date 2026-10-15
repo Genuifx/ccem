@@ -2,7 +2,7 @@
 //
 // Conversation history support for both Claude and Codex sources.
 
-use crate::{dsh_history, opencode, runtime, session_provenance};
+use crate::{agent_home, dsh_history, opencode, runtime, session_provenance};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -771,6 +771,9 @@ fn load_legacy_conversation_detail(
     session_id: &str,
     source_hint: Option<&'static str>,
 ) -> Result<(Vec<ConversationMessage>, Vec<CompactSegment>), String> {
+    if source_hint.is_none() || matches!(source_hint, Some(SOURCE_CLAUDE | SOURCE_CODEX)) {
+        agent_home::ensure_agent_homes()?;
+    }
     // Legacy: only resolve among claude/codex/opencode; never probe DSH.
     let resolved_source = match resolve_history_source_for_session(session_id, source_hint) {
         Some(s) => s,
@@ -779,8 +782,7 @@ fn load_legacy_conversation_detail(
 
     match resolved_source {
         SOURCE_CLAUDE => {
-            let home = dirs::home_dir().ok_or("Could not find home directory")?;
-            let projects_dir = home.join(".claude").join("projects");
+            let projects_dir = agent_home::claude_home().join("projects");
             if !projects_dir.exists() {
                 return Ok((vec![], vec![]));
             }
@@ -956,6 +958,9 @@ pub async fn get_session_subagents(
             detail: None,
         };
         let source_hint = normalize_history_source(source.as_deref())?;
+        if source_hint.is_none() || matches!(source_hint, Some(SOURCE_CLAUDE | SOURCE_CODEX)) {
+            agent_home::ensure_agent_homes()?;
+        }
         let resolved_source = match resolve_history_source_for_session(&session_id, source_hint) {
             Some(s) => s,
             None => return Ok(empty()),
@@ -965,8 +970,7 @@ pub async fn get_session_subagents(
             return Ok(empty());
         }
 
-        let home = dirs::home_dir().ok_or("Could not find home directory")?;
-        let projects_dir = home.join(".claude").join("projects");
+        let projects_dir = agent_home::claude_home().join("projects");
         if !projects_dir.exists() {
             return Ok(empty());
         }
@@ -1473,7 +1477,11 @@ fn record_agent_terminal(
 /// line: structured `toolUseResult.task` (TaskOutput), `<task-notification>`
 /// blocks (queue-operation content, attachment prompts, tool_result text) and
 /// the text-form `<task_id>…<status>…<output>` TaskOutput fallback.
-fn collect_agent_terminal_from_line(index: &mut AgentCallIndex, v: &serde_json::Value, line_ts: u64) {
+fn collect_agent_terminal_from_line(
+    index: &mut AgentCallIndex,
+    v: &serde_json::Value,
+    line_ts: u64,
+) {
     let completed_at = (line_ts > 0).then_some(line_ts);
 
     // Structured TaskOutput result: {retrieval_status, task: {task_id, task_type, status, output, result}}.
@@ -1497,7 +1505,11 @@ fn collect_agent_terminal_from_line(index: &mut AgentCallIndex, v: &serde_json::
                     index,
                     task_id,
                     status,
-                    if status == "running" { None } else { completed_at },
+                    if status == "running" {
+                        None
+                    } else {
+                        completed_at
+                    },
                     summary,
                 );
                 return;
@@ -1527,9 +1539,9 @@ fn collect_agent_terminal_from_line(index: &mut AgentCallIndex, v: &serde_json::
             if block.get("type").and_then(|x| x.as_str()) != Some("tool_result") {
                 continue;
             }
-            if let Some(text) = extract_plain_text_content(
-                block.get("content").unwrap_or(&serde_json::Value::Null),
-            ) {
+            if let Some(text) =
+                extract_plain_text_content(block.get("content").unwrap_or(&serde_json::Value::Null))
+            {
                 candidates.push(text);
             }
         }
@@ -1546,7 +1558,11 @@ fn collect_agent_terminal_from_line(index: &mut AgentCallIndex, v: &serde_json::
                     index,
                     task_id,
                     status,
-                    if status == "running" { None } else { completed_at },
+                    if status == "running" {
+                        None
+                    } else {
+                        completed_at
+                    },
                     summary,
                 );
             }
@@ -1561,7 +1577,11 @@ fn collect_agent_terminal_from_line(index: &mut AgentCallIndex, v: &serde_json::
                     index,
                     task_id,
                     status,
-                    if status == "running" { None } else { completed_at },
+                    if status == "running" {
+                        None
+                    } else {
+                        completed_at
+                    },
                     summary,
                 );
             }
@@ -1669,13 +1689,11 @@ fn scan_main_transcript_agent_calls(main_path: &Path) -> Option<AgentCallIndex> 
                 let structured_agent_id = tool_use_result
                     .and_then(|tur| tur.get("agentId"))
                     .and_then(|x| x.as_str());
-                let agent_id = structured_agent_id
-                    .map(ToString::to_string)
-                    .or_else(|| {
-                        result_text
-                            .as_deref()
-                            .and_then(extract_agent_id_from_result_text)
-                    });
+                let agent_id = structured_agent_id.map(ToString::to_string).or_else(|| {
+                    result_text
+                        .as_deref()
+                        .and_then(extract_agent_id_from_result_text)
+                });
                 if let Some(agent_id) = agent_id {
                     index
                         .agent_id_to_index
@@ -1778,9 +1796,10 @@ fn load_claude_history() -> Result<Vec<HistorySession>, String> {
 fn load_claude_history_limited(
     project_scan_limit: Option<usize>,
 ) -> Result<Vec<HistorySession>, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    let history_path = home.join(".claude").join("history.jsonl");
-    let projects_dir = home.join(".claude").join("projects");
+    agent_home::ensure_agent_homes()?;
+    let root = agent_home::claude_home();
+    let history_path = root.join("history.jsonl");
+    let projects_dir = root.join("projects");
 
     load_claude_history_from_paths_limited(&history_path, &projects_dir, project_scan_limit)
 }
@@ -2413,7 +2432,7 @@ fn supplement_claude_history_from_projects(
 
     for project_entry in projects.flatten() {
         let project_path = project_entry.path();
-        if !project_path.is_dir() {
+        if !project_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
 
@@ -2424,6 +2443,9 @@ fn supplement_claude_history_from_projects(
 
         for entry in entries.flatten() {
             let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
@@ -2441,12 +2463,18 @@ fn supplement_claude_history_from_projects(
             .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         project_session_paths.truncate(limit);
 
-        let paths = project_session_paths.into_iter().map(|(_, _, path)| path).collect::<Vec<_>>();
+        let paths = project_session_paths
+            .into_iter()
+            .map(|(_, _, path)| path)
+            .collect::<Vec<_>>();
         // Fixture/alternate directories never write the user's production cache.
-        let cache_path = dirs::home_dir()
-            .filter(|home| projects_dir == home.join(".claude/projects"))
-            .map(|_| crate::config::get_ccem_dir().join("workspace-history-index.json"));
-        for candidate in index_cache::load(&paths, cache_path.as_deref(), parse_claude_project_session_index) {
+        let cache_path = (projects_dir == agent_home::claude_home().join("projects"))
+            .then(|| crate::config::get_ccem_dir().join("workspace-history-index.json"));
+        for candidate in index_cache::load(
+            &paths,
+            cache_path.as_deref(),
+            parse_claude_project_session_index,
+        ) {
             merge_claude_history_session(session_map, candidate);
         }
     }
@@ -2521,7 +2549,11 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
     Some(HistorySession {
         id: session_id,
         source: SOURCE_CLAUDE.to_string(),
-        display: if display_priority == 4 { display.unwrap_or_default() } else { normalize_history_display(display) },
+        display: if display_priority == 4 {
+            display.unwrap_or_default()
+        } else {
+            normalize_history_display(display)
+        },
         timestamp,
         project,
         project_name,
@@ -2577,22 +2609,28 @@ fn extract_first_claude_message_text(message: &serde_json::Value) -> Option<&str
 }
 
 fn find_claude_session_file(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) {
+        return None;
+    }
     let projects = fs::read_dir(projects_dir).ok()?;
 
     for project_entry in projects.flatten() {
         let project_path = project_entry.path();
-        if !project_path.is_dir() {
+        if !project_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
 
         let candidate = project_path.join(format!("{}.jsonl", session_id));
-        if candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file()) {
             return Some(candidate);
         }
 
         if let Ok(dir_entries) = fs::read_dir(&project_path) {
             for entry in dir_entries.flatten() {
                 let path = entry.path();
+                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    continue;
+                }
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
@@ -2839,8 +2877,8 @@ fn strip_internal_tips_from_user_content(content: &mut serde_json::Value) {
         serde_json::Value::String(text)
             if crate::user_prompt_display::strip_internal_system_tips(text) != text.as_str() =>
         {
-            *text = crate::user_prompt_display::normalize_user_visible_prompt(text)
-                .unwrap_or_default();
+            *text =
+                crate::user_prompt_display::normalize_user_visible_prompt(text).unwrap_or_default();
         }
         serde_json::Value::Array(blocks) => {
             for block in blocks {
@@ -3079,55 +3117,21 @@ fn find_codex_session_file(session_id: &str) -> Option<PathBuf> {
 }
 
 fn resolve_codex_path_config() -> Result<CodexPathConfig, String> {
+    agent_home::ensure_agent_homes()?;
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-    let codex_home_env = std::env::var("CODEX_HOME").ok();
-    let sqlite_home_env = std::env::var("CODEX_SQLITE_HOME").ok();
-    resolve_codex_path_config_from(
-        Some(home_dir.as_path()),
-        codex_home_env.as_deref(),
-        sqlite_home_env.as_deref(),
-    )
+    Ok(codex_path_config_for(&home_dir, agent_home::codex_home()))
 }
 
-fn resolve_codex_path_config_from(
-    home_dir: Option<&Path>,
-    codex_home_env: Option<&str>,
-    sqlite_home_env: Option<&str>,
-) -> Result<CodexPathConfig, String> {
-    let home_dir = home_dir.ok_or("Could not find home directory")?;
-    let env_base = std::env::current_dir().unwrap_or_else(|_| home_dir.to_path_buf());
-
-    let codex_home = codex_home_env
-        .and_then(non_empty_str)
-        .map(|raw| resolve_path_value(raw, home_dir, &env_base))
-        .unwrap_or_else(|| home_dir.join(".codex"));
-
-    let sqlite_home = sqlite_home_env
-        .and_then(non_empty_str)
-        .map(|raw| resolve_path_value(raw, home_dir, &env_base))
-        .or_else(|| {
-            read_codex_sqlite_home_from_config(&codex_home)
-                .as_deref()
-                .map(|raw| resolve_path_value(raw, home_dir, &codex_home))
-        })
-        .unwrap_or_else(|| codex_home.clone());
-
-    Ok(CodexPathConfig {
+fn codex_path_config_for(home_dir: &Path, codex_home: PathBuf) -> CodexPathConfig {
+    // Both databases and transcripts belong to this application. An inherited
+    // CODEX_SQLITE_HOME or sqlite_home in config cannot reconnect official state.
+    CodexPathConfig {
         home_dir: home_dir.to_path_buf(),
         history_path: codex_home.join("history.jsonl"),
         sessions_root: codex_home.join("sessions"),
         session_index_path: codex_home.join("session_index.jsonl"),
-        sqlite_home,
+        sqlite_home: codex_home.clone(),
         codex_home,
-    })
-}
-
-fn non_empty_str(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
     }
 }
 
@@ -3147,16 +3151,6 @@ fn resolve_path_value(raw: &str, home_dir: &Path, relative_base: &Path) -> PathB
     }
 }
 
-fn read_codex_sqlite_home_from_config(codex_home: &Path) -> Option<String> {
-    let config_path = codex_home.join("config.toml");
-    let content = fs::read_to_string(config_path).ok()?;
-    let parsed: toml::Value = toml::from_str(&content).ok()?;
-    parsed
-        .get("sqlite_home")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-}
-
 fn load_codex_history_from_config(config: &CodexPathConfig) -> Result<Vec<HistorySession>, String> {
     load_codex_history_from_config_limited(config, None)
 }
@@ -3170,7 +3164,9 @@ fn load_codex_history_from_config_limited(
         .into_values()
         .filter_map(|record| {
             let rollout_path = record.rollout_path?;
-            if fs::File::open(&rollout_path).is_err() {
+            if !is_owned_codex_rollout(&rollout_path, &config.codex_home)
+                || fs::File::open(&rollout_path).is_err()
+            {
                 return None;
             }
 
@@ -3233,6 +3229,27 @@ fn merge_codex_session_records(
 ) {
     let mut session_files =
         collect_codex_session_files_limited(&config.sessions_root, session_scan_limit);
+    let active_ids = session_files
+        .files
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    let archived = collect_codex_session_files_limited(
+        &config.codex_home.join("archived_sessions"),
+        session_scan_limit,
+    );
+    session_files.files.extend(
+        archived
+            .files
+            .into_iter()
+            .filter(|(id, _)| !active_ids.contains(id)),
+    );
+    session_files
+        .subagent_parent_by_id
+        .extend(archived.subagent_parent_by_id);
+    session_files
+        .guardian_parent_by_id
+        .extend(archived.guardian_parent_by_id);
     let history_entries = load_codex_history_index(&config.history_path);
     let session_index_entries = load_codex_session_index(&config.session_index_path);
     let sqlite_threads = load_codex_threads_from_state_db(config);
@@ -3325,7 +3342,9 @@ fn find_codex_session_file_with_config(
         .ok()?
         .get(session_id)
         .and_then(|record| record.rollout_path.clone())
-        .filter(|path| fs::File::open(path).is_ok())
+        .filter(|path| {
+            is_owned_codex_rollout(path, &config.codex_home) && fs::File::open(path).is_ok()
+        })
 }
 
 fn load_codex_history_index(path: &Path) -> Vec<CodexHistoryLine> {
@@ -3396,7 +3415,7 @@ fn load_codex_threads_from_state_db(config: &CodexPathConfig) -> Vec<CodexThread
                 rollout_path: rollout_path
                     .as_deref()
                     .map(|raw| resolve_path_value(raw, &config.home_dir, &config.codex_home))
-                    .filter(|path| path.exists()),
+                    .filter(|path| is_owned_codex_rollout(path, &config.codex_home)),
                 created_at: normalize_unix_timestamp_i64(row.get::<_, i64>(2)?),
                 updated_at: normalize_unix_timestamp_i64(row.get::<_, i64>(3)?),
                 cwd: row.get(4)?,
@@ -3413,6 +3432,20 @@ fn load_codex_threads_from_state_db(config: &CodexPathConfig) -> Vec<CodexThread
     }
 
     vec![]
+}
+
+/// SQLite can retain stale absolute paths after a move. Never open a rollout
+/// outside the isolated home, including through a symlink inside that home.
+fn is_owned_codex_rollout(path: &Path, codex_home: &Path) -> bool {
+    let Ok(root) = fs::canonicalize(codex_home) else {
+        return false;
+    };
+    let Ok(resolved) = fs::canonicalize(path) else {
+        return false;
+    };
+    (resolved.starts_with(root.join("sessions"))
+        || resolved.starts_with(root.join("archived_sessions")))
+        && resolved.is_file()
 }
 
 fn codex_thread_table_columns(conn: &Connection) -> HashSet<String> {
@@ -3639,7 +3672,13 @@ fn collect_codex_session_files_limited(
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
@@ -5089,11 +5128,7 @@ fn resolve_history_source_for_session(
 }
 
 fn has_claude_session(session_id: &str) -> bool {
-    let home = match dirs::home_dir() {
-        Some(home) => home,
-        None => return false,
-    };
-    let projects_dir = home.join(".claude").join("projects");
+    let projects_dir = agent_home::claude_home().join("projects");
     find_claude_session_file(&projects_dir, session_id).is_some()
 }
 
@@ -5157,8 +5192,8 @@ fn normalize_history_display(display: Option<String>) -> String {
 /// Non-destructive cleanup: strip noise artifacts but do NOT truncate.
 /// Search and export rely on the raw string; truncation is handled by frontend CSS.
 fn clean_display_title(raw: &str) -> String {
-    let visible = crate::user_prompt_display::normalize_user_visible_prompt(raw)
-        .unwrap_or_default();
+    let visible =
+        crate::user_prompt_display::normalize_user_visible_prompt(raw).unwrap_or_default();
     let s = visible.trim();
     if s.is_empty() {
         return String::new();
@@ -5423,13 +5458,23 @@ fn is_noise_display(display: &str) -> bool {
 fn is_low_signal_followup(display: &str) -> bool {
     let trimmed = display
         .trim()
-        .trim_matches(|c: char| {
-            matches!(c, '?' | '？' | '!' | '！' | '.' | '。' | ',' | '，')
-        })
+        .trim_matches(|c: char| matches!(c, '?' | '？' | '!' | '！' | '.' | '。' | ',' | '，'))
         .trim()
         .to_ascii_lowercase();
 
-    matches!(trimmed.as_str(), "继续" | "继续呢" | "继续啊" | "继续呗" | "怎么样了" | "好的" | "ok" | "hi" | "hello" | "你好")
+    matches!(
+        trimmed.as_str(),
+        "继续"
+            | "继续呢"
+            | "继续啊"
+            | "继续呗"
+            | "怎么样了"
+            | "好的"
+            | "ok"
+            | "hi"
+            | "hello"
+            | "你好"
+    )
 }
 
 /// Heuristic: slash command token such as /clear, /superpowers:executing-plans.
@@ -5528,7 +5573,7 @@ fn extract_usage_fields(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_workspace_overview_snapshot, codex_subagent_label,
+        build_workspace_overview_snapshot, codex_path_config_for, codex_subagent_label,
         collect_codex_session_files_limited, dedupe_history_sessions_with_provenance_records,
         dedupe_near_duplicate_history_sessions, discover_subagent_metas, discover_subagent_records,
         enrich_subagent_metas, enrich_subagent_records, find_codex_session_file_with_config,
@@ -5538,9 +5583,9 @@ mod tests {
         normalize_history_source, parse_claude_conversation_file,
         parse_claude_project_session_index, parse_codex_history_timestamp,
         parse_opencode_conversation_export, parse_opencode_history_session,
-        resolve_codex_path_config_from, score_history_search_match,
-        supplement_history_from_provenance_records, upsert_codex_history_session, CodexHistoryLine,
-        CodexPathConfig, ConversationMessage, HistorySession, HISTORY_LIMIT_MAX, SOURCE_CLAUDE,
+        score_history_search_match, supplement_history_from_provenance_records,
+        upsert_codex_history_session, CodexHistoryLine, CodexPathConfig, ConversationMessage,
+        HistorySession, HISTORY_LIMIT_MAX, SOURCE_CLAUDE,
     };
     use crate::session_provenance::SessionProvenanceRecord;
     use rusqlite::Connection;
@@ -6675,7 +6720,11 @@ mod tests {
             ),
         )
         .expect("write main transcript");
-        write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+        write_subagent_file(
+            &root.join("subagents"),
+            "a1b2c3",
+            "Review the recent commits",
+        );
 
         let mut records = discover_subagent_records(&root.join("subagents"));
         assert_eq!(records.len(), 1);
@@ -6683,7 +6732,10 @@ mod tests {
         let meta = &records[0].meta;
         assert_eq!(meta.agent_id, "a1b2c3");
         // The async launch result must NOT be projected as completion.
-        assert_eq!(meta.status, "running", "agent still executing stays running");
+        assert_eq!(
+            meta.status, "running",
+            "agent still executing stays running"
+        );
         assert_eq!(meta.completed_at, None);
         // Correlation still enriches type/description from the Agent call.
         assert_eq!(meta.subagent_type.as_deref(), Some("general-purpose"));
@@ -6697,7 +6749,11 @@ mod tests {
         let root = temp_history_dir("subagents-async-completed");
         let main_path = root.join("session-async.jsonl");
         write_async_agent_main_transcript(&main_path, "completed");
-        write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+        write_subagent_file(
+            &root.join("subagents"),
+            "a1b2c3",
+            "Review the recent commits",
+        );
 
         let mut records = discover_subagent_records(&root.join("subagents"));
         enrich_subagent_records(&mut records, &main_path);
@@ -6715,7 +6771,11 @@ mod tests {
             let root = temp_history_dir(&format!("subagents-async-{status}"));
             let main_path = root.join("session-async.jsonl");
             write_async_agent_main_transcript(&main_path, status);
-            write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+            write_subagent_file(
+                &root.join("subagents"),
+                "a1b2c3",
+                "Review the recent commits",
+            );
 
             let mut records = discover_subagent_records(&root.join("subagents"));
             enrich_subagent_records(&mut records, &main_path);
@@ -6754,12 +6814,19 @@ mod tests {
                 + "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"2026-10-08T01:04:07.034Z\",\"sessionId\":\"session-async\",\"content\":\"<task-notification>\\n<task-id>a1b2c3</task-id>\\n<status>completed</status>\\n<result>Final report</result>\\n</task-notification>\"}\n",
         )
         .expect("write main transcript");
-        write_subagent_file(&root.join("subagents"), "a1b2c3", "Review the recent commits");
+        write_subagent_file(
+            &root.join("subagents"),
+            "a1b2c3",
+            "Review the recent commits",
+        );
 
         let mut records = discover_subagent_records(&root.join("subagents"));
         enrich_subagent_records(&mut records, &main_path);
         let meta = &records[0].meta;
-        assert_eq!(meta.status, "completed", "later notification beats earlier running poll");
+        assert_eq!(
+            meta.status, "completed",
+            "later notification beats earlier running poll"
+        );
         assert_eq!(meta.result_summary.as_deref(), Some("Final report"));
 
         let _ = fs::remove_dir_all(root);
@@ -6822,11 +6889,25 @@ mod tests {
             serde_json::json!({ "type": "user", "uuid": "user-one", "message": { "content": [{ "type": "text", "text": prompt }, image.clone()] } }),
             serde_json::json!({ "type": "assistant", "uuid": "assistant-one", "message": { "content": prompt } }),
         ];
-        fs::write(&claude, lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+        fs::write(
+            &claude,
+            lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
         let (messages, _) = parse_claude_conversation_file(&claude).unwrap();
         assert_eq!(messages[0].content[0]["text"], "请生成报告");
-        assert_eq!(messages[0].content[1], image, "attached images remain intact");
-        assert_eq!(messages[1].content, prompt, "assistant content is never stripped");
+        assert_eq!(
+            messages[0].content[1], image,
+            "attached images remain intact"
+        );
+        assert_eq!(
+            messages[1].content, prompt,
+            "assistant content is never stripped"
+        );
 
         let codex = temp.path().join("codex.jsonl");
         // Exercise both supported Codex transcript formats.
@@ -7058,7 +7139,15 @@ mod tests {
             serde_json::json!({"type":"user","message":{"content":"给这个改动补测试"}}),
             serde_json::json!({"type":"last-prompt","lastPrompt":"给这个改动补测试"}),
         ];
-        fs::write(&path, lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
         let session = parse_claude_project_session_index(&path).unwrap();
         assert_eq!(session.display, "修复 ProjectTree 标题生成");
         let _ = fs::remove_dir_all(root);
@@ -7075,21 +7164,54 @@ mod tests {
             serde_json::json!({"type":"summary","summary":"后续摘要"}),
             serde_json::json!({"type":"user","message":{"content":"后续请求"}}),
         ];
-        fs::write(&path, lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")).unwrap();
-        assert_eq!(parse_claude_project_session_index(&path).unwrap().display, "手动命名 ProjectTree");
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_claude_project_session_index(&path).unwrap().display,
+            "手动命名 ProjectTree"
+        );
         fs::write(&path, "{\"type\":\"custom-title\",\"customTitle\":\"Hi\"}\n{\"type\":\"summary\",\"summary\":\"后续摘要\"}\n").unwrap();
-        assert_eq!(parse_claude_project_session_index(&path).unwrap().display, "Hi");
+        assert_eq!(
+            parse_claude_project_session_index(&path).unwrap().display,
+            "Hi"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn test_history_display_recovers_owned_wrappers_but_preserves_user_xml() {
-        let prompt = format!("<system_tip>{}</system_tip>\n\n请生成报告\n并提供预览", crate::user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP);
-        assert_eq!(normalize_history_display(Some(prompt)), "请生成报告 并提供预览");
-        assert_eq!(normalize_history_display(Some("<workspace_annotations>hidden</workspace_annotations>".into())), "");
-        assert_eq!(normalize_history_display(Some("<system_tip>用户自己写的 XML</system_tip>保留全文".into())), "<system_tip>用户自己写的 XML</system_tip>保留全文");
+        let prompt = format!(
+            "<system_tip>{}</system_tip>\n\n请生成报告\n并提供预览",
+            crate::user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP
+        );
+        assert_eq!(
+            normalize_history_display(Some(prompt)),
+            "请生成报告 并提供预览"
+        );
+        assert_eq!(
+            normalize_history_display(Some(
+                "<workspace_annotations>hidden</workspace_annotations>".into()
+            )),
+            ""
+        );
+        assert_eq!(
+            normalize_history_display(Some(
+                "<system_tip>用户自己写的 XML</system_tip>保留全文".into()
+            )),
+            "<system_tip>用户自己写的 XML</system_tip>保留全文"
+        );
         assert_eq!(normalize_history_display(Some("继续呗！".into())), "");
-        assert_eq!(normalize_history_display(Some("继续优化标题生成".into())), "继续优化标题生成");
+        assert_eq!(
+            normalize_history_display(Some("继续优化标题生成".into())),
+            "继续优化标题生成"
+        );
     }
 
     #[test]
@@ -7793,46 +7915,110 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_codex_paths_honors_env_and_config() {
-        let root = temp_history_dir("codex-paths");
-        let home_dir = root.join("home");
-        let codex_home = root.join("custom-codex");
-        let sqlite_from_config = root.join("sqlite-from-config");
-        fs::create_dir_all(&home_dir).expect("create home");
-        fs::create_dir_all(&codex_home).expect("create codex home");
+    fn codex_paths_keep_sqlite_inside_isolated_home_despite_config_escape() {
+        let root = temp_history_dir("codex-isolated-paths");
+        let home = root.join("home");
+        let isolated = home.join(".ccem/agents/codex");
+        fs::create_dir_all(&isolated).unwrap();
         fs::write(
-            codex_home.join("config.toml"),
-            "sqlite_home = \"sqlite-from-config\"\n",
+            isolated.join("config.toml"),
+            "sqlite_home = \"/outside/official\"\n",
         )
-        .expect("write config");
+        .unwrap();
+        let resolved = codex_path_config_for(&home, isolated.clone());
+        assert_eq!(resolved.codex_home, isolated);
+        assert_eq!(resolved.sqlite_home, isolated);
+        assert_eq!(resolved.sessions_root, isolated.join("sessions"));
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let resolved = resolve_codex_path_config_from(
-            Some(home_dir.as_path()),
-            Some(codex_home.to_str().expect("utf8 path")),
-            None,
-        )
-        .expect("resolve codex path config");
+    #[test]
+    fn agent_snapshot_history_resolves_original_ids_only_inside_ccem() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(temp.path()).unwrap().join("user");
+        fs::create_dir_all(&home).unwrap();
+        let base = home.join(".ccem/agents");
+        let old_claude = home.join(".claude/projects/project/claude-original.jsonl");
+        fs::create_dir_all(old_claude.parent().unwrap()).unwrap();
+        fs::write(&old_claude, "{\"type\":\"user\",\"sessionId\":\"claude-original\",\"cwd\":\"/fixture/project\",\"message\":{\"role\":\"user\",\"content\":\"Original task\"}}\n").unwrap();
+        let codex_id = "019cbc5a-5720-7451-905e-84b96a508abb";
+        let old_codex =
+            write_codex_session_file(&home.join(".codex"), codex_id, "/fixture/project");
+        crate::agent_home::ensure_agent_homes_at(&home, &base).unwrap();
 
-        assert_eq!(resolved.codex_home, codex_home);
-        assert_eq!(resolved.sqlite_home, codex_home.join("sqlite-from-config"));
+        let claude_file =
+            super::find_claude_session_file(&base.join("claude/projects"), "claude-original")
+                .unwrap();
+        assert_ne!(claude_file, old_claude);
+        assert_eq!(
+            super::parse_claude_conversation_file(&claude_file)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        let config = codex_path_config_for(&home, base.join("codex"));
+        let codex_file = find_codex_session_file_with_config(codex_id, &config).unwrap();
+        assert_ne!(codex_file, old_codex);
+        assert!(codex_file.starts_with(base.join("codex/sessions")));
+        assert_eq!(
+            super::parse_codex_conversation_file(&codex_file)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        fs::write(&codex_file, "isolated continuation").unwrap();
+        assert!(fs::read_to_string(old_codex)
+            .unwrap()
+            .contains("session_meta"));
+    }
 
-        let env_override = root.join("sqlite-from-env");
-        let overridden = resolve_codex_path_config_from(
-            Some(home_dir.as_path()),
-            Some(codex_home.to_str().expect("utf8 path")),
-            Some(env_override.to_str().expect("utf8 path")),
-        )
-        .expect("resolve codex path config with env override");
+    #[test]
+    fn sqlite_rollout_outside_ccem_cannot_override_migrated_session() {
+        let root = temp_history_dir("codex-reject-official-rollout");
+        let home = root.join("home");
+        let isolated = home.join(".ccem/agents/codex");
+        let id = "019cbc5a-5720-7451-905e-84b96a508abb";
+        let official = write_codex_session_file(&home.join(".codex"), id, "/fixture/official");
+        let migrated = write_codex_session_file(&isolated, id, "/fixture/ccem");
+        create_state_db(&isolated, "state_5.sqlite", &[&format!(
+            "INSERT INTO threads (id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode) VALUES ('{id}','{}',1776181000,1776181001,'vscode','openai','/fixture/official','old title','workspace-write','never');", official.display()
+        )]);
+        let config = codex_path_config_for(&home, isolated.clone());
+        assert_eq!(
+            find_codex_session_file_with_config(id, &config),
+            Some(migrated.clone())
+        );
+        fs::remove_file(&migrated).unwrap();
+        assert!(find_codex_session_file_with_config(id, &config).is_none());
 
-        assert_eq!(overridden.sqlite_home, env_override);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&official, &migrated).unwrap();
+            assert!(
+                find_codex_session_file_with_config(id, &config).is_none(),
+                "symlink must not reopen official transcript"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let defaulted = resolve_codex_path_config_from(Some(home_dir.as_path()), None, None)
-            .expect("resolve default config");
-        assert_eq!(defaulted.codex_home, home_dir.join(".codex"));
-        assert_eq!(defaulted.sqlite_home, home_dir.join(".codex"));
-        assert_eq!(resolved.sqlite_home, codex_home.join("sqlite-from-config"));
-        assert_ne!(sqlite_from_config, resolved.sqlite_home);
-
+    #[test]
+    fn migrated_archived_codex_session_remains_available_without_official_database() {
+        let root = temp_history_dir("codex-isolated-archive");
+        let id = "019cbc5a-5720-7451-905e-84b96a508abb";
+        let active = write_codex_session_file(&root, id, "/fixture/project");
+        let archive = root
+            .join("archived_sessions")
+            .join(active.file_name().unwrap());
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::rename(&active, &archive).unwrap();
+        let config = codex_path_config_for(&root, root.clone());
+        assert_eq!(
+            find_codex_session_file_with_config(id, &config),
+            Some(archive)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

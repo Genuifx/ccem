@@ -5,7 +5,9 @@ import chalk from 'chalk';
 import type { EnvConfig, PermissionModeName } from '@ccem/core';
 import {
   assertClaudeEnvironmentAuthBoundary,
+  buildIsolatedAgentEnv,
   decrypt,
+  ensureCcemAgentHome,
   PERMISSION_PRESETS,
   ensureCcemDir,
   normalizePermissionAllowRules,
@@ -31,18 +33,6 @@ export interface LaunchOptions {
 export interface BuildEnvVarsOptions {
   allowDesktopProxyOverride?: boolean;
 }
-
-const MANAGED_CLAUDE_ENV_KEYS = [
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_MODEL',
-  'CLAUDE_CODE_SUBAGENT_MODEL',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_SMALL_FAST_MODEL',
-] as const;
 
 /**
  * Build environment variables from an EnvConfig, decrypting the auth token.
@@ -147,13 +137,9 @@ export async function launchClaude(options: LaunchOptions): Promise<void> {
   const ccemRuntimeId = sessionId ?? `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // Build env
-  const env = { ...process.env };
-  for (const key of MANAGED_CLAUDE_ENV_KEYS) {
-    delete env[key];
-  }
-  if (envConfig) {
-    Object.assign(env, buildEnvVars(envName, envConfig, { allowDesktopProxyOverride }));
-  }
+  ensureCcemAgentHome('claude');
+  const env = buildIsolatedAgentEnv(process.env,
+    envConfig ? buildEnvVars(envName, envConfig, { allowDesktopProxyOverride }) : {});
   // Prevent nested session detection
   delete env.CLAUDECODE;
   env.CCEM_RUNTIME_ID = ccemRuntimeId;
@@ -249,6 +235,23 @@ export async function launchClaude(options: LaunchOptions): Promise<void> {
         console.error(chalk.red(`启动 Claude Code 失败: ${err.message}`));
       }
       process.exit(1);
+    });
+  });
+}
+
+/** Authenticate only the CCEM-owned account, without an environment's API-token override. */
+export async function launchAgentAuth(provider: 'claude' | 'codex'): Promise<void> {
+  ensureCcemAgentHome(provider);
+  const env = buildIsolatedAgentEnv();
+  const args = provider === 'claude'
+    ? ['auth', 'login']
+    : ['--config', `sqlite_home=${JSON.stringify(env.CODEX_HOME)}`, 'login'];
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(provider, args, { env, stdio: 'inherit', shell: false });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${provider} login ${signal ? `was interrupted (${signal})` : `failed (exit ${code ?? 1})`}`));
     });
   });
 }

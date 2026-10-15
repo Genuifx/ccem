@@ -1148,6 +1148,7 @@ fn build_claude_command(
     options: &ManagedSessionOptions,
     runtime_id: &str,
 ) -> Result<BuildClaudeCommandResult, String> {
+    crate::agent_home::ensure_agent_homes()?;
     let claude_binary = resolve_claude_path().unwrap_or_else(|| "claude".to_string());
     let mut command = Command::new(&claude_binary);
     let permission_mode = official_permission_mode(&options.perm_mode);
@@ -1219,8 +1220,11 @@ fn build_claude_command(
         .current_dir(&options.working_dir);
 
     config::clear_managed_claude_env(&mut command);
-    for (key, value) in &options.env_vars {
-        command.env(key, value);
+    let mut env_vars = options.env_vars.clone();
+    crate::agent_profile::apply_env("claude", &mut env_vars);
+    for (key, value) in &env_vars {
+        if value.is_empty() { command.env_remove(key); }
+        else { command.env(key, value); }
     }
 
     Ok(BuildClaudeCommandResult {

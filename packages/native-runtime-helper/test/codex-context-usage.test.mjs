@@ -32,7 +32,8 @@ test('reads Codex context usage from last_token_usage instead of cumulative tota
   } = await importCodexContextUsageModule();
 
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-codex-home-'));
-  const sessionsRoot = resolveCodexSessionsRoot({ CODEX_HOME: codexHome });
+  const sessionsRoot = resolveCodexSessionsRoot({ CCEM_AGENT_HOME: codexHome, CODEX_HOME: '/official/codex' });
+  assert.equal(sessionsRoot, path.join(codexHome, 'codex', 'sessions'));
   const sessionId = '019dbb39-4e70-7351-a75d-3847d4288e31';
   const sessionDir = path.join(sessionsRoot, '2026', '05', '11');
   const sessionPath = path.join(sessionDir, `rollout-2026-05-11T01-02-03-${sessionId}.jsonl`);

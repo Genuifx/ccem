@@ -223,18 +223,18 @@ describe('path utilities', () => {
   });
 
   describe('getGlobalClaudeConfigPath', () => {
-    it('should return ~/.claude.json path', () => {
+    it('should return CCEM isolated Claude config path', () => {
       const home = path.join(tempDir, 'home');
       process.env.HOME = home;
-      expect(getGlobalClaudeConfigPath()).toBe(path.join(home, '.claude.json'));
+      expect(getGlobalClaudeConfigPath()).toBe(path.join(home, '.ccem', 'agents', 'claude', '.claude.json'));
     });
   });
 
   describe('getGlobalClaudeSettingsPath', () => {
-    it('should return ~/.claude/settings.json path', () => {
+    it('should return CCEM isolated Claude settings path', () => {
       const home = path.join(tempDir, 'home');
       process.env.HOME = home;
-      expect(getGlobalClaudeSettingsPath()).toBe(path.join(home, '.claude', 'settings.json'));
+      expect(getGlobalClaudeSettingsPath()).toBe(path.join(home, '.ccem', 'agents', 'claude', 'settings.json'));
     });
   });
 });

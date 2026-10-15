@@ -191,7 +191,11 @@ fn scan_command_dir(root: &Path, options: &CommandScanOptions) -> Vec<WorkspaceC
     commands
 }
 
-fn collect_workspace_command_dirs(working_dir: Option<&Path>, folder_name: &str) -> Vec<PathBuf> {
+fn collect_workspace_command_dirs(
+    working_dir: Option<&Path>,
+    folder_name: &str,
+    user_home: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let Some(working_dir) = working_dir else {
         return dirs;
@@ -203,6 +207,9 @@ fn collect_workspace_command_dirs(working_dir: Option<&Path>, folder_name: &str)
     };
 
     while let Some(dir) = current {
+        if user_home == Some(dir.as_path()) {
+            break;
+        }
         let commands_dir = dir.join(folder_name).join("commands");
         if commands_dir.exists() {
             dirs.push(commands_dir);
@@ -229,7 +236,8 @@ fn add_commands_unique_by_path(
 }
 
 fn scan_provider_commands(
-    home: Option<&Path>,
+    profile_home: Option<&Path>,
+    user_home: Option<&Path>,
     working_dir: Option<&Path>,
     provider: &str,
     folder_name: &str,
@@ -237,7 +245,7 @@ fn scan_provider_commands(
     let mut commands = Vec::new();
     let mut seen_paths = HashSet::new();
 
-    for project_dir in collect_workspace_command_dirs(working_dir, folder_name) {
+    for project_dir in collect_workspace_command_dirs(working_dir, folder_name, user_home) {
         let options = CommandScanOptions {
             scope: "project".to_string(),
             source: format!("{}/commands", folder_name),
@@ -250,11 +258,11 @@ fn scan_provider_commands(
         );
     }
 
-    if let Some(home) = home {
-        let global_dir = home.join(folder_name).join("commands");
+    if let Some(profile_home) = profile_home {
+        let global_dir = profile_home.join("commands");
         let options = CommandScanOptions {
             scope: "global".to_string(),
-            source: format!("~/{}/commands", folder_name),
+            source: format!("CCEM {}/commands", provider),
             provider: provider.to_string(),
         };
         add_commands_unique_by_path(
@@ -277,10 +285,22 @@ fn scan_provider_commands(
 }
 
 #[tauri::command]
-pub fn list_workspace_commands(
+pub async fn list_workspace_commands(
     working_dir: Option<String>,
     provider: Option<String>,
 ) -> Result<Vec<WorkspaceCommand>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        list_workspace_commands_sync(working_dir, provider)
+    })
+    .await
+    .map_err(|error| format!("Failed to scan workspace commands: {}", error))?
+}
+
+fn list_workspace_commands_sync(
+    working_dir: Option<String>,
+    provider: Option<String>,
+) -> Result<Vec<WorkspaceCommand>, String> {
+    crate::agent_home::ensure_agent_homes()?;
     let home = dirs::home_dir();
     let working_dir = working_dir
         .as_deref()
@@ -295,6 +315,7 @@ pub fn list_workspace_commands(
     match normalized_provider.as_deref() {
         Some("codex") => {
             commands.extend(scan_provider_commands(
+                Some(&crate::agent_home::codex_home()),
                 home.as_deref(),
                 working_dir.as_deref(),
                 "codex",
@@ -303,6 +324,7 @@ pub fn list_workspace_commands(
         }
         Some("claude") | Some("claude-code") => {
             commands.extend(scan_provider_commands(
+                Some(&crate::agent_home::claude_home()),
                 home.as_deref(),
                 working_dir.as_deref(),
                 "claude",
@@ -311,12 +333,14 @@ pub fn list_workspace_commands(
         }
         _ => {
             commands.extend(scan_provider_commands(
+                Some(&crate::agent_home::claude_home()),
                 home.as_deref(),
                 working_dir.as_deref(),
                 "claude",
                 ".claude",
             ));
             commands.extend(scan_provider_commands(
+                Some(&crate::agent_home::codex_home()),
                 home.as_deref(),
                 working_dir.as_deref(),
                 "codex",
@@ -352,7 +376,7 @@ mod tests {
         )
         .unwrap();
 
-        let commands = scan_provider_commands(None, Some(&dir), "claude", ".claude");
+        let commands = scan_provider_commands(None, None, Some(&dir), "claude", ".claude");
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].token, "/verify");
@@ -378,7 +402,7 @@ mod tests {
         )
         .unwrap();
 
-        let commands = scan_provider_commands(None, Some(&dir), "claude", ".claude");
+        let commands = scan_provider_commands(None, None, Some(&dir), "claude", ".claude");
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].token, "/dev-desktop");
@@ -388,5 +412,40 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scans_profile_commands_without_discovering_official_home_as_a_project() {
+        let dir = temp_dir("profile-isolation");
+        let home = dir.join("user");
+        let workspace = home.join("projects/non-git");
+        let profile = home.join(".ccem/agents/claude");
+        for (root, name) in [
+            (home.join(".claude/commands"), "official"),
+            (profile.join("commands"), "ccem"),
+            (workspace.join(".claude/commands"), "project"),
+        ] {
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{}.md", name)), name).unwrap();
+        }
+
+        let commands = scan_provider_commands(
+            Some(&profile),
+            Some(&home),
+            Some(&workspace),
+            "claude",
+            ".claude",
+        );
+        let names: Vec<_> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["project", "ccem"]);
+        assert_eq!(
+            commands[1].path,
+            profile.join("commands/ccem.md").to_string_lossy()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

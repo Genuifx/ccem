@@ -4,3 +4,4 @@ export * from './env-config.js';
 export * from './router.js';
 export * from './presets.js';
 export * from './utils.js';
+export * from './agent-home.js';

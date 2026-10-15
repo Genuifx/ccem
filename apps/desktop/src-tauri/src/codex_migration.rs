@@ -234,15 +234,9 @@ fn evaluate(context: PreflightContext) -> PreflightEvaluation {
     }
 }
 
-fn resolve_codex_home(working_dir: &Path) -> Option<PathBuf> {
-    let home_dir = dirs::home_dir()?;
-    let raw = std::env::var("CODEX_HOME").ok();
-    let path = raw
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| resolve_path_value(value, &home_dir, working_dir))
-        .unwrap_or_else(|| home_dir.join(".codex"));
-    let canonical = fs::canonicalize(path).ok()?;
+fn resolve_codex_home(_working_dir: &Path) -> Option<PathBuf> {
+    crate::agent_home::ensure_agent_homes().ok()?;
+    let canonical = fs::canonicalize(crate::agent_home::codex_home()).ok()?;
     canonical.is_dir().then_some(canonical)
 }
 
@@ -288,6 +282,7 @@ fn is_process_auth_override_key(key: &str, case_insensitive: bool) -> bool {
 fn is_unknown_codex_environment_key(key: &str, case_insensitive: bool) -> bool {
     env_key_has_prefix(key, "CODEX_", case_insensitive)
         && !env_key_eq(key, "CODEX_HOME", case_insensitive)
+        && !env_key_eq(key, "CODEX_SQLITE_HOME", case_insensitive)
 }
 
 fn env_key_eq(actual: &str, expected: &str, case_insensitive: bool) -> bool {
@@ -368,6 +363,7 @@ fn has_project_config_surface(working_dir: &Path, user_config_path: &Path) -> bo
     let mut candidates = BTreeSet::new();
     candidates.insert(working_dir.join("config.toml"));
     for ancestor in working_dir.ancestors() {
+        if dirs::home_dir().as_deref() == Some(ancestor) { break; }
         candidates.insert(ancestor.join(".codex").join("config.toml"));
     }
 
