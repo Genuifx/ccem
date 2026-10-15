@@ -113,21 +113,41 @@ impl HermesBridgeManager {
             .get("label")
             .map(|v| v.as_str().ok_or("invalid_connection_label"))
             .transpose()?;
-        let snapshot = self.host_process()?.snapshot();
-        let meta = snapshot["platforms"]
-            .as_array()
-            .and_then(|ps| ps.iter().find(|p| p["id"] == platform))
-            .ok_or("platform_not_supported")?;
-        if meta["available"] != true || meta["strictSend"] != true {
-            return Err("platform_not_available".into());
-        }
-        let schema = meta["fields"].as_array().ok_or("platform_schema_missing")?;
+        // Gateway may be offline when editing an existing connection. Fall back
+        // gracefully so the edit form remains usable without full platform metadata.
+        let snapshot = self.host_process().ok().map(|p| p.snapshot());
+        let meta = snapshot.as_ref().and_then(|s| {
+            s["platforms"]
+                .as_array()
+                .and_then(|ps| ps.iter().find(|p| p["id"] == platform))
+        });
         let existing = account
             .map(|a| self.with_store(|s| s.connection(a)))
             .transpose()?;
         if existing.as_ref().is_some_and(|c| c.platform != platform) {
             return Err("connection_platform_immutable".into());
         }
+        // When full metadata is available, apply strict validation.
+        // When offline but editing an existing connection, build a synthetic schema
+        // from the saved configured fields and skip availability/required checks.
+        let (schema, strict) = if let Some(meta) = meta {
+            if meta["available"] != true || meta["strictSend"] != true {
+                return Err("platform_not_available".into());
+            }
+            let s = meta["fields"].as_array().ok_or("platform_schema_missing")?;
+            (s.clone(), true)
+        } else if let Some(ref conn) = existing {
+            // Synthetic schema: every configured field is accepted, none required
+            let s: Vec<Value> = conn
+                .configured_fields
+                .iter()
+                .map(|k| json!({"key": k, "label": k, "secret": false, "required": false}))
+                .collect();
+            (s, false)
+        } else {
+            // New connections always need full platform metadata
+            return Err("platform_not_supported".into());
+        };
         let old_fields = existing
             .as_ref()
             .map(|c| decode_fields(&c.cipher))
@@ -149,16 +169,24 @@ impl HermesBridgeManager {
                 merged.insert(key.clone(), json!(value));
             }
         }
-        for field in schema.iter().filter(|f| f["required"] == true) {
-            if merged
-                .get(field["key"].as_str().unwrap_or(""))
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                return Err("required_channel_field_missing".into());
+        if strict {
+            for field in schema.iter().filter(|f| f["required"] == true) {
+                if merged
+                    .get(field["key"].as_str().unwrap_or(""))
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err("required_channel_field_missing".into());
+                }
             }
         }
-        self.ensure_unique_connection_locked(platform, &merged, account, meta)?;
+        let dedup_meta = meta.cloned().unwrap_or_else(|| json!({}));
+        self.ensure_unique_connection_locked(
+            platform,
+            &merged,
+            account,
+            &dedup_meta,
+        )?;
         let changed = existing.is_none() || merged != old_fields;
         let cipher = if changed {
             crypto::encrypt(&json!(merged).to_string())?
@@ -177,8 +205,6 @@ impl HermesBridgeManager {
         })?;
         if changed {
             self.invalidate_setup_for_account(&connection.account_ref);
-            // Saving succeeds even when transport startup fails: the card retains
-            // its credentials and a retryable error, without disrupting peers.
             if connection.enabled {
                 let _ = self.start_connection_locked(app, &connection.account_ref);
             }

@@ -115,16 +115,17 @@
 .hermes-connection-state .hermes-status-dot:not(.is-running) { background: hsl(var(--muted-foreground)); }
 .hermes-connection-actions { display: flex; align-items: center; gap: 4px; }
 .hermes-connection-actions button { font-size: 12px; }
-.hermes-connection-details { padding: 0 2px 20px; }
-.hermes-connection-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 2px 0 18px; }
+.hermes-connection-details { padding: 0 2px 16px; }
+.hermes-detail-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.hermes-connection-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 0 0 14px; }
 .hermes-connection-toolbar svg { width: 13px; height: 13px; }
 .hermes-connection-toolbar button { font-size: 12px; }
-.hermes-account-id { margin-left: auto; font-size: 11px; color: hsl(var(--muted-foreground)); font-family: monospace; overflow-wrap: anywhere; }
-.hermes-pairing-command { padding: 20px; margin-bottom: 20px; border-radius: 10px; background: hsl(var(--primary) / .055); }
+.hermes-account-id { font-size: 11px; color: hsl(var(--muted-foreground)); font-family: monospace; overflow-wrap: anywhere; flex-shrink: 0; }
+.hermes-pairing-command { padding: 16px; margin-bottom: 14px; border-radius: 10px; background: hsl(var(--primary) / .055); }
 .hermes-pairing-command .hermes-steps { padding: 0 0 18px; }
 .hermes-command-line { display: flex; align-items: center; gap: 12px; margin: 12px 0 6px; background: hsl(var(--surface-raised)); border: 1px solid hsl(var(--border-subtle)); padding: 4px 6px 4px 14px; border-radius: 7px; }
 .hermes-command-line code { min-width: 0; flex: 1; font-size: 13px; overflow-wrap: anywhere; }
-.hermes-pairing { padding: 22px 0; border-top: 1px solid hsl(var(--border-subtle)); }
+.hermes-pairing { padding: 16px 0; border-top: 1px solid hsl(var(--border-subtle)); }
 .hermes-pairing h4 { font-size: 14px; font-weight: 600; margin-bottom: 16px; }
 .hermes-identity { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 20px; font-size: 12px; margin-bottom: 20px; }
 .hermes-identity dt { color: hsl(var(--muted-foreground)); }
@@ -207,7 +208,7 @@
   .hermes-section-heading > .hermes-caption { display: none; }
   .hermes-pairing-command { padding: 16px; }
   .hermes-pairing-command .hermes-steps { padding-inline: 0; }
-  .hermes-account-id { margin-left: 0; width: 100%; }
+  .hermes-account-id { width: auto; }
   .hermes-runtime-name { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -226,7 +227,7 @@
 .hermes-empty h3 { font-size: 16px; font-weight: 600; }
 .hermes-empty p { color: hsl(var(--muted-foreground)); font-size: 13px; margin-top: 8px; }
 .hermes-authorization-intro { color: hsl(var(--muted-foreground)); font-size: 13px; margin-bottom: 24px; }
-.hermes-detail-context { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.hermes-detail-context { display: flex; align-items: center; gap: 12px; }
 .hermes-detail-context h4 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .hermes-complete { padding: 40px 20px 60px; text-align: center; }
 .hermes-complete > svg { width: 40px; height: 40px; color: hsl(var(--success)); margin: 0 auto 18px; }
@@ -241,10 +242,12 @@
 .hermes-drawer-header svg { width: 18px; height: 18px; }
 .hermes-drawer-body { padding: 24px 28px; overflow-y: auto; min-height: 0; overscroll-behavior: contain; }
 .hermes-drawer .hermes-manual-layout { grid-template-columns: 1fr; }
-.hermes-drawer .hermes-account-id { flex-basis: 100%; margin-left: 0; margin-top: 8px; }
+.hermes-drawer .hermes-account-id { flex-basis: auto; }
 .hermes-drawer .hermes-form-aside { padding: 18px; }
 @media (max-width: 500px) {
   .hermes-drawer-header { padding: 22px 20px 18px; }
   .hermes-drawer-body { padding: 22px 20px; }
 }
-.hermes-conversation-model { display: grid; gap: 10px; padding: 18px 0; border-top: 1px solid hsl(var(--border)); }
+.hermes-conversation-model { display: grid; gap: 8px; padding: 14px 0; }
+.hermes-settings-group { border-top: 1px solid hsl(var(--border-subtle)); }
+.hermes-settings-group > * + * { border-top: 1px solid hsl(var(--border-subtle)); }

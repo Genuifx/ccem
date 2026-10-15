@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNo
 import { Activity, ArrowLeft, ArrowRight, CheckCircle2, KeyRound, MessageCircle, Plus, QrCode, RefreshCw } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/locales';
-import { getHermesStatus, performHermesAction, type HermesAction, type HermesRunAction, type HermesStatus } from '@/lib/hermes-ipc';
+import { getHermesStatus, performHermesAction, type HermesAction, type HermesPlatform, type HermesRunAction, type HermesStatus } from '@/lib/hermes-ipc';
 import { HermesRuntime } from './HermesRuntime';
 import { HermesSteps } from './HermesVisuals';
 import './hermes.css';
@@ -318,18 +318,30 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
       </>}
       {children}
     </>}
-    {details && detailConnection && !wizard && <HermesConnectionDrawer key={detailConnection.accountRef} accountRef={detailConnection.accountRef}
-      title={detailConnection.label && detailConnection.label !== detailConnection.platform ? detailConnection.label : platformDisplayName(detailConnection.platform, platforms.find((item) => item.id === detailConnection.platform)?.label, t)}
-      description={t(details.editing ? 'hermes.editConnection' : 'hermes.connectionDetails')} onClose={() => setDetails(null)}>
-      {details.editing ? <>
-        {connectionRequestErrors[detailConnection.accountRef] && <p role="alert" className="hermes-alert">{connectionRequestErrors[detailConnection.accountRef]}</p>}
-        {platforms.find((item) => item.id === detailConnection.platform) ? <HermesChannelForm key={detailConnection.accountRef}
-          platform={platforms.find((item) => item.id === detailConnection.platform)!} connection={detailConnection}
-          disabled={disabled || Boolean(busyActions[`account:${detailConnection.accountRef}`])} run={run}
-          onSaved={() => setDetails((current) => current === details ? { ...current, editing: false } : current)}
-          onCancel={() => setDetails((current) => current ? { ...current, editing: false } : current)} />
-          : <div className="hermes-discovery"><p role="status">{t('hermes.connectionSchemaUnavailable')}</p><Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button></div>}
-      </> : <HermesConnectionDetails {...connectionProps(detailConnection)} />}
-    </HermesConnectionDrawer>}
+    {details && detailConnection && !wizard && (() => {
+      const detailPlatform = platforms.find((item) => item.id === detailConnection.platform);
+      // When gateway is offline, construct a degraded platform from the connection's saved field keys
+      // so the edit form can still render. Fields inferred from configuredFields lack labels/required
+      // metadata, but allow users to update values without waiting for the gateway to recover.
+      const editPlatform: HermesPlatform | null = detailPlatform ?? (detailConnection.configuredFields.length > 0 ? {
+        id: detailConnection.platform, label: platformDisplayName(detailConnection.platform, undefined, t),
+        available: true, strictSend: true, fields: detailConnection.configuredFields.map((key) => ({
+          key, label: key, secret: key.toLowerCase().includes('secret') || key.toLowerCase().includes('token'), required: false,
+        })),
+      } : null);
+      return <HermesConnectionDrawer key={detailConnection.accountRef} accountRef={detailConnection.accountRef}
+        title={detailConnection.label && detailConnection.label !== detailConnection.platform ? detailConnection.label : platformDisplayName(detailConnection.platform, detailPlatform?.label, t)}
+        description={t(details.editing ? 'hermes.editConnection' : 'hermes.connectionDetails')} onClose={() => setDetails(null)}>
+        {details.editing ? <>
+          {connectionRequestErrors[detailConnection.accountRef] && <p role="alert" className="hermes-alert">{connectionRequestErrors[detailConnection.accountRef]}</p>}
+          {editPlatform ? <HermesChannelForm key={detailConnection.accountRef}
+            platform={editPlatform} connection={detailConnection}
+            disabled={disabled || Boolean(busyActions[`account:${detailConnection.accountRef}`])} run={run}
+            onSaved={() => setDetails((current) => current === details ? { ...current, editing: false } : current)}
+            onCancel={() => setDetails((current) => current ? { ...current, editing: false } : current)} />
+            : <div className="hermes-discovery"><p role="status">{t('hermes.connectionSchemaUnavailable')}</p><Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button></div>}
+        </> : <HermesConnectionDetails {...connectionProps(detailConnection)} />}
+      </HermesConnectionDrawer>;
+    })()}
   </div>;
 }

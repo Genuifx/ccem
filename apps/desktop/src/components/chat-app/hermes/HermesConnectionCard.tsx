@@ -85,22 +85,27 @@ export function HermesConnectionDetails({ connection, platform, routes, workspac
   const platformLabel = platformDisplayName(connection.platform, platform?.label, t);
   const label = !connection.label || connection.label === connection.platform || connection.label === platform?.label ? platformLabel : connection.label;
   const activeRoutes = routes.filter((route) => route.enabled);
+  const hasError = Boolean(connection.error || requestError || setupError);
   return <div className="hermes-connection-details" data-hermes-connection-details={connection.accountRef}>
-      <div className="hermes-detail-context">
-        {authorizationOnly && <HermesPlatformIcon platform={connection.platform} />}
-        <div>{authorizationOnly && <h4>{label}</h4>}<p className="hermes-connection-state" role="status"><span className={`hermes-status-dot${running ? ' is-running' : ''}`} aria-hidden="true" />{stateLabel(connection.state)}</p></div>
+      {/* Status + account ID header row */}
+      <div className="hermes-detail-header">
+        <div className="hermes-detail-context">
+          {authorizationOnly && <HermesPlatformIcon platform={connection.platform} />}
+          <div>{authorizationOnly && <h4>{label}</h4>}<p className="hermes-connection-state" role="status"><span className={`hermes-status-dot${running && !hasError ? ' is-running' : ''}`} aria-hidden="true" />{stateLabel(connection.state)}</p></div>
+        </div>
+        <span className="hermes-account-id" title={connection.accountRef}>{connection.accountRef.slice(-12)}</span>
       </div>
       {connection.error && <p role="alert" className="hermes-alert">{connection.error === 'pairing_rate_limited' ? t('hermes.pairingRateLimited') : errorText(connection.error)}</p>}
       {requestError && <p role="alert" className="hermes-alert">{requestError}</p>}
       {setupError && <p role="alert" className="hermes-alert" data-hermes-setup-error>{t(setupError)}</p>}
+      {/* Action toolbar: start/stop first, then new pairing, edit/remove last */}
       <div className="hermes-connection-toolbar">
-        {running && <Button size="sm" variant={activeRoutes.length ? 'outline' : 'default'} disabled={disabled} onClick={() => { setCopiedCode(null); setCopyError(null); void run('openPairing', { accountRef: connection.accountRef }); }}>{t('hermes.newPairing')}</Button>}
         <Button size="sm" variant={canStop ? 'outline' : 'default'} disabled={(canStop ? stopDisabled : disabled) || connection.state === 'stopping'} onClick={() => void run(canStop ? 'stop' : 'start', { accountRef: connection.accountRef })}>
           {canStop ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}{t(canStop ? 'hermes.stop' : 'hermes.start')}
         </Button>
+        {running && <Button size="sm" variant={activeRoutes.length ? 'outline' : 'default'} disabled={disabled} onClick={() => { setCopiedCode(null); setCopyError(null); void run('openPairing', { accountRef: connection.accountRef }); }}>{t('hermes.newPairing')}</Button>}
         {!authorizationOnly && <><Button size="sm" variant="ghost" disabled={disabled || editDisabled || transitioning} onClick={onEdit}>{t('hermes.editConnection')}</Button>
         <Button size="sm" variant="ghost" disabled={removeDisabled} onClick={() => setConfirmRemove(true)}>{t('hermes.removeChannel')}</Button></>}
-        <span className="hermes-account-id" title={connection.accountRef}>{connection.accountRef.slice(-12)}</span>
       </div>
       {confirmRemove && <div className="hermes-remove-confirmation" data-hermes-remove-confirmation>
         <p>{t('hermes.removeChannelConfirm', { label })}</p>
@@ -121,8 +126,11 @@ export function HermesConnectionDetails({ connection, platform, routes, workspac
         {copyError && <p role="alert" className="hermes-error">{copyError}</p>}
       </div>}
       {connection.pending.map((pairing) => <PendingPairing key={pairing.id} pairing={pairing} accountRef={connection.accountRef} workspaces={workspaces} disabled={disabled || !running} run={run} />)}
-      <HermesConversationModel connection={connection} models={conversationModels} disabled={disabled} run={run} />
-      <HermesToolsMode key={connection.accountRef} connection={connection} disabled={disabled} run={run} />
+      {/* Settings: conversation model + tools mode */}
+      <div className="hermes-settings-group">
+        <HermesConversationModel connection={connection} models={conversationModels} disabled={disabled} run={run} />
+        <HermesToolsMode key={connection.accountRef} connection={connection} disabled={disabled} run={run} />
+      </div>
       {routes.length > 0 && <div className="hermes-routes"><h4>{t('hermes.routes')}</h4>{routes.map((route) => <PairedChat key={route.id} route={route} workspaces={workspaces} disabled={disabled} accessDisabled={disabled || !connection.enabled} run={run} />)}</div>}
   </div>;
 }
