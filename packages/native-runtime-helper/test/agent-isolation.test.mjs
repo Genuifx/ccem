@@ -86,13 +86,15 @@ for (const isolated of [false, true]) {
     const capture = path.join(base, 'capture.json');
     await fs.mkdir(base);
     const preferences = path.join(base, 'profiles.json');
+    const officialHome = path.join(temporary, 'official custom codex');
+    const officialSqlite = path.join(temporary, 'official custom sqlite');
     await fs.writeFile(preferences, JSON.stringify({ codexIsolation: isolated }));
     const child = spawn(process.execPath, [helper], {
       cwd: temporary,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env, CCEM_AGENT_HOME: base, CCEM_CODEX_ISOLATED: undefined,
-        CCEM_ISOLATION_CAPTURE: capture, CODEX_HOME: '/official/custom-codex', CODEX_SQLITE_HOME: '/official/custom-sqlite',
+        CCEM_ISOLATION_CAPTURE: capture, CODEX_HOME: officialHome, CODEX_SQLITE_HOME: officialSqlite,
         OPENAI_API_KEY: 'official-openai', CODEX_API_KEY: 'official-codex', CODEX_ACCESS_TOKEN: 'official-access',
       },
     });
@@ -122,8 +124,8 @@ for (const isolated of [false, true]) {
       }
       assert.ok(captured, `Codex child did not start: ${stdout}\n${stderr}`);
       assert.equal(captured.isolated, isolated ? '1' : '0');
-      assert.equal(captured.home, isolated ? path.join(base, 'codex') : '/official/custom-codex');
-      assert.equal(captured.sqlite, isolated ? captured.home : '/official/custom-sqlite');
+      assert.equal(captured.home, isolated ? path.join(base, 'codex') : officialHome);
+      assert.equal(captured.sqlite, isolated ? captured.home : officialSqlite);
       assert.equal(captured.args.some((arg) => arg.startsWith('sqlite_home=')), isolated);
       assert.equal(captured.apiKey, isolated ? undefined : 'official-codex');
       assert.equal(captured.openaiKey, isolated ? undefined : 'official-openai');

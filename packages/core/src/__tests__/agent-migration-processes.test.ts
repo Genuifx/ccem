@@ -6,6 +6,10 @@ import { once } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AGENT_MIGRATION_MARKER, ensureCcemAgentHome, getCcemAgentHome } from '../agent-home';
 
+// A real Windows CIM query has its own 5 s deadline. The enclosing integration test
+// also starts/stops a writer and copies the final snapshot; it must not expire first.
+const writerTestTimeout = 15_000;
+
 describe('migration with live legacy CCEM processes', () => {
   let home: string;
   let children: ChildProcess[];
@@ -15,15 +19,19 @@ describe('migration with live legacy CCEM processes', () => {
     children = [];
   });
   afterEach(async () => {
-    await Promise.all(children.map(async (child) => {
-      if (child.exitCode === null && child.signalCode === null) {
-        const stopped = once(child, 'exit');
-        child.kill();
-        await stopped;
-      }
-    }));
+    await Promise.all(children.map(stop));
     fs.rmSync(home, { recursive: true, force: true });
   });
+
+  async function stop(child: ChildProcess) {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const stopped = once(child, 'exit', { signal: AbortSignal.timeout(2000) });
+    child.kill();
+    try { await stopped; } catch (error) {
+      child.kill('SIGKILL');
+      throw new Error(`Writer fixture ${child.pid} did not exit after termination`, { cause: error });
+    }
+  }
 
   function write(relative: string, contents: string) {
     const file = path.join(home, relative);
@@ -39,7 +47,30 @@ describe('migration with live legacy CCEM processes', () => {
       env: { PATH: process.env.PATH, HOME: home, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     children.push(child);
-    await Promise.race([once(child.stdout!, 'data'), once(child, 'error').then(([error]) => { throw error; })]);
+    await new Promise<void>((resolve, reject) => {
+      let output = '';
+      let diagnostics = '';
+      const onData = (data: Buffer) => {
+        output += data.toString();
+        if (output.includes('ready\n')) finish();
+      };
+      const onStderr = (data: Buffer) => { diagnostics += data.toString(); };
+      const onError = (error: Error) => finish(error);
+      const onExit = (code: number | null) => finish(new Error(`Writer exited before ready (${code}): ${diagnostics}`));
+      const timer = setTimeout(() => finish(new Error(`Writer did not become ready: ${diagnostics}`)), 3000);
+      function finish(error?: Error) {
+        clearTimeout(timer);
+        child.stdout!.off('data', onData);
+        child.stderr!.off('data', onStderr);
+        child.off('error', onError);
+        child.off('exit', onExit);
+        if (error) reject(error); else resolve();
+      }
+      child.stdout!.on('data', onData);
+      child.stderr!.on('data', onStderr);
+      child.on('error', onError);
+      child.on('exit', onExit);
+    });
     if (persistedPath) write('.ccem/sessions.json', JSON.stringify([
       { id: 'fixture', client: provider, pid: child.pid, status: 'running', jsonl_path: persistedPath },
     ]));
@@ -55,14 +86,12 @@ describe('migration with live legacy CCEM processes', () => {
     expect(fs.existsSync(path.join(root, AGENT_MIGRATION_MARKER))).toBe(false);
     expect(fs.existsSync(path.join(home, '.ccem/agents/.ccem-migration.lock'))).toBe(false);
     fs.appendFileSync(source, 'last-message\n');
-    const stopped = once(child, 'exit');
-    child.kill();
-    await stopped;
+    await stop(child);
     ensureCcemAgentHome(provider, { HOME: home, CCEM_CODEX_ISOLATED: '1' });
     const copied = path.join(root, relative.split('/').slice(1).join('/'));
     expect(fs.readFileSync(copied, 'utf8')).toBe('initial\nlast-message\n');
     expect(fs.readFileSync(source, 'utf8')).toBe('initial\nlast-message\n');
-  });
+  }, writerTestTimeout);
 
   it('allows official and already isolated writers and writers using another source home', async () => {
     write('.claude/projects/project/session.jsonl', 'legacy\n');
@@ -90,10 +119,8 @@ describe('migration with live legacy CCEM processes', () => {
     const env = { HOME: home, CODEX_HOME: sharedRoot, CCEM_CODEX_ISOLATED: '1' };
     expect(() => ensureCcemAgentHome('codex', env)).toThrow(/live CCEM|still writing/);
     fs.appendFileSync(source, 'last-message\n');
-    const stopped = once(child, 'exit');
-    child.kill();
-    await stopped;
+    await stop(child);
     const root = ensureCcemAgentHome('codex', env);
     expect(fs.readFileSync(path.join(root, 'sessions/old.jsonl'), 'utf8')).toBe('initial\nlast-message\n');
-  });
+  }, writerTestTimeout);
 });
