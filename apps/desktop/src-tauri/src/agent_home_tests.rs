@@ -600,12 +600,21 @@ fn process_environment_probe_reads_only_owned_fixture_process() {
 #[test]
 fn invalid_roots_and_live_or_malformed_locks_fail_before_migration() {
     let (_temp, home, base) = fixture();
+    // Joining onto a Windows verbatim path resolves '..' before validation.
+    // Preserve the raw input so this really exercises traversal rejection.
+    let mut traversal = home.as_os_str().to_os_string();
+    let separator = std::path::MAIN_SEPARATOR;
+    traversal.push(format!("{separator}..{separator}escape"));
+    let traversal = PathBuf::from(traversal);
+    assert!(traversal
+        .components()
+        .any(|part| matches!(part, Component::ParentDir)));
     for invalid in [
         PathBuf::from("relative"),
         home.clone(),
         home.join(".claude/ccem"),
         home.join(".codex"),
-        home.join("../escape"),
+        traversal,
     ] {
         assert!(
             ensure_agent_homes_at(&home, &invalid).is_err(),
