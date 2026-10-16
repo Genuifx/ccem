@@ -175,10 +175,12 @@ import {
 import { createBrowserPresentationRevisionAllocator } from '@/components/workspace/browserPresentationRevision';
 import type { BrowserSurfaceHostShortcutAction } from '@/lib/browserSurfaceIpc';
 import {
+  WORKSPACE_SIDEBAR_COLLAPSED_STORAGE_KEY,
   WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX,
   WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY,
   calculateWorkspaceSidebarWidth,
   clampWorkspaceSidebarWidth,
+  readStoredWorkspaceSidebarCollapsed,
 } from '@/components/workspace/workspaceSidebarLayout';
 import { LazyWorkspaceReviewPopover } from '@/components/workspace/LazyWorkspaceReviewPopover';
 import {
@@ -568,6 +570,7 @@ export function Workspace({
     readStoredBrowserPanelWidthPercent,
   );
   const [workspaceSidebarWidth, setWorkspaceSidebarWidth] = useState(readStoredWorkspaceSidebarWidth);
+  const [workspaceSidebarCollapsed, setWorkspaceSidebarCollapsed] = useState(readStoredWorkspaceSidebarCollapsed);
   const browserLayoutRef = useRef<HTMLDivElement>(null);
   const workspaceColumnRef = useRef<HTMLDivElement>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -687,6 +690,14 @@ export function Workspace({
       // Ignore private-mode storage failures; the current session width still works.
     }
   }, [workspaceSidebarWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(WORKSPACE_SIDEBAR_COLLAPSED_STORAGE_KEY, String(workspaceSidebarCollapsed));
+    } catch {
+      // Ignore private-mode storage failures.
+    }
+  }, [workspaceSidebarCollapsed]);
 
   const handleBrowserPanelResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
@@ -3904,6 +3915,8 @@ export function Workspace({
               onCreateForProject={handleCreateForProject}
               onNewSession={handleProjectTreeNewSession}
               width={workspaceSidebarWidth}
+              collapsed={workspaceSidebarCollapsed}
+              onToggleCollapsed={() => setWorkspaceSidebarCollapsed((prev) => !prev)}
               onResizeStart={handleWorkspaceSidebarResizeStart}
             />
 

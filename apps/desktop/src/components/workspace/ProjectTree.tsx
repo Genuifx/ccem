@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Check, Clock, Copy, FolderOpen, FolderTree, Link, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
+import { Check, Clock, Copy, FolderOpen, FolderTree, Link, PanelLeft, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion } from '@/lib/gsapMotion';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -85,6 +85,8 @@ interface ProjectTreeProps {
   onCreateForProject?: (projectPath: string) => void;
   onNewSession?: () => void;
   width?: number;
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
   onResizeStart?: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }
 
@@ -521,6 +523,8 @@ export const ProjectTree = memo(function ProjectTree({
   onCreateForProject,
   onNewSession,
   width,
+  collapsed = false,
+  onToggleCollapsed,
   onResizeStart,
 }: ProjectTreeProps) {
   const { t } = useLocale();
@@ -1697,6 +1701,53 @@ export const ProjectTree = memo(function ProjectTree({
     togglePinnedSession,
   ]);
 
+  if (collapsed) {
+    return (
+      <div className="relative flex w-10 shrink-0 flex-col items-center border-r border-border-subtle/30 bg-sidebar/80 backdrop-blur-xl">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onToggleCollapsed}
+              aria-label={t('workspace.expandSidebar')}
+              className={cn(
+                'mt-2 flex h-8 w-8 items-center justify-center rounded-lg',
+                'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                'active:scale-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
+                'transition-all'
+              )}
+            >
+              <PanelLeft className="h-4 w-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" sideOffset={6} className="whitespace-nowrap">
+            {t('workspace.expandSidebar')}
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onNewSession}
+              aria-label={t('workspace.newSession')}
+              className={cn(
+                'mt-1 flex h-8 w-8 items-center justify-center rounded-lg',
+                'text-primary hover:bg-primary/10',
+                'active:scale-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
+                'transition-all'
+              )}
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" sideOffset={6} className="whitespace-nowrap">
+            {t('workspace.newSession')}
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={treeMotionRef}
@@ -1708,7 +1759,7 @@ export const ProjectTree = memo(function ProjectTree({
         className="absolute inset-y-0 right-0 z-20 w-1.5 cursor-col-resize touch-none"
         onPointerDown={onResizeStart}
       />
-      {/* Header: unified toolbar (new session / sort / refresh) + pinned conversations */}
+      {/* Header: unified toolbar (new session / sort / refresh / collapse) + pinned conversations */}
       <div className="shrink-0 p-2 flex flex-col gap-2">
         <div className="flex items-center gap-0.5 rounded-xl bg-surface-raised/75 p-1">
           <button
@@ -1809,13 +1860,38 @@ export const ProjectTree = memo(function ProjectTree({
         t={t}
       />
 
-      {/* Footer stats */}
-      {totalSessions > 0 && (
-        <div className="shrink-0 px-3 py-2 text-2xs text-muted-foreground">
-          {totalProjects} {t('history.allProjects').toLowerCase()} · {totalSessions}{' '}
-          {t('workspace.projectSessions')}
-        </div>
-      )}
+      {/* Footer: stats + collapse toggle */}
+      <div className="shrink-0 flex items-center gap-1 border-t border-border-subtle/30 px-2 py-1.5">
+        {totalSessions > 0 && (
+          <span className="min-w-0 flex-1 truncate px-1 text-2xs tabular-nums text-muted-foreground/60">
+            {totalProjects} {t('history.allProjects').toLowerCase()} · {totalSessions}{' '}
+            {t('workspace.projectSessions')}
+          </span>
+        )}
+        {!totalSessions && <span className="flex-1" />}
+        {onToggleCollapsed && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onToggleCollapsed}
+                aria-label={t('workspace.collapseSidebar')}
+                className={cn(
+                  'flex h-6 w-6 shrink-0 items-center justify-center rounded-md',
+                  'text-muted-foreground/50 hover:bg-muted/50 hover:text-foreground',
+                  'active:scale-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/25',
+                  'transition-all'
+                )}
+              >
+                <PanelLeft className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" sideOffset={6} className="whitespace-nowrap">
+              {t('workspace.collapseSidebar')}
+            </TooltipContent>
+          </Tooltip>
+        )}
+      </div>
     </div>
   );
 });

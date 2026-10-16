@@ -353,6 +353,8 @@
     "noHistory": "No history yet",
     "noHistoryHint": "Launch Claude Code to start your first conversation",
     "projectSessions": "sessions",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
     "temporaryProjects": "Temporary Workspaces",
     "groupChat": "No Project",
     "groupAgent": "Agent Tasks",

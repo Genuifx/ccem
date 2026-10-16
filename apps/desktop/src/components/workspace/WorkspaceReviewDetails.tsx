@@ -352,9 +352,11 @@ function FilesDetail({
         </Tabs>
         <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewRefresh')} disabled={isRefreshingGit} onClick={onRefreshGit}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshingGit && 'animate-spin')} /></Button>
       </div>
-      <p className="border-b border-border-subtle/40 px-4 py-2 text-[10px] leading-relaxed text-muted-foreground">
-        {t(scope === 'git' ? 'workspace.filesGitHint' : scope === 'session' ? 'workspace.filesSessionHint' : 'workspace.filesBrowseHint')}
-      </p>
+      {scope !== 'browse' && (
+        <p className="border-b border-border-subtle/40 px-4 py-2 text-[10px] leading-relaxed text-muted-foreground">
+          {t(scope === 'git' ? 'workspace.filesGitHint' : 'workspace.filesSessionHint')}
+        </p>
+      )}
       <div className="flex min-h-0 flex-1">
         {showList ? <div className="flex w-[32%] min-w-[140px] max-w-[260px] shrink-0 flex-col border-r border-border-subtle/50">
           <div className="p-2"><Input aria-label={t('workspace.filesSearch')} placeholder={t('workspace.filesSearch')} value={query} onChange={(event) => setQuery(event.target.value)} className="h-8 px-2 text-xs" /></div>

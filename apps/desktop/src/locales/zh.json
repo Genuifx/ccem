@@ -353,6 +353,8 @@
     "noHistory": "暂无历史会话",
     "noHistoryHint": "启动 Claude Code 开始你的第一个对话",
     "projectSessions": "个会话",
+    "collapseSidebar": "收起侧边栏",
+    "expandSidebar": "展开侧边栏",
     "temporaryProjects": "临时工作区",
     "groupChat": "无项目会话",
     "groupAgent": "Agent 任务",
