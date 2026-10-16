@@ -1,35 +1,35 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { launchAgentAuth } from '../launcher';
 
 describe('isolated agent authentication executable boundary', () => {
   let home: string;
+  let fixtureDir: string;
+  let executable: string;
+  const extension = process.platform === 'win32' ? '.exe' : '';
+  beforeAll(() => {
+    fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-auth-executable-'));
+    executable = path.join(fixtureDir, `agent-auth${extension}`);
+    // shell:false must launch a native executable on Windows. Rust is already part
+    // of the repository's CI toolchain; use the same real fixture on every OS.
+    execFileSync('rustc', [
+      '--edition=2021', fileURLToPath(new URL('./fixtures/agent-auth.rs', import.meta.url)), '-o', executable,
+    ], { stdio: 'pipe', timeout: 30_000 });
+  }, 35_000);
+  afterAll(() => fs.rmSync(fixtureDir, { recursive: true, force: true }));
   beforeEach(() => {
-    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-agent-auth-')));
+    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccem agent auth ')));
     const bin = path.join(home, 'bin');
     fs.mkdirSync(bin);
     for (const provider of ['claude', 'codex']) {
       const official = path.join(home, `.${provider}`);
       fs.mkdirSync(official);
       fs.writeFileSync(path.join(official, 'auth-fixture.json'), 'official-account');
-      const script = `#!${process.execPath}\n` + `
-        const fs = require('node:fs');
-        const path = require('node:path');
-        const root = process.env.${provider === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME'};
-        fs.writeFileSync(path.join(root, 'login-fixture.json'), 'ccem-account');
-        fs.writeFileSync(process.env.CCEM_AUTH_CAPTURE, JSON.stringify({
-          args: process.argv.slice(2), root,
-          secure: process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
-          sqlite: process.env.CODEX_SQLITE_HOME,
-          oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN,
-          anthropic: process.env.ANTHROPIC_AUTH_TOKEN,
-          openai: process.env.OPENAI_API_KEY,
-          codex: process.env.CODEX_API_KEY,
-        }));
-      `;
-      fs.writeFileSync(path.join(bin, provider), script, { mode: 0o700 });
+      fs.copyFileSync(executable, path.join(bin, `${provider}${extension}`));
     }
     vi.stubEnv('HOME', home);
     vi.stubEnv('CCEM_CODEX_ISOLATED', '1');

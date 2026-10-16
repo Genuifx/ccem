@@ -31,6 +31,24 @@ const executable = await createCodexExecutableFixture(temporary, `
   process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }) + '\\n');
 `);
 
+async function stopHelper(child, closed) {
+  const wait = async () => {
+    let timer;
+    try {
+      return await Promise.race([
+        closed.then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), 2000); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  child.kill('SIGTERM');
+  if (await wait()) return;
+  child.kill('SIGKILL');
+  assert.ok(await wait(), 'helper did not close after forced fixture cleanup');
+}
+
 for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
   test(`Codex SDK child forces CCEM roots and ${selectedApiKey ? 'preserves selected API key' : 'uses isolated login'}`, async () => {
     const capture = path.join(temporary, `capture-${selectedApiKey ? 'selected' : 'official'}.json`);
@@ -44,6 +62,8 @@ for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
         OPENAI_API_KEY: 'ambient-openai', CODEX_API_KEY: 'ambient-codex', CLAUDE_CODE_OAUTH_TOKEN: 'ambient-oauth',
       },
     });
+    // Register immediately: initialization failures may close before the assertion's cleanup.
+    const closed = new Promise((resolve) => child.once('close', resolve));
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (data) => { stdout += data; });
@@ -74,8 +94,7 @@ for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
       assert.equal(captured.hostCredentials, undefined);
       assert.equal(captured.apiKey, selectedApiKey);
     } finally {
-      child.kill('SIGTERM');
-      await new Promise((resolve) => child.once('close', resolve));
+      await stopHelper(child, closed);
     }
   });
 }
@@ -98,6 +117,7 @@ for (const isolated of [false, true]) {
         OPENAI_API_KEY: 'official-openai', CODEX_API_KEY: 'official-codex', CODEX_ACCESS_TOKEN: 'official-access',
       },
     });
+    const closed = new Promise((resolve) => child.once('close', resolve));
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (data) => { stdout += data; });
@@ -133,8 +153,7 @@ for (const isolated of [false, true]) {
       assert.equal(captured.oauth, undefined);
       assert.equal(captured.hostCredentials, undefined);
     } finally {
-      child.kill('SIGTERM');
-      await new Promise((resolve) => child.once('close', resolve));
+      await stopHelper(child, closed);
     }
   });
 }

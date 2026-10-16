@@ -28,12 +28,13 @@ async function importClaudeEnvModule() {
 
 test('builds a non-interactive Claude query environment for desktop sessions', async () => {
   const { buildClaudeQueryEnv } = await importClaudeEnvModule();
+  const agentHome = path.join(os.tmpdir(), 'ccem test agents');
 
   const env = buildClaudeQueryEnv({
     baseEnv: {
       PATH: '/usr/bin',
       CLAUDE_CODE_SANDBOXED: '0',
-      CCEM_AGENT_HOME: '/tmp/ccem-test-agents',
+      CCEM_AGENT_HOME: agentHome,
     },
     envVars: {
       ANTHROPIC_AUTH_TOKEN: 'sk-ant-test',
@@ -46,8 +47,8 @@ test('builds a non-interactive Claude query environment for desktop sessions', a
   assert.equal(env.PATH, '/usr/bin');
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'sk-ant-test');
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
-  assert.equal(env.CLAUDE_CONFIG_DIR, '/tmp/ccem-test-agents/claude');
-  assert.equal(env.CLAUDE_SECURESTORAGE_CONFIG_DIR, '/tmp/ccem-test-agents/claude');
+  assert.equal(env.CLAUDE_CONFIG_DIR, path.join(agentHome, 'claude'));
+  assert.equal(env.CLAUDE_SECURESTORAGE_CONFIG_DIR, path.join(agentHome, 'claude'));
   assert.equal(env.CLAUDE_AGENT_SDK_CLIENT_APP, 'ccem-desktop');
   assert.equal(env.CLAUDE_CODE_SANDBOXED, '1');
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, 'high');

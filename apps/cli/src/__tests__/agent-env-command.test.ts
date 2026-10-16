@@ -13,6 +13,21 @@ vi.mock('conf', () => ({
   },
 }));
 
+function posixShell(): string {
+  if (process.platform !== 'win32') return '/bin/sh';
+  // The command emits POSIX shell syntax, so exercise it in the actual Git Bash
+  // shipped on Windows CI rather than trying to run a Unix absolute executable.
+  const gitPaths = spawnSync('where.exe', ['git'], { encoding: 'utf8' });
+  if (gitPaths.error) throw gitPaths.error;
+  for (const git of gitPaths.stdout.trim().split(/\r?\n/)) {
+    for (const relative of ['../bin/bash.exe', '../../bin/bash.exe']) {
+      const shell = path.resolve(path.dirname(git), relative);
+      if (fs.existsSync(shell)) return shell;
+    }
+  }
+  throw new Error('The POSIX env integration test requires Git Bash on Windows');
+}
+
 describe('CLI shell environment profile selection', () => {
   let home: string;
   const argv = process.argv;
@@ -50,8 +65,10 @@ describe('CLI shell environment profile selection', () => {
         'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CLAUDE_CONFIG_DIR',
       ])}.map(key => [key, process.env[key]]))));`);
       const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
-      const evaluated = spawnSync('/bin/sh', ['-c', `${output.join('\n')}\n${quote(process.execPath)} ${quote(capture)}`], {
-        env: process.env, encoding: 'utf8',
+      const shellPath = (value: string) => process.platform === 'win32' ? value.replace(/\\/g, '/') : value;
+      const evaluated = spawnSync(posixShell(), ['-c', `${output.join('\n')}\n${quote(shellPath(process.execPath))} ${quote(shellPath(capture))}`], {
+        env: { ...process.env, MSYS_NO_PATHCONV: '1', MSYS2_ARG_CONV_EXCL: '*', MSYS2_ENV_CONV_EXCL: '*' },
+        encoding: 'utf8', timeout: 5000,
       });
       expect(evaluated.status, evaluated.stderr).toBe(0);
       const env = JSON.parse(evaluated.stdout);

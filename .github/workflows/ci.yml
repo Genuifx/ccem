@@ -77,7 +77,8 @@ jobs:
           node --test scripts/hermes/release-contract.test.mjs
 
       - name: Run tests
-        run: pnpm -r test:run
+        # Collect downstream platform failures in the same run; any failure still fails this step.
+        run: pnpm -r --no-bail test:run
 
       - name: Build all packages
         run: pnpm -r build
