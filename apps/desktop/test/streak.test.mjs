@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { build, stop as stopEsbuild } from 'esbuild';
 
 const desktopDir = path.resolve(import.meta.dirname, '..');
@@ -44,7 +45,7 @@ async function loadStreakUtil() {
     plugins: [aliasPlugin],
     logLevel: 'silent',
   });
-  return import(outfile);
+  return import(pathToFileURL(outfile).href);
 }
 
 const key = (date) =>
