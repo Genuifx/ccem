@@ -541,11 +541,17 @@ fn concurrent_lease_is_rejected_and_drop_requires_recovery_proof() {
         Err(ProfileError::ProfileInUse)
     ));
     let ownership_id = lease.ownership_id().to_string();
+    // A concurrent fork can retain this open file description until exec. Closing only the
+    // parent's handle must not leave a phantom lock blocking durable-state recovery.
+    #[cfg(unix)]
+    let inherited_lock = lease.lock_file.as_ref().unwrap().0.try_clone().unwrap();
     drop(lease);
-    assert!(matches!(
-        manager.acquire_launch_lease(descriptor.profile_id(), &workspace),
-        Err(ProfileError::ProfileRequiresCleanup)
-    ));
+    let launch = manager.acquire_launch_lease(descriptor.profile_id(), &workspace);
+    assert!(
+        matches!(&launch, Err(ProfileError::ProfileRequiresCleanup)),
+        "dropped lease must require recovery, got {:?}",
+        launch.err()
+    );
 
     manager
         .recover_after_ownership_domain_gone(
@@ -554,6 +560,8 @@ fn concurrent_lease_is_rejected_and_drop_requires_recovery_proof() {
             proof(&ownership_id),
         )
         .expect("recover after supervisor proof");
+    #[cfg(unix)]
+    drop(inherited_lock);
     let lease = manager
         .acquire_launch_lease(descriptor.profile_id(), &workspace)
         .expect("lease after recovery");
@@ -576,6 +584,24 @@ fn platform_lock_contention_maps_to_profile_in_use() {
         ),
         ProfileError::Io(_)
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_lock_errors_release_inherited_descriptors_before_a_lease_exists() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("profile.lock");
+    let mut inherited = None;
+    let result = (|| -> Result<(), ProfileError> {
+        let lock = ProfileFileLock::acquire(&path, "test early error")?;
+        inherited = Some(lock.0.try_clone().unwrap());
+        // Metadata/workspace validation can fail before a lease is constructed.
+        Err(ProfileError::WorkspaceMismatch)
+    })();
+    assert!(matches!(result, Err(ProfileError::WorkspaceMismatch)));
+    let _next = ProfileFileLock::acquire(&path, "retry after early error")
+        .expect("an inherited descriptor must not retain the failed operation's lock");
+    drop(inherited);
 }
 
 #[test]
@@ -1087,6 +1113,9 @@ fn reset_restarts_safely_from_every_durable_cleanup_stage() {
             since: Utc::now().to_rfc3339(),
         };
         interrupted.persist().expect("persist reset intent");
+        // Deterministically retain the same open file description as a concurrent fork would.
+        #[cfg(unix)]
+        let inherited_lock = interrupted.lock_file.as_ref().unwrap().0.try_clone().unwrap();
         drop(interrupted);
 
         let user_tombstone = profile_dir.join(format!("user-data.reset-{reset_id}"));
@@ -1124,15 +1153,19 @@ fn reset_restarts_safely_from_every_durable_cleanup_stage() {
             ProfileCleanupState::Resetting { authorization_id, .. }
                 if authorization_id == &reset_id
         ));
-        assert!(matches!(
-            restarted.acquire_launch_lease(descriptor.profile_id(), &workspace),
-            Err(ProfileError::ProfileRequiresCleanup)
-        ));
+        let launch = restarted.acquire_launch_lease(descriptor.profile_id(), &workspace);
+        assert!(
+            matches!(&launch, Err(ProfileError::ProfileRequiresCleanup)),
+            "cleanup stage {stage} must require recovery, got {:?}",
+            launch.err()
+        );
 
         let reset = authorization(DestructiveProfileAction::Reset, &descriptor, &workspace);
         let recovered = restarted
             .reset_profile(reset)
             .expect("resume reset after process restart");
+        #[cfg(unix)]
+        drop(inherited_lock);
         assert!(matches!(
             recovered.cleanup_state(),
             ProfileCleanupState::Stopped

@@ -5,18 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createCodexExecutableFixture } from './codex-executable-fixture.mjs';
 
 const helper = fileURLToPath(new URL('../dist/native-runtime-helper.mjs', import.meta.url));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const executableFixture = { skip: process.platform === 'win32' ? 'The fixture uses a Unix executable shebang.' : false };
 
 // Run the production helper AND bundled Codex SDK. Only the final Codex binary
 // is a fixture: record argv and emit a successful SDK JSON stream.
 async function launch(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-task-model-'));
   const probe = path.join(dir, 'argv.jsonl');
-  const executable = path.join(dir, 'codex');
-  await fs.writeFile(executable, `#!${process.execPath}
+  const executable = await createCodexExecutableFixture(dir, `
 const fs = require('node:fs');
 fs.appendFileSync(process.env.MODEL_PROBE, JSON.stringify(process.argv.slice(2))+'\\n');
 process.stdin.resume();
@@ -32,8 +31,9 @@ process.stdin.on('end', () => {
   {type:'turn.completed',usage:{input_tokens:1,output_tokens:1,cached_input_tokens:0}}
  ]) process.stdout.write(JSON.stringify(event)+'\\n');
 });
-`, { mode: 0o700 });
+`);
   const child = spawn(process.execPath, [helper], {
+    cwd: dir,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: dir, MODEL_PROBE: probe },
   });
@@ -81,7 +81,7 @@ process.stdin.on('end', () => {
 
 for (const resumed of [false, true]) {
   for (const model of [undefined, 'gpt-6-astra']) {
-    test(`Codex SDK ${resumed ? 'resume' : 'start'} preserves ${model ?? 'legacy model absence'}`, executableFixture, async (t) => {
+    test(`Codex SDK ${resumed ? 'resume' : 'start'} preserves ${model ?? 'legacy model absence'}`, async (t) => {
       const h = await launch(t);
       h.send({ ...h.init, ...(model === undefined ? {} : { model }),
         ...(resumed ? { provider_session_id: 'ccem-model-resumed' } : {}), initial_prompt: 'first' });
@@ -107,7 +107,7 @@ for (const resumed of [false, true]) {
   }
 }
 
-test('provider rejection of explicit model is an error with no default-model retry', executableFixture, async (t) => {
+test('provider rejection of explicit model is an error with no default-model retry', async (t) => {
   const h = await launch(t);
   h.send({ ...h.init, model: 'unavailable-model', initial_prompt: 'first' });
   const error = await h.wait((o) => o.type === 'status' && o.status === 'error');

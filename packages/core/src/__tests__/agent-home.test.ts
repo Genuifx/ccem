@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENT_MIGRATION_MARKER,
   buildIsolatedAgentEnv,
@@ -15,7 +15,7 @@ import {
 describe('CCEM agent homes', () => {
   let home: string;
   beforeEach(() => { home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccem-agent-home-'))); });
-  afterEach(() => { fs.rmSync(home, { recursive: true, force: true }); });
+  afterEach(() => { vi.restoreAllMocks(); fs.rmSync(home, { recursive: true, force: true }); });
 
   function write(relative: string, value = relative) {
     const file = path.join(home, relative);
@@ -78,10 +78,16 @@ describe('CCEM agent homes', () => {
     write('.codex/config.toml', 'sqlite_home = "/official/config-sqlite"');
     const official = path.join(home, '.codex');
     fs.chmodSync(official, 0o751);
+    // Windows exposes only read/write mode bits. Assert preservation of the actual mode,
+    // and also catch chmod attempts that Windows would normalize to the same value.
+    const originalMode = fs.statSync(official).mode;
+    if (process.platform !== 'win32') expect(originalMode & 0o777).toBe(0o751);
+    const chmod = vi.spyOn(fs, 'chmodSync');
     expect(isCodexIsolated({ HOME: home })).toBe(false);
     expect(ensureCcemAgentHome('codex', { HOME: home })).toBe(official);
     expect(fs.readFileSync(auth, 'utf8')).toBe('official-login');
-    expect(fs.statSync(official).mode & 0o777).toBe(0o751);
+    expect(fs.statSync(official).mode).toBe(originalMode);
+    expect(chmod).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(home, '.ccem'))).toBe(false);
     expect(fs.existsSync(path.join(official, AGENT_MIGRATION_MARKER))).toBe(false);
     expect(getCcemAgentEnv({ HOME: home })).not.toHaveProperty('CODEX_SQLITE_HOME');

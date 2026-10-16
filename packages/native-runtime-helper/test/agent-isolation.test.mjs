@@ -6,16 +6,16 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
+import { createCodexExecutableFixture } from './codex-executable-fixture.mjs';
 
-const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-helper-isolation-'));
+const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem helper isolation '));
 after(() => fs.rm(temporary, { recursive: true, force: true }));
 const helper = path.join(temporary, 'helper.mjs');
 await build({
   entryPoints: [fileURLToPath(new URL('../src/index.ts', import.meta.url))],
   outfile: helper, bundle: true, platform: 'node', format: 'esm', target: 'node20', logLevel: 'silent',
 });
-const executable = path.join(temporary, 'codex-fixture');
-await fs.writeFile(executable, `#!${process.execPath}\n` + `
+const executable = await createCodexExecutableFixture(temporary, `
   const fs = require('node:fs');
   fs.writeFileSync(process.env.CCEM_ISOLATION_CAPTURE, JSON.stringify({
     args: process.argv.slice(2),
@@ -29,13 +29,14 @@ await fs.writeFile(executable, `#!${process.execPath}\n` + `
   process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: '11111111-2222-3333-4444-555555555555' }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.started' }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }) + '\\n');
-`, { mode: 0o700 });
+`);
 
 for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
   test(`Codex SDK child forces CCEM roots and ${selectedApiKey ? 'preserves selected API key' : 'uses isolated login'}`, async () => {
     const capture = path.join(temporary, `capture-${selectedApiKey ? 'selected' : 'official'}.json`);
     const base = path.join(temporary, 'agents');
     const child = spawn(process.execPath, [helper], {
+      cwd: temporary,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env, CCEM_AGENT_HOME: base, CCEM_ISOLATION_CAPTURE: capture, CCEM_CODEX_ISOLATED: '1',
@@ -87,6 +88,7 @@ for (const isolated of [false, true]) {
     const preferences = path.join(base, 'profiles.json');
     await fs.writeFile(preferences, JSON.stringify({ codexIsolation: isolated }));
     const child = spawn(process.execPath, [helper], {
+      cwd: temporary,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env, CCEM_AGENT_HOME: base, CCEM_CODEX_ISOLATED: undefined,

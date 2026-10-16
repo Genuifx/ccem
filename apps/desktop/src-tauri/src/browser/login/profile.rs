@@ -280,14 +280,14 @@ impl BrowserProfileManager {
         self.reserve_in_process(profile_id)?;
         let result = (|| {
             let profile_dir = self.checked_profile_dir(profile_id)?;
-            let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
-            lock_file
-                .try_lock_exclusive()
-                .map_err(|error| profile_lock_error("reserve embedded browser profile", error))?;
+            let lock_file = ProfileFileLock::acquire(
+                &profile_dir.join("profile.lock"),
+                "reserve embedded browser profile",
+            )?;
             let descriptor = load_current_descriptor(&profile_dir, profile_id)?;
             verify_workspace(&descriptor, workspace_identity)?;
             if !descriptor.cleanup_state.is_stopped() {
-                let _ = FileExt::unlock(&lock_file);
+                let _ = lock_file.unlock();
                 return Err(ProfileError::ProfileRequiresCleanup);
             }
             Ok(EmbeddedProfileLaunchReservation {
@@ -311,15 +311,15 @@ impl BrowserProfileManager {
         workspace_identity: &TrustedWorkspaceIdentity,
     ) -> Result<BrowserProfileLease, ProfileError> {
         let profile_dir = self.checked_profile_dir(profile_id)?;
-        let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
-        lock_file
-            .try_lock_exclusive()
-            .map_err(|error| profile_lock_error("lock browser profile", error))?;
+        let lock_file = ProfileFileLock::acquire(
+            &profile_dir.join("profile.lock"),
+            "lock browser profile",
+        )?;
 
         let mut descriptor = load_current_descriptor(&profile_dir, profile_id)?;
         verify_workspace(&descriptor, workspace_identity)?;
         if !descriptor.cleanup_state.is_stopped() {
-            let _ = FileExt::unlock(&lock_file);
+            let _ = lock_file.unlock();
             return Err(ProfileError::ProfileRequiresCleanup);
         }
 
@@ -478,10 +478,10 @@ impl BrowserProfileManager {
         self.reserve_in_process(profile_id)?;
         let result = (|| {
             let profile_dir = self.checked_profile_dir(profile_id)?;
-            let lock_file = open_profile_lock(&profile_dir.join("profile.lock"))?;
-            lock_file.try_lock_exclusive().map_err(|error| {
-                profile_lock_error("lock browser profile for maintenance", error)
-            })?;
+            let lock_file = ProfileFileLock::acquire(
+                &profile_dir.join("profile.lock"),
+                "lock browser profile for maintenance",
+            )?;
             let descriptor = load_current_descriptor(&profile_dir, profile_id)?;
             verify_workspace(&descriptor, workspace_identity)?;
             Ok(ProfileMaintenanceLease {
@@ -597,7 +597,7 @@ pub(crate) struct BrowserProfileLease {
     profile_dir: PathBuf,
     descriptor: BrowserProfileDescriptor,
     ownership_id: String,
-    lock_file: Option<File>,
+    lock_file: Option<ProfileFileLock>,
     active_leases: Arc<Mutex<HashSet<ProfileId>>>,
 }
 
@@ -606,7 +606,7 @@ pub(in crate::browser::login) struct EmbeddedProfileLaunchReservation {
     profile_dir: PathBuf,
     descriptor: BrowserProfileDescriptor,
     ownership_id: String,
-    lock_file: Option<File>,
+    lock_file: Option<ProfileFileLock>,
     active_leases: Arc<Mutex<HashSet<ProfileId>>>,
     reserved: bool,
 }
@@ -657,7 +657,7 @@ impl EmbeddedProfileLaunchReservation {
 impl Drop for EmbeddedProfileLaunchReservation {
     fn drop(&mut self) {
         if let Some(lock_file) = self.lock_file.take() {
-            let _ = FileExt::unlock(&lock_file);
+            let _ = lock_file.unlock();
         }
         if self.reserved {
             if let Ok(mut active) = self.active_leases.lock() {
@@ -838,7 +838,7 @@ impl BrowserProfileLease {
 
     fn release_lock(&mut self) -> Result<(), ProfileError> {
         if let Some(lock_file) = self.lock_file.as_ref() {
-            FileExt::unlock(lock_file)
+            lock_file.unlock()
                 .map_err(|error| io_error("unlock browser profile", error))?;
         }
         self.lock_file.take();
@@ -851,11 +851,15 @@ impl BrowserProfileLease {
 
 impl Drop for BrowserProfileLease {
     fn drop(&mut self) {
+        // A concurrent fork may still hold the open file description until exec. Explicitly
+        // unlock before releasing the reservation; closing our handle alone is not sufficient.
+        if let Some(lock_file) = self.lock_file.take() {
+            let _ = lock_file.unlock();
+        }
         if let Ok(mut active) = self.active_leases.lock() {
             active.remove(&self.descriptor.profile_id);
         }
-        // The OS releases the file lock on process death or accidental drop. The persisted
-        // LaunchPending/RuntimeOwned state intentionally remains non-stopped, so a subsequent launch
+        // The persisted LaunchPending/RuntimeOwned state remains non-stopped, so a subsequent launch
         // still requires an OwnershipDomainGone proof from the supervisor.
     }
 }
@@ -864,7 +868,7 @@ struct ProfileMaintenanceLease {
     profile_dir: PathBuf,
     descriptor: BrowserProfileDescriptor,
     profile_id: ProfileId,
-    lock_file: Option<File>,
+    lock_file: Option<ProfileFileLock>,
     active_leases: Arc<Mutex<HashSet<ProfileId>>>,
 }
 
@@ -882,7 +886,7 @@ impl ProfileMaintenanceLease {
 
     fn release_without_state_change(&mut self) -> Result<(), ProfileError> {
         if let Some(lock_file) = self.lock_file.take() {
-            FileExt::unlock(&lock_file)
+            lock_file.unlock()
                 .map_err(|error| io_error("unlock browser profile maintenance lease", error))?;
         }
         if let Ok(mut active) = self.active_leases.lock() {
@@ -894,6 +898,11 @@ impl ProfileMaintenanceLease {
 
 impl Drop for ProfileMaintenanceLease {
     fn drop(&mut self) {
+        // Match launch reservations: inherited/duplicated descriptors must not retain this lock
+        // after maintenance ends. The durable Resetting/Deleting intent is left untouched.
+        if let Some(lock_file) = self.lock_file.take() {
+            let _ = lock_file.unlock();
+        }
         if let Ok(mut active) = self.active_leases.lock() {
             active.remove(&self.profile_id);
         }
@@ -908,6 +917,30 @@ fn verify_workspace(
         Ok(())
     } else {
         Err(ProfileError::WorkspaceMismatch)
+    }
+}
+
+// Establish the unlock guard immediately after acquisition, including fallible checks before
+// a launch/maintenance lease can be constructed. flock is shared by fork/dup descriptors, so
+// closing only our File can otherwise retain the lock in an unrelated child until it execs.
+struct ProfileFileLock(File);
+
+impl ProfileFileLock {
+    fn acquire(path: &Path, context: &str) -> Result<Self, ProfileError> {
+        let file = open_profile_lock(path)?;
+        file.try_lock_exclusive()
+            .map_err(|error| profile_lock_error(context, error))?;
+        Ok(Self(file))
+    }
+
+    fn unlock(&self) -> std::io::Result<()> {
+        FileExt::unlock(&self.0)
+    }
+}
+
+impl Drop for ProfileFileLock {
+    fn drop(&mut self) {
+        let _ = self.unlock();
     }
 }
 

@@ -621,13 +621,30 @@ mod tests {
     use chrono::Utc;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    fn env_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
+    // These integration fixtures override process-global storage roots. A module-local mutex
+    // cannot protect readers in native_runtime/history tests running on other harness threads.
+    fn run_in_isolated_process(name: &str) -> bool {
+        const CHILD: &str = "CCEM_PROVENANCE_TEST_CHILD";
+        let module = module_path!().split_once("::").unwrap().1;
+        let test_name = format!("{module}::{name}");
+        if std::env::var(CHILD).as_deref() == Ok(test_name.as_str()) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(CHILD, &test_name)
+            .output()
+            .expect("run provenance fixture in its own process");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated {test_name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
     }
 
     fn temp_root(name: &str) -> PathBuf {
@@ -640,7 +657,9 @@ mod tests {
 
     #[test]
     fn register_and_bind_records_can_be_looked_up_by_client() {
-        let _guard = env_guard().lock().expect("lock env guard");
+        if run_in_isolated_process("register_and_bind_records_can_be_looked_up_by_client") {
+            return;
+        }
         let root = temp_root("register-bind");
         let db_path = root.join("state.sqlite");
         std::env::set_var("CCEM_STATE_DB_PATH", &db_path);
@@ -678,7 +697,9 @@ mod tests {
 
     #[test]
     fn codex_binding_scans_launch_profile_even_after_default_changes() {
-        let _guard = env_guard().lock().expect("lock env guard");
+        if run_in_isolated_process("codex_binding_scans_launch_profile_even_after_default_changes") {
+            return;
+        }
         let root = temp_root("codex-scan");
         let db_path = root.join("state.sqlite");
         let agent_base = root.join("agents");
@@ -726,10 +747,15 @@ mod tests {
             true,
         );
 
-        thread::sleep(Duration::from_millis(1200));
-
-        let records = list_records_by_client("codex").expect("list codex records");
-        assert!(records.contains_key("019d7d58-6c57-76d3-8712-d9126006a5cb"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let records = list_records_by_client("codex").expect("list codex records");
+            if records.contains_key("019d7d58-6c57-76d3-8712-d9126006a5cb") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Codex source binding did not complete");
+            thread::sleep(Duration::from_millis(25));
+        }
         assert_eq!(state_db_path(), db_path);
 
         std::env::remove_var("CCEM_STATE_DB_PATH");

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createCodexExecutableFixture } from './codex-executable-fixture.mjs';
 import { startHelper, send, waitForOutput, sleep, isLifecycle } from './claude-command-lifecycle-harness.mjs';
 
 const helper = fileURLToPath(new URL('../dist/native-runtime-helper.mjs', import.meta.url));
@@ -21,9 +22,8 @@ const isOperation = (clientId, stage) => (output) => output.type === 'event'
 // transport is a fixture. This exercises independent processes and stdin/stdout.
 async function codex(t, model) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-input-operation-'));
-  const executable = path.join(dir, 'codex');
   const records = path.join(dir, 'calls.jsonl');
-  await fs.writeFile(executable, `#!${process.execPath}
+  const executable = await createCodexExecutableFixture(dir, `
 const fs = require('node:fs');
 let text = '';
 process.stdin.on('data', data => { text += data; });
@@ -38,8 +38,9 @@ process.stdin.on('end', () => {
  const finish = () => emit({type:'turn.completed',usage:{input_tokens:1,output_tokens:1,cached_input_tokens:0}});
  setTimeout(finish, text.includes('slow') ? 400 : 5);
 });
-`, { mode: 0o700 });
+`);
   const child = spawn(process.execPath, [helper], {
+    cwd: dir,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: dir, INPUT_PROBE: records },
   });
@@ -72,9 +73,7 @@ process.stdin.on('end', () => {
   return session;
 }
 
-const executableFixture = { skip: process.platform === 'win32' ? 'Unix executable fixture.' : false };
-
-test('Codex busy FIFO associates each SDK turn only with its own input', executableFixture, async (t) => {
+test('Codex busy FIFO associates each SDK turn only with its own input', async (t) => {
   const session = await codex(t);
   send(session, { type: 'prompt', text: 'slow first', client_message_ids: ['a'] });
   await waitForOutput(session, isOperation('a', 'started'), 'first started');
@@ -90,7 +89,7 @@ test('Codex busy FIFO associates each SDK turn only with its own input', executa
   assert.equal((await session.calls()).length, 2);
 });
 
-test('Codex repeated external client ID is a distinct execution, not a false dedup receipt', executableFixture, async (t) => {
+test('Codex repeated external client ID is a distinct execution, not a false dedup receipt', async (t) => {
   const session = await codex(t);
   send(session, { type: 'prompt', text: 'first', client_message_ids: ['duplicate'] });
   await waitForOutput(session, isOperation('duplicate', 'completed'), 'first completion');
@@ -103,7 +102,7 @@ test('Codex repeated external client ID is a distinct execution, not a false ded
 });
 
 for (const model of [undefined, 'gpt-6-astra']) {
-  test(`Codex explicit failed terminal remains failed (${model ?? 'default model'})`, executableFixture, async (t) => {
+  test(`Codex explicit failed terminal remains failed (${model ?? 'default model'})`, async (t) => {
     const session = await codex(t, model);
     send(session, { type: 'prompt', text: 'fail-turn', client_message_ids: ['failed'] });
     await waitForOutput(session, isOperation('failed', 'failed'), 'provider failure');
@@ -113,7 +112,7 @@ for (const model of [undefined, 'gpt-6-astra']) {
 }
 
 for (const text of ['exhausted', 'exit-error']) {
-  test(`Codex ${text} does not fabricate a completed input`, executableFixture, async (t) => {
+  test(`Codex ${text} does not fabricate a completed input`, async (t) => {
     const session = await codex(t);
     send(session, { type: 'prompt', text, client_message_ids: ['unknown'] });
     await waitForOutput(session, isOperation('unknown', 'unknown'), 'uncertain stream exit');
@@ -121,7 +120,7 @@ for (const text of ['exhausted', 'exit-error']) {
   });
 }
 
-test('Codex runtime stop distinguishes an active unknown from never-dispatched queued input', executableFixture, async (t) => {
+test('Codex runtime stop distinguishes an active unknown from never-dispatched queued input', async (t) => {
   const session = await codex(t);
   send(session, { type: 'prompt', text: 'slow first', client_message_ids: ['active'] });
   await waitForOutput(session, isOperation('active', 'started'), 'active input');

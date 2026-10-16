@@ -292,6 +292,13 @@ for line in sys.stdin:
         .unwrap();
         let process =
             Arc::new(GatewayProcess::spawn(python, &host, &root, &root, json!({})).unwrap());
+        // Observe the stdout reader's startup event before starting the blocking request.
+        // The host's later file marker alone does not synchronize with that reader thread.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process.snapshot()["state"] != "running" && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process.snapshot()["state"], "running", "host must start");
         let pending = process.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let worker =
