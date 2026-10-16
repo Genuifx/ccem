@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { getCcemAgentHome } from '@ccem/core';
 
 const DEFAULT_CONFIG_SOURCE = 'ccem';
 const STATE_DB_FILE_NAME = 'state.sqlite';
@@ -338,7 +339,7 @@ function schemaSql(): string {
 }
 
 function discoverClaudeJsonlPath(projectDir: string, startedAtMs: number): string | null {
-  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const projectsDir = path.join(getCcemAgentHome('claude'), 'projects');
   const earliestModifiedAt = startedAtMs - 15_000;
 
   for (const key of projectDirKeys(projectDir)) {

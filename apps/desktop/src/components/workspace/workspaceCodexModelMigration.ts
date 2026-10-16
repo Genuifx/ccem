@@ -12,9 +12,11 @@ interface CodexModelMigrationGateOptions {
   provider: NativeProvider;
   envName: string;
   workingDir: string;
+  codexIsolated?: boolean | null;
   preflight: (
     envName: string,
     workingDir: string,
+    codexIsolated?: boolean | null,
   ) => Promise<CodexModelMigrationPreflightResult>;
   confirm: (warning: CodexModelMigrationWarning) => Promise<boolean>;
   acknowledgedWarnings?: Set<string>;
@@ -77,9 +79,10 @@ async function readCodexModelMigrationPreflight(
   preflight: CodexModelMigrationGateOptions['preflight'],
   envName: string,
   workingDir: string,
+  codexIsolated?: boolean | null,
 ): Promise<CodexModelMigrationPreflightResult | null> {
   try {
-    return await preflight(envName, workingDir);
+    return await preflight(envName, workingDir, codexIsolated);
   } catch {
     return null;
   }
@@ -96,6 +99,7 @@ export async function runCodexModelMigrationGate({
   provider,
   envName,
   workingDir,
+  codexIsolated,
   preflight,
   confirm,
   acknowledgedWarnings,
@@ -104,7 +108,7 @@ export async function runCodexModelMigrationGate({
     return { allowed: true };
   }
 
-  let result = await readCodexModelMigrationPreflight(preflight, envName, workingDir);
+  let result = await readCodexModelMigrationPreflight(preflight, envName, workingDir, codexIsolated);
   while (result && isCodexModelMigrationWarning(result)) {
     const warningKey = codexModelMigrationWarningKey(workingDir, result);
     if (acknowledgedWarnings?.has(warningKey)) {
@@ -125,6 +129,7 @@ export async function runCodexModelMigrationGate({
       preflight,
       envName,
       workingDir,
+      codexIsolated,
     );
     if (!verifiedResult || !isCodexModelMigrationWarning(verifiedResult)) {
       return { allowed: true };

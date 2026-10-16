@@ -1,6 +1,7 @@
 import fs from 'fs';
 import chalk from 'chalk';
 import { spawn } from 'child_process';
+import { buildIsolatedAgentEnv } from '@ccem/core';
 import {
   getGlobalClaudeConfigPath,
   getGlobalClaudeSettingsPath,
@@ -37,6 +38,7 @@ const setupOnboarding = (): boolean => {
   const configPath = getGlobalClaudeConfigPath();
 
   try {
+    ensureGlobalClaudeDir();
     const config = readJsonFile(configPath);
 
     if (config.hasCompletedOnboarding === true) {
@@ -115,6 +117,7 @@ const setupMcpTool = (): Promise<boolean> => {
       '--scope', 'user'
     ], {
       stdio: 'pipe',
+      env: buildIsolatedAgentEnv(),
       shell: true
     });
 
@@ -158,7 +161,7 @@ const setupMcpTool = (): Promise<boolean> => {
  * 执行完整的 setup init 流程
  */
 export const runSetupInit = async (options: { chrome?: boolean } = {}): Promise<void> => {
-  console.log(chalk.bold('\n🔧 Claude Code 初始化设置\n'));
+  console.log(chalk.bold('\n🔧 CCEM Claude Code 初始化设置\n'));
 
   // 步骤 1
   console.log(chalk.cyan('1. 设置 onboarding 状态'));

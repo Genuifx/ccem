@@ -29,8 +29,8 @@ function isEffortLevel(value: string | null | undefined): value is EffortLevel {
   );
 }
 
-function sessionPreferenceKey(session: Pick<HistorySessionItem, 'id' | 'source'>): string {
-  return `${session.source}:${session.id}`;
+function sessionPreferenceKey(session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>): string {
+  return `${session.source}:${session.source === 'codex' && session.codexIsolated ? 'isolated:' : ''}${session.id}`;
 }
 
 export function normalizeEffortForProvider(

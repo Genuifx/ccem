@@ -1,6 +1,6 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { getCcemAgentHome } from '../../core/src/agent-home';
 
 export interface CodexContextUsageSnapshot {
   usedTokens: number;
@@ -82,7 +82,7 @@ export function buildCodexContextUsageFromTokenCount(
 }
 
 export function resolveCodexSessionsRoot(env: Record<string, string | undefined> = process.env) {
-  const codexHome = env.CODEX_HOME?.trim() || path.join(os.homedir(), '.codex');
+  const codexHome = getCcemAgentHome('codex', env);
   return path.join(codexHome, 'sessions');
 }
 

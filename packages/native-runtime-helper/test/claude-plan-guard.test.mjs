@@ -54,13 +54,22 @@ test('allows Claude internal plan-file writes while in plan mode', async () => {
     hook_event_name: 'PreToolUse',
     tool_name: 'Write',
     tool_input: {
-      file_path: path.join(os.homedir(), '.claude/plans/example.md'),
+      file_path: path.join(os.homedir(), '.ccem/agents/claude/plans/example.md'),
     },
     tool_use_id: 'tool-plan-file',
   });
 
   assert.equal(result.continue, true);
   assert.equal(result.hookSpecificOutput, undefined);
+});
+
+test('allows the configured CCEM plans directory and blocks the official plans directory', async () => {
+  const { buildClaudePlanModePreToolUseHook } = await importClaudePlanGuardModule();
+  const hook = buildClaudePlanModePreToolUseHook(() => true, '/tmp/ccem-isolated/claude');
+  const write = (file_path) => hook({ hook_event_name: 'PreToolUse', tool_name: 'Write', tool_input: { file_path } });
+  assert.equal((await write('/tmp/ccem-isolated/claude/plans/plan.md')).hookSpecificOutput, undefined);
+  assert.equal((await write(path.join(os.homedir(), '.claude/plans/plan.md'))).hookSpecificOutput?.permissionDecision, 'deny');
+  assert.equal((await write('/tmp/ccem-isolated/claude/plans/../../outside.md')).hookSpecificOutput?.permissionDecision, 'deny');
 });
 
 test('allows delegated Agent tools while Claude runtime is still in plan mode', async () => {

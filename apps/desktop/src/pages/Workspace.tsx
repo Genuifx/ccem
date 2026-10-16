@@ -354,6 +354,9 @@ function nativeSessionMatchesHistorySession(
   if (nativeSession.provider !== session.source) {
     return false;
   }
+  if (session.source === 'codex' && Boolean(nativeSession.codex_isolated) !== Boolean(session.codexIsolated)) {
+    return false;
+  }
   if (
     normalizeHistoryRouteProject(nativeSession.project_dir)
     !== normalizeHistoryRouteProject(session.project)
@@ -1377,7 +1380,7 @@ export function Workspace({
         continue;
       }
 
-      const key = `${entry.session.provider}:${providerSessionId}:${generatedTitle}`;
+      const key = `${entry.session.runtime_id}:${providerSessionId}:${generatedTitle}`;
       if (persistedGeneratedTitleKeysRef.current.has(key)) {
         continue;
       }
@@ -1487,7 +1490,7 @@ export function Workspace({
     return sessions.find((session) => toSessionKey(session) === selectedKey) ?? null;
   }, [selectedKey, sessions]);
   const historyAnnotationSessionKey = selectedSession
-    ? `history:${selectedSession.source}:${selectedSession.id}`
+    ? `history:${toSessionKey(selectedSession)}`
     : null;
   const historyAnnotations = useWorkspaceAnnotations(historyAnnotationSessionKey);
 
@@ -1848,6 +1851,7 @@ export function Workspace({
       const { messages: historyMessages } = await fetchConversationDetail({
         id: session.provider_session_id,
         source: session.provider,
+        codexIsolated: session.codex_isolated ?? false,
       });
       // The persisted seed boundary remains authoritative even when a freshly
       // restarted backend has not repopulated `last_event_seq` yet. Bypassing
@@ -1998,7 +2002,7 @@ export function Workspace({
 
     return {
       runtime_id: workspaceMode === 'history' && selectedSession
-        ? `history:${selectedSession.source}:${selectedSession.id}`
+        ? `history:${toSessionKey(selectedSession)}`
         : 'compose',
       provider,
       transport: 'native_sdk',
@@ -2159,10 +2163,16 @@ export function Workspace({
     : workspaceMode === 'live' && activeLiveEntry
       ? activeLiveEntry.session.provider
       : composeProvider;
+  const skillsCodexIsolated = workspaceMode === 'history' && selectedSession
+    ? selectedSession.source === 'codex' ? selectedSession.codexIsolated ?? false : null
+    : workspaceMode === 'live' && activeLiveEntry
+      ? activeLiveEntry.session.provider === 'codex' ? activeLiveEntry.session.codex_isolated ?? false : null
+      : null;
   const skillsContext = useMemo(() => ({
     workingDir: skillsWorkingDir,
     provider: skillsProvider,
-  }), [skillsWorkingDir, skillsProvider]);
+    codexIsolated: skillsCodexIsolated,
+  }), [skillsWorkingDir, skillsProvider, skillsCodexIsolated]);
 
   useEffect(() => {
     if (!browserWorkspaceReady) return;
@@ -2191,20 +2201,17 @@ export function Workspace({
     void loadWorkspaceSkills({
       workingDir: skillsContext.workingDir,
       provider: skillsContext.provider,
+      codexIsolated: skillsContext.codexIsolated,
     })
       .then((skills) => {
         if (cancelled) {
           return;
         }
-        if (skills.length > 0) {
-          setWorkspaceInstalledSkills(skills);
-          return;
-        }
-        setWorkspaceInstalledSkills(installedSkills);
+        setWorkspaceInstalledSkills(skills);
       })
       .catch(() => {
         if (!cancelled) {
-          setWorkspaceInstalledSkills(installedSkills);
+          setWorkspaceInstalledSkills([]);
         }
       });
 
@@ -2218,6 +2225,7 @@ export function Workspace({
     void loadWorkspaceCommands({
       workingDir: skillsContext.workingDir,
       provider: skillsContext.provider,
+      codexIsolated: skillsContext.codexIsolated,
     })
       .then((commands) => {
         if (!cancelled) {
@@ -2233,17 +2241,17 @@ export function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [loadWorkspaceCommands, skillsContext]);
+  }, [installedSkills, loadWorkspaceCommands, skillsContext]);
 
   const refreshWorkspaceInstalledSkills = useCallback(async () => {
     const skills = await loadWorkspaceSkills({
       workingDir: skillsContext.workingDir,
       provider: skillsContext.provider,
+      codexIsolated: skillsContext.codexIsolated,
     });
-    const nextSkills = skills.length > 0 ? skills : installedSkills;
-    setWorkspaceInstalledSkills(nextSkills);
-    return nextSkills;
-  }, [installedSkills, loadWorkspaceSkills, skillsContext]);
+    setWorkspaceInstalledSkills(skills);
+    return skills;
+  }, [loadWorkspaceSkills, skillsContext]);
 
   const handleSelect = useCallback(
     async (
@@ -3096,6 +3104,7 @@ export function Workspace({
         provider,
         envName: historyEnv,
         workingDir: selectedSession.project,
+        codexIsolated: provider === 'codex' ? selectedSession.codexIsolated ?? false : null,
         preflight: preflightCodexModelMigration,
         confirm: requestCodexModelMigrationDecision,
         acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
@@ -3112,6 +3121,7 @@ export function Workspace({
             initialImages: images.length > 0 ? images : undefined,
             initialAnnotations: payload?.annotations,
             providerSessionId: selectedSession.id,
+            codexIsolated: provider === 'codex' ? selectedSession.codexIsolated ?? false : null,
             effort: normalizeEffortForProvider(historyEffort, provider),
             seedBoundaryMessageCount: messages.length,
             routerLaunchDraft,
@@ -3717,6 +3727,8 @@ export function Workspace({
                             selectedSession.id,
                             historyProvider as LaunchClient,
                             historyEnv,
+                            undefined,
+                            historyProvider === 'codex' ? selectedSession.codexIsolated ?? false : null,
                           )
                             .then(() => toast.success(t('workspace.nativeHandoffDone')))
                             .catch(showWorkspaceTerminalLaunchError);

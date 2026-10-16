@@ -8,7 +8,7 @@ import type {
   WorkspaceOverviewSnapshot,
   WorkspaceOverviewSnapshotPayload,
 } from './types';
-import { isResumableHistorySource } from './types';
+import { isResumableHistorySource, toSessionKey } from './types';
 
 const HISTORY_CACHE_TTL_MS = 60_000;
 
@@ -73,6 +73,7 @@ interface FetchHistorySessionsOptions {
 
 const historySessionCache = new Map<string, HistorySessionCacheEntry>();
 const workspaceOverviewCache = new Map<string, WorkspaceOverviewCacheEntry>();
+let historyCacheGeneration = 0;
 
 function historySessionCacheKey(
   sourceFilter: HistorySourceFilter,
@@ -117,7 +118,7 @@ export function normalizeWorkspaceOverviewSnapshot(
   const sessions = normalizeHistorySessions(data.sessions).filter(
     (session) => isResumableHistorySource(session.source),
   );
-  const sessionByKey = new Map(sessions.map((session) => [`${session.source}:${session.id}`, session]));
+  const sessionByKey = new Map(sessions.map((session) => [toSessionKey(session), session]));
   const projectNodes = data.projectNodes.map((node) => ({
     project: node.project,
     projectName: node.projectName,
@@ -129,7 +130,7 @@ export function normalizeWorkspaceOverviewSnapshot(
       : normalizeHistorySessions(node.sessions ?? [])
           .filter((session) => isResumableHistorySource(session.source))
           .map((session) =>
-            sessionByKey.get(`${session.source}:${session.id}`) ?? session
+            sessionByKey.get(toSessionKey(session)) ?? session
           ),
   }));
 
@@ -178,6 +179,7 @@ export async function fetchHistorySessionsWithDiagnostics(
 ): Promise<HistoryFetchResult> {
   const cacheKey = historySessionCacheKey(sourceFilter, options);
   const cached = historySessionCache.get(cacheKey);
+  const generation = historyCacheGeneration;
 
   if (!force && cached?.data && isHistoryCacheFresh(sourceFilter, options)) {
     return { sessions: cached.data, diagnostics: cached.diagnostics };
@@ -194,6 +196,7 @@ export async function fetchHistorySessionsWithDiagnostics(
     .then((result) => {
       const normalized = normalizeHistorySessions(result.sessions);
       const diagnostics = result.diagnostics ?? [];
+      if (generation !== historyCacheGeneration) return { sessions: normalized, diagnostics };
       historySessionCache.set(cacheKey, {
         data: normalized,
         diagnostics,
@@ -202,6 +205,7 @@ export async function fetchHistorySessionsWithDiagnostics(
       return { sessions: normalized, diagnostics };
     })
     .catch((err) => {
+      if (generation !== historyCacheGeneration) throw err;
       if (cached?.data) {
         historySessionCache.set(cacheKey, cached);
       } else {
@@ -227,6 +231,7 @@ export async function fetchWorkspaceOverviewSnapshot(
   const options = { limit };
   const cacheKey = historySessionCacheKey('all', options);
   const cached = workspaceOverviewCache.get(cacheKey);
+  const generation = historyCacheGeneration;
 
   if (!force && cached?.data && Date.now() - cached.fetchedAt < HISTORY_CACHE_TTL_MS) {
     return cached.data;
@@ -241,6 +246,7 @@ export async function fetchWorkspaceOverviewSnapshot(
   })
     .then(normalizeWorkspaceOverviewSnapshot)
     .then((snapshot) => {
+      if (generation !== historyCacheGeneration) return snapshot;
       workspaceOverviewCache.set(cacheKey, {
         data: snapshot,
         fetchedAt: Date.now(),
@@ -253,6 +259,7 @@ export async function fetchWorkspaceOverviewSnapshot(
       return snapshot;
     })
     .catch((err) => {
+      if (generation !== historyCacheGeneration) throw err;
       if (cached?.data) {
         workspaceOverviewCache.set(cacheKey, cached);
       } else {
@@ -300,10 +307,11 @@ export async function searchHistorySessionsWithDiagnostics(
   };
 }
 
-export async function fetchConversationDetail(session: Pick<HistorySessionItem, 'id' | 'source'>) {
+export async function fetchConversationDetail(session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>) {
   const detail = await invoke<ConversationDetailPayload>('get_conversation_detail', {
     sessionId: session.id,
     source: session.source,
+    codexIsolated: session.source === 'codex' ? session.codexIsolated ?? false : null,
   });
   const messages = detail.messages as ConversationMessageList;
   if (detail.toolResultsMerged) {
@@ -323,6 +331,7 @@ export function primeHistoryPage() {
 }
 
 export function invalidateHistoryCache() {
+  historyCacheGeneration += 1;
   historySessionCache.clear();
   workspaceOverviewCache.clear();
 }

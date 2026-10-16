@@ -112,6 +112,11 @@ impl TmuxManager {
         env_vars: &HashMap<String, String>,
         working_dir: &Path,
     ) -> Result<TmuxWindowInfo, String> {
+        let mut prepared_env = env_vars.clone();
+        if matches!(client, "claude" | "codex") {
+            crate::agent_profile::prepare_env(client, &mut prepared_env)?;
+        }
+        let env_vars = &prepared_env;
         Self::check_tmux_installed()?;
         let session_name = session_name_for_runtime(runtime_id, &self.session_prefix);
         let window_name = DEFAULT_TMUX_WINDOW.to_string();
@@ -1526,6 +1531,8 @@ fn build_tmux_launch_spec(
     target: &str,
     tmux_binary: &str,
 ) -> TmuxLaunchSpec {
+    let mut env_vars = env_vars.clone();
+    crate::agent_profile::apply_env(client, &mut env_vars);
     let client_binary = match client {
         "codex" => resolve_codex_path().unwrap_or_else(|| "codex".to_string()),
         "opencode" => resolve_opencode_path().unwrap_or_else(|| "opencode".to_string()),
@@ -1533,19 +1540,32 @@ fn build_tmux_launch_spec(
     };
     let mut environment = vec![format!("PATH={}", get_user_path())];
     let mut environment_keys = vec!["PATH".to_string()];
+    let mut cleared_keys = Vec::new();
 
     let mut env_entries = env_vars.iter().collect::<Vec<_>>();
     env_entries.sort_by(|left, right| left.0.cmp(right.0));
     for (key, value) in env_entries {
+        if value.is_empty() {
+            cleared_keys.push(shell_quote(key));
+            continue;
+        }
         environment.push(format!("{}={}", key, value));
         environment_keys.push(key.clone());
     }
 
     let mut command_parts = vec![shell_quote(&client_binary)];
+    if client == "codex" && crate::agent_profile::codex_isolated_for_env(&env_vars) {
+        command_parts.push("-c".to_string());
+        command_parts.push(shell_quote(&format!("sqlite_home={}", serde_json::to_string(&env_vars["CODEX_HOME"]).unwrap())));
+    }
     command_parts.extend(client_args.iter().map(|arg| shell_quote(arg)));
 
     let environment_loader = build_tmux_environment_loader(&environment_keys, target, tmux_binary);
-    let managed_env_keys = MANAGED_CLAUDE_ENV_KEYS.join(" ");
+    let mut managed_env_keys = MANAGED_CLAUDE_ENV_KEYS.join(" ");
+    if !cleared_keys.is_empty() {
+        managed_env_keys.push(' ');
+        managed_env_keys.push_str(&cleared_keys.join(" "));
+    }
 
     TmuxLaunchSpec {
         command: format!(
@@ -2685,6 +2705,17 @@ mod tests {
         );
         assert!(command.contains("exec "));
         assert!(command.contains("'resume' 'session-123'"));
+    }
+
+    #[test]
+    fn codex_tmux_launch_keeps_the_pinned_profile() {
+        for isolated in [false, true] {
+            let env = HashMap::from([("CCEM_CODEX_ISOLATED".into(), if isolated { "1" } else { "0" }.into())]);
+            let spec = build_tmux_launch_spec("codex", &["resume".into(), "session-123".into()], &env, "test:main", "tmux");
+            assert_eq!(spec.command.contains("sqlite_home="), isolated);
+            assert!(spec.environment.contains(&format!("CODEX_HOME={}", crate::agent_home::codex_home_for_mode(isolated).display())));
+            assert!(spec.environment.contains(&format!("CCEM_CODEX_ISOLATED={}", if isolated { "1" } else { "0" })));
+        }
     }
 
     #[test]

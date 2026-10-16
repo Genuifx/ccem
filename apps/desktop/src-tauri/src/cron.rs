@@ -863,7 +863,12 @@ fn build_cron_claude_command(
         .stderr(Stdio::piped());
 
     config::clear_managed_claude_env(&mut command);
-    command.envs(env_vars);
+    let mut env_vars = env_vars.clone();
+    crate::agent_profile::apply_env("claude", &mut env_vars);
+    for (key, value) in env_vars {
+        if value.is_empty() { command.env_remove(key); }
+        else { command.env(key, value); }
+    }
     command
 }
 
@@ -1055,7 +1060,9 @@ fn execute_task(
     let mut cmd =
         build_cron_claude_command(&task, &working_dir, &env_vars, &expanded_path, &tool_policy);
 
-    let (status_str, exit_code, stdout, stderr) = match cmd.spawn() {
+    let launch = crate::agent_home::ensure_agent_homes()
+        .map_err(std::io::Error::other).and_then(|_| cmd.spawn());
+    let (status_str, exit_code, stdout, stderr) = match launch {
         Ok(mut child) => {
             let stdout_reader = spawn_output_collector(child.stdout.take());
             let stderr_reader = spawn_output_collector(child.stderr.take());
@@ -1614,6 +1621,11 @@ fn get_user_path() -> String {
 #[tauri::command]
 pub fn generate_cron_task_stream(app: AppHandle, query: String) {
     thread::spawn(move || {
+        if let Err(error) = crate::agent_home::ensure_agent_homes() {
+            let _ = app.emit("cron-ai-stream", &serde_json::json!({"type":"error","error":error}).to_string());
+            let _ = app.emit("cron-ai-done", ());
+            return;
+        }
         let prompt = format!(
             "用户想创建一个定时任务: {}\n\n\
              请根据用户描述，生成一个 cron 任务配置。返回一个 JSON 对象（不要包含在 markdown 代码块中）：\n\

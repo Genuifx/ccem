@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { buildIsolatedAgentEnv, getCcemAgentEnv, getCcemAgentHome } from '../../core/src/agent-home';
 import { buildClaudeQueryEnv } from './claudeEnv';
 import { generateWorkspaceTitle } from './workspaceTitleQuery';
 import { resolveClaudeInterruptTimeoutMs } from './claudeInterruptTimeout';
@@ -3004,6 +3005,7 @@ function buildClaudeQueryOptions(handoffOwner?: { snapshot: ClaudeQuerySnapshot 
     hooks: mergeClaudeRouteHooks(
       buildClaudePlanModeHooks(
         () => initCommand?.provider === 'claude' && initCommand.perm_mode === 'plan',
+        env.CLAUDE_CONFIG_DIR,
       ),
       initCommand.router,
     ),
@@ -4232,14 +4234,13 @@ async function ensureCodexThread() {
   }
 
   if (!codexClient) {
+    const env = buildIsolatedAgentEnv(process.env, initCommand.env_vars);
     codexClient = new Codex({
       codexPathOverride: initCommand.codex_path ?? undefined,
       baseUrl: initCommand.codex_base_url ?? undefined,
       apiKey: initCommand.codex_api_key ?? undefined,
-      env: {
-        ...process.env,
-        ...initCommand.env_vars,
-      },
+      env,
+      ...(env.CCEM_CODEX_ISOLATED === '1' ? { config: { sqlite_home: env.CODEX_HOME } } : {}),
     });
   }
 
@@ -4270,7 +4271,7 @@ async function ensureCodexThread() {
 async function runCodexTurn(text: string, images: PromptImage[] | null | undefined, abortController: AbortController, operation?: InputOperation) {
   const thread = await ensureCodexThread();
   abortController.signal.throwIfAborted();
-  const codexHome = initCommand?.env_vars?.CODEX_HOME ?? process.env.CODEX_HOME;
+  const codexHome = getCcemAgentHome('codex');
   const usageBaseline = captureCodexUsageBaseline(currentProviderSessionId, codexHome);
 
   let input: import('@openai/codex-sdk').Input;
@@ -4668,6 +4669,8 @@ async function handleCommand(command: InputCommand) {
   }
 
   if (command.type === 'init') {
+    // Keep this helper's storage mode stable if preferences change while it is alive.
+    Object.assign(process.env, getCcemAgentEnv());
     if (command.model != null) {
       if (command.provider !== 'codex') {
         throw new Error('MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.');
@@ -4707,6 +4710,7 @@ async function handleCommand(command: InputCommand) {
     if (forkRequested) {
       const parentSessionId = command.provider_session_id!.trim();
       try {
+        // SDK filesystem helpers use the process roots pinned during initialization.
         const forked = await forkSession(parentSessionId, {
           upToMessageId: command.fork_at_message_id?.trim() || undefined,
           dir: command.working_dir,

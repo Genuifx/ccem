@@ -2,9 +2,9 @@
 //
 // Native JSONL scanner for Claude, Codex, OpenCode, and DSH usage.
 
-use crate::config;
 use crate::dsh_history;
 use crate::opencode;
+use crate::{agent_home, config};
 use chrono::{Datelike, Local, NaiveDate};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -704,9 +704,9 @@ struct JsonlDiscovery {
     codex_complete: bool,
 }
 
-fn discover_jsonl_files() -> JsonlDiscovery {
+fn discover_jsonl_files(codex_home: &Path) -> JsonlDiscovery {
     let (mut files, claude_complete) = discover_claude_jsonl_files();
-    let (codex_files, codex_complete) = discover_codex_jsonl_files();
+    let (codex_files, codex_complete) = discover_codex_jsonl_files(codex_home);
     files.extend(codex_files);
     JsonlDiscovery {
         files,
@@ -715,15 +715,10 @@ fn discover_jsonl_files() -> JsonlDiscovery {
     }
 }
 
-/// Scan ~/.claude/projects/*/*.jsonl
+/// Scan CCEM's independently persisted Claude transcripts.
 fn discover_claude_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
     let mut files = Vec::new();
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return (files, false),
-    };
-
-    let projects_dir = home.join(".claude").join("projects");
+    let projects_dir = agent_home::claude_home().join("projects");
     if !projects_dir.exists() {
         return (files, true);
     }
@@ -743,7 +738,7 @@ fn discover_claude_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
             }
         };
         let project_path = project_entry.path();
-        if !project_path.is_dir() {
+        if !project_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         // Depth-limited walk: main transcripts sit directly in the project
@@ -778,8 +773,14 @@ fn collect_claude_jsonl_dir(
             }
         };
         let path = entry.path();
-        let is_dir = path.is_dir();
-        if is_dir {
+        let Ok(file_type) = entry.file_type() else {
+            complete = false;
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             complete &= collect_claude_jsonl_dir(&path, depth + 1, max_depth, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(DiscoveredFile {
@@ -791,15 +792,10 @@ fn collect_claude_jsonl_dir(
     complete
 }
 
-/// Scan ~/.codex/sessions recursively for *.jsonl
-fn discover_codex_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
+/// Scan the Codex profile selected for this refresh.
+fn discover_codex_jsonl_files(codex_home: &Path) -> (Vec<DiscoveredFile>, bool) {
     let mut files = Vec::new();
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return (files, false),
-    };
-
-    let sessions_dir = home.join(".codex").join("sessions");
+    let sessions_dir = codex_home.join("sessions");
     if !sessions_dir.exists() {
         return (files, true);
     }
@@ -824,7 +820,14 @@ fn discover_codex_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
                 }
             };
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                complete = false;
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
@@ -1913,6 +1916,69 @@ fn should_write_usage_cache(
         || existing.global_rollup != next.global_rollup
 }
 
+/// A copied transcript is the same historical contribution at a new path.
+/// Retaining both paths would count its old turns twice. Prefer an existing
+/// isolated entry (which may include resumed turns), and leave old-only cache
+/// entries intact when log retention removed their source before migration.
+fn migrate_agent_cache_paths(
+    cache: &mut CacheFile,
+    user_home: &Path,
+    claude_home: &Path,
+    codex_home: &Path,
+) -> bool {
+    let roots = [
+        (
+            user_home.join(".claude/projects"),
+            claude_home.join("projects"),
+        ),
+        (
+            user_home.join(".codex/sessions"),
+            codex_home.join("sessions"),
+        ),
+    ];
+    remap_agent_cache_paths(cache, &roots)
+}
+
+fn remap_agent_cache_paths(cache: &mut CacheFile, roots: &[(PathBuf, PathBuf)]) -> bool {
+    let mut moves = Vec::new();
+    for old_key in cache.files.keys() {
+        for (source_root, target_root) in roots {
+            if source_root == target_root {
+                continue;
+            }
+            let Ok(relative) = Path::new(old_key).strip_prefix(source_root) else {
+                continue;
+            };
+            let target = target_root.join(relative);
+            // Preparation skips symlinks. A subsequently introduced link must
+            // not make a legacy entry appear to have an independent snapshot.
+            let is_regular = fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_file());
+            let is_inside = fs::canonicalize(&target)
+                .ok()
+                .zip(fs::canonicalize(target_root).ok())
+                .is_some_and(|(path, root)| path.starts_with(root));
+            if is_regular && is_inside {
+                moves.push((old_key.clone(), target.to_string_lossy().to_string()));
+            }
+        }
+    }
+    let changed = !moves.is_empty();
+    for (old_key, new_key) in moves {
+        if let Some(mut entry) = cache.files.remove(&old_key) {
+            // A profile switch can select a diverged snapshot with identical
+            // size and mtime. Retain totals until refresh, but reparse that
+            // destination instead of carrying another profile's cursor.
+            entry.meta.mtime = -1.0;
+            entry.append_anchor = None;
+            cache.files.entry(new_key).or_insert(entry);
+        }
+    }
+    if changed {
+        cache.global_rollup = CacheRollup::from_file_entries(&cache.files);
+    }
+    changed
+}
+
 // ============================================================================
 // Orchestration: incremental refresh
 // ============================================================================
@@ -1944,10 +2010,34 @@ fn refresh_usage_cache() -> CacheFile {
 }
 
 fn refresh_usage_cache_locked() -> CacheFile {
+    if let Err(error) = agent_home::ensure_agent_homes() {
+        eprintln!("CCEM agent history migration failed; retaining previous usage totals: {error}");
+        return read_usage_cache();
+    }
     let prices = load_model_prices();
-    let discovery = discover_jsonl_files();
+    let codex_isolated = agent_home::codex_isolated();
+    let discovery = discover_jsonl_files(&agent_home::codex_home_for_mode(codex_isolated));
     let desktop_cache_exists = usage_cache_path().exists();
-    let existing_cache = read_usage_cache();
+    let mut existing_cache = read_usage_cache();
+    let remapped = dirs::home_dir().is_some_and(|home| {
+        let shared = agent_home::codex_home_for_mode(false).join("sessions");
+        let isolated = agent_home::isolated_codex_home().join("sessions");
+        let (inactive, active) = if codex_isolated {
+            (shared, isolated)
+        } else {
+            (isolated, shared)
+        };
+        remap_agent_cache_paths(
+            &mut existing_cache,
+            &[
+                (
+                    home.join(".claude/projects"),
+                    agent_home::claude_home().join("projects"),
+                ),
+                (inactive, active),
+            ],
+        )
+    });
 
     let mut new_cache = CacheFile {
         version: USAGE_CACHE_VERSION,
@@ -2012,7 +2102,7 @@ fn refresh_usage_cache_locked() -> CacheFile {
 
     new_cache.global_rollup = update_global_rollup(&existing_cache, &new_cache.files).0;
 
-    if should_write_usage_cache(desktop_cache_exists, &existing_cache, &new_cache) {
+    if remapped || should_write_usage_cache(desktop_cache_exists, &existing_cache, &new_cache) {
         write_usage_cache(&new_cache);
     }
     new_cache
@@ -2826,10 +2916,18 @@ fn trim_model_breakdown_to_visible_window(
 // ============================================================================
 
 fn detect_source_from_path(path: &str) -> Option<&'static str> {
-    if path.contains("/.claude/projects/") || path.contains("\\.claude\\projects\\") {
+    if Path::new(path).starts_with(agent_home::claude_home().join("projects"))
+        || path.contains("/.claude/projects/")
+        || path.contains("\\.claude\\projects\\")
+    {
         return Some(SOURCE_CLAUDE);
     }
-    if path.contains("/.codex/sessions/") || path.contains("\\.codex\\sessions\\") {
+    if Path::new(path).starts_with(agent_home::codex_home().join("sessions"))
+        || Path::new(path).starts_with(agent_home::codex_home_for_mode(false).join("sessions"))
+        || Path::new(path).starts_with(agent_home::isolated_codex_home().join("sessions"))
+        || path.contains("/.codex/sessions/")
+        || path.contains("\\.codex\\sessions\\")
+    {
         return Some(SOURCE_CODEX);
     }
     if path.starts_with("opencode://") {
@@ -3215,15 +3313,14 @@ mod tests {
         parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
         parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
         refresh_discovered_entry, reset_model_price_lookup_count, retain_incomplete_source_entries,
-        retain_unseen_local_log_entries,
-        shared_usage_cache, should_reuse_usage_stats, should_write_usage_cache, snapshot_is_fresh,
-        update_global_rollup, usage_cache_path, write_json_atomic, write_usage_summary_to,
-        CacheEntry, CacheFile, CacheFileEntry, CacheMeta, CacheRollup, CacheRollupBucket,
-        CacheStats, CacheUsage, ClaudeParseState, CodexParseState, DiscoveredFile,
-        ModelBreakdownGranularity, ModelPrice, TokenUsageWithCost, UsageSource, UsageStats,
-        ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME, SOURCE_CLAUDE, SOURCE_CODEX,
-        SOURCE_DSH, SOURCE_OPENCODE, TEST_SNAPSHOT_REFRESH, USAGE_CACHE_VERSION,
-        USAGE_SUMMARY_VERSION,
+        retain_unseen_local_log_entries, shared_usage_cache, should_reuse_usage_stats,
+        should_write_usage_cache, snapshot_is_fresh, update_global_rollup, usage_cache_path,
+        write_json_atomic, write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry,
+        CacheMeta, CacheRollup, CacheRollupBucket, CacheStats, CacheUsage, ClaudeParseState,
+        CodexParseState, DiscoveredFile, ModelBreakdownGranularity, ModelPrice, TokenUsageWithCost,
+        UsageSource, UsageStats, ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME,
+        SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_DSH, SOURCE_OPENCODE, TEST_SNAPSHOT_REFRESH,
+        USAGE_CACHE_VERSION, USAGE_SUMMARY_VERSION,
     };
     use chrono::{Datelike, Local, TimeZone};
     use std::collections::HashMap;
@@ -3753,6 +3850,197 @@ mod tests {
             meta_of(&discovered.path),
             &default_prices(),
         )
+    }
+
+    #[test]
+    fn agent_snapshot_cache_remaps_without_double_counting_and_preserves_retired_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("user");
+        let claude = home.join(".ccem/agents/claude");
+        let codex = home.join(".ccem/agents/codex");
+        let old = home.join(".claude/projects/p/session.jsonl");
+        let new = claude.join("projects/p/session.jsonl");
+        let retired = home.join(".claude/projects/p/retired.jsonl");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        let original = format!("{}\n", claude_line("2026-03-01T10:00:00Z", 100, 10));
+        fs::write(&old, &original).unwrap();
+        fs::write(
+            &new,
+            format!("{original}{}\n", claude_line("2026-03-01T11:00:00Z", 50, 5)),
+        )
+        .unwrap();
+        fs::write(
+            &retired,
+            format!("{}\n", claude_line("2026-02-01T10:00:00Z", 25, 2)),
+        )
+        .unwrap();
+        let files = HashMap::from([
+            (
+                old.to_string_lossy().to_string(),
+                refresh_round(None, &discovered_at(&old, UsageSource::Claude)),
+            ),
+            (
+                new.to_string_lossy().to_string(),
+                refresh_round(None, &discovered_at(&new, UsageSource::Claude)),
+            ),
+            (
+                retired.to_string_lossy().to_string(),
+                refresh_round(None, &discovered_at(&retired, UsageSource::Claude)),
+            ),
+        ]);
+        fs::remove_file(&retired).unwrap();
+        let mut cache = CacheFile {
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files,
+            ..CacheFile::default()
+        };
+        assert!(super::migrate_agent_cache_paths(
+            &mut cache, &home, &claude, &codex
+        ));
+        assert_eq!(cache.files.len(), 2);
+        assert!(!cache.files.contains_key(&old.to_string_lossy().to_string()));
+        assert!(cache
+            .files
+            .contains_key(&retired.to_string_lossy().to_string()));
+        assert_eq!(
+            aggregate_cache(&cache, None, &default_prices())
+                .total
+                .input_tokens,
+            175
+        );
+        assert!(!super::migrate_agent_cache_paths(
+            &mut cache, &home, &claude, &codex
+        ));
+        assert_eq!(fs::read_to_string(&old).unwrap(), original);
+    }
+
+    #[test]
+    fn agent_snapshot_cache_counts_only_isolated_codex_followups() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("user");
+        let claude = home.join(".ccem/agents/claude");
+        let codex = home.join(".ccem/agents/codex");
+        let old = home.join(".codex/sessions/rollout.jsonl");
+        let new = codex.join("sessions/rollout.jsonl");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        let initial = format!(
+            "{}\n{}\n",
+            codex_context_line("gpt-5.3-codex"),
+            codex_count_line("2026-03-01T10:00:00Z", 100, 0, 10, 0)
+        );
+        fs::write(&old, &initial).unwrap();
+        let old_entry = refresh_round(None, &discovered_at(&old, UsageSource::Codex));
+        fs::copy(&old, &new).unwrap();
+        let files = HashMap::from([(old.to_string_lossy().to_string(), old_entry)]);
+        let mut cache = CacheFile {
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files,
+            ..CacheFile::default()
+        };
+        assert!(super::migrate_agent_cache_paths(
+            &mut cache, &home, &claude, &codex
+        ));
+
+        // Activity in the official app after the snapshot is deliberately not
+        // part of the isolated transcript or its incremental accounting.
+        fs::write(
+            &old,
+            format!(
+                "{initial}{}\n",
+                codex_count_line("2026-03-01T11:00:00Z", 900, 0, 90, 0)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &new,
+            format!(
+                "{initial}{}\n",
+                codex_count_line("2026-03-01T11:00:00Z", 150, 0, 15, 0)
+            ),
+        )
+        .unwrap();
+        let new_key = new.to_string_lossy().to_string();
+        let updated = refresh_round(
+            cache.files.get(&new_key),
+            &discovered_at(&new, UsageSource::Codex),
+        );
+        cache.files.insert(new_key, updated);
+        cache.global_rollup = CacheRollup::from_file_entries(&cache.files);
+        assert_eq!(
+            aggregate_cache(&cache, Some(SOURCE_CODEX), &default_prices())
+                .total
+                .input_tokens,
+            150
+        );
+        assert_eq!(cache.files.len(), 1);
+    }
+
+    #[test]
+    fn codex_profile_switch_reparses_diverged_snapshot_without_double_counting() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared_root = temp.path().join("shared/sessions");
+        let isolated_root = temp.path().join("isolated/sessions");
+        let shared = shared_root.join("rollout.jsonl");
+        let isolated = isolated_root.join("rollout.jsonl");
+        fs::create_dir_all(&shared_root).unwrap();
+        fs::create_dir_all(&isolated_root).unwrap();
+        for (path, input) in [(&shared, 100), (&isolated, 900)] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    codex_context_line("gpt-5.3-codex"),
+                    codex_count_line("2026-03-01T10:00:00Z", input, 0, 10, 0)
+                ),
+            )
+            .unwrap();
+        }
+        let modified = fs::metadata(&shared).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&isolated)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let files = HashMap::from([(
+            shared.to_string_lossy().to_string(),
+            refresh_round(None, &discovered_at(&shared, UsageSource::Codex)),
+        )]);
+        let mut cache = CacheFile {
+            global_rollup: CacheRollup::from_file_entries(&files),
+            files,
+            ..CacheFile::default()
+        };
+        for (source, target, path, expected) in [
+            (&shared_root, &isolated_root, &isolated, 900),
+            (&isolated_root, &shared_root, &shared, 100),
+            (&shared_root, &isolated_root, &isolated, 900),
+        ] {
+            assert!(super::remap_agent_cache_paths(
+                &mut cache,
+                &[(source.clone(), target.clone())]
+            ));
+            let key = path.to_string_lossy().to_string();
+            let entry = refresh_round(
+                cache.files.get(&key),
+                &discovered_at(path, UsageSource::Codex),
+            );
+            cache.files.insert(key, entry);
+            cache.global_rollup = CacheRollup::from_file_entries(&cache.files);
+            assert_eq!(cache.files.len(), 1);
+            assert_eq!(
+                aggregate_cache(&cache, Some(SOURCE_CODEX), &default_prices())
+                    .total
+                    .input_tokens,
+                expected
+            );
+        }
+        assert!(!super::remap_agent_cache_paths(
+            &mut cache,
+            &[(isolated_root.clone(), isolated_root)]
+        ));
     }
 
     /// Independent full-parse reference for shadow assertions.
@@ -4757,7 +5045,12 @@ mod tests {
         );
     }
 
-    fn local_log_entry(path: &str, timestamp: &str, source: &str, tokens: u64) -> (String, CacheFileEntry) {
+    fn local_log_entry(
+        path: &str,
+        timestamp: &str,
+        source: &str,
+        tokens: u64,
+    ) -> (String, CacheFileEntry) {
         let stats = CacheStats {
             entries: vec![CacheEntry {
                 timestamp: timestamp.to_string(),

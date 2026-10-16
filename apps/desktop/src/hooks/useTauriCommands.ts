@@ -112,6 +112,7 @@ interface TauriSession {
   id: string;
   pid?: number;
   client?: string;
+  codex_isolated?: boolean | null;
   env_name: string;
   config_source?: 'ccem' | 'native';
   perm_mode: string;
@@ -227,6 +228,7 @@ function toFrontendSession(tauriSession: TauriSession): Session {
   return {
     id: tauriSession.id,
     client: normalizeLaunchClient(tauriSession.client),
+    codexIsolated: tauriSession.codex_isolated ?? false,
     envName: tauriSession.env_name,
     configSource: tauriSession.config_source,
     workingDir: tauriSession.working_dir,
@@ -537,6 +539,7 @@ export function useTauriCommands() {
     resumeSessionId?: string | null;
     client?: LaunchClient;
     initialPrompt?: string | null;
+    codexIsolated?: boolean | null;
   } = {}): Promise<Session> => {
     setLoading(true);
     const launchTraceId = makeLaunchTraceId();
@@ -563,6 +566,7 @@ export function useTauriCommands() {
             resumeSessionId: options.resumeSessionId ?? null,
             client: options.client ?? 'claude',
             initialPrompt: options.initialPrompt ?? null,
+            codexIsolated: options.codexIsolated ?? null,
             launchTraceId,
           });
           return toFrontendSession(tauriSession);
@@ -637,6 +641,7 @@ export function useTauriCommands() {
     client: LaunchClient = 'claude',
     envName?: string,
     initialPrompt?: string,
+    codexIsolated?: boolean | null,
   ): Promise<Session> => {
     return createInteractiveSession({
       envName: envName ?? undefined,
@@ -644,6 +649,7 @@ export function useTauriCommands() {
       resumeSessionId: resumeSessionId ?? null,
       client,
       initialPrompt: initialPrompt ?? null,
+      codexIsolated: codexIsolated ?? null,
     });
   }, [createInteractiveSession]);
 
@@ -943,10 +949,12 @@ export function useTauriCommands() {
   const preflightCodexModelMigration = useCallback(async (
     envName: string,
     workingDir: string,
+    codexIsolated?: boolean | null,
   ): Promise<CodexModelMigrationPreflightResult> => {
     return invoke<CodexModelMigrationPreflightResult>('preflight_codex_model_migration', {
       envName,
       workingDir,
+      codexIsolated: codexIsolated ?? null,
     });
   }, []);
 
@@ -973,6 +981,7 @@ export function useTauriCommands() {
     routerLaunchDraft?: RouterLaunchDraft | null;
     resumeRouterFromRuntimeId?: string | null;
     codexMigrationProofToken?: string | null;
+    codexIsolated?: boolean | null;
   }): Promise<NativeSessionSummary> => {
     const { currentEnv, permissionMode, selectedWorkingDir } = getSessionDefaults();
     return invoke<NativeSessionSummary>('create_native_session', {
@@ -992,6 +1001,7 @@ export function useTauriCommands() {
       routerLaunchDraft: options.routerLaunchDraft ?? null,
       resumeRouterFromRuntimeId: options.resumeRouterFromRuntimeId ?? null,
       codexMigrationProofToken: options.codexMigrationProofToken ?? null,
+      codexIsolated: options.codexIsolated ?? null,
     });
   }, [getSessionDefaults]);
 
@@ -1221,11 +1231,13 @@ export function useTauriCommands() {
     sessionId: string,
     source: string,
     detailAgentId?: string | null,
+    codexIsolated?: boolean | null,
   ): Promise<SessionSubagentsPayload> => {
     return invoke<SessionSubagentsPayload>('get_session_subagents', {
       sessionId,
       source,
       detailAgentId: detailAgentId ?? null,
+      codexIsolated: source === 'codex' ? codexIsolated ?? false : null,
     });
   }, []);
 
@@ -1382,11 +1394,13 @@ export function useTauriCommands() {
   const loadWorkspaceSkills = useCallback(async (options: {
     workingDir?: string | null;
     provider?: string | null;
+    codexIsolated?: boolean | null;
   } = {}): Promise<InstalledSkill[]> => {
     try {
       return await invoke<InstalledSkill[]>('list_workspace_skills', {
         workingDir: options.workingDir ?? null,
         provider: options.provider ?? null,
+        codexIsolated: options.codexIsolated ?? null,
       });
     } catch (err) {
       console.error('Failed to load workspace skills:', err);
@@ -1397,11 +1411,13 @@ export function useTauriCommands() {
   const loadWorkspaceCommands = useCallback(async (options: {
     workingDir?: string | null;
     provider?: string | null;
+    codexIsolated?: boolean | null;
   } = {}): Promise<WorkspaceCommand[]> => {
     try {
       return await invoke<WorkspaceCommand[]>('list_workspace_commands', {
         workingDir: options.workingDir ?? null,
         provider: options.provider ?? null,
+        codexIsolated: options.codexIsolated ?? null,
       });
     } catch (err) {
       console.error('Failed to load workspace commands:', err);

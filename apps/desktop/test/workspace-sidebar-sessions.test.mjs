@@ -54,6 +54,20 @@ function historySession(overrides = {}) {
   };
 }
 
+test('shared and isolated Codex copies remain separate and select their own runtime', async () => {
+  const { buildWorkspaceSidebarSessions, liveSessionSidebarKey, findLiveEntryForSidebarSession } = await importWorkspaceSidebarSessions();
+  const shared = { session: nativeSession({ provider: 'codex', runtime_id: 'shared-runtime', provider_session_id: 'copied-id', codex_isolated: false }) };
+  const isolated = { session: nativeSession({ provider: 'codex', runtime_id: 'isolated-runtime', provider_session_id: 'copied-id', codex_isolated: true }) };
+  const history = historySession({ source: 'codex', id: 'copied-id', codexIsolated: true });
+  const rows = buildWorkspaceSidebarSessions([history], [shared, isolated]);
+  assert.equal(rows.length, 2);
+  assert.equal(liveSessionSidebarKey(shared), 'codex:copied-id');
+  assert.equal(liveSessionSidebarKey(isolated), 'codex:isolated:copied-id');
+  assert.equal(findLiveEntryForSidebarSession([shared, isolated], history), isolated);
+  assert.equal(findLiveEntryForSidebarSession([shared, isolated], { ...history, codexIsolated: false }), shared);
+  assert.equal(findLiveEntryForSidebarSession([shared], history), undefined);
+});
+
 test('retains workspace history session references when refresh data is unchanged', async () => {
   const { retainStableHistorySessions } = await importWorkspaceSidebarSessions();
   const previous = [

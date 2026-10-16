@@ -28,6 +28,7 @@ export function areNativeSessionSummariesEqual(
 ) {
   return previous.runtime_id === next.runtime_id
     && previous.provider === next.provider
+    && previous.codex_isolated === next.codex_isolated
     && previous.transport === next.transport
     && previous.provider_session_id === next.provider_session_id
     && previous.display_title === next.display_title

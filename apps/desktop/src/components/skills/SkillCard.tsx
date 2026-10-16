@@ -30,6 +30,7 @@ interface InstalledCardProps {
     agents?: string[];
     source?: string;
     version?: string;
+    managedByCcem?: boolean;
   };
   isExpanded: boolean;
   onToggleExpand: () => void;
@@ -292,7 +293,7 @@ function InstalledCard({
       </div>
 
       {/* Action footer */}
-      <div className="px-5 pb-4 flex items-center justify-end">
+      {skill.managedByCcem && <div className="px-5 pb-4 flex items-center justify-end">
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -308,7 +309,7 @@ function InstalledCard({
           )}
           {isUninstalling ? t('skills.uninstalling') : t('skills.uninstall')}
         </button>
-      </div>
+      </div>}
     </div>
   );
 }

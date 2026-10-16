@@ -9,7 +9,8 @@ Source: `apps/desktop/src-tauri/src/`
 | `main.rs` | ~2600 | All `#[tauri::command]` handlers + app bootstrap, 90+ commands |
 | `runtime.rs` | ~2400 | `HeadlessRuntimeManager` — `claude -p` subprocess with stream-json |
 | `proxy_debug.rs` | ~2300 | Local HTTP proxy for API traffic recording |
-| `history.rs` | ~1700 | Claude/Codex history projection from `~/.claude/*` and `~/.codex/{sessions,session_index,state_*.sqlite}`, `/compact` segmentation |
+| `agent_home.rs` / `agent_profile.rs` | — | CCEM-owned Claude/Codex state roots, one-time legacy snapshot, launch environment and independent login |
+| `history.rs` | ~1700 | Claude/Codex history projection from `~/.ccem/agents/{claude,codex}`, `/compact` segmentation |
 | `terminal.rs` | ~1450 | Terminal detection (iTerm2/Terminal.app), launch/focus/close/arrange |
 | `analytics.rs` | ~1400 | JSONL log parsing, incremental cache, LiteLLM pricing |
 | `cron.rs` | ~1270 | Cron scheduler, task CRUD, run history, AI-generated task streaming |

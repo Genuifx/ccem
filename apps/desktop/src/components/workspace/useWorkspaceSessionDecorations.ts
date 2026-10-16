@@ -20,6 +20,7 @@ export interface WorkspaceSessionDecoration {
 interface WorkspaceDecorationSessionInput {
   id: string;
   source: HistorySessionItem['source'];
+  codexIsolated?: boolean;
   timestamp: number;
   project: string;
   projectName: string;
@@ -37,6 +38,7 @@ function toDecorationSessionInput(session: HistorySessionItem): WorkspaceDecorat
   return {
     id: session.id,
     source: session.source,
+    codexIsolated: session.codexIsolated,
     timestamp: session.timestamp,
     project: session.project,
     projectName: session.projectName,

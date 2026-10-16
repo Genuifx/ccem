@@ -344,17 +344,21 @@ pub fn spawn_claude_source_binding(
     });
 }
 
-pub fn spawn_codex_source_binding(
+pub fn spawn_codex_source_binding_for_mode(
     ccem_session_id: String,
     project_dir: String,
     started_at: DateTime<Utc>,
     preferred_session_id: Option<String>,
+    isolated: bool,
 ) {
     if let Some(session_id) = normalize_optional_text(preferred_session_id) {
         let _ = bind_source_session_id("codex", &ccem_session_id, &session_id);
         return;
     }
 
+    // A settings toggle during this polling window must not switch the
+    // transcript directory underneath an already-launched process.
+    let sessions_root = crate::agent_home::codex_home_for_mode(isolated).join("sessions");
     thread::spawn(move || {
         let started = Instant::now();
         let earliest_modified_at = started_at
@@ -362,9 +366,11 @@ pub fn spawn_codex_source_binding(
             .saturating_sub(BIND_POLL_TIMEOUT.as_millis() as i64);
 
         while started.elapsed() < BIND_POLL_TIMEOUT {
-            if let Some(session_id) =
-                discover_codex_session_id(&project_dir, earliest_modified_at as u64)
-            {
+            if let Some(session_id) = discover_codex_session_id_in(
+                &sessions_root,
+                &project_dir,
+                earliest_modified_at as u64,
+            ) {
                 let _ = bind_source_session_id("codex", &ccem_session_id, &session_id);
                 return;
             }
@@ -461,13 +467,16 @@ fn path_stem_string(path: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn discover_codex_session_id(project_dir: &str, earliest_modified_at: u64) -> Option<String> {
-    let sessions_root = codex_sessions_root()?;
+fn discover_codex_session_id_in(
+    sessions_root: &Path,
+    project_dir: &str,
+    earliest_modified_at: u64,
+) -> Option<String> {
     if !sessions_root.exists() {
         return None;
     }
 
-    let mut stack = vec![sessions_root];
+    let mut stack = vec![sessions_root.to_path_buf()];
     let mut best: Option<(u64, String)> = None;
 
     while let Some(dir) = stack.pop() {
@@ -477,7 +486,13 @@ fn discover_codex_session_id(project_dir: &str, earliest_modified_at: u64) -> Op
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
@@ -510,33 +525,6 @@ fn discover_codex_session_id(project_dir: &str, earliest_modified_at: u64) -> Op
     }
 
     best.map(|(_, session_id)| session_id)
-}
-
-fn codex_sessions_root() -> Option<PathBuf> {
-    let home_dir = dirs::home_dir()?;
-    let env_base = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
-    let codex_home = std::env::var("CODEX_HOME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|raw| resolve_path_value(&raw, &home_dir, &env_base))
-        .unwrap_or_else(|| home_dir.join(".codex"));
-    Some(codex_home.join("sessions"))
-}
-
-fn resolve_path_value(raw: &str, home_dir: &Path, relative_base: &Path) -> PathBuf {
-    if raw == "~" {
-        return home_dir.to_path_buf();
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return home_dir.join(rest);
-    }
-
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        path
-    } else {
-        relative_base.join(path)
-    }
 }
 
 fn file_modified_at_millis(path: &Path) -> u64 {
@@ -627,7 +615,8 @@ fn normalize_project_dir(value: &str) -> String {
 mod tests {
     use super::{
         bind_source_session_id, find_record_by_ccem_session_id, list_records_by_client,
-        register_launch, spawn_codex_source_binding, state_db_path, SessionProvenanceUpsert,
+        register_launch, spawn_codex_source_binding_for_mode, state_db_path,
+        SessionProvenanceUpsert,
     };
     use chrono::Utc;
     use std::fs;
@@ -688,11 +677,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_binding_scans_rollout_files_for_matching_project() {
+    fn codex_binding_scans_launch_profile_even_after_default_changes() {
         let _guard = env_guard().lock().expect("lock env guard");
         let root = temp_root("codex-scan");
         let db_path = root.join("state.sqlite");
-        let codex_home = root.join(".codex");
+        let agent_base = root.join("agents");
+        let codex_home = agent_base.join("codex");
         let sessions_root = codex_home
             .join("sessions")
             .join("2026")
@@ -702,8 +692,13 @@ mod tests {
             .join("rollout-2026-04-17T12-00-00-019d7d58-6c57-76d3-8712-d9126006a5cb.jsonl");
 
         std::env::set_var("CCEM_STATE_DB_PATH", &db_path);
-        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CCEM_AGENT_HOME", &agent_base);
         fs::create_dir_all(&sessions_root).expect("create codex sessions root");
+        fs::write(
+            agent_base.join("profiles.json"),
+            "{\"codexIsolation\":false}",
+        )
+        .expect("shared default after isolated launch");
         fs::write(
             &rollout_path,
             "{\"timestamp\":\"2026-04-17T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/codex-project\"}}\n",
@@ -723,11 +718,12 @@ mod tests {
         })
         .expect("register codex launch");
 
-        spawn_codex_source_binding(
+        spawn_codex_source_binding_for_mode(
             "ccem-codex".to_string(),
             "/tmp/codex-project".to_string(),
             Utc::now(),
             None,
+            true,
         );
 
         thread::sleep(Duration::from_millis(1200));
@@ -737,7 +733,7 @@ mod tests {
         assert_eq!(state_db_path(), db_path);
 
         std::env::remove_var("CCEM_STATE_DB_PATH");
-        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("CCEM_AGENT_HOME");
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -12,6 +12,8 @@ const RUNTIME_HISTORY_FALLBACK_WINDOW_MS: u64 = 2 * 60 * 1000;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceDecorationSessionInput {
+    #[serde(default)]
+    pub codex_isolated: Option<bool>,
     pub id: String,
     pub source: String,
     pub timestamp: u64,
@@ -52,6 +54,7 @@ pub enum WorkspaceRuntimeDescriptor {
         history_session_id: Option<String>,
     },
     Native {
+        codex_isolated: Option<bool>,
         id: String,
         client: String,
         status: String,
@@ -62,6 +65,7 @@ pub enum WorkspaceRuntimeDescriptor {
         provider_session_id: Option<String>,
     },
     LegacyInteractive {
+        codex_isolated: Option<bool>,
         id: String,
         client: String,
         status: String,
@@ -81,7 +85,7 @@ pub fn build_workspace_session_decorations(
     let mut decorations = Vec::new();
 
     for session in sessions {
-        let session_key = session_key(&session.source, &session.id);
+        let session_key = session_key(&session.source, &session.id, session.codex_isolated);
         let Some(runtime) = matched_runtime_by_session_key.get(&session_key) else {
             continue;
         };
@@ -137,6 +141,7 @@ pub fn unified_runtime_descriptor(runtime: &UnifiedSessionInfo) -> WorkspaceRunt
 
 pub fn native_runtime_descriptor(runtime: &NativeSessionSummary) -> WorkspaceRuntimeDescriptor {
     WorkspaceRuntimeDescriptor::Native {
+        codex_isolated: runtime.codex_isolated,
         id: runtime.runtime_id.clone(),
         client: runtime.provider.as_str().to_string(),
         status: runtime.status.clone(),
@@ -150,6 +155,7 @@ pub fn native_runtime_descriptor(runtime: &NativeSessionSummary) -> WorkspaceRun
 
 pub fn legacy_interactive_runtime_descriptor(session: &Session) -> WorkspaceRuntimeDescriptor {
     WorkspaceRuntimeDescriptor::LegacyInteractive {
+        codex_isolated: session.codex_isolated,
         id: session.id.clone(),
         client: normalize_runtime_client(Some(session.client.as_str())),
         status: session.status.clone(),
@@ -161,6 +167,18 @@ pub fn legacy_interactive_runtime_descriptor(session: &Session) -> WorkspaceRunt
 }
 
 impl WorkspaceRuntimeDescriptor {
+    fn matches_profile(&self, session: &WorkspaceDecorationSessionInput) -> bool {
+        if session.source != "codex" {
+            return true;
+        }
+        let isolated = match self {
+            Self::Native { codex_isolated, .. }
+            | Self::LegacyInteractive { codex_isolated, .. } => codex_isolated.unwrap_or(false),
+            _ => false,
+        };
+        isolated == session.codex_isolated.unwrap_or(false)
+    }
+
     fn id(&self) -> &str {
         match self {
             Self::Unified { id, .. }
@@ -247,11 +265,15 @@ fn build_runtime_match_map(
         let direct_match = runtimes_by_priority.iter().find(|runtime| {
             !used_runtime_ids.contains(runtime.id())
                 && runtime.client() == session.source
+                && runtime.matches_profile(session)
                 && runtime.provider_identity() == Some(session.id.as_str())
         });
 
         if let Some(runtime) = direct_match {
-            matched_by_key.insert(session_key(&session.source, &session.id), runtime.clone());
+            matched_by_key.insert(
+                session_key(&session.source, &session.id, session.codex_isolated),
+                runtime.clone(),
+            );
             used_runtime_ids.insert(runtime.id().to_string());
         }
     }
@@ -264,8 +286,11 @@ fn build_runtime_match_map(
         let project_dir = normalize_path(runtime.project_dir());
         let project_dir_base = basename(runtime.project_dir());
         let candidate = history_by_timestamp.iter().find(|session| {
-            let key = session_key(&session.source, &session.id);
-            if matched_by_key.contains_key(&key) || session.source != runtime.client() {
+            let key = session_key(&session.source, &session.id, session.codex_isolated);
+            if matched_by_key.contains_key(&key)
+                || session.source != runtime.client()
+                || !runtime.matches_profile(session)
+            {
                 return false;
             }
             if let Some(env_name) = &session.env_name {
@@ -286,7 +311,10 @@ fn build_runtime_match_map(
         });
 
         if let Some(session) = candidate {
-            matched_by_key.insert(session_key(&session.source, &session.id), runtime.clone());
+            matched_by_key.insert(
+                session_key(&session.source, &session.id, session.codex_isolated),
+                runtime.clone(),
+            );
             used_runtime_ids.insert(runtime.id().to_string());
         }
     }
@@ -474,8 +502,12 @@ fn basename(path: &str) -> String {
         .to_string()
 }
 
-fn session_key(source: &str, id: &str) -> String {
-    format!("{source}:{id}")
+fn session_key(source: &str, id: &str, codex_isolated: Option<bool>) -> String {
+    if source == "codex" && codex_isolated == Some(true) {
+        format!("codex:isolated:{id}")
+    } else {
+        format!("{source}:{id}")
+    }
 }
 
 fn timestamp_millis(value: DateTime<Utc>) -> u64 {
@@ -507,6 +539,7 @@ mod tests {
         project: &str,
     ) -> WorkspaceDecorationSessionInput {
         WorkspaceDecorationSessionInput {
+            codex_isolated: None,
             id: id.to_string(),
             source: source.to_string(),
             timestamp,
@@ -527,6 +560,7 @@ mod tests {
             session("nearby", "codex", 1001, "/repo/a"),
         ];
         let runtimes = vec![WorkspaceRuntimeDescriptor::Native {
+            codex_isolated: None,
             id: "runtime-1".to_string(),
             client: "codex".to_string(),
             status: "processing".to_string(),
@@ -546,9 +580,55 @@ mod tests {
     }
 
     #[test]
+    fn copied_codex_ids_and_legacy_fallback_match_only_their_profile() {
+        let shared = session("same-id", "codex", 1000, "/repo/a");
+        let mut isolated = shared.clone();
+        isolated.codex_isolated = Some(true);
+        let sessions = vec![shared, isolated];
+        let runtimes = [false, true].map(|isolated| WorkspaceRuntimeDescriptor::Native {
+            codex_isolated: Some(isolated),
+            id: format!("native-{isolated}"),
+            client: "codex".into(),
+            status: "ready".into(),
+            is_active: true,
+            env_name: "dev".into(),
+            project_dir: "/repo/a".into(),
+            created_at: 1000,
+            provider_session_id: Some("same-id".into()),
+        });
+        let decorations =
+            build_workspace_session_decorations(&sessions, &runtimes, &HashMap::new());
+        assert_eq!(decorations.len(), 2);
+        assert!(decorations
+            .iter()
+            .any(|row| row.session_key == "codex:same-id"
+                && row.runtime_id.as_deref() == Some("native-false")));
+        assert!(decorations
+            .iter()
+            .any(|row| row.session_key == "codex:isolated:same-id"
+                && row.runtime_id.as_deref() == Some("native-true")));
+
+        let legacy = WorkspaceRuntimeDescriptor::LegacyInteractive {
+            codex_isolated: Some(true),
+            id: "legacy-isolated".into(),
+            client: "codex".into(),
+            status: "running".into(),
+            is_active: true,
+            env_name: "dev".into(),
+            project_dir: "/repo/a".into(),
+            created_at: 1000,
+        };
+        let decorations =
+            build_workspace_session_decorations(&sessions, &[legacy], &HashMap::new());
+        assert_eq!(decorations.len(), 1);
+        assert_eq!(decorations[0].session_key, "codex:isolated:same-id");
+    }
+
+    #[test]
     fn inactive_native_runtime_cannot_claim_processing_priority() {
         let sessions = vec![session("target", "claude", 1000, "/repo/a")];
         let runtimes = vec![WorkspaceRuntimeDescriptor::Native {
+            codex_isolated: None,
             id: "native-stale".to_string(),
             client: "claude".to_string(),
             status: "processing".to_string(),
@@ -573,6 +653,7 @@ mod tests {
         let sessions = vec![session("target", "claude", 1000, "/repo/a")];
         let runtimes = vec![
             WorkspaceRuntimeDescriptor::Native {
+                codex_isolated: None,
                 id: "native-active".to_string(),
                 client: "claude".to_string(),
                 status: "ready".to_string(),
@@ -583,6 +664,7 @@ mod tests {
                 provider_session_id: Some("target".to_string()),
             },
             WorkspaceRuntimeDescriptor::Native {
+                codex_isolated: None,
                 id: "native-newer-inactive".to_string(),
                 client: "claude".to_string(),
                 status: "processing".to_string(),
@@ -956,6 +1038,7 @@ mod tests {
     fn native_events_promote_permission_attention() {
         let sessions = vec![session("target", "claude", 1000, "/repo/a")];
         let runtimes = vec![WorkspaceRuntimeDescriptor::Native {
+            codex_isolated: None,
             id: "native-1".to_string(),
             client: "claude".to_string(),
             status: "processing".to_string(),

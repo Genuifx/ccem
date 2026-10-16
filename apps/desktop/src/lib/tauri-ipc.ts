@@ -34,6 +34,9 @@ import type {
 // ============================================
 
 export interface TauriCommands {
+  get_agent_profiles: [void, AgentProfileStatus[]];
+  set_codex_isolation: [{ isolated: boolean }, AgentProfileStatus[]];
+  login_agent_profile: [{ provider: 'claude' | 'codex' }, void];
   // 环境管理
   get_environments: [void, Record<string, Environment>];
   get_current_env: [void, string | null];
@@ -181,6 +184,7 @@ export interface TauriCommands {
       workingDir?: string;
       resumeSessionId?: string;
       client?: 'claude' | 'codex' | 'opencode' | null;
+      codexIsolated?: boolean | null;
     },
     Session
   ];
@@ -191,6 +195,7 @@ export interface TauriCommands {
       workingDir?: string | null;
       resumeSessionId?: string | null;
       client?: 'claude' | 'codex' | 'opencode' | null;
+      codexIsolated?: boolean | null;
       launchTraceId?: string | null;
     },
     Session
@@ -328,6 +333,7 @@ export interface TauriCommands {
     {
       envName: string;
       workingDir: string;
+      codexIsolated?: boolean | null;
     },
     CodexModelMigrationPreflightResult
   ];
@@ -354,6 +360,7 @@ export interface TauriCommands {
       routerLaunchDraft?: RouterLaunchDraft | null;
       resumeRouterFromRuntimeId?: string | null;
       codexMigrationProofToken?: string | null;
+      codexIsolated?: boolean | null;
     },
     NativeSessionSummary
   ];
@@ -524,18 +531,18 @@ export interface TauriCommands {
   search_skills_stream: [{ query: string }, void];
   list_installed_skills: [void, InstalledSkill[]];
   list_workspace_skills: [
-    { workingDir?: string | null; provider?: string | null },
+    { workingDir?: string | null; provider?: string | null; codexIsolated?: boolean | null },
     InstalledSkill[]
   ];
   list_workspace_commands: [
-    { workingDir?: string | null; provider?: string | null },
+    { workingDir?: string | null; provider?: string | null; codexIsolated?: boolean | null },
     WorkspaceCommand[]
   ];
   read_skill_files: [{ skillFiles: string[] }, SelectedSkillContent[]];
   get_ccem_agent_skill_status: [void, CcemAgentSkillStatus];
   install_ccem_agent_skill: [void, CcemAgentSkillStatus];
   install_skill: [{ packageId: string; global: boolean }, void];  // 修正：后端参数是 package_id + global
-  uninstall_skill: [{ name: string }, void];
+  uninstall_skill: [{ name: string; global: boolean; path?: string }, void];
 
   // Cron 任务
   list_cron_tasks: [void, CronTask[]];
@@ -1018,6 +1025,7 @@ export interface NativeLifecycleProjection {
 export interface NativeSessionSummary {
   runtime_id: string;
   provider: NativeProvider;
+  codex_isolated?: boolean | null;
   transport: NativeTransport;
   provider_session_id?: string | null;
   display_title?: string | null;
@@ -1635,7 +1643,15 @@ export interface ConversationSegment {
   messageCount: number;
 }
 
+export interface AgentProfileStatus {
+  provider: 'claude' | 'codex';
+  directory: string;
+  initialized: boolean;
+  isolated: boolean;
+}
+
 export interface InstalledSkill {
+  managedByCcem?: boolean;
   id?: string;
   name: string;
   description: string;

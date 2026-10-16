@@ -101,8 +101,9 @@ struct PreflightEvaluation {
 pub fn preflight_codex_model_migration(
     env_name: String,
     working_dir: String,
+    codex_isolated: Option<bool>,
 ) -> CodexModelMigrationPreflightResult {
-    evaluate_live(&env_name, &working_dir).result
+    evaluate_live(&env_name, &working_dir, codex_isolated).result
 }
 
 /// Re-evaluate immediately inside `create_native_session`, before CCEM opens
@@ -112,8 +113,12 @@ pub fn runtime_path_for_verified_launch(
     env_name: &str,
     working_dir: &str,
     proof_token: Option<&str>,
+    codex_isolated: Option<bool>,
 ) -> Result<Option<String>, String> {
-    require_matching_proof(evaluate_live(env_name, working_dir), proof_token)
+    require_matching_proof(
+        evaluate_live(env_name, working_dir, codex_isolated),
+        proof_token,
+    )
 }
 
 fn require_matching_proof(
@@ -137,7 +142,11 @@ fn require_matching_proof(
     Ok(evaluation.runtime_path)
 }
 
-fn evaluate_live(env_name: &str, working_dir: &str) -> PreflightEvaluation {
+fn evaluate_live(
+    env_name: &str,
+    working_dir: &str,
+    codex_isolated: Option<bool>,
+) -> PreflightEvaluation {
     let unknown = || PreflightEvaluation {
         result: CodexModelMigrationPreflightResult::unknown(),
         runtime_path: None,
@@ -150,7 +159,7 @@ fn evaluate_live(env_name: &str, working_dir: &str) -> PreflightEvaluation {
     if working_dir.as_os_str().is_empty() {
         return unknown();
     }
-    let Some(codex_home) = resolve_codex_home(&working_dir) else {
+    let Some(codex_home) = resolve_codex_home(&working_dir, codex_isolated) else {
         return unknown();
     };
     let layer_paths = system_layer_paths(&codex_home);
@@ -234,15 +243,13 @@ fn evaluate(context: PreflightContext) -> PreflightEvaluation {
     }
 }
 
-fn resolve_codex_home(working_dir: &Path) -> Option<PathBuf> {
-    let home_dir = dirs::home_dir()?;
-    let raw = std::env::var("CODEX_HOME").ok();
-    let path = raw
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| resolve_path_value(value, &home_dir, working_dir))
-        .unwrap_or_else(|| home_dir.join(".codex"));
-    let canonical = fs::canonicalize(path).ok()?;
+fn resolve_codex_home(_working_dir: &Path, codex_isolated: Option<bool>) -> Option<PathBuf> {
+    // Preflight only reads the selected profile; launch preparation owns any
+    // isolation migration and can surface errors without blocking this IPC.
+    let canonical = fs::canonicalize(crate::agent_home::codex_home_for_mode(
+        codex_isolated.unwrap_or_else(crate::agent_home::codex_isolated),
+    ))
+    .ok()?;
     canonical.is_dir().then_some(canonical)
 }
 
@@ -288,6 +295,7 @@ fn is_process_auth_override_key(key: &str, case_insensitive: bool) -> bool {
 fn is_unknown_codex_environment_key(key: &str, case_insensitive: bool) -> bool {
     env_key_has_prefix(key, "CODEX_", case_insensitive)
         && !env_key_eq(key, "CODEX_HOME", case_insensitive)
+        && !env_key_eq(key, "CODEX_SQLITE_HOME", case_insensitive)
 }
 
 fn env_key_eq(actual: &str, expected: &str, case_insensitive: bool) -> bool {
@@ -368,6 +376,9 @@ fn has_project_config_surface(working_dir: &Path, user_config_path: &Path) -> bo
     let mut candidates = BTreeSet::new();
     candidates.insert(working_dir.join("config.toml"));
     for ancestor in working_dir.ancestors() {
+        if dirs::home_dir().as_deref() == Some(ancestor) {
+            break;
+        }
         candidates.insert(ancestor.join(".codex").join("config.toml"));
     }
 

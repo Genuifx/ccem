@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
+mod agent_home;
+mod agent_profile;
 mod analytics;
 mod app_update_engine;
 mod app_updates;
@@ -131,8 +133,7 @@ use session::{
     SessionManager,
 };
 use session_provenance::{
-    register_launch, spawn_claude_source_binding, spawn_codex_source_binding,
-    SessionProvenanceUpsert, DEFAULT_CONFIG_SOURCE,
+    register_launch, spawn_claude_source_binding, SessionProvenanceUpsert, DEFAULT_CONFIG_SOURCE,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -610,6 +611,7 @@ async fn launch_claude_code(
     working_dir: Option<String>,
     resume_session_id: Option<String>,
     client: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<Session, String> {
     let client_name = history::validate_launch_client(client.as_deref())?;
 
@@ -647,6 +649,16 @@ async fn launch_claude_code(
         config_source = Some(resolved.config_source);
         env_vars = resolved.env_vars;
     }
+    if client_name == "codex"
+        && resume_session_id.as_deref().is_some_and(|id| !id.trim().is_empty())
+    {
+        if let Some(isolated) = codex_isolated {
+            env_vars.insert("CCEM_CODEX_ISOLATED".into(), if isolated { "1" } else { "0" }.into());
+        }
+    }
+    agent_profile::prepare_env(&client_name, &mut env_vars)?;
+    let codex_isolated = (client_name == "codex")
+        .then(|| agent_profile::codex_isolated_for_env(&env_vars));
 
     if proxy_state.is_enabled() {
         if client_name == "opencode" {
@@ -754,6 +766,7 @@ async fn launch_claude_code(
     };
 
     let session = Session {
+        codex_isolated,
         id: session_id,
         pid: None, // Terminal-launched sessions don't have direct PID access
         client: client_name,
@@ -796,11 +809,12 @@ async fn launch_claude_code(
             resume_session_id.clone(),
         );
     } else if session.client == "codex" {
-        spawn_codex_source_binding(
+        session_provenance::spawn_codex_source_binding_for_mode(
             session.id.clone(),
             session.working_dir.clone(),
             started_at,
             resume_session_id.clone(),
+            session.codex_isolated.unwrap_or(false),
         );
     }
 
@@ -1354,6 +1368,7 @@ async fn create_native_session(
     router_launch_draft: Option<RouterLaunchDraft>,
     resume_router_from_runtime_id: Option<String>,
     codex_migration_proof_token: Option<String>,
+    codex_isolated: Option<bool>,
 ) -> Result<NativeSessionSummary, String> {
     let mutation_guard = environment_mutations.lock()?;
     let provider = parse_native_provider(&provider)?;
@@ -1388,11 +1403,21 @@ async fn create_native_session(
         );
     }
     let effective_working_dir = resolve_headless_working_dir(working_dir);
+    let codex_isolated = if provider == NativeProvider::Codex {
+        Some(match provider_session_id.as_ref().and(codex_isolated) {
+            Some(mode) => mode,
+            None => match native_state.codex_profile_for_resume(provider_session_id.as_deref(), &effective_working_dir)? {
+                Some(mode) => mode,
+                None => agent_home::codex_isolation_preference()?,
+            },
+        })
+    } else { None };
     let verified_codex_path = if provider == NativeProvider::Codex {
         codex_migration::runtime_path_for_verified_launch(
             &env_name,
             &effective_working_dir,
             codex_migration_proof_token.as_deref(),
+            codex_isolated,
         )?
     } else {
         None
@@ -1426,6 +1451,7 @@ async fn create_native_session(
             NativeSessionOptions {
                 model: None,
                 provider,
+                codex_isolated: None,
                 env_name: resolved.env_name,
                 perm_mode: effective_perm_mode,
                 runtime_perm_mode: effective_runtime_perm_mode.clone(),
@@ -1457,6 +1483,7 @@ async fn create_native_session(
             NativeSessionOptions {
                 model: None,
                 provider,
+                codex_isolated,
                 env_name: if resolved.env_name.is_empty() {
                     env_name
                 } else {
@@ -2119,6 +2146,7 @@ async fn create_interactive_session(
     working_dir: Option<String>,
     resume_session_id: Option<String>,
     client: Option<String>,
+    codex_isolated: Option<bool>,
     initial_prompt: Option<String>,
     launch_trace_id: Option<String>,
 ) -> Result<Session, String> {
@@ -2164,6 +2192,7 @@ async fn create_interactive_session(
             working_dir,
             resume_session_id,
             Some(client_name),
+            codex_isolated,
         )
         .await;
     }
@@ -2177,6 +2206,9 @@ async fn create_interactive_session(
         let session_id = generate_session_id();
         let effective_working_dir = resolve_headless_working_dir(working_dir);
         let mut env_vars = HashMap::new();
+        if let Some(isolated) = codex_isolated {
+            env_vars.insert("CCEM_CODEX_ISOLATED".into(), if isolated { "1" } else { "0" }.into());
+        }
         let resume_target = resume_session_id.clone();
         let started_at = chrono::Utc::now();
 
@@ -2254,11 +2286,12 @@ async fn create_interactive_session(
                 session.id, error
             );
         }
-        spawn_codex_source_binding(
+        session_provenance::spawn_codex_source_binding_for_mode(
             session.id.clone(),
             session.working_dir.clone(),
             started_at,
             resume_target.clone(),
+            session.codex_isolated.unwrap_or(false),
         );
         if let Some(session_id) = resume_target.as_deref() {
             if let Err(error) = clear_runtime_recovery_candidates_by_claude_session_id(session_id) {
@@ -2281,6 +2314,7 @@ async fn create_interactive_session(
             working_dir,
             resume_session_id,
             Some(client_name),
+            codex_isolated,
         )
         .await;
     }
@@ -5927,6 +5961,9 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            agent_profile::get_agent_profiles,
+            agent_profile::set_codex_isolation,
+            agent_profile::login_agent_profile,
             hermes_bridge::hermes_status,
             hermes_bridge::hermes_notification_targets,
             hermes_bridge::hermes_action,
@@ -6201,6 +6238,11 @@ pub fn run_desktop_app() -> i32 {
             }
         })
         .setup(move |app| {
+            tauri::async_runtime::spawn_blocking(|| {
+                if let Err(error) = agent_home::ensure_agent_homes() {
+                    eprintln!("CCEM agent profile preparation failed: {error}");
+                }
+            });
             webcontent_recovery::initialize(app.handle());
             // Load desktop settings once for startup logic
             let startup_settings = config::read_settings().unwrap_or_default();

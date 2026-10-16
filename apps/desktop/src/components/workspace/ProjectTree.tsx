@@ -102,8 +102,8 @@ function formatRelativeTime(timestamp: number): string {
   return `${weeks}w`;
 }
 
-function toKey(session: Pick<HistorySessionItem, 'id' | 'source'>): string {
-  return `${session.source}:${session.id}`;
+function toKey(session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>): string {
+  return `${session.source}:${session.source === 'codex' && session.codexIsolated ? 'isolated:' : ''}${session.id}`;
 }
 
 const MAX_LABEL_LENGTH = 24;

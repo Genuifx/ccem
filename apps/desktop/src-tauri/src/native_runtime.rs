@@ -329,6 +329,9 @@ pub enum NativeTransport {
 pub struct NativeSessionRecord {
     pub runtime_id: String,
     pub provider: NativeProvider,
+    /// Captured at creation. Records predating profile selection use shared Codex state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_isolated: Option<bool>,
     pub transport: NativeTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
@@ -384,6 +387,8 @@ pub(crate) fn runtime_child_is_owned(record: &NativeSessionRecord) -> bool {
 pub struct NativeSessionSummary {
     pub runtime_id: String,
     pub provider: NativeProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_isolated: Option<bool>,
     pub transport: NativeTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
@@ -456,6 +461,8 @@ pub struct NativeTerminalHandoff {
 #[derive(Debug, Clone)]
 pub struct NativeSessionOptions {
     pub provider: NativeProvider,
+    /// None captures the current default; resumes pass their source profile.
+    pub codex_isolated: Option<bool>,
     pub env_name: String,
     pub perm_mode: String,
     pub runtime_perm_mode: Option<String>,
@@ -2009,6 +2016,7 @@ impl NativeSessionHandle {
         NativeSessionSummary {
             runtime_id: record.runtime_id,
             provider: record.provider,
+            codex_isolated: record.codex_isolated,
             transport: record.transport,
             provider_session_id: record.provider_session_id,
             display_title: None,
@@ -2420,6 +2428,25 @@ impl NativeRuntimeManager {
             );
         }
         let mut options = options;
+        let codex_isolated = if options.provider == NativeProvider::Codex {
+            let mode = match options.codex_isolated {
+                Some(mode) => mode,
+                None => match self.codex_profile_for_resume(options.provider_session_id.as_deref(), &options.working_dir)? {
+                    Some(mode) => mode,
+                    None => crate::agent_home::codex_isolation_preference()?,
+                },
+            };
+            options.codex_isolated = Some(mode);
+            mode
+        } else {
+            crate::agent_home::codex_isolation_preference()?
+        };
+        crate::agent_home::prepare_agent_homes_for_mode(codex_isolated)?;
+        let client = match options.provider { NativeProvider::Claude => "claude", NativeProvider::Codex => "codex" };
+        pin_codex_profile(options.provider, options.codex_isolated, &mut options.helper_env_vars);
+        pin_codex_profile(options.provider, options.codex_isolated, &mut options.terminal_env_vars);
+        crate::agent_profile::apply_env(client, &mut options.helper_env_vars);
+        crate::agent_profile::apply_env(client, &mut options.terminal_env_vars);
         validate_task_model(options.provider, options.model.as_deref())?;
         self.prepare_router_launch(&mut options, false)?;
         options.initial_annotations =
@@ -2432,6 +2459,7 @@ impl NativeRuntimeManager {
         let record = NativeSessionRecord {
             runtime_id: runtime_id.clone(),
             provider: options.provider,
+            codex_isolated: options.codex_isolated,
             transport: NativeTransport::NativeSdk,
             // A fork starts with its parent's provider id in the helper init
             // options. It is not the child session's identity and must never be
@@ -2770,6 +2798,38 @@ impl NativeRuntimeManager {
         })
     }
 
+    pub(crate) fn codex_profile_for_resume(&self, provider_session_id: Option<&str>, working_dir: &str) -> Result<Option<bool>, String> {
+        let Some(id) = provider_session_id.filter(|id| !id.trim().is_empty()) else { return Ok(None); };
+        let records = self.records.lock().map_err(|_| "Failed to lock native runtime records")?;
+        let modes = records.values().filter(|record| {
+            record.provider == NativeProvider::Codex
+                && record.provider_session_id.as_deref() == Some(id)
+                && native_project_dirs_match(&record.project_dir, working_dir)
+        }).map(|record| record.codex_isolated.unwrap_or(false)).collect::<HashSet<_>>();
+        if modes.len() > 1 {
+            return Err("This Codex conversation exists in both profiles; resume it from the selected history profile.".into());
+        }
+        Ok(modes.into_iter().next())
+    }
+
+    /// An idle SDK helper can write another turn later, even when its Codex
+    /// subprocess has already exited. Do not snapshot while it owns shared state.
+    pub(crate) fn ensure_no_active_shared_codex_helpers(&self) -> Result<(), String> {
+        let handles = self.handles.lock().map_err(|_| "Failed to inspect native runtimes")?
+            .values().cloned().collect::<Vec<_>>();
+        for handle in handles {
+            let record = handle.record.lock().map_err(|_| "Failed to inspect native session")?.clone();
+            if record.provider == NativeProvider::Codex && !record.codex_isolated.unwrap_or(false)
+                && runtime_child_is_owned(&record)
+                && (handle.child.lock().map_err(|_| "Failed to inspect native helper")?.is_some()
+                    || (record.is_active && handle.alive.load(Ordering::SeqCst)))
+            {
+                return Err("A shared Codex session is still open. Stop it before enabling isolation so its final turns are included.".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_sessions(&self) -> Vec<NativeSessionSummary> {
         let handles = self
             .handles
@@ -2793,6 +2853,7 @@ impl NativeRuntimeManager {
                     NativeSessionSummary {
                         runtime_id: record.runtime_id,
                         provider: record.provider,
+                        codex_isolated: record.codex_isolated,
                         transport: record.transport,
                         provider_session_id: record.provider_session_id,
                         display_title: None,
@@ -7225,7 +7286,10 @@ impl NativeRuntimeManager {
             .cloned();
 
         if let Some(handle) = handle {
-            return Ok(handle.terminal_env_vars.clone());
+            let mut env = handle.terminal_env_vars.clone();
+            pin_codex_profile(record.provider, record.codex_isolated, &mut env);
+            crate::agent_profile::apply_env(record.provider.as_str(), &mut env);
+            return Ok(env);
         }
 
         build_runtime_bootstrap_options(record).map(|options| options.terminal_env_vars)
@@ -7740,11 +7804,16 @@ impl NativeRuntimeManager {
             .filter(|router| router.launch_transport == LaunchTransport::Routed)
             .map(build_helper_router_init);
         let helper_path = native_helper_script_path(&app)?;
+        let mut profile_env = HashMap::new();
+        pin_codex_profile(options.provider, options.codex_isolated, &mut profile_env);
+        crate::agent_profile::apply_env(options.provider.as_str(), &mut profile_env);
+        inject_ccem_runtime_env(&mut profile_env, runtime_id);
         let command = app
             .shell()
             .sidecar("ccem-node")
             .map_err(|error| format!("Failed to resolve Node sidecar: {error}"))?
             .arg(helper_path.to_string_lossy().to_string())
+            .envs(profile_env)
             .current_dir(&options.working_dir);
 
         let (mut rx, child) = spawn_native_helper_process(command.into())?;
@@ -10824,6 +10893,7 @@ impl NativeRuntimeManager {
             .map(|record| NativeSessionSummary {
                 runtime_id: record.runtime_id,
                 provider: record.provider,
+                codex_isolated: record.codex_isolated,
                 transport: record.transport,
                 provider_session_id: record.provider_session_id,
                 display_title: None,
@@ -11221,11 +11291,21 @@ fn build_runtime_bootstrap_options(
             }
         };
     merge_helper_env_path(&mut helper_env_vars, &terminal::get_user_path());
+    let client = match record.provider { NativeProvider::Claude => "claude", NativeProvider::Codex => "codex" };
+    let codex_isolated = record.codex_isolated.unwrap_or(false);
+    crate::agent_home::prepare_agent_homes_for_mode(
+        if record.provider == NativeProvider::Codex { codex_isolated } else { crate::agent_home::codex_isolation_preference()? }
+    )?;
+    pin_codex_profile(record.provider, record.codex_isolated, &mut helper_env_vars);
+    pin_codex_profile(record.provider, record.codex_isolated, &mut terminal_env_vars);
+    crate::agent_profile::apply_env(client, &mut helper_env_vars);
+    crate::agent_profile::apply_env(client, &mut terminal_env_vars);
     inject_ccem_runtime_env(&mut helper_env_vars, &record.runtime_id);
     inject_ccem_runtime_env(&mut terminal_env_vars, &record.runtime_id);
 
     Ok(NativeSessionOptions {
         provider: record.provider,
+        codex_isolated: (record.provider == NativeProvider::Codex).then_some(codex_isolated),
         env_name: record.env_name.clone(),
         perm_mode: record.perm_mode.clone(),
         runtime_perm_mode: record.runtime_perm_mode.clone(),
@@ -11253,6 +11333,12 @@ fn build_runtime_bootstrap_options(
 fn inject_ccem_runtime_env(env_vars: &mut HashMap<String, String>, runtime_id: &str) {
     env_vars.insert("CCEM_RUNTIME_ID".to_string(), runtime_id.to_string());
     env_vars.insert("CCEM_SESSION_ID".to_string(), runtime_id.to_string());
+}
+
+fn pin_codex_profile(provider: NativeProvider, isolated: Option<bool>, env: &mut HashMap<String, String>) {
+    if provider == NativeProvider::Codex {
+        env.insert("CCEM_CODEX_ISOLATED".into(), if isolated.unwrap_or(false) { "1" } else { "0" }.into());
+    }
 }
 
 fn build_helper_router_init(record: &SessionRouterRecord) -> HelperRouterInit {
@@ -11376,6 +11462,47 @@ mod tests {
             assert!(super::validate_task_model(NativeProvider::Codex, Some(invalid))
                 .unwrap_err().contains("MODEL_INVALID"));
         }
+    }
+
+    #[test]
+    fn codex_profile_record_restart_and_handoff_keep_the_captured_mode() {
+        for mode in [None, Some(false), Some(true)] {
+            let mut record = native_record("codex-profile-roundtrip", "idle", true);
+            record.provider = NativeProvider::Codex;
+            record.env_name.clear();
+            record.codex_isolated = mode;
+            let record: NativeSessionRecord = serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+            let options = super::build_runtime_bootstrap_options(&record).unwrap();
+            let isolated = mode.unwrap_or(false);
+            assert_eq!(options.codex_isolated, Some(isolated));
+            for env in [&options.helper_env_vars, &options.terminal_env_vars] {
+                assert_eq!(env["CCEM_CODEX_ISOLATED"], if isolated { "1" } else { "0" });
+                assert_eq!(env["CODEX_HOME"], crate::agent_home::codex_home_for_mode(isolated).to_string_lossy());
+            }
+            let manager = manager_with_handle("codex-profile-roundtrip");
+            let handle = manager.handles.lock().unwrap().get("codex-profile-roundtrip").unwrap().clone();
+            *handle.record.lock().unwrap() = record.clone();
+            let handoff = manager.terminal_env_vars_for_record(&record).unwrap();
+            assert_eq!(handoff["CCEM_CODEX_ISOLATED"], if isolated { "1" } else { "0" });
+            assert_eq!(handoff["CODEX_HOME"], crate::agent_home::codex_home_for_mode(isolated).to_string_lossy());
+            assert_eq!(handle.summary().codex_isolated, mode);
+            assert_eq!(manager.ensure_no_active_shared_codex_helpers().is_err(), !isolated);
+        }
+    }
+
+    #[test]
+    fn codex_history_resume_distinguishes_copied_provider_ids() {
+        let mut shared = native_record("shared-codex", "stopped", false);
+        shared.provider = NativeProvider::Codex;
+        shared.provider_session_id = Some("same-provider-id".into());
+        let manager = manager_with_records("shared-codex", vec![shared.clone()]);
+        assert_eq!(manager.codex_profile_for_resume(Some("same-provider-id"), "/tmp/project").unwrap(), Some(false));
+        let mut isolated = shared;
+        isolated.runtime_id = "isolated-codex".into();
+        isolated.codex_isolated = Some(true);
+        manager.records.lock().unwrap().insert(isolated.runtime_id.clone(), isolated);
+        assert!(manager.codex_profile_for_resume(Some("same-provider-id"), "/tmp/project").is_err());
+        assert_eq!(manager.codex_profile_for_resume(None, "/tmp/project").unwrap(), None);
     }
 
     #[test]
@@ -11527,6 +11654,7 @@ mod tests {
         let record = NativeSessionRecord {
             runtime_id: runtime_id.to_string(),
             provider: NativeProvider::Claude,
+            codex_isolated: None,
             transport: NativeTransport::NativeSdk,
             provider_session_id: None,
             browser_actor_id: super::legacy_browser_actor_id(NativeProvider::Claude, runtime_id),
@@ -11832,6 +11960,7 @@ mod tests {
         NativeSessionRecord {
             runtime_id: runtime_id.to_string(),
             provider: NativeProvider::Claude,
+            codex_isolated: None,
             transport: NativeTransport::NativeSdk,
             provider_session_id: None,
             browser_actor_id: super::legacy_browser_actor_id(NativeProvider::Claude, runtime_id),
@@ -13569,6 +13698,7 @@ mod tests {
     ) -> NativeSessionOptions {
         NativeSessionOptions {
             provider: NativeProvider::Claude,
+            codex_isolated: None,
             env_name: "default".to_string(),
             perm_mode: perm_mode.to_string(),
             runtime_perm_mode: runtime_perm_mode.map(str::to_string),

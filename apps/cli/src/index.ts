@@ -23,6 +23,7 @@ import type { CcemConfig, EnvConfig, PermissionModeName } from '@ccem/core';
 import {
   assertClaudeEnvironmentAuthBoundary,
   assertOfficialEnvironmentInvariant,
+  buildIsolatedAgentEnv,
   decrypt,
   encrypt,
   ENV_PRESETS,
@@ -33,7 +34,11 @@ import {
   PERMISSION_PRESETS,
   getCcemConfigDir,
   ensureCcemDir,
-  getHomeDir,
+  ensureCcemAgentHome,
+  getCcemAgentEnv,
+  INHERITED_AGENT_ENV_KEYS,
+  SHARED_CODEX_ENV_KEYS,
+  isAgentIdentityEnvKey,
   getCcemConfigPath,
   getLegacyConfigPath,
   OFFICIAL_ENV_NAME,
@@ -60,7 +65,7 @@ import {
   listAvailableModes,
   runWithTempPermissions
 } from './permissions.js';
-import { isTrustedDesktopProxyBaseUrl, launchClaude } from './launcher.js';
+import { isTrustedDesktopProxyBaseUrl, launchAgentAuth, launchClaude } from './launcher.js';
 import {
   deleteEnvironmentWithAuthority,
   renameEnvironmentWithAuthority,
@@ -106,25 +111,9 @@ const DEFAULT_OFFICIAL_ENV: EnvConfig = {
   ANTHROPIC_MODEL: 'opus',
 };
 
-const MANAGED_CLAUDE_ENV_KEYS = [
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_MODEL',
-  'CLAUDE_CODE_SUBAGENT_MODEL',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_SMALL_FAST_MODEL',
-] as const;
+const MANAGED_CLAUDE_ENV_KEYS = INHERITED_AGENT_ENV_KEYS;
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
-
-const clearManagedClaudeEnv = (env: NodeJS.ProcessEnv): void => {
-  for (const key of MANAGED_CLAUDE_ENV_KEYS) {
-    delete env[key];
-  }
-};
 
 const buildResolvedEnvVars = (
   envName: string | undefined,
@@ -139,7 +128,7 @@ const buildResolvedEnvVars = (
     runtimeEnv.ANTHROPIC_BASE_URL,
     authToken,
   );
-  const resolved: Record<string, string> = {};
+  const resolved: Record<string, string> = getCcemAgentEnv();
   if (runtimeEnv.ANTHROPIC_BASE_URL) resolved.ANTHROPIC_BASE_URL = runtimeEnv.ANTHROPIC_BASE_URL;
   if (authToken) resolved.ANTHROPIC_AUTH_TOKEN = authToken;
   if (runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL) resolved.ANTHROPIC_DEFAULT_OPUS_MODEL = runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL;
@@ -151,9 +140,17 @@ const buildResolvedEnvVars = (
 };
 
 const buildShellEnvCommands = (envName: string | undefined, env: EnvConfig): string[] => {
+  ensureCcemAgentHome('claude');
+  ensureCcemAgentHome('codex');
   const resolved = buildResolvedEnvVars(envName, env);
 
-  return MANAGED_CLAUDE_ENV_KEYS.map((key) =>
+  const keys = [...new Set([
+    ...MANAGED_CLAUDE_ENV_KEYS,
+    ...Object.keys(process.env).filter(isAgentIdentityEnvKey),
+    ...Object.keys(resolved),
+  ])];
+  return keys.filter((key) => resolved.CCEM_CODEX_ISOLATED === '1'
+    || !(SHARED_CODEX_ENV_KEYS as readonly string[]).includes(key)).map((key) =>
     resolved[key]
       ? `export ${key}=${shellQuote(resolved[key])}`
       : `unset ${key}`
@@ -989,6 +986,8 @@ program
 
     if (!env) return;
 
+    ensureCcemAgentHome('claude');
+    ensureCcemAgentHome('codex');
     const outputEnv = buildResolvedEnvVars(current, env);
 
     if (options.json) {
@@ -1011,9 +1010,9 @@ program
       process.exit(1);
     }
 
-    const env = { ...process.env };
-    clearManagedClaudeEnv(env);
-    Object.assign(env, buildResolvedEnvVars(current, envConfig));
+    ensureCcemAgentHome('claude');
+    ensureCcemAgentHome('codex');
+    const env = buildIsolatedAgentEnv(process.env, buildResolvedEnvVars(current, envConfig));
 
     const [cmd, ...args] = command;
     const child = spawn(cmd, args, {
@@ -1025,6 +1024,16 @@ program
     child.on('exit', (code) => {
       process.exit(code ?? 0);
     });
+  });
+
+program
+  .command('auth <provider>')
+  .description('Sign in using the selected Claude Code or Codex profile')
+  .action(async (provider: string) => {
+    if (provider !== 'claude' && provider !== 'codex') {
+      program.error('Provider must be claude or codex');
+    }
+    await launchAgentAuth(provider as 'claude' | 'codex');
   });
 
 registerCronCommands(program);
@@ -1175,11 +1184,11 @@ setupCmd
 
 setupCmd
   .command('cron')
-  .description('安装 ccem-cron skill 到 Claude Code（~/.claude/skills/）')
+  .description('安装 ccem-cron skill 到 CCEM 的 Claude Code')
   .option('--force', '强制覆盖已有文件')
   .action(async function(this: any) {
     const options = this.opts();
-    const skillDir = path.join(getHomeDir(), '.claude', 'skills');
+    const skillDir = path.join(ensureCcemAgentHome('claude'), 'skills');
     const targetPath = path.join(skillDir, 'ccem-cron.md');
 
     // 确保目录存在
@@ -1213,11 +1222,11 @@ setupCmd
 
 setupCmd
   .command('bot-bind')
-  .description('安装 ccem-bot-bind skill 到 Claude Code（~/.claude/skills/）')
+  .description('安装 ccem-bot-bind skill 到 CCEM 的 Claude Code')
   .option('--force', '强制覆盖已有文件')
   .action(async function(this: any) {
     const options = this.opts();
-    const skillDir = path.join(getHomeDir(), '.claude', 'skills');
+    const skillDir = path.join(ensureCcemAgentHome('claude'), 'skills');
     const targetPath = path.join(skillDir, 'ccem-bot-bind.md');
 
     if (!fs.existsSync(skillDir)) {

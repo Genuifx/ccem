@@ -987,6 +987,10 @@ pub fn build_claude_env_vars(env: &EnvConfig) -> HashMap<String, String> {
         env_vars.insert("CLAUDE_CODE_SUBAGENT_MODEL".to_string(), model.clone());
     }
 
+    crate::agent_profile::apply_env("claude", &mut env_vars);
+    // Keep omitted model pins absent in the resolved config. Launch boundaries
+    // explicitly unset inherited values before applying this selected config.
+    env_vars.retain(|_, value| !value.is_empty());
     env_vars
 }
 
@@ -994,6 +998,7 @@ pub fn clear_managed_claude_env(command: &mut Command) {
     for key in MANAGED_CLAUDE_ENV_KEYS {
         command.env_remove(key);
     }
+    crate::agent_profile::configure_command("claude", command);
 }
 
 /// Resolve a named Claude environment into concrete process env vars.
@@ -1358,6 +1363,7 @@ pub fn update_settings(
 /// When `ai_enhanced` is true in settings, uses the configured `ai_env_name`;
 /// otherwise falls back to the current active environment.
 pub fn inject_ai_env(cmd: &mut std::process::Command) {
+    clear_managed_claude_env(cmd);
     let settings = read_settings().unwrap_or_default();
     let cfg = match read_config() {
         Ok(c) => c,

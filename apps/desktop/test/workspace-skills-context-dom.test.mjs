@@ -39,7 +39,7 @@ async function importHarness() {
   const ast = ts.createSourceFile('Workspace.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const workspace = ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === 'Workspace');
   assert.ok(workspace?.body, 'Workspace function must be available to the behavior harness');
-  const declarations = new Set(['skillsWorkingDir', 'skillsProvider', 'skillsContext', 'refreshWorkspaceInstalledSkills']);
+  const declarations = new Set(['skillsWorkingDir', 'skillsProvider', 'skillsCodexIsolated', 'skillsContext', 'refreshWorkspaceInstalledSkills']);
   const statements = workspace.body.statements.filter((node) => {
     if (ts.isVariableStatement(node)) {
       return node.declarationList.declarations.some((declaration) =>
@@ -64,6 +64,7 @@ async function importHarness() {
           const calls = { skills: [], commands: [] };
           const loadWorkspaceSkills = async (context) => {
             calls.skills.push(context);
+            if (current.emptySkills) return [];
             return [{ name: 'loaded', ...context }];
           };
           const loadWorkspaceCommands = async (context) => {
@@ -198,14 +199,14 @@ test('effective project/provider changes reload both lists and manual refresh us
   assert.equal(mounted.calls.skills.length, 2);
   assert.equal(mounted.calls.commands.length, 2);
   await mounted.update({ activeLiveEntry: liveEntry({ project_dir: '/repo/b', provider: 'codex' }) });
-  assert.deepEqual(mounted.calls.skills.at(-1), { workingDir: '/repo/b', provider: 'codex' });
-  assert.deepEqual(mounted.calls.commands.at(-1), { workingDir: '/repo/b', provider: 'codex' });
+  assert.deepEqual(mounted.calls.skills.at(-1), { workingDir: '/repo/b', provider: 'codex', codexIsolated: false });
+  assert.deepEqual(mounted.calls.commands.at(-1), { workingDir: '/repo/b', provider: 'codex', codexIsolated: false });
   assert.equal(mounted.calls.skills.length, 3);
   assert.equal(mounted.calls.commands.length, 3);
   const result = await mounted.refresh();
   assert.equal(mounted.calls.skills.length, 4);
   assert.equal(mounted.calls.commands.length, 3);
-  assert.deepEqual(result, [{ name: 'loaded', workingDir: '/repo/b', provider: 'codex' }]);
+  assert.deepEqual(result, [{ name: 'loaded', workingDir: '/repo/b', provider: 'codex', codexIsolated: false }]);
   assert.deepEqual(mounted.snapshot().workspaceInstalledSkills, result);
 });
 
@@ -213,13 +214,34 @@ test('history/live selection precedence, source normalization and absent-session
   const mounted = await setup(t, {
     workspaceMode: 'history', selectedSession: historySession({ project: '', source: 'other' }),
   });
-  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: null, provider: 'claude' });
+  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: null, provider: 'claude', codexIsolated: null });
   await mounted.update({ selectedSession: historySession({ project: '/history', source: 'codex' }) });
-  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: '/history', provider: 'codex' });
+  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: '/history', provider: 'codex', codexIsolated: false });
   await mounted.update({ selectedSession: null });
-  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: '/repo/compose', provider: 'codex' });
+  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: '/repo/compose', provider: 'codex', codexIsolated: null });
   await mounted.update({ workspaceMode: 'live', activeLiveEntry: liveEntry({ project_dir: '', provider: 'opencode' }) });
-  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: null, provider: 'opencode' });
+  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: null, provider: 'opencode', codexIsolated: null });
   await mounted.update({ activeLiveEntry: null, effectiveComposeDir: null });
-  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: null, provider: 'codex' });
+  assert.deepEqual(mounted.snapshot().skillsContext, { workingDir: null, provider: 'codex', codexIsolated: null });
+});
+
+
+test('Codex profile switches reload skills and commands for the selected session', async (t) => {
+  const mounted = await setup(t, { activeLiveEntry: liveEntry({ provider: 'codex', codex_isolated: false }) });
+  const shared = mounted.snapshot().skillsContext;
+  await mounted.update({ activeLiveEntry: liveEntry({ provider: 'codex', codex_isolated: true }) });
+  assert.notEqual(mounted.snapshot().skillsContext, shared);
+  assert.equal(mounted.calls.skills.at(-1).codexIsolated, true);
+  assert.equal(mounted.calls.commands.at(-1).codexIsolated, true);
+  assert.equal(mounted.calls.skills.length, 2);
+  await mounted.update({ workspaceMode: 'history', selectedSession: historySession({ source: 'codex', codexIsolated: false }) });
+  assert.equal(mounted.calls.skills.at(-1).codexIsolated, false);
+  assert.equal(mounted.calls.commands.at(-1).codexIsolated, false);
+});
+
+test('an empty isolated skill set never falls back to global skills', async (t) => {
+  const mounted = await setup(t, { emptySkills: true, activeLiveEntry: liveEntry({ provider: 'codex', codex_isolated: true }) });
+  assert.deepEqual(mounted.snapshot().workspaceInstalledSkills, []);
+  assert.deepEqual(await mounted.refresh(), []);
+  assert.deepEqual(mounted.snapshot().workspaceInstalledSkills, []);
 });

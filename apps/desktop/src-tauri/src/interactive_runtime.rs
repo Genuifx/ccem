@@ -157,6 +157,9 @@ impl InteractiveRuntimeManager {
             }),
         );
         let mut env_vars = options.env_vars.clone();
+        crate::agent_profile::prepare_env(&options.client, &mut env_vars)?;
+        let codex_isolated = (options.client == "codex")
+            .then(|| crate::agent_profile::codex_isolated_for_env(&env_vars));
         env_vars.insert("CCEM_RUNTIME_ID".to_string(), options.session_id.clone());
         env_vars.insert("CCEM_SESSION_ID".to_string(), options.session_id.clone());
         diagnostic_log::append_session_launch_event(
@@ -194,6 +197,7 @@ impl InteractiveRuntimeManager {
         );
 
         let session = Session {
+            codex_isolated,
             id: options.session_id.clone(),
             pid: window.pane_pid,
             client: options.client.clone(),

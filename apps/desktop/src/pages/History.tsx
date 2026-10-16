@@ -181,6 +181,8 @@ export function History() {
         selectedSession.id,
         selectedSession.source,
         selectedSession.envName,
+        undefined,
+        selectedSession.source === 'codex' ? selectedSession.codexIsolated ?? false : null,
       );
       setLaunched(true);
       setTimeout(() => setLaunched(false), 1200);

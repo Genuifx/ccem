@@ -10,6 +10,7 @@ import { toast } from 'sonner';
 import { PERMISSION_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { SettingsRouterSection } from '@/components/SettingsRouterSection';
+import { AgentProfilesSettings } from '@/components/AgentProfilesSettings';
 import { useLocale } from '../locales';
 import { SettingsSkeleton } from '@/components/ui/skeleton-states';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
@@ -61,7 +62,7 @@ interface InstallStatusState {
   tmux: boolean | null;
 }
 
-type SectionId = 'appearance' | 'application' | 'notifications' | 'agentSkill' | 'ai' | 'permission' | 'router' | 'about';
+type SectionId = 'appearance' | 'application' | 'notifications' | 'agentSkill' | 'agentProfiles' | 'ai' | 'permission' | 'router' | 'about';
 
 const CCEM_REPO_URL = 'https://github.com/Genuifx/ccem';
 
@@ -438,6 +439,7 @@ export function Settings() {
   const sections: { id: SectionId; icon: typeof Palette; label: string }[] = [
     { id: 'appearance', icon: Palette, label: t('settings.appearance') },
     { id: 'application', icon: AppWindow, label: t('settings.application') },
+    { id: 'agentProfiles', icon: ShieldCheck, label: t('agentProfiles.title') },
     { id: 'notifications', icon: BellRing, label: t('settings.notifications') },
     { id: 'agentSkill', icon: Bot, label: t('settings.agentSkill') },
     { id: 'ai', icon: Sparkles, label: t('settings.aiEnhancement') },
@@ -999,6 +1001,8 @@ export function Settings() {
         return renderAppearanceSection();
       case 'application':
         return renderApplicationSection();
+      case 'agentProfiles':
+        return <AgentProfilesSettings />;
       case 'notifications':
         return renderNotificationsSection();
       case 'agentSkill':

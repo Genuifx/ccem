@@ -29,6 +29,8 @@ export type SessionStickerId =
 export interface HistorySessionItem {
   id: string;
   source: HistorySource;
+  /** Codex state profile captured with the row; missing means shared. */
+  codexIsolated?: boolean;
   display: string;
   timestamp: number;
   project: string;
@@ -144,6 +146,6 @@ export interface SessionSubagentsPayload {
   detail?: ConversationMessageData[] | null;
 }
 
-export function toSessionKey(session: Pick<HistorySessionItem, 'id' | 'source'>): string {
-  return `${session.source}:${session.id}`;
+export function toSessionKey(session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated'>): string {
+  return `${session.source}:${session.source === 'codex' && session.codexIsolated ? 'isolated:' : ''}${session.id}`;
 }

@@ -1,5 +1,5 @@
-import os from 'node:os';
 import path from 'node:path';
+import { getCcemAgentHome } from '../../core/src/agent-home';
 
 const PLAN_MODE_BLOCKED_TOOLS = new Set([
   'Write',
@@ -40,7 +40,7 @@ function extractPathLikeValue(input: Record<string, unknown>) {
   return null;
 }
 
-export function isClaudeInternalPlanFile(toolName: string, input: Record<string, unknown>) {
+export function isClaudeInternalPlanFile(toolName: string, input: Record<string, unknown>, claudeHome = getCcemAgentHome('claude')) {
   if (!['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(toolName)) {
     return false;
   }
@@ -51,20 +51,21 @@ export function isClaudeInternalPlanFile(toolName: string, input: Record<string,
   }
 
   const resolvedTarget = path.resolve(pathLikeValue);
-  const planDir = path.resolve(os.homedir(), '.claude', 'plans');
+  const planDir = path.resolve(claudeHome, 'plans');
   return resolvedTarget === planDir || resolvedTarget.startsWith(`${planDir}${path.sep}`);
 }
 
-export function shouldBlockClaudeToolInPlanMode(toolName: string, input: Record<string, unknown>) {
+export function shouldBlockClaudeToolInPlanMode(toolName: string, input: Record<string, unknown>, claudeHome = getCcemAgentHome('claude')) {
   if (!PLAN_MODE_BLOCKED_TOOLS.has(toolName)) {
     return false;
   }
 
-  return !isClaudeInternalPlanFile(toolName, input);
+  return !isClaudeInternalPlanFile(toolName, input, claudeHome);
 }
 
 export function buildClaudePlanModePreToolUseHook(
   isPlanMode: () => boolean,
+  claudeHome = getCcemAgentHome('claude'),
 ) {
   return async function claudePlanModePreToolUseHook(
     input: ClaudePlanModePreToolUseInput,
@@ -75,7 +76,7 @@ export function buildClaudePlanModePreToolUseHook(
 
     const toolName = input.tool_name ?? '';
     const toolInput = asRecord(input.tool_input);
-    if (!shouldBlockClaudeToolInPlanMode(toolName, toolInput)) {
+    if (!shouldBlockClaudeToolInPlanMode(toolName, toolInput, claudeHome)) {
       return { continue: true };
     }
 
@@ -93,10 +94,11 @@ export function buildClaudePlanModePreToolUseHook(
 
 export function buildClaudePlanModeHooks(
   isPlanMode: () => boolean,
+  claudeHome = getCcemAgentHome('claude'),
 ) {
   return {
     PreToolUse: [{
-      hooks: [buildClaudePlanModePreToolUseHook(isPlanMode)],
+      hooks: [buildClaudePlanModePreToolUseHook(isPlanMode, claudeHome)],
     }],
   };
 }

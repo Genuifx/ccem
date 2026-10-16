@@ -1,4 +1,19 @@
 {
+  "agentProfiles": {
+    "title": "Agent data & sign-in",
+    "preparing": "Loading agent data settings…",
+    "retry": "Retry",
+    "loginClaude": "Sign in to Claude",
+    "loginCodex": "Sign in to ChatGPT",
+    "isolated": "Configuration, sign-in, history, and memory are stored separately in CCEM.",
+    "shared": "Uses the official Codex configuration, sign-in, history, and memory.",
+    "isolateCodex": "Isolate Codex data",
+    "switchHint": "Applies to new sessions. Existing sessions keep their original profile. History and memory are copied when first enabled.",
+    "saving": "Switching data profile…",
+    "opening": "Opening…",
+    "loginOpened": "Opened the CCEM sign-in flow in your terminal",
+    "loginHint": "Isolated profiles require a separate sign-in for official subscriptions. API keys remain available. Project files, instructions, and skills remain shared."
+  },
   "startup": {
     "preparing": "Preparing your workspace…",
     "configuration": "Loading configuration…",
@@ -1231,9 +1246,9 @@
     "defaultPermissionHint": "Default permission when launching Claude, can be temporarily overridden on Home page",
     "agentSkill": "Agent Skill",
     "agentSkillTitle": "CCEM Agent Skill",
-    "agentSkillDesc": "Install the bundled CCEM skill globally so Codex and Claude Code know how to call CCEM through structured CLI commands.",
-    "agentSkillInstall": "Install globally",
-    "agentSkillUpdate": "Update globally",
+    "agentSkillDesc": "Install the CCEM skill so Codex and Claude Code within CCEM can use its structured CLI commands.",
+    "agentSkillInstall": "Install in CCEM",
+    "agentSkillUpdate": "Update CCEM skill",
     "agentSkillReinstall": "Reinstall",
     "agentSkillInstalling": "Installing",
     "agentSkillCurrent": "Current",
