@@ -1663,7 +1663,7 @@ export function WorkspaceSessionComposer({
         )}
         style={{ transitionTimingFunction: 'cubic-bezier(0.25, 1, 0.5, 1)' }}
       >
-        <div className="max-h-[min(35vh,280px)] space-y-1 overflow-y-auto overscroll-contain">
+        <div className="max-h-[min(35vh,280px)] space-y-1 overflow-hidden overscroll-contain">
           {aboveComposer ? (
             <div className="max-h-[min(60vh,440px)] overflow-y-auto pr-0.5">
               {aboveComposer}
@@ -1677,13 +1677,9 @@ export function WorkspaceSessionComposer({
             <div className="h-px bg-border/35" aria-hidden="true" />
           ) : null}
           {composerAttentionPanel ? (
-            hasInterruption ? (
-              <div className="max-h-[120px] overflow-y-auto">
-                {composerAttentionPanel}
-              </div>
-            ) : (
-              composerAttentionPanel
-            )
+            <div className={cn('overflow-y-auto', hasInterruption ? 'max-h-[120px]' : 'max-h-[min(35vh,280px)]')}>
+              {composerAttentionPanel}
+            </div>
           ) : null}
         </div>
       </div>
