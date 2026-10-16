@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(names, vec!["project", "ccem"]);
         assert_eq!(
             commands[1].path,
-            profile.join("commands/ccem.md").to_string_lossy()
+            profile.join("commands").join("ccem.md").to_string_lossy()
         );
 
         let _ = std::fs::remove_dir_all(dir);

@@ -3856,11 +3856,14 @@ mod tests {
     fn agent_snapshot_cache_remaps_without_double_counting_and_preserves_retired_logs() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("user");
-        let claude = home.join(".ccem/agents/claude");
-        let codex = home.join(".ccem/agents/codex");
-        let old = home.join(".claude/projects/p/session.jsonl");
-        let new = claude.join("projects/p/session.jsonl");
-        let retired = home.join(".claude/projects/p/retired.jsonl");
+        let claude = home.join(".ccem").join("agents").join("claude");
+        let codex = home.join(".ccem").join("agents").join("codex");
+        let old_project = home.join(".claude").join("projects").join("p");
+        let old = old_project.join("session.jsonl");
+        // Production discovery appends each directory entry separately. Keep
+        // cache keys in that spelling, including native Windows separators.
+        let new = claude.join("projects").join("p").join("session.jsonl");
+        let retired = old_project.join("retired.jsonl");
         fs::create_dir_all(old.parent().unwrap()).unwrap();
         fs::create_dir_all(new.parent().unwrap()).unwrap();
         let original = format!("{}\n", claude_line("2026-03-01T10:00:00Z", 100, 10));
@@ -3919,10 +3922,10 @@ mod tests {
     fn agent_snapshot_cache_counts_only_isolated_codex_followups() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("user");
-        let claude = home.join(".ccem/agents/claude");
-        let codex = home.join(".ccem/agents/codex");
-        let old = home.join(".codex/sessions/rollout.jsonl");
-        let new = codex.join("sessions/rollout.jsonl");
+        let claude = home.join(".ccem").join("agents").join("claude");
+        let codex = home.join(".ccem").join("agents").join("codex");
+        let old = home.join(".codex").join("sessions").join("rollout.jsonl");
+        let new = codex.join("sessions").join("rollout.jsonl");
         fs::create_dir_all(old.parent().unwrap()).unwrap();
         fs::create_dir_all(new.parent().unwrap()).unwrap();
         let initial = format!(

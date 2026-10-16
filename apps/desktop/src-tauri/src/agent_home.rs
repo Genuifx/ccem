@@ -773,6 +773,11 @@ fn validate_no_symlinks(path: &Path) -> Result<(), String> {
     let mut current = PathBuf::new();
     for part in path.components() {
         current.push(part.as_os_str());
+        // A Windows drive/verbatim prefix (C: or \\?\C:) is not the root
+        // directory. Inspect it only after RootDir completes the path.
+        if matches!(part, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(format!(
@@ -782,7 +787,12 @@ fn validate_no_symlinks(path: &Path) -> Result<(), String> {
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(format!("Could not inspect agent home: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect agent home {}: {error}",
+                    current.display()
+                ))
+            }
         }
     }
     Ok(())

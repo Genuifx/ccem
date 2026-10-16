@@ -15,6 +15,23 @@ fn write(path: &Path, value: &str) {
     fs::write(path, value).expect("fixture file");
 }
 
+#[cfg(windows)]
+#[test]
+fn path_validation_accepts_native_and_canonical_roots_but_checks_descendants() {
+    let temp = tempfile::tempdir().unwrap();
+    for root in [
+        temp.path().to_path_buf(),
+        fs::canonicalize(temp.path()).unwrap(),
+    ] {
+        // canonicalize produces a verbatim drive prefix on Windows.
+        validate_no_symlinks(&root.join("new-profile").join("profiles.json")).unwrap();
+        assert!(
+            validate_no_symlinks(&root.join("invalid\0component")).is_err(),
+            "a valid root must not bypass errors in its descendants"
+        );
+    }
+}
+
 #[test]
 fn codex_defaults_to_shared_and_pins_override_only_the_process() {
     let (_temp, home, base) = fixture();
