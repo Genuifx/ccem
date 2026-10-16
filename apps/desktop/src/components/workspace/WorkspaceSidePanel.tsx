@@ -1,11 +1,15 @@
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type PointerEventHandler, type ReactNode } from 'react';
-import { Bot, FileText, Globe, X } from '@/lib/lucide-react';
+import { Bot, FolderSearch, GitBranch, FilePenLine, Globe, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useLocale } from '@/locales';
 import { cn } from '@/lib/utils';
 
-export type WorkspaceSideTab = 'browser' | 'files' | 'agents';
+export type WorkspaceSideTab = 'browser' | 'git' | 'session' | 'browse' | 'agents';
+
+export function isFileTab(tab: WorkspaceSideTab | null): tab is 'git' | 'session' | 'browse' {
+  return tab === 'git' || tab === 'session' || tab === 'browse';
+}
+
 interface SidePanelSelection {
   tab: WorkspaceSideTab | null;
   filePath?: string;
@@ -33,7 +37,6 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
     const next = { tab: nextTab, filePath: filePath ?? previous?.filePath, revision: (previous?.revision ?? 0) + 1 };
     selectionsRef.current = { ...selectionsRef.current, [owner]: next };
     setSelections(selectionsRef.current);
-    // Native browser activation may roll back only the selection it installed.
     return () => {
       if (selectionsRef.current[owner] !== next) return;
       const restored = { ...selectionsRef.current };
@@ -44,8 +47,6 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
     };
   }, [ownerKey]);
   const revealBrowser = useCallback((owner: string) => {
-    // Concurrent native requests share the first automatic selection/rollback.
-    // Manual open() calls still install a fresh selection to fence that rollback.
     if (selectionsRef.current[owner]?.tab === 'browser') return () => {};
     return open('browser', undefined, owner);
   }, [open]);
@@ -60,14 +61,22 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
   }), [ownerKey, tab, selection, target, open, revealBrowser, close]);
 }
 
-export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectBrowser, children }: {
+export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectBrowser, fileCounts, children }: {
   controller: WorkspaceSidePanelController;
   width: number;
   onResizeStart: PointerEventHandler<HTMLDivElement>;
   onSelectBrowser: () => void;
+  fileCounts?: { git: number; session: number };
   children: ReactNode;
 }) {
   const { t } = useLocale();
+  const tabs: { key: WorkspaceSideTab; icon: typeof Globe; label: string; count?: number }[] = [
+    { key: 'browser', icon: Globe, label: t('workspace.sidePanelBrowser') },
+    { key: 'git', icon: GitBranch, label: 'Git', count: fileCounts?.git },
+    { key: 'session', icon: FilePenLine, label: t('workspace.scopeSessionShort'), count: fileCounts?.session },
+    { key: 'browse', icon: FolderSearch, label: t('workspace.scopeBrowseShort') },
+    { key: 'agents', icon: Bot, label: t('workspace.sidePanelAgents') },
+  ];
   return (
     <aside
       data-ccem-workspace-side-panel={controller.tab ?? 'closed'}
@@ -75,20 +84,35 @@ export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectB
       style={{ flex: `0 0 ${width}%`, maxWidth: '60%', minWidth: 360 }}
     >
       <div data-ccem-side-panel-resize-handle className="absolute inset-y-0 left-0 z-20 w-1.5 cursor-col-resize touch-none" onPointerDown={onResizeStart} />
-      <div className="workspace-browser-chrome flex h-11 shrink-0 items-center gap-2 border-b border-border/45 px-3">
-        <Tabs value={controller.tab ?? 'browser'} onValueChange={(tab) => {
-          if (tab === 'browser') onSelectBrowser();
-          else controller.open(tab as WorkspaceSideTab);
-        }} className="min-w-0 flex-1">
-          <TabsList aria-label={t('workspace.sidePanelTitle')} className="h-8 bg-transparent p-0">
-            <TabsTrigger value="browser" className="gap-1.5 px-2.5 text-xs"><Globe className="h-3.5 w-3.5" />{t('workspace.sidePanelBrowser')}</TabsTrigger>
-            <TabsTrigger value="files" className="gap-1.5 px-2.5 text-xs"><FileText className="h-3.5 w-3.5" />{t('workspace.sidePanelFiles')}</TabsTrigger>
-            <TabsTrigger value="agents" className="gap-1.5 px-2.5 text-xs"><Bot className="h-3.5 w-3.5" />{t('workspace.reviewSubagents')}</TabsTrigger>
-          </TabsList>
-        </Tabs>
-        <Button variant="ghost" size="icon" className="h-7 w-7" aria-label={t('workspace.sidePanelClose')} onClick={controller.close}><X className="h-4 w-4" /></Button>
+      <div className="workspace-browser-chrome flex h-9 shrink-0 items-center border-b border-border/45 px-1">
+        <div className="flex min-w-0 flex-1 items-center" role="tablist" aria-label={t('workspace.sidePanelTitle')}>
+          {tabs.map(({ key, icon: Icon, label, count }) => (
+            <button
+              key={key}
+              role="tab"
+              aria-selected={controller.tab === key}
+              onClick={() => {
+                if (key === 'browser') onSelectBrowser();
+                else controller.open(key);
+              }}
+              className={cn(
+                'inline-flex items-center justify-center gap-1 rounded-md px-2 py-1 text-2xs font-medium transition-colors',
+                controller.tab === key
+                  ? 'bg-muted/60 text-foreground'
+                  : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground',
+              )}
+            >
+              <Icon className="h-3 w-3" />
+              {label}
+              {count !== undefined && count > 0 && (
+                <span className="ml-0.5 tabular-nums text-3xs opacity-60">{count}</span>
+              )}
+            </button>
+          ))}
+        </div>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.sidePanelClose')} onClick={controller.close}><X className="h-3.5 w-3.5" /></Button>
       </div>
-      <div ref={controller.setTarget} data-ccem-side-panel-content role="region" aria-label={t(controller.tab === 'agents' ? 'workspace.reviewSubagents' : 'workspace.sidePanelFiles')} className={cn('min-h-0 flex-1 flex-col', controller.tab === 'files' || controller.tab === 'agents' ? 'flex' : 'hidden')} />
+      <div ref={controller.setTarget} data-ccem-side-panel-content role="region" aria-label={t(controller.tab === 'agents' ? 'workspace.reviewSubagents' : 'workspace.sidePanelFiles')} className={cn('min-h-0 flex-1 flex-col', isFileTab(controller.tab) || controller.tab === 'agents' ? 'flex' : 'hidden')} />
       {children}
     </aside>
   );

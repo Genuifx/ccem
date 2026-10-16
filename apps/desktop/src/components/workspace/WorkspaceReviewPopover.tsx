@@ -203,9 +203,13 @@ export function WorkspaceReviewPopover({
   const { t } = useLocale();
   const gatedOpen = useNativeSurfaceOcclusion(isOpen);
   const sidePanel = useWorkspaceSidePanel();
-  const detailPage = sidePanel?.tab === 'files' || sidePanel?.tab === 'agents' ? sidePanel.tab : null;
+  const sidePanelTab = sidePanel?.tab ?? null;
+  const isFileScopeTab = sidePanelTab === 'git' || sidePanelTab === 'session' || sidePanelTab === 'browse';
+  const detailPage = isFileScopeTab ? 'files' as const : sidePanelTab === 'agents' ? 'agents' as const : null;
+  const externalScope = isFileScopeTab ? sidePanelTab : undefined;
   const openDetail = (page: WorkspaceReviewDetailPage) => {
-    sidePanel?.open(page);
+    // 'files' → default to 'git' scope; 'agents' stays as-is
+    sidePanel?.open(page === 'files' ? 'git' : page);
     onOpenChange(false);
   };
   const envColor = getEnvColorVar(session.env_name);
@@ -457,6 +461,7 @@ export function WorkspaceReviewPopover({
         requestedPath={sidePanel.filePath}
         requestRevision={sidePanel.revision}
         isLive={isLive}
+        externalScope={externalScope}
       />, sidePanel.target,
     ) : null}
     </>

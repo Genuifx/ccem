@@ -183,7 +183,7 @@ import {
   foldSessionUsageEvents,
   type SessionUsageFold,
 } from './workspaceUsage';
-import { WorkspaceSidePanelContext, useWorkspaceSidePanel } from './WorkspaceSidePanel';
+import { WorkspaceSidePanelContext, useWorkspaceSidePanel, isFileTab } from './WorkspaceSidePanel';
 import { WorkspaceFileLinkContext, useWorkspaceFileLinks } from './WorkspaceFileLinkContext';
 import { LazyWorkspaceReviewPopover } from './LazyWorkspaceReviewPopover';
 import {
@@ -1607,7 +1607,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
   const isReviewPopoverOpen = isVisible && reviewPanelOpen;
   const sidePanel = useWorkspaceSidePanel();
-  const isReviewDetailOpen = isVisible && (sidePanel?.tab === 'files' || sidePanel?.tab === 'agents');
+  const isReviewDetailOpen = isVisible && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [recentFiles, setRecentFiles] = useState<WorkspaceRecentFile[] | null>(null);
   const recentFilesRequestSeqRef = useRef(0);

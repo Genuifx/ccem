@@ -57,7 +57,7 @@ import {
   type WorkspaceEscapeCommandIdentity,
 } from '@/pages/workspaceEscape';
 import type { RouterLaunchDraft } from '@ccem/core/browser';
-import { WorkspaceSidePanel, WorkspaceSidePanelContext, useWorkspaceSidePanelController } from '@/components/workspace/WorkspaceSidePanel';
+import { WorkspaceSidePanel, WorkspaceSidePanelContext, useWorkspaceSidePanelController, isFileTab, type WorkspaceSideTab } from '@/components/workspace/WorkspaceSidePanel';
 import { WorkspaceFileLinkContext } from '@/components/workspace/WorkspaceFileLinkContext';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { useNativeBrowserActivation } from '@/components/workspace/useNativeBrowserActivation';
@@ -1563,7 +1563,7 @@ export function Workspace({
     : workspaceMode === 'history' ? selectedSession?.project ?? '' : composeDir || selectedWorkingDir || defaultWorkingDir || '';
   const sidePanel = useWorkspaceSidePanelController(`${activeBrowserSessionId}:${sidePanelWorkingDir}`, browserPanelOpen);
   const sidePanelOpen = sidePanel.tab !== null;
-  const sidePanelDetailOpen = isActive && (sidePanel.tab === 'files' || sidePanel.tab === 'agents');
+  const sidePanelDetailOpen = isActive && (isFileTab(sidePanel.tab) || sidePanel.tab === 'agents');
   const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
   const browserSurfaceHidden = !isActive || sidePanel.tab !== 'browser';
   const browserSurfaceOccluded = browserSurfaceHidden
@@ -1649,12 +1649,12 @@ export function Workspace({
   const userSidePanel = useMemo(() => ({
     ...sidePanel,
     close: closeSidePanel,
-    open: (tab: 'browser' | 'files' | 'agents', filePath?: string) => {
+    open: (tab: WorkspaceSideTab, filePath?: string) => {
       if (tab !== 'browser') browserActivation.cancel(activeBrowserSessionId, true);
       return sidePanel.open(tab, filePath);
     },
   }), [sidePanel, closeSidePanel, activeBrowserSessionId, browserActivation]);
-  const fileLinkTarget = useMemo(() => ({ workingDir: sidePanelWorkingDir, openFile: (path: string) => userSidePanel.open('files', path) }), [sidePanelWorkingDir, userSidePanel.open]);
+  const fileLinkTarget = useMemo(() => ({ workingDir: sidePanelWorkingDir, openFile: (path: string) => userSidePanel.open('browse', path) }), [sidePanelWorkingDir, userSidePanel.open]);
   const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
     if (sidePanelOpen) closeSidePanel();
     else selectActiveBrowser(workingDir);
@@ -4005,6 +4005,10 @@ export function Workspace({
           width={browserPanelWidthPercent}
           onResizeStart={handleBrowserPanelResizeStart}
           onSelectBrowser={() => selectActiveBrowser(skillsContext.workingDir)}
+          fileCounts={workspaceReviewModel ? {
+            git: workspaceReviewModel.changedFiles.filter((f) => f.source !== 'sdk').length,
+            session: workspaceReviewModel.changedFiles.filter((f) => f.source !== 'git').length,
+          } : undefined}
         >
         {Object.entries(browserTargetBySessionId).map(([sessionId, target]) => {
           if (!target) return null;

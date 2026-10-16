@@ -53,6 +53,8 @@ interface WorkspaceReviewDetailsProps {
   requestRevision?: number;
   onRefreshGit?: () => void;
   isRefreshingGit?: boolean;
+  /** When provided, the internal scope tab bar is hidden and this scope is used directly. */
+  externalScope?: 'git' | 'session' | 'browse';
 }
 
 const MEDIA_EXTENSION_KIND: Record<string, WorkspaceMediaKind> = {
@@ -254,12 +256,14 @@ function MediaPreview({
 function FilesDetail({
   session, model, onLoadDiff, onLoadMediaPreview, gitSnapshot,
   requestedPath, requestRevision, onRefreshGit, isRefreshingGit,
+  externalScope,
 }: WorkspaceReviewDetailsProps) {
   const { t } = useLocale();
   const fileLinks = useWorkspaceFileLinks();
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [mode, setMode] = useState<'preview' | 'source' | 'diff'>('preview');
-  const [scope, setScope] = useState('git');
+  const [internalScope, setInternalScope] = useState('git');
+  const scope = externalScope ?? internalScope;
   const [showList, setShowList] = useState(true);
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<WorkspaceFileSuggestion[]>([]);
@@ -342,20 +346,18 @@ function FilesDetail({
     : files.filter((file) => file.path.toLowerCase().includes(query.toLowerCase()));
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-review-page="files">
-      <div className="flex items-center gap-2 border-b border-border-subtle/50 px-3 py-2">
-        <Tabs value={scope} onValueChange={setScope} className="min-w-0 flex-1">
-          <TabsList className="h-8 bg-transparent p-0" aria-label={t('workspace.fileSources')}>
-            <TabsTrigger value="git" className="px-2 text-[11px]">{t('workspace.filesGit')} {model.changedFiles.filter((file) => file.source !== 'sdk').length}</TabsTrigger>
-            <TabsTrigger value="session" className="px-2 text-[11px]">{t('workspace.filesSession')} {model.changedFiles.filter((file) => file.source !== 'git').length}</TabsTrigger>
-            <TabsTrigger value="browse" className="px-2 text-[11px]">{t('workspace.filesBrowse')}</TabsTrigger>
-          </TabsList>
-        </Tabs>
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewRefresh')} disabled={isRefreshingGit} onClick={onRefreshGit}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshingGit && 'animate-spin')} /></Button>
-      </div>
-      {scope !== 'browse' && (
-        <p className="border-b border-border-subtle/40 px-4 py-2 text-[10px] leading-relaxed text-muted-foreground">
-          {t(scope === 'git' ? 'workspace.filesGitHint' : 'workspace.filesSessionHint')}
-        </p>
+      {/* Internal scope tab bar — only when scope is NOT controlled externally */}
+      {!externalScope && (
+        <div className="flex items-center gap-2 border-b border-border-subtle/50 px-3 py-2">
+          <Tabs value={scope} onValueChange={setInternalScope} className="min-w-0 flex-1">
+            <TabsList className="h-8 bg-transparent p-0" aria-label={t('workspace.fileSources')}>
+              <TabsTrigger value="git" className="px-2 text-[11px]">{t('workspace.filesGit')} {model.changedFiles.filter((file) => file.source !== 'sdk').length}</TabsTrigger>
+              <TabsTrigger value="session" className="px-2 text-[11px]">{t('workspace.filesSession')} {model.changedFiles.filter((file) => file.source !== 'git').length}</TabsTrigger>
+              <TabsTrigger value="browse" className="px-2 text-[11px]">{t('workspace.filesBrowse')}</TabsTrigger>
+            </TabsList>
+          </Tabs>
+          <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewRefresh')} disabled={isRefreshingGit} onClick={onRefreshGit}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshingGit && 'animate-spin')} /></Button>
+        </div>
       )}
       <div className="flex min-h-0 flex-1">
         {showList ? <div className="flex w-[32%] min-w-[140px] max-w-[260px] shrink-0 flex-col border-r border-border-subtle/50">
