@@ -35,6 +35,21 @@ async function resolveDesktopSource(importPath) {
 const stubsPlugin = {
   name: 'ccem-composer-compact-stubs',
   setup(builder) {
+    builder.onResolve({ filter: /^@\/components\/prompt-area$/ }, (args) => {
+      if (!args.importer.endsWith('WorkspaceSessionComposer.tsx')) return null;
+      return { path: 'prompt-area-observer', namespace: 'composer-compact-stubs' };
+    });
+    builder.onLoad({ filter: /^prompt-area-observer$/, namespace: 'composer-compact-stubs' }, () => ({
+      loader: 'tsx', resolveDir: desktopDir,
+      contents: `
+        import React from 'react';
+        import { PromptArea as RealPromptArea } from ${JSON.stringify(path.join(desktopDir, 'src/components/prompt-area.tsx'))};
+        export const PromptArea = React.forwardRef((props, ref) => {
+          globalThis.__composerAttentionTrigger = props.onTriggerPanelChange;
+          return <RealPromptArea {...props} ref={ref} />;
+        });
+      `,
+    }));
     builder.onResolve({ filter: /^@\/lib\/webcontentRecovery$/ }, () => ({ path: 'recovery-stub', namespace: 'composer-compact-stubs' }));
     builder.onLoad({ filter: /^recovery-stub$/, namespace: 'composer-compact-stubs' }, () => ({
       loader: 'js', contents: 'export const isRecoveringWebcontent = () => Boolean(globalThis.window?.__ccemRecoveryTest);',
@@ -81,8 +96,8 @@ async function importHarness() {
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
         import { ComposerControls } from '@/components/workspace/ComposerControls';
 
-        export function mountCompactControls(container) {
-          function Harness() {
+        export function mountCompactControls(container, { question = false, queue = false } = {}) {
+          function Harness({ question, queue }) {
             return (
               <LocaleProvider>
                 <WorkspaceSessionComposer
@@ -92,6 +107,11 @@ async function importHarness() {
                 placeholder="composer input"
                 canSubmit={false}
                 submitLabel="send message"
+                aboveComposer={question ? <div style={{ height: 440 }}><button>answer question</button></div> : null}
+                queuedMessages={queue ? [{ id: 'queued', text: 'queued message', displayText: 'queued message', removable: true }] : []}
+                queueCanFlush
+                onFlushQueuedMessages={() => {}}
+                onRemoveQueuedMessage={() => {}}
                 controls={(
                   <ComposerControls
                     provider="claude"
@@ -110,9 +130,19 @@ async function importHarness() {
           }
 
           const root = createRoot(container);
-          act(() => root.render(<Harness />));
+          act(() => root.render(<Harness question={question} queue={queue} />));
 
           return {
+            setAttentionPanels({ question = false, queue = false } = {}) {
+              act(() => root.render(<Harness question={question} queue={queue} />));
+            },
+            showTrigger() {
+              act(() => globalThis.__composerAttentionTrigger({
+                suggestions: Array.from({ length: 30 }, (_, index) => ({ value: String(index), label: 'file ' + index })),
+                loading: false, selectedIndex: 0, triggerChar: '@',
+                onSelect() {}, onDismiss() {},
+              }));
+            },
             driveResize(width) {
               act(() => {
                 for (const callback of globalThis.__composerCompactResizeCallbacks ?? []) {
@@ -149,6 +179,9 @@ function installDom() {
     url: 'http://localhost/',
   });
   const { window } = dom;
+  // JSDOM has no layout/scroll implementation; the tests inspect the rendered
+  // scroll ownership only; pixel geometry is not verified by JSDOM.
+  window.HTMLElement.prototype.scrollIntoView = () => {};
   const previous = new Map();
 
   const expose = (name, value) => {
@@ -241,6 +274,7 @@ function installDom() {
       }
     }
     delete globalThis.__composerCompactResizeCallbacks;
+    delete globalThis.__composerAttentionTrigger;
     while (animationFrames.size > 0) {
       for (const [handle, callback] of [...animationFrames]) {
         animationFrames.delete(handle);
@@ -256,6 +290,69 @@ function spanByText(container, text) {
   return [...container.querySelectorAll('span.truncate')]
     .find((node) => node.textContent === text) ?? null;
 }
+
+// Exercise the real Composer and TriggerPopover: only the input's existing
+// callback is driven directly, so no attention-container JSX is mocked.
+for (const scenario of [
+  { name: 'trigger alone', trigger: true, question: false, queue: false, overflow: 'overflow-hidden' },
+  { name: 'long question alone', trigger: false, question: true, queue: false, overflow: 'overflow-y-auto' },
+  { name: 'queue alone', trigger: false, question: false, queue: true, overflow: 'overflow-y-auto' },
+  { name: 'trigger plus queue', trigger: true, question: false, queue: true, overflow: 'overflow-y-auto' },
+  { name: 'question plus queue', trigger: false, question: true, queue: true, overflow: 'overflow-y-auto' },
+  { name: 'question plus trigger plus queue', trigger: true, question: true, queue: true, overflow: 'overflow-y-auto' },
+]) {
+  test(`attention dock preserves scroll access for ${scenario.name}`, async () => {
+    const harness = await (importedHarnessPromise ??= importHarness());
+    const restore = installDom();
+    let mounted;
+    try {
+      const container = document.getElementById('root');
+      mounted = harness.mountCompactControls(container, scenario);
+      if (scenario.trigger) mounted.showTrigger();
+      const dock = container.querySelector('[data-attention-state] > div');
+      assert.ok(dock, 'the actual attention dock must render');
+      assert.ok(dock.classList.contains('max-h-[min(35vh,280px)]'), 'the shared height budget remains bounded');
+      assert.ok(dock.classList.contains(scenario.overflow), `${scenario.name} must use ${scenario.overflow}`);
+      assert.equal(dock.classList.contains(scenario.overflow === 'overflow-hidden' ? 'overflow-y-auto' : 'overflow-hidden'), false);
+      if (scenario.trigger) assert.ok(dock.querySelector('[data-radix-scroll-area-viewport]'), 'suggestions retain their own ScrollArea');
+      if (scenario.question) assert.ok([...dock.querySelectorAll('button')].some(button => button.textContent === 'answer question'));
+      if (scenario.queue) assert.match(dock.textContent, /queued message/);
+    } finally {
+      mounted?.unmount();
+      restore();
+    }
+  });
+}
+
+test('attention dock restores single-list scrolling when stacked panels clear without remounting', async () => {
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    mounted = harness.mountCompactControls(container, { question: true, queue: true });
+    mounted.showTrigger();
+    const dock = container.querySelector('[data-attention-state] > div');
+    const viewport = dock.querySelector('[data-radix-scroll-area-viewport]');
+    assert.ok(viewport);
+    assert.ok(dock.classList.contains('overflow-y-auto'));
+
+    mounted.setAttentionPanels();
+    assert.equal(container.querySelector('[data-attention-state] > div'), dock, 'the same dock remains mounted');
+    assert.equal(dock.querySelector('[data-radix-scroll-area-viewport]'), viewport, 'the suggestion list remains mounted');
+    assert.ok(dock.classList.contains('overflow-hidden'), 'clearing other panels restores the suggestion-only scroll owner');
+    assert.equal(dock.classList.contains('overflow-y-auto'), false);
+    assert.doesNotMatch(dock.textContent, /answer question|queued message/);
+
+    mounted.setAttentionPanels({ queue: true });
+    assert.ok(dock.classList.contains('overflow-y-auto'), 'adding a queue restores outer scrolling');
+    assert.equal(dock.classList.contains('overflow-hidden'), false);
+    assert.equal(dock.querySelector('[data-radix-scroll-area-viewport]'), viewport);
+  } finally {
+    mounted?.unmount();
+    restore();
+  }
+});
 
 test('composer controls collapse to icon-only when the footer goes narrow, and restore when it widens', async () => {
   const harness = importedHarnessPromise ?? (importedHarnessPromise = importHarness());

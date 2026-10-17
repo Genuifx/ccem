@@ -1663,7 +1663,12 @@ export function WorkspaceSessionComposer({
         )}
         style={{ transitionTimingFunction: 'cubic-bezier(0.25, 1, 0.5, 1)' }}
       >
-        <div className="max-h-[min(35vh,280px)] space-y-1 overflow-hidden overscroll-contain">
+        <div className={cn(
+          'max-h-[min(35vh,280px)] space-y-1 overflow-y-auto overscroll-contain',
+          // A lone trigger owns its ScrollArea. Long interruptions and stacked
+          // panels still need the outer scroller to keep their actions reachable.
+          triggerAttentionPanel && !aboveComposer && !composerAttentionPanel && 'overflow-hidden',
+        )}>
           {aboveComposer ? (
             <div className="max-h-[min(60vh,440px)] overflow-y-auto pr-0.5">
               {aboveComposer}
