@@ -14,6 +14,7 @@ import { applyClaudePermissionModeToQuery } from './claudePermissionControl';
 import { resolveClaudePermissionRequestId, type ClaudeToolPermissionOptions } from './claudePermissionRequests';
 import { QuerySnapshotSlot, type QuerySnapshot } from './claudeQuerySnapshotSlot';
 import { buildClaudePlanModeHooks } from './claudePlanGuard';
+import { ClaudeTurnPlanTracker } from './claudeTurnPlan';
 import { terminateOwnedProcessGroupOnParentClose } from './parentProcessTeardown';
 import {
   buildClaudeRouterSystemPrompt,
@@ -374,6 +375,8 @@ const pendingClaudeInteractivePrompts = new Map<string, ClaudeInteractivePromptR
 const startedToolNames = new Map<string, string>();
 const completedToolUseIds = new Set<string>();
 const pendingClaudeToolInputs = new Map<string, Record<string, unknown>>();
+const claudeTurnPlan = new ClaudeTurnPlanTracker();
+const claudePlanPromptContents = new Map<string, string | undefined>();
 // Launch capabilities belong to the exact query, not its mutable permission mode.
 const claudeQueryBypassCapabilities = new WeakMap<object, { allowBypass: boolean; admitted: boolean }>();
 const claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
@@ -1364,6 +1367,8 @@ function resetClaudeContentTracking() {
 
 function resetClaudeTurnTracking() {
   clearClaudeLifecycleTerminalTimer();
+  claudeTurnPlan.reset();
+  claudePlanPromptContents.clear();
   resetClaudeContentTracking();
   claudeTurnCompletionEmitted = false;
   claudeLastAssistantMessageUuid = null;
@@ -1822,7 +1827,7 @@ function summarizeClaudeToolInput(
   }
 
   if (toolName.includes('PlanMode') && toolName.includes('Exit')) {
-    const planSummary = extractStringField(input, ['plan']);
+    const planSummary = extractStringField(input, ['plan']) || claudeTurnPlan.content;
     if (planSummary) {
       return formatPermissionPreview(planSummary);
     }
@@ -1935,7 +1940,7 @@ function parseClaudeInteractiveToolPrompt(name: string, input: Record<string, un
         .map((value) => value.trim())
         .filter(Boolean)
       : [];
-    const planSummary = extractStringField(input, ['plan']);
+    const planSummary = extractStringField(input, ['plan']) || claudeTurnPlan.content;
 
     return {
       prompt_type: 'plan_exit' as const,
@@ -1970,9 +1975,15 @@ function emitClaudeToolUseStarted(payload: {
     }
   }
 
-  if (startedToolNames.has(payload.toolUseId)) {
+  const isPlanExit = payload.prompt?.prompt_type === 'plan_exit';
+  const planContent = isPlanExit && typeof payload.prompt?.plan_summary === 'string'
+    ? payload.prompt.plan_summary : undefined;
+  if (startedToolNames.has(payload.toolUseId)
+    && (!isPlanExit || (claudePlanPromptContents.has(payload.toolUseId)
+      && claudePlanPromptContents.get(payload.toolUseId) === planContent))) {
     return;
   }
+  if (isPlanExit) claudePlanPromptContents.set(payload.toolUseId, planContent);
 
   startedToolNames.set(payload.toolUseId, payload.rawName);
   emitEvent({
@@ -3331,6 +3342,11 @@ async function consumeClaudeMessages() {
             const input = block.input && typeof block.input === 'object'
               ? block.input as Record<string, unknown>
               : {};
+            if (!claudeMessageParentToolUseId(message)) {
+              claudeTurnPlan.started(
+                block.id, block.name, input, initCommand!.working_dir,
+              );
+            }
             const prompt = parseClaudeInteractiveToolPrompt(block.name, input);
             const category = categorizeClaudeTool(block.name);
             const needsResponse = category.category === 'user_input'
@@ -3425,6 +3441,19 @@ async function consumeClaudeMessages() {
               message.tool_use_result ?? block.content,
             )
             : undefined;
+          claudeTurnPlan.completed(block.tool_use_id, success);
+          // SDK control callbacks can arrive before the preceding Write result
+          // is drained from the stream. Enrich the same pending card once that
+          // success is known, without replacing its approval resolver. Further
+          // results may replace an intermediate draft before approval.
+          for (const [toolUseId, pending] of pendingClaudeInteractivePrompts) {
+            if (pending.promptType !== 'plan_exit') continue;
+            emitClaudeToolUseStarted({
+              toolUseId, rawName: 'ExitPlanMode', needsResponse: true,
+              inputSummary: summarizeClaudeToolInput('ExitPlanMode', pending.input),
+              prompt: parseClaudeInteractiveToolPrompt('ExitPlanMode', pending.input),
+            });
+          }
           emitClaudeToolUseCompleted(
             block.tool_use_id,
             summarizeClaudeToolResult(block),

@@ -5859,7 +5859,7 @@ var sd = v(function(iB) {
     if (o.$async) r.throw(Ae._`new ${e.ValidationError}(${t})`);
     else r.assign(Ae._`${n}.errors`, t), r.return(false);
   }
-  var fs6 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
+  var fs7 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
   function oB(e, t, r) {
     let { createErrors: n } = e.it;
     if (n === false) return Ae._`{}`;
@@ -5876,13 +5876,13 @@ var sd = v(function(iB) {
   function XAe({ keyword: e, it: { errSchemaPath: t } }, { schemaPath: r, parentSchema: n }) {
     let o = n ? t : Ae.str`${t}/${e}`;
     if (r) o = Ae.str`${o}${(0, H_.getErrorPath)(r, H_.Type.Str)}`;
-    return [fs6.schemaPath, o];
+    return [fs7.schemaPath, o];
   }
   function QAe(e, { params: t, message: r }, n) {
     let { keyword: o, data: i, schemaValue: s, it: a } = e, { opts: c, propertyName: u, topSchemaRef: d, schemaPath: f } = a;
-    if (n.push([fs6.keyword, o], [fs6.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs6.message, typeof r == "function" ? r(e) : r]);
-    if (c.verbose) n.push([fs6.schema, s], [fs6.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
-    if (u) n.push([fs6.propertyName, u]);
+    if (n.push([fs7.keyword, o], [fs7.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs7.message, typeof r == "function" ? r(e) : r]);
+    if (c.verbose) n.push([fs7.schema, s], [fs7.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
+    if (u) n.push([fs7.propertyName, u]);
   }
 });
 var uB = v(function(cB) {
@@ -28254,6 +28254,39 @@ function buildClaudePlanModeHooks(isPlanMode, claudeHome = getCcemAgentHome("cla
   };
 }
 
+// src/claudeTurnPlan.ts
+import fs3 from "node:fs";
+import path5 from "node:path";
+var ClaudeTurnPlanTracker = class {
+  pending = /* @__PURE__ */ new Map();
+  content;
+  reset() {
+    this.pending.clear();
+    this.content = void 0;
+  }
+  started(toolUseId, toolName, input, workingDir) {
+    if (!["Write", "Edit", "MultiEdit"].includes(toolName) || typeof input.file_path !== "string") return;
+    const filePath = path5.resolve(workingDir, input.file_path);
+    if (!/\.md$/i.test(filePath)) return;
+    if (!filePath.split(path5.sep).some((part) => part === ".plans" || part === "plans")) return;
+    this.pending.set(toolUseId, {
+      filePath,
+      ...toolName === "Write" && typeof input.content === "string" ? { content: input.content } : {}
+    });
+  }
+  completed(toolUseId, success2) {
+    const write = this.pending.get(toolUseId);
+    this.pending.delete(toolUseId);
+    if (!write || !success2) return;
+    try {
+      const content = write.content ?? fs3.readFileSync(write.filePath, "utf8");
+      this.content = content.trim() ? content : void 0;
+    } catch {
+      this.content = void 0;
+    }
+  }
+};
+
 // src/parentProcessTeardown.ts
 function terminateOwnedProcessGroupOnParentClose(platform = process.platform, pid = process.pid, killProcess = process.kill.bind(process)) {
   if (platform === "win32" || !Number.isInteger(pid) || pid <= 1) {
@@ -29132,10 +29165,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path8) {
-  if (!path8)
+function getElementAtPath(obj, path9) {
+  if (!path9)
     return obj;
-  return path8.reduce((acc, key) => acc?.[key], obj);
+  return path9.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -29518,11 +29551,11 @@ function aborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path8, issues) {
+function prefixIssues(path9, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path8);
+    iss.path.unshift(path9);
     return iss;
   });
 }
@@ -29705,7 +29738,7 @@ function formatError(error48, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error48, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error49, path8 = []) => {
+  const processError = (error49, path9 = []) => {
     var _a3, _b2;
     for (const issue2 of error49.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
@@ -29715,7 +29748,7 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
       } else if (issue2.code === "invalid_element") {
         processError({ issues: issue2.issues }, issue2.path);
       } else {
-        const fullpath = [...path8, ...issue2.path];
+        const fullpath = [...path9, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -29747,8 +29780,8 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path8 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path8) {
+  const path9 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path9) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -41725,13 +41758,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path8 = ref.slice(1).split("/").filter(Boolean);
-  if (path8.length === 0) {
+  const path9 = ref.slice(1).split("/").filter(Boolean);
+  if (path9.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path8[0] === defsKey) {
-    const key = path8[1];
+  if (path9[0] === defsKey) {
+    const key = path9[1];
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -42595,14 +42628,14 @@ function createCcemSessionHandoffMcpServer(permissionMode, sendMessage) {
 }
 
 // src/imageInputs.ts
-import fs3 from "fs";
+import fs4 from "fs";
 import os3 from "os";
-import path5 from "path";
+import path6 from "path";
 var MAX_SINGLE_IMAGE_BYTES = 30 * 1024 * 1024;
 var MAX_TOTAL_IMAGE_BYTES = 300 * 1024 * 1024;
 function createLocalImageInputs(parts) {
-  const tempDir = path5.join(os3.tmpdir(), "ccem-images");
-  fs3.mkdirSync(tempDir, { recursive: true });
+  const tempDir = path6.join(os3.tmpdir(), "ccem-images");
+  fs4.mkdirSync(tempDir, { recursive: true });
   const inputs = [];
   const tempFiles = [];
   let totalSize = 0;
@@ -42622,8 +42655,8 @@ function createLocalImageInputs(parts) {
       }
       const ext = part.image.mediaType.split("/")[1] || "png";
       const filename = `paste-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
-      const filePath = path5.join(tempDir, filename);
-      fs3.writeFileSync(filePath, data);
+      const filePath = path6.join(tempDir, filename);
+      fs4.writeFileSync(filePath, data);
       tempFiles.push(filePath);
       inputs.push({ type: "local_image", path: filePath });
     }
@@ -42636,15 +42669,15 @@ function createLocalImageInputs(parts) {
 function cleanupTempFiles(files) {
   for (const file2 of files) {
     try {
-      fs3.unlinkSync(file2);
+      fs4.unlinkSync(file2);
     } catch {
     }
   }
 }
 
 // src/codexContextUsage.ts
-import fs4 from "node:fs";
-import path6 from "node:path";
+import fs5 from "node:fs";
+import path7 from "node:path";
 var TAIL_BYTES = 512 * 1024;
 function asRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
@@ -42698,7 +42731,7 @@ function buildCodexContextUsageFromTokenCount(payload, fallbackModel = "codex") 
 }
 function resolveCodexSessionsRoot(env = process.env) {
   const codexHome = getCcemAgentHome("codex", env);
-  return path6.join(codexHome, "sessions");
+  return path7.join(codexHome, "sessions");
 }
 function looksLikeUuid(value) {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
@@ -42706,12 +42739,12 @@ function looksLikeUuid(value) {
 function scanDirectoryForSessionFile(dir, sessionId, recursive) {
   let entries;
   try {
-    entries = fs4.readdirSync(dir, { withFileTypes: true });
+    entries = fs5.readdirSync(dir, { withFileTypes: true });
   } catch {
     return null;
   }
   for (const entry of entries) {
-    const entryPath = path6.join(dir, entry.name);
+    const entryPath = path7.join(dir, entry.name);
     if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(sessionId)) {
       return entryPath;
     }
@@ -42723,7 +42756,7 @@ function scanDirectoryForSessionFile(dir, sessionId, recursive) {
     if (!entry.isDirectory()) {
       continue;
     }
-    const match = scanDirectoryForSessionFile(path6.join(dir, entry.name), sessionId, true);
+    const match = scanDirectoryForSessionFile(path7.join(dir, entry.name), sessionId, true);
     if (match) {
       return match;
     }
@@ -42737,7 +42770,7 @@ function recentSessionDirs(root, days = 7) {
     const yyyy = String(date5.getFullYear());
     const mm2 = String(date5.getMonth() + 1).padStart(2, "0");
     const dd2 = String(date5.getDate()).padStart(2, "0");
-    dirs.push(path6.join(root, yyyy, mm2, dd2));
+    dirs.push(path7.join(root, yyyy, mm2, dd2));
   }
   return dirs;
 }
@@ -42755,18 +42788,18 @@ function findCodexSessionFile(sessionId, sessionsRoot2 = resolveCodexSessionsRoo
   return scanDirectoryForSessionFile(sessionsRoot2, trimmed, true);
 }
 function readTailLines(filePath) {
-  const stat = fs4.statSync(filePath);
+  const stat = fs5.statSync(filePath);
   const length = Math.min(stat.size, TAIL_BYTES);
   const start = Math.max(0, stat.size - length);
-  const fd = fs4.openSync(filePath, "r");
+  const fd = fs5.openSync(filePath, "r");
   try {
     const buffer = Buffer.alloc(length);
-    fs4.readSync(fd, buffer, 0, length, start);
+    fs5.readSync(fd, buffer, 0, length, start);
     const text = buffer.toString("utf8");
     const lines = text.split(/\r?\n/).filter((line) => line.trim());
     return start > 0 ? lines.slice(1) : lines;
   } finally {
-    fs4.closeSync(fd);
+    fs5.closeSync(fd);
   }
 }
 function readLatestCodexContextUsageFromSessionFile(filePath) {
@@ -43841,8 +43874,8 @@ var InputOperation = class {
 };
 
 // src/codexTurnUsage.ts
-import fs5 from "node:fs";
-import path7 from "node:path";
+import fs6 from "node:fs";
+import path8 from "node:path";
 var TAIL_BYTES2 = 1024 * 1024;
 var MAX_TURN_BYTES = 32 * 1024 * 1024;
 var RETRY_COUNT = 8;
@@ -43881,13 +43914,13 @@ function normalize(raw) {
   };
 }
 function sessionsRoot(codexHome) {
-  return codexHome?.trim() ? path7.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
+  return codexHome?.trim() ? path8.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
 }
 function readRange(fd, start, length) {
   const buffer = Buffer.alloc(length);
   let read = 0;
   while (read < length) {
-    const next = fs5.readSync(fd, buffer, read, length - read, start + read);
+    const next = fs6.readSync(fd, buffer, read, length - read, start + read);
     if (next === 0) throw new Error("Codex rollout changed while reading");
     read += next;
   }
@@ -43914,8 +43947,8 @@ function captureCodexUsageBaseline(sessionId, codexHome) {
   if (!filePath) return baseline;
   let fd;
   try {
-    fd = fs5.openSync(filePath, "r");
-    const stat = fs5.fstatSync(fd);
+    fd = fs6.openSync(filePath, "r");
+    const stat = fs6.fstatSync(fd);
     if (!stat.isFile() || stat.size === 0) return baseline;
     const start = Math.max(0, stat.size - TAIL_BYTES2);
     const tail = readRange(fd, start, stat.size - start);
@@ -43934,12 +43967,12 @@ function captureCodexUsageBaseline(sessionId, codexHome) {
       }
     }
     const anchor = readAnchor(fd, stat.size);
-    if (fs5.fstatSync(fd).size !== stat.size) return baseline;
+    if (fs6.fstatSync(fd).size !== stat.size) return baseline;
     return { ...baseline, filePath, offset: stat.size, device: stat.dev, inode: stat.ino, anchor, valid: true };
   } catch {
     return baseline;
   } finally {
-    if (fd !== void 0) fs5.closeSync(fd);
+    if (fd !== void 0) fs6.closeSync(fd);
   }
 }
 var INVALID = { state: "invalid" };
@@ -44021,8 +44054,8 @@ function tryResolve(sessionId, baseline) {
   if (!filePath) return PENDING;
   let fd;
   try {
-    fd = fs5.openSync(filePath, "r");
-    const stat = fs5.fstatSync(fd);
+    fd = fs6.openSync(filePath, "r");
+    const stat = fs6.fstatSync(fd);
     if (!stat.isFile() || stat.size < baseline.offset || stat.size - baseline.offset > MAX_TURN_BYTES) return INVALID;
     if (baseline.filePath && (stat.dev !== baseline.device || stat.ino !== baseline.inode || readAnchor(fd, baseline.offset) !== baseline.anchor)) return INVALID;
     const bytes = readRange(fd, baseline.offset, stat.size - baseline.offset);
@@ -44031,7 +44064,7 @@ function tryResolve(sessionId, baseline) {
   } catch {
     return PENDING;
   } finally {
-    if (fd !== void 0) fs5.closeSync(fd);
+    if (fd !== void 0) fs6.closeSync(fd);
   }
 }
 async function resolveCodexTurnUsage(sessionId, baseline, codexHome) {
@@ -44116,6 +44149,8 @@ var pendingClaudeInteractivePrompts = /* @__PURE__ */ new Map();
 var startedToolNames = /* @__PURE__ */ new Map();
 var completedToolUseIds = /* @__PURE__ */ new Set();
 var pendingClaudeToolInputs = /* @__PURE__ */ new Map();
+var claudeTurnPlan = new ClaudeTurnPlanTracker();
+var claudePlanPromptContents = /* @__PURE__ */ new Map();
 var claudeQueryBypassCapabilities = /* @__PURE__ */ new WeakMap();
 var claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
 var claudeTaskProgressEmittedAt = /* @__PURE__ */ new Map();
@@ -44818,6 +44853,8 @@ function resetClaudeContentTracking() {
 }
 function resetClaudeTurnTracking() {
   clearClaudeLifecycleTerminalTimer();
+  claudeTurnPlan.reset();
+  claudePlanPromptContents.clear();
   resetClaudeContentTracking();
   claudeTurnCompletionEmitted = false;
   claudeLastAssistantMessageUuid = null;
@@ -45174,7 +45211,7 @@ function summarizeClaudeToolInput(toolName, input, options) {
     return questionSummary;
   }
   if (toolName.includes("PlanMode") && toolName.includes("Exit")) {
-    const planSummary = extractStringField(input, ["plan"]);
+    const planSummary = extractStringField(input, ["plan"]) || claudeTurnPlan.content;
     if (planSummary) {
       return formatPermissionPreview(planSummary);
     }
@@ -45245,7 +45282,7 @@ function parseClaudeInteractiveToolPrompt(name, input) {
   }
   if (name.includes("PlanMode") && name.includes("Exit")) {
     const allowedPrompts = Array.isArray(input.allowedPrompts) ? input.allowedPrompts.filter((value) => typeof value === "string").map((value) => value.trim()).filter(Boolean) : [];
-    const planSummary = extractStringField(input, ["plan"]);
+    const planSummary = extractStringField(input, ["plan"]) || claudeTurnPlan.content;
     return {
       prompt_type: "plan_exit",
       allowed_prompts: allowedPrompts,
@@ -45267,9 +45304,12 @@ function emitClaudeToolUseStarted(payload) {
       claudeBackgroundTasks.markToolBackgroundCandidate(payload.toolUseId);
     }
   }
-  if (startedToolNames.has(payload.toolUseId)) {
+  const isPlanExit = payload.prompt?.prompt_type === "plan_exit";
+  const planContent = isPlanExit && typeof payload.prompt?.plan_summary === "string" ? payload.prompt.plan_summary : void 0;
+  if (startedToolNames.has(payload.toolUseId) && (!isPlanExit || claudePlanPromptContents.has(payload.toolUseId) && claudePlanPromptContents.get(payload.toolUseId) === planContent)) {
     return;
   }
+  if (isPlanExit) claudePlanPromptContents.set(payload.toolUseId, planContent);
   startedToolNames.set(payload.toolUseId, payload.rawName);
   emitEvent({
     type: "tool_use_started",
@@ -46304,6 +46344,14 @@ async function consumeClaudeMessages() {
           }
           if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string" && block.name) {
             const input = block.input && typeof block.input === "object" ? block.input : {};
+            if (!claudeMessageParentToolUseId(message)) {
+              claudeTurnPlan.started(
+                block.id,
+                block.name,
+                input,
+                initCommand.working_dir
+              );
+            }
             const prompt = parseClaudeInteractiveToolPrompt(block.name, input);
             const category = categorizeClaudeTool(block.name);
             const needsResponse = category.category === "user_input" && (category.kind === "question" || category.kind === "plan_exit");
@@ -46386,6 +46434,17 @@ async function consumeClaudeMessages() {
             input,
             message.tool_use_result ?? block.content
           ) : void 0;
+          claudeTurnPlan.completed(block.tool_use_id, success2);
+          for (const [toolUseId, pending] of pendingClaudeInteractivePrompts) {
+            if (pending.promptType !== "plan_exit") continue;
+            emitClaudeToolUseStarted({
+              toolUseId,
+              rawName: "ExitPlanMode",
+              needsResponse: true,
+              inputSummary: summarizeClaudeToolInput("ExitPlanMode", pending.input),
+              prompt: parseClaudeInteractiveToolPrompt("ExitPlanMode", pending.input)
+            });
+          }
           emitClaudeToolUseCompleted(
             block.tool_use_id,
             summarizeClaudeToolResult(block),

@@ -136,6 +136,27 @@ test('plan exit prompts always expose a primary approval reply', async () => {
   );
 });
 
+test('late plan content updates the same approval occurrence and waits for its receipt', async () => {
+  const { extractAttentionState } = await importWorkspaceNativeAttention();
+  const payload = {
+    type: 'tool_use_started', tool_use_id: 'same-plan', raw_name: 'ExitPlanMode',
+    needs_response: true, input_summary: '',
+    category: { category: 'user_input', kind: 'plan_exit', raw_name: 'ExitPlanMode' },
+    prompt: { prompt_type: 'plan_exit', allowed_prompts: [] },
+  };
+  const events = [event(1, payload), event(3, {
+    ...payload, prompt: { ...payload.prompt, plan_summary: '# Complete plan\n\nLast line.' },
+  })];
+  const attention = extractAttentionState(events);
+  assert.equal(attention.prompts.length, 1);
+  assert.equal(attention.prompts[0].toolUseId, 'same-plan');
+  assert.equal(attention.prompts[0].eventSeq, 3);
+  assert.equal(attention.prompts[0].prompt.plan_summary, '# Complete plan\n\nLast line.');
+  assert.equal(extractAttentionState([...events, event(4, {
+    type: 'interactive_response_result', tool_use_id: 'same-plan', state: 'applied',
+  })]).prompts.length, 0);
+});
+
 test('persisted user replies and tool completion cannot dismiss a prompt before its applied receipt', async () => {
   const { extractAttentionState } = await importWorkspaceNativeAttention();
 
