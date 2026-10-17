@@ -5,32 +5,6 @@ description: Publish a new ccem release, commit generated release files, or trig
 
 # Ccem Release
 
-先只看这几个文件，不要大范围读代码：
+先读取并遵循 [唯一发布流程](../../../.agents/skills/ccem-release/SKILL.md)，即仓库根目录的 `.agents/skills/ccem-release/SKILL.md`。本入口不维护另一套发布步骤。
 
-- `git status --short`
-- `git tag -l 'v*' --sort=-version:refname | head -n 5`
-- `apps/cli/package.json`
-- `apps/desktop/package.json`
-- `.github/workflows/release-cli.yml`
-- `.github/workflows/release-desktop.yml`
-
-规则：
-
-- 有未提交的 release 文件就直接 review 后提交。
-- 工作区干净且当前版本等于最新 tag 时，不要只触发 `workflow_dispatch`，那通常不是“新版本”。
-- `ccem` 默认走新 tag 发布，因为 CLI 和 Desktop workflow 都支持 tag 触发。
-- 如果 `main` 在最新 tag 之后还有新提交，且需要发下一版 beta，就补一个很小的 patch changeset，再跑 `pnpm version-packages`。
-
-默认流程：
-
-1. 确认或生成下一版号
-2. 检查版本和 changelog diff
-3. 提交 `chore: release vX.Y.Z`
-4. `git tag vX.Y.Z`
-5. `git push origin main`
-6. `git push origin vX.Y.Z`
-
-注意：
-
-- `git push --follow-tags` 不会推 lightweight tag
-- 最终要明确汇报版本号、commit、tag push 是否成功
+尤其是恢复已升版但未打 tag 的候选：保留版本，以当前 `origin/main` 的精确 SHA 重新验证两条 readiness；历史 bump commit 不锁定候选源码。只有 baseline 和当前 SHA 的门禁都通过，且用户请求包括发布，才进入打 tag / 交付阶段。
