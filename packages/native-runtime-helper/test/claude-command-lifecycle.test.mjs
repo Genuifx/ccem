@@ -436,14 +436,33 @@ test('concurrent stamped admissions cannot overwrite foreground ownership', asyn
     const session = await startHelper(t, { scenario: 'full', resultDelayMs: 250 });
     send(session, { type: 'prompt', text: 'first race', command_id: 'race-one' });
     send(session, { type: 'prompt', text: 'second race', command_id: 'race-two' });
-    await waitForOutput(session, (output) => isLifecycle(
+    const rejected = await waitForOutput(session, (output) => isLifecycle(
       output,
       'command_rejected',
       'race-two',
     ) || isLifecycle(output, 'command_rejected', 'race-one'), 'one racing command rejected');
+    // The reservation rejects the follower synchronously, while the winner
+    // still awaits setup. Its admission receipt can arrive in a later stdout
+    // chunk, so observe both outcomes before counting accepted commands.
+    const winner = await waitForOutput(session, (output) => isLifecycle(output, 'command_admitted')
+      && ['race-one', 'race-two'].includes(output.payload.command_id), 'one racing command admitted');
+    assert.notEqual(winner.payload.command_id, rejected.payload.command_id);
+    await waitForOutput(session, (output) => isLifecycle(
+      output,
+      'sdk_command_state',
+      winner.payload.command_id,
+      'completed',
+    ), 'the admitted command reaches its SDK terminal');
+    await waitForOutput(session, (output) => isLifecycle(
+      output,
+      'turn_completed',
+      winner.payload.command_id,
+    ), 'the helper confirms completion for the same foreground owner');
     const admitted = session.outputs.filter((output) => isLifecycle(output, 'command_admitted')
       && ['race-one', 'race-two'].includes(output.payload.command_id));
     assert.equal(admitted.length, 1);
+    assert.equal(lifecycleCount(session, 'command_rejected', rejected.payload.command_id), 1);
+    assert.equal(lifecycleCount(session, 'command_rejected', winner.payload.command_id), 0);
   });
 
   await t.test('initial prompt owns foreground before initialized ready is observable', async (t) => {
