@@ -7,6 +7,7 @@ import {
   ExternalLink,
   FileDiff,
   FileText,
+  FolderClosed,
   LoaderCircle,
   RefreshCw,
   PanelLeft,
@@ -429,8 +430,8 @@ function FilesDetail({
                     : 'hover:bg-surface-raised/55',
                 )}>
                   {item.is_dir
-                    ? <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/50" />
-                    : <span className="flex h-3 w-3 shrink-0 items-center justify-center text-muted-foreground/30">·</span>}
+                    ? <><ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/50" /><FolderClosed className="h-3.5 w-3.5 shrink-0 opacity-50" /></>
+                    : <><span className="w-3 shrink-0" /><FileText className="h-3.5 w-3.5 shrink-0 opacity-50" /></>}
                   <span className="min-w-0 flex-1 truncate">{item.display_name}</span>
                 </button>
               ))
