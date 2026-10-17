@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   CheckCircle2,
+  ChevronRight,
   CircleAlert,
   ExternalLink,
   FileDiff,
   FileText,
-  FolderClosed,
   LoaderCircle,
   RefreshCw,
   PanelLeft,
@@ -397,15 +397,15 @@ function FilesDetail({
           <div className="p-2"><Input aria-label={t('workspace.filesSearch')} placeholder={t('workspace.filesSearch')} value={query} onChange={(event) => setQuery(event.target.value)} className="h-8 px-2 text-xs" /></div>
           {/* Breadcrumb for browse mode (only when not searching) */}
           {scope === 'browse' && !browseHasQuery && (
-            <div className="flex min-h-0 shrink-0 flex-wrap items-center gap-0.5 border-b border-border-subtle/40 px-3 py-1.5">
-              <button type="button" onClick={() => setBrowseDir('')} className={cn('rounded px-1 py-0.5 text-[10px] font-medium transition-colors', browseDir === '' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')}>{projectName}</button>
+            <div className="flex min-h-0 shrink-0 items-center overflow-x-auto border-b border-border-subtle/40 px-3 py-1.5">
+              <button type="button" onClick={() => setBrowseDir('')} className={cn('shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors', browseDir === '' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')}>{projectName}</button>
               {breadcrumbSegments.map((seg, i) => {
                 const path = breadcrumbSegments.slice(0, i + 1).join('/');
                 const isLast = i === breadcrumbSegments.length - 1;
                 return (
-                  <span key={path} className="flex items-center gap-0.5">
-                    <span className="text-[10px] text-muted-foreground/40">/</span>
-                    <button type="button" onClick={() => setBrowseDir(path)} className={cn('rounded px-1 py-0.5 text-[10px] font-medium transition-colors', isLast ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')}>{seg}</button>
+                  <span key={path} className="flex shrink-0 items-center">
+                    <ChevronRight className="h-3 w-3 text-muted-foreground/40" />
+                    <button type="button" onClick={() => setBrowseDir(path)} className={cn('rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors', isLast ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')}>{seg}</button>
                   </span>
                 );
               })}
@@ -422,8 +422,15 @@ function FilesDetail({
                   if (item.is_dir) { setBrowseDir(item.relative_path); setQuery(''); return; }
                   if (fileLinks) fileLinks.openFile(item.relative_path);
                   else void selectFile(item.relative_path);
-                }} className={cn('flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs', item.is_dir ? 'text-muted-foreground hover:bg-surface-raised/55' : selectedPath === item.relative_path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
-                  {item.is_dir ? <FolderClosed className="h-3.5 w-3.5 shrink-0 opacity-50" /> : <FileText className="h-3.5 w-3.5 shrink-0 opacity-50" />}
+                }} className={cn(
+                  'flex w-full items-center gap-1.5 px-2 py-[5px] text-left text-xs transition-colors',
+                  selectedPath === item.relative_path
+                    ? 'rounded-md bg-primary/8 ring-1 ring-primary/30 text-foreground'
+                    : 'hover:bg-surface-raised/55',
+                )}>
+                  {item.is_dir
+                    ? <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/50" />
+                    : <span className="flex h-3 w-3 shrink-0 items-center justify-center text-muted-foreground/30">·</span>}
                   <span className="min-w-0 flex-1 truncate">{item.display_name}</span>
                 </button>
               ))
@@ -441,9 +448,25 @@ function FilesDetail({
           </ScrollArea>
         </div> : null}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border-subtle/40 px-2">
+          <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border-subtle/40 px-2">
             <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesToggleList')} aria-pressed={showList} onClick={() => setShowList(!showList)}><PanelLeft className="h-3.5 w-3.5" /></Button>
-            <p className="min-w-0 flex-1 truncate text-xs font-medium" title={selectedPath ?? ''}>{selectedPath ? basename(selectedPath) : t('workspace.sidePanelFiles')}</p>
+            {selectedPath ? (
+              <div className="flex min-w-0 flex-1 items-center overflow-hidden">
+                <button type="button" onClick={() => { if (scope === 'browse') setBrowseDir(''); }} className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground">{projectName}</button>
+                {selectedPath.split('/').map((seg, i, arr) => (
+                  <span key={i} className="flex shrink-0 items-center">
+                    <ChevronRight className="h-3 w-3 text-muted-foreground/40" />
+                    {i < arr.length - 1 ? (
+                      <button type="button" onClick={() => { if (scope === 'browse') setBrowseDir(arr.slice(0, i + 1).join('/')); }} className="text-[11px] text-muted-foreground hover:text-foreground">{seg}</button>
+                    ) : (
+                      <span className="text-[11px] font-medium text-foreground">{seg}</span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{t('workspace.sidePanelFiles')}</p>
+            )}
             {selectedPath ? <>
               <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesRefreshPreview')} onClick={() => void selectFile(selectedPath, mode)}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
               <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewOpenInEditor')} onClick={() => void openInEditor(selectedPath)}><ExternalLink className="h-3.5 w-3.5" /></Button>
