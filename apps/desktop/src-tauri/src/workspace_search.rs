@@ -322,6 +322,71 @@ pub fn search_workspace_files(
         .collect())
 }
 
+/// List direct children of a directory inside the workspace index.
+/// `relative_dir` is "" for the root, or "src/components" for a subfolder.
+/// Returns entries sorted: directories first (alphabetical), then files (alphabetical).
+#[tauri::command]
+pub fn list_workspace_dir(
+    working_dir: String,
+    relative_dir: Option<String>,
+) -> Result<Vec<WorkspaceFileSuggestion>, String> {
+    let root = fs::canonicalize(PathBuf::from(&working_dir)).map_err(|error| {
+        format!(
+            "Failed to resolve workspace path {}: {}",
+            working_dir, error
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Workspace path {} is not a directory",
+            root.display()
+        ));
+    }
+
+    let prefix = relative_dir
+        .unwrap_or_default()
+        .trim_matches('/')
+        .to_string();
+    let target_depth = if prefix.is_empty() {
+        0
+    } else {
+        prefix.matches('/').count() + 1
+    };
+
+    let entries = get_workspace_index(&root)?;
+
+    let mut children: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry.depth == target_depth
+                && if prefix.is_empty() {
+                    true
+                } else {
+                    entry
+                        .relative_path
+                        .starts_with(&format!("{}/", prefix))
+                }
+        })
+        .collect();
+
+    // dirs first, then files, each group alphabetical
+    children.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+
+    Ok(children
+        .into_iter()
+        .map(|entry| WorkspaceFileSuggestion {
+            absolute_path: entry.absolute_path.clone(),
+            relative_path: entry.relative_path.clone(),
+            display_name: entry.display_name.clone(),
+            is_dir: entry.is_dir,
+        })
+        .collect())
+}
+
 /// A workspace file detected as written/modified at or after a point in time
 /// (the owning session's start), regardless of which tool produced it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

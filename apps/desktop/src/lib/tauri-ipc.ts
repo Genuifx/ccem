@@ -162,6 +162,13 @@ export interface TauriCommands {
     },
     WorkspaceFileSuggestion[]
   ];
+  list_workspace_dir: [
+    {
+      workingDir: string;
+      relativeDir?: string | null;
+    },
+    WorkspaceFileSuggestion[]
+  ];
   get_workspace_git_snapshot: [{ workingDir: string }, WorkspaceGitSnapshot];
   get_workspace_file_diff: [{ workingDir: string; filePath: string }, WorkspaceFileDiff];
   get_workspace_file_preview: [{ workingDir: string; filePath: string }, WorkspaceFilePreview];

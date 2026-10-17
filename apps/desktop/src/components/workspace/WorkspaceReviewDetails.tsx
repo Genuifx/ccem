@@ -6,6 +6,7 @@ import {
   ExternalLink,
   FileDiff,
   FileText,
+  FolderClosed,
   LoaderCircle,
   RefreshCw,
   PanelLeft,
@@ -269,6 +270,11 @@ function FilesDetail({
   const [suggestions, setSuggestions] = useState<WorkspaceFileSuggestion[]>([]);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
+  // Browse directory navigation
+  const [browseDir, setBrowseDir] = useState('');
+  const [browseDirEntries, setBrowseDirEntries] = useState<WorkspaceFileSuggestion[]>([]);
+  const [browseDirLoading, setBrowseDirLoading] = useState(false);
+  const [browseDirError, setBrowseDirError] = useState<string | null>(null);
   const [diff, setDiff] = useState<WorkspaceFileDiff | null>(null);
   const [mediaPreview, setMediaPreview] = useState<WorkspaceMediaPreview | null>(null);
   const [textPreview, setTextPreview] = useState<WorkspaceFilePreview | null>(null);
@@ -320,16 +326,35 @@ function FilesDetail({
   useEffect(() => {
     if (scope !== 'browse') return;
     let cancelled = false;
-    setSearching(true);
-    setSearchError(null);
-    const timer = window.setTimeout(() => {
-      void invoke<WorkspaceFileSuggestion[]>('search_workspace_files', { workingDir: session.project_dir, query, limit: 40 })
-        .then((files) => { if (!cancelled) setSuggestions(files.filter((file) => !file.is_dir)); })
-        .catch((err) => { if (!cancelled) { setSuggestions([]); setSearchError(String(err)); } })
-        .finally(() => { if (!cancelled) setSearching(false); });
-    }, 180);
-    return () => { cancelled = true; window.clearTimeout(timer); };
+    // If there's a search query, use fuzzy search; otherwise use directory listing
+    if (query.trim()) {
+      setSearching(true);
+      setSearchError(null);
+      const timer = window.setTimeout(() => {
+        void invoke<WorkspaceFileSuggestion[]>('search_workspace_files', { workingDir: session.project_dir, query, limit: 40 })
+          .then((files) => { if (!cancelled) setSuggestions(files); })
+          .catch((err) => { if (!cancelled) { setSuggestions([]); setSearchError(String(err)); } })
+          .finally(() => { if (!cancelled) setSearching(false); });
+      }, 180);
+      return () => { cancelled = true; window.clearTimeout(timer); };
+    }
+    setSuggestions([]);
+    setSearching(false);
+    return undefined;
   }, [query, scope, session.project_dir]);
+
+  // Browse directory listing
+  useEffect(() => {
+    if (scope !== 'browse') return;
+    let cancelled = false;
+    setBrowseDirLoading(true);
+    setBrowseDirError(null);
+    void invoke<WorkspaceFileSuggestion[]>('list_workspace_dir', { workingDir: session.project_dir, relativeDir: browseDir || null })
+      .then((entries) => { if (!cancelled) setBrowseDirEntries(entries); })
+      .catch((err) => { if (!cancelled) { setBrowseDirEntries([]); setBrowseDirError(String(err)); } })
+      .finally(() => { if (!cancelled) setBrowseDirLoading(false); });
+    return () => { cancelled = true; };
+  }, [browseDir, scope, session.project_dir]);
 
   const openInEditor = async (path: string) => {
     try {
@@ -341,9 +366,16 @@ function FilesDetail({
     }
   };
   const files = model.changedFiles.filter((file) => scope === 'session' ? file.source !== 'git' : file.source !== 'sdk');
-  const rows = scope === 'browse'
-    ? suggestions.map((file) => ({ path: file.relative_path, status: '', source: 'browse' }))
-    : files.filter((file) => file.path.toLowerCase().includes(query.toLowerCase()));
+  const gitSessionRows = files.filter((file) => file.path.toLowerCase().includes(query.toLowerCase())).map((file) => ({ ...file, isDir: false }));
+  // For browse: show search results if query present, otherwise directory listing
+  const browseHasQuery = scope === 'browse' && query.trim().length > 0;
+  const browseListItems = browseHasQuery ? suggestions : browseDirEntries;
+  const browseIsLoading = browseHasQuery ? searching : browseDirLoading;
+  const browseError = browseHasQuery ? searchError : browseDirError;
+  // Breadcrumb segments for browse mode
+  const breadcrumbSegments = browseDir ? browseDir.split('/') : [];
+  const projectName = basename(session.project_dir);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-review-page="files">
       {/* Internal scope tab bar — only when scope is NOT controlled externally */}
@@ -361,19 +393,51 @@ function FilesDetail({
       )}
       <div className="flex min-h-0 flex-1">
         {showList ? <div className="flex w-[32%] min-w-[140px] max-w-[260px] shrink-0 flex-col border-r border-border-subtle/50">
+          {/* Search bar */}
           <div className="p-2"><Input aria-label={t('workspace.filesSearch')} placeholder={t('workspace.filesSearch')} value={query} onChange={(event) => setQuery(event.target.value)} className="h-8 px-2 text-xs" /></div>
+          {/* Breadcrumb for browse mode (only when not searching) */}
+          {scope === 'browse' && !browseHasQuery && (
+            <div className="flex min-h-0 shrink-0 flex-wrap items-center gap-0.5 border-b border-border-subtle/40 px-3 py-1.5">
+              <button type="button" onClick={() => setBrowseDir('')} className={cn('rounded px-1 py-0.5 text-[10px] font-medium transition-colors', browseDir === '' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')}>{projectName}</button>
+              {breadcrumbSegments.map((seg, i) => {
+                const path = breadcrumbSegments.slice(0, i + 1).join('/');
+                const isLast = i === breadcrumbSegments.length - 1;
+                return (
+                  <span key={path} className="flex items-center gap-0.5">
+                    <span className="text-[10px] text-muted-foreground/40">/</span>
+                    <button type="button" onClick={() => setBrowseDir(path)} className={cn('rounded px-1 py-0.5 text-[10px] font-medium transition-colors', isLast ? 'text-foreground' : 'text-muted-foreground hover:text-foreground')}>{seg}</button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
           <ScrollArea className="min-h-0 flex-1">
             {scope === 'git' && gitSnapshot?.error ? <p className="px-3 py-3 text-xs text-muted-foreground">{gitSnapshot.error}</p> : null}
-            {searchError && scope === 'browse' ? <p className="px-3 py-3 text-xs text-destructive">{searchError}</p> : null}
-            {rows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{searching && scope === 'browse' ? t('workspace.reviewLoading') : t('workspace.filesEmpty')}</p> : rows.map((file) => (
-              <button key={file.path} type="button" data-review-file-row title={file.path} onClick={() => {
-                if (fileLinks) fileLinks.openFile(file.path);
-                else void selectFile(file.path, file.status === 'deleted' ? 'diff' : undefined);
-              }} className={cn('flex w-full items-center gap-2 px-3 py-2 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
-                <FileText className="h-3.5 w-3.5 shrink-0 opacity-60" /><span className="min-w-0 flex-1 truncate">{file.path}</span>
-                {file.status ? <span className={cn('font-mono text-[10px]', statusMark(file.status).className)}>{statusMark(file.status).letter}</span> : null}
-              </button>
-            ))}
+            {browseError && scope === 'browse' ? <p className="px-3 py-3 text-xs text-destructive">{browseError}</p> : null}
+            {scope === 'browse' ? (
+              browseIsLoading ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.reviewLoading')}</p>
+              : browseListItems.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.filesEmpty')}</p>
+              : browseListItems.map((item) => (
+                <button key={item.relative_path} type="button" data-review-file-row title={item.relative_path} onClick={() => {
+                  if (item.is_dir) { setBrowseDir(item.relative_path); setQuery(''); return; }
+                  if (fileLinks) fileLinks.openFile(item.relative_path);
+                  else void selectFile(item.relative_path);
+                }} className={cn('flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs', item.is_dir ? 'text-muted-foreground hover:bg-surface-raised/55' : selectedPath === item.relative_path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
+                  {item.is_dir ? <FolderClosed className="h-3.5 w-3.5 shrink-0 opacity-50" /> : <FileText className="h-3.5 w-3.5 shrink-0 opacity-50" />}
+                  <span className="min-w-0 flex-1 truncate">{item.display_name}</span>
+                </button>
+              ))
+            ) : (
+              gitSessionRows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.filesEmpty')}</p> : gitSessionRows.map((file) => (
+                <button key={file.path} type="button" data-review-file-row title={file.path} onClick={() => {
+                  if (fileLinks) fileLinks.openFile(file.path);
+                  else void selectFile(file.path, file.status === 'deleted' ? 'diff' : undefined);
+                }} className={cn('flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
+                  <FileText className="h-3.5 w-3.5 shrink-0 opacity-50" /><span className="min-w-0 flex-1 truncate">{file.path}</span>
+                  {file.status ? <span className={cn('font-mono text-[10px]', statusMark(file.status).className)}>{statusMark(file.status).letter}</span> : null}
+                </button>
+              ))
+            )}
           </ScrollArea>
         </div> : null}
         <div className="flex min-w-0 flex-1 flex-col">
