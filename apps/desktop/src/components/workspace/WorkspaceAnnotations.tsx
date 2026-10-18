@@ -8,7 +8,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { toast } from 'sonner';
-import { Check, MessageSquareQuote, Pencil, Plus, Trash2, X } from '@/lib/lucide-react';
+import { Check, Copy, MessageSquareQuote, Pencil, Plus, Trash2, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -19,6 +19,9 @@ import {
   normalizeWorkspaceSelection,
   type WorkspaceAnnotation,
   type WorkspaceAnnotationAnchor,
+  type WorkspaceAnnotationAppearance,
+  type WorkspaceAnnotationColor,
+  type WorkspaceAnnotationHighlightStyle,
 } from './workspaceAnnotationModel';
 import {
   captureWorkspaceAnnotationAnchor,
@@ -30,9 +33,9 @@ import {
   type ViewportRect,
 } from './workspaceAnnotationRects';
 import {
-  WorkspaceAnnotationStyleToggle,
-  useWorkspaceAnnotationHighlightStyle,
-} from './WorkspaceAnnotationStyleToggle';
+  WorkspaceAnnotationAppearanceControls,
+  useWorkspaceAnnotationAppearance,
+} from './WorkspaceAnnotationAppearance';
 
 interface SelectionCandidate {
   quote: string | null;
@@ -42,6 +45,8 @@ interface SelectionCandidate {
   left: number;
   top: number;
   editing: boolean;
+  style: WorkspaceAnnotationHighlightStyle;
+  color: WorkspaceAnnotationColor;
 }
 
 interface AnnotationPlacement {
@@ -61,8 +66,17 @@ interface WorkspaceTranscriptSelectionProps {
   canCreate?: boolean;
   canAdd: boolean;
   annotations: WorkspaceAnnotation[];
-  onAdd: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
-  onUpdate: (id: string, note: string) => boolean;
+  onAdd: (
+    quote: string,
+    note: string,
+    anchor?: WorkspaceAnnotationAnchor,
+    appearance?: WorkspaceAnnotationAppearance,
+  ) => boolean;
+  onUpdate: (
+    id: string,
+    note: string,
+    appearance?: Partial<WorkspaceAnnotationAppearance>,
+  ) => boolean;
   onRemove: (id: string) => void;
 }
 
@@ -109,7 +123,7 @@ function placementsEqual(left: AnnotationPlacement[], right: AnnotationPlacement
   }
   return left.every((placement, index) => {
     const other = right[index];
-    return placement.annotation.id === other.annotation.id
+    return placement.annotation === other.annotation
       && placement.index === other.index
       && placement.markerLeft === other.markerLeft
       && placement.markerTop === other.markerTop
@@ -127,6 +141,17 @@ function nodeInsideAnnotationLayer(node: Node | null): boolean {
 
 function mutationsTouchTranscript(records: MutationRecord[]): boolean {
   return records.some((record) => !nodeInsideAnnotationLayer(record.target));
+}
+
+function annotationMarkClass(
+  style: WorkspaceAnnotationHighlightStyle,
+  color: WorkspaceAnnotationColor,
+): string {
+  return cn(
+    'absolute',
+    `workspace-annotation-mark-${style}`,
+    `workspace-annotation-color-${color}`,
+  );
 }
 
 function useAnnotationPlacements(
@@ -300,16 +325,32 @@ export function WorkspaceTranscriptSelection({
   // Viewport anchor captured when a marker opens the editor; the panel stays
   // put while the transcript scrolls beneath it.
   const [savedEditorAnchor, setSavedEditorAnchor] = useState<{ left: number; top: number } | null>(null);
-  const [highlightStyle] = useWorkspaceAnnotationHighlightStyle();
-  const highlightClass = highlightStyle === 'wave'
-    ? 'workspace-annotation-mark-wave'
-    : 'workspace-annotation-mark-selection';
+  const [copied, setCopied] = useState(false);
+  const {
+    appearance: defaultAppearance,
+    setStyle: setDefaultStyle,
+    setColor: setDefaultColor,
+  } = useWorkspaceAnnotationAppearance();
   const placements = useAnnotationPlacements(rootRef, contentRef, annotations, isActive);
   const hasSelectionCandidate = Boolean(candidate);
+
+  const appearanceFor = useCallback((annotation: WorkspaceAnnotation): WorkspaceAnnotationAppearance => ({
+    style: annotation.highlightStyle ?? defaultAppearance.style,
+    color: annotation.highlightColor ?? defaultAppearance.color,
+  }), [defaultAppearance.color, defaultAppearance.style]);
+
+  useEffect(() => {
+    if (!copied) {
+      return;
+    }
+    const timer = window.setTimeout(() => setCopied(false), 1_200);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
 
   const dismiss = useCallback(() => {
     setCandidate(null);
     setNote('');
+    setCopied(false);
     candidateRangeRef.current = null;
   }, []);
 
@@ -375,9 +416,11 @@ export function WorkspaceTranscriptSelection({
           anchor: null,
           blocked: true,
           rects,
-          left: Math.max(124, Math.min(window.innerWidth - 124, lastRect.left + lastRect.width / 2)),
-          top: Math.max(12, Math.min(window.innerHeight - 72, lastRect.bottom + 8)),
+          left: Math.max(220, Math.min(window.innerWidth - 220, lastRect.left + lastRect.width / 2)),
+          top: Math.max(12, Math.min(window.innerHeight - 160, lastRect.bottom + 8)),
           editing: false,
+          style: defaultAppearance.style,
+          color: defaultAppearance.color,
         });
         setNote('');
       } else if (!candidate?.editing) {
@@ -395,12 +438,23 @@ export function WorkspaceTranscriptSelection({
       anchor,
       blocked: false,
       rects,
-      left: Math.max(124, Math.min(window.innerWidth - 124, lastRect.left + lastRect.width / 2)),
-      top: Math.max(12, Math.min(window.innerHeight - 72, lastRect.bottom + 8)),
+      left: Math.max(220, Math.min(window.innerWidth - 220, lastRect.left + lastRect.width / 2)),
+      top: Math.max(12, Math.min(window.innerHeight - 160, lastRect.bottom + 8)),
       editing: false,
+      style: defaultAppearance.style,
+      color: defaultAppearance.color,
     });
     setNote('');
-  }, [canCreate, candidate?.editing, contentRef, dismiss, isActive, rootRef]);
+  }, [
+    canCreate,
+    candidate?.editing,
+    contentRef,
+    defaultAppearance.color,
+    defaultAppearance.style,
+    dismiss,
+    isActive,
+    rootRef,
+  ]);
 
   useEffect(() => {
     const handleMouseDown = (event: MouseEvent) => {
@@ -594,7 +648,10 @@ export function WorkspaceTranscriptSelection({
     if (!candidate?.quote || !note.trim()) {
       return;
     }
-    if (onAdd(candidate.quote, note, candidate.anchor ?? undefined)) {
+    if (onAdd(candidate.quote, note, candidate.anchor ?? undefined, {
+      style: candidate.style,
+      color: candidate.color,
+    })) {
       window.getSelection()?.removeAllRanges();
       dismiss();
     } else {
@@ -602,9 +659,42 @@ export function WorkspaceTranscriptSelection({
     }
   };
 
+  const copySelection = async () => {
+    if (!candidate?.quote) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(candidate.quote);
+      setCopied(true);
+    } catch {
+      toast.error(t('workspace.annotationCopyFailed'));
+    }
+  };
+
+  const updateCandidateStyle = (style: WorkspaceAnnotationHighlightStyle) => {
+    setDefaultStyle(style);
+    setCandidate((current) => (current ? { ...current, style } : current));
+  };
+
+  const updateCandidateColor = (color: WorkspaceAnnotationColor) => {
+    setDefaultColor(color);
+    setCandidate((current) => (current ? { ...current, color } : current));
+  };
+
   const editingAnnotation = editingAnnotationId
     ? annotations.find((annotation) => annotation.id === editingAnnotationId) ?? null
     : null;
+  const editingAppearance = editingAnnotation ? appearanceFor(editingAnnotation) : null;
+
+  const updateEditingAppearance = (patch: Partial<WorkspaceAnnotationAppearance>) => {
+    if (!editingAnnotation) {
+      return;
+    }
+    if (!onUpdate(editingAnnotation.id, editingAnnotation.note, patch)) {
+      toast.error(t('workspace.annotationSaveFailed'));
+    }
+  };
+
   const contentWidth = contentRef.current?.clientWidth ?? window.innerWidth;
 
   return (
@@ -618,22 +708,27 @@ export function WorkspaceTranscriptSelection({
         className="pointer-events-none absolute inset-0 z-0"
         aria-hidden="true"
       >
-        {placements.flatMap((placement) => placement.rects.map((rect, rectIndex) => (
-          <span
-            key={`${placement.annotation.id}:${rectIndex}`}
-            data-workspace-selection-highlight="saved"
-            data-annotation-style={highlightStyle}
-            className={cn('absolute', highlightClass)}
-            style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
-          />
-        )))}
+        {placements.flatMap((placement) => {
+          const appearance = appearanceFor(placement.annotation);
+          return placement.rects.map((rect, rectIndex) => (
+            <span
+              key={`${placement.annotation.id}:${rectIndex}`}
+              data-workspace-selection-highlight="saved"
+              data-annotation-style={appearance.style}
+              data-annotation-color={appearance.color}
+              className={annotationMarkClass(appearance.style, appearance.color)}
+              style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
+            />
+          ));
+        })}
         {candidate ? candidate.rects.map((rect, index) => (
           <span
             key={`candidate:${index}`}
             data-workspace-selection-highlight="candidate"
-            data-annotation-style={highlightStyle}
+            data-annotation-style={candidate.style}
+            data-annotation-color={candidate.color}
             data-candidate="true"
-            className={cn('absolute', highlightClass)}
+            className={annotationMarkClass(candidate.style, candidate.color)}
             style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
           />
         )) : null}
@@ -645,6 +740,7 @@ export function WorkspaceTranscriptSelection({
       >
         {placements.map((placement) => {
           const tooltipOnLeft = placement.markerLeft > contentWidth - 320;
+          const appearance = appearanceFor(placement.annotation);
           return (
             <div
               key={placement.annotation.id}
@@ -656,7 +752,10 @@ export function WorkspaceTranscriptSelection({
               <button
                 type="button"
                 aria-label={t('workspace.composerAnnotationEdit')}
-                className="pointer-events-auto flex h-6 min-w-6 items-center justify-center rounded-full bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground shadow-[0_4px_14px_rgba(0,122,255,0.28)] transition-transform hover:scale-105"
+                className={cn(
+                  'workspace-annotation-marker-badge pointer-events-auto flex h-6 min-w-6 items-center justify-center rounded-full px-1.5 text-[10px] font-semibold transition-transform hover:scale-105',
+                  `workspace-annotation-color-${appearance.color}`,
+                )}
                 onClick={(event) => {
                   const rect = event.currentTarget.getBoundingClientRect();
                   setSavedEditorAnchor({ left: rect.left, top: rect.top });
@@ -697,7 +796,7 @@ export function WorkspaceTranscriptSelection({
                     ? savedEditorAnchor.left - 348
                     : savedEditorAnchor.left + 30,
                 )),
-                top: Math.max(12, Math.min(window.innerHeight - 190, savedEditorAnchor.top - 12)),
+                top: Math.max(12, Math.min(window.innerHeight - 230, savedEditorAnchor.top - 12)),
               }}
             >
               <div className="mb-2 flex items-start gap-2">
@@ -706,6 +805,15 @@ export function WorkspaceTranscriptSelection({
                   {editingAnnotation.quote}
                 </p>
               </div>
+              {editingAppearance ? (
+                <WorkspaceAnnotationAppearanceControls
+                  className="mb-2"
+                  style={editingAppearance.style}
+                  color={editingAppearance.color}
+                  onStyleChange={(style) => updateEditingAppearance({ style })}
+                  onColorChange={(color) => updateEditingAppearance({ color })}
+                />
+              ) : null}
               <textarea
                 autoFocus
                 maxLength={4_000}
@@ -714,7 +822,7 @@ export function WorkspaceTranscriptSelection({
                 onKeyDown={(event) => {
                   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && editingAnnotationNote.trim()) {
                     event.preventDefault();
-                    if (onUpdate(editingAnnotation.id, editingAnnotationNote)) {
+                    if (onUpdate(editingAnnotation.id, editingAnnotationNote, editingAppearance ?? undefined)) {
                       dismissSavedEditor();
                     } else {
                       toast.error(t('workspace.annotationSaveFailed'));
@@ -736,7 +844,6 @@ export function WorkspaceTranscriptSelection({
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
                 <div className="flex items-center gap-1.5">
-                  <WorkspaceAnnotationStyleToggle />
                   <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-3" onClick={dismissSavedEditor}>
                     {t('common.cancel')}
                   </Button>
@@ -746,7 +853,7 @@ export function WorkspaceTranscriptSelection({
                     className="h-7 rounded-full px-3"
                     disabled={!editingAnnotationNote.trim()}
                     onClick={() => {
-                      if (onUpdate(editingAnnotation.id, editingAnnotationNote)) {
+                      if (onUpdate(editingAnnotation.id, editingAnnotationNote, editingAppearance ?? undefined)) {
                         dismissSavedEditor();
                       } else {
                         toast.error(t('workspace.annotationSaveFailed'));
@@ -767,7 +874,9 @@ export function WorkspaceTranscriptSelection({
               data-workspace-selection-action
               className={cn(
                 'fixed z-50 -translate-x-1/2 rounded-2xl border border-border/45 bg-popover shadow-xl',
-                candidate.editing ? 'w-[min(420px,calc(100vw-24px))] p-3' : 'p-1',
+                candidate.editing
+                  ? 'w-[min(420px,calc(100vw-24px))] p-3'
+                  : 'w-[min(440px,calc(100vw-24px))] p-2',
               )}
               style={{ left: candidate.left, top: candidate.top }}
               onMouseDown={(event) => {
@@ -784,6 +893,12 @@ export function WorkspaceTranscriptSelection({
                       {candidate.quote}
                     </p>
                   </div>
+                  <WorkspaceAnnotationAppearanceControls
+                    style={candidate.style}
+                    color={candidate.color}
+                    onStyleChange={updateCandidateStyle}
+                    onColorChange={updateCandidateColor}
+                  />
                   <textarea
                     autoFocus
                     maxLength={4_000}
@@ -814,31 +929,53 @@ export function WorkspaceTranscriptSelection({
                   </div>
                 </div>
               ) : candidate.blocked ? (
-                <span className="px-3 py-1.5 text-xs text-muted-foreground">
+                <span className="px-2 py-1 text-xs text-muted-foreground">
                   {t('workspace.selectionTooLong')}
                 </span>
               ) : (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  className="h-8 rounded-xl px-3"
-                  disabled={!canAdd}
-                  onClick={() => {
-                    setCandidate((current) => current ? {
-                      ...current,
-                      editing: true,
-                      // The editing panel is wider than the trigger pill; keep it
-                      // fully on screen when the selection sits near an edge.
-                      left: Math.max(212, Math.min(window.innerWidth - 212, current.left)),
-                      top: Math.max(12, Math.min(current.top, window.innerHeight - 230)),
-                    } : current);
-                    window.getSelection()?.removeAllRanges();
-                  }}
-                >
-                  <Plus className="mr-1.5 h-3.5 w-3.5" />
-                  {t(canAdd ? 'workspace.selectionAddToTask' : 'workspace.selectionAnnotationLimit')}
-                </Button>
+                <div className="space-y-2">
+                  <WorkspaceAnnotationAppearanceControls
+                    style={candidate.style}
+                    color={candidate.color}
+                    onStyleChange={updateCandidateStyle}
+                    onColorChange={updateCandidateColor}
+                  />
+                  <div className="flex items-center justify-between gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 rounded-full px-2.5 text-[11px]"
+                      onClick={() => void copySelection()}
+                    >
+                      {copied
+                        ? <Check className="mr-1 h-3.5 w-3.5" />
+                        : <Copy className="mr-1 h-3.5 w-3.5" />}
+                      {t(copied ? 'workspace.annotationCopied' : 'workspace.annotationCopy')}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-8 rounded-xl px-3"
+                      disabled={!canAdd}
+                      onClick={() => {
+                        setCandidate((current) => current ? {
+                          ...current,
+                          editing: true,
+                          // The note editor is taller and wider; keep it fully
+                          // on screen when the selection sits near an edge.
+                          left: Math.max(220, Math.min(window.innerWidth - 220, current.left)),
+                          top: Math.max(12, Math.min(current.top, window.innerHeight - 250)),
+                        } : current);
+                        window.getSelection()?.removeAllRanges();
+                      }}
+                    >
+                      <Plus className="mr-1.5 h-3.5 w-3.5" />
+                      {t(canAdd ? 'workspace.selectionAddToTask' : 'workspace.selectionAnnotationLimit')}
+                    </Button>
+                  </div>
+                </div>
               )}
             </div>
           ) : null}
@@ -894,13 +1031,10 @@ export function WorkspaceComposerAnnotations({
         >
           <div className="mb-1.5 flex items-center justify-between gap-2 px-1">
             <span className="min-w-0 truncate text-xs font-semibold">{t('workspace.composerAnnotationsTitle')}</span>
-            <div className="flex shrink-0 items-center gap-1">
-              <WorkspaceAnnotationStyleToggle />
-              <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-2 text-[10px]" onClick={onClear}>
-                <Trash2 className="mr-1 h-3 w-3" />
-                {t('workspace.composerAnnotationsClear')}
-              </Button>
-            </div>
+            <Button type="button" size="sm" variant="ghost" className="h-7 shrink-0 rounded-full px-2 text-[10px]" onClick={onClear}>
+              <Trash2 className="mr-1 h-3 w-3" />
+              {t('workspace.composerAnnotationsClear')}
+            </Button>
           </div>
           <ScrollArea className="max-h-[320px] min-h-0">
             <div className="space-y-1.5">

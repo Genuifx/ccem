@@ -24,6 +24,7 @@ import {
 import type {
   WorkspaceAnnotation,
   WorkspaceAnnotationAnchor,
+  WorkspaceAnnotationAppearance,
 } from './workspaceAnnotationModel';
 
 interface WorkspaceConversationDetailProps {
@@ -37,8 +38,17 @@ interface WorkspaceConversationDetailProps {
   onTranscriptRetry?: () => void;
   canAddAnnotation?: boolean;
   annotations?: WorkspaceAnnotation[];
-  onAddAnnotation?: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
-  onUpdateAnnotation?: (id: string, note: string) => boolean;
+  onAddAnnotation?: (
+    quote: string,
+    note: string,
+    anchor?: WorkspaceAnnotationAnchor,
+    appearance?: WorkspaceAnnotationAppearance,
+  ) => boolean;
+  onUpdateAnnotation?: (
+    id: string,
+    note: string,
+    appearance?: Partial<WorkspaceAnnotationAppearance>,
+  ) => boolean;
   onRemoveAnnotation?: (id: string) => void;
   /** Fork-session-from-turn action for model-output bubbles (stable callback). */
   onForkTurn?: (message: ConversationMessageData) => void;

@@ -1227,18 +1227,46 @@
   background-color: transparent;
 }
 
+/* Workspace annotation palette. Dark is the default theme; `.light` overrides
+   with deeper shades so the same palette stays legible on white surfaces. */
+:root {
+  --annotation-rose: 348 90% 68%;
+  --annotation-violet: 265 85% 72%;
+  --annotation-blue: 210 100% 64%;
+  --annotation-green: 152 65% 56%;
+  --annotation-amber: 38 96% 60%;
+  --annotation-fg: hsl(30 7% 10%);
+}
+
+.light {
+  --annotation-rose: 348 80% 52%;
+  --annotation-violet: 264 72% 56%;
+  --annotation-blue: 211 90% 46%;
+  --annotation-green: 152 62% 38%;
+  --annotation-amber: 33 92% 44%;
+  --annotation-fg: #fff;
+}
+
+.workspace-annotation-color-rose { --annotation-hsl: var(--annotation-rose); }
+.workspace-annotation-color-violet { --annotation-hsl: var(--annotation-violet); }
+.workspace-annotation-color-blue { --annotation-hsl: var(--annotation-blue); }
+.workspace-annotation-color-green { --annotation-hsl: var(--annotation-green); }
+.workspace-annotation-color-amber { --annotation-hsl: var(--annotation-amber); }
+
+.light .workspace-annotation-color-amber { --annotation-fg: hsl(30 7% 10%); }
+
 /* Workspace annotation marks. The marks are absolutely positioned line rects
    inside the transcript content box; these classes only paint the chosen
-   highlight style. */
+   highlight style and color. */
 .workspace-annotation-mark-selection {
-  background-color: hsl(var(--primary) / 0.22);
+  background-color: hsl(var(--annotation-hsl, var(--primary)) / 0.28);
   border-radius: 3px;
-  box-shadow: inset 0 -1.5px 0 hsl(var(--primary) / 0.62);
+  box-shadow: inset 0 -2px 0 hsl(var(--annotation-hsl, var(--primary)) / 0.85);
 }
 
 .workspace-annotation-mark-selection[data-candidate='true'] {
-  background-color: hsl(var(--primary) / 0.3);
-  box-shadow: inset 0 -2px 0 hsl(var(--primary) / 0.75);
+  background-color: hsl(var(--annotation-hsl, var(--primary)) / 0.36);
+  box-shadow: inset 0 -2px 0 hsl(var(--annotation-hsl, var(--primary)) / 0.95);
 }
 
 .workspace-annotation-mark-wave {
@@ -1246,7 +1274,7 @@
 }
 
 .workspace-annotation-mark-wave[data-candidate='true'] {
-  background-color: hsl(var(--primary) / 0.08);
+  background-color: hsl(var(--annotation-hsl, var(--primary)) / 0.1);
 }
 
 .workspace-annotation-mark-wave::after {
@@ -1255,21 +1283,23 @@
   left: 0;
   right: 0;
   bottom: 0;
-  height: 5px;
+  height: 6px;
   pointer-events: none;
-  background-color: hsl(var(--primary));
-  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='5'%20viewBox='0%200%2012%205'%3E%3Cpath%20d='M0%203Q3%200%206%203T12%203'%20fill='none'%20stroke='white'%20stroke-width='2'%20stroke-linecap='round'/%3E%3C/svg%3E");
-  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='5'%20viewBox='0%200%2012%205'%3E%3Cpath%20d='M0%203Q3%200%206%203T12%203'%20fill='none'%20stroke='white'%20stroke-width='2'%20stroke-linecap='round'/%3E%3C/svg%3E");
+  background-color: hsl(var(--annotation-hsl, var(--primary)));
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='6'%20viewBox='0%200%2012%206'%3E%3Cpath%20d='M0%203.5Q3%200%206%203.5T12%203.5'%20fill='none'%20stroke='white'%20stroke-width='2.2'%20stroke-linecap='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='6'%20viewBox='0%200%2012%206'%3E%3Cpath%20d='M0%203.5Q3%200%206%203.5T12%203.5'%20fill='none'%20stroke='white'%20stroke-width='2.2'%20stroke-linecap='round'/%3E%3C/svg%3E");
   -webkit-mask-repeat: repeat-x;
   mask-repeat: repeat-x;
-  -webkit-mask-size: 12px 5px;
-  mask-size: 12px 5px;
+  -webkit-mask-size: 12px 6px;
+  mask-size: 12px 6px;
   -webkit-mask-position: 0 100%;
   mask-position: 0 100%;
 }
 
-.workspace-annotation-mark-wave[data-candidate='true']::after {
-  background-color: hsl(var(--primary));
+.workspace-annotation-marker-badge {
+  background-color: hsl(var(--annotation-hsl, var(--primary)));
+  color: var(--annotation-fg, white);
+  box-shadow: 0 4px 14px hsl(var(--annotation-hsl, var(--primary)) / 0.35);
 }
 
 .ccem-prompt-area .prompt-area-placeholder {

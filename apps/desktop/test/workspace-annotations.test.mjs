@@ -287,6 +287,41 @@ test('stored annotations preserve valid transcript anchors and discard malformed
   assert.equal('anchor' in normalized[1], false);
 });
 
+test('stored annotations keep valid highlight appearance and drop unknown values', async () => {
+  const { normalizeStoredWorkspaceAnnotations } = await importWorkspaceAnnotations();
+  const normalized = normalizeStoredWorkspaceAnnotations([
+    {
+      id: 'painted',
+      quote: 'selected text',
+      note: 'wave it',
+      createdAt: '2026-07-13T00:00:00.000Z',
+      highlightStyle: 'wave',
+      highlightColor: 'rose',
+    },
+    {
+      id: 'legacy',
+      quote: 'legacy text',
+      note: 'keep defaults',
+      createdAt: '2026-07-13T00:00:01.000Z',
+    },
+    {
+      id: 'invalid',
+      quote: 'invalid text',
+      note: 'fall back',
+      createdAt: '2026-07-13T00:00:02.000Z',
+      highlightStyle: 'scribble',
+      highlightColor: 'chartreuse',
+    },
+  ]);
+
+  assert.equal(normalized[0].highlightStyle, 'wave');
+  assert.equal(normalized[0].highlightColor, 'rose');
+  assert.equal('highlightStyle' in normalized[1], false);
+  assert.equal('highlightColor' in normalized[1], false);
+  assert.equal('highlightStyle' in normalized[2], false);
+  assert.equal('highlightColor' in normalized[2], false);
+});
+
 test('sent annotation snapshots reject overflow instead of silently truncating model context', async () => {
   const {
     buildComposerPromptWithAnnotations,

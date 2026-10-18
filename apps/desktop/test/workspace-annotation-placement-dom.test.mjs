@@ -38,7 +38,6 @@ async function importHarness() {
         import React, { act, useRef, useState } from 'react';
         import { createRoot } from 'react-dom/client';
         import { WorkspaceTranscriptSelection } from '@/components/workspace/WorkspaceAnnotations';
-        import { WorkspaceAnnotationStyleToggle } from '@/components/workspace/WorkspaceAnnotationStyleToggle';
 
         export function mount(container) {
           let addCalls = 0;
@@ -48,47 +47,52 @@ async function importHarness() {
             const viewportRef = useRef(null);
             const contentRef = useRef(null);
             const [annotations, setAnnotations] = useState([]);
-            flushState = { setAnnotations };
+            flushState = { setAnnotations, annotations };
             return React.createElement(
-              React.Fragment,
-              null,
+              'div',
+              { ref: viewportRef, id: 'viewport', style: { overflow: 'auto', height: 600 } },
               React.createElement(
                 'div',
-                { id: 'style-toggle' },
-                React.createElement(WorkspaceAnnotationStyleToggle),
-              ),
-              React.createElement(
-                'div',
-                { ref: viewportRef, id: 'viewport', style: { overflow: 'auto', height: 600 } },
+                { ref: contentRef, id: 'content', style: { position: 'relative', height: 1200 } },
                 React.createElement(
                   'div',
-                  { ref: contentRef, id: 'content', style: { position: 'relative', height: 1200 } },
-                  React.createElement(
-                    'div',
-                    { 'data-transcript-item-key': 'message-a', id: 'item-a' },
-                    'Alpha selected words here.',
-                  ),
-                  React.createElement(WorkspaceTranscriptSelection, {
-                    rootRef: viewportRef,
-                    contentRef: contentRef,
-                    scopeKey: 'placement-test',
-                    canAdd: true,
-                    annotations,
-                    onAdd: (quote, note, anchor) => {
-                      addCalls += 1;
-                      setAnnotations((current) => [...current, {
-                        id: 'a-1',
-                        quote,
-                        note,
-                        createdAt: '2026-01-01T00:00:00.000Z',
-                        anchor,
-                      }]);
-                      return true;
-                    },
-                    onUpdate: () => true,
-                    onRemove: () => {},
-                  }),
+                  { 'data-transcript-item-key': 'message-a', id: 'item-a' },
+                  'Alpha selected words here.',
                 ),
+                React.createElement(WorkspaceTranscriptSelection, {
+                  rootRef: viewportRef,
+                  contentRef: contentRef,
+                  scopeKey: 'placement-test',
+                  canAdd: true,
+                  annotations,
+                  onAdd: (quote, note, anchor, appearance) => {
+                    addCalls += 1;
+                    setAnnotations((current) => [...current, {
+                      id: 'a-1',
+                      quote,
+                      note,
+                      createdAt: '2026-01-01T00:00:00.000Z',
+                      anchor,
+                      ...(appearance ? {
+                        highlightStyle: appearance.style,
+                        highlightColor: appearance.color,
+                      } : {}),
+                    }]);
+                    return true;
+                  },
+                  onUpdate: (id, note, appearance) => {
+                    setAnnotations((current) => current.map((annotation) => (
+                      annotation.id === id ? {
+                        ...annotation,
+                        note,
+                        ...(appearance?.style ? { highlightStyle: appearance.style } : {}),
+                        ...(appearance?.color ? { highlightColor: appearance.color } : {}),
+                      } : annotation
+                    )));
+                    return true;
+                  },
+                  onRemove: () => {},
+                }),
               ),
             );
           }
@@ -98,6 +102,9 @@ async function importHarness() {
           return {
             get addCalls() {
               return addCalls;
+            },
+            get annotations() {
+              return flushState?.annotations ?? [];
             },
             unmount() {
               act(() => root.unmount());
@@ -146,9 +153,17 @@ async function importHarness() {
               'workspace.selectionTooLong': 'Selection too long',
               'workspace.composerAnnotationEdit': 'Edit annotation',
               'workspace.composerAnnotationRemove': 'Remove annotation',
-              'workspace.annotationStyleLabel': 'Annotation highlight style',
-              'workspace.annotationStyleSelection': 'Selection',
+              'workspace.annotationAppearance': 'Annotation style',
+              'workspace.annotationStyleMarker': 'Marker',
               'workspace.annotationStyleWave': 'Wave',
+              'workspace.annotationCopy': 'Copy',
+              'workspace.annotationCopied': 'Copied',
+              'workspace.annotationCopyFailed': 'Copy failed',
+              'workspace.annotationColorRose': 'Rose',
+              'workspace.annotationColorViolet': 'Violet',
+              'workspace.annotationColorBlue': 'Blue',
+              'workspace.annotationColorGreen': 'Green',
+              'workspace.annotationColorAmber': 'Amber',
               'workspace.annotationSaveFailed': 'Save failed',
               'common.cancel': 'Cancel',
               'common.save': 'Save',
@@ -279,6 +294,16 @@ test('annotation highlights and markers live in content coordinates and ignore s
     viewport.getBoundingClientRect = () => domRect(0, 0, 800, 600);
     content.getBoundingClientRect = () => domRect(100, -50, 900, 1150);
 
+    let copiedText = null;
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (text) => {
+          copiedText = text;
+        },
+      },
+    });
+
     let rangeMeasurements = 0;
     window.Range.prototype.getClientRects = function getClientRects() {
       rangeMeasurements += 1;
@@ -305,11 +330,55 @@ test('annotation highlights and markers live in content coordinates and ignore s
     assert.match(pill.className, /\bz-50\b/);
     assert.doesNotMatch(pill.className, /z-\[100\]/);
 
-    // Ask for a note, then submit the annotation.
+    const roseSwatch = pill.querySelector('[data-workspace-annotation-color="rose"]');
+    const waveStyle = pill.querySelector('[data-workspace-annotation-style="wave"]');
+    assert.ok(roseSwatch, 'color swatches should be in the selection toolbar');
+    assert.ok(waveStyle, 'wave style should be in the selection toolbar');
     harness.run(() => {
-      pill.querySelector('button').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      roseSwatch.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      waveStyle.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
     });
     await harness.flush();
+
+    const candidateHighlight = document.querySelector('[data-workspace-selection-highlight="candidate"]');
+    assert.match(candidateHighlight.className, /workspace-annotation-mark-wave/);
+    assert.match(candidateHighlight.className, /workspace-annotation-color-rose/);
+    assert.equal(candidateHighlight.getAttribute('data-annotation-color'), 'rose');
+    assert.equal(
+      window.localStorage.getItem('ccem:workspace-annotation-appearance:v1'),
+      '{"style":"wave","color":"rose"}',
+    );
+
+    const copyButton = [...pill.querySelectorAll('button')]
+      .find((button) => button.textContent.trim() === 'Copy');
+    assert.ok(copyButton, 'copy action should be in the selection toolbar');
+    harness.run(() => {
+      copyButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    });
+    await harness.flush();
+    assert.equal(copiedText, 'selected words');
+    assert.ok(
+      [...pill.querySelectorAll('button')].some((button) => button.textContent.trim() === 'Copied'),
+      'copy action should acknowledge the clipboard write',
+    );
+
+    // Ask for a note, then submit the annotation.
+    const addToTask = [...pill.querySelectorAll('button')]
+      .find((button) => button.textContent.trim() === 'Add to task');
+    assert.ok(addToTask, 'add-to-task action should exist');
+    harness.run(() => {
+      addToTask.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    });
+    await harness.flush();
+
+    assert.equal(
+      pill.querySelector('[data-workspace-annotation-color="rose"]').getAttribute('aria-pressed'),
+      'true',
+    );
+    assert.equal(
+      pill.querySelector('[data-workspace-annotation-style="wave"]').getAttribute('aria-pressed'),
+      'true',
+    );
 
     const textarea = document.querySelector('textarea');
     assert.ok(textarea);
@@ -340,8 +409,10 @@ test('annotation highlights and markers live in content coordinates and ignore s
     assert.equal(highlight.style.left, '50px');
     assert.equal(highlight.style.top, '150px');
 
-    assert.match(highlight.className, /workspace-annotation-mark-selection/);
-    assert.equal(highlight.getAttribute('data-annotation-style'), 'selection');
+    assert.match(highlight.className, /workspace-annotation-mark-wave/);
+    assert.match(highlight.className, /workspace-annotation-color-rose/);
+    assert.equal(highlight.getAttribute('data-annotation-style'), 'wave');
+    assert.equal(highlight.getAttribute('data-annotation-color'), 'rose');
 
     const marker = document.querySelector('[data-workspace-annotation-marker]');
     assert.ok(marker, 'numbered marker should render');
@@ -350,37 +421,51 @@ test('annotation highlights and markers live in content coordinates and ignore s
     assert.doesNotMatch(marker.className, /\bfixed\b/);
     assert.equal(marker.style.left, '208px');
     assert.equal(marker.style.top, '148px');
+    const markerBadge = marker.querySelector('button');
+    assert.match(markerBadge.className, /workspace-annotation-marker-badge/);
+    assert.match(markerBadge.className, /workspace-annotation-color-rose/);
 
-    const measurementsBeforeStyleSwitch = rangeMeasurements;
-    const styleButton = (label) => [...document.querySelectorAll('#style-toggle [role="group"] button')]
-      .find((button) => button.textContent.trim() === label);
-    const waveButton = styleButton('Wave');
-    assert.ok(waveButton, 'wave style toggle should exist');
+    assert.equal(api.annotations[0].highlightStyle, 'wave');
+    assert.equal(api.annotations[0].highlightColor, 'rose');
+
+    // Restyle the saved annotation from its editor.
     harness.run(() => {
-      waveButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      markerBadge.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
     });
     await harness.flush();
 
-    const waveHighlight = document.querySelector('[data-workspace-selection-highlight="saved"]');
-    assert.match(waveHighlight.className, /workspace-annotation-mark-wave/);
-    assert.equal(waveHighlight.getAttribute('data-annotation-style'), 'wave');
+    const savedEditor = [...document.querySelectorAll('[data-workspace-selection-action].fixed')]
+      .find((panel) => panel.querySelector('textarea'));
+    assert.ok(savedEditor, 'saved annotation editor should open');
+    const greenSwatch = savedEditor.querySelector('[data-workspace-annotation-color="green"]');
+    const markerStyle = savedEditor.querySelector('[data-workspace-annotation-style="selection"]');
+    assert.ok(greenSwatch && markerStyle);
+    harness.run(() => {
+      greenSwatch.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      markerStyle.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    });
+    await harness.flush();
+
+    const restyledHighlight = document.querySelector('[data-workspace-selection-highlight="saved"]');
+    assert.match(restyledHighlight.className, /workspace-annotation-mark-selection/);
+    assert.match(restyledHighlight.className, /workspace-annotation-color-green/);
+    assert.equal(api.annotations[0].highlightStyle, 'selection');
+    assert.equal(api.annotations[0].highlightColor, 'green');
+    // Editing an existing annotation does not change the next-selection default.
     assert.equal(
-      window.localStorage.getItem('ccem:workspace-annotation-highlight-style:v1'),
-      'wave',
+      window.localStorage.getItem('ccem:workspace-annotation-appearance:v1'),
+      '{"style":"wave","color":"rose"}',
     );
 
-    const selectionButton = styleButton('Selection');
-    assert.ok(selectionButton, 'selection style toggle should exist');
     harness.run(() => {
-      selectionButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+      document.dispatchEvent(new window.KeyboardEvent('keydown', {
+        key: 'Escape',
+        code: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      }));
     });
     await harness.flush();
-    assert.match(
-      document.querySelector('[data-workspace-selection-highlight="saved"]').className,
-      /workspace-annotation-mark-selection/,
-    );
-    // Style switching only repaints the marks; it must not recompute ranges.
-    assert.equal(rangeMeasurements, measurementsBeforeStyleSwitch);
 
     const measurementsBeforeScroll = rangeMeasurements;
     // Native scrolling moves the content box. Content-space placements stay
