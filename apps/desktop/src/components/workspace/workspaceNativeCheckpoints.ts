@@ -14,6 +14,12 @@ export interface NativeFileCheckpoint {
   error?: string | null;
 }
 
+/** Events that can change `deriveNativeFileCheckpoints`. */
+export function isFileCheckpointEvent(event: SessionEventRecord): boolean {
+  const type = event.payload.type;
+  return type === 'checkpoint_created' || type === 'files_rewound' || type === 'file_rewind_failed';
+}
+
 export function deriveNativeFileCheckpoints(
   events: SessionEventRecord[],
 ): NativeFileCheckpoint[] {
@@ -76,5 +82,6 @@ export function deriveNativeFileCheckpoints(
     }
   }
 
-  return Array.from(checkpoints.values()).sort((a, b) => b.turnIndex - a.turnIndex);
+  // turnIndex grows with Map insertion order, so reversing yields newest first.
+  return Array.from(checkpoints.values()).reverse();
 }

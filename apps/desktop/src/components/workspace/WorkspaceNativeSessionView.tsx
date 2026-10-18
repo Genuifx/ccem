@@ -111,6 +111,7 @@ import {
 import type { EffortLevel } from './ComposerControls';
 import {
   extractAttentionState,
+  isAttentionRelevantEvent,
   getPlanExitPrimaryReply,
   isPlanExitApprovalText,
   type NativeSessionAttentionState,
@@ -124,6 +125,7 @@ import { normalizeEffortForProvider } from './workspaceSessionPreferences';
 import { resolveWorkspaceRuntimePlanMode } from './workspaceRuntimePlanMode';
 import {
   deriveNativeFileCheckpoints,
+  isFileCheckpointEvent,
   type NativeFileCheckpoint,
 } from './workspaceNativeCheckpoints';
 import {
@@ -177,7 +179,8 @@ import {
 } from './WorkspaceTranscriptBackfillStatus';
 import { ContextWindowIndicator } from './ContextWindowIndicator';
 import { WorkspaceBackgroundTasksPopover } from './WorkspaceBackgroundTasksPopover';
-import { deriveWorkspaceBackgroundTasks } from './workspaceBackgroundTasks';
+import { deriveWorkspaceBackgroundTasks, isBackgroundTaskEvent } from './workspaceBackgroundTasks';
+import { foldEventSubset, type EventSubsetFold } from './workspaceEventSubsetFold';
 import {
   buildSessionUsageState,
   foldSessionUsageEvents,
@@ -1680,6 +1683,12 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     consumedCount: number;
     fold: WorkspaceReviewEventFold;
   } | null>(null);
+  // Relevant-event subsets for attention, checkpoints and background tasks:
+  // fast ACTIVE polling appends mostly unrelated events, so these derivations
+  // rerun only when an event they actually read arrives.
+  const attentionEventsFoldRef = useRef<EventSubsetFold | null>(null);
+  const checkpointEventsFoldRef = useRef<EventSubsetFold | null>(null);
+  const backgroundTaskEventsFoldRef = useRef<EventSubsetFold | null>(null);
   // Seqs where a jump in the CURRENT events array is a prune/anchor seam, not
   // a real gap. Set by cache reads and pruning; consumed by reset derivations.
   const rawTailSeamsRef = useRef<number[]>([]);
@@ -2045,9 +2054,14 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     // running totals already account for pruned events).
     return buildSessionUsageState(previous.fold);
   }, [events]);
+  const backgroundTaskEvents = useMemo(() => {
+    const fold = foldEventSubset(backgroundTaskEventsFoldRef.current, events, isBackgroundTaskEvent);
+    backgroundTaskEventsFoldRef.current = fold;
+    return fold.relevant;
+  }, [events]);
   const backgroundTaskModel = useMemo(
-    () => deriveWorkspaceBackgroundTasks(session, events),
-    [events, session.background_tasks, session.last_event_seq],
+    () => deriveWorkspaceBackgroundTasks(session, backgroundTaskEvents),
+    [backgroundTaskEvents, session.background_tasks, session.last_event_seq],
   );
   const activeBackgroundTaskCount = backgroundTaskModel.active.length;
   const [bgTasksDismissed, setBgTasksDismissed] = useState(false);
@@ -2061,7 +2075,15 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       console.debug('Failed to query native session usage:', error);
     });
   }, [queryNativeSessionUsage, session.provider, session.runtime_id]);
-  const fileCheckpoints = useMemo(() => deriveNativeFileCheckpoints(events), [events]);
+  const checkpointEvents = useMemo(() => {
+    const fold = foldEventSubset(checkpointEventsFoldRef.current, events, isFileCheckpointEvent);
+    checkpointEventsFoldRef.current = fold;
+    return fold.relevant;
+  }, [events]);
+  const fileCheckpoints = useMemo(
+    () => deriveNativeFileCheckpoints(checkpointEvents),
+    [checkpointEvents],
+  );
 
   const clearFileRewindTimeout = useCallback(() => {
     if (fileRewindTimeoutRef.current !== null) {
@@ -2221,6 +2243,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     transcriptDerivationRef.current = null;
     sessionUsageDerivationRef.current = null;
     reviewFoldRef.current = null;
+    attentionEventsFoldRef.current = null;
+    checkpointEventsFoldRef.current = null;
+    backgroundTaskEventsFoldRef.current = null;
     rawTailSeamsRef.current = cached.seams;
     initialReplayUnloadedGapStartsRef.current = [];
     rawTailSettledRef.current = false;
@@ -3024,9 +3049,14 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     return promise;
   }, [runPollEvents, session.runtime_id]);
 
+  const attentionEvents = useMemo(() => {
+    const fold = foldEventSubset(attentionEventsFoldRef.current, events, isAttentionRelevantEvent);
+    attentionEventsFoldRef.current = fold;
+    return fold.relevant;
+  }, [events]);
   const attentionState = useMemo(
-    () => extractAttentionState(events),
-    [events],
+    () => extractAttentionState(attentionEvents),
+    [attentionEvents],
   );
 
   const pollIntervalMs = transcriptPollFailure?.runtimeId === session.runtime_id

@@ -1895,15 +1895,11 @@ fn load_claude_history_index(
     }
 
     if let Some(limit) = history_entry_limit {
-        let content = fs::read_to_string(history_path)
-            .map_err(|e| format!("Failed to read history.jsonl: {}", e))?;
-        for line in content.lines().rev() {
+        return for_each_line_reverse(history_path, REVERSE_READ_CHUNK_BYTES, |line| {
             merge_claude_history_line(session_map, line);
-            if session_map.len() >= limit {
-                break;
-            }
-        }
-        return Ok(());
+            session_map.len() < limit
+        })
+        .map_err(|e| format!("Failed to read history.jsonl: {}", e));
     }
 
     let file =
@@ -1917,6 +1913,51 @@ fn load_claude_history_index(
         merge_claude_history_line(session_map, &line);
     }
 
+    Ok(())
+}
+
+const REVERSE_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Visit a file's lines from last to first, reading fixed-size chunks from the
+/// tail so limited scans of large append-only logs avoid loading the whole file.
+/// The visitor returns `false` to stop early.
+fn for_each_line_reverse(
+    path: &Path,
+    chunk_size: usize,
+    mut visit: impl FnMut(&str) -> bool,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path)?;
+    let mut pos = file.seek(SeekFrom::End(0))?;
+    // Bytes of the line that started before the current chunk (in file order).
+    let mut carry: Vec<u8> = Vec::new();
+    let mut emit = |bytes: &[u8]| -> bool {
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        visit(&String::from_utf8_lossy(bytes))
+    };
+
+    while pos > 0 {
+        let read_len = (chunk_size as u64).min(pos) as usize;
+        pos -= read_len as u64;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; read_len];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&carry);
+
+        let mut end = chunk.len();
+        while let Some(newline) = chunk[..end].iter().rposition(|byte| *byte == b'\n') {
+            if !emit(&chunk[newline + 1..end]) {
+                return Ok(());
+            }
+            end = newline;
+        }
+        carry = chunk[..end].to_vec();
+    }
+
+    if !carry.is_empty() {
+        emit(&carry);
+    }
     Ok(())
 }
 
@@ -4453,7 +4494,7 @@ fn extract_reasoning_text(payload: &serde_json::Value) -> String {
 fn load_opencode_history() -> Result<Vec<HistorySession>, String> {
     let mut session_map: HashMap<String, HistorySession> = HashMap::new();
 
-    if let Some(raw_value) = opencode::load_session_list_value_from_cli_or_fixture()? {
+    if let Some(raw_value) = opencode::load_session_list_value_cached()? {
         if let Some(items) = raw_value.as_array() {
             for item in items {
                 if let Some(session) = parse_opencode_history_session(item) {
@@ -5689,6 +5730,7 @@ mod tests {
         collect_codex_session_files_limited, dedupe_history_sessions_with_provenance_records,
         dedupe_near_duplicate_history_sessions, discover_subagent_metas, discover_subagent_records,
         enrich_subagent_metas, enrich_subagent_records, find_codex_session_file_with_config,
+        for_each_line_reverse, load_claude_history_index,
         is_noise_display, load_claude_history_from_paths_limited_with_provenance_records,
         load_codex_history_from_config, merge_opencode_history_session,
         merge_tool_results_into_messages, normalize_history_display, normalize_history_limit,
@@ -5714,6 +5756,74 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ccem-history-{prefix}-{unique}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn collect_reverse(path: &Path, chunk: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for_each_line_reverse(path, chunk, |line| {
+            lines.push(line.to_string());
+            true
+        })
+        .expect("reverse read");
+        lines
+    }
+
+    #[test]
+    fn reverse_line_reader_matches_forward_lines_across_chunk_boundaries() {
+        let root = temp_history_dir("reverse-lines");
+        let path = root.join("lines.txt");
+        let content = "alpha\r\nbeta 中文\n\ngamma-longer-line\ndelta";
+        fs::write(&path, content).expect("write");
+        let mut expected: Vec<String> = content.lines().map(str::to_string).collect();
+        expected.reverse();
+        for chunk in [1, 2, 3, 5, 7, 64, 4096] {
+            assert_eq!(collect_reverse(&path, chunk), expected, "chunk size {chunk}");
+        }
+
+        fs::write(&path, "one\ntwo\n").expect("write trailing newline");
+        let lines = collect_reverse(&path, 3);
+        assert_eq!(
+            lines.into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>(),
+            vec!["two", "one"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reverse_line_reader_stops_early() {
+        let root = temp_history_dir("reverse-stop");
+        let path = root.join("lines.txt");
+        fs::write(&path, "a\nb\nc\nd").expect("write");
+        let mut seen = Vec::new();
+        for_each_line_reverse(&path, 2, |line| {
+            seen.push(line.to_string());
+            seen.len() < 2
+        })
+        .expect("reverse read");
+        assert_eq!(seen, vec!["d", "c"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn limited_claude_history_index_keeps_newest_sessions_from_tail() {
+        let root = temp_history_dir("history-tail");
+        let path = root.join("history.jsonl");
+        let lines: Vec<String> = (0..50)
+            .map(|index| {
+                format!(
+                    r#"{{"sessionId":"s{index}","display":"prompt {index}","timestamp":{},"project":"/tmp/p"}}"#,
+                    1_700_000_000_000u64 + index
+                )
+            })
+            .collect();
+        fs::write(&path, lines.join("\n") + "\n").expect("write history");
+
+        let mut session_map = HashMap::new();
+        load_claude_history_index(&path, &mut session_map, Some(3)).expect("load");
+        let mut ids: Vec<_> = session_map.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["s47", "s48", "s49"]);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_codex_config(root: &Path, sqlite_home: &Path) -> CodexPathConfig {

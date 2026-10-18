@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,7 +56,60 @@ pub struct OpenCodeSessionSnapshot {
     pub project: Option<String>,
 }
 
+const SESSION_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+
+type SessionListCache = Mutex<Option<(Instant, Option<Value>)>>;
+
+static SESSION_LIST_CACHE: SessionListCache = Mutex::new(None);
+
+/// Cached `opencode session list` for read-only overview/analytics paths.
+/// Spawning the CLI on every workspace snapshot is expensive, and a missing
+/// binary is cached as `None` so uninstalled OpenCode is skipped quickly.
+pub fn load_session_list_value_cached() -> Result<Option<Value>, String> {
+    if fixture_dir().is_some() {
+        return load_session_list_value_from_cli_or_fixture();
+    }
+    load_with_ttl_cache(
+        &SESSION_LIST_CACHE,
+        SESSION_LIST_CACHE_TTL,
+        Instant::now(),
+        load_session_list_value_from_cli_or_fixture,
+    )
+}
+
+fn load_with_ttl_cache(
+    cache: &SessionListCache,
+    ttl: Duration,
+    now: Instant,
+    loader: impl FnOnce() -> Result<Option<Value>, String>,
+) -> Result<Option<Value>, String> {
+    if let Ok(guard) = cache.lock() {
+        if let Some((loaded_at, value)) = guard.as_ref() {
+            if now.saturating_duration_since(*loaded_at) < ttl {
+                return Ok(value.clone());
+            }
+        }
+    }
+    let value = loader()?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((now, value.clone()));
+    }
+    Ok(value)
+}
+
+/// Uncached CLI call. Launch tracking needs fresh results; every fresh
+/// result also refreshes the cache used by overview reads.
 pub fn load_session_list_value_from_cli_or_fixture() -> Result<Option<Value>, String> {
+    let value = load_session_list_value_uncached()?;
+    if fixture_dir().is_none() {
+        if let Ok(mut guard) = SESSION_LIST_CACHE.lock() {
+            *guard = Some((Instant::now(), value.clone()));
+        }
+    }
+    Ok(value)
+}
+
+fn load_session_list_value_uncached() -> Result<Option<Value>, String> {
     if let Some(fixture_dir) = fixture_dir() {
         let sessions_path = fixture_dir.join("sessions.json");
         if !sessions_path.exists() {
@@ -709,7 +763,7 @@ fn current_timestamp_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_text_from_parts_json, list_local_sessions, load_local_messages,
+        extract_text_from_parts_json, load_with_ttl_cache, SessionListCache, list_local_sessions, load_local_messages,
         read_session_metadata, scan_local_sessions, storage_project_from_db_path,
         track_launched_session, OPENCODE_NATIVE_ENV_NAME,
     };
@@ -717,6 +771,49 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn ttl_cache_reuses_value_until_expiry_including_missing_cli() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        let cache: SessionListCache = std::sync::Mutex::new(None);
+        let calls = Cell::new(0);
+        let ttl = Duration::from_secs(30);
+        let start = Instant::now();
+        let loader = || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+
+        assert_eq!(load_with_ttl_cache(&cache, ttl, start, loader), Ok(None));
+        assert_eq!(
+            load_with_ttl_cache(&cache, ttl, start + Duration::from_secs(29), loader),
+            Ok(None)
+        );
+        assert_eq!(calls.get(), 1, "missing CLI result is cached within TTL");
+
+        let fresh = || {
+            calls.set(calls.get() + 1);
+            Ok(Some(serde_json::json!([{ "id": "s1" }])))
+        };
+        let value = load_with_ttl_cache(&cache, ttl, start + Duration::from_secs(31), fresh)
+            .expect("reload after expiry");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(value, Some(serde_json::json!([{ "id": "s1" }])));
+    }
+
+    #[test]
+    fn ttl_cache_does_not_store_errors() {
+        use std::time::{Duration, Instant};
+
+        let cache: SessionListCache = std::sync::Mutex::new(None);
+        let now = Instant::now();
+        let ttl = Duration::from_secs(30);
+        assert!(load_with_ttl_cache(&cache, ttl, now, || Err("boom".to_string())).is_err());
+        let value = load_with_ttl_cache(&cache, ttl, now, || Ok(Some(serde_json::json!([]))));
+        assert_eq!(value, Ok(Some(serde_json::json!([]))));
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

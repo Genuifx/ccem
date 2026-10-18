@@ -138,7 +138,10 @@ import {
   retainStableHistorySessions,
   resolveWorkspaceReviewProviderSessionId,
   selectWorkspaceLiveSessionsForRestore,
+  shouldReloadSelectedHistorySession,
+  toLoadedHistorySessionVersion,
   toLiveHistorySessionItem,
+  type LoadedHistorySessionVersion,
 } from '@/components/workspace/workspaceSidebarSessions';
 import { launchWorkspaceTerminalSession } from '@/components/workspace/workspaceTerminalLaunch';
 import {
@@ -577,10 +580,15 @@ export function Workspace({
   const refreshRequestSeqRef = useRef(0);
   const skillsBootstrapAttemptedRef = useRef(false);
   const conversationRequestSeqRef = useRef(0);
+  // Snapshot version of the transcript that last committed successfully.
+  // Failed or skipped loads leave it behind so the next refresh retries.
+  const loadedConversationVersionRef = useRef<LoadedHistorySessionVersion | null>(null);
   const conversationLoadAbortRef = useRef<AbortController | null>(null);
   const hydratingLiveRuntimeIdsRef = useRef(new Set<string>());
   const hydratedLiveRuntimeIdsRef = useRef(new Set<string>());
   const pendingRefreshRef = useRef(false);
+  // A coalesced refresh is forced if any of its requesters asked for force.
+  const pendingRefreshForceRef = useRef(false);
   const hasLoadedRef = useRef(false);
   const prevIsActiveRef = useRef(isActive);
   const selectedKeyRef = useRef<string | null>(null);
@@ -1184,6 +1192,7 @@ export function Workspace({
         updateIsLoadingMessages(true);
       }
 
+      let failed = false;
       try {
         const nativeHistoryPromise = options.nativeHistorySession
           ? loadNativeHistoryConversation(
@@ -1278,11 +1287,15 @@ export function Workspace({
           setHistoryTranscriptBackfillState('idle');
         }
       } catch (error) {
+        failed = true;
         if (requestSeq !== conversationRequestSeqRef.current) {
           return;
         }
         console.error('Failed to load conversation:', error);
       } finally {
+        if (!failed && requestSeq === conversationRequestSeqRef.current) {
+          loadedConversationVersionRef.current = toLoadedHistorySessionVersion(session);
+        }
         if (conversationLoadAbortRef.current === requestController) {
           conversationLoadAbortRef.current = null;
         }
@@ -1296,12 +1309,19 @@ export function Workspace({
 
   const refreshWorkspaceData = useCallback(
     async (
-      options: { force?: boolean; silent?: boolean; includeSelectedConversation?: boolean } = {}
+      options: {
+        force?: boolean;
+        silent?: boolean;
+        includeSelectedConversation?: boolean;
+        /** Reload the selected transcript even if its snapshot timestamp is unchanged. */
+        reloadUnchangedSelection?: boolean;
+      } = {}
     ) => {
       const {
         force = true,
         silent = true,
         includeSelectedConversation = true,
+        reloadUnchangedSelection = false,
       } = options;
       const requestSeq = ++refreshRequestSeqRef.current;
 
@@ -1330,7 +1350,16 @@ export function Workspace({
             const selectedSession = retainedSessions.find(
               (session) => toSessionKey(session) === currentSelectedKey
             );
-            if (selectedSession) {
+            if (
+              selectedSession
+              && (
+                reloadUnchangedSelection
+                || shouldReloadSelectedHistorySession(
+                  loadedConversationVersionRef.current,
+                  selectedSession,
+                )
+              )
+            ) {
               await loadConversation(selectedSession, {
                 resetBeforeLoad: false,
                 showLoading: false,
@@ -1362,8 +1391,9 @@ export function Workspace({
     [loadConversation, syncSessionState, t]
   );
 
-  const scheduleWorkspaceRefresh = useCallback((delayMs = 700) => {
+  const scheduleWorkspaceRefresh = useCallback((delayMs = 700, force = true) => {
     pendingRefreshRef.current = true;
+    pendingRefreshForceRef.current = pendingRefreshForceRef.current || force;
 
     if (refreshTimerRef.current) {
       clearTimeout(refreshTimerRef.current);
@@ -1371,12 +1401,14 @@ export function Workspace({
 
     refreshTimerRef.current = setTimeout(() => {
       refreshTimerRef.current = null;
+      const pendingForce = pendingRefreshForceRef.current;
+      pendingRefreshForceRef.current = false;
       if (!isActive) {
         return;
       }
 
       void refreshWorkspaceData({
-        force: true,
+        force: pendingForce,
         silent: true,
         includeSelectedConversation: true,
       });
@@ -1450,7 +1482,8 @@ export function Workspace({
     }
 
     const handleWindowFocus = () => {
-      scheduleWorkspaceRefresh(220);
+      // Focus is frequent; reuse the frontend snapshot cache (HISTORY_CACHE_TTL_MS).
+      scheduleWorkspaceRefresh(220, false);
     };
 
     window.addEventListener('focus', handleWindowFocus);
@@ -3777,6 +3810,7 @@ export function Workspace({
         force: true,
         silent: false,
         includeSelectedConversation: true,
+        reloadUnchangedSelection: true,
       }),
       restoreNativeSessions({ restorePersistedSelection: false }),
     ]);

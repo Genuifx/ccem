@@ -136,6 +136,25 @@ export function isTerminalInteractiveResponseState(state: string) {
     || state === 'resolver_expired';
 }
 
+const ATTENTION_EVENT_TYPES = new Set<string>([
+  'user_prompt',
+  'permission_required',
+  'permission_responded',
+  'interactive_response_result',
+  'terminal_prompt_required',
+  'terminal_prompt_resolved',
+  'session_completed',
+]);
+
+/** Events that can change `extractAttentionState`; keep in sync with its switch. */
+export function isAttentionRelevantEvent(event: SessionEventRecord): boolean {
+  const payload = event.payload;
+  if (payload.type === 'tool_use_started') {
+    return Boolean(payload.needs_response && payload.prompt);
+  }
+  return ATTENTION_EVENT_TYPES.has(payload.type);
+}
+
 export function extractAttentionState(events: SessionEventRecord[]): NativeSessionAttentionState {
   const permissions = new Map<string, PendingPermissionRequest>();
   const prompts = new Map<string, PendingInteractivePrompt>();

@@ -110,6 +110,30 @@ export function retainStableHistorySessions(
   return hasChanged ? retainedSessions : previousSessions;
 }
 
+export interface LoadedHistorySessionVersion {
+  key: string;
+  timestamp: number;
+}
+
+export function toLoadedHistorySessionVersion(
+  session: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated' | 'timestamp'>,
+): LoadedHistorySessionVersion {
+  return { key: historySessionKey(session), timestamp: session.timestamp };
+}
+
+/**
+ * Background refreshes reload the selected transcript only when the snapshot
+ * version differs from the last transcript that loaded successfully.
+ */
+export function shouldReloadSelectedHistorySession(
+  loaded: LoadedHistorySessionVersion | null,
+  next: Pick<HistorySessionItem, 'id' | 'source' | 'codexIsolated' | 'timestamp'>,
+): boolean {
+  return !loaded
+    || loaded.key !== historySessionKey(next)
+    || loaded.timestamp !== next.timestamp;
+}
+
 function isTerminalNativeStatus(status: string): boolean {
   return TERMINAL_NATIVE_STATUSES.has(status);
 }
