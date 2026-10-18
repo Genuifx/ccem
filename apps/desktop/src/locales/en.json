@@ -266,6 +266,7 @@
     "reviewOpenFailed": "Open failed",
     "reviewPathOutsideWorkspace": "The path is outside this workspace and was blocked",
     "reviewOpenInEditor": "Open in editor",
+    "viewInBrowse": "View source file",
     "reviewSelectFile": "Select a file on the left to inspect its diff",
     "reviewNoSubagents": "No subagents were dispatched for this session.",
     "reviewNoAgentTrace": "No execution trace is available yet.",

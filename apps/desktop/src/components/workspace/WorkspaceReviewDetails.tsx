@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleAlert,
+  Eye,
   ExternalLink,
   FileDiff,
   FileText,
@@ -462,8 +463,7 @@ function FilesDetail({
             ) : (
               changesRows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.filesEmpty')}</p> : changesRows.map((file) => (
                 <button key={file.path} type="button" data-review-file-row title={file.path} onClick={() => {
-                  if (fileLinks) fileLinks.openFile(file.path);
-                  else void selectFile(file.path, file.status === 'deleted' ? 'diff' : undefined);
+                  void selectFile(file.path, 'diff');
                 }} className={cn('flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
                   <FileText className="h-3.5 w-3.5 shrink-0 opacity-50" />
                   <span className="min-w-0 flex-1 truncate">{file.path}</span>
@@ -500,6 +500,7 @@ function FilesDetail({
               {!mediaKindForPath(selectedPath) && mode !== 'source' ? <button type="button" onClick={() => void selectFile(selectedPath, 'source')} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-surface-raised/60 hover:text-foreground">{t('workspace.filesSource')}</button> : null}
               {mode !== 'diff' ? <button type="button" onClick={() => void selectFile(selectedPath, 'diff')} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-surface-raised/60 hover:text-foreground">{t('workspace.filesDiff')}</button> : null}
               <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesRefreshPreview')} onClick={() => void selectFile(selectedPath, mode)}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
+              {scope === 'changes' && fileLinks ? <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.viewInBrowse')} onClick={() => fileLinks.openFile(selectedPath)}><Eye className="h-3.5 w-3.5" /></Button> : null}
               <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewOpenInEditor')} onClick={() => void openInEditor(selectedPath)}><ExternalLink className="h-3.5 w-3.5" /></Button>
             </div> : null}
           </div>

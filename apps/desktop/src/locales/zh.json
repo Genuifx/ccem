@@ -266,6 +266,7 @@
     "reviewOpenFailed": "打开失败",
     "reviewPathOutsideWorkspace": "路径超出工作区范围，已拒绝打开",
     "reviewOpenInEditor": "在编辑器中打开",
+    "viewInBrowse": "查看源文件",
     "reviewSelectFile": "选择左侧文件查看差异",
     "reviewNoSubagents": "本会话未派发子 Agent。",
     "reviewNoAgentTrace": "暂无执行过程记录。",
