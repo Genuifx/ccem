@@ -35,6 +35,8 @@ export interface HistorySessionItem {
   timestamp: number;
   project: string;
   projectName: string;
+  /** Latest working directory from the transcript (worktrees included). */
+  cwd?: string;
   envName?: string;
   configSource?: 'ccem' | 'native';
   taskStage?: SessionTaskStage;

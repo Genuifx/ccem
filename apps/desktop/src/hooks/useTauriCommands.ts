@@ -1216,8 +1216,9 @@ export function useTauriCommands() {
   const getWorkspaceFileDiff = useCallback(async (
     workingDir: string,
     filePath: string,
+    committed?: boolean,
   ): Promise<WorkspaceFileDiff> => {
-    return invoke<WorkspaceFileDiff>('get_workspace_file_diff', { workingDir, filePath });
+    return invoke<WorkspaceFileDiff>('get_workspace_file_diff', { workingDir, filePath, committed });
   }, []);
 
   const getWorkspaceMediaPreview = useCallback(async (

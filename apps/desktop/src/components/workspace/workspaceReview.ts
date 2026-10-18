@@ -361,6 +361,35 @@ export function execWriteTargets(command: string): string[] {
   return Array.from(targets);
 }
 
+/** Reject display-only or truncated tool summaries that can leak through as "…". */
+function isPlausibleReviewPath(path: string) {
+  const value = path.trim();
+  if (!value || value === '…' || value === '...') return false;
+  if (value.endsWith('…') || value.includes('\n') || value.includes('\r')) return false;
+  return true;
+}
+
+/**
+ * Build/dev outputs are not session edits. They are regenerated on every
+ * desktop launch and would otherwise flood the Changes list once review uses
+ * the real worktree directory.
+ */
+const REVIEW_IGNORED_ARTIFACT_PATTERNS: RegExp[] = [
+  /^\.artifacts\/tauri-dev\//,
+  /^\.artifacts\/hermes-managed\//,
+  /(^|\/)bridge\.sqlite3(?:-shm|-wal)?$/,
+  /^apps\/desktop\/src-tauri\/binaries\//,
+  /^apps\/desktop\/src-tauri\/resources\/native-runtime-helper\.mjs$/,
+  /^apps\/desktop\/src-tauri\/resources\/dsh-history\//,
+  /^apps\/desktop\/src-tauri\/gen\/schemas\//,
+  /(^|\/)(?:target|node_modules)\//,
+];
+
+function isIgnoredReviewArtifactPath(path: string) {
+  const normalized = path.replace(/\\/g, '/').replace(/^\.\//, '');
+  return REVIEW_IGNORED_ARTIFACT_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 function normalizeReviewPath(path: string, workingDir?: string | null): string {
   const normalize = (value: string) => {
     const absolute = value.startsWith('/');
@@ -395,6 +424,7 @@ export function foldWorkspaceReviewEvents(
     toolUseId: string,
     sourceSeq: number,
   ) => {
+    if (!isPlausibleReviewPath(path)) return;
     const current = fold.sdkFiles.get(path);
     if (current) {
       if (!current.toolUseIds.includes(toolUseId)) {
@@ -495,6 +525,7 @@ function reviewFilesFromFold(
 ): ReviewChangedFile[] {
   const files = new Map<string, ReviewChangedFile>();
   for (const file of gitSnapshot?.files ?? []) {
+    if (isIgnoredReviewArtifactPath(file.path)) continue;
     files.set(file.path, {
       path: file.path,
       status: gitStatusLabel(file.status),
@@ -540,7 +571,7 @@ function reviewFilesFromFold(
   // event stream cannot see — bash redirection the summary truncated away,
   // script-generated files, gitignored outputs, non-git working dirs.
   for (const file of recentFiles ?? []) {
-    if (!file?.path) continue;
+    if (!file?.path || !isPlausibleReviewPath(file.path) || isIgnoredReviewArtifactPath(file.path)) continue;
     const path = normalizeReviewPath(file.path, workingDir ?? gitSnapshot?.root);
     const current = files.get(path);
     if (current) {

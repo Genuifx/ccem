@@ -57,7 +57,7 @@ import {
   type WorkspaceEscapeCommandIdentity,
 } from '@/pages/workspaceEscape';
 import type { RouterLaunchDraft } from '@ccem/core/browser';
-import { WorkspaceSidePanel, WorkspaceSidePanelContext, useWorkspaceSidePanelController } from '@/components/workspace/WorkspaceSidePanel';
+import { WorkspaceSidePanel, WorkspaceSidePanelContext, useWorkspaceSidePanelController, isFileTab, type WorkspaceSideTab } from '@/components/workspace/WorkspaceSidePanel';
 import { WorkspaceFileLinkContext } from '@/components/workspace/WorkspaceFileLinkContext';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { useNativeBrowserActivation } from '@/components/workspace/useNativeBrowserActivation';
@@ -175,10 +175,12 @@ import {
 import { createBrowserPresentationRevisionAllocator } from '@/components/workspace/browserPresentationRevision';
 import type { BrowserSurfaceHostShortcutAction } from '@/lib/browserSurfaceIpc';
 import {
+  WORKSPACE_SIDEBAR_COLLAPSED_STORAGE_KEY,
   WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX,
   WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY,
   calculateWorkspaceSidebarWidth,
   clampWorkspaceSidebarWidth,
+  readStoredWorkspaceSidebarCollapsed,
 } from '@/components/workspace/workspaceSidebarLayout';
 import { LazyWorkspaceReviewPopover } from '@/components/workspace/LazyWorkspaceReviewPopover';
 import {
@@ -568,6 +570,7 @@ export function Workspace({
     readStoredBrowserPanelWidthPercent,
   );
   const [workspaceSidebarWidth, setWorkspaceSidebarWidth] = useState(readStoredWorkspaceSidebarWidth);
+  const [workspaceSidebarCollapsed, setWorkspaceSidebarCollapsed] = useState(readStoredWorkspaceSidebarCollapsed);
   const browserLayoutRef = useRef<HTMLDivElement>(null);
   const workspaceColumnRef = useRef<HTMLDivElement>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -687,6 +690,14 @@ export function Workspace({
       // Ignore private-mode storage failures; the current session width still works.
     }
   }, [workspaceSidebarWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(WORKSPACE_SIDEBAR_COLLAPSED_STORAGE_KEY, String(workspaceSidebarCollapsed));
+    } catch {
+      // Ignore private-mode storage failures.
+    }
+  }, [workspaceSidebarCollapsed]);
 
   const handleBrowserPanelResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
@@ -1552,7 +1563,7 @@ export function Workspace({
     : workspaceMode === 'history' ? selectedSession?.project ?? '' : composeDir || selectedWorkingDir || defaultWorkingDir || '';
   const sidePanel = useWorkspaceSidePanelController(`${activeBrowserSessionId}:${sidePanelWorkingDir}`, browserPanelOpen);
   const sidePanelOpen = sidePanel.tab !== null;
-  const sidePanelDetailOpen = isActive && (sidePanel.tab === 'files' || sidePanel.tab === 'agents');
+  const sidePanelDetailOpen = isActive && (isFileTab(sidePanel.tab) || sidePanel.tab === 'agents');
   const nativeSurfaceModalOccluded = useNativeSurfaceOccluded();
   const browserSurfaceHidden = !isActive || sidePanel.tab !== 'browser';
   const browserSurfaceOccluded = browserSurfaceHidden
@@ -1638,12 +1649,12 @@ export function Workspace({
   const userSidePanel = useMemo(() => ({
     ...sidePanel,
     close: closeSidePanel,
-    open: (tab: 'browser' | 'files' | 'agents', filePath?: string) => {
+    open: (tab: WorkspaceSideTab, filePath?: string) => {
       if (tab !== 'browser') browserActivation.cancel(activeBrowserSessionId, true);
       return sidePanel.open(tab, filePath);
     },
   }), [sidePanel, closeSidePanel, activeBrowserSessionId, browserActivation]);
-  const fileLinkTarget = useMemo(() => ({ workingDir: sidePanelWorkingDir, openFile: (path: string) => userSidePanel.open('files', path) }), [sidePanelWorkingDir, userSidePanel.open]);
+  const fileLinkTarget = useMemo(() => ({ workingDir: sidePanelWorkingDir, openFile: (path: string) => userSidePanel.open('browse', path) }), [sidePanelWorkingDir, userSidePanel.open]);
   const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
     if (sidePanelOpen) closeSidePanel();
     else selectActiveBrowser(workingDir);
@@ -1694,6 +1705,18 @@ export function Workspace({
     () => buildWorkspaceSidebarSessions(sessions, liveSessionEntries),
     [liveSessionEntries, sessions],
   );
+
+  // Live native sessions keep their launch dir in project_dir. When the
+  // transcript moved into a worktree, review/diff surfaces must use the
+  // history row's latest cwd instead.
+  const historyCwdByProviderSessionId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of sessions) {
+      const cwd = session.cwd?.trim();
+      if (cwd) map.set(session.id, cwd);
+    }
+    return map;
+  }, [sessions]);
 
   const liveSessionTreeState = useMemo(
     () => buildLiveSessionTreeState(liveSessionEntries),
@@ -1981,7 +2004,7 @@ export function Workspace({
     [historyEvents, selectedSession, workspaceMode],
   );
   const workspaceReviewWorkingDir = workspaceMode === 'history' && selectedSession
-    ? selectedSession.project || null
+    ? selectedSession.cwd || selectedSession.project || null
     : effectiveComposeDir;
   const workspaceReviewProviderSessionId = workspaceMode === 'history' && selectedSession
     ? resolveWorkspaceReviewProviderSessionId(selectedSession, findLiveEntryForSession(selectedSession))
@@ -3904,6 +3927,8 @@ export function Workspace({
               onCreateForProject={handleCreateForProject}
               onNewSession={handleProjectTreeNewSession}
               width={workspaceSidebarWidth}
+              collapsed={workspaceSidebarCollapsed}
+              onToggleCollapsed={() => setWorkspaceSidebarCollapsed((prev) => !prev)}
               onResizeStart={handleWorkspaceSidebarResizeStart}
             />
 
@@ -3919,7 +3944,7 @@ export function Workspace({
                     isRefreshingGit={isRefreshingWorkspaceGitSnapshot}
                     onOpenChange={setWorkspaceReviewOpen}
                     onRefreshGit={() => void refreshWorkspaceGitSnapshot()}
-                    onLoadDiff={(filePath) => getWorkspaceFileDiff(workspaceReviewWorkingDir || '', filePath)}
+                    onLoadDiff={(filePath, options) => getWorkspaceFileDiff(workspaceReviewWorkingDir || '', filePath, options?.committed)}
                     onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(workspaceReviewWorkingDir || '', filePath)}
                     isLive={workspaceMode !== 'history'}
                     onLoadSubagents={
@@ -3977,6 +4002,10 @@ export function Workspace({
                           onForkTurnRequest={openForkTurn}
                           onNavigateEnvironments={handleNavigateEnvironments}
                           onStartNew={handleLiveStartNew}
+                          reviewWorkingDir={
+                            historyCwdByProviderSessionId.get(entry.session.provider_session_id ?? '')
+                              || entry.session.project_dir
+                          }
                       />
                       </div>
                     );
@@ -3992,6 +4021,7 @@ export function Workspace({
           width={browserPanelWidthPercent}
           onResizeStart={handleBrowserPanelResizeStart}
           onSelectBrowser={() => selectActiveBrowser(skillsContext.workingDir)}
+          changeCount={workspaceReviewModel?.changedFiles.length}
         >
         {Object.entries(browserTargetBySessionId).map(([sessionId, target]) => {
           if (!target) return null;

@@ -1,31 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import {
   CheckCircle2,
   CircleAlert,
-  ExternalLink,
-  FileDiff,
-  FileText,
   LoaderCircle,
-  RefreshCw,
-  PanelLeft,
   Users,
 } from '@/lib/lucide-react';
-import { toast } from 'sonner';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { MarkdownRenderer } from '@/components/history/MarkdownRenderer';
-import { WorkspaceFileLinkContext, useWorkspaceFileLinks } from './WorkspaceFileLinkContext';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
 import type {
   NativeSessionSummary,
   WorkspaceFileDiff,
-  WorkspaceFilePreview,
-  WorkspaceFileSuggestion,
   WorkspaceGitSnapshot,
-  WorkspaceMediaKind,
   WorkspaceMediaPreview,
 } from '@/lib/tauri-ipc';
 import { cn } from '@/lib/utils';
@@ -37,6 +22,7 @@ import type {
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
 import type { WorkspaceReviewModel } from './workspaceReview';
 import { getSubagentDisplayMeta, resolveSubagentSelection } from './workspaceSubagents';
+import { WorkspaceFilesPanel } from './WorkspaceFilesPanel';
 
 export type WorkspaceReviewDetailPage = 'files' | 'agents';
 
@@ -44,372 +30,18 @@ interface WorkspaceReviewDetailsProps {
   page: WorkspaceReviewDetailPage;
   session: NativeSessionSummary;
   model: WorkspaceReviewModel;
-  onLoadDiff: (filePath: string) => Promise<WorkspaceFileDiff>;
+  onLoadDiff: (filePath: string, options?: { committed?: boolean }) => Promise<WorkspaceFileDiff>;
   onLoadMediaPreview?: (filePath: string) => Promise<WorkspaceMediaPreview>;
   onLoadSubagents?: (detailAgentId: string | null) => Promise<SessionSubagentsPayload>;
   isLive?: boolean;
   gitSnapshot?: WorkspaceGitSnapshot | null;
   requestedPath?: string;
   requestRevision?: number;
+  requestedMode?: 'preview' | 'source' | 'diff';
   onRefreshGit?: () => void;
   isRefreshingGit?: boolean;
-}
-
-const MEDIA_EXTENSION_KIND: Record<string, WorkspaceMediaKind> = {
-  png: 'image',
-  jpg: 'image',
-  jpeg: 'image',
-  gif: 'image',
-  webp: 'image',
-  bmp: 'image',
-  svg: 'image',
-  ico: 'image',
-  avif: 'image',
-  mp3: 'audio',
-  wav: 'audio',
-  ogg: 'audio',
-  m4a: 'audio',
-  flac: 'audio',
-  aac: 'audio',
-  mp4: 'video',
-  webm: 'video',
-  mov: 'video',
-  mkv: 'video',
-  avi: 'video',
-};
-
-function basename(path: string) {
-  const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/);
-  return parts[parts.length - 1] || path;
-}
-
-function mediaKindForPath(filePath: string): WorkspaceMediaKind | null {
-  const extension = filePath.toLowerCase().split('.').pop() ?? '';
-  return MEDIA_EXTENSION_KIND[extension] ?? null;
-}
-
-function formatByteSize(bytes: number): string {
-  if (!bytes || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let value = bytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  return `${unitIndex === 0 ? Math.round(value) : value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
-}
-
-function statusMark(status: string) {
-  const value = status.toLowerCase();
-  if (value.includes('add') || value.includes('untrack') || value === 'a' || value === '??') {
-    return { letter: 'A', className: 'text-success' };
-  }
-  if (value.includes('delet') || value === 'd') {
-    return { letter: 'D', className: 'text-destructive' };
-  }
-  if (value.includes('renam') || value === 'r') {
-    return { letter: 'R', className: 'text-primary' };
-  }
-  return { letter: 'M', className: 'text-warning' };
-}
-
-function DiffPreview({
-  diff,
-  loading,
-  error,
-}: {
-  diff: WorkspaceFileDiff | null;
-  loading: boolean;
-  error: string | null;
-}) {
-  const { t } = useLocale();
-  if (loading) {
-    return (
-      <div className="space-y-2 px-4 py-4" aria-label={t('workspace.reviewLoading')}>
-        {Array.from({ length: 9 }).map((_, index) => (
-          <div
-            key={index}
-            className="h-3 rounded bg-surface-raised/60"
-            style={{ width: `${58 + ((index * 29) % 39)}%` }}
-          />
-        ))}
-      </div>
-    );
-  }
-  if (error) return <p className="px-4 py-4 text-xs text-destructive">{error}</p>;
-  if (!diff) return null;
-  if (!diff.is_repo) {
-    return <p className="px-4 py-4 text-xs text-muted-foreground">{diff.error || t('workspace.reviewNotGitRepo')}</p>;
-  }
-  if (diff.is_binary) {
-    return <p className="px-4 py-4 text-xs text-muted-foreground">{t('workspace.reviewBinaryUnavailable')}</p>;
-  }
-  if (diff.lines.length === 0) {
-    return <p className="px-4 py-4 text-xs text-muted-foreground">{t('workspace.reviewNoDiff')}</p>;
-  }
-
-  return (
-    <div className="py-1 font-mono text-[11px] leading-[1.55]">
-      {diff.lines.map((line, index) => {
-        const addition = line.kind === 'addition';
-        const deletion = line.kind === 'deletion';
-        const hunk = line.kind === 'hunk';
-        const meta = line.kind === 'meta';
-        return (
-          <div
-            key={`${index}:${line.text}`}
-            className={cn(
-              'flex min-w-0',
-              addition && 'bg-success/10',
-              deletion && 'bg-destructive/10',
-              hunk && 'bg-primary/8 text-primary/80',
-              meta && 'text-muted-foreground/50',
-            )}
-          >
-            <span className="w-10 shrink-0 select-none border-r border-border-subtle/40 pr-1.5 text-right text-[10px] tabular-nums text-muted-foreground/45">
-              {line.new_line ?? line.old_line ?? ''}
-            </span>
-            {!hunk && !meta ? (
-              <span className={cn('w-4 shrink-0 select-none text-center', addition && 'text-success', deletion && 'text-destructive')}>
-                {addition ? '+' : deletion ? '-' : ' '}
-              </span>
-            ) : null}
-            <span
-              className={cn(
-                'min-w-0 flex-1 whitespace-pre-wrap break-words px-1 pr-3',
-                addition && 'text-success',
-                deletion && 'text-muted-foreground line-through decoration-destructive/40',
-                !addition && !deletion && !hunk && !meta && 'text-foreground/80',
-              )}
-            >
-              {line.text || ' '}
-            </span>
-          </div>
-        );
-      })}
-      {diff.truncated ? (
-        <p className="px-4 py-2 text-[10px] text-muted-foreground/60">{t('workspace.reviewDiffTruncated')}</p>
-      ) : null}
-    </div>
-  );
-}
-
-function MediaPreview({
-  preview,
-  loading,
-  error,
-}: {
-  preview: WorkspaceMediaPreview | null;
-  loading: boolean;
-  error: string | null;
-}) {
-  const { t } = useLocale();
-  if (loading) {
-    return <div className="m-4 h-36 animate-pulse rounded-xl bg-surface-raised/60" />;
-  }
-  if (error) return <p className="px-4 py-4 text-xs text-destructive">{error}</p>;
-  if (!preview) return null;
-  if (preview.error || !preview.data_url) {
-    return <p className="px-4 py-4 text-xs text-muted-foreground">{preview.error || t('workspace.reviewMediaUnavailable')}</p>;
-  }
-
-  const metadata = (
-    <div className="mt-2 flex items-center gap-2 text-[10px] text-muted-foreground">
-      <span className="truncate">{preview.media_type}</span>
-      <span className="ml-auto font-mono tabular-nums">{formatByteSize(preview.byte_size)}</span>
-    </div>
-  );
-  if (preview.kind === 'image') {
-    return (
-      <div className="p-4">
-        <img
-          src={preview.data_url}
-          alt={basename(preview.path)}
-          className="mx-auto block max-h-[420px] max-w-full rounded-lg border border-border-subtle/40 bg-background/40 object-contain"
-        />
-        {metadata}
-      </div>
-    );
-  }
-  if (preview.kind === 'audio') {
-    return (
-      <div className="p-4">
-        <audio controls src={preview.data_url} className="w-full" />
-        {metadata}
-      </div>
-    );
-  }
-  if (preview.kind === 'video') {
-    return (
-      <div className="p-4">
-        <video controls src={preview.data_url} className="max-h-[420px] w-full rounded-lg bg-black" />
-        {metadata}
-      </div>
-    );
-  }
-  return <p className="px-4 py-4 text-xs text-muted-foreground">{t('workspace.reviewBinaryUnavailable')}</p>;
-}
-
-function FilesDetail({
-  session, model, onLoadDiff, onLoadMediaPreview, gitSnapshot,
-  requestedPath, requestRevision, onRefreshGit, isRefreshingGit,
-}: WorkspaceReviewDetailsProps) {
-  const { t } = useLocale();
-  const fileLinks = useWorkspaceFileLinks();
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const [mode, setMode] = useState<'preview' | 'source' | 'diff'>('preview');
-  const [scope, setScope] = useState('git');
-  const [showList, setShowList] = useState(true);
-  const [query, setQuery] = useState('');
-  const [suggestions, setSuggestions] = useState<WorkspaceFileSuggestion[]>([]);
-  const [searchError, setSearchError] = useState<string | null>(null);
-  const [searching, setSearching] = useState(false);
-  const [diff, setDiff] = useState<WorkspaceFileDiff | null>(null);
-  const [mediaPreview, setMediaPreview] = useState<WorkspaceMediaPreview | null>(null);
-  const [textPreview, setTextPreview] = useState<WorkspaceFilePreview | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const fileRequestSeqRef = useRef(0);
-  const loaders = useRef({ onLoadDiff, onLoadMediaPreview });
-  loaders.current = { onLoadDiff, onLoadMediaPreview };
-  const markdown = (path: string) => /\.(md|markdown|mdown)$/i.test(path);
-
-  useEffect(() => () => { fileRequestSeqRef.current += 1; }, []);
-
-  const selectFile = useCallback(async (path: string, requestedMode?: 'preview' | 'source' | 'diff') => {
-    const nextMode = requestedMode ?? (markdown(path) || mediaKindForPath(path) ? 'preview' : 'source');
-    const requestSeq = ++fileRequestSeqRef.current;
-    setSelectedPath(path);
-    setMode(nextMode);
-    setDiff(null);
-    setTextPreview(null);
-    setMediaPreview(null);
-    setError(null);
-    setLoading(true);
-    try {
-      if (nextMode === 'diff') {
-        const next = await loaders.current.onLoadDiff(path);
-        if (requestSeq !== fileRequestSeqRef.current) return;
-        setDiff(next);
-      } else if (mediaKindForPath(path) && loaders.current.onLoadMediaPreview) {
-        const next = await loaders.current.onLoadMediaPreview(path);
-        if (requestSeq !== fileRequestSeqRef.current) return;
-        setMediaPreview(next);
-      } else {
-        const next = await invoke<WorkspaceFilePreview>('get_workspace_file_preview', { workingDir: session.project_dir, filePath: path });
-        if (requestSeq !== fileRequestSeqRef.current) return;
-        setTextPreview(next);
-      }
-    } catch (requestError) {
-      if (requestSeq !== fileRequestSeqRef.current) return;
-      setError(String(requestError));
-    } finally {
-      if (requestSeq === fileRequestSeqRef.current) setLoading(false);
-    }
-  }, [session.project_dir]);
-
-  useEffect(() => {
-    if (requestedPath) void selectFile(requestedPath, model.changedFiles.find(file => file.path === requestedPath)?.status === 'deleted' ? 'diff' : undefined);
-  }, [requestedPath, requestRevision, selectFile]);
-
-  useEffect(() => {
-    if (scope !== 'browse') return;
-    let cancelled = false;
-    setSearching(true);
-    setSearchError(null);
-    const timer = window.setTimeout(() => {
-      void invoke<WorkspaceFileSuggestion[]>('search_workspace_files', { workingDir: session.project_dir, query, limit: 40 })
-        .then((files) => { if (!cancelled) setSuggestions(files.filter((file) => !file.is_dir)); })
-        .catch((err) => { if (!cancelled) { setSuggestions([]); setSearchError(String(err)); } })
-        .finally(() => { if (!cancelled) setSearching(false); });
-    }, 180);
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [query, scope, session.project_dir]);
-
-  const openInEditor = async (path: string) => {
-    try {
-      await invoke<boolean>('open_file_in_workspace', { workingDir: session.project_dir, filePath: path });
-    } catch (err) {
-      const message = String(err);
-      if (message.includes('escapes working dir')) toast.error(t('workspace.reviewPathOutsideWorkspace'));
-      else toast.error(message);
-    }
-  };
-  const files = model.changedFiles.filter((file) => scope === 'session' ? file.source !== 'git' : file.source !== 'sdk');
-  const rows = scope === 'browse'
-    ? suggestions.map((file) => ({ path: file.relative_path, status: '', source: 'browse' }))
-    : files.filter((file) => file.path.toLowerCase().includes(query.toLowerCase()));
-  return (
-    <div className="flex min-h-0 flex-1 flex-col" data-review-page="files">
-      <div className="flex items-center gap-2 border-b border-border-subtle/50 px-3 py-2">
-        <Tabs value={scope} onValueChange={setScope} className="min-w-0 flex-1">
-          <TabsList className="h-8 bg-transparent p-0" aria-label={t('workspace.fileSources')}>
-            <TabsTrigger value="git" className="px-2 text-[11px]">{t('workspace.filesGit')} {model.changedFiles.filter((file) => file.source !== 'sdk').length}</TabsTrigger>
-            <TabsTrigger value="session" className="px-2 text-[11px]">{t('workspace.filesSession')} {model.changedFiles.filter((file) => file.source !== 'git').length}</TabsTrigger>
-            <TabsTrigger value="browse" className="px-2 text-[11px]">{t('workspace.filesBrowse')}</TabsTrigger>
-          </TabsList>
-        </Tabs>
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewRefresh')} disabled={isRefreshingGit} onClick={onRefreshGit}><RefreshCw className={cn('h-3.5 w-3.5', isRefreshingGit && 'animate-spin')} /></Button>
-      </div>
-      <p className="border-b border-border-subtle/40 px-4 py-2 text-[10px] leading-relaxed text-muted-foreground">
-        {t(scope === 'git' ? 'workspace.filesGitHint' : scope === 'session' ? 'workspace.filesSessionHint' : 'workspace.filesBrowseHint')}
-      </p>
-      <div className="flex min-h-0 flex-1">
-        {showList ? <div className="flex w-[32%] min-w-[140px] max-w-[260px] shrink-0 flex-col border-r border-border-subtle/50">
-          <div className="p-2"><Input aria-label={t('workspace.filesSearch')} placeholder={t('workspace.filesSearch')} value={query} onChange={(event) => setQuery(event.target.value)} className="h-8 px-2 text-xs" /></div>
-          <ScrollArea className="min-h-0 flex-1">
-            {scope === 'git' && gitSnapshot?.error ? <p className="px-3 py-3 text-xs text-muted-foreground">{gitSnapshot.error}</p> : null}
-            {searchError && scope === 'browse' ? <p className="px-3 py-3 text-xs text-destructive">{searchError}</p> : null}
-            {rows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{searching && scope === 'browse' ? t('workspace.reviewLoading') : t('workspace.filesEmpty')}</p> : rows.map((file) => (
-              <button key={file.path} type="button" data-review-file-row title={file.path} onClick={() => {
-                if (fileLinks) fileLinks.openFile(file.path);
-                else void selectFile(file.path, file.status === 'deleted' ? 'diff' : undefined);
-              }} className={cn('flex w-full items-center gap-2 px-3 py-2 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
-                <FileText className="h-3.5 w-3.5 shrink-0 opacity-60" /><span className="min-w-0 flex-1 truncate">{file.path}</span>
-                {file.status ? <span className={cn('font-mono text-[10px]', statusMark(file.status).className)}>{statusMark(file.status).letter}</span> : null}
-              </button>
-            ))}
-          </ScrollArea>
-        </div> : null}
-        <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border-subtle/40 px-2">
-            <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesToggleList')} aria-pressed={showList} onClick={() => setShowList(!showList)}><PanelLeft className="h-3.5 w-3.5" /></Button>
-            <p className="min-w-0 flex-1 truncate text-xs font-medium" title={selectedPath ?? ''}>{selectedPath ? basename(selectedPath) : t('workspace.sidePanelFiles')}</p>
-            {selectedPath ? <>
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesRefreshPreview')} onClick={() => void selectFile(selectedPath, mode)}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
-              <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewOpenInEditor')} onClick={() => void openInEditor(selectedPath)}><ExternalLink className="h-3.5 w-3.5" /></Button>
-            </> : null}
-          </div>
-          {selectedPath ? <>
-            <div className="border-b border-border-subtle/40 px-3 py-1.5">
-              <p className="mb-1 truncate font-mono text-[10px] text-muted-foreground" title={selectedPath}>{selectedPath}</p>
-              <Tabs value={mode} onValueChange={(value) => void selectFile(selectedPath, value as typeof mode)}>
-                <TabsList className="h-7 bg-transparent p-0" aria-label={t('workspace.filesView')}>
-                  {markdown(selectedPath) || mediaKindForPath(selectedPath) ? <TabsTrigger className="px-2 py-1 text-[11px]" value="preview">{t('workspace.filesPreview')}</TabsTrigger> : null}
-                  {!mediaKindForPath(selectedPath) ? <TabsTrigger className="px-2 py-1 text-[11px]" value="source">{t('workspace.filesSource')}</TabsTrigger> : null}
-                  <TabsTrigger className="px-2 py-1 text-[11px]" value="diff">{t('workspace.filesDiff')}</TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </div>
-            <ScrollArea className="min-h-0 flex-1">
-              {mode === 'diff' ? <DiffPreview diff={diff} loading={loading} error={error} />
-                : mediaKindForPath(selectedPath) ? <MediaPreview preview={mediaPreview} loading={loading} error={error} />
-                : loading ? <p role="status" className="p-4 text-xs text-muted-foreground">{t('workspace.reviewLoading')}</p>
-                : error ? <p role="alert" className="p-4 text-xs text-destructive">{error}</p>
-                : textPreview?.is_binary ? <p className="p-4 text-xs text-muted-foreground">{t('workspace.reviewBinaryUnavailable')}</p>
-                : textPreview ? <>
-                  {textPreview.truncated ? <p className="p-3 text-xs text-warning">{t('workspace.filesTruncated')}</p> : null}
-                  {mode === 'preview' && markdown(selectedPath)
-                    ? <WorkspaceFileLinkContext.Provider value={fileLinks ? { ...fileLinks, documentPath: selectedPath } : null}><div data-ccem-markdown-preview className="p-5"><MarkdownRenderer content={textPreview.content} codeTone="reading" /></div></WorkspaceFileLinkContext.Provider>
-                    : <pre data-ccem-file-source className="whitespace-pre-wrap break-words p-4 font-mono text-[11px] leading-relaxed">{textPreview.content}</pre>}
-                </> : null}
-            </ScrollArea>
-          </> : <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center"><FileDiff className="h-6 w-6 text-muted-foreground/35" /><p className="text-xs text-muted-foreground">{t('workspace.reviewSelectFile')}</p></div>}
-        </div>
-      </div>
-    </div>
-  );
+  /** When provided, the internal scope tab bar is hidden and this scope is used directly. */
+  externalScope?: 'changes' | 'browse';
 }
 
 function AgentsDetail({
@@ -570,7 +202,21 @@ function AgentsDetail({
 
 export function WorkspaceReviewDetails(props: WorkspaceReviewDetailsProps) {
   if (props.page === 'files') {
-    return <FilesDetail {...props} />;
+    return (
+      <WorkspaceFilesPanel
+        session={props.session}
+        model={props.model}
+        onLoadDiff={props.onLoadDiff}
+        onLoadMediaPreview={props.onLoadMediaPreview}
+        gitSnapshot={props.gitSnapshot}
+        requestedPath={props.requestedPath}
+        requestRevision={props.requestRevision}
+        requestedMode={props.requestedMode}
+        onRefreshGit={props.onRefreshGit}
+        isRefreshingGit={props.isRefreshingGit}
+        externalScope={props.externalScope}
+      />
+    );
   }
-  return <AgentsDetail {...props} />;
+  return <AgentsDetail onLoadSubagents={props.onLoadSubagents} isLive={props.isLive} />;
 }

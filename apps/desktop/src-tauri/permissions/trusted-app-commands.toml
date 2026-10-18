@@ -173,6 +173,7 @@ commands.allow = [
   "install_skill",
   "uninstall_skill",
   "search_workspace_files",
+  "list_workspace_dir",
   "list_cron_tasks",
   "add_cron_task",
   "update_cron_task",

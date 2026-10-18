@@ -45,7 +45,7 @@ interface WorkspaceReviewPopoverProps {
   isRefreshingGit: boolean;
   onOpenChange: (open: boolean) => void;
   onRefreshGit: () => void;
-  onLoadDiff: (filePath: string) => Promise<WorkspaceFileDiff>;
+  onLoadDiff: (filePath: string, options?: { committed?: boolean }) => Promise<WorkspaceFileDiff>;
   onLoadMediaPreview?: (filePath: string) => Promise<WorkspaceMediaPreview>;
   onLoadSubagents?: (detailAgentId: string | null) => Promise<SessionSubagentsPayload>;
   isLive?: boolean;
@@ -203,9 +203,12 @@ export function WorkspaceReviewPopover({
   const { t } = useLocale();
   const gatedOpen = useNativeSurfaceOcclusion(isOpen);
   const sidePanel = useWorkspaceSidePanel();
-  const detailPage = sidePanel?.tab === 'files' || sidePanel?.tab === 'agents' ? sidePanel.tab : null;
+  const sidePanelTab = sidePanel?.tab ?? null;
+  const isFileScopeTab = sidePanelTab === 'changes' || sidePanelTab === 'browse';
+  const detailPage = isFileScopeTab ? 'files' as const : sidePanelTab === 'agents' ? 'agents' as const : null;
+  const externalScope = isFileScopeTab ? sidePanelTab : undefined;
   const openDetail = (page: WorkspaceReviewDetailPage) => {
-    sidePanel?.open(page);
+    sidePanel?.open(page === 'files' ? 'changes' : page);
     onOpenChange(false);
   };
   const envColor = getEnvColorVar(session.env_name);
@@ -456,7 +459,9 @@ export function WorkspaceReviewPopover({
         isRefreshingGit={isRefreshingGit}
         requestedPath={sidePanel.filePath}
         requestRevision={sidePanel.revision}
+        requestedMode={sidePanel.fileMode}
         isLive={isLive}
+        externalScope={externalScope}
       />, sidePanel.target,
     ) : null}
     </>

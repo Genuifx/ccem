@@ -105,6 +105,18 @@ test('retains unchanged workspace history rows across partial refresh changes', 
   assert.equal(retained[1].taskStage, 'validation');
 });
 
+test('refresh replaces a history row when only its working directory changes', async () => {
+  const { retainStableHistorySessions } = await importWorkspaceSidebarSessions();
+  const previous = [historySession({ id: 'a', display: 'A' })];
+  const next = [{ ...previous[0], cwd: '/repo/.claude/worktrees/feature' }];
+
+  const retained = retainStableHistorySessions(previous, next);
+
+  assert.notEqual(retained, previous, 'a late cwd update must not be swallowed by stable-row retention');
+  assert.equal(retained[0], next[0]);
+  assert.equal(retained[0].cwd, '/repo/.claude/worktrees/feature');
+});
+
 test('returns the existing history array when no live sidebar sessions are appended', async () => {
   const { buildWorkspaceSidebarSessions } = await importWorkspaceSidebarSessions();
   const history = [

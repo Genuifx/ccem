@@ -10,7 +10,7 @@ const desktopDir = path.resolve(__dirname, '..');
 async function readReviewDetails() {
   try {
     return await fs.readFile(
-      path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceReviewDetails.tsx'),
+      path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceFilesPanel.tsx'),
       'utf8',
     );
   } catch (error) {
