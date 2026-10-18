@@ -4481,20 +4481,20 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         </Suspense>
       ) : null}
 
-      <WorkspaceTranscriptSelection
-        rootRef={containerRef}
-        scopeKey={`live:${session.runtime_id}`}
-        isActive={isVisible}
-        canCreate={!isTerminalStatus(session.status)}
-        canAdd={sessionAnnotations.canAddAnnotation}
-        annotations={sessionAnnotations.annotations}
-        onAdd={sessionAnnotations.addAnnotation}
-        onUpdate={sessionAnnotations.updateAnnotation}
-        onRemove={sessionAnnotations.removeAnnotation}
-      />
-
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div ref={contentRef} className="mx-auto max-w-[960px] px-8 py-8">
+        <div ref={contentRef} className="relative mx-auto max-w-[960px] px-8 py-8">
+          <WorkspaceTranscriptSelection
+            rootRef={containerRef}
+            contentRef={contentRef}
+            scopeKey={`live:${session.runtime_id}`}
+            isActive={isVisible}
+            canCreate={!isTerminalStatus(session.status)}
+            canAdd={sessionAnnotations.canAddAnnotation}
+            annotations={sessionAnnotations.annotations}
+            onAdd={sessionAnnotations.addAnnotation}
+            onUpdate={sessionAnnotations.updateAnnotation}
+            onRemove={sessionAnnotations.removeAnnotation}
+          />
           {hasTranscriptPollFailure || transcriptBackfillState !== 'idle' ? (
             <div className="sticky top-2 z-10">
               <WorkspaceTranscriptBackfillStatus

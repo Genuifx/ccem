@@ -7,6 +7,7 @@ import {
   normalizeWorkspaceSelection,
   type WorkspaceAnnotation,
   type WorkspaceAnnotationAnchor,
+  type WorkspaceAnnotationAppearance,
 } from './workspaceAnnotationModel';
 
 const STORAGE_PREFIX = 'ccem:workspace-annotations:v1:';
@@ -105,6 +106,7 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
     quote: string,
     note: string,
     anchor?: WorkspaceAnnotationAnchor,
+    appearance?: WorkspaceAnnotationAppearance,
   ): boolean => {
     const normalizedQuote = normalizeWorkspaceSelection(quote);
     const normalizedNote = note.trim();
@@ -124,10 +126,18 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
       note: normalizedNote,
       createdAt: new Date().toISOString(),
       ...(anchor ? { anchor } : {}),
+      ...(appearance ? {
+        highlightStyle: appearance.style,
+        highlightColor: appearance.color,
+      } : {}),
     }]);
   }, [annotationCharCount, annotations.length, updateItems]);
 
-  const updateAnnotation = useCallback((id: string, note: string): boolean => {
+  const updateAnnotation = useCallback((
+    id: string,
+    note: string,
+    appearance?: Partial<WorkspaceAnnotationAppearance>,
+  ): boolean => {
     const normalizedNote = note.trim();
     if (!normalizedNote || normalizedNote.length > MAX_WORKSPACE_ANNOTATION_NOTE_CHARS) {
       return false;
@@ -138,7 +148,12 @@ export function useWorkspaceAnnotations(sessionKey: string | null) {
       return false;
     }
     return updateItems((items) => items.map((item) => (
-      item.id === id ? { ...item, note: normalizedNote } : item
+      item.id === id ? {
+        ...item,
+        note: normalizedNote,
+        ...(appearance?.style ? { highlightStyle: appearance.style } : {}),
+        ...(appearance?.color ? { highlightColor: appearance.color } : {}),
+      } : item
     )));
   }, [annotationCharCount, annotations, updateItems]);
 

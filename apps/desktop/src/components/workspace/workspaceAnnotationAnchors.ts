@@ -35,28 +35,105 @@ function characterOffsetWithin(
   }
 }
 
-function textBoundaryAt(item: HTMLElement, characterOffset: number): {
+interface ItemTextIndex {
+  nodes: Text[];
+  starts: number[];
+  startsByNode: Map<Text, number>;
+  total: number;
+}
+
+type ItemTextIndexCache = Map<HTMLElement, ItemTextIndex>;
+
+function buildItemTextIndex(item: HTMLElement): ItemTextIndex {
+  const nodes: Text[] = [];
+  const starts: number[] = [];
+  const startsByNode = new Map<Text, number>();
+  let total = 0;
+  const walker = item.ownerDocument.createTreeWalker(item, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    startsByNode.set(node, total);
+    nodes.push(node);
+    starts.push(total);
+    total += node.data.length;
+  }
+  return { nodes, starts, startsByNode, total };
+}
+
+function itemTextIndex(item: HTMLElement, cache?: ItemTextIndexCache): ItemTextIndex {
+  if (!cache) {
+    return buildItemTextIndex(item);
+  }
+  const cached = cache.get(item);
+  if (cached) {
+    return cached;
+  }
+  const built = buildItemTextIndex(item);
+  cache.set(item, built);
+  return built;
+}
+
+// One TreeWalker-free lookup per boundary: the item's text nodes and cumulative
+// offsets are indexed once per placement pass, then offsets resolve by binary
+// search instead of walking the item again for every annotation.
+function textBoundaryAt(
+  item: HTMLElement,
+  characterOffset: number,
+  cache?: ItemTextIndexCache,
+): {
   node: Text;
   offset: number;
 } | null {
-  const walker = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
-  let consumed = 0;
-  let lastTextNode: Text | null = null;
+  const index = itemTextIndex(item, cache);
+  if (characterOffset < 0 || characterOffset > index.total || index.nodes.length === 0) {
+    return null;
+  }
 
-  while (walker.nextNode()) {
-    const node = walker.currentNode as Text;
-    lastTextNode = node;
-    const nextConsumed = consumed + node.data.length;
-    if (characterOffset <= nextConsumed) {
-      return { node, offset: Math.max(0, characterOffset - consumed) };
+  let low = 0;
+  let high = index.nodes.length - 1;
+  let found = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const end = index.starts[mid] + index.nodes[mid].data.length;
+    if (characterOffset <= end) {
+      found = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
     }
-    consumed = nextConsumed;
   }
 
-  if (lastTextNode && characterOffset === consumed) {
-    return { node: lastTextNode, offset: lastTextNode.data.length };
+  if (found < 0) {
+    if (characterOffset === index.total) {
+      const last = index.nodes.length - 1;
+      return { node: index.nodes[last], offset: index.nodes[last].data.length };
+    }
+    return null;
   }
-  return null;
+
+  const node = index.nodes[found];
+  return { node, offset: Math.max(0, characterOffset - index.starts[found]) };
+}
+
+function textBetweenBoundaries(
+  index: ItemTextIndex,
+  start: { node: Text; offset: number },
+  end: { node: Text; offset: number },
+): string | null {
+  if (start.node === end.node) {
+    return start.node.data.slice(start.offset, end.offset);
+  }
+  const startNodeIndex = index.startsByNode.get(start.node);
+  const endNodeIndex = index.startsByNode.get(end.node);
+  if (startNodeIndex == null || endNodeIndex == null || startNodeIndex > endNodeIndex) {
+    return null;
+  }
+  const parts: string[] = [start.node.data.slice(start.offset)];
+  for (let nodeIndex = startNodeIndex + 1; nodeIndex < endNodeIndex; nodeIndex += 1) {
+    parts.push(index.nodes[nodeIndex].data);
+  }
+  parts.push(end.node.data.slice(0, end.offset));
+  return parts.join('');
 }
 
 function transcriptItems(root: HTMLElement): HTMLElement[] {
@@ -69,9 +146,12 @@ function findItem(root: HTMLElement, key: string): HTMLElement | null {
 
 type ItemIndex = Map<string, HTMLElement>;
 
-function buildItemIndex(root: HTMLElement): ItemIndex {
+function buildItemIndex(
+  root: HTMLElement,
+  items: HTMLElement[] = transcriptItems(root),
+): ItemIndex {
   const index: ItemIndex = new Map();
-  for (const item of transcriptItems(root)) {
+  for (const item of items) {
     const key = itemKey(item);
     if (key) {
       index.set(key, item);
@@ -88,6 +168,7 @@ function rangeFromAnchor(
   root: HTMLElement,
   anchor: WorkspaceAnnotationAnchor,
   index?: ItemIndex,
+  textCache?: ItemTextIndexCache,
 ): Range | null {
   const startItem = index
     ? indexedFindItem(index, anchor.startItemKey)
@@ -99,8 +180,8 @@ function rangeFromAnchor(
     return null;
   }
 
-  const start = textBoundaryAt(startItem, anchor.startOffset);
-  const end = textBoundaryAt(endItem, anchor.endOffset);
+  const start = textBoundaryAt(startItem, anchor.startOffset, textCache);
+  const end = textBoundaryAt(endItem, anchor.endOffset, textCache);
   if (!start || !end) {
     return null;
   }
@@ -115,15 +196,20 @@ function rangeFromAnchor(
   }
 }
 
-function rangeForExactQuote(root: HTMLElement, quote: string): Range | null {
-  for (const item of transcriptItems(root)) {
+function rangeForExactQuote(
+  root: HTMLElement,
+  quote: string,
+  items?: HTMLElement[],
+  textCache?: ItemTextIndexCache,
+): Range | null {
+  for (const item of items ?? transcriptItems(root)) {
     const text = item.textContent ?? '';
     const startOffset = text.indexOf(quote);
     if (startOffset < 0) {
       continue;
     }
-    const start = textBoundaryAt(item, startOffset);
-    const end = textBoundaryAt(item, startOffset + quote.length);
+    const start = textBoundaryAt(item, startOffset, textCache);
+    const end = textBoundaryAt(item, startOffset + quote.length, textCache);
     if (!start || !end) {
       continue;
     }
@@ -143,6 +229,7 @@ export function domTextBetween(
   root: HTMLElement,
   anchor: WorkspaceAnnotationAnchor,
   index?: ItemIndex,
+  textCache?: ItemTextIndexCache,
 ): string | null {
   const startItem = index
     ? indexedFindItem(index, anchor.startItemKey)
@@ -154,10 +241,18 @@ export function domTextBetween(
     return null;
   }
 
-  const start = textBoundaryAt(startItem, anchor.startOffset);
-  const end = textBoundaryAt(endItem, anchor.endOffset);
+  const start = textBoundaryAt(startItem, anchor.startOffset, textCache);
+  const end = textBoundaryAt(endItem, anchor.endOffset, textCache);
   if (!start || !end) {
     return null;
+  }
+
+  // Single-item selections are the common case and can be read straight from
+  // the text-node index, avoiding the DOM fragment allocation that dominates
+  // repeated placement passes. Cross-item selections keep the Range path so
+  // any text between the two items has the exact same semantics.
+  if (startItem === endItem) {
+    return textBetweenBoundaries(itemTextIndex(startItem, textCache), start, end);
   }
 
   try {
@@ -223,11 +318,13 @@ export function resolveWorkspaceAnnotationRanges(
   root: HTMLElement,
   annotations: ReadonlyArray<Pick<WorkspaceAnnotation, 'quote' | 'anchor'>>,
 ): Array<Range | null> {
-  const index = buildItemIndex(root);
+  const items = transcriptItems(root);
+  const index = buildItemIndex(root, items);
+  const textCache: ItemTextIndexCache = new Map();
   return annotations.map((annotation) => {
     if (annotation.anchor) {
-      const anchoredRange = rangeFromAnchor(root, annotation.anchor, index);
-      const domText = domTextBetween(root, annotation.anchor, index);
+      const anchoredRange = rangeFromAnchor(root, annotation.anchor, index, textCache);
+      const domText = domTextBetween(root, annotation.anchor, index, textCache);
       if (
         anchoredRange
         && domText !== null
@@ -237,6 +334,6 @@ export function resolveWorkspaceAnnotationRanges(
       }
       return null;
     }
-    return rangeForExactQuote(root, annotation.quote);
+    return rangeForExactQuote(root, annotation.quote, items, textCache);
   });
 }

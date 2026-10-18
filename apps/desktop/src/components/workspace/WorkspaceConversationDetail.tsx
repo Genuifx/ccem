@@ -24,6 +24,7 @@ import {
 import type {
   WorkspaceAnnotation,
   WorkspaceAnnotationAnchor,
+  WorkspaceAnnotationAppearance,
 } from './workspaceAnnotationModel';
 
 interface WorkspaceConversationDetailProps {
@@ -37,8 +38,17 @@ interface WorkspaceConversationDetailProps {
   onTranscriptRetry?: () => void;
   canAddAnnotation?: boolean;
   annotations?: WorkspaceAnnotation[];
-  onAddAnnotation?: (quote: string, note: string, anchor?: WorkspaceAnnotationAnchor) => boolean;
-  onUpdateAnnotation?: (id: string, note: string) => boolean;
+  onAddAnnotation?: (
+    quote: string,
+    note: string,
+    anchor?: WorkspaceAnnotationAnchor,
+    appearance?: WorkspaceAnnotationAppearance,
+  ) => boolean;
+  onUpdateAnnotation?: (
+    id: string,
+    note: string,
+    appearance?: Partial<WorkspaceAnnotationAppearance>,
+  ) => boolean;
   onRemoveAnnotation?: (id: string) => void;
   /** Fork-session-from-turn action for model-output bubbles (stable callback). */
   onForkTurn?: (message: ConversationMessageData) => void;
@@ -69,6 +79,7 @@ export function WorkspaceConversationDetail({
   const { t } = useLocale();
   const [, startTransition] = useTransition();
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
   const initialScrollKeyRef = useRef<string | null>(null);
   const lastVisibleMessageCountRef = useRef(0);
@@ -277,19 +288,20 @@ export function WorkspaceConversationDetail({
 
   return (
     <>
-      {onAddAnnotation && onUpdateAnnotation && onRemoveAnnotation ? (
-        <WorkspaceTranscriptSelection
-          rootRef={messagesContainerRef}
-          scopeKey={`history:${toSessionKey(selectedSession)}:${activeSegment ?? 'all'}`}
-          canAdd={canAddAnnotation}
-          annotations={annotations}
-          onAdd={onAddAnnotation}
-          onUpdate={onUpdateAnnotation}
-          onRemove={onRemoveAnnotation}
-        />
-      ) : null}
       <ScrollArea viewportRef={messagesContainerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div className="mx-auto max-w-[860px] px-8 py-8">
+        <div ref={contentRef} className="relative mx-auto max-w-[860px] px-8 py-8">
+          {onAddAnnotation && onUpdateAnnotation && onRemoveAnnotation ? (
+            <WorkspaceTranscriptSelection
+              rootRef={messagesContainerRef}
+              contentRef={contentRef}
+              scopeKey={`history:${toSessionKey(selectedSession)}:${activeSegment ?? 'all'}`}
+              canAdd={canAddAnnotation}
+              annotations={annotations}
+              onAdd={onAddAnnotation}
+              onUpdate={onUpdateAnnotation}
+              onRemove={onRemoveAnnotation}
+            />
+          ) : null}
           <div className="sticky top-2 z-10">
             <WorkspaceTranscriptBackfillStatus
               state={transcriptBackfillState}

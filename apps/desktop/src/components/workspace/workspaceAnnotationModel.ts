@@ -12,6 +12,22 @@ export interface WorkspaceAnnotationAnchor {
   endOffset: number;
 }
 
+export const WORKSPACE_ANNOTATION_STYLES = ['selection', 'wave'] as const;
+export type WorkspaceAnnotationHighlightStyle = (typeof WORKSPACE_ANNOTATION_STYLES)[number];
+
+export const WORKSPACE_ANNOTATION_COLORS = ['rose', 'violet', 'blue', 'green', 'amber'] as const;
+export type WorkspaceAnnotationColor = (typeof WORKSPACE_ANNOTATION_COLORS)[number];
+
+export interface WorkspaceAnnotationAppearance {
+  style: WorkspaceAnnotationHighlightStyle;
+  color: WorkspaceAnnotationColor;
+}
+
+export const DEFAULT_WORKSPACE_ANNOTATION_APPEARANCE: WorkspaceAnnotationAppearance = {
+  style: 'selection',
+  color: 'blue',
+};
+
 export interface WorkspaceAnnotation {
   id: string;
   quote: string;
@@ -25,6 +41,25 @@ export interface WorkspaceAnnotation {
    */
   sentAt?: string;
   anchor?: WorkspaceAnnotationAnchor;
+  /** Per-annotation paint. Missing values fall back to the last used default. */
+  highlightStyle?: WorkspaceAnnotationHighlightStyle;
+  highlightColor?: WorkspaceAnnotationColor;
+}
+
+export function normalizeWorkspaceAnnotationHighlightStyle(
+  value: unknown,
+): WorkspaceAnnotationHighlightStyle | undefined {
+  return WORKSPACE_ANNOTATION_STYLES.includes(value as WorkspaceAnnotationHighlightStyle)
+    ? value as WorkspaceAnnotationHighlightStyle
+    : undefined;
+}
+
+export function normalizeWorkspaceAnnotationColor(
+  value: unknown,
+): WorkspaceAnnotationColor | undefined {
+  return WORKSPACE_ANNOTATION_COLORS.includes(value as WorkspaceAnnotationColor)
+    ? value as WorkspaceAnnotationColor
+    : undefined;
 }
 
 export interface WorkspacePromptAnnotation {
@@ -119,6 +154,8 @@ export function normalizeStoredWorkspaceAnnotations(value: unknown): WorkspaceAn
       const sentAt = typeof annotation.sentAt === 'string' && annotation.sentAt.length > 0
         ? annotation.sentAt
         : undefined;
+      const highlightStyle = normalizeWorkspaceAnnotationHighlightStyle(annotation.highlightStyle);
+      const highlightColor = normalizeWorkspaceAnnotationColor(annotation.highlightColor);
       return {
         id: annotation.id,
         quote: annotation.quote.trim(),
@@ -126,6 +163,8 @@ export function normalizeStoredWorkspaceAnnotations(value: unknown): WorkspaceAn
         createdAt: annotation.createdAt,
         ...(sentAt ? { sentAt } : {}),
         ...(anchor ? { anchor } : {}),
+        ...(highlightStyle ? { highlightStyle } : {}),
+        ...(highlightColor ? { highlightColor } : {}),
       };
     });
 }
